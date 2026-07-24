@@ -2,6 +2,7 @@ package fcvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,6 +73,11 @@ type fakeVMM struct {
 	// path passed to TriggerResumeHook. Tests assert both ordering (Boot
 	// doesn't fire it, Restore does) and the dial-time argument.
 	resumeHookCalls []resumeHookCall
+	// bootCgroupFail, when non-nil, causes Boot to return this error after
+	// creating the cgroup scope — used to simulate a cgroup write failure
+	// (e.g. memory.max WriteFile failing due to permissions) without
+	// depending on filesystem permissions that may be bypassed by root.
+	bootCgroupFail error
 	// M6 builder-VM path: DestroyWithExport returns this exit code, copies
 	// nothing. App VMs just see "destroyed" the same way Kill did.
 	destroyWithExportExit int
@@ -91,13 +97,19 @@ func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig) error {
 	v.bootCount++
 	v.mu.Unlock()
 	// Mirror what jailer does in production: create the per-VM cgroup
-	// scope under faas-tenant.slice. Without this the post-bringUp
-	// writeMemoryMax in Wake fails on the test side even though the
-	// code path is correct. Best-effort: if the test set cgroupRoot to
-	// a path where this would fail, leave it; the cgroup write will
-	// surface the error.
-	if err := os.MkdirAll(filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance)), 0o755); err != nil {
+	// scope under faas-tenant.slice, then write memory.max to set the
+	// RAM cap. Both operations must succeed for Boot to be considered
+	// successful — a missing scope or unwritable memory.max means the
+	// VM is not properly constrained and we must fail.
+	scopePath := filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance))
+	if err := os.MkdirAll(scopePath, 0o755); err != nil {
 		return err
+	}
+	// Injectable cgroup failure — used to simulate memory.max write failure
+	// (CAP_SYS_ADMIN not granted, cgroup namespace isolation, etc.) without
+	// depending on filesystem permissions that root can bypass.
+	if v.bootCgroupFail != nil {
+		return v.bootCgroupFail
 	}
 	return v.bootErr
 }
@@ -1120,35 +1132,14 @@ func TestWakeWritesMemoryMaxAfterBringUp(t *testing.T) {
 // TestWakeCgroupWriteFailureUnwindsNetns covers the leak invariant
 // when the post-bringUp cgroup write itself fails. The cleanup
 // defer in Wake must still tear down the netns and release the lease
-// so a transient cgroup permission issue doesn't leak. We point
-// cgroupRoot at a read-only directory so os.WriteFile returns an
-// error.
+// so a transient cgroup permission issue doesn't leak. We inject a
+// cgroup failure via fakeVMM.bootCgroupFail so the test works
+// regardless of whether it runs as root (root can bypass fs permissions).
 func TestWakeCgroupWriteFailureUnwindsNetns(t *testing.T) {
-	// Build a directory where the slice dir exists but is read-only —
-	// the scope-create inside fakeVMM.Boot succeeds (it MkdirAll's
-	// the scope), but the subsequent memory.max WriteFile inside the
-	// scope fails. Easiest: chmod the parent dir to 0500 after the
-	// scope is created. We do it by pointing cgroupRoot at a path
-	// that exists but is unwritable.
-	tmp := t.TempDir()
-	ro := filepath.Join(tmp, "ro")
-	if err := os.Mkdir(ro, 0o555); err != nil {
-		t.Fatalf("mkdir ro: %v", err)
-	}
-	// Restore permissions on cleanup so t.TempDir can remove the
-	// tree — t.TempDir removes with a regular rm.
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
-
-	saved := cgroupRoot
-	cgroupRoot = ro
-	t.Cleanup(func() { cgroupRoot = saved })
-
-	// fakeVMM.Boot does MkdirAll(<cgroupRoot>/faas-tenant.slice/vm-…scope)
-	// on a read-only root → fails → Boot returns an error. That makes
-	// bringUp fail, which routes through the existing defer-cleanup.
-	// The expected assertion is just that the Wake error mentions the
-	// failure (whatever the underlying cause) and nothing leaks.
 	run, vmm := &fakeRunner{}, &fakeVMM{}
+	// Inject a synthetic cgroup write failure — same shape as what
+	// writeMemoryMax would return if the cgroup scope was unwritable.
+	vmm.bootCgroupFail = errors.New("cgroup write: open /sys/fs/cgroup/faas-tenant.slice/vm-cgroup-fail/cgroup.controller: permission denied")
 	m := newTestManager(run, vmm)
 
 	_, err := m.ColdBoot(context.Background(), req("cgroup-fail"))
