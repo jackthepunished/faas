@@ -119,16 +119,19 @@ func TestAppsSuffix(t *testing.T) {
 	}
 }
 
-// fakeInvalidator records EvictTarget / FlushRoutes calls.
+// fakeInvalidator records EvictInstance / FlushRoutes calls.
 type fakeInvalidator struct {
 	mu       sync.Mutex
-	evicted  []string
+	evicted  map[string]string // instance_id -> app_id
 	flushCnt int
 }
 
-func (f *fakeInvalidator) EvictTarget(appID string) {
+func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
 	f.mu.Lock()
-	f.evicted = append(f.evicted, appID)
+	if f.evicted == nil {
+		f.evicted = map[string]string{}
+	}
+	f.evicted[instanceID] = appID
 	f.mu.Unlock()
 }
 func (f *fakeInvalidator) FlushRoutes() {
@@ -146,15 +149,63 @@ func TestHandleInvalidation(t *testing.T) {
 	handleInvalidation(f, db.Notification{Channel: db.NotifyDomainChanged, Payload: `{"domain":"x.io"}`}, log)
 	// Malformed instance payload → no evict, no panic.
 	handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `not json`}, log)
+	// instance payload missing instance_id → no evict.
+	handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"app_id":"app-7"}`}, log)
 	// Unknown channel → ignored.
 	handleInvalidation(f, db.Notification{Channel: "other", Payload: `{}`}, log)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.evicted) != 1 || f.evicted[0] != "app-7" {
-		t.Errorf("evicted = %v, want [app-7]", f.evicted)
+	if got, want := f.evicted["i-1"], "app-7"; got != want {
+		t.Errorf("evicted[i-1] = %q, want %q", got, want)
+	}
+	if len(f.evicted) != 1 {
+		t.Errorf("evicted map = %v, want 1 entry", f.evicted)
 	}
 	if f.flushCnt != 2 {
 		t.Errorf("flush count = %d, want 2 (app + domain)", f.flushCnt)
+	}
+}
+
+// TestHandleInvalidation_LifecycleStatesDoNotEvict (issue #168) pins the
+// cache-self-destruct guard: lifecycle states (waking/cold_booting/running)
+// must NOT evict. The wake flow emits two notifications per successful
+// wake — WAKING right after CreateInstance, RUNNING after vmmd boot —
+// and the gateway adds the Target to its cache on the Admit RPC return
+// between those two emissions. Evicting on either notification drops
+// the Target we just added, defeating the cache.
+func TestHandleInvalidation_LifecycleStatesDoNotEvict(t *testing.T) {
+	for _, state := range []string{"waking", "cold_booting", "running"} {
+		f := &fakeInvalidator{}
+		log := testLogger()
+		payload := `{"instance_id":"i-lifecycle","app_id":"app-9","state":"` + state + `"}`
+		handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
+
+		f.mu.Lock()
+		evicted := len(f.evicted)
+		f.mu.Unlock()
+		if evicted != 0 {
+			t.Errorf("state=%q: evicted %d entries, want 0 (cache-self-destruct guard)", state, evicted)
+		}
+	}
+}
+
+// TestHandleInvalidation_TerminalStatesEvict (issue #168) verifies the
+// companion to the lifecycle test: terminal-ish states (stopped, failed,
+// parked, snapshotting) DO evict so the next request re-admits on a
+// different node / wakes fresh.
+func TestHandleInvalidation_TerminalStatesEvict(t *testing.T) {
+	for _, state := range []string{"stopped", "failed", "parked", "snapshotting"} {
+		f := &fakeInvalidator{}
+		log := testLogger()
+		payload := `{"instance_id":"i-term","app_id":"app-9","state":"` + state + `"}`
+		handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
+
+		f.mu.Lock()
+		got := f.evicted["i-term"]
+		f.mu.Unlock()
+		if got != "app-9" {
+			t.Errorf("state=%q: evicted[i-term] = %q, want app-9", state, got)
+		}
 	}
 }

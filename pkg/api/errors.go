@@ -220,6 +220,13 @@ const (
 	CodeCliAuthPending     = "cli_auth_code_pending"
 	CodeCliAuthUnavailable = "cli_auth_code_unavailable"
 
+	// CodeAppConcurReached is the typed "already at max_concurrency"
+	// result from Engine.AdmitInstance (issue #168). Distinct from
+	// CodePlanLimitConcur because the gateway treats this as a benign
+	// no-op when it already has ≥1 cached target, while plan_limit
+	// (the Wake path) is always fatal to the requesting call.
+	CodeAppConcurReached = "app_concurrency_reached"
+
 	// Dashboard auth (issue #165, ADR-032). Pre-#165, POST /login
 	// auto-created an account + minted a "web-console" API key + set
 	// the session cookie on ANY email with zero verification, which
@@ -279,7 +286,7 @@ func StatusForCode(code string) int {
 	switch code {
 	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
 		return http.StatusForbidden
-	case CodePlanLimitConcur, CodeQuotaExhausted:
+	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -383,6 +390,19 @@ func ErrPlanLimitConcurrency(l Limits, observed int) *Problem {
 // (RAM headroom or vCPU slots, spec §4.3). This should be near-impossible in
 // practice — admission alerts fire long before customers see it (spec §12) — so
 // it is a page for us, not just a message for them (UX spec §7).
+// ErrAppConcurrencyReached is returned by Engine.AdmitInstance when the
+// app is already at its effective max_concurrency (issue #168). The
+// gateway treats this as a benign no-op when it already has ≥1 cached
+// target; the Wire RPC carries the same information as a typed
+// at_capacity boolean so the gateway never has to parse problems.
+func ErrAppConcurrencyReached(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusTooManyRequests, CodeAppConcurReached,
+		"App concurrency reached",
+		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
+		WithLimit(int64(l.MaxConcurrency), int64(observed)).
+		WithDocs("https://docs.DOMAIN/plans#concurrency")
+}
+
 func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
