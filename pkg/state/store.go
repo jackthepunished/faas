@@ -214,6 +214,34 @@ type Store interface {
 	ConsumeLoginToken(ctx context.Context, tokenHash []byte) (string, error)
 	DeleteOldLoginTokens(ctx context.Context, before time.Time) (int64, error)
 
+	// Account passwords (issue #165 / ADR-032 PR #2). The Argon2id
+	// PHC hash lives in the account_passwords side table; OAuth-only
+	// accounts have no row. SetAccountPassword upserts the hash
+	// (overwriting any prior hash for the same account — the
+	// password-set path). AccountPasswordByAccountID returns the
+	// stored hash or ErrNotFound (the postLogin handler uses the
+	// ErrNotFound branch as the trigger for the anti-enumeration
+	// Argon2id pad). DeleteAccountPassword removes the row (used by
+	// the G6 hard-delete path on account removal and reserved for a
+	// future "switch to OAuth-only" opt-out).
+	SetAccountPassword(ctx context.Context, accountID, phc string) error
+	AccountPasswordByAccountID(ctx context.Context, accountID string) (string, error)
+	DeleteAccountPassword(ctx context.Context, accountID string) error
+
+	// OAuth links (issue #165 / ADR-032 PR #2). The (provider,
+	// provider_subject) composite primary key is the §11
+	// anti-takeover invariant: one OAuth subject binds to exactly
+	// one account, period. UpsertOAuthLink is the "first party to
+	// bind a sub owns the row" path: a re-bind by the same account
+	// updates the email/email_verified snapshot, a re-bind by a
+	// different account is rejected by the PK at the database floor.
+	// OAuthLinkByProviderSubject is the sub-first lookup the OAuth
+	// callback runs on every handshake to decide whether the
+	// incoming sub belongs to an existing account or whether to
+	// create a fresh one.
+	UpsertOAuthLink(ctx context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error
+	OAuthLinkByProviderSubject(ctx context.Context, provider, providerSubject string) (OAuthLink, error)
+
 	// CLI auth codes (spec §2.2 device-code flow). The mint + peek +
 	// claim + consume cycle mirrors the magic-link primitives but with
 	// a nullable account_id — the binding to a customer happens at
