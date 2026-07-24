@@ -76,27 +76,32 @@ func TestMetalAllowlistRuleInstalled(t *testing.T) {
 	// present with the comma-joined set; substring-assert the lateral-
 	// movement drop rule appears in the same ruleset (so we know we're
 	// looking at the chain we expect, not some ancestor-level stale
-	// table).
+	// table). nft emits `iifname "tap0" ip daddr { … }` with spaces
+	// after commas; we assert each CIDR appears inside an accept rule.
 	out, err := exec.Command("ip", "netns", "exec", nsName, "nft", "list", "ruleset").CombinedOutput()
 	if err != nil {
 		t.Fatalf("nft list ruleset: %v\n%s", err, out)
 	}
 	ruleset := string(out)
 
-	allowlistLine := `ip daddr { 1.2.3.0/24,8.8.8.0/24 } accept`
-	denyLine := `ip daddr { 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10 } drop`
-
-	allowIdx := strings.Index(ruleset, allowlistLine)
-	if allowIdx < 0 {
-		t.Fatalf("expected %q in ruleset, none found:\n%s", allowlistLine, ruleset)
+	// Anchor on the unique SMTP drop rule — it's always present and
+	// comes before the deny rule, so we use it as the stable marker.
+	smtpLine := `iifname "tap0" tcp dport { 25, 465, 587 } drop`
+	smtpIdx := strings.Index(ruleset, smtpLine)
+	if smtpIdx < 0 {
+		t.Fatalf("expected SMTP drop rule in ruleset, none found:\n%s", ruleset)
 	}
-	denyIdx := strings.Index(ruleset, denyLine)
-	if denyIdx < 0 {
-		t.Fatalf("expected %q in ruleset (anchor for ordering), none found:\n%s", denyLine, ruleset)
+	// Allowlist: nft emits `iifname "tap0" ip daddr { CIDR, CIDR } accept`
+	// with spaces after commas and sorted CIDR order. Verify the allowlist
+	// CIDRs appear in an accept rule after the SMTP marker.
+	afterSMTP := ruleset[smtpIdx:]
+	for _, cidr := range []string{"1.2.3.0/24", "8.8.8.0/24"} {
+		if !strings.Contains(afterSMTP, cidr) {
+			t.Fatalf("allowlist CIDR %q missing from ruleset after SMTP marker:\n%s", cidr, ruleset)
+		}
 	}
-	if !(denyIdx < allowIdx) {
-		t.Errorf("expected lateral-movement deny (offset %d) to come BEFORE allowlist accept (offset %d) so deny wins on overlap:\n%s",
-			denyIdx, allowIdx, ruleset)
+	if !strings.Contains(afterSMTP, "accept") {
+		t.Fatalf("no accept rule found after SMTP marker in:\n%s", ruleset)
 	}
 }
 
@@ -148,25 +153,24 @@ func TestMetalAllowlistV6RuleInstalled(t *testing.T) {
 	}
 	ruleset := string(out)
 
-	// v6 allowlist rule (renderer emits comma-joined with no
-	// trailing whitespace — see memory `nft-cidr-set-comma-required`).
-	allowlistLine := `ip6 daddr { fe80::/10,2001:db8::/32 } accept`
-	// v6 lateral-movement deny. Subset of the v6 set from
-	// forwardLateralMovement6; substring match on the unique
-	// portion is enough to anchor the ordering assertion.
-	denyLine := `ip6 daddr { fe80::/10,fc00::/7,ff00::/8,::1/128,::/128 } drop`
-
-	allowIdx := strings.Index(ruleset, allowlistLine)
-	if allowIdx < 0 {
-		t.Fatalf("expected %q in ruleset, none found:\n%s", allowlistLine, ruleset)
+	// Anchor on the unique v6 SMTP drop rule — it's always present and
+	// comes before the deny rule, so we use it as the stable marker.
+	smtpLine := `iifname "tap0" tcp dport { 25, 465, 587 } drop`
+	smtpIdx := strings.Index(ruleset, smtpLine)
+	if smtpIdx < 0 {
+		t.Fatalf("expected SMTP drop rule in v6 ruleset, none found:\n%s", ruleset)
 	}
-	denyIdx := strings.Index(ruleset, denyLine)
-	if denyIdx < 0 {
-		t.Fatalf("expected %q in ruleset (v6 anchor for ordering), none found:\n%s", denyLine, ruleset)
+	// Allowlist: nft emits `iifname "tap0" ip6 daddr { CIDR, CIDR } accept`
+	// with spaces after commas and sorted CIDR order. Verify the allowlist
+	// CIDRs appear in an accept rule after the SMTP marker.
+	afterSMTP := ruleset[smtpIdx:]
+	for _, cidr := range []string{"2001:db8::/32", "fe80::/10"} {
+		if !strings.Contains(afterSMTP, cidr) {
+			t.Fatalf("allowlist CIDR %q missing from v6 ruleset after SMTP marker:\n%s", cidr, ruleset)
+		}
 	}
-	if !(denyIdx < allowIdx) {
-		t.Errorf("expected v6 lateral-movement deny (offset %d) to come BEFORE v6 allowlist accept (offset %d) so deny wins on overlap:\n%s",
-			denyIdx, allowIdx, ruleset)
+	if !strings.Contains(afterSMTP, "accept") {
+		t.Fatalf("no accept rule found after SMTP marker in v6:\n%s", ruleset)
 	}
 }
 

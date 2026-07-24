@@ -339,8 +339,12 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if _, err := stageReadOnly(root, baseSrc); err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
-	if _, err := stageWritable(root, layerSrc, l.UID, l.GID); err != nil {
-		return fmt.Errorf("vmm: stage layer: %w", err)
+	// layerSrc is empty when cold-booting without a layer (cold path, no snapshot yet).
+	// stageWritable with an empty src would fail; skip it — Boot handles a missing drive1.
+	if layerSrc != "" {
+		if _, err := stageWritable(root, layerSrc, l.UID, l.GID); err != nil {
+			return fmt.Errorf("vmm: stage layer: %w", err)
+		}
 	}
 
 	// Snapshot files are read-only inputs shared across the N instances a single
@@ -1320,8 +1324,18 @@ func moveOut(src, dst string) (int64, error) {
 // the call from /srv/fc/snap and a future remote driver from a registry.
 // The chroot staging layer never has to learn about storage.
 func (v *JailerVMM) materializeFromStorage(ctx context.Context, instanceID, key string) (string, error) {
-	if v.storage == nil || key == "" {
-		return "", nil
+	if key == "" {
+		return "", nil // nil layer key: cold boot without layer, skip staging
+	}
+	// Absolute paths (builderd's layer at /var/lib/faas/build-drive/…,
+	// or any direct host path) bypass storage. validateKey rejects
+	// keys starting with '/', so we detect them here and return as-is.
+	// The caller treats the returned path as a host file to stage.
+	if filepath.IsAbs(key) {
+		return key, nil
+	}
+	if v.storage == nil {
+		return key, nil // nil storage: key IS the direct host path (builderd path-through mode)
 	}
 	rc, err := v.storage.Get(ctx, key)
 	if err != nil {
