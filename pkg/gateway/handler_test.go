@@ -157,13 +157,6 @@ func (b *fakeBackend) setLegacyHot() {
 	}
 }
 
-// unlimitedLimiter is duplicated here from handler_load_test.go so the
-// fan-out + cold-coalesce tests in handler_test.go can disable the
-// per-app rate limit without dragging in load-test infrastructure.
-func unlimitedLimiter() *Limiter {
-	return NewLimiter().WithNoop()
-}
-
 func TestColdWakeReturns200AndHeader(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 
