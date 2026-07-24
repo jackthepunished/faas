@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -52,6 +53,9 @@ func seedAppForAllowlist(t *testing.T, ctx context.Context, s *state.PgStore, la
 func TestPgStore_UpdateApp_V6RoundTrip(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
 	s := state.NewPgStore(pool)
 	appID := seedAppForAllowlist(t, ctx, s, "v6-roundtrip")
 
@@ -95,6 +99,9 @@ func TestPgStore_UpdateApp_V6RoundTrip(t *testing.T) {
 func TestPgStore_UpdateApp_MixedRoundTrip(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
 	s := state.NewPgStore(pool)
 	appID := seedAppForAllowlist(t, ctx, s, "mix-roundtrip")
 
@@ -132,6 +139,9 @@ func TestPgStore_UpdateApp_MixedRoundTrip(t *testing.T) {
 func TestPgStore_UpdateApp_SlashZeroRejected(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
 	s := state.NewPgStore(pool)
 
 	for _, tc := range []struct {
