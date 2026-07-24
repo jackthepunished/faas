@@ -445,8 +445,19 @@ type Store interface {
 	CancelInvocation(ctx context.Context, id string) error
 	// ListInvocationsForAccount is the dashboard's "recent invocations"
 	// view; pagination cursor is the same opaque `before` convention used
-	// by ListDeployments.
-	ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before time.Time) ([]Invocation, error)
+	// by ListDeployments. The cursor is an Invocation.ID (uuid) — the
+	// handler pages by ?before=<id>; "" means "start from the newest".
+	// Move 2 cursor change: was time.Time (drifted across equal-second
+	// rows); id is stable across ties.
+	ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before string) ([]Invocation, error)
+	// ListInvocationsForApp is the per-app filtered variant used by
+	// deleteApp's GC sweep (cancel every pending/dispatching row before
+	// the app row goes away). Index-backed by `invocations_app_pending_idx`
+	// (migrations/00030_invocations.sql) when the states filter is the
+	// partial-index predicate (pending + dispatching); for other state
+	// combinations the planner falls back to a sequential scan, which is
+	// fine for the rare delete path.
+	ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error)
 	// CountInstanceInvocationsInMinute is the meter's join key: it counts
 	// dispatched rows for (instance, minute) so SampleAndRoll can set
 	// usage_minutes.requests = N on each rolling minute. Index-backed by

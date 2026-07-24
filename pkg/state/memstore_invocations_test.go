@@ -201,7 +201,7 @@ func TestInvocationListForAccount_OrdersDescAndCaps(t *testing.T) {
 		inv.CreatedAt = now.Add(time.Duration(i) * time.Second)
 		m.invocations[inv.ID] = inv
 	}
-	rows, err := m.ListInvocationsForAccount(ctx, acctID, 2, time.Time{})
+	rows, err := m.ListInvocationsForAccount(ctx, acctID, 2, "")
 	if err != nil {
 		t.Fatalf("ListInvocationsForAccount: %v", err)
 	}

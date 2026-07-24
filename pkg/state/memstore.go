@@ -1415,8 +1415,10 @@ func (m *MemStore) CancelInvocation(_ context.Context, id string) error {
 }
 
 // ListInvocationsForAccount is the dashboard's unified history read.
-// MemStore returns rows ordered CreatedAt DESC for any caller.
-func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, _ time.Time) ([]Invocation, error) {
+// MemStore returns rows ordered CreatedAt DESC (with ID as tie-breaker)
+// for any caller. The `before` cursor is an Invocation.ID; an empty
+// string means "start from the newest".
+func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, before string) ([]Invocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Invocation
@@ -1425,10 +1427,65 @@ func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string
 			out = append(out, inv)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	// Apply the cursor: drop everything at-or-after the cursor row
+	// (we want strictly older). MemStore is single-process so a linear
+	// scan is fine.
+	if before != "" {
+		var cursorIdx = -1
+		for i, inv := range out {
+			if inv.ID == before {
+				cursorIdx = i
+				break
+			}
+		}
+		if cursorIdx >= 0 {
+			out = out[cursorIdx+1:]
+		}
+		// If the cursor isn't in the page (already GC'd, expired),
+		// PgStore falls back to the inner SELECT; MemStore returns the
+		// full page, which is the cheap-and-cheerful answer.
+	}
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+// ListInvocationsForApp is the per-app filtered variant used by
+// deleteApp's GC sweep. An empty `states` slice returns all rows for
+// the app; otherwise the row's state must match one of the filter
+// values. MemStore is single-process so a linear scan is fine.
+func (m *MemStore) ListInvocationsForApp(_ context.Context, appID string, states ...InvocationState) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stateSet := make(map[InvocationState]struct{}, len(states))
+	for _, s := range states {
+		stateSet[s] = struct{}{}
+	}
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.AppID != appID {
+			continue
+		}
+		if len(stateSet) > 0 {
+			if _, ok := stateSet[inv.State]; !ok {
+				continue
+			}
+		}
+		out = append(out, inv)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
