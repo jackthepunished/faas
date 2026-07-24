@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"net/netip"
 	"time"
 
 	"github.com/google/uuid"
@@ -150,9 +151,19 @@ type App struct {
 	// of idle timeout. Pro/Scale only — the apid updateApp handler
 	// rejects Hobby/Free with 403 plan_min_instances_not_allowed.
 	MinInstances int
-	Status       AppStatus
-	Manifest     AppManifest
-	CreatedAt    time.Time
+	// EgressAllowlist is the per-app outbound CIDR allowlist (ADR-031,
+	// tier-2 of the network roadmap). Empty => no allowlist rule
+	// emitted, current behaviour preserved; non-empty => the per-netns
+	// forward chain gains an `iifname tap0 ip daddr { … } accept`
+	// rule after the lateral-movement deny. v4 only in v1 (the v6
+	// mirror is a separate ADR). Plan-gated: Free/Hobby always read
+	// empty (apid updateApp rejects PATCH with 403
+	// plan_egress_allowlist_not_allowed); Pro max 16 entries; Scale
+	// max 64 entries — see pkg/api/limits.go.
+	EgressAllowlist []netip.Prefix
+	Status          AppStatus
+	Manifest        AppManifest
+	CreatedAt       time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -266,6 +277,65 @@ type Cron struct {
 	Enabled     bool
 	CreatedAt   time.Time
 	LastFiredAt time.Time // zero until first fire; updated by MarkCronFired
+}
+
+// InvocationSource tags the API surface that originated a row on the
+// invocations table (Move 1 — async_invoke / queue / delayed_task / cron).
+// Mirrored as a CHECK constraint in migrations/00030_invocations.sql.
+type InvocationSource string
+
+const (
+	InvocationAsyncInvoke InvocationSource = "async_invoke"
+	InvocationQueue       InvocationSource = "queue"
+	InvocationDelayedTask InvocationSource = "delayed_task"
+	InvocationCron        InvocationSource = "cron"
+)
+
+// InvocationState is the row lifecycle on the invocations table. The
+// allowed transitions are pending→dispatching→completed (happy path)
+// and pending/dispatching→failed or pending→cancelled (terminal). The
+// CHECK constraint enforces the discrete values; the engine admits
+// transitions only through the Store.ClaimInvocation / Complete / Fail /
+// Cancel methods.
+type InvocationState string
+
+const (
+	InvocationPending     InvocationState = "pending"
+	InvocationDispatching InvocationState = "dispatching"
+	InvocationCompleted   InvocationState = "completed"
+	InvocationFailed      InvocationState = "failed"
+	InvocationCancelled   InvocationState = "cancelled"
+)
+
+// Invocation mirrors a row on the invocations table. apid writes
+// customer-intent rows; schedd's drain loop owns state transitions
+// pending → dispatching → completed/failed via the Store.Claim /
+// Complete / Fail methods. InstanceID is NULL on the inbound INSERT path
+// and is stamped by the drain's claim step (state→dispatching); the
+// meter reads it via CountInstanceInvocationsInMinute to set
+// usage_minutes.requests.
+type Invocation struct {
+	ID             string           `json:"id"`
+	AppID          string           `json:"app_id"`
+	AccountID      string           `json:"account_id"`
+	InstanceID     string           `json:"instance_id,omitempty"`
+	Source         InvocationSource `json:"source"`
+	State          InvocationState  `json:"state"`
+	Method         string           `json:"method"`
+	Path           string           `json:"path"`
+	Payload        json.RawMessage  `json:"payload"`
+	Headers        json.RawMessage  `json:"headers"`
+	DueAt          time.Time        `json:"due_at"`
+	ScheduledAt    *time.Time       `json:"scheduled_at,omitempty"`
+	CronID         *string          `json:"cron_id,omitempty"`
+	AckURL         string           `json:"ack_url,omitempty"`
+	Result         json.RawMessage  `json:"result,omitempty"`
+	LeaseExpiresAt *time.Time       `json:"lease_expires_at,omitempty"`
+	ReceivedAt     *time.Time       `json:"received_at,omitempty"`
+	CompletedAt    *time.Time       `json:"completed_at,omitempty"`
+	Attempts       int              `json:"attempts"`
+	LastError      string           `json:"last_error,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
 }
 
 // GdprAction enumerates the GDPR self-service actions recorded in
@@ -405,8 +475,17 @@ type UpdateAppParams struct {
 	// default for Free/Hobby).
 	MinInstances    *int
 	SetMinInstances bool
-	Status          *AppStatus
-	Manifest        *AppManifest
+	// EgressAllowlist is the per-app outbound CIDR allowlist
+	// (ADR-031). SetEgressAllowlist distinguishes "unset" from
+	// "explicit empty" (= "no allowlist rule, current behaviour").
+	// A nil pointer when SetEgressAllowlist is false leaves the
+	// column unchanged; a non-nil empty slice with
+	// SetEgressAllowlist true replaces the stored array with '{}'
+	// (the default — see migration 00029).
+	EgressAllowlist    *[]netip.Prefix
+	SetEgressAllowlist bool
+	Status             *AppStatus
+	Manifest           *AppManifest
 }
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

@@ -196,6 +196,8 @@ func TestCodeConstants_UniqueAndNonEmpty(t *testing.T) {
 		CodeUnauthorized, CodeNotFound, CodeValidation,
 		CodeImageNotFound, CodeImageEgressDenied, CodeImageManifestInvalid,
 		CodeCliAuthPending, CodeCliAuthUnavailable,
+		CodeInvalidCredentials, CodeEmailNotVerified, CodePasswordTooWeak,
+		CodeResetTokenInvalid, CodeResetTokenExpired, CodeAccountExists,
 	}
 	seen := make(map[string]bool)
 	for _, c := range codes {
@@ -224,6 +226,33 @@ func TestStatusForCode_ImageCodes(t *testing.T) {
 		{CodeImageManifestInvalid, http.StatusUnprocessableEntity},
 		{CodeImageEgressDenied, http.StatusForbidden},
 		{"totally_made_up_code", http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if got := StatusForCode(tc.code); got != tc.want {
+				t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStatusForCode_AuthCodes locks the HTTP status mapping for the
+// dashboard-auth codes added in PR #1 (issue #165, ADR-032). Both
+// invalid_credentials and email_not_verified must collapse to 401 so
+// the dashboard form can render a single "sign in failed" copy for
+// both; the surface must NOT distinguish them, otherwise an attacker
+// can probe for which case fired.
+func TestStatusForCode_AuthCodes(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{CodeInvalidCredentials, http.StatusUnauthorized},
+		{CodeEmailNotVerified, http.StatusUnauthorized},
+		{CodePasswordTooWeak, http.StatusBadRequest},
+		{CodeAccountExists, http.StatusBadRequest},
+		{CodeResetTokenInvalid, http.StatusGone},
+		{CodeResetTokenExpired, http.StatusGone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.code, func(t *testing.T) {
@@ -269,4 +298,70 @@ func TestValidateAppConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProblem_PaddleExtensionMarshalled asserts the Paddle checkout
+// URL + tx_id extensions serialize correctly on a 402 — and stay
+// omitted on a Problem that doesn't carry them (so the Stripe-default
+// response shape is unchanged).
+//
+// Pin for PR #3 / ADR-025: the 402 Problem carries at most one of
+// BillingPortalURL or PaddleCheckoutURL on the wire; the JSON omitempty
+// tag guarantees the unused field drops out cleanly.
+func TestProblem_PaddleExtensionMarshalled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("both fields populated", func(t *testing.T) {
+		p := &Problem{
+			Code:              CodePayment,
+			PaddleCheckoutURL: "https://sandbox.paddle.example/checkout/abc",
+			TxID:              "txn_test_123",
+		}
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !strings.Contains(string(b), `"paddle_checkout_url":"https://sandbox.paddle.example/checkout/abc"`) {
+			t.Errorf("missing paddle_checkout_url in JSON: %s", b)
+		}
+		if !strings.Contains(string(b), `"tx_id":"txn_test_123"`) {
+			t.Errorf("missing tx_id in JSON: %s", b)
+		}
+	})
+
+	t.Run("empty fields omitted", func(t *testing.T) {
+		p := &Problem{Code: CodePayment}
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if strings.Contains(string(b), "paddle_checkout_url") {
+			t.Errorf("paddle_checkout_url should be omitted when empty: %s", b)
+		}
+		if strings.Contains(string(b), "tx_id") {
+			t.Errorf("tx_id should be omitted when empty: %s", b)
+		}
+	})
+
+	t.Run("stripe default unchanged", func(t *testing.T) {
+		// The pre-PR-#3 402 Problem carried BillingPortalURL only.
+		// PR #3 must not change that wire shape — pin it.
+		p := &Problem{
+			Code:             CodePayment,
+			BillingPortalURL: "https://billing.example/?acct=acc_1",
+		}
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !strings.Contains(string(b), `"billing_portal_url":"https://billing.example/?acct=acc_1"`) {
+			t.Errorf("missing billing_portal_url in JSON: %s", b)
+		}
+		if strings.Contains(string(b), "paddle_checkout_url") {
+			t.Errorf("paddle_checkout_url must not appear on the Stripe 402: %s", b)
+		}
+		if strings.Contains(string(b), "tx_id") {
+			t.Errorf("tx_id must not appear on the Stripe 402: %s", b)
+		}
+	})
 }

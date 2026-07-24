@@ -48,6 +48,19 @@ type Problem struct {
 	// substituted. Optional; omitempty keeps the existing API shape
 	// unchanged for every other error code.
 	BillingPortalURL string `json:"billing_portal_url,omitempty"`
+	// PaddleCheckoutURL is set on payment_required (CodePayment) errors
+	// when the platform is running on the Paddle provider. Mirrors
+	// BillingPortalURL's shape — the customer's next action is to land
+	// on a Paddle-hosted checkout page for the target plan. Optional +
+	// omitempty so the Stripe-default response shape is unchanged.
+	// Mutually exclusive with BillingPortalURL on a single Problem: the
+	// 402 carries either billing_portal_url (Stripe) or
+	// paddle_checkout_url+tx_id (Paddle), never both.
+	PaddleCheckoutURL string `json:"paddle_checkout_url,omitempty"`
+	// TxID is the provider's transaction handle (Paddle: txn_…,
+	// Stripe: empty). The dashboard renders this as a confirmation id
+	// after the customer completes checkout. Empty on the Stripe path.
+	TxID string `json:"tx_id,omitempty"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -139,6 +152,33 @@ const (
 	// --max-concurrency").
 	CodeInvalidMinInstances = "invalid_min_instances"
 
+	// Move 1 event-shaped surfaces (spec §4.4, §4.9). The CLI exit-code
+	// table treats them as 403/422/402; surfacing the codes separately
+	// lets the dashboard render a "move to Scale to lift the cap"
+	// hint without parsing prose.
+	CodePlanQueueDepth     = "plan_queue_depth"
+	CodePlanSourceBytes    = "plan_source_bytes"
+	CodePlanFeatureGated   = "plan_feature_gated"
+	CodePlanDelayedCap     = "plan_delayed_tasks_cap"
+	CodeInvocationNotFound = "invocation_not_found"
+
+	// ADR-031 (tier-2 of the network roadmap) — per-app egress
+	// allowlist. Same gate shape as MinInstances: the feature is
+	// plan-locked (Pro/Scale only), and there are two distinct
+	// failure modes that warrant distinct codes so the CLI can
+	// render actionable retry guidance.
+	//   * CodePlanEgressAllowlistNotAllowed = 403 "your plan does
+	//     not unlock this knob at all" (Free/Hobby).
+	//   * CodeEgressAllowlistTooLong = 400 "the PATCH carries more
+	//     CIDRs than your plan caps" (Pro/Scale but the slice is
+	//     too long; not a billing failure).
+	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
+	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
+	// CodeInvalidEgressAllowlist is a 400 for shape violations:
+	// an entry that doesn't ParsePrefix, or a v6 CIDR (v1 is v4
+	// only; v6 mirror is a separate ADR).
+	CodeInvalidEgressAllowlist = "invalid_egress_allowlist"
+
 	// Account self-service (spec §17 G6, ADR-021). The
 	// "confirm_required" code is returned when a DELETE arrives without
 	// the confirmation header so a stale CLI prompt can't silently wipe
@@ -186,6 +226,43 @@ const (
 	// no-op when it already has ≥1 cached target, while plan_limit
 	// (the Wake path) is always fatal to the requesting call.
 	CodeAppConcurReached = "app_concurrency_reached"
+
+	// Dashboard auth (issue #165, ADR-032). Pre-#165, POST /login
+	// auto-created an account + minted a "web-console" API key + set
+	// the session cookie on ANY email with zero verification, which
+	// was a full pre-auth account-takeover (spec §11 violation).
+	// Post-#165, the dashboard surfaces are real auth:
+	//
+	//   - invalid_credentials: 401 for both "no such email" and
+	//     "wrong password" — the two paths share the same response
+	//     body so the surface doesn't leak which case it hit. The
+	//     constant-time Argon2id pad on the no-account path closes
+	//     the timing oracle; see cmd/apid/handlers_auth.go.
+	//   - email_not_verified: 401 when a Google / GitHub OAuth
+	//     callback returns a profile whose primary email is not
+	//     verified by the provider. Distinct from invalid_credentials
+	//     because the customer can fix this by verifying the email
+	//     upstream; we never mint an unverified session.
+	//   - password_too_weak: 400 at /signup when the password fails
+	//     the NIST-style floor (≥12 chars). The Detail names the
+	//     rule so the dashboard form can highlight which constraint
+	//     tripped.
+	//   - reset_token_invalid / reset_token_expired: 410 for GET /
+	//     POST /auth/reset when the token doesn't exist (invalid)
+	//     or has aged past 15 minutes (expired). 410 Gone is the
+	//     semantically correct status: the resource was a one-shot
+	//     and is no longer addressable.
+	//   - account_exists: never returned directly. Anti-enumeration
+	//     keeps the body identical between "signed in via /signup"
+	//     and "email already taken"; the constant exists so future
+	//     surfaces (e.g. an explicit "claim this email" admin tool)
+	//     can branch on it without inventing a new code.
+	CodeInvalidCredentials = "invalid_credentials"
+	CodeEmailNotVerified   = "email_not_verified"
+	CodePasswordTooWeak    = "password_too_weak"
+	CodeResetTokenInvalid  = "reset_token_invalid"
+	CodeResetTokenExpired  = "reset_token_expired"
+	CodeAccountExists      = "account_exists"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -245,6 +322,20 @@ func StatusForCode(code string) int {
 	case CodeCliAuthPending:
 		return http.StatusNotFound
 	case CodeCliAuthUnavailable:
+		return http.StatusGone
+	case CodePlanQueueDepth, CodePlanDelayedCap:
+		return http.StatusForbidden
+	case CodePlanSourceBytes:
+		return http.StatusRequestEntityTooLarge
+	case CodePlanFeatureGated:
+		return http.StatusPaymentRequired
+	case CodeInvocationNotFound:
+		return http.StatusNotFound
+	case CodeInvalidCredentials, CodeEmailNotVerified:
+		return http.StatusUnauthorized
+	case CodePasswordTooWeak, CodeAccountExists:
+		return http.StatusBadRequest
+	case CodeResetTokenInvalid, CodeResetTokenExpired:
 		return http.StatusGone
 	default:
 		return http.StatusInternalServerError
@@ -443,6 +534,42 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		WithDocs("https://docs.DOMAIN/apps#min-instances")
 }
 
+// ErrPlanEgressAllowlistNotAllowed (ADR-031) is returned when a Free or Hobby
+// account tries to set apps.egress_allowlist. Same gate shape as
+// ErrPlanMinInstancesNotAllowed: the knob is plan-locked, and Pro/Scale
+// is where the operator surface lives. The plan is named in the body so
+// a CLI prompt can render "upgrade to Pro to unlock this knob" without
+// a second lookup.
+func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanEgressAllowlistNotAllowed,
+		"Plan doesn't allow an egress allowlist",
+		fmt.Sprintf("the %s plan cannot pin an egress IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
+		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+}
+
+// ErrEgressAllowlistTooLong (ADR-031) is returned when the PATCH carries more
+// CIDRs than the plan's per-app cap. 400 (not 422) because the request shape is
+// well-formed — only the count is over budget. The limit + observed pair rides
+// on the Problem so the CLI can branch on its own copy of the cap (no re-fetch).
+func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeEgressAllowlistTooLong,
+		"Egress allowlist too long",
+		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
+		WithLimit(int64(maxSize), int64(got)).
+		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+}
+
+// ErrInvalidEgressAllowlist (ADR-031) is a 400 for entries that don't
+// ParsePrefix as a v4 CIDR. The detail names the offending entry so an
+// operator triaging a rejected PATCH sees exactly which line is bad.
+// v6 attempts land here too (v1 is v4 only; v6 mirror is a future ADR).
+func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeInvalidEgressAllowlist,
+		"Invalid egress allowlist entry",
+		fmt.Sprintf("entry %q is not a valid IPv4 CIDR: %v.", entry, reason)).
+		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+}
+
 // ErrValidation is a 400 fallback for malformed request bodies. Used by
 // handlers when JSON decode fails — the underlying error detail isn't
 // surfaced (it's attacker-influenced) but the cause class is the same
@@ -450,4 +577,63 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 func ErrValidation(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeValidation,
 		"Validation failed", detail)
+}
+
+// ErrPlanQueueDepth is returned by the apid handlers on POST
+// .../queues/invocations:send (and on delayed-task create) when
+// accepting the row would push the per-app live queue/depth past
+// the plan cap. Observed is the current live count (matching the
+// response payload so dashboards can render the gauge without a
+// second round-trip).
+func ErrPlanQueueDepth(limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanQueueDepth,
+		"Per-app queue depth exceeded",
+		fmt.Sprintf("the plan caps this app at %d pending + dispatching rows; observed %d.", limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.DOMAIN/event-driven#queue-depth")
+}
+
+// ErrPlanSourceBytes is returned when a request body for an event-shaped
+// surface (sync / async / queue :send / delayed-task create) exceeds
+// the per-plan MaxSourceBytesPerInvocation.
+func ErrPlanSourceBytes(limit int, observed int64) *Problem {
+	return NewProblem(http.StatusRequestEntityTooLarge, CodePlanSourceBytes,
+		"Invocation payload too large",
+		fmt.Sprintf("this plan caps each invocation at %d bytes; observed %d.", limit, observed)).
+		WithLimit(int64(limit), observed).
+		WithDocs("https://docs.DOMAIN/event-driven#payload-size")
+}
+
+// ErrPlanFeatureGated is returned when the customer's plan does not
+// unlock the requested surface (spec §4.4 reserves async invoke and
+// queues for paid tiers; Free customers get 402 with the upgrade
+// nudge). Code differs from CodePlanLimit* because the failure mode
+// is plan-gating, not "you used more than the plan allows".
+func ErrPlanFeatureGated(feature string, p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanFeatureGated,
+		"Plan doesn't include this feature",
+		fmt.Sprintf("the %s plan doesn't unlock %s; upgrade to Hobby or higher to use event-driven features.", p, feature)).
+		WithDocs("https://docs.DOMAIN/plans#event-driven")
+}
+
+// ErrPlanDelayedTasksCap is the variant surfaced when a delayed-task
+// schedule would push the per-app delayed-task count past the plan
+// cap. Distinct code so the dashboard can suggest "schedule later"
+// vs the queue-depth case which is a stricter 403.
+func ErrPlanDelayedTasksCap(limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanDelayedCap,
+		"Per-app delayed-task cap exceeded",
+		fmt.Sprintf("the plan caps this app at %d scheduled delayed_tasks; observed %d.", limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
+}
+
+// ErrInvocationNotFound is the Move 1 counterpart to ErrSecretNotFound:
+// the URL name (the resource IS the invocation) is intentional, and a
+// generic not_found would force the CLI to parse the message.
+func ErrInvocationNotFound(id string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeInvocationNotFound,
+		"Invocation not found",
+		fmt.Sprintf("no invocation with id %q on this account.", id)).
+		WithDocs("https://docs.DOMAIN/event-driven#invocations")
 }
