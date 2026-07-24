@@ -43,12 +43,18 @@ type Provider struct {
 	catalog       *priceCatalog
 	// pendingOverage accumulates mb_seconds between month-rollovers,
 	// keyed by acct.ID. PushUsageRecord adds to it on every non-rollover
-	// call; FlushOverageNow emits the prior-month line item (idempotent
-	// on redelivery via Paddle's Idempotency-Key header) — called by
-	// meterd's quota + dunning timers when the calendar month rolls
-	// over. Mutex serializes the per-account accumulation.
+	// call; month-rollover triggers flushOverageLocked which emits the
+	// prior-month line item. Mutex serializes the per-account
+	// accumulation.
 	pendingOverage sync.Map // map[string]*overageAccumulator
 	flushFn        FlushFn  // test seam; nil → defaultFlushLocked (production)
+	// dedupe is the state-store-backed cross-process gate consulted
+	// before each Paddle CreateTransaction POST and stamped after.
+	// nil → within-process dedupe only (apid's path; apid never pushes
+	// overage, so the only accumulator is meterd's). meterd wires it
+	// via NewProviderWithDedupe so a crash between POST and stamp
+	// cannot cause a second POST on the next process boot.
+	dedupe PaddleOverageDedupe
 	// createUpgradeTxnFn is the seam CreateUpgradeTransaction delegates
 	// to. Tests substitute a counter/recorder stub so they can assert
 	// the SDK request shape (price handle, CustomData, Idempotency-Key
@@ -90,6 +96,23 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) *
 		catalog:       &priceCatalog{planMonthly: map[api.Plan]string{}, planOverage: map[api.Plan]string{}, planCustomers: map[api.Plan]string{}},
 		now:           time.Now,
 	}
+}
+
+// NewProviderWithDedupe is the meterd-side constructor. Same as
+// NewProvider but with the state-store-backed cross-process dedupe
+// wired so a meterd crash between the Paddle CreateTransaction POST
+// and the in-process `acc.flushed` stamp cannot cause a second POST
+// on the next process boot for the same (account, month). apid's path
+// uses NewProvider (no ingress from apid writes to the overage
+// accumulator; the only accumulator is meterd's).
+//
+// Keeping this as a separate constructor (rather than a WithDedupe
+// option) avoids touching every existing test call site that uses
+// NewProvider — the loader is the only caller that needs the dedupe.
+func NewProviderWithDedupe(apiKey string, sandbox bool, log *slog.Logger, dedupe PaddleOverageDedupe) *Provider {
+	p := NewProvider(apiKey, "", sandbox, log)
+	p.dedupe = dedupe
+	return p
 }
 
 // Compile-time conformance to billing.Provider. Adding a method to the

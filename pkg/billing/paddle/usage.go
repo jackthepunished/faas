@@ -95,6 +95,25 @@ func calendarMonthStart(t time.Time) time.Time {
 // planOverage[plan]. Idempotent: a redelivered month gets the same
 // Idempotency-Key so the SDK (and Paddle) collapse it.
 //
+// Cross-process dedupe (state.Store-backed paddle.PaddleOverageDedupe):
+// if `p.dedupe` is wired, we read the (acct, month) gate BEFORE the
+// SDK POST and write it AFTER a successful POST. A meterd that
+// crashed between a prior month's POST and the in-process `flushed`
+// stamp has flushed the month on Paddle's side but lost the flag;
+// the next process boot's HasPaddleOverageMonth returns true and
+// short-circuits the POST. The within-process `acc.flushed` flag
+// stays as the same-process gate so a second PushUsageRecord in the
+// same meterd boot does not re-`Has`-check the store.
+//
+// Residual risk: the window between the SDK POST committing and
+// RecordPaddleOverageMonth returning nil is the same TOCTOU Stripe
+// has, but Paddle has no external Idempotency-Key header in this SDK
+// version — the post-POST record is the only guard. Bounded by
+// meterd's daily cadence and the Paddle `transaction.completed`
+// webhook surface; a double-bill is visible on the merchant dashboard
+// on the next reconciliation. The state-machine alternative was
+// rejected for over-engineering at the current risk profile.
+//
 // `p.flushFn` is the seam tests use to substitute a counter stub
 // without standing up a full *paddle.SDK (the SDK has no recorder
 // interface). Production paths never touch it. Same pattern as
@@ -103,12 +122,35 @@ func (p *Provider) flushOverageLocked(ctx context.Context, acc *overageAccumulat
 	if acc.flushed {
 		return nil
 	}
+	if p.dedupe != nil {
+		monthStart := calendarMonthStart(acc.month.UTC())
+		already, err := p.dedupe.HasPaddleOverageMonth(ctx, acc.acct.ID, monthStart)
+		if err != nil {
+			return fmt.Errorf("paddle: dedupe has month=%s acct=%s: %w",
+				monthStart.Format("2006-01"), acc.acct.ID, err)
+		}
+		if already {
+			// Another process (or a prior boot) already flushed this
+			// month. Mark the in-process accumulator so the next push
+			// doesn't re-check the store either.
+			acc.flushed = true
+			acc.lastFlush = p.now()
+			return nil
+		}
+	}
 	flusher := p.flushFn
 	if flusher == nil {
 		flusher = defaultFlushLocked
 	}
 	if err := flusher(ctx, p, acc); err != nil {
 		return err
+	}
+	if p.dedupe != nil {
+		monthStart := calendarMonthStart(acc.month.UTC())
+		if err := p.dedupe.RecordPaddleOverageMonth(ctx, acc.acct.ID, monthStart); err != nil {
+			return fmt.Errorf("paddle: dedupe record month=%s acct=%s: %w",
+				monthStart.Format("2006-01"), acc.acct.ID, err)
+		}
 	}
 	acc.flushed = true
 	acc.lastFlush = p.now()

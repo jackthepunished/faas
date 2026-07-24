@@ -2547,6 +2547,34 @@ func (s *PgStore) RecordStripePushHour(ctx context.Context, accountID string, ho
 	return err
 }
 
+// HasPaddleOverageMonth is the dedupe gate the meterd daily pusher
+// reads before issuing the Paddle CreateTransaction POST. Backed by
+// a unique index on (account_id, month) in the paddle_overage_dedupe
+// table (added in migration 00034). `month` is a calendar-month
+// start — the caller (pkg/billing/paddle/usage.go calendarMonthStart)
+// is responsible for normalising to the 1st of the month at 00:00 UTC.
+func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and month = $2)`,
+		accountID, month.UTC()).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// RecordPaddleOverageMonth inserts the dedupe row. ON CONFLICT DO
+// NOTHING so a redelivered (account, month) is idempotent — same shape
+// as RecordStripePushHour one method above.
+func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into paddle_overage_dedupe (account_id, month) values ($1, $2)
+		 on conflict (account_id, month) do nothing`,
+		accountID, month.UTC())
+	return err
+}
+
 // --- idempotency -------------------------------------------------------------
 
 func (s *PgStore) GetIdempotent(ctx context.Context, accountID, key string) (int, []byte, error) {

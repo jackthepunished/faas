@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,6 +141,47 @@ func flushFnCounter(counter *int, flushErr error) FlushFn {
 	}
 }
 
+// recordingDedupe is a PaddleOverageDedupe stub that records every
+// Has + Record call. The cross-process contract is tested by sharing
+// one fake between two Providers — the second Provider's push must
+// see Has return true and skip the flush. Mirrors the recordingStripe
+// shape in pkg/meter/pusher_shadow_test.go so the test code reads the
+// same way across the two billing providers.
+type recordingDedupe struct {
+	mu   sync.Mutex
+	has  int
+	rec  int
+	rows map[paddleDedupeKey]struct{}
+}
+
+type paddleDedupeKey struct {
+	accountID string
+	month     time.Time
+}
+
+func newRecordingDedupe() *recordingDedupe {
+	return &recordingDedupe{rows: map[paddleDedupeKey]struct{}{}}
+}
+
+func (d *recordingDedupe) HasPaddleOverageMonth(_ context.Context, accountID string, month time.Time) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.has++
+	_, ok := d.rows[paddleDedupeKey{accountID: accountID, month: month.UTC()}]
+	return ok, nil
+}
+
+func (d *recordingDedupe) RecordPaddleOverageMonth(_ context.Context, accountID string, month time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rec++
+	d.rows[paddleDedupeKey{accountID: accountID, month: month.UTC()}] = struct{}{}
+	return nil
+}
+
+func (d *recordingDedupe) Has() int { d.mu.Lock(); defer d.mu.Unlock(); return d.has }
+func (d *recordingDedupe) Rec() int { d.mu.Lock(); defer d.mu.Unlock(); return d.rec }
+
 // seedOverageProvider builds a Provider whose catalog has the
 // overage price for `plan` primed, so accumulateOverage reaches
 // the flush step without EnsurePlanProducts needing the live SDK.
@@ -155,6 +197,21 @@ func seedOverageProvider(t *testing.T, plan api.Plan, priceID string, flush Flus
 		flushFn: flush,
 	}
 	return p
+}
+
+// seedOverageProviderWithDedupe is the dedupe-wired variant of
+// seedOverageProvider. Used by the cross-process dedupe tests; the
+// shared recordingDedupe is the assertion target.
+func seedOverageProviderWithDedupe(plan api.Plan, priceID string, flush FlushFn, dedupe PaddleOverageDedupe) *Provider {
+	return &Provider{
+		client: nil,
+		now:    time.Now,
+		catalog: &priceCatalog{
+			planOverage: map[api.Plan]string{plan: priceID},
+		},
+		flushFn: flush,
+		dedupe:  dedupe,
+	}
 }
 
 // TestAccumulateOverage_CrossMonthFlush is the boundary-case pin
@@ -303,5 +360,123 @@ func acctWithPlan(plan api.Plan) state.Account {
 		Email:            "test@example.test",
 		Plan:             plan,
 		StripeCustomerID: "ctm_test_dummy",
+	}
+}
+
+// TestAccumulateOverage_PostFlushRecordsDedupeRow is the single-Provider
+// contract pin: after a cross-month flush, the dedupe row for the
+// prior month is observable via HasPaddleOverageMonth. This is the
+// per-process happy path; the cross-process variant below proves the
+// redelivery-skip.
+func TestAccumulateOverage_PostFlushRecordsDedupeRow(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe()
+	var calls int
+	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&calls, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	if err := p.accumulateOverage(context.Background(), acct, jan15, 500); err != nil {
+		t.Fatalf("Jan push: %v", err)
+	}
+	// Before the rollover: dedupe has not been touched.
+	if got := dedupe.Has(); got != 0 {
+		t.Errorf("pre-flush Has count = %d, want 0", got)
+	}
+	if got := dedupe.Rec(); got != 0 {
+		t.Errorf("pre-flush Rec count = %d, want 0", got)
+	}
+
+	// Rollover triggers the flush; dedupe should see 1 Has (gate) and
+	// 1 Rec (post-POST stamp).
+	if err := p.accumulateOverage(context.Background(), acct, feb1, 700); err != nil {
+		t.Fatalf("Feb push: %v", err)
+	}
+	if got := calls; got != 1 {
+		t.Errorf("flush calls = %d, want 1", got)
+	}
+	if got := dedupe.Rec(); got != 1 {
+		t.Errorf("post-flush Rec count = %d, want 1", got)
+	}
+
+	janStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	has, err := dedupe.HasPaddleOverageMonth(context.Background(), acct.ID, janStart)
+	if err != nil {
+		t.Fatalf("dedupe.Has jan: %v", err)
+	}
+	if !has {
+		t.Error("jan dedupe row missing after flush")
+	}
+}
+
+// TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush is the
+// load-bearing test for the cross-process dedupe: two Providers that
+// share one dedupe fake simulate a meterd crash-and-restart. The
+// first Provider's cross-month push flushes January and stamps the
+// dedupe row. The second Provider's same-Mar push observes Has=true
+// and short-circuits the POST without invoking the flusher. This is
+// the regression test for the double-bill window the PR closes.
+func TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe()
+	var callsA, callsB int
+
+	// Two Providers, same dedupe. The `flushFn` counters are
+	// per-Provider so we can assert each one independently — the
+	// second Provider's flusher should never fire because the dedupe
+	// short-circuits it.
+	pA := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&callsA, nil), dedupe)
+	pB := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&callsB, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+
+	// Provider A pushes Jan 31 23:59 UTC, then Mar 1 00:01 UTC (skip
+	// Feb entirely to exercise calendar math rather than adjacent-
+	// month drift). The March push crosses into a new month and
+	// triggers the January flush — exactly one POST.
+	if err := pA.accumulateOverage(context.Background(), acct,
+		time.Date(2025, 1, 31, 23, 59, 0, 0, time.UTC), 1000); err != nil {
+		t.Fatalf("pA Jan push: %v", err)
+	}
+	if err := pA.accumulateOverage(context.Background(), acct,
+		time.Date(2025, 3, 1, 0, 1, 0, 0, time.UTC), 2000); err != nil {
+		t.Fatalf("pA Mar push: %v", err)
+	}
+	if callsA != 1 {
+		t.Errorf("pA flush calls = %d, want 1 (Jan's bucket drained on Mar rollover)", callsA)
+	}
+	if got := dedupe.Rec(); got != 1 {
+		t.Errorf("dedupe.Rec after pA flush = %d, want 1", got)
+	}
+
+	// Provider B — fresh process, no in-process `acc.flushed` state.
+	// Its own accumulator is empty; the only signal it has is the
+	// shared dedupe. March 1 push lands in March's bucket (not a
+	// rollover for Provider B's own accumulator), so its flush path
+	// goes through flushOverageLocked — which consults dedupe and
+	// short-circuits because the row already exists.
+	if err := pB.accumulateOverage(context.Background(), acct,
+		time.Date(2025, 3, 1, 1, 0, 0, 0, time.UTC), 500); err != nil {
+		t.Fatalf("pB Mar push: %v", err)
+	}
+	if callsB != 0 {
+		t.Errorf("pB flush calls = %d, want 0 (dedupe short-circuits)", callsB)
+	}
+
+	// Dedupe was consulted (Has >= 1 from pB's gate), not re-stamped
+	// (Rec stays at 1).
+	if got := dedupe.Has(); got < 1 {
+		t.Errorf("dedupe.Has after pB = %d, want >= 1 (gate observed)", got)
+	}
+	if got := dedupe.Rec(); got != 1 {
+		t.Errorf("dedupe.Rec after pB = %d, want 1 (no second stamp)", got)
 	}
 }

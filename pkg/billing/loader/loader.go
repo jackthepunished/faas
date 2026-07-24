@@ -135,7 +135,11 @@ func LoadProviderForMeterd(env func(string) string, store state.Store, dedupe st
 		apiKey := env("FAAS_PADDLE_API_KEY")
 		sandbox := env("FAAS_PADDLE_SANDBOX") == "1" || env("FAAS_PADDLE_SANDBOX") == "true"
 		// meterd doesn't need the webhook secret (no ingress in meterd).
-		p := paddle.NewProvider(apiKey, "", sandbox, log)
+		// store is also the cross-process dedupe gate (state.Store
+		// implements paddle.PaddleOverageDedupe via the Has/Record pair
+		// added in the same PR) — mirrors how the Stripe branch above
+		// passes the same `store` as its PushDedupe.
+		p := paddle.NewProviderWithDedupe(apiKey, sandbox, log, store)
 		return p, "paddle", nil
 	default:
 		return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", env("FAAS_BILLING_PROVIDER"))
