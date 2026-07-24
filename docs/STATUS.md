@@ -28,8 +28,10 @@ applier), base→ext4 auto-stage (`pkg/imaged::EnsureBaseExt4`), real-mkfs
 build in Linux CI, `guest/init` overlay + crash supervisor, two-drive
 boot verified metal-side (`cmd/e2e/deploy_wake_metal_test.go`).
 
-**Remaining:** the same `deploy_wake_metal_test.go` has a body/trim
-fixture mismatch that also blocks the M5 §14 gate. PR #55 in flight.
+**Fixture follow-up:** the body/trim mismatch originally flagged in PR #55
+was resolved by PRs #151, #159, #135; `deploy_wake_metal_test.go` is now
+exercised by the M8 netns + egress test path. EX44 / Lima sign-off on the
+§14 metal acceptance gate is tracked under [What's next](#whats-next).
 
 ## M3 — snapshots + wake. ✅
 
@@ -58,9 +60,29 @@ snapshot-prime handshake that flips a deployment to `live` after
 one cold-boot priming cycle, and the G2 sealed-secrets path
 (PR #42); `faas` CLI renders RFC 7807 problems (UX §3.3).
 
-**Remaining:** the same `deploy_wake_metal_test.go` body/trim
-fixture mismatch — the M5 §14 metal acceptance gate does not pass
-on a clean checkout. PR #55 in flight.
+**Fixture follow-up:** the body/trim mismatch flagged in PR #55
+was resolved by PRs #151, #159, #135 (same fixture exercised by
+the M8 netns + egress path). EX44 / Lima sign-off on the §14
+metal acceptance gate is tracked under [What's next](#whats-next).
+
+**Beta ship-blockers landed** — PR #136 (`PR-A`, ship-blockers
+for the beta cohort) and PR #154 (`PR-B`, atomic supersede +
+durable build queue).
+
+**Authentication surface rewritten** — PR #161 added Google
+OAuth 2.0 (`cmd/apid/handlers_google.go`, routes mounted at
+`cmd/apid/server.go:426-427`); PR #162 auto-creates the user
+account and issues an active Bearer API key + session cookie
+on signup; PRs #163 and #164 retired the stale magic-link login
+email (the `/auth/verify` route remains in the codebase but is
+no longer reachable through `/login`); PR #174 hardened
+`POST /login` against pre-auth takeover
+(`cmd/apid/handlers_auth.go:112`, closes #165).
+
+**CLI SDK promoted** — PR #157 lifted `cmd/faas/client.go` to
+`pkg/api/client.go` as the public SDK (38 exported methods
+covering apps, deployments, plans, domains, crons, keys,
+secrets, usage, and the OAuth device-code flow).
 
 ## M6 — builderd + real image pulls. ✅
 
@@ -91,68 +113,89 @@ CLAUDE.md.
 
 ## M7 — metering, billing, functions, cron. 🚧
 
-The sampling/quota shapes are in `cmd/meterd` and `pkg/stripex`,
-the dunning state machine is `pkg/state.MarkAccountDeletionPending`
-(ADR-021), GB-h = plan RAM + 8 MB per running second is in
-`pkg/meter`. Functions: `guest/runners/node22` +
-`guest/runners/python312` (handler contract per spec §4.9). Cron:
-`pkg/sched/cron.go`, single-flight per scheduled fire, loop-tested
-in `cron_loop_test.go`. Email: `pkg/mail` interface with Resend +
-Postmark backends (gap G4).
+The sampling/quota shapes are in `cmd/meterd` and
+`pkg/billing/stripe`, the dunning state machine is
+`pkg/state.MarkAccountDeletionPending` (ADR-021), GB-h = plan RAM
++ 8 MB per running second is in `pkg/meter`. Functions:
+`guest/runners/node22` + `guest/runners/python312` (handler
+contract per spec §4.9). Cron: `pkg/sched/cron.go`, single-flight
+per scheduled fire, loop-tested in `cron_loop_test.go`. Email:
+`pkg/mail` interface with Resend + Postmark backends (gap G4).
 
-**Remaining (pre-PR-#69 claim, now stale):** `cmd/meterd/main.go::defaultDeps` ships
-nil `parker` and nil `stripe` collaborators; production never wires
-`scheddgrpc.Dial(...)` or `stripex.NewClient(...)`, so quota hard-stop and
-hourly Stripe usage push are not operational.
-`pkg/stripex/usage.go::PushUsageRecord` is a `nil`-returning stub
-(`TODO stripe-go`). PR #59 in flight.
+**Billing-provider extraction (PR #155)** — the Stripe
+implementation moved from `pkg/stripex` to `pkg/billing/stripe/`
+and the `billing.Provider` interface is defined at
+`pkg/billing/provider.go:39`. PR #173 later added the 5th method
+`CreateUpgradeTransaction` to the interface.
 
-**Actually remaining after #69 (which landed the wiring + dunning + SDK):**
+**Paddle MoR provider (PR #158)** — `pkg/billing/paddle/` ships
+with HMAC webhook verification (`pkg/billing/paddle/webhook.go`)
+and an overage accumulator (`pkg/billing/paddle/usage.go`).
 
-- **Idempotent billing** — `usage_minutes` used to upsert-add on redelivered
-  minutes, silently inflating bills under any meterd restart. PR #71
-  (`feat/m7-beta-hardening`) flips to `ON CONFLICT DO NOTHING` and adds a
-  parity test for the shared `BillableRAMMB` helper.
-- **observability surface** — `cmd/meterd` previously had no `/metrics` or
-  `/healthz`. Same PR #71 wires both via `wire.NewOpsMetrics("meterd")` and
-  an inline `/healthz` (returning 200 unconditionally — richer semantics
-  follow-up).
-- **§14 M7 acceptance test (24h GB-h shadow, integer-arithmetic exact)**
-  — landed. See `pkg/meter/meter_test.go::TestInvoiceShadow24h`
-  (local math), `pkg/meter/pusher_shadow_test.go::TestPushHour_Shadow24h`
-  (push-side integer equality), and
-  `pkg/stripex/sandbox_test.go::TestInvoiceShadow24h_Sandbox` (live
-  Stripe SDK — asserts `record.Quantity == 6187` exactly, zero
-  delta). Cadence switched from per-hour float (`qty =
-  int64(gbHours * 1000)`, 0.315 % short over 24h) to per-day integer
-  (`qty = mbSeconds * 1000 / 1024 / 3600`).
-- **A3 (transactional suspend-and-park)**, **A4 (Free restore)**,
-  **A5 (quota/dunning ordering race)** — separate PRs, polish.
-- **Provider-pluggable billing layer (Stripe + Paddle)** — landed via
-  PR #1 (Stripe facade extraction + `billing.Provider`), PR #2
-  (`pkg/billing/paddle` + HMAC verify + overage accumulator), and
-  PR #3 (apid + meterd dispatch + `CreateUpgradeTransaction` 5th
-  method + apid `/v1/webhooks/paddle` mount). Operator selects via
-  `FAAS_BILLING_PROVIDER=paddle`; empty = Stripe (bit-for-bit
-  unchanged). ADR-032 records the decision. Dashboard + CLI surface
-  for `paddle_checkout_url` rendering is PR #4.
+**apid + meterd dispatch (PR #173)** — both daemons now route
+through `billing.Provider` via
+`pkg/billing/loader/loader.go::LoadProviderForAPID` /
+`LoadProviderForMeterd`. Operator selects via
+`FAAS_BILLING_PROVIDER=paddle`; empty (or `stripe`) keeps the
+historical path bit-for-bit unchanged. apid also mounts
+`/v1/webhooks/paddle` with HMAC verification. ADR-032 records the
+decision; the operator runbook is
+`docs/ops/billing-provider-switch.md`.
 
-## M7.5 — thin dashboard + githubd. ✅
+**§14 M7 acceptance test (24h GB-h shadow, integer-arithmetic exact)**
+— landed via PR #126. See
+`pkg/meter/meter_test.go::TestInvoiceShadow24h` (local math),
+`pkg/meter/pusher_shadow_test.go::TestPushHour_Shadow24h`
+(push-side integer equality), and
+`pkg/billing/stripe/sandbox_test.go::TestInvoiceShadow24h_Sandbox`
+(live Stripe SDK — asserts `record.Quantity == 6187` exactly,
+zero delta). Cadence switched from per-hour float (`qty =
+int64(gbHours * 1000)`, 0.315 % short over 24h) to per-day
+integer (`qty = mbSeconds * 1000 / 1024 / 3600`). The
+`pkg/stripex/` directory no longer exists post-PR-#155 rename.
 
-`pkg/dashboard` ships server-rendered Go `html/template` pages
-(apps, billing, usage, login, account, deployment-detail); ADR-011
-keeps dashboard on the apid loopback, gatewayd reverse-proxies
-`/dashboard/*` and `/oauth/*`. `pkg/githubd` + `cmd/githubd`
-provide HMAC-verified webhook ingress, GitHub App OAuth + repo
-picker, Checks-API status writer, and a per-install token cache
-with proactive refresh. Magic-link auth lives in `pkg/state`
-(`IssueLoginToken` / `ConsumeLoginToken`) with sealed cookies in
-`pkg/session`. SSE live updates on `/v1/events`; `deployment_logs`
-persistence landed. PR #41, ADR-011, ADR-012.
+**Idempotent billing + observability surface (PR #75, not #71)**
+— `usage_minutes` flipped to `ON CONFLICT DO NOTHING` and a parity
+test was added for the shared `BillableRAMMB` helper. `cmd/meterd`
+also got `/metrics` via `wire.NewOpsMetrics("meterd")`
+(`cmd/meterd/main.go:256/278/285`) and an inline `/healthz`
+(`cmd/meterd/main.go:293`). *(Earlier revisions of this file
+attributed both to PR #71; that's the CLI-only `feat/m7-beta-hardening`
+PR — corrected.)*
 
-**Caveat:** `pkg/dashboard/templates/` load HTMX 2.0.4 but no
-`hx-*` attributes are used yet (`apps_list.html` uses
-`<meta refresh>`); HTMX polling is a follow-up.
+**M7 customer email coverage (PR #133)** — dunning entry /
+recovery and quota-warning bodies in `pkg/mail/account.go`:
+`PaymentFailedBody` (line 131), `AccountSuspendedBody` (96),
+`AccountRestoredBody` (169), `QuotaWarningBody` (205). apid's
+webhook handler fires `PaymentFailedBody` / `AccountRestoredBody`
+on the success branch of `MarkDunningStep`; meterd's quota loop
+fires `QuotaWarningBody` alongside `db.NotifyQuotaWarning` on the
+first warning of each UTC day (dedupe gate at
+`accounts.last_quota_warning_at`).
+
+**Paddle e2e (PR #173)** — `cmd/e2e/paddle_e2e_test.go` exercises
+three flows: signed `transaction.paid` on past_due → active within
+5 s; signed `transaction.payment_failed` on active → past_due
+within 5 s; bad HMAC → 400 with `validation_failed` problem.
+
+## M7.5 — extracted Next.js dashboard + githubd. ✅
+
+The frontend was extracted to the dedicated `faas-frontend`
+repository by PR #160 (commit `42814d6` deleted `website/`). The
+Go `html/template` dashboard described in earlier revisions of
+this file is historical — see the external repo for the shipped
+implementation. `pkg/dashboard` may remain in this repo for
+backward compatibility but is not the production frontend.
+
+`pkg/githubd` + `cmd/githubd` still live in this repo and provide
+HMAC-verified webhook ingress, GitHub App OAuth + repo picker,
+Checks-API status writer, and a per-install token cache with
+proactive refresh. The production auth surface (Google OAuth +
+dual Bearer / session cookies, `POST /login` takeover hardening,
+retired magic-link machinery) is described under [M5](#m5--apid--deploy-pipeline--cli-)
+via PRs #161–#164 and #174. SSE live updates on `/v1/events` and
+`deployment_logs` persistence landed via PR #41, ADR-011,
+ADR-012.
 
 ## M8 — hardening & ops. 🚧
 
@@ -202,6 +245,70 @@ spinner) and PR #51 (the closeout batch):
   file `docs/drills/2026-07-20-restore-drill.md` is the template.
 - **`leakcheck.sh` glob fix** matches the v1.7 jailer `--id`
   constraint.
+
+**Networking & egress (PRs #128, #151, #159):**
+
+- **PR #151 (tier-1 tenant egress)** — `pkg/netns/policy.go:77`
+  adds `MasqueradeCIDR` (default `10.100.0.0/16`, line 121);
+  `Render()` emits a `postrouting` nat chain at lines 198–201 with
+  `ip saddr <CIDR> oifname "eth0" masquerade`. The persistent
+  `br-tenants` bridge is brought up by
+  `deploy/ansible/roles/br-tenants-up/` before
+  `nftables.service` / `vmmd.service`. Metal regression in
+  `pkg/netns/policy_metal_test.go`. Closes #134.
+- **PR #128** — `pkg/netns/config.go:124` installs the netns
+  default route inline in `Config.SetupCommands`; the forward
+  chain uses the `BridgeName = "br-tenants"` constant
+  (`pkg/netns/config.go:21`). Pinned by
+  `TestSetupInstallsNetnsDefaultRouteViaBridge` /
+  `TestSetupInstallsDefaultRouteAfterAddressing`
+  (`pkg/netns/config_test.go:128,155`).
+- **PR #159 (tier-2 per-app outbound IP allowlist, ADR-031)** —
+  `migrations/00029_app_egress_allowlist.sql` adds an
+  `egress_allowlist cidr[]` column to `apps` (v4-only BEFORE-row
+  trigger). State path: `pkg/state/pgstore.go:336,455,493`,
+  `pkg/state/memstore.go:585,602`. Metal regression in
+  `pkg/netns/allowlist_metal_test.go::TestMetalAllowlistRuleInstalled`.
+  Per spec §7 the feature is gated to **Pro / Scale** plans.
+
+**Observability & dashboards (PR #156):**
+
+- Self-hosted Grafana role at `deploy/ansible/roles/grafana/`
+  (templates: `grafana.ini.j2`, `provisioning-dashboards.yml.j2`,
+  `provisioning-datasources.yml.j2`; files: `faas-fleet.json`,
+  `grafana-server.service`). Includes the M1/M2 fleet panels and
+  the D1–D5 dashboard fixes per ADR-031. The Prometheus pipeline
+  + alertmanager + status-page `degraded` flag (PR #140) feed
+  these dashboards end-to-end.
+
+**Security & acceptance gates (PRs #130, #149, #150, #152, #153):**
+
+- **PR #130 — per-wake stable `wake_id`** — minted in
+  `Engine.Wake` (`pkg/sched/engine.go:282`) and on the Prime path
+  (line 665). Schema in `migrations/00028_instances_wake_id.sql`;
+  v4 fallback metric `faas_wake_id_v4_fallback_total`.
+- **PR #149 — OpenAPI spec gate** — `make spec-check` invokes
+  `vacuum lint` with `VACUUM_VER := v0.29.10` (`Makefile:225`);
+  CI installs the vacuum binary from a SHA-256-pinned tarball
+  (`.github/workflows/ci.yml`, `spec-check` job).
+- **PR #150 — `changePlan` Stripe subscription gate** —
+  `cmd/apid/handlers_ext.go:671-705` returns a 402 Problem with
+  `CodePayment` when `acct.StripeSubscriptionItem == ""` and the
+  requested plan requires a Stripe upgrade. Closes #142.
+- **PR #152 — per-IP `AuthLimit` restored across loopback**
+  (closes #89). `pkg/middleware/authlimit.go::defaultClientIP`
+  trusts `X-Forwarded-For` only when `RemoteAddr` is loopback;
+  the gatewayd pin is at `cmd/gatewayd/proxy.go:215-222`.
+- **PR #153 — §11 security-hardening e2e sweep**.
+  `cmd/e2e/sec11_sweep_test.go` (4 tests:
+  `TestSec11_AuthLimitPerIP_CrossProcess`,
+  `TestSec11_ApiKeyHashedAtRest`,
+  `TestSec11_UnixSocketOnlyDSN`,
+  `TestSec11_HostKey0400_Required`) plus
+  `cmd/e2e/sec11_host_linux_test.go` (5 host-side checks:
+  cgroups-v2 unified, kernel ≥ 6.8, unprivileged user-ns disabled,
+  unattended-upgrades security-only, nftables policy file
+  in-sync).
 
 The §14 M8 gates still on the board are listed in [What's next](#whats-next).
 
@@ -278,8 +385,9 @@ Post-M8 = private beta (founding doc M2–M3 hand-held phase).
 
 ## What's next
 
-The M6 / M7 / M8 §14 acceptance gates still on the board. Pick one
-and open an issue if you want it.
+M0 → M8 are the spec-defined milestones (spec §14, lines 444–461).
+Items below are operator verification still on the M8 board plus
+explicitly open issues that the doc otherwise implies are closed.
 
 ### M6
 
@@ -288,42 +396,13 @@ and open an issue if you want it.
 ### M7
 
 - ~~**`cmd/meterd/main.go` wiring** — `defaultDeps` leaves `parker`
-  and `stripe` nil. Wire `scheddgrpc.Dial(...)` for the quota
-  hard-stop's `ScheddParker`, and `stripex.NewClient(...)` for the
-  hourly push. Until then, the sampling loop runs but doesn't act
-  on quota breaches or send Stripe usage records.~~ **Closed by
-  PR #69** (`worktree-harden-meterd`).
-- ~~**`pkg/stripex/usage.go::PushUsageRecord`** — currently
-  `nil`-returning `TODO stripe-go`. Bring the SDK in, write a
-  test against the Stripe sandbox.~~ **Closed by PR #69.**
-- **§14 M7 acceptance test (24h GB-h shadow, integer-arithmetic exact)**
-  — landed. See `pkg/meter/meter_test.go::TestInvoiceShadow24h`
-  (local math), `pkg/meter/pusher_shadow_test.go::TestPushHour_Shadow24h`
-  (push-side integer equality), and
-  `pkg/stripex/sandbox_test.go::TestInvoiceShadow24h_Sandbox` (live
-  Stripe SDK — asserts `record.Quantity == 6187` exactly, zero
-  delta). Cadence switched from per-hour float (`qty =
-  int64(gbHours * 1000)`, 0.315 % short over 24h) to per-day integer
-  (`qty = mbSeconds * 1000 / 1024 / 3600`).
-- **Idempotent billing + meterd `/metrics` + `/healthz`** —
-  PR #71 (`feat/m7-beta-hardening`).
-- **Customer-facing email coverage of billing transitions** — spec
-  §171 "All transitions emailed". The two missing entries on the
-  dunning state machine (`payment_failed → past_due` entry-point
-  email, `payment_succeeded → active` recovery email) plus the paid
-  overage `quota_warning` mail are now wired. apid's webhook handler
-  fires `pkg/mail.PaymentFailedBody` / `pkg/mail.AccountRestoredBody`
-  on the success branch of `MarkDunningStep` (Stripe redelivery is
-  naturally silent via `state.ErrNotFound`); meterd's quota loop
-  fires `pkg/mail.QuotaWarningBody` alongside `db.NotifyQuotaWarning`
-  on the first warning of each UTC day (dedupe gate at
-  `accounts.last_quota_warning_at`). All three new bodies are in
-  `pkg/mail/account.go` and pinned by `pkg/mail/account_test.go` +
-  `cmd/apid/handlers_ext_test.go` (4 webhook tests covering first
-  delivery + redelivery + already-active no-op) +
-  `pkg/meter/meter_test.go::TestPaidOverageDedupesPerDay` (mailer
-  count assertions across the day rollover + post-`ClearQuotaWarning`
-  re-tick).
+  and `stripe` nil.~~ **Closed by PR #69** (`worktree-harden-meterd`).
+- ~~**`pkg/stripex/usage.go::PushUsageRecord`** — `nil`-returning
+  `TODO stripe-go`.~~ **Closed by PR #69.**
+- **Provider-pluggable billing (Stripe + Paddle)** — see the M7
+  body above. **Note:** the dashboard / CLI surface for
+  `paddle_checkout_url` rendering is still outstanding (the original
+  PR #4 in the paddle-mor series). Track via the issue search.
 
 ### M8
 
@@ -349,7 +428,7 @@ and open an issue if you want it.
   (API 99.5 % monthly, wake p95 < 1 s, build success ≥ 99 %).
   Pipeline (Prometheus scrape + Grafana JSON + `apid /status` +
   `apid /status/slo.json`) in via PR #51; Grafana provisioning +
-  D1–D5 threshold fixes + M1/M2 panels via PR #141 (ADR-031).
+  D1–D5 threshold fixes + M1/M2 panels via PR #156 (ADR-031).
   Operator verification (Grafana panels render non-zero data, SLO
   JSON returns denominators) is the EX44 follow-up.
 - **§11 checklist item-by-item sign-off** (cgroups v2 only,
@@ -357,3 +436,28 @@ and open an issue if you want it.
   etc.). The IPv6 egress item (ADR-023) is now in via PR #51;
   remaining items are operator verification on the EX44.
 - **Gate-A runbook** — 2nd-box active-passive (founding doc R3).
+- **M2 / M5 §14 metal gate sign-off** — the body/trim fixture
+  mismatch flagged in PR #55 is resolved at the code level
+  (PRs #151, #159, #135). The remaining item is a clean-checkout
+  `make metal-lima` run on EX44 / Lima recording the gate green.
+
+### Open security & infrastructure issues
+
+These are still open on GitHub. Earlier revisions of this file
+sometimes implied they were closed; they aren't.
+
+- **#144** — `NftResetCommands` missing ip6 reset (snapshot-restore
+  Wake fails on second add).
+- **#146** — host egress chain deny lines are dead-code; PR #128 /
+  #151 did **not** close this.
+- **#147** — `stripeWebhook customer.subscription.updated` should
+  validate `Plan` via `api.Plan.Valid()`.
+- **#148** — `bootstrap.sh` should pin the Go toolchain via
+  SHA-256 (closes a toolchain-supply-chain gap; sister to #143,
+  which is closed).
+- **#145** — streamed OCI blob SHA-256 verification against the
+  URL-path digest (spec's digest-pinned immutability).
+- **#125** — `sqlc-check` in the CI bundle to prevent sqlc source
+  drift.
+- **#90** — document `/v1/*` as a permanent platform path
+  reservation (issue #85 follow-up).
