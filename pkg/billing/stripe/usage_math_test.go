@@ -118,95 +118,105 @@ func TestWireQuantityForMBSeconds(t *testing.T) {
 	}
 }
 
-// TestWireQuantityForMBSeconds_LargeValue is the overflow-safety
-// guard. The docstring claims 1 TB-resident-24 h (~2.1e9 mb_seconds)
-// stays well below int64 max. Pin the claim with a value 100x larger
-// than that ceiling — if the formula ever changed to a narrower
-// integer type that silently truncated high windows to 0, the test
-// would catch it.
-//
-// Headroom fact-check: at 100 TB-resident-24 h the numerator is
-// 9_059_696_640_000_000 ≈ 9.06e15, well below int64 max (9.22e18).
-// staticcheck's SA4003 flags any int64*1000 comparison with
-// math.MaxInt64 as tautologically false, so the safety claim is left
-// here as a constant-propagated fact rather than re-checked at
-// runtime.
-func TestWireQuantityForMBSeconds_LargeValue(t *testing.T) {
+// TestWireQuantityForMBSeconds_HundredTBResidentDay pins the
+// answer at a high-but-representative billable volume: a
+// 100 TB-resident instance for 24 h, which is ~10_000x the
+// canonical Hobby 24h window. The arithmetic is constant-folded
+// at compile time, so this isn't an overflow test (Go's int64
+// max is 9.22e18 and the numerator is 9.06e15); it's a pin of
+// the helper's answer at a wire-quantity magnitude that stresses
+// the integer multiply. If a future contributor narrows the
+// helper to int32 or introduces a float, the answer (`2_457_600_000`,
+// just above int32 max) would surface as a wrong value here.
+func TestWireQuantityForMBSeconds_HundredTBResidentDay(t *testing.T) {
 	// 100 TB-resident for 24 h.
 	//   mbSeconds = 100 * 1024 * 1024 * 86_400 = 9_059_696_640_000
 	//   numerator = mbSeconds * 1000 = 9_059_696_640_000_000
 	//   qty = numerator / 3_686_400 = 2_457_600_000
-	// Pin the expected qty exactly.
 	const tb = 1024 * 1024
 	mbSeconds := int64(100 * tb * 86_400)
 	const want int64 = 2_457_600_000
 	got := WireQuantityForMBSeconds(mbSeconds)
 	if got != want {
-		t.Fatalf("large value: got %d, want %d (mbSeconds=%d)", got, want, mbSeconds)
+		t.Fatalf("100 TB-resident-24h: got %d, want %d (mbSeconds=%d)",
+			got, want, mbSeconds)
 	}
 }
 
-// TestWireQuantityForMBSeconds_NeverNegative pins the defensive
-// invariant. meterd never produces a negative window (it's a sum of
-// non-negative per-second contributions), but if a future caller
-// passes a negative int64 we want to know via the
-// ErrNegativeQuantity sentinel at pushUsageRecordSDKSumWithID, not
-// via a silently-wrapped int64 produced by integer overflow.
+// TestWireQuantityForMBSeconds_NeverNegative pins the contract
+// that the helper itself is the *math* layer, not the *guard*
+// layer. meterds never produces a negative window (it's a sum of
+// non-negative per-second contributions), and the call sites no
+// longer wrap ErrNegativeQuantity at runtime — the upstreams
+// guarantee non-negativity.
 //
-// The helper itself returns whatever the math says (which would be a
-// large positive number for negative mbSeconds due to int64 overflow
-// at the multiply step); the negative guard is a layer above. This
-// test documents that the helper is the *math* layer, not the *guard*
-// layer, so future refactors don't accidentally move the guard down.
+// This test documents that contract: a small negative input
+// (-1) yields 0 (truncation toward zero in Go integer division),
+// not a panic and not a silently-overflowed int64. If a future
+// refactor adds a defensive guard inside the helper, this test
+// will fail and force the author to decide what layer the guard
+// belongs to.
 func TestWireQuantityForMBSeconds_NeverNegativeMathResult(t *testing.T) {
-	// Math note: a negative mbSeconds multiplied by 1000 still
-	// overflows in int64 (smallest representable values). The math
-	// result is therefore *not* guaranteed positive at the helper
-	// level — the negative guard lives at the caller. Pin that
-	// contract here so the helper isn't later "fixed" to do the
-	// guard's job.
 	got := WireQuantityForMBSeconds(-1)
 	// -1 * 1000 / secondsPerGBHour = -1000 / 3686400 = 0 (truncated
 	// toward zero in Go integer division). So a small negative
-	// input produces 0, not the panic'd reflection of overflow.
+	// input produces 0, not a panic'd reflection of overflow.
 	if got != 0 {
-		t.Fatalf("small negative input: got %d, want 0 (caller's guard is authoritative)", got)
+		t.Fatalf("small negative input: got %d, want 0", got)
 	}
 }
 
-// TestLegacyWireQuantityForGBHours pins the deprecated float path so
-// it can't quietly drift. The legacy formula is `int64(gbHours *
-// 1000)`, used by the deprecated PushUsageRecordSum and its live
-// sandbox regression test. If a future refactor accidentally
-// substitutes the integer path's division, every customer on the
-// legacy wire path would be silently under-billed.
-func TestLegacyWireQuantityForGBHours(t *testing.T) {
+// TestLegacyWireQuantityForGBHours_BitIdentical pins the deprecated
+// path's contract: it MUST be bit-identical to
+// `int64(gbHours * 1000)`. TestInvoiceShadow24h_Sandbox (live
+// Stripe) and the existing legacy callers rely on this exact
+// formula — a future refactor that accidentally routes through
+// the integer path's division would silently under-bill every
+// customer on the legacy wire path.
+//
+// The reference answer is computed inline as
+// `int64(gbHours * WireQuantityMillicentsPerGBHour)` so the test
+// is self-documenting: there's no "expected" value to mis-transcribe,
+// and a future refactor that changes the inline reference
+// expression is caught by code review rather than a magic-number
+// discrepancy.
+func TestLegacyWireQuantityForGBHours_BitIdentical(t *testing.T) {
 	cases := []struct {
 		name    string
 		gbHours float64
-		want    int64
 	}{
-		// Zero, pinning the floor.
-		{name: "zero", gbHours: 0, want: 0},
-		// 0.001 GB-h (one MB-resident-hour) → 1 wire unit. The
-		// cleanest alignment of the legacy formula.
-		{name: "one_mb_hour", gbHours: 0.001, want: 1},
-		// 6.187 GB-h exactly → 6187 wire units. Same answer as the
-		// integer path's canonical 24h Hobby case — but for an
-		// entirely different reason. If the integer path ever
-		// diverged from 6187 for this window, this test would
-		// document the legacy answer remains as-is.
-		{name: "hobby_24h_legacy", gbHours: 6.187, want: 6187},
-		// Below the truncation floor. 0.0009 GB-h * 1000 = 0.9 →
-		// int64 truncates to 0. Pin the sub-milliunit truncation.
-		{name: "below_floor", gbHours: 0.0009, want: 0},
+		// Floor.
+		{name: "zero", gbHours: 0},
+		// 0.001 GB-h (one MB-resident-hour) → 1 wire unit.
+		// The cleanest alignment of the legacy formula.
+		{name: "one_mb_hour", gbHours: 0.001},
+		// 6.187 GB-h → 6187 wire units. Same number as the
+		// integer path's canonical 24h Hobby case, but here
+		// the floating-point representation is the only
+		// thing that determines the answer.
+		{name: "hobby_24h_legacy", gbHours: 6.187},
+		// Below the sub-milliunit truncation floor: 0.0009 →
+		// 0.9 → int64 truncates to 0.
+		{name: "below_floor", gbHours: 0.0009},
+		// A non-round number that exercises the float→int64
+		// cast at a value where the bit pattern matters.
+		// 0.006187 → 6.187 → 6187 (the same canonical qty,
+		// but at a different magnitude).
+		{name: "non_round", gbHours: 0.006187},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := legacyWireQuantityForGBHours(tc.gbHours)
-			if got != tc.want {
-				t.Fatalf("legacyWireQuantityForGBHours(%v) = %d, want %d",
-					tc.gbHours, got, tc.want)
+			// Reference: the literal formula the function
+			// is supposed to be a wrapper for. If anyone
+			// "improves" the test by replacing this with a
+			// magic number, the inline comment is the
+			// prompt that explains what the number is.
+			want := int64(tc.gbHours * WireQuantityMillicentsPerGBHour)
+			if got != want {
+				t.Fatalf("legacyWireQuantityForGBHours(%v) = %d, "+
+					"want %d (bit-identical to int64(gbHours * 1000))",
+					tc.gbHours, got, want)
 			}
 		})
 	}

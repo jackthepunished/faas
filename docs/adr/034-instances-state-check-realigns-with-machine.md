@@ -284,14 +284,6 @@ alter table instances
   PR; a follow-up ADR can generalize the tripwire pattern if
   a second string-enum table appears.
 
-- **Skip the migration upgrade and instead fix the Go side
-  to remove `snapshotting` / `failed`:**
-  not viable. schedd writes these values because the spec
-  requires them — `snapshotting` is the pause-before-snapshot
-  step in the Park path (spec §6.1), `failed` is the
-  crash-loop / boot-timeout outcome (spec §6.2 watchdog).
-  Removing them from the Go side would break the spec.
-
 ## Cross-reference
 
 - `migrations/00035_instances_state_check_realigns.sql` —

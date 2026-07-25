@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
@@ -125,11 +126,13 @@ func TestPgStore_InstancesStateCheck_SetMatchesMachineStates(t *testing.T) {
 	want["pending"] = true
 
 	// Same-length first; the symmetric-diff loop below is
-	// clearer with both sides pre-validated.
+	// clearer with both sides pre-validated. Print the desired
+	// set, not just its size — a future States expansion (e.g.
+	// M8 quota_evicting) would otherwise show "want 9" even
+	// though the desired set is now 10.
 	if len(got) != len(want) {
-		t.Fatalf("instances_state_check has %d values, want %d "+
-			"(States ∪ {pending} = %d); got %v",
-			len(got), len(want), len(want), got)
+		t.Fatalf("instances_state_check has %d values, want %v got %v",
+			len(got), sortedKeys(want), sortedKeys(got))
 	}
 
 	// Symmetric diff. Print only the offending values, not the
@@ -205,24 +208,22 @@ func TestPgStore_InstancesStateCheck_RejectsInjection(t *testing.T) {
 }
 
 // parseCheckLiterals extracts the literal set from a CHECK
-// definition rendered by pg_get_constraintdef. Postgres rewrites
-// `state IN ('a', 'b', 'c')` to one of two shapes depending on the
-// length:
+// definition rendered by pg_get_constraintdef. Postgres emits
+// exactly two shapes for `CHECK (col IN (...))`, depending on
+// the literal-set cardinality:
 //
 //   * short set (≤ a few elements): `state IN ('a', 'b', 'c')`
 //   * longer set: `state = ANY (ARRAY['a'::text, 'b'::text, ...])`
 //
-// Both forms are observed in this repo (the SCHECK for the
-// instances_state_check set is past the ANY-form threshold).
-// The parser handles both, plus a `state = 'a' OR state = 'b' …`
-// disjunctive form a future migration could write. Anything
-// else is a parse failure — the conservative shape is deliberate:
-// if a future migration writes the CHECK in a way that's no
-// longer parseable here, the test fails loudly rather than
-// silently passing with an empty set.
+// (The `ANY` form always has a space between `ANY` and `(` —
+// Postgres's canonical emission. The literal-list contents also
+// carry `'<val>'::text` casts in the ARRAY form, which the
+// parser strips below.)
 //
-// The regex is anchored on the captured group so the function
-// returns only the literal values, not the surrounding SQL.
+// Anything else is a parse failure — the conservative shape is
+// deliberate: a future migration that writes the CHECK in a
+// form the parser doesn't recognise will fail loudly here
+// rather than silently passing with an empty set.
 func parseCheckLiterals(t *testing.T, def, name string) map[string]bool {
 	t.Helper()
 	// Strip the outer (...) wrapper.
@@ -232,16 +233,14 @@ func parseCheckLiterals(t *testing.T, def, name string) map[string]bool {
 		t.Fatalf("%s: cannot find (...) in definition %q", name, def)
 	}
 	inner := def[open+1 : close]
-
-	// Normalise whitespace once for the dispatch.
 	upper := strings.ToUpper(inner)
 
 	switch {
-	case strings.Contains(upper, "ANY (ARRAY[") || strings.Contains(upper, "ANY(ARRAY["):
-		// ANY(ARRAY[...]) form. Extract the ARRAY content.
+	case strings.Contains(upper, "ANY (ARRAY["):
+		// ANY (ARRAY[...]) form. Extract the ARRAY content.
 		arrStart := strings.Index(upper, "ARRAY[")
 		if arrStart < 0 {
-			t.Fatalf("%s: ANY(...) without ARRAY[...] in %q", name, inner)
+			t.Fatalf("%s: ANY (...) without ARRAY[...] in %q", name, inner)
 		}
 		arrEnd := strings.LastIndex(upper, "]")
 		if arrEnd < 0 || arrEnd <= arrStart {
@@ -257,20 +256,6 @@ func parseCheckLiterals(t *testing.T, def, name string) map[string]bool {
 		inPos := strings.Index(upper, " IN ")
 		after := inner[inPos+4:]
 		return parseLiteralList(t, name, after, "IN (...)")
-
-	case strings.Contains(upper, " = "):
-		// Bare `state = 'a'` form (one literal) or
-		// disjunctive `state = 'a' OR state = 'b' OR ...` form.
-		// Split on " OR " (case-insensitive) and parse each side.
-		parts := splitScopedOR(inner)
-		out := map[string]bool{}
-		for _, p := range parts {
-			// Each part is `state = 'literal'`. Take the last
-			// quoted string.
-			lit := lastQuotedLiteral(t, p, name)
-			out[lit] = true
-		}
-		return out
 
 	default:
 		t.Fatalf("%s: unrecognised CHECK shape in %q", name, def)
@@ -321,58 +306,14 @@ func parseLiteralList(t *testing.T, name, raw, form string) map[string]bool {
 	return out
 }
 
-// splitScopedOR splits an expression on top-level ` OR ` tokens.
-// Not a full SQL parser — sufficient for the `state = 'a' OR
-// state = 'b' OR ...` shape a future migration could write.
-// Parentheses-in-OR is not supported (the CHECK would not be
-// emitted in that shape by Postgres anyway).
-func splitScopedOR(expr string) []string {
-	parts := []string{expr}
-	upper := strings.ToUpper(expr)
-	for {
-		idx := strings.Index(upper, " OR ")
-		if idx < 0 {
-			return parts
-		}
-		last := parts[len(parts)-1]
-		parts[len(parts)-1] = strings.TrimSpace(last[:idx])
-		parts = append(parts, strings.TrimSpace(last[idx+4:]))
-		upper = upper[idx+4:]
+// sortedKeys returns the keys of m as a sorted slice. Used in
+// failure messages so the test output is deterministic and
+// grep-friendly across runs (Go map iteration is randomized).
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-}
-
-// lastQuotedLiteral extracts the last single-quoted string in
-// expr. Used for the disjunctive `state = 'a' OR state = 'b' OR
-// ...` form where each disjunct is `state = '<literal>'`.
-func lastQuotedLiteral(t *testing.T, expr, name string) string {
-	t.Helper()
-	// Find the last quote pair.
-	upper := expr
-	// Walk from the end.
-	for i := len(upper) - 1; i >= 1; i-- {
-		if upper[i] != '\'' {
-			continue
-		}
-		// Walk back to the opening quote.
-		j := i - 1
-		for j >= 0 {
-			if upper[j] == '\'' && (j == 0 || upper[j-1] != '\'') {
-				break
-			}
-			j--
-		}
-		if j < 0 {
-			t.Fatalf("%s: no opening quote in %q", name, expr)
-		}
-		lit := upper[j+1 : i]
-		// Unescape SQL doubled quotes.
-		lit = strings.ReplaceAll(lit, "''", "'")
-		// Strip the optional `::type` cast.
-		if cast := strings.Index(lit, "::"); cast >= 0 {
-			lit = lit[:cast]
-		}
-		return lit
-	}
-	t.Fatalf("%s: no quoted literal in %q", name, expr)
-	return ""
+	sort.Strings(out)
+	return out
 }
