@@ -480,3 +480,42 @@ type DelayedTaskRequest struct {
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	ScheduledAt time.Time       `json:"scheduled_at"`
 }
+
+// Invocation is the SDK-side mirror of state.Invocation. The wire
+// is the same JSON the handler emits (writeJSON(w, 200, inv) where
+// inv is a state.Invocation), but pkg/api cannot import pkg/state
+// (import cycle — state pkg is the lowest layer). The mirror is
+// exhaustive: every field with a JSON tag on state.Invocation gets a
+// typed row here so the SDK gets proper Go types and JSON tags. The
+// name `Invocation` matches the OpenAPI schema (api/openapi.yaml
+// `Invocation`) so the spec_compliance test sees a 1:1 mapping.
+type Invocation struct {
+	ID             string          `json:"id"`
+	AppID          string          `json:"app_id"`
+	AccountID      string          `json:"account_id"`
+	InstanceID     string          `json:"instance_id,omitempty"`
+	Source         string          `json:"source"`
+	State          string          `json:"state"`
+	Method         string          `json:"method"`
+	Path           string          `json:"path"`
+	Payload        json.RawMessage `json:"payload"`
+	Headers        json.RawMessage `json:"headers"`
+	DueAt          time.Time       `json:"due_at"`
+	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
+	AckURL         string          `json:"ack_url,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	ReceivedAt     *time.Time      `json:"received_at,omitempty"`
+	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
+	Attempts       int             `json:"attempts"`
+	LastError      string          `json:"last_error,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// ListInvocationsResponse is the wire shape for GET /v1/invocations.
+// The handler emits a `[]state.Invocation` under the `invocations`
+// key; here we declare the same shape with the SDK-side mirror type
+// so pkg/api stays decoupled from pkg/state.
+type ListInvocationsResponse struct {
+	Invocations []Invocation `json:"invocations"`
+}

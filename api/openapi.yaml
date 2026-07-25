@@ -1621,6 +1621,10 @@ components:
         instance_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$' }
         result: { type: [object, "null"], additionalProperties: true }
         last_error: { type: [string, "null"] }
+        ack_url: { type: [string, "null"], description: "Optional ack URL for queueReceive consumers; populated on queue-sourced rows." }
+        attempts: { type: integer, description: "Number of dispatch attempts so far; 0 on the first try." }
+        lease_expires_at: { type: [string, "null"], format: date-time, description: "When the in-flight dispatch lease expires; null when no lease is held." }
+        received_at: { type: [string, "null"], format: date-time, description: "When the drain first claimed the row; null until claimed." }
 
     ListInvocationsResponse:
       description: "Page of invocations; ordered by created_at DESC, id DESC. Pass the LAST id of the returned slice as the next `?before=` to load older."
