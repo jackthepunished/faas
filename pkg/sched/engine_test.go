@@ -254,6 +254,22 @@ func newEngine(t *testing.T, store state.Store, vmm RoutedVMM, notif Notifier, f
 	return e
 }
 
+// testBootBudget is the scaled-down vmmd budget the deadline tests
+// inject in place of the §6.1 constants. Large enough that a loaded
+// runner won't trip it spuriously, small enough that proving the
+// deadline costs 0.2s instead of 35s.
+const testBootBudget = 200 * time.Millisecond
+
+// withTestBootBudget replaces the engine's §6.1 vmmd budget with
+// testBootBudget for every state. Production never sets this field —
+// see Engine.bootBudget. The real §6.1 numbers are asserted directly by
+// TestBootTimeout_SpecBudgets, so shrinking them here costs no coverage.
+func withTestBootBudget(t *testing.T, e *Engine) *Engine {
+	t.Helper()
+	e.bootBudget = func(state.State) time.Duration { return testBootBudget }
+	return e
+}
+
 func TestEngineWake_ColdBoot(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
@@ -694,22 +710,18 @@ func TestEngineSeedLedger(t *testing.T) {
 // before the test gives up. After the Wake fails, the ledger is
 // released and the instance row is FAILED.
 func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
-	// t.Parallel: this test and TestEnginePrime_VMMDDeadlineEnforced each
-	// block on a real 35s timer, and together they were the long pole of
-	// the whole `make test` run (70s of the package's 74.5s). They share
-	// nothing — own MemStore, own NodeLedger, own Engine — so running
-	// them concurrently halves the wait.
 	t.Parallel()
 
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
-	// Cold-boot path: no snapshot, initState = COLD_BOOTING, so the
-	// deadline is ColdBootTimeout (35s). sleep well past it — but the
-	// test fails immediately if the engine doesn't honour the budget,
-	// so we set 5× and rely on the test wall-clock to bound the
-	// failure mode.
-	vmm := &fakeVMM{sleepFor: 2 * ColdBootTimeout}
-	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	// Cold-boot path: no snapshot, so initState = COLD_BOOTING and the
+	// budget is whatever budgetFor returns for that state. The engine
+	// below runs on testBootBudget (200ms) rather than the real
+	// ColdBootTimeout (35s); the fake sleeps 25× that, far enough past
+	// the deadline that a broken wrapper is unambiguous, and the failure
+	// mode costs 5s instead of 70s.
+	vmm := &fakeVMM{sleepFor: 25 * testBootBudget}
+	e := withTestBootBudget(t, newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0"))
 
 	start := time.Now()
 	_, err := e.Wake(context.Background(), app.ID)
@@ -721,14 +733,14 @@ func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Wake err = %v, want context.DeadlineExceeded", err)
 	}
-	// Slack is 4s rather than 2s because this test is now parallel: on a
-	// saturated 2-4 vCPU runner the post-deadline unwind (ledger release,
-	// FAILED write) queues behind other parallel tests. The assertion's
-	// job is to prove the budget is enforced at all — the fake sleeps 2×
-	// ColdBootTimeout (70s), so anything under that is a real signal and
-	// the extra 2s does not weaken the gate.
-	if elapsed > ColdBootTimeout+4*time.Second {
-		t.Errorf("Wake took %v, want ≤ ColdBootTimeout (35s) + slack", elapsed)
+	// The point of the elapsed check is that Wake returned on the
+	// deadline rather than riding the fake's sleep to completion. 2s is
+	// 10× the budget and 40% of the fake's sleep: generous enough that a
+	// saturated runner won't trip it, tight enough that it still fails
+	// if the WithTimeout wrapper is dropped.
+	if elapsed > 2*time.Second {
+		t.Errorf("Wake took %v, want the %v budget to fire (fake sleeps %v)",
+			elapsed, testBootBudget, 25*testBootBudget)
 	}
 	if got := e.Ledger().ResidentRAM(); got != 0 {
 		t.Errorf("resident = %d, want 0 (reservation released on deadline)", got)
@@ -745,13 +757,12 @@ func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
 // RUNNING → SNAPSHOTTING → PARKED on success, but a hung vmmd should
 // leave the row FAILED with no reservation.
 func TestEnginePrime_VMMDDeadlineEnforced(t *testing.T) {
-	// t.Parallel: see TestEngineWake_VMMDColdBootDeadlineEnforced.
 	t.Parallel()
 
 	store := state.NewMemStore()
 	_, app, dep := seedApp(t, store, api.PlanHobby, 256, 2)
-	vmm := &fakeVMM{sleepFor: 2 * ColdBootTimeout}
-	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	vmm := &fakeVMM{sleepFor: 25 * testBootBudget}
+	e := withTestBootBudget(t, newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0"))
 
 	err := e.Prime(context.Background(), app.ID, dep.ID)
 	if err == nil {
@@ -766,6 +777,77 @@ func TestEnginePrime_VMMDDeadlineEnforced(t *testing.T) {
 	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
 	if len(rows) != 1 || rows[0].State != string(state.StateFailed) {
 		t.Errorf("rows = %+v, want one FAILED row", rows)
+	}
+}
+
+// TestBootTimeout_SpecBudgets pins the §6.1 vmmd budgets directly.
+//
+// This is the assertion the two deadline tests above used to make
+// implicitly, by sleeping a fake past a real 35s timer and observing
+// that it fired. Doing it on the table instead is both instant and
+// stricter: the old form proved only "some deadline fired within 37s",
+// so ColdBootTimeout could have drifted to 20s or 34s and stayed green.
+// Here a drift of one second fails.
+func TestBootTimeout_SpecBudgets(t *testing.T) {
+	t.Parallel()
+
+	// Spec §6.1: WAKING ≤ 5s → fall back to cold-boot (+1s vmmd round
+	// trip = 6s); COLD_BOOTING ≤ 30s → FAILED (+5s jailer setup = 35s).
+	if WakingTimeout != 6*time.Second {
+		t.Errorf("WakingTimeout = %v, want 6s (§6.1: 5s + 1s vmmd round trip)", WakingTimeout)
+	}
+	if ColdBootTimeout != 35*time.Second {
+		t.Errorf("ColdBootTimeout = %v, want 35s (§6.1: 30s + jailer setup)", ColdBootTimeout)
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   state.State
+		want time.Duration
+	}{
+		{"waking gets the waking budget", state.StateWaking, WakingTimeout},
+		{"cold-booting gets the cold-boot budget", state.StateColdBooting, ColdBootTimeout},
+		// Unknown states fall through to the conservative branch rather
+		// than returning a zero duration — a zero would make
+		// context.WithTimeout fire immediately and fail every wake.
+		{"running falls through to cold-boot", state.StateRunning, ColdBootTimeout},
+		{"empty falls through to cold-boot", state.State(""), ColdBootTimeout},
+	} {
+		if got := bootTimeout(tc.in); got != tc.want {
+			t.Errorf("%s: bootTimeout(%q) = %v, want %v", tc.name, tc.in, got, tc.want)
+		}
+		if got := bootTimeout(tc.in); got == 0 {
+			t.Errorf("%s: bootTimeout(%q) returned zero — every wake would fail instantly", tc.name, tc.in)
+		}
+	}
+}
+
+// TestNewEngine_UsesSpecBudgets is the guard on the bootBudget test
+// seam: an engine built the way production builds one must carry a nil
+// override and resolve to the §6.1 constants. If someone wires a
+// shortened budget into NewEngine — or ships withTestBootBudget's
+// assignment outside a test — this fails.
+func TestNewEngine_UsesSpecBudgets(t *testing.T) {
+	t.Parallel()
+
+	store := state.NewMemStore()
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+
+	if e.bootBudget != nil {
+		t.Error("NewEngine set bootBudget; the override is a test seam and must stay nil in production")
+	}
+	if got := e.budgetFor(state.StateColdBooting); got != ColdBootTimeout {
+		t.Errorf("budgetFor(COLD_BOOTING) = %v, want ColdBootTimeout %v", got, ColdBootTimeout)
+	}
+	if got := e.budgetFor(state.StateWaking); got != WakingTimeout {
+		t.Errorf("budgetFor(WAKING) = %v, want WakingTimeout %v", got, WakingTimeout)
+	}
+
+	// And the seam actually takes effect when a test does set it —
+	// otherwise the deadline tests above would be asserting nothing.
+	withTestBootBudget(t, e)
+	if got := e.budgetFor(state.StateColdBooting); got != testBootBudget {
+		t.Errorf("after withTestBootBudget: budgetFor = %v, want %v", got, testBootBudget)
 	}
 }
 
