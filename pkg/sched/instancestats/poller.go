@@ -48,10 +48,9 @@ func (f DialerFunc) Dial(ctx context.Context, targetURL string, tlsCfg *tls.Conf
 
 // Poller is the periodic instance-stats worker. Mirrors
 // pkg/sched.Heartbeat in shape: Tick does one full sweep; Run
-// loops Tick on a fixed interval until ctx is done. The poller
-// holds per-instance state for CPU delta math; the state is
-// process-local and resets on process restart (no durable
-// baseline — the cgroup cumulative counter survives).
+// loops Tick on a fixed interval until ctx is done. Per-instance
+// state lives in the Reader; the poller itself is stateless across
+// ticks so process restart has no plumbing consequence.
 type Poller struct {
 	Interval  time.Duration
 	Store     state.Store
@@ -62,18 +61,6 @@ type Poller struct {
 	Log       *slog.Logger
 	Now       func() time.Time
 	Freshness time.Duration
-
-	// prevCPU holds the previous cumulative cpu.stat usage_usec
-	// per instance id. The poller computes the rate as
-	// (cur - prev) / (now - prevSampled) * 100. Reset to
-	// (math.NaN, zeroTime) on first sight; the Reader stamps
-	// CPU=Unknown for the first tick per instance.
-	prevCPU map[string]cpuState
-}
-
-type cpuState struct {
-	usageUsec uint64
-	at        time.Time
 }
 
 // NewPoller builds a Poller with sensible defaults applied to
@@ -94,7 +81,6 @@ func NewPoller(store state.Store, dialer Dialer, tlsCfg *tls.Config, reader *Rea
 		Log:       log,
 		Now:       time.Now,
 		Freshness: DefaultFreshness,
-		prevCPU:   map[string]cpuState{},
 	}
 }
 
@@ -280,22 +266,6 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 		rows = append(rows, row)
 		rolled = append(rolled, wireRow)
 	}
-	// Apply per-instance CPU delta math on top of the wire's
-	// already-encoded CPUPct. The wire CPUPct today is unused
-	// (vmmd doesn't populate it), but the poller is the
-	// canonical place to compute rates from the cumulative
-	// counter once vmmd starts emitting it. For now the
-	// prevCPU map stays empty; the poller will start using
-	// it the moment vmmd emits cumulative usage_usec on the
-	// wire.
-	//
-	// (The cgroupstats.Reader returns cumulative
-	// usage_usec; the Stats handler currently emits a nil
-	// CPUPct wrapper, but the handler change to read the
-	// cumulative and let the poller do the rate is a one-line
-	// edit in PR-B's stats.go extraction. The poller is
-	// already shaped for it.)
-	_ = p.prevCPU
 	return rows, rolled
 }
 
