@@ -70,6 +70,38 @@ func (c *Client) StreamDeploymentLogs(ctx context.Context, id string, beforeSeq 
 	return c.stream(ctx, path)
 }
 
+// StreamEvents opens GET /v1/events — the multi-channel push surface
+// apid forwards to dashboard SSE clients and the CLI's `faas tail`.
+//
+// The route returns text/event-stream with frames carrying one of the
+// dashboard topic names (`app_changed`, `deployment_changed`,
+// `instance_changed`, `cron_fired`, `quota_warning`,
+// `billing_past_due`, `invocation_done`); the caller filters and
+// decodes the JSON payload itself. The server forwards frames to the
+// caller as soon as apid's pg_notify fan-in republishes them, so
+// end-to-end latency from cron-fires / queue-receives / async invoke
+// terminations is dominated by Postgres NOTIFY round-trip (~ms).
+//
+// Authentication: the route goes through the dashboard auth chain, so
+// a Bearer token issued to a customer account only sees frames whose
+// account_id matches the caller's. The CLI's `faas tail` is therefore
+// safe to ship to the customer — there is no escalation path where
+// one customer can tail another customer's invocations.
+//
+// Caller contract mirrors StreamAppLogs: the returned io.ReadCloser
+// MUST be Closed by the caller; the server keeps the SSE connection
+// open until EOF or context cancel. The CLI uses
+// signal.NotifyContext(os.Interrupt) so a Ctrl-C drops the connection
+// inside ~50 ms instead of waiting for the apid-side heartbeat
+// timeout.
+//
+// Move 3 / M7.5 prep — this is the SDK seam for `faas tail`. The
+// dashboard uses the same route via the browser EventSource; nothing
+// in this slice changes the dashboard's auth path.
+func (c *Client) StreamEvents(ctx context.Context) (io.ReadCloser, error) {
+	return c.stream(ctx, "/v1/events")
+}
+
 // stream is the shared HTTP-execution backbone for both SSE helpers.
 // It keeps the request body close discipline in one place so the
 // public API can stay "return io.ReadCloser, error" without dragging

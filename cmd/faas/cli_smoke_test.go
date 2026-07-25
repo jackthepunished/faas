@@ -88,7 +88,7 @@ func TestFaasCLI_Deploy_HappyPath_ReachesAPID(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/v1/deployments/") && strings.HasSuffix(r.URL.Path, "/logs"):
 			hits[2] = r.URL.Path
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("data: {\"status\":\"live\"}\n\n"))
+			_, _ = w.Write([]byte("event: status\ndata: {\"status\":\"live\"}\n\n"))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}

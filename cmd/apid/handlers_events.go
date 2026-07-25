@@ -63,9 +63,6 @@ var eventsChannels = []string{
 // callers are implicitly admin. IAM-1, ADR-034.
 func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-<<<<<<< HEAD
-		acct, key, ok := resolveEventsCaller(r, s)
-=======
 		// Move 3 / §12: apid_sse_clients tracks the number of open
 		// /v1/events connections. Increment before auth (so an
 		// unauthenticated 401 still reflects a connection attempt)
@@ -76,7 +73,6 @@ func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 			defer s.ops.SSEClients().Dec()
 		}
 		acct, key, ok := resolveEventsCaller(r, s)
->>>>>>> 8651863 (feat(streaming): Move 3 PR1 — apid fan-in + handler fixes + gauge)
 		if !ok {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 				"Unauthorized", "session cookie or API key required"))

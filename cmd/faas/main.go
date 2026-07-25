@@ -168,6 +168,10 @@ func run(args []string) int {
 		return cmdUsage(args[1:])
 	case "logs":
 		return cmdLogs(args[1:])
+	case "tail":
+		return cmdTail(args[1:])
+	case "queue":
+		return cmdQueueDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "faas: unknown command %q\nRun 'faas help' for usage.\n", args[0])
 		return 1

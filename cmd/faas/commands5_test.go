@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1171,4 +1172,147 @@ func containsAll(haystack []string, needles []string) bool {
 		}
 	}
 	return true
+}
+
+// --- tail / queue tail -----------------------------------------------------
+
+// sseHoldSink is a fake /v1/events handler that holds the request
+// open with periodic heartbeats until the test closes the gate
+// channel. Mirrors the pattern in pkg/api/client_test.go where a
+// goroutine handshake gates the request lifecycle so the client under
+// test can be exercised against a deterministic wire.
+//
+// Why hold instead of immediately returning: cmdTail reads Events
+// forever (the production wire is supposed to be long-lived); without
+// the hold the SDK's stream helper would return EOF on the first Read
+// and the test would degenerate into a no-op.
+type sseHoldSink struct {
+	gate    chan struct{} // closed by the test on Ctrl-C
+	written chan struct{} // signaled once the handler has flushed headers
+	t       *testing.T
+}
+
+func (s *sseHoldSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/events" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	select {
+	case s.written <- struct{}{}:
+	default:
+	}
+	// Periodic heartbeats until the test closes the gate. The CLI's
+	// signal-aware context cancel propagates to the underlying HTTP
+	// request, which causes this goroutine to return when the
+	// connection drops.
+	heartbeat := time.NewTicker(100 * time.Millisecond)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-s.gate:
+			return
+		case <-heartbeat.C:
+			_, _ = w.Write([]byte(":ping\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// TestFaasTail_CtrlCExits asserts that `faas tail` honors SIGINT
+// within ~500 ms by returning exit code 130. Without
+// signal.NotifyContext the test would block on the SDK's blocking
+// Read until the heartbeats stop or the test framework kills it.
+//
+// Pattern: spin up a fake /v1/events that holds the connection open
+// with heartbeats; set up auth via FAAS_TOKEN; start cmdTail in a
+// goroutine; wait for "written" to confirm headers flushed (proves
+// we're past the auth round-trip); send SIGINT to ourselves; assert
+// the goroutine returns within the deadline with exit 130.
+//
+// Move 3 / M7.5 prep — locks the Ctrl-C contract that ships `faas
+// tail` and `faas queue tail` to customers. A regression here is the
+// classic "Ctrl-C does nothing, user ^C's three times and the
+// terminal ends up in a weird state" bug.
+func TestFaasTail_CtrlCExits(t *testing.T) {
+	// Hermeticity: no stray auth + no stray jsonOutput.
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("FAAS_TOKEN", "test-token")
+	resetJSONOutput()
+	t.Cleanup(resetJSONOutput)
+
+	gate := make(chan struct{})
+	sink := &sseHoldSink{gate: gate, written: make(chan struct{}, 1), t: t}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+
+	// Probe the sink before driving cmdTail: httptest's keepalive
+	// setup is occasionally cold-warm on the first non-default-
+	// client request. One cheap GET pre-flushes the listener state
+	// so the real command under test doesn't race it.
+	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
+	probeResp, err := http.DefaultClient.Do(probeReq)
+	if err != nil {
+		close(gate)
+		t.Fatalf("probe GET /v1/events: %v", err)
+	}
+	probeResp.Body.Close()
+
+	// Drive cmdTail in a goroutine.
+	done := make(chan int, 1)
+	go func() { done <- cmdTail(nil) }()
+
+	// Wait for the handler to flush headers — proves cmdTail reached
+	// the streaming loop and isn't stuck at auth or before the HTTP
+	// round-trip.
+	select {
+	case <-sink.written:
+	case <-time.After(2 * time.Second):
+		close(gate)
+		t.Fatal("fake /v1/events never flushed headers; cmdTail may not have reached the streaming loop")
+	}
+
+	// Give the goroutine a beat to enter signal.NotifyContext's wait.
+	time.Sleep(50 * time.Millisecond)
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+		close(gate)
+		t.Fatalf("could not raise SIGINT: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got != 130 {
+			close(gate)
+			t.Fatalf("cmdTail exit = %d, want 130", got)
+		}
+	case <-time.After(2 * time.Second):
+		close(gate)
+		t.Fatal("cmdTail did not exit within 2s of SIGINT")
+	}
+	close(gate)
+}
+
+// TestFaasQueueTail_UsageError pins the dispatch shape: `faas queue`
+// alone prints usage and returns 1. Mirrors the pattern in
+// TestPS_UsageError at the top of this file.
+func TestFaasQueueTail_UsageError(t *testing.T) {
+	requireNoAuth(t)
+	if got := cmdQueueDispatch(nil); got != 1 {
+		t.Errorf("cmdQueueDispatch(nil) = %d, want 1", got)
+	}
+	if got := cmdQueueDispatch([]string{"bogus"}); got != 1 {
+		t.Errorf("cmdQueueDispatch(bogus) = %d, want 1", got)
+	}
 }
