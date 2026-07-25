@@ -45,6 +45,23 @@ type UpdateAppRequest struct {
 	// chain policy). The non-/0 contract is enforced by the DB
 	// trigger `apps_egress_allowlist_cidr` (migration 00033).
 	EgressAllowlist *[]string `json:"egress_allowlist,omitempty"`
+	// AutoscaleTargetRPS is the per-instance RPS target for the
+	// reactive scale-up trigger (issue #169 / #172 / pkg/sched/scaleup).
+	// When measured RPS / live_instance_count exceeds this value,
+	// schedd admits another instance up to plan.MaxConcurrency. Plan-gated
+	// upstream: Free returns 403 CodePlanScaleUpNotAllowed. Hobby/Pro/Scale
+	// accept values > 0; values <= 0 return 422 CodeInvalidAutoscaleTargetRPS.
+	// Autoscale is "enabled" iff at least one of AutoscaleTargetRPS /
+	// AutoscaleTargetCPUPct is non-nil (no separate boolean, per user
+	// direction).
+	AutoscaleTargetRPS *int `json:"autoscale_target_rps,omitempty"`
+	// AutoscaleTargetCPUPct is the per-instance CPU% target (1..100)
+	// for the scale-up trigger. Same semantics as AutoscaleTargetRPS
+	// but the signal source is pkg/sched/instancestats.Reader (PR #205);
+	// nil reader falls back to RPS-only mode (PR #169 never lands the
+	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
+	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
+	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -90,6 +107,13 @@ type AppResponse struct {
 	// order matches insertion order. NOT in `required:` because the
 	// empty-slice case is the contract.
 	EgressAllowlist []string `json:"egress_allowlist"`
+	// AutoscaleTargetRPS / AutoscaleTargetCPUPct are the per-app
+	// reactive scale-up targets (issue #169 / #172 / pkg/sched/scaleup).
+	// Each is 0 when unset ("disabled") and > 0 when configured.
+	// Surfaces on GET /v1/apps/{slug} so dashboards can show the
+	// current target. Plan-gated upstream.
+	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
+	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

@@ -21,6 +21,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -34,9 +35,10 @@ type Loop struct {
 	gateway    GatewaySynth
 	now        func() time.Time
 	flowCounts FlowCounter
-	watchdog   *Watchdog  // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention  *Retention // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat  *Heartbeat // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	watchdog   *Watchdog        // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention  *Retention       // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat  *Heartbeat       // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	scaleup    *scaleup.Trigger // issue #169 / #172 reactive scale-up trigger; nil opts out
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -120,6 +122,18 @@ func (l *Loop) WithFlowCounter(fc FlowCounter) *Loop {
 	return l
 }
 
+// WithScaleUp attaches the per-app reactive scale-up trigger
+// (issue #169 / #172, pkg/sched/scaleup). Nil opts out (the
+// scaleupTick arm of Run's select never fires). Production wires
+// the real trigger from cmd/schedd after the Engine + Store + (PR
+// #205) instancestats.Reader are available; tests inject a manual
+// ticker or skip via nil. The trigger's own Interval() governs the
+// cadence — same opt-out shape as WithHeartbeat / WithWatchdog.
+func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
+	l.scaleup = t
+	return l
+}
+
 // Run blocks until ctx is cancelled. It owns three event sources: the LISTEN
 // subscriber, the reaper tick, and the cron tick.
 func (l *Loop) Run(ctx context.Context) error {
@@ -195,6 +209,21 @@ func (l *Loop) Run(ctx context.Context) error {
 		heartbeatT = time.NewTicker(interval)
 		defer heartbeatT.Stop()
 	}
+	// Scale-up trigger ticker (issue #169 / #172).
+	// Per-app reactive scale-up: every Interval() seconds, run
+	// the trigger's Tick so a hot RPS / CPU signal can pre-empt
+	// the request-driven wake path. Default cadence 1s
+	// (api.ScaleUpDecisionIntervalSeconds); the trigger supervises
+	// its own nil-safety so a nil trigger never fires the case.
+	var scaleupT *time.Ticker
+	if l.scaleup != nil {
+		interval := l.scaleup.Interval()
+		if interval <= 0 {
+			interval = api.ScaleUpDecisionIntervalSeconds * time.Second
+		}
+		scaleupT = time.NewTicker(interval)
+		defer scaleupT.Stop()
+	}
 
 	for {
 		select {
@@ -214,6 +243,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runWatchdog(ctx)
 		case <-heartbeatTick(heartbeatT):
 			l.runHeartbeat(ctx)
+		case <-scaleupTick(scaleupT):
+			l.runScaleUp(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -256,6 +287,15 @@ func heartbeatTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// scaleupTick is the reactive scale-up trigger ticker (issue #169 /
+// #172). Same nil-safe shape as the heartbeat/retention tickers.
+func scaleupTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
 // runHeartbeat dispatches one sweep of the per-node liveness
 // ticker. Exported as a method so tests can drive a single tick
 // without spinning up Run's goroutine. Tick errors are logged
@@ -287,6 +327,18 @@ func (l *Loop) runRetention(ctx context.Context) {
 	}
 	if deleted > 0 {
 		l.log.Info("retention: swept", "deleted", deleted)
+	}
+}
+
+// runScaleUp dispatches one tick of the per-app reactive scale-up
+// trigger (issue #169 / #172). Same shape as runHeartbeat —
+// exported as a method so tests drive a single tick without
+// spinning up Run. Tick errors are logged inside the trigger; Run
+// never returns them so a transient store / scraper blip can't
+// tear down the loop.
+func (l *Loop) runScaleUp(ctx context.Context) {
+	if err := l.scaleup.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("scaleup tick error", "err", err)
 	}
 }
 

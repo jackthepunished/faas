@@ -216,6 +216,12 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 			User:       a.Manifest.User,
 		},
 		EgressAllowlist: ea,
+		// Issue #169 / #172: per-app reactive scale-up trigger
+		// targets. 0 = "disabled" (no autoscale rule). Reactive
+		// scale-up runs in pkg/sched/scaleup; the trigger reads
+		// these columns every tick.
+		AutoscaleTargetRPS:    a.AutoscaleTargetRPS,
+		AutoscaleTargetCPUPct: a.AutoscaleTargetCPUPct,
 	}
 }
 

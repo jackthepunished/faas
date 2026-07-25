@@ -181,6 +181,137 @@ func TestUpdateAppMinInstances_Negative(t *testing.T) {
 	assertProblem(t, rec, 422, api.CodeInvalidMinInstances)
 }
 
+// TestUpdateAppAutoscaleRPS_FreeGate locks the plan-tier gate for the
+// reactive scale-up trigger (issue #169 / #172). Free plans cannot set
+// autoscale_target_rps at all — the handler must return 403
+// plan_autoscale_not_allowed, not 422, because the feature is
+// tier-locked (the value the customer typed is irrelevant). Mirrors
+// TestUpdateAppMinInstances_Hobby above.
+func TestUpdateAppAutoscaleRPS_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-rps")
+	fifty := 50
+	rec := e.do(t, "PATCH", "/v1/apps/free-rps", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
+}
+
+// TestUpdateAppAutoscaleRPS_HobbyZero pins the lower bound: 0 is
+// the explicit-disable form (the Set bit is set, so the column
+// gets overwritten to 0). It must round-trip as 200, NOT 422 — the
+// only invalid value is negative. The PG CHECK constraint
+// `apps_autoscale_target_rps_positive` enforces `> 0 OR NULL`; we
+// rely on the apid-side validation to reject negatives before they
+// reach the DB.
+func TestUpdateAppAutoscaleRPS_HobbyZero(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-rps-zero")
+	neg := -1
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-zero", api.UpdateAppRequest{AutoscaleTargetRPS: &neg}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidAutoscaleTargetRPS)
+}
+
+// TestUpdateAppAutoscaleRPS_HobbyHappy is the happy path: Hobby
+// plans accept autoscale_target_rps and the response carries the
+// new value. Hobby stays RPS-only — setting CPU on Hobby must 403
+// (covered by TestUpdateAppAutoscaleCPU_HobbyGate).
+func TestUpdateAppAutoscaleRPS_HobbyHappy(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-rps-ok")
+	fifty := 50
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-ok", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.AutoscaleTargetRPS != 50 {
+		t.Errorf("AutoscaleTargetRPS = %d, want 50", out.AutoscaleTargetRPS)
+	}
+}
+
+// TestUpdateAppAutoscaleCPU_HobbyGate locks the CPU tier gate: Hobby
+// plans do not unlock autoscale_target_cpu_pct. The handler must 403
+// even when the value is a perfectly valid 60 (the gate runs first,
+// value validation is irrelevant on a tier-locked feature).
+func TestUpdateAppAutoscaleCPU_HobbyGate(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-cpu")
+	sixty := 60
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-cpu", api.UpdateAppRequest{AutoscaleTargetCPUPct: &sixty}, nil)
+	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
+}
+
+// TestUpdateAppAutoscaleCPU_ProOutOfRange pins the bounds check: CPU
+// must be in [1, 100]. Pro unlocks CPU, so the gate is satisfied,
+// but 150 must 422 invalid_autoscale_target_cpu_pct.
+func TestUpdateAppAutoscaleCPU_ProOutOfRange(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-cpu-over")
+	over := 150
+	rec := e.do(t, "PATCH", "/v1/apps/pro-cpu-over", api.UpdateAppRequest{AutoscaleTargetCPUPct: &over}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidAutoscaleTargetCPU)
+}
+
+// TestUpdateAppAutoscaleCPU_ProHappy is the happy path: Pro plans
+// accept autoscale_target_cpu_pct in [1, 100] and the response
+// carries the new value.
+func TestUpdateAppAutoscaleCPU_ProHappy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-cpu-ok")
+	sixty := 60
+	rec := e.do(t, "PATCH", "/v1/apps/pro-cpu-ok", api.UpdateAppRequest{AutoscaleTargetCPUPct: &sixty}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.AutoscaleTargetCPUPct != 60 {
+		t.Errorf("AutoscaleTargetCPUPct = %d, want 60", out.AutoscaleTargetCPUPct)
+	}
+}
+
+// TestUpdateAppAutoscaleDisableZero verifies that a PATCH with
+// autoscale_target_rps=0 (or cpu_pct=0) is treated as "explicit
+// disable" — the value is stored as 0 and surfaces back on GET.
+// This is the contract that lets customers turn autoscale OFF
+// without having to know the trigger's internal enable bit (which
+// is "an autoscale_target_* column is non-zero").
+func TestUpdateAppAutoscaleDisableZero(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	mustSeedApp(t, e, "scale-toggle")
+	// First set both targets.
+	rps := 25
+	cpu := 70
+	rec := e.do(t, "PATCH", "/v1/apps/scale-toggle", api.UpdateAppRequest{
+		AutoscaleTargetRPS: &rps, AutoscaleTargetCPUPct: &cpu,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("set status %d: %s", rec.Code, rec.Body)
+	}
+	// Then disable both with explicit 0.
+	zero := 0
+	rec = e.do(t, "PATCH", "/v1/apps/scale-toggle", api.UpdateAppRequest{
+		AutoscaleTargetRPS: &zero, AutoscaleTargetCPUPct: &zero,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("disable status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.AutoscaleTargetRPS != 0 {
+		t.Errorf("AutoscaleTargetRPS = %d, want 0 (disabled)", out.AutoscaleTargetRPS)
+	}
+	if out.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("AutoscaleTargetCPUPct = %d, want 0 (disabled)", out.AutoscaleTargetCPUPct)
+	}
+}
+
 // TestUpdateAppEgressAllowlist_FreeGate locks the plan-tier gate:
 // Free plans cannot set egress_allowlist at all. The handler must
 // return 403 plan_egress_allowlist_not_allowed, not 400, because the

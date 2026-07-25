@@ -81,7 +81,7 @@ const (
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: faas app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N]", "apps")
+		PrintUsage(os.Stderr, "usage: faas app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -94,6 +94,15 @@ func cmdApp(args []string) int {
 	// plan_min_instances_not_allowed, which surfaces here as an
 	// "Update failed" error with the API's problem code.
 	min := fs.Int("min", 0, "min instances kept warm (Pro/Scale only; 0 = scale to zero)")
+	// Issue #169 / #172: per-app reactive scale-up trigger targets.
+	// --autoscale-target-rps sets the per-instance RPS target
+	// (Hobby/Pro/Scale; Free rejects with 403). --autoscale-target-cpu-pct
+	// sets the per-instance CPU% target in [1,100] (Pro/Scale only).
+	// Both use Visit-flag detection so the explicit "0 = disable" form
+	// round-trips correctly (a sentinel compare would swallow a valid
+	// --autoscale-target-rps=0).
+	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
+	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -123,8 +132,17 @@ func cmdApp(args []string) int {
 		v := *min
 		req.MinInstances = &v
 	}
+	if explicit["autoscale-target-rps"] {
+		v := *rps
+		req.AutoscaleTargetRPS = &v
+	}
+	if explicit["autoscale-target-cpu-pct"] {
+		v := *cpu
+		req.AutoscaleTargetCPUPct = &v
+	}
 
-	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil {
+	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
+		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -155,6 +173,19 @@ func cmdApp(args []string) int {
 		if len(a.EgressAllowlist) > 0 {
 			fmt.Printf("%-30s %s\n", "egress allowlist:",
 				strings.Join(a.EgressAllowlist, ", "))
+		}
+		// Issue #169 / #172: surface the per-app autoscale targets
+		// so a customer can verify their PATCH round-tripped. 0
+		// renders as "disabled" — same UX rule as min instances.
+		if a.AutoscaleTargetRPS > 0 {
+			fmt.Printf("%-30s %d\n", "autoscale target rps:", a.AutoscaleTargetRPS)
+		} else {
+			fmt.Printf("%-30s %s\n", "autoscale target rps:", "disabled")
+		}
+		if a.AutoscaleTargetCPUPct > 0 {
+			fmt.Printf("%-30s %d%%\n", "autoscale target cpu:", a.AutoscaleTargetCPUPct)
+		} else {
+			fmt.Printf("%-30s %s\n", "autoscale target cpu:", "disabled")
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0

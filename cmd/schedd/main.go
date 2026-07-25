@@ -26,6 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
+	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -303,6 +304,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// the wiring without waiting 30s for production cadence.
 		hb.Interval = deps.heartbeatInterval
 	}
+	// Issue #169 / #172: per-app reactive scale-up trigger.
+	// Reads apps.autoscale_target_* + Ledger.Concurrency every
+	// cfg.ScaleUpInterval (default 1s); admits another instance
+	// when measured per-instance RPS or CPU exceeds the target
+	// and headroom is available. The trigger is nil-safe on every
+	// dep; an empty GatewayMetricsURL disables the RPS path (and
+	// the trigger still fires on CPU when PR #205's
+	// instancestats.Reader is wired). The engine adapter converts
+	// sched.WakeResult → scaleup.AdmitResult (a small subset —
+	// the trigger only inspects AtCapacity).
 	loop := sched.NewLoop(pool, engine, log).
 		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{})).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
@@ -311,6 +322,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// when zero). Ticker fires at api.DefaultRetentionInterval (1h).
 		WithRetention(sched.NewRetention(store, log).WithRetention(time.Duration(cfg.RetentionDuration))).
 		WithHeartbeat(hb)
+	if cfg.GatewayMetricsURL != "" {
+		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
+		trigger := scaleup.New(
+			store, nil, scraper,
+			schedScaleUpEngine{engine: engine},
+			engine.Ledger(),
+			scaleup.Options{
+				Logger:   log,
+				Metrics:  ops,
+				Interval: cfg.ScaleUpInterval,
+			},
+		)
+		loop.WithScaleUp(trigger)
+		log.Info("scaleup trigger enabled", "metrics_url", cfg.GatewayMetricsURL, "interval", trigger.Interval())
+	}
 	// Cron dispatch path: route synthetic requests through gatewayd's
 	// internal unix socket so metering + rate limits apply identically
 	// to user traffic (spec §4.4, M7). A failure to dial is logged but
@@ -455,4 +481,26 @@ func subscribeWithReconnect(
 			delay = 1 * time.Second
 		}
 	}
+}
+
+// schedScaleUpEngine adapts *sched.Engine to the scaleup.Engine
+// interface (issue #169 / #172). The trigger only needs the
+// AtCapacity flag and the InstanceID echo — the rest of
+// WakeResult's surface (Method, WakeID, NodeID) is internal to
+// the gateway's wake path. The adapter is a thin closure stored
+// as a value so the trigger never pays an indirection cost on the
+// hot path.
+type schedScaleUpEngine struct {
+	engine *sched.Engine
+}
+
+// AdmitInstance implements scaleup.Engine: delegates to the wrapped
+// engine and lifts the relevant fields into the thinned
+// scaleup.AdmitResult.
+func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (scaleup.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID)
+	if err != nil {
+		return scaleup.AdmitResult{}, err
+	}
+	return scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }

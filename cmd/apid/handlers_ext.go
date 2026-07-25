@@ -160,6 +160,46 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			req.EgressAllowlist = &rewritten
 		}
 	}
+	// Issue #169 / #172: per-app reactive scale-up trigger. Plan
+	// gates run first (403 supersedes 422) so a Free account
+	// PATCHing an invalid value surfaces the gate error, not the
+	// bounds error. RPS is Hobby+ (Free is single-concurrency and
+	// can't grow beyond 1); CPU is Pro+ (Hobby's cost band is too
+	// tight for "scale on CPU without a min_instances floor").
+	if req.AutoscaleTargetRPS != nil {
+		if !acct.Plan.ScaleUpTargetRPSAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanScaleUpNotAllowed,
+				"Autoscale target RPS is not allowed on this plan",
+				"Free tier does not support per-app autoscaling; upgrade to Hobby or higher.")
+		}
+		// 0 is the explicit-disable form (the Set bit is set, so
+		// the column gets overwritten to 0). Negative values are
+		// still rejected — 422 invalid_autoscale_target_rps.
+		if *req.AutoscaleTargetRPS < 0 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidAutoscaleTargetRPS,
+				"Invalid autoscale target RPS",
+				fmt.Sprintf("autoscale_target_rps must be >= 0 (0 = disable); got %d", *req.AutoscaleTargetRPS))
+		}
+	}
+	if req.AutoscaleTargetCPUPct != nil {
+		if !acct.Plan.ScaleUpTargetCPUAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanScaleUpNotAllowed,
+				"Autoscale target CPU%% is not allowed on this plan",
+				"Autoscale target CPU%% requires Pro or Scale; upgrade to a paid tier.")
+		}
+		// 0 is the explicit-disable form; values outside [1, 100]
+		// are invalid (PG CHECK enforces this as a second-layer
+		// defense).
+		if *req.AutoscaleTargetCPUPct != 0 && (*req.AutoscaleTargetCPUPct < 1 || *req.AutoscaleTargetCPUPct > 100) {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidAutoscaleTargetCPU,
+				"Invalid autoscale target CPU%%",
+				fmt.Sprintf("autoscale_target_cpu_pct must be 0 (disable) or in [1, 100]; got %d", *req.AutoscaleTargetCPUPct))
+		}
+	}
 	return nil
 }
 
@@ -233,6 +273,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		SetMinInstances:    req.MinInstances != nil,
 		EgressAllowlist:    allowPrefixes,
 		SetEgressAllowlist: req.EgressAllowlist != nil,
+		// Issue #169 / #172: autoscale trigger targets. Set bits
+		// distinguish "unset" from "explicit zero" (the disable
+		// signal). Plain nil-with-Set=false leaves the column
+		// untouched. Apid validation already gated the plan and
+		// the bounds; the store is a plain column write.
+		AutoscaleTargetRPS:       req.AutoscaleTargetRPS,
+		SetAutoscaleTargetRPS:    req.AutoscaleTargetRPS != nil,
+		AutoscaleTargetCPUPct:    req.AutoscaleTargetCPUPct,
+		SetAutoscaleTargetCPUPct: req.AutoscaleTargetCPUPct != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))

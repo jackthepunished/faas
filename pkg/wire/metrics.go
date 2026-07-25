@@ -98,6 +98,20 @@ type OpsMetrics struct {
 	// (60 s); the 5 s control-plane bucket is wrong for the multi-second
 	// blob downloads.
 	imagedOCIPull *prometheus.HistogramVec
+	// scaleUpDecisions: per-app scale-up trigger decisions (issue #169 /
+	// #172). Counter labelled by app_id and outcome ∈ {admit,
+	// reject_at_cap, no_signal, no_capacity}. App cardinality is bounded
+	// by the number of apps with autoscale configured — the trigger
+	// emits one row per decision. Outcomes are pre-instantiated so the
+	// series surface in /metrics from boot (same precedent as
+	// stripePushDur / buildDur).
+	scaleUpDecisions *prometheus.CounterVec
+	// scaleUpAdmitRPS: per-instance RPS at the moment the trigger
+	// admitted a new instance. Sized to the per-instance RPS target
+	// range (1–1000); p95/p99 over this histogram is the spec §12
+	// "scale-up aggressiveness" diagnostic. Unlabelled: every
+	// observation has the same shape.
+	scaleUpAdmitRPS prometheus.Histogram
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -182,7 +196,27 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// multi-second for big layers; 60 s ceiling = OCIPullTimeoutSeconds.
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"op", "result"})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull)
+	// Issue #169 / #172: scale-up trigger observability. Outcome
+	// label set is closed ({admit, reject_at_cap, no_signal,
+	// no_capacity}); pre-instantiated below so the rows surface in
+	// /metrics from boot. App label is per-app (bounded by apps with
+	// autoscale configured) — the closed outcome set means the
+	// total series cardinality is O(autoscale-enabled apps × 4).
+	scaleUpDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_scale_up_decisions_total",
+		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, no_capacity}; app label is the apps.id.",
+	}, []string{"app", "outcome"})
+	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: prefix + "_scale_up_admit_rps",
+		Help: "Per-instance RPS at the moment the trigger admitted a new instance. Sized to the per-instance RPS target range (1..1000); p95/p99 is the spec §12 'scale-up aggressiveness' diagnostic.",
+		// Sized for per-instance RPS, not fleet RPS. Hobby RAM tiers
+		// hit ~50 RPS/inst; Pro's higher RAM and CPU hit ~250;
+		// Scale is bounded by plan MaxConcurrency = 20 × per-instance
+		// ≈ 1000. 1..1000 covers the realistic range; the 2000
+		// ceiling catches pathological cases.
+		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000},
+	})
+	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -227,6 +261,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, plan := range api.Plans {
 		residentGBPerCustomer.WithLabelValues(string(plan))
 	}
+	// Pre-instantiate the closed outcome label set for the scale-up
+	// decisions counter — same precedent as the build / Stripe /
+	// Paddle histograms above. The (app="") tuple is NEVER used
+	// (the trigger always emits a real app_id); the empty-app row
+	// is a placeholder so the help/TYPE surfaces in /metrics before
+	// the first decision fires. Real per-app rows are added by
+	// ObserveScaleUp below.
+	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal", "no_capacity"} {
+		scaleUpDecisions.WithLabelValues("", outcome)
+	}
 	return &OpsMetrics{
 		registry:              reg,
 		ops:                   ops,
@@ -240,6 +284,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		residentGBPerCustomer: residentGBPerCustomer,
 		wakeIDV4Fallback:      wakeIDV4Fallback,
 		imagedOCIPull:         imagedOCIPull,
+		scaleUpDecisions:      scaleUpDecisions,
+		scaleUpAdmitRPS:       scaleUpAdmitRPS,
 	}
 }
 
@@ -385,6 +431,28 @@ func (m *OpsMetrics) SetResidentGBPerCustomer(plan string, gb float64) {
 		return
 	}
 	m.residentGBPerCustomer.WithLabelValues(plan).Set(gb)
+}
+
+// ObserveScaleUp records one scale-up trigger decision (issue #169 /
+// #172). Outcome ∈ {admit, reject_at_cap, no_signal, no_capacity}.
+// app is the apps.id (UUID). Safe on a nil receiver so schedd unit
+// tests without metrics keep working.
+func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
+	if m == nil {
+		return
+	}
+	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
+}
+
+// ObserveScaleUpAdmitRPS records the per-instance RPS at the moment
+// the trigger admitted a new instance (issue #169 / #172). Sized to
+// the per-instance RPS target range; observation lands in
+// <daemon>_scale_up_admit_rps. Safe on a nil receiver.
+func (m *OpsMetrics) ObserveScaleUpAdmitRPS(rps float64) {
+	if m == nil {
+		return
+	}
+	m.scaleUpAdmitRPS.Observe(rps)
 }
 
 // Handler returns an http.Handler that serves the registry's metrics.
