@@ -35,7 +35,7 @@ type Loop struct {
 	gateway    GatewaySynth
 	now        func() time.Time
 	flowCounts FlowCounter
-watchdog   *Watchdog           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	watchdog   *Watchdog           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
 	retention  *Retention          // §17 retention sweep; nil means "no retention" (tests can opt out)
 	heartbeat  *Heartbeat          // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
 	instStats  InstanceStatsPoller // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
@@ -235,7 +235,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		heartbeatT = time.NewTicker(interval)
 		defer heartbeatT.Stop()
 	}
-// Instance-stats poller ticker (issue #170 / PR-A). Per-Tick
+	// Instance-stats poller ticker (issue #170 / PR-A). Per-Tick
 	// sweep: enumerate live instances + active compute_nodes,
 	// dial each node fresh, decode Stats, replace the Reader
 	// snapshot, emit the wire rollup. Default cadence
@@ -302,7 +302,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runWatchdog(ctx)
 		case <-heartbeatTick(heartbeatT):
 			l.runHeartbeat(ctx)
-case <-instStatsTick(instStatsT):
+		case <-instStatsTick(instStatsT):
 			l.runInstanceStats(ctx)
 		case <-scaleupTick(scaleupT):
 			l.runScaleUp(ctx)

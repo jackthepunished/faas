@@ -305,7 +305,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// the wiring without waiting 30s for production cadence.
 		hb.Interval = deps.heartbeatInterval
 	}
-// PR-A observability slice (issue #170): per-{app,node} instance
+	// PR-A observability slice (issue #170): per-{app,node} instance
 	// stats poller. Builds a Reader (the canonical seam #171 reaper
 	// and #169 scale-up will read from), wires the Poller with the
 	// same deps.dialVMM the heartbeat uses (so dial churn is bounded

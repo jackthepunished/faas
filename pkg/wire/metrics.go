@@ -264,7 +264,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// multi-second for big layers; 60 s ceiling = OCIPullTimeoutSeconds.
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"op", "result"})
-// issue #170 / PR-A: per-{app,node} instance-stats gauges. Sized
+	// issue #170 / PR-A: per-{app,node} instance-stats gauges. Sized
 	// for the poller’s 200 ms cadence — the per-tick histogram tops
 	// out at the 200 ms interval so a regression that doubles the
 	// interval surfaces immediately.
