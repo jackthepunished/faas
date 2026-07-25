@@ -89,3 +89,7 @@ ignore:
   - "**/*_grpc.pb.go"
   - "guest/runners/**"
   - "deploy/**"
+  # pkg/e2etest is harness code for cmd/e2e, not product code. It is
+  # never the subject of a test, so it reported 701 lines at 0% and was
+  # counted against the project number as if it were untested product.
+  - "pkg/e2etest/**"
