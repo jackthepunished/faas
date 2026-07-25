@@ -34,6 +34,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +91,14 @@ func (v *statsFakeVMM) PauseAndSnapshot(context.Context, string, string, string,
 	return sched.SnapshotBytes{}, nil
 }
 func (v *statsFakeVMM) Destroy(context.Context, string) error { return nil }
+
+// UpdateEgressAllowlist (tier-2 PR-B) — instancestats tests don't
+// drive the egress drift path; egress_drift_test.go covers it.
+// Returning nil keeps the sched.VMM contract satisfied for the
+// poller tests that wire statsFakeDialer.
+func (v *statsFakeVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
+	return nil
+}
 
 func (v *statsFakeVMM) Stats(_ context.Context) (*sched.StatsSnapshot, error) {
 	v.dialer.mu.Lock()

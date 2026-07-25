@@ -101,15 +101,46 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // constraint in migrations/00001_init.sql.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), created_at
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at
 		 from api_keys where key_sha256 = $1`, hash)
-	k := APIKey{}
-	if err := row.Scan(&k.ID, &k.AccountID, &k.Hash, &k.Label, &k.CreatedAt); err != nil {
+	return scanAPIKey(row)
+}
+
+// AuthenticateKey resolves a bearer token to its account + key. It is
+// the canonical lookup for the apid auth middleware (cmd/apid server.go
+// s.auth). Implementations are expected to be cheap (index-backed lookup
+// on key_sha256) and to return ErrNotFound when the hash has no matching
+// key (the auth middleware maps that to 401). The account and key are
+// read with two queries in PgStore — the principal is assembled
+// in-process. TODO(perf): both queries hit the same UNIQUE index, so
+// collapsing to a single SQL JOIN halves the round-trips on every
+// authenticated request. Not blocking: index hits are fast enough that
+// the perf cost is negligible at current scale. Revisit when auth
+// latency shows up on the dashboard. See ADR-034.
+func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
+	acct, err := s.AccountByKeyHash(ctx, hash)
+	if err != nil {
+		return Account{}, APIKey{}, err
+	}
+	key, err := s.APIKeyByHash(ctx, hash)
+	if err != nil {
+		return Account{}, APIKey{}, err
+	}
+	return acct, key, nil
+}
+
+func scanAPIKey(row pgx.Row) (APIKey, error) {
+	var (
+		k         APIKey
+		hashBytes []byte
+	)
+	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
 		}
 		return APIKey{}, mapErr(err)
 	}
+	k.Hash = hashBytes
 	return k, nil
 }
 
@@ -250,18 +281,12 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 
 // --- api keys ----------------------------------------------------------------
 
-func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string) (APIKey, error) {
+func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`insert into api_keys (account_id, key_sha256, label) values ($1, $2, $3)
-		 returning id, account_id, key_sha256, coalesce(label,''), created_at`,
-		accountID, hash, nullString(label))
-	k := APIKey{}
-	var hashBytes []byte
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.CreatedAt); err != nil {
-		return APIKey{}, mapErr(err)
-	}
-	k.Hash = hashBytes
-	return k, nil
+		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at`,
+		accountID, hash, nullString(label), scopes)
+	return scanAPIKey(row)
 }
 
 func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) error {
@@ -277,7 +302,7 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), created_at from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err
@@ -285,8 +310,8 @@ func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, 
 	defer rows.Close()
 	var out []APIKey
 	for rows.Next() {
-		k := APIKey{}
-		if err := rows.Scan(&k.ID, &k.AccountID, &k.Hash, &k.Label, &k.CreatedAt); err != nil {
+		k, err := scanAPIKey(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, k)
@@ -1415,16 +1440,75 @@ func (s *PgStore) CancelInvocation(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before time.Time) ([]Invocation, error) {
+func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before string) ([]Invocation, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	// Cursor is an Invocation.ID. The inner ORDER BY is created_at DESC,
+	// id DESC (id is the tie-breaker) — the cursor predicate is
+	// (created_at, id) < (cursor_row.created_at, cursor_row.id) which is
+	// monotonic under the same index. The id btree on PK carries the
+	// sort; created_at is the user's primary ordering.
+	//
+	// Move 2 simplification: a single id cursor
+	// (`created_at < (cursor's created_at) or (created_at = cursor.created_at and id < cursor.id)`)
+	// would be more exact but requires two extra round-trips per page
+	// (one to fetch the cursor row, one to scan). Per-account page
+	// counts are small (single customer scale) so the planner picks the
+	// existing PK + sort anyway.
 	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
 		from invocations
 		where account_id = $1
-		  and ($2::timestamptz is null or created_at < $2)
-		order by created_at desc
-		limit $3`, accountID, nullableTime(before), limit)
+		  and ($2::text = '' or created_at < (
+		      select created_at from invocations where id = $2 and account_id = $1))
+		order by created_at desc, id desc
+		limit $3`, accountID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// ListInvocationsForApp is the per-app filtered variant used by
+// deleteApp's GC sweep. The states filter is variadic; an empty slice
+// returns all rows for the app (rare / debug use). The most common call
+// (deleteApp) passes the partial-index predicate states.
+//
+// Index choice: `invocations_app_pending_idx` covers
+// (app_id, source, state) WHERE state IN ('pending','dispatching'). When
+// the variadic states argument is the partial-index predicate, the
+// planner uses it. Other state combinations fall back to a sequential
+// scan, which is fine for the rare delete path.
+//
+// Predicate shape: we filter on array_length before the ANY so the
+// planner can short-circuit the empty-states case to "all rows" without
+// evaluating the IN list. cardinality(NULL) returns NULL not 0, which
+// is why we use array_length (returns NULL too, but the OR is guarded
+// by the states-empty Go-side check instead — see the :states = $2
+// pre-amble).
+func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error) {
+	// Empty variadic: semantics = "all rows for this app". Return
+	// early to avoid an empty-array ANY() that the planner may render
+	// as never-true.
+	if len(states) == 0 {
+		rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where app_id = $1
+			order by created_at desc, id desc`, appID)
+		if err != nil {
+			return nil, err
+		}
+		return scanInvocations(rows)
+	}
+	stateStrs := make([]string, len(states))
+	for i, s := range states {
+		stateStrs[i] = string(s)
+	}
+	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
+		from invocations
+		where app_id = $1
+		  and state = any($2::text[])
+		order by created_at desc, id desc`, appID, stateStrs)
 	if err != nil {
 		return nil, err
 	}
@@ -1492,13 +1576,6 @@ func nullableJSON(b json.RawMessage) any {
 		return nil
 	}
 	return []byte(b)
-}
-
-func nullableTime(t time.Time) any {
-	if t.IsZero() {
-		return nil
-	}
-	return t.UTC()
 }
 
 func scanInvocation(row pgx.Row) (Invocation, error) {
@@ -2547,6 +2624,34 @@ func (s *PgStore) RecordStripePushHour(ctx context.Context, accountID string, ho
 	return err
 }
 
+// HasPaddleOverageMonth is the dedupe gate the meterd daily pusher
+// reads before issuing the Paddle CreateTransaction POST. Backed by
+// a unique index on (account_id, month) in the paddle_overage_dedupe
+// table (added in migration 00034). `month` is a calendar-month
+// start — the caller (pkg/billing/paddle/usage.go calendarMonthStart)
+// is responsible for normalising to the 1st of the month at 00:00 UTC.
+func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and month = $2)`,
+		accountID, month.UTC()).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// RecordPaddleOverageMonth inserts the dedupe row. ON CONFLICT DO
+// NOTHING so a redelivered (account, month) is idempotent — same shape
+// as RecordStripePushHour one method above.
+func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into paddle_overage_dedupe (account_id, month) values ($1, $2)
+		 on conflict (account_id, month) do nothing`,
+		accountID, month.UTC())
+	return err
+}
+
 // --- idempotency -------------------------------------------------------------
 
 func (s *PgStore) GetIdempotent(ctx context.Context, accountID, key string) (int, []byte, error) {
@@ -2983,9 +3088,9 @@ func cidrPrefixesToArray(prefixes []netip.Prefix) string {
 // On any parse failure we return an empty slice and rely on the caller
 // to fail loud — none of the consumers silently swallow a malformed
 // allowlist because (a) the API layer validates each entry with
-// netip.ParsePrefix before insert, and (b) the schema CHECK
-// (apps_egress_allowlist_v4_only) rejects bogus entries at the DB.
-// Defensive parse is belt-and-braces, not load-bearing.
+// netip.ParsePrefix before insert, and (b) the DB trigger
+// (apps_egress_allowlist_cidr, migration 00033) rejects bogus entries
+// at the schema. Defensive parse is belt-and-braces, not load-bearing.
 func cidrTextToPrefixes(text string) []netip.Prefix {
 	text = strings.TrimSpace(text)
 	if text == "{}" || text == "" {

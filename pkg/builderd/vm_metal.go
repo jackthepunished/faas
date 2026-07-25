@@ -173,8 +173,8 @@ func (d *VMMDriver) Spawn(ctx context.Context, req VMRequest) (BuildHandle, erro
 	resp, err := d.cli.CreateColdBoot(ctx, &vmmdpb.CreateColdBootRequest{
 		Instance: instance,
 		App: &vmmdpb.AppSpec{
-			BasePath:   d.builderBase,
-			LayerPath:  drive1Path, // vmmd's stageWritable will copy into the chroot
+			BaseKey:    "base/builder-base.ext4", // ADR-025: storage key → vmmd resolves via StorageBackend
+			LayerKey:   drive1Path,               // absolute host path; vmmd treats as direct path (abs path bypass)
 			VcpuCount:  api.BuildVMVCPU,
 			MemSizeMib: int32(api.BuildVMRAMMB),
 		},

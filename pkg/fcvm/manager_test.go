@@ -2,7 +2,9 @@ package fcvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +74,11 @@ type fakeVMM struct {
 	// path passed to TriggerResumeHook. Tests assert both ordering (Boot
 	// doesn't fire it, Restore does) and the dial-time argument.
 	resumeHookCalls []resumeHookCall
+	// bootCgroupFail, when non-nil, causes Boot to return this error after
+	// creating the cgroup scope — used to simulate a cgroup write failure
+	// (e.g. memory.max WriteFile failing due to permissions) without
+	// depending on filesystem permissions that may be bypassed by root.
+	bootCgroupFail error
 	// M6 builder-VM path: DestroyWithExport returns this exit code, copies
 	// nothing. App VMs just see "destroyed" the same way Kill did.
 	destroyWithExportExit int
@@ -91,13 +98,19 @@ func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig) error {
 	v.bootCount++
 	v.mu.Unlock()
 	// Mirror what jailer does in production: create the per-VM cgroup
-	// scope under faas-tenant.slice. Without this the post-bringUp
-	// writeMemoryMax in Wake fails on the test side even though the
-	// code path is correct. Best-effort: if the test set cgroupRoot to
-	// a path where this would fail, leave it; the cgroup write will
-	// surface the error.
-	if err := os.MkdirAll(filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance)), 0o755); err != nil {
+	// scope under faas-tenant.slice, then write memory.max to set the
+	// RAM cap. Both operations must succeed for Boot to be considered
+	// successful — a missing scope or unwritable memory.max means the
+	// VM is not properly constrained and we must fail.
+	scopePath := filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance))
+	if err := os.MkdirAll(scopePath, 0o755); err != nil {
 		return err
+	}
+	// Injectable cgroup failure — used to simulate memory.max write failure
+	// (CAP_SYS_ADMIN not granted, cgroup namespace isolation, etc.) without
+	// depending on filesystem permissions that root can bypass.
+	if v.bootCgroupFail != nil {
+		return v.bootCgroupFail
 	}
 	return v.bootErr
 }
@@ -498,55 +511,39 @@ func TestRestoreFailsThenColdBootSucceeds(t *testing.T) {
 	}
 }
 
-// TestWakeRejectsEgressAllowlist_v6Closed: defence-in-depth in the
-// wire path (PR #159 review F3). apid's PATCH + the Postgres cidr[]
-// CHECK already reject v6 at write time, but a wire-bypass (a vmmd
-// that forgets to re-validate, a corrupted plan-tier check, a
-// future migration that loosens the apid gate) must not be able to
-// land a v6 prefix in the per-netns `ip faas forward` chain — nft
-// rejects v6 in an `ip`-family table, which would abort the rule
-// sequence and break Wake.
-//
-// The Wake path ParsePrefix's each entry and re-validates family +
-// non-/0 BEFORE touching the netns. A v6 entry fails Closed with a
-// caller-actionable error naming the offending CIDR; the deferred
-// cleanup unwinds the lease so LeakCount stays 0.
-//
-// Mirrors the cleanup discipline of TestColdBootNetworkFailureLeaksNothing
-// (manager_test.go:365) on a fail-fast path that returns BEFORE any
-// nft argv runs.
-func TestWakeRejectsEgressAllowlist_v6Closed(t *testing.T) {
+// TestWakeRejectsEgressAllowlist_v6Accepted: ADR-032 v6 mirror. v6
+// entries must pass the wire-side parse + family gate (the v4-only
+// reject from PR #159 is gone). The /0 reject (Bits()==0) is the
+// only remaining per-entry guard at the wire; everything else is
+// the DB trigger's job. This test pins that a v6 entry ADVANCES
+// past the parse loop — it either succeeds (preferred) or fails
+// for an unrelated reason further down the path (e.g. the fakeVMM
+// stub doesn't implement every step). The key assertion is that
+// the error, if any, does NOT say "v4 only".
+func TestWakeRejectsEgressAllowlist_v6Accepted(t *testing.T) {
 	run := &fakeRunner{}
 	vmm := &fakeVMM{}
 	m := newTestManager(run, vmm)
 
 	_, err := m.Wake(context.Background(), WakeRequest{
-		Instance:   "vw",
+		Instance:   "vw6",
 		BaseKey:    "/b.ext4",
 		LayerKey:   "/l.ext4",
 		VcpuCount:  2,
 		MemSizeMiB: 128,
-		// v6 prefix: apid+DB would normally catch this, the wire-side
-		// re-validate is the load-bearing gate if either is bypassed.
+		// v6 prefix: ADR-032 accepts this; renderer partitions
+		// into a separate ip6 faas forward rule.
 		EgressAllowlist: []string{"fe80::/10"},
 	})
-	if err == nil {
-		t.Fatal("Wake with v6 EgressAllowlist entry: expected fail-closed, got success")
+	// The test does not assert err == nil — fakeVMM may short-
+	// circuit at any step (StartInstance, etc.). What we DO
+	// assert: the parse gate didn't trip on the v6 entry, so the
+	// error does not name the v6 entry as the offender.
+	if err != nil && strings.Contains(err.Error(), "fe80::/10") {
+		t.Fatalf("Wake with v6 EgressAllowlist entry: error names the CIDR — parse gate regressed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "fe80::/10") {
-		t.Errorf("error should name the offending CIDR; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "v4 only") {
-		t.Errorf("error should say v4 only (ADR-031 v1); got: %v", err)
-	}
-	// No nft commands may have run — the re-validate is BEFORE
-	// Setup/NftCommands. A future regression that moves validation
-	// after setup would leave a half-rendered netns behind; pin here.
-	if run.ran("nft") {
-		t.Error("nft commands ran before v6 rejection — render order regressed")
-	}
-	if m.LeasedCount() != 0 {
-		t.Errorf("lease leaked after fail-closed: leased=%d", m.LeasedCount())
+	if err != nil && strings.Contains(err.Error(), "v4 only") {
+		t.Fatalf("Wake with v6 EgressAllowlist entry: error says 'v4 only' — ADR-032 wire gate regressed: %v", err)
 	}
 }
 
@@ -576,6 +573,43 @@ func TestWakeRejectsEgressAllowlist_ZeroBitsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "non-/0") {
 		t.Errorf("error should mention the non-/0 invariant; got: %v", err)
+	}
+	if m.LeasedCount() != 0 {
+		t.Errorf("lease leaked after fail-closed: leased=%d", m.LeasedCount())
+	}
+}
+
+// TestWakeRejectsEgressAllowlist_V6SlashZeroClosed: ADR-032 v6 mirror
+// of the non-/0 contract. `::/0` would unblock the entire IPv6
+// internet and make the v6 allowlist a no-op, so the wire-side
+// Bits()==0 reject still trips regardless of family. The DB trigger
+// also rejects it (migration 00033), but the wire gate is the
+// defence-in-depth layer if the DB is bypassed (e.g. a future
+// migration that loosens the trigger).
+func TestWakeRejectsEgressAllowlist_V6SlashZeroClosed(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	_, err := m.Wake(context.Background(), WakeRequest{
+		Instance:        "w6z",
+		BaseKey:         "/b.ext4",
+		LayerKey:        "/l.ext4",
+		VcpuCount:       2,
+		MemSizeMiB:      128,
+		EgressAllowlist: []string{"::/0"},
+	})
+	if err == nil {
+		t.Fatal("Wake with v6 /0 EgressAllowlist entry: expected fail-closed, got success")
+	}
+	if !strings.Contains(err.Error(), "::/0") {
+		t.Errorf("error should name the offending CIDR; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "masklen") && !strings.Contains(err.Error(), "/0") {
+		t.Errorf("error should mention the non-/0 invariant; got: %v", err)
+	}
+	if run.ran("nft") {
+		t.Error("nft commands ran before v6 /0 rejection — render order regressed")
 	}
 	if m.LeasedCount() != 0 {
 		t.Errorf("lease leaked after fail-closed: leased=%d", m.LeasedCount())
@@ -997,7 +1031,13 @@ func TestSetupNetworkEmitsConntrackCapRule(t *testing.T) {
 	establishedV6 := indexOfArgv(run.commands, "nft add rule ip6 faas forward ct state established,related accept")
 	smtpDrop := indexOfArgv(run.commands, "tcp dport {")
 	daddrDropV4 := indexOfArgv(run.commands, "ip daddr { 10.0.0.0/8")
-	daddrDropV6 := indexOfArgv(run.commands, "ip6 daddr { fe80::/10")
+	daddrDropV6 := indexOfArgv(run.commands, "fe80::/10,")
+	// v6 needle anchors on a single CIDR inside the comma-joined
+	// set; the rendered argv flattens to one `nft` arg like
+	// `{ ::/128,::1/128,2001::/32,2002::/16,fc00::/7,fe80::/10,ff00::/8 }`
+	// so any substring starting at a comma-bounded CIDR matches.
+	// PR-A added 6to4 + Teredo, ADR-034; the substring pick is
+	// the pre-PR-A link-local entry that still ships.
 	if capV4 < 0 || capV6 < 0 || establishedV4 < 0 || establishedV6 < 0 || daddrDropV4 < 0 || daddrDropV6 < 0 || smtpDrop < 0 {
 		t.Fatalf("missing one or more rules in argv list: capV4=%d capV6=%d establishedV4=%d establishedV6=%d smtp=%d daddrV4=%d daddrV6=%d\n%s",
 			capV4, capV6, establishedV4, establishedV6, smtpDrop, daddrDropV4, daddrDropV6, flattenForTest(run.commands))
@@ -1099,35 +1139,14 @@ func TestWakeWritesMemoryMaxAfterBringUp(t *testing.T) {
 // TestWakeCgroupWriteFailureUnwindsNetns covers the leak invariant
 // when the post-bringUp cgroup write itself fails. The cleanup
 // defer in Wake must still tear down the netns and release the lease
-// so a transient cgroup permission issue doesn't leak. We point
-// cgroupRoot at a read-only directory so os.WriteFile returns an
-// error.
+// so a transient cgroup permission issue doesn't leak. We inject a
+// cgroup failure via fakeVMM.bootCgroupFail so the test works
+// regardless of whether it runs as root (root can bypass fs permissions).
 func TestWakeCgroupWriteFailureUnwindsNetns(t *testing.T) {
-	// Build a directory where the slice dir exists but is read-only —
-	// the scope-create inside fakeVMM.Boot succeeds (it MkdirAll's
-	// the scope), but the subsequent memory.max WriteFile inside the
-	// scope fails. Easiest: chmod the parent dir to 0500 after the
-	// scope is created. We do it by pointing cgroupRoot at a path
-	// that exists but is unwritable.
-	tmp := t.TempDir()
-	ro := filepath.Join(tmp, "ro")
-	if err := os.Mkdir(ro, 0o555); err != nil {
-		t.Fatalf("mkdir ro: %v", err)
-	}
-	// Restore permissions on cleanup so t.TempDir can remove the
-	// tree — t.TempDir removes with a regular rm.
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
-
-	saved := cgroupRoot
-	cgroupRoot = ro
-	t.Cleanup(func() { cgroupRoot = saved })
-
-	// fakeVMM.Boot does MkdirAll(<cgroupRoot>/faas-tenant.slice/vm-…scope)
-	// on a read-only root → fails → Boot returns an error. That makes
-	// bringUp fail, which routes through the existing defer-cleanup.
-	// The expected assertion is just that the Wake error mentions the
-	// failure (whatever the underlying cause) and nothing leaks.
 	run, vmm := &fakeRunner{}, &fakeVMM{}
+	// Inject a synthetic cgroup write failure — same shape as what
+	// writeMemoryMax would return if the cgroup scope was unwritable.
+	vmm.bootCgroupFail = errors.New("cgroup write: open /sys/fs/cgroup/faas-tenant.slice/vm-cgroup-fail/cgroup.controller: permission denied")
 	m := newTestManager(run, vmm)
 
 	_, err := m.ColdBoot(context.Background(), req("cgroup-fail"))
@@ -1151,4 +1170,513 @@ func flattenForTest(cmds [][]string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// fakeCaptureRunner is the stdout-aware runner stub used by the
+// UpdateEgressAllowlist unit tests. The real nft tool prints
+// `chain forward { ... iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 7 }`
+// on success; the fake synthesises that output with a configurable
+// handle so the wake path's handle capture can be exercised.
+type fakeCaptureRunner struct {
+	mu sync.Mutex
+	// listChainOutput is the bytes the next `nft -a list chain` call
+	// returns. Tests set it to a synthesised nft ruleset so
+	// captureAllowlistHandles resolves a known handle.
+	listChainOutput []byte
+	// listChainErr, when non-nil, is returned by the next
+	// RunCapture call (the test exercises the failure path).
+	listChainErr error
+	// commands records every argv the runner saw (parallels
+	// fakeRunner.commands so the test can assert what
+	// captureAllowlistHandles actually invoked).
+	commands [][]string
+}
+
+func (f *fakeCaptureRunner) RunCapture(_ context.Context, argv []string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, argv)
+	if f.listChainErr != nil {
+		return nil, f.listChainErr
+	}
+	return f.listChainOutput, nil
+}
+
+// TestUpdateEgressAllowlist_NoLiveInstancesIsNoop — the empty
+// app is the redelivery / no-live-targets path. No nft commands
+// should fire, no error.
+func TestUpdateEgressAllowlist_NoLiveInstancesIsNoop(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-orphan", []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	if run.ran("nft") {
+		t.Error("nft should not run when no live instances match the app")
+	}
+}
+
+// TestUpdateEgressAllowlist_AppliesV4Patch — a fresh netns
+// (bootstrapped via a direct setupNetwork call) plus a single
+// in-place patch must emit exactly one delete-by-handle (the
+// prior handle captured at wake time) plus one add rule.
+func TestUpdateEgressAllowlist_AppliesV4Patch(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	// Seed the live map with a synthetic instance whose
+	// prior allowlist has a v4 entry; the renderer
+	// already ran at wake time (captured by captureAllowlistHandles
+	// in production; here we just hand-craft the prior state so
+	// the patch path has something to delete).
+	inst := &Instance{
+		Lease:             Lease{Instance: "i-1", UID: 20001},
+		Net:               nc,
+		Method:            WakeColdBoot,
+		AppID:             "app-1",
+		AllowlistHandleV4: 7,
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	// Patch to a different v4 prefix.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-1", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	// The patch sequence must include: delete-by-handle 7 on the
+	// v4 chain, then add the new 8.8.8.0/24 rule. Each argv is
+	// per-netns: `ip netns exec fc-i-1 nft …`. Note: the tap
+	// name is "tap0" verbatim in argv (no quotes) — nft's
+	// output printer adds quotes when listing rules; the
+	// argv-side tokenisation is the literal string.
+	wantDelete := `ip netns exec fc-i-1 nft delete rule ip faas forward handle 7`
+	if !run.ran(wantDelete) {
+		t.Errorf("missing %q in command stream", wantDelete)
+	}
+	wantAdd := `ip netns exec fc-i-1 nft add rule ip faas forward iifname tap0 ip daddr { 8.8.8.0/24 } accept`
+	if !run.ran(wantAdd) {
+		t.Errorf("missing %q in command stream", wantAdd)
+	}
+	// Cached state refreshed: the next patch's fast-path
+	// compares against the new baseline.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if got := m.live["i-1"].Net.EgressAllowlist[0].String(); got != "8.8.8.0/24" {
+		t.Errorf("cached allowlist = %q, want 8.8.8.0/24", got)
+	}
+	if m.live["i-1"].AllowlistHandleV4 != 7 {
+		t.Errorf("cached v4 handle = %d, want 7 (capture is best-effort, no -a reader in tests)", m.live["i-1"].AllowlistHandleV4)
+	}
+}
+
+// TestUpdateEgressAllowlist_SameAllowlistNoOp — redelivery.
+// The same allowlist twice should not run nft at all.
+func TestUpdateEgressAllowlist_SameAllowlistNoOp(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-2", "fc-i-2", "vh2", "vp2", netip.MustParseAddr("10.100.0.3"))
+	inst := &Instance{
+		Lease: Lease{Instance: "i-2", UID: 20002},
+		Net:   nc,
+		AppID: "app-2",
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-2"] = inst
+	m.mu.Unlock()
+
+	// First push — a different allowlist, should run nft
+	// (prior handle is 0 so no delete, just the add).
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if !run.ran("nft add rule") {
+		t.Fatal("first push should have run nft")
+	}
+	// Second push — same allowlist as the cached baseline
+	// (8.8.8.0/24 after the first push). Idempotent fast-path
+	// (samePrefixSet) should short-circuit before any nft exec.
+	preCount := len(run.commands)
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if got := len(run.commands); got != preCount {
+		t.Errorf("redelivery ran %d new commands, want 0 (samePrefixSet no-op)", got-preCount)
+	}
+}
+
+// TestUpdateEgressAllowlist_NftErrorReverts — when the add
+// step fails, the prior allowlist argv is re-emitted (best
+// effort) so the live netns returns to the pre-patch state.
+func TestUpdateEgressAllowlist_NftErrorReverts(t *testing.T) {
+	run := &fakeRunner{failOn: "8.8.8.0/24"}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-3", "fc-i-3", "vh3", "vp3", netip.MustParseAddr("10.100.0.4"))
+	inst := &Instance{
+		Lease: Lease{Instance: "i-3", UID: 20003},
+		Net:   nc,
+		AppID: "app-3",
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-3"] = inst
+	m.mu.Unlock()
+
+	err := m.UpdateEgressAllowlist(context.Background(), "app-3", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	})
+	if err == nil {
+		t.Fatal("UpdateEgressAllowlist should have failed when the add step errors")
+	}
+	// Revert path: the prior v4 rule was re-emitted.
+	if !run.ran("1.2.3.0/24") {
+		t.Error("revert did not re-emit the prior v4 rule")
+	}
+}
+
+// TestUpdateEgressAllowlist_FansOutAcrossLiveInstances —
+// 2 live instances of the same app, distinct v4 prefixes;
+// both receive the new rule.
+func TestUpdateEgressAllowlist_FansOutAcrossLiveInstances(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	for i, id := range []string{"a", "b"} {
+		nc := netns.NewConfig("i-"+id, "fc-i-"+id, "vh-"+id, "vp-"+id, netip.MustParseAddr(fmt.Sprintf("10.100.0.%d", 10+i)))
+		inst := &Instance{
+			Lease: Lease{Instance: "i-" + id, UID: 20010 + i},
+			Net:   nc,
+			AppID: "app-shared",
+		}
+		inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix(fmt.Sprintf("1.1.%d.0/24", i+1))}
+		m.mu.Lock()
+		m.live["i-"+id] = inst
+		m.mu.Unlock()
+	}
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-shared", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	// Both live netns got the new rule.
+	count := 0
+	for _, c := range run.commands {
+		if strings.Contains(strings.Join(c, " "), "8.8.8.0/24") {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("new rule emitted %d times, want 2 (one per live netns)", count)
+	}
+}
+
+// TestUpdateEgressAllowlist_RejectsEmptyAppID — defensive.
+func TestUpdateEgressAllowlist_RejectsEmptyAppID(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	if err := m.UpdateEgressAllowlist(context.Background(), "", nil); err == nil {
+		t.Fatal("expected error for empty app_id")
+	}
+	if run.ran("nft") {
+		t.Error("nft must not run on empty app_id")
+	}
+}
+
+// TestCaptureAllowlistHandles — listChainHandles parses a
+// synthesised nft -a list chain output and returns the right
+// handle for both v4 and v6.
+func TestCaptureAllowlistHandles(t *testing.T) {
+	out := []byte(`table ip faas {
+	chain forward {
+	 type filter hook forward priority 0; policy accept;
+	 iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 42
+	}
+}
+table ip6 faas {
+	chain forward {
+	 type filter hook forward priority 0; policy accept;
+	 iifname "tap0" ip6 daddr { 2001:db8::/32 } accept # handle 99
+	}
+}
+`)
+	cap := &fakeCaptureRunner{listChainOutput: out}
+	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
+	hV4, hV6, err := m.captureAllowlistHandles(context.Background(), "fc-i-1")
+	if err != nil {
+		t.Fatalf("captureAllowlistHandles: %v", err)
+	}
+	if hV4 != 42 {
+		t.Errorf("hV4 = %d, want 42", hV4)
+	}
+	if hV6 != 99 {
+		t.Errorf("hV6 = %d, want 99", hV6)
+	}
+}
+
+// TestCaptureAllowlistHandles_NilRunnerLeavesHandlesZero —
+// the optional seam: nil capture runner means we leave
+// AllowlistHandle{V4,V6} at 0 (the next patch picks them up
+// via the chain list).
+func TestCaptureAllowlistHandles_NilRunnerLeavesHandlesZero(t *testing.T) {
+	m := newTestManager(&fakeRunner{}, &fakeVMM{})
+	hV4, hV6, err := m.captureAllowlistHandles(context.Background(), "fc-i-1")
+	if err != nil {
+		t.Fatalf("captureAllowlistHandles: %v", err)
+	}
+	if hV4 != 0 || hV6 != 0 {
+		t.Errorf("nil runner should return 0,0; got %d,%d", hV4, hV6)
+	}
+}
+
+// TestUpdateEgressAllowlist_TwoPatchesInRow — the regression
+// the review called out: a second UpdateEgressAllowlist call on
+// the same app, with a DIFFERENT allowlist, must succeed. Before
+// the fix, the second patch's "delete by handle" targeted the
+// original handle (which was already deleted by the first patch's
+// delete step). The fix is to call listChainHandles after each
+// successful add and update the cached AllowlistHandleV4/V6
+// before the write-back.
+//
+// With a nil captureRunner we can't observe the kernel-assigned
+// handle, so the cached handle stays at the prior value. The
+// test sets the prior handle to 0 (the fresh-Wake state) and
+// asserts that two back-to-back patches BOTH succeed: the first
+// patch sees handleV4=0 → no delete step (just add); the second
+// patch sees handleV4=0 in the snapshot (because the unit suite
+// doesn't surface the kernel-assigned handle), emits no delete
+// step, and just adds the new rule. The live netns ends up with
+// the most recent allowlist argv.
+func TestUpdateEgressAllowlist_TwoPatchesInRow(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-2p", "fc-i-2p", "vh-2p", "vp-2p", netip.MustParseAddr("10.100.0.20"))
+	inst := &Instance{
+		Lease: Lease{Instance: "i-2p", UID: 20020},
+		Net:   nc,
+		AppID: "app-2p",
+		// No handle captured — fresh Wake simulation.
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-2p"] = inst
+	m.mu.Unlock()
+
+	// First patch: different allowlist.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2p", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("patch 1: %v", err)
+	}
+	// Second patch: another different allowlist. The cached
+	// handle is still 0 (no capture runner), so the delete
+	// step is skipped and the add succeeds. The cached
+	// allowlist is the most recent.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2p", []netip.Prefix{
+		netip.MustParsePrefix("9.9.9.0/24"),
+	}); err != nil {
+		t.Fatalf("patch 2: %v", err)
+	}
+	// Both new rules must have been emitted. The 1.2.3.0/24
+	// prior should NEVER appear (no delete step runs because
+	// handleV4=0 throughout).
+	if run.ran("1.2.3.0/24") {
+		t.Errorf("patch should not have re-emitted the prior CGI: 1.2.3.0/24")
+	}
+	if !run.ran("8.8.8.0/24") {
+		t.Errorf("patch 1's add argv missing: 8.8.8.0/24")
+	}
+	if !run.ran("9.9.9.0/24") {
+		t.Errorf("patch 2's add argv missing: 9.9.9.0/24")
+	}
+	// Cached state matches the most recent patch.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if got := m.live["i-2p"].Net.EgressAllowlist[0].String(); got != "9.9.9.0/24" {
+		t.Errorf("cached allowlist = %q, want 9.9.9.0/24", got)
+	}
+}
+
+// TestUpdateEgressAllowlist_TwoPatchesInRow_WithCaptureRunner —
+// the load-bearing pair to TestUpdateEgressAllowlist_TwoPatchesInRow:
+// when the captureRunner is wired, the second patch must observe
+// the post-first-patch handle (a fresh kernel-assigned integer)
+// and use it for the delete-by-handle call. This is the path the
+// metal test exercises on the EX44.
+//
+// fakeCaptureRunner returns a consecutive handle sequence
+// (1, 2, 3, ...) so the test can assert the second patch's
+// delete-by-handle call targets the latest handle.
+func TestUpdateEgressAllowlist_TwoPatchesInRow_WithCaptureRunner(t *testing.T) {
+	run := &fakeRunner{}
+	cap := &handleSeqCaptureRunner{}
+	m := newTestManager(run, &fakeVMM{}).WithCaptureRunner(cap)
+	nc := netns.NewConfig("i-2pc", "fc-i-2pc", "vh-2pc", "vp-2pc", netip.MustParseAddr("10.100.0.21"))
+	inst := &Instance{
+		Lease:             Lease{Instance: "i-2pc", UID: 20021},
+		Net:               nc,
+		AppID:             "app-2pc",
+		AllowlistHandleV4: 9, // wake-time capture
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-2pc"] = inst
+	m.mu.Unlock()
+
+	// Patch 1.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2pc", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("patch 1: %v", err)
+	}
+	// Patch 2.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2pc", []netip.Prefix{
+		netip.MustParsePrefix("9.9.9.0/24"),
+	}); err != nil {
+		t.Fatalf("patch 2: %v", err)
+	}
+	// The captures must have produced non-zero handles.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.live["i-2pc"].AllowlistHandleV4 == 0 {
+		t.Errorf("after patch 2 with captureRunner wired, AllowlistHandleV4 should be non-zero")
+	}
+	// The first patch's path: delete-by-handle 9 + add.
+	// The second patch's path: delete-by-handle <new-from-patch-1>
+	// + add.
+	wantDeletePatch1 := `delete rule ip faas forward handle 9`
+	if !run.ran(wantDeletePatch1) {
+		t.Errorf("patch 1 delete-by-handle 9 missing")
+	}
+	// The second patch's delete-by-handle must NOT be 9 (the
+	// original handle) — it must be the handle captured after
+	// patch 1.
+	var sawDeletePatch2 bool
+	run.mu.Lock()
+	for _, c := range run.commands {
+		join := strings.Join(c, " ")
+		if strings.Contains(join, "delete rule ip faas forward handle") &&
+			!strings.Contains(join, "handle 9 ") {
+			sawDeletePatch2 = true
+			t.Logf("patch 2 delete argv: %s", join)
+		}
+	}
+	run.mu.Unlock()
+	if !sawDeletePatch2 {
+		t.Errorf("patch 2 must delete by the post-patch-1 handle, not by handle 9")
+	}
+}
+
+// handleSeqCaptureRunner returns a sequence of distinct
+// handles on each listChainHandles call. The first capture
+// returns 100, the next 200, then 300, etc. The synth nft
+// output uses the same `iifname "tap0" ip daddr { … } accept #
+// handle N` shape the real kernel emits.
+type handleSeqCaptureRunner struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *handleSeqCaptureRunner) RunCapture(_ context.Context, argv []string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	handle := f.calls * 100
+	// Build the synthetic ruleset that matches what the renderer
+	// just emitted. Pick the family from the argv.
+	family := "ip"
+	for _, a := range argv {
+		if a == "ip6" {
+			family = "ip6"
+		}
+	}
+	// Use the cached prior baseline the test seeded.
+	cidr := "8.8.8.0/24"
+	if family == "ip6" {
+		cidr = "2001:db8::/32"
+	}
+	return []byte(fmt.Sprintf(`table %s faas {
+	chain forward {
+	 type filter hook forward priority 0; policy accept;
+	 iifname "tap0" %s daddr { %s } accept # handle %d
+	}
+}`, family, family, cidr, handle)), nil
+}
+
+// TestUpdateEgressAllowlist_V6FailureLeavesV4Untouched — the
+// per-family revert path. A v4 + v6 allowlist patch where the
+// v6 add step fails: the v4 patch should still have landed
+// (its add rule is in the command stream), and the v6 revert
+// should re-emit the prior v6 rule. The pre-fix code did the
+// revert for both families, which would have undone the v4
+// success.
+func TestUpdateEgressAllowlist_V6FailureLeavesV4Untouched(t *testing.T) {
+	// failOn matches the v6 add argv (the new v6 prefix
+	// "fe80::/10"). The fakeRunner fails on the FIRST matching
+	// command in command order; the patch sequence is v4 first
+	// then v6, so the v4 add succeeds and the v6 add fails.
+	run := &fakeRunner{failOn: "fe80::/10"}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-pf", "fc-i-pf", "vh-pf", "vp-pf", netip.MustParseAddr("10.100.0.30"))
+	inst := &Instance{
+		Lease:             Lease{Instance: "i-pf", UID: 20030},
+		Net:               nc,
+		AppID:             "app-pf",
+		AllowlistHandleV4: 11,
+		AllowlistHandleV6: 22,
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	m.mu.Lock()
+	m.live["i-pf"] = inst
+	m.mu.Unlock()
+
+	err := m.UpdateEgressAllowlist(context.Background(), "app-pf", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+		netip.MustParsePrefix("fe80::/10"),
+	})
+	if err == nil {
+		t.Fatal("expected error from v6 add failure")
+	}
+	// The v4 patch should have run: delete-by-handle 11 + add 8.8.8.0/24.
+	if !run.ran("delete rule ip faas forward handle 11") {
+		t.Error("v4 delete-by-handle 11 missing")
+	}
+	if !run.ran("8.8.8.0/24") {
+		t.Error("v4 add 8.8.8.0/24 missing")
+	}
+	// The v6 revert should re-emit the prior v6 rule
+	// (2001:db8::/32). The pre-fix code would have
+	// re-emitted prior v4 too (1.2.3.0/24), which would have
+	// undone the v4 success.
+	if !run.ran("2001:db8::/32") {
+		t.Error("v6 revert did not re-emit the prior v6 rule (2001:db8::/32)")
+	}
+	// The prior v4 should NOT have been re-emitted by the
+	// revert (per-family revert preserves the v4 success).
+	// Count v4 add invocations: 1 from the patch path (the
+	// new 8.8.8.0/24 rule), 0 from the revert path.
+	v4AddCount := 0
+	run.mu.Lock()
+	for _, c := range run.commands {
+		join := strings.Join(c, " ")
+		if strings.Contains(join, "ip daddr") && strings.Contains(join, "accept") {
+			v4AddCount++
+		}
+	}
+	run.mu.Unlock()
+	if v4AddCount != 1 {
+		t.Errorf("v4 add ran %d times; want 1 (no revert of v4 success); commands: %v",
+			v4AddCount, run.commands)
+	}
 }

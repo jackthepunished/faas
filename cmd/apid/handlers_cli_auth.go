@@ -139,7 +139,7 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
 		return
 	}
-	k, err := h.srv.store.CreateAPIKey(r.Context(), accountID, keyHash, "cli-login")
+	k, err := h.srv.store.CreateAPIKey(r.Context(), accountID, keyHash, "cli-login", api.DefaultScopes())
 	if err != nil {
 		h.log.Error("cli_auth.create_key", "err", err)
 		api.WriteProblem(w, api.ErrCapacity("could not persist key"))

@@ -26,6 +26,15 @@ type stripePushKey struct {
 	hour      time.Time
 }
 
+// paddleOverageKey is the (account, month) dedupe key the daily Paddle
+// overage pusher uses; declared above MemStore so the struct field
+// below can reference it. `month` is the calendar-month start
+// (calendarMonthStart in pkg/billing/paddle/usage.go).
+type paddleOverageKey struct {
+	accountID string
+	month     time.Time
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -91,6 +100,11 @@ type MemStore struct {
 	// Stripe pusher has already pushed; prevents double-billing on
 	// redelivery.
 	stripePushHours map[stripePushKey]struct{}
+	// paddleOverageMonths tracks which (account, month) pairs the daily
+	// Paddle overage pusher has already flushed; same role as
+	// stripePushHours but at the calendar-month grain because the
+	// Paddle overage push fires at month-rollover rather than hourly.
+	paddleOverageMonths map[paddleOverageKey]struct{}
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
@@ -166,7 +180,10 @@ func NewMemStore() *MemStore {
 		// stripePushHours is the per-(account, hour) dedupe set the
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
-		secrets:         map[secretKey]AppSecret{},
+		// paddleOverageMonths is the per-(account, month) dedupe set
+		// the meterd daily pusher reads/writes.
+		paddleOverageMonths: map[paddleOverageKey]struct{}{},
+		secrets:             map[secretKey]AppSecret{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -245,6 +262,23 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 		return APIKey{}, ErrNotFound
 	}
 	return k, nil
+}
+
+// AuthenticateKey mirrors the key+account lookup the apid auth
+// middleware needs. Single lock acquisition; returns ErrNotFound when
+// the hash has no matching key. See ADR-034.
+func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keyByHash[hex.EncodeToString(hash)]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	acct, ok := m.accounts[k.AccountID]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	return acct, k, nil
 }
 
 func (m *MemStore) UpdateAccountPlan(_ context.Context, id string, plan api.Plan) error {
@@ -378,14 +412,14 @@ func (m *MemStore) ListAllAccounts(_ context.Context) ([]Account, error) {
 
 // --- API keys ---------------------------------------------------------------
 
-func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string) (APIKey, error) {
+func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h := hex.EncodeToString(hash)
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
 	}
-	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, CreatedAt: time.Now()}
+	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, Scopes: scopes, CreatedAt: time.Now()}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
 	return k, nil
@@ -580,12 +614,15 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		a.MinInstances = derefInt(p.MinInstances)
 	}
 	if p.SetEgressAllowlist {
-		// ADR-031: nil-with-Set is treated as "clear to default
-		// (empty)" so the API can express "drop the allowlist back to
-		// no-list" via a PATCH with egress_allowlist:[] ; non-nil is
-		// copied verbatim. The slice is intentionally reallocated so
-		// the caller can't mutate the stored value through the slice
-		// header it holds after the call returns.
+		// ADR-031 + ADR-032: nil-with-Set is treated as "clear to
+		// default (empty)" so the API can express "drop the
+		// allowlist back to no-list" via a PATCH with
+		// egress_allowlist:[] ; non-nil is copied verbatim. The
+		// slice is intentionally reallocated so the caller can't
+		// mutate the stored value through the slice header it holds
+		// after the call returns. v4 + v6 entries share the same
+		// counter (Pro 16, Scale 64) — see
+		// pkg/api/limits.go::EgressAllowlistMaxSize.
 		src := derefPrefixes(p.EgressAllowlist)
 		dst := make([]netip.Prefix, len(src))
 		copy(dst, src)
@@ -1465,8 +1502,10 @@ func (m *MemStore) CancelInvocation(_ context.Context, id string) error {
 }
 
 // ListInvocationsForAccount is the dashboard's unified history read.
-// MemStore returns rows ordered CreatedAt DESC for any caller.
-func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, _ time.Time) ([]Invocation, error) {
+// MemStore returns rows ordered CreatedAt DESC (with ID as tie-breaker)
+// for any caller. The `before` cursor is an Invocation.ID; an empty
+// string means "start from the newest".
+func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, before string) ([]Invocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Invocation
@@ -1475,10 +1514,65 @@ func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string
 			out = append(out, inv)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	// Apply the cursor: drop everything at-or-after the cursor row
+	// (we want strictly older). MemStore is single-process so a linear
+	// scan is fine.
+	if before != "" {
+		var cursorIdx = -1
+		for i, inv := range out {
+			if inv.ID == before {
+				cursorIdx = i
+				break
+			}
+		}
+		if cursorIdx >= 0 {
+			out = out[cursorIdx+1:]
+		}
+		// If the cursor isn't in the page (already GC'd, expired),
+		// PgStore falls back to the inner SELECT; MemStore returns the
+		// full page, which is the cheap-and-cheerful answer.
+	}
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+// ListInvocationsForApp is the per-app filtered variant used by
+// deleteApp's GC sweep. An empty `states` slice returns all rows for
+// the app; otherwise the row's state must match one of the filter
+// values. MemStore is single-process so a linear scan is fine.
+func (m *MemStore) ListInvocationsForApp(_ context.Context, appID string, states ...InvocationState) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stateSet := make(map[InvocationState]struct{}, len(states))
+	for _, s := range states {
+		stateSet[s] = struct{}{}
+	}
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.AppID != appID {
+			continue
+		}
+		if len(stateSet) > 0 {
+			if _, ok := stateSet[inv.State]; !ok {
+				continue
+			}
+		}
+		out = append(out, inv)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
@@ -2488,6 +2582,29 @@ func (m *MemStore) RecordStripePushHour(_ context.Context, accountID string, hou
 	return nil
 }
 
+// HasPaddleOverageMonth + RecordPaddleOverageMonth implement the
+// pkg/billing/paddle PaddleOverageDedupe interface. Mirrors the Stripe
+// pair one method above: flat set keyed by (account, month); UTC-
+// normalized on every read/write so a future caller that forgets to
+// normalize cannot create a phantom row. `month` is a calendar-month
+// start (calendarMonthStart in pkg/billing/paddle/usage.go).
+func (m *MemStore) HasPaddleOverageMonth(_ context.Context, accountID string, month time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}]
+	return ok, nil
+}
+
+func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string, month time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageMonths == nil {
+		m.paddleOverageMonths = map[paddleOverageKey]struct{}{}
+	}
+	m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}] = struct{}{}
+	return nil
+}
+
 type appHourKey struct {
 	AccountID string
 	AppID     string
@@ -2974,6 +3091,16 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for sc, acid := range m.stripeByCustomer {
 		if acid == id {
 			delete(m.stripeByCustomer, sc)
+		}
+	}
+	// Drop Paddle overage dedupe rows for this account so a redelivered
+	// grace tick doesn't observe a stale (account, month) pair. Mirrors
+	// the pgstore.go steps slice entry for paddle_overage_dedupe; the
+	// MemStore has no FK so the explicit walk is the production
+	// equivalent for tests.
+	for k := range m.paddleOverageMonths {
+		if k.accountID == id {
+			delete(m.paddleOverageMonths, k)
 		}
 	}
 	// Audit events (spec §17 G6 right-to-erasure). Drop events whose

@@ -2,12 +2,23 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrWaitTimeout is returned by WaitForNotification when the timeout
+// elapses without a matching payload. It is distinct from
+// context.DeadlineExceeded so the queueReceive / invokeApp handlers can
+// tell "server-side budget ran out" from "client cancelled".
+//
+// Move 2 (long-lived surface). The drain and daemon-side loops use
+// SubscribeWithReconnect because they own a long-lived LISTEN session;
+// per-request callers (apid handlers) want the short-lived sibling.
+var ErrWaitTimeout = errors.New("db: wait timeout")
 
 // Notification is a single pg_notify delivery on a subscribed channel.
 // Channel names live in one place (cmd/* and pkg/* use the constants below).

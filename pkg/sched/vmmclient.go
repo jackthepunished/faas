@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
@@ -57,6 +58,15 @@ type VMM interface {
 	// heartbeat goroutine dials fresh per tick and relies on this
 	// to keep its conn churn bounded (no goroutine/conn leak).
 	Close() error
+	// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) pushes
+	// a fresh per-app egress allowlist into vmmd's live-instance
+	// map without tearing the netns down. RoutedVMM routes by
+	// nodeID; the per-node VMMClient forwards over gRPC via the
+	// vmmdpb.UpdateEgressAllowlist RPC. vmmd is idempotent (set-
+	// equal allowlist is a no-op) so a redelivered event is
+	// safe. Errors surface as the gRPC status (Unavailable /
+	// Internal) — the egress_drift subscriber logs and drops.
+	UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error
 }
 
 // PingOutcome is the sched-side view of vmmdpb.PingResponse.
@@ -133,7 +143,7 @@ type AppSpec struct {
 	MemSizeMiB      int32  // plan RAM; the slice fences at +8 MiB (pkg/api/limits.go)
 	EgressMbit      int32  // per-plan tc cap (pkg/api/limits.EgressMbit); 0 = no cap
 	SealedEnv       []fcvm.SealedEnvEntry
-	EgressAllowlist []string // ADR-031; v4 CIDRs; empty = no allowlist rule
+	EgressAllowlist []string // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
 }
 
 // SnapshotRef points at the snapshot to restore from and the Firecracker
@@ -291,6 +301,35 @@ func (c *VMMClient) PauseAndSnapshot(ctx context.Context, instance, vmstatePath,
 
 func (c *VMMClient) Destroy(ctx context.Context, instance string) error {
 	if _, err := c.cli.Destroy(ctx, &vmmdpb.DestroyRequest{Instance: instance}); err != nil {
+		return liftErr(err)
+	}
+	return nil
+}
+
+// UpdateEgressAllowlist implements VMM. The wire is a repeated
+// string of CIDR literals; vmmd partitions by family. Empty
+// list is valid (clears the per-app rule on vmmd's side, flips
+// the chain policy back to accept). The call is best-effort: a
+// gRPC Unavailable / Internal surfaces as a typed error; the
+// caller (egress_drift subscriber) logs and drops so a single
+// bad patch never blocks the loop. Idempotent on the vmmd side
+// — redelivered identical allowlist is a no-op (set-equal
+// short-circuit).
+func (c *VMMClient) UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error {
+	// netip.Prefix → wire string round-trip. Use prefix.String()
+	// for canonical form (Masked() already applied at parse time
+	// upstream in apid's validateUpdateApp, so the renderer's
+	// partition by prefix.Addr().Is4() works unchanged). Nil
+	// allowlist → nil slice on the wire (vmmd treats nil and
+	// empty identically: clear the rule).
+	ss := make([]string, 0, len(allowlist))
+	for _, p := range allowlist {
+		ss = append(ss, p.String())
+	}
+	if _, err := c.cli.UpdateEgressAllowlist(ctx, &vmmdpb.UpdateEgressAllowlistRequest{
+		AppId:           appID,
+		EgressAllowlist: ss,
+	}); err != nil {
 		return liftErr(err)
 	}
 	return nil

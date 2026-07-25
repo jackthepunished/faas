@@ -53,6 +53,14 @@ type runDeps struct {
 	// subscriber is not started (cmd/schedd's main wires the
 	// production db.Subscribe adapter; tests inject a fake).
 	subscribeDeletion func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeEgressDrift (tier-2 PR-B, ADR-031 + ADR-033) is the
+	// producer-side seam for the app_changed consumer that fans
+	// out per-app egress_allowlist updates to every vmmd that
+	// owns a live instance of the app (the "live-instance drift"
+	// closure). nil = the subscriber is not started; the loop's
+	// existing app_changed consumer stays as the logging-only
+	// fallback. Tests inject a fake channel.
+	subscribeEgressDrift func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// heartbeatInterval overrides sched.DefaultHeartbeatInterval for
 	// tests that want a sub-second cadence. Zero falls back to the
 	// production default (30s).
@@ -74,6 +82,13 @@ func defaultDeps() runDeps {
 		// without standing up Postgres.
 		subscribeDeletion: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAccountDeletionPending})
+		},
+		// Production wires the same db.Subscribe primitive, scoped
+		// to the app_changed channel. The egress_drift subscriber
+		// filters to kind="updated" internally — wider-list
+		// callers are safe.
+		subscribeEgressDrift: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
 		},
 	}
 }
@@ -253,55 +268,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// = skip in tests that don't want a fake channel.
 	if deps.subscribeDeletion != nil {
 		sub := sched.NewDeletionSubscriber(engine, log)
-		go func() {
-			delay := 1 * time.Second
-			const maxDelay = 30 * time.Second
-			for {
-				if ctx.Err() != nil {
-					return
-				}
-				delFeed, delCancel, delErr := deps.subscribeDeletion(ctx, pool)
-				if delErr != nil {
-					log.Warn("schedd: deletion subscriber dial failed",
-						"err", delErr, "retry_in", delay.String())
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(delay):
-					}
-					if delay < maxDelay {
-						delay *= 2
-						if delay > maxDelay {
-							delay = maxDelay
-						}
-					}
-					continue
-				}
-				// Dial succeeded — run the drain on this channel
-				// until it closes (a reconnect signal from
-				// db.Subscribe) or ctx fires.
-				err := sub.Run(ctx, delFeed)
-				delCancel()
-				if err != nil && !errors.Is(err, context.Canceled) {
-					log.Warn("schedd: deletion subscriber exited; retrying dial",
-						"err", err, "retry_in", delay.String())
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(delay):
-					}
-				}
-				if ctx.Err() != nil {
-					return
-				}
-				// Reset backoff after a successful drain that we
-				// voluntarily tore down (rare in practice, but
-				// keeps the curve sane after a partial outage).
-				if err == nil || errors.Is(err, context.Canceled) {
-					delay = 1 * time.Second
-				}
-			}
-		}()
+		go subscribeWithReconnect(ctx, "deletion", log, deps.subscribeDeletion, pool, sub.Run)
+	}
+
+	// tier-2 PR-B (ADR-031 + ADR-033): egress drift subscriber.
+	// Same dial-loop shape as the deletion subscriber above
+	// (see subscribeWithReconnect for the shared backoff shape).
+	// The production channel is NotifyAppChanged; the subscriber
+	// filters to kind="updated" internally. nil seam = skip in
+	// tests that don't want a fake channel.
+	if deps.subscribeEgressDrift != nil {
+		driftSub := sched.NewEgressDriftSubscriber(engine, vmmRouter, log)
+		go subscribeWithReconnect(ctx, "egress drift", log, deps.subscribeEgressDrift, pool, driftSub.Run)
 	}
 
 	// PR #114 / ADR-025 axis 3: per-node liveness sweep. Every
@@ -427,4 +405,74 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	_ = lis.Close()
 	return nil
+}
+
+// subscribeWithReconnect drains a pg_notify-style feed via the
+// Shared subscriber Drain loop. Shared by the deletion
+// subscriber (ADR-026) and the egress drift subscriber (PR-B).
+//
+// contract: ctx is the long-lived daemon context; subscribe is
+// the producer-side seam (already opened channel + cancel +
+// error); run is the subscriber's drain (run blocks until the
+// channel closes or ctx fires).
+//
+// Backoff schedule: linear 1s → 30s on dial failure or drain
+// exit. Reset to 1s after a successful drain that exited
+// cleanly (channel-closed from the producer side, which
+// db.Subscribe uses as a reconnect signal).
+func subscribeWithReconnect(
+	ctx context.Context,
+	name string,
+	log *slog.Logger,
+	subscribe func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error),
+	pool *pgxpool.Pool,
+	run func(context.Context, <-chan db.Notification) error,
+) {
+	delay := 1 * time.Second
+	const maxDelay = 30 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		feed, cancel, err := subscribe(ctx, pool)
+		if err != nil {
+			log.Warn("schedd: "+name+" subscriber dial failed",
+				"err", err, "retry_in", delay.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			if delay < maxDelay {
+				delay *= 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+			}
+			continue
+		}
+		// Dial succeeded — run the drain on this channel
+		// until it closes (a reconnect signal from
+		// db.Subscribe) or ctx fires.
+		err = run(ctx, feed)
+		cancel()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Warn("schedd: "+name+" subscriber exited; retrying dial",
+				"err", err, "retry_in", delay.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// Reset backoff after a successful drain that we
+		// voluntarily tore down (rare in practice, but
+		// keeps the curve sane after a partial outage).
+		if err == nil || errors.Is(err, context.Canceled) {
+			delay = 1 * time.Second
+		}
+	}
 }

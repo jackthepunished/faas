@@ -50,7 +50,7 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 	} else if err != nil {
 		return err
 	}
-	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev")
+	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev", api.DefaultScopes())
 	if err != nil && !errors.Is(err, state.ErrConflict) {
 		return err
 	}
@@ -426,4 +426,11 @@ func (p pgNotifier) Notify(ctx context.Context, channel, payload string) error {
 // Postgres pool. Returns immediately if no channels are requested.
 func (p pgNotifier) Subscribe(ctx context.Context, channels []string) (<-chan db.Notification, func(), error) {
 	return db.Subscribe(ctx, p.pool, channels)
+}
+
+// WaitFor is the Move 2 long-poll sibling: per-request LISTEN + predicate
+// filter. Thin wrapper around db.WaitForNotification so the Notifier
+// interface stays the only thing the handlers depend on.
+func (p pgNotifier) WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error) {
+	return db.WaitForNotification(ctx, p.pool, channel, predicate, timeout)
 }

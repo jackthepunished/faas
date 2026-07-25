@@ -123,12 +123,16 @@ type Account struct {
 // Active reports whether the account may deploy (not suspended/deleted).
 func (a Account) Active() bool { return a.Status == AccountActive || a.Status == AccountPastDue }
 
-// APIKey is a hashed, account-scoped credential.
+// APIKey is a hashed, account-scoped credential. Scopes is the set of
+// authorization scopes attached to the key (e.g. "admin", "read", "write");
+// the apid middleware checks them on every authenticated request. See
+// ADR-034 and the IAM-1 plan.
 type APIKey struct {
 	ID         string
 	AccountID  string
 	Hash       []byte
 	Label      string
+	Scopes     []string
 	LastUsedAt time.Time
 	CreatedAt  time.Time
 }
@@ -141,7 +145,7 @@ type App struct {
 	AccountID      string
 	Slug           string
 	Type           AppType
-	Runtime        string // node22|python312 for functions
+	Runtime        string // node22|python312|go124 for functions
 	RAMMB          int
 	IdleTimeoutS   int // 0 => plan default
 	MaxConcurrency int

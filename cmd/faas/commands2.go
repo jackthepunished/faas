@@ -53,6 +53,16 @@ const (
 	// goconst stops flagging the repeated "apps" / "status" / etc.
 	// literals. Tests intentionally keep the literal form.
 	dispatchApps = "apps"
+
+	// Plural deployments list (mirrors dispatchApps shape). User runs
+	// `faas deployments` to list; pagination flags live on the handler.
+	dispatchDeployments = "deployments"
+
+	// Singular deployment-get. Lifted so the dispatch literal stays
+	// constant-named (goconst); the constant does NOT route through
+	// appSlugFallback — the dispatch table places it before the
+	// "app" case so `faas deployment <id>` is never read as an app slug.
+	dispatchDeployment = "deployment"
 )
 
 // cmdApp implements `faas app <slug>` (GET /v1/apps/{slug}), `faas app <slug>
@@ -202,9 +212,9 @@ func cmdDeployTarball(args []string) int {
 	image := fs.String("image", "", "digest-pinned image reference")
 	tarball := fs.String("tarball", "", "path to source archive (tar.gz)")
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
-	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python)")
+	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python|function-go)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
-	runtime := fs.String("runtime", "", "function runtime (node22|python312)")
+	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
 	if err := fs.Parse(args); err != nil {
@@ -243,6 +253,14 @@ func cmdDeployTarball(args []string) int {
 		case "function-python":
 			*runtime = "python312"
 			*handler = "handler.handler"
+		case "function-go":
+			// The customer's handler is a static Go binary; the
+			// --handler wire field is vestigial for go124 (the imaged
+			// manifest locks the entrypoint to /app/handler). We set
+			// a non-empty value so the multipart writer doesn't skip
+			// the field, but the value is never read by the runtime.
+			*runtime = "go124"
+			*handler = "handler.go"
 		}
 		f, err := os.CreateTemp("", "faas-template-*.tar.gz")
 		if err != nil {
@@ -556,7 +574,7 @@ func cmdKeys(args []string) int {
 		if err != nil {
 			return printErr("Not logged in", err)
 		}
-		k, err := client.CreateKey(context.Background(), args[1])
+		k, err := client.CreateKey(context.Background(), args[1], nil)
 		if err != nil {
 			return printErr("Create failed", err)
 		}

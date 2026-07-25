@@ -79,6 +79,12 @@ func (n *cliAuthTestNotifier) Subscribe(_ context.Context, _ []string) (<-chan d
 	close(ch)
 	return ch, func() {}, nil
 }
+func (n *cliAuthTestNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) bool, _ time.Duration) (string, error) {
+	// cliAuthTestNotifier is used by tests that don't exercise
+	// long-poll semantics; return ErrWaitTimeout so a queueReceive-style
+	// call degrades to a clean 204 instead of hanging.
+	return "", db.ErrWaitTimeout
+}
 
 func (n *cliAuthTestNotifier) Calls() []cliAuthNotifyCall {
 	n.mu.Lock()

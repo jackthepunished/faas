@@ -80,13 +80,18 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		if len(*req.EgressAllowlist) > maxSize {
 			return api.ErrEgressAllowlistTooLong(len(*req.EgressAllowlist), maxSize)
 		}
-		// Per-entry shape: every CIDR must ParsePrefix as a v4 with a
-		// non-zero host-bits prefix. The Postgres cidr[] CHECK rejects
-		// v6 at write time — catching it here just gives a more
-		// operator-friendly error message naming the bad entry.
+		// Per-entry shape: every CIDR must ParsePrefix as either v4
+		// or v6 (ADR-032 — the v6 mirror), with a non-zero mask. The
+		// Postgres cidr[] TRIGGER `apps_egress_allowlist_cidr`
+		// (migration 00033) rejects families outside {4,6} and any
+		// /0 at write time — catching it here just gives a more
+		// operator-friendly error message naming the bad entry. The
+		// `Bits() == 0` reject is shared with the DB trigger so a
+		// future /0 rejection in either layer cannot quietly
+		// disagree.
 		for _, raw := range *req.EgressAllowlist {
 			prefix, err := netip.ParsePrefix(raw)
-			if err != nil || !prefix.Addr().Is4() || prefix.Bits() == 0 {
+			if err != nil || prefix.Bits() == 0 {
 				return api.ErrInvalidEgressAllowlist(raw, errOrZero("parse failed", err))
 			}
 		}
@@ -181,6 +186,28 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
 		return
+	}
+	// Move 2: GC pending invocations for this app BEFORE the row goes
+	// away. Without this, a delayed_task can fire after deleteApp and
+	// the drain is forced to log a permanent-wake error on a row the
+	// customer has already given up on. CancelInvocation is a no-op on
+	// terminal rows (returns state.ErrNotFound) so dispatching /
+	// completed rows are untouched.
+	pending, err := s.store.ListInvocationsForApp(ctx(r), app.ID,
+		state.InvocationPending, state.InvocationDispatching)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list-inv"))
+		return
+	}
+	for _, inv := range pending {
+		if err := s.store.CancelInvocation(ctx(r), inv.ID); err != nil && !errors.Is(err, state.ErrNotFound) {
+			// Don't fail the delete on a per-row cancel error; the
+			// drain will surface the row as failed and the customer
+			// sees it in the meter. Logging at warn so it's
+			// observable.
+			s.log.Warn("deleteApp: cancel invocation",
+				"inv", inv.ID, "app", app.ID, "err", err)
+		}
 	}
 	if err := s.store.DeleteApp(ctx(r), app.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete app"))
@@ -564,16 +591,28 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 // --- api keys --------------------------------------------------------------
 
 func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	var req struct {
-		Label string `json:"label"`
-	}
+	var req api.CreateKeyRequest
 	_ = decodeJSON(r, &req)
+	scopes := req.Scopes
+	if len(scopes) == 0 {
+		// Preserve the legacy "full access" default for callers that
+		// don't yet know about scopes. New SDK releases pass scopes
+		// explicitly. See ADR-034.
+		scopes = []string{"admin"}
+	}
+	for _, sc := range scopes {
+		if !api.IsValidScope(sc) {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Unknown scope", "scopes must be one of admin, read, write; got "+sc))
+			return
+		}
+	}
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
 		return
 	}
-	k, err := s.store.CreateAPIKey(ctx(r), acct.ID, hash, req.Label)
+	k, err := s.store.CreateAPIKey(ctx(r), acct.ID, hash, req.Label, scopes)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
@@ -584,6 +623,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		ID:        k.ID,
 		Prefix:    keyPrefix(plaintext),
 		Label:     k.Label,
+		Scopes:    k.Scopes,
 		CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
 		Plaintext: plaintext,
 	})
@@ -601,6 +641,7 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 			ID:        k.ID,
 			Prefix:    keyPrefixFromHash(k.Hash),
 			Label:     k.Label,
+			Scopes:    k.Scopes,
 			CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
 		}
 		if !k.LastUsedAt.IsZero() {

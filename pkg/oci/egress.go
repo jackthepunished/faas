@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+
+	"github.com/onebox-faas/faas/pkg/netns"
 )
 
 // Egress policy for the OCI puller (spec §11). Tenant egress is fenced by
@@ -24,28 +26,49 @@ import (
 // The transport refuses both DNS lookups that resolve into a denied range
 // AND direct IPs in a denied range — closes the DNS-rebinding hole that a
 // naive IP allowlist leaves open.
+//
+// The base list is the shared netns.DefaultDenySet so the user-space
+// check and the firewall rules can't drift apart (PR-A, ADR-034).
+// OCI adds a small set of client-only entries that the host firewall
+// doesn't need (loopback / 0.0.0.0/8 / IETF-assigned / benchmarking /
+// reserved) because the puller runs out of init — it's the process that
+// happens to call into the OCI registry, and a misconfigured firewall
+// plus a pull to a loopback is exactly the regression the user-space
+// check is meant to catch. The OCI-only entries are listed in
+// ociOnlyDenyCIDRs and union'd at dial time.
 var (
-	// deniedCIDRv4 lists every IPv4 range the puller must never reach.
-	deniedCIDRv4 = []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/8"),      // unspecified
-		netip.MustParsePrefix("10.0.0.0/8"),     // RFC1918
-		netip.MustParsePrefix("100.64.0.0/10"),  // carrier-grade NAT
-		netip.MustParsePrefix("127.0.0.0/8"),    // loopback
-		netip.MustParsePrefix("169.254.0.0/16"), // link-local + IMDS
-		netip.MustParsePrefix("172.16.0.0/12"),  // RFC1918
-		netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments
-		netip.MustParsePrefix("192.168.0.0/16"), // RFC1918
-		netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
-		netip.MustParsePrefix("224.0.0.0/4"),    // multicast
-		netip.MustParsePrefix("240.0.0.0/4"),    // reserved
+	// ociOnlyDenyCIDRs are ranges the OCI puller denies in addition
+	// to the shared netns.DefaultDenySet. The host firewall already
+	// covers RFC1918 / link-local / metadata via the per-netns
+	// chain; these are the client-side hardening extras.
+	ociOnlyDenyCIDRsV4 = []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),     // unspecified
+		netip.MustParsePrefix("127.0.0.0/8"),   // loopback
+		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
+		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking
+		netip.MustParsePrefix("240.0.0.0/4"),   // reserved
 	}
-	deniedCIDRv6 = []netip.Prefix{
-		netip.MustParsePrefix("::/128"),    // unspecified
-		netip.MustParsePrefix("::1/128"),   // loopback
-		netip.MustParsePrefix("fe80::/10"), // link-local
-		netip.MustParsePrefix("fc00::/7"),  // ULA
-		netip.MustParsePrefix("ff00::/8"),  // multicast
-	}
+)
+
+// deniedCIDRs builds the OCI deny set as the union of the shared
+// netns.DefaultDenySet + the OCI-only extras above. Built once at
+// init; ipAllowed reads from it on every dial. The shared set has
+// been growing since PR-A (ADR-034 added 6to4 + Teredo) — a future
+// editorial pass will decide whether the OCI-only entries deserve
+// to land on the host side too; today the union is the cheapest
+// contract that closes the regression.
+var (
+	deniedCIDRv4 = func() []netip.Prefix {
+		base := netns.NewDefaultDenySet()
+		out := make([]netip.Prefix, 0, len(base.V4DenyCIDRs)+len(ociOnlyDenyCIDRsV4))
+		out = append(out, base.V4DenyCIDRs...)
+		out = append(out, ociOnlyDenyCIDRsV4...)
+		return out
+	}()
+	deniedCIDRv6 = func() []netip.Prefix {
+		base := netns.NewDefaultDenySet()
+		return append([]netip.Prefix{}, base.V6DenyCIDRs...)
+	}()
 )
 
 // EgressDialContext returns a DialContext that rejects every address that

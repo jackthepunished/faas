@@ -90,6 +90,15 @@ func (f *fakeVMM) LeasedCount() int { return 0 }
 // test that needs the bridge will wire netnsFn itself.
 func (f *fakeVMM) NetnsFor(instance string) (string, bool) { return "", false }
 
+// UpdateEgressAllowlist (tier-2 PR-B) — the sched test rig
+// doesn't drive the in-place patch path; the egress_drift
+// subscriber tests in pkg/sched/egress_drift_test.go use a
+// separate seam (RoutedVMM.UpdateEgressAllowlist). Returns nil
+// here so the vmmdgrpc.VmmdAPI contract is satisfied.
+func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error {
+	return nil
+}
+
 // newClient stands up a vmmdgrpc.Server on bufconn and returns a sched.VMMClient
 // dialed to it.
 func newClient(t *testing.T, fake *fakeVMM) *sched.VMMClient {

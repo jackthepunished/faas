@@ -18,6 +18,7 @@ func TestMapFramework(t *testing.T) {
 	}{
 		{"node", FrameworkNode, api.FrameworkRailpackNode},
 		{"python", FrameworkPython, api.FrameworkRailpackPython},
+		{"go", FrameworkGo, api.FrameworkRailpackGo},
 		{"docker → dockerfile (buildctl)", FrameworkDocker, api.FrameworkDockerfile},
 		{"unknown falls back to auto", FrameworkUnknown, api.FrameworkAuto},
 		{"empty string falls back to auto", Framework(""), api.FrameworkAuto},
@@ -39,10 +40,27 @@ func TestMapFramework(t *testing.T) {
 func TestMapFramework_DockerIsNotRailpack(t *testing.T) {
 	got := MapFramework(FrameworkDocker)
 	switch got {
-	case api.FrameworkRailpackNode, api.FrameworkRailpackPython, api.FrameworkAuto:
+	case api.FrameworkRailpackNode, api.FrameworkRailpackPython, api.FrameworkRailpackGo, api.FrameworkAuto:
 		t.Fatalf("FrameworkDocker mapped to %q (Railpack fallback) — expected FrameworkDockerfile (buildctl)", got)
 	}
 	if got != api.FrameworkDockerfile {
 		t.Fatalf("FrameworkDocker mapped to %q, want %q", got, api.FrameworkDockerfile)
+	}
+}
+
+// TestMapFramework_GoIsNotAuto is the Go-side acceptance guard: a Go
+// tarball (go.mod at root) must dispatch to railpack_go explicitly, not
+// fall through to FrameworkAuto. If this regresses, every Go deploy
+// hands Railpack the wrong plan and silently builds the wrong image
+// (or fails inside the VM with a Railpack heuristic error that the
+// customer can't act on). Parallel in shape to the Docker guard above.
+func TestMapFramework_GoIsNotAuto(t *testing.T) {
+	got := MapFramework(FrameworkGo)
+	switch got {
+	case api.FrameworkRailpackNode, api.FrameworkRailpackPython, api.FrameworkDockerfile, api.FrameworkAuto:
+		t.Fatalf("FrameworkGo mapped to %q (non-Go fallback) — expected FrameworkRailpackGo", got)
+	}
+	if got != api.FrameworkRailpackGo {
+		t.Fatalf("FrameworkGo mapped to %q, want %q", got, api.FrameworkRailpackGo)
 	}
 }

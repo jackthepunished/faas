@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 type CreateAppRequest struct {
 	Slug           string `json:"slug"`
 	Type           string `json:"type,omitempty"`    // "app" (default) | "function"
-	Runtime        string `json:"runtime,omitempty"` // node22|python312 for functions
+	Runtime        string `json:"runtime,omitempty"` // node22|python312|go124 for functions
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
@@ -32,14 +33,17 @@ type UpdateAppRequest struct {
 	// 403 plan_min_instances_not_allowed (apid gate). Must be <=
 	// plan MaxConcurrency (422 invalid_min_instances).
 	MinInstances *int `json:"min_instances,omitempty"`
-	// EgressAllowlist (ADR-031, tier-2 of the network roadmap) is
-	// the per-app outbound IPv4 allowlist. Each entry is a CIDR
-	// string ("1.2.3.0/24"); the slice replaces the full list
-	// (atomic full-overwrite at the apps row). Plan-gated upstream
-	// (Free/Hobby return 403 plan_egress_allowlist_not_allowed);
-	// size-capped at plan.EgressAllowlistMaxSize() (Pro 16, Scale 64).
-	// Empty slice / nil pointer = clear the allowlist (back to the
-	// default-accept chain policy).
+	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
+	// roadmap) is the per-app outbound IP allowlist. Each entry is
+	// a CIDR string ("1.2.3.0/24" for v4, "2001:db8::/32" for v6);
+	// the slice replaces the full list (atomic full-overwrite at the
+	// apps row). Plan-gated upstream (Free/Hobby return 403
+	// plan_egress_allowlist_not_allowed); size-capped at
+	// plan.EgressAllowlistMaxSize() (Pro 16, Scale 64) — v4 + v6
+	// entries share the same count budget. Empty slice / nil
+	// pointer = clear the allowlist (back to the default-accept
+	// chain policy). The non-/0 contract is enforced by the DB
+	// trigger `apps_egress_allowlist_cidr` (migration 00033).
 	EgressAllowlist *[]string `json:"egress_allowlist,omitempty"`
 }
 
@@ -131,22 +135,29 @@ type AccountLimits struct {
 
 // APIKeyResponse is an API key returned to the customer. The plaintext
 // appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
-// + label + last_used_at + id are returned thereafter.
+// + label + scopes + last_used_at + id are returned thereafter. Scopes is
+// the explicit permission set attached to the key (e.g. ["admin"],
+// ["read"], ["write"]); see ADR-034.
 type APIKeyResponse struct {
-	ID         string `json:"id"`
-	Prefix     string `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
-	Label      string `json:"label,omitempty"`
-	LastUsedAt string `json:"last_used_at,omitempty"`
-	CreatedAt  string `json:"created_at"`
+	ID         string   `json:"id"`
+	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
+	Label      string   `json:"label,omitempty"`
+	Scopes     []string `json:"scopes"`
+	LastUsedAt string   `json:"last_used_at,omitempty"`
+	CreatedAt  string   `json:"created_at"`
 	// Plaintext appears ONLY on the create response, never persisted.
 	Plaintext string `json:"plaintext,omitempty"`
 }
 
 // CreateKeyRequest is the body of POST /v1/keys. Label is optional
 // (max 100 chars per spec); empty label is allowed and renders as
-// `{}` so the server's optional-field handling stays in scope.
+// `{}` so the server's optional-field handling stays in scope. Scopes
+// is the requested permission set; the server validates each entry
+// against the allowed vocabulary (admin, read, write) and defaults to
+// ["admin"] when omitted so existing callers keep full access. See ADR-034.
 type CreateKeyRequest struct {
-	Label string `json:"label,omitempty"`
+	Label  string   `json:"label,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the
@@ -324,13 +335,17 @@ type UsageExportResponse struct {
 
 // APIKeyExportResponse is one row in the export's API key slice.
 // The plaintext key never appears here (and never reappears after
-// the create response, per §4.2). Only the prefix + label + timestamps.
+// the create response, per §4.2). Only the prefix + label + scopes +
+// timestamps. Scopes is included so the customer's GDPR export carries
+// the full audit trail of which keys had which permissions at the
+// moment of export (ADR-034).
 type APIKeyExportResponse struct {
-	ID        string `json:"id"`
-	Prefix    string `json:"prefix"`
-	Label     string `json:"label,omitempty"`
-	CreatedAt string `json:"created_at"`
-	LastUsed  string `json:"last_used_at,omitempty"`
+	ID        string   `json:"id"`
+	Prefix    string   `json:"prefix"`
+	Label     string   `json:"label,omitempty"`
+	Scopes    []string `json:"scopes"`
+	CreatedAt string   `json:"created_at"`
+	LastUsed  string   `json:"last_used_at,omitempty"`
 }
 
 // GdprAuditExportResponse is one row of the customer's own GDPR audit
@@ -403,4 +418,115 @@ type StatusPage struct {
 	// "degraded: <reason>" so an operator tailing the JSON can tell
 	// at a glance why a snapshot is or isn't trustworthy.
 	Source string `json:"source"`
+}
+
+// --- Move 2: event-driven surface response shapes ----------------------------
+//
+// AsyncInvokeResponse is the 202-side of POST /v1/apps/{slug}/invoke/async.
+// StatusURL is the well-known read endpoint so the dashboard (and the
+// SDK) can poll without parsing the id.
+type AsyncInvokeResponse struct {
+	ID        string `json:"id"`
+	StatusURL string `json:"status_url"`
+}
+
+// InvokeResponse is the sync-side of POST /v1/apps/{slug}/invoke.
+// Status is the final row state (one of "completed" | "failed"
+// | "cancelled"); Result is the per-app payload the drain stamped
+// (nil while pending, populated by drain.emitDone).
+type InvokeResponse struct {
+	ID     string          `json:"id"`
+	Status string          `json:"status"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+// QueueSendResponse is returned on POST /v1/apps/{slug}/queues/invocations:send.
+// 201 Created with the new id; the customer pairs this with the
+// /receive long-poll.
+type QueueSendResponse struct {
+	ID string `json:"id"`
+}
+
+// QueueReceiveResponse is returned on POST /v1/apps/{slug}/queues/invocations:receive.
+// 200 with the dequeued row's payload + result; 204 on timeout.
+type QueueReceiveResponse struct {
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
+	Result  json.RawMessage `json:"result,omitempty"`
+}
+
+// DelayedTaskResponse is the create/get shape for delayed tasks.
+// ScheduledAt is the customer-facing UTC dispatch time; State is
+// populated on get, omitted on create (always "pending" there).
+type DelayedTaskResponse struct {
+	ID          string    `json:"id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	State       string    `json:"state,omitempty"`
+}
+
+// ListInvocationsResponse lives in cmd/apid because pkg/api cannot
+// import pkg/state (cyclic). The handler-local type is `[]state.Invocation`
+// — the wire shape is identical, only the package differs.
+
+// InvokeRequest is the body for POST /v1/apps/{slug}/invoke[/async].
+// Method defaults to POST; path defaults to `/` (the handler fills
+// defaults; the zero values are not persisted).
+type InvokeRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Headers json.RawMessage `json:"headers,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Path    string          `json:"path,omitempty"`
+}
+
+// QueueSendRequest is the body for POST /v1/apps/{slug}/queues/send.
+// Cap-checked against MaxQueueDepth at the handler.
+type QueueSendRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// DelayedTaskRequest is the body for POST /v1/apps/{slug}/delayed-tasks.
+// ScheduledAt must be in the future (UTC); the handler rejects past
+// timestamps with invalid_scheduled_at.
+type DelayedTaskRequest struct {
+	Payload     json.RawMessage `json:"payload,omitempty"`
+	ScheduledAt time.Time       `json:"scheduled_at"`
+}
+
+// Invocation is the SDK-side mirror of state.Invocation. The wire
+// is the same JSON the handler emits (writeJSON(w, 200, inv) where
+// inv is a state.Invocation), but pkg/api cannot import pkg/state
+// (import cycle — state pkg is the lowest layer). The mirror is
+// exhaustive: every field with a JSON tag on state.Invocation gets a
+// typed row here so the SDK gets proper Go types and JSON tags. The
+// name `Invocation` matches the OpenAPI schema (api/openapi.yaml
+// `Invocation`) so the spec_compliance test sees a 1:1 mapping.
+type Invocation struct {
+	ID             string          `json:"id"`
+	AppID          string          `json:"app_id"`
+	AccountID      string          `json:"account_id"`
+	InstanceID     string          `json:"instance_id,omitempty"`
+	Source         string          `json:"source"`
+	State          string          `json:"state"`
+	Method         string          `json:"method"`
+	Path           string          `json:"path"`
+	Payload        json.RawMessage `json:"payload"`
+	Headers        json.RawMessage `json:"headers"`
+	DueAt          time.Time       `json:"due_at"`
+	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
+	AckURL         string          `json:"ack_url,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	ReceivedAt     *time.Time      `json:"received_at,omitempty"`
+	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
+	Attempts       int             `json:"attempts"`
+	LastError      string          `json:"last_error,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// ListInvocationsResponse is the wire shape for GET /v1/invocations.
+// The handler emits a `[]state.Invocation` under the `invocations`
+// key; here we declare the same shape with the SDK-side mirror type
+// so pkg/api stays decoupled from pkg/state.
+type ListInvocationsResponse struct {
+	Invocations []Invocation `json:"invocations"`
 }

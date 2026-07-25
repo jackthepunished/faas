@@ -197,27 +197,7 @@ func runBuild(m api.BuildManifest) error {
 	}
 
 	// 2. Pick the build command.
-	var argv []string
-	switch m.Framework {
-	case api.FrameworkDockerfile:
-		argv = []string{
-			"buildctl", "build",
-			"--frontend", "dockerfile",
-			"--local", "context=" + m.Workdir,
-			"--local", "dockerfile=" + m.Workdir,
-			"--output", "type=oci,dest=" + m.OutDir + "/image.tar",
-		}
-	default:
-		// railpack with --plan auto|node|python
-		plan := "auto"
-		switch m.Framework {
-		case api.FrameworkRailpackNode:
-			plan = "node"
-		case api.FrameworkRailpackPython:
-			plan = "python"
-		}
-		argv = []string{"railpack", "build", m.OutDir, "--plan", plan}
-	}
+	argv := buildArgv(m)
 
 	// 3. Run with a wall-clock timeout (we already get OOM protection from
 	//    cgroup v2 memory.max on the Firecracker config — see spec §11).
@@ -236,6 +216,34 @@ func runBuild(m api.BuildManifest) error {
 	err := cmd.Run()
 
 	return writeAndPoweroff(m, err, tailOf(buf.Bytes(), m.LogTailBytes))
+}
+
+// buildArgv constructs the build-engine argv for one BuildManifest. The
+// Dockerfile framework uses buildctl; everything else is Railpack with an
+// explicit --plan. Extracted from runBuild so the table-driven
+// TestBuildArgv can pin the wire shape without spinning up a builder VM.
+func buildArgv(m api.BuildManifest) []string {
+	switch m.Framework {
+	case api.FrameworkDockerfile:
+		return []string{
+			"buildctl", "build",
+			"--frontend", "dockerfile",
+			"--local", "context=" + m.Workdir,
+			"--local", "dockerfile=" + m.Workdir,
+			"--output", "type=oci,dest=" + m.OutDir + "/image.tar",
+		}
+	}
+	// railpack with --plan auto|node|python|go
+	plan := "auto"
+	switch m.Framework {
+	case api.FrameworkRailpackNode:
+		plan = "node"
+	case api.FrameworkRailpackPython:
+		plan = "python"
+	case api.FrameworkRailpackGo:
+		plan = "go"
+	}
+	return []string{"railpack", "build", m.OutDir, "--plan", plan}
 }
 
 // classify maps an in-VM exit code to a builderd FailureClass. The vocabulary

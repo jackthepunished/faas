@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -245,3 +246,11 @@ func (stubVMM) Stats(context.Context) (*sched.StatsSnapshot, error) {
 	return &sched.StatsSnapshot{}, nil
 }
 func (stubVMM) Close() error { return nil }
+
+// UpdateEgressAllowlist (tier-2 PR-B) — wiring tests don't drive
+// the egress drift path. Returns nil so the VMM contract is
+// satisfied when schedd's deps.subscribeEgressDrift is left
+// nil (the production subscriber is not started in these tests).
+func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
+	return nil
+}

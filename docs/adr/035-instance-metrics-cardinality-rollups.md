@@ -1,4 +1,4 @@
-# ADR-033 · Per-instance metrics: {app,node} cardinality rollups (issue #170 / PR-A)
+# ADR-035 · Per-instance metrics: {app,node} cardinality rollups (issue #170 / PR-A)
 
 - **Status:** proposed
 - **Date:** 2026-07-25

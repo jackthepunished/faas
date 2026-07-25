@@ -377,6 +377,12 @@ func (n *spyNotifier) Subscribe(_ context.Context, _ []string) (<-chan db.Notifi
 	close(ch)
 	return ch, func() {}, nil
 }
+func (n *spyNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) bool, _ time.Duration) (string, error) {
+	// spyNotifier is used by tests that don't exercise long-poll
+	// semantics; return ErrWaitTimeout so a queueReceive-style call
+	// degrades to a clean 204 instead of hanging.
+	return "", db.ErrWaitTimeout
+}
 func (n *spyNotifier) snapshot() []db.Notification {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -429,7 +435,7 @@ func TestScheduleDeletion_EmitsAccountDeletionPending(t *testing.T) {
 	srv := newServerWithDeps(store, log, "example.com", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "")
 
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 

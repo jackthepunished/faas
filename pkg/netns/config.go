@@ -42,6 +42,15 @@ type Config struct {
 	HostIP     netip.Addr // routable identity, 10.100.x.y
 	HostBits   int        // prefix length for HostIP (16)
 	EgressMbit int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
+	// DenySet is the typed egress denylist applied at the per-netns
+	// forward chain. Defaults to NewDefaultDenySet() when zero
+	// (pkg/fcvm/manager.go::Wake does not set it; the renderer falls
+	// back so existing call paths are unchanged). Tests that vary
+	// the deny set assert against this field directly. Single source
+	// of truth shared with the host renderer (pkg/netns/policy.go)
+	// and the OCI puller (pkg/oci/egress.go) — see
+	// pkg/netns/denylist.go.
+	DenySet DenySet
 	// ConntrackCap caps the per-instance conntrack table size at
 	// `forward` time (spec §7 line 344 of docs/faas_implementation_spec.md,
 	// ADR-018 deferral resolved). 0 = no cap rule emitted, so existing
@@ -52,16 +61,27 @@ type Config struct {
 	// counters`-readable so PR-C can surface cap-hit telemetry without
 	// a netlink dependency.
 	ConntrackCap int64
-	// EgressAllowlist (ADR-031, tier-2 of the network roadmap):
-	// per-app outbound IPv4 allowlist. Empty slice = no allowlist
-	// rule emitted (current behaviour preserved — chain-policy accept
-	// stays effective). Non-empty → NftCommands emits a single
-	//   `iifname "tap0" ip daddr { … } accept`
-	// rule in the per-netns forward chain AFTER the lateral-movement
-	// deny + SMTP drops, so deny > allow on overlap (an operator typo
-	// into RFC1918 still gets dropped). The IPv6 mirror is a separate
-	// follow-up ADR. Free/Hobby plans never populate this field —
-	// apid gates the PATCH upstream.
+	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
+	// roadmap): per-app outbound IP allowlist. Empty slice = no
+	// allowlist rule emitted (current behaviour preserved —
+	// chain-policy accept stays effective). Non-empty → NftCommands
+	// emits one or two rules in the per-netns forward chain(s),
+	// partitioned by `prefix.Addr().Is4()`:
+	//   * the v4 half lands on `ip faas forward` as
+	//     `iifname "tap0" ip daddr { … } accept`
+	//   * the v6 half lands on `ip6 faas forward` as
+	//     `iifname "tap0" ip6 daddr { … } accept`
+	// (nft rejects mixing `ip` and `ip6` matches in one table —
+	// ADR-023; the renderer partitions internally so the wire shape
+	// stays a single repeated string at proto AppSpec field 7).
+	// Both rules are placed AFTER the lateral-movement deny + SMTP
+	// drops, so deny > allow on overlap (an operator typo into
+	// RFC1918 still gets dropped); and BEFORE the chain's default
+	// policy, so unlisted destinations drop when an allowlist
+	// exists on either chain. Free/Hobby plans never populate this
+	// field — apid gates the PATCH upstream. The non-/0 contract
+	// is enforced by the DB trigger
+	// `apps_egress_allowlist_cidr` (migration 00033, ADR-032).
 	EgressAllowlist []netip.Prefix
 }
 
@@ -233,19 +253,27 @@ func (c Config) NftCommands() [][]string {
 	if rule := c.forwardConnlimitRule(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
-	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "tcp", "dport", "{", "25,", "465,", "587", "}", "drop")
-	// CGN (100.64.0.0/10) included for symmetry with pkg/netns.DefaultHostPolicy
-	// .ForwardDenyCIDRs. IPv6 sibling follows — see ADR-023 and
-	// pkg/oci/egress.go::deniedCIDRv6.
-	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "ip", "daddr", "{", "10.0.0.0/8,", "172.16.0.0/12,", "192.168.0.0/16,", "169.254.0.0/16,", "100.64.0.0/10", "}", "drop")
-	// ADR-031 per-app egress allowlist. Placed AFTER the lateral-movement
-	// deny + SMTP drops so deny > allow on overlap (an operator typo
-	// landing a sensitive CIDR in the allowlist still gets dropped).
-	// Placed BEFORE the chain's default-accept policy so unlisted
-	// destinations drop when an allowlist exists. Empty EgressAllowlist
-	// means no rule and current behaviour is preserved (chain-default
-	// accept does the work).
-	if rule := c.forwardAllowlistRule(nft); rule != nil {
+	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "tcp", "dport", "{", c.denySMTPPortsSet(), "}", "drop")
+	// Lateral-movement deny (spec §11 + ADR-023 + ADR-034) — the v4
+	// half of the shared DenySet. ADR-031 reorders this list so
+	// deny > allow on overlap with the per-app EgressAllowlist accept
+	// rule below. The set is shared verbatim with the host renderer
+	// (pkg/netns/policy.go) and the OCI puller (pkg/oci/egress.go) —
+	// see pkg/netns/denylist.go.
+	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "ip", "daddr", "{", c.denyV4Set(), "}", "drop")
+	// ADR-031 + ADR-032 per-app egress allowlist. Placed AFTER the
+	// lateral-movement deny + SMTP drops so deny > allow on overlap
+	// (an operator typo landing a sensitive CIDR in the allowlist
+	// still gets dropped). Placed BEFORE the chain's default-accept
+	// policy so unlisted destinations drop when an allowlist exists.
+	// Empty EgressAllowlist means no rule and current behaviour is
+	// preserved (chain-default accept does the work). The v4 helper
+	// is called here, after the v4 lateral-movement drop; the v6
+	// helper is called later, after the v6 lateral-movement drop, so
+	// each rule sits inside its chain block (the ruleset's per-chain
+	// ordering — established,related accept → cap → SMTP → deny →
+	// allowlist → chain-policy — holds for both v4 and v6).
+	if rule := c.ForwardAllowlistRule(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
 	// The per-netns table is `ip faas` (not `inet faas` — nft requires an
@@ -275,8 +303,55 @@ func (c Config) NftCommands() [][]string {
 	if rule := c.forwardConnlimitRule6(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
-	add("add", "rule", "ip6", "faas", "forward", "iifname", c.Tap, "ip6", "daddr", "{", "fe80::/10,", "fc00::/7,", "ff00::/8,", "::1/128,", "::/128", "}", "drop")
+	add("add", "rule", "ip6", "faas", "forward", "iifname", c.Tap, "ip6", "daddr", "{", c.denyV6Set(), "}", "drop")
+	// ADR-032 — per-app egress allowlist v6 mirror. Same placement
+	// contract as the v4 sibling above (AFTER deny, BEFORE
+	// chain-policy), only on the v6 chain. Empty EgressAllowlist or
+	// a v4-only allowlist returns nil here — v6 stays at
+	// chain-policy drop (because forwardChainPolicy flips when the
+	// single field is non-empty), with no per-chain accept rule.
+	if rule := c.ForwardAllowlistRule6(nft); rule != nil {
+		cmds = append(cmds, rule)
+	}
 	return cmds
+}
+
+// denySMTPPortsSet returns the comma-joined SMTP port set used by
+// the per-netns forward chain's `tcp dport { … } drop` rule. Falls
+// back to NewDefaultDenySet() when Config.DenySet is the zero value
+// (pkg/fcvm/manager.go::Wake does not set it today — the default
+// is the only contract).
+//
+// Internal to NftCommands — do not invoke from anywhere else.
+func (c Config) denySMTPPortsSet() string {
+	if len(c.DenySet.SMTPPorts) == 0 {
+		return NewDefaultDenySet().SMTPPortsCommaSet()
+	}
+	return c.DenySet.SMTPPortsCommaSet()
+}
+
+// denyV4Set is the v4 sibling of denySMTPPortsSet. Same fallback
+// semantics; the default value matches the literal list that lived
+// inline in NftCommands before the denylist refactor (PR-A,
+// ADR-034). The test in pkg/netns/config_test.go iterates over
+// NewDefaultDenySet().V4DenyCIDRs so adding a new entry here is
+// mechanically covered.
+func (c Config) denyV4Set() string {
+	if len(c.DenySet.V4DenyCIDRs) == 0 {
+		return NewDefaultDenySet().V4CommaSet()
+	}
+	return c.DenySet.V4CommaSet()
+}
+
+// denyV6Set is the v6 sibling of denyV4Set. ADR-034 adds 6to4
+// (2002::/16) + Teredo (2001::/32) to the default — the pre-PR-A
+// list was missing both, leaving two lateral-movement channels into
+// the IPv4 RFC1918 ranges through a 6to4 / Teredo tunnel endpoint.
+func (c Config) denyV6Set() string {
+	if len(c.DenySet.V6DenyCIDRs) == 0 {
+		return NewDefaultDenySet().V6CommaSet()
+	}
+	return c.DenySet.V6CommaSet()
 }
 
 // forwardConnlimitRule emits a single-element argv (or nothing when the
@@ -337,34 +412,72 @@ func (c Config) forwardChainPolicy() string {
 	return nftPolicyDrop
 }
 
-// forwardAllowlistRule (ADR-031) emits the per-app outbound IP
-// allowlist accept rule, or nil when EgressAllowlist is empty (so
-// current behaviour — chain-policy accept — stays the default for
-// any vmmd that hasn't been wired or any app that didn't PATCH the
-// list). Shape:
+// ForwardAllowlistRule (ADR-031 + ADR-032, tier-2 PR-B: also used
+// from pkg/fcvm.Manager.UpdateEgressAllowlist for in-place netns
+// patches) emits the IPv4 half of the per-app outbound IP
+// allowlist accept rule, or nil when EgressAllowlist is empty or
+// contains no v4 entries (so current behaviour — chain-policy
+// accept — stays the default for any vmmd that hasn't been wired,
+// any app that didn't PATCH the list, or any list that holds only
+// v6 entries — the v6 half is emitted by ForwardAllowlistRule6).
+// Shape:
 //
 //	nft add rule ip faas forward
 //	  iifname "tap0" ip daddr { CIDR1,CIDR2,… } accept
 //
 // The CIDR set uses comma-joined values inside `{ … }` with NO
 // trailing whitespace, matching the modern-nft syntax gate at
-// pkg/netns/policy.go (PR #128's comma-required regression net).
-// Order in the chain: AFTER lateral-movement deny + SMTP drops
-// (deny > allow on overlap), BEFORE chain-default accept
-// (unlisted destinations drop when an allowlist exists).
+// pkg/netns/policy.go (PR #128's comma-required regression net —
+// memory `nft-cidr-set-comma-required`). Order in the v4 chain:
+// AFTER lateral-movement deny + SMTP drops (deny > allow on
+// overlap), BEFORE chain-default accept (unlisted destinations
+// drop when an allowlist exists on the v4 chain).
 //
-// Internal to NftCommands — do not invoke from anywhere else.
-func (c Config) forwardAllowlistRule(nft func(...string) []string) []string {
-	if len(c.EgressAllowlist) == 0 {
+// Exported because Manager.UpdateEgressAllowlist renders the same
+// argv against a live netns (in-place patch) using a per-netns
+// `nft` builder; the internal NftCommands path also calls it via
+// the closure it threads.
+func (c Config) ForwardAllowlistRule(nft func(...string) []string) []string {
+	var v4 []string
+	for _, p := range c.EgressAllowlist {
+		if p.Addr().Is4() {
+			v4 = append(v4, p.String())
+		}
+	}
+	if len(v4) == 0 {
 		return nil
 	}
-	parts := make([]string, 0, len(c.EgressAllowlist))
-	for _, p := range c.EgressAllowlist {
-		parts = append(parts, p.String())
-	}
-	daddr := strings.Join(parts, ",")
 	return nft("add", "rule", "ip", "faas", "forward",
-		"iifname", c.Tap, "ip", "daddr", "{", daddr, "}", "accept")
+		"iifname", c.Tap, "ip", "daddr", "{", strings.Join(v4, ","), "}", "accept")
+}
+
+// ForwardAllowlistRule6 (ADR-032 — v6 mirror of ForwardAllowlistRule;
+// tier-2 PR-B: also called from pkg/fcvm.Manager.UpdateEgressAllowlist
+// for the in-place v6 patch) emits the per-app outbound IPv6
+// allowlist accept rule, or nil when EgressAllowlist is empty or
+// contains no v6 entries. Same shape as the v4 helper but with
+// the `ip6` family keyword and the `ip6 faas forward` chain (nft
+// rejects mixing `ip` and `ip6 daddr` matches in one table —
+// ADR-023). Order in the v6 chain: AFTER the v6 lateral-movement
+// deny (deny > allow on overlap), BEFORE chain-default accept
+// (unlisted destinations drop when an allowlist exists on the v6
+// chain).
+//
+// Exported for the same reason as ForwardAllowlistRule: the live
+// in-place patch path runs against the same argv shape, just on
+// a different netns.
+func (c Config) ForwardAllowlistRule6(nft func(...string) []string) []string {
+	var v6 []string
+	for _, p := range c.EgressAllowlist {
+		if !p.Addr().Is4() {
+			v6 = append(v6, p.String())
+		}
+	}
+	if len(v6) == 0 {
+		return nil
+	}
+	return nft("add", "rule", "ip6", "faas", "forward",
+		"iifname", c.Tap, "ip6", "daddr", "{", strings.Join(v6, ","), "}", "accept")
 }
 
 // NftResetCommands returns the best-effort argv list that brings the

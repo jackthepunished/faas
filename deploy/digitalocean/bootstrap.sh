@@ -56,10 +56,28 @@ apt-get install -y -qq postgresql postgresql-contrib libpq-dev \
 ok "Packages installed"
 
 # ─── 2. Go toolchain ─────────────────────────────────────────────────────────
+# SHA-256 pinned (issue #193): bumping GO_VERSION requires bumping
+# GO_SHA256_LINUX_AMD64 at the same time, in the same commit. Fetch the new
+# value from https://go.dev/dl/?mode=json&include=all (filter os=linux,
+# arch=amd64, kind=archive) and paste it verbatim. The script refuses to
+# install on a mismatch — same fail-loud contract as the EX44 ansible binary
+# pin pattern (deploy/ansible/roles/firecracker/tasks/main.yml) and the CI
+# vacuum pin (.github/workflows/ci.yml). A backdoored Go on a fresh box
+# compiles every production daemon; the pin is the only thing standing
+# between a go.dev CDN compromise and root.
 step "Installing Go toolchain"
 GO_VERSION="1.25.7"
+GO_SHA256_LINUX_AMD64="12e6d6a191091ae27dc31f6efc630e3a3b8ba409baf3573d955b196fdf086005"
 if ! command -v go &>/dev/null || [[ "$(go version)" != *"go${GO_VERSION}"* ]]; then
-  curl -sSfL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf -
+  GO_TARBALL="/tmp/go${GO_VERSION}.linux-amd64.tar.gz"
+  echo "→ downloading https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+  curl --fail --silent --show-error --location --output "$GO_TARBALL" \
+    "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+  echo "→ verifying SHA-256"
+  echo "${GO_SHA256_LINUX_AMD64}  ${GO_TARBALL}" | sha256sum --check --strict
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$GO_TARBALL"
+  rm -f "$GO_TARBALL"
   ln -sf /usr/local/go/bin/go /usr/local/bin/go
   ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 fi

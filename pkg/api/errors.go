@@ -101,19 +101,24 @@ func (p *Problem) WithDocs(url string) *Problem {
 // Stable error codes (spec Appendix A, UX spec §7). Keep in sync with docs and
 // the CLI's exit-code mapping.
 const (
-	CodePlanLimitApps     = "plan_limit_apps"
-	CodePlanLimitRAM      = "plan_limit_ram"
-	CodePlanLimitConcur   = "plan_limit_concurrency"
-	CodeSourceTooLarge    = "source_too_large"
-	CodeSourceInvalid     = "source_invalid"
-	CodeAppLayerTooBig    = "app_layer_too_large"
-	CodeBuildUndetected   = "build_undetected"
-	CodeBuildOOM          = "build_oom"
-	CodeBuildTimeout      = "build_timeout"
-	CodeQuotaExhausted    = "quota_exhausted"
-	CodeBillingPastDue    = "billing_past_due"
-	CodeCapacity          = "capacity_unavailable"
-	CodeUnauthorized      = "unauthorized"
+	CodePlanLimitApps   = "plan_limit_apps"
+	CodePlanLimitRAM    = "plan_limit_ram"
+	CodePlanLimitConcur = "plan_limit_concurrency"
+	CodeSourceTooLarge  = "source_too_large"
+	CodeSourceInvalid   = "source_invalid"
+	CodeAppLayerTooBig  = "app_layer_too_large"
+	CodeBuildUndetected = "build_undetected"
+	CodeBuildOOM        = "build_oom"
+	CodeBuildTimeout    = "build_timeout"
+	CodeQuotaExhausted  = "quota_exhausted"
+	CodeBillingPastDue  = "billing_past_due"
+	CodeCapacity        = "capacity_unavailable"
+	CodeUnauthorized    = "unauthorized"
+	// CodeForbidden is returned when the authenticated principal lacks
+	// the scope required by the route (IAM-1, ADR-034). Distinct from
+	// CodeUnauthorized so a customer can tell "I need to log in" from
+	// "my key does not have permission for this endpoint".
+	CodeForbidden         = "insufficient_scope"
 	CodeNotFound          = "not_found"
 	CodeValidation        = "validation_failed"
 	CodeConflict          = "conflict"
@@ -559,14 +564,16 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
 }
 
-// ErrInvalidEgressAllowlist (ADR-031) is a 400 for entries that don't
-// ParsePrefix as a v4 CIDR. The detail names the offending entry so an
-// operator triaging a rejected PATCH sees exactly which line is bad.
-// v6 attempts land here too (v1 is v4 only; v6 mirror is a future ADR).
+// ErrInvalidEgressAllowlist (ADR-031 + ADR-032) is a 400 for
+// entries that don't ParsePrefix as a v4 or v6 CIDR, or that
+// have masklen /0. The detail names the offending entry so an
+// operator triaging a rejected PATCH sees exactly which line is
+// bad. ADR-032 — v6 entries are accepted alongside v4 entries;
+// the non-/0 contract is shared with the DB trigger.
 func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeInvalidEgressAllowlist,
 		"Invalid egress allowlist entry",
-		fmt.Sprintf("entry %q is not a valid IPv4 CIDR: %v.", entry, reason)).
+		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
 }
 
@@ -636,4 +643,28 @@ func ErrInvocationNotFound(id string) *Problem {
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
 		WithDocs("https://docs.DOMAIN/event-driven#invocations")
+}
+
+// ErrLongPollTimeout is returned by the long-poll handlers (sync
+// invoke, queueReceive) when the server-side wait budget ran out.
+// Distinct code so the CLI can retry transparently — a 504 Gateway
+// Timeout would force the customer to disambiguate "server is down"
+// from "no event yet, retry". The HTTP status is 504 (the SLO is
+// server-side); the body type is the only ordering.
+func ErrLongPollTimeout() *Problem {
+	return NewProblem(http.StatusGatewayTimeout, "long_poll_timeout",
+		"Long-poll wait budget ran out",
+		"the server waited for the configured long-poll window and the event did not arrive; retry.").
+		WithDocs("https://docs.DOMAIN/event-driven#long-poll")
+}
+
+// ErrInvalidScheduledAt is returned when a delayed-task POST carries a
+// scheduled_at that is in the past (or zero). The handler uses time.Now()
+// as the source of truth so a clock-skewed client gets a 400 rather than
+// a row that fires immediately on insert.
+func ErrInvalidScheduledAt() *Problem {
+	return NewProblem(http.StatusBadRequest, "invalid_scheduled_at",
+		"Invalid scheduled_at",
+		"scheduled_at must be a future timestamp; the server clock rejected the value").
+		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
 }

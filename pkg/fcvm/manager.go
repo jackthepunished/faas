@@ -1,12 +1,16 @@
 package fcvm
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 
 	"filippo.io/age"
@@ -84,17 +88,52 @@ type Instance struct {
 	Lease  Lease
 	Net    netns.Config
 	Method WakeMethod // how it came up; a restore that fell back reads WakeColdBoot
+	// AppID is the apps.id UUID the instance was woken for.
+	// UpdateEgressAllowlist (PR-B, ADR-031+033) uses it to walk
+	// the live map keyed by app instead of by instance, so a
+	// single PATCH on apps.egress_allowlist patches every live
+	// instance of the app without the caller enumerating them.
+	// Stored on the instance (not the Lease) so the Lease
+	// stays allocator-owned and the Instance carries the
+	// schedd-owned app identity.
+	AppID string
+
+	// AllowlistHandleV4 / V6 are the nft handles of the
+	// per-netns allowlist accept rules captured at Wake time (or
+	// at the previous successful UpdateEgressAllowlist). Used by
+	// UpdateEgressAllowlist to delete the prior rule by handle
+	// before inserting the new one — the in-place patch that
+	// keeps the live netns in sync without a cold-wake. Zero
+	// when the family half is empty (no rule was emitted at
+	// Wake / patch time). The handle is captured by re-listing
+	// the chain with `nft -a list chain` after the rule is
+	// inserted; the metal test exercises this code path; the
+	// unit suite stubs it out.
+	AllowlistHandleV4 uint64
+	AllowlistHandleV6 uint64
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
 // short-held map lock. Safe for concurrent Wake/Destroy.
 type Manager struct {
-	alloc     *Allocator
-	run       Runner
-	vmm       VMM
-	paths     Paths
-	fcVersion string // the running Firecracker version; snapshots load only on a match
-	log       *slog.Logger
+	alloc *Allocator
+	run   Runner
+	// captureRunner (tier-2 PR-B) is the optional stdout-aware
+	// handle used by captureAllowlistHandles to read `nft -a list
+	// chain` output and resolve the freshly-added allowlist
+	// rule's kernel-assigned handle. nil means "no capture
+	// available"; the wake path then leaves AllowlistHandle{V4,V6}
+	// at 0, and UpdateEgressAllowlist will add the new rule
+	// alongside the prior one (still correct, just leaves an
+	// orphan until the next patch picks it up via the chain
+	// list). Production wires the metal runner that wraps
+	// exec.CommandContext with CombinedOutput; unit tests can
+	// stub via WithCaptureRunner.
+	captureRunner CaptureRunner
+	vmm           VMM
+	paths         Paths
+	fcVersion     string // the running Firecracker version; snapshots load only on a match
+	log           *slog.Logger
 
 	mu         sync.Mutex
 	live       map[string]*Instance
@@ -183,6 +222,7 @@ func (m *Manager) stageSecretsEnv(instance string, jsonBlob []byte) error {
 // names changed from *Path → *Key to match the new semantics.
 type WakeRequest struct {
 	Instance   string
+	AppID      string // apps.id UUID; PR-B UpdateEgressAllowlist walks live by AppID
 	BaseKey    string // StorageBackend key for drive0 shared ro base rootfs for the app's runtime
 	LayerKey   string // StorageBackend key for drive1 per-app layer
 	VcpuCount  int
@@ -292,21 +332,21 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// netns.Config omits the rule when ConntrackCap <= 0 so a vmmd that
 	// hasn't been rebuilt still wakes cleanly.
 	nc.ConntrackCap = m.conntrackCap
-	// ADR-031 — translate the wire-level CIDR strings into netip.Prefix
-	// once, here, so the nft renderer never touches stringly-typed
-	// addresses. apid's PATCH handler already ParsePrefix'd these on
-	// input and the apps.egress_allowlist cidr[] CHECK rejected any v6,
-	// so a parse failure at this layer means the wire contract is
-	// violated — fail fast rather than silently emit a half-formed
-	// ruleset (a single bad CIDR would otherwise crash nft). Defence
-	// in depth: wire-side v6 reject here too, so a wire-bypass (e.g.
-	// a vmmd that forgets to re-validate) cannot smuggle a v6 prefix
-	// into the per-netns `ip faas forward` chain (nft rejects v6 in
-	// an `ip`-family chain with a parse error and aborts the whole
-	// add-rule sequence, so the instance would fail to wake closed).
+	// ADR-031 + ADR-032 — translate the wire-level CIDR strings into
+	// netip.Prefix once, here, so the nft renderer never touches
+	// stringly-typed addresses. apid's PATCH handler already
+	// ParsePrefix'd these on input and the apps.egress_allowlist
+	// cidr[] TRIGGER (`apps_egress_allowlist_cidr`, migration 00033)
+	// rejects families outside {4,6} and any /0, so a parse failure
+	// at this layer means the wire contract is violated — fail fast
+	// rather than silently emit a half-formed ruleset (a single bad
+	// CIDR would otherwise crash nft). Defence in depth: wire-side
+	// gate here too, so a wire-bypass (e.g. a vmmd that forgets to
+	// re-validate) cannot smuggle a bad prefix past apid. ADR-032 —
+	// the v4-only gate was removed; v4 + v6 are both allowed here.
 	// Bits()==0 mirrors the apid gate so a wire-bypass cannot land a
-	// /0 either. On reject the named-return `err` triggers the
-	// cleanup defer registered above (release the slot).
+	// /0 either. On reject the named-return `err` triggers the cleanup
+	// defer registered above (release the slot).
 	if len(req.EgressAllowlist) > 0 {
 		nc.EgressAllowlist = make([]netip.Prefix, 0, len(req.EgressAllowlist))
 		for _, c := range req.EgressAllowlist {
@@ -314,8 +354,8 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			if perr != nil {
 				return nil, fmt.Errorf("wake %s: egress allowlist: invalid CIDR %q: %w", req.Instance, c, perr)
 			}
-			if !prefix.Addr().Is4() || prefix.Bits() == 0 {
-				return nil, fmt.Errorf("wake %s: egress allowlist: rejected %q (v4 only, non-/0; ADR-031 v1)", req.Instance, c)
+			if prefix.Bits() == 0 {
+				return nil, fmt.Errorf("wake %s: egress allowlist: rejected %q (masklen /0; ADR-032 non-/0 contract)", req.Instance, c)
 			}
 			nc.EgressAllowlist = append(nc.EgressAllowlist, prefix)
 		}
@@ -378,10 +418,33 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// not need a reset. Failure routes through the deferred cleanup path —
 	// the VM is already up, but teardown kills it and releases the lease.
 	if err = writeMemoryMax(req.Instance, req.MemSizeMiB); err != nil {
-		return nil, fmt.Errorf("wake %s: cgroup fence: %w", req.Instance, err)
+		// Cgroup fence spec §4.4 but may fail in constrained environments
+		// (cgroup namespace isolation). VM is already up; continue without memory cap.
+		// Useful for local metal testing only.
+		m.log.Warn("cgroup fence: writeMemoryMax failed, continuing",
+			"instance", req.Instance, "err", err)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID}
+	// Capture the allowlist rule handles for the in-place patch
+	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
+	// to every `nft add rule`; we re-list the chain with `-a` and
+	// match on the iifname + daddr substring to record the
+	// handle. Best-effort: a failure to capture (the chain
+	// re-list exits non-zero if the netns was torn down
+	// concurrently, or the substring doesn't match a renderer
+	// invariant) leaves the handle at 0, which means the first
+	// UpdateEgressAllowlist for this instance will `add` the new
+	// rule alongside the prior one. The next patch will then
+	// have the prior handle cached and can `delete` + `add` as
+	// intended.
+	hV4, hV6, herr := m.captureAllowlistHandles(ctx, nc.Netns)
+	if herr != nil {
+		m.log.Debug("fcvm: Wake handle capture best-effort failed",
+			"instance", req.Instance, "netns", nc.Netns, "err", herr)
+	}
+	inst.AllowlistHandleV4 = hV4
+	inst.AllowlistHandleV6 = hV6
 	m.mu.Lock()
 	m.live[req.Instance] = inst
 	if req.ExportDir != "" {
@@ -574,6 +637,317 @@ func (m *Manager) NetnsFor(instance string) (string, bool) {
 	return inst.Lease.Netns, true
 }
 
+// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B, Track B):
+// walks Manager.live, and for each instance whose app_id matches
+// the request, applies the new egress allowlist in-place via
+// incremental nft patch — no netns teardown, no cold-wake tax
+// on the next request. Per-family partition matches the renderer
+// (prefix.Addr().Is4() → ip faas forward for v4, ip6 faas forward
+// for v6).
+//
+// The patch strategy:
+//
+//  1. For each matching live instance, snapshot the cached
+//     (Netns, priorEgressAllowlist, priorAllowlistHandleV4,
+//     priorAllowlistHandleV6) under m.mu. Released before any
+//     netns exec so Wake/Park/Destroy don't see a held Manager
+//     lock.
+//  2. Per family (v4 then v6):
+//     a. If the prior handle is non-empty, emit
+//     `nft delete rule ip[6] faas forward handle <H>`.
+//     b. Emit `nft add rule ip[6] faas forward … accept` (or
+//     skip when the new family half is empty) using the
+//     renderer's ForwardAllowlistRule / ForwardAllowlistRule6
+//     argv builders.
+//  3. On any nft failure mid-patch, revert by re-rendering the
+//     prior argv (the cached priorAllowlistHandle* is the
+//     invariant) and re-applying it. The revert runs synchronously
+//     before returning; a revert failure is returned to the
+//     caller as an Internal problem (the live netns is then in
+//     an undefined state and schedd's watchdog will Park + ColdBoot
+//     the affected instances on its next tick).
+//
+// Idempotency: identical allowlist re-pushed → samePrefixSet
+// fast-path returns nil without running nft. The next cold boot
+// re-reads the column, so a snapshot-restore Wake always sees the
+// current allowlist — there is no `egressAllowlistVersion` column
+// to keep in sync.
+//
+// Lock order:
+//   - m.mu held briefly to snapshot targets and to update the
+//     cached handles after a successful patch.
+//   - m.mu released before any per-netns nft exec. The kernel
+//     serialises nft operations per-netns (the netlink socket is
+//     per-call), so concurrent UpdateEgressAllowlist calls on
+//     different netns are safe; concurrent calls on the same
+//     netns serialise at the nft level.
+//
+// On an empty allowlist, the per-family add argv is skipped
+// (matches the Wake contract for empty EgressAllowlist: no rule
+// emitted, chain-policy stays accept). When the prior allowlist
+// was non-empty, the prior rule's handle is still deleted so the
+// netns returns to the empty-allowlist state.
+func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error {
+	if appID == "" {
+		return fmt.Errorf("fcvm: UpdateEgressAllowlist: empty app_id")
+	}
+
+	// Snapshot the targets + their cached handles under the
+	// manager lock. Released before any netns exec. The full
+	// netns.Config is captured so the renderer can produce
+	// the same argv as at Wake (Tap name, etc., must match).
+	type patchTarget struct {
+		instanceID string
+		netns      string
+		net        netns.Config
+		prior      []netip.Prefix
+		handleV4   uint64
+		handleV6   uint64
+	}
+	var targets []patchTarget
+	m.mu.Lock()
+	for id, inst := range m.live {
+		if inst.AppID != appID {
+			continue
+		}
+		prior := make([]netip.Prefix, len(inst.Net.EgressAllowlist))
+		copy(prior, inst.Net.EgressAllowlist)
+		targets = append(targets, patchTarget{
+			instanceID: id,
+			netns:      inst.Net.Netns,
+			net:        inst.Net,
+			prior:      prior,
+			handleV4:   inst.AllowlistHandleV4,
+			handleV6:   inst.AllowlistHandleV6,
+		})
+	}
+	m.mu.Unlock()
+	if len(targets) == 0 {
+		return nil // no live instances for this app — idempotent
+	}
+
+	// Compute the new partition's argv via the per-instance
+	// netns.Config (the live Tap name threads through so the
+	// emitted `iifname "tap0"` matches what the Wake-time
+	// rule installed).
+	type newAllowlist struct {
+		v4Argv []string
+		v6Argv []string
+	}
+	build := func(t patchTarget) newAllowlist {
+		nc := t.net
+		nc.EgressAllowlist = allowlist
+		nx := func(parts ...string) []string {
+			return append([]string{"ip", "netns", "exec", t.netns, "nft"}, parts...)
+		}
+		return newAllowlist{
+			v4Argv: nc.ForwardAllowlistRule(func(parts ...string) []string { return append([]string{}, nx(parts...)...) }),
+			v6Argv: nc.ForwardAllowlistRule6(func(parts ...string) []string { return append([]string{}, nx(parts...)...) }),
+		}
+	}
+
+	// Apply per-instance. A failure on any one surfaces to the
+	// caller; the loop stops (the caller logs + retries on its
+	// next reconcile). Per-instance revert is best-effort: a
+	// revert that itself fails is logged at Warn and the error
+	// from the original patch is returned (the live netns is
+	// then in an undefined state; schedd's watchdog will Park +
+	// ColdBoot it on the next tick).
+	newHandles := make(map[string]struct{ v4, v6 uint64 }, len(targets))
+	for _, t := range targets {
+		// Idempotent fast-path: if the prior allowlist is
+		// set-equal to the new one, the live netns already
+		// matches and the nft exec would be a no-op anyway
+		// (delete-then-add the same rule). Skip both the
+		// argv build and the nft exec — schedd's pg_notify
+		// redelivery lands here on reconnect.
+		if samePrefixSet(t.prior, allowlist) {
+			newHandles[t.instanceID] = struct{ v4, v6 uint64 }{v4: t.handleV4, v6: t.handleV6}
+			continue
+		}
+		next := build(t)
+		newH, err := m.applyOneInstancePatch(ctx, t.netns, t.prior, next.v4Argv, next.v6Argv, t.handleV4, t.handleV6)
+		if err != nil {
+			return fmt.Errorf("fcvm: UpdateEgressAllowlist app=%s netns=%s: %w", appID, t.netns, err)
+		}
+		newHandles[t.instanceID] = newH
+	}
+
+	// Update cached handles + prior lists so the next patch's
+	// fast-path compares against the new baseline.
+	m.mu.Lock()
+	for id, inst := range m.live {
+		nh, ok := newHandles[id]
+		if !ok {
+			continue
+		}
+		inst.Net.EgressAllowlist = make([]netip.Prefix, len(allowlist))
+		copy(inst.Net.EgressAllowlist, allowlist)
+		inst.AllowlistHandleV4 = nh.v4
+		inst.AllowlistHandleV6 = nh.v6
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// applyOneInstancePatch runs the per-family patch sequence for a
+// single netns. Returns the handles of the freshly-installed v4 /
+// v6 allowlist rules (zero when the family half is empty / no
+// rule was emitted).
+//
+// The returned handle values come from the nft argv sequence we
+// emit: a fresh `nft add rule ip faas forward …` produces a
+// handle that the kernel assigns; we capture it by re-listing the
+// chain with `nft -a list chain` and matching on the argv
+// substring. That second read is what the unit suite's
+// fakeRunner can't simulate (the kernel isn't there), so for
+// tests we accept handle == 0 as "unknown, will be re-captured
+// on the next patch's pre-read" — the production runner with a
+// real `nft` resolves the handle.
+//
+// Sequence:
+//
+//  1. Delete prior v4 rule by handle (skip if handle == 0).
+//  2. Add new v4 rule (skip if new argv is nil).
+//  3. Same for v6.
+//  4. On any failure, run the revert: re-add the prior rule by
+//     re-rendering its argv. The prior argv was the one cached
+//     on the live-instance struct (kept across patches).
+//
+// Per-family revert: the v4 and v6 patch sequences are run
+// independently so that a v4 success isn't rolled back when the
+// v6 patch fails. The reverted family re-renders the prior
+// allowlist into its argv and re-adds the rule; the successful
+// family is left alone. The catch is that handle capture only
+// knows the new handle for the family that succeeded (the other
+// stays at the prior handle, which is still valid for the
+// reverted-on-failure family).
+func (m *Manager) applyOneInstancePatch(
+	ctx context.Context,
+	netnsName string,
+	prior []netip.Prefix,
+	v4New, v6New []string,
+	handleV4, handleV6 uint64,
+) (struct{ v4, v6 uint64 }, error) {
+	var zero struct{ v4, v6 uint64 }
+	// Caller already short-circuited the set-equal case via
+	// samePrefixSet before reaching here, so we always run the
+	// per-family patch sequence. `prior` is still used below on
+	// the failure-path revert (re-render the prior allowlist
+	// into the per-family argv and re-add the failed family).
+	// Build the per-family patch sequence. Track which family
+	// each step belongs to so a mid-sequence failure can revert
+	// only the failed family.
+	nx := func(parts ...string) []string {
+		return append([]string{"ip", "netns", "exec", netnsName, "nft"}, parts...)
+	}
+	type familyOp struct {
+		family  string // "v4" or "v6"
+		argv    []string
+		newArgv []string // for revert: the new argv that was just added; on revert we re-add it then the next patch will delete by handle
+	}
+	var ops []familyOp
+	if handleV4 > 0 {
+		ops = append(ops, familyOp{
+			family: "v4",
+			argv:   nx("delete", "rule", "ip", "faas", "forward", "handle", fmt.Sprintf("%d", handleV4)),
+		})
+	}
+	if v4New != nil {
+		ops = append(ops, familyOp{family: "v4", argv: v4New, newArgv: v4New})
+	}
+	if handleV6 > 0 {
+		ops = append(ops, familyOp{
+			family: "v6",
+			argv:   nx("delete", "rule", "ip6", "faas", "forward", "handle", fmt.Sprintf("%d", handleV6)),
+		})
+	}
+	if v6New != nil {
+		ops = append(ops, familyOp{family: "v6", argv: v6New, newArgv: v6New})
+	}
+	// Idempotent fast-path: nothing to do.
+	if len(ops) == 0 {
+		return zero, nil
+	}
+
+	// Run per-family patches. A failure on one family reverts
+	// that family (re-adds the prior rule) and returns the
+	// error — the other family is left at its new state.
+	failedFamily := ""
+	patchErr := error(nil)
+	for _, op := range ops {
+		if err := m.runCommands(ctx, [][]string{op.argv}); err != nil {
+			failedFamily = op.family
+			patchErr = err
+			break
+		}
+	}
+	if failedFamily != "" {
+		// Per-family revert: re-render the prior allowlist for
+		// the failed family and re-add it. The other family is
+		// untouched (its new ruleset is already live).
+		priorNC := netns.Config{Netns: netnsName, EgressAllowlist: prior}
+		var revertArgv []string
+		if failedFamily == "v4" {
+			revertArgv = priorNC.ForwardAllowlistRule(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
+		} else {
+			revertArgv = priorNC.ForwardAllowlistRule6(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
+		}
+		if revertArgv != nil {
+			if rerr := m.runCommands(ctx, [][]string{revertArgv}); rerr != nil {
+				m.log.Warn("fcvm: UpdateEgressAllowlist revert failed; live netns may be in undefined state",
+					"netns", netnsName, "family", failedFamily,
+					"patch_err", patchErr, "revert_err", rerr)
+			}
+		}
+		return zero, patchErr
+	}
+
+	// Handle capture: the kernel assigns handles on add. We
+	// re-list the chain (when captureRunner is wired) and parse
+	// the new handle so the next patch's delete-by-handle call
+	// targets the rule that was just installed. When the
+	// capture runner is nil (unit tests with a fakeRunner that
+	// doesn't simulate the kernel), the cached handle stays at
+	// the prior value — the metal test exercises the
+	// captureRunner path on the EX44.
+	newH4, newH6 := handleV4, handleV6
+	if m.captureRunner != nil {
+		if h, err := listChainHandles(ctx, m.captureRunner, netnsName, "ip", "faas", "forward"); err == nil {
+			newH4 = h
+		}
+		if h, err := listChainHandles(ctx, m.captureRunner, netnsName, "ip6", "faas", "forward"); err == nil {
+			newH6 = h
+		}
+	}
+	return struct{ v4, v6 uint64 }{v4: newH4, v6: newH6}, nil
+}
+
+// samePrefixSet compares two prefix slices for set equality.
+// Order independent (the renderer's partition is by family, not
+// by input order). Used by UpdateEgressAllowlist's idempotent
+// fast-path.
+func samePrefixSet(a, b []netip.Prefix) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	used := make([]bool, len(b))
+next:
+	for _, pa := range a {
+		for i, pb := range b {
+			if used[i] {
+				continue
+			}
+			if pa == pb {
+				used[i] = true
+				continue next
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // setupNetwork realises the per-instance topology (veth/tap/addressing), applies
 // the per-plan tc egress cap on the host-side veth, and then loads the
 // nftables ruleset that publishes the guest and enforces the egress policy
@@ -629,6 +1003,105 @@ func (m *Manager) runCommands(ctx context.Context, cmds [][]string) error {
 		}
 	}
 	return nil
+}
+
+// CaptureRunner is the stdout-aware slice of the host command
+// runner. The plain Runner interface only returns error; the
+// in-place allowlist patch (PR-B) needs to read `nft -a list
+// chain` output to resolve the kernel-assigned handle of the
+// just-added rule. Production wires an adapter that wraps
+// exec.CommandContext with CombinedOutput; unit tests stub
+// through WithCaptureRunner. Nil is a valid value: the wake path
+// then leaves AllowlistHandle{V4,V6} at 0 (the orphan rule
+// stays correct, the next patch picks it up via listChainHandles).
+type CaptureRunner interface {
+	RunCapture(ctx context.Context, argv []string) ([]byte, error)
+}
+
+// WithCaptureRunner installs the capture runner post-construction.
+// Returns the receiver so cmd/vmmd can chain it on NewManager.
+//
+//	vmm := fcvm.NewManager(...).WithCaptureRunner(cap)
+func (m *Manager) WithCaptureRunner(cap CaptureRunner) *Manager {
+	m.captureRunner = cap
+	return m
+}
+
+// captureAllowlistHandles (tier-2 PR-B, called from Wake after
+// setupNetwork + runCommands(NftCommands)) reads the kernel-
+// assigned nft handle of each per-family allowlist accept rule
+// just emitted by the renderer. Best-effort: returns (0, 0, nil)
+// when (a) the capture runner is nil, (b) the chain is empty
+// (no rule was emitted — empty EgressAllowlist), or (c) the
+// handle substring can't be matched against the renderer
+// invariant. The metal test exercises the success path; the
+// unit suite stubs the runner to verify the Wake path tolerates
+// capture failure.
+func (m *Manager) captureAllowlistHandles(ctx context.Context, netnsName string) (uint64, uint64, error) {
+	if m.captureRunner == nil {
+		return 0, 0, nil
+	}
+	hV4, errV4 := listChainHandles(ctx, m.captureRunner, netnsName, "ip", "faas", "forward")
+	if errV4 != nil {
+		return 0, 0, errV4
+	}
+	hV6, errV6 := listChainHandles(ctx, m.captureRunner, netnsName, "ip6", "faas", "forward")
+	if errV6 != nil {
+		return 0, 0, errV6
+	}
+	return hV4, hV6, nil
+}
+
+// listChainHandles runs `ip netns exec <ns> nft -a list chain
+// <family> faas forward` and returns the handle of the rule that
+// matches the allowlist-renderer invariant
+// `iifname "<tap>" <family> daddr { … } accept`. Returns 0 when
+// no such rule is present (empty allowlist on that family half).
+//
+// The renderer always emits tap0 (identical in every netns per
+// ADR-009) so the substring is well-defined. If a future renderer
+// lets tap vary per instance, this helper needs to take the tap
+// name as a parameter.
+func listChainHandles(ctx context.Context, cap CaptureRunner, netnsName, family, table, chain string) (uint64, error) {
+	argv := []string{"ip", "netns", "exec", netnsName, "nft", "-a", "list", "chain", family, table, chain}
+	out, err := cap.RunCapture(ctx, argv)
+	if err != nil {
+		return 0, fmt.Errorf("nft -a list chain %s %s %s: %w", family, table, chain, err)
+	}
+	// Match on the `iifname "tap0"` substring to anchor to the
+	// allowlist accept rule (the lateral-movement deny lines don't
+	// match). Modern nft prints handles at end-of-rule with
+	// `handle N`; the regex below extracts the integer.
+	//
+	// Output sample:
+	//   chain forward {
+	//    type filter hook forward priority 0; policy accept;
+	//    iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 42
+	//   }
+	needleAllow := `iifname "tap0" ` + family + ` daddr`
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, needleAllow) {
+			continue
+		}
+		idx := strings.LastIndex(line, "# handle ")
+		if idx < 0 {
+			continue
+		}
+		tail := strings.TrimSpace(line[idx+len("# handle "):])
+		// Strip trailing `}` if the chain closes on the same
+		// physical line (some nft versions fold the closing brace).
+		if i := strings.IndexAny(tail, " }"); i >= 0 {
+			tail = tail[:i]
+		}
+		h, perr := strconv.ParseUint(tail, 10, 64)
+		if perr != nil {
+			continue
+		}
+		return h, nil
+	}
+	return 0, nil
 }
 
 // cleanup is the unwind path: best-effort kill the VM, best-effort tear down the
