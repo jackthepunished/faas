@@ -34,9 +34,10 @@ type Loop struct {
 	gateway    GatewaySynth
 	now        func() time.Time
 	flowCounts FlowCounter
-	watchdog   *Watchdog  // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention  *Retention // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat  *Heartbeat // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	watchdog   *Watchdog           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention  *Retention          // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat  *Heartbeat          // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	instStats  InstanceStatsPoller // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -74,6 +75,31 @@ func (l *Loop) WithRetention(r *Retention) *Loop {
 // (DefaultHeartbeatInterval = 30s; overridable for tests).
 func (l *Loop) WithHeartbeat(h *Heartbeat) *Loop {
 	l.heartbeat = h
+	return l
+}
+
+// InstanceStatsPoller is the narrow interface the Loop's per-tick
+// instance-stats worker exposes (issue #170 / PR-A). Production
+// wires *instancestats.Poller; tests inject a fake. The interface
+// lives here — not in pkg/sched/instancestats — to avoid the
+// import cycle "instancestats → sched → instancestats" the
+// existing flowcount pattern established (the interface is the
+// contract the Loop reads; the concrete type lives behind it).
+type InstanceStatsPoller interface {
+	Tick(ctx context.Context) error
+	TickInterval() time.Duration
+}
+
+// WithInstanceStats attaches the per-instance metrics poller
+// (issue #170 / PR-A). Same nil-skip semantics as the heartbeat
+// ticker — production wires instancestats.NewPoller(...); tests
+// inject a fake or skip. The interval lives on the poller itself
+// (instancestats.DefaultStatsInterval = 200 ms — 5 Hz, the 250 ms
+// spike-capture acceptance gate). The reader the poller populates
+// is the canonical seam #171 (reaper scale-down bias) and #169
+// (reactive scale-up trigger) will read from.
+func (l *Loop) WithInstanceStats(p InstanceStatsPoller) *Loop {
+	l.instStats = p
 	return l
 }
 
@@ -195,6 +221,39 @@ func (l *Loop) Run(ctx context.Context) error {
 		heartbeatT = time.NewTicker(interval)
 		defer heartbeatT.Stop()
 	}
+	// Instance-stats poller ticker (issue #170 / PR-A). Per-Tick
+	// sweep: enumerate live instances + active compute_nodes,
+	// dial each node fresh, decode Stats, replace the Reader
+	// snapshot, emit the wire rollup. Default cadence
+	// instancestats.DefaultStatsInterval (200 ms — 5 Hz). The
+	// ticker is constructed BEFORE the first Tick (below) so
+	// the first sample lands at t=0 instead of t=Interval — a
+	// documented correction to the heartbeat loop's
+	// "first sample at t=Interval" behaviour. nil poller skips
+	// the ticker entirely (tests + run-without-metrics mode).
+	var instStatsT *time.Ticker
+	if l.instStats != nil {
+		interval := l.instStats.TickInterval()
+		if interval <= 0 {
+			// Defensive: the poller is contract-bound to
+			// return a positive interval, but a test that
+			// injects a stub returning 0 must not hang on
+			// time.NewTicker(0). Fall back to the package
+			// default — the same one the poller would use.
+			interval = 200 * time.Millisecond
+		}
+		instStatsT = time.NewTicker(interval)
+		defer instStatsT.Stop()
+	}
+	// First Tick at t=0 (issue #170 / PR-A). Heartbeat uses
+	// time.NewTicker's "fires immediately on construction" property
+	// to land its first sample at t=0; the stats poller can't rely
+	// on the same — its 200 ms cadence is much shorter and a
+	// spurious first fire would burn a dial cycle on every restart.
+	// Call Tick directly so the first sample lands deterministically.
+	if l.instStats != nil {
+		l.runInstanceStats(ctx)
+	}
 
 	for {
 		select {
@@ -214,6 +273,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runWatchdog(ctx)
 		case <-heartbeatTick(heartbeatT):
 			l.runHeartbeat(ctx)
+		case <-instStatsTick(instStatsT):
+			l.runInstanceStats(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -256,6 +317,18 @@ func heartbeatTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// instStatsTick is the per-instance metrics ticker (issue #170 /
+// PR-A). Same nil-safe shape as the heartbeat ticker: nil ticker
+// ⇒ nil channel, so the select case never fires. Kept separate
+// from heartbeatTick so each ticker type's name shows up in stack
+// traces if a future regression corrupts the channel wiring.
+func instStatsTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
 // runHeartbeat dispatches one sweep of the per-node liveness
 // ticker. Exported as a method so tests can drive a single tick
 // without spinning up Run's goroutine. Tick errors are logged
@@ -264,6 +337,25 @@ func heartbeatTick(t *time.Ticker) <-chan time.Time {
 func (l *Loop) runHeartbeat(ctx context.Context) {
 	if err := l.heartbeat.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		l.log.Warn("heartbeat tick error", "err", err)
+	}
+}
+
+// runInstanceStats dispatches one sweep of the per-instance
+// metrics poller (issue #170 / PR-A). Same shape as runHeartbeat
+// — exported as a method so tests drive a single tick without
+// spinning up Run's goroutine. Tick errors are logged + swallowed
+// (a partial sweep is still useful; the next tick has a fresh
+// chance). The nil guard mirrors runHeartbeat's defensiveness
+// even though Run's ticker construction gates instStatsT to nil
+// when the poller is absent — keeping the helper panic-safe
+// means tests can call it directly on a bare Loop without
+// tripping an unhelpful nil pointer dereference.
+func (l *Loop) runInstanceStats(ctx context.Context) {
+	if l.instStats == nil {
+		return
+	}
+	if err := l.instStats.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("instance stats tick error", "err", err)
 	}
 }
 
