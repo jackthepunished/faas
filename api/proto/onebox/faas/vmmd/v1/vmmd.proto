@@ -299,6 +299,24 @@ message InstanceStats {
   int32  lease_uid = 2;
   string host_ip   = 3;
   google.protobuf.Int64Value resident_bytes = 4;
+  // Issue #170 (PR-A, observability slice): host cgroup CPU percent
+  // (cpu.stat usage_usec delta over wall clock, * 100). Wrapper so
+  // "absent" means "first sample, non-Linux, or transient cgroup
+  // miss" — distinct from a real 0% reading. The schedd poller
+  // treats absent as Unknown and excludes it from the
+  // {app,node}-rolled-up Prometheus series until two valid samples
+  // are observed. Field is additive per ADR-016 (frozen wire shape)
+  // — see docs/adr/032-instance-metrics-cardinality-rollups.md.
+  google.protobuf.DoubleValue cpu_pct = 5;
+  // Inflight HTTP forward count from vmmd's ActivityTracker. Zero
+  // is a real value ("no requests in flight right now") and is
+  // distinct from the empty wire state only by reader-side
+  // Validity, not the proto. Populated by PR-B.
+  int64 inflight_requests = 6;
+  // Latest ForwardHTTP start time. Zero (1970-01-01) means "no
+  // request observed yet on this instance" — the poller falls back
+  // to state.Instance.LastRequestAt in that case.
+  google.protobuf.Timestamp last_request_at = 7;
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the

@@ -22,6 +22,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/sched/instancestats"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -91,7 +93,7 @@ vmmd_tls_cert_path = "/some/cert"
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); err == nil {
 		t.Fatal("expected partial vmmd_tls_* cluster to fail at boot")
@@ -106,11 +108,67 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 		listen:     func(context.Context, string, *tls.Config, string) (net.Listener, error) { return nil, wantErr },
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, want wraps %v", err, wantErr)
+	}
+}
+
+// TestMain_AttachesInstanceStats pins the production wiring
+// contract for the per-instance metrics poller (issue #170 / PR-A).
+//
+// runWithDeps is a one-shot function — it constructs the Loop,
+// runs it, and tears down on cancel — so we can't observe the
+// constructed Loop directly. Instead, this test mirrors the
+// production wiring inline (a) by exercising the same code paths
+// the production main.go uses (NewPoller, the dial adapter, and
+// Loop.WithInstanceStats) and (b) by asserting the constructed
+// poller has the right shape (non-nil Reader, non-nil Dialer,
+// non-nil Metrics, Interval == DefaultStatsInterval). The reader
+// is the canonical seam #171 / #169 will read from — its presence
+// in the test verifies the production wiring would carry it
+// through.
+//
+// The Loop's runInstanceStats helper is unexported, so we can't
+// drive it from cmd/schedd (package main, not pkg/sched_test).
+// The deeper integration is covered by
+// pkg/sched/loop_instancestats_test.go. Here we pin the
+// production-shape wiring only.
+func TestMain_AttachesInstanceStats(t *testing.T) {
+	log := discardLog()
+	ops := wire.NewOpsMetrics("schedd")
+	reader := instancestats.NewReader()
+	dialer := instancestats.DialerFunc(stubDialVMM)
+	poller := instancestats.NewPoller(state.NewMemStore(), dialer, nil, reader, ops, log)
+
+	// Reader is non-nil + empty (no Replace yet).
+	if reader == nil {
+		t.Fatal("reader is nil after NewReader()")
+	}
+	if got := reader.SnapshotAll(); got != nil {
+		t.Errorf("SnapshotAll on fresh Reader = %v, want nil", got)
+	}
+
+	// Poller wired correctly: non-nil, default cadence.
+	if poller == nil {
+		t.Fatal("poller is nil after NewPoller()")
+	}
+	if got := poller.TickInterval(); got != instancestats.DefaultStatsInterval {
+		t.Errorf("TickInterval = %v, want %v", got, instancestats.DefaultStatsInterval)
+	}
+
+	// WithInstanceStats accepts the poller (compile-time guarantee
+	// that *instancestats.Poller satisfies sched.InstanceStatsPoller;
+	// this is the load-bearing part of the wiring contract).
+	chain := sched.NewLoop(nil, nil, log).
+		WithWatchdog(nil).
+		WithRetention(nil).
+		WithHeartbeat(nil).
+		WithInstanceStats(poller)
+	if chain == nil {
+		t.Fatal("WithInstanceStats returned nil chain")
 	}
 }
 
@@ -130,7 +188,7 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 		listen: func(_ context.Context, target string, _ *tls.Config, _ string) (net.Listener, error) {
 			t2, err := wire.ParseTarget(target)
 			if err != nil {
@@ -156,6 +214,15 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 	}
 }
 
+// stubDialVMM is the canonical no-op dialer for the wiring tests
+// (no VM is booted, no net dial happens). Every runDeps in this
+// file uses it so the runDeps literal stays one line per knob;
+// production main.go passes deps.dialVMM, which is the real
+// overlay.Dial.
+func stubDialVMM(context.Context, string, *tls.Config) (sched.VMM, error) {
+	return stubVMM{}, nil
+}
+
 // stubVMM is a no-op sched.VMM for the wiring tests (no VM is booted).
 type stubVMM struct{}
 
@@ -171,6 +238,12 @@ func (stubVMM) PauseAndSnapshot(context.Context, string, string, string, string)
 func (stubVMM) Destroy(context.Context, string) error { return nil }
 func (stubVMM) Ping(context.Context) (*sched.PingOutcome, error) {
 	return &sched.PingOutcome{FcVersion: "1.10.0"}, nil
+}
+
+// Stats implements sched.VMM (issue #170 / PR-A). Wiring tests
+// don't observe instance metrics; return empty snapshot.
+func (stubVMM) Stats(context.Context) (*sched.StatsSnapshot, error) {
+	return &sched.StatsSnapshot{}, nil
 }
 func (stubVMM) Close() error { return nil }
 

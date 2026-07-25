@@ -183,6 +183,15 @@ func (f *fakeVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0", ServerTime: time.Now()}, nil
 }
 
+// Stats implements RoutedVMM (issue #170 / PR-A). Engine tests do
+// not assert on Stats contents — the instancestats poller's own
+// tests cover that. Returns the empty snapshot; tests that want
+// the engine to "see" instance metrics don't need them yet (the
+// engine never reads them in PR-A).
+func (f *fakeVMM) Stats(_ context.Context, _ string) (*StatsSnapshot, error) {
+	return &StatsSnapshot{}, nil
+}
+
 // UpdateEgressAllowlist (tier-2 PR-B) — engine tests don't drive
 // the egress drift path; the egress_drift_test.go suite does.
 // Records nothing. Returning nil keeps the gRPC VmmdAPI /

@@ -26,6 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
+	"github.com/onebox-faas/faas/pkg/sched/instancestats"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -304,6 +305,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// the wiring without waiting 30s for production cadence.
 		hb.Interval = deps.heartbeatInterval
 	}
+	// PR-A observability slice (issue #170): per-{app,node} instance
+	// stats poller. Builds a Reader (the canonical seam #171 reaper
+	// and #169 scale-up will read from), wires the Poller with the
+	// same deps.dialVMM the heartbeat uses (so dial churn is bounded
+	// by the dialer — same pattern PR #120 established), and
+	// attaches it via WithInstanceStats. The Reader is intentionally
+	// NOT threaded to the reaper or any policy consumer today —
+	// that's #171 / #169's job. PR-A keeps the reader as the only
+	// public surface.
+	reader := instancestats.NewReader()
+	statsPoller := instancestats.NewPoller(
+		store,
+		instancestats.DialerFunc(deps.dialVMM),
+		vmmTLS,
+		reader,
+		ops,
+		log,
+	)
 	// Issue #169 / #172: per-app reactive scale-up trigger.
 	// Reads apps.autoscale_target_* + Ledger.Concurrency every
 	// cfg.ScaleUpInterval (default 1s); admits another instance
@@ -321,7 +340,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// than cfg.RetentionDuration (defaults to api.DefaultInstanceRetention
 		// when zero). Ticker fires at api.DefaultRetentionInterval (1h).
 		WithRetention(sched.NewRetention(store, log).WithRetention(time.Duration(cfg.RetentionDuration))).
-		WithHeartbeat(hb)
+		WithHeartbeat(hb).
+		WithInstanceStats(statsPoller)
 	if cfg.GatewayMetricsURL != "" {
 		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
 		trigger := scaleup.New(
