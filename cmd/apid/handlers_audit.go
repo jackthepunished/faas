@@ -113,7 +113,14 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrCapacity("could not list audit events"))
 		return
 	}
-	out := make([]api.AuditEventResponse, 0, limit)
+	// Cap the backing array at listAuditEventsLimitMax (the same bound
+	// the request handler applies to ?limit=…) regardless of the
+	// caller-supplied limit value. This keeps the allocation shape
+	// constant for CodeQL's taint analysis — the previous `make(..., 0,
+	// limit)` form was flagged by codeql go/allocation-rule because
+	// `limit` is a parsed query-string value the analysis can't bound.
+	// Limit the audit-events list response to listAuditEventsLimitMax rows.
+	out := make([]api.AuditEventResponse, 0, listAuditEventsLimitMax)
 	for _, e := range rows {
 		if !since.IsZero() && e.At.Before(since) {
 			continue
