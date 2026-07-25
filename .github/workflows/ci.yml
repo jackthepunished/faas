@@ -447,6 +447,30 @@ jobs:
       - name: migrations apply-and-walk
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
 
+  sqlc-check:
+    # Drift gate between pkg/state/queries.sql (sqlc source of truth)
+    # and the generated pkg/state/sqlc/* baseline (issue #125). Mirrors
+    # the migrations-check shape: same ubuntu-latest runner, same
+    # setup-go cache, but no Postgres service — sqlc parses the
+    # committed schema.sql statically and generates against a tmpdir
+    # copy of queries.sql + schema.sql + sqlc.yaml. ADR-017 keeps the
+    # PgStore hand-written until M5.1; this gate does NOT yet prove
+    # semantic parity between pgstore.go and queries.sql — it
+    # verifies the generated package stays in sync with the canonical
+    # sqlc source.
+    name: sqlc-check (generated drift)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: sqlc-check
+        run: make sqlc-check
+
   e2e:
     # cmd/e2e harness — boots real daemons (apid + schedd + meterd) as
     # subprocesses and drives them through the production wire (HTTP/

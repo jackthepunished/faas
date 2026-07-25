@@ -199,20 +199,29 @@ SQLC_VER ?= v1.27.0
 
 .PHONY: sqlc
 sqlc: ## Install sqlc at the pinned version
-	@command -v $(SQLC) >/dev/null 2>&1 && $(SQLC) version | grep -q $(SQLC_VER) && echo "sqlc $(SQLC_VER) already installed" && exit 0
-	GOFLAGS='' go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER)
+	@if command -v $(SQLC) >/dev/null 2>&1 && $(SQLC) version | grep -q $(SQLC_VER); then \
+	  echo "sqlc $(SQLC_VER) already installed"; \
+	else \
+	  GOFLAGS='' GOBIN=$$(go env GOPATH)/bin go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER); \
+	fi
 
 .PHONY: sqlc-generate
-sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.sql.go from queries.sql
+sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.go from queries.sql + schema.sql
 	$(SQLC) generate
 
 .PHONY: sqlc-check
-sqlc-check: ## Verify checked-in sqlc output matches what would be regenerated
+sqlc-check: ## CI gate: verify checked-in sqlc output matches what would be regenerated
 	@$(MAKE) sqlc > /tmp/faas-sqlc-check.out 2>&1 || (cat /tmp/faas-sqlc-check.out; exit 1)
-	@tmp=$$(mktemp -d) && cp -R pkg/state/queries.sql sqlc.yaml $$tmp/ && cd $$tmp && $(SQLC) generate >/dev/null 2>&1; \
-	  diff -r pkg/state/sqlc $$tmp/pkg/state/sqlc >/dev/null || \
-	    (echo "sqlc-check: generated sqlc/*.sql.go is out of sync with queries.sql; run 'make sqlc-generate' and commit the diff"; exit 1); \
-	  rm -rf $$tmp
+	@tmp=$$(mktemp -d); \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  mkdir -p "$$tmp/pkg/state"; \
+	  cp sqlc.yaml "$$tmp/"; \
+	  cp pkg/state/queries.sql "$$tmp/pkg/state/"; \
+	  cp schema.sql "$$tmp/"; \
+	  (cd "$$tmp" && $(SQLC) generate) || \
+	    (echo "sqlc-check: sqlc generation failed (see $$tmp for the live generate output)"; exit 1); \
+	  diff -r pkg/state/sqlc "$$tmp/pkg/state/sqlc" || \
+	    (echo "sqlc-check: generated pkg/state/sqlc/*.go is out of sync with queries.sql or schema.sql; run 'make sqlc-generate' and commit the diff"; exit 1)
 	@echo "sqlc-check: OK"
 
 .PHONY: migrate-up
