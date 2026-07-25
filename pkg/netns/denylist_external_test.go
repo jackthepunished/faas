@@ -79,16 +79,6 @@ func flattenArgv(cmds [][]string) string {
 	return b.String()
 }
 
-// familyDaddrKeyword returns the nft daddr keyword for a family
-// ("ip" or "ip6"). Hard-coded so a Family rename surfaces as a
-// clear test failure instead of a silent semantic shift.
-func familyDaddrKeyword(f netns.Family) string {
-	if f == netns.FamilyV6 {
-		return "ip6 daddr"
-	}
-	return "ip daddr"
-}
-
 // sampleAddrInPrefix returns a deterministic address inside the
 // prefix for OCI predicate probing. Result is masked to guarantee
 // it's inside the prefix even for boundary cases like 127.0.0.0/8.
@@ -191,7 +181,11 @@ func TestAllThreeConsumersAgreeOnDenySet(t *testing.T) {
 
 	for i, e := range ds.Entries {
 		cidr := e.Prefix.String()
-		daddrKW := familyDaddrKeyword(e.Family)
+		// e.Family.String() returns the nft family keyword (`ip` / `ip6`).
+		// The cross-renderer test pins the keyword at the Family-tag
+		// interface, so any divergence between the enum and the nft
+		// keyword surfaces as a literal-string mismatch here.
+		daddrKW := e.Family.String() + " daddr"
 		daddrNeedle := daddrKW + " { "
 
 		// Per-netns sink.

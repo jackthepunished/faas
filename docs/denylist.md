@@ -43,6 +43,8 @@ Enforced by all three sinks: per-netns nftables (table `ip faas` / `ip6 faas`, c
 
 These ranges are enforced by the OCI user-space dialer ONLY. They are intentionally NOT in the shared catalog because the host firewall does not need them (no tenant process binds to loopback from the OCI puller, etc.). They are process-level defence-in-depth: if the firewall ever regresses, the user-space check still refuses the dial. Pinned by `pkg/oci/egress_test.go`.
 
+Note: the `0.0.0.0/8` and `127.0.0.0/8` entries are also denied by the `IsLoopback` / `IsUnspecified` predicate in `pkg/oci/egress.go::ipAllowed` (the address-class layer). They are restated here as explicit ranges so the user-space check remains a deny even if the predicate is ever refactored. `192.0.0.0/24`, `198.18.0.0/15`, and `240.0.0.0/4` are NOT covered by the predicate and rely on these entries alone.
+
 ### IPv4 CIDRs (OCI-only)
 
 | CIDR | Source | Rationale | Test pin |

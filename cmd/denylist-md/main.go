@@ -33,53 +33,14 @@ import (
 	"sort"
 
 	"github.com/onebox-faas/faas/pkg/netns"
+	"github.com/onebox-faas/faas/pkg/oci"
 )
 
-// ociOnlyEntry is the OCI-side typed entry shape. We duplicate
-// the five OCI-only entries here rather than export them from
-// pkg/oci because they are intentionally NOT part of the
-// platform-wide catalog — the test for "is this entry in the
-// shared catalog or OCI-only?" must be a code review, not an
-// import. PR-D.
-type ociOnlyEntry struct {
-	cidr    string
-	source  string
-	comment string
-	testPin string
-}
-
-var ociOnlyEntries = []ociOnlyEntry{
-	{
-		cidr:    "0.0.0.0/8",
-		source:  "ADR-034",
-		comment: "unspecified IPv4 source range (defence-in-depth)",
-		testPin: "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied",
-	},
-	{
-		cidr:    "127.0.0.0/8",
-		source:  "ADR-034",
-		comment: "loopback range; OCI puller runs outside tenant netns",
-		testPin: "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied",
-	},
-	{
-		cidr:    "192.0.0.0/24",
-		source:  "ADR-034",
-		comment: "IETF protocol assignments",
-		testPin: "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied",
-	},
-	{
-		cidr:    "198.18.0.0/15",
-		source:  "ADR-034",
-		comment: "benchmarking range",
-		testPin: "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied",
-	},
-	{
-		cidr:    "240.0.0.0/4",
-		source:  "ADR-034",
-		comment: "reserved IPv4 range",
-		testPin: "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied",
-	},
-}
+// ociOnlyTestPin is the regression net for every OCI-only entry.
+// Hard-coded once; the entry set itself is consumed via
+// oci.OCIOnlyDenyCIDRsV4() so the table can never drift from
+// the runtime enforcement path (PR-D review).
+const ociOnlyTestPin = "pkg/oci/egress_test.go::TestIPAllowed_OCIOnlyEntriesDenied"
 
 func main() {
 	if err := run(); err != nil {
@@ -90,7 +51,8 @@ func main() {
 
 func run() error {
 	ds := netns.NewDefaultDenySet()
-	out := render(ds)
+	ociOnly := oci.OCIOnlyDenyCIDRsV4()
+	out := render(ds, ociOnly)
 	if _, err := os.Stdout.WriteString(out); err != nil {
 		return fmt.Errorf("write stdout: %w", err)
 	}
@@ -99,7 +61,10 @@ func run() error {
 
 // render emits the full markdown document. Pure function; no
 // timestamps, no maps iterated without sort, no template strings.
-func render(ds netns.DenySet) string {
+// The OCI-only section is sourced from pkg/oci via the exported
+// accessor (PR-D review) so the artifact can never drift from
+// the runtime enforcement path.
+func render(ds netns.DenySet, ociOnly []netns.DenyEntry) string {
 	var b []byte
 
 	// Header.
@@ -161,13 +126,26 @@ func render(ds netns.DenySet) string {
 	// Section 2: OCI-only client hardening.
 	b = append(b, []byte("## OCI-only client hardening\n\n")...)
 	b = append(b, []byte("These ranges are enforced by the OCI user-space dialer ONLY. They are intentionally NOT in the shared catalog because the host firewall does not need them (no tenant process binds to loopback from the OCI puller, etc.). They are process-level defence-in-depth: if the firewall ever regresses, the user-space check still refuses the dial. Pinned by `pkg/oci/egress_test.go`.\n\n")...)
+	b = append(b, []byte("Note: the `0.0.0.0/8` and `127.0.0.0/8` entries are also denied by the `IsLoopback` / `IsUnspecified` predicate in `pkg/oci/egress.go::ipAllowed` (the address-class layer). They are restated here as explicit ranges so the user-space check remains a deny even if the predicate is ever refactored. `192.0.0.0/24`, `198.18.0.0/15`, and `240.0.0.0/4` are NOT covered by the predicate and rely on these entries alone.\n\n")...)
+
 	b = append(b, []byte("### IPv4 CIDRs (OCI-only)\n\n")...)
 	b = append(b, []byte("| CIDR | Source | Rationale | Test pin |\n")...)
 	b = append(b, []byte("|------|--------|-----------|----------|\n")...)
-	sort.Slice(ociOnlyEntries, func(i, j int) bool { return ociOnlyEntries[i].cidr < ociOnlyEntries[j].cidr })
-	for _, e := range ociOnlyEntries {
+	// Sort by canonical prefix string so the diff stays reviewable.
+	// The entries are typed netns.DenyEntry — SourceADR and Comment
+	// are read directly from the accessor, no second source of truth.
+	// The IsLoopback/IsUnspecified predicate in pkg/oci/egress.go
+	// also denies these ranges at the address-class layer; the
+	// entries here are explicit defence-in-depth so the user-space
+	// check remains a deny even if the predicate is ever refactored.
+	ocr := make([]denyEntryView, 0, len(ociOnly))
+	for _, e := range ociOnly {
+		ocr = append(ocr, denyEntryView{Prefix: e.Prefix.String(), SourceADR: e.SourceADR, Comment: e.Comment})
+	}
+	sort.Slice(ocr, func(i, j int) bool { return ocr[i].Prefix < ocr[j].Prefix })
+	for _, r := range ocr {
 		b = append(b, []byte(fmt.Sprintf("| `%s` | %s | %s | `%s` |\n",
-			e.cidr, e.source, e.comment, e.testPin))...)
+			r.Prefix, r.SourceADR, r.Comment, ociOnlyTestPin))...)
 	}
 
 	return string(b)

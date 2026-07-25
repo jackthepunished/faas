@@ -49,6 +49,20 @@ import (
 // are deliberately NOT in netns.NewDefaultDenySet() — they are
 // process-level hardening, not platform-wide policy, and the
 // host firewall / per-netns renderer do not need them.
+// OCIOnlyDenyCIDRsV4 returns a copy of the OCI-only client-hardening
+// entries as provenance-bearing netns.DenyEntry records. Exported
+// (PR-D feedback) so cmd/denylist-md can consume the typed slice
+// directly instead of maintaining a duplicate literal table — the
+// previous shape had a silent drift surface (a future edit to
+// ociOnlyDenyCIDRsV4 below would not auto-update the generated
+// docs/denylist.md). The accessor returns a copy so the caller
+// cannot mutate the runtime union. Read-only contract.
+func OCIOnlyDenyCIDRsV4() []netns.DenyEntry {
+	out := make([]netns.DenyEntry, len(ociOnlyDenyCIDRsV4))
+	copy(out, ociOnlyDenyCIDRsV4)
+	return out
+}
+
 var ociOnlyDenyCIDRsV4 = []netns.DenyEntry{
 	{
 		Family:    netns.FamilyV4,
