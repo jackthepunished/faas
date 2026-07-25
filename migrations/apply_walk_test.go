@@ -100,13 +100,16 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 
 	// Fresh-install schema pin: a fresh-DB apply must end with the
 	// accounts table carrying provider_customer_id (not
-	// stripe_customer_id) — the rename in 00036 (originally 00035 in
-	// PR #204) is part of the same apply sequence. Catches the
-	// failure mode PR #204 shipped: a hand-edit to migration 00001
-	// that left the rename target column absent on a clean DB,
-	// causing 00036's ALTER TABLE to fail with "column does not
-	// exist". ApplyAndWalk only checked version-table row counts
-	// before; this assertion pins the post-rename schema shape.
+	// stripe_customer_id) — the rename in 00038 (originally 00035 in
+	// PR #204, but slots 35/36/37 are taken on origin/main by
+	// 00035_instances_state_check_realigns.sql /
+	// 00036_api_key_scopes.sql / 00037_app_runtime_go124.sql) is
+	// part of the same apply sequence. Catches the failure mode
+	// PR #204 shipped: a hand-edit to migration 00001 that left
+	// the rename target column absent on a clean DB, causing 00038's
+	// ALTER TABLE to fail with "column does not exist". ApplyAndWalk
+	// only checked version-table row counts before; this assertion
+	// pins the post-rename schema shape.
 	assertColumnRenamed(t, pool, "accounts", "provider_customer_id")
 }
 

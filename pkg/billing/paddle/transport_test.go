@@ -111,7 +111,9 @@ func TestIdempotencyRoundTripper_SkipsNonTransactionsPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if got := inner.captured.Header.Get(IdempotencyKeyHeader); got != "" {
 		t.Errorf("Idempotency-Key header set on /products POST: got %q, want empty", got)
 	}
@@ -137,7 +139,9 @@ func TestIdempotencyRoundTripper_SkipsGETMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if got := inner.captured.Header.Get(IdempotencyKeyHeader); got != "" {
 		t.Errorf("Idempotency-Key header set on GET /transactions: got %q, want empty", got)
 	}
@@ -165,7 +169,9 @@ func TestIdempotencyRoundTripper_NoTransitID_NoHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if got := inner.captured.Header.Get(IdempotencyKeyHeader); got != "" {
 		t.Errorf("Idempotency-Key header set without X-Transit-Id: got %q, want empty", got)
 	}
@@ -276,7 +282,9 @@ func TestIdempotencyRoundTripper_PassThroughPreservesOtherHeaders(t *testing.T) 
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if got := inner.captured.Header.Get("Authorization"); got != "Bearer pdl_test_xxx" {
 		t.Errorf("Authorization header dropped: got %q", got)
 	}

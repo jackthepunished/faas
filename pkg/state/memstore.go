@@ -226,7 +226,7 @@ func NewMemStore() *MemStore {
 		// column to paddle_overage_dedupe; this in-memory mirror
 		// keeps the MemStore parity tests in lockstep.
 		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
-		secrets:             map[secretKey]AppSecret{},
+		secrets:              map[secretKey]AppSecret{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},

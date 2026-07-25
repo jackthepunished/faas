@@ -211,8 +211,8 @@ func flushFnCounter(counter *int, flushErr error) FlushFn {
 // race-tests against this fake are equivalent to race-tests
 // against PgStore under -race.
 type recordingDedupe struct {
-	mu    sync.Mutex
-	rows  map[paddleWindowKey]*paddleWindowRow
+	mu   sync.Mutex
+	rows map[paddleWindowKey]*paddleWindowRow
 	// counters
 	claimCount    int
 	completeCount int
@@ -229,10 +229,10 @@ type paddleWindowKey struct {
 }
 
 type paddleWindowRow struct {
-	completed  bool
-	claimedAt  time.Time
-	claimedBy  string
-	mbSeconds  int64
+	completed bool
+	claimedAt time.Time
+	claimedBy string
+	mbSeconds int64
 }
 
 func newRecordingDedupe(now func() time.Time) *recordingDedupe {
