@@ -389,7 +389,7 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 //
 // CreateKey accepts an explicit scopes slice. Pass nil to preserve the
 // historical "full access" behavior (the server defaults nil to
-// ["admin"]). See ADR-011 for the scope vocabulary.
+// ["admin"]). See ADR-034 for the scope vocabulary.
 func (c *Client) ListKeys(ctx context.Context) ([]APIKeyResponse, error) {
 	var out []APIKeyResponse
 	return out, c.do(ctx, "GET", "/v1/keys", nil, &out)

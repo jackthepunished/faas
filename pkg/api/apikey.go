@@ -64,12 +64,12 @@ func ConstantTimeEqualHash(a, b []byte) bool {
 	return subtle.ConstantTimeCompare(a, b) == 1
 }
 
-// API-key scopes (IAM-1, ADR-011). Every key carries an explicit set of
+// API-key scopes (IAM-1, ADR-034). Every key carries an explicit set of
 // scopes; the apid middleware checks the requested scope on each
 // authenticated route. Unknown scopes are rejected at mint time so a
 // typo cannot masquerade as a permissive scope. `admin` is the legacy
 // "do everything" scope; `read` covers GETs; `write` covers POST/PUT/
-// PATCH/DELETE. See ADR-011 for the rationale.
+// PATCH/DELETE. See ADR-034 for the rationale.
 const (
 	ScopeAdmin = "admin"
 	ScopeRead  = "read"
@@ -92,7 +92,7 @@ func IsValidScope(s string) bool {
 
 // DefaultScopes is the scope set applied when a caller omits scopes on
 // POST /v1/keys. Preserves the legacy "full access" behavior for SDK
-// callers that have not yet learned about scopes. See ADR-011.
+// callers that have not yet learned about scopes. See ADR-034.
 func DefaultScopes() []string {
 	return []string{ScopeAdmin}
 }

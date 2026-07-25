@@ -182,7 +182,7 @@ type Store interface {
 	// API keys.
 	// CreateAPIKey persists a new key row. Scopes is the explicit set of
 	// authorization scopes attached to the key (e.g. "admin", "read",
-	// "write"); see ADR-011. The store does not validate the scope
+	// "write"); see ADR-034. The store does not validate the scope
 	// vocabulary — that is the apid handler's responsibility.
 	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error)
 	DeleteAPIKey(ctx context.Context, accountID, keyID string) error

@@ -115,7 +115,7 @@ const (
 	CodeCapacity        = "capacity_unavailable"
 	CodeUnauthorized    = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
-	// the scope required by the route (IAM-1, ADR-011). Distinct from
+	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
 	// "my key does not have permission for this endpoint".
 	CodeForbidden         = "insufficient_scope"

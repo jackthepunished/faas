@@ -713,13 +713,13 @@ func (s *server) cliAuthSubmitChain(h http.Handler) http.Handler {
 // requireScope wrapper) read it back via principalFrom. Handlers
 // themselves only need the Account and continue to receive it as the
 // third argument, so this change is invisible to the 38 existing
-// accountHandler bodies. See ADR-011.
+// accountHandler bodies. See ADR-034.
 type accountHandler func(w http.ResponseWriter, r *http.Request, acct state.Account)
 
 // principal is the authenticated caller. Key is nil when the caller
 // authenticated via the dashboard session cookie (in which case the
 // caller is implicitly treated as having the "admin" scope by
-// requireScope). See ADR-011.
+// requireScope). See ADR-034.
 type principal struct {
 	Acct state.Account
 	Key  *state.APIKey
@@ -750,6 +750,14 @@ func withPrincipal(ctx context.Context, p principal) context.Context {
 // of the allowed scopes. Session-cookie principals (Key == nil) are
 // implicitly admin. An empty allowed set is a no-op (the caller didn't
 // ask for any scope check, e.g. internal routes).
+//
+// INVARIANT: this helper is called only from requireScope, which
+// guarantees the principal was populated by s.auth. The Key==nil branch
+// relies on that — it short-circuits before consulting allowed, so a
+// direct call here without going through the auth middleware would let
+// unauthenticated requests reach the handler. Callers other than
+// requireScope must guard with principalFrom(...) != (principal{}, true)
+// first.
 func principalHasScope(p principal, allowed []string) bool {
 	if len(allowed) == 0 {
 		return true
@@ -785,7 +793,7 @@ func principalHasScope(p principal, allowed []string) bool {
 // via withPrincipal. The accountHandler that wraps s.auth reads the
 // Account out of the principal; the requireScope wrapper reads the
 // scopes. Session-cookie auth produces a principal with Key == nil
-// (treated as implicit admin by the scope check). See ADR-011.
+// (treated as implicit admin by the scope check). See ADR-034.
 func (s *server) auth(next accountHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok := bearerToken(r)
@@ -839,7 +847,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 //
 // Use api.MethodDefaultScope(r.Method) for the per-method default
 // (read for GET, write for everything else). Add "admin" explicitly to
-// require operator-level access on top of the method default. See ADR-011.
+// require operator-level access on top of the method default. See ADR-034.
 func (s *server) requireScope(allowed ...string) func(accountHandler) accountHandler {
 	return func(next accountHandler) accountHandler {
 		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {

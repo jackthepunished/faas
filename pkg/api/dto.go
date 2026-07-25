@@ -136,7 +136,7 @@ type AccountLimits struct {
 // appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
 // + label + scopes + last_used_at + id are returned thereafter. Scopes is
 // the explicit permission set attached to the key (e.g. ["admin"],
-// ["read"], ["write"]); see ADR-011.
+// ["read"], ["write"]); see ADR-034.
 type APIKeyResponse struct {
 	ID         string   `json:"id"`
 	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
@@ -153,7 +153,7 @@ type APIKeyResponse struct {
 // `{}` so the server's optional-field handling stays in scope. Scopes
 // is the requested permission set; the server validates each entry
 // against the allowed vocabulary (admin, read, write) and defaults to
-// ["admin"] when omitted so existing callers keep full access. See ADR-011.
+// ["admin"] when omitted so existing callers keep full access. See ADR-034.
 type CreateKeyRequest struct {
 	Label  string   `json:"label,omitempty"`
 	Scopes []string `json:"scopes,omitempty"`
@@ -337,7 +337,7 @@ type UsageExportResponse struct {
 // the create response, per §4.2). Only the prefix + label + scopes +
 // timestamps. Scopes is included so the customer's GDPR export carries
 // the full audit trail of which keys had which permissions at the
-// moment of export (ADR-011).
+// moment of export (ADR-034).
 type APIKeyExportResponse struct {
 	ID        string   `json:"id"`
 	Prefix    string   `json:"prefix"`

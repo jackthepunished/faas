@@ -575,7 +575,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if len(scopes) == 0 {
 		// Preserve the legacy "full access" default for callers that
 		// don't yet know about scopes. New SDK releases pass scopes
-		// explicitly. See ADR-011.
+		// explicitly. See ADR-034.
 		scopes = []string{"admin"}
 	}
 	for _, sc := range scopes {

@@ -46,7 +46,7 @@ var eventsChannels = []string{
 // frames until the client disconnects.
 //
 // API-key callers must hold at least the "read" scope; session-cookie
-// callers are implicitly admin. IAM-1, ADR-011.
+// callers are implicitly admin. IAM-1, ADR-034.
 func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		acct, key, ok := resolveEventsCaller(r, s)

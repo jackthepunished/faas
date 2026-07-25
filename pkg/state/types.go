@@ -126,7 +126,7 @@ func (a Account) Active() bool { return a.Status == AccountActive || a.Status ==
 // APIKey is a hashed, account-scoped credential. Scopes is the set of
 // authorization scopes attached to the key (e.g. "admin", "read", "write");
 // the apid middleware checks them on every authenticated request. See
-// ADR-011 and the IAM-1 plan.
+// ADR-034 and the IAM-1 plan.
 type APIKey struct {
 	ID         string
 	AccountID  string

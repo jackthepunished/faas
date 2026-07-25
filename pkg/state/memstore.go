@@ -266,7 +266,7 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 
 // AuthenticateKey mirrors the key+account lookup the apid auth
 // middleware needs. Single lock acquisition; returns ErrNotFound when
-// the hash has no matching key. See ADR-011.
+// the hash has no matching key. See ADR-034.
 func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

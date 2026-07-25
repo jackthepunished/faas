@@ -112,9 +112,11 @@ func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
 // on key_sha256) and to return ErrNotFound when the hash has no matching
 // key (the auth middleware maps that to 401). The account and key are
 // read with two queries in PgStore — the principal is assembled
-// in-process; on a single-account-per-key model a single SQL join would
-// not save a round-trip meaningfully because both queries hit the same
-// UNIQUE index. See ADR-011.
+// in-process. TODO(perf): both queries hit the same UNIQUE index, so
+// collapsing to a single SQL JOIN halves the round-trips on every
+// authenticated request. Not blocking: index hits are fast enough that
+// the perf cost is negligible at current scale. Revisit when auth
+// latency shows up on the dashboard. See ADR-034.
 func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
 	acct, err := s.AccountByKeyHash(ctx, hash)
 	if err != nil {
