@@ -467,6 +467,11 @@ paths:
         `/user/emails`, filters the primary && verified email,
         and signs the user in. Sub-first lookup against
         `oauth_links` enforces the §11 anti-takeover invariant.
+
+        On success, `auth.login` is appended to the events table
+        (ADR-035) with `method=github`, `email=<verified email>`,
+        and `login=<GitHub username>` so the audit dashboard and
+        the corroborating slog line reference one identifier.
       parameters:
         - name: code
           in: query
@@ -483,14 +488,43 @@ paths:
           description: |
             CSRF state token. Must match the `faas_github_state`
             cookie set on the consent redirect. Mismatch returns
-            401 `csrf_mismatch`.
+            400 `csrf_mismatch`.
       responses:
         '302':
           description: |
             Redirect to `WEBSITE_URL` or `/` after a successful
             GitHub OAuth handshake. `Set-Cookie: faas_sid=…` is set.
+        '400':
+          description: |
+            Malformed callback. The `code` field maps to
+            `invalid_state` (no CSRF cookie), `csrf_mismatch`
+            (query `state` does not match the cookie), or
+            `missing_code` (no `code` query param). The
+            `oauth_exchange_failed` code signals the upstream
+            GitHub token exchange returned a non-JSON body
+            (rarely seen post-2024; the handler sends
+            `Accept: application/json`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           description: GitHub account has no primary && verified email.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: |
+            OAuth misconfigured server-side (`GITHUB_CLIENT_ID`
+            or `GITHUB_CLIENT_SECRET` unset). Surfaces as
+            `github_oauth_misconfigured`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: |
+            `github.com/login/oauth/access_token`,
+            `api.github.com/user`, or `api.github.com/user/emails`
+            unreachable. Surfaces as `github_unreachable`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

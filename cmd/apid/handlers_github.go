@@ -165,13 +165,26 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	// application/json variant is documented at
 	// https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps
 	// — without it the response is form-encoded and the JWT-style
-	// token is buried in the body text.
-	tokenResp, err := http.PostForm("https://github.com/login/oauth/access_token", url.Values{
+	// token is buried in the body text. http.PostForm cannot set
+	// request headers, so build the request explicitly with the
+	// Accept header before issuing the POST.
+	form := url.Values{
 		"client_id":     {clientID},
 		"client_secret": {clientSecret},
 		"code":          {code},
 		"redirect_uri":  {redirectURI},
-	})
+	}
+	tokenReq, err := http.NewRequestWithContext(r.Context(),
+		http.MethodPost, "https://github.com/login/oauth/access_token",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		s.log.Error("github oauth token exchange build", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Internal Error", "failed to build token exchange request"))
+		return
+	}
+	tokenReq.Header.Set("Accept", "application/json")
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenResp, err := http.DefaultClient.Do(tokenReq)
 	if err != nil {
 		s.log.Error("github oauth token exchange failed", "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable", "GitHub Unreachable", "token exchange failed"))
@@ -242,6 +255,18 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	})
 
 	s.log.Info("github oauth sign-in successful", "login", logsanitize.Field(githubUser.Login), "account_id", acct.ID)
+
+	// IAM-4 (ADR-035): record the auth.login success. Mirrors the
+	// existing slog line + the Google handler at handlers_google.go:
+	// 228-231 so operators correlating slog and audit see one
+	// identifier. data.login carries the GitHub username (Google has
+	// no equivalent — Google's identity display name comes from the
+	// /userinfo "name" field which is not a stable handle).
+	s.audit.Emit(r.Context(), "auth.login", &acct.ID, map[string]any{
+		"method": "github",
+		"email":  email,
+		"login":  githubUser.Login,
+	})
 
 	redirectTarget := os.Getenv("WEBSITE_URL")
 	if redirectTarget == "" {
