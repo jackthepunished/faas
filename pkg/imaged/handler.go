@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -73,6 +74,13 @@ type Handler struct {
 	// (also a static Go binary, built by Railpack) lives at /app/handler
 	// in the layer and is exec'd per request by the runner.
 	functionRunnerGo124Path string
+	// functionRunnerGo124AlpinePath mirrors functionRunnerGo124Path for
+	// the go124-alpine runtime (FAAS_FUNCTION_RUNNER_GO124_ALPINE). The
+	// runner binary at the wired path is the SAME static Go executable
+	// as go124 — the only difference is the base image's libc
+	// (alpine/musl vs bookworm/glibc). The function layer's argv is
+	// identical to go124.
+	functionRunnerGo124AlpinePath string
 	// deployBaseRefOverride replaces the per-runtime base ref during
 	// aboveBaseLayers. See WithDeployBaseRef — test-only seam.
 	deployBaseRefOverride string
@@ -127,6 +135,15 @@ func (h *Handler) WithFunctionRunnerPython312(p string) *Handler {
 // FAAS_FUNCTION_RUNNER_GO124. Empty in unit tests.
 func (h *Handler) WithFunctionRunnerGo124(p string) *Handler {
 	h.functionRunnerGo124Path = p
+	return h
+}
+
+// WithFunctionRunnerGo124Alpine mirrors WithFunctionRunnerGo124 for the
+// go124-alpine runtime. The runner binary is identical; only the base
+// image's libc differs. Wired from cmd/imaged via
+// FAAS_FUNCTION_RUNNER_GO124_ALPINE.
+func (h *Handler) WithFunctionRunnerGo124Alpine(p string) *Handler {
+	h.functionRunnerGo124AlpinePath = p
 	return h
 }
 
@@ -534,7 +551,7 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// doesn't carry the runtime — keeps older clients working.
 		runtime = dep.Handler
 	}
-	if runtime != RuntimeNode22 && runtime != RuntimePython312 && runtime != RuntimeGo124 {
+	if runtime != RuntimeNode22 && runtime != RuntimePython312 && runtime != RuntimeGo124 && runtime != RuntimeGo124Alpine {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "unsupported runtime: "+runtime)
 		return fmt.Errorf("imaged: unsupported function runtime %q", runtime)
 	}
@@ -594,6 +611,21 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--handler", "/app/handler",
 		}
 	}
+	if runtime == RuntimeGo124Alpine {
+		// Same argv as go124 (bookworm): the runner shim is identical
+		// (guest/runners/go124/main.go), only the base image's libc
+		// differs (musl vs glibc). CGO_ENABLED=0 (Railpack's default)
+		// produces a fully-static binary that runs on both bases.
+		// Customers with cgo bindings must rebuild against
+		// `FROM golang:1.24-alpine AS build` in their Dockerfile —
+		// the libc mismatch surfaces as `exec format error` on first
+		// wake (see docs/runtimes/go124.md failure-mode table).
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/handler",
+		}
+	}
 	if err := manifest.Validate(); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "manifest invalid: "+err.Error())
 		return fmt.Errorf("imaged: validate manifest: %w", err)
@@ -637,6 +669,8 @@ func (h *Handler) runnerPathFor(runtime string) string {
 		return h.functionRunnerPython312Path
 	case RuntimeGo124:
 		return h.functionRunnerGo124Path
+	case RuntimeGo124Alpine:
+		return h.functionRunnerGo124AlpinePath
 	}
 	return ""
 }
@@ -652,6 +686,8 @@ func runtimeToEnvSuffix(runtime string) string {
 		return "PYTHON312"
 	case RuntimeGo124:
 		return "GO124"
+	case RuntimeGo124Alpine:
+		return "GO124_ALPINE"
 	}
 	return runtime
 }
@@ -667,7 +703,12 @@ func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 		Env:        cloneEnv(cfg.Env),
 	}
 	if len(cfg.Cmd) > 0 {
-		manifest.Entrypoint = append(manifest.Entrypoint, cfg.Cmd...)
+		// slices.Clone forces a fresh backing array so post-conversion
+		// mutation of cfg.Cmd (caller-owned; not pooled today, but the
+		// OCI puller shape could change) cannot leak into the stored
+		// manifest.Entrypoint. Pinned by
+		// TestManifestFromImageConfig_AppModeCmd in handler_test.go.
+		manifest.Entrypoint = slices.Clone(cfg.Cmd)
 	}
 	return manifest
 }

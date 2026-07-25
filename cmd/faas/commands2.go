@@ -228,7 +228,7 @@ func cmdDeployTarball(args []string) int {
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
 	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python|function-go)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
-	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124)")
+	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
 	if err := fs.Parse(args); err != nil {
