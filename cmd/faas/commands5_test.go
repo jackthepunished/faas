@@ -1631,13 +1631,35 @@ func TestFaasQueueTail_PrintsDequeuedRow(t *testing.T) {
 		}
 		select {
 		case got := <-done:
-			// cmdQueueTail's SIGINT path hits net/http's transport
-			// "interrupt signal received" error, which the cmdQueueTail
-			// code path renders as exit 3 (PrintWarn + return 3),
-			// not 130. The 130 path is reserved for
-			// `errors.Is(err, context.Canceled)` (timeout cancellation).
-			if got != 3 {
-				t.Errorf("cmdQueueTail exit = %d, want 3 (attempt %d)", got, attempt)
+			// Both exit 3 and exit 130 are valid SIGINT exits
+			// from cmdQueueTail. Which one lands depends on Go's
+			// net/http transport wrapping the cancellation:
+			//
+			//   * 3  — net/http wraps the SIGINT-derivative
+			//     context cancellation as a transport
+			//     "interrupt signal received" error; cmdQueueTail
+			//     does NOT match `errors.Is(..., context.Canceled)`
+			//     so it falls through to PrintWarn + return 3.
+			//     Observed on darwin/amd64 local.
+			//
+			//   * 130 — net/http returns the underlying
+			//     context.Canceled directly; cmdQueueTail's
+			//     `errors.Is(err, context.Canceled)` matches and
+			//     returns 130 (the shell standard for SIGINT).
+			//     Observed on linux/amd64 CI (ubuntu-latest).
+			//
+			// Either path means Ctrl-C propagated correctly —
+			// only assert "not the hung-request exit" (3 from
+			// PrintWarn on a real transport error vs the SIGINT
+			// path) AND not 0 (which would mean the row hung
+			// forever). The PrintWarn-of-a-real-error path is
+			// also exit 3, so accepting 3 here means we also
+			// accept the rare flaky path where the SIGINT
+			// arrived AFTER QueueReceive returned normally but
+			// before the print loop — that path is also a
+			// benign exit 3 with the row already printed.
+			if got != 3 && got != 130 {
+				t.Errorf("cmdQueueTail exit = %d, want 3 or 130 (attempt %d)", got, attempt)
 			}
 			return
 		case <-time.After(150 * time.Millisecond):
