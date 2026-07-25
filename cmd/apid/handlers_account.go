@@ -69,7 +69,7 @@ func (s *server) exportAccount(w http.ResponseWriter, r *http.Request, acct stat
 // returns the same envelope (status + scheduled_at + restore_until)
 // without re-stamping the timestamp or re-sending the email.
 func (s *server) deleteAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	fresh, err := s.scheduleDeletion(r.Context(), acct)
+	fresh, err := s.scheduleDeletion(r.Context(), acct, "rest")
 	if err != nil {
 		api.WriteProblem(w, err)
 		return
@@ -82,7 +82,12 @@ func (s *server) deleteAccount(w http.ResponseWriter, r *http.Request, acct stat
 // (dashboardDelete in handlers_dashboard.go). Idempotent: a repeat
 // call on a row already in deleted_pending returns the existing
 // envelope without re-sending the email.
-func (s *server) scheduleDeletion(ctx context.Context, acct state.Account) (state.Account, *api.Problem) {
+//
+// via is the surface that initiated the deletion ("rest" or
+// "dashboard"); it's threaded through so the IAM-4 audit emit can
+// attribute the action to the right caller (the dashboard form vs
+// the REST DELETE).
+func (s *server) scheduleDeletion(ctx context.Context, acct state.Account, via string) (state.Account, *api.Problem) {
 	if acct.Status != state.AccountDeletedPending {
 		if err := s.store.MarkAccountDeletionPending(ctx, acct.ID); err != nil {
 			return acct, api.ErrCapacity("could not mark for deletion")
@@ -129,6 +134,14 @@ func (s *server) scheduleDeletion(ctx context.Context, acct state.Account) (stat
 			// row outlives DeleteAccount; pkg/grace stamps
 			// completed_at after the hard-delete fires.
 			s.recordGdprRequest(ctx, fresh, state.GdprActionDelete)
+			// IAM-4 (ADR-035): record the deletion scheduling.
+			// data.via lets the operator distinguish a dashboard
+			// form submission from a CLI/API DELETE — useful when
+			// a customer's session cookie was stolen and the
+			// attacker prefers the dashboard surface.
+			s.audit.Emit(ctx, "account.deletion_scheduled", &fresh.ID, map[string]any{
+				"via": via,
+			})
 		}
 		return fresh, nil
 	}
@@ -170,7 +183,7 @@ func (s *server) recordGdprRequest(ctx context.Context, acct state.Account, acti
 // restoreAccount flips the account back to active iff inside the
 // 30-day grace window. Past grace → 409 account_not_restorable.
 func (s *server) restoreAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	fresh, prob := s.cancelDeletion(r.Context(), acct)
+	fresh, prob := s.cancelDeletion(r.Context(), acct, "rest")
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
@@ -182,7 +195,11 @@ func (s *server) restoreAccount(w http.ResponseWriter, r *http.Request, acct sta
 // cancelDeletion is the business-logic core reused by both the REST
 // handler (restoreAccount) and the dashboard form handler. Returns
 // (refreshed-account, problem). A nil problem means success.
-func (s *server) cancelDeletion(ctx context.Context, acct state.Account) (state.Account, *api.Problem) {
+//
+// via is the surface that initiated the restore ("rest" or
+// "dashboard"); threaded through so the IAM-4 audit emit can
+// attribute the action to the right caller.
+func (s *server) cancelDeletion(ctx context.Context, acct state.Account, via string) (state.Account, *api.Problem) {
 	if acct.Status != state.AccountDeletedPending {
 		return acct, api.NewProblem(http.StatusConflict, api.CodeAccountNotRestorable,
 			"Not restorable",
@@ -197,6 +214,13 @@ func (s *server) cancelDeletion(ctx context.Context, acct state.Account) (state.
 	if err != nil {
 		return acct, api.ErrCapacity("could not refresh account")
 	}
+	// IAM-4 (ADR-035): record the deletion restore. Pairs with the
+	// account.deletion_scheduled row emitted inside
+	// scheduleDeletion so a customer can trace the full lifecycle
+	// of a near-deletion in their audit timeline.
+	s.audit.Emit(ctx, "account.deletion_restored", &fresh.ID, map[string]any{
+		"via": via,
+	})
 	return fresh, nil
 }
 
@@ -281,9 +305,13 @@ func gatherExport(ctx context.Context, s *server, acct state.Account, includeSec
 	keys, keyErr := listKeysForAccountExport(ctx, s.store, acct.ID)
 	builds, bldErr := listBuildsForAccountExport(ctx, s.store, acct.ID, depByID)
 	secrets, secErr := listSecretsForAccountExport(ctx, s.store, acct.ID, apps, includeSecrets)
-	audit, audErr := listGdprRequestsForAccountExport(ctx, s.store, acct.ID)
+	auditGdpr, audErr := listGdprRequestsForAccountExport(ctx, s.store, acct.ID)
+	auditEvents, evtErr := listEventsForAccountExport(ctx, s.store, acct.ID)
+	// IAM-4 (ADR-035): union the two audit sources into one ordered
+	// timeline so a reviewer sees a single chronological feed.
+	audit := mergeAuditTrail(auditGdpr, auditEvents)
 
-	if err := errors.Join(depErr, insErr, useErr, domErr, crnErr, keyErr, bldErr, secErr, audErr); err != nil {
+	if err := errors.Join(depErr, insErr, useErr, domErr, crnErr, keyErr, bldErr, secErr, audErr, evtErr); err != nil {
 		// Log per-resource failures so an operator can correlate a
 		// customer-reported "export is missing X" with the actual DB
 		// failure. The handler returns 500; the customer retries.
@@ -444,6 +472,9 @@ func listKeysForAccountExport(ctx context.Context, st state.Store, accountID str
 // audit ledger slice in the export bundle. Bounded to 1000 rows so
 // the bundle stays < ~300 KB even for power customers; pagination is
 // the right fix here, deferred per the FIXME in gatherExport.
+//
+// Each row carries source="gdpr" so the union with events rows
+// (IAM-4, ADR-035) carries a single discriminator field per row.
 func listGdprRequestsForAccountExport(ctx context.Context, st state.Store, accountID string) ([]api.GdprAuditExportResponse, error) {
 	rows, err := st.ListGdprRequestsForAccount(ctx, accountID, 1000)
 	if err != nil {
@@ -452,9 +483,68 @@ func listGdprRequestsForAccountExport(ctx context.Context, st state.Store, accou
 	out := make([]api.GdprAuditExportResponse, 0, len(rows))
 	for _, g := range rows {
 		out = append(out, api.GdprAuditExportResponse{
+			Source:      "gdpr",
 			Action:      string(g.Action),
 			RequestedAt: g.RequestedAt.UTC().Format(time.RFC3339),
 			CompletedAt: formatTimeOrEmpty(g.CompletedAt),
+		})
+	}
+	return out, nil
+}
+
+// mergeAuditTrail interleaves the GDPR-action rows (gdpr_requests)
+// with the security event rows (events table) by timestamp descending
+// so the bundle surfaces one ordered timeline. Stable sort so two rows
+// at the same instant preserve the order they were fetched (gdpr
+// first, then events).
+//
+// The merge itself is unbounded w.r.t. its inputs; the bound lives on
+// the upstream list helpers (listGdprRequestsForAccountExport and
+// listEventsForAccountExport both cap at 1000 rows), so the merged
+// result is ≤ 2000 rows for any account. Same posture as
+// listGdprRequestsForAccountExport.
+func mergeAuditTrail(gdpr, events []api.GdprAuditExportResponse) []api.GdprAuditExportResponse {
+	out := make([]api.GdprAuditExportResponse, 0, len(gdpr)+len(events))
+	i, j := 0, 0
+	for i < len(gdpr) && j < len(events) {
+		if gdpr[i].RequestedAt >= events[j].RequestedAt {
+			out = append(out, gdpr[i])
+			i++
+		} else {
+			out = append(out, events[j])
+			j++
+		}
+	}
+	for ; i < len(gdpr); i++ {
+		out = append(out, gdpr[i])
+	}
+	for ; j < len(events); j++ {
+		out = append(out, events[j])
+	}
+	return out
+}
+
+// listEventsForAccountExport surfaces the customer's security event
+// rows in the export bundle, interleaved with the GDPR-action rows by
+// gatherExport. Same 1000-row cap as listGdprRequestsForAccountExport;
+// pagination lives behind the same FIXME.
+//
+// Each row carries source="event" so the union is a single, ordered
+// timeline. The Data field is the verbatim jsonb the auditor wrote at
+// emit time — the kind-specific schema is documented in
+// docs/adr/035-auth-audit-events.md.
+func listEventsForAccountExport(ctx context.Context, st state.Store, accountID string) ([]api.GdprAuditExportResponse, error) {
+	rows, err := st.ListEvents(ctx, accountID, 1000)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.GdprAuditExportResponse, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, api.GdprAuditExportResponse{
+			Source:      "event",
+			RequestedAt: e.At.UTC().Format(time.RFC3339),
+			Kind:        e.Kind,
+			Data:        e.Data,
 		})
 	}
 	return out, nil

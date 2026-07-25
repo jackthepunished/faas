@@ -128,6 +128,13 @@ type server struct {
 	// apid_op_duration_seconds without each one wrapping itself.
 	// Nil = observation disabled (unit tests).
 	ops *wire.OpsMetrics
+	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
+	// call to record a security event. The seam wraps
+	// state.Store.AppendEvent with best-effort failure semantics
+	// (log Warn + apid_audit_write_failures_total counter, never
+	// roll back the action). nil falls back to a no-op helper so
+	// older tests can build a server without an audit handle.
+	audit *auditor
 }
 
 // WithOpsMetrics attaches the daemon-wide Prometheus registry. The
@@ -137,6 +144,13 @@ type server struct {
 // WithOpsMetrics (this PR).
 func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 	s.ops = ops
+	// Re-bind the audit counter so the IAM-4 seam can record
+	// failures. If ops is nil (unit tests that don't care about
+	// metrics), leave the auditor with a nil ops interface so Emit
+	// silently skips the .Inc().
+	if s.audit != nil {
+		s.audit.ops = ops
+	}
 	return s
 }
 
@@ -293,6 +307,12 @@ func newServerWithDeps(
 		MaxFailures:   3,
 		CountStatuses: []int{middleware.CountEveryAttempt},
 	})
+	// IAM-4 (ADR-035): the auth audit seam. Wired here so handlers
+	// can call s.audit.Emit(...) without a per-request nil check.
+	// ops is passed in via WithOpsMetrics after this returns; until
+	// then audit.ops is nil and Emit silently skips the counter
+	// increment (the production caller always sets ops before
+	// serving traffic; tests can call WithOpsMetrics to opt in).
 	return &server{
 		store:                  store,
 		log:                    log,
@@ -310,6 +330,7 @@ func newServerWithDeps(
 		cliAuthLimiter:         cliAuthLimiter,
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
+		audit:                  newAuditor(store, log, nil),
 	}
 }
 
@@ -428,6 +449,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listKeys)))
 	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.createKey)))
 	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteKey)))
+
+	// IAM-4 (ADR-035) — auth audit log surface. Read-only;
+	// the events table is append-only (spec §5). Same scope gating
+	// as GET /v1/keys: session cookie or any read- or write-scoped
+	// API key can list/fetch; admin-only routes (compute nodes)
+	// remain gated separately.
+	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listAuditEvents)))
+	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getAuditEvent)))
 
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.

@@ -130,7 +130,6 @@ var methodRouteMap = map[string]string{
 	"POST /v1/domains":                     "CreateDomain",
 	"GET /v1/keys":                         "ListKeys",
 	"POST /v1/keys":                        "CreateKey",
-
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and
@@ -145,6 +144,14 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/delayed-tasks/{id}":        "CancelDelayedTask",
 	"GET /v1/invocations":                  "ListInvocations",
 	"GET /v1/invocations/{id}":             "GetInvocation",
+
+	// IAM-4 (ADR-035) audit log surface. The auto-derivation would
+	// otherwise produce names with literal hyphens ("GetAudit-events",
+	// "GetAudit-eventsId") because the spec path uses an unhyphenated
+	// root resource; the explicit map drops the hyphen and conforms to
+	// the SDK's flat resource naming.
+	"GET /v1/audit-events":      "ListAuditEvents",
+	"GET /v1/audit-events/{id}": "GetAuditEvent",
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
