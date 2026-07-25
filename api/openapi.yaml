@@ -1350,7 +1350,7 @@ paths:
         and cannot be retrieved; subsequent GETs return only the prefix.
       requestBody:
         required: true
-        description: "API key creation payload — label only. Plaintext is returned exactly once in the 201 response."
+        description: "Create a new API key for the authenticated account. Plaintext is returned exactly once in the 201 response and cannot be recovered later — store it immediately. See IAM-1, ADR-034 rev2 for the scope vocabulary."
         content:
           application/json:
             schema:
