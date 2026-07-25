@@ -606,6 +606,19 @@ func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, err
 	return out, c.do(ctx, "GET", "/v1/usage?month="+month, nil, &out)
 }
 
+// UsageSummary returns the account-wide monthly roll-up
+// (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
+// Distinct from GetUsage which returns per-app rows; empty month falls
+// back to the server's default (current month).
+func (c *Client) UsageSummary(ctx context.Context, month string) (UsageSummaryResponse, error) {
+	var out UsageSummaryResponse
+	path := "/v1/usage/summary"
+	if month != "" {
+		path += "?month=" + month
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // ListDeployments returns a single page of deployments with a
 // "next_before" cursor (RFC3339Nano). Use ListDeploymentsAll (added in
 // commit 2) to walk every page automatically.
