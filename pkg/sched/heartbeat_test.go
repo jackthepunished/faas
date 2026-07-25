@@ -91,6 +91,7 @@ func (h *heartbeatFakeVMM) PauseAndSnapshot(context.Context, string, string, str
 	return SnapshotBytes{}, nil
 }
 func (h *heartbeatFakeVMM) Destroy(context.Context, string) error { return nil }
+
 // Stats implements VMM (issue #170 / PR-A). Heartbeat does not
 // call Stats — the instancestats poller does, via its own
 // dialer — so the heartbeat fake just returns an empty snapshot.

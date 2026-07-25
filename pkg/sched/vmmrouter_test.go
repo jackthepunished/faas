@@ -62,6 +62,7 @@ func (f *fakeRouterVMM) Ping(_ context.Context) (*PingOutcome, error) {
 	f.mu.Unlock()
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }
+
 // Stats implements VMM (issue #170 / PR-A). Returns the empty
 // snapshot — the router test does not assert on Stats contents;
 // the dedicated vmmclient_test.go covers wire decoding. Records

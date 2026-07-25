@@ -156,12 +156,12 @@ func TestInstancesFiltersSystemdAndKernelSiblings(t *testing.T) {
 	// rejects '.' in --id). The siblings below are what systemd /
 	// kernel install in the same slice.
 	for _, leaf := range []string{
-		"vm-alpha",  // ours
-		"vm-bravo",  // ours
-		"init.scope",  // kernel
-		"user.slice",  // systemd
+		"vm-alpha",     // ours
+		"vm-bravo",     // ours
+		"init.scope",   // kernel
+		"user.slice",   // systemd
 		"system.slice", // systemd
-		"foo.mount",  // systemd
+		"foo.mount",    // systemd
 	} {
 		if err := os.MkdirAll(filepath.Join(root, fcvm.ParentCgroup, leaf), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", leaf, err)
