@@ -296,7 +296,7 @@ func TestSecrets_AppOwnershipBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
+		if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 			t.Fatal(err)
 		}
 		return acct, pt
@@ -412,7 +412,7 @@ func mustAccount(t *testing.T, store *state.MemStore, plan api.Plan) (state.Acco
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatal(err)
 	}
 	return acct, "", pt

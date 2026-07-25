@@ -1,90 +1,46 @@
 package main
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"flag"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
-// fakeHandlerScript is a small POSIX-sh script that mimics a Go static
-// binary: it reads the §4.9 envelope from stdin, writes a response
-// envelope to stdout. The runner exec's this file directly (no
-// interpreter), so the script must be self-executable. (The
-// interpreter is the kernel's shebang handler, not the runner.)
-const fakeHandlerScript = `#!/bin/sh
-read -r env
-method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
-path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
-printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
-  "$method" "$path" "$(printf '%s' "echo:$path" | base64)"
-`
-
+// TestHandle_RoundTrip spins a stub handler with the same JSON contract
+// the runner expects. The runner execs the handler file directly with no
+// interpreter (guest/runners/go124/main.go:117), so POSIX-sh is enough
+// and the helper never skips this test.
 func TestHandle_RoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	script := dir + "/handler"
-	if err := os.WriteFile(script, []byte(fakeHandlerScript), 0o755); err != nil {
-		t.Fatalf("write handler: %v", err)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, script)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/hello?x=1")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if got := resp.Header.Get("X-Echo-Method"); got != "GET" {
-		t.Fatalf("X-Echo-Method = %q, want GET", got)
-	}
-	if got := resp.Header.Get("X-Echo-Path"); got != "/hello" {
-		t.Fatalf("X-Echo-Path = %q, want /hello", got)
-	}
-	body := new(bytes.Buffer)
-	body.ReadFrom(resp.Body)
-	if !strings.Contains(body.String(), "echo:/hello") {
-		t.Fatalf("body = %q, want echo:/hello", body.String())
-	}
+	fake := runnerparity.FakeGoScript()
+	runnerparity.RunRoundTrip(t, fake, handle)
 }
 
+// TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9.
+// Body delegated to runnerparity.AssertEnvelopeJSONTags so all three
+// runners pin the same tag set.
 func TestEnvelopeRoundTrip(t *testing.T) {
-	env := envelope{
+	runnerparity.AssertEnvelopeJSONTags(t, envelope{
 		Method:  "POST",
 		Path:    "/foo",
 		Headers: map[string]string{"X": "y"},
 		Query:   "a=1",
 		BodyB64: base64.StdEncoding.EncodeToString([]byte("hi")),
-	}
-	b, err := json.Marshal(env)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !bytes.Contains(b, []byte(`"body_b64":"aGk="`)) {
-		t.Fatalf("body_b64 tag missing: %s", b)
-	}
+	}, []byte("hi"))
 }
 
 // TestGoRunnerHandlerDefault pins the default --handler value. The
 // path must be `/app/handler` (no extension) to match what
 // imaged.handleDeployment writes into AppManifest.Entrypoint for
-// runtime=go124 function deploys (Phase 5 in the plan). If this
+// runtime=go124 function deploys (PR #219 follow-up Phase 2). If this
 // drifts, the runner's os.Stat startup check fails on first wake
 // and every Go function deploy rolls back. The flag default and
 // the imaged manifest path are the only two places this string
 // lives; the test pins the flag side.
+//
+// Stays in this package — the constant lives in production code
+// (guest/runners/go124/main.go:48) and the helper cannot reach it.
 func TestGoRunnerHandlerDefault(t *testing.T) {
 	const want = "/app/handler"
 	// Re-create the flag with the SAME default literal that the

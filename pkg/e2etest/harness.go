@@ -59,6 +59,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -158,8 +159,8 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	// Block until the schema is at the current migration target. The
 	// meterd subprocess (issue #52) reads accounts on its first tick and
 	// would otherwise race the migration — see cmd-e2e-schedd-migration-race.
-	// 12 = migrations/00012_account_stripe_subscription_item.sql (current head).
-	pgtest.WaitForMigration(t, pool, 12, 10*time.Second)
+	// See e2eMigrationTarget for the head value and the bump rationale.
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
 
 	if which&APID != 0 {
 		startAPID(t, h, bin, dbURL)
@@ -168,21 +169,7 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
-		// schedd needs to dial vmmd; on the metal tag vmmd is started below
-		// and we use the same path. On tests that skip vmmd, schedd still
-		// starts — it just warns on wake. Wire both paths so schedd config
-		// is consistent regardless of order.
-		cfgPath := filepath.Join(tmp, "schedd.toml")
-		cfg := fmt.Sprintf(
-			`socket_path = %q
-owner_user = %q
-vmmd_socket = %q
-`,
-			sockPath, "root", vmmdSock,
-		)
-		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
-			t.Fatalf("e2etest: write schedd.toml: %v", err)
-		}
+		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
 		)
@@ -266,35 +253,7 @@ kernel_path = %q
 	}
 
 	if which&Gatewayd != 0 {
-		addr := freeTCPAddr(t)
-		controlAddr := freeTCPAddr(t)
-		if h.ScheddSock == "" {
-			h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
-		}
-		// The harness always runs gatewayd in the TLS-disabled path
-		// (cfg.TLS.Disabled=true) so we don't have to provision a Hetzner
-		// DNS token + storage dir for metal tests. We still need the control
-		// listener bound to a known address so wake-latency assertions can
-		// scrape /metrics — drop a minimal TOML that overrides control_addr.
-		gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
-		if err := os.WriteFile(gwCfg, []byte(
-			fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\n", addr, controlAddr),
-		), 0o600); err != nil {
-			t.Fatalf("e2etest: write gatewayd.toml: %v", err)
-		}
-		env := append(testEnvCommon(dbURL),
-			"FAAS_GATEWAY_LISTEN="+addr,
-			"FAAS_GATEWAYD_CONFIG="+gwCfg,
-			"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
-			"FAAS_APPS_DOMAIN="+testDomain,
-		)
-		h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
-		h.GatewayURL = "http://" + addr
-		// Strip the leading 127.0.0.1: from controlAddr to expose the host
-		// separately (or just hand callers the full URL — keeps it simple).
-		h.GatewayControlURL = "http://" + controlAddr
-		waitTCP(t, addr, 10*time.Second)
-		waitTCP(t, controlAddr, 10*time.Second)
+		startGatewayd(t, h, bin, dbURL, nil)
 	}
 
 	if which&Meterd != 0 {
@@ -381,6 +340,14 @@ const All = DeployWake | Meterd | Builderd
 
 const testDomain = "apps.test.example"
 
+// e2eMigrationTarget is the migration head every e2e harness boot waits
+// for. Centralised here so the next migration land only touches this one
+// constant (Start and StartWithEnv both reference it). The value MUST
+// match the highest NNNNN_<name>.sql filename under migrations/. The
+// per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
+// call pgtest.WaitForMigration with their own N and remain green.
+const e2eMigrationTarget = 36
+
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
 // RECIPIENT_PATH) so it can seal. StartWithEnv boots JUST apid — not
@@ -422,8 +389,9 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	// Gate every daemon launch on the schema arriving at the current
 	// migration target. Without this, meterd's first tick races the
 	// migration (issue #52 acceptance race; see
-	// cmd-e2e-schedd-migration-race memory).
-	pgtest.WaitForMigration(t, pool, 12, 10*time.Second)
+	// cmd-e2e-schedd-migration-race memory). See e2eMigrationTarget
+	// for the head value and bump history.
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
 
 	if which&APID != 0 {
 		addr := freeTCPAddr(t)
@@ -439,17 +407,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
-		cfgPath := filepath.Join(tmp, "schedd.toml")
-		cfg := fmt.Sprintf(
-			`socket_path = %q
-owner_user = %q
-vmmd_socket = %q
-`,
-			sockPath, "root", vmmdSock,
-		)
-		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
-			t.Fatalf("e2etest: write schedd.toml: %v", err)
-		}
+		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
 		)
@@ -463,6 +421,9 @@ vmmd_socket = %q
 	}
 	if which&Meterd != 0 {
 		startMeterd(t, h, bin, dbURL, extraEnv)
+	}
+	if which&Gatewayd != 0 {
+		startGatewayd(t, h, bin, dbURL, extraEnv)
 	}
 	t.Cleanup(h.stop)
 	return h
@@ -482,6 +443,90 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 	h.procs = append(h.procs, startProc(t, bin, "apid", env))
 	h.APIDURL = "http://" + addr
 	waitTCP(t, addr, 10*time.Second)
+}
+
+// writeScheddConfig renders the per-test schedd.toml and writes it under
+// tmp. Returns the path to the file. The gateway_synth_socket line is
+// emitted when includeSynth is true so the drain goroutine actually
+// subscribes to invocation_due; an empty value silently disables the
+// drain (cmd/schedd/main.go:319-345) which is the correct shape for
+// tests that don't exercise async-invoke. Centralised so a future env
+// var or config knob lands in one place instead of two (Start vs
+// StartWithEnv had identical templates before PR #218).
+func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) string {
+	t.Helper()
+	sockPath := filepath.Join(h.SockDir, "schedd.sock")
+	vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
+	gatewaySynth := ""
+	if includeSynth {
+		gatewaySynth = filepath.Join(h.SockDir, "gatewayd-internal.sock")
+	}
+	cfgPath := filepath.Join(tmp, "schedd.toml")
+	cfg := fmt.Sprintf(
+		`socket_path = %q
+owner_user = %q
+vmmd_socket = %q
+gateway_synth_socket = %q
+`,
+		sockPath, "root", vmmdSock, gatewaySynth,
+	)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("e2etest: write schedd.toml: %v", err)
+	}
+	return cfgPath
+}
+
+// startGatewayd boots gatewayd in the TLS-disabled path (cfg.TLS.Disabled=true)
+// so tests don't need a Hetzner DNS token + storage dir. The control
+// listener binds to a known address so wake-latency assertions can scrape
+// /metrics; the public listener binds to the per-test free port.
+//
+// The synth unix socket (spec §4.4) is the path gatewayd listens on for
+// synthetic cron / async-invoke envelopes from schedd. It is paired with
+// the gateway_synth_socket line the Schedd block writes into the per-test
+// schedd.toml; both must use the same path or schedd's dial fails and the
+// drain goroutine is silently disabled.
+//
+// apid_loopback is wired to h.APIDURL (set by startAPID before this runs)
+// so gatewayd's apidProxy actually proxies to the per-test apid — without
+// it, gatewayd falls back to the production default http://127.0.0.1:8081
+// and a test that hits the gateway would forward to a phantom apid.
+//
+// extraEnv is appended last so a test can inject extra knobs if needed
+// (none today; mirrors startMeterd's signature).
+func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []string) {
+	t.Helper()
+	addr := freeTCPAddr(t)
+	controlAddr := freeTCPAddr(t)
+	if h.ScheddSock == "" {
+		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
+	}
+	apidLoopback := h.APIDURL
+	if apidLoopback == "" {
+		apidLoopback = "http://127.0.0.1:8081"
+	}
+	gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
+	if err := os.WriteFile(gwCfg, []byte(
+		fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\napid_loopback=%q\n",
+			addr, controlAddr, apidLoopback),
+	), 0o600); err != nil {
+		t.Fatalf("e2etest: write gatewayd.toml: %v", err)
+	}
+	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
+	env := append(testEnvCommon(dbURL),
+		"FAAS_GATEWAY_LISTEN="+addr,
+		"FAAS_GATEWAYD_CONFIG="+gwCfg,
+		"FAAS_GATEWAY_CONTROL_LISTEN="+controlAddr,
+		"FAAS_GATEWAY_SYNTH_SOCKET="+synthSock,
+		"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
+		"FAAS_APPS_DOMAIN="+testDomain,
+	)
+	env = append(env, extraEnv...)
+	h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
+	h.GatewayURL = "http://" + addr
+	h.GatewayControlURL = "http://" + controlAddr
+	waitTCP(t, addr, 10*time.Second)
+	waitTCP(t, controlAddr, 10*time.Second)
 }
 
 // testEnvCommon returns the env every daemon gets in the harness:
@@ -558,7 +603,7 @@ func (h *Harness) stop() {
 		}
 		// Always dump the daemon's last words so an e2e t.Fatalf has
 		// meterd's quota-tick output to reason about.
-		if buf, ok := proc.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := proc.Stdout.(*safeBuffer); ok {
 			h.T.Logf("e2etest: %s final state=%v\n%s",
 				filepath.Base(proc.Path), proc.ProcessState, buf.String())
 		}
@@ -609,6 +654,30 @@ func modulePath(t *testing.T) string {
 	return ""
 }
 
+// safeBuffer is a sync.Mutex-guarded *bytes.Buffer. The harness's
+// cmd.Stdout is written by the daemon subprocess goroutine and read
+// by the test goroutine via DumpLogs / MeterdLogs; a bare *bytes.Buffer
+// is not safe for concurrent Read+Write and trips -race. *os.File (the
+// real stdout) is safe; this mirrors that on the test side without
+// changing the daemon. In-memory only — not used in production.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+// String returns a snapshot of the buffer's contents under the lock.
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // startProc runs bin/<name> with env, returns the *exec.Cmd. stdout/stderr go
 // to a buffer that stop() logs if the daemon exits unexpectedly. Note: this
 // function does NOT call cmd.Wait — stop() owns that single Wait. Double-Wait
@@ -617,7 +686,7 @@ func startProc(t *testing.T, bin, name string, env []string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(bin, name))
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdout = &bytes.Buffer{}
+	cmd.Stdout = &safeBuffer{}
 	cmd.Stderr = cmd.Stdout // share the same buffer (only one consumer: stop)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -634,7 +703,7 @@ func startProc(t *testing.T, bin, name string, env []string) *exec.Cmd {
 func (h *Harness) DumpLogs(t *testing.T) {
 	t.Helper()
 	for _, p := range h.procs {
-		if buf, ok := p.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
 			s := buf.String()
 			if s == "" {
 				continue
@@ -642,6 +711,31 @@ func (h *Harness) DumpLogs(t *testing.T) {
 			t.Logf("e2etest: %s captured output:\n%s", filepath.Base(p.Path), s)
 		}
 	}
+}
+
+// MeterdLogs returns the captured stdout/stderr of the meterd
+// subprocess as a string. Returns "" if meterd wasn't started, has
+// already exited, or no procs are tracked. The buffer is shared
+// with stop()/DumpLogs (cmd.Stdout == cmd.Stderr per startProc at
+// line 620-621), so a concurrent test that drives more pushes may
+// see additional lines appended after the call returns — the
+// caller is expected to re-call or poll.
+//
+// Used by the §14 M7 invoice-shadow e2e (cmd/e2e/billing_invoice_shadow_test.go)
+// to scrape the per-push `mb_seconds` value from the meterd log,
+// which is the unified oracle across both Stripe and Paddle
+// (the provider-specific dedupe tables have different shapes;
+// the log line is provider-neutral). See pkg/meter/pusher.go:155.
+func (h *Harness) MeterdLogs() string {
+	for _, p := range h.procs {
+		if filepath.Base(p.Path) != "meterd" {
+			continue
+		}
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
+			return buf.String()
+		}
+	}
+	return ""
 }
 
 // injectSearchPath adds (or replaces) the search_path query parameter on a
@@ -677,7 +771,9 @@ func freeTCPAddr(t *testing.T) string {
 	return addr
 }
 
-// waitTCP dials addr every 50ms until it accepts or deadline.
+// waitTCP dials addr every 50ms until it accepts or deadline. On timeout
+// it dumps the live daemon stdout/stderr so a CI flake has the daemon's
+// last words to bisect with (mirrors waitUnix's dumpProcs).
 func waitTCP(t *testing.T, addr string, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -689,6 +785,7 @@ func waitTCP(t *testing.T, addr string, d time.Duration) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	dumpProcs(t)
 	t.Fatalf("e2etest: %s did not accept within %s", addr, d)
 }
 
@@ -724,7 +821,7 @@ func dumpProcs(t *testing.T) {
 		if p.ProcessState != nil {
 			continue
 		}
-		if buf, ok := p.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
 			t.Logf("e2etest: %s still running, output:\n%s", filepath.Base(p.Path), buf.String())
 		}
 	}
@@ -798,7 +895,7 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 		if gerr != nil {
 			h.T.Fatalf("e2etest: generate API key: %v", gerr)
 		}
-		if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.DefaultScopes()); err != nil {
+		if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.ScopesAdminOnly); err != nil {
 			h.T.Logf("e2etest: store API key (already exists, ignoring): %v", err)
 		}
 		return pt
@@ -807,7 +904,7 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 	if err != nil {
 		h.T.Fatalf("e2etest: generate API key: %v", err)
 	}
-	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.DefaultScopes()); err != nil {
+	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.ScopesAdminOnly); err != nil {
 		h.T.Fatalf("e2etest: store API key: %v", err)
 	}
 	return pt

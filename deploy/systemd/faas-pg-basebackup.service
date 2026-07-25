@@ -1,0 +1,62 @@
+[Unit]
+Description=onebox-faas Postgres base backup (spec §14 M8)
+Documentation=https://github.com/poyrazK/cloud-faas
+After=postgresql.service
+Requires=postgresql.service
+
+# Spec §14 M8 acceptance: nightly basebackup into
+# /var/lib/pgsql/basebackup/basebackup-<UTC-date>/. The drill script
+# (`deploy/scripts/faas-m8-restore-drill.sh`) replays the newest basebackup
+# + the local WAL archive when it simulates a wiped /var/lib/pgsql/data.
+#
+# Why tar format (`-Ft -z`): rsync-friendly, easy to inspect with `tar -tzf`,
+# and avoids the cp-through-pipe race that plain format hits under write
+# traffic on a busy cluster.
+#
+# The label is `faas-m8-nightly`; the drill prints this when it picks the
+# basebackup.
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+# ExecStart only — the timer stamps the destination.
+# `-X fetch` streams the WAL segments inline; we don't want a slot because
+# pg_basebackup's slot creation lingers if the drill is interrupted.
+# `--checkpoint=fast` smooths the on-disk checkpoints; basebackup starts
+# immediately instead of waiting for a normal checkpoint.
+Environment=PG_BB_ROOT=/var/lib/pgsql/basebackup
+Environment=PG_BB_LABEL=faas-m8-nightly
+ExecStart=/usr/bin/env bash -c '\
+  set -euo pipefail; \
+  ts=$$(date -u +%Y-%m-%dT%H%M%SZ); \
+  out="$${PG_BB_ROOT}/basebackup-$${ts}"; \
+  mkdir -p "$${out}"; \
+  /usr/lib/postgresql/15/bin/pg_basebackup \
+    -Ft -z \
+    -D "$${out}" \
+    -P \
+    -X fetch \
+    --checkpoint=fast \
+    --label="$${PG_BB_LABEL}"; \
+  echo "wrote $${out}"'
+SuccessExitStatus=0
+TimeoutStartSec=30min
+
+# Spec §11: secret-bearing files inherit root-only mode. Basebackup tarballs
+# contain customer PII and sealed secrets; the parent directory must be
+# readable only by postgres (which owns the cluster) and the backup
+# operator (root via sudo). The /var/lib/pgsql base directory is created
+# with 0750 postgres:postgres by the postgres role (tasks/main.yml:158-165);
+# we tighten per-backup dirs to 0700 so a leaked backup cannot be slurped
+# by an unprivileged user.
+UMask=0077
+
+# Logging: the basebackup is a disk-bound job, not a streaming service;
+# stdio to journal is fine. The drill's pre-flight reads mtime, not stdout,
+# so we don't need a sidecar log path.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

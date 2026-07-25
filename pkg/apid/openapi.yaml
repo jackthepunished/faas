@@ -56,6 +56,8 @@ tags:
     description: Scheduled future invocations (cron-style, one-shot).
   - name: keys
     description: API key management.
+  - name: audit
+    description: Customer-facing security event timeline (IAM-4, ADR-035). Append-only; read-only.
   - name: secrets
     description: Per-app sealed secrets (sealed at rest).
   - name: usage
@@ -1336,7 +1338,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/APIKeyResponse' }
               example:
-                - {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z","requests":42}
+                - {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","scopes":["apps:read","deploy:write"],"created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
@@ -1348,7 +1350,7 @@ paths:
         and cannot be retrieved; subsequent GETs return only the prefix.
       requestBody:
         required: true
-        description: "API key creation payload — label only. Plaintext is returned exactly once in the 201 response."
+        description: "Create a new API key for the authenticated account. Plaintext is returned exactly once in the 201 response and cannot be recovered later — store it immediately. See IAM-1, ADR-034 rev2 for the scope vocabulary."
         content:
           application/json:
             schema:
@@ -1361,7 +1363,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/APIKeyResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z","requests":42}
+                example: {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","scopes":["apps:read","deploy:write"],"created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -1374,6 +1376,100 @@ paths:
       summary: Revoke an API key.
       responses:
         '204': { description: No body. The key was revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Audit events (IAM-4 / ADR-035) ───────────────────────────────────────
+
+  /v1/audit-events:
+    get:
+      tags: [audit]
+      operationId: listAuditEvents
+      summary: List the caller's auth audit events.
+      description: |
+        Newest-first. Returns the customer's own security event timeline:
+        logins, logouts, key mints/deletes, secret sets/deletes, plan
+        changes, and account deletion scheduling/restore.
+
+        The events table is append-only (spec §5 / §6.1). The response
+        is bounded by `limit` (default 50, max 100). For a full-history
+        pull, use `GET /v1/account/export`, which unions these events
+        with the customer's GDPR-action rows.
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Only return rows with `at >= since` (RFC 3339). Omit to read from the newest row."
+        - name: kind_prefix
+          in: query
+          schema: { type: string }
+          description: "Only return rows whose `kind` starts with this prefix (e.g. `key.` returns `key.created` and `key.deleted`)."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: "Max rows to return. Silently capped at 100."
+      responses:
+        '200':
+          description: Newest-first audit events for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListAuditEventsResponse'
+              example:
+                limit: 50
+                events:
+                  - id: "42"
+                    at: "2026-07-25T13:25:00Z"
+                    actor: apid
+                    kind: auth.login
+                    subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    data: { method: password }
+                  - id: "41"
+                    at: "2026-07-25T11:00:00Z"
+                    actor: apid
+                    kind: key.created
+                    subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    data: { key_id: "0123456789abcdef0123456789abcdef", scopes: [admin] }
+        '400':
+          description: Bad request — malformed `since` or `limit`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/audit-events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9]+$' }
+        description: "Event row id (bigint as string)."
+    get:
+      tags: [audit]
+      operationId: getAuditEvent
+      summary: Fetch one auth audit event by id.
+      description: |
+        Returns the single event with that id if and only if it
+        belongs to the caller's account. Cross-account access is
+        indistinguishable from "not found" — a customer cannot
+        enumerate other accounts' row counts by ID-probing.
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventResponse'
+              example:
+                id: "42"
+                at: "2026-07-25T13:25:00Z"
+                actor: apid
+                kind: auth.login
+                subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                data: { method: password }
+        '400':
+          description: Bad request — id is not a positive integer.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -1664,7 +1760,7 @@ components:
         requests: { type: integer, format: int64 }
 
     APIKeyExportResponse:
-      description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034)."
+      description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
       type: object
       required: [id, prefix, scopes, created_at]
       properties:
@@ -1673,20 +1769,24 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE. See IAM-1, ADR-034."
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): `admin` is the legacy full-access scope; `apps:read` covers GETs across the apps/deployments/audit/secrets-list surface; `deploy:write` covers POST/PUT/PATCH/DELETE on apps+queues; `secrets:write` covers PUT/DELETE on /apps/{slug}/secrets/{key}; `usage:read` covers GET /v1/usage*."
           example: [admin]
         created_at: { type: string, format: date-time }
         last_used_at: { type: [string, "null"], format: date-time }
+      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-07-25T13:25:00Z", last_used_at: "2026-07-25T13:25:00Z"}
 
     GdprAuditExportResponse:
-      description: "One row of the GDPR audit trail: actor, action (`export`, `delete`, `restore`), timestamp, and IP."
+      description: "One row of the customer's audit trail in the GDPR export bundle. Two row kinds live here: source=`gdpr` carries a self-service action (`export`, `delete`, `restore`); source=`event` carries a security event from the events table (IAM-4, ADR-035) with a `kind` and JSON `data` payload. The two are interleaved by timestamp descending."
       type: object
-      required: [action, requested_at]
+      required: [source, requested_at]
       properties:
+        source: { type: string, enum: [gdpr, event] }
         action: { type: string, enum: [export, delete, restore] }
         requested_at: { type: string, format: date-time }
         completed_at: { type: [string, "null"], format: date-time }
+        kind: { type: string, description: "Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `account.deletion_scheduled`." }
+        data: { type: object, additionalProperties: true, description: "Kind-specific JSON payload from the events row. Populated only when `source` = `event`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`." }
 
     AppSecretExportResponse:
       description: "One sealed secret in export form: key name, sealed ciphertext (sealed at rest per §11), version, and timestamps. Plaintext is never exported."
@@ -1702,9 +1802,9 @@ components:
     # ─── Apps ─────────────────────────────────────────────────────────────
 
     AppResponse:
-      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, and per-app outbound CIDR allowlist (ADR-031 + ADR-032)."
+      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, per-app outbound CIDR allowlist (ADR-031 + ADR-032), and reactive scale-up trigger targets (issue #169 / #172)."
       type: object
-      required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest]
+      required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest, autoscale_target_rps, autoscale_target_cpu_pct]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
@@ -1733,6 +1833,23 @@ components:
             type: string
             pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
+        # Issue #169 / #172: per-instance reactive scale-up
+        # trigger targets. 0 = "disabled" (the trigger skips
+        # this app). autoscale is enabled iff at least one of
+        # these two is non-zero (no separate boolean). Plan
+        # gated: autoscale_target_rps is Hobby/Pro/Scale;
+        # autoscale_target_cpu_pct is Pro/Scale only.
+        autoscale_target_rps:
+          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."
+          type: integer
+          minimum: 0
+          example: 50
+        autoscale_target_cpu_pct:
+          description: "Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 70
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -1773,6 +1890,23 @@ components:
             type: string
             pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
+        # Issue #169 / #172: per-app reactive scale-up trigger
+        # targets. PATCH semantics mirror the wire DTO: omitted
+        # → no change; 0 → explicit disable. Plan gates run
+        # first (403 plan_autoscale_not_allowed) so a Free
+        # PATCHing a 50-rps value surfaces the gate, not the
+        # bounds. See ADR-037.
+        autoscale_target_rps:
+          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are 422 invalid_autoscale_target_rps."
+          type: [integer, "null"]
+          minimum: 0
+          example: 50
+        autoscale_target_cpu_pct:
+          description: "Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct."
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 100
+          example: 70
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -1923,25 +2057,73 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers mutating requests. See IAM-1, ADR-034."
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access scope; apps:read covers GETs across the apps/deployments/audit/secrets-list surface; deploy:write covers POST/PUT/PATCH/DELETE on apps+queues; secrets:write covers PUT/DELETE on /apps/{slug}/secrets/{key}; usage:read covers GET /v1/usage*."
           example: [admin]
         last_used_at: { type: [string, "null"], format: date-time }
-        created_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time, example: "2026-07-25T13:25:00Z" }
         plaintext:
           type: [string, "null"]
           description: PRESENT ONLY on POST /v1/keys response. Never returned again.
+      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-07-25T13:25:00Z", last_used_at: "2026-07-25T13:25:00Z", plaintext: "fp_live_abcd1234567890abcdef12345678"}
 
     CreateKeyRequest:
-      description: "API key creation payload: label and scopes. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034."
+      description: "API key creation payload — label and optional scopes. Plaintext is returned exactly once in the 201 response. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034 rev2."
       type: object
       properties:
         label: { type: string, maxLength: 100 , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Requested permission set. Server validates each entry against the allowed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE."
-          example: [read]
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Requested permission set. Server validates each entry against the closed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; the other five cover narrower surfaces (see APIKeyResponse.scopes). See IAM-1, ADR-034 rev2."
+          example: [apps:read, deploy:write]
+
+    # ─── Audit events (IAM-4 / ADR-035) ──────────────────────────────────
+
+    AuditEventResponse:
+      description: "One row of the customer's security event timeline. The `kind` taxonomy and per-kind `data` schema are documented in `docs/adr/035-auth-audit-events.md`."
+      type: object
+      required: [id, at, actor, kind, data]
+      properties:
+        id:
+          type: string
+          description: "Audit event row id (bigint as string)."
+          example: "42"
+        at:
+          type: string
+          format: date-time
+          description: "When the event was recorded (RFC 3339, UTC)."
+          example: "2026-07-25T13:25:00Z"
+        actor:
+          type: string
+          description: "Which daemon wrote the row. `apid` for IAM-4 surface; `schedd` for state-transition events (instance wakes / parks / watchdog timeouts)."
+          example: apid
+        kind:
+          type: string
+          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
+          example: auth.login
+        subject:
+          type: string
+          description: "Account id (uuid string form) the event was recorded against. Omitted when the event has no subject (e.g. system-level)."
+          example: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+        data:
+          type: object
+          description: "Kind-specific payload. Always a JSON object; the inner shape depends on `kind`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`."
+          additionalProperties: true
+          example: { method: password }
+
+    ListAuditEventsResponse:
+      description: "Envelope for `GET /v1/audit-events`. `limit` echoes the effective limit applied by the handler so the SDK can render `showing N of M` without re-issuing the request."
+      type: object
+      required: [events, limit]
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEventResponse' }
+        limit:
+          type: integer
+          description: "Effective limit applied (always 1..100)."
+          example: 50
 
     # ─── Secrets ──────────────────────────────────────────────────────────
 

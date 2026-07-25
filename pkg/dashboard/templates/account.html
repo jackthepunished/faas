@@ -40,12 +40,22 @@
       <p>Create a key with the CLI: <code>faas keys create &lt;label&gt;</code>. Plaintext shows ONCE; store it now.</p>
       {{if $d.Keys}}
         <table>
-          <thead><tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+          <thead><tr><th>Prefix</th><th>Label</th><th>Scopes</th><th>Created</th><th>Last used</th><th></th></tr></thead>
           <tbody>
             {{range $d.Keys}}
               <tr>
                 <td><code>{{.Prefix}}</code></td>
                 <td>{{.Label}}</td>
+                <td>
+                  {{- if .Scopes -}}
+                    {{- range $i, $s := .Scopes -}}
+                      {{- if $i }}, {{ end -}}
+                      <code>{{$s}}</code>
+                    {{- end -}}
+                  {{- else -}}
+                    &mdash;
+                  {{- end -}}
+                </td>
                 <td>{{.CreatedAt}}</td>
                 <td>{{.LastUsedAt}}</td>
                 <td>

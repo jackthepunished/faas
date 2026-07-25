@@ -84,9 +84,9 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if typ != state.AppTypeApp && typ != state.AppTypeFunction {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Invalid type", "type must be app or function")
 	}
-	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" && req.Runtime != "go124" {
+	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" && req.Runtime != "go124" && req.Runtime != "go124-alpine" {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-			"Invalid runtime", "functions require runtime node22, python312, or go124")
+			"Invalid runtime", "functions require runtime node22, python312, go124, or go124-alpine")
 	}
 	ram := req.RAMMB
 	if ram == 0 {
@@ -216,6 +216,12 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 			User:       a.Manifest.User,
 		},
 		EgressAllowlist: ea,
+		// Issue #169 / #172: per-app reactive scale-up trigger
+		// targets. 0 = "disabled" (no autoscale rule). Reactive
+		// scale-up runs in pkg/sched/scaleup; the trigger reads
+		// these columns every tick.
+		AutoscaleTargetRPS:    a.AutoscaleTargetRPS,
+		AutoscaleTargetCPUPct: a.AutoscaleTargetCPUPct,
 	}
 }
 

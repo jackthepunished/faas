@@ -48,8 +48,10 @@ var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 
 // gatewaydInternalSocket is the unix-domain socket schedd dials to
 // fire synthetic cron requests through gatewayd (spec §4.4, M7).
-// Mode 0660 group `faas` (ADR-015); only schedd can dial.
-const gatewaydInternalSocket = "/run/faas/gatewayd-internal.sock"
+// Mode 0660 group `faas` (ADR-015); only schedd can dial. Overridable
+// via FAAS_GATEWAY_SYNTH_SOCKET so the e2e harness can place it on a
+// per-test path without needing /run/faas on the host (PR #203).
+var gatewaydInternalSocket = envOrGateway("FAAS_GATEWAY_SYNTH_SOCKET", "/run/faas/gatewayd-internal.sock")
 
 // listenAddr is the public listener (TLS lands here in M8). Overridable via
 // FAAS_GATEWAY_LISTEN so the e2e harness can bind a free port without colliding
@@ -60,12 +62,24 @@ var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", ":8080")
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
 var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 
-const (
-	// controlAddr is the private control-plane listener — never reachable from
-	// the internet; bind to the loopback interface by default so an
-	// operator-prometheus scrape is the only thing that can reach it.
-	controlAddr = "127.0.0.1:9090"
-)
+// controlAddr is the private control-plane listener — never reachable from
+// the internet; bound to the loopback interface by default so an
+// operator-prometheus scrape is the only thing that can reach it.
+// SECURITY: the env override must stay loopback in production. An
+// operator who sets FAAS_GATEWAY_CONTROL_LISTEN to a non-loopback
+// address exposes /metrics to the network (the control mux is
+// unauthenticated by design — it's intended for a trusted prometheus
+// sidecar on the same host). Refuse anything that resolves to a
+// non-loopback interface when the env knob is used (PR #218 review
+// finding). Overridable via FAAS_GATEWAY_CONTROL_LISTEN so the e2e
+// harness can pick a free port (without this, two parallel harness
+// runs would race for the hard-coded 127.0.0.1:9090 — the
+// deploy_wake_metal test is the only consumer of /metrics and lives
+// behind a metal build tag, so CI on plain ubuntu-latest doesn't trip
+// the race, but a local dev box with two concurrent invocations
+// would). The default matches the legacy constant so existing
+// deployments are unaffected.
+var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
@@ -485,6 +499,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if deps.controlAddr != "" {
 		ctrlAddr = deps.controlAddr
 	}
+	// PR #218 review finding: refuse non-loopback binds for the control
+	// listener when the env knob was used. The control mux is
+	// unauthenticated by design (operator-prometheus scrape), so an
+	// accidental public bind would expose /metrics. The default address
+	// is already loopback so this only fires for misconfigured overrides
+	// (and silently no-ops for in-process tests that inject via
+	// deps.controlAddr on a loopback listener).
+	if os.Getenv("FAAS_GATEWAY_CONTROL_LISTEN") != "" {
+		if err := assertLoopbackBind(ctrlAddr); err != nil {
+			return fmt.Errorf("gatewayd: FAAS_GATEWAY_CONTROL_LISTEN must bind loopback: %w", err)
+		}
+	}
 	go func() {
 		log.Info("gatewayd control listening", "addr", ctrlAddr)
 		errc <- gateway.RunControlServer(ctx, ctrlAddr, controlMux)
@@ -556,4 +582,26 @@ func envOrGateway(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// assertLoopbackBind rejects non-loopback control-listener addresses.
+// The check accepts explicit 127.0.0.0/8 and ::1 forms plus the
+// "localhost" hostname. Bare ":port" (empty host) is rejected —
+// Listen on a bare ":port" binds 0.0.0.0, which is exactly what this
+// guard exists to prevent. The PR #218 controlAddr env override only
+// lands in the harness today, but a future operator footgun (env in a
+// dev systemd unit) would otherwise be a silent /metrics exposure.
+func assertLoopbackBind(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse %q: %w", addr, err)
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("control listener %q is not loopback; bind 127.0.0.1:9090 (or ::1) only", addr)
 }

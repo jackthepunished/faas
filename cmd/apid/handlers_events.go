@@ -30,7 +30,20 @@ import (
 )
 
 // eventsChannels is the set we subscribe to. Slice 6 keeps it flat;
-// slice 9 (CLI smoke) widens if a notify is needed that isn't here.
+// Move 3 widens it to include NotifyInvocationDone so the dashboard
+// reacts when a customer runs `faas invoke` from another terminal.
+// Mirrored in cmd/apid/sse_fanin.go::sseChannels for the in-process
+// publisher; the two lists must stay in lock-step because the
+// fan-in's job is to be a faithful mirror of pg_notify for the
+// in-process broadcaster.
+//
+// Idempotency note (Move 3): invocation_done is published by BOTH the
+// DB trigger (migrations/00031_invocations_notify.sql:36-53) AND the
+// schedd drain's emitDone (pkg/sched/drain.go). Consumers MUST dedup
+// on (invocation_id, state); the first frame wins. The dashboard's
+// htmx-sse consumer is naturally idempotent (fragment re-render) and
+// the CLI's faas tail printer prints the same id+state line twice
+// without harm.
 var eventsChannels = []string{
 	db.NotifyAppChanged,
 	db.NotifyDeploymentChanged,
@@ -38,6 +51,7 @@ var eventsChannels = []string{
 	db.NotifyCronFired,
 	db.NotifyQuotaWarning,
 	db.NotifyBillingPastDue,
+	db.NotifyInvocationDone,
 }
 
 // eventsHandler is the SSE handler. It accepts either a session cookie
@@ -45,19 +59,29 @@ var eventsChannels = []string{
 // every relevant pg_notify frame to the client as `event: <kind>`
 // frames until the client disconnects.
 //
-// API-key callers must hold at least the "read" scope; session-cookie
-// callers are implicitly admin. IAM-1, ADR-034.
+// API-key callers must hold at least the "apps:read" scope (the read
+// surface, see ScopesReadSurface); session-cookie callers are
+// implicitly admin. IAM-1, ADR-034 rev2.
 func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Move 3 / §12: apid_sse_clients tracks the number of open
+		// /v1/events connections. Increment before auth (so an
+		// unauthenticated 401 still reflects a connection attempt)
+		// and defer Dec on every exit path. nil-safe — production
+		// always wires OpsMetrics, but unit tests don't.
+		if s.ops != nil {
+			s.ops.SSEClients().Inc()
+			defer s.ops.SSEClients().Dec()
+		}
 		acct, key, ok := resolveEventsCaller(r, s)
 		if !ok {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 				"Unauthorized", "session cookie or API key required"))
 			return
 		}
-		if key != nil && !principalHasScope(principal{Acct: acct, Key: key}, []string{api.ScopeAdmin, api.ScopeRead}) {
+		if key != nil && !principalHasScope(principal{Acct: acct, Key: key}, api.ScopesReadSurface) {
 			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
-				"Insufficient scope", "event stream requires the read or admin scope"))
+				"Insufficient scope", "event stream requires the apps:read or admin scope"))
 			return
 		}
 		ownedApps := s.buildOwnedAppCache(r.Context(), acct.ID)

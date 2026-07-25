@@ -9,7 +9,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -43,7 +42,8 @@ Commands:
   keys         Manage API keys
   secrets      Manage env secrets on an app (--app <slug>)
   account      Self-service: export your data, delete account, restore
-  usage        Show this month's usage
+  usage        Show this month's usage (faas usage [--month YYYY-MM])
+  usage summary  Account-wide usage roll-up (faas usage summary [--month YYYY-MM])
   logs         Tail app or deployment logs (--follow)
   version      Print the CLI version
   connect      Connect a third-party service (github)
@@ -156,18 +156,16 @@ func run(args []string) int {
 	case "account":
 		return cmdAccount(args[1:])
 	case "usage":
-		// cmdUsage has its own --month flag and defaults to the
-		// current month — it intentionally accepts no positional args.
-		// The usage line is reached only when an extra positional arg
-		// is supplied; the per-command flag errors are handled by
-		// flag.ContinueOnError via the helper hook below.
-		if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
-			PrintUsage(os.Stderr, "usage: faas usage [--month YYYY-MM]", "usage")
-			return 1
-		}
+		// cmdUsage dispatches: bare `faas usage` → per-app rows;
+		// `faas usage summary [--month X]` → account roll-up.
+		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
 	case "logs":
 		return cmdLogs(args[1:])
+	case "tail":
+		return cmdTail(args[1:])
+	case "queue":
+		return cmdQueueDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "faas: unknown command %q\nRun 'faas help' for usage.\n", args[0])
 		return 1

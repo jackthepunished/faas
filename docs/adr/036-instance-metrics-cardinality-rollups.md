@@ -1,4 +1,4 @@
-# ADR-035 · Per-instance metrics: {app,node} cardinality rollups (issue #170 / PR-A)
+# ADR-036 · Per-instance metrics: {app,node} cardinality rollups (issue #170 / PR-A)
 
 - **Status:** Accepted, 2026-07-25. Owner: @poyrazK. Closes: #170 (PR-A slice).
 - **Date:** 2026-07-25

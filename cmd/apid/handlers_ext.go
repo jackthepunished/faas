@@ -160,6 +160,46 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			req.EgressAllowlist = &rewritten
 		}
 	}
+	// Issue #169 / #172: per-app reactive scale-up trigger. Plan
+	// gates run first (403 supersedes 422) so a Free account
+	// PATCHing an invalid value surfaces the gate error, not the
+	// bounds error. RPS is Hobby+ (Free is single-concurrency and
+	// can't grow beyond 1); CPU is Pro+ (Hobby's cost band is too
+	// tight for "scale on CPU without a min_instances floor").
+	if req.AutoscaleTargetRPS != nil {
+		if !acct.Plan.ScaleUpTargetRPSAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanScaleUpNotAllowed,
+				"Autoscale target RPS is not allowed on this plan",
+				"Free tier does not support per-app autoscaling; upgrade to Hobby or higher.")
+		}
+		// 0 is the explicit-disable form (the Set bit is set, so
+		// the column gets overwritten to 0). Negative values are
+		// still rejected — 422 invalid_autoscale_target_rps.
+		if *req.AutoscaleTargetRPS < 0 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidAutoscaleTargetRPS,
+				"Invalid autoscale target RPS",
+				fmt.Sprintf("autoscale_target_rps must be >= 0 (0 = disable); got %d", *req.AutoscaleTargetRPS))
+		}
+	}
+	if req.AutoscaleTargetCPUPct != nil {
+		if !acct.Plan.ScaleUpTargetCPUAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanScaleUpNotAllowed,
+				"Autoscale target CPU%% is not allowed on this plan",
+				"Autoscale target CPU%% requires Pro or Scale; upgrade to a paid tier.")
+		}
+		// 0 is the explicit-disable form; values outside [1, 100]
+		// are invalid (PG CHECK enforces this as a second-layer
+		// defense).
+		if *req.AutoscaleTargetCPUPct != 0 && (*req.AutoscaleTargetCPUPct < 1 || *req.AutoscaleTargetCPUPct > 100) {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidAutoscaleTargetCPU,
+				"Invalid autoscale target CPU%%",
+				fmt.Sprintf("autoscale_target_cpu_pct must be 0 (disable) or in [1, 100]; got %d", *req.AutoscaleTargetCPUPct))
+		}
+	}
 	return nil
 }
 
@@ -233,6 +273,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		SetMinInstances:    req.MinInstances != nil,
 		EgressAllowlist:    allowPrefixes,
 		SetEgressAllowlist: req.EgressAllowlist != nil,
+		// Issue #169 / #172: autoscale trigger targets. Set bits
+		// distinguish "unset" from "explicit zero" (the disable
+		// signal). Plain nil-with-Set=false leaves the column
+		// untouched. Apid validation already gated the plan and
+		// the bounds; the store is a plain column write.
+		AutoscaleTargetRPS:       req.AutoscaleTargetRPS,
+		SetAutoscaleTargetRPS:    req.AutoscaleTargetRPS != nil,
+		AutoscaleTargetCPUPct:    req.AutoscaleTargetCPUPct,
+		SetAutoscaleTargetCPUPct: req.AutoscaleTargetCPUPct != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -657,19 +706,11 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	var req api.CreateKeyRequest
 	_ = decodeJSON(r, &req)
-	scopes := req.Scopes
-	if len(scopes) == 0 {
-		// Preserve the legacy "full access" default for callers that
-		// don't yet know about scopes. New SDK releases pass scopes
-		// explicitly. See ADR-034.
-		scopes = []string{"admin"}
-	}
-	for _, sc := range scopes {
-		if !api.IsValidScope(sc) {
-			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-				"Unknown scope", "scopes must be one of admin, read, write; got "+sc))
-			return
-		}
+	scopes, err := api.NormalizeCreateKeyScopes(req.Scopes)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid scopes", err.Error()))
+		return
 	}
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
@@ -683,6 +724,13 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"created","account":"`+acct.ID+`"}`)
 	s.log.Info("key created", "key", k.ID, "account", acct.ID)
+	// IAM-4 (ADR-035): record the key mint. subject = account_id (the
+	// owner); data.scopes is the per-key permission set so the
+	// audit row can answer "who minted which scopes today?".
+	s.audit.Emit(ctx(r), "key.created", &acct.ID, map[string]any{
+		"key_id": k.ID,
+		"scopes": scopes,
+	})
 	writeJSON(w, http.StatusCreated, api.APIKeyResponse{
 		ID:        k.ID,
 		Prefix:    keyPrefix(plaintext),
@@ -718,11 +766,21 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 
 func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	if err := s.store.DeleteAPIKey(ctx(r), acct.ID, id); err != nil {
+	deleted, err := s.store.DeleteAPIKeyReturning(ctx(r), acct.ID, id)
+	if err != nil {
 		s.notFound(w, "no such key")
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"deleted","account":"`+acct.ID+`"}`)
+	// IAM-4 + IAM-1 (ADR-034 rev2 / ADR-035): record the key
+	// revocation carrying the dismissed scopes so an operator can
+	// answer "what did this key allow before it died?" without
+	// re-deriving it from logs. Single DELETE…RETURNING gives us
+	// the row shape without a pre-fetch race.
+	s.audit.Emit(ctx(r), "key.deleted", &acct.ID, map[string]any{
+		"key_id": deleted.ID,
+		"scopes": deleted.Scopes,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -851,6 +909,14 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 	// future relax of plan.Valid() cannot smuggle CR/LF into the audit
 	// line.
 	s.log.Info("plan changed", "account", acct.ID, "plan", logsanitize.Field(string(plan)))
+	// IAM-4 (ADR-035): record the plan transition. data carries
+	// the pre-change plan (acct.Plan) and post-change plan so the
+	// audit row is self-describing — no need to walk the gdpr ledger
+	// to find the prior state.
+	s.audit.Emit(ctx(r), "account.plan_changed", &acct.ID, map[string]any{
+		"from": string(acct.Plan),
+		"to":   string(plan),
+	})
 	writeJSON(w, http.StatusOK, api.AccountResponse{
 		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
 	})
@@ -1411,6 +1477,17 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 	statusTicker := time.NewTicker(2 * time.Second)
 	defer statusTicker.Stop()
 
+	// Move 3: one-shot backstop timer (replaces per-iteration
+	// time.After(10*time.Minute), which was never reaping the timer
+	// on a busy stream — the select arm would re-allocate a fresh
+	// timer every pass and the 10-min cap was effectively a
+	// "10-min-after-last-event" cap, not an absolute cap). Reset
+	// only on terminal status / client disconnect; the busy
+	// subscriber never resets, so a build that keeps emitting
+	// never escapes the cap if the status poll ever flakes.
+	backstop := time.NewTimer(10 * time.Minute)
+	defer backstop.Stop()
+
 	for {
 		// Done status short-circuits the tail. deployment status flips
 		// to live/failed via NotifyDeploymentChanged; the dashboard
@@ -1449,7 +1526,7 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			if flusher != nil {
 				flusher.Flush()
 			}
-		case <-time.After(10 * time.Minute):
+		case <-backstop.C:
 			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
@@ -1475,26 +1552,34 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 }
 
 // streamAppLogs streams the running instance's stdout/stderr ring buffer.
-// Implementation note: the in-memory stub emits a placeholder until vmmd
-// exposes a Logs gRPC stream (planned for the follow-up PR). Spec §12 lists
-// per-app logs as a separate stream from build logs.
+// Move 3 stub: the vmmd Logs(req) gRPC stream is the real implementation
+// (pkg/fcvm/vmmd exposes a per-instance ring buffer). Until that lands,
+// emit a `not_implemented` frame and a terminal `end` so the SDK
+// contract (pkg/api/logs.go::StreamAppLogs) keeps returning a 200 with
+// parseable frames and the dashboard's per-app log button doesn't 404.
+// Move 4 replaces the body.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
 		return
 	}
-	instances, err := s.store.ListInstancesForApp(ctx(r), app.ID)
-	if err != nil || len(instances) == 0 {
+	if _, err := s.store.ListInstancesForApp(ctx(r), app.ID); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 			"No running instance", "the app is parked; wake it first"))
 		return
 	}
 	startSSE(w)
-	// Stub: emit a single heartbeat. The real implementation dials vmmd
-	// gRPC Logs(req) and tails the per-instance ring buffer (M5 follow-up).
-	_, _ = fmt.Fprintf(w, "event: log\ndata: {\"instance\":\"%s\",\"line\":\"app is running\"}\n\n",
-		instances[0].ID)
-	w.(http.Flusher).Flush()
+	flusher, _ := w.(http.Flusher)
+	// Two frames then close: a not_implemented signal so a client can
+	// distinguish "not built yet" from "empty stream" + a terminal
+	// `end` so consumers with a structured-frame loop exit cleanly
+	// (the build-tailing streamDeployLogs pattern at
+	// cmd/faas/commands2.go uses the same `end` sentinel).
+	_, _ = fmt.Fprint(w, "event: not_implemented\ndata: {\"reason\":\"vmmd Logs(req) gRPC pending — Move 4\"}\n\n")
+	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // startSSE sets the SSE response headers and disables write timeouts for the

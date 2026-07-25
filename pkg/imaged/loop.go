@@ -311,23 +311,17 @@ func (l *Loop) deleteSnapshotsAndFiles(ctx context.Context, ts []deleteTarget) e
 			l.log.Warn("imaged: gc remove snap vmstate", "deployment", t.DeploymentID, "err", err)
 		}
 		// Per-app ext4 (drive1) — derive the key the same way buildImageLayer
-		// writes it. We need the app slug for the key; fall back to a
-		// single DeploymentByID + AppByID lookup when the GC algorithms
-		// (which don't carry the slug) returned an empty AppSlug.
-		slug := t.AppSlug
-		if slug == "" {
-			dep, derr := l.store.DeploymentByID(ctx, t.DeploymentID)
-			if derr == nil {
-				app, aerr := l.store.AppByID(ctx, dep.AppID)
-				if aerr == nil {
-					slug = app.Slug
-				}
-			}
+		// writes it. B1.1 (issue #195): AppSlug is now on SnapshotForGC;
+		// an empty AppSlug here is an invariant violation (the projection
+		// JOIN broke) — log loudly and skip the ext4 delete rather than
+		// silently paying 2 SQL round-trips per row to re-resolve it.
+		if t.AppSlug == "" {
+			l.log.Warn("imaged: gc evict without slug, skipping ext4 delete",
+				"snapshot", t.ID, "deployment", t.DeploymentID)
+			continue
 		}
-		if slug != "" {
-			if err := be.Delete(ctx, sched.AppLayerKey(slug, t.DeploymentID)); err != nil {
-				l.log.Warn("imaged: gc remove ext4", "deployment", t.DeploymentID, "err", err)
-			}
+		if err := be.Delete(ctx, sched.AppLayerKey(t.AppSlug, t.DeploymentID)); err != nil {
+			l.log.Warn("imaged: gc remove ext4", "deployment", t.DeploymentID, "err", err)
 		}
 	}
 	// Best-effort: if the backend supports LocalArtifactLister (it does

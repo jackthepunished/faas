@@ -2020,3 +2020,106 @@ func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
 		t.Errorf("unknown id err = %v, want ErrNotFound", err)
 	}
 }
+
+// TestMemStore_UpdateApp_AutoscaleSetBits pins the Set-bit
+// semantics for the autoscale trigger targets (issue #169 / #172).
+// The Set bits distinguish "unset" (don't touch the column) from
+// "explicit zero" (disable). Without this guard, a PATCH with
+// autoscale_target_rps omitted would silently write 0 and disable
+// an existing trigger. Three cases:
+//
+//  1. Set + non-zero → column updated to the value.
+//  2. Set + zero     → column updated to 0 (explicit disable).
+//  3. Not Set (nil)  → column unchanged.
+//
+// The third case is the load-bearing one — the apid handler
+// branches on the JSON field's presence, so a future refactor that
+// drops the Set bit (or that writes 0 unconditionally when nil)
+// would silently disable every customer's existing autoscale
+// target. Round-trip via AppByID to catch the pgstore drift.
+func TestMemStore_UpdateApp_AutoscaleSetBits(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "scaleup@x.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "scaleup-app", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 5, IdleTimeoutS: 60,
+		Status:                AppActive,
+		AutoscaleTargetRPS:    50,
+		AutoscaleTargetCPUPct: 70,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// Case 1: Set + non-zero → column updated.
+	updated, err := m.UpdateApp(ctx, app.ID, UpdateAppParams{
+		AutoscaleTargetRPS:    ptrInt(80),
+		SetAutoscaleTargetRPS: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateApp (Set + 80): %v", err)
+	}
+	if updated.AutoscaleTargetRPS != 80 {
+		t.Errorf("AutoscaleTargetRPS = %d, want 80", updated.AutoscaleTargetRPS)
+	}
+	// CPU untouched (Set=false on CPU).
+	if updated.AutoscaleTargetCPUPct != 70 {
+		t.Errorf("AutoscaleTargetCPUPct = %d, want 70 (untouched)", updated.AutoscaleTargetCPUPct)
+	}
+
+	// Case 2: Set + zero → explicit disable.
+	updated, err = m.UpdateApp(ctx, app.ID, UpdateAppParams{
+		AutoscaleTargetCPUPct:    ptrInt(0),
+		SetAutoscaleTargetCPUPct: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateApp (Set + 0): %v", err)
+	}
+	if updated.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("AutoscaleTargetCPUPct = %d, want 0 (explicit disable)", updated.AutoscaleTargetCPUPct)
+	}
+	// RPS untouched.
+	if updated.AutoscaleTargetRPS != 80 {
+		t.Errorf("AutoscaleTargetRPS = %d, want 80 (untouched)", updated.AutoscaleTargetRPS)
+	}
+
+	// Case 3: Not Set → column unchanged (the load-bearing case).
+	// Patch something else entirely; verify autoscale columns survive.
+	updated, err = m.UpdateApp(ctx, app.ID, UpdateAppParams{
+		MaxConcurrency: ptrInt(10),
+	})
+	if err != nil {
+		t.Fatalf("UpdateApp (no Set): %v", err)
+	}
+	if updated.MaxConcurrency != 10 {
+		t.Errorf("MaxConcurrency = %d, want 10", updated.MaxConcurrency)
+	}
+	if updated.AutoscaleTargetRPS != 80 {
+		t.Errorf("AutoscaleTargetRPS = %d, want 80 (survived PATCH without Set)", updated.AutoscaleTargetRPS)
+	}
+	if updated.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("AutoscaleTargetCPUPct = %d, want 0 (survived PATCH without Set)", updated.AutoscaleTargetCPUPct)
+	}
+
+	// Round-trip via AppByID — proves the same shape hydrates on
+	// the read path (catches the "wrote to RETURNING but the SELECT
+	// forgot to add the column" class of bug).
+	loaded, err := m.AppByID(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if loaded.AutoscaleTargetRPS != 80 {
+		t.Errorf("loaded AutoscaleTargetRPS = %d, want 80", loaded.AutoscaleTargetRPS)
+	}
+	if loaded.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("loaded AutoscaleTargetCPUPct = %d, want 0", loaded.AutoscaleTargetCPUPct)
+	}
+}
+
+// ptrInt is a tiny helper to take the address of an int literal
+// (the UpdateAppParams fields are *int).
+func ptrInt(v int) *int { return &v }

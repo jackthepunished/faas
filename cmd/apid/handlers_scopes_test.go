@@ -72,24 +72,30 @@ func setupWithSession(t *testing.T) (testEnv, *http.Cookie) {
 		&http.Cookie{Name: sessionCookie, Value: token}
 }
 
-// TestScopeMatrix is the IAM-1 regression net for the per-route scope
-// check. Each row exercises one combination of (method, key-scope)
-// against a representative route and asserts the expected HTTP status:
+// TestScopeMatrix is the IAM-1 (ADR-034 rev2) regression net for the
+// per-route scope check. Each row exercises one combination of
+// (method, key-scope) against a representative route and asserts the
+// expected HTTP status:
 //
-//   - admin key + allowed op      → 2xx (handler runs)
-//   - read-only key + GET         → 2xx
-//   - read-only key + POST        → 403 insufficient_scope
-//   - write-only key + GET        → 403 (write is not enough for read)
-//   - write-only key + POST       → 2xx
-//   - unknown scope on mint       → 400 validation_failed
-//   - empty scope on mint         → 400 validation_failed (deny by default)
-//   - admin-only route + non-admin → 403 (compute-nodes, /v1/account/plan,
-//     DELETE /v1/account, POST /v1/keys, DELETE /v1/keys/{id})
+//   - admin key + allowed op            → 2xx
+//   - apps:read key + GET               → 2xx
+//   - apps:read key + POST              → 403
+//   - deploy:write key + POST           → 2xx
+//   - deploy:write key + GET            → 403 (write is not enough for read)
+//   - usage:read key + GET /v1/usage    → 2xx
+//   - usage:read key + GET /v1/apps     → 403
+//   - secrets:write key + PUT secret    → 2xx
+//   - secrets:write key + POST deploy   → 403
+//   - admin-only route + non-admin      → 403 (compute-nodes,
+//     /v1/account/plan, DELETE /v1/account, POST/DELETE /v1/keys)
+//   - unknown scope on mint              → 400 validation
+//   - empty scope on mint               → defaults to [admin] (legacy behavior)
 //
-// See ADR-034 for the rationale.
+// The fine-grained vocabulary replaces the coarse admin|read|write
+// from rev1. See ADR-034 rev2 for the rationale.
 func TestScopeMatrix(t *testing.T) {
 	t.Run("admin-key/GET-allowed", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
+		e := setupWithScopes(t, api.ScopesAdminOnly)
 		rec := e.do(t, http.MethodGet, "/v1/apps", nil, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("admin GET /v1/apps: %d %s", rec.Code, rec.Body)
@@ -97,89 +103,154 @@ func TestScopeMatrix(t *testing.T) {
 	})
 
 	t.Run("admin-key/POST-allowed", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
+		e := setupWithScopes(t, api.ScopesAdminOnly)
 		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "admin-app"}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("admin POST /v1/apps: %d %s", rec.Code, rec.Body)
 		}
 	})
 
-	t.Run("read-key/GET-allowed", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"read"})
+	t.Run("apps-read-key/GET-allowed", func(t *testing.T) {
+		e := setupWithScopes(t, api.ScopesReadSurface)
 		rec := e.do(t, http.MethodGet, "/v1/apps", nil, nil)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("read GET /v1/apps: %d %s", rec.Code, rec.Body)
+			t.Fatalf("apps:read GET /v1/apps: %d %s", rec.Code, rec.Body)
 		}
 	})
 
-	t.Run("read-key/POST-forbidden", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"read"})
-		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "read-app"}, nil)
+	t.Run("apps-read-only-key/POST-forbidden", func(t *testing.T) {
+		// A key with the bare apps:read scope (NOT admin) cannot
+		// mutate; using api.ScopesReadSurface here would mint a key
+		// that ALSO carries admin — defeating the matrix's whole
+		// point. So this case mints a single-scope apps:read key.
+		e := setupWithScopes(t, []string{api.ScopeAppsRead})
+		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "apps-read-app"}, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
-	t.Run("write-key/POST-allowed", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"write"})
-		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "write-app"}, nil)
+	t.Run("deploy-write-key/POST-allowed", func(t *testing.T) {
+		e := setupWithScopes(t, api.ScopesDeployWriteSurface)
+		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "deploy-app"}, nil)
 		if rec.Code != http.StatusCreated {
-			t.Fatalf("write POST /v1/apps: %d %s", rec.Code, rec.Body)
+			t.Fatalf("deploy:write POST /v1/apps: %d %s", rec.Code, rec.Body)
 		}
 	})
 
-	t.Run("write-key/GET-forbidden", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"write"})
+	t.Run("deploy-write-only-key/GET-forbidden", func(t *testing.T) {
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
 		rec := e.do(t, http.MethodGet, "/v1/apps", nil, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
-	t.Run("write-key/account-plan-forbidden", func(t *testing.T) {
-		// /v1/account/plan is admin-only — write scope is not enough.
-		e := setupWithScopes(t, []string{"write"})
+	t.Run("deploy-write-only-key/account-plan-forbidden", func(t *testing.T) {
+		// /v1/account/plan is admin-only — deploy:write is not enough.
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
 		rec := e.do(t, http.MethodPatch, "/v1/account/plan", map[string]string{"plan": "scale"}, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
-	t.Run("read-key/account-plan-forbidden", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"read"})
+	t.Run("apps-read-only-key/account-plan-forbidden", func(t *testing.T) {
+		e := setupWithScopes(t, []string{api.ScopeAppsRead})
 		rec := e.do(t, http.MethodPatch, "/v1/account/plan", map[string]string{"plan": "scale"}, nil)
+		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
+	})
+
+	t.Run("usage-read-only-key/GET-usage-allowed", func(t *testing.T) {
+		e := setupWithScopes(t, []string{api.ScopeUsageRead})
+		rec := e.do(t, http.MethodGet, "/v1/usage", nil, nil)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("usage:read GET /v1/usage was 403: %s", rec.Body)
+		}
+	})
+
+	t.Run("usage-read-only-key/GET-apps-forbidden", func(t *testing.T) {
+		e := setupWithScopes(t, []string{api.ScopeUsageRead})
+		rec := e.do(t, http.MethodGet, "/v1/apps", nil, nil)
+		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
+	})
+
+	t.Run("secrets-write-key/PUT-secret-scope-allowed", func(t *testing.T) {
+		// The seal-and-persist path requires a recipient that the
+		// setupWithScopes harness doesn't wire, but the
+		// requireScope middleware fires BEFORE the handler — so
+		// any non-403 result (a 400 validation, a 5xx seal error,
+		// or the success 204) confirms the scope check passed.
+		// Asserting != 403 pins "secrets:write satisfied the route".
+		e := setupWithScopes(t, []string{api.ScopeSecretsWrite})
+		rec := e.do(t, http.MethodPut, "/v1/apps/missing-app/secrets/API_TOKEN",
+			api.PutAppSecretRequest{Value: "hush"}, nil)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("secrets:write PUT secret was 403: %s", rec.Body)
+		}
+	})
+
+	t.Run("secrets-write-key/DELETE-secret-scope-allowed", func(t *testing.T) {
+		// Symmetric to PUT: secrets:write covers DELETE too per
+		// ADR-034 rev2. The requireScope middleware fires before
+		// loadApp, so any non-403 result (404 from a missing app
+		// is the most likely) confirms the scope check passed.
+		// This case pins the wiring bug from PR #232 review:
+		// before the fix, DELETE was gated by ScopesDeployWriteSurface
+		// which leaked admin/deploy rights into the secrets surface.
+		e := setupWithScopes(t, []string{api.ScopeSecretsWrite})
+		rec := e.do(t, http.MethodDelete, "/v1/apps/missing-app/secrets/API_TOKEN", nil, nil)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("secrets:write DELETE secret was 403: %s", rec.Body)
+		}
+	})
+
+	t.Run("deploy-write-only-key/DELETE-secret-forbidden", func(t *testing.T) {
+		// Symmetric negative: deploy:write must NOT grant DELETE
+		// on /v1/apps/{slug}/secrets/{key}. ADR-034 rev2 reserves
+		// that surface for secrets:write (and admin). A deploy-only
+		// CI key cannot rotate secrets by deletion.
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
+		rec := e.do(t, http.MethodDelete, "/v1/apps/some-app/secrets/API_TOKEN", nil, nil)
+		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
+	})
+
+	t.Run("secrets-write-only-key/POST-deploy-forbidden", func(t *testing.T) {
+		e := setupWithScopes(t, []string{api.ScopeSecretsWrite})
+		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "elevator-app"}, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
 	t.Run("mint-rejects-unknown-scope", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
-		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "bad", Scopes: []string{"superuser"}}, nil)
+		e := setupWithScopes(t, api.ScopesAdminOnly)
+		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "bad", Scopes: []string{"banana"}}, nil)
 		assertProblem(t, rec, http.StatusBadRequest, api.CodeValidation)
 	})
 
-	t.Run("build-key-requires-read-or-admin", func(t *testing.T) {
-		// sanity check on a different family of routes — secrets are
-		// gated by the same read/write per-method default.
-		e := setupWithScopes(t, []string{"read"})
+	t.Run("apps-read-only-key/list-secrets-allowed", func(t *testing.T) {
+		// GET /v1/apps/{slug}/secrets is on the read surface. For
+		// the read assertion, we only need the scope check to
+		// fire — a missing app surfaces as 404, not 403.
+		e := setupWithScopes(t, []string{api.ScopeAppsRead})
 		rec := e.do(t, http.MethodGet, "/v1/apps/foo/secrets", nil, nil)
-		assertProblem(t, rec, http.StatusNotFound, api.CodeNotFound) // 404 notFound on app, not 403 — read scope was accepted
+		assertProblem(t, rec, http.StatusNotFound, api.CodeNotFound) // 404, not 403
 	})
 
-	t.Run("write-key/list-keys-403", func(t *testing.T) {
-		// GET /v1/keys accepts {admin, read}. A write-only key has
-		// neither and gets 403 from requireScope before the handler
-		// runs. Pins that listing is read-only, not write.
-		e := setupWithScopes(t, []string{"write"})
+	t.Run("deploy-write-only-key/list-keys-403", func(t *testing.T) {
+		// GET /v1/keys is on the read surface. A deploy-only key has
+		// neither scope and gets 403 from requireScope before the
+		// handler runs.
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
 		rec := e.do(t, http.MethodGet, "/v1/keys", nil, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
-	t.Run("write-key/mint-key-403", func(t *testing.T) {
+	t.Run("deploy-write-only-key/mint-key-403", func(t *testing.T) {
 		// POST /v1/keys is admin-only (minting a key from a scoped key
-		// would be a self-elevation primitive). Write must not suffice.
-		e := setupWithScopes(t, []string{"write"})
+		// would be a self-elevation primitive).
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
 		rec := e.do(t, http.MethodPost, "/v1/keys",
 			api.CreateKeyRequest{Label: "try"}, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
 
-	t.Run("write-key/delete-key-403", func(t *testing.T) {
+	t.Run("deploy-write-only-key/delete-key-403", func(t *testing.T) {
 		// DELETE /v1/keys/{id} is admin-only for the same reason.
-		e := setupWithScopes(t, []string{"write"})
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
 		rec := e.do(t, http.MethodDelete, "/v1/keys/some-id", nil, nil)
 		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
 	})
@@ -210,8 +281,9 @@ func TestScopeMatrix(t *testing.T) {
 // and a key with the listed scopes can authenticate.
 func TestMintKeyScopes(t *testing.T) {
 	t.Run("mint-with-scopes", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
-		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "deploy-only", Scopes: []string{"read", "write"}}, nil)
+		e := setupWithScopes(t, api.ScopesAdminOnly)
+		rec := e.do(t, http.MethodPost, "/v1/keys",
+			api.CreateKeyRequest{Label: "deploy-only", Scopes: []string{"apps:read", "deploy:write"}}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("mint: %d %s", rec.Code, rec.Body)
 		}
@@ -219,13 +291,27 @@ func TestMintKeyScopes(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if got := fmt.Sprintf("%v", out.Scopes); got != "[read write]" {
-			t.Errorf("scopes = %s, want [read write]", got)
+		if got := fmt.Sprintf("%v", out.Scopes); got != "[apps:read deploy:write]" {
+			t.Errorf("scopes = %s, want [apps:read deploy:write]", got)
+		}
+	})
+
+	t.Run("mint-dedupes-repeated-scopes", func(t *testing.T) {
+		e := setupWithScopes(t, api.ScopesAdminOnly)
+		rec := e.do(t, http.MethodPost, "/v1/keys",
+			api.CreateKeyRequest{Label: "dup", Scopes: []string{"apps:read", "apps:read", "deploy:write"}}, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("mint: %d %s", rec.Code, rec.Body)
+		}
+		var out api.APIKeyResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if got := fmt.Sprintf("%v", out.Scopes); got != "[apps:read deploy:write]" {
+			t.Errorf("deduped scopes = %s, want [apps:read deploy:write]", got)
 		}
 	})
 
 	t.Run("mint-omitted-scopes-defaults-to-admin", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
+		e := setupWithScopes(t, api.ScopesAdminOnly)
 		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "defaulted"}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("mint: %d %s", rec.Code, rec.Body)
@@ -238,7 +324,7 @@ func TestMintKeyScopes(t *testing.T) {
 	})
 
 	t.Run("list-keys-shows-scopes", func(t *testing.T) {
-		e := setupWithScopes(t, []string{"admin"})
+		e := setupWithScopes(t, api.ScopesAdminOnly)
 		rec := e.do(t, http.MethodGet, "/v1/keys", nil, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("list: %d %s", rec.Code, rec.Body)
@@ -255,9 +341,10 @@ func TestMintKeyScopes(t *testing.T) {
 
 	t.Run("mint-empty-scopes-defaults-to-admin", func(t *testing.T) {
 		// Explicit empty array is operationally identical to omitted:
-		// both fall through the len(scopes)==0 default in createKey.
-		// Pin the contract so a future "deny empty" change is loud.
-		e := setupWithScopes(t, []string{"admin"})
+		// both fall through the empty-input branch in
+		// NormalizeCreateKeyScopes. Pin the contract so a future
+		// "deny empty" change is loud.
+		e := setupWithScopes(t, api.ScopesAdminOnly)
 		rec := e.do(t, http.MethodPost, "/v1/keys",
 			api.CreateKeyRequest{Label: "empty", Scopes: []string{}}, nil)
 		if rec.Code != http.StatusCreated {

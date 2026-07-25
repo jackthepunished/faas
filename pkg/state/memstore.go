@@ -131,6 +131,13 @@ type MemStore struct {
 	// DeleteAccount, the GDPR ledger still has the delete row" needs
 	// them to survive.
 	gdprRequests []GdprRequest
+	// recentClaims is the B2.2 (issue #196) fairness mirror of the
+	// recent_build_claims table — keyed by account_id, value is the
+	// time of the LAST claim for that account within the window.
+	// We keep only the latest per account (the SQL table keeps the
+	// full row history; the MemStore only needs the timestamp to
+	// answer `now.Sub(t) <= fairnessWindow` correctly).
+	recentClaims map[string]time.Time
 	// stripePushHours tracks which (account, hour) pairs the hourly
 	// Stripe pusher has already pushed; prevents double-billing on
 	// redelivery.
@@ -225,6 +232,10 @@ func NewMemStore() *MemStore {
 		stripeByCustomer: map[string]string{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
+		// recentClaims is the B2.2 fairness mirror; starts empty so
+		// the FIRST ClaimNextQueuedBuildWithFairness round picks from
+		// every queued row (no account is in the skip set yet).
+		recentClaims: map[string]time.Time{},
 		// stripePushHours is the per-(account, hour) dedupe set the
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
@@ -493,6 +504,24 @@ func (m *MemStore) DeleteAPIKey(_ context.Context, accountID, keyID string) erro
 	return nil
 }
 
+// DeleteAPIKeyReturning is the IAM-1 (ADR-034 rev2) variant of
+// DeleteAPIKey: deletes the key in one statement and returns the
+// pre-delete row so the apid handler can emit a `key.deleted` audit
+// event carrying the dismissed scopes. Mirrors PgStore's
+// DELETE...RETURNING contract so tests against either backend
+// exercise the same handler shape.
+func (m *MemStore) DeleteAPIKeyReturning(_ context.Context, accountID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.AccountID != accountID {
+		return APIKey{}, ErrNotFound
+	}
+	delete(m.keys, keyID)
+	delete(m.keyByHash, hex.EncodeToString(k.Hash))
+	return k, nil
+}
+
 func (m *MemStore) ListAPIKeys(_ context.Context, accountID string) ([]APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -683,6 +712,16 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		dst := make([]netip.Prefix, len(src))
 		copy(dst, src)
 		a.EgressAllowlist = dst
+	}
+	// Issue #169 / #172: per-app reactive scale-up trigger. Set
+	// distinguishes "unset" (don't touch) from "explicit zero"
+	// (disable). Apid already gated the plan and the bounds
+	// (RPS > 0, CPU in [1,100]); the store is a plain column write.
+	if p.SetAutoscaleTargetRPS {
+		a.AutoscaleTargetRPS = derefInt(p.AutoscaleTargetRPS)
+	}
+	if p.SetAutoscaleTargetCPUPct {
+		a.AutoscaleTargetCPUPct = derefInt(p.AutoscaleTargetCPUPct)
 	}
 	m.apps[id] = a
 	return a, nil
@@ -1100,11 +1139,26 @@ func (m *MemStore) BuildByDeployment(_ context.Context, deploymentID string) (Bu
 	return latest, nil
 }
 
+// UpdateBuildStatus flips the build row to a new status. Mirrors
+// PgStore.UpdateBuildStatus's CAS guard (issue #195 B1.4): terminal
+// writes (BuildSucceeded / BuildFailed) only succeed if the row is
+// still 'running'. A late-arriving markSucceeded after a reaper sweep
+// that flipped the row to 'failed(timeout)' must NOT resurrect it —
+// the guard makes UpdateBuildStatus a CAS primitive that returns
+// ErrNotFound on a no-op match (the caller logs WARN and moves on).
+//
+// Non-terminal transitions (BuildRunning, BuildQueued) are NOT
+// guarded — ClaimQueuedBuild and the legacy UpdateBuildStatus(
+// BuildRunning, started=true) path both rely on a clean queued→
+// running flip.
 func (m *MemStore) UpdateBuildStatus(_ context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.builds[id]
 	if !ok {
+		return ErrNotFound
+	}
+	if (status == BuildSucceeded || status == BuildFailed) && b.Status != BuildRunning {
 		return ErrNotFound
 	}
 	b.Status = status
@@ -1120,6 +1174,43 @@ func (m *MemStore) UpdateBuildStatus(_ context.Context, id string, status BuildS
 	}
 	m.builds[id] = b
 	return nil
+}
+
+// SweepStuckRunningBuilds mirrors PgStore.SweepStuckRunningBuilds
+// (issue #195 B1.4). Returns the number of rows flipped.
+func (m *MemStore) SweepStuckRunningBuilds(_ context.Context, threshold time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	now := time.Now()
+	for id, b := range m.builds {
+		if b.Status != BuildRunning {
+			continue
+		}
+		if b.StartedAt.IsZero() || !b.StartedAt.Before(threshold) {
+			continue
+		}
+		b.Status = BuildFailed
+		b.FailureClass = FailureTimeout
+		b.FinishedAt = now
+		m.builds[id] = b
+		n++
+	}
+	return n, nil
+}
+
+// SetBuildStartedAtForTest is a test-only hook that lets the reaper
+// tests backdate a build's started_at without touching the public
+// Create flow. Mirrors the BackdateForTest pattern on instances.
+func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.builds[id]
+	if !ok {
+		return
+	}
+	b.StartedAt = t
+	m.builds[id] = b
 }
 
 // ClaimQueuedBuild atomically flips queued → running under m.mu (PR-A
@@ -1171,6 +1262,108 @@ func (m *MemStore) ClaimNextQueuedBuild(_ context.Context) (Build, error) {
 	b.StartedAt = time.Now()
 	m.builds[pick] = b
 	return b, nil
+}
+
+// ClaimNextQueuedBuildWithFairness mirrors PgStore (B2.2 issue #196).
+// Same selection shape as ClaimNextQueuedBuild but filters out
+// accounts whose last claim is more recent than fairnessWindow, with
+// the same starvation fallback when every queued account is recent.
+// Implementation note: MemStore's `builds` map does not carry
+// account_id directly, so we resolve it through deployments → apps
+// for each candidate (mirroring the SQL JOIN path). For small test
+// fixtures (≤ a few hundred queued builds) this is fine; the test
+// surface is what matters here.
+func (m *MemStore) ClaimNextQueuedBuildWithFairness(_ context.Context, fairnessWindow time.Duration) (Build, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	skip := map[string]struct{}{}
+	for acc, t := range m.recentClaims {
+		if now.Sub(t) <= fairnessWindow {
+			skip[acc] = struct{}{}
+		}
+	}
+	// Build (id, enqueuedAt, account) for queued rows. Skip lookup
+	// failures (deployment/app missing) — treat them as "no
+	// account known", which means the fallback "all queued" path
+	// applies (they're never in skip).
+	type candidate struct {
+		id         string
+		enqueuedAt time.Time
+		account    string
+	}
+	var queued []candidate
+	for id, b := range m.builds {
+		if b.Status != BuildQueued {
+			continue
+		}
+		dep, ok := m.deployments[b.DeploymentID]
+		if !ok {
+			continue
+		}
+		app, ok := m.apps[dep.AppID]
+		if !ok {
+			continue
+		}
+		queued = append(queued, candidate{id: id, enqueuedAt: b.EnqueuedAt, account: app.AccountID})
+	}
+	if len(queued) == 0 {
+		return Build{}, ErrNotFound
+	}
+	// First pass: pick from accounts NOT in skip.
+	hasFresh := false
+	for _, c := range queued {
+		if _, isRecent := skip[c.account]; !isRecent {
+			hasFresh = true
+			break
+		}
+	}
+	var pick string
+	if hasFresh {
+		var earliest time.Time
+		for _, c := range queued {
+			if _, isRecent := skip[c.account]; isRecent {
+				continue
+			}
+			if pick == "" || c.enqueuedAt.Before(earliest) {
+				pick = c.id
+				earliest = c.enqueuedAt
+			}
+		}
+	} else {
+		// Starvation fallback: every queued account is in skip;
+		// pick the earliest queued row, period.
+		var earliest time.Time
+		for _, c := range queued {
+			if pick == "" || c.enqueuedAt.Before(earliest) {
+				pick = c.id
+				earliest = c.enqueuedAt
+			}
+		}
+	}
+	if pick == "" {
+		return Build{}, ErrNotFound
+	}
+	b := m.builds[pick]
+	b.Status = BuildRunning
+	b.StartedAt = time.Now()
+	m.builds[pick] = b
+	return b, nil
+}
+
+// RecordRecentBuildClaim records a single claim for the given account
+// at now(). The MemStore in-memory map is the equivalent of the
+// recent_build_claims table; rows older than the next call's
+// fairnessWindow are harmlessly skipped (the WHERE-equivalent is the
+// `now.Sub(t) <= fairnessWindow` check inside ClaimNextQueuedBuildWithFairness).
+func (m *MemStore) RecordRecentBuildClaim(_ context.Context, accountID, buildID string) error {
+	if accountID == "" {
+		return fmt.Errorf("state: record recent build claim: empty account_id")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recentClaims[accountID] = time.Now()
+	return nil
 }
 
 // RequeueBuild resets a running build row back to queued with
@@ -2111,9 +2304,12 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			DeploymentID: s.DeploymentID,
 			AppID:        app.ID,
 			AccountID:    app.AccountID,
-			FCVersion:    s.FCVersion,
-			MemBytes:     s.MemBytes,
-			DiskBytes:    s.DiskBytes,
+			// B1.1: forward the slug so imaged's GC doesn't have to
+			// re-resolve it per eviction (was O(2N) extra SQL).
+			AppSlug:   app.Slug,
+			FCVersion: s.FCVersion,
+			MemBytes:  s.MemBytes,
+			DiskBytes: s.DiskBytes,
 			// #96 / ADR-025 axis 2: forward the canonical storage
 			// key so imaged's GC loop can Storage.Delete under it
 			// without a second hop through Snapshot.
@@ -2500,6 +2696,7 @@ func (m *MemStore) AppendEvent(_ context.Context, actor, kind string, subject *s
 		subj = parseSubjectID(*subject)
 	}
 	e := Event{
+		ID:      int64(len(m.events) + 1),
 		At:      time.Now(),
 		Actor:   actor,
 		Kind:    kind,

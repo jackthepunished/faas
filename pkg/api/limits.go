@@ -75,6 +75,22 @@ type Limits struct {
 	// apid's updateApp handler gates the PATCH body on this flag.
 	MinInstancesAllowed bool
 
+	// ScaleUpTargetRPSAllowed toggles `autoscale_target_rps` per plan
+	// (issue #169 / #172). Hobby + Pro + Scale opt in; Free does not
+	// (Free is single-concurrency and the per-request cost envelope
+	// already covers any reasonable load). apid's updateApp handler
+	// returns 403 CodePlanScaleUpNotAllowed when the plan lacks this
+	// gate.
+	ScaleUpTargetRPSAllowed bool
+
+	// ScaleUpTargetCPUAllowed toggles `autoscale_target_cpu_pct` per
+	// plan (issue #169 / #172). Pro + Scale only — "scale on CPU"
+	// without `min_instances` set is unbounded on Hobby, where the cost
+	// shape is too steep for the cheaper tier. apid's updateApp handler
+	// returns 403 CodePlanScaleUpNotAllowed when the plan lacks this
+	// gate.
+	ScaleUpTargetCPUAllowed bool
+
 	// Move 1 event-shaped surfaces (spec §4.4, §4.9, CLAUDE.md Hard
 	// limits). The apid cap checks on POST .../queues/invocations:send
 	// and POST /v1/apps/{slug}/delayed-tasks read these via
@@ -157,6 +173,11 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       0,
 		MaxSourceBytesPerInvocation: 0,
 		AsyncInvokeAllowed:          false,
+		// Autoscale (issue #169 / #172): Free stays off. The per-request
+		// cost envelope already covers Free's load shape, and a "scale
+		// up" trigger on a 1-concurrency plan is meaningless.
+		ScaleUpTargetRPSAllowed: false,
+		ScaleUpTargetCPUAllowed: false,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -181,6 +202,11 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       5,
 		MaxSourceBytesPerInvocation: 64 * 1024,
 		AsyncInvokeAllowed:          true,
+		// Autoscale: Hobby gets the RPS target only. CPU-driven scaling
+		// is gated on Pro+ because the cost shape of "scale on CPU
+		// without a min_instances floor" is unbounded on Hobby.
+		ScaleUpTargetRPSAllowed: true,
+		ScaleUpTargetCPUAllowed: false,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -209,6 +235,11 @@ var planLimits = map[Plan]Limits{
 		// is the typical Pro-tier reachability graph.
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 16,
+		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
+		// is gated on Pro+ to bound the "scale on CPU without a
+		// min_instances floor" cost shape.
+		ScaleUpTargetRPSAllowed: true,
+		ScaleUpTargetCPUAllowed: true,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -238,6 +269,9 @@ var planLimits = map[Plan]Limits{
 		// the Pro budget tracks the doubling in DeployedApps (25 -> 100).
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 64,
+		// Autoscale: Scale gets both targets; same rationale as Pro.
+		ScaleUpTargetRPSAllowed: true,
+		ScaleUpTargetCPUAllowed: true,
 	},
 }
 
@@ -317,6 +351,16 @@ const (
 	// no higher than plan default × this multiplier.
 	IdleTimeoutFloorSeconds = 10
 	IdleTimeoutMaxMultiple  = 2
+
+	// Autoscale (issue #169 / §17 G8). ScaleUpDecisionIntervalSeconds
+	// is the trigger's tick rate — 1 s balances "admit the Nth
+	// instance before the gateway wake queue builds" against "don't
+	// hammer Postgres with a full app list on every tick". ScaleUpWindowSeconds
+	// is the rolling RPS window — 5 s is the smallest window that
+	// smooths a single-tick spike without lagging so much that a burst
+	// is already over by the time the trigger fires.
+	ScaleUpDecisionIntervalSeconds = 1
+	ScaleUpWindowSeconds           = 5
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -541,6 +585,33 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// ScaleUpTargetRPSAllowed reports whether the plan may set
+// `autoscale_target_rps` (issue #169 / #172). Hobby + Pro + Scale opt
+// in; Free stays off. apid's updateApp handler gates `req.AutoscaleTargetRPS`
+// on this and surfaces the rejection with CodePlanScaleUpNotAllowed.
+// Unknown plans fail closed (return false) — same contract as
+// MinInstancesAllowed / EgressAllowlistAllowed.
+func (p Plan) ScaleUpTargetRPSAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.ScaleUpTargetRPSAllowed
+}
+
+// ScaleUpTargetCPUAllowed reports whether the plan may set
+// `autoscale_target_cpu_pct`. Pro + Scale opt in; Free + Hobby stay
+// off (cost shape of "scale on CPU without a min_instances floor"
+// is unbounded on the cheaper tiers). Same fail-closed contract as
+// ScaleUpTargetRPSAllowed above.
+func (p Plan) ScaleUpTargetCPUAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.ScaleUpTargetCPUAllowed
 }
 
 // AdmissionMB is the RAM an instance charges against the admission ceiling and

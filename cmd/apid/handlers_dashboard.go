@@ -335,6 +335,7 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 			ID:        k.ID,
 			Prefix:    api.APIKeyPrefix + hexPrefix(k.Hash),
 			Label:     k.Label,
+			Scopes:    k.Scopes,
 			CreatedAt: k.CreatedAt.UTC().Format("2006-01-02"),
 		}
 		if !k.LastUsedAt.IsZero() {

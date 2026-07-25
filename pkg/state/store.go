@@ -181,11 +181,37 @@ type Store interface {
 
 	// API keys.
 	// CreateAPIKey persists a new key row. Scopes is the explicit set of
-	// authorization scopes attached to the key (e.g. "admin", "read",
-	// "write"); see ADR-034. The store does not validate the scope
-	// vocabulary — that is the apid handler's responsibility.
+	// authorization scopes attached to the key (e.g. "admin",
+	// "apps:read", "deploy:write", "secrets:read", "secrets:write",
+	// "usage:read"); see ADR-034 rev2. The store does not validate the
+	// scope vocabulary — that is the apid handler's responsibility
+	// (api.NormalizeCreateKeyScopes is the canonical funnel; the DB
+	// CHECK constraint added in migration 00044 is the floor a typo
+	// cannot cross).
 	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error)
+	// DeleteAPIKey removes a key without returning the row. Used by
+	// paths that don't need to surface the deleted scopes (none
+	// today; DeleteAPIKeyReturning is the preferred shape for new
+	// callers).
 	DeleteAPIKey(ctx context.Context, accountID, keyID string) error
+	// DeleteAPIKeyReturning deletes the key and returns the row in a
+	// single statement (IAM-1, ADR-034 rev2). The handler uses the
+	// returned APIKey.Scopes to emit a `key.deleted` audit event
+	// carrying the dismissed permission set, so operators can
+	// answer "what just got revoked?" without re-deriving it from
+	// logs. Returns ErrNotFound when no matching row exists.
+	//
+	// **NOT atomic with audit emission.** This method issues a
+	// single DELETE...RETURNING; the subsequent AppendEvent call in
+	// the handler is a separate statement and round-trip. If the
+	// audit INSERT fails (network blip, schema drift), the key is
+	// gone but no `key.deleted` row exists. Callers MUST handle this
+	// partial-failure mode — the IAM-1 handler in cmd/apid logs a
+	// WARN via apid_audit_write_failures_total and accepts the
+	// loss-of-audit-row risk. A future tx-wrapper method
+	// (DeleteAPIKeyReturningAudited) could close this gap; today,
+	// document the trade-off.
+	DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error)
 	ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error)
 	// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used
 	// by the post-login audit log (cmd/apid/handlers_auth.go) so an
@@ -199,6 +225,11 @@ type Store interface {
 	// the principal is assembled atomically. Returns ErrNotFound when
 	// the hash has no matching key.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
+	// fire-and-forget on every successful bearer auth in the apid
+	// middleware so the dashboard can show "X used 2 minutes ago"
+	// (PRD §4.4) without coupling request latency to a non-critical
+	// observability write.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
@@ -431,6 +462,24 @@ type Store interface {
 	// starving the in-process worker — both compete cleanly for the
 	// head of the queue without ever observing the same row.
 	ClaimNextQueuedBuild(ctx context.Context) (Build, error)
+	// ClaimNextQueuedBuildWithFairness is the B2.2 (issue #196) variant
+	// that prefers accounts whose last claim is older than fairnessWindow.
+	// Identical SQL to ClaimNextQueuedBuild plus a CTE that filters out
+	// rows whose account shows up in recent_build_claims (claimed within
+	// the window) — falling back to all queued rows if every queued
+	// account is recent, so no build is ever starved (issue #196 B2.2
+	// critical invariant #1). The caller must RecordRecentBuildClaim on
+	// the chosen row's account_id AFTER the claim succeeds so the next
+	// round sees the just-claimed account in the "recent" set.
+	ClaimNextQueuedBuildWithFairness(ctx context.Context, fairnessWindow time.Duration) (Build, error)
+	// RecordRecentBuildClaim records that builderd just claimed a build
+	// for the given account. Called by builderd after a successful
+	// ClaimNextQueuedBuildWithFairness so the next fairness round
+	// excludes this account from the "fresh" set. Rows persist until
+	// they age out of the WHERE clause (claimed_at + window < now), so
+	// the table grows by ~claim-rate per window — bounded by a future
+	// Tier-3 GC (out of scope for #196).
+	RecordRecentBuildClaim(ctx context.Context, accountID, buildID string) error
 	// RequeueBuild resets a running build back to queued with enqueued_at
 	// untouched (preserving FIFO order) when the builder slot allocator
 	// (DecideSlot) rules the row out (builderd worker PR-B). started_at
@@ -439,6 +488,23 @@ type Store interface {
 	// RequeueBuild itself is unconditional.
 	RequeueBuild(ctx context.Context, id string) error
 	UpdateBuildStatus(ctx context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error
+
+	// SweepStuckRunningBuilds flips every build row whose status is
+	// 'running' AND whose started_at is older than threshold to
+	// status='failed' with failure_class='timeout'. Used by the
+	// builderd reaper (issue #195 B1.4) to clean up rows left
+	// orphaned by a builder VM crash, OOM, or kernel panic that
+	// bypassed the normal markFailed / markSucceeded path.
+	//
+	// Returns the number of rows affected. Idempotent: a second
+	// call with the same threshold affects 0 rows because all
+	// matching rows are now 'failed'.
+	//
+	// The reaper only updates the build row. The owning deployment
+	// row is flipped to DeployFailed separately (issue #195 B1.5
+	// for the imaged defer path; ADR-031 for the requeue-vs-fail
+	// reconciliation).
+	SweepStuckRunningBuilds(ctx context.Context, threshold time.Time) (int, error)
 
 	// Custom domains (apid is sole writer).
 	CreateCustomDomain(ctx context.Context, domain, appID, token string) (CustomDomain, error)

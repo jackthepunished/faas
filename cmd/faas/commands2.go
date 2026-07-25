@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,10 +23,11 @@ import (
 // Subcommand names — lifted to constants so goconst stops flagging the
 // repeated "list"/"add"/"rm" string literals in the dispatch tables below.
 const (
-	subList   = "list"
-	subAdd    = "add"
-	subUpdate = "update"
-	subRm     = "rm"
+	subList    = "list"
+	subAdd     = "add"
+	subUpdate  = "update"
+	subRm      = "rm"
+	subSummary = "summary"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -81,7 +83,7 @@ const (
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: faas app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N]", "apps")
+		PrintUsage(os.Stderr, "usage: faas app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -94,6 +96,15 @@ func cmdApp(args []string) int {
 	// plan_min_instances_not_allowed, which surfaces here as an
 	// "Update failed" error with the API's problem code.
 	min := fs.Int("min", 0, "min instances kept warm (Pro/Scale only; 0 = scale to zero)")
+	// Issue #169 / #172: per-app reactive scale-up trigger targets.
+	// --autoscale-target-rps sets the per-instance RPS target
+	// (Hobby/Pro/Scale; Free rejects with 403). --autoscale-target-cpu-pct
+	// sets the per-instance CPU% target in [1,100] (Pro/Scale only).
+	// Both use Visit-flag detection so the explicit "0 = disable" form
+	// round-trips correctly (a sentinel compare would swallow a valid
+	// --autoscale-target-rps=0).
+	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
+	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -123,8 +134,17 @@ func cmdApp(args []string) int {
 		v := *min
 		req.MinInstances = &v
 	}
+	if explicit["autoscale-target-rps"] {
+		v := *rps
+		req.AutoscaleTargetRPS = &v
+	}
+	if explicit["autoscale-target-cpu-pct"] {
+		v := *cpu
+		req.AutoscaleTargetCPUPct = &v
+	}
 
-	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil {
+	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
+		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -155,6 +175,19 @@ func cmdApp(args []string) int {
 		if len(a.EgressAllowlist) > 0 {
 			fmt.Printf("%-30s %s\n", "egress allowlist:",
 				strings.Join(a.EgressAllowlist, ", "))
+		}
+		// Issue #169 / #172: surface the per-app autoscale targets
+		// so a customer can verify their PATCH round-tripped. 0
+		// renders as "disabled" — same UX rule as min instances.
+		if a.AutoscaleTargetRPS > 0 {
+			fmt.Printf("%-30s %d\n", "autoscale target rps:", a.AutoscaleTargetRPS)
+		} else {
+			fmt.Printf("%-30s %s\n", "autoscale target rps:", "disabled")
+		}
+		if a.AutoscaleTargetCPUPct > 0 {
+			fmt.Printf("%-30s %d%%\n", "autoscale target cpu:", a.AutoscaleTargetCPUPct)
+		} else {
+			fmt.Printf("%-30s %s\n", "autoscale target cpu:", "disabled")
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
@@ -227,7 +260,7 @@ func cmdDeployTarball(args []string) int {
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
 	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python|function-go)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
-	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124)")
+	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
 	if err := fs.Parse(args); err != nil {
@@ -717,9 +750,40 @@ func cmdKeys(args []string) int {
 	return 1
 }
 
-// cmdUsage: GET /v1/usage?month=YYYY-MM. Defaults to the current month.
+// cmdUsage: dispatcher for `faas usage [summary]`.
+//
+//	faas usage                          → cmdUsageList  (per-app rows, current month)
+//	faas usage --month YYYY-MM          → cmdUsageList  (per-app rows, explicit month)
+//	faas usage summary                  → cmdUsageSummary (account roll-up, current month)
+//	faas usage summary --month YYYY-MM  → cmdUsageSummary (account roll-up, explicit month)
+//
+// Strict positional dispatch matches cmdCrons / cmdDomains / cmdKeys:
+// an unknown positional returns 1 with `unknown usage subcommand "..."`.
+// Flag-leading args (e.g. `--month`) are forwarded to cmdUsageList so
+// the legacy `faas usage --month YYYY-MM` invocation keeps working —
+// the PR description's "back-compat" promise. Forwarding any flag-like
+// arg to the leaf FlagSet also preserves its normal unknown-flag
+// handling (cmdUsageList exits 1 on `--bogus`).
 func cmdUsage(args []string) int {
-	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
+	if len(args) == 0 {
+		return cmdUsageList(nil)
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return cmdUsageList(args)
+	}
+	switch args[0] {
+	case subSummary:
+		return cmdUsageSummary(args[1:])
+	}
+	PrintUsage(os.Stderr, "usage: faas usage [--month YYYY-MM] | faas usage summary [--month YYYY-MM]", "usage")
+	fmt.Fprintf(os.Stderr, "unknown usage subcommand %q\n", args[0])
+	return 1
+}
+
+// cmdUsageList: GET /v1/usage?month=YYYY-MM. Defaults to the current
+// month. Per-app rows (UsageResponse — AppID, MBSeconds, Requests).
+func cmdUsageList(args []string) int {
+	fs := flag.NewFlagSet("usage-list", flag.ContinueOnError)
 	month := fs.String("month", "", "month (YYYY-MM); default: current month")
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -738,8 +802,56 @@ func cmdUsage(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(u))
 	}
-	fmt.Printf("App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
+	_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
 	return 0
+}
+
+// cmdUsageSummary: GET /v1/usage/summary?month=YYYY-MM. Account-wide
+// roll-up (used / included / overage / overage cost). Distinct from
+// cmdUsageList which returns per-app rows.
+//
+// Default-month behavior matches the SDK contract: an unset
+// --month passes "" through and the server defaults to the
+// current month. We deliberately don't fs.Visit for explicit
+// --month "" because the server treats "" and "unset" the same
+// (issue #64 family: avoid four lines for unobservable behavior).
+func cmdUsageSummary(args []string) int {
+	fs := flag.NewFlagSet("usage-summary", flag.ContinueOnError)
+	month := fs.String("month", "", "month (YYYY-MM); default: current month")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	s, err := client.UsageSummary(context.Background(), *month)
+	if err != nil {
+		return printErr("Request failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(s))
+	}
+	renderUsageSummary(osStdout, s)
+	return 0
+}
+
+// renderUsageSummary writes the account roll-up to w as a 5-row
+// labelled block (matches the dashboard's usage page). Width = 13
+// (longest label is "Overage cost"). GB-hour precision %.3f
+// (matches cmdUsageList). Cents is integer.
+//
+// The customer-facing label is "Overage cost" — the wire field is
+// `overage_cents` (cents, integer) but the dashboard labels it
+// "overage cost" and the customer is reading the value, not the
+// unit. The label here matches the dashboard.
+func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
+	const labelWidth = 13
+	_, _ = fmt.Fprintf(w, "  %-*s %s\n", labelWidth, "Month:", s.Month)
+	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB-hours\n", labelWidth, "Used:", s.UsedGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %d GB-hours\n", labelWidth, "Included:", s.IncludedGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB-hours\n", labelWidth, "Overage:", s.OverageGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %d cents\n", labelWidth, "Overage cost:", s.OverageCents)
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -923,8 +1035,12 @@ func validateRepoSlug(s string) error {
 	return nil
 }
 
-// cmdLogs: tail app or deployment logs via SSE. Minimal client-side parser;
-// we just print lines with a timestamp prefix.
+// cmdLogs: tail app or deployment logs via SSE. Move 3 swaps the
+// hand-rolled sseLineReader for the SDK's typed Decoder
+// (pkg/api/sse.go) so the same parser powers faas logs, faas tail,
+// and faas queue tail. signal.NotifyContext on os.Interrupt makes
+// Ctrl-C tear down the in-flight request within ~50 ms instead of
+// waiting for the body Close to be GC'd.
 func cmdLogs(args []string) int {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "follow new lines")
@@ -941,7 +1057,8 @@ func cmdLogs(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow)
 	if err != nil {
 		var ae *APIError
@@ -952,92 +1069,36 @@ func cmdLogs(args []string) int {
 		return printErr("Could not reach the API", err)
 	}
 	defer func() { _ = body.Close() }()
-	dec := newSSELineReader(body)
+	dec := api.NewDecoder(body)
+	dec.SetCloseFn(body.Close)
+	defer func() { _ = dec.Close() }()
 	for {
-		line, err := dec.Next()
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			// Ctrl-C. Exit cleanly with status 130 (the
+			// shell's standard for SIGINT exit).
+			return 130
+		case e, ok := <-dec.Events():
+			if !ok {
+				return 0
+			}
+			if e.Event == "not_implemented" {
+				fmt.Fprintln(os.Stderr, "vmmd Logs(req) gRPC pending — Move 4")
+				return 0
+			}
+			if e.Event == "end" {
+				return 0
+			}
+			if e.Data != "" {
+				fmt.Println(e.Data)
+			}
+		case err := <-dec.Errors():
 			if errors.Is(err, io.EOF) {
 				return 0
 			}
 			return printErr("Stream closed", err)
 		}
-		fmt.Println(line)
 	}
-}
-
-// sseLineReader peels "data: <line>\n\n" off a text/event-stream.
-type sseLineReader struct {
-	r   io.Reader
-	buf []byte
-}
-
-func newSSELineReader(r io.Reader) *sseLineReader { return &sseLineReader{r: r} }
-
-func (s *sseLineReader) Next() (string, error) {
-	for {
-		prefix, err := s.readUntil(":")
-		if err != nil {
-			return "", err
-		}
-		if prefix != "data" {
-			continue
-		}
-		// consume " " after the colon, then read until \n
-		_, _ = s.readByte() // ' '
-		line, err := s.readUntil("\n")
-		if err != nil {
-			return "", err
-		}
-		// drain trailing blank line (\n\n)
-		_, _ = s.readByte()
-		return line, nil
-	}
-}
-
-func (s *sseLineReader) readByte() (byte, error) {
-	for len(s.buf) == 0 {
-		if err := s.fill(); err != nil {
-			return 0, err
-		}
-	}
-	b := s.buf[0]
-	s.buf = s.buf[1:]
-	return b, nil
-}
-
-func (s *sseLineReader) readUntil(delim string) (string, error) {
-	var b strings.Builder
-	for {
-		for _, d := range delim {
-			_ = d
-		}
-		idx := strings.Index(string(s.buf), delim)
-		if idx >= 0 {
-			b.Write(s.buf[:idx])
-			s.buf = s.buf[idx+len(delim):]
-			return b.String(), nil
-		}
-		b.Write(s.buf)
-		s.buf = nil
-		if err := s.fill(); err != nil {
-			if errors.Is(err, io.EOF) && b.Len() > 0 {
-				return b.String(), nil
-			}
-			return b.String(), err
-		}
-	}
-}
-
-func (s *sseLineReader) fill() error {
-	tmp := make([]byte, 1024)
-	n, err := s.r.Read(tmp)
-	if n > 0 {
-		s.buf = append(s.buf, tmp[:n]...)
-	}
-	if err == io.EOF && len(s.buf) > 0 {
-		return nil
-	}
-	return err
 }
 
 // streamDeployLogs opens GET /v1/deployments/{id}/logs?follow=1 and
@@ -1065,49 +1126,67 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 		return 3
 	}
 	defer func() { _ = body.Close() }()
-	dec := newSSELineReader(body)
+	dec := api.NewDecoder(body)
+	dec.SetCloseFn(body.Close)
+	defer func() { _ = dec.Close() }()
+streamLoop:
 	for {
-		line, err := dec.Next()
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			return 130
+		case e, ok := <-dec.Events():
+			if !ok {
+				break streamLoop
+			}
+			// Move 3: switch on the typed Event name. The decoder
+			// preserves `event: <name>` so a single parser handles
+			// all four frame shapes this stream emits (log, status,
+			// end, error) plus heartbeat comments.
+			switch e.Event {
+			case "log":
+				var entry struct {
+					Line string `json:"line"`
+				}
+				if json.Unmarshal([]byte(e.Data), &entry) == nil && entry.Line != "" {
+					fmt.Println(entry.Line)
+				}
+			case statusLiteral:
+				var status struct {
+					Status string `json:"status"`
+				}
+				if json.Unmarshal([]byte(e.Data), &status) == nil &&
+					(status.Status == statusLive || status.Status == "failed") {
+					if status.Status == statusLive {
+						PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", dep.AppID)
+						printDeployColdWakeSentence()
+						return 0
+					}
+					return renderDeployFailure(dep)
+				}
+			case "end":
+				var end struct {
+					Reason string `json:"reason"`
+				}
+				if json.Unmarshal([]byte(e.Data), &end) == nil && end.Reason != "" {
+					PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
+				}
+				break streamLoop
+			case "error":
+				PrintWarn(os.Stderr, "stream closed; follow manually: faas logs --deployment %s", dep.ID)
+				return 3
+			default:
+				// Unknown frame shape — print raw so the customer can see it.
+				if e.Data != "" {
+					fmt.Println(e.Data)
+				}
+			}
+		case err := <-dec.Errors():
 			if errors.Is(err, io.EOF) {
-				break
+				break streamLoop
 			}
 			PrintWarn(os.Stderr, "stream closed; follow manually: faas logs --deployment %s", dep.ID)
 			return 3
 		}
-		// event:log frames — JSON LogEntry with a `line` field.
-		var entry struct {
-			Line string `json:"line"`
-		}
-		if json.Unmarshal([]byte(line), &entry) == nil && entry.Line != "" {
-			fmt.Println(entry.Line)
-			continue
-		}
-		// event:status terminal frame.
-		var status struct { //nolint:goconst
-			Status string `json:"status"` //nolint:goconst
-		}
-		if json.Unmarshal([]byte(line), &status) == nil &&
-			(status.Status == statusLive || status.Status == "failed") {
-			if status.Status == statusLive {
-				PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", dep.AppID)
-				printDeployColdWakeSentence()
-				return 0
-			}
-			return renderDeployFailure(dep)
-		}
-		// event:end backstop frame from apid's 10-min timeout.
-		// Render a clean message instead of dumping the raw SSE
-		// envelope on stdout.
-		var end struct {
-			Reason string `json:"reason"`
-		}
-		if json.Unmarshal([]byte(line), &end) == nil && end.Reason != "" {
-			PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
-			break
-		}
-		// Unknown frame shape — print raw so the customer can see it.
-		fmt.Println(line)
 	}
 	// Stream ended without a terminal frame — try one GetDeployment
 	// poll so a fast build that raced the SSE open isn't reported as

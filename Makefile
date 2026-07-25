@@ -109,6 +109,19 @@ e2e: ## End-to-end tests in cmd/e2e (needs Postgres reachable; metal subset via 
 	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set; set it to a reachable Postgres to run e2e" ; exit 1)
 	$(GO) test -race -count=1 -timeout=15m ./cmd/e2e/...
 
+.PHONY: backup-pg
+backup-pg: ## Take a Postgres base backup into /var/lib/pgsql/basebackup/basebackup-<UTC>/ (spec §14 M8)
+	@test -d /var/lib/pgsql/basebackup || (echo "/var/lib/pgsql/basebackup missing — run the postgres role first" ; exit 1)
+	@sudo -u postgres pg_basebackup -Ft -z -D /var/lib/pgsql/basebackup/basebackup-$$(date -u +%Y-%m-%dT%H%M%SZ) -P -X fetch --checkpoint=fast --label=faas-m8-nightly
+
+.PHONY: backup-restore-drill
+backup-restore-drill: ## Run the M8 restore drill end-to-end (must run on EX44 as root)
+	sudo bash deploy/scripts/faas-m8-restore-drill.sh
+
+.PHONY: lint-drill
+lint-drill: ## Static lint of the restore drill script + record template shape (spec §14 M8)
+	bash deploy/scripts/faas-m8-restore-drill_test.sh
+
 .PHONY: metal-lima
 metal-lima: ## Run metal tests locally on an M3+ Mac via Lima nested KVM (see deploy/lima/README.md)
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
@@ -250,13 +263,21 @@ spec-lint: spec-install ## vacuum lint (style + rules) on the OpenAPI spec
 	@vacuum lint -r $(VACUUM_RULES) $(SPEC)
 
 .PHONY: spec-check
-spec-check: spec-install spec-lint spec-sync ## CI gate: vacuum lint + AST parity + git clean (runs in PR CI)
+spec-check: spec-install spec-lint spec-sync denylist-md ## CI gate: vacuum lint + AST parity + git clean + denylist.md drift (runs in PR CI)
 	# No -race: the AST tests are pure CPU (no I/O, no goroutines). -race
 	# would double the wall time without adding signal.
 	@$(GO) test -count=1 -run TestSpecCompliance ./cmd/apid/...
-	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) || \
-	  (echo "spec-check: spec drift — re-run 'make spec-check' or hand-fix to match"; exit 1)
+	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) docs/denylist.md || \
+	  (echo "spec-check: drift (spec or denylist.md) — re-run 'make spec-check' or hand-fix to match"; exit 1)
 	@echo "spec-check: OK"
+
+.PHONY: denylist-md
+denylist-md: ## Regenerate docs/denylist.md from the shared egress catalog (ADR-034 §Consequences)
+	# Pure-Go generator — no template strings, no timestamps. Deterministic
+	# order (v4 by prefix asc, v6 by prefix asc, SMTP by port asc) so the
+	# git diff stays reviewable.
+	@$(GO) run ./cmd/denylist-md > docs/denylist.md
+	@echo "denylist-md: docs/denylist.md regenerated"
 
 .PHONY: sdk-check
 sdk-check: ## CI gate: every OpenAPI route has a typed SDK method on pkg/api.Client

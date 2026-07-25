@@ -315,3 +315,40 @@ func TestRunWithDeps_TLSBundleCloseStopsRenewLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestAssertLoopbackBind exercises the /metrics listener guard added
+// in PR #218. Accepts every loopback form; rejects public addresses and
+// bare ":port" (which would bind 0.0.0.0). The harness path passes a
+// loopback form so the in-process tests in this file keep passing.
+func TestAssertLoopbackBind(t *testing.T) {
+	cases := []struct {
+		addr string
+		ok   bool
+	}{
+		// Accepted: explicit loopback forms the harness / production use.
+		{"127.0.0.1:9090", true},
+		{"127.0.0.42:9100", true},
+		{"[::1]:9090", true},
+		{"localhost:9090", true},
+
+		// Rejected: any address that would expose /metrics off-box.
+		{"0.0.0.0:9090", false},
+		{":9090", false}, // bare ":port" binds 0.0.0.0 — exactly what this guard prevents
+		{"10.0.0.1:9090", false},
+		{"[2001:db8::1]:9090", false},
+
+		// Rejected: malformed.
+		{"no-port", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			err := assertLoopbackBind(tc.addr)
+			if tc.ok && err != nil {
+				t.Errorf("assertLoopbackBind(%q) = %v, want nil", tc.addr, err)
+			}
+			if !tc.ok && err == nil {
+				t.Errorf("assertLoopbackBind(%q) = nil, want error", tc.addr)
+			}
+		})
+	}
+}

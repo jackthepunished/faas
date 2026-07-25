@@ -1,0 +1,67 @@
+# postgres_backup — install the nightly pg_basebackup timer (spec §14 M8).
+#
+# Runs AFTER the `postgres` role so:
+#   * the cluster is up (postgresql.service exists),
+#   * the `faas` system user + DB exist (the role reads them),
+#   * `/var/lib/pgsql/archive` exists (postgres role:158-165),
+#   * WAL archiving is wired (wal_level=replica, archive_mode=on,
+#     archive_command='cp %p /var/lib/pgsql/archive/%f').
+#
+# This role does NOT change PG config — the producer only consumes the
+# existing GUCs. It only drops two systemd units into /etc/systemd/system/
+# and enables the timer. Re-running is a no-op on a converged box.
+
+- name: postgres_backup — create basebackup root
+  ansible.builtin.file:
+    path: /var/lib/pgsql/basebackup
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+  failed_when: false  # chroot/CI may not have the postgres user
+
+- name: postgres_backup — drop basebackup.service
+  ansible.builtin.copy:
+    src: faas-pg-basebackup.service
+    dest: /etc/systemd/system/faas-pg-basebackup.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload postgres_backup
+
+- name: postgres_backup — drop basebackup.timer
+  ansible.builtin.copy:
+    src: faas-pg-basebackup.timer
+    dest: /etc/systemd/system/faas-pg-basebackup.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload postgres_backup
+
+- name: postgres_backup — daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+  failed_when: false  # chroot/CI lacks systemd
+
+- name: postgres_backup — enable + start the timer
+  ansible.builtin.systemd:
+    name: faas-pg-basebackup.timer
+    enabled: true
+    state: started
+  failed_when: false  # chroot/CI lacks systemd
+
+# Spec §11 sanity check — refuse to claim success if the basebackup root
+# is world-readable. Catches a wrong umask in a future edit of the
+# service unit.
+- name: postgres_backup — verify basebackup root mode (spec §11)
+  ansible.builtin.stat:
+    path: /var/lib/pgsql/basebackup
+  register: pg_bb_root
+  failed_when: false
+- name: postgres_backup — assert mode ≤ 0750
+  ansible.builtin.assert:
+    that:
+      - pg_bb_root.stat.exists
+      - pg_bb_root.stat.mode in ["0750", "0700"]
+    fail_msg: "/var/lib/pgsql/basebackup must be 0750 or tighter (spec §11)"
+  when: pg_bb_root.stat.exists

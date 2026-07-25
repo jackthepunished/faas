@@ -129,6 +129,14 @@ func (s *server) setSecret(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"account", acct.ID,
 		"value_bytes", logsanitize.RedactValue(req.Value),
 	)
+	// IAM-4 (ADR-035): record the secret set. NEVER carry the
+	// plaintext value in the audit row — same posture as slog.
+	// data.app_id lets the audit log filter by app; data.name is
+	// the secret key (not the value).
+	s.audit.Emit(ctx(r), "secret.set", &acct.ID, map[string]any{
+		"app_id": app.ID,
+		"name":   key,
+	})
 	writeJSON(w, http.StatusOK, struct {
 		Key string `json:"key"`
 	}{Key: key})
@@ -208,6 +216,11 @@ func (s *server) deleteSecret(w http.ResponseWriter, r *http.Request, acct state
 		"key", logsanitize.Field(key),
 		"account", acct.ID,
 	)
+	// IAM-4 (ADR-035): record the secret delete.
+	s.audit.Emit(ctx(r), "secret.deleted", &acct.ID, map[string]any{
+		"app_id": app.ID,
+		"name":   key,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
