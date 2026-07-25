@@ -45,6 +45,23 @@ type UpdateAppRequest struct {
 	// chain policy). The non-/0 contract is enforced by the DB
 	// trigger `apps_egress_allowlist_cidr` (migration 00033).
 	EgressAllowlist *[]string `json:"egress_allowlist,omitempty"`
+	// AutoscaleTargetRPS is the per-instance RPS target for the
+	// reactive scale-up trigger (issue #169 / #172 / pkg/sched/scaleup).
+	// When measured RPS / live_instance_count exceeds this value,
+	// schedd admits another instance up to plan.MaxConcurrency. Plan-gated
+	// upstream: Free returns 403 CodePlanScaleUpNotAllowed. Hobby/Pro/Scale
+	// accept values > 0; values <= 0 return 422 CodeInvalidAutoscaleTargetRPS.
+	// Autoscale is "enabled" iff at least one of AutoscaleTargetRPS /
+	// AutoscaleTargetCPUPct is non-nil (no separate boolean, per user
+	// direction).
+	AutoscaleTargetRPS *int `json:"autoscale_target_rps,omitempty"`
+	// AutoscaleTargetCPUPct is the per-instance CPU% target (1..100)
+	// for the scale-up trigger. Same semantics as AutoscaleTargetRPS
+	// but the signal source is pkg/sched/instancestats.Reader (PR #205);
+	// nil reader falls back to RPS-only mode (PR #169 never lands the
+	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
+	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
+	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -90,6 +107,13 @@ type AppResponse struct {
 	// order matches insertion order. NOT in `required:` because the
 	// empty-slice case is the contract.
 	EgressAllowlist []string `json:"egress_allowlist"`
+	// AutoscaleTargetRPS / AutoscaleTargetCPUPct are the per-app
+	// reactive scale-up targets (issue #169 / #172 / pkg/sched/scaleup).
+	// Each is 0 when unset ("disabled") and > 0 when configured.
+	// Surfaces on GET /v1/apps/{slug} so dashboards can show the
+	// current target. Plan-gated upstream.
+	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
+	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
@@ -152,7 +176,7 @@ type AccountLimits struct {
 // appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
 // + label + scopes + last_used_at + id are returned thereafter. Scopes is
 // the explicit permission set attached to the key (e.g. ["admin"],
-// ["read"], ["write"]); see ADR-034.
+// ["apps:read", "deploy:write"]); see ADR-034 rev2.
 type APIKeyResponse struct {
 	ID         string   `json:"id"`
 	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
@@ -168,8 +192,10 @@ type APIKeyResponse struct {
 // (max 100 chars per spec); empty label is allowed and renders as
 // `{}` so the server's optional-field handling stays in scope. Scopes
 // is the requested permission set; the server validates each entry
-// against the allowed vocabulary (admin, read, write) and defaults to
-// ["admin"] when omitted so existing callers keep full access. See ADR-034.
+// against the closed vocabulary (admin, apps:read, deploy:write,
+// secrets:read, secrets:write, usage:read) and defaults to
+// ["admin"] when omitted so existing callers keep full access. See
+// ADR-034 rev2.
 type CreateKeyRequest struct {
 	Label  string   `json:"label,omitempty"`
 	Scopes []string `json:"scopes,omitempty"`
@@ -426,7 +452,7 @@ type UsageExportResponse struct {
 // the create response, per §4.2). Only the prefix + label + scopes +
 // timestamps. Scopes is included so the customer's GDPR export carries
 // the full audit trail of which keys had which permissions at the
-// moment of export (ADR-034).
+// moment of export (ADR-034 rev2).
 type APIKeyExportResponse struct {
 	ID        string   `json:"id"`
 	Prefix    string   `json:"prefix"`

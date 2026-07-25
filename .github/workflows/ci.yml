@@ -191,22 +191,24 @@ jobs:
       # `make test` is `go test -race -count=1 ./...` — covers every
       # package that builds on `ubuntu-latest`. ~4:20 on a cold runner,
       # dominated by `pkg/sched` + `pkg/fcvm` lifecycle tests.
+      #
+      # This one step is the whole job: it covers the public Go SDK
+      # (./pkg/api/...) AND the pgx-backed Store integration tests
+      # (./pkg/state/..., ./pkg/db/...), because `./...` includes them
+      # and DATABASE_URL is set at the job level above — so the pg tests
+      # see a live Postgres here and do not take their skip-when-unset
+      # branch. Dedicated "SDK unit tests" and "pg integration tests"
+      # steps used to re-run those same packages after this line; they
+      # were pure duplicates (~28s/run) and were removed.
       - name: unit tests
         run: make test
       # Public Go SDK drift gate. Companion to spec-check: fails the
       # PR when an OpenAPI route ships without a typed *Client method in
-      # pkg/api. Pure read-only AST+YAML walk; no installs needed.
+      # pkg/api. Pure read-only AST+YAML walk; no installs needed. NOT
+      # covered by `make test` — this is a generator-parity check, not a
+      # test binary.
       - name: sdk-check
         run: make sdk-check
-      # Public Go SDK test suite. Mirrors every SDK method against a
-      # stub apid via httptest; fast enough for the standard PR run.
-      # -race catches any sync issue in the SSE / multipart helpers.
-      - name: SDK unit tests
-        run: go test -race -count=1 ./pkg/api/...
-      # M5+: pgx-backed Store. Tests that need Postgres are skipped when
-      # DATABASE_URL is unset, so the suite stays green on local dev too.
-      - name: pg integration tests
-        run: go test -race -count=1 ./pkg/state/... ./pkg/db/...
 
   # OpenAPI spec gate (PR #129). The spec is the source of truth for
   # documentation; the code is the source of truth for behavior; this

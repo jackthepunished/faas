@@ -101,7 +101,7 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // constraint in migrations/00001_init.sql.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
 		 from api_keys where key_sha256 = $1`, hash)
 	return scanAPIKey(row)
 }
@@ -116,7 +116,7 @@ func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
 // collapsing to a single SQL JOIN halves the round-trips on every
 // authenticated request. Not blocking: index hits are fast enough that
 // the perf cost is negligible at current scale. Revisit when auth
-// latency shows up on the dashboard. See ADR-034.
+// latency shows up on the dashboard. See ADR-034 rev2.
 func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
 	acct, err := s.AccountByKeyHash(ctx, hash)
 	if err != nil {
@@ -129,12 +129,18 @@ func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, AP
 	return acct, key, nil
 }
 
+// scanAPIKey reads the seven-column api_keys projection (id,
+// account_id, key_sha256, label, scopes, created_at, last_used_at).
+// Columns not enumerated in the seven-tuple (e.g. legacy callers from
+// before IAM-1) still work because every query in this package writes
+// the full seven-column list; the shared helper makes the projections
+// stay in lockstep.
 func scanAPIKey(row pgx.Row) (APIKey, error) {
 	var (
 		k         APIKey
 		hashBytes []byte
 	)
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
 		}
@@ -284,7 +290,7 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
 		accountID, hash, nullString(label), scopes)
 	return scanAPIKey(row)
 }
@@ -300,9 +306,24 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 	return nil
 }
 
+// DeleteAPIKeyReturning deletes the key and returns the row in a
+// single DELETE ... RETURNING statement (IAM-1, ADR-034 rev2). The
+// handler uses the returned row's Scopes to emit a key.deleted audit
+// event so an operator investigating "what just got revoked?" can see
+// the dismissed permission set without re-deriving it from logs.
+// Returns ErrNotFound when no matching key exists (account mismatch
+// is indistinguishable from a missing id, matching DeleteAPIKey).
+func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`delete from api_keys where id = $1 and account_id = $2
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
+		keyID, accountID)
+	return scanAPIKey(row)
+}
+
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz) from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err
@@ -338,7 +359,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
 	return scanApp(row)
 }
@@ -404,7 +426,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
 	created, err := scanApp(row)
 	if err != nil {
@@ -419,7 +442,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where id = $1`, id)
 	return scanApp(row)
 }
@@ -427,7 +451,8 @@ func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
 func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where slug = $1 and status <> 'deleted'`, slug)
 	return scanApp(row)
 }
@@ -435,7 +460,8 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where account_id = $1 and status <> 'deleted' order by created_at desc`, accountID)
 	if err != nil {
 		return nil, err
@@ -447,7 +473,8 @@ func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error)
 func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where status <> 'deleted' order by created_at desc`)
 	if err != nil {
 		return nil, err
@@ -477,16 +504,21 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
 		   min_instances   = case when $9 then $10 else min_instances end,
-		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end
+		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
+		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
+		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
 		 where id = $1
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		id,
 		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
 		p.Manifest != nil, manifestBytes,
 		p.SetMinInstances, derefInt(p.MinInstances),
-		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)))
+		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
+		p.SetAutoscaleTargetRPS, derefInt(p.AutoscaleTargetRPS),
+		p.SetAutoscaleTargetCPUPct, derefInt(p.AutoscaleTargetCPUPct))
 	return scanApp(row)
 }
 
@@ -520,7 +552,8 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 		`update apps set slug = $3
 		 where account_id = $1 and slug = $2 and status <> 'deleted'
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		accountID, oldSlug, newSlug)
 	return scanApp(row)
 }
@@ -1068,6 +1101,96 @@ func (s *PgStore) ClaimNextQueuedBuild(ctx context.Context) (Build, error) {
 		return Build{}, fmt.Errorf("state: claim next queued build: %w", err)
 	}
 	return b, nil
+}
+
+// ClaimNextQueuedBuildWithFairness is the B2.2 (issue #196) variant.
+// Same shape as ClaimNextQueuedBuild (single UPDATE+RETURNING under a
+// SELECT … FOR UPDATE SKIP LOCKED) but with a CTE that excludes
+// accounts whose last claim is more recent than fairnessWindow.
+//
+// Critical invariant #1 (never starve): if every queued account is in
+// recent_claims (e.g. 100% of accounts claimed within the window), the
+// `or not exists (… fresh_candidate …)` clause falls back to ALL queued
+// rows. This is the standard round-robin fairness property.
+//
+// Critical invariant #2 (must not regress basic claim): the row we
+// SELECT FOR UPDATE must still be only status='queued' (the
+// freshness-fallback path also enforces status='queued').
+//
+// Critical invariant #3 (builds↔account path): builds does NOT carry
+// account_id directly; we join through deployments → apps. The double
+// join is the cost of the fairness filter without denormalising
+// account_id onto the builds row (a future B3.x could carry
+// account_id on builds to skip the JOIN, but that's a separate slice).
+func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairnessWindow time.Duration) (Build, error) {
+	row := s.pool.QueryRow(ctx,
+		`with skipped as (
+		   select account_id from recent_build_claims
+		    where claimed_at > now() - $1::interval
+		 ),
+		 queued_with_account as (
+		   select b.id, b.enqueued_at, a.account_id
+		     from builds b
+		     join deployments d on d.id = b.deployment_id
+		     join apps a        on a.id = d.app_id
+		    where b.status = 'queued'
+		 ),
+		 fresh_candidates as (
+		   select id from queued_with_account
+		    where account_id not in (select account_id from skipped)
+		 ),
+		 has_fresh as (
+		   select exists (select 1 from fresh_candidates) as yes
+		 ),
+		 target as (
+		   -- prefer fresh; if none, fall back to ALL queued (starvation guard)
+		   select id from fresh_candidates
+		    where (select yes from has_fresh)
+		   union all
+		   select id from queued_with_account
+		    where not (select yes from has_fresh)
+		    order by enqueued_at
+		    limit 1
+		 )
+		 update builds set status='running', started_at = now()
+		  where id = (select id from target)
+		  returning id, deployment_id, kind, source_bytes, status,
+		            coalesce(failure_class,''), coalesce(log_path,''),
+		            started_at, finished_at, enqueued_at`,
+		fmt.Sprintf("%d milliseconds", fairnessWindow.Milliseconds()))
+	b, err := scanBuild(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Build{}, ErrNotFound
+		}
+		return Build{}, fmt.Errorf("state: claim next queued build (fairness): %w", err)
+	}
+	return b, nil
+}
+
+// RecordRecentBuildClaim records a single claim into recent_build_claims
+// so the next ClaimNextQueuedBuildWithFairness round excludes this
+// account from the "fresh" set. Called by builderd after a successful
+// ClaimNextQueuedBuildWithFairness, with the build's account_id loaded
+// from app.AccountID via the existing deployment → app join.
+//
+// The insert is intentionally append-only with no UPSERT. Multiple rows
+// for the same account within the window are fine — the WHERE clause
+// is "claimed_at > now() - interval", not "exists some row for this
+// account", so a noisiy customer with N concurrent builds just gets N
+// rows in the window. Keeping the row count = "claims within the
+// window" is also useful operator telemetry in the meantime.
+func (s *PgStore) RecordRecentBuildClaim(ctx context.Context, accountID, buildID string) error {
+	if accountID == "" {
+		return fmt.Errorf("state: record recent build claim: empty account_id")
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into recent_build_claims (account_id, build_id) values ($1::uuid, $2::uuid)`,
+		accountID, buildID)
+	if err != nil {
+		return fmt.Errorf("state: record recent build claim: %w", err)
+	}
+	return nil
 }
 
 // RequeueBuild resets a build row to queued when builderd's slot
@@ -2973,7 +3096,8 @@ func scanApp(row pgx.Row) (App, error) {
 	var manifestBytes []byte
 	var allowlistText string
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText); err != nil {
+		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
 		return App{}, mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -2993,7 +3117,8 @@ func scanApps(rows pgx.Rows) ([]App, error) {
 		var manifestBytes []byte
 		var allowlistText string
 		if err := rows.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText); err != nil {
+			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+			&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
 			return nil, err
 		}
 		a.Type = AppType(typeStr)

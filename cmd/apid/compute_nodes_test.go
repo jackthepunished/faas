@@ -38,7 +38,7 @@ func newComputeNodeTestServer(t *testing.T, adminCSV, email string) (*httptest.S
 	if err != nil {
 		t.Fatalf("mint key: %v", err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatalf("seed key: %v", err)
 	}
 	srv := newServerWithDeps(store, nil, "example.com", nil, "", nil, nil, nil, nil, 0, "")

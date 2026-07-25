@@ -162,10 +162,19 @@ type BillingData struct {
 }
 
 // APIKeyItem is one row on the /dashboard/account page's keys tab.
+//
+// Scopes is the fine-grained permission set the apid IAM-1 (ADR-034
+// rev2) vocabulary grants the key (e.g. ["admin"], ["apps:read",
+// "deploy:write"], or the legacy single-element form). The dashboard
+// template renders the slice as a comma-separated list. Defaults to
+// empty for older accounts that pre-date the migration's CHECK
+// constraint guarantee (the renderer treats nil as "—" — see
+// account.html).
 type APIKeyItem struct {
 	ID         string
 	Prefix     string
 	Label      string
+	Scopes     []string
 	CreatedAt  string
 	LastUsedAt string // empty until first use
 }

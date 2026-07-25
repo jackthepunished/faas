@@ -149,9 +149,11 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		ops.observe(p.ops, code, dur)
 		if perr != nil {
 			p.log.Warn("meter: push usage", "account", acct.ID, "hour", start,
-				"code", code, "err", perr)
+				"code", code, "mb_seconds", mbSec, "err", perr)
 			continue
 		}
+		p.log.Info("meter: push usage", "account", acct.ID, "hour", start,
+			"code", code, "mb_seconds", mbSec)
 		pushed++
 	}
 	return pushed, nil

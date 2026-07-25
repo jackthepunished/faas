@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -135,6 +136,39 @@ type server struct {
 	// roll back the action). nil falls back to a no-op helper so
 	// older tests can build a server without an audit handle.
 	audit *auditor
+	// touchDebounce coalesces per-key last_used_at updates (PR #232
+	// review #7). Without this, every successful bearer auth would
+	// spawn a goroutine issuing an UPDATE api_keys SET last_used_at =
+	// now(). Hot keys (gateway pinned under one key) would amplify
+	// into WAL+lock pressure. keyTouchWindow below is the
+	// minimum interval — recent touches within the window drop.
+	// Reads are lock-free via sync.Map.Load; the Store path is
+	// LoadOrStore so the first writer wins. A periodic janitor
+	// (pkg/grace) evicts old entries to bound memory.
+	touchDebounce sync.Map // map[string]time.Time
+}
+
+// keyTouchWindow is the minimum interval between per-key last_used_at
+// stamps. PR #232 review pinned this at 30s — observability doesn't need
+// sub-second resolution, and a long-enough window keeps WAL amplification
+// bounded even under sustained 1k RPS on one key.
+const keyTouchWindow = 30 * time.Second
+
+// shouldTouchKey reports whether the key's last_used_at is stale enough
+// to warrant an UPDATE. Atomic-ish via sync.Map.LoadOrStore so two
+// concurrent first-time callers don't both schedule a touch; the
+// second caller observes the freshly-stored timestamp and skips.
+func (s *server) shouldTouchKey(keyID string, now time.Time) bool {
+	last, loaded := s.touchDebounce.LoadOrStore(keyID, now)
+	if !loaded {
+		return true // first touch wins
+	}
+	if now.Sub(last.(time.Time)) < keyTouchWindow {
+		return false // recent touch — drop
+	}
+	// stale entry; CAS to refresh.
+	s.touchDebounce.Store(keyID, now)
+	return true
 }
 
 // WithOpsMetrics attaches the daemon-wide Prometheus registry. The
@@ -370,8 +404,8 @@ func (s *server) handler() http.Handler {
 	// Account. The /v1/account/plan change is destructive across the
 	// whole account, so it requires the admin scope; the read-only
 	// /v1/account carries the method default (read or admin).
-	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.whoami)))
-	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin)(s.idempotent(s.changePlan))))
+	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.whoami)))
+	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan))))
 	// G6 account self-service (spec §17 G6, ADR-021). /v1/account/dpa
 	// is intentionally mounted without s.auth — the DPA is a public
 	// artefact a prospect reads before signing up. The export + delete
@@ -380,41 +414,41 @@ func (s *server) handler() http.Handler {
 	// can take a final export or cancel during the 30-day grace.
 	// DELETE /v1/account is admin-only — losing the account is
 	// irreversible.
-	mux.HandleFunc("GET /v1/account/export", s.auth(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.exportAccount)))
-	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.idempotent(s.deleteAccount))))
-	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.restoreAccount)))
+	mux.HandleFunc("GET /v1/account/export", s.auth(s.requireScope(api.ScopesReadSurface...)(s.exportAccount)))
+	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.deleteAccount))))
+	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(api.ScopesDeployWriteSurface...)(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
 
 	// Apps.
-	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listApps)))
-	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createApp))))
-	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getApp)))
-	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPatch))(s.updateApp)))
-	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteApp)))
+	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listApps)))
+	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createApp))))
+	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getApp)))
+	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp)))
 
 	// Deployments.
-	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createDeployment))))
-	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getDeployment)))
-	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.streamDeploymentLogs)))
-	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.rollbackApp))))
-	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.parkApp)))
-	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.wakeApp)))
-	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.renameApp))))
+	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment))))
+	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getDeployment)))
+	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs)))
+	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.rollbackApp))))
+	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.parkApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.wakeApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.renameApp))))
 
 	// Instances (read-only here; schedd is the writer).
-	mux.HandleFunc("GET /v1/apps/{slug}/instances", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listInstances)))
-	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.streamAppLogs)))
+	mux.HandleFunc("GET /v1/apps/{slug}/instances", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listInstances)))
+	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.streamAppLogs)))
 
 	// Custom domains.
-	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listDomains)))
-	mux.HandleFunc("POST /v1/domains", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createDomain))))
-	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteDomain)))
+	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listDomains)))
+	mux.HandleFunc("POST /v1/domains", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDomain))))
+	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteDomain)))
 
 	// Crons.
-	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listCrons)))
-	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createCron))))
-	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPatch))(s.updateCron)))
-	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteCron)))
+	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listCrons)))
+	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createCron))))
+	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron)))
+	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron)))
 
 	// Move 2: event-driven surface (handlers_invocations.go).
 	// Charged routes take idempotent so retries are safe; the long-poll
@@ -432,44 +466,46 @@ func (s *server) handler() http.Handler {
 	// write, receive/get/list are read. None are admin-only because
 	// they're the customer-facing event surface; the existing
 	// adminAllows email gate still narrows /v1/compute-nodes separately.
-	mux.HandleFunc("POST /v1/apps/{slug}/invoke", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.invokeApp)))
-	mux.HandleFunc("POST /v1/apps/{slug}/invoke/async", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.invokeAppAsync))))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/send", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.queueSend))))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/receive", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.queueReceive)))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/{id}/ack", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.queueAck))))
-	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.delayedTaskCreate))))
-	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listInvocations)))
-	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getInvocation)))
-	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.delayedTaskGet)))
-	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.delayedTaskCancel)))
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.invokeApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke/async", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.invokeAppAsync))))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/send", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.queueSend))))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/receive", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.queueReceive)))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/{id}/ack", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.queueAck))))
+	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.delayedTaskCreate))))
+	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listInvocations)))
+	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getInvocation)))
+	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.delayedTaskGet)))
+	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.delayedTaskCancel)))
 
 	// API keys. Minting and revoking keys are admin-only — a leaked
 	// write-scoped key must not be able to grant itself more scopes.
 	// Listing is read.
-	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listKeys)))
-	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.createKey)))
-	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteKey)))
+	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listKeys)))
+	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.createKey)))
+	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.deleteKey)))
 
-	// IAM-4 (ADR-035) — auth audit log surface. Read-only;
-	// the events table is append-only (spec §5). Same scope gating
-	// as GET /v1/keys: session cookie or any read- or write-scoped
-	// API key can list/fetch; admin-only routes (compute nodes)
-	// remain gated separately.
-	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listAuditEvents)))
-	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getAuditEvent)))
+	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
+	// events table is append-only (spec §5). Scope gating: session
+	// cookie (implicitly admin) or any API key carrying {admin,
+	// apps:read} (api.ScopesReadSurface). Compute-node admin-only
+	// routes are gated separately below.
+	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listAuditEvents)))
+	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAuditEvent)))
 
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.
-	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listSecrets)))
-	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(http.MethodPut, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPut))(s.setSecret)))
-	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteSecret)))
+	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listSecrets)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret)))
 
 	// Usage.
-	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getUsage)))
-	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.usageSummary)))
+	// Usage endpoints are narrower than the read surface — a deploy-write
+	// CI key doesn't need them. usage:read is the right knob here.
+	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage)))
+	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.usageSummary)))
 
 	// Account-scoped deployments list (M7.5 dashboard).
-	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listDeployments)))
+	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listDeployments)))
 
 	// Stripe webhook (no auth — Stripe signs requests; for M5 we accept
 	// unsigned and trust the network boundary; ADR-007 hardening later).
@@ -491,9 +527,9 @@ func (s *server) handler() http.Handler {
 	// the routes share the spec §11 10/min/IP budget with the rest
 	// of /v1/* — a brute-force on admin routes costs the attacker
 	// the same budget they'd burn trying customer keys.
-	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin)(s.listComputeNodes)))
-	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.idempotent(s.createOrUpdateComputeNode))))
-	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteComputeNode)))
+	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.listComputeNodes)))
+	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.createOrUpdateComputeNode))))
+	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.deleteComputeNode)))
 
 	// M7.5 SSE live-update (ADR-011). Handles session-cookie OR
 	// API-key auth itself — the cookie path is for the dashboard,
@@ -924,6 +960,24 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 					}
 				}
 				r = r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
+				// TouchKeyLastUsed is observability, not auth — a slow or
+				// failing PG must not block the user's request. Detached
+				// context so a request that cancels client-side (tab close,
+				// SSE disconnect) still stamps the key; bounded timeout
+				// so a hung pool is reclaimed in 2 s. No pkg/grace.Recover:
+				// a panic in a 5-line goroutine implies a code bug worth
+				// surfacing in the daemon logs. Pass r.Context() to satisfy
+				// contextcheck even though the goroutine's detached ctx
+				// ignores it. Per-key debounce (keyTouchWindow,
+				// server.touchDebounce) keeps hot keys from amplifying
+				// into 1k+ UPDATEs/sec under sustained load (PR #232
+				// review #7).
+				if s.shouldTouchKey(key.ID, time.Now()) {
+					//nolint:contextcheck // see touchKeyLastUsed — detached is load-bearing
+					go func(parent context.Context, id string) {
+						s.touchKeyLastUsed(parent, id)
+					}(r.Context(), key.ID)
+				}
 				next(w, r, acct)
 				return
 			}
@@ -959,11 +1013,46 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 // middleware runs after s.auth (which stashes the principal) so it
 // composes inside the auth wrappers as:
 //
-//	s.authLimited(s.requireScope(http.MethodPost, "admin", "write")(s.handler))
+//	s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.handler))
 //
-// Use api.MethodDefaultScope(r.Method) for the per-method default
-// (read for GET, write for everything else). Add "admin" explicitly to
-// require operator-level access on top of the method default. See ADR-034.
+// Pick the named shape that matches the route
+// (api.ScopesAdminOnly / api.ScopesReadSurface /
+// api.ScopesDeployWriteSurface / api.ScopesSecretsWriteSurface /
+// api.ScopesUsageReadSurface) — admin is in every set, so a session
+// cookie or admin key always satisfies. See ADR-034 rev2.
+
+// touchKeyLastUsed bumps last_used_at on the given api_key after a
+// successful bearer auth. Observability only — never auth. Detached
+// context + 2 s timeout means a slow or hung PG cannot block the user's
+// request, and a canceled client (tab close, SSE disconnect) still
+// leaves a stamp. An error is logged at WARN; the next successful
+// request will overwrite a stale value anyway. Accepts a parent ctx
+// (unused — the goroutine detaches) so it matches contextcheck's
+// "function takes ctx" guidance; the touch never respects its parent
+// because it MUST outlive the request.
+//
+//nolint:contextcheck // detached-context is the load-bearing behavior for fire-and-forget observability
+func (s *server) touchKeyLastUsed(_ context.Context, keyID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.store.TouchKeyLastUsed(ctx, keyID); err != nil {
+		s.log.Warn("api_key last_used_at touch failed", "key_id", keyID, "error", err.Error())
+	}
+}
+
+// requireScope(allowed ...string) accepts the route's allowed scope set.
+// The HTTP method is implicit in the closure below — handlers chain
+// requireScope before calling the real handler, so method is no longer
+// a separate parameter. Routes pick the named shape that matches the
+// HTTP verb (api.ScopesDeployWriteSurface for POST/PATCH/DELETE,
+// api.ScopesReadSurface for GET, etc.) — admin is in every set, so a
+// session cookie or admin key always satisfies.
+//
+// Pick the named shape that matches the route
+// (api.ScopesAdminOnly / api.ScopesReadSurface /
+// api.ScopesDeployWriteSurface / api.ScopesSecretsWriteSurface /
+// api.ScopesUsageReadSurface) — admin is in every set, so a session
+// cookie or admin key always satisfies. See ADR-034 rev2.
 func (s *server) requireScope(allowed ...string) func(accountHandler) accountHandler {
 	return func(next accountHandler) accountHandler {
 		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {

@@ -62,6 +62,10 @@ const (
 // bootTimeout returns the §6.1 budget for a vmmd call when the row is
 // in the given state. Unknown states get the cold-boot budget
 // (conservative); never returns zero.
+//
+// This is the production table and the only thing that ships: see
+// Engine.budgetFor for the test-only override and why it does not make
+// these numbers operator-configurable.
 func bootTimeout(s state.State) time.Duration {
 	switch s {
 	case state.StateWaking:
@@ -127,6 +131,30 @@ type Engine struct {
 	// a router still have a usable default-local UUID for cold-boot
 	// single-box paths.
 	defaultLocalNodeID string
+
+	// bootBudget overrides the §6.1 vmmd call budget. It is nil in every
+	// production path — NewEngine never sets it and there is no exported
+	// setter — so budgetFor falls through to the bootTimeout constants.
+	// The §6.1 budgets remain spec, not operator preference (see the
+	// const block above); this field is a *test* seam, not a config knob.
+	//
+	// Why it exists: the two deadline-enforcement tests used to prove the
+	// budget by sleeping a fake vmmd past a real 35s ColdBootTimeout and
+	// waiting. That was 70s of the package's 74.5s and made pkg/sched the
+	// critical path of the whole `go test ./...` run. Injecting a 200ms
+	// budget proves the same property — reservation released, row FAILED,
+	// context.DeadlineExceeded surfaced — in 0.2s, and the spec numbers
+	// themselves are pinned directly by TestBootTimeout_SpecBudgets.
+	bootBudget func(state.State) time.Duration
+}
+
+// budgetFor returns the vmmd call budget for a row in state s: the
+// injected test budget when one is set, otherwise the §6.1 constants.
+func (e *Engine) budgetFor(s state.State) time.Duration {
+	if e.bootBudget != nil {
+		return e.bootBudget(s)
+	}
+	return bootTimeout(s)
 }
 
 // NewEngine wires the engine. notif may be nil (notifications are best-effort in
@@ -497,7 +525,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	// ── Phase 3: drop the lock, do the slow vmmd RPC ──────────────
 	var out *WakeOutcome
-	bootCtx, cancel := context.WithTimeout(ctx, bootTimeout(bootInput.initState))
+	bootCtx, cancel := context.WithTimeout(ctx, e.budgetFor(bootInput.initState))
 	defer cancel()
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
@@ -807,7 +835,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	// Prime's vmmd call gets the ColdBootTimeout budget — a Prime
 	// that takes longer is dead and the operator should restart
 	// imaged's pipeline, not wait for a hung Firecracker.
-	bootCtx, pcancel := context.WithTimeout(ctx, bootTimeout(state.StateColdBooting))
+	bootCtx, pcancel := context.WithTimeout(ctx, e.budgetFor(state.StateColdBooting))
 	defer pcancel()
 	out, err := e.vmm.CreateColdBoot(bootCtx, placement.NodeID, ins.ID, spec)
 	if err != nil {

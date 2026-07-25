@@ -165,9 +165,25 @@ type App struct {
 	// plan_egress_allowlist_not_allowed); Pro max 16 entries; Scale
 	// max 64 entries — see pkg/api/limits.go.
 	EgressAllowlist []netip.Prefix
-	Status          AppStatus
-	Manifest        AppManifest
-	CreatedAt       time.Time
+	// AutoscaleTargetRPS is the per-instance RPS target for the
+	// reactive scale-up trigger (issue #169 / #172). 0 means
+	// "disabled" — the trigger skips this app. Plan-gated upstream
+	// (Free returns 403 plan_autoscale_not_allowed); apid enforces
+	// value > 0 in [1, max-int]. Hobby/Pro/Scale only. When
+	// measured RPS / live_instance_count exceeds this, schedd admits
+	// another instance up to plan.MaxConcurrency.
+	AutoscaleTargetRPS int
+	// AutoscaleTargetCPUPct is the per-instance CPU% target (1..100)
+	// for the scale-up trigger. 0 means "disabled". Pro/Scale only
+	// (the plan gate is stricter than RPS — Hobby does not get CPU
+	// because the cost shape is unbounded on the cheaper tiers).
+	// Signal source is pkg/sched/instancestats.Reader (PR #205); a
+	// nil reader falls back to RPS-only mode and this target is
+	// silently skipped.
+	AutoscaleTargetCPUPct int
+	Status                AppStatus
+	Manifest              AppManifest
+	CreatedAt             time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -488,8 +504,20 @@ type UpdateAppParams struct {
 	// (the default — see migration 00029).
 	EgressAllowlist    *[]netip.Prefix
 	SetEgressAllowlist bool
-	Status             *AppStatus
-	Manifest           *AppManifest
+	// AutoscaleTargetRPS is the per-instance RPS target for the
+	// reactive scale-up trigger (issue #169 / #172). SetAutoscaleTargetRPS
+	// distinguishes "unset" (don't touch the column) from "explicit
+	// zero" (disable autoscale for RPS). Plan-gated upstream (apid
+	// rejects Free PATCH with 403). Hobby/Pro/Scale only.
+	AutoscaleTargetRPS    *int
+	SetAutoscaleTargetRPS bool
+	// AutoscaleTargetCPUPct is the per-instance CPU% target (1..100).
+	// SetAutoscaleTargetCPUPct has the same "unset" vs "explicit zero"
+	// semantics as AutoscaleTargetRPS. Pro/Scale only.
+	AutoscaleTargetCPUPct    *int
+	SetAutoscaleTargetCPUPct bool
+	Status                   *AppStatus
+	Manifest                 *AppManifest
 }
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

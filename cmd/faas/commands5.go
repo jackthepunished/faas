@@ -435,6 +435,8 @@ func cmdAppScale(slug string, args []string) int {
 	conc := fs.Int("max-concurrency", 0, "update max concurrent requests")
 	idle := fs.Int("idle", 0, "update idle timeout (seconds)")
 	min := fs.Int("min", 0, "min instances kept warm (Pro/Scale only; 0 = scale to zero)")
+	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
+	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -457,9 +459,18 @@ func cmdAppScale(slug string, args []string) int {
 		v := *min
 		req.MinInstances = &v
 	}
+	if explicit["autoscale-target-rps"] {
+		v := *rps
+		req.AutoscaleTargetRPS = &v
+	}
+	if explicit["autoscale-target-cpu-pct"] {
+		v := *cpu
+		req.AutoscaleTargetCPUPct = &v
+	}
 	if req.RAMMB == nil && req.MaxConcurrency == nil &&
-		req.IdleTimeoutS == nil && req.MinInstances == nil {
-		PrintUsage(os.Stderr, "usage: faas app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N]", "apps")
+		req.IdleTimeoutS == nil && req.MinInstances == nil &&
+		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil {
+		PrintUsage(os.Stderr, "usage: faas app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N]", "apps")
 		return 1
 	}
 	client, err := authedClient()

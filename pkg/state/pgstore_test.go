@@ -289,6 +289,73 @@ func TestPg_UpdateApp_WithMinInstances(t *testing.T) {
 	}
 }
 
+// TestPg_UpdateApp_AutoscaleTargets pins the partial-update +
+// round-trip semantics for the autoscale trigger targets (issue
+// #169 / #172) on PgStore. Mirrors TestPg_UpdateApp_WithMinInstances
+// above; without it, a future sqlc renumbering could quietly drop
+// the new columns from the RETURNING clause and the handler-side
+// validation would pass on stale data. The test exercises:
+//   - Set + non-zero → column written
+//   - Set + zero     → explicit disable
+//   - Not Set        → column unchanged (load-bearing case)
+func TestPg_UpdateApp_AutoscaleTargets(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, _ := seedLiveDeploy(t, s, ctx)
+
+	// Set both targets, then re-read via AppByID.
+	rps := 50
+	cpu := 70
+	if _, err := s.UpdateApp(ctx, appID, state.UpdateAppParams{
+		AutoscaleTargetRPS:       &rps,
+		SetAutoscaleTargetRPS:    true,
+		AutoscaleTargetCPUPct:    &cpu,
+		SetAutoscaleTargetCPUPct: true,
+	}); err != nil {
+		t.Fatalf("UpdateApp initial: %v", err)
+	}
+	got, err := s.AppByID(ctx, appID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.AutoscaleTargetRPS != 50 || got.AutoscaleTargetCPUPct != 70 {
+		t.Fatalf("after Set: rps=%d cpu=%d, want 50/70", got.AutoscaleTargetRPS, got.AutoscaleTargetCPUPct)
+	}
+
+	// Explicit zero on CPU (disable).
+	zero := 0
+	if _, err := s.UpdateApp(ctx, appID, state.UpdateAppParams{
+		AutoscaleTargetCPUPct:    &zero,
+		SetAutoscaleTargetCPUPct: true,
+	}); err != nil {
+		t.Fatalf("UpdateApp zero cpu: %v", err)
+	}
+	got, err = s.AppByID(ctx, appID)
+	if err != nil {
+		t.Fatalf("AppByID post-zero: %v", err)
+	}
+	if got.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("explicit-zero cpu: got %d, want 0", got.AutoscaleTargetCPUPct)
+	}
+	if got.AutoscaleTargetRPS != 50 {
+		t.Errorf("unset rps: got %d, want 50 (must be unchanged when Set=false)", got.AutoscaleTargetRPS)
+	}
+
+	// Not Set → column survives the PATCH.
+	if _, err := s.UpdateApp(ctx, appID, state.UpdateAppParams{}); err != nil {
+		t.Fatalf("UpdateApp no-Set: %v", err)
+	}
+	got, err = s.AppByID(ctx, appID)
+	if err != nil {
+		t.Fatalf("AppByID no-Set: %v", err)
+	}
+	if got.AutoscaleTargetRPS != 50 {
+		t.Errorf("survived PATCH without Set: rps=%d, want 50", got.AutoscaleTargetRPS)
+	}
+	if got.AutoscaleTargetCPUPct != 0 {
+		t.Errorf("survived PATCH without Set: cpu=%d, want 0", got.AutoscaleTargetCPUPct)
+	}
+}
+
 // TestPg_ListLatestInstancePerApp pins the dashboard N+1 fix (PR #48
 // follow-up): DISTINCT ON (app_id) returns exactly one row per app
 // (the newest by started_at DESC) and the map is keyed by app ID.

@@ -179,6 +179,19 @@ const (
 	//     too long; not a billing failure).
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
+
+	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
+	// shape as MinInstances: a single plan-locked feature with two
+	// failure modes that warrant distinct codes so the CLI can render
+	// actionable retry guidance.
+	//   * CodePlanScaleUpNotAllowed = 403 "your plan does not unlock
+	//     this knob at all" (Free for either target; Hobby for CPU).
+	//   * CodeInvalidAutoscaleTargetRPS = 422 "value < 1 — RPS target
+	//     must be positive".
+	//   * CodeInvalidAutoscaleTargetCPUPct = 422 "value outside [1, 100]".
+	CodePlanScaleUpNotAllowed     = "plan_autoscale_not_allowed"
+	CodeInvalidAutoscaleTargetRPS = "invalid_autoscale_target_rps"
+	CodeInvalidAutoscaleTargetCPU = "invalid_autoscale_target_cpu_pct"
 	// CodeInvalidEgressAllowlist is a 400 for shape violations:
 	// an entry that doesn't ParsePrefix, or a v6 CIDR (v1 is v4
 	// only; v6 mirror is a separate ADR).

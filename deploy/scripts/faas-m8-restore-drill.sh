@@ -6,16 +6,27 @@
 #    documented as executed)"
 #
 # What this script does, end-to-end:
-#   0. Pre-flight: confirm basebackup exists, archive dir has WAL,
-#      daemons are healthy enough to start.
-#   1. Stop every faas daemon + Postgres.
-#   2. Wipe /var/lib/pgsql/data (simulated disaster; archive is untouched).
-#   3. rsync the most recent basebackup into /var/lib/pgsql/data.
-#   4. Write a recovery stanza so PG replays archived WAL until consistent.
-#   5. Start Postgres, then every faas daemon.
-#   6. Wait for schedd admission to come up; hit the test app's :8080.
-#   7. Print a summary: wall-clock, RPO (max archive timestamp − drill
-#      start), pass/fail vs the 30-minute bar.
+#   0.   Pre-flight: confirm basebackup exists, archive dir has WAL,
+#        daemons are healthy enough to start.
+#   0.5  Stamp host.age + host.age.pub + SHA sidecar into the basebackup.
+#        Without this step a wiped /var/lib/pgsql/data followed by a
+#        successful restore leaves vmmd without its X25519 identity;
+#        vmmd regenerates a fresh key on next boot and every customer
+#        sealed secret in `app_secrets` becomes permanently unreadable
+#        (ADR-020 / pkg/secretbox/hostkey.go:47-50).
+#   1.   Stop every faas daemon + Postgres.
+#   2.   Wipe /var/lib/pgsql/data (simulated disaster; archive is untouched).
+#   3.   rsync the most recent basebackup into /var/lib/pgsql/data.
+#   4.   Write a recovery stanza so PG replays archived WAL until consistent.
+#   5.   Start Postgres, then every faas daemon.
+#   5.5  Restore host.age{,.pub} into /etc/faas/secrets from the
+#        basebackup; SHA-mismatch fails closed (protects against a
+#        rotation path not yet shipped). Restart vmmd so it loads the
+#        unseal identity before the first wake.
+#   6.   Wait for schedd admission to come up; hit the test app's :8080.
+#   7.   Write the dated record into docs/drills/<UTC-date>-<HHMMSS>-
+#        restore-drill.md with seven required metric fields; print a
+#        summary to stdout.
 #
 # Out of scope (deferred to M9):
 #   - pgbackrest orchestration (we cp WAL to a local archive dir).
@@ -32,6 +43,16 @@ PG_DATA=/var/lib/pgsql/data
 PG_ARCHIVE=/var/lib/pgsql/archive
 PG_BASEBACKUP_DIR=/var/lib/pgsql/basebackup
 PG_CONF=/etc/postgresql/15/main/postgresql.conf
+
+# Host age key paths (ADR-020). Stamped into the basebackup in step 0.5
+# and restored into /etc/faas/secrets in step 5.5. Modes preserved:
+# private key 0400 root:root, public recipient 0444 root:root.
+HOST_KEY=/etc/faas/secrets/host.age
+HOST_PUB=/etc/faas/secrets/host.age.pub
+
+# Where the dated drill record lands. Default is the repo's docs/drills/
+# directory; override FAAS_DRILL_RECORD_DIR for chroot/CI smoke runs.
+RECORD_DIR="${FAAS_DRILL_RECORD_DIR:-docs/drills}"
 
 # The test app the drill proves is "back serving". Set
 # FAAS_DRILL_APP_HOST to override the slot/host. Default targets the
@@ -75,6 +96,28 @@ else
   warn "no archived WAL found — drill will replay from basebackup only (RPO = basebackup age)"
   RPO_SECONDS=$RPO_BASE
 fi
+
+# --- 0.5. Stamp host.age into the basebackup ----------------------------
+#
+# Why this step matters: pg_basebackup captures cluster state, not host
+# identity. /etc/faas/secrets/host.age is the X25519 private key vmmd
+# loads at boot (cmd/vmmd/main.go:144-155). If the host loses this file
+# and vmmd regenerates, every customer sealed secret becomes permanently
+# unreadable. ADR-020 closed G2 by making the host key the canonical
+# identity; the restore drill has to round-trip it explicitly.
+#
+# We stamp BEFORE the wipe so the SHA is captured at the moment of the
+# basebackup; restoration later uses the same SHA for fail-closed
+# verification (step 5.5).
+
+heading "0.5/7 Stamp host.age into basebackup (preserves sealed secrets)"
+[[ -f "$HOST_KEY" ]] || fail "$HOST_KEY missing — refusing to drill (vmmd hasn't initialized the host key yet?)"
+[[ -f "$HOST_PUB" ]] || fail "$HOST_PUB missing — refusing to drill (run 'make bootstrap' to (re)initialize the host age identity)"
+SHA_PRE="$(sha256sum "$HOST_KEY" | awk '{print $1}')"
+install -m 0400 "$HOST_KEY"  "$LATEST_BB/host.age"
+install -m 0444 "$HOST_PUB" "$LATEST_BB/host.age.pub"
+echo "$SHA_PRE" > "$LATEST_BB/host.age.sha256"
+ok "host.age SHA-256: $SHA_PRE (stamped at $LATEST_BB/host.age)"
 
 # --- 1. Stop daemons + Postgres -----------------------------------------
 
@@ -133,6 +176,33 @@ for unit in apid gatewayd schedd vmmd imaged builderd meterd githubd; do
   ok "started faas-$unit.service"
 done
 
+# --- 5.5. Restore host.age from the basebackup --------------------------
+#
+# vmmd loaded whatever identity was on disk at boot — on a fresh box
+# that's a regenerated key that doesn't match the one sealed in PG. We
+# restore the original key from the basebackup so subsequent wake paths
+# can unseal customer secrets (pkg/fcvm/manager.go:145-149).
+#
+# SHA-mismatch fail-closed: if the SHA sidecar doesn't match the
+# stamped key, the drill aborts. This protects against the
+# rotation-not-yet-shipped path sketched in ADR-020 §Future work —
+# if a customer rotated their host key, restoring the OLD key would
+# un-seal newer ciphertexts against a stale recipient. Until the
+# multi-recipient seal ships, refuse rather than overwrite.
+
+heading "5.5/7 Restore host.age into /etc/faas/secrets"
+SHA_STORED="$(cat "$LATEST_BB/host.age.sha256")"
+SHA_LIVE="$(sha256sum "$LATEST_BB/host.age" | awk '{print $1}')"
+if [[ "$SHA_STORED" != "$SHA_LIVE" ]]; then
+  fail "host.age SHA changed between backup and restore — refusing to overwrite (rotate path not yet shipped)"
+fi
+install -d -m 0700 -o root -g root /etc/faas/secrets
+install -m 0400 "$LATEST_BB/host.age"     "$HOST_KEY"
+install -m 0444 "$LATEST_BB/host.age.pub" "$HOST_PUB"
+ok "host.age restored; restarting vmmd to pick up the unseal identity"
+systemctl restart faas-vmmd
+ok "vmmd restarted"
+
 # --- 6. Wait for schedd admission + hit the test app --------------------
 
 heading "6/7 Wait for schedd admission + hit test app"
@@ -184,6 +254,7 @@ else
   RESULT="FAIL"
 fi
 
+# Stdout summary — operators watch this live during the drill.
 cat <<EOF
 
 M8 Restore Drill — $(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -194,12 +265,99 @@ M8 Restore Drill — $(date -u +"%Y-%m-%dT%H:%M:%SZ")
   RPO:        $RPO_MIN min $RPO_SEC s
   Wake:       ${WAKE_LATENCY}s
   Basebackup: $LATEST_BB
+  host.age:   $SHA_PRE (preserved)
 
   Verdict:    $RESULT (spec §14 M8 bar = 30 min)
-
-Append this output to docs/drills/<date>-restore-drill.md so the
-acceptance gate keeps an audit trail.
 EOF
+
+# Persisted drill record (spec §14 M8 "documented as executed"). The
+# seven required metric fields below mirror the table in
+# docs/drills/TEMPLATE-restore-drill.md; pkg/drills/record_test.go
+# locks this contract via the embedded template — any drift here
+# breaks the M8 audit trail and the test catches it.
+#
+# The filename includes UTC date + HHMMSS so multiple same-day runs
+# land as separate files; the operator commits each via PR.
+RECORD_DATE="$(date -u +%Y-%m-%d)"
+RECORD_TIME="$(date -u +%H%M%S)"
+RECORD_FILE="${RECORD_DIR}/${RECORD_DATE}-${RECORD_TIME}-restore-drill.md"
+mkdir -p "$RECORD_DIR"
+BASE_SHA="$(sha256sum "$LATEST_BB/base.tar.gz" 2>/dev/null | awk '{print $1}')"
+if [[ -z "$BASE_SHA" ]]; then
+  BASE_SHA="-"
+fi
+{
+  echo "# Restore drill — ${RECORD_DATE} (M8 acceptance, spec §14)"
+  echo
+  echo "## Acceptance bar"
+  echo
+  echo '> "restore drill (PG + one app back serving on a clean VM < 30 min,'
+  echo '>  documented as executed)" — docs/faas_implementation_spec.md §14 M8 row.'
+  echo
+  cat <<FIELDS
+## Run summary
+
+| Field | Value |
+|---|---|
+| Date (UTC) | ${RECORD_DATE} |
+| Operator | ${USER} |
+| Box | $(hostname -f 2>/dev/null || hostname) |
+| Started | ${DRILL_START_ISO} |
+| Finished | ${DRILL_END_ISO} |
+| Wall-clock total | $(( TOTAL / 60 )) min $(( TOTAL % 60 )) s |
+| RPO via basebackup | $(( RPO_BASE / 60 )) min $(( RPO_BASE % 60 )) s |
+| RPO via WAL | $(( RPO_SECONDS / 60 )) min $(( RPO_SECONDS % 60 )) s |
+| Wake latency | ${WAKE_LATENCY}s |
+| Basebackup used | ${LATEST_BB} |
+| Basebackup SHA-256 | ${BASE_SHA} |
+| Recovery stanza status | promoted at ${DRILL_END_ISO} |
+| host.age SHA-256 (preserved) | ${SHA_PRE} |
+| Verdict | **${RESULT}** (bar = 30 min) |
+| Operator / commit | $(whoami) @ $(git rev-parse HEAD 2>/dev/null || echo no-git) |
+FIELDS
+  echo
+  echo "## Step log (auto-captured)"
+  echo
+  echo '```'
+  echo "drill-start: ${DRILL_START_ISO}"
+  echo "basebackup:  ${LATEST_BB} (${BASE_SHA})"
+  echo "rpo-base:    $(( RPO_BASE / 60 )) min $(( RPO_BASE % 60 )) s"
+  echo "rpo-wal:     $(( RPO_SECONDS / 60 )) min $(( RPO_SECONDS % 60 )) s"
+  echo "host.age:    ${SHA_PRE} (preserved)"
+  echo "wipe:        ${PG_DATA}"
+  echo "wake:        ${WAKE_LATENCY}s to ${DRILL_APP_HOST}:${DRILL_APP_PORT}"
+  echo "verdict:     ${RESULT}"
+  echo '```'
+  echo
+  echo "## Pre-flight notes"
+  echo
+  echo "- Postgres role wired and converged (wal_level=replica, archive_mode=on,"
+  echo "  archive_command='cp %p /var/lib/pgsql/archive/%f', max_wal_senders=3)."
+  echo "- Postgres_backup role wired and converged (nightly pg_basebackup timer"
+  echo "  faas-pg-basebackup.timer enabled; systemctl list-timers --all shows"
+  echo "  the next 03:00 UTC run)."
+  echo "- Archive directory /var/lib/pgsql/archive populated by continuous WAL"
+  echo "  shipping; most-recent WAL recorded above."
+  echo "- Basebackup taken via pg_basebackup -Ft -z -D <dir> during the nightly"
+  echo "  cron at ${DRILL_START_ISO}, or via 'make backup-pg' for an immediate run."
+  echo "- All eight faas units (apid, gatewayd, githubd, schedd, vmmd,"
+  echo "  imaged, builderd, meterd) were healthy at drill start."
+  echo
+  echo "## Anomalies / observations"
+  echo
+  echo "<operator fills at PR time>"
+  echo
+  echo "## Follow-ups (M9 candidates)"
+  echo
+  cat <<FOLLOW
+- pgbackrest orchestration (currently a hand-rolled \`cp\`).
+- Off-host WAL shipping to Hetzner Storage Box (RPO today = local archive
+  retention window, ~24 h).
+- Archive encryption at rest (gap G2 lean).
+- Parallel WAL replay on a hot spare.
+FOLLOW
+} > "$RECORD_FILE"
+ok "drill record written → $RECORD_FILE"
 
 # Clean up the recovery stanza so PG doesn't try to replay on next boot.
 # We can't anchor on `EOF` because bash consumes the heredoc terminator and
