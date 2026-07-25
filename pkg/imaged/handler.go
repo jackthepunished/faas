@@ -875,6 +875,12 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 // fires. If the reload sees a terminal-good status (DeployFailed /
 // DeployLive / DeploySuperseded) the defer is a no-op so a late error
 // after a successful path can never clobber the success.
+//
+//nolint:contextcheck // ctx is detached via context.WithoutCancel so the
+// underlying SQL keeps its tracing handles but the cancellation chain
+// is broken — the lint rule sees the WithoutCancel but expects a
+// function-shape continuation; documenting the intent here is the
+// cleaner alternative to passing ctx through unused.
 func (h *Handler) markFailedOnUnhandledError(ctx context.Context, depID string, errp *error) {
 	if errp == nil || *errp == nil {
 		return

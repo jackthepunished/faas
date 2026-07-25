@@ -298,9 +298,9 @@ func TestCacheStore_ConcurrentStoresAreSafe(t *testing.T) {
 	}
 }
 
-// TestCacheStore_IdempotentExistingEntry still passes after the rewrite —
+// TestCacheStore_FirstWriterWins still passes after the rewrite —
 // it was the old behavior the rewrite must preserve. First-writer wins.
-func TestCacheStore_IdempotentExistingEntry(t *testing.T) {
+func TestCacheStore_FirstWriterWins(t *testing.T) {
 	root := t.TempDir()
 	c := NewCache(root)
 	src := filepath.Join(t.TempDir(), "layer.ext4")

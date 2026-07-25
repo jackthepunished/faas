@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CacheEntry is one cached build: source-hash + framework → produced layer
@@ -197,6 +198,9 @@ func (c *Cache) Store(sourceHash string, fw Framework, layerPath string, bytes i
 		// configuration error that the operator must fix (the cache
 		// must be on the same filesystem as /srv/fc).
 		_ = os.Remove(tmpPath)
+		if errors.Is(err, syscall.EXDEV) {
+			return fmt.Errorf("cache: store %s: cross-device rename (cache_dir must be on the same filesystem as /srv/fc — %w)", dst, err)
+		}
 		return fmt.Errorf("cache: store %s: rename tmp: %w", dst, err)
 	}
 	// Layer published. Now write the sidecar (B1.3). Publish order

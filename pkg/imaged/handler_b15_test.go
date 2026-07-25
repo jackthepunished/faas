@@ -247,8 +247,9 @@ func TestMarkFailedOnUnhandledError_DeployLiveSkipped(t *testing.T) {
 	}
 }
 
-// guard: the failingNotifier type below satisfies the Notifier
-// interface (the struct embeds fakeNotifier so we get the typed
-// fields; we override Notify to always error). This compile-time
-// assertion catches drift if the Notifier interface changes.
+// guard: failingNotifier satisfies the Notifier interface. We test
+// on the bare struct (no fakeNotifier embedding — that was previously
+// inherited for typed fields but lint cleanup dropped the
+// embedding). The compile-time assertion catches drift if the Notifier
+// interface changes.
 var _ Notifier = (*failingNotifier)(nil)
