@@ -108,6 +108,26 @@ type Config struct {
 	// list on every tick" — the trigger reads from apps +
 	// instances per tick.
 	ScaleUpInterval time.Duration `toml:"scaleup_interval"`
+
+	// ReaperAggressive (issue #171) toggles the aggressive-reaper
+	// scale-down path. Default ON (true) — schedd parks surplus
+	// instances above max(min_instances, desired + 1) on the next
+	// 10 s reaper tick when recent-window RPS is below target.
+	// Set false via FAAS_REAPER_AGGRESSIVE=false to disable
+	// in-place if a regression surfaces; the signal mirror still
+	// runs so the metric and the audit row surface for diagnosis.
+	// The flag does NOT disable the existing ReapIdle timeout
+	// reaper — only the new path.
+	ReaperAggressive bool `toml:"reaper_aggressive"`
+
+	// ReaperAggressiveParkCap (issue #171) caps the number of
+	// aggressive-path parks per app per 10 s tick. Zero reverts
+	// to sched.MaxParksPerTickPerApp (= 8). The cap prevents a
+	// single tick from blocking the reaper for `cap × ~150 ms`
+	// during a sudden-scale-down storm. The existing
+	// ReapIdle / SelectEvictions paths are NOT capped — they
+	// already drain at their own cadences.
+	ReaperAggressiveParkCap int `toml:"reaper_aggressive_park_cap"`
 }
 
 // ResolveListenTarget returns the gRPC target schedd should bind.
@@ -156,6 +176,10 @@ func LoadConfig(path string) (*Config, error) {
 		// control listener. Empty disables the trigger (the
 		// loop with WithScaleUp(nil) skips the ticker arm).
 		GatewayMetricsURL: "http://127.0.0.1:9090/metrics",
+		// issue #171: aggressive reaper defaults to ON. Operators
+		// can flip FAAS_REAPER_AGGRESSIVE=false to disable in-place
+		// without redeploying.
+		ReaperAggressive: true,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

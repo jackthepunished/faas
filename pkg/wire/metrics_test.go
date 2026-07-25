@@ -268,6 +268,41 @@ func TestOpsMetrics_EgressDenyNilSafe(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_ObserveScaleDown (issue #171) — the aggressive-
+// reaper observer increments the per-(app, outcome) counter and the
+// value surfaces in /metrics. Pins the wire path end-to-end. Two
+// `park` observations on `app="a1"` + one `keep` + pre-instantiated
+// empty-app placeholders. Mirrors TestOpsMetrics_ObserveBuild.
+func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveScaleDown("a1", "park")
+	m.ObserveScaleDown("a1", "park")
+	m.ObserveScaleDown("a1", "keep")
+
+	body := render(t, m)
+	for _, want := range []string{
+		// Real observations.
+		`schedd_scale_down_decisions_total{app="a1",outcome="park"} 2`,
+		`schedd_scale_down_decisions_total{app="a1",outcome="keep"} 1`,
+		// Pre-instantiated empty-app placeholder: zero-valued, must
+		// surface in /metrics from boot so the panel exists at day 1.
+		`schedd_scale_down_decisions_total{app="",outcome="park"} 0`,
+		`schedd_scale_down_decisions_total{app="",outcome="keep"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_ObserveScaleDownNilSafe — schedd unit tests
+// construct the engine without metrics; the observer must be a
+// no-op on a nil receiver rather than panicking.
+func TestOpsMetrics_ObserveScaleDownNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	m.ObserveScaleDown("a1", "park")
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration
