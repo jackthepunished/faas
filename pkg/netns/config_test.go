@@ -230,12 +230,15 @@ func TestNftCommandsPublishGuestPort(t *testing.T) {
 func TestNftCommandsEnforceEgressPolicy(t *testing.T) {
 	rules := flatten(testConfig().NftCommands())
 	// §11 ship-blocking egress denies, scoped to the guest side (iifname tap0) so
-	// the inbound DNAT path (iifname vp7) is never affected. CGN (100.64.0.0/10)
-	// is included for symmetry with pkg/netns.DefaultHostPolicy.ForwardDenyCIDRs.
+	// the inbound DNAT path (iifname vp7) is never affected. The list comes
+	// from NewDefaultDenySet() so adding a new CIDR is mechanically covered
+	// (PR-A, ADR-034 added 6to4 + Teredo; this test would have silently
+	// regressed without the typed DenySet).
+	denySet := NewDefaultDenySet()
 	wants := []string{
-		"iifname tap0 tcp dport { 25, 465, 587 } drop",                                                            // deny SMTP (spam/abuse)
-		"iifname tap0 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop", // deny RFC1918 + link-local/metadata + CGN
-		"iifname tap0 ip6 daddr { fe80::/10, fc00::/7, ff00::/8, ::1/128, ::/128 } drop",                          // deny IPv6 link-local + ULA + multicast + unspecified (ADR-023)
+		"iifname tap0 tcp dport { " + denySet.SMTPPortsCommaSet() + " } drop",
+		"iifname tap0 ip daddr { " + denySet.V4CommaSet() + " } drop",
+		"iifname tap0 ip6 daddr { " + denySet.V6CommaSet() + " } drop",
 	}
 	for _, w := range wants {
 		if !strings.Contains(rules, w) {
@@ -248,6 +251,67 @@ func TestNftCommandsEnforceEgressPolicy(t *testing.T) {
 		line := strings.Join(cmd, " ")
 		if strings.Contains(line, "daddr") && strings.Contains(line, "drop") && !strings.Contains(line, "iifname tap0") {
 			t.Errorf("egress daddr-drop not scoped to the guest side: %q", line)
+		}
+	}
+}
+
+// TestNftCommandsEnforceEgressPolicy_PerEntry pins every DenySet
+// entry individually so an entry the renderer silently dropped
+// would surface as a single t.Errorf per missed CIDR. The exact-
+// string fixture above pins the rendered argv; this test pins the
+// DATA so an edit to NewDefaultDenySet() that changes the slice
+// but forgets to re-render the argv is caught here.
+//
+// Iterates Entries (the provenance-bearing view) so the test stays
+// in lockstep with the source list — adding a new CIDR to
+// NewDefaultDenySet() is mechanically covered. Also asserts the
+// per-family argv family keyword matches Family.String() so a
+// v4 entry can't accidentally land in an `ip6 daddr` rule.
+func TestNftCommandsEnforceEgressPolicy_PerEntry(t *testing.T) {
+	cmds := testConfig().NftCommands()
+	rules := flatten(cmds)
+	denySet := NewDefaultDenySet()
+
+	for _, e := range denySet.Entries {
+		// The rendered argv uses `ip daddr { ... } drop` for v4 and
+		// `ip6 daddr { ... } drop` for v6. Both must contain the
+		// entry's Prefix.String(). The substring check would also
+		// succeed for a sub-string match in a larger CIDR; instead
+		// the test relies on NewDefaultDenySet() returning prefixes
+		// that are unique enough that a stray match is impossible.
+		needle := e.Prefix.String()
+		if !strings.Contains(rules, needle) {
+			t.Errorf("DenySet entry %s (%s) missing from NftCommands; check denyV4Set / denyV6Set render path",
+				needle, e.SourceADR)
+		}
+	}
+
+	// Family-keyword gate: a v4 entry must appear inside an
+	// `ip daddr` argv, not an `ip6 daddr` argv, and vice versa.
+	// Scans each argv individually — a slice-wide substring check
+	// would silently pass if both family argvs shared the CIDR
+	// (impossible today, but the future-proofing cost is one
+	// nested loop).
+	for _, argv := range cmds {
+		line := strings.Join(argv, " ")
+		if !strings.Contains(line, "daddr") || !strings.Contains(line, "drop") {
+			continue
+		}
+		isV4 := strings.Contains(line, "ip daddr") && !strings.Contains(line, "ip6 daddr")
+		isV6 := strings.Contains(line, "ip6 daddr")
+		if !isV4 && !isV6 {
+			t.Errorf("daddr-drop argv has neither `ip daddr` nor `ip6 daddr` keyword: %q", line)
+		}
+		for _, e := range denySet.Entries {
+			if !strings.Contains(line, e.Prefix.String()) {
+				continue
+			}
+			if e.Family == FamilyV4 && !isV4 {
+				t.Errorf("v4 entry %s in non-v4 argv: %q", e.Prefix, line)
+			}
+			if e.Family == FamilyV6 && !isV6 {
+				t.Errorf("v6 entry %s in non-v6 argv: %q", e.Prefix, line)
+			}
 		}
 	}
 }

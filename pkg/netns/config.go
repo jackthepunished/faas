@@ -42,6 +42,15 @@ type Config struct {
 	HostIP     netip.Addr // routable identity, 10.100.x.y
 	HostBits   int        // prefix length for HostIP (16)
 	EgressMbit int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
+	// DenySet is the typed egress denylist applied at the per-netns
+	// forward chain. Defaults to NewDefaultDenySet() when zero
+	// (pkg/fcvm/manager.go::Wake does not set it; the renderer falls
+	// back so existing call paths are unchanged). Tests that vary
+	// the deny set assert against this field directly. Single source
+	// of truth shared with the host renderer (pkg/netns/policy.go)
+	// and the OCI puller (pkg/oci/egress.go) — see
+	// pkg/netns/denylist.go.
+	DenySet DenySet
 	// ConntrackCap caps the per-instance conntrack table size at
 	// `forward` time (spec §7 line 344 of docs/faas_implementation_spec.md,
 	// ADR-018 deferral resolved). 0 = no cap rule emitted, so existing
@@ -244,11 +253,14 @@ func (c Config) NftCommands() [][]string {
 	if rule := c.forwardConnlimitRule(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
-	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "tcp", "dport", "{", "25,", "465,", "587", "}", "drop")
-	// CGN (100.64.0.0/10) included for symmetry with pkg/netns.DefaultHostPolicy
-	// .ForwardDenyCIDRs. IPv6 sibling follows — see ADR-023 and
-	// pkg/oci/egress.go::deniedCIDRv6.
-	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "ip", "daddr", "{", "10.0.0.0/8,", "172.16.0.0/12,", "192.168.0.0/16,", "169.254.0.0/16,", "100.64.0.0/10", "}", "drop")
+	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "tcp", "dport", "{", c.denySMTPPortsSet(), "}", "drop")
+	// Lateral-movement deny (spec §11 + ADR-023 + ADR-034) — the v4
+	// half of the shared DenySet. ADR-031 reorders this list so
+	// deny > allow on overlap with the per-app EgressAllowlist accept
+	// rule below. The set is shared verbatim with the host renderer
+	// (pkg/netns/policy.go) and the OCI puller (pkg/oci/egress.go) —
+	// see pkg/netns/denylist.go.
+	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "ip", "daddr", "{", c.denyV4Set(), "}", "drop")
 	// ADR-031 + ADR-032 per-app egress allowlist. Placed AFTER the
 	// lateral-movement deny + SMTP drops so deny > allow on overlap
 	// (an operator typo landing a sensitive CIDR in the allowlist
@@ -291,7 +303,7 @@ func (c Config) NftCommands() [][]string {
 	if rule := c.forwardConnlimitRule6(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
-	add("add", "rule", "ip6", "faas", "forward", "iifname", c.Tap, "ip6", "daddr", "{", "fe80::/10,", "fc00::/7,", "ff00::/8,", "::1/128,", "::/128", "}", "drop")
+	add("add", "rule", "ip6", "faas", "forward", "iifname", c.Tap, "ip6", "daddr", "{", c.denyV6Set(), "}", "drop")
 	// ADR-032 — per-app egress allowlist v6 mirror. Same placement
 	// contract as the v4 sibling above (AFTER deny, BEFORE
 	// chain-policy), only on the v6 chain. Empty EgressAllowlist or
@@ -302,6 +314,44 @@ func (c Config) NftCommands() [][]string {
 		cmds = append(cmds, rule)
 	}
 	return cmds
+}
+
+// denySMTPPortsSet returns the comma-joined SMTP port set used by
+// the per-netns forward chain's `tcp dport { … } drop` rule. Falls
+// back to NewDefaultDenySet() when Config.DenySet is the zero value
+// (pkg/fcvm/manager.go::Wake does not set it today — the default
+// is the only contract).
+//
+// Internal to NftCommands — do not invoke from anywhere else.
+func (c Config) denySMTPPortsSet() string {
+	if len(c.DenySet.SMTPPorts) == 0 {
+		return NewDefaultDenySet().SMTPPortsCommaSet()
+	}
+	return c.DenySet.SMTPPortsCommaSet()
+}
+
+// denyV4Set is the v4 sibling of denySMTPPortsSet. Same fallback
+// semantics; the default value matches the literal list that lived
+// inline in NftCommands before the denylist refactor (PR-A,
+// ADR-034). The test in pkg/netns/config_test.go iterates over
+// NewDefaultDenySet().V4DenyCIDRs so adding a new entry here is
+// mechanically covered.
+func (c Config) denyV4Set() string {
+	if len(c.DenySet.V4DenyCIDRs) == 0 {
+		return NewDefaultDenySet().V4CommaSet()
+	}
+	return c.DenySet.V4CommaSet()
+}
+
+// denyV6Set is the v6 sibling of denyV4Set. ADR-034 adds 6to4
+// (2002::/16) + Teredo (2001::/32) to the default — the pre-PR-A
+// list was missing both, leaving two lateral-movement channels into
+// the IPv4 RFC1918 ranges through a 6to4 / Teredo tunnel endpoint.
+func (c Config) denyV6Set() string {
+	if len(c.DenySet.V6DenyCIDRs) == 0 {
+		return NewDefaultDenySet().V6CommaSet()
+	}
+	return c.DenySet.V6CommaSet()
 }
 
 // forwardConnlimitRule emits a single-element argv (or nothing when the
