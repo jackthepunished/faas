@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -100,5 +101,25 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte(`"body_b64":"aGk="`)) {
 		t.Fatalf("body_b64 tag missing: %s", b)
+	}
+}
+
+// TestNodeRunnerHandlerDefault pins the default --handler value. The
+// path must be `/app/node22.js` to match what imaged.handleDeployment
+// writes into AppManifest.Entrypoint for runtime=node22 function
+// deploys. (A previous revision of this runner had `/app/handler.js`
+// here, which silently mismatched the imaged manifest and only
+// surfaced as a first-wake rollback — the path drift was load-bearing
+// enough to ship the fix in the go124 PR. If this test breaks, every
+// node22 function deploy rolls back on first wake.)
+func TestNodeRunnerHandlerDefault(t *testing.T) {
+	const want = "/app/node22.js"
+	fs := flag.NewFlagSet("node22-test", flag.ContinueOnError)
+	handler := fs.String("handler", want, "x")
+	if err := fs.Parse([]string{}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *handler != want {
+		t.Errorf("default --handler = %q, want %q", *handler, want)
 	}
 }

@@ -317,7 +317,7 @@ paths:
                   enum: [app, function]
                 runtime:
                   type: string
-                  enum: [node22, python312]
+                  enum: [node22, python312, go124]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -1066,7 +1066,7 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
         type: { type: string, enum: [app, function] , example: "app"}
-        runtime: { type: string, enum: [node22, python312], description: "Runtime for `type: function` apps. Omit for `type: app` (the default)." }
+        runtime: { type: string, enum: [node22, python312, go124], description: "Runtime for `type: function` apps. Omit for `type: app` (the default)." }
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
         idle_timeout_s: { type: [integer, "null"] }
@@ -1082,7 +1082,7 @@ components:
       properties:
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', minLength: 3, maxLength: 40, example: "hello-world" }
         type: { type: string, enum: [app, function] , example: "app"}
-        runtime: { type: string, enum: [node22, python312] }
+        runtime: { type: string, enum: [node22, python312, go124] }
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
         idle_timeout_s: { type: integer }

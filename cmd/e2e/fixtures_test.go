@@ -118,6 +118,92 @@ func DockerfileFixture(t *testing.T) []byte {
 	return buildTarGz(t, files)
 }
 
+// GoFixture returns the bytes of a minimal Go 1.24 source tarball for the
+// Railpack `--plan go` build path. The Railpack go plan emits a static
+// binary at /app/server (per upstream catalog); imaged.handleDeployment
+// stamps the layer manifest from the OCI image's `Cmd` via
+// manifestFromImageConfig, so the static binary becomes the app's
+// entrypoint. The fixture's main.go listens on :3000 to match the
+// existing waitReady probe shape (and the node/python fixtures above).
+//
+// The fixture is the first "static binary" deploy on the app path —
+// previously every runtime needed a runtime-scaffold runner shim. The
+// no-shim path is the load-bearing novelty here.
+func GoFixture(t *testing.T) []byte {
+	t.Helper()
+	const goMod = "module example.com/faas-go-fixture\n\n" +
+		"go 1.24\n"
+	const mainGo = `package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello from faas (go fixture)\n")
+	})
+	if err := http.ListenAndServe(":3000", nil); err != nil {
+		panic(err)
+	}
+}
+`
+	files := map[string]string{
+		"go.mod":          goMod,
+		"main.go":         mainGo,
+		".faas-fixture":   "go124\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
+// GoDockerfileFixture returns the bytes of a tarball whose root contains
+// a multi-stage Dockerfile (FROM golang AS build → FROM scratch) and a
+// go.mod + main.go. Exercises the buildctl --frontend dockerfile path
+// for go124 (railpack is bypassed entirely; the customer writes the
+// Dockerfile). Used by the build_metal_test `go124-dockerfile-tarball`
+// subtest to pin the buildctl path for the new runtime.
+func GoDockerfileFixture(t *testing.T) []byte {
+	t.Helper()
+	const goMod = "module example.com/faas-go-dockerfile-fixture\n\n" +
+		"go 1.24\n"
+	const mainGo = `package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello from faas (go dockerfile fixture)\n")
+	})
+	if err := http.ListenAndServe(":3000", nil); err != nil {
+		panic(err)
+	}
+}
+`
+	dockerfile := "FROM golang:1.24-bookworm AS build\n" +
+		"WORKDIR /src\n" +
+		"COPY go.mod main.go ./\n" +
+		"RUN CGO_ENABLED=0 go build -o /out/server ./\n" +
+		"FROM scratch\n" +
+		"COPY --from=build /out/server /app/server\n" +
+		"LABEL org.opencontainers.image.title=\"faas-fixture-go-dockerfile\"\n" +
+		"LABEL faas.build.token=\"" + time.Now().UTC().Format(time.RFC3339Nano) + "\"\n" +
+		"EXPOSE 3000\n" +
+		"CMD [\"/app/server\"]\n"
+	files := map[string]string{
+		"Dockerfile":      dockerfile,
+		"go.mod":          goMod,
+		"main.go":         mainGo,
+		".faas-fixture":   "go124-dockerfile\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
 // buildTarGz packs a flat name→content map into a gzipped tar. Files are
 // stored with mode 0644 and a fixed mtime so the tar headers are stable
 // across runs. The body bytes are *not* byte-stable: every fixture embeds
