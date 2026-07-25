@@ -114,19 +114,27 @@ func hasApidPrefix(p, prefix string) bool {
 // review finding #6.
 //
 // NOTE: this means customer apps cannot expose routes starting with
-// /v1/, /dashboard/, /oauth/, /login/, /auth/verify/, /logout/,
-// /status/, /healthz, or /cli-auth. /v1/ in particular is a permanent
-// API reservation; customer-facing docs should call this out (issue
-// #85 follow-up). /cli-auth is the device-code approval page
-// (spec §2.2) — same single-host reverse proxy handles it, no
-// rewrite needed.
+// /v1/, /dashboard/, /oauth/, /login/, /signup/, /login/forgot/,
+// /auth/verify/, /auth/reset/, /logout/, /status/, /healthz, or
+// /cli-auth. /v1/ in particular is a permanent API reservation;
+// customer-facing docs should call this out (issue #85 follow-up).
+// /cli-auth is the device-code approval page (spec §2.2) — same
+// single-host reverse proxy handles it, no rewrite needed.
+//
+// PR #180 (issue #165 PR #2) added the new password + reset routes
+// here. The /auth/verify root (legacy magic-link consume) was already
+// present from M7.5; the new /auth/reset sits next to it as a sibling
+// anchored root, so /auth/reset/anything is also proxied.
 func isApidPath(p string) bool {
 	// Anchored roots: each matched as exact + "/" subtree.
 	for _, root := range []string{
 		apidRootV1,
 		apidRootDashboard,
 		apidRootLogin,
+		apidRootSignup,
+		apidRootLoginForgot,
 		apidRootAuthVerify,
+		apidRootAuthReset,
 		apidRootLogout,
 		apidRootStatus,
 		apidRootHealthz,
@@ -153,7 +161,10 @@ const (
 	apidRootDashboard   = "/dashboard"
 	apidRootOAuthPrefix = "/oauth/"
 	apidRootLogin       = "/login"
+	apidRootSignup      = "/signup"
+	apidRootLoginForgot = "/login/forgot"
 	apidRootAuthVerify  = "/auth/verify"
+	apidRootAuthReset   = "/auth/reset"
 	apidRootLogout      = "/logout"
 	apidRootStatus      = "/status"
 	apidRootHealthz     = "/healthz"
