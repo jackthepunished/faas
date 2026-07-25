@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 )
 
@@ -60,4 +61,135 @@ func TestConstantTimeEqualHash(t *testing.T) {
 	if ConstantTimeEqualHash(hash, HashAPIKey("fp_live_different")) {
 		t.Error("different hashes should not compare equal")
 	}
+}
+
+// apikey_test.go (IAM-1, ADR-034 rev2). The fine-grained scope
+// vocabulary is the load-bearing guarantee behind every requireScope
+// check on the apid route table. The tests below pin
+// NormalizeCreateKeyScopes — the single funnel every key-mint path
+// (POST /v1/keys + the CLI device-code exchange) flows through before
+// reaching the DB CHECK constraint added in migration 00044.
+
+func TestNormalizeCreateKeyScopes(t *testing.T) {
+	cases := []struct {
+		name    string
+		request []string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:    "empty_defaults_to_admin",
+			request: nil,
+			want:    []string{ScopeAdmin},
+		},
+		{
+			name:    "empty_slice_defaults_to_admin",
+			request: []string{},
+			want:    []string{ScopeAdmin},
+		},
+		{
+			name:    "known_single_scope",
+			request: []string{ScopeAppsRead},
+			want:    []string{ScopeAppsRead},
+		},
+		{
+			name:    "known_multi_scope_preserved",
+			request: []string{ScopeAppsRead, ScopeDeployWrite},
+			want:    []string{ScopeAppsRead, ScopeDeployWrite},
+		},
+		{
+			name:    "duplicates_collapsed_first_wins",
+			request: []string{ScopeAppsRead, ScopeAppsRead, ScopeDeployWrite},
+			want:    []string{ScopeAppsRead, ScopeDeployWrite},
+		},
+		{
+			name: "all_six_accepted",
+			request: []string{
+				ScopeAdmin, ScopeAppsRead, ScopeDeployWrite,
+				ScopeSecretsRead, ScopeSecretsWrite, ScopeUsageRead,
+			},
+			want: []string{
+				ScopeAdmin, ScopeAppsRead, ScopeDeployWrite,
+				ScopeSecretsRead, ScopeSecretsWrite, ScopeUsageRead,
+			},
+		},
+		{
+			name:    "unknown_rejected",
+			request: []string{ScopeAdmin, "banana"},
+			wantErr: true,
+		},
+		{
+			name: "legacy_coarse_vocabulary_now_rejected",
+			// Rev1 vocabulary (read|write) is gone — a customer
+			// SDK that still posts these must fail at the
+			// handler so the error surfaces in their tooling.
+			request: []string{"read"},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormalizeCreateKeyScopes(tc.request)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (result=%v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsValidScope pins the closed vocabulary at the package surface —
+// mirror of the DB CHECK constraint added in migration 00044. If a
+// route file references a scope that isn't in this set, it would
+// fail closed everywhere: the migration prevents the INSERT,
+// NormalizeCreateKeyScopes blocks the mint, and principalHasScope
+// never sees it from a valid key.
+func TestIsValidScope(t *testing.T) {
+	valid := []string{
+		ScopeAdmin, ScopeAppsRead, ScopeDeployWrite,
+		ScopeSecretsRead, ScopeSecretsWrite, ScopeUsageRead,
+	}
+	for _, s := range valid {
+		if !IsValidScope(s) {
+			t.Errorf("expected %q to be a valid scope", s)
+		}
+	}
+	invalid := []string{"", "read", "write", "ROOT", "superuser", "deploy", "admin:write"}
+	for _, s := range invalid {
+		if IsValidScope(s) {
+			t.Errorf("expected %q to be rejected", s)
+		}
+	}
+}
+
+// TestScopeSurfaceConstants pin the named surface-set shapes used by
+// requireScope callers. Misspelled constant names are compile errors;
+// this test pins the actual membership so a future "rename
+// ScopesReadSurface to ScopesReadScope" lands here too.
+func TestScopeSurfaceConstants(t *testing.T) {
+	mustContain := func(name string, set []string, want ...string) {
+		t.Helper()
+		contains := map[string]bool{}
+		for _, s := range set {
+			contains[s] = true
+		}
+		for _, w := range want {
+			if !contains[w] {
+				t.Errorf("%s missing %q (have %v)", name, w, set)
+			}
+		}
+	}
+	mustContain("ScopesAdminOnly", ScopesAdminOnly, ScopeAdmin)
+	mustContain("ScopesReadSurface", ScopesReadSurface, ScopeAdmin, ScopeAppsRead)
+	mustContain("ScopesUsageReadSurface", ScopesUsageReadSurface, ScopeAdmin, ScopeUsageRead)
+	mustContain("ScopesSecretsWriteSurface", ScopesSecretsWriteSurface, ScopeAdmin, ScopeSecretsWrite)
+	mustContain("ScopesDeployWriteSurface", ScopesDeployWriteSurface, ScopeAdmin, ScopeDeployWrite)
 }

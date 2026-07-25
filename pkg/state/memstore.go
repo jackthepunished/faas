@@ -504,6 +504,24 @@ func (m *MemStore) DeleteAPIKey(_ context.Context, accountID, keyID string) erro
 	return nil
 }
 
+// DeleteAPIKeyReturning is the IAM-1 (ADR-034 rev2) variant of
+// DeleteAPIKey: deletes the key in one statement and returns the
+// pre-delete row so the apid handler can emit a `key.deleted` audit
+// event carrying the dismissed scopes. Mirrors PgStore's
+// DELETE...RETURNING contract so tests against either backend
+// exercise the same handler shape.
+func (m *MemStore) DeleteAPIKeyReturning(_ context.Context, accountID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.AccountID != accountID {
+		return APIKey{}, ErrNotFound
+	}
+	delete(m.keys, keyID)
+	delete(m.keyByHash, hex.EncodeToString(k.Hash))
+	return k, nil
+}
+
 func (m *MemStore) ListAPIKeys(_ context.Context, accountID string) ([]APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

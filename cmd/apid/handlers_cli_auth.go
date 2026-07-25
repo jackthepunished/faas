@@ -139,7 +139,7 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
 		return
 	}
-	k, err := h.srv.store.CreateAPIKey(r.Context(), accountID, keyHash, "cli-login", api.DefaultScopes())
+	k, err := h.srv.store.CreateAPIKey(r.Context(), accountID, keyHash, "cli-login", api.ScopesAdminOnly)
 	if err != nil {
 		h.log.Error("cli_auth.create_key", "err", err)
 		api.WriteProblem(w, api.ErrCapacity("could not persist key"))
@@ -154,7 +154,7 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 	// the existing NotifyKeyChanged payload convention.
 	h.srv.audit.Emit(r.Context(), "key.created", &accountID, map[string]any{
 		"key_id": k.ID,
-		"scopes": api.DefaultScopes(),
+		"scopes": api.ScopesAdminOnly,
 	})
 	// IAM-4 (ADR-035): the exchange itself is an auth.login
 	// success from the customer's perspective. The CLI never set a

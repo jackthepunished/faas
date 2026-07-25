@@ -7,12 +7,12 @@
 //
 // Trust model
 //
-//   - Both routes sit behind s.auth + requireScope(http.MethodGet,
-//     api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet)) — the
-//     same gating as GET /v1/keys. A session-cookie principal (Key ==
-//     nil) implicitly carries admin scope per principalHasScope, so a
-//     dashboard customer can read their own log without holding an
-//     API key. A read-scoped or write-scoped API key works too.
+//   - Both routes sit behind s.auth + requireScope(api.ScopesReadSurface)
+//     — the same gating as the rest of the read surface (GET
+//     /v1/apps, /v1/deployments, /v1/keys). A session-cookie principal
+//     (Key == nil) implicitly carries admin scope per principalHasScope,
+//     so a dashboard customer can read their own log without holding an
+//     API key. An apps:read- or admin-scoped API key works too.
 //
 //   - Cross-account invisibility is enforced at the SQL layer via
 //     store.ListEvents(acct.ID, ...) — the events_subject_idx

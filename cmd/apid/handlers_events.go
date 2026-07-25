@@ -78,9 +78,9 @@ func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 				"Unauthorized", "session cookie or API key required"))
 			return
 		}
-		if key != nil && !principalHasScope(principal{Acct: acct, Key: key}, []string{api.ScopeAdmin, api.ScopeRead}) {
+		if key != nil && !principalHasScope(principal{Acct: acct, Key: key}, api.ScopesReadSurface) {
 			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
-				"Insufficient scope", "event stream requires the read or admin scope"))
+				"Insufficient scope", "event stream requires the apps:read or admin scope"))
 			return
 		}
 		ownedApps := s.buildOwnedAppCache(r.Context(), acct.ID)

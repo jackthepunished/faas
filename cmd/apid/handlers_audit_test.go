@@ -56,7 +56,7 @@ func uuidStringOf(s string) string {
 // assert the audit row landed.
 func TestAuditEvents_KeyMintEmitsEvent(t *testing.T) {
 	e := setup(t, api.PlanPro)
-	body := api.CreateKeyRequest{Label: "audit-test", Scopes: []string{"read"}}
+	body := api.CreateKeyRequest{Label: "audit-test", Scopes: []string{api.ScopeAppsRead}}
 	rec := e.do(t, http.MethodPost, "/v1/keys", body, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
@@ -99,7 +99,7 @@ func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 	e := setup(t, api.PlanPro)
 
 	// Mint a second key we can delete.
-	body := api.CreateKeyRequest{Label: "to-delete", Scopes: []string{"read"}}
+	body := api.CreateKeyRequest{Label: "to-delete", Scopes: []string{api.ScopeAppsRead}}
 	rec := e.do(t, http.MethodPost, "/v1/keys", body, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
@@ -182,7 +182,7 @@ func TestAuditEvents_ListEndpointRespectsKindPrefixFilter(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	// Mint two keys → 2x key.created rows.
 	for _, label := range []string{"first", "second"} {
-		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: label, Scopes: []string{"read"}}, nil)
+		rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: label, Scopes: []string{api.ScopeAppsRead}}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
 		}
@@ -221,7 +221,7 @@ func TestAuditEvents_ListEndpointRespectsKindPrefixFilter(t *testing.T) {
 func TestAuditEvents_ListEndpointRespectsSince(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	// First key.created row.
-	rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "first", Scopes: []string{"read"}}, nil)
+	rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "first", Scopes: []string{api.ScopeAppsRead}}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -229,7 +229,7 @@ func TestAuditEvents_ListEndpointRespectsSince(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	cutoff := time.Now().UTC()
 	time.Sleep(20 * time.Millisecond)
-	rec = e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "second", Scopes: []string{"read"}}, nil)
+	rec = e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "second", Scopes: []string{api.ScopeAppsRead}}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -291,7 +291,7 @@ func TestAuditEvents_ListEndpointCrossAccountInvisible(t *testing.T) {
 // wire shape (id, at, actor, kind, subject, data) comes back correctly.
 func TestAuditEvents_GetEndpointReturnsRow(t *testing.T) {
 	e := setup(t, api.PlanPro)
-	rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "get-me", Scopes: []string{"read"}}, nil)
+	rec := e.do(t, http.MethodPost, "/v1/keys", api.CreateKeyRequest{Label: "get-me", Scopes: []string{api.ScopeAppsRead}}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/keys: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -342,7 +342,7 @@ func TestAuditEvents_GetEndpointCrossAccount404(t *testing.T) {
 	}
 	// Mount a server and ask as acctB.
 	ptB, hashB, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acctB.ID, hashB, "test", api.DefaultScopes()); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acctB.ID, hashB, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatal(err)
 	}
 	srv := newServer(store,
@@ -579,7 +579,7 @@ func TestAuditEvents_FailingStoreDoesNotRollback(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}).WithOpsMetrics(e.ops)
 	h := srv.handler()
-	body, _ := json.Marshal(api.CreateKeyRequest{Label: "audit-fail", Scopes: []string{"read"}})
+	body, _ := json.Marshal(api.CreateKeyRequest{Label: "audit-fail", Scopes: []string{api.ScopeAppsRead}})
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+e.key)
 	req.Header.Set("Content-Type", "application/json")

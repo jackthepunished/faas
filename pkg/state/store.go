@@ -181,11 +181,26 @@ type Store interface {
 
 	// API keys.
 	// CreateAPIKey persists a new key row. Scopes is the explicit set of
-	// authorization scopes attached to the key (e.g. "admin", "read",
-	// "write"); see ADR-034. The store does not validate the scope
-	// vocabulary — that is the apid handler's responsibility.
+	// authorization scopes attached to the key (e.g. "admin",
+	// "apps:read", "deploy:write", "secrets:read", "secrets:write",
+	// "usage:read"); see ADR-034 rev2. The store does not validate the
+	// scope vocabulary — that is the apid handler's responsibility
+	// (api.NormalizeCreateKeyScopes is the canonical funnel; the DB
+	// CHECK constraint added in migration 00044 is the floor a typo
+	// cannot cross).
 	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error)
+	// DeleteAPIKey removes a key without returning the row. Used by
+	// paths that don't need to surface the deleted scopes (none
+	// today; DeleteAPIKeyReturning is the preferred shape for new
+	// callers).
 	DeleteAPIKey(ctx context.Context, accountID, keyID string) error
+	// DeleteAPIKeyReturning deletes the key and returns the row in a
+	// single statement (IAM-1, ADR-034 rev2). The handler uses the
+	// returned APIKey.Scopes to emit a `key.deleted` audit event
+	// carrying the dismissed permission set, so operators can
+	// answer "what just got revoked?" without re-deriving it from
+	// logs. Returns ErrNotFound when no matching row exists.
+	DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error)
 	ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error)
 	// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used
 	// by the post-login audit log (cmd/apid/handlers_auth.go) so an
@@ -199,6 +214,11 @@ type Store interface {
 	// the principal is assembled atomically. Returns ErrNotFound when
 	// the hash has no matching key.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
+	// fire-and-forget on every successful bearer auth in the apid
+	// middleware so the dashboard can show "X used 2 minutes ago"
+	// (PRD §4.4) without coupling request latency to a non-critical
+	// observability write.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
