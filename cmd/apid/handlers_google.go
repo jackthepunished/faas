@@ -21,9 +21,11 @@ const (
 	googleAuthStateCookie = "faas_google_state"
 	googleAuthPath        = "/v1/auth/google"
 	googleCallbackPath    = "/v1/auth/google/callback"
-	// schemeHTTPS is the value of the X-Forwarded-Proto header (and the
-	// tld of the redirect scheme) when the request was served over TLS.
-	// Lifted to a const so goconst doesn't flag the repeated literal.
+	// schemeHTTP + schemeHTTPS are the URL schemes used in the OAuth
+	// redirect / domain helper. Lifted to package-level consts so
+	// goconst doesn't flag the repeated literals across the auth
+	// handlers (handlers_github.go, handlers_auth_login.go).
+	schemeHTTP  = "http"
 	schemeHTTPS = "https"
 )
 
@@ -68,7 +70,7 @@ func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request
 	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}
@@ -116,7 +118,7 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}

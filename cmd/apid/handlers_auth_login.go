@@ -56,19 +56,14 @@ const (
 	setPasswordPath    = "/dashboard/account/set-password"
 	logoutPathPublic   = "/logout"
 
-	// schemeHTTP is the URL scheme used for the loopback dev path
-	// and as the default in sendPasswordResetEmail; schemeHTTPS
-	// (declared in handlers_google.go:27) is the TLS / X-Forwarded-Proto
-	// match. Lifted to a const so goconst doesn't flag the repeated
-	// literal across the auth surface.
-	schemeHTTP = "http"
-
 	// domainUnset is the sentinel value apid uses to mean
 	// "no canonical domain configured" — distinct from "" (which
 	// triggers the dev-mode defaults in other handlers). The
 	// forgot-password path treats both the empty string and
 	// domainUnset as "use the request Host verbatim" so a misconfigured
 	// dev deploy never mails out a "DOMAIN" link.
+	// schemeHTTP / schemeHTTPS live in handlers_google.go alongside
+	// googleAuthStateCookie so all auth handlers share them.
 	domainUnset = "DOMAIN"
 
 	// passwordResetTTL is how long a reset token stays valid. 15 min

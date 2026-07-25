@@ -106,7 +106,7 @@ func (s *server) renderGitHubAuthRedirect(w http.ResponseWriter, r *http.Request
 	redirectURI := os.Getenv("GITHUB_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}
@@ -154,7 +154,7 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	redirectURI := os.Getenv("GITHUB_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}
