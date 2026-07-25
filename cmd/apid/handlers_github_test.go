@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -330,6 +332,26 @@ func TestGitHubAuthCallback_UnverifiedEmail(t *testing.T) {
 			t.Errorf("session cookie must NOT be set on unverified-email path: %v", c)
 		}
 	}
+	// No oauth_links row was created for the impersonated sub=42.
+	// The handler returns 401 BEFORE provisionOrFetchOAuthAccount
+	// runs, so the (provider, sub) row must not exist. Asserting
+	// against the handler's own store requires we share it; the
+	// helper above (newGitHubTestServer) constructs a fresh store
+	// per call, so we drive the same handler one more time with
+	// the SAME store the test wired up. If a future refactor moves
+	// the 401 emit to AFTER the provision step, this assertion will
+	// fail loudly.
+	store := state.NewMemStore()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := newServer(store, log, "example.com", noopNotifier{}).handler()
+	rec2 := httptest.NewRecorder()
+	srv.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("second unverified call: code = %d, want 401", rec2.Code)
+	}
+	if link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", "42"); err == nil && link.AccountID != "" {
+		t.Errorf("oauth_links row was created for sub=42 on the rejected path: %+v", link)
+	}
 }
 
 // TestGitHubAuthCallback_FreshAccount drives the happy path end-to-end:
@@ -342,7 +364,7 @@ func TestGitHubAuthCallback_FreshAccount(t *testing.T) {
 	t.Setenv("WEBSITE_URL", "https://dashboard.example.com/welcome")
 	f := newFakeGitHubAPI(t)
 	const ghID int64 = 4242
-	f.userBody = []byte(`{"id":` + int64ToStr(ghID) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
+	f.userBody = []byte(`{"id":` + itoa(int(ghID)) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
 	f.emailsBody = []byte(`[{"email":"alice@example.com","primary":true,"verified":true}]`)
 	restore := withGitHubTransport(t, f)
 	defer restore()
@@ -370,7 +392,7 @@ func TestGitHubAuthCallback_FreshAccount(t *testing.T) {
 	if !sessionSeen {
 		t.Fatalf("expected session cookie to be set on success")
 	}
-	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", int64ToStr(ghID))
+	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", itoa(int(ghID)))
 	if err != nil {
 		t.Fatalf("OAuthLinkByProviderSubject: %v", err)
 	}
@@ -384,6 +406,16 @@ func TestGitHubAuthCallback_FreshAccount(t *testing.T) {
 	if acct.Email != "alice@example.com" {
 		t.Errorf("acct.Email = %q, want alice@example.com", acct.Email)
 	}
+	// Fresh accounts always land on the Free plan. A regression that
+	// defaults a brand-new OAuth account to Pro (or any other paid
+	// tier) would silently grant paid-tier quotas to unverified
+	// prospects — the audit row would still emit but the customer
+	// would be paying for nothing. api.PlanFree is the only allowed
+	// default for the create-on-first-sight path (handlers_github.go:
+	// 222 → provisionOrFetchOAuthAccount).
+	if acct.Plan != api.PlanFree {
+		t.Errorf("acct.Plan = %q, want %q (Free is the only valid default for fresh OAuth accounts)", acct.Plan, api.PlanFree)
+	}
 }
 
 // TestGitHubAuthCallback_LegacyAccountBind covers the merge case: a
@@ -395,7 +427,7 @@ func TestGitHubAuthCallback_LegacyAccountBind(t *testing.T) {
 	t.Setenv("GITHUB_CLIENT_SECRET", "test_gh_client_secret")
 	f := newFakeGitHubAPI(t)
 	const ghID int64 = 9999
-	f.userBody = []byte(`{"id":` + int64ToStr(ghID) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
+	f.userBody = []byte(`{"id":` + itoa(int(ghID)) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
 	f.emailsBody = []byte(`[{"email":"alice@example.com","primary":true,"verified":true}]`)
 	restore := withGitHubTransport(t, f)
 	defer restore()
@@ -415,7 +447,7 @@ func TestGitHubAuthCallback_LegacyAccountBind(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("expected 302, got %d; body=%s", rec.Code, rec.Body.String())
 	}
-	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", int64ToStr(ghID))
+	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", itoa(int(ghID)))
 	if err != nil {
 		t.Fatalf("OAuthLinkByProviderSubject: %v", err)
 	}
@@ -428,51 +460,87 @@ func TestGitHubAuthCallback_LegacyAccountBind(t *testing.T) {
 }
 
 // TestGitHubAuthCallback_SubFirstAntiTakeover is the §11 property
-// regression. Two logins try to bind the same `sub`: the first one
-// wins; the second one's email-based lookup either creates a fresh
-// account OR remains bound to its OWN existing account — it MUST NOT
-// hijack the first one's account row. (MemStore's UpsertOAuthLink
-// returns ErrConflict on different-account re-bind which the handler
-// currently swallows via `s.log.Error` — the first-login row stays.)
+// regression. It fires TWO callbacks that share the same GitHub
+// `sub` (provider_subject) but resolve to different verified
+// emails — the second callback hits a pre-existing password account
+// at its email. The (provider=github, sub) row MUST stay anchored
+// to the first login's account; the second account MUST NOT pick
+// up the foreign sub. MemStore's UpsertOAuthLink returns an error
+// on a different-account re-bind which the handler currently
+// swallows via s.log.Error, so the first row is preserved.
+//
+// Why two callbacks matter: a single login + an anchor check is
+// tautological — the row cannot move between bind and assertion.
+// The §11 invariant is exercised by the second callback's attempt
+// to claim the sub for preExisting via the email-fallback path.
 func TestGitHubAuthCallback_SubFirstAntiTakeover(t *testing.T) {
 	t.Setenv("GITHUB_CLIENT_ID", "test_gh_client_id")
 	t.Setenv("GITHUB_CLIENT_SECRET", "test_gh_client_secret")
 	const sharedGHID int64 = 1234
-	f := newFakeGitHubAPI(t)
-	f.userBody = []byte(`{"id":` + int64ToStr(sharedGHID) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
-	f.emailsBody = []byte(`[{"email":"shared@example.com","primary":true,"verified":true}]`)
-	restore := withGitHubTransport(t, f)
-	defer restore()
 
 	store := state.NewMemStore()
+	preExisting, err := store.CreateAccount(context.Background(), "other@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("seed preExisting: %v", err)
+	}
+
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newServer(store, log, "example.com", noopNotifier{}).handler()
 
-	// First login: (sub, email) lands on a fresh Free account.
-	req1 := newSignedGitHubRequest("k1", "c1")
+	// --- First login: (sub, email=shared@example.com) lands on a
+	// fresh Free account.
+	f1 := newFakeGitHubAPI(t)
+	f1.userBody = []byte(`{"id":` + itoa(int(sharedGHID)) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
+	f1.emailsBody = []byte(`[{"email":"shared@example.com","primary":true,"verified":true}]`)
+	restore1 := withGitHubTransport(t, f1)
 	rec1 := httptest.NewRecorder()
-	h.ServeHTTP(rec1, req1)
+	h.ServeHTTP(rec1, newSignedGitHubRequest("k1", "c1"))
+	restore1()
 	if rec1.Code != http.StatusFound {
 		t.Fatalf("first login: code = %d, body=%s", rec1.Code, rec1.Body.String())
 	}
-	firstLink, err := store.OAuthLinkByProviderSubject(context.Background(), "github", int64ToStr(sharedGHID))
+	firstLink, err := store.OAuthLinkByProviderSubject(context.Background(), "github", itoa(int(sharedGHID)))
 	if err != nil || firstLink.AccountID == "" {
 		t.Fatalf("first OAuthLinkByProviderSubject: link=%v err=%v", firstLink, err)
 	}
 	firstAcctID := firstLink.AccountID
+	if firstAcctID == preExisting.ID {
+		t.Fatalf("first login should NOT bind to preExisting; got %s", firstAcctID)
+	}
 
-	// The (sub) row is now anchored to firstAcctID. A subsequent login
-	// returning the same sub but a different email must not move the
-	// sub away from firstAcctID. MemStore's UpsertOAuthLink returns an
-	// error on different-account re-bind (which the handler logs and
-	// continues), so the original binding stays.
-	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", int64ToStr(sharedGHID))
+	// --- Second login: SAME GitHub sub, DIFFERENT verified email
+	// (other@example.com). The email-fallback path hits preExisting,
+	// which tries to claim the sub for itself.
+	f2 := newFakeGitHubAPI(t)
+	f2.userBody = []byte(`{"id":` + itoa(int(sharedGHID)) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
+	f2.emailsBody = []byte(`[{"email":"other@example.com","primary":true,"verified":true}]`)
+	restore2 := withGitHubTransport(t, f2)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, newSignedGitHubRequest("k2", "c2"))
+	restore2()
+
+	// The (provider=github, sub=sharedGHID) row MUST still point at
+	// firstAcctID. If the takeover succeeded, the row now points at
+	// preExisting.ID and the §11 anti-takeover invariant is broken.
+	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", itoa(int(sharedGHID)))
 	if err != nil {
-		t.Fatalf("OAuthLinkByProviderSubject after first login: %v", err)
+		t.Fatalf("OAuthLinkByProviderSubject after second login: %v", err)
 	}
 	if link.AccountID != firstAcctID {
-		t.Errorf("§11 anti-takeover violated: sub %s now points to %s instead of firstAcctID (%s)",
-			int64ToStr(sharedGHID), link.AccountID, firstAcctID)
+		t.Errorf("§11 anti-takeover violated: sub %s now points to %s instead of firstAcctID (%s); a different-account UpsertOAuthLink succeeded when it should have been rejected",
+			itoa(int(sharedGHID)), link.AccountID, firstAcctID)
+	}
+	// preExisting has NO github oauth_links row for sharedGHID. The
+	// only path through the handler that would create one is the
+	// successful UpsertOAuthLink at the email-fallback step; that
+	// step must have failed (MemStore ErrConflict) for the invariant
+	// to hold. The link is already anchored above; this redundant
+	// check makes the failure mode more readable if the anchor ever
+	// moves: "the row points at preExisting" tells the next reader
+	// exactly which row was forged.
+	if link.AccountID == preExisting.ID {
+		t.Errorf("§11 anti-takeover: sharedGHID row IS bound to preExisting (%s) — the foreign-account re-bind was NOT rejected at the store layer; firstAcctID=%s",
+			preExisting.ID, firstAcctID)
 	}
 }
 
@@ -481,18 +549,27 @@ func TestGitHubAuthCallback_SubFirstAntiTakeover(t *testing.T) {
 // with kind=auth.login, data.method=github, data.email=<the verified
 // email>, and data.login=<the GitHub username>. Mirrors the Google
 // handler's audit emission at handlers_google.go:228-231.
+//
+// In addition to the audit-row shape, this test asserts the cross-
+// system correlation invariant: the slog "github oauth sign-in
+// successful" line and the audit row's data.login MUST carry the
+// SAME value. Operators correlating slog and audit by login should
+// see one identifier; a regression that hard-codes one but not the
+// other (e.g., audit carries the email while slog carries the login)
+// would silently break dashboard filtering.
 func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 	t.Setenv("GITHUB_CLIENT_ID", "test_gh_client_id")
 	t.Setenv("GITHUB_CLIENT_SECRET", "test_gh_client_secret")
 	const ghID int64 = 7777
 	f := newFakeGitHubAPI(t)
-	f.userBody = []byte(`{"id":` + int64ToStr(ghID) + `,"login":"login-name","name":"Login Name","avatar_url":"https://x","email":""}`)
+	f.userBody = []byte(`{"id":` + itoa(int(ghID)) + `,"login":"login-name","name":"Login Name","avatar_url":"https://x","email":""}`)
 	f.emailsBody = []byte(`[{"email":"audit-gh@example.com","primary":true,"verified":true}]`)
 	restore := withGitHubTransport(t, f)
 	defer restore()
 
 	store := state.NewMemStore()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slogBuf := &safeBuffer{}
+	log := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	h := newServer(store, log, "example.com", noopNotifier{}).handler()
 
 	req := newSignedGitHubRequest("audit-state", "audit-code")
@@ -503,7 +580,7 @@ func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 		t.Fatalf("expected 302, got %d; body=%s", rec.Code, rec.Body.String())
 	}
 
-	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", int64ToStr(ghID))
+	link, err := store.OAuthLinkByProviderSubject(context.Background(), "github", itoa(int(ghID)))
 	if err != nil || link.AccountID == "" {
 		t.Fatalf("OAuthLinkByProviderSubject: link=%v err=%v", link, err)
 	}
@@ -540,6 +617,66 @@ func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 	if data["login"] != "login-name" {
 		t.Errorf("auth.login Data.login = %v, want login-name", data["login"])
 	}
+
+	// Cross-system correlation: the slog "github oauth sign-in
+	// successful" line carries `login=<slog login>` and the audit
+	// row carries `data.login`. Both must equal "login-name" and
+	// they must come from the SAME source (the GitHub user profile
+	// the handler just fetched). We parse slog with key=value
+	// pairs — sufficient for the slog.NewTextHandler output the
+	// apid server uses.
+	slogLine := slogBuf.String()
+	if !strings.Contains(slogLine, "github oauth sign-in successful") {
+		t.Fatalf("slog did not record the sign-in line; buf=%q", slogLine)
+	}
+	if !strings.Contains(slogLine, "login=login-name") {
+		t.Errorf("slog sign-in line missing login=login-name; buf=%q", slogLine)
+	}
+	// Stronger check: extract the slog login value and assert it
+	// equals data["login"]. This catches regressions that hard-code
+	// different identifiers in the two paths (e.g., audit emits the
+	// email while slog emits the login — they would BOTH pass the
+	// individual contains checks above but FAIL this equality).
+	slogLogin := slogFieldValue(t, slogLine, "login")
+	if slogLogin != data["login"] {
+		t.Errorf("slog login=%q ≠ audit data.login=%q (cross-system correlation broken)", slogLogin, data["login"])
+	}
+}
+
+// slogFieldValue extracts a single key=value pair from a slog text
+// handler output line. Returns "" if not found. Sufficient for the
+// audit-correlation assertion; not a general slog parser.
+func slogFieldValue(t *testing.T, line, key string) string {
+	t.Helper()
+	needle := key + "="
+	for _, field := range strings.Fields(line) {
+		if strings.HasPrefix(field, needle) {
+			return strings.TrimSuffix(strings.TrimPrefix(field, needle), "\n")
+		}
+	}
+	_ = needle // satisfy unused-var linter if needle isn't read (always is)
+	return ""
+}
+
+// safeBuffer is an io.Writer guarded by a mutex. slog's text handler
+// writes from the handler goroutine while the test reads the buffer
+// from the test goroutine; a bare *bytes.Buffer races under -race.
+// Per MEMORY.md/capturestdout-race, this is the standard pattern.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 // --- 4. parseGitHubAccessToken unit tests -------------------------------
@@ -570,7 +707,7 @@ func TestGitHubAuthCallback_TokenExchangeSendsAcceptJSON(t *testing.T) {
 	t.Setenv("GITHUB_CLIENT_SECRET", "test_gh_client_secret")
 	f := newFakeGitHubAPI(t)
 	const ghID int64 = 5555
-	f.userBody = []byte(`{"id":` + int64ToStr(ghID) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
+	f.userBody = []byte(`{"id":` + itoa(int(ghID)) + `,"login":"alice","name":"Alice","avatar_url":"https://x","email":""}`)
 	f.emailsBody = []byte(`[{"email":"hdr@example.com","primary":true,"verified":true}]`)
 	restore := withGitHubTransport(t, f)
 	defer restore()
@@ -585,30 +722,4 @@ func TestGitHubAuthCallback_TokenExchangeSendsAcceptJSON(t *testing.T) {
 	if got := f.acceptSeen.Load(); got < 1 {
 		t.Errorf("access_token request did not carry Accept: application/json; saw %d", got)
 	}
-}
-
-// int64ToStr is a tiny strconv-free int64→string helper used to build
-// inline JSON bodies without importing strconv at test-file scope.
-// Named to avoid the package-level `itoa(n int)` from
-// handlers_ext_test.go.
-func int64ToStr(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }
