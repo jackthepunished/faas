@@ -81,6 +81,15 @@ type Config struct {
 	// BuildTimeoutSeconds mirrors pkg/api/limits.go BuildTimeoutSeconds;
 	// the per-build deadline. 0 falls back to the limit.
 	BuildTimeoutSeconds int `toml:"build_timeout_seconds"`
+	// FairnessWindow is the per-account claim-fairness lookback
+	// (issue #196 B2.2). A claim that finds an account in
+	// recent_build_claims within this window will skip that account's
+	// queued builds and prefer a quieter one. If every queued
+	// account is in the window, the claim falls back to FIFO so no
+	// build is starved. Zero disables the fairness filter (worker
+	// behaves like the pre-B2.2 FIFO claim). Default 30s; a longer
+	// window trades queue latency for fairness.
+	FairnessWindow time.Duration `toml:"fairness_window"`
 }
 
 // Builderd is the orchestrator. It is the cmd/builderd main loop.
@@ -203,8 +212,22 @@ func (b *Builderd) ProcessOne(ctx context.Context, buildID string) (BuildResult,
 // after seeing ErrNoSlot so the build stays in the FIFO position
 // until a slot opens up. cmd/builderd's workerLoop in main.go owns
 // the cadence.
+//
+// B2.2 (issue #196): the claim switches to
+// ClaimNextQueuedBuildWithFairness(cfg.FairnessWindow) which prefers
+// accounts whose last claim is older than the window. Zero window
+// disables the filter (falls back to FIFO via the CTE's
+// "not exists" branch). The fairness record is written by
+// processClaimedBuild after AppByID resolves the account — see
+// that comment for the +1 SQL trip rationale.
 func (b *Builderd) ProcessNext(ctx context.Context) (BuildResult, error) {
-	build, err := b.store.ClaimNextQueuedBuild(ctx)
+	var build state.Build
+	var err error
+	if b.cfg.FairnessWindow > 0 {
+		build, err = b.store.ClaimNextQueuedBuildWithFairness(ctx, b.cfg.FairnessWindow)
+	} else {
+		build, err = b.store.ClaimNextQueuedBuild(ctx)
+	}
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return BuildResult{}, state.ErrNotFound
@@ -229,6 +252,23 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	app, err := b.store.AppByID(ctx, dep.AppID)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("builderd: load app: %w", err)
+	}
+
+	// B2.2 (issue #196): record the claim so the next
+	// ClaimNextQueuedBuildWithFairness round excludes this account
+	// from the "fresh" set. We do this AFTER the deployment/app load
+	// (which already paid for the round-trip) — adding a separate
+	// SQL trip just for the record would be wasteful. The record is
+	// best-effort: a failure here is logged at WARN and the claim
+	// itself succeeds (losing one window of fairness, not the build).
+	// When FairnessWindow == 0 the fairness path is fully disabled
+	// and we skip the record to keep the SQL footprint identical to
+	// pre-B2.2.
+	if b.cfg.FairnessWindow > 0 && app.AccountID != "" {
+		if recErr := b.store.RecordRecentBuildClaim(ctx, app.AccountID, build.ID); recErr != nil {
+			b.log.Warn("builderd: record recent build claim",
+				"build", build.ID, "account", app.AccountID, "err", recErr)
+		}
 	}
 
 	// started_at was set by ClaimQueuedBuild; the legacy UpdateBuildStatus

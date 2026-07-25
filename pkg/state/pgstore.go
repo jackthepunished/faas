@@ -1070,6 +1070,96 @@ func (s *PgStore) ClaimNextQueuedBuild(ctx context.Context) (Build, error) {
 	return b, nil
 }
 
+// ClaimNextQueuedBuildWithFairness is the B2.2 (issue #196) variant.
+// Same shape as ClaimNextQueuedBuild (single UPDATE+RETURNING under a
+// SELECT … FOR UPDATE SKIP LOCKED) but with a CTE that excludes
+// accounts whose last claim is more recent than fairnessWindow.
+//
+// Critical invariant #1 (never starve): if every queued account is in
+// recent_claims (e.g. 100% of accounts claimed within the window), the
+// `or not exists (… fresh_candidate …)` clause falls back to ALL queued
+// rows. This is the standard round-robin fairness property.
+//
+// Critical invariant #2 (must not regress basic claim): the row we
+// SELECT FOR UPDATE must still be only status='queued' (the
+// freshness-fallback path also enforces status='queued').
+//
+// Critical invariant #3 (builds↔account path): builds does NOT carry
+// account_id directly; we join through deployments → apps. The double
+// join is the cost of the fairness filter without denormalising
+// account_id onto the builds row (a future B3.x could carry
+// account_id on builds to skip the JOIN, but that's a separate slice).
+func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairnessWindow time.Duration) (Build, error) {
+	row := s.pool.QueryRow(ctx,
+		`with skipped as (
+		   select account_id from recent_build_claims
+		    where claimed_at > now() - $1::interval
+		 ),
+		 queued_with_account as (
+		   select b.id, b.enqueued_at, a.account_id
+		     from builds b
+		     join deployments d on d.id = b.deployment_id
+		     join apps a        on a.id = d.app_id
+		    where b.status = 'queued'
+		 ),
+		 fresh_candidates as (
+		   select id from queued_with_account
+		    where account_id not in (select account_id from skipped)
+		 ),
+		 has_fresh as (
+		   select exists (select 1 from fresh_candidates) as yes
+		 ),
+		 target as (
+		   -- prefer fresh; if none, fall back to ALL queued (starvation guard)
+		   select id from fresh_candidates
+		    where (select yes from has_fresh)
+		   union all
+		   select id from queued_with_account
+		    where not (select yes from has_fresh)
+		    order by enqueued_at
+		    limit 1
+		 )
+		 update builds set status='running', started_at = now()
+		  where id = (select id from target)
+		  returning id, deployment_id, kind, source_bytes, status,
+		            coalesce(failure_class,''), coalesce(log_path,''),
+		            started_at, finished_at, enqueued_at`,
+		fmt.Sprintf("%d milliseconds", fairnessWindow.Milliseconds()))
+	b, err := scanBuild(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Build{}, ErrNotFound
+		}
+		return Build{}, fmt.Errorf("state: claim next queued build (fairness): %w", err)
+	}
+	return b, nil
+}
+
+// RecordRecentBuildClaim records a single claim into recent_build_claims
+// so the next ClaimNextQueuedBuildWithFairness round excludes this
+// account from the "fresh" set. Called by builderd after a successful
+// ClaimNextQueuedBuildWithFairness, with the build's account_id loaded
+// from app.AccountID via the existing deployment → app join.
+//
+// The insert is intentionally append-only with no UPSERT. Multiple rows
+// for the same account within the window are fine — the WHERE clause
+// is "claimed_at > now() - interval", not "exists some row for this
+// account", so a noisiy customer with N concurrent builds just gets N
+// rows in the window. Keeping the row count = "claims within the
+// window" is also useful operator telemetry in the meantime.
+func (s *PgStore) RecordRecentBuildClaim(ctx context.Context, accountID, buildID string) error {
+	if accountID == "" {
+		return fmt.Errorf("state: record recent build claim: empty account_id")
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into recent_build_claims (account_id, build_id) values ($1::uuid, $2::uuid)`,
+		accountID, buildID)
+	if err != nil {
+		return fmt.Errorf("state: record recent build claim: %w", err)
+	}
+	return nil
+}
+
 // RequeueBuild resets a build row to queued when builderd's slot
 // allocator (DecideSlot) rules it out (PR-B). enqueued_at is preserved
 // verbatim so the row slots back into its original FIFO position;

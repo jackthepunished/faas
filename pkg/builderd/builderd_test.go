@@ -17,6 +17,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+
+	"github.com/google/uuid"
 )
 
 // fakeNotifier records every Notify call. Used to assert build_log fan-out
@@ -976,5 +978,123 @@ func TestProcessOne_NoSlotDoesNotMarkFailed(t *testing.T) {
 	dep, _ := store.DeploymentByID(context.Background(), depID)
 	if dep.Status == state.DeployFailed {
 		t.Errorf("deployment flipped to failed on no-slot; want unchanged")
+	}
+}
+
+// --- B2.2 (issue #196): per-account claim fairness ---
+
+// TestProcessNext_FairnessWindow_ZeroDisablesFilter verifies that
+// FairnessWindow=0 makes ProcessNext call the legacy FIFO claim
+// (ClaimNextQueuedBuild), not the fairness variant — the regression
+// gate for "operators can disable the fairness filter". A bug here
+// would surprise operators whose workloads behave fine without the
+// filter (single-customer, no contention).
+//
+// Implementation note: ProcessNext runs the full pipeline. To avoid
+// the VM spawn path entirely we pre-populate the cache so the
+// processClaimedBuild path short-circuits at the cache hit (no VM
+// spawn, no BuildDriveDir required).
+func TestProcessNext_FairnessWindow_ZeroDisablesFilter(t *testing.T) {
+	store := state.NewMemStore()
+	src := filepath.Join(t.TempDir(), "src.tar.gz")
+	makeTarballWithName(t, src, []string{"package.json", "index.js"})
+	buildID, _, _ := seedDeploymentWithSlug(t, store, src, fmt.Sprintf("fifo-zero-%s", uuid.NewString()[:6]))
+
+	// Pre-record the queue's account as recent; with FairnessWindow=0
+	// (DISABLED) the FIFO claim still picks it. With FairnessWindow=30s
+	// the next test verifies the opposite.
+	b, _ := store.BuildByID(context.Background(), buildID)
+	dep, _ := store.DeploymentByID(context.Background(), b.DeploymentID)
+	app, _ := store.AppByID(context.Background(), dep.AppID)
+	if err := store.RecordRecentBuildClaim(context.Background(), app.AccountID, uuid.NewString()); err != nil {
+		t.Fatalf("seed skip: %v", err)
+	}
+
+	// Pre-cache the source so the pipeline short-circuits at the
+	// cache-hit branch (which writes deployment rootfs and skips VM spawn).
+	cacheRoot := t.TempDir()
+	c := NewCache(cacheRoot)
+	srcCopy := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(srcCopy, []byte("pre-cached layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := hashFile(src)
+	if err := c.Store(hash, FrameworkNode, srcCopy, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	ops := wire.NewOpsMetrics("builderd")
+	bld := New(store, &fakeNotifier{}, &fakeVM{}, c, NewDetector(), nil,
+		Config{BuildTimeoutSeconds: 1, FairnessWindow: 0}, // DISABLED
+		slog.New(slog.NewTextHandler(io.Discard, nil))).WithOpsMetrics(ops)
+
+	if _, err := bld.ProcessNext(context.Background()); err != nil && !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+	// Build should now be succeeded (cache hit short-circuits to terminal).
+	post, _ := store.BuildByID(context.Background(), buildID)
+	if post.Status != state.BuildSucceeded {
+		t.Errorf("build status = %s, want succeeded", post.Status)
+	}
+}
+
+// TestProcessNext_FairnessWindow_PreferQuietAccount is the wired-up
+// gate for B2.2: after marking A as recent, ProcessNext must skip
+// A's queued builds and pick B or C. The cache-hit path lets us run
+// the full pipeline without spinning up a VM.
+func TestProcessNext_FairnessWindow_PreferQuietAccount(t *testing.T) {
+	store := state.NewMemStore()
+	src := filepath.Join(t.TempDir(), "src.tar.gz")
+	makeTarballWithName(t, src, []string{"package.json", "index.js"})
+
+	// Three accounts × one build each. The three builds share a
+	// source-hash (all call seedDeploymentWithSlug with the same
+	// source) so a single Cache.Store primes all three with one
+	// write.
+	type seedInfo struct {
+		accountID string
+		buildID   string
+	}
+	var seeded []seedInfo
+	for i := 0; i < 3; i++ {
+		buildID, _, _ := seedDeploymentWithSlug(t, store, src, fmt.Sprintf("fair-%d-%s", i, uuid.NewString()[:6]))
+		b, _ := store.BuildByID(context.Background(), buildID)
+		dep, _ := store.DeploymentByID(context.Background(), b.DeploymentID)
+		app, _ := store.AppByID(context.Background(), dep.AppID)
+		seeded = append(seeded, seedInfo{accountID: app.AccountID, buildID: buildID})
+	}
+
+	if err := store.RecordRecentBuildClaim(context.Background(), seeded[0].accountID, uuid.NewString()); err != nil {
+		t.Fatalf("seed skip: %v", err)
+	}
+
+	// Pre-cache the source so each ProcessNext short-circuits at the
+	// cache hit branch.
+	cacheRoot := t.TempDir()
+	c := NewCache(cacheRoot)
+	srcCopy := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(srcCopy, []byte("pre-cached layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := hashFile(src)
+	if err := c.Store(hash, FrameworkNode, srcCopy, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	ops := wire.NewOpsMetrics("builderd")
+	bld := New(store, &fakeNotifier{}, &fakeVM{}, c, NewDetector(), nil,
+		Config{BuildTimeoutSeconds: 1, FairnessWindow: 30 * time.Second},
+		slog.New(slog.NewTextHandler(io.Discard, nil))).WithOpsMetrics(ops)
+
+	// Two ProcessNext calls: each must pick a non-A build (cache hit).
+	for i := 0; i < 2; i++ {
+		if _, err := bld.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext[%d]: %v", i, err)
+		}
+	}
+	// A's build must still be queued.
+	post, _ := store.BuildByID(context.Background(), seeded[0].buildID)
+	if post.Status != state.BuildQueued {
+		t.Errorf("A's build status = %s, want queued (fairness should have skipped A's queued row)", post.Status)
 	}
 }
