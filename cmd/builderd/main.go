@@ -133,8 +133,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// series real rather than a throwaway (ADR-030).
 	ops := wire.NewOpsMetrics("builderd")
 	b := builderdpkg.New(store, notif, driver, nil, nil, resid, builderdpkg.Config{
-		CacheDir:    cfg.CacheDir,
-		MetricsAddr: cfg.MetricsAddr,
+		CacheDir:       cfg.CacheDir,
+		MetricsAddr:    cfg.MetricsAddr,
+		FairnessWindow: cfg.FairnessWindow,
 	}, log).WithOpsMetrics(ops)
 
 	notifCh, err := db.SubscribeWithReconnect(ctx, pool, []string{

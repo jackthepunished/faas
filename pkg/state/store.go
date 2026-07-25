@@ -431,6 +431,24 @@ type Store interface {
 	// starving the in-process worker — both compete cleanly for the
 	// head of the queue without ever observing the same row.
 	ClaimNextQueuedBuild(ctx context.Context) (Build, error)
+	// ClaimNextQueuedBuildWithFairness is the B2.2 (issue #196) variant
+	// that prefers accounts whose last claim is older than fairnessWindow.
+	// Identical SQL to ClaimNextQueuedBuild plus a CTE that filters out
+	// rows whose account shows up in recent_build_claims (claimed within
+	// the window) — falling back to all queued rows if every queued
+	// account is recent, so no build is ever starved (issue #196 B2.2
+	// critical invariant #1). The caller must RecordRecentBuildClaim on
+	// the chosen row's account_id AFTER the claim succeeds so the next
+	// round sees the just-claimed account in the "recent" set.
+	ClaimNextQueuedBuildWithFairness(ctx context.Context, fairnessWindow time.Duration) (Build, error)
+	// RecordRecentBuildClaim records that builderd just claimed a build
+	// for the given account. Called by builderd after a successful
+	// ClaimNextQueuedBuildWithFairness so the next fairness round
+	// excludes this account from the "fresh" set. Rows persist until
+	// they age out of the WHERE clause (claimed_at + window < now), so
+	// the table grows by ~claim-rate per window — bounded by a future
+	// Tier-3 GC (out of scope for #196).
+	RecordRecentBuildClaim(ctx context.Context, accountID, buildID string) error
 	// RequeueBuild resets a running build back to queued with enqueued_at
 	// untouched (preserving FIFO order) when the builder slot allocator
 	// (DecideSlot) rules the row out (builderd worker PR-B). started_at
