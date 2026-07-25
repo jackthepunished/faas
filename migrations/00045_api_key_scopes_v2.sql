@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00044_api_key_scopes_v2.sql — IAM-1 (ADR-034 rev2).
+-- 00045_api_key_scopes_v2.sql — IAM-1 (ADR-034 rev2).
 --
 -- Replaces the coarse closed vocabulary (admin | read | write) with
 -- the fine-grained set (admin | apps:read | deploy:write |
