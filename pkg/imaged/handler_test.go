@@ -1299,7 +1299,7 @@ func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
 	}
 }
 
-// TestManifestFromImageConfig_IgnoresOCIEntrypointWithoutCmd pins the
+// TestManifestFromImageConfig_NoCmdYieldsEmptyEntrypoint pins the
 // negative contract: an OCI image without Cmd must produce an empty
 // manifest (and fail loud at Validate). The imaged-side oci.ImageConfig
 // struct only exposes `Cmd` — Entrypoint is an upstream OCI concept that
@@ -1309,11 +1309,15 @@ func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
 // `len(cfg.Cmd) > 0` guard, which would silently produce a manifest
 // whose Entrypoint is empty.
 //
+// (The earlier test name referenced the historical doc-warning shape
+// "IgnoresOCIEntrypointWithoutCmd" — renamed here so the negative
+// contract is self-describing: no Cmd → empty entrypoint.)
+//
 // End-to-end coverage that "empty manifest → deployment failed" is
 // already provided by TestHandleDeployment_NoCmdImageSkipsLayerStream;
 // this test pins the conversion helper directly so a regression in
 // manifestFromImageConfig surfaces here, before the wire.
-func TestManifestFromImageConfig_IgnoresOCIEntrypointWithoutCmd(t *testing.T) {
+func TestManifestFromImageConfig_NoCmdYieldsEmptyEntrypoint(t *testing.T) {
 	// oci.ImageConfig has only Cmd/Env/WorkingDir/ExposedPorts. An image
 	// without Cmd is the canonical misconfiguration this test pins.
 	cfg := oci.ImageConfig{

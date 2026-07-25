@@ -559,6 +559,9 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--handler", "/app/node22.js",
 		},
 	}
+	// node22 has no explicit override here — its `/app/node22.js`
+	// matches the default above. Adding `case RuntimeNode22 { ... }`
+	// for symmetry would silently diverge from the runner default.
 	if runtime == RuntimePython312 {
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
