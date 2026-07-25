@@ -40,7 +40,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/dashboard"
-	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -153,7 +152,8 @@ func (s *server) postSignup(w http.ResponseWriter, r *http.Request) {
 				writeLoginJSON(w, existing)
 				return
 			}
-			s.log.Error("signup.create_account", "err", createErr, "email", logsanitize.Field(email))
+			s.log.Error("signup.create_account", "err", createErr,
+				"email", strings.ReplaceAll(strings.ReplaceAll(email, "\r", ""), "\n", ""))
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
 				"internal_error", "Internal Error", "failed to create account"))
 			return
