@@ -317,7 +317,7 @@ func matchedDenyEntry(ip netip.Addr) netns.DenyEntry {
 // catalog is consumed by the OCI dialer without exposing the
 // internal slices or the resolver/dial plumbing. Adding a new
 // catalog entry to netns.NewDefaultDenySet() is automatically
-// picked up here because deniedCIDRv4 / deniedCIDRv6 are built
+// picked up here because deniedEntriesV4 / deniedEntriesV6 are built
 // from that source at init.
 func EgressIPAllowed(addr netip.Addr) bool { return ipAllowed(addr) }
 

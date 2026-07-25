@@ -8,7 +8,7 @@ package netns
 // firewall rules and the user-space check can never drift apart.
 //
 // Renaming a field on HostPolicy / inlining new CIDRs in
-// NftCommands() / adding a deny to deniedCIDRv4 in oci/egress.go is
+// NftCommands() / adding a deny to deniedEntriesV4 in oci/egress.go is
 // how this code base silently dropped a deny line in the past
 // (issue #146). The DenySet type makes "the deny list" a thing
 // you import; add a new CIDR once, three places update.
@@ -266,9 +266,8 @@ func NewDefaultDenySet() DenySet {
 	// populated).
 	for i, e := range entries {
 		if e.CounterName == "" {
-			panic("netns.NewDefaultDenySet: entry " + e.Prefix.String() + " missing CounterName")
+			panic(fmt.Sprintf("netns.NewDefaultDenySet: entry[%d] %s missing CounterName", i, e.Prefix.String()))
 		}
-		_ = i
 	}
 
 	// Sort Entries by family then prefix for deterministic ordering

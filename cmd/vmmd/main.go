@@ -281,7 +281,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// startEgressPoll to skip the loop or capture the seam args; nil
 	// means "start the production goroutine". The interval is
 	// parameterised so a unit test can drive the loop at sub-second
-	// cadence (see cmd/vmmd/main_test.go::TestRunEgressPollDelta).
+	// cadence (see cmd/vmmd/poller_test.go::TestRunEgressPoll_DeltaOnSecondTick).
 	interval := EgressPollInterval
 	if deps.egressPollInterval != nil {
 		interval = *deps.egressPollInterval
