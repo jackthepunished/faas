@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00038 (account_passwords). Pins the load-bearing
+// Migration-apply test for 00039 (account_passwords). Pins the load-bearing
 // Argon2id-storage contract from ADR-032 / issue #165 PR #2:
 //
-//   1. The migration set applies cleanly through 00038.
+//   1. The migration set applies cleanly through 00039.
 //   2. The table exposes (account_id PK, hash text NOT NULL, updated_at
 //      timestamptz NOT NULL DEFAULT now()).
 //   3. The PK is on account_id — one row per account. A second insert
@@ -31,9 +31,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00038_AccountPasswords pins the schema + PK + NOT NULL
+// TestMigrations_00039_AccountPasswords pins the schema + PK + NOT NULL
 // contract for the Argon2id hash storage. Mirrors the 00029/00033 shape.
-func TestMigrations_00038_AccountPasswords(t *testing.T) {
+func TestMigrations_00039_AccountPasswords(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

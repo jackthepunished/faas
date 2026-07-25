@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00037 (oauth_links). Pins the load-bearing §11
+// Migration-apply test for 00038 (oauth_links). Pins the load-bearing §11
 // anti-takeover contract from ADR-032 / issue #165 PR #2:
 //
-//   1. The migration set applies cleanly through 00037.
+//   1. The migration set applies cleanly through 00038.
 //   2. The table exposes the documented columns + the composite PK on
 //      (provider, provider_subject) is the load-bearing anti-takeover
 //      invariant. A duplicate (provider, sub) on a DIFFERENT account_id
@@ -30,10 +30,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00037_OAuthLinks pins the schema + PK contract for the
+// TestMigrations_00038_OAuthLinks pins the schema + PK contract for the
 // OAuth-links table. Mirrors the 00029/00030 shape: one test, comprehensive
 // coverage, no per-feature drift.
-func TestMigrations_00037_OAuthLinks(t *testing.T) {
+func TestMigrations_00038_OAuthLinks(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
