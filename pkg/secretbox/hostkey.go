@@ -58,23 +58,50 @@ var ErrRecipientInsecurePerms = errors.New("secretbox: host.age.pub permissions 
 // needed to keep vmmd (root) and apid (faas group) in the read set.
 const DefaultHostKeyPath = "/etc/faas/secrets/host.age"
 
+// ErrHostKeyInsecurePerms is returned by LoadHostKey when the file's mode
+// allows anything other than owner-read. The private half of the host identity
+// is the secret material every SealedSecret in app_secrets is encrypted
+// against; a host.age that's group- or world-readable lets any unprivileged
+// user on the box extract the X25519 secret key and unseal every customer's
+// env vars. Spec §11: secrets in /etc/faas/secrets/ root:root 0400. This
+// runtime check is the tripwire when the file's been chmod'd loose (operator
+// drift) or restored from a backup with wrong mode.
+var ErrHostKeyInsecurePerms = errors.New("secretbox: host.key permissions allow read/write/exec/setuid to non-owner")
+
 // ErrHostKeyNotFound is returned by LoadHostKey when the file is missing.
 // Callers (vmmd) treat this as the first-boot signal and call
 // GenerateAndSaveHostKey to create one.
 var ErrHostKeyNotFound = errors.New("secretbox: host key not found")
 
-// LoadHostKey parses an age-format X25519 identity from path. The file is
-// expected to be the raw "AGE-SECRET-KEY-1..." string (age's standard
-// textual representation). Production mode is 0440 root:faas but mode is
-// not enforced here — the host key's filesystem permissions are an
-// ansible / bootstrap.sh concern, not a runtime check. LoadHostKey never
-// opens a file writable by anyone outside the file's owner.
+// LoadHostKey parses an age-format X25519 identity from path. The file is the
+// raw "AGE-SECRET-KEY-1..." string (age's standard textual representation).
+//
+// Security check (M8 §11): refuse to load if the file's mode permits anything
+// other than owner-read (0o400). The private half is the secret material that
+// decrypts every customer's sealed env blobs — a single bit set for group,
+// other, or any write/exec/setuid is enough for an attacker to extract it.
+// Mirrors the public-side check in LoadRecipient, but stricter: 0o400 only.
+// ErrHostKeyInsecurePerms is returned for any deviation; the vmmd startup
+// path fails-fast on this so a stolen/loosened host.age cannot reach the
+// unseal path.
 func LoadHostKey(path string) (*age.X25519Identity, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrHostKeyNotFound
 		}
+		return nil, fmt.Errorf("secretbox: stat host key %q: %w", path, err)
+	}
+	// The private key must be owner-read ONLY. Any other bit
+	// (group/other read, any write/exec/suid) is rejected. The
+	// bitwise AND `info.Mode().Perm() & ^0o400` is non-zero
+	// whenever the file has any bit outside 0o400.
+	if info.Mode().Perm() & ^os.FileMode(0o400) != 0 {
+		return nil, fmt.Errorf("secretbox: host key %q mode %#o: %w",
+			path, info.Mode().Perm(), ErrHostKeyInsecurePerms)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil, fmt.Errorf("secretbox: read host key %q: %w", path, err)
 	}
 	if len(data) == 0 {

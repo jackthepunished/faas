@@ -298,3 +298,51 @@ func TestLoadOrGenerateHostIdentity_WriteRecipientFailure(t *testing.T) {
 		t.Errorf("err = %v, want wraps %v", err, wantErr)
 	}
 }
+
+// TestLoadOrGenerateHostIdentity_RejectsInsecureHostKeyPerms pins
+// the M8 §11 fail-fast path for the *private* host.age. The earlier
+// tests above use a mock loadHostKey so they stay fast and don't
+// touch /etc/faas/secrets/. This one drives the REAL secretbox
+// loader against a temp file deliberately chmod'd loose — the
+// canonical operator-drift scenario the runtime check is here to
+// catch.
+//
+// The helper wraps the sentinel with %w (see cmd/vmmd/main.go
+// loadOrGenerateHostIdentity), so errors.Is matches through the
+// chain.
+func TestLoadOrGenerateHostIdentity_RejectsInsecureHostKeyPerms(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "host.age")
+	if _, err := secretbox.GenerateAndSaveHostKey(keyPath); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Drift the mode to 0o644 (group-readable). On a CIFS / FAT
+	// mount that loses mode bits, Chmod may fail — the production
+	// path also can't enforce on those mounts, so skip rather than
+	// fail spuriously.
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Skipf("chmod 0o644 unsupported on this host: %v", err)
+	}
+	deps := runDeps{
+		loadHostKey:    secretbox.LoadHostKey,
+		genAndSaveKey:  secretbox.GenerateAndSaveHostKey,
+		writeRecipient: secretbox.WriteRecipientFile,
+	}
+	_, _, _, err := loadOrGenerateHostIdentity(deps, keyPath, filepath.Join(dir, "host.age.pub"))
+	if err == nil {
+		t.Fatal("expected insecure perms to abort loadOrGenerateHostIdentity")
+	}
+	if !errors.Is(err, secretbox.ErrHostKeyInsecurePerms) {
+		t.Errorf("err = %v, want wraps ErrHostKeyInsecurePerms", err)
+	}
+	// Defensive: the helper must NOT have generated over the
+	// drifted file (that would silently destroy the host key and
+	// invalidate every sealed env blob on the box).
+	st, statErr := os.Stat(keyPath)
+	if statErr != nil {
+		t.Fatalf("stat after rejection: %v (helper overwrote the file?)", statErr)
+	}
+	if perm := st.Mode().Perm(); perm != 0o644 {
+		t.Errorf("file mode changed during rejection: got %o want 0o644 (helper must NOT overwrite on ErrHostKeyInsecurePerms)", perm)
+	}
+}

@@ -94,7 +94,77 @@ func TestLoadRecipientMissing(t *testing.T) {
 	}
 }
 
-// TestLoadRecipient_RejectsInsecurePerms pins down the security-critical
+// TestLoadHostKey_RejectsInsecurePerms is the M8 §11 private-side
+// counterpart to TestLoadRecipient_RejectsInsecurePerms. spec §11:
+// /etc/faas/secrets/host.age 0400 — the private half of the host
+// identity. A group- or world-readable host.age is the canonical
+// signal that the secret material has leaked; the runtime check is
+// the tripwire that prevents vmmd from unsealing customer env
+// blobs against a stolen identity.
+//
+// Reject cases: anything that adds group/other read, anything that
+// adds any write/exec/setuid. Accept cases: 0o400 only — that is
+// the production mode and the only mode vmmd ever writes (see
+// GenerateAndSaveHostKey).
+func TestLoadHostKey_RejectsInsecurePerms(t *testing.T) {
+	id, err := GenerateAndSaveHostKey(filepath.Join(t.TempDir(), "host.age"))
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	idStr := id.String()
+
+	rejectModes := []os.FileMode{
+		0o600,  // owner write — even owner-write is too permissive
+		0o640,  // group read — secret material exposed
+		0o604,  // other read — world-readable
+		0o660,  // group write + group read
+		0o666,  // world-writable
+		0o755,  // exec for everyone
+		0o711,  // exec for owner
+		0o4744, // setuid
+		0o2744, // setgid
+		0o1744, // sticky
+	}
+	for _, mode := range rejectModes {
+		t.Run(fmt.Sprintf("mode_%o", mode), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "host.age")
+			if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatalf("chmod %o: %v", mode, err)
+			}
+			_, err := LoadHostKey(path)
+			if err == nil {
+				t.Fatalf("mode %o accepted — must refuse (spec §11 / ErrHostKeyInsecurePerms)", mode)
+			}
+			if !errors.Is(err, ErrHostKeyInsecurePerms) {
+				t.Errorf("mode %o: err = %v, want ErrHostKeyInsecurePerms in chain", mode, err)
+			}
+		})
+	}
+
+	// Accept case: 0o400 only. The pre-existing
+	// TestGenerateAndSaveRoundTrip exercises the actual production
+	// path (vmmd writes 0o400 on first boot), but pinning a
+	// standalone accept case here keeps the contract + the
+	// rejection table in one place.
+	t.Run("accept_0o400", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "host.age")
+		if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := LoadHostKey(path); err != nil {
+			t.Errorf("mode 0o400 rejected: %v", err)
+		}
+	})
+}
+
 // refuse-to-start behavior: apid must reject host.age.pub files whose mode
 // allows write/exec/setuid to non-owner. A writable public key is the
 // canonical tamper signal — an attacker could substitute their own
