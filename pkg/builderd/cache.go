@@ -1,15 +1,20 @@
 package builderd
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // CacheEntry is one cached build: source-hash + framework → produced layer
@@ -258,6 +263,230 @@ func (c *Cache) writeSidecar(sourceHash string, fw Framework) error {
 
 func (c *Cache) entryPath(sourceHash string, fw Framework) string {
 	return filepath.Join(c.root, sourceHash+"."+string(fw), "layer.ext4")
+}
+
+// CacheGCSweepLoop is the free-function goroutine that calls
+// Cache.Sweep on a fixed cadence (issue #196 B2.1). Runs alongside
+// workerLoop and ReaperLoop in cmd/builderd/main.go.
+//
+// Why this is its own loop (not folded into the reaper): the reaper
+// hits Postgres on every tick (cheap-ish but DB-bound); the cache GC
+// hits the filesystem (no DB). Pairing them would force an operator
+// who wants to tune one cadence to also tune the other.
+//
+// Cadence defaults to 24h in cmd/builderd/config.go (configurable
+// via cache_gc_sweep_interval). MaxBytes/MaxAge/Now come from the
+// caller so tests can inject small values via the runDeps seam.
+func CacheGCSweepLoop(ctx context.Context, c *Cache, interval time.Duration, maxBytes int64, maxAge time.Duration, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		n, err := c.Sweep(maxBytes, maxAge, time.Now(), log)
+		if err != nil {
+			log.Warn("cache: gc sweep", "err", err)
+			continue
+		}
+		_ = n // swept count is logged inside Sweep when > 0
+	}
+}
+
+// Sweep deletes cache entries that are older than maxAge OR pushes the
+// total cache size below maxBytes by deleting oldest-first.
+//
+// Two policies, applied in order:
+//
+//  1. TTL eviction: every entry whose ModTime is before now.Add(-maxAge)
+//     is removed. Stable-sorted by (ModTime, path) so the same inputs
+//     produce the same deletion order on every tick.
+//  2. Size cap: if dirSize still exceeds maxBytes after TTL eviction,
+//     delete oldest-first by (ModTime, path) until under cap.
+//
+// Errors are best-effort: per-entry os.RemoveAll failures are logged
+// via the cache's slog logger and the sweep continues. Returns the
+// total count of entries swept (TTL + size-cap combined). A missing
+// or empty cache root returns (0, nil) without error — the GC is a
+// no-op when there's nothing to do.
+//
+// Concurrency: a concurrent Cache.Store for a NEW (sourceHash, fw)
+// key racing with Sweep may see its destination directory deleted
+// mid-rename. Store returns an error and the next build retries —
+// acceptable, the next tick will re-create the entry.
+//
+// This is B2.1 (issue #196). The defaults in cmd/builderd/config.go
+// are 30-day TTL + 50 GB size cap; both configurable via TOML.
+func (c *Cache) Sweep(maxBytes int64, maxAge time.Duration, now time.Time, log *slog.Logger) (int, error) {
+	if c == nil || c.root == "" {
+		return 0, nil
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+
+	// Stat the root; a missing or non-directory cache root is a no-op
+	// (the operator hasn't created the cache yet, or wiped it).
+	info, err := os.Stat(c.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("cache: sweep: stat %s: %w", c.root, err)
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("cache: sweep: %s is not a directory", c.root)
+	}
+
+	cutoff := now.Add(-maxAge)
+
+	// Collect every cache entry with its mod time + size. The size is
+	// the sum of all files in the entry directory (layer.ext4 +
+	// layer.sha256 sidecar from B1.3).
+	entries, err := c.collectEntries(cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("cache: sweep: collect: %w", err)
+	}
+
+	swept := 0
+
+	// Policy 1: TTL. Everything older than cutoff. Sort oldest-first
+	// so the deletion order is stable across ticks (helps debugging
+	// log output).
+	ttlVictims := make([]cacheEntry, 0)
+	fresh := make([]cacheEntry, 0)
+	for _, e := range entries {
+		if e.modTime.Before(cutoff) {
+			ttlVictims = append(ttlVictims, e)
+		} else {
+			fresh = append(fresh, e)
+		}
+	}
+	sort.SliceStable(ttlVictims, func(i, j int) bool {
+		if ttlVictims[i].modTime.Equal(ttlVictims[j].modTime) {
+			return ttlVictims[i].path < ttlVictims[j].path
+		}
+		return ttlVictims[i].modTime.Before(ttlVictims[j].modTime)
+	})
+	for _, e := range ttlVictims {
+		if err := os.RemoveAll(e.path); err != nil {
+			log.Warn("cache: sweep: ttl remove", "path", e.path, "err", err)
+			continue
+		}
+		swept++
+	}
+
+	// Policy 2: size cap. Only if maxBytes > 0 (zero means "no cap").
+	// Recompute total after TTL — the deleted entries no longer count.
+	if maxBytes > 0 {
+		var total int64
+		for _, e := range fresh {
+			total += e.size
+		}
+		if total > maxBytes {
+			// Sort fresh oldest-first; delete until under cap.
+			sort.SliceStable(fresh, func(i, j int) bool {
+				if fresh[i].modTime.Equal(fresh[j].modTime) {
+					return fresh[i].path < fresh[j].path
+				}
+				return fresh[i].modTime.Before(fresh[j].modTime)
+			})
+			for _, e := range fresh {
+				if total <= maxBytes {
+					break
+				}
+				if err := os.RemoveAll(e.path); err != nil {
+					log.Warn("cache: sweep: size-cap remove", "path", e.path, "err", err)
+					continue
+				}
+				total -= e.size
+				swept++
+			}
+		}
+	}
+
+	if swept > 0 {
+		log.Info("cache: swept", "count", swept, "max_age", maxAge, "max_bytes", maxBytes)
+	}
+	return swept, nil
+}
+
+// cacheEntry is one <sha256>.<fw>/ directory with its mod time + size.
+// path is the entry directory (not the layer.ext4 inside it); size is
+// the recursive sum of all files in that directory.
+type cacheEntry struct {
+	path    string
+	modTime time.Time
+	size    int64
+}
+
+// collectEntries walks c.root one level deep (each child is an entry
+// directory named <sha256>.<fw>). The mod time is the entry dir's
+// own ModTime — fresh writes touch the dir, so the dir mtime reflects
+// the most recent Store for that key. Size is recursive (layer + sidecar).
+func (c *Cache) collectEntries(cutoff time.Time) ([]cacheEntry, error) {
+	dirs, err := os.ReadDir(c.root)
+	if err != nil {
+		return nil, fmt.Errorf("readdir %s: %w", c.root, err)
+	}
+	var out []cacheEntry
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		full := filepath.Join(c.root, d.Name())
+		info, err := d.Info()
+		if err != nil {
+			// Skip unreadable entries — the sweep will retry next tick.
+			continue
+		}
+		size, err := dirSize(full)
+		if err != nil {
+			// Per-entry dirSize failures are non-fatal; we still
+			// record the entry with size=0 so it can be evicted.
+			size = 0
+		}
+		out = append(out, cacheEntry{
+			path:    full,
+			modTime: info.ModTime(),
+			size:    size,
+		})
+	}
+	return out, nil
+}
+
+// dirSize returns the total byte size of all files under root,
+// recursively. filepath.WalkDir is the precedent for recursive size
+// accumulation (pkg/rootfs/size.go:30, pkg/storage/local.go:245).
+//
+// Per-file access errors are intentionally swallowed: the sweep is
+// best-effort and a single permission glitch on one file shouldn't
+// fail the whole sweep (the next tick will retry). Top-level walk
+// errors (e.g. the root dir is gone) propagate.
+func dirSize(root string) (int64, error) {
+	var total int64
+	walkErr := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			//nolint:nilerr // best-effort: skip unreadable files; next sweep tick retries
+			return nil
+		}
+		_ = info
+		total += info.Size()
+		return nil
+	})
+	return total, walkErr
 }
 
 // hashFile streams the file at path through sha256 and returns the hex digest.
