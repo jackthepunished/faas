@@ -155,7 +155,7 @@ func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWrit
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
