@@ -53,10 +53,31 @@ func (c *Cache) Lookup(sourceHash string, fw Framework) (CacheEntry, bool) {
 }
 
 // Store moves the produced layer into the cache under the source-hash key.
-// The move is atomic via os.Rename; if the entry already exists, we keep the
-// existing one (first build wins; later builds still leave the same content
-// behind). The path is left in place — the caller continues using the
-// original out.LayerPath; we just record that this content is cached.
+// The publish is atomic: write to a unique temp file in the destination
+// directory, fsync, close, then os.Rename onto the canonical name. A crash
+// mid-write leaves the temp file behind; the canonical name is never
+// observable in a half-written state.
+//
+// CRITICAL invariants:
+//
+//  1. The source layerPath is NEVER renamed — pkg/builderd/builderd.go:432
+//     uses out.OCIImage (the original path) immediately after Store
+//     returns. Renaming the source would silently break the subsequent
+//     SetDeploymentRootfs call. Always copy-then-rename-to-dst.
+//
+//  2. Concurrent Store calls for DIFFERENT (sourceHash, fw) keys MUST NOT
+//     share a temp path. Two writers with a literal dst.tmp would race —
+//     one writer's os.Rename would publish the other's data. os.CreateTemp
+//     with a "cache-*.tmp" wildcard gives each call a unique suffix
+//     (mirrors pkg/storage/local.go::Put's atomic-publish idiom).
+//
+//  3. Cross-device writes fail loud — the old copyFile fallback was the
+//     bug that allowed partial writes to be observable on EXDEV. A
+//     cross-filesystem cache root is a config error; refuse it.
+//
+//  4. First-writer wins: if the canonical entry already exists, return
+//     nil without rewriting. Content-addressed storage means later
+//     writers should produce identical bytes; the existing copy is fine.
 func (c *Cache) Store(sourceHash string, fw Framework, layerPath string, bytes int64) error {
 	if c == nil || c.root == "" {
 		return errors.New("cache: not configured")
@@ -70,11 +91,61 @@ func (c *Cache) Store(sourceHash string, fw Framework, layerPath string, bytes i
 	if _, err := os.Stat(dst); err == nil {
 		return nil
 	}
-	if err := os.Rename(layerPath, dst); err != nil {
-		// Cross-device rename fails — fall back to copy.
-		if err := copyFile(layerPath, dst); err != nil {
-			return fmt.Errorf("cache: store %s: %w", dst, err)
+	// Step 1: open source for reading (never write to it).
+	//
+	//nolint:forbidigo // layerPath is the builderd-produced OCI image from
+	// pkg/builderd/builderd.go::processClaimedBuild; the path is built by
+	// builderd itself under its vetted cache/spool dir, never reaches a
+	// customer-supplied path. The shape validator (validateTarballShape in
+	// cmd/apid/deploy_inputs.go) ran on the source tarball before
+	// builderd saw it.
+	in, err := os.Open(layerPath)
+	if err != nil {
+		return fmt.Errorf("cache: store %s: open source: %w", dst, err)
+	}
+	// Step 2: create a UNIQUE temp file on the destination filesystem.
+	// os.CreateTemp gives a random suffix and atomic create semantics
+	// (O_EXCL). Two concurrent Store calls for distinct keys cannot
+	// collide on this temp.
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "cache-*.tmp")
+	if err != nil {
+		_ = in.Close()
+		return fmt.Errorf("cache: store %s: open tmp: %w", dst, err)
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
 		}
+	}()
+	// Step 3: copy source bytes into temp.
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = in.Close()
+		return fmt.Errorf("cache: store %s: copy: %w", dst, err)
+	}
+	if err := in.Close(); err != nil {
+		return fmt.Errorf("cache: store %s: close source: %w", dst, err)
+	}
+	// Step 4: fsync so the rename publishes durable bytes.
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("cache: store %s: fsync tmp: %w", dst, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("cache: store %s: close tmp: %w", dst, err)
+	}
+	closed = true
+	// Step 5: atomic rename. The temp file is in filepath.Dir(dst), so
+	// the rename stays on the same filesystem (atomic).
+	if err := os.Rename(tmpPath, dst); err != nil {
+		// EXDEV: temp file is on a different filesystem than dst.
+		// Old code silently fell back to copyFile — the bug B1.2
+		// closes. New code refuses: a cross-device cache root is a
+		// configuration error that the operator must fix (the cache
+		// must be on the same filesystem as /srv/fc).
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("cache: store %s: rename tmp: %w", dst, err)
 	}
 	return nil
 }
@@ -99,22 +170,4 @@ func hashFile(path string) (string, error) {
 		return "", fmt.Errorf("hash: read: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-//nolint:forbidigo // src/dst are vetted-id cache paths joined from c.root + sourceHash + framework — builderd is the sole writer and apid's spool validator (validateTarballShape in cmd/apid/deploy_inputs.go) already ran shape checks before builderd ever sees the file.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
 }
