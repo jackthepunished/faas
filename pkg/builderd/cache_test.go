@@ -325,3 +325,195 @@ func TestCacheStore_IdempotentExistingEntry(t *testing.T) {
 		t.Errorf("first-writer-wins regression: bytes = %d, want 5", got.Bytes)
 	}
 }
+
+// TestCacheLookup_RejectsMissingSidecar is the B1.3 negative test. A
+// layer file without a sidecar (or with a deleted one) is a cache
+// miss — the next Store re-creates the sidecar.
+func TestCacheLookup_RejectsMissingSidecar(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store("missing-sidecar", FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	// Delete the sidecar out from under the cache.
+	cs := c.checksumPath("missing-sidecar", FrameworkNode)
+	if err := os.Remove(cs); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Lookup("missing-sidecar", FrameworkNode); ok {
+		t.Error("B1.3 regression: Lookup returned hit after sidecar was deleted")
+	}
+}
+
+// TestCacheLookup_RejectsMismatchedSidecar asserts a sidecar whose
+// content doesn't match the sourceHash is a cache miss.
+func TestCacheLookup_RejectsMismatchedSidecar(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store("mismatch", FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	cs := c.checksumPath("mismatch", FrameworkNode)
+	if err := os.WriteFile(cs, []byte("different-hash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Lookup("mismatch", FrameworkNode); ok {
+		t.Error("B1.3 regression: Lookup returned hit after sidecar was tampered")
+	}
+}
+
+// TestCacheLookup_RejectsMalformedSidecar asserts table-driven
+// malformed sidecars all return cache miss. Each entry seeds the
+// cache, then overwrites the sidecar with malformed content.
+func TestCacheLookup_RejectsMalformedSidecar(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store("malformed", FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	cs := c.checksumPath("malformed", FrameworkNode)
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"empty", ""},
+		{"single_newline", "\n"},
+		{"only_whitespace", "   \t  \n"},
+		{"garbage", "not-a-valid-hash-just-noise"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(cs, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := c.Lookup("malformed", FrameworkNode); ok {
+				t.Errorf("B1.3 regression: malformed sidecar %q returned cache hit", tc.name)
+			}
+		})
+	}
+}
+
+// TestCacheLookup_AcceptsSidecarWithTrailingWhitespace locks the
+// TrimSpace tolerance. Store writes "<sourceHash>\n"; a future
+// operator inspecting the file may add trailing whitespace via
+// `echo >> layer.sha256`. Lookup must still accept it.
+func TestCacheLookup_AcceptsSidecarWithTrailingWhitespace(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := "trailing-ws-hash"
+	if err := c.Store(hash, FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	cs := c.checksumPath(hash, FrameworkNode)
+	if err := os.WriteFile(cs, []byte(hash+"\n\n\n  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Lookup(hash, FrameworkNode); !ok {
+		t.Error("B1.3 regression: Lookup rejected sidecar with trailing whitespace")
+	}
+}
+
+// TestCacheStore_RepairsSidecar is the legacy-cache self-heal
+// regression. Pre-B1.3 caches have a layer without a sidecar (a
+// cache miss under the new Lookup). The first Store of that key
+// post-upgrade must re-create the sidecar — even when the layer
+// file already exists (the first-writer-wins short-circuit).
+func TestCacheStore_RepairsSidecar(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := "legacy-cache-key"
+	if err := c.Store(hash, FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	// Delete the sidecar to simulate a legacy cache state.
+	cs := c.checksumPath(hash, FrameworkNode)
+	if err := os.Remove(cs); err != nil {
+		t.Fatal(err)
+	}
+	// Re-Store with a DIFFERENT source path. First-writer-wins
+	// must hold for the layer, but the sidecar MUST be re-created.
+	src2 := filepath.Join(t.TempDir(), "layer2.ext4")
+	if err := os.WriteFile(src2, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store(hash, FrameworkNode, src2, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(cs); err != nil {
+		t.Fatalf("B1.3 self-heal regression: sidecar not re-created: %v", err)
+	}
+	if _, ok := c.Lookup(hash, FrameworkNode); !ok {
+		t.Error("B1.3 self-heal regression: Lookup missed after sidecar re-creation")
+	}
+}
+
+// TestCacheStore_IdempotentSidecar — calling Store twice on the same
+// key MUST leave the sidecar with the same content. Tests the
+// writeSidecar short-circuit (existing sidecar → nil return).
+func TestCacheStore_IdempotentSidecar(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	src := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(src, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := "idem-sidecar"
+	if err := c.Store(hash, FrameworkNode, src, 5); err != nil {
+		t.Fatal(err)
+	}
+	cs := c.checksumPath(hash, FrameworkNode)
+	first, err := os.ReadFile(cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second Store with the same hash — layer already exists, sidecar
+	// short-circuit must fire.
+	src2 := filepath.Join(t.TempDir(), "layer2.ext4")
+	if err := os.WriteFile(src2, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Store(hash, FrameworkNode, src2, 5); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Errorf("B1.3 idempotency regression: sidecar content changed across Store calls\n"+
+			"first:  %q\nsecond: %q", first, second)
+	}
+}
+
+// TestChecksumPath_Roundtrip pins the canonical sidecar path shape.
+// Future renames that move the sidecar outside the layer dir, or
+// that change the extension, will trip this test.
+func TestChecksumPath_Roundtrip(t *testing.T) {
+	root := t.TempDir()
+	c := NewCache(root)
+	got := c.checksumPath("0123456789abcdef", FrameworkNode)
+	want := filepath.Join(root, "0123456789abcdef.node", "layer.sha256")
+	if got != want {
+		t.Errorf("checksumPath = %q, want %q (sibling file inside layer dir)", got, want)
+	}
+}

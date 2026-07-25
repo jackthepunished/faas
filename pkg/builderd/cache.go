@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // CacheEntry is one cached build: source-hash + framework → produced layer
@@ -37,6 +38,21 @@ func NewCache(dir string) *Cache { return &Cache{root: dir} }
 
 // Lookup returns the cached layer for (sourceHash, fw) if one exists and
 // looks intact. (false, nil) is a cache miss, not an error.
+//
+// B1.3 (issue #195): a cache hit requires BOTH the layer file AND a
+// matching sidecar. The sidecar is a sibling file
+// `<root>/<sha256>.<fw>/layer.sha256` whose contents are the sourceHash
+// the layer was built from. A missing sidecar, an empty sidecar, or a
+// mismatched sidecar all return a cache miss — the next Store
+// re-creates the sidecar (idempotent), so legacy caches written before
+// B1.3 self-heal on first Store of the same key.
+//
+// The sidecar is a tamper-detector for crash-recovery (the layer
+// publish is atomic, but a process kill between the layer rename and
+// the sidecar write could leave a half-keyed entry). It is NOT a
+// content-addressed proof of layer bytes — that requires hashing the
+// layer, not the source, and is out of scope for #195 (Tier 3 cosign
+// signing territory).
 func (c *Cache) Lookup(sourceHash string, fw Framework) (CacheEntry, bool) {
 	if c == nil || c.root == "" {
 		return CacheEntry{}, false
@@ -49,7 +65,39 @@ func (c *Cache) Lookup(sourceHash string, fw Framework) (CacheEntry, bool) {
 	if !st.Mode().IsRegular() {
 		return CacheEntry{}, false
 	}
+	// Sidecar check: must exist, must be regular, must contain the
+	// sourceHash. Whitespace-tolerant because Store writes
+	// "<sourceHash>\n" and operators may inspect the file with `cat`.
+	cs := c.checksumPath(sourceHash, fw)
+	sc, err := os.Stat(cs)
+	if err != nil {
+		return CacheEntry{}, false
+	}
+	if !sc.Mode().IsRegular() || sc.Size() == 0 {
+		return CacheEntry{}, false
+	}
+	content, err := os.ReadFile(cs)
+	if err != nil {
+		return CacheEntry{}, false
+	}
+	if strings.TrimSpace(string(content)) != sourceHash {
+		return CacheEntry{}, false
+	}
 	return CacheEntry{Path: p, Bytes: st.Size()}, true
+}
+
+// checksumPath returns the canonical sidecar path for (sourceHash, fw).
+// The sidecar is a SIBLING of the layer.ext4 file inside the layer's
+// own directory:
+//
+//	<root>/<sha256>.<fw>/layer.ext4   ← the layer
+//	<root>/<sha256>.<fw>/layer.sha256 ← the sidecar
+//
+// The two filenames are siblings inside the same directory, so neither
+// can collide with the other and a future "manifest.json" or "meta.json"
+// added to the same dir won't rename-conflict.
+func (c *Cache) checksumPath(sourceHash string, fw Framework) string {
+	return filepath.Join(c.root, sourceHash+"."+string(fw), "layer.sha256")
 }
 
 // Store moves the produced layer into the cache under the source-hash key.
@@ -88,8 +136,12 @@ func (c *Cache) Store(sourceHash string, fw Framework, layerPath string, bytes i
 	}
 	// Idempotent: if the destination already exists, keep it (its bytes
 	// should match — content-addressed — so the existing copy is fine).
+	// We still write the sidecar if it's missing (legacy cache self-heal
+	// after the B1.3 upgrade — a pre-B1.3 entry is a cache miss under
+	// the new Lookup, and the sidecar is the small bit of metadata that
+	// makes it a hit again).
 	if _, err := os.Stat(dst); err == nil {
-		return nil
+		return c.writeSidecar(sourceHash, fw)
 	}
 	// Step 1: open source for reading (never write to it).
 	//
@@ -146,6 +198,56 @@ func (c *Cache) Store(sourceHash string, fw Framework, layerPath string, bytes i
 		// must be on the same filesystem as /srv/fc).
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("cache: store %s: rename tmp: %w", dst, err)
+	}
+	// Layer published. Now write the sidecar (B1.3). Publish order
+	// is layer-first-then-sidecar: a concurrent Lookup arriving
+	// after the layer rename but before the sidecar rename sees a
+	// layer-without-sidecar and returns a cache miss — the
+	// conservative choice. Every successful Lookup after both
+	// publishes have landed sees both files.
+	return c.writeSidecar(sourceHash, fw)
+}
+
+// writeSidecar atomically publishes the sidecar file at
+// checksumPath(sourceHash, fw) with content "<sourceHash>\n". Uses
+// the same temp+rename idiom as the layer publish: unique temp,
+// copy, sync, close, rename. Idempotent on existing sidecar.
+func (c *Cache) writeSidecar(sourceHash string, fw Framework) error {
+	if c == nil || c.root == "" {
+		return errors.New("cache: not configured")
+	}
+	cs := c.checksumPath(sourceHash, fw)
+	if _, err := os.Stat(cs); err == nil {
+		return nil // already published
+	}
+	if err := os.MkdirAll(filepath.Dir(cs), 0o755); err != nil {
+		return fmt.Errorf("cache: sidecar mkdir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(cs), "sidecar-*.tmp")
+	if err != nil {
+		return fmt.Errorf("cache: sidecar open tmp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.WriteString(sourceHash + "\n"); err != nil {
+		return fmt.Errorf("cache: sidecar write: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("cache: sidecar fsync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("cache: sidecar close: %w", err)
+	}
+	closed = true
+	if err := os.Rename(tmpPath, cs); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("cache: sidecar rename: %w", err)
 	}
 	return nil
 }
