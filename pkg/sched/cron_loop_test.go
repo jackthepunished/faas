@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,6 +50,13 @@ func (f *fakeWakeVMM) Destroy(_ context.Context, _, _ string) error { return nil
 // instead.
 func (f *fakeWakeVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
+}
+
+// UpdateEgressAllowlist (tier-2 PR-B) — the cron loop tests
+// never drive the egress drift path. Records nothing; the
+// egress_drift subscriber's own tests wire a recording fake.
+func (f *fakeWakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []netip.Prefix) error {
+	return nil
 }
 
 // recordingSynth captures every synthesize call. The cron loop's

@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +96,13 @@ func (h *heartbeatFakeVMM) Close() error {
 	h.dialer.mu.Lock()
 	h.dialer.closed++
 	h.dialer.mu.Unlock()
+	return nil
+}
+
+// UpdateEgressAllowlist (tier-2 PR-B) — heartbeat tests don't
+// drive the egress drift path; the egress_drift_test.go suite
+// does. Returns nil so the VMM contract is satisfied.
+func (h *heartbeatFakeVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
 	return nil
 }
 

@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"sync"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -68,6 +69,18 @@ type RoutedVMM interface {
 	// forwards. Returns *api.Problem Capacity on an unknown
 	// nodeID (no target_url to dial).
 	Ping(ctx context.Context, nodeID string) (*PingOutcome, error)
+	// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) pushes
+	// a fresh per-app egress allowlist into vmmd's live-instance
+	// map without tearing the netns down. The egress_drift
+	// subscriber invokes this on every pg_notify app_changed
+	// payload with kind="updated"; the router resolves the
+	// per-node vmmd client by nodeID (the node the live instance
+	// actually lives on) and forwards the call. Idempotent on
+	// the vmmd side (set-equal allowlist is a no-op). Returns
+	// *api.Problem Capacity on an unknown nodeID (no target_url
+	// to dial), or the wrapped gRPC error / vmmd-typed problem
+	// on patch failure.
+	UpdateEgressAllowlist(ctx context.Context, nodeID, appID string, allowlist []netip.Prefix) error
 }
 
 // DialFunc is the factory VMMRouter uses to open a per-target VMM
@@ -232,6 +245,22 @@ func (r *VMMRouter) Ping(ctx context.Context, nodeID string) (*PingOutcome, erro
 		return nil, err
 	}
 	return cli.Ping(ctx)
+}
+
+// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) routes the
+// patch to the vmmd that owns the live instance. The egress_drift
+// subscriber hands us a single (appID, allowlist) pair; we resolve
+// the per-node client by nodeID and forward. Per-node vmmd fans
+// out to its own live-instance map. Errors from vmmd bubble up
+// (gRPC status / typed problem); the subscriber logs + drops so a
+// bad patch never blocks the loop — the next reconcile on the
+// next event (or a watchdog-driven Park + ColdBoot) re-syncs.
+func (r *VMMRouter) UpdateEgressAllowlist(ctx context.Context, nodeID, appID string, allowlist []netip.Prefix) error {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	return cli.UpdateEgressAllowlist(ctx, appID, allowlist)
 }
 
 // Compile-time assertion: VMMRouter satisfies the engine-facing
