@@ -682,7 +682,7 @@ func cmdTail(args []string) int {
 
 	dec := api.NewDecoder(body)
 	dec.SetCloseFn(body.Close)
-	defer dec.Close()
+	defer func() { _ = dec.Close() }()
 
 	_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
 	for {
@@ -705,7 +705,7 @@ func cmdTail(args []string) int {
 			if err := json.Unmarshal([]byte(e.Data), &p); err != nil {
 				// Unparseable frame — print raw so the customer
 				// can see it; the next frame is independent.
-				fmt.Fprintln(osStdout, e.Data)
+				_, _ = fmt.Fprintln(osStdout, e.Data)
 				continue
 			}
 			if *onlySlug != "" && p.AppSlug != *onlySlug && p.AppID != *onlySlug {
@@ -715,7 +715,7 @@ func cmdTail(args []string) int {
 			if display == "" {
 				display = p.AppID
 			}
-			fmt.Fprintf(osStdout, "%s %s %s\n", p.InvocationID, display, p.State)
+			_, _ = fmt.Fprintf(osStdout, "%s %s %s\n", p.InvocationID, display, p.State)
 		case err := <-dec.Errors():
 			if err != nil && !errors.Is(err, io.EOF) {
 				PrintWarn(os.Stderr, "stream closed: %v", err)
@@ -781,14 +781,14 @@ func cmdQueueTail(args []string) int {
 		}
 		payload := strings.TrimSpace(string(row.Payload))
 		if payload == "" || !json.Valid(row.Payload) {
-			fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
+			_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
 		} else {
 			var pretty any
 			if json.Unmarshal(row.Payload, &pretty) == nil {
 				buf, _ := json.MarshalIndent(pretty, "", "  ")
-				fmt.Fprintf(osStdout, "%s %s\n", row.ID, string(buf))
+				_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, string(buf))
 			} else {
-				fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
+				_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
 			}
 		}
 	}

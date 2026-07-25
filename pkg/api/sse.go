@@ -189,9 +189,12 @@ func (d *Decoder) run() {
 			// Heartbeat or pure-comment frame; nothing to emit.
 			return
 		}
-		select {
-		case d.out <- Event{Event: event, Data: strings.Join(data, "\n"), ID: id}:
-		}
+		// Plain send: the parser goroutine has no other wakeup
+		// path (it exits on scanner EOF or closeFn firing) and the
+		// out channel is buffered (32) so a slow consumer doesn't
+		// stall the network read long-term — eventually the bufio
+		// reader blocks, back-pressuring the TCP socket.
+		d.out <- Event{Event: event, Data: strings.Join(data, "\n"), ID: id}
 		event = ""
 		data = nil
 		id = ""

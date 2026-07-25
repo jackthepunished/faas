@@ -960,7 +960,7 @@ func cmdLogs(args []string) int {
 	defer func() { _ = body.Close() }()
 	dec := api.NewDecoder(body)
 	dec.SetCloseFn(body.Close)
-	defer dec.Close()
+	defer func() { _ = dec.Close() }()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1017,7 +1017,7 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 	defer func() { _ = body.Close() }()
 	dec := api.NewDecoder(body)
 	dec.SetCloseFn(body.Close)
-	defer dec.Close()
+	defer func() { _ = dec.Close() }()
 streamLoop:
 	for {
 		select {

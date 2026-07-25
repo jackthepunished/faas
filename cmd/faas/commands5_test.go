@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1101,13 +1102,58 @@ func TestTemplates_RejectsPathTraversal(t *testing.T) {
 
 // --- helpers ---------------------------------------------------------------
 
-// captureStdout swaps osStdout for a buffer and returns a restore func.
-func captureStdout(t *testing.T) (*bytes.Buffer, func()) {
+// captureStdout swaps osStdout for a thread-safe buffer and returns
+// a restore func. The returned *safeBuffer satisfies io.Writer (cmdTail
+// and cmdQueueTail write to it concurrently with the test goroutine
+// reading the captured bytes under -race), and exposes String() /
+// Bytes() with the same shape *bytes.Buffer does for the older
+// non-streaming callers.
+//
+// The lock covers every Read/Write on the underlying buffer; tests
+// can call String() and Bytes() from any goroutine without tripping
+// the race detector. Production keeps os.Stdout (which is itself
+// safe for concurrent Write).
+func captureStdout(t *testing.T) (*safeBuffer, func()) {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &safeBuffer{}
 	old := osStdout
-	osStdout = &buf
-	return &buf, func() { osStdout = old }
+	osStdout = buf
+	return buf, func() { osStdout = old }
+}
+
+// safeBuffer is the race-safe io.Writer stand-in used by captureStdout.
+// Internally a sync.Mutex guards a *bytes.Buffer; callers may Write
+// concurrently from any goroutine and read String()/Bytes() from
+// the test goroutine.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write implements io.Writer. Production os.Stdout accepts concurrent
+// writes; the test substitute has to mirror that.
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+// String returns the accumulated bytes as a string under the lock.
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// Bytes returns the accumulated bytes under the lock (the
+// json.Unmarshal-style read path).
+func (s *safeBuffer) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Return a copy so the caller can't race against a future Write.
+	out := make([]byte, s.buf.Len())
+	copy(out, s.buf.Bytes())
+	return out
 }
 
 // captureStderr redirects os.Stderr to a tempfile and returns a
