@@ -66,7 +66,7 @@ type AppResponse struct {
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5).
 	// 0 => scale to zero; >0 => keep N warm. Pro/Scale only.
-	MinInstances int `json:"min_instances"`
+	MinInstances int    `json:"min_instances"`
 	Status       string `json:"status"`
 	URL          string `json:"url"`
 	// Manifest is the runner-scaffold payload (env, healthz path,
