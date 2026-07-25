@@ -21,19 +21,29 @@ import (
 //go:embed testdata/TEMPLATE-restore-drill.md
 var templateMarkdown string
 
-// RequiredTokens is the list of field names the drill record MUST
+// RequiredTokens is the list of row labels the drill record MUST
 // contain. The bash script emits each of these via a literal table cell
 // in docs/drills/<UTC-date>-<HHMMSS>-restore-drill.md; the Go test
 // iterates this list to assert the template (and by extension the script)
-// still contains every one.
+// still contains every one. The slice MUST match the row labels emitted
+// by RenderRecord exactly — TestRecord_RenderProducesLabels wires the
+// two together so a drift in either direction fails the build.
 var RequiredTokens = []string{
+	"Date (UTC)",
+	"Operator",
+	"Box",
+	"Started",
+	"Finished",
 	"Wall-clock total",
 	"RPO via basebackup",
 	"RPO via WAL",
 	"Wake latency",
+	"Basebackup used",
 	"Basebackup SHA-256",
-	"host.age SHA-256",
+	"Recovery stanza status",
+	"host.age SHA-256 (preserved)",
 	"Verdict",
+	"Operator / commit",
 }
 
 // Metrics is the seven-field drill summary block the bash script populates
