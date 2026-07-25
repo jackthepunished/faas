@@ -59,6 +59,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -602,7 +603,7 @@ func (h *Harness) stop() {
 		}
 		// Always dump the daemon's last words so an e2e t.Fatalf has
 		// meterd's quota-tick output to reason about.
-		if buf, ok := proc.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := proc.Stdout.(*safeBuffer); ok {
 			h.T.Logf("e2etest: %s final state=%v\n%s",
 				filepath.Base(proc.Path), proc.ProcessState, buf.String())
 		}
@@ -653,6 +654,30 @@ func modulePath(t *testing.T) string {
 	return ""
 }
 
+// safeBuffer is a sync.Mutex-guarded *bytes.Buffer. The harness's
+// cmd.Stdout is written by the daemon subprocess goroutine and read
+// by the test goroutine via DumpLogs / MeterdLogs; a bare *bytes.Buffer
+// is not safe for concurrent Read+Write and trips -race. *os.File (the
+// real stdout) is safe; this mirrors that on the test side without
+// changing the daemon. In-memory only — not used in production.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+// String returns a snapshot of the buffer's contents under the lock.
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // startProc runs bin/<name> with env, returns the *exec.Cmd. stdout/stderr go
 // to a buffer that stop() logs if the daemon exits unexpectedly. Note: this
 // function does NOT call cmd.Wait — stop() owns that single Wait. Double-Wait
@@ -661,7 +686,7 @@ func startProc(t *testing.T, bin, name string, env []string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(bin, name))
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdout = &bytes.Buffer{}
+	cmd.Stdout = &safeBuffer{}
 	cmd.Stderr = cmd.Stdout // share the same buffer (only one consumer: stop)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -678,7 +703,7 @@ func startProc(t *testing.T, bin, name string, env []string) *exec.Cmd {
 func (h *Harness) DumpLogs(t *testing.T) {
 	t.Helper()
 	for _, p := range h.procs {
-		if buf, ok := p.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
 			s := buf.String()
 			if s == "" {
 				continue
@@ -686,6 +711,31 @@ func (h *Harness) DumpLogs(t *testing.T) {
 			t.Logf("e2etest: %s captured output:\n%s", filepath.Base(p.Path), s)
 		}
 	}
+}
+
+// MeterdLogs returns the captured stdout/stderr of the meterd
+// subprocess as a string. Returns "" if meterd wasn't started, has
+// already exited, or no procs are tracked. The buffer is shared
+// with stop()/DumpLogs (cmd.Stdout == cmd.Stderr per startProc at
+// line 620-621), so a concurrent test that drives more pushes may
+// see additional lines appended after the call returns — the
+// caller is expected to re-call or poll.
+//
+// Used by the §14 M7 invoice-shadow e2e (cmd/e2e/billing_invoice_shadow_test.go)
+// to scrape the per-push `mb_seconds` value from the meterd log,
+// which is the unified oracle across both Stripe and Paddle
+// (the provider-specific dedupe tables have different shapes;
+// the log line is provider-neutral). See pkg/meter/pusher.go:155.
+func (h *Harness) MeterdLogs() string {
+	for _, p := range h.procs {
+		if filepath.Base(p.Path) != "meterd" {
+			continue
+		}
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
+			return buf.String()
+		}
+	}
+	return ""
 }
 
 // injectSearchPath adds (or replaces) the search_path query parameter on a
@@ -771,7 +821,7 @@ func dumpProcs(t *testing.T) {
 		if p.ProcessState != nil {
 			continue
 		}
-		if buf, ok := p.Stdout.(*bytes.Buffer); ok {
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
 			t.Logf("e2etest: %s still running, output:\n%s", filepath.Base(p.Path), buf.String())
 		}
 	}
