@@ -184,21 +184,28 @@ func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWrit
 }
 
 // AssertEnvelopeJSONTags marshals an envelope-shaped value and asserts
-// the §4.9 JSON tags spell out method/path/headers/query/body_b64. The
-// caller passes the runner's local `envelope` struct as `any` — the
-// helper never imports a runner package, so the value flows through the
-// `encoding/json` reflection path. Replaces the three near-identical
-// TestEnvelopeRoundTrip bodies (one per runner).
-func AssertEnvelopeJSONTags(t *testing.T, env any) {
+// the §4.9 JSON tags spell out method/path/headers/query/body_b64, and
+// that the encoded body_b64 decodes back to wantBody via
+// base64.StdEncoding. The caller passes the runner's local `envelope`
+// struct as `any` and the original byte slice that was encoded into
+// envelope.BodyB64 — the helper never imports a runner package, so
+// the value flows through the `encoding/json` reflection path. Replaces
+// the three near-identical TestEnvelopeRoundTrip bodies (one per
+// runner).
+//
+// The body_b64 round-trip is the load-bearing check: a swap from
+// base64.StdEncoding to base64.URLEncoding (or vice versa) would
+// survive a tag-presence check but fail this decode step.
+func AssertEnvelopeJSONTags(t *testing.T, env any, wantBody []byte) {
 	t.Helper()
 	b, err := json.Marshal(env)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	// A more thorough check would assert every tag individually; the
-	// body_b64 check is the load-bearing one because a typo there
-	// would break the runner's base64 decoder without compile-time
-	// signal. The other tags are caught by RoundTrip's headers / path.
+	// Tag presence: a typo on body_b64 (e.g. `json:"body"` vs
+	// `json:"body_b64"`) would break the runner's decoder without
+	// compile-time signal. The other tags are caught by
+	// RunRoundTrip's headers / path assertions.
 	if !bytes.Contains(b, []byte(`"body_b64":"`)) {
 		t.Errorf("body_b64 tag missing or empty: %s", b)
 	}
@@ -208,14 +215,20 @@ func AssertEnvelopeJSONTags(t *testing.T, env any) {
 	if !bytes.Contains(b, []byte(`"path":"`)) {
 		t.Errorf("path tag missing: %s", b)
 	}
+	// Decode round-trip: pull the body_b64 string out of the marshaled
+	// JSON (the helper is reflection-free) and decode via StdEncoding.
+	// A StdEncoding ↔ URLEncoding swap on the encoding side would
+	// emit a different wire string for the same input bytes; this
+	// step pins the encoding choice the runner's decoder expects.
+	if wantBody != nil {
+		bodyB64 := extractBodyB64(t, b)
+		AssertBase64BodyRoundTrip(t, bodyB64, wantBody)
+	}
 }
 
-// AssertBase64BodyRoundTrip is a tiny convenience for future helpers:
-// given the base64-encoded body_b64 field, decode it back and compare
-// to the original. Today no TestEnvelopeRoundTrip does the decode
-// round-trip — the runner's actual handler is the only place that
-// matters — but this is the natural seam if a future test wants to
-// pin the decode path.
+// AssertBase64BodyRoundTrip decodes b64 via base64.StdEncoding and
+// compares to want. The runner's decode path uses StdEncoding (per the
+// §4.9 envelope contract); the caller's encoding side must match.
 func AssertBase64BodyRoundTrip(t *testing.T, b64 string, want []byte) {
 	t.Helper()
 	got, err := base64.StdEncoding.DecodeString(b64)
@@ -225,4 +238,19 @@ func AssertBase64BodyRoundTrip(t *testing.T, b64 string, want []byte) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("decoded = %q, want %q", got, want)
 	}
+}
+
+// extractBodyB64 pulls the body_b64 string value out of a marshaled
+// envelope JSON blob without depending on the runner's struct shape.
+// The helper deliberately avoids reflection so a runner-side field
+// rename does not break parity tests.
+func extractBodyB64(t *testing.T, marshaled []byte) string {
+	t.Helper()
+	var probe struct {
+		BodyB64 string `json:"body_b64"`
+	}
+	if err := json.Unmarshal(marshaled, &probe); err != nil {
+		t.Fatalf("unmarshal envelope for body_b64 probe: %v", err)
+	}
+	return probe.BodyB64
 }

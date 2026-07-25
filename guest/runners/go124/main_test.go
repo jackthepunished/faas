@@ -27,7 +27,7 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		Headers: map[string]string{"X": "y"},
 		Query:   "a=1",
 		BodyB64: base64.StdEncoding.EncodeToString([]byte("hi")),
-	})
+	}, []byte("hi"))
 }
 
 // TestGoRunnerHandlerDefault pins the default --handler value. The
