@@ -749,6 +749,15 @@ type Store interface {
 	HasStripePushHour(ctx context.Context, accountID string, hour time.Time) (bool, error)
 	RecordStripePushHour(ctx context.Context, accountID string, hour time.Time) error
 
+	// PaddleOverageDedup is the dedupe table for monthly overage pushes.
+	// The PaddleOverageDedupe interface in pkg/billing/paddle is satisfied
+	// by both stores. Mirrors StripePushDedup one block above; the PK
+	// shape is (account_id, month) instead of (account_id, hour) because
+	// the Paddle overage push fires at month-rollover rather than hourly
+	// (paddle-go-sdk/v5 has no metered-subscription equivalent to Stripe).
+	HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error)
+	RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error
+
 	// Idempotency (spec §4.2: Idempotency-Key stored 24 h).
 	GetIdempotent(ctx context.Context, accountID, key string) (status int, body []byte, err error)
 	PutIdempotent(ctx context.Context, accountID, key string, status int, body []byte) error

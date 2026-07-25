@@ -26,6 +26,15 @@ type stripePushKey struct {
 	hour      time.Time
 }
 
+// paddleOverageKey is the (account, month) dedupe key the daily Paddle
+// overage pusher uses; declared above MemStore so the struct field
+// below can reference it. `month` is the calendar-month start
+// (calendarMonthStart in pkg/billing/paddle/usage.go).
+type paddleOverageKey struct {
+	accountID string
+	month     time.Time
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -91,6 +100,11 @@ type MemStore struct {
 	// Stripe pusher has already pushed; prevents double-billing on
 	// redelivery.
 	stripePushHours map[stripePushKey]struct{}
+	// paddleOverageMonths tracks which (account, month) pairs the daily
+	// Paddle overage pusher has already flushed; same role as
+	// stripePushHours but at the calendar-month grain because the
+	// Paddle overage push fires at month-rollover rather than hourly.
+	paddleOverageMonths map[paddleOverageKey]struct{}
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
@@ -166,7 +180,10 @@ func NewMemStore() *MemStore {
 		// stripePushHours is the per-(account, hour) dedupe set the
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
-		secrets:         map[secretKey]AppSecret{},
+		// paddleOverageMonths is the per-(account, month) dedupe set
+		// the meterd daily pusher reads/writes.
+		paddleOverageMonths: map[paddleOverageKey]struct{}{},
+		secrets:             map[secretKey]AppSecret{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -2491,6 +2508,29 @@ func (m *MemStore) RecordStripePushHour(_ context.Context, accountID string, hou
 	return nil
 }
 
+// HasPaddleOverageMonth + RecordPaddleOverageMonth implement the
+// pkg/billing/paddle PaddleOverageDedupe interface. Mirrors the Stripe
+// pair one method above: flat set keyed by (account, month); UTC-
+// normalized on every read/write so a future caller that forgets to
+// normalize cannot create a phantom row. `month` is a calendar-month
+// start (calendarMonthStart in pkg/billing/paddle/usage.go).
+func (m *MemStore) HasPaddleOverageMonth(_ context.Context, accountID string, month time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}]
+	return ok, nil
+}
+
+func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string, month time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageMonths == nil {
+		m.paddleOverageMonths = map[paddleOverageKey]struct{}{}
+	}
+	m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}] = struct{}{}
+	return nil
+}
+
 type appHourKey struct {
 	AccountID string
 	AppID     string
@@ -2977,6 +3017,16 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for sc, acid := range m.stripeByCustomer {
 		if acid == id {
 			delete(m.stripeByCustomer, sc)
+		}
+	}
+	// Drop Paddle overage dedupe rows for this account so a redelivered
+	// grace tick doesn't observe a stale (account, month) pair. Mirrors
+	// the pgstore.go steps slice entry for paddle_overage_dedupe; the
+	// MemStore has no FK so the explicit walk is the production
+	// equivalent for tests.
+	for k := range m.paddleOverageMonths {
+		if k.accountID == id {
+			delete(m.paddleOverageMonths, k)
 		}
 	}
 	// Audit events (spec §17 G6 right-to-erasure). Drop events whose

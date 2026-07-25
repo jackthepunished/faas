@@ -78,6 +78,13 @@ func seedMemStoreFullAccount(t *testing.T, m *MemStore) (acctID string) {
 	if err := m.RecordStripePushHour(ctx, acct.ID, time.Now().UTC().Truncate(time.Hour)); err != nil {
 		t.Fatalf("RecordStripePushHour: %v", err)
 	}
+	// Seed a Paddle overage dedupe row too — the cross-process dedupe
+	// the meterd daily pusher writes after a successful flush. Mirrors
+	// the Stripe pair above; the PG side drops it via FK ON DELETE
+	// CASCADE so this seed is purely for the in-memory walk.
+	if err := m.RecordPaddleOverageMonth(ctx, acct.ID, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("RecordPaddleOverageMonth: %v", err)
+	}
 	return acct.ID
 }
 
@@ -232,6 +239,11 @@ func TestMem_DeleteAccount_CascadesIdempotencyAndUsageAndStripe(t *testing.T) {
 	for sc, acid := range m.stripeByCustomer {
 		if acid == acctID {
 			t.Errorf("stripeByCustomer[%q] still present (accountID = %q)", sc, acid)
+		}
+	}
+	for k := range m.paddleOverageMonths {
+		if k.accountID == acctID {
+			t.Errorf("paddleOverageMonths[%v] still present (accountID = %q)", k, acctID)
 		}
 	}
 }
