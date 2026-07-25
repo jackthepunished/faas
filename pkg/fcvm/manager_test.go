@@ -3,6 +3,7 @@ package fcvm
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1178,4 +1179,269 @@ func flattenForTest(cmds [][]string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// fakeCaptureRunner is the stdout-aware runner stub used by the
+// UpdateEgressAllowlist unit tests. The real nft tool prints
+// `chain forward { ... iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 7 }`
+// on success; the fake synthesises that output with a configurable
+// handle so the wake path's handle capture can be exercised.
+type fakeCaptureRunner struct {
+	mu sync.Mutex
+	// listChainOutput is the bytes the next `nft -a list chain` call
+	// returns. Tests set it to a synthesised nft ruleset so
+	// captureAllowlistHandles resolves a known handle.
+	listChainOutput []byte
+	// listChainErr, when non-nil, is returned by the next
+	// RunCapture call (the test exercises the failure path).
+	listChainErr error
+	// commands records every argv the runner saw (parallels
+	// fakeRunner.commands so the test can assert what
+	// captureAllowlistHandles actually invoked).
+	commands [][]string
+}
+
+func (f *fakeCaptureRunner) RunCapture(_ context.Context, argv []string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commands = append(f.commands, argv)
+	if f.listChainErr != nil {
+		return nil, f.listChainErr
+	}
+	return f.listChainOutput, nil
+}
+
+// TestUpdateEgressAllowlist_NoLiveInstancesIsNoop — the empty
+// app is the redelivery / no-live-targets path. No nft commands
+// should fire, no error.
+func TestUpdateEgressAllowlist_NoLiveInstancesIsNoop(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-orphan", []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	if run.ran("nft") {
+		t.Error("nft should not run when no live instances match the app")
+	}
+}
+
+// TestUpdateEgressAllowlist_AppliesV4Patch — a fresh netns
+// (bootstrapped via a direct setupNetwork call) plus a single
+// in-place patch must emit exactly one delete-by-handle (the
+// prior handle captured at wake time) plus one add rule.
+func TestUpdateEgressAllowlist_AppliesV4Patch(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-1", "fc-i-1", "vh1", "vp1", netip.MustParseAddr("10.100.0.2"))
+	// Seed the live map with a synthetic instance whose
+	// prior allowlist has a v4 entry; the renderer
+	// already ran at wake time (captured by captureAllowlistHandles
+	// in production; here we just hand-craft the prior state so
+	// the patch path has something to delete).
+	inst := &Instance{
+		Lease:             Lease{Instance: "i-1", UID: 20001},
+		Net:               nc,
+		Method:            WakeColdBoot,
+		AppID:             "app-1",
+		AllowlistHandleV4: 7,
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-1"] = inst
+	m.mu.Unlock()
+
+	// Patch to a different v4 prefix.
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-1", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	// The patch sequence must include: delete-by-handle 7 on the
+	// v4 chain, then add the new 8.8.8.0/24 rule. Each argv is
+	// per-netns: `ip netns exec fc-i-1 nft …`. Note: the tap
+	// name is "tap0" verbatim in argv (no quotes) — nft's
+	// output printer adds quotes when listing rules; the
+	// argv-side tokenisation is the literal string.
+	wantDelete := `ip netns exec fc-i-1 nft delete rule ip faas forward handle 7`
+	if !run.ran(wantDelete) {
+		t.Errorf("missing %q in command stream", wantDelete)
+	}
+	wantAdd := `ip netns exec fc-i-1 nft add rule ip faas forward iifname tap0 ip daddr { 8.8.8.0/24 } accept`
+	if !run.ran(wantAdd) {
+		t.Errorf("missing %q in command stream", wantAdd)
+	}
+	// Cached state refreshed: the next patch's fast-path
+	// compares against the new baseline.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if got := m.live["i-1"].Net.EgressAllowlist[0].String(); got != "8.8.8.0/24" {
+		t.Errorf("cached allowlist = %q, want 8.8.8.0/24", got)
+	}
+	if m.live["i-1"].AllowlistHandleV4 != 7 {
+		t.Errorf("cached v4 handle = %d, want 7 (capture is best-effort, no -a reader in tests)", m.live["i-1"].AllowlistHandleV4)
+	}
+}
+
+// TestUpdateEgressAllowlist_SameAllowlistNoOp — redelivery.
+// The same allowlist twice should not run nft at all.
+func TestUpdateEgressAllowlist_SameAllowlistNoOp(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-2", "fc-i-2", "vh2", "vp2", netip.MustParseAddr("10.100.0.3"))
+	inst := &Instance{
+		Lease: Lease{Instance: "i-2", UID: 20002},
+		Net:   nc,
+		AppID: "app-2",
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-2"] = inst
+	m.mu.Unlock()
+
+	// First push — a different allowlist, should run nft
+	// (prior handle is 0 so no delete, just the add).
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if !run.ran("nft add rule") {
+		t.Fatal("first push should have run nft")
+	}
+	// Second push — same allowlist as the cached baseline
+	// (8.8.8.0/24 after the first push). Idempotent fast-path
+	// (samePrefixSet) should short-circuit before any nft exec.
+	preCount := len(run.commands)
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-2", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if got := len(run.commands); got != preCount {
+		t.Errorf("redelivery ran %d new commands, want 0 (samePrefixSet no-op)", got-preCount)
+	}
+}
+
+// TestUpdateEgressAllowlist_NftErrorReverts — when the add
+// step fails, the prior allowlist argv is re-emitted (best
+// effort) so the live netns returns to the pre-patch state.
+func TestUpdateEgressAllowlist_NftErrorReverts(t *testing.T) {
+	run := &fakeRunner{failOn: "8.8.8.0/24"}
+	m := newTestManager(run, &fakeVMM{})
+	nc := netns.NewConfig("i-3", "fc-i-3", "vh3", "vp3", netip.MustParseAddr("10.100.0.4"))
+	inst := &Instance{
+		Lease: Lease{Instance: "i-3", UID: 20003},
+		Net:   nc,
+		AppID: "app-3",
+	}
+	inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
+	m.mu.Lock()
+	m.live["i-3"] = inst
+	m.mu.Unlock()
+
+	err := m.UpdateEgressAllowlist(context.Background(), "app-3", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	})
+	if err == nil {
+		t.Fatal("UpdateEgressAllowlist should have failed when the add step errors")
+	}
+	// Revert path: the prior v4 rule was re-emitted.
+	if !run.ran("1.2.3.0/24") {
+		t.Error("revert did not re-emit the prior v4 rule")
+	}
+}
+
+// TestUpdateEgressAllowlist_FansOutAcrossLiveInstances —
+// 2 live instances of the same app, distinct v4 prefixes;
+// both receive the new rule.
+func TestUpdateEgressAllowlist_FansOutAcrossLiveInstances(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	for i, id := range []string{"a", "b"} {
+		nc := netns.NewConfig("i-"+id, "fc-i-"+id, "vh-"+id, "vp-"+id, netip.MustParseAddr(fmt.Sprintf("10.100.0.%d", 10+i)))
+		inst := &Instance{
+			Lease: Lease{Instance: "i-" + id, UID: 20010 + i},
+			Net:   nc,
+			AppID: "app-shared",
+		}
+		inst.Net.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix(fmt.Sprintf("1.1.%d.0/24", i+1))}
+		m.mu.Lock()
+		m.live["i-"+id] = inst
+		m.mu.Unlock()
+	}
+	if err := m.UpdateEgressAllowlist(context.Background(), "app-shared", []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.0/24"),
+	}); err != nil {
+		t.Fatalf("UpdateEgressAllowlist: %v", err)
+	}
+	// Both live netns got the new rule.
+	count := 0
+	for _, c := range run.commands {
+		if strings.Contains(strings.Join(c, " "), "8.8.8.0/24") {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("new rule emitted %d times, want 2 (one per live netns)", count)
+	}
+}
+
+// TestUpdateEgressAllowlist_RejectsEmptyAppID — defensive.
+func TestUpdateEgressAllowlist_RejectsEmptyAppID(t *testing.T) {
+	run := &fakeRunner{}
+	m := newTestManager(run, &fakeVMM{})
+	if err := m.UpdateEgressAllowlist(context.Background(), "", nil); err == nil {
+		t.Fatal("expected error for empty app_id")
+	}
+	if run.ran("nft") {
+		t.Error("nft must not run on empty app_id")
+	}
+}
+
+// TestCaptureAllowlistHandles — listChainHandles parses a
+// synthesised nft -a list chain output and returns the right
+// handle for both v4 and v6.
+func TestCaptureAllowlistHandles(t *testing.T) {
+	out := []byte(`table ip faas {
+	chain forward {
+	 type filter hook forward priority 0; policy accept;
+	 iifname "tap0" ip daddr { 1.2.3.0/24 } accept # handle 42
+	}
+}
+table ip6 faas {
+	chain forward {
+	 type filter hook forward priority 0; policy accept;
+	 iifname "tap0" ip6 daddr { 2001:db8::/32 } accept # handle 99
+	}
+}
+`)
+	cap := &fakeCaptureRunner{listChainOutput: out}
+	m := newTestManager(&fakeRunner{}, &fakeVMM{}).WithCaptureRunner(cap)
+	hV4, hV6, err := m.captureAllowlistHandles(context.Background(), "fc-i-1")
+	if err != nil {
+		t.Fatalf("captureAllowlistHandles: %v", err)
+	}
+	if hV4 != 42 {
+		t.Errorf("hV4 = %d, want 42", hV4)
+	}
+	if hV6 != 99 {
+		t.Errorf("hV6 = %d, want 99", hV6)
+	}
+}
+
+// TestCaptureAllowlistHandles_NilRunnerLeavesHandlesZero —
+// the optional seam: nil capture runner means we leave
+// AllowlistHandle{V4,V6} at 0 (the next patch picks them up
+// via the chain list).
+func TestCaptureAllowlistHandles_NilRunnerLeavesHandlesZero(t *testing.T) {
+	m := newTestManager(&fakeRunner{}, &fakeVMM{})
+	hV4, hV6, err := m.captureAllowlistHandles(context.Background(), "fc-i-1")
+	if err != nil {
+		t.Fatalf("captureAllowlistHandles: %v", err)
+	}
+	if hV4 != 0 || hV6 != 0 {
+		t.Errorf("nil runner should return 0,0; got %d,%d", hV4, hV6)
+	}
 }

@@ -689,10 +689,13 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	}
 
 	// Snapshot the targets + their cached handles under the
-	// manager lock. Released before any netns exec.
+	// manager lock. Released before any netns exec. The full
+	// netns.Config is captured so the renderer can produce
+	// the same argv as at Wake (Tap name, etc., must match).
 	type patchTarget struct {
 		instanceID string
 		netns      string
+		net        netns.Config
 		prior      []netip.Prefix
 		handleV4   uint64
 		handleV6   uint64
@@ -708,6 +711,7 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 		targets = append(targets, patchTarget{
 			instanceID: id,
 			netns:      inst.Net.Netns,
+			net:        inst.Net,
 			prior:      prior,
 			handleV4:   inst.AllowlistHandleV4,
 			handleV6:   inst.AllowlistHandleV6,
@@ -718,18 +722,19 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 		return nil // no live instances for this app — idempotent
 	}
 
-	// Compute the new partition's argv helpers ONCE — they don't
-	// depend on the per-instance netns. The helpers take a
-	// per-netns `nft` argv builder, so we pass a closure that
-	// injects the target netns.
+	// Compute the new partition's argv via the per-instance
+	// netns.Config (the live Tap name threads through so the
+	// emitted `iifname "tap0"` matches what the Wake-time
+	// rule installed).
 	type newAllowlist struct {
 		v4Argv []string
 		v6Argv []string
 	}
-	build := func(netnsName string) newAllowlist {
-		nc := netns.Config{Netns: netnsName, EgressAllowlist: allowlist}
+	build := func(t patchTarget) newAllowlist {
+		nc := t.net
+		nc.EgressAllowlist = allowlist
 		nx := func(parts ...string) []string {
-			return append([]string{"ip", "netns", "exec", netnsName, "nft"}, parts...)
+			return append([]string{"ip", "netns", "exec", t.netns, "nft"}, parts...)
 		}
 		return newAllowlist{
 			v4Argv: nc.ForwardAllowlistRule(func(parts ...string) []string { return append([]string{}, nx(parts...)...) }),
@@ -756,7 +761,7 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 			newHandles[t.instanceID] = struct{ v4, v6 uint64 }{v4: t.handleV4, v6: t.handleV6}
 			continue
 		}
-		next := build(t.netns)
+		next := build(t)
 		newH, err := m.applyOneInstancePatch(ctx, t.netns, t.prior, next.v4Argv, next.v6Argv, t.handleV4, t.handleV6)
 		if err != nil {
 			return fmt.Errorf("fcvm: UpdateEgressAllowlist app=%s netns=%s: %w", appID, t.netns, err)
