@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,6 +64,14 @@ func (f *fakeRouterVMM) Ping(_ context.Context) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }
 func (f *fakeRouterVMM) Close() error { return nil }
+
+// UpdateEgressAllowlist (tier-2 PR-B) — router tests don't drive
+// the egress drift path; the egress_drift_test.go suite does.
+// Records nothing. Returning nil keeps the gRPC VmmdAPI /
+// RoutedVMM contract satisfied.
+func (f *fakeRouterVMM) UpdateEgressAllowlist(_ context.Context, _ string, _ []netip.Prefix) error {
+	return nil
+}
 
 // trackingDial records every (target, tls) it sees and returns a
 // cached fakeRouterVMM on subsequent calls to the same target.

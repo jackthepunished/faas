@@ -76,17 +76,17 @@ func TestHostPolicyRenderDeniesAllSMTPPorts(t *testing.T) {
 		t.Fatalf("malformed tcp dport deny line:\n%s", out)
 	}
 	dportLine := out[start : start+end]
-	for _, p := range DefaultHostPolicy.ForwardDenyTCPPorts {
-		needle := strconv.Itoa(p)
+	for _, p := range DefaultHostPolicy.DenySet.SMTPPorts {
+		needle := strconv.Itoa(int(p))
 		if !strings.Contains(dportLine, needle) {
 			t.Errorf("tcp port %s not in deny set; line %q", needle, dportLine)
 		}
 	}
 }
 
-// TestHostPolicyRenderDeniesRFC1918AndMetadata — table-driven over the CIDR
-// deny list. Every range in spec §11 ("RFC1918 + link-local + metadata") must
-// render as a drop.
+// TestHostPolicyRenderDeniesRFC1918AndMetadata — table-driven over the v4
+// CIDR deny list. Every range in spec §11 ("RFC1918 + link-local +
+// metadata") must render as a drop.
 func TestHostPolicyRenderDeniesRFC1918AndMetadata(t *testing.T) {
 	out := DefaultHostPolicy.Render()
 	dportLineIdx := strings.Index(out, "ip daddr { ")
@@ -98,8 +98,8 @@ func TestHostPolicyRenderDeniesRFC1918AndMetadata(t *testing.T) {
 		t.Fatalf("malformed ip daddr line:\n%s", out)
 	}
 	dportLine := out[dportLineIdx : dportLineIdx+end]
-	for _, cidr := range DefaultHostPolicy.ForwardDenyCIDRs {
-		if !strings.Contains(dportLine, cidr) {
+	for _, cidr := range DefaultHostPolicy.DenySet.V4DenyCIDRs {
+		if !strings.Contains(dportLine, cidr.String()) {
 			t.Errorf("CIDR %s not in ip daddr deny set; line %q", cidr, dportLine)
 		}
 	}
@@ -107,8 +107,9 @@ func TestHostPolicyRenderDeniesRFC1918AndMetadata(t *testing.T) {
 
 // TestHostPolicyRenderDeniesIPv6LinkLocalAndULA — table-driven over the IPv6
 // CIDR deny list. The list mirrors pkg/oci/egress.go::deniedCIDRv6 per ADR-023
-// ("spec §11 is IPv4-only; fe80::/10 + ULA + multicast unblocked"). Every
-// range must render as a `ip6 daddr { … } drop` line — a missing entry is a
+// ("spec §11 is IPv4-only; fe80::/10 + ULA + multicast unblocked"). ADR-034
+// extends it with 6to4 (2002::/16) + Teredo (2001::/32). Every range must
+// render as a `ip6 daddr { … } drop` line — a missing entry is a
 // lateral-movement / metadata-exposure regression.
 func TestHostPolicyRenderDeniesIPv6LinkLocalAndULA(t *testing.T) {
 	out := DefaultHostPolicy.Render()
@@ -121,8 +122,8 @@ func TestHostPolicyRenderDeniesIPv6LinkLocalAndULA(t *testing.T) {
 		t.Fatalf("malformed ip6 daddr line:\n%s", out)
 	}
 	denyLine := out[lineIdx : lineIdx+end]
-	for _, cidr := range DefaultHostPolicy.ForwardDenyIPv6CIDRs {
-		if !strings.Contains(denyLine, cidr) {
+	for _, cidr := range DefaultHostPolicy.DenySet.V6DenyCIDRs {
+		if !strings.Contains(denyLine, cidr.String()) {
 			t.Errorf("CIDR %s not in ip6 daddr deny set; line %q", cidr, denyLine)
 		}
 	}
@@ -130,6 +131,46 @@ func TestHostPolicyRenderDeniesIPv6LinkLocalAndULA(t *testing.T) {
 	// implicit, matching the v4 line above (ADR-023 rejected alternative).
 	if strings.Contains(out, "meta nfproto") {
 		t.Errorf("ip6 daddr rule wrapped in `meta nfproto`; ADR-023 chose the implicit form")
+	}
+}
+
+// TestHostPolicyRenderDenySetEntriesEveryEntryAppears — pin every
+// DenySet.Entries entry individually (PR-A, ADR-034). Same shape
+// as pkg/netns/config_test.go::TestNftCommandsEnforceEgressPolicy_PerEntry
+// for the per-netns side; the host side mirrors it so both
+// renderers stay in lock-step.
+func TestHostPolicyRenderDenySetEntriesEveryEntryAppears(t *testing.T) {
+	out := DefaultHostPolicy.Render()
+	for _, e := range DefaultHostPolicy.DenySet.Entries {
+		needle := e.Prefix.String()
+		// v4 entries land in the `ip daddr { … } drop` argv, v6 in
+		// the `ip6 daddr { … } drop` argv. Check the relevant argv
+		// (substring match within the family-scoped line) — a
+		// naive whole-ruleset substring check would let a v4 entry
+		// pass even if it landed in the v6 line.
+		var familyLine string
+		switch e.Family {
+		case FamilyV4:
+			idx := strings.Index(out, "ip daddr { ")
+			if idx < 0 {
+				t.Errorf("v4 entry %s: no `ip daddr {` line in:\n%s", needle, out)
+				continue
+			}
+			end := strings.Index(out[idx:], " } drop")
+			familyLine = out[idx : idx+end]
+		case FamilyV6:
+			idx := strings.Index(out, "ip6 daddr { ")
+			if idx < 0 {
+				t.Errorf("v6 entry %s: no `ip6 daddr {` line in:\n%s", needle, out)
+				continue
+			}
+			end := strings.Index(out[idx:], " } drop")
+			familyLine = out[idx : idx+end]
+		}
+		if !strings.Contains(familyLine, needle) {
+			t.Errorf("DenySet entry %s (%s) missing from host %s deny argv",
+				needle, e.SourceADR, e.Family)
+		}
 	}
 }
 
@@ -203,9 +244,9 @@ func TestHostPolicyForwardDeniesComeBeforeBroadAllow(t *testing.T) {
 		t.Fatalf("forward chain missing broad allow %q\nchain:\n%s", broadAllow, forward)
 	}
 	denies := []string{
-		"tcp dport { 25,465,587 } drop",
-		"ip daddr { 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10 } drop",
-		"ip6 daddr { fe80::/10,fc00::/7,ff00::/8,::1/128,::/128 } drop",
+		"tcp dport { " + DefaultHostPolicy.DenySet.SMTPPortsCommaSet() + " } drop",
+		"ip daddr { " + DefaultHostPolicy.DenySet.V4CommaSet() + " } drop",
+		"ip6 daddr { " + DefaultHostPolicy.DenySet.V6CommaSet() + " } drop",
 	}
 	for _, d := range denies {
 		idx := strings.Index(forward, d)
