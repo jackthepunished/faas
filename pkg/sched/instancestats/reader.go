@@ -1,0 +1,190 @@
+package instancestats
+
+import (
+	"sort"
+	"sync/atomic"
+	"time"
+)
+
+// Validity tags the freshness of a single signal on an InstanceStat
+// row. The poller stamps Unknown on the first sample (CPUPct has no
+// prior baseline) and on transient cgroup reads; Stale is reserved
+// for a future "freshness budget" — when a row's SampledAt is older
+// than the budget, future readers should treat its values as
+// advisory. Today only Valid and Unknown are emitted.
+type Validity uint8
+
+const (
+	// Valid means the value was sampled successfully on the most
+	// recent Tick and is fresh within the poller's natural
+	// cadence.
+	Valid Validity = 0
+	// Unknown means the poller has no value to report yet. For
+	// CPUPct this is the first sample (the cumulative counter
+	// needs a prior reading to produce a rate). For RSSMB this
+	// is the vmmd reporting no value (non-Linux, transient cgroup
+	// miss, first sample). The Prometheus rollup excludes Unknown
+	// rows.
+	Unknown Validity = 1
+	// Stale means the value is older than the freshness budget.
+	// Reserved for a future gate; today the poller never stamps
+	// Stale (no budget is enforced).
+	Stale Validity = 2
+)
+
+// InstanceStat is the in-memory row the poller publishes per live
+// VM, per Tick. The fields are the union of the cgroup-derived
+// signals (CPUPct, RSSMB) and the vmmd ActivityTracker signals
+// (InflightRequests, LastRequestAt). Per-instance values are the
+// raw inputs to the {app,node} Prometheus rollup in
+// pkg/wire.ReplaceInstanceStats.
+//
+// #171 (reaper scale-down bias) will call SnapshotForApp from
+// runReaper and look up RecentCPUPct / RecentInflight on
+// InstanceInfo. #169 (reactive scale-up trigger) will call
+// SnapshotAll from a new Loop worker. Both depend on this struct
+// staying stable — adding a field is fine, renaming or removing
+// breaks the future PRs.
+type InstanceStat struct {
+	// InstanceID is the per-node instance id (state.Instances.ID).
+	// Empty rows are not published; the poller filters them.
+	InstanceID string
+	// NodeID is the compute_node the instance lives on
+	// (state.Instances.NodeID). The Prometheus rollup uses
+	// (AppID, NodeID) as the label tuple.
+	NodeID string
+	// AppID is the app the instance belongs to
+	// (state.Instances.AppID). Empty rows are not published.
+	AppID string
+	// CPUPct is the host cgroup CPU percent for the most recent
+	// interval (cpu.stat usage_usec delta / wall clock, *100). NaN
+	// or 0 with CPU=Unknown is the "first sample" sentinel.
+	// Valid only when CPU == Valid.
+	CPUPct float64
+	// RSSMB is cgroup memory.current, in MiB. NaN or 0 with
+	// RSS=Unknown is the "absent this tick" sentinel.
+	// Valid only when RSS == Valid.
+	RSSMB float64
+	// InflightRequests is the count of in-flight ForwardHTTP
+	// calls on this instance, populated by the vmmd
+	// ActivityTracker (PR-B). PR-A leaves this at 0 because the
+	// wire currently carries zero (no vmmd-side population yet).
+	// Zero is a real value and is distinct from the
+	// "not-yet-observed" case only by the reader's Validity,
+	// not the field.
+	InflightRequests int64
+	// LastRequestAt is the most recent ForwardHTTP start time on
+	// this instance. PR-B populates it from the vmmd
+	// ActivityTracker; PR-A leaves it zero and the poller
+	// falls back to state.Instance.LastRequestAt.
+	LastRequestAt time.Time
+	// SampledAt is the wall-clock time the poller stamped this
+	// row. Future freshness gating (Reader.PruneOlderThan) reads
+	// this; today's poller always stamps it.
+	SampledAt time.Time
+	// CPU is the validity of CPUPct. Unknown on the first
+	// sample; Valid thereafter (until a regression / cgroup
+	// recreation forces a baseline reset, which the poller
+	// detects and re-stamps Unknown for one tick).
+	CPU Validity
+	// RSS is the validity of RSSMB. Unknown on a transient
+	// cgroup miss; Valid otherwise.
+	RSS Validity
+}
+
+// Reader is the stable, concurrency-safe read API the future
+// scale-up and reaper code will call. It is populated exclusively
+// by Poller.Replace (the only writer); readers use the Snapshot
+// accessors.
+//
+// The internal store is a *atomic.Pointer[[]InstanceStat] — each
+// Replace atomically swaps in a freshly built slice, and Snapshot
+// reads pin the pointer before walking the slice. This avoids the
+// copy-on-Replace + read-mutex pattern that would force the
+// reader to take a lock on every wake path; the trade-off is one
+// pointer-size atomic per Snapshot. For the schedd hot path this
+// is the right shape (the Reader is read in many places, written
+// once per 200 ms).
+type Reader struct {
+	snap atomic.Pointer[[]InstanceStat]
+}
+
+// NewReader returns a Reader with an empty snapshot. Safe to call
+// before any Replace; the Snapshot accessors return empty slices
+// until the first Replace.
+func NewReader() *Reader { return &Reader{} }
+
+// Replace atomically swaps in the next snapshot. The poller calls
+// this once per Tick. The slice is taken by reference — the poller
+// MUST NOT mutate the slice after handing it over. The reader's
+// Snapshot accessors do not copy, so a Replace that mutates the
+// previous slice would race against an in-flight reader.
+func (r *Reader) Replace(next []InstanceStat) {
+	// Defensive: stable-sort once so Snapshot accessors do not
+	// need to. Determinism is part of the Reader's contract
+	// (issue #170 plan §2.1 — "deterministic (appID,
+	// instanceID) ordering is part of the contract").
+	sort.SliceStable(next, func(i, j int) bool {
+		if next[i].AppID != next[j].AppID {
+			return next[i].AppID < next[j].AppID
+		}
+		return next[i].InstanceID < next[j].InstanceID
+	})
+	cp := make([]InstanceStat, len(next))
+	copy(cp, next)
+	r.snap.Store(&cp)
+}
+
+// SnapshotAll returns every row in the latest snapshot, in
+// deterministic (AppID, InstanceID) order. Empty slice if the
+// poller has not yet ticked. The returned slice is a defensive
+// copy so the caller cannot mutate the Reader's state.
+func (r *Reader) SnapshotAll() []InstanceStat {
+	cur := r.snap.Load()
+	if cur == nil {
+		return nil
+	}
+	out := make([]InstanceStat, len(*cur))
+	copy(out, *cur)
+	return out
+}
+
+// SnapshotForApp returns the rows for one app, in InstanceID
+// order. Empty slice if the app has no live instances or the
+// poller has not ticked. The returned slice is a defensive copy
+// of the matching rows (the Reader's slice stays intact).
+func (r *Reader) SnapshotForApp(appID string) []InstanceStat {
+	cur := r.snap.Load()
+	if cur == nil {
+		return nil
+	}
+	// Linear scan; the per-Tick N is bounded by the
+	// (max_concurrency × apps) which is O(100s) for a one-box
+	// and O(1000s) for a small cluster. Sort+bisect would be
+	// premature. The linear scan is O(N) and runs on cold
+	// paths (reaper, scale-up trigger), not the hot path.
+	out := make([]InstanceStat, 0, 4)
+	for _, row := range *cur {
+		if row.AppID == appID {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// SnapshotForInstance returns the row for one instance id, with a
+// "found" boolean. Empty (InstanceStat{}, false) if the poller
+// has no row for that id this tick — the caller treats that as
+// "the instance is gone, fall back to durable state".
+func (r *Reader) SnapshotForInstance(instanceID string) (InstanceStat, bool) {
+	cur := r.snap.Load()
+	if cur == nil {
+		return InstanceStat{}, false
+	}
+	for _, row := range *cur {
+		if row.InstanceID == instanceID {
+			return row, true
+		}
+	}
+	return InstanceStat{}, false
+}
