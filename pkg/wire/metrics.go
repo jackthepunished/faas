@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -51,6 +52,15 @@ type OpsMetrics struct {
 	// ≈ 5 s, p99.9 ≈ 30 s); the 60 s ceiling is the documented API
 	// timeout.
 	stripePushDur *prometheus.HistogramVec
+	// paddlePushDur: parallel to stripePushDur for the Paddle Billing v2
+	// provider. The label set is paddle.PushResultLabels() — the Paddle
+	// closed set has one substitution ("negative-quantity" → "negative-
+	// mb-sec") and one addition ("overage-price-missing") vs Stripe;
+	// both histograms are pre-instantiated with their own canonical
+	// labels at boot (same precedent as stripePushDur). Sharing the
+	// Stripe histogram would lose the closed-set distinction the
+	// dashboard panel definitions depend on.
+	paddlePushDur *prometheus.HistogramVec
 	// wakeIDV4Fallback: introduced in feat/wake-id review followup
 	// (gaps analysis 2026-07-23, finding #6). Increments when schedd
 	// mints a wake_id and uuid.NewV7 returns an error — the engine
@@ -126,6 +136,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// 60 s ceiling = documented API timeout.
 		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"result"})
+	paddlePushDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_paddle_push_duration_seconds",
+		Help: "Per-push latency to Paddle, labelled by terminal result code (ok on success, or a paddle.ClassifyPushError label on failure).",
+		// Sized for Paddle's catalog POSTs: price handle lookups on the
+		// first call dominate (≈1–2 s); subsequent flushes are <500 ms
+		// since the catalog is hot. The 60 s ceiling matches the SDK's
+		// default timeout. Same bucket boundaries as stripePushDur so
+		// the §12 dashboard panels align horizontally between providers
+		// — the closed label set diverges, but the latency shape is
+		// comparable.
+		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 45, 60},
+	}, []string{"result"})
 	buildDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_build_duration_seconds",
 		Help: "Wall-clock duration of a builder-VM build, in seconds (ADR-030). Labelled by outcome {cache_hit,ok,failed} so the §12 panels can slice out cache-hit noise (<1 s); success/failure classification lives on ops_total{op=\"build\",code}.",
@@ -160,7 +182,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// multi-second for big layers; 60 s ceiling = OCIPullTimeoutSeconds.
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"op", "result"})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull)
+	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -184,6 +206,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, label := range stripe.PushResultLabels() {
 		stripePushDur.WithLabelValues(label)
 	}
+	// Pre-instantiate every label in the closed result set for the
+	// Paddle push histogram so its HELP/TYPE and zero-valued buckets
+	// surface in /metrics from the moment the daemon boots — even
+	// before the first Paddle push on a Paddle-enabled deployment.
+	// Without this, a deployments that boot FAAS_BILLING_PROVIDER=paddle
+	// would render the dashboard panel as "no data" until at least
+	// one push happened (a real ops hazard). The label set is the
+	// canonical closed list from paddle.PushResultLabels — adding a
+	// label there must also extend this loop. ADR-032.
+	for _, label := range paddle.PushResultLabels() {
+		paddlePushDur.WithLabelValues(label)
+	}
 	// Pre-instantiate the closed plan set for the residentGBPerCustomer
 	// gauge so its HELP/TYPE and zero-valued samples surface in /metrics
 	// from the moment the daemon boots — same precedent as the histogram
@@ -200,6 +234,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		watchdogKills:         watchdogKills,
 		eventsWriteFail:       eventsWriteFail,
 		stripePushDur:         stripePushDur,
+		paddlePushDur:         paddlePushDur,
 		buildDur:              buildDur,
 		buildQueueWait:        buildQueueWait,
 		residentGBPerCustomer: residentGBPerCustomer,
@@ -272,6 +307,20 @@ func (m *OpsMetrics) ObserveCode(op, code string, dur time.Duration) {
 // to cache; the underlying HistogramVec is shared across labels.
 func (m *OpsMetrics) StripePushDuration(result string) prometheus.Observer {
 	return m.stripePushDur.WithLabelValues(result)
+}
+
+// PaddlePushDuration returns the per-(result) observer for the dedicated
+// <daemon>_paddle_push_duration_seconds histogram. result is the closed
+// label set from paddle.PushResultLabels() — "ok" on success, or a
+// paddle.ClassifyPushError label on failure (note the substitution
+// "negative-quantity" → "negative-mb-sec" and the addition of
+// "overage-price-missing" vs the Stripe set; the dashboard panel
+// definitions are paired per-provider). Returned Observer is safe to
+// cache; the underlying HistogramVec is shared across labels. The
+// caller (pkg/meter.Pusher) dispatches to this or StripePushDuration
+// based on the runtime provider type — see pusherDispatch.
+func (m *OpsMetrics) PaddlePushDuration(result string) prometheus.Observer {
+	return m.paddlePushDur.WithLabelValues(result)
 }
 
 // ObserveBuildCount increments <daemon>_ops_total{op="build",code} by one

@@ -10,6 +10,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
+	stripeclassifier "github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -103,6 +104,25 @@ func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account,
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, recordedCall{AccountID: acct.ID, Hour: hour, MBSeconds: mbSeconds})
 	return r.err
+}
+
+// ClassifyPushError opts recordingStripe into the meterd pusher's
+// billing.Classifier dispatch (added with the big-Paddle-enablement
+// PR). The meterd pusher's classifier seam feeds synthetic errors
+// through the same code path as a real *stripe.Client, so tests can
+// pin the classifier→wire counter behavior end-to-end. Mirrors the
+// Stripe classifier at pkg/billing/stripe/usage_test.go:131 — the
+// label set is the same closed set ClassifyPushError uses
+// production.
+//
+// nil → "ok" mirrors stripe.ClassifyPushError; the meterd pusher
+// already short-circuits on nil before reaching this method, but the
+// guard stays here for defensive callers.
+func (r *recordingStripe) ClassifyPushError(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return stripeclassifier.ClassifyPushError(err)
 }
 
 func (r *recordingStripe) Calls() []recordedCall {

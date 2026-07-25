@@ -73,22 +73,22 @@ type Store interface {
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error
 	UpdateAccountStatus(ctx context.Context, id string, status AccountStatus) error
-	// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID on the
+	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
 	// account row so the webhook + push paths can join. Idempotent — a
 	// repeat call with the same value is a no-op (ADR-010, Slice 2).
-	UpdateAccountStripeCustomerID(ctx context.Context, id, stripeCustomerID string) error
+	UpdateAccountProviderCustomerID(ctx context.Context, id, stripeCustomerID string) error
 	// UpdateAccountStripeSubscriptionItem records the Stripe metered
 	// subscription item ID (si_…) so meterd's hourly push knows
 	// where to POST UsageRecord (issue #52, M7). Empty until the
 	// customer's first subscription.created webhook lands.
 	UpdateAccountStripeSubscriptionItem(ctx context.Context, id, subItem string) error
-	// AccountByStripeCustomerID resolves an account from the Stripe customer
+	// AccountByProviderCustomerID resolves an account from the Stripe customer
 	// ID. The webhook is the only caller; backed by an index in production
 	// (deferred). Returns ErrNotFound for unknown customers.
-	AccountByStripeCustomerID(ctx context.Context, stripeCustomerID string) (Account, error)
+	AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error)
 	// UpdateAccountPaddleCustomerID records the Paddle `ctm_…` ID on the
 	// account row so the Paddle webhook can join. Mirrors
-	// UpdateAccountStripeCustomerID; the existing stripe_customer_id
+	// UpdateAccountProviderCustomerID; the existing provider_customer_id
 	// column is reused per ADR-025 (the column name is on the
 	// documented stale-names list — the rename is a separate, smaller
 	// migration PR). Stripe cus_… and Paddle ctm_… values are
@@ -97,7 +97,7 @@ type Store interface {
 	// not per-row).
 	UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error
 	// AccountByPaddleCustomerID resolves an account from the Paddle
-	// customer ID. Same body as AccountByStripeCustomerID — the lookup
+	// customer ID. Same body as AccountByProviderCustomerID — the lookup
 	// is against the same column. Kept as a named entry (not a thin
 	// wrapper from the call sites) so the Paddle webhook code path
 	// reads self-documentingly and the column-rename PR can swap

@@ -4,7 +4,7 @@
 //   - EnsurePlanProducts: idempotent product/price creation for the four
 //     plans (Free/Hobby/Pro/Scale) + the metered `gb_ram_hour` price.
 //   - CreateCustomer: maps a state.Account to a Stripe `cus_…` and writes
-//     the customer ID back via state.Store.UpdateAccountStripeCustomerID.
+//     the customer ID back via state.Store.UpdateAccountProviderCustomerID.
 //   - PushUsageRecord: hourly metered usage record with our own
 //     (account, hour) dedupe table on top of the Stripe SDK idempotency
 //     key.

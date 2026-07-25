@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
+	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -83,9 +84,14 @@ func HourWindow(at time.Time) (start, end time.Time) {
 //
 // Paddle's CreateUsageRecord is the parallel surface — PR #3 wires the
 // loop dispatch through billing.Provider so the same body drives
-// either SDK. Paddle's failure-mode labels are not classified today
-// (the Paddle error classifier is a separate slice follow-up); the
-// ObserveCode label is "paddle-ok" / "paddle-error" for now.
+// either SDK. The per-provider classify/observe pair
+// (pusherDispatch, classifyProviderError — below) is the dispatch
+// seam: each provider gets a stable label set and a parallel
+// `_paddle_push_duration_seconds` histogram so the dashboard panels
+// for Paddle and Stripe render with the same grain. The classifiers
+// (stripe.ClassifyPushError, paddle.ClassifyPushError) are
+// SDK-typed and live in each provider's package so the pusher
+// doesn't depend on either SDK's internal error shape.
 func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 	if p.pusher == nil {
 		return 0, errors.New("meter: billing pusher not configured")
@@ -96,6 +102,11 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Snapshot the provider dispatch once so the per-account loop
+	// doesn't re-type-switch on every iteration. opLabel is stamped
+	// on ops_total and the per-provider PushDuration histogram; it
+	// doesn't change per-account so hoisting is safe.
+	opLabel, pushDurObs := pusherDispatch(p.pusher)
 	pushed := 0
 	for _, acct := range accounts {
 		if acct.Plan == "free" {
@@ -126,13 +137,10 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		}
 		pushStart := time.Now()
 		perr := p.pusher.PushUsageRecord(ctx, acct, start, mbSec)
-		// ClassifyPushError is Stripe-shaped today; non-Stripe errors
-		// collapse to "other" via the SDK-neutral classification. When
-		// a Paddle classifier lands, branch on provider type here.
-		code := stripe.ClassifyPushError(perr)
+		code := classifyProviderError(p.pusher, perr)
 		dur := time.Since(pushStart)
-		p.ops.ObserveCode("stripe", code, dur)
-		p.ops.StripePushDuration(code).Observe(dur.Seconds())
+		p.ops.ObserveCode(opLabel, code, dur)
+		pushDurObs(p.ops, code, dur)
 		if perr != nil {
 			p.log.Warn("meter: push usage", "account", acct.ID, "hour", start,
 				"code", code, "err", perr)
@@ -141,4 +149,67 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		pushed++
 	}
 	return pushed, nil
+}
+
+// pusherDispatch returns the per-provider observation seam
+// (opLabel + PushDuration observer) for a billing.Provider. The
+// dispatcher is intentionally SDK-typed locally — the Provider
+// interface is SDK-agnostic by design (ADR-025), but the dispatch
+// itself needs to know which SDK to call. Two SDK shapes today
+// (Stripe, Paddle); a new provider would extend the switch.
+//
+// Returns ("stripe", StripePushDuration observer) for *stripe.Client;
+// ("paddle", PaddlePushDuration observer) for *paddle.Provider; falls
+// back to ("stripe", StripePushDuration observer) for an unknown
+// provider so a future addition doesn't silently lose
+// observations. A new provider PR should add a case here + a new
+// histogram in metrics.go.
+//
+// The signature uses a closure so the per-provider observer captures
+// the SDK-typed selector method; the alternative — returning a
+// method value — would force the pusher to know the method name
+// ahead of dispatch.
+func pusherDispatch(prov billing.Provider) (opLabel string, obs func(*wire.OpsMetrics, string, time.Duration)) {
+	switch prov.(type) {
+	case *stripe.Client:
+		return "stripe", func(m *wire.OpsMetrics, code string, d time.Duration) {
+			m.StripePushDuration(code).Observe(d.Seconds())
+		}
+	case *paddle.Provider:
+		return "paddle", func(m *wire.OpsMetrics, code string, d time.Duration) {
+			m.PaddlePushDuration(code).Observe(d.Seconds())
+		}
+	default:
+		// Unknown provider — fall back to the Stripe observer so
+		// observations are not silently dropped. The op label stays
+		// "stripe" because the histogram name encodes it; renaming it
+		// here would require a new histogram in metrics.go.
+		return "stripe", func(m *wire.OpsMetrics, code string, d time.Duration) {
+			m.StripePushDuration(code).Observe(d.Seconds())
+		}
+	}
+}
+
+// classifyProviderError maps a pusher-side error to the per-provider
+// closed label set. The dispatch goes through the
+// billing.Classifier optional interface (declared at pkg/billing/provider.go)
+// so SDK-typed classification stays in the provider's own package
+// (which knows about *stripe.Error / *paddleerr.Error) without
+// forcing billing.Provider wider. Test doubles can also implement
+// Classifier to feed synthetic errors through the same path.
+//
+// nil → "ok" unconditionally (the closed label set's success label
+// is identical for both providers — the dashboard panel joins on
+// `code="ok"`). A provider that doesn't implement Classifier → "other"
+// so the dashboard panel doesn't render "no data" for a misconfigured
+// env. The label set is the per-provider closed list — see
+// stripe.PushResultLabels() / paddle.PushResultLabels().
+func classifyProviderError(prov billing.Provider, err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if c, ok := prov.(billing.Classifier); ok {
+		return c.ClassifyPushError(err)
+	}
+	return "other"
 }

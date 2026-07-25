@@ -59,7 +59,7 @@ var _ Store = (*PgStore)(nil)
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at`,
+		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at`,
 		email, string(plan))
 	acct, err := scanAccount(row)
 	if err != nil {
@@ -76,19 +76,19 @@ func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan
 
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where id = $1`, id)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where id = $1`, id)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where email = $1`, email)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where email = $1`, email)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select a.id, a.email, a.plan, a.status, coalesce(a.stripe_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at
+		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at
 		 from accounts a join api_keys k on k.account_id = a.id where k.key_sha256 = $1`, hash)
 	return scanAccount(row)
 }
@@ -123,13 +123,13 @@ func (s *PgStore) UpdateAccountStatus(ctx context.Context, id string, status Acc
 	return err
 }
 
-// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID on the
-// account row. Schema carries a unique index on stripe_customer_id so a
+// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
+// account row. Schema carries a unique index on provider_customer_id so a
 // second customer picking up an old ID would fail at the DB; MemStore
 // mirrors that with the same shape (single-value index map).
-func (s *PgStore) UpdateAccountStripeCustomerID(ctx context.Context, id, stripeCustomerID string) error {
+func (s *PgStore) UpdateAccountProviderCustomerID(ctx context.Context, id, stripeCustomerID string) error {
 	tag, err := s.pool.Exec(ctx,
-		`update accounts set stripe_customer_id = $2 where id = $1`,
+		`update accounts set provider_customer_id = $2 where id = $1`,
 		id, stripeCustomerID)
 	if err != nil {
 		return err
@@ -158,25 +158,25 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 	return nil
 }
 
-// AccountByStripeCustomerID resolves the account behind a Stripe webhook
+// AccountByProviderCustomerID resolves the account behind a Stripe webhook
 // payload. The unique index makes this O(log n); MemStore does it with a
 // map.
-func (s *PgStore) AccountByStripeCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
+func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
-		 from accounts where stripe_customer_id = $1`,
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		 from accounts where provider_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
 }
 
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
-// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
+// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
 // reused (ADR-025 — column rename is a separate migration PR), so the
 // underlying UPDATE is identical; the dedicated method name keeps the
 // Paddle call sites self-documenting.
 func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error {
 	tag, err := s.pool.Exec(ctx,
-		`update accounts set stripe_customer_id = $2 where id = $1`,
+		`update accounts set provider_customer_id = $2 where id = $1`,
 		id, paddleCustomerID)
 	if err != nil {
 		return err
@@ -192,14 +192,14 @@ func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleC
 // as the Stripe path (the rename is a separate PR per ADR-025); the
 // dedicated method name keeps the Paddle call sites self-documenting.
 func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return s.AccountByStripeCustomerID(ctx, paddleCustomerID)
+	return s.AccountByProviderCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts returns every account. Meterd walks this on the quota
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
 		 from accounts order by created_at`)
 	if err != nil {
 		return nil, err
@@ -231,7 +231,7 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 	a := Account{}
 	var planStr, statusStr string
 	var deletionAt, lastWarnAt, pastDueAt *time.Time
-	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.StripeCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt); err != nil {
+	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt); err != nil {
 		return Account{}, err
 	}
 	a.Plan = api.Plan(planStr)

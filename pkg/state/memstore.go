@@ -87,7 +87,7 @@ type MemStore struct {
 	usageByMonth []Usage
 	idem         map[string]idemEntry
 	// stripeByCustomer is the reverse-lookup index used by
-	// AccountByStripeCustomerID; keyed by Stripe `cus_…` ID.
+	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
 	// gdprRequests is the in-memory mirror of the gdpr_requests ledger
 	// row. MemStore does not auto-cascade on DeleteAccount (the
@@ -172,8 +172,8 @@ func NewMemStore() *MemStore {
 		usage:          []usageMinute{},
 		usageByMonth:   []Usage{},
 		idem:           map[string]idemEntry{},
-		// stripeByCustomer is the reverse-lookup map AccountByStripeCustomerID
-		// walks; populated by UpdateAccountStripeCustomerID.
+		// stripeByCustomer is the reverse-lookup map AccountByProviderCustomerID
+		// walks; populated by UpdateAccountProviderCustomerID.
 		stripeByCustomer: map[string]string{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
@@ -288,19 +288,19 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 	return nil
 }
 
-// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID. MemStore
+// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID. MemStore
 // keeps an index map for O(1) webhook lookup; PgStore mirrors with a
 // schema-level unique index (added in Slice 2's migration).
-func (m *MemStore) UpdateAccountStripeCustomerID(_ context.Context, id, stripeCustomerID string) error {
+func (m *MemStore) UpdateAccountProviderCustomerID(_ context.Context, id, stripeCustomerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
 		return ErrNotFound
 	}
-	a.StripeCustomerID = stripeCustomerID
+	a.ProviderCustomerID = stripeCustomerID
 	m.accounts[id] = a
-	// Maintain the reverse-lookup map for AccountByStripeCustomerID.
+	// Maintain the reverse-lookup map for AccountByProviderCustomerID.
 	for k, v := range m.stripeByCustomer {
 		if v == id && k != stripeCustomerID {
 			delete(m.stripeByCustomer, k)
@@ -327,10 +327,10 @@ func (m *MemStore) UpdateAccountStripeSubscriptionItem(_ context.Context, id, su
 	return nil
 }
 
-// AccountByStripeCustomerID is the reverse-lookup the Stripe webhook
+// AccountByProviderCustomerID is the reverse-lookup the Stripe webhook
 // uses to find the account behind an event's `customer` field. O(1) via
 // the index map; PgStore implements this with a unique index.
-func (m *MemStore) AccountByStripeCustomerID(_ context.Context, stripeCustomerID string) (Account, error) {
+func (m *MemStore) AccountByProviderCustomerID(_ context.Context, stripeCustomerID string) (Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id, ok := m.stripeByCustomer[stripeCustomerID]
@@ -344,8 +344,8 @@ func (m *MemStore) AccountByStripeCustomerID(_ context.Context, stripeCustomerID
 	return a, nil
 }
 
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
-// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
+// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
 // reused (ADR-025 — column rename is a separate migration PR), so the
 // underlying field + reverse-lookup map are the same; the dedicated
 // method name keeps the Paddle call sites self-documenting.
@@ -356,7 +356,7 @@ func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCu
 	if !ok {
 		return ErrNotFound
 	}
-	a.StripeCustomerID = paddleCustomerID // column is reused per ADR-025
+	a.ProviderCustomerID = paddleCustomerID // column is reused per ADR-025
 	m.accounts[id] = a
 	// Maintain the reverse-lookup map. Same map as the Stripe path —
 	// a single deployment uses one provider, so the prefix-stripped
@@ -377,7 +377,7 @@ func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCu
 // keeps the Paddle call sites self-documenting and leaves the door
 // open for a column-rename PR to swap bodies without touching callers.
 func (m *MemStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return m.AccountByStripeCustomerID(ctx, paddleCustomerID)
+	return m.AccountByProviderCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts walks the account map under the store mutex. The

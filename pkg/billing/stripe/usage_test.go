@@ -45,7 +45,7 @@ func TestPushUsageRecord_MissingAPIKeyFails(t *testing.T) {
 	store := state.NewMemStore()
 	c := NewClient(store, store, "", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	err := c.pushUsageRecordSDK(context.Background(), state.Account{
-		ID: "acct_x", StripeCustomerID: "cus_x", StripeSubscriptionItem: "si_test",
+		ID: "acct_x", ProviderCustomerID: "cus_x", StripeSubscriptionItem: "si_test",
 	}, time.Now(), 1.5)
 	if err == nil || !errors.Is(err, ErrNoAPIKey) {
 		t.Fatalf("expected error wrapping ErrNoAPIKey, got %v", err)
@@ -61,7 +61,7 @@ func TestPushUsageRecord_MissingAPIKeyFails(t *testing.T) {
 func TestPushUsageRecord_DedupeGateSkipsSecondCall(t *testing.T) {
 	store := state.NewMemStore()
 	c := NewClient(store, store, "sk_test_dummy", "whsec_dummy", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	acct := state.Account{ID: "acct_dedupe", StripeCustomerID: "cus_x", StripeSubscriptionItem: "si_test"}
+	acct := state.Account{ID: "acct_dedupe", ProviderCustomerID: "cus_x", StripeSubscriptionItem: "si_test"}
 	hour := time.Now().UTC().Truncate(time.Hour)
 
 	if err := store.RecordStripePushHour(context.Background(), acct.ID, hour); err != nil {
@@ -96,7 +96,7 @@ func TestPushUsageRecord_PostsToStripeSandbox(t *testing.T) {
 	hour := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
 	record, err := c.PushUsageRecordWithID(context.Background(), state.Account{
 		ID:                     "acct_sandbox_" + hour.Format("2006010215"),
-		StripeCustomerID:       "cus_sandbox",
+		ProviderCustomerID:       "cus_sandbox",
 		StripeSubscriptionItem: sub,
 	}, hour, 0.001) // 1 MB-h keeps the sandbox bill line tiny (legacy float path)
 	if err != nil {
@@ -121,7 +121,7 @@ func TestPushUsageRecord_ValidationNegativeQuantity(t *testing.T) {
 	store := state.NewMemStore()
 	c := NewClient(store, store, "sk_test_x", "whsec_x", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	err := c.pushUsageRecordSDK(context.Background(), state.Account{
-		ID: "acct_neg", StripeCustomerID: "cus_x", StripeSubscriptionItem: "si_test",
+		ID: "acct_neg", ProviderCustomerID: "cus_x", StripeSubscriptionItem: "si_test",
 	}, time.Now(), -0.5)
 	if err == nil || !errors.Is(err, ErrNegativeQuantity) {
 		t.Fatalf("expected error wrapping ErrNegativeQuantity, got %v", err)

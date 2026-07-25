@@ -77,7 +77,7 @@ func (c *Client) pushUsageRecordSDKSum(ctx context.Context, acct state.Account, 
 // surfaces it for the §14 M7 acceptance gate (issue #52).
 func (c *Client) pushUsageRecordSDKSumWithID(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) (*stripe.UsageRecord, error) {
 	if acct.StripeSubscriptionItem == "" {
-		// Mirror the StripeCustomerID-emptiness skip at
+		// Mirror the ProviderCustomerID-emptiness skip at
 		// client.go::PushUsageRecordSum — pending customers are a no-op.
 		// products.go::EnsureCustomer stamps this on the first
 		// successful subscription webhook.

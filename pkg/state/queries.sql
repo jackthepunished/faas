@@ -1,18 +1,18 @@
 -- name: CreateAccount :one
-insert into accounts (id, email, plan, status, stripe_customer_id)
+insert into accounts (id, email, plan, status, provider_customer_id)
 values (gen_random_uuid(), $1, $2, $3, null)
-returning id, email, plan, status, coalesce(stripe_customer_id, ''), created_at;
+returning id, email, plan, status, coalesce(provider_customer_id, ''), created_at;
 
 -- name: AccountByID :one
-select id, email, plan, status, coalesce(stripe_customer_id, ''), created_at
+select id, email, plan, status, coalesce(provider_customer_id, ''), created_at
 from accounts where id = $1;
 
 -- name: AccountByEmail :one
-select id, email, plan, status, coalesce(stripe_customer_id, ''), created_at
+select id, email, plan, status, coalesce(provider_customer_id, ''), created_at
 from accounts where email = $1;
 
 -- name: AccountByKeyHash :one
-select a.id, a.email, a.plan, a.status, coalesce(a.stripe_customer_id, ''), a.created_at
+select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id, ''), a.created_at
 from accounts a
 join api_keys k on k.account_id = a.id
 where k.key_sha256 = $1;

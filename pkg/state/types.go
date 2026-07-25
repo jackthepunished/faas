@@ -88,10 +88,10 @@ type Account struct {
 	Email  string
 	Plan   api.Plan
 	Status AccountStatus
-	// StripeCustomerID is the per-account `cus_…` returned by Stripe when
+	// ProviderCustomerID is the per-account `cus_…` returned by Stripe when
 	// the customer signs up (spec §4.7). The unique index makes it a
 	// stable webhook lookup key.
-	StripeCustomerID string
+	ProviderCustomerID string
 	// StripeSubscriptionItem is the per-account `si_…` (metered
 	// subscription item) that meterd pushes hourly usage against
 	// (issue #52, §4.7). Empty until pkg/billing/stripe::EnsureCustomer

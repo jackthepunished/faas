@@ -6,10 +6,13 @@ package paddle
 // pinned at the unit level so a regression is caught at the
 // cheapest layer.
 //
-// Driving accumulateOverage end-to-end requires substituting the
-// SDK's CreateTransaction call; PR #3 introduces the state-store-
-// backed dedupe that makes a stub-mode of the provider worth
-// adding. Today we pin the primitives the executor depends on.
+// Driving PushUsageRecord end-to-end requires substituting the
+// SDK's CreateTransaction call; we use the `flushFn` seam
+// installed at provider.go to swap in a counter stub. Tests that
+// use the dedupe gate get a second stub (`recordingDedupe`)
+// that records Has/Rec pairs. Together the two stubs expose every
+// branch of flushOverageLocked without standing up a real
+// *paddle.SDK.
 
 import (
 	"context"
@@ -19,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PaddleHQ/paddle-go-sdk/v5"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -128,14 +132,15 @@ func TestPlanProducts_ExcludesFree(t *testing.T) {
 	}
 }
 
-// --- accumulator end-to-end via the FlushFn test seam ---
+// --- stateless per-push PushUsageRecord ---
 
 // flushFnCounter is a FlushFn stub that records every call. The
-// locking around `acc.flushed` is exercised by the production
-// code; the stub only counts. Production default is defaultFlushLocked
-// (real SDK POST); tests inject this counter.
+// dedupe gate consult happens before this stub fires; the stub
+// itself only counts. Production default is defaultFlushLocked
+// (real SDK POST); tests inject this counter so they can assert
+// call counts without standing up a real SDK.
 func flushFnCounter(counter *int, flushErr error) FlushFn {
-	return func(_ context.Context, _ *Provider, acc *overageAccumulator) error {
+	return func(_ context.Context, _ *Provider, _ state.Account, _ time.Time, _ int64) error {
 		*counter++
 		return flushErr
 	}
@@ -189,13 +194,16 @@ func (d *recordingDedupe) Has() int { d.mu.Lock(); defer d.mu.Unlock(); return d
 func (d *recordingDedupe) Rec() int { d.mu.Lock(); defer d.mu.Unlock(); return d.rec }
 
 // seedOverageProvider builds a Provider whose catalog has the
-// overage price for `plan` primed, so accumulateOverage reaches
+// overage price for `plan` primed, so PushUsageRecord reaches
 // the flush step without EnsurePlanProducts needing the live SDK.
 // Also swaps in a counting flushFn so tests can assert call counts.
+//
+// The `client: nil` is intentional — the flusher is stubbed, so the
+// SDK is never invoked. This mirrors the pattern from PR #179.
 func seedOverageProvider(t *testing.T, plan api.Plan, priceID string, flush FlushFn) *Provider {
 	t.Helper()
 	p := &Provider{
-		client: nil, // unused — accumulator never reaches CreateTransaction via stubbed flushFn
+		client: nil, // unused — flusher never reaches CreateTransaction via stubbed flushFn
 		now:    time.Now,
 		catalog: &priceCatalog{
 			planOverage: map[api.Plan]string{plan: priceID},
@@ -220,144 +228,9 @@ func seedOverageProviderWithDedupe(plan api.Plan, priceID string, flush FlushFn,
 	}
 }
 
-// TestAccumulateOverage_CrossMonthFlush is the boundary-case pin
-// for the calendarMonthStart fix. Two pushes on either side of a
-// Feb → Mar boundary must bucket separately — one flush per
-// month, in the right order.
-func TestAccumulateOverage_CrossMonthFlush(t *testing.T) {
-	t.Parallel()
-
-	var calls int
-	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
-
-	acct := acctWithPlan(api.PlanHobby)
-
-	// Jan 31 23:59 UTC.
-	jan31 := time.Date(2025, 1, 31, 23, 59, 0, 0, time.UTC)
-	if err := p.accumulateOverage(context.Background(), acct, jan31, 1000); err != nil {
-		t.Fatalf("Jan push: %v", err)
-	}
-	if calls != 0 {
-		t.Errorf("after first push: calls=%d, want 0", calls)
-	}
-
-	// Mar 1 00:01 UTC (skips Feb entirely; exercises the calendar
-	// math rather than adjacent-month drift).
-	mar1 := time.Date(2025, 3, 1, 0, 1, 0, 0, time.UTC)
-	if err := p.accumulateOverage(context.Background(), acct, mar1, 2000); err != nil {
-		t.Fatalf("Mar push: %v", err)
-	}
-
-	// Crossing Jan → Mar should produce exactly 1 flush: Jan's
-	// bucket drains when March's hour is observed. Feb never has
-	// any pushes, so it doesn't flush (the bucket for Feb doesn't
-	// exist).
-	if calls != 1 {
-		t.Errorf("after crossing Jan → Mar: calls=%d, want 1", calls)
-	}
-}
-
-// TestAccumulateOverage_AdjacentMonthBoundary pins the simpler
-// Jan → Feb case (every-month-has-30-day-shaped data) so a regression
-// in the calendar math is loud.
-func TestAccumulateOverage_AdjacentMonthBoundary(t *testing.T) {
-	t.Parallel()
-
-	var calls int
-	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
-
-	acct := acctWithPlan(api.PlanHobby)
-
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
-
-	if err := p.accumulateOverage(context.Background(), acct, jan15, 500); err != nil {
-		t.Fatalf("Jan push: %v", err)
-	}
-	if calls != 0 {
-		t.Errorf("after Jan push: calls=%d, want 0", calls)
-	}
-	if err := p.accumulateOverage(context.Background(), acct, feb1, 700); err != nil {
-		t.Fatalf("Feb push: %v", err)
-	}
-	if calls != 1 {
-		t.Errorf("after Feb push: calls=%d, want 1 (Jan's bucket flushed)", calls)
-	}
-}
-
-// TestAccumulateOverage_WithinMonthDedupe confirms the second push
-// in the same calendar month does NOT cause an additional flush —
-// the `flushed` flag prevents double-billing within the same month.
-// (Cross-process dedupe is documented in usage.go as a PR #3
-// follow-up; this test pins the within-process contract only.)
-func TestAccumulateOverage_WithinMonthDedupe(t *testing.T) {
-	t.Parallel()
-
-	var calls int
-	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
-
-	acct := acctWithPlan(api.PlanHobby)
-
-	// Three pushes in the same month with hour-precision spacing.
-	if err := p.accumulateOverage(context.Background(), acct, time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC), 100); err != nil {
-		t.Fatalf("push1: %v", err)
-	}
-	if err := p.accumulateOverage(context.Background(), acct, time.Date(2025, 6, 1, 0, 30, 0, 0, time.UTC), 200); err != nil {
-		t.Fatalf("push2: %v", err)
-	}
-	if err := p.accumulateOverage(context.Background(), acct, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC), 300); err != nil {
-		t.Fatalf("push3: %v", err)
-	}
-	if calls != 0 {
-		t.Errorf("within-month pushes: calls=%d, want 0 (no flush yet)", calls)
-	}
-
-	// Crossing into July triggers the June flush.
-	if err := p.accumulateOverage(context.Background(), acct, time.Date(2025, 7, 1, 0, 0, 0, 0, time.UTC), 50); err != nil {
-		t.Fatalf("July push: %v", err)
-	}
-	if calls != 1 {
-		t.Errorf("after month-rollover: calls=%d, want 1", calls)
-	}
-
-	// Another July push: same bucket, should not flush again.
-	if err := p.accumulateOverage(context.Background(), acct, time.Date(2025, 7, 15, 12, 0, 0, 0, time.UTC), 80); err != nil {
-		t.Fatalf("second July push: %v", err)
-	}
-	if calls != 1 {
-		t.Errorf("second July push should not flush: calls=%d, want 1", calls)
-	}
-}
-
-// TestAccumulateOverage_FlushErrorPropagates pins the error
-// contract: a failed flush must surface to the caller so meterd
-// can decide whether to retry, escalate, or skip.
-func TestAccumulateOverage_FlushErrorPropagates(t *testing.T) {
-	t.Parallel()
-
-	stubErr := errors.New("paddle: simulated flush failure")
-	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(new(int), stubErr))
-
-	acct := acctWithPlan(api.PlanHobby)
-
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
-
-	if err := p.accumulateOverage(context.Background(), acct, jan15, 100); err != nil {
-		t.Fatalf("Jan push should succeed: %v", err)
-	}
-	err := p.accumulateOverage(context.Background(), acct, feb1, 200)
-	if err == nil {
-		t.Fatal("Feb push should surface flush failure")
-	}
-	if !strings.Contains(err.Error(), "simulated flush failure") {
-		t.Errorf("err = %v, want it to wrap the stub error", err)
-	}
-}
-
 // acctWithPlan builds a state.Account with a Plan stamped for the
-// overage accumulator's price-key lookup (priceIDForPlan) and a
-// non-empty StripeCustomerID (column name stale per ADR-025 — the
+// overage flusher's price-key lookup (overagePriceForPlan) and a
+// non-empty ProviderCustomerID (column name stale per ADR-025 — the
 // stub flush doesn't post, but the production flushFn DOES pass
 // it to CreateTransaction).
 func acctWithPlan(plan api.Plan) state.Account {
@@ -365,16 +238,149 @@ func acctWithPlan(plan api.Plan) state.Account {
 		ID:               "acct_test_" + string(plan),
 		Email:            "test@example.test",
 		Plan:             plan,
-		StripeCustomerID: "ctm_test_dummy",
+		ProviderCustomerID: "ctm_test_dummy",
 	}
 }
 
-// TestAccumulateOverage_PostFlushRecordsDedupeRow is the single-Provider
-// contract pin: after a cross-month flush, the dedupe row for the
-// prior month is observable via HasPaddleOverageMonth. This is the
-// per-process happy path; the cross-process variant below proves the
-// redelivery-skip.
-func TestAccumulateOverage_PostFlushRecordsDedupeRow(t *testing.T) {
+// TestFlushOverageLocked_PostsOnFirstCall — first call for a (acct,
+// month) pair hits the flusher exactly once. Mirrors the Stripe
+// PushHour happy path (pkg/meter/pusher_test.go).
+//
+// flushOverageLocked is invoked directly rather than via
+// PushUsageRecord because the seeded test Provider has a nil
+// client (the flusher stub replaces the SDK call). The production
+// PushUsageRecord short-circuits on nil-client with ErrNoAPIKey
+// — see TestPushUsageRecord_NilClientIsNoAPIKey.
+func TestFlushOverageLocked_PostsOnFirstCall(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
+	acct := acctWithPlan(api.PlanHobby)
+
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	if err := p.flushOverageLocked(context.Background(), acct, jan15, 1024); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("flush calls = %d, want 1 (first push should flush)", calls)
+	}
+}
+
+// TestFlushOverageLocked_SkipsOnZeroSum — mb_seconds == 0 is a no-op
+// (no SDK POST, no dedupe touch). flushOverageLocked guards on 0
+// defensively even though PushUsageRecord's pre-SDK guards already
+// short-circuit.
+func TestFlushOverageLocked_SkipsOnZeroSum(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
+	acct := acctWithPlan(api.PlanHobby)
+
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	if err := p.flushOverageLocked(context.Background(), acct, jan15, 0); err != nil {
+		t.Fatalf("zero-sum push: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("zero-sum push fired flusher: calls=%d, want 0", calls)
+	}
+}
+
+// TestDefaultFlushLocked_MissingOveragePrice — EnsurePlanProducts has
+// not populated the catalog (or the plan changed at runtime). The
+// default flusher must surface ErrOveragePriceMissing so the
+// classifier maps to "overage-price-missing". Pushing an empty
+// priceID through a real *paddle.SDK would 422; we want the pre-SDK
+// fast-fail.
+//
+// Tested at the default-flusher layer (not flushOverageLocked) because
+// flushOverageLocked delegates to p.flushFn first and only consults
+// defaultFlushLocked when p.flushFn is nil. The price-missing
+// guard lives inside defaultFlushLocked.
+func TestDefaultFlushLocked_MissingOveragePrice(t *testing.T) {
+	t.Parallel()
+
+	// Provider with no catalog entries for the requested plan —
+	// overagePriceForPlan returns "" and the default flusher short-
+	// circuits before touching the SDK.
+	p := &Provider{
+		client: nil, // never reached
+		now:    time.Now,
+		catalog: &priceCatalog{
+			planOverage: map[api.Plan]string{}, // empty → lookup returns ""
+		},
+	}
+	acct := acctWithPlan(api.PlanHobby)
+	janStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	err := defaultFlushLocked(context.Background(), p, acct, janStart, 1024)
+	if err == nil {
+		t.Fatal("missing overage price should error")
+	}
+	if !errors.Is(err, ErrOveragePriceMissing) {
+		t.Errorf("err = %v, want errors.Is(_, ErrOveragePriceMissing) == true", err)
+	}
+}
+
+// TestPushUsageRecord_NilClientIsNoAPIKey — when the SDK didn't init
+// (bad apiKey at boot), PushUsageRecord must surface ErrNoAPIKey so
+// the classifier maps to "no-api-key" rather than a generic SDK init
+// error. Belt + braces against a future change that passes through
+// the paddle.New error.
+func TestPushUsageRecord_NilClientIsNoAPIKey(t *testing.T) {
+	t.Parallel()
+
+	// Provider with no flusher substituted AND no client — exercises the
+	// fast-fail at provider.go's PushUsageRecord entry (not the flusher).
+	p := &Provider{
+		client:  nil,
+		now:     time.Now,
+		catalog: &priceCatalog{planOverage: map[api.Plan]string{api.PlanHobby: "pri_test_overage"}},
+	}
+	acct := acctWithPlan(api.PlanHobby)
+
+	err := p.PushUsageRecord(context.Background(), acct, time.Now(), 1024)
+	if err == nil {
+		t.Fatal("nil-client push should error")
+	}
+	if !errors.Is(err, ErrNoAPIKey) {
+		t.Errorf("err = %v, want errors.Is(_, ErrNoAPIKey) == true", err)
+	}
+}
+
+// TestPushUsageRecord_NegativeMBSeconds — PushUsageRecord surfaces
+// ErrNegativeMBSeconds so the classifier at errors.go maps to
+// "negative-mb-sec". Belt + braces against an inline error message
+// drift (the classifier uses errors.Is, not string-fragment
+// matching).
+func TestPushUsageRecord_NegativeMBSeconds(t *testing.T) {
+	t.Parallel()
+
+	// Need a non-nil client to bypass the nil-client guard; we never
+	// reach the SDK because the negative-mb_seconds guard fires first.
+	p := &Provider{
+		client:  &paddle.SDK{}, // non-nil; never invoked
+		now:     time.Now,
+		catalog: &priceCatalog{planOverage: map[api.Plan]string{api.PlanHobby: "pri_test_overage"}},
+	}
+	acct := acctWithPlan(api.PlanHobby)
+
+	err := p.PushUsageRecord(context.Background(), acct, time.Now(), -1)
+	if err == nil {
+		t.Fatal("negative mb_seconds should error")
+	}
+	if !errors.Is(err, ErrNegativeMBSeconds) {
+		t.Errorf("err = %v, want errors.Is(_, ErrNegativeMBSeconds) == true", err)
+	}
+}
+
+// TestFlushOverageLocked_PostFlushRecordsDedupeRow is the single-Provider
+// contract pin: after a successful flush, the dedupe row for that
+// (acct, month) is observable via HasPaddleOverageMonth. The within-
+// process "flushed" stamp that the old accumulator provided is now
+// provided by the state.Store row itself.
+func TestFlushOverageLocked_PostFlushRecordsDedupeRow(t *testing.T) {
 	t.Parallel()
 
 	dedupe := newRecordingDedupe()
@@ -385,29 +391,19 @@ func TestAccumulateOverage_PostFlushRecordsDedupeRow(t *testing.T) {
 	acct := acctWithPlan(api.PlanHobby)
 
 	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
-
-	if err := p.accumulateOverage(context.Background(), acct, jan15, 500); err != nil {
+	if err := p.flushOverageLocked(context.Background(), acct, jan15, 500); err != nil {
 		t.Fatalf("Jan push: %v", err)
 	}
-	// Before the rollover: dedupe has not been touched.
-	if got := dedupe.Has(); got != 0 {
-		t.Errorf("pre-flush Has count = %d, want 0", got)
-	}
-	if got := dedupe.Rec(); got != 0 {
-		t.Errorf("pre-flush Rec count = %d, want 0", got)
-	}
 
-	// Rollover triggers the flush; dedupe should see 1 Has (gate) and
-	// 1 Rec (post-POST stamp).
-	if err := p.accumulateOverage(context.Background(), acct, feb1, 700); err != nil {
-		t.Fatalf("Feb push: %v", err)
+	// One flush, one gate observation, one record stamp.
+	if calls != 1 {
+		t.Errorf("flush calls = %d, want 1", calls)
 	}
-	if got := calls; got != 1 {
-		t.Errorf("flush calls = %d, want 1", got)
+	if got := dedupe.Has(); got != 1 {
+		t.Errorf("Has count = %d, want 1 (gate observed)", got)
 	}
 	if got := dedupe.Rec(); got != 1 {
-		t.Errorf("post-flush Rec count = %d, want 1", got)
+		t.Errorf("Rec count = %d, want 1 (post-POST stamp)", got)
 	}
 
 	janStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -420,14 +416,13 @@ func TestAccumulateOverage_PostFlushRecordsDedupeRow(t *testing.T) {
 	}
 }
 
-// TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush is the
-// load-bearing test for the cross-process dedupe: two Providers that
-// share one dedupe fake simulate a meterd crash-and-restart. The
-// first Provider's cross-month push flushes January and stamps the
-// dedupe row. The second Provider's same-Mar push observes Has=true
-// and short-circuits the POST without invoking the flusher. This is
-// the regression test for the double-bill window the PR closes.
-func TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
+// TestFlushOverageLocked_CrossProcessDedupeSkipsSecondFlush is the
+// load-bearing regression test for the double-bill window the PR
+// closes: two Providers that share one dedupe fake simulate a
+// meterd crash-and-restart. The first Provider's flush stamps the
+// dedupe row. The second Provider's same-month flush observes
+// Has=true and short-circuits without invoking the flusher.
+func TestFlushOverageLocked_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 	t.Parallel()
 
 	dedupe := newRecordingDedupe()
@@ -444,34 +439,24 @@ func TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 
 	acct := acctWithPlan(api.PlanHobby)
 
-	// Provider A pushes Jan 31 23:59 UTC, then Mar 1 00:01 UTC (skip
-	// Feb entirely to exercise calendar math rather than adjacent-
-	// month drift). The March push crosses into a new month and
-	// triggers the January flush — exactly one POST.
-	if err := pA.accumulateOverage(context.Background(), acct,
-		time.Date(2025, 1, 31, 23, 59, 0, 0, time.UTC), 1000); err != nil {
+	// pA flushes January.
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	if err := pA.flushOverageLocked(context.Background(), acct, jan15, 1000); err != nil {
 		t.Fatalf("pA Jan push: %v", err)
 	}
-	if err := pA.accumulateOverage(context.Background(), acct,
-		time.Date(2025, 3, 1, 0, 1, 0, 0, time.UTC), 2000); err != nil {
-		t.Fatalf("pA Mar push: %v", err)
-	}
 	if callsA != 1 {
-		t.Errorf("pA flush calls = %d, want 1 (Jan's bucket drained on Mar rollover)", callsA)
+		t.Errorf("pA flush calls = %d, want 1", callsA)
 	}
 	if got := dedupe.Rec(); got != 1 {
 		t.Errorf("dedupe.Rec after pA flush = %d, want 1", got)
 	}
 
-	// Provider B — fresh process, no in-process `acc.flushed` state.
-	// Its own accumulator is empty; the only signal it has is the
-	// shared dedupe. March 1 push lands in March's bucket (not a
-	// rollover for Provider B's own accumulator), so its flush path
-	// goes through flushOverageLocked — which consults dedupe and
-	// short-circuits because the row already exists.
-	if err := pB.accumulateOverage(context.Background(), acct,
-		time.Date(2025, 3, 1, 1, 0, 0, 0, time.UTC), 500); err != nil {
-		t.Fatalf("pB Mar push: %v", err)
+	// pB — fresh process, no in-process state. Its flush targets the
+	// same January bucket. The gate consult observes the row and
+	// short-circuits the flush; the flusher never fires.
+	jan20 := time.Date(2025, 1, 20, 8, 0, 0, 0, time.UTC)
+	if err := pB.flushOverageLocked(context.Background(), acct, jan20, 500); err != nil {
+		t.Fatalf("pB Jan push: %v", err)
 	}
 	if callsB != 0 {
 		t.Errorf("pB flush calls = %d, want 0 (dedupe short-circuits)", callsB)
@@ -487,18 +472,52 @@ func TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 	}
 }
 
-// TestAccumulateOverage_RecordErrorPropagates pins the post-POST
-// error-wrap path: the SDK POST commits, but RecordPaddleOverageMonth
-// fails. The flush must surface the wrapped error so meterd can
-// decide whether to retry, escalate, or skip — same contract the
-// existing TestAccumulateOverage_FlushErrorPropagates pins for the
-// SDK POST itself.
+// TestFlushOverageLocked_DistinctMonthsBothFlush — the dedupe gate is
+// keyed on (acct, month); a flush for a different month with the
+// same account does NOT short-circuit. Two flushes for January then
+// February both fire — one per month.
+func TestFlushOverageLocked_DistinctMonthsBothFlush(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe()
+	var calls int
+	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&calls, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+
+	// Two flushes in adjacent months.
+	if err := p.flushOverageLocked(context.Background(), acct,
+		time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC), 500); err != nil {
+		t.Fatalf("Jan push: %v", err)
+	}
+	if err := p.flushOverageLocked(context.Background(), acct,
+		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 700); err != nil {
+		t.Fatalf("Feb push: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("flush calls = %d, want 2 (Jan + Feb)", calls)
+	}
+	if got := dedupe.Rec(); got != 2 {
+		t.Errorf("dedupe.Rec = %d, want 2 (one stamp per month)", got)
+	}
+}
+
+// TestFlushOverageLocked_RecordErrorPropagates pins the post-POST
+// error-wrap path: the SDK POST commits (flushFnCounter returns
+// nil), but RecordPaddleOverageMonth fails. The push must surface
+// the wrapped error so meterd can decide whether to retry,
+// escalate, or skip.
 //
 // This is the residual TOCTOU risk the flushOverageLocked docstring
-// calls out: Paddle has no external Idempotency-Key header, so a
-// failed Record means the next push re-POSTs. Surfacing the error
-// keeps the failure mode observable instead of silent.
-func TestAccumulateOverage_RecordErrorPropagates(t *testing.T) {
+// calls out: a failed Record means the next push re-POSTs. Surfacing
+// the error keeps the failure mode observable instead of silent.
+//
+// The new Idempotency-Key HTTP header (NewIdempotencyRT,
+// transport.go) is the load-bearing mitigation for this risk when
+// Paddle's server-side dedupe ships — until then, surfacing the
+// error is the only signal.
+func TestFlushOverageLocked_RecordErrorPropagates(t *testing.T) {
 	t.Parallel()
 
 	dedupe := newRecordingDedupe()
@@ -509,19 +528,11 @@ func TestAccumulateOverage_RecordErrorPropagates(t *testing.T) {
 		flushFnCounter(&calls, nil), dedupe)
 
 	acct := acctWithPlan(api.PlanHobby)
-
 	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
 
-	if err := p.accumulateOverage(context.Background(), acct, jan15, 100); err != nil {
-		t.Fatalf("Jan push should succeed (no rollover yet): %v", err)
-	}
-	// Rollover triggers the flush; SDK POST succeeds (flushFnCounter
-	// returns nil), then Record fails — the wrapped error must
-	// surface to the caller.
-	err := p.accumulateOverage(context.Background(), acct, feb1, 200)
+	err := p.flushOverageLocked(context.Background(), acct, jan15, 100)
 	if err == nil {
-		t.Fatal("Feb push should surface the dedupe record failure")
+		t.Fatal("push should surface the dedupe record failure")
 	}
 	if !strings.Contains(err.Error(), "simulated dedupe record failure") {
 		t.Errorf("err = %v, want it to wrap the stub error", err)
@@ -539,5 +550,35 @@ func TestAccumulateOverage_RecordErrorPropagates(t *testing.T) {
 	}
 	if got := dedupe.Rec(); got != 1 {
 		t.Errorf("dedupe.Rec = %d, want 1 (Record was attempted)", got)
+	}
+}
+
+// TestFlushOverageLocked_FlushErrorPropagates pins the error
+// contract: a failed flush must surface to the caller so meterd
+// can decide whether to retry, escalate, or skip. The dedupe row
+// must NOT be stamped when the flush fails (otherwise the second
+// push would be silently skipped instead of retried).
+func TestFlushOverageLocked_FlushErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe()
+	stubErr := errors.New("paddle: simulated flush failure")
+	var calls int
+	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&calls, stubErr), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	err := p.flushOverageLocked(context.Background(), acct, jan15, 100)
+	if err == nil {
+		t.Fatal("push should surface flush failure")
+	}
+	if !errors.Is(err, stubErr) {
+		t.Errorf("err = %v, want errors.Is(_, stubErr) == true", err)
+	}
+	// Record was NOT stamped because the flush returned an error.
+	if got := dedupe.Rec(); got != 0 {
+		t.Errorf("dedupe.Rec = %d, want 0 (Record skipped when flush fails)", got)
 	}
 }

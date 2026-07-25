@@ -169,7 +169,7 @@ type Event struct {
 
 	// CustomerID is the provider's customer handle (Stripe: cus_…,
 	// Paddle: ctm_…). apid resolves this to a state.Account via
-	// Store.AccountByStripeCustomerID.
+	// Store.AccountByProviderCustomerID.
 	CustomerID string
 
 	// PlanID is the provider's plan identifier (Stripe: plan_… /
@@ -193,3 +193,24 @@ type Event struct {
 // tolerance, or the HMAC does not match. Provider implementations
 // must wrap with %w so callers can use errors.Is.
 var ErrBadSignature = errors.New("billing: bad webhook signature")
+
+// Classifier is the optional seam a Provider can implement to declare
+// its push-error classification. meterd's pusher loop dispatches via
+// this interface first so SDK-typed classification stays in the
+// provider's own package (which knows about *stripe.Error /
+// *paddleerr.Error) without forcing the billing.Provider interface
+// wider. Returning "other" for an unknown inner error is the
+// provider's contract; nil always returns "ok".
+//
+// Providers that don't implement this interface get meterd's default
+// fallback ("other") — same as the prior all-Stripe dispatch. The
+// pusher's opLabel/observer dispatch falls back to a Stripe-shaped
+// histogram so a missing Classifier doesn't lose observations.
+//
+// Keep the label set closed per provider: pkg/billing/stripe's
+// stripe.PushResultLabels and pkg/billing/paddle's paddle.PushResultLabels
+// are each pre-instantiated in pkg/wire/metrics.go at registry
+// construction time.
+type Classifier interface {
+	ClassifyPushError(err error) string
+}
