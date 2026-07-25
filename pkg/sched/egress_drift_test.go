@@ -71,6 +71,29 @@ func (r *recordingRouterVMM) callsByNode() map[string]int {
 	return m
 }
 
+// snapshotLen returns the current call count under the lock. The
+// bare `len(r.calls)` reads the test ran before caused the race
+// detector to fire on the post-wait pass (the goroutine that
+// handled the payload may still be writing the same struct after
+// waitFor observed the trigger). Every test that races against a
+// fan-out goroutine MUST go through this helper.
+func (r *recordingRouterVMM) snapshotLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+// snapshot returns a copy of the recorded calls under the lock.
+// The returned slice is owned by the caller; mutations don't
+// reach into the recording fake.
+func (r *recordingRouterVMM) snapshot() []recordedAllowlistCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recordedAllowlistCall, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
 // Stub the rest of RoutedVMM so the engine can be constructed.
 func (r *recordingRouterVMM) CreateColdBoot(context.Context, string, string, AppSpec) (*WakeOutcome, error) {
 	return &WakeOutcome{}, nil
@@ -150,8 +173,8 @@ func TestEgressDrift_FiltersToKindUpdated(t *testing.T) {
 	// One valid payload — should fan out to node-A.
 	feed.Send(db.Notification{Channel: db.NotifyAppChanged, Payload: `{"kind":"updated","app_id":"` + app.ID + `","slug":"the-app"}`})
 
-	if err := waitFor(func() bool { return len(router.calls) == 1 }, 2*time.Second); err != nil {
-		t.Fatalf("expected exactly 1 valid call, got %d", len(router.calls))
+	if err := waitFor(func() bool { return router.snapshotLen() == 1 }, 2*time.Second); err != nil {
+		t.Fatalf("expected exactly 1 valid call, got %d", router.snapshotLen())
 	}
 	cancel()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
@@ -186,8 +209,10 @@ func TestEgressDrift_FansOutAcrossNodes(t *testing.T) {
 		t.Fatalf("expected 1 call to node-A and 1 to node-B; got %v", router.callsByNode())
 	}
 
-	// Every call carries the new allowlist.
-	for _, c := range router.calls {
+	// Every call carries the new allowlist. Snapshot under the
+	// lock so the race detector doesn't fire on the post-wait
+	// read.
+	for _, c := range router.snapshot() {
 		if len(c.Allowlist) != 1 || c.Allowlist[0].String() != "8.8.8.0/24" {
 			t.Errorf("call %+v has wrong allowlist", c)
 		}
@@ -224,8 +249,8 @@ func TestEgressDrift_IdempotentOnRedelivery(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		feed.Send(db.Notification{Channel: db.NotifyAppChanged, Payload: `{"kind":"updated","app_id":"` + app.ID + `"}`})
 	}
-	if err := waitFor(func() bool { return len(router.calls) == 3 }, 2*time.Second); err != nil {
-		t.Fatalf("expected 3 calls (subscriber fans out every payload; vmmd short-circuits), got %d", len(router.calls))
+	if err := waitFor(func() bool { return router.snapshotLen() == 3 }, 2*time.Second); err != nil {
+		t.Fatalf("expected 3 calls (subscriber fans out every payload; vmmd short-circuits), got %d", router.snapshotLen())
 	}
 	cancel()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
@@ -256,8 +281,8 @@ func TestEgressDrift_RejectsBadPayload(t *testing.T) {
 	// survived.
 	feed.Send(db.Notification{Channel: db.NotifyAppChanged, Payload: `{"kind":"updated","app_id":"` + app.ID + `"}`})
 
-	if err := waitFor(func() bool { return len(router.calls) == 1 }, 2*time.Second); err != nil {
-		t.Fatalf("expected 1 call after 3 bad + 1 good, got %d", len(router.calls))
+	if err := waitFor(func() bool { return router.snapshotLen() == 1 }, 2*time.Second); err != nil {
+		t.Fatalf("expected 1 call after 3 bad + 1 good, got %d", router.snapshotLen())
 	}
 	cancel()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
@@ -323,10 +348,14 @@ func TestEgressDrift_EmptyAllowlistClears(t *testing.T) {
 
 	feed.Send(db.Notification{Channel: db.NotifyAppChanged, Payload: `{"kind":"updated","app_id":"` + app.ID + `"}`})
 
-	if err := waitFor(func() bool { return len(router.calls) == 1 }, 2*time.Second); err != nil {
-		t.Fatalf("expected 1 call (empty allowlist), got %d", len(router.calls))
+	if err := waitFor(func() bool { return router.snapshotLen() == 1 }, 2*time.Second); err != nil {
+		t.Fatalf("expected 1 call (empty allowlist), got %d", router.snapshotLen())
 	}
-	if got := len(router.calls[0].Allowlist); got != 0 {
+	// Snapshot under the lock so the race detector doesn't fire
+	// on the timing of "wait returned vs the goroutine's last
+	// write".
+	calls := router.snapshot()
+	if got := len(calls[0].Allowlist); got != 0 {
 		t.Errorf("expected empty allowlist on the wire, got %d entries", got)
 	}
 	cancel()
