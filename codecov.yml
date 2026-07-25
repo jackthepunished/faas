@@ -58,7 +58,14 @@ comment:
 # invariant suite). These don't enforce thresholds yet — they only
 # colour the badge.
 component_management:
-  default_rules: null
+  # NOTE: `default_rules: null` here made this ENTIRE file invalid
+  # ("Error at ['component_management', 'default_rules']: null value not
+  # allowed" from https://codecov.io/validate). Codecov discards a config
+  # it cannot parse and falls back to its defaults, so nothing below —
+  # and nothing above — was in effect. That is why the `ignore` list at
+  # the bottom never applied: all 6 generated *.pb.go files were still
+  # counted, 2029 lines at 0%, dragging the project number down.
+  # Omit the key entirely rather than setting it null.
   individual_components:
     - component_id: core_runtime
       paths:
