@@ -566,7 +566,7 @@ func cmdKeys(args []string) int {
 		if err != nil {
 			return printErr("Not logged in", err)
 		}
-		k, err := client.CreateKey(context.Background(), args[1])
+		k, err := client.CreateKey(context.Background(), args[1], nil)
 		if err != nil {
 			return printErr("Create failed", err)
 		}

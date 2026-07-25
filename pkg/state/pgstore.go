@@ -101,15 +101,46 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // constraint in migrations/00001_init.sql.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), created_at
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at
 		 from api_keys where key_sha256 = $1`, hash)
-	k := APIKey{}
-	if err := row.Scan(&k.ID, &k.AccountID, &k.Hash, &k.Label, &k.CreatedAt); err != nil {
+	return scanAPIKey(row)
+}
+
+// AuthenticateKey resolves a bearer token to its account + key. It is
+// the canonical lookup for the apid auth middleware (cmd/apid server.go
+// s.auth). Implementations are expected to be cheap (index-backed lookup
+// on key_sha256) and to return ErrNotFound when the hash has no matching
+// key (the auth middleware maps that to 401). The account and key are
+// read with two queries in PgStore — the principal is assembled
+// in-process. TODO(perf): both queries hit the same UNIQUE index, so
+// collapsing to a single SQL JOIN halves the round-trips on every
+// authenticated request. Not blocking: index hits are fast enough that
+// the perf cost is negligible at current scale. Revisit when auth
+// latency shows up on the dashboard. See ADR-034.
+func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
+	acct, err := s.AccountByKeyHash(ctx, hash)
+	if err != nil {
+		return Account{}, APIKey{}, err
+	}
+	key, err := s.APIKeyByHash(ctx, hash)
+	if err != nil {
+		return Account{}, APIKey{}, err
+	}
+	return acct, key, nil
+}
+
+func scanAPIKey(row pgx.Row) (APIKey, error) {
+	var (
+		k         APIKey
+		hashBytes []byte
+	)
+	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
 		}
 		return APIKey{}, mapErr(err)
 	}
+	k.Hash = hashBytes
 	return k, nil
 }
 
@@ -250,18 +281,12 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 
 // --- api keys ----------------------------------------------------------------
 
-func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string) (APIKey, error) {
+func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`insert into api_keys (account_id, key_sha256, label) values ($1, $2, $3)
-		 returning id, account_id, key_sha256, coalesce(label,''), created_at`,
-		accountID, hash, nullString(label))
-	k := APIKey{}
-	var hashBytes []byte
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.CreatedAt); err != nil {
-		return APIKey{}, mapErr(err)
-	}
-	k.Hash = hashBytes
-	return k, nil
+		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at`,
+		accountID, hash, nullString(label), scopes)
+	return scanAPIKey(row)
 }
 
 func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) error {
@@ -277,7 +302,7 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), created_at from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err
@@ -285,8 +310,8 @@ func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, 
 	defer rows.Close()
 	var out []APIKey
 	for rows.Next() {
-		k := APIKey{}
-		if err := rows.Scan(&k.ID, &k.AccountID, &k.Hash, &k.Label, &k.CreatedAt); err != nil {
+		k, err := scanAPIKey(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, k)

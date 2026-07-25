@@ -118,7 +118,7 @@ func TestAccountByKeyHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash := []byte("0123456789abcdef")
-	if _, err := m.CreateAPIKey(ctx, acc.ID, hash, "laptop"); err != nil {
+	if _, err := m.CreateAPIKey(ctx, acc.ID, hash, "laptop", []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -143,7 +143,7 @@ func TestCreateAndDeleteAPIKey(t *testing.T) {
 	acc, _ := m.CreateAccount(ctx, "k@example.com", api.PlanHobby)
 
 	hash := []byte("deadbeef")
-	k, err := m.CreateAPIKey(ctx, acc.ID, hash, "ci")
+	k, err := m.CreateAPIKey(ctx, acc.ID, hash, "ci", []string{"admin"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -169,10 +169,10 @@ func TestCreateAPIKeyDuplicateHash(t *testing.T) {
 	a2, _ := m.CreateAccount(ctx, "a2@x.com", api.PlanFree)
 
 	hash := []byte("samehash")
-	if _, err := m.CreateAPIKey(ctx, a1.ID, hash, "first"); err != nil {
+	if _, err := m.CreateAPIKey(ctx, a1.ID, hash, "first", []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.CreateAPIKey(ctx, a2.ID, hash, "second"); err == nil {
+	if _, err := m.CreateAPIKey(ctx, a2.ID, hash, "second", []string{"admin"}); err == nil {
 		t.Fatal("duplicate hash must error")
 	}
 }
@@ -189,7 +189,7 @@ func TestDeleteAPIKeyNotFoundAndCrossAccount(t *testing.T) {
 	}
 
 	// cross-account: key belongs to a1, a2 asks to delete
-	k, _ := m.CreateAPIKey(ctx, a1.ID, []byte("h"), "lbl")
+	k, _ := m.CreateAPIKey(ctx, a1.ID, []byte("h"), "lbl", []string{"admin"})
 	if err := m.DeleteAPIKey(ctx, a2.ID, k.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cross-account delete: want ErrNotFound, got %v", err)
 	}

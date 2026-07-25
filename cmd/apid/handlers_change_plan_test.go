@@ -50,7 +50,7 @@ func setupChangePlan(t *testing.T, plan api.Plan, stripeItem string) (testEnv, *
 		}
 	}
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
 		t.Fatal(err)
 	}
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -202,7 +202,7 @@ func TestChangePlan_NoBillingPortalURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
 		t.Fatal(err)
 	}
 	// Note: WithBillingPortalURL is NOT called — simulates the operator
