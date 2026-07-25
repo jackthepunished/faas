@@ -386,7 +386,9 @@ func (c *Client) CreateCron(ctx context.Context, slug string, req CreateCronRequ
 
 // UpdateCron edits a cron's schedule/path/enabled. Pointer-based
 // fields let the caller distinguish "unset" from "explicit zero" —
-// coverage is `pkg/api/client_test.go:133`'s idempotency-key pin.
+// matches the partial-update shape of Client.UpdateApp. The wire
+// method is PATCH; the idempotency-key auto-mint covers this call
+// (TestDo_MutatingCallsCarryIdempotencyKey in client_test.go).
 func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronRequest) (CronResponse, error) {
 	var out CronResponse
 	return out, c.do(ctx, "PATCH", "/v1/crons/"+id, req, &out)

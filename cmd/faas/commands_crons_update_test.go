@@ -1,7 +1,6 @@
 // Tests for the `faas crons update <id>` subcommand. Mirrors the
 // `commands_deployments_test.go` shape: httptest.NewServer fake + t.Setenv
-// + osStdout swap + (for JSON) writeJSONTestStatus from commands_test.go
-// for path-routed handlers. The dispatch placement lives in main_test.go.
+// + osStdout swap. The dispatch placement lives in main_test.go.
 package main
 
 import (
@@ -385,5 +384,32 @@ func TestCmdCronsUpdate_Disable_PrintsFalse(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "enabled:") || !strings.Contains(stdout.String(), "false") {
 		t.Errorf("expected 'enabled: false' in human output\nfull: %s", stdout.String())
+	}
+}
+
+// TestRenderCronState_PinsColumnLayout pins the multi-line state
+// block against the writer seam (io.Writer). Same shape as
+// TestRenderDeploymentRow_PinsColumnLayout — if the field set on
+// the CronResponse grows (e.g. last_fired_at gains a long token),
+// the column count or widths have to shift and this test surfaces
+// that.
+func TestRenderCronState_PinsColumnLayout(t *testing.T) {
+	var buf bytes.Buffer
+	renderCronState(&buf, api.CronResponse{
+		ID:       cronsUpdateID,
+		AppID:    "a1",
+		Schedule: "*/15 * * * *",
+		Path:     "/webhook",
+		Enabled:  true,
+	})
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	// 3 labels → schedule / path / enabled.
+	if len(lines) != 3 {
+		t.Fatalf("line count = %d, want 3\nraw: %s", len(lines), buf.String())
+	}
+	for _, want := range []string{"schedule:", "*/15 * * * *", "path:", "/webhook", "enabled:", "true"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("rendered output missing %q\nfull: %s", want, buf.String())
+		}
 	}
 }

@@ -544,6 +544,19 @@ func cmdCrons(args []string) int {
 // deploymentIDPattern — same 32-hex convention across the platform.
 var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 
+// renderCronState writes the human multi-line state block for one
+// cron. Routes through io.Writer so tests can capture the body via
+// the osStdout seam (same pattern as renderDeploymentRow in
+// commands_deployments.go). Widths assume short schedule / path /
+// boolean fields; no id-style left-pad because cron ids aren't
+// shown on the update block — the "Updated cron <id>" line above
+// already names the row.
+func renderCronState(w io.Writer, c api.CronResponse) {
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "schedule:", c.Schedule)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "path:", c.Path)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "enabled:", strconv.FormatBool(c.Enabled))
+}
+
 // cmdCronsUpdate implements `faas crons update <id> [--schedule EXPR]
 // [--path PATH] [--enable|--disable]`. Partial-update semantics:
 // every flag is optional, but at least one patch field must be set
@@ -625,9 +638,7 @@ func cmdCronsUpdate(args []string) int {
 		return jsonOut(writeJSON(updated))
 	}
 	PrintOK(osStdout, "Updated cron %s", updated.ID)
-	_, _ = fmt.Fprintf(osStdout, "  %-10s %s\n", "schedule:", updated.Schedule)
-	_, _ = fmt.Fprintf(osStdout, "  %-10s %s\n", "path:", updated.Path)
-	_, _ = fmt.Fprintf(osStdout, "  %-10s %s\n", "enabled:", strconv.FormatBool(updated.Enabled))
+	renderCronState(osStdout, updated)
 	return 0
 }
 
