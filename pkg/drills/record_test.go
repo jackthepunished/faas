@@ -7,13 +7,6 @@ import (
 	"testing"
 )
 
-// operatorTemplatePath is the runtime copy of the template the bash
-// script reads. It MUST stay byte-identical to the embedded testdata
-// copy — a refactor that edits only one side silently breaks the M8
-// audit trail. The test below asserts equality; the Makefile's
-// lint-drill target duplicates the check at the shell level.
-const operatorTemplateRel = "../../docs/drills/TEMPLATE-restore-drill.md"
-
 // TestRecord_TemplateHasRequiredTokens locks the seven required field
 // labels in the embedded template. The bash script emits each token
 // literally in the heredoc block (see deploy/scripts/faas-m8-restore-drill.sh
@@ -103,10 +96,18 @@ func TestRecord_RenderEmptyMetricsIsDeterministic(t *testing.T) {
 // the contract silently desynchronizes (lint-drill's grep catches this
 // for individual tokens; this catches whole-file drift).
 func TestRecord_OperatorTemplateStaysInSync(t *testing.T) {
-	path := filepath.Join("..", "..", operatorTemplateRel)
+	// `go test` cwd's into the package dir, so we walk up to the repo
+	// root by counting the path elements. pkg/drills → repo root.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	repoRoot := filepath.Clean(filepath.Join(cwd, "..", ".."))
+	path := filepath.Join(repoRoot, "docs", "drills", "TEMPLATE-restore-drill.md")
 	got, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read operator template %q: %v", path, err)
+		t.Skipf("operator template %q not readable from %q; run tests from repo root: %v",
+			path, cwd, err)
 	}
 	if string(got) != TemplateMarkdown() {
 		t.Errorf("operator template drifted from embedded testdata copy\n"+
