@@ -147,11 +147,17 @@ func flushFnCounter(counter *int, flushErr error) FlushFn {
 // see Has return true and skip the flush. Mirrors the recordingStripe
 // shape in pkg/meter/pusher_shadow_test.go so the test code reads the
 // same way across the two billing providers.
+//
+// `recordErr` is an optional injected error for RecordPaddleOverageMonth;
+// nil → success path. Tests that exercise the post-POST error-wrap
+// branch set it to a sentinel and assert the wrapped message lands at
+// the caller.
 type recordingDedupe struct {
-	mu   sync.Mutex
-	has  int
-	rec  int
-	rows map[paddleDedupeKey]struct{}
+	mu        sync.Mutex
+	has       int
+	rec       int
+	recordErr error
+	rows      map[paddleDedupeKey]struct{}
 }
 
 type paddleDedupeKey struct {
@@ -176,7 +182,7 @@ func (d *recordingDedupe) RecordPaddleOverageMonth(_ context.Context, accountID 
 	defer d.mu.Unlock()
 	d.rec++
 	d.rows[paddleDedupeKey{accountID: accountID, month: month.UTC()}] = struct{}{}
-	return nil
+	return d.recordErr
 }
 
 func (d *recordingDedupe) Has() int { d.mu.Lock(); defer d.mu.Unlock(); return d.has }
@@ -478,5 +484,60 @@ func TestAccumulateOverage_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 	}
 	if got := dedupe.Rec(); got != 1 {
 		t.Errorf("dedupe.Rec after pB = %d, want 1 (no second stamp)", got)
+	}
+}
+
+// TestAccumulateOverage_RecordErrorPropagates pins the post-POST
+// error-wrap path: the SDK POST commits, but RecordPaddleOverageMonth
+// fails. The flush must surface the wrapped error so meterd can
+// decide whether to retry, escalate, or skip — same contract the
+// existing TestAccumulateOverage_FlushErrorPropagates pins for the
+// SDK POST itself.
+//
+// This is the residual TOCTOU risk the flushOverageLocked docstring
+// calls out: Paddle has no external Idempotency-Key header, so a
+// failed Record means the next push re-POSTs. Surfacing the error
+// keeps the failure mode observable instead of silent.
+func TestAccumulateOverage_RecordErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe()
+	stubErr := errors.New("paddle: simulated dedupe record failure")
+	dedupe.recordErr = stubErr
+	var calls int
+	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&calls, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+
+	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	feb1 := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	if err := p.accumulateOverage(context.Background(), acct, jan15, 100); err != nil {
+		t.Fatalf("Jan push should succeed (no rollover yet): %v", err)
+	}
+	// Rollover triggers the flush; SDK POST succeeds (flushFnCounter
+	// returns nil), then Record fails — the wrapped error must
+	// surface to the caller.
+	err := p.accumulateOverage(context.Background(), acct, feb1, 200)
+	if err == nil {
+		t.Fatal("Feb push should surface the dedupe record failure")
+	}
+	if !strings.Contains(err.Error(), "simulated dedupe record failure") {
+		t.Errorf("err = %v, want it to wrap the stub error", err)
+	}
+	if !strings.Contains(err.Error(), "paddle: dedupe record month=") {
+		t.Errorf("err = %v, want it to carry the dedupe record wrap prefix", err)
+	}
+
+	// Sanity: the SDK POST actually fired (Record only runs after a
+	// successful flush), so the cross-process gate would have
+	// observed the row on a retry — this is the leak the residual
+	// risk calls out.
+	if calls != 1 {
+		t.Errorf("flush calls = %d, want 1 (SDK POST must commit before Record)", calls)
+	}
+	if got := dedupe.Rec(); got != 1 {
+		t.Errorf("dedupe.Rec = %d, want 1 (Record was attempted)", got)
 	}
 }

@@ -122,8 +122,11 @@ func (p *Provider) flushOverageLocked(ctx context.Context, acc *overageAccumulat
 	if acc.flushed {
 		return nil
 	}
+	// Normalise once so the Has + Record branches share the value.
+	// Cheap (one time.Date call) but keeps the call sites uniform.
+	var monthStart time.Time
 	if p.dedupe != nil {
-		monthStart := calendarMonthStart(acc.month.UTC())
+		monthStart = calendarMonthStart(acc.month.UTC())
 		already, err := p.dedupe.HasPaddleOverageMonth(ctx, acc.acct.ID, monthStart)
 		if err != nil {
 			return fmt.Errorf("paddle: dedupe has month=%s acct=%s: %w",
@@ -146,7 +149,6 @@ func (p *Provider) flushOverageLocked(ctx context.Context, acc *overageAccumulat
 		return err
 	}
 	if p.dedupe != nil {
-		monthStart := calendarMonthStart(acc.month.UTC())
 		if err := p.dedupe.RecordPaddleOverageMonth(ctx, acc.acct.ID, monthStart); err != nil {
 			return fmt.Errorf("paddle: dedupe record month=%s acct=%s: %w",
 				monthStart.Format("2006-01"), acc.acct.ID, err)
