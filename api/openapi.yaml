@@ -48,6 +48,12 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: invocations
+    description: Sync / async function invocations (event-driven surface, Move 2).
+  - name: queues
+    description: Per-app FIFO queues (send / receive / ack).
+  - name: delayed_tasks
+    description: Scheduled future invocations (cron-style, one-shot).
   - name: keys
     description: API key management.
   - name: secrets
@@ -912,8 +918,16 @@ paths:
         Paginated by `?before=<id>` (the LAST id of the returned slice).
         Defaults to 20 per page; capped at 200.
       parameters:
-        - { name: before, in: query, required: false, schema: { type: string } }
-        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 20 } }
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor — return rows whose id is strictly less than this. Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: "Page size; 1-200, default 20."
       responses:
         '200':
           description: The page.
