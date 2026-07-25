@@ -75,7 +75,7 @@ func TestInvoiceShadow24h_Sandbox(t *testing.T) {
 	acctID := fmt.Sprintf("acct_sandbox24h_%s_%d", startUTC.Format("20060102"), time.Now().UTC().UnixNano())
 	acct := state.Account{
 		ID:                     acctID,
-		ProviderCustomerID:       "cus_sandbox",
+		ProviderCustomerID:     "cus_sandbox",
 		StripeSubscriptionItem: sub,
 	}
 

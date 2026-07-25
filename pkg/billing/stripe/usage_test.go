@@ -96,7 +96,7 @@ func TestPushUsageRecord_PostsToStripeSandbox(t *testing.T) {
 	hour := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
 	record, err := c.PushUsageRecordWithID(context.Background(), state.Account{
 		ID:                     "acct_sandbox_" + hour.Format("2006010215"),
-		ProviderCustomerID:       "cus_sandbox",
+		ProviderCustomerID:     "cus_sandbox",
 		StripeSubscriptionItem: sub,
 	}, hour, 0.001) // 1 MB-h keeps the sandbox bill line tiny (legacy float path)
 	if err != nil {

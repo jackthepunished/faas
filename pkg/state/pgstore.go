@@ -2547,16 +2547,19 @@ func (s *PgStore) RecordStripePushHour(ctx context.Context, accountID string, ho
 	return err
 }
 
-// HasPaddleOverageMonth is the dedupe gate the meterd daily pusher
-// reads before issuing the Paddle CreateTransaction POST. Backed by
-// a unique index on (account_id, month) in the paddle_overage_dedupe
-// table (added in migration 00034). `month` is a calendar-month
-// start — the caller (pkg/billing/paddle/usage.go calendarMonthStart)
-// is responsible for normalising to the 1st of the month at 00:00 UTC.
+// HasPaddleOverageMonth is the legacy month-scoped dedupe gate kept on
+// the state.Store interface for back-compat with PR #179 callers.
+// Migration 00039 replaced the month-keyed PK with a per-window PK
+// `(account_id, window_start)`; the legacy pair therefore now keys on
+// `window_start` and accepts any hour-aligned timestamp (the
+// calendar-month start at 00:00 UTC is itself a valid window). New
+// callers (post-#204 meterd pusher) must use ClaimPaddleOverageWindow
+// + CompletePaddleOverageWindow — those carry the pending/completed
+// claim state machine this legacy pair does not.
 func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
-		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and month = $2)`,
+		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and window_start = $2)`,
 		accountID, month.UTC()).Scan(&exists)
 	if err != nil {
 		return false, err
@@ -2564,13 +2567,14 @@ func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, m
 	return exists, nil
 }
 
-// RecordPaddleOverageMonth inserts the dedupe row. ON CONFLICT DO
-// NOTHING so a redelivered (account, month) is idempotent — same shape
-// as RecordStripePushHour one method above.
+// RecordPaddleOverageMonth inserts a 'completed' dedupe row on the
+// new window-keyed PK. Same ON CONFLICT DO NOTHING idempotency as
+// RecordStripePushHour — preserved for callers that still pass the
+// calendar-month start (which is itself a valid windowStart).
 func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error {
 	_, err := s.pool.Exec(ctx,
-		`insert into paddle_overage_dedupe (account_id, month) values ($1, $2)
-		 on conflict (account_id, month) do nothing`,
+		`insert into paddle_overage_dedupe (account_id, window_start, state) values ($1, $2, 'completed')
+		 on conflict (account_id, window_start) do nothing`,
 		accountID, month.UTC())
 	return err
 }
