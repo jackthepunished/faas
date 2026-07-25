@@ -307,8 +307,14 @@ jobs:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
     # Decoupled from `test` so a coverage upload doesn't lengthen the
     # developer-feedback loop. Always runs on push-to-main + PR (no
-    # `if:` filter) but `continue-on-error` on the upload step — the gate
-    # project >= 70% is enforced at Codecov via codecov.yml status checks.
+    # `if:` filter).
+    #
+    # codecov.yml declares a project >= 70% status. Codecov POSTS that
+    # status; it does not BLOCK a merge. Blocking needs `codecov/project`
+    # added to the required-status-checks rule on main — the ruleset
+    # there currently carries only `deletion` and `non_fast_forward`, so
+    # no check of any kind is required to merge today. Don't read a green
+    # tick here as "coverage held".
     name: coverage (Codecov)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -332,10 +338,18 @@ jobs:
         with:
           files: coverage/cover.out
           flags: unittests
-          # Tokenless public repo upload is supported; the token in
-          # secrets.CODECOV_TOKEN lifts the rate limit / adds PR comments.
+          # secrets.CODECOV_TOKEN is REQUIRED, not an optimisation.
+          # Codecov rejects tokenless uploads on a repo with protected
+          # branches ("Token required because branch is protected"), and
+          # this repo has an active ruleset on main. Without the secret
+          # every upload is refused.
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          # true, so a refused upload fails the job instead of passing
+          # silently. This was `false`, which is why the uploads above
+          # were rejected on every run from the workflow's introduction
+          # until 2026-07-25 while the job stayed green and Codecov
+          # reported `activated: false` with no coverage data at all.
+          fail_ci_if_error: true
 
   load:
     # M4 acceptance gate (spec §14 row 2): "1,000 rps to hot app adds < 2 ms p50".

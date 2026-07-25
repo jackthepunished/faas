@@ -1,4 +1,4 @@
-# ADR-036 — reactive scale-up trigger (issue #169 / #172)
+# ADR-037 — reactive scale-up trigger (issue #169 / #172)
 
 Status: Accepted, 2026-07-25. Owner: @poyrazK. Closes: #169, #172.
 Related: #170 (PR #205, in flight, CPU signal source), #171 (preferential

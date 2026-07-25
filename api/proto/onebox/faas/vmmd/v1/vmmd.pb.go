@@ -1023,6 +1023,24 @@ type InstanceStats struct {
 	LeaseUid      int32                  `protobuf:"varint,2,opt,name=lease_uid,json=leaseUid,proto3" json:"lease_uid,omitempty"`
 	HostIp        string                 `protobuf:"bytes,3,opt,name=host_ip,json=hostIp,proto3" json:"host_ip,omitempty"`
 	ResidentBytes *wrapperspb.Int64Value `protobuf:"bytes,4,opt,name=resident_bytes,json=residentBytes,proto3" json:"resident_bytes,omitempty"`
+	// Issue #170 (PR-A, observability slice): host cgroup CPU percent
+	// (cpu.stat usage_usec delta over wall clock, * 100). Wrapper so
+	// "absent" means "first sample, non-Linux, or transient cgroup
+	// miss" — distinct from a real 0% reading. The schedd poller
+	// treats absent as Unknown and excludes it from the
+	// {app,node}-rolled-up Prometheus series until two valid samples
+	// are observed. Field is additive per ADR-016 (frozen wire shape)
+	// — see docs/adr/032-instance-metrics-cardinality-rollups.md.
+	CpuPct *wrapperspb.DoubleValue `protobuf:"bytes,5,opt,name=cpu_pct,json=cpuPct,proto3" json:"cpu_pct,omitempty"`
+	// Inflight HTTP forward count from vmmd's ActivityTracker. Zero
+	// is a real value ("no requests in flight right now") and is
+	// distinct from the empty wire state only by reader-side
+	// Validity, not the proto. Populated by PR-B.
+	InflightRequests int64 `protobuf:"varint,6,opt,name=inflight_requests,json=inflightRequests,proto3" json:"inflight_requests,omitempty"`
+	// Latest ForwardHTTP start time. Zero (1970-01-01) means "no
+	// request observed yet on this instance" — the poller falls back
+	// to state.Instance.LastRequestAt in that case.
+	LastRequestAt *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=last_request_at,json=lastRequestAt,proto3" json:"last_request_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1081,6 +1099,27 @@ func (x *InstanceStats) GetHostIp() string {
 func (x *InstanceStats) GetResidentBytes() *wrapperspb.Int64Value {
 	if x != nil {
 		return x.ResidentBytes
+	}
+	return nil
+}
+
+func (x *InstanceStats) GetCpuPct() *wrapperspb.DoubleValue {
+	if x != nil {
+		return x.CpuPct
+	}
+	return nil
+}
+
+func (x *InstanceStats) GetInflightRequests() int64 {
+	if x != nil {
+		return x.InflightRequests
+	}
+	return 0
+}
+
+func (x *InstanceStats) GetLastRequestAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastRequestAt
 	}
 	return nil
 }
@@ -1652,12 +1691,15 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"live_count\x18\x01 \x01(\x05R\tliveCount\x12!\n" +
 	"\fleased_count\x18\x02 \x01(\x05R\vleasedCount\x12M\n" +
 	"\x14total_resident_bytes\x18\x03 \x01(\v2\x1b.google.protobuf.Int64ValueR\x12totalResidentBytes\x12@\n" +
-	"\tinstances\x18\x04 \x03(\v2\".onebox.faas.vmmd.v1.InstanceStatsR\tinstances\"\xa5\x01\n" +
+	"\tinstances\x18\x04 \x03(\v2\".onebox.faas.vmmd.v1.InstanceStatsR\tinstances\"\xcd\x02\n" +
 	"\rInstanceStats\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12\x1b\n" +
 	"\tlease_uid\x18\x02 \x01(\x05R\bleaseUid\x12\x17\n" +
 	"\ahost_ip\x18\x03 \x01(\tR\x06hostIp\x12B\n" +
-	"\x0eresident_bytes\x18\x04 \x01(\v2\x1b.google.protobuf.Int64ValueR\rresidentBytes\"\r\n" +
+	"\x0eresident_bytes\x18\x04 \x01(\v2\x1b.google.protobuf.Int64ValueR\rresidentBytes\x125\n" +
+	"\acpu_pct\x18\x05 \x01(\v2\x1c.google.protobuf.DoubleValueR\x06cpuPct\x12+\n" +
+	"\x11inflight_requests\x18\x06 \x01(\x03R\x10inflightRequests\x12B\n" +
+	"\x0flast_request_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\rlastRequestAt\"\r\n" +
 	"\vPingRequest\"j\n" +
 	"\fPingResponse\x12\x1d\n" +
 	"\n" +
@@ -1740,7 +1782,8 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_goTypes = []any{
 	(*UpdateEgressAllowlistAck)(nil),     // 23: onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
 	(*structpb.Struct)(nil),              // 24: google.protobuf.Struct
 	(*wrapperspb.Int64Value)(nil),        // 25: google.protobuf.Int64Value
-	(*timestamppb.Timestamp)(nil),        // 26: google.protobuf.Timestamp
+	(*wrapperspb.DoubleValue)(nil),       // 26: google.protobuf.DoubleValue
+	(*timestamppb.Timestamp)(nil),        // 27: google.protobuf.Timestamp
 }
 var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	2,  // 0: onebox.faas.vmmd.v1.AppSpec.sealed_env:type_name -> onebox.faas.vmmd.v1.SealedSecret
@@ -1754,32 +1797,34 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	25, // 8: onebox.faas.vmmd.v1.StatsResponse.total_resident_bytes:type_name -> google.protobuf.Int64Value
 	14, // 9: onebox.faas.vmmd.v1.StatsResponse.instances:type_name -> onebox.faas.vmmd.v1.InstanceStats
 	25, // 10: onebox.faas.vmmd.v1.InstanceStats.resident_bytes:type_name -> google.protobuf.Int64Value
-	26, // 11: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
-	18, // 12: onebox.faas.vmmd.v1.ForwardHTTPRequest.headers:type_name -> onebox.faas.vmmd.v1.Header
-	18, // 13: onebox.faas.vmmd.v1.ForwardHTTPResponse.headers:type_name -> onebox.faas.vmmd.v1.Header
-	5,  // 14: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
-	6,  // 15: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
-	8,  // 16: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
-	10, // 17: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
-	12, // 18: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
-	15, // 19: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
-	17, // 20: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:input_type -> onebox.faas.vmmd.v1.ForwardHTTPRequest
-	20, // 21: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
-	22, // 22: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
-	4,  // 23: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	4,  // 24: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	9,  // 25: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
-	11, // 26: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
-	13, // 27: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
-	16, // 28: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
-	19, // 29: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:output_type -> onebox.faas.vmmd.v1.ForwardHTTPResponse
-	21, // 30: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
-	23, // 31: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	23, // [23:32] is the sub-list for method output_type
-	14, // [14:23] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	26, // 11: onebox.faas.vmmd.v1.InstanceStats.cpu_pct:type_name -> google.protobuf.DoubleValue
+	27, // 12: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
+	27, // 13: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
+	18, // 14: onebox.faas.vmmd.v1.ForwardHTTPRequest.headers:type_name -> onebox.faas.vmmd.v1.Header
+	18, // 15: onebox.faas.vmmd.v1.ForwardHTTPResponse.headers:type_name -> onebox.faas.vmmd.v1.Header
+	5,  // 16: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
+	6,  // 17: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
+	8,  // 18: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
+	10, // 19: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
+	12, // 20: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
+	15, // 21: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
+	17, // 22: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:input_type -> onebox.faas.vmmd.v1.ForwardHTTPRequest
+	20, // 23: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
+	22, // 24: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
+	4,  // 25: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	4,  // 26: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	9,  // 27: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
+	11, // 28: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
+	13, // 29: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
+	16, // 30: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
+	19, // 31: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:output_type -> onebox.faas.vmmd.v1.ForwardHTTPResponse
+	21, // 32: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
+	23, // 33: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
+	25, // [25:34] is the sub-list for method output_type
+	16, // [16:25] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_onebox_faas_vmmd_v1_vmmd_proto_init() }

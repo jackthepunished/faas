@@ -52,6 +52,12 @@ func (f *fakeWakeVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }
 
+// Stats implements RoutedVMM (issue #170 / PR-A). Cron tests do
+// not assert on Stats; return empty snapshot.
+func (f *fakeWakeVMM) Stats(_ context.Context, _ string) (*StatsSnapshot, error) {
+	return &StatsSnapshot{}, nil
+}
+
 // UpdateEgressAllowlist (tier-2 PR-B) — the cron loop tests
 // never drive the egress drift path. Records nothing; the
 // egress_drift subscriber's own tests wire a recording fake.

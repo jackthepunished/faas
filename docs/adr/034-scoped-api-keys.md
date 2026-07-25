@@ -5,8 +5,10 @@
 - **Evolution:** 034 (accepted 2026-07-25, coarse admin|read|write)
   → rev2 (2026-07-25, fine-grained vocabulary, IAM-1 closes issue #185).
   The ADR was revised in place because the prefix was already the
-  canonical reference inside apid. ADR-036 is reserved for unrelated
-  future work.
+  canonical reference inside apid. (Subsequent renumbering: ADR-036
+  is the per-instance metrics cardinality rollups ADR — PR #205,
+  issue #170 / PR-A. ADR-037 is the reactive scale-up trigger ADR
+  — issue #169 / #172.)
 
 ## Decision (rev2)
 

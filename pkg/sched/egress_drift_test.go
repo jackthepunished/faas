@@ -109,6 +109,14 @@ func (r *recordingRouterVMM) Ping(_ context.Context, _ string) (*PingOutcome, er
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }
 
+// Stats implements RoutedVMM (issue #170 / PR-A, observability
+// slice). Egress-drift tests do not assert on Stats contents; the
+// instancestats package's own tests cover the wire. Returns the
+// empty snapshot so the VMM / RoutedVMM contract stays satisfied.
+func (r *recordingRouterVMM) Stats(_ context.Context, _ string) (*StatsSnapshot, error) {
+	return &StatsSnapshot{}, nil
+}
+
 // seedEgressApp populates the store with one account + one app +
 // one deployment + a caller-supplied list of live instances, each
 // pinned to a nodeID. Returns the account, app, and the

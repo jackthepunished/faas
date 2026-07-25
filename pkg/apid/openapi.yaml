@@ -1840,12 +1840,12 @@ components:
         # gated: autoscale_target_rps is Hobby/Pro/Scale;
         # autoscale_target_cpu_pct is Pro/Scale only.
         autoscale_target_rps:
-          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-036."
+          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."
           type: integer
           minimum: 0
           example: 50
         autoscale_target_cpu_pct:
-          description: "Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-036."
+          description: "Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."
           type: integer
           minimum: 0
           maximum: 100
@@ -1895,7 +1895,7 @@ components:
         # → no change; 0 → explicit disable. Plan gates run
         # first (403 plan_autoscale_not_allowed) so a Free
         # PATCHing a 50-rps value surfaces the gate, not the
-        # bounds. See ADR-036.
+        # bounds. See ADR-037.
         autoscale_target_rps:
           description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are 422 invalid_autoscale_target_rps."
           type: [integer, "null"]

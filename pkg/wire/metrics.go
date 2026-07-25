@@ -14,6 +14,7 @@
 package wire
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,6 +26,31 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// InstanceStatRow is the minimal per-instance rollup signal the
+// instancestats poller (issue #170 / PR-A) feeds into the
+// per-{app,node} Prometheus gauges. Defined here so pkg/wire does
+// not import pkg/sched/instancestats and the schedd-side package
+// stays free to evolve its richer InstanceStat (validity, freshness,
+// sampling metadata) without disturbing the wire-emission contract.
+//
+// The values are:
+//   - AppID / NodeID: the (app, node) label tuple.
+//   - CPUPct: host cgroup CPU percent. math.NaN() means "absent
+//     this tick" — the wire does not emit a sample for that row.
+//   - RSSMB: cgroup memory.current, in MiB. math.NaN() means "absent".
+//   - InflightRequests: outstanding ForwardHTTP count. Always 0 or
+//     positive; zero is a real value and is emitted.
+//
+// The NaN-for-absent convention lets the wire side collapse rows
+// the poller marked Unknown without a separate Validity field.
+type InstanceStatRow struct {
+	AppID            string
+	NodeID           string
+	CPUPct           float64
+	RSSMB            float64
+	InflightRequests int64
+}
 
 // OpsMetrics is the (per-daemon) bundle emitted at /metrics. Construct via
 // NewOpsMetrics and pass the result into every handler that wants to record
@@ -104,6 +130,31 @@ type OpsMetrics struct {
 	// (60 s); the 5 s control-plane bucket is wrong for the multi-second
 	// blob downloads.
 	imagedOCIPull *prometheus.HistogramVec
+	// issue #170 / PR-A: per-{app,node} instance-stats gauges. The
+	// (app, node) label tuple is unbounded because it grows with the
+	// customer count, so it cannot be pre-instantiated at boot.
+	// Instead, ReplaceInstanceStats calls Reset() on each Tick and
+	// re-emits the present (app, node) pairs. Three signals:
+	//   - instanceCPUPct: max over live siblings (peaks are what
+	//     scaling cares about).
+	//   - instanceRSSMB: sum over live siblings (capacity rollup).
+	//   - instanceInflightReqs: sum over live siblings (load rollup).
+	// Per-instance cardinality is NOT used — issue #168 allows N
+	// siblings of one app on one node, and per-instance rollups
+	// would nondeterministically overwrite siblings on .Set. The
+	// per-instance values live in pkg/sched/instancestats.Reader;
+	// the wire only carries the {app,node} rollup.
+	instanceCPUPct       *prometheus.GaugeVec
+	instanceRSSMB        *prometheus.GaugeVec
+	instanceInflightReqs *prometheus.GaugeVec
+	// instanceStatsCollectDur: per-Tick wall-clock duration of the
+	// instancestats poller. Sized to the 200 ms poller interval.
+	instanceStatsCollectDur prometheus.Histogram
+	// instanceStatsPartialErrors: per-node dial/decode failures.
+	// Distinct from the per-op ops_total because the poller
+	// intentionally prefers partial snapshots to aborting on a
+	// single bad node.
+	instanceStatsPartialErrors *prometheus.CounterVec
 	// scaleUpDecisions: per-app scale-up trigger decisions (issue #169 /
 	// #172). Counter labelled by app_id and outcome ∈ {admit,
 	// reject_at_cap, no_signal}. App cardinality is bounded
@@ -240,6 +291,31 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// multi-second for big layers; 60 s ceiling = OCIPullTimeoutSeconds.
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"op", "result"})
+	// issue #170 / PR-A: per-{app,node} instance-stats gauges. Sized
+	// for the poller’s 200 ms cadence — the per-tick histogram tops
+	// out at the 200 ms interval so a regression that doubles the
+	// interval surfaces immediately.
+	instanceCPUPct := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_instance_cpu_pct",
+		Help: "Host cgroup CPU percent, per (app, node) — max over live siblings of that app on that node (issue #170 / PR-A). Peaks are what scaling cares about.",
+	}, []string{"app", "node"})
+	instanceRSSMB := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_instance_rss_mb",
+		Help: "Cgroup memory.current in MiB, per (app, node) — sum over live siblings (issue #170 / PR-A). Capacity rollup.",
+	}, []string{"app", "node"})
+	instanceInflightReqs := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_instance_inflight_requests",
+		Help: "Outbound ForwardHTTP count in flight, per (app, node) — sum over live siblings (issue #170 / PR-A). Load rollup.",
+	}, []string{"app", "node"})
+	instanceStatsCollectDur := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_instance_stats_collect_seconds",
+		Help:    "Per-Tick wall-clock duration of the instancestats poller (issue #170 / PR-A). Buckets sized to the 200 ms polling interval.",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0},
+	})
+	instanceStatsPartialErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_instance_stats_partial_errors_total",
+		Help: "Per-node dial/decode failures during an instancestats poller Tick (issue #170 / PR-A). The poller logs and continues on partial failures; a non-zero rate points at a sick node.",
+	}, []string{"node"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
 	// label set is closed ({admit, reject_at_cap, no_signal});
 	// pre-instantiated below so the rows surface in /metrics from
@@ -282,9 +358,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
 	} else {
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
 	}
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -369,24 +445,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
 	return &OpsMetrics{
-		registry:              reg,
-		ops:                   ops,
-		dur:                   dur,
-		watchdogKills:         watchdogKills,
-		eventsWriteFail:       eventsWriteFail,
-		auditWriteFail:        auditWriteFail,
-		stripePushDur:         stripePushDur,
-		paddlePushDur:         paddlePushDur,
-		buildDur:              buildDur,
-		buildQueueWait:        buildQueueWait,
-		residentGBPerCustomer: residentGBPerCustomer,
-		wakeIDV4Fallback:      wakeIDV4Fallback,
-		imagedOCIPull:         imagedOCIPull,
-		scaleUpDecisions:      scaleUpDecisions,
-		scaleUpAdmitRPS:       scaleUpAdmitRPS,
-		sseClients:            sseClients,
-		egressDeny:            egressDeny,
-		ociEgressDeny:         ociEgressDeny,
+		registry:                   reg,
+		ops:                        ops,
+		dur:                        dur,
+		watchdogKills:              watchdogKills,
+		eventsWriteFail:            eventsWriteFail,
+		auditWriteFail:             auditWriteFail,
+		stripePushDur:              stripePushDur,
+		paddlePushDur:              paddlePushDur,
+		buildDur:                   buildDur,
+		buildQueueWait:             buildQueueWait,
+		residentGBPerCustomer:      residentGBPerCustomer,
+		wakeIDV4Fallback:           wakeIDV4Fallback,
+		imagedOCIPull:              imagedOCIPull,
+		instanceCPUPct:             instanceCPUPct,
+		instanceRSSMB:              instanceRSSMB,
+		instanceInflightReqs:       instanceInflightReqs,
+		instanceStatsCollectDur:    instanceStatsCollectDur,
+		instanceStatsPartialErrors: instanceStatsPartialErrors,
+		scaleUpDecisions:           scaleUpDecisions,
+		scaleUpAdmitRPS:            scaleUpAdmitRPS,
+		sseClients:                 sseClients,
+		egressDeny:                 egressDeny,
+		ociEgressDeny:              ociEgressDeny,
 	}
 }
 
@@ -620,6 +701,124 @@ func (m *OpsMetrics) SetResidentGBPerCustomer(plan string, gb float64) {
 		return
 	}
 	m.residentGBPerCustomer.WithLabelValues(plan).Set(gb)
+}
+
+// ReplaceInstanceStats rewrites the per-{app,node} instance-stats
+// gauges from the latest poller snapshot (issue #170 / PR-A).
+//
+// Rollup semantics across live siblings of one (app, node):
+//
+//   - CPUPct: max — peaks are what scaling cares about. NaN values
+//     are excluded (the poller marks a row Unknown when the first
+//     sample is missing or the cgroup is unreadable).
+//   - RSSMB: sum — capacity rollup. NaN values are excluded.
+//   - InflightRequests: sum — load rollup. Always 0 or positive;
+//     zero is a real value.
+//
+// After each call the three gauge label sets are exactly the
+// (app, node) pairs present in rows. The GaugeVec.Reset() call
+// drops any prior label tuples that no longer have a live
+// instance, so a destroyed app stops surfacing in the next
+// scrape (no zombie samples). The trade-off is that we lose
+// any "app X is now idle" history — the gauge was designed to
+// be the live view, the audit log is the durable view.
+//
+// dur is recorded in the per-Tick histogram. The caller passes
+// the wall-clock duration of the Tick so the poller doesn't
+// have to know about wire plumbing.
+//
+// Safe on a nil receiver so schedd unit tests without metrics
+// keep working.
+func (m *OpsMetrics) ReplaceInstanceStats(rows []InstanceStatRow, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	m.instanceStatsCollectDur.Observe(dur.Seconds())
+	if len(rows) == 0 {
+		m.instanceCPUPct.Reset()
+		m.instanceRSSMB.Reset()
+		m.instanceInflightReqs.Reset()
+		return
+	}
+	// Roll into per-(app,node) buckets. The map key is the
+	// (app, node) tuple — same string form used as the Prom label.
+	type acc struct {
+		maxCPU  float64
+		hasCPU  bool
+		sumRSS  float64
+		sumInfl int64
+	}
+	rolled := make(map[string]*acc, len(rows))
+	for _, r := range rows {
+		key := r.AppID + "\x00" + r.NodeID
+		a, ok := rolled[key]
+		if !ok {
+			a = &acc{}
+			rolled[key] = a
+		}
+		// CPUPct: max over rows that have a real reading.
+		if !math.IsNaN(r.CPUPct) {
+			if !a.hasCPU || r.CPUPct > a.maxCPU {
+				a.maxCPU = r.CPUPct
+				a.hasCPU = true
+			}
+		}
+		// RSSMB: sum over rows that have a real reading.
+		if !math.IsNaN(r.RSSMB) {
+			a.sumRSS += r.RSSMB
+		}
+		// InflightRequests: sum always (zero is a real value).
+		a.sumInfl += r.InflightRequests
+	}
+	// Reset all three GaugeVecs so disappeared (app, node) pairs
+	// don't linger. The (app, node) label pair is bounded by the
+	// app+node cardinality, which is fine for a one-box or small
+	// cluster; the customer count is the load-bearing bound.
+	m.instanceCPUPct.Reset()
+	m.instanceRSSMB.Reset()
+	m.instanceInflightReqs.Reset()
+	for key, a := range rolled {
+		app, node := splitKey(key)
+		if a.hasCPU {
+			m.instanceCPUPct.WithLabelValues(app, node).Set(a.maxCPU)
+		}
+		m.instanceRSSMB.WithLabelValues(app, node).Set(a.sumRSS)
+		m.instanceInflightReqs.WithLabelValues(app, node).Set(float64(a.sumInfl))
+	}
+}
+
+// InstanceStatsPartialError increments the per-node
+// instance_stats_partial_errors counter. Called by the poller
+// when a single node's dial or decode fails but the rest of the
+// sweep still completes. Distinct from the per-op ops_total
+// because the poller intentionally logs + continues on partial
+// failures rather than aborting the whole Tick.
+func (m *OpsMetrics) InstanceStatsPartialError(node string) {
+	if m == nil {
+		return
+	}
+	m.instanceStatsPartialErrors.WithLabelValues(node).Inc()
+}
+
+// InstanceStatsCollectSeconds is the per-Tick duration observer the
+// poller uses to record its own wall-clock time. The returned
+// Observer is safe to cache; the underlying Histogram is shared
+// across all callers.
+func (m *OpsMetrics) InstanceStatsCollectSeconds() prometheus.Observer {
+	return m.instanceStatsCollectDur
+}
+
+// splitKey reverses the (app, node) key-join used by
+// ReplaceInstanceStats. The separator is the NUL byte (never
+// valid in an app_id or node_id — both are UUIDs / [a-z0-9-]+)
+// so a malicious payload can't smuggle an extra delimiter.
+func splitKey(key string) (string, string) {
+	for i := 0; i < len(key); i++ {
+		if key[i] == 0 {
+			return key[:i], key[i+1:]
+		}
+	}
+	return key, ""
 }
 
 // ObserveScaleUp records one scale-up trigger decision (issue #169 /
