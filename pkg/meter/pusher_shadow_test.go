@@ -10,6 +10,8 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
+	paddleclassifier "github.com/onebox-faas/faas/pkg/billing/paddle"
+	stripeclassifier "github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -103,6 +105,25 @@ func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account,
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, recordedCall{AccountID: acct.ID, Hour: hour, MBSeconds: mbSeconds})
 	return r.err
+}
+
+// ClassifyPushError opts recordingStripe into the meterd pusher's
+// billing.Classifier dispatch (added with the big-Paddle-enablement
+// PR). The meterd pusher's classifier seam feeds synthetic errors
+// through the same code path as a real *stripe.Client, so tests can
+// pin the classifier→wire counter behavior end-to-end. Mirrors the
+// Stripe classifier at pkg/billing/stripe/usage_test.go:131 — the
+// label set is the same closed set ClassifyPushError uses
+// production.
+//
+// nil → "ok" mirrors stripe.ClassifyPushError; the meterd pusher
+// already short-circuits on nil before reaching this method, but the
+// guard stays here for defensive callers.
+func (r *recordingStripe) ClassifyPushError(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return stripeclassifier.ClassifyPushError(err)
 }
 
 func (r *recordingStripe) Calls() []recordedCall {
@@ -431,5 +452,131 @@ func TestPushHour_RecordsStripeError(t *testing.T) {
 	body := scrapeOpsTotal(t, ops)
 	if got := body[`stripe|card-error`]; got != 1 {
 		t.Errorf("ops_total{op=stripe,code=card-error} = %d, want 1 (classifier seam must feed the wire counter)", got)
+	}
+}
+
+// --- Paddle dispatch seam regression (PR #204 review Fix #5) ---
+
+// scrapePushDuration pulls a per-provider histogram family out of
+// the test registry as a map keyed by `result`. The pusher observes
+// into PaddlePushDuration / StripePushDuration histograms; the
+// histogram label is `result` (not `code` — see
+// pkg/wire/metrics.go:152). This is the assertion target for the
+// dispatch tests — confirms the type-switch routed the call to the
+// correct histogram (not the other-provider fallback).
+func scrapePushDuration(t *testing.T, m *wire.OpsMetrics, suffix string) map[string]int {
+	t.Helper()
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("registry gather: %v", err)
+	}
+	out := map[string]int{}
+	for _, fam := range families {
+		if !strings.HasSuffix(fam.GetName(), suffix) {
+			continue
+		}
+		for _, mv := range fam.GetMetric() {
+			var code string
+			for _, l := range mv.GetLabel() {
+				if l.GetName() == "result" {
+					code = l.GetValue()
+				}
+			}
+			out[code] = int(mv.GetHistogram().GetSampleCount())
+		}
+	}
+	return out
+}
+
+// TestPushHour_PaddleDispatchHitsPaddleHistogram pins the
+// Paddle-side dispatch seam end-to-end. A real *paddle.Provider
+// is constructed via the package's NewProviderForTest seam (a
+// nil-client *Provider that satisfies billing.Provider +
+// billing.Classifier) so the pusher's providerOpsFor type-switch
+// MUST route it onto:
+//
+//   - opLabel="paddle" (not "stripe") — asserted via the
+//     meterd_ops_total counter family.
+//   - the _paddle_push_duration_seconds histogram (not the
+//     stripe one) — asserted via the histogram family.
+//
+// providerOpsFor dispatches on concrete type, so a test fake
+// satisfying only the Provider interface would land on the Stripe
+// fallback. The real *paddle.Provider exercises the correct arm.
+//
+// This is the load-bearing regression net for Fix #5: pre-fix,
+// the type-switch + the classifier lookup were two separate
+// seams (pusherDispatch + classifyProviderError) that could drift
+// — a Provider whose classifier was implemented but whose
+// concrete type was not in pusherDispatch's switch would have
+// landed on the Stripe histogram with the provider's own
+// classifier label. After Fix #5 the dispatch is a single
+// type-switch so the two cannot drift.
+func TestPushHour_PaddleDispatchHitsPaddleHistogram(t *testing.T) {
+	t.Parallel()
+	s := state.NewMemStore()
+	ctx := context.Background()
+
+	t0 := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	now := t0
+	clock := func() time.Time { return now }
+
+	acct := makeAccount(t, ctx, s, api.PlanHobby)
+	app := newApp(t, ctx, s, acct.ID)
+	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
+
+	sampler := meter.NewSampler(s, clock)
+	for i := 0; i < 60; i++ {
+		if _, err := sampler.SampleAndRoll(ctx); err != nil {
+			t.Fatalf("sample %d: %v", i, err)
+		}
+		now = now.Add(time.Minute)
+	}
+
+	// Real *paddle.Provider via the test seam. The push path's pre-SDK
+	// guards (ErrNoAPIKey on nil client, ErrNegativeMBSeconds on
+	// negative qty, ErrOveragePriceMissing on missing catalog) cover
+	// the case where the stub flushFn isn't injected; for the
+	// happy-path "flush succeeds, code='ok'" assertion we inject a
+	// no-op flushFn + a primed catalog.
+	var calls int
+	p := paddleclassifier.NewProviderForTest(discardLog())
+	p.FlushFnForTest(func(_ context.Context, _ *paddleclassifier.Provider, _ state.Account, _ time.Time, _ int64) error {
+		calls++
+		return nil
+	})
+	p.SetOveragePriceForTest(api.PlanHobby, "pri_test_overage")
+	p.SetDedupeForTest(nil) // bypass dedupe gate — we want the flushFn to fire
+
+	ops := testOpsMetrics(t)
+	pusher := meter.NewPusher(s, p, discardLog(), clock, ops)
+
+	if _, err := pusher.PushHour(ctx); err != nil {
+		t.Fatalf("PushHour returned aggregate error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("recorded flush calls = %d, want 1", calls)
+	}
+
+	// Paddle histogram: must observe exactly one sample with code="ok".
+	pushBody := scrapePushDuration(t, ops, "_paddle_push_duration_seconds")
+	if got := pushBody["ok"]; got != 1 {
+		t.Errorf("_paddle_push_duration_seconds{code=ok} count = %d, want 1 (Paddle dispatch must hit Paddle histogram)", got)
+	}
+	// Stripe histogram: must NOT observe a sample with code="ok" —
+	// pre-Fix-5, a non-Stripe-shaped Provider could land on the
+	// Stripe fallback histogram. Belt + braces.
+	stripeBody := scrapePushDuration(t, ops, "_stripe_push_duration_seconds")
+	if got := stripeBody["ok"]; got != 0 {
+		t.Errorf("_stripe_push_duration_seconds{code=ok} count = %d, want 0 (Paddle dispatch must NOT hit Stripe histogram)", got)
+	}
+
+	// Ops counter: op="paddle", code="ok" must be 1.
+	opsBody := scrapeOpsTotal(t, ops)
+	if got := opsBody[`paddle|ok`]; got != 1 {
+		t.Errorf("ops_total{op=paddle,code=ok} = %d, want 1 (op label must be paddle)", got)
+	}
+	if _, ok := opsBody[`stripe|ok`]; ok {
+		t.Errorf("ops_total{op=stripe,code=ok} present; want absent (Paddle dispatch must NOT register a stripe op row)")
 	}
 }

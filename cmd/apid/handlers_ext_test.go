@@ -1315,8 +1315,8 @@ func stripeWebhookHarness(t *testing.T, plan api.Plan) (testEnv, *recordingMaile
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	if err := store.UpdateAccountStripeCustomerID(context.Background(), acct.ID, "cus_test_123"); err != nil {
-		t.Fatalf("UpdateAccountStripeCustomerID: %v", err)
+	if err := store.UpdateAccountProviderCustomerID(context.Background(), acct.ID, "cus_test_123"); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
 	}
 	mailer := &recordingMailer{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

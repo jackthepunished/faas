@@ -26,20 +26,22 @@ type CreateUpgradeTxnFn func(ctx context.Context, p *Provider, acct state.Accoun
 // subscription item yet — the typical free → paid direct path
 // (spec §4.7).
 //
-// Shape mirrors defaultFlushLocked (usage.go:127-158): same SDK call
+// Shape mirrors defaultFlushLocked (usage.go:153-201): same SDK call
 // (paddle.Client.CreateTransaction), same CustomData tags, same column
-// for the customer ID (acct.StripeCustomerID — the column is reused
-// per ADR-025, the rename is a separate migration PR). The differences:
+// for the customer ID (acct.ProviderCustomerID — the rename is a
+// follow-up migration PR per the big-Paddle-enablement plan; today
+// the column carries both Stripe cus_… and Paddle ctm_… values).
+// The differences:
 //
 //   - priceID comes from planMonthly[plan] (the recurring subscription
 //     price) instead of planOverage[plan] (the metered overage line).
 //   - CustomData["kind"] = "plan_upgrade" so the merchant-dashboard
 //     audit trail distinguishes upgrades from monthly overage flushes.
-//   - CustomData["faas_paddle_idem_key"] is a stable (acct.ID, plan)
-//     key so a redelivered upgrade click is collapsed by the merchant-
-//     side dedupe (the paddle-go-sdk/v5@v5.2.0 SDK has no
-//     Idempotency-Key request option, so we record it in CustomData;
-//     HTTP-transport injection is a follow-up).
+//   - CustomData["faas_paddle_idem_key"] AND the Idempotency-Key HTTP
+//     header (via NewIdempotencyRT at provider.go:NewProvider) carry the
+//     same stable (acct.ID, plan) value, so a redelivered upgrade
+//     click is collapsed by both Paddle's server-side dedupe (when
+//     native support ships) and our state-store row — belt + braces.
 //
 // Returns (txn_…, https://paddle.checkout/…, nil) on success. The 402
 // Problem carries these as PaddleCheckoutURL + TxID extensions so the
@@ -71,7 +73,16 @@ func defaultCreateUpgradeTxn(ctx context.Context, p *Provider, acct state.Accoun
 	if priceID == "" {
 		return "", "", fmt.Errorf("paddle: monthly price missing for plan=%s — EnsurePlanProducts must run first", targetPlan)
 	}
-	customerID := acct.StripeCustomerID // column name stale per ADR-025
+	customerID := acct.ProviderCustomerID // acct.ProviderCustomerID carries Stripe cus_… or Paddle ctm_… — same column, provider-discriminated by value shape per ADR-032.
+	idem := fmt.Sprintf("faas-upgrade-%s-%s", acct.ID, targetPlan)
+
+	// Stamp the transit ID on the context. The SDK's internal/client
+	// reads this and sets X-Transit-Id on the outbound request; our
+	// IdempotencyRT (provider.go:NewProvider) copies X-Transit-Id as
+	// Idempotency-Key on POST /transactions. Same single source of
+	// truth as usage.go's defaultFlushLocked.
+	ctx = paddle.ContextWithTransitID(ctx, idem)
+
 	txn, err := p.client.CreateTransaction(ctx, &paddle.CreateTransactionRequest{
 		CustomerID: &customerID,
 		Items: []paddle.CreateTransactionItems{{
@@ -84,7 +95,7 @@ func defaultCreateUpgradeTxn(ctx context.Context, p *Provider, acct state.Accoun
 			"faas_account_id":      acct.ID,
 			"target_plan":          string(targetPlan),
 			"kind":                 "plan_upgrade",
-			"faas_paddle_idem_key": fmt.Sprintf("faas-upgrade-%s-%s", acct.ID, targetPlan),
+			"faas_paddle_idem_key": idem,
 		},
 	})
 	if err != nil {

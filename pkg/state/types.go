@@ -88,10 +88,10 @@ type Account struct {
 	Email  string
 	Plan   api.Plan
 	Status AccountStatus
-	// StripeCustomerID is the per-account `cus_…` returned by Stripe when
+	// ProviderCustomerID is the per-account `cus_…` returned by Stripe when
 	// the customer signs up (spec §4.7). The unique index makes it a
 	// stable webhook lookup key.
-	StripeCustomerID string
+	ProviderCustomerID string
 	// StripeSubscriptionItem is the per-account `si_…` (metered
 	// subscription item) that meterd pushes hourly usage against
 	// (issue #52, §4.7). Empty until pkg/billing/stripe::EnsureCustomer
@@ -532,9 +532,17 @@ type SnapshotForGC struct {
 	DeploymentID string
 	AppID        string
 	AccountID    string
-	FCVersion    string
-	MemBytes     int64
-	DiskBytes    int64
+	// AppSlug is the apps.slug of the parent app. Populated from the
+	// snapshot → deployments → apps JOIN so the GC algorithm doesn't
+	// have to issue per-eviction DeploymentByID + AppByID lookups to
+	// build the apps/<slug>/<dep>.ext4 storage key (issue #195 B1.1).
+	// An empty AppSlug after the projection runs is an invariant
+	// violation — call sites should log + skip, never silently fall
+	// back to a slow path.
+	AppSlug   string
+	FCVersion string
+	MemBytes  int64
+	DiskBytes int64
 	// StorageKey mirrors Snapshot.StorageKey; populated from the
 	// join so imaged's snapshot GC can Storage.Delete under the
 	// canonical key (issue #96, ADR-025 axis 2 final slice).

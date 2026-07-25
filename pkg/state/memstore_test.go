@@ -1972,11 +1972,11 @@ func TestMemStore_ListLatestInstancesForApp_BoundedLimit(t *testing.T) {
 }
 
 // TestAccountByPaddleCustomerID_Mirror asserts the Paddle mirror of
-// AccountByStripeCustomerID is a 1-line pass-through that reads from
-// the same reverse-lookup map (accounts.stripe_customer_id is reused
+// AccountByProviderCustomerID is a 1-line pass-through that reads from
+// the same reverse-lookup map (accounts.provider_customer_id is reused
 // per ADR-025). The test exercises the full write→read round-trip:
 // UpdateAccountPaddleCustomerID writes ctm_xyz, AccountByPaddleCustomerID
-// reads it back, and AccountByStripeCustomerID returns the same account
+// reads it back, and AccountByProviderCustomerID returns the same account
 // (the column is shared — the dedicated Paddle method name is just a
 // self-documenting alias for the same body).
 func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
@@ -1998,16 +1998,16 @@ func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
 	if got.ID != acct.ID {
 		t.Errorf("ID = %q, want %q", got.ID, acct.ID)
 	}
-	if got.StripeCustomerID != "ctm_test_xyz" {
-		t.Errorf("StripeCustomerID = %q, want ctm_test_xyz (column reused per ADR-025)", got.StripeCustomerID)
+	if got.ProviderCustomerID != "ctm_test_xyz" {
+		t.Errorf("ProviderCustomerID = %q, want ctm_test_xyz (column reused per ADR-025)", got.ProviderCustomerID)
 	}
 
 	// The Stripe-side mirror must return the same account — proves
 	// the index is genuinely shared (the dedicated Paddle method name
 	// is documentation, not a different index).
-	stripeSame, err := m.AccountByStripeCustomerID(ctx, "ctm_test_xyz")
+	stripeSame, err := m.AccountByProviderCustomerID(ctx, "ctm_test_xyz")
 	if err != nil {
-		t.Fatalf("AccountByStripeCustomerID (mirror): %v", err)
+		t.Fatalf("AccountByProviderCustomerID (mirror): %v", err)
 	}
 	if stripeSame.ID != acct.ID {
 		t.Errorf("Stripe mirror ID = %q, want %q", stripeSame.ID, acct.ID)

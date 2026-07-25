@@ -86,7 +86,7 @@ func (c *Client) findOrCreatePlan(_ context.Context, nickname string, params *st
 
 // CreateCustomer is the wrapper around stripe.Customers.New. We record
 // the returned `cus_…` on the account row via
-// UpdateAccountStripeCustomerID so the webhook + push paths can join.
+// UpdateAccountProviderCustomerID so the webhook + push paths can join.
 // Metadata carries the faas account id + plan so the Stripe dashboard
 // can pivot without a separate lookup.
 func (c *Client) CreateCustomer(ctx context.Context, acct state.Account) (string, error) {
@@ -105,7 +105,7 @@ func (c *Client) CreateCustomer(ctx context.Context, acct state.Account) (string
 	if err != nil {
 		return "", fmt.Errorf("stripex: Customers.New account %s: %w", acct.ID, err)
 	}
-	if err := c.store.UpdateAccountStripeCustomerID(ctx, acct.ID, cus.ID); err != nil {
+	if err := c.store.UpdateAccountProviderCustomerID(ctx, acct.ID, cus.ID); err != nil {
 		return "", err
 	}
 	return cus.ID, nil

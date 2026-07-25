@@ -319,7 +319,7 @@ type snapshotBootPayload struct {
 // Both paths share the same imaging→snapshotting→live handshake via
 // snapshot_prime (ADR-018). Tarball/dockerfile deployments start via
 // build_queued and skip this function.
-func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPayload) error {
+func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPayload) (err error) {
 	if p.Kind != string(state.DeploymentKindImage) {
 		// Tarball/dockerfile deployments start via build_queued; apid also
 		// fires deployment_changed as a hint, but imaged reads the
@@ -349,6 +349,16 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	if err := h.transition(ctx, dep.ID, state.DeployBuilding, ""); err != nil {
 		return err
 	}
+	// Issue #195 B1.5: every error path from here forward MUST land
+	// the deployment row in a terminal-good state. The inner
+	// buildImageLayer/buildFunctionLayer paths call markDeployFailed
+	// on their own failures; the defer catches the windows they
+	// miss (transition failures between DeployBuilding and the
+	// build, notif.Notify failures after a successful build, and
+	// any unknown-kind dispatch). The defer installs AFTER the
+	// status guard so a pg_notify redelivery that bails at
+	// dep.Status != DeployPending never fires a spurious mark.
+	defer h.markFailedOnUnhandledError(ctx, dep.ID, &err)
 
 	// Branch on app type. Functions take a different path: the customer
 	// uploads a source tarball; the runner binary lives in the layer
@@ -538,23 +548,30 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
 		return fmt.Errorf("imaged: %s", msg)
 	}
-	// Per-runtime handler path. The default `/app/<runtime>` works for
-	// runtimes whose handler binary carries the runtime name (go124's
-	// static binary lives at /app/handler — see the Go branch below).
-	// The python312 and node22 branches override because their
-	// handlers ship with a language-specific extension (.py / .js).
-	// A new runtime that needs a different path adds its own branch;
-	// the default is no longer a `.js` stub so a runtime omission
-	// can't silently produce `/app/<runtime>.js`.
+	// Per-runtime handler path. The baseline is `/app/node22.js` —
+	// matches the node22 runner's `--handler` default at
+	// guest/runners/node22/main.go so the round-trip works without an
+	// override. python312 and go124 override because their handlers
+	// ship under different filenames: `/app/handler.py` for python
+	// (the .py suffix matters), `/app/handler` for the Go static
+	// binary (Railpack's --plan go emits CGO_ENABLED=0). The go124
+	// branch is also a tripwire: an unknown runtime that ever slips
+	// past the allow-list above would silently produce
+	// `/app/node22.js` and the runner would exec the wrong file on
+	// first wake. Pin: TestBuildFunctionLayer_Runtimes in
+	// handler_test.go asserts every runtime's argv verbatim.
 	manifest := api.AppManifest{
 		Port:    api.DefaultAppPort,
 		Healthz: "/healthz",
 		Entrypoint: []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
-			"--handler", "/app/" + runtime,
+			"--handler", "/app/node22.js",
 		},
 	}
+	// node22 has no explicit override here — its `/app/node22.js`
+	// matches the default above. Adding `case RuntimeNode22 { ... }`
+	// for symmetry would silently diverge from the runner default.
 	if runtime == RuntimePython312 {
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
@@ -562,23 +579,15 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--handler", "/app/handler.py",
 		}
 	}
-	if runtime == RuntimeNode22 {
-		manifest.Entrypoint = []string{
-			"/usr/local/bin/faas-runner",
-			"--runtime", runtime,
-			"--handler", "/app/node22.js",
-		}
-	}
 	if runtime == RuntimeGo124 {
 		// The customer's handler is a static Go binary (Railpack's go
 		// plan emits CGO_ENABLED=0 by default), so the runner execs
 		// the file directly with no interpreter argument. The path
-		// is `/app/handler` (the default above) and pinned by
+		// `/app/handler` is independent of the node22 baseline above
+		// and pinned by
 		// guest/runners/go124/main_test.go::TestGoRunnerHandlerDefault
 		// so a default-flag drift surfaces at unit-test time, not
-		// on first wake. The branch is left here as a tripwire — if
-		// the default ever needs to differ for Go, it lives next to
-		// the other per-runtime overrides.
+		// on first wake.
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
@@ -740,7 +749,7 @@ func (h *Handler) handleSnapshotWritten(ctx context.Context, p snapshotWrittenPa
 // notification, apid has already advanced the row to `building` (apid's
 // POST /v1/apps/{app}/deployments handler flips it). imaged picks up at
 // `imaging` to keep the state-machine CHECK constraints happy.
-func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload) error {
+func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload) (err error) {
 	if p.DeploymentID == "" {
 		return errors.New("imaged: snapshot_boot missing deployment_id")
 	}
@@ -765,6 +774,13 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 			"deployment", p.DeploymentID)
 		return nil
 	}
+	// Issue #195 B1.5: install the defer AFTER the empty-rootfs
+	// early-return so the no-op skip path doesn't touch the row.
+	// The defer covers the build-window + snapshot_prime notifier
+	// windows — the build may succeed (builds.status='succeeded')
+	// while the snapshot_prime notifier fails, and the deployment
+	// row would otherwise be left in DeployBuilding indefinitely.
+	defer h.markFailedOnUnhandledError(ctx, dep.ID, &err)
 	app, err := h.store.AppByID(ctx, dep.AppID)
 	if err != nil {
 		return fmt.Errorf("imaged: load app: %w", err)
@@ -837,6 +853,65 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 		return fmt.Errorf("imaged: mark failed: %w", err)
 	}
 	return nil
+}
+
+// markFailedOnUnhandledError is the catch-all (issue #195 B1.5). It
+// runs from a named-return defer in handleDeployment and
+// handleSnapshotBoot. The defer catches error windows the inner
+// markDeployFailed calls miss:
+//
+//   - transition(DeployBuilding) → buildImageLayer call site
+//     (the inner call has its own mark, but a notif.Notify failure
+//     after a successful build does not — without this defer the
+//     deployment row would stay in DeployBuilding indefinitely).
+//   - handleSnapshotBoot's snapshot_prime notifier failure.
+//   - any unknown-kind dispatch in the function-type switch.
+//
+// The defer uses a fresh context with a 5 s timeout so the catch-all
+// mark survives a cancelled parent ctx (deploy restart). It reloads
+// the deployment row before marking — the in-memory `dep` struct
+// captured at function entry may be stale by the time the defer
+// fires. If the reload sees a terminal-good status (DeployFailed /
+// DeployLive / DeploySuperseded) the defer is a no-op so a late error
+// after a successful path can never clobber the success.
+//
+// underlying SQL keeps its tracing handles but the cancellation chain
+// is broken — the lint rule sees the WithoutCancel but expects a
+// function-shape continuation; documenting the intent here is the
+// cleaner alternative to passing ctx through unused.
+//
+//nolint:contextcheck // ctx is detached via context.WithoutCancel so the
+func (h *Handler) markFailedOnUnhandledError(ctx context.Context, depID string, errp *error) {
+	if errp == nil || *errp == nil {
+		return
+	}
+	// Detach from the caller's ctx so a cancelled parent (deploy
+	// restart) doesn't preclude the safety mark, but inherit values
+	// (logger etc.) so the underlying SQL keeps its tracing handles.
+	detached := context.WithoutCancel(ctx)
+	markCtx, cancel := context.WithTimeout(detached, 5*time.Second)
+	defer cancel()
+	current, err := h.store.DeploymentByID(markCtx, depID)
+	if err != nil {
+		// Best-effort; if we can't read the row, we can't safely
+		// mark it. Log and skip.
+		h.log.Warn("imaged: catch-all mark: reload failed",
+			"deployment", depID, "err", err)
+		return
+	}
+	switch current.Status {
+	case state.DeployFailed, state.DeployLive, state.DeploySuperseded:
+		// Inner path already handled it (or it's a success). The
+		// catch-all must NEVER clobber a terminal-good row.
+		return
+	}
+	upstreamErr := *errp
+	h.log.Warn("imaged: catch-all mark: unhandled error after transition",
+		"deployment", depID, "status", current.Status, "err", upstreamErr)
+	if mErr := h.markDeployFailed(markCtx, depID, upstreamErr, "handleDeployment"); mErr != nil {
+		h.log.Warn("imaged: catch-all mark: mark failed",
+			"deployment", depID, "err", mErr)
+	}
 }
 
 // aboveBaseStream is the result of resolving the above-base layers for an
