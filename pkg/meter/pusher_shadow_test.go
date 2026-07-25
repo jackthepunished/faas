@@ -580,3 +580,188 @@ func TestPushHour_PaddleDispatchHitsPaddleHistogram(t *testing.T) {
 		t.Errorf("ops_total{op=stripe,code=ok} present; want absent (Paddle dispatch must NOT register a stripe op row)")
 	}
 }
+
+// --- §14 M7 push-side shadow (Stripe + Paddle dual) ---
+//
+// The pre-existing TestPushHour_Shadow24h (line 219) covers Stripe
+// only via the recordingStripe fake. ADR-032's provider-neutrality
+// claim extends the same 24h math to Paddle; the two tests below
+// pin the dual shape in-process so a future refactor of the pusher's
+// dispatch, the SDK conversion, or the FlushFn signature surfaces
+// in the correct provider's test before reaching production.
+//
+// Per-hour expected value (256 MB Hobby instance, 1 hour resident):
+//   api.BillableRAMMB(256) * 60 * 60 = 264 * 3600 = 950_400 mb_seconds
+// Sum across 24 hours: 22_809_600 mb_seconds.
+// Integer equality (NOT a 0.1% float delta — that tolerance lives on
+// the meter-side monthly aggregation in meter_test.go:256; the push-
+// side wire math is integer-deterministic).
+
+// TestPushHour_Shadow24h_StripeFake is the Stripe-shaped sibling of
+// the existing TestPushHour_Shadow24h. Same math, same sampler
+// loop, same recordingStripe fake — the only difference is the
+// test name, which routes a future regression to this test rather
+// than the canonical one. Belongs next to TestPushHour_Shadow24h
+// because the two share a fake; the Paddle sibling below swaps
+// the fake.
+//
+// The 1440 minute-rows / 24 PushHour ticks shape mirrors the
+// canonical test exactly. See TestPushHour_Shadow24h (line 219)
+// for the math derivation.
+func TestPushHour_Shadow24h_StripeFake(t *testing.T) {
+	t.Parallel()
+	s := state.NewMemStore()
+	ctx := context.Background()
+
+	t0 := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	now := t0
+	clock := func() time.Time { return now }
+
+	acct := makeAccount(t, ctx, s, api.PlanHobby)
+	app := newApp(t, ctx, s, acct.ID)
+	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
+
+	sampler := meter.NewSampler(s, clock)
+	const hoursIn24h = 24
+	const minutesIn24h = hoursIn24h * 60
+	for i := 0; i < minutesIn24h; i++ {
+		if _, err := sampler.SampleAndRoll(ctx); err != nil {
+			t.Fatalf("sample %d: %v", i, err)
+		}
+		now = now.Add(time.Minute)
+	}
+
+	rec := &recordingStripe{}
+	pusher := meter.NewPusher(s, rec, discardLog(), clock, nil)
+
+	now = t0.Add(time.Hour)
+	for h := 0; h < hoursIn24h; h++ {
+		pushed, err := pusher.PushHour(ctx)
+		if err != nil {
+			t.Fatalf("PushHour hour %d: %v", h, err)
+		}
+		if pushed != 1 {
+			t.Errorf("PushHour hour %d: pushed = %d, want 1", h, pushed)
+		}
+		now = now.Add(time.Hour)
+	}
+
+	calls := rec.Calls()
+	if len(calls) != hoursIn24h {
+		t.Fatalf("recorded calls = %d, want %d", len(calls), hoursIn24h)
+	}
+	wantPerHour := int64(api.BillableRAMMB(256)) * 60 * 60
+	wantTotal := wantPerHour * hoursIn24h
+	var total int64
+	for i, c := range calls {
+		if c.AccountID != acct.ID {
+			t.Errorf("call[%d].AccountID = %q, want %q", i, c.AccountID, acct.ID)
+		}
+		if c.MBSeconds != wantPerHour {
+			t.Errorf("call[%d].MBSeconds = %d, want %d", i, c.MBSeconds, wantPerHour)
+		}
+		total += c.MBSeconds
+	}
+	if total != wantTotal {
+		t.Fatalf("Stripe shadow sum = %d mb_sec, want %d (exact integer)", total, wantTotal)
+	}
+}
+
+// TestPushHour_Shadow24h_Paddle is the Paddle-shaped sibling of
+// TestPushHour_Shadow24h_StripeFake. Same math, different fake —
+// the paddle.Provider test seam (NewProviderForTest +
+// FlushFnForTest + SetOveragePriceForTest + SetDedupeForTest) is
+// the canonical pin for the per-window FlushFn contract.
+//
+// Per-tick assertion: each FlushFn call sees the integer
+// mb_seconds the pusher computed for one 1h window. Per-call
+// distinctness: 24 distinct windowStart values (top-of-hour
+// boundaries [t0, t0+1h), [t0+1h, t0+2h), …, [t0+23h, t0+24h)).
+// Sum: 22_809_600 mb_seconds.
+//
+// SetDedupeForTest(nil) bypasses the claim state machine because
+// the math is the assertion target, not the dedupe gate (the e2e
+// TestInvoiceShadow_24h covers the dedupe path against real
+// Postgres).
+func TestPushHour_Shadow24h_Paddle(t *testing.T) {
+	t.Parallel()
+	s := state.NewMemStore()
+	ctx := context.Background()
+
+	t0 := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	now := t0
+	clock := func() time.Time { return now }
+
+	acct := makeAccount(t, ctx, s, api.PlanHobby)
+	app := newApp(t, ctx, s, acct.ID)
+	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
+
+	sampler := meter.NewSampler(s, clock)
+	const hoursIn24h = 24
+	const minutesIn24h = hoursIn24h * 60
+	for i := 0; i < minutesIn24h; i++ {
+		if _, err := sampler.SampleAndRoll(ctx); err != nil {
+			t.Fatalf("sample %d: %v", i, err)
+		}
+		now = now.Add(time.Minute)
+	}
+
+	type flushCall struct {
+		AccountID string
+		Hour      time.Time
+		MBSeconds int64
+	}
+	var (
+		mu    sync.Mutex
+		calls []flushCall
+	)
+	p := paddleclassifier.NewProviderForTest(discardLog())
+	p.FlushFnForTest(func(_ context.Context, _ *paddleclassifier.Provider, a state.Account, hour time.Time, mbSeconds int64) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, flushCall{AccountID: a.ID, Hour: hour, MBSeconds: mbSeconds})
+		return nil
+	})
+	p.SetOveragePriceForTest(api.PlanHobby, "pri_test_overage")
+	p.SetDedupeForTest(nil)
+
+	pusher := meter.NewPusher(s, p, discardLog(), clock, nil)
+
+	now = t0.Add(time.Hour)
+	for h := 0; h < hoursIn24h; h++ {
+		pushed, err := pusher.PushHour(ctx)
+		if err != nil {
+			t.Fatalf("PushHour hour %d: %v", h, err)
+		}
+		if pushed != 1 {
+			t.Errorf("PushHour hour %d: pushed = %d, want 1", h, pushed)
+		}
+		now = now.Add(time.Hour)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != hoursIn24h {
+		t.Fatalf("recorded flush calls = %d, want %d", len(calls), hoursIn24h)
+	}
+	wantPerHour := int64(api.BillableRAMMB(256)) * 60 * 60
+	wantTotal := wantPerHour * hoursIn24h
+	seenHours := make(map[time.Time]bool, hoursIn24h)
+	var total int64
+	for i, c := range calls {
+		if c.AccountID != acct.ID {
+			t.Errorf("call[%d].AccountID = %q, want %q", i, c.AccountID, acct.ID)
+		}
+		if c.MBSeconds != wantPerHour {
+			t.Errorf("call[%d].MBSeconds = %d, want %d", i, c.MBSeconds, wantPerHour)
+		}
+		if seenHours[c.Hour] {
+			t.Errorf("call[%d].Hour = %s: duplicate windowStart across 24 ticks", i, c.Hour.UTC().Format(time.RFC3339))
+		}
+		seenHours[c.Hour] = true
+		total += c.MBSeconds
+	}
+	if total != wantTotal {
+		t.Fatalf("Paddle shadow sum = %d mb_sec, want %d (exact integer)", total, wantTotal)
+	}
+}

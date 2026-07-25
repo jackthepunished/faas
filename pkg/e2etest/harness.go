@@ -644,6 +644,31 @@ func (h *Harness) DumpLogs(t *testing.T) {
 	}
 }
 
+// MeterdLogs returns the captured stdout/stderr of the meterd
+// subprocess as a string. Returns "" if meterd wasn't started, has
+// already exited, or no procs are tracked. The buffer is shared
+// with stop()/DumpLogs (cmd.Stdout == cmd.Stderr per startProc at
+// line 620-621), so a concurrent test that drives more pushes may
+// see additional lines appended after the call returns — the
+// caller is expected to re-call or poll.
+//
+// Used by the §14 M7 invoice-shadow e2e (cmd/e2e/billing_invoice_shadow_test.go)
+// to scrape the per-push `mb_seconds` value from the meterd log,
+// which is the unified oracle across both Stripe and Paddle
+// (the provider-specific dedupe tables have different shapes;
+// the log line is provider-neutral). See pkg/meter/pusher.go:155.
+func (h *Harness) MeterdLogs() string {
+	for _, p := range h.procs {
+		if filepath.Base(p.Path) != "meterd" {
+			continue
+		}
+		if buf, ok := p.Stdout.(*bytes.Buffer); ok {
+			return buf.String()
+		}
+	}
+	return ""
+}
+
 // injectSearchPath adds (or replaces) the search_path query parameter on a
 // pgx DSN. The test's pool uses <schema>,public — match that so the daemon
 // subprocess reads the same tables the test wrote to.
