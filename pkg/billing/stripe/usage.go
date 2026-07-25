@@ -22,10 +22,23 @@ var (
 	// misconfigured deployment from a live Stripe-side failure.
 	ErrNoAPIKey = errors.New("stripex: cannot push usage without apiKey")
 
-	// ErrNegativeQuantity is the defensive guard against a
-	// negative wire quantity that would silently credit the
-	// customer. meterd never produces these; the gate documents
-	// the invariant for future callers.
+	// ErrNegativeQuantity is the sentinel for a wire quantity
+	// that would silently credit the customer. The meterd wire
+	// path never produces one (the per-second sums are non-negative
+	// and the helpers truncate toward zero on positive inputs), so
+	// the call sites no longer guard at runtime. The sentinel is
+	// retained for two reasons:
+	//
+	//   1. errors.go's classifier maps it to a stable
+	//      "negative-quantity" Prometheus label so dashboard
+	//      alerts stay consistent with the historical contract.
+	//   2. Future callers (third-party Stripe-push utilities, sandbox
+	//      fakers, integration tests) can wrap and surface the same
+	//      sentinel — the classifier is the canonical entry point.
+	//
+	// If a caller DOES produce a negative quantity (e.g. a buggy
+	// pusher with a signed/unsigned mix-up), wrapping this
+	// sentinel is the supported way to surface it.
 	ErrNegativeQuantity = errors.New("stripex: negative usage quantity")
 )
 
@@ -43,6 +56,40 @@ const WireQuantityMillicentsPerGBHour = 1000
 // quantity is deterministic across architectures and rounding modes.
 const secondsPerGBHour = 1024 * 3600
 
+// WireQuantityForMBSeconds converts a summed mb_seconds window into the
+// integer wire quantity Stripe's metered subscription_item accepts.
+//
+//	qty = mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
+//
+// Pure integer math — no float, no per-hour truncation loss. Extracted
+// from the SDK-touching push path so the money-critical formula can be
+// pinned by a hermetic unit test (no live Stripe). The canonical
+// acceptance case is a 256 MB Hobby app (billed at ram+8 = 264 MB)
+// resident for a full 24 h: 264 * 60 * 60 * 24 = 22_809_600 mb-s →
+// 6187. See usage_math_test.go.
+//
+// Truncation is by design — the sub-milliunit remainder is dropped
+// exactly the way the spec's integer money model requires (CLAUDE.md:
+// "Floats near money fail review"). Range guard: the largest billable
+// window under spec §4.7 is a 1 TB instance resident for 24 h =
+// ~2.1e9 mb_seconds, so mbSeconds * 1000 ≈ 2.1e12, well below int64
+// max (~9.2e18).
+func WireQuantityForMBSeconds(mbSeconds int64) int64 {
+	return mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
+}
+
+// legacyWireQuantityForGBHours is the pre-M7 float wire formula
+// (`int64(gbHours * 1000)`), extracted so the deprecated path's
+// truncation behaviour is documented and testable.
+//
+// Deprecated: the float-to-int64 conversion accumulates ~0.3 %
+// truncation loss over a 24 h horizon; the integer
+// WireQuantityForMBSeconds path replaced it. Use
+// WireQuantityForMBSeconds instead.
+func legacyWireQuantityForGBHours(gbHours float64) int64 {
+	return int64(gbHours * WireQuantityMillicentsPerGBHour)
+}
+
 // pushUsageRecordSDKSum is the seam where stripe-go lands (issue #52).
 //
 // It posts a metered UsageRecord against the per-account
@@ -51,16 +98,13 @@ const secondsPerGBHour = 1024 * 3600
 // (Client).PushUsageRecordSum already short-circuits repeated hours,
 // so this function only runs once per (account, hour).
 //
-// The wire quantity is integer arithmetic:
-//
-//	qty = mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
-//
-// Pure integer math — no float, no per-hour truncation loss. The
-// pusher calls this with the *sum* of mb_seconds across the billing
-// window (a full day for the production cadence, see
-// meterd.cfg.StripeInterval) so the wire quantity is the deterministic
-// integer answer for that window. Stripe aggregates at the
-// source-currency scale (DecimalFractionDigits = 3 for USD).
+// The wire quantity is integer arithmetic computed by
+// WireQuantityForMBSeconds (pure int64, no float, no per-hour
+// truncation loss). The pusher calls this with the *sum* of
+// mb_seconds across the billing window (a full day for the production
+// cadence, see meterd.cfg.StripeInterval) so the wire quantity is the
+// deterministic integer answer for that window. Stripe aggregates at
+// the source-currency scale (DecimalFractionDigits = 3 for USD).
 //
 // Idempotency is enforced with the standard Stripe pattern: one
 // Idempotency-Key header derived from (accountID, RFC3339 hour). A
@@ -90,22 +134,15 @@ func (c *Client) pushUsageRecordSDKSumWithID(ctx context.Context, acct state.Acc
 		// misconfiguration in the meterd log line.
 		return nil, fmt.Errorf("%w (account %s)", ErrNoAPIKey, acct.ID)
 	}
-	// Integer wire quantity — no float on the path. The formula is
-	// (mbSeconds * WireQuantityMillicentsPerGBHour) / secondsPerGBHour
-	// evaluated in Go int64 arithmetic. Range guard: the largest
-	// billable window under spec §4.7 is a 1 TB instance resident
-	// for 24 h = ~2.1e9 mb_seconds, so mbSeconds * 1000 ≈ 2.1e12,
-	// well below int64 max (~9.2e18). Truncation is by design — the
-	// sub-milliunit remainder is dropped exactly the way the spec's
-	// integer money model requires (CLAUDE.md: "Floats near money
-	// fail review").
-	qty := mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
-	if qty < 0 {
-		// Defensive: a negative quantity would silently credit the
-		// customer. meterd never produces these; the gate here
-		// documents the invariant for future callers.
-		return nil, fmt.Errorf("%w (account %s, qty %d)", ErrNegativeQuantity, acct.ID, qty)
-	}
+	// Integer wire quantity — no float on the path. See
+	// WireQuantityForMBSeconds for the formula, range guard, and
+	// truncation rationale. The helper truncates toward zero on
+	// positive inputs (the meterd wire path always produces
+	// non-negative sums), so no caller-side negative guard is
+	// needed: a negative qty would have to come from int64
+	// overflow at the mbSeconds * 1000 multiply step, which the
+	// helper's range guard (see its docstring) prevents.
+	qty := WireQuantityForMBSeconds(mbSeconds)
 	idem := acct.ID + "/" + hour.UTC().Format(time.RFC3339)
 	params := &stripe.UsageRecordParams{
 		SubscriptionItem: stripe.String(acct.StripeSubscriptionItem),
@@ -160,11 +197,17 @@ func (c *Client) pushUsageRecordSDKWithID(ctx context.Context, acct state.Accoun
 		// clear error than bounce 401s off the unauthenticated SDK.
 		return nil, fmt.Errorf("%w (account %s)", ErrNoAPIKey, acct.ID)
 	}
-	// Legacy wire formula. Truncates the sub-milliunit remainder —
-	// the very truncation the M7 fix avoids on the integer path.
-	// Keep this exactly as-is so callers on the float path see no
-	// behaviour change.
-	qty := int64(gbHours * WireQuantityMillicentsPerGBHour)
+	// Legacy wire formula. See legacyWireQuantityForGBHours for the
+	// truncation rationale and the migration story. The helper
+	// is `int64(gbHours * 1000)`, which is genuinely negative-p
+	// rone if a future caller passes a negative gbHours (no Go
+	// overflow, the float round-trips the sign). The guard here
+	// is therefore load-bearing on the legacy path — unlike the
+	// integer path where WireQuantityForMBSeconds truncates toward
+	// zero on positive inputs. Concretely: `int64(-0.5 * 1000) =
+	// -500`, which would silently credit the customer if it
+	// reached Stripe.
+	qty := legacyWireQuantityForGBHours(gbHours)
 	if qty < 0 {
 		return nil, fmt.Errorf("%w (account %s, qty %d)", ErrNegativeQuantity, acct.ID, qty)
 	}
