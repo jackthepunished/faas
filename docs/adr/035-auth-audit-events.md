@@ -93,6 +93,37 @@
   is explicitly rejected. A `failingEventStore` test (mirror of
   `pkg/sched/events_test.go:99-118`) proves this in CI.
 
+  **Idempotency** — the audit emit is **not** idempotent at the row
+  level: a replayed request mints a fresh `id`, a fresh `at`, and a
+  fresh row. The customer-facing handler layer is responsible for
+  being idempotent (CLI auth exchange uses
+  `ConsumeCliAuthCode` which is a CAS, so the second call returns
+  410 `cli_auth_code_unavailable` and never reaches `Emit`; key
+  deletion uses the underlying `DeleteAPIKey` idempotency; account
+  deletion is naturally idempotent because `deleted_pending` +
+  `scheduleDeletion` is a no-op). A customer reading the audit log
+  therefore sees exactly one row per **successful** underlying
+  action, regardless of HTTP-level retries. This is the correct
+  behavior — auditors want one row per "thing that happened", not
+  one row per "request that ran".
+
+- **Customer-scoping (load-bearing for tenant isolation, spec §11):**
+
+  Every read endpoint in this surface is **subject-pinned to the
+  caller's `account_id`**. The list handler reads via
+  `store.ListEvents(r.Context(), acct.ID, ...)` — the events table's
+  primary subject index is `(subject, at desc)`, so the planner
+  walks only the caller's slice. The single-row handler re-uses
+  the same `ListEvents(acct.ID, ...)` call and filters by id in
+  Go, so a customer who guesses another account's row id gets a
+  404 — byte-for-byte identical to an unknown-id 404. There is no
+  admin-operator override; a SOC2 auditor wanting the platform-wide
+  audit log reads `events` directly against the database, not
+  through this API. This is a deliberate constraint: spec §11
+  forbids any tenant-visible surface from leaking cross-tenant
+  data, and the GDPR export bundle is the only "give me everything
+  I own" answer.
+
 - **GDPR interaction:**
 
   - `GdprAuditExportResponse` gains optional `Kind` and `Data` fields
