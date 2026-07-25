@@ -143,6 +143,16 @@ func cmdApp(args []string) int {
 		} else {
 			fmt.Printf("%-30s %d\n", "min instances:", a.MinInstances)
 		}
+		// ADR-031 + ADR-032: surface the per-app outbound CIDR
+		// allowlist in the text-mode `faas app <slug>` output so a
+		// customer can verify their PATCH round-tripped without
+		// dropping into --json. Print only when non-empty — empty
+		// is the Free/Hobby default and "no row" output is
+		// misleading.
+		if len(a.EgressAllowlist) > 0 {
+			fmt.Printf("%-30s %s\n", "egress allowlist:",
+				strings.Join(a.EgressAllowlist, ", "))
+		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
 	}

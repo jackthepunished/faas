@@ -89,11 +89,75 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// `Bits() == 0` reject is shared with the DB trigger so a
 		// future /0 rejection in either layer cannot quietly
 		// disagree.
+		//
+		// PR-C (ADR-031+032 follow-up): beyond the bare shape check,
+		// this loop now also (a) rewrites the v4-mapped v6 form
+		// (RFC 4291 §2.5.5.2 — `::ffff:0:0/96` block) to its v4
+		// form so the persisted row never carries a "::ffff:"
+		// prefix and the read-back is consistent across plans, and
+		// (b) de-duplicates entries AFTER canonicalisation so
+		// `1.2.3.0/24` and `::ffff:1.2.3.0/120` collapse to one
+		// entry. Insertion order is first-seen-wins — the surviving
+		// entries keep the order they were submitted in. When the
+		// canonicalised list differs from the input (rewrite OR
+		// dedup), `req.EgressAllowlist` is replaced so the
+		// downstream conversion at updateApp sees canonical strings
+		// — without that replacement, the second parse would
+		// silently resurrect the v4-mapped form on the wire.
+		canonicalised := make([]netip.Prefix, 0, len(*req.EgressAllowlist))
+		seen := make(map[string]struct{}, len(*req.EgressAllowlist))
+		// dirty tracks whether ANY entry had its string form
+		// changed (v4-mapped rewrite) OR was dropped (dedup). The
+		// downstream `len(canonicalised) != len(input)` check
+		// alone is not enough — a single-entry input that
+		// canonicalises but doesn't dedup has the same length
+		// before and after. Without this flag, the rewritten
+		// string never replaces the original on req, and the
+		// second parse at updateApp silently resurrects the
+		// pre-canonical form on the wire.
+		dirty := false
 		for _, raw := range *req.EgressAllowlist {
 			prefix, err := netip.ParsePrefix(raw)
 			if err != nil || prefix.Bits() == 0 {
 				return api.ErrInvalidEgressAllowlist(raw, errOrZero("parse failed", err))
 			}
+			// v4-mapped v6 → v4. RFC 4291 §2.5.5.2: ::ffff:0:0/96
+			// is the v4-mapped block; any prefix inside that block
+			// (bits >= 96) is a v4 prefix translated to v6 form.
+			// Rewrite to the canonical v4 form. The DB trigger
+			// holds the v4 /0 floor; the handler catches "wider
+			// than /8" here so the operator gets a more actionable
+			// message than a generic Postgres constraint error.
+			if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+				v4Bits := prefix.Bits() - 96
+				if v4Bits < 8 {
+					return api.ErrInvalidEgressAllowlist(raw,
+						errors.New("v4-mapped prefix maps to v4 /0..7"))
+				}
+				// Unmap() strips the ::ffff: prefix from the v6
+				// representation so the resulting prefix is a true
+				// v4 prefix (Is4() returns true, Is4In6() returns
+				// false, prefix.String() renders without `::`).
+				// Without the Unmap, Masked().Addr() returns the
+				// v6 form (e.g. `::ffff:1.2.3.0`) and the rewrite
+				// silently produces `::/24` instead of `1.2.3.0/24`.
+				prefix = netip.PrefixFrom(prefix.Masked().Addr().Unmap(), v4Bits).Masked()
+				dirty = true
+			}
+			key := prefix.String()
+			if _, ok := seen[key]; ok {
+				dirty = true // dedup drop counts as a change.
+				continue
+			}
+			seen[key] = struct{}{}
+			canonicalised = append(canonicalised, prefix)
+		}
+		if dirty {
+			rewritten := make([]string, len(canonicalised))
+			for i, p := range canonicalised {
+				rewritten[i] = p.String()
+			}
+			req.EgressAllowlist = &rewritten
 		}
 	}
 	return nil

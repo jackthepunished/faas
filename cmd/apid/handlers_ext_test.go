@@ -277,6 +277,12 @@ func TestUpdateAppEgressAllowlist_V6AcceptedOnPro(t *testing.T) {
 // TestUpdateAppEgressAllowlist_MixedAcceptedOnPro: a mixed v4 + v6
 // allowlist must be accepted (ADR-032). The renderer partitions
 // into two argvs; the handler does not need to know.
+//
+// PR-C: strengthened to assert exact values + insertion order,
+// mirroring the v6-only test above (which only ever sent a single
+// entry so order was trivial). The mixed list is the natural
+// mirror for the v4-mapped dedup test below — both share the
+// "list crosses families" shape and need first-seen-wins pinning.
 func TestUpdateAppEgressAllowlist_MixedAcceptedOnPro(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	id := mustSeedApp(t, e, "pro-mixed")
@@ -290,8 +296,14 @@ func TestUpdateAppEgressAllowlist_MixedAcceptedOnPro(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppByID: %v", err)
 	}
-	if len(app.EgressAllowlist) != 2 {
-		t.Fatalf("allowlist len = %d, want 2: %+v", len(app.EgressAllowlist), app.EgressAllowlist)
+	want := []string{"1.2.3.0/24", "fe80::/10"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
 	}
 }
 
@@ -324,6 +336,236 @@ func TestUpdateAppEgressAllowlist_TooLong(t *testing.T) {
 		EgressAllowlist: &many,
 	}, nil)
 	assertProblem(t, rec, 400, api.CodeEgressAllowlistTooLong)
+}
+
+// --- PR-C v4-mapped canonicalisation + dedup -----------------------------
+//
+// The validateUpdateApp loop was extended in PR-C to (a) rewrite
+// `::ffff:V4ADDR/N` to its canonical v4 form (`V4ADDR/(N-96)`),
+// (b) de-duplicate entries after canonicalisation. The tests
+// below pin each branch. The pattern mirrors the existing v6-only
+// and mixed tests above: PATCH → AppByID → assert exact stored
+// string form.
+
+// TestUpdateAppEgressAllowlist_V4MappedCanonicalised: a single
+// v4-mapped v6 entry is rewritten to its v4 form. PATCH
+// `::ffff:1.2.3.0/120` → 200; AppByID reads back `1.2.3.0/24`.
+// This is the happy-path pin for the rewrite branch.
+func TestUpdateAppEgressAllowlist_V4MappedCanonicalised(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:1.2.3.0/120"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if len(app.EgressAllowlist) != 1 || app.EgressAllowlist[0].String() != "1.2.3.0/24" {
+		t.Fatalf("allowlist = %+v, want [1.2.3.0/24]", app.EgressAllowlist)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedMixed_Dedup: an input list
+// that contains BOTH the v4 form and the v4-mapped form of the
+// same prefix must collapse to a single entry after
+// canonicalisation. Order is first-seen-wins — the surviving
+// entry keeps the position of the FIRST occurrence. Also pins
+// that a v4 entry + an unrelated v6 entry + the v4-mapped
+// equivalent of the v4 entry ends up as [v4, v6].
+func TestUpdateAppEgressAllowlist_V4MappedMixed_Dedup(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped-mixed")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-mixed", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24", "::ffff:1.2.3.0/120", "8.8.8.0/24"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	want := []string{"1.2.3.0/24", "8.8.8.0/24"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
+	}
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedBelowV4Min: a v4-mapped
+// entry that would canonicalise to a v4 prefix wider than /8
+// (the v4 floor enforced by the DB trigger) is rejected at the
+// handler with a more actionable message than the trigger's
+// generic constraint error. `::ffff:0.0.0.0/96` canonically maps
+// to v4 /0 (rejected); `::ffff:0.1.0.0/104` maps to v4 /8 (the
+// boundary, accepted by the next test).
+func TestUpdateAppEgressAllowlist_V4MappedBelowV4Min(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-v4mapped-floor")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-floor", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:0.0.0.0/96"},
+	}, nil)
+	assertProblem(t, rec, 400, api.CodeInvalidEgressAllowlist)
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedAtV4S8: the /8 boundary
+// is the FLOOR. PATCH `::ffff:1.2.3.0/104` → 200; AppByID
+// reads back `1.0.0.0/8`. The host bits get masked off by /8
+// (1.2.3.0 round-downs to 1.0.0.0) — that is a property of the
+// prefix length, not the canonicalisation. Pins that the handler
+// agrees with the DB trigger on the floor and applies Masked()
+// after the Unmap.
+func TestUpdateAppEgressAllowlist_V4MappedAtV4S8(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped-s8")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-s8", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:1.2.3.0/104"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if len(app.EgressAllowlist) != 1 || app.EgressAllowlist[0].String() != "1.0.0.0/8" {
+		t.Fatalf("allowlist = %+v, want [1.0.0.0/8]", app.EgressAllowlist)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_DedupPreservesFirstSeenOrder: the
+// dedup branch is independent of v4-mapped canonicalisation —
+// plain duplicates are also collapsed. The remaining entries
+// keep insertion order (first-seen wins). Pins that the handler
+// does NOT sort before persisting (a sort would change
+// observable behaviour across repeat PATCHes).
+func TestUpdateAppEgressAllowlist_DedupPreservesFirstSeenOrder(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-dedup-order")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-dedup-order", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"8.8.8.0/24", "1.2.3.0/24", "8.8.8.0/24"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	want := []string{"8.8.8.0/24", "1.2.3.0/24"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
+	}
+}
+
+// --- PR-C read-path: AppResponse surfaces EgressAllowlist -----------------
+//
+// PR-C added EgressAllowlist []string to api.AppResponse. The tests
+// below pin the read path: field is materialised in the JSON body
+// (never `null`), populated from state.App.EgressAllowlist, and
+// reflects the persisted canonical form. The pattern mirrors the
+// v6-only write test above: PATCH → GET → assert body shape.
+
+// TestGetApp_SurfacesEgressAllowlist: PATCH a 3-entry mixed list,
+// then GET and assert the JSON body has egress_allowlist as a
+// 3-element array of the canonical strings (no `::ffff:` after
+// PR-C's rewrite). Catches DTO field missing, appResponse
+// population bug, JSON tag mismatch.
+func TestGetApp_SurfacesEgressAllowlist(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "get-surface")
+	rec := e.do(t, "PATCH", "/v1/apps/get-surface", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24", "8.8.8.0/24", "fe80::/10"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	rec = e.do(t, "GET", "/v1/apps/get-surface", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		EgressAllowlist []string `json:"egress_allowlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal GET body: %v; body: %s", err, rec.Body.String())
+	}
+	want := []string{"1.2.3.0/24", "8.8.8.0/24", "fe80::/10"}
+	if len(got.EgressAllowlist) != len(want) {
+		t.Fatalf("egress_allowlist len = %d, want %d (body: %s)", len(got.EgressAllowlist), len(want), rec.Body.String())
+	}
+	for i, e := range got.EgressAllowlist {
+		if e != want[i] {
+			t.Errorf("egress_allowlist[%d] = %q, want %q", i, e, want[i])
+		}
+	}
+}
+
+// TestGetApp_EmptyAllowlistSerializesAsArray: a Free plan (the
+// default) has no allowlist; the GET response must serialise
+// egress_allowlist as `[]` (never `null`). This is the
+// load-bearing pin against `omitempty` on the AppResponse field —
+// without it, a future refactor that adds `omitempty` would
+// silently regress the dashboard parser.
+func TestGetApp_EmptyAllowlistSerializesAsArray(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "get-empty-free")
+	rec := e.do(t, "GET", "/v1/apps/get-empty-free", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	// Body must contain the literal "egress_allowlist":[] —
+	// substring search avoids pulling in a JSON parser.
+	if !strings.Contains(rec.Body.String(), `"egress_allowlist":[]`) {
+		t.Errorf("expected egress_allowlist:[] in GET body, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"egress_allowlist":null`) {
+		t.Errorf("egress_allowlist serialised as null (omitempty regression); got: %s", rec.Body.String())
+	}
+}
+
+// TestGetApp_PostPatchEmptyAllowlist: a Pro plan PATCHing []
+// (the "clear" sentinel) must read back [] on GET. Pins the
+// contract that explicit-clear and never-set have the same wire
+// shape — both `[]`, not `null`, not the prior list.
+func TestGetApp_PostPatchEmptyAllowlist(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "get-clear")
+	// First PATCH populates the list.
+	if rec := e.do(t, "PATCH", "/v1/apps/get-clear", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24"},
+	}, nil); rec.Code != 200 {
+		t.Fatalf("initial PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	// Second PATCH clears it.
+	if rec := e.do(t, "PATCH", "/v1/apps/get-clear", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{},
+	}, nil); rec.Code != 200 {
+		t.Fatalf("clear PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	rec := e.do(t, "GET", "/v1/apps/get-clear", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"egress_allowlist":[]`) {
+		t.Errorf("expected egress_allowlist:[] after clear, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"egress_allowlist":null`) {
+		t.Errorf("egress_allowlist serialised as null; got: %s", rec.Body.String())
+	}
 }
 
 // --- CRUD coverage for handlers_ext.go (slice 2) ----------------------------
