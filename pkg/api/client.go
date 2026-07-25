@@ -383,6 +383,14 @@ func (c *Client) CreateCron(ctx context.Context, slug string, req CreateCronRequ
 	var out CronResponse
 	return out, c.do(ctx, "POST", "/v1/crons", req, &out)
 }
+
+// UpdateCron edits a cron's schedule/path/enabled. Pointer-based
+// fields let the caller distinguish "unset" from "explicit zero" —
+// coverage is `pkg/api/client_test.go:133`'s idempotency-key pin.
+func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronRequest) (CronResponse, error) {
+	var out CronResponse
+	return out, c.do(ctx, "PATCH", "/v1/crons/"+id, req, &out)
+}
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
