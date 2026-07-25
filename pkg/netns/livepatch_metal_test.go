@@ -27,6 +27,8 @@ package netns
 import (
 	"net/netip"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -52,6 +54,35 @@ func listChainForFamily(t *testing.T, ns, table, family, chain string) string {
 		return ""
 	}
 	return out
+}
+
+// handleFromListChainOutput scans the nft `-a list chain` output
+// for the rule line containing the given substring and returns
+// the trailing `# handle N` integer as a string. Returns the
+// empty string if no match.
+//
+// The handle extraction is regex-anchored on `# handle \d+` so
+// the rule body's argument tokens (which may contain the word
+// "handle" in a future renderer extension) can't collide with
+// the comment-anchored handle. The match is intended to be
+// positional — the handle is the LAST `# handle N` token on
+// the matching line, which is what `nft -a` emits.
+func handleFromListChainOutput(ruleset, lineContains string) string {
+	re := regexp.MustCompile(`# handle (\d+)`)
+	for _, line := range strings.Split(ruleset, "\n") {
+		if !strings.Contains(line, lineContains) {
+			continue
+		}
+		match := re.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		if _, err := strconv.ParseUint(match[1], 10, 64); err != nil {
+			continue
+		}
+		return match[1]
+	}
+	return ""
 }
 
 func TestMetalEgressAllowlist_LivePatch(t *testing.T) {
@@ -102,21 +133,12 @@ func TestMetalEgressAllowlist_LivePatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nft -a list chain: %v\n%s", err, listOut)
 	}
-	// Parse `# handle N` from the allowlist line. The
-	// nft text printer puts the handle at the end of the
-	// matching rule line. Walk lines, find the one with
-	// the old allowlist, extract the trailing handle.
-	var handle string
-	for _, line := range strings.Split(listOut, "\n") {
-		if strings.Contains(line, "ip daddr { 1.2.3.0/24 } accept") {
-			idx := strings.LastIndex(line, "handle ")
-			if idx < 0 {
-				t.Fatalf("no handle suffix in allowlist line:\n%s", line)
-			}
-			handle = strings.TrimSpace(line[idx+len("handle "):])
-			break
-		}
-	}
+	// Parse `# handle N` from the allowlist line via the
+	// regex-anchored helper. Modern nft prints handles at
+	// end-of-rule with `# handle N`; the regex match is
+	// anchored on the comment so a future rule body tokens
+	// that contain the word "handle" can't collide.
+	handle := handleFromListChainOutput(listOut, "ip daddr { 1.2.3.0/24 } accept")
 	if handle == "" {
 		t.Fatalf("could not find allowlist rule handle in:\n%s", listOut)
 	}
@@ -200,17 +222,7 @@ func TestMetalEgressAllowlist_LivePatchV6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nft -a list chain (v6): %v\n%s", err, listOut)
 	}
-	var handle string
-	for _, line := range strings.Split(listOut, "\n") {
-		if strings.Contains(line, "ip6 daddr { 2001:db8::/32 } accept") {
-			idx := strings.LastIndex(line, "handle ")
-			if idx < 0 {
-				t.Fatalf("no handle suffix in v6 allowlist line:\n%s", line)
-			}
-			handle = strings.TrimSpace(line[idx+len("handle "):])
-			break
-		}
-	}
+	handle := handleFromListChainOutput(listOut, "ip6 daddr { 2001:db8::/32 } accept")
 	if handle == "" {
 		t.Fatalf("could not find v6 allowlist rule handle in:\n%s", listOut)
 	}

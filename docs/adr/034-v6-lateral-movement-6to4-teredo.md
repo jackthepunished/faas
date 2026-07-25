@@ -45,6 +45,72 @@ ADR-031 + ADR-033 added the per-app allowlist (deny > allow on
 overlap) but did not address the underlying denylist. PR-A in the
 tier-2 follow-up plan ships the fix.
 
+## Threat model
+
+Both 6to4 and Teredo are *IPv6 transition mechanisms* — they let
+a host speak IPv6 when only an IPv4 path is available. The
+security model we're building on is "the per-netns forward chain
+sees everything the guest sends out". That guarantee falls apart
+the moment a guest can pick a different wire format to escape
+the rule:
+
+**Path 1 — v6-in-IPv4 to reach a v4 destination indirectly.**
+The Per-App allowlist (ADR-031) is partitioned by
+`prefix.Addr().Is4()`. A CIDR like `8.8.8.0/24` is recognised as
+v4 and emits the `ip daddr { 8.8.8.0/24 } accept` rule on the
+`ip faas forward` chain. A guest that wants to reach `8.8.8.8`
+but is blocked by the allowlist can package the v4 packet as
+`2002:0808:0808::` (the 6to4-encoded equivalent of `8.8.8.8`) and
+send it as v6. The allowlist chain has no `accept` rule for
+`2002:0808:0808::/48` (the prefix is not in the customer's list
+because the customer only knows v4), so the packet would normally
+drop. **But** — the packet does not match the v6 deny set either
+(because `2002::/16` is not in the v6 deny list today). Result:
+the packet lands on the host, the host's 6to4 anycast relay
+decapsulates it, and the inner v4 packet is forwarded to
+`8.8.8.8`. The firewall saw *no* allow + *no* deny = the packet
+escaped.
+
+**Path 2 — v6-in-IPv4 to reach an RFC1918 destination.**
+Same mechanism, worse target. A 6to4-encoded `2002:0a00:0001::`
+decapsulates to `10.0.0.1`. The v4 deny list blocks the direct
+v4 attempt, but the v6 path lets the guest bypass the v4 deny
+and reach the internal network *through the relay*. The relay
+is on the public internet, so the inner packet emerges from a
+public IP — which is exactly the lateral-movement vector the v4
+deny list is meant to close.
+
+**Path 3 — Teredo-as-UDP-app.**
+Teredo tunnels over UDP/3544. A guest cannot trivially establish
+a Teredo tunnel without a server handshake (the protocol is
+stateful), but the *handshake packets* themselves are UDP/3544
+that the host bridge will happily forward. A guest that resolves
+`teredo.ipv6.microsoft.com` (or any attacker-controlled server)
+can complete the handshake and then send arbitrary v6 over the
+established tunnel. The v6 deny list today doesn't include
+`2001::/32`, so the tunnel's traffic flows.
+
+**Why these are not caught by the per-app allowlist.**
+The allowlist is opt-in per-app. A customer's allowlist is
+typically `["8.8.8.0/24", "1.1.1.0/24"]` — the addresses the
+customer's code needs to reach. Anything not in the list is
+implicitly denied. The implicit deny is the *v4 allowlist chain*
+(`ip daddr { … } accept` followed by `policy accept`) and the
+*v6 deny chain* (`ip6 daddr { fe80::/10, fc00::/7, … } drop`
+followed by `policy accept`). The v6 deny chain is
+over-permissive today: it drops link-local, ULA, multicast, and
+loopback, but it permits public v6 traffic. That permissiveness
+is what makes Path 1 (and Path 2 / 3) work.
+
+**Closing the gap.** Adding `2002::/16` and `2001::/32` to the
+v6 deny chain forces the guest to encode the v4 destination as
+v6 *and* have the v6 form pass the chain. Both 6to4 and Teredo
+prefixes are now drops. The customer who legitimately needs
+6to4 (none have asked) has no path; the customer who
+maliciously reaches for the tunnel has no path. The fix is
+symmetric to the v4 deny list's posture and matches the
+"no path that bypasses the egress allowlist" first principle.
+
 ## Decision
 
 `pkg/netns.NewDefaultDenySet()` adds two new v6 entries:

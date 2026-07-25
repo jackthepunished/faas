@@ -809,6 +809,15 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 //  4. On any failure, run the revert: re-add the prior rule by
 //     re-rendering its argv. The prior argv was the one cached
 //     on the live-instance struct (kept across patches).
+//
+// Per-family revert: the v4 and v6 patch sequences are run
+// independently so that a v4 success isn't rolled back when the
+// v6 patch fails. The reverted family re-renders the prior
+// allowlist into its argv and re-adds the rule; the successful
+// family is left alone. The catch is that handle capture only
+// knows the new handle for the family that succeeded (the other
+// stays at the prior handle, which is still valid for the
+// reverted-on-failure family).
 func (m *Manager) applyOneInstancePatch(
 	ctx context.Context,
 	netnsName string,
@@ -821,57 +830,93 @@ func (m *Manager) applyOneInstancePatch(
 	// samePrefixSet before reaching here, so we always run the
 	// per-family patch sequence. `prior` is still used below on
 	// the failure-path revert (re-render the prior allowlist
-	// into the per-family argv and re-add both).
-	// Build the patch argv sequence: per family, delete-by-handle
-	// (if any) then add-new (if any).
+	// into the per-family argv and re-add the failed family).
+	// Build the per-family patch sequence. Track which family
+	// each step belongs to so a mid-sequence failure can revert
+	// only the failed family.
 	nx := func(parts ...string) []string {
 		return append([]string{"ip", "netns", "exec", netnsName, "nft"}, parts...)
 	}
-	var patchCmds [][]string
+	type familyOp struct {
+		family  string // "v4" or "v6"
+		argv    []string
+		newArgv []string // for revert: the new argv that was just added; on revert we re-add it then the next patch will delete by handle
+	}
+	var ops []familyOp
 	if handleV4 > 0 {
-		patchCmds = append(patchCmds, nx("delete", "rule", "ip", "faas", "forward", "handle", fmt.Sprintf("%d", handleV4)))
+		ops = append(ops, familyOp{
+			family: "v4",
+			argv:   nx("delete", "rule", "ip", "faas", "forward", "handle", fmt.Sprintf("%d", handleV4)),
+		})
 	}
 	if v4New != nil {
-		patchCmds = append(patchCmds, v4New)
+		ops = append(ops, familyOp{family: "v4", argv: v4New, newArgv: v4New})
 	}
 	if handleV6 > 0 {
-		patchCmds = append(patchCmds, nx("delete", "rule", "ip6", "faas", "forward", "handle", fmt.Sprintf("%d", handleV6)))
+		ops = append(ops, familyOp{
+			family: "v6",
+			argv:   nx("delete", "rule", "ip6", "faas", "forward", "handle", fmt.Sprintf("%d", handleV6)),
+		})
 	}
 	if v6New != nil {
-		patchCmds = append(patchCmds, v6New)
+		ops = append(ops, familyOp{family: "v6", argv: v6New, newArgv: v6New})
 	}
 	// Idempotent fast-path: nothing to do.
-	if len(patchCmds) == 0 {
+	if len(ops) == 0 {
 		return zero, nil
 	}
-	if err := m.runCommands(ctx, patchCmds); err != nil {
-		// Revert: re-emit the prior argv (best-effort). The
-		// revert re-renders the prior allowlist into the per-
-		// family argv and re-adds both. A revert failure is
-		// logged and the original patch error is returned.
+
+	// Run per-family patches. A failure on one family reverts
+	// that family (re-adds the prior rule) and returns the
+	// error — the other family is left at its new state.
+	failedFamily := ""
+	patchErr := error(nil)
+	for _, op := range ops {
+		if err := m.runCommands(ctx, [][]string{op.argv}); err != nil {
+			failedFamily = op.family
+			patchErr = err
+			break
+		}
+	}
+	if failedFamily != "" {
+		// Per-family revert: re-render the prior allowlist for
+		// the failed family and re-add it. The other family is
+		// untouched (its new ruleset is already live).
 		priorNC := netns.Config{Netns: netnsName, EgressAllowlist: prior}
-		priorV4 := priorNC.ForwardAllowlistRule(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
-		priorV6 := priorNC.ForwardAllowlistRule6(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
-		var revertCmds [][]string
-		if priorV4 != nil {
-			revertCmds = append(revertCmds, priorV4)
+		var revertArgv []string
+		if failedFamily == "v4" {
+			revertArgv = priorNC.ForwardAllowlistRule(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
+		} else {
+			revertArgv = priorNC.ForwardAllowlistRule6(func(parts ...string) []string { return append([]string{}, nx(parts...)...) })
 		}
-		if priorV6 != nil {
-			revertCmds = append(revertCmds, priorV6)
-		}
-		if len(revertCmds) > 0 {
-			if rerr := m.runCommands(ctx, revertCmds); rerr != nil {
+		if revertArgv != nil {
+			if rerr := m.runCommands(ctx, [][]string{revertArgv}); rerr != nil {
 				m.log.Warn("fcvm: UpdateEgressAllowlist revert failed; live netns may be in undefined state",
-					"netns", netnsName, "patch_err", err, "revert_err", rerr)
+					"netns", netnsName, "family", failedFamily,
+					"patch_err", patchErr, "revert_err", rerr)
 			}
 		}
-		return zero, err
+		return zero, patchErr
 	}
-	// Handle capture: the kernel assigns handles on add; we
-	// record zero here and the next patch's pre-read (or Wake
-	// re-read) refreshes them. The unit suite doesn't simulate
-	// the kernel pre-read, but the metal test does.
-	return struct{ v4, v6 uint64 }{v4: handleV4, v6: handleV6}, nil
+
+	// Handle capture: the kernel assigns handles on add. We
+	// re-list the chain (when captureRunner is wired) and parse
+	// the new handle so the next patch's delete-by-handle call
+	// targets the rule that was just installed. When the
+	// capture runner is nil (unit tests with a fakeRunner that
+	// doesn't simulate the kernel), the cached handle stays at
+	// the prior value — the metal test exercises the
+	// captureRunner path on the EX44.
+	newH4, newH6 := handleV4, handleV6
+	if m.captureRunner != nil {
+		if h, err := listChainHandles(ctx, m.captureRunner, netnsName, "ip", "faas", "forward"); err == nil {
+			newH4 = h
+		}
+		if h, err := listChainHandles(ctx, m.captureRunner, netnsName, "ip6", "faas", "forward"); err == nil {
+			newH6 = h
+		}
+	}
+	return struct{ v4, v6 uint64 }{v4: newH4, v6: newH6}, nil
 }
 
 // samePrefixSet compares two prefix slices for set equality.
