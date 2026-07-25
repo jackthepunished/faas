@@ -323,7 +323,7 @@ paths:
                   enum: [app, function]
                 runtime:
                   type: string
-                  enum: [node22, python312]
+                  enum: [node22, python312, go124]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -1262,13 +1262,18 @@ components:
         requests: { type: integer, format: int64 }
 
     APIKeyExportResponse:
-      description: "One API key in export form: id, prefix (first 8 chars), label, created/last-used timestamps, and request count."
+      description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034)."
       type: object
-      required: [id, prefix, created_at]
+      required: [id, prefix, scopes, created_at]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         prefix: { type: string }
         label: { type: [string, "null"] , example: "ci-deploy"}
+        scopes:
+          type: array
+          items: { type: string, enum: [admin, read, write] }
+          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE. See IAM-1, ADR-034."
+          example: [admin]
         created_at: { type: string, format: date-time }
         last_used_at: { type: [string, "null"], format: date-time }
 
@@ -1295,14 +1300,14 @@ components:
     # ─── Apps ─────────────────────────────────────────────────────────────
 
     AppResponse:
-      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, and last-deploy pointer."
+      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, and per-app outbound CIDR allowlist (ADR-031 + ADR-032)."
       type: object
       required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
         type: { type: string, enum: [app, function] , example: "app"}
-        runtime: { type: string, enum: [node22, python312], description: "Runtime for `type: function` apps. Omit for `type: app` (the default)." }
+        runtime: { type: string, enum: [node22, python312, go124], description: "Runtime for `type: function` apps. Omit for `type: app` (the default)." }
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
         idle_timeout_s: { type: [integer, "null"] }
@@ -1310,6 +1315,22 @@ components:
         status: { type: string , example: "active"}
         url: { type: string, format: uri }
         manifest: { $ref: '#/components/schemas/AppManifest' }
+        # ADR-031 + ADR-032 (tier-2 network follow-ups, PR-C):
+        # the per-app outbound CIDR allowlist. Each entry is a
+        # canonical CIDR string — v4 ("1.2.3.0/24") or v6
+        # ("2001:db8::/32"). v4-mapped v6 form ("::ffff:1.2.3.0/120")
+        # is silently rewritten to its v4 form at PATCH time by
+        # validateUpdateApp, so the read-back never carries a
+        # "::ffff:" prefix. Always present (serialised as `[]`
+        # when empty, never `null`); NOT in `required:` so the
+        # empty case stays the contract for Free/Hobby.
+        egress_allowlist:
+          description: "Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6 (`2001:db8::/32`). v4-mapped v6 form (`::ffff:1.2.3.0/120`) is silently canonicalised to its v4 form at write time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies."
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9a-fA-F:./]+$'
+            example: 1.2.3.0/24
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -1318,7 +1339,7 @@ components:
       properties:
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', minLength: 3, maxLength: 40, example: "hello-world" }
         type: { type: string, enum: [app, function] , example: "app"}
-        runtime: { type: string, enum: [node22, python312] }
+        runtime: { type: string, enum: [node22, python312, go124] }
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
         idle_timeout_s: { type: integer }
@@ -1332,17 +1353,23 @@ components:
         max_concurrency: { type: [integer, "null"] }
         min_instances: { type: [integer, "null"], minimum: 0 }
         # ADR-031 (tier-2 of the network roadmap): per-app
-        # outbound IPv4 allowlist. Replace-mode semantics:
+        # outbound CIDR allowlist. Replace-mode semantics:
         # omitted → no change; non-null array → atomic
         # overwrite (empty array clears). Pro/Scale only;
         # Free/Hobby PATCH → 403 plan_egress_allowlist_not_
         # allowed. Plan caps: Pro 16 entries, Scale 64.
+        # PR-C widens the pattern from IPv4-only to v4+v6
+        # (ADR-032 already shipped the handler-side acceptance
+        # but the spec wasn't updated; pre-PR-C the validator
+        # was permissive relative to the spec, allowing
+        # `::ffff:1.2.3.0/120` because the spec said "forbid
+        # `:`" while the handler said "accept v6").
         egress_allowlist:
-          description: "IPv4 CIDR allowlist; empty array clears to chain-default-accept."
+          description: "v4 or v6 CIDR allowlist; empty array clears to chain-default-accept."
           type: array
           items:
             type: string
-            pattern: '^[0-9./]+$'
+            pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
 
     RenameAppRequest:
@@ -1485,13 +1512,18 @@ components:
     # ─── API keys ─────────────────────────────────────────────────────────
 
     APIKeyResponse:
-      description: "API key metadata: id, prefix (first 8 chars), label, created/last-used timestamps, request count. **Plaintext is returned only on POST**."
+      description: "API key metadata: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, request count. **Plaintext is returned only on POST**."
       type: object
-      required: [id, prefix, created_at]
+      required: [id, prefix, scopes, created_at]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         prefix: { type: string, description: 'First 16 chars of the key (e.g. `fp_live_abc12345…`).' }
         label: { type: [string, "null"] , example: "ci-deploy"}
+        scopes:
+          type: array
+          items: { type: string, enum: [admin, read, write] }
+          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers mutating requests. See IAM-1, ADR-034."
+          example: [admin]
         last_used_at: { type: [string, "null"], format: date-time }
         created_at: { type: string, format: date-time }
         plaintext:
@@ -1499,10 +1531,15 @@ components:
           description: PRESENT ONLY on POST /v1/keys response. Never returned again.
 
     CreateKeyRequest:
-      description: "API key creation payload: label only."
+      description: "API key creation payload: label and scopes. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034."
       type: object
       properties:
         label: { type: string, maxLength: 100 , example: "ci-deploy"}
+        scopes:
+          type: array
+          items: { type: string, enum: [admin, read, write] }
+          description: "Requested permission set. Server validates each entry against the allowed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE."
+          example: [read]
 
     # ─── Secrets ──────────────────────────────────────────────────────────
 

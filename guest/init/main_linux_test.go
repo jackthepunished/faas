@@ -137,3 +137,76 @@ func mustMarshal(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// TestBuildArgv pins the in-VM build-engine argv shape. builderd relies
+// on the (framework → argv) mapping to render BuildDone.FailureClass
+// correctly (the LogTail carries railpack / buildctl output verbatim,
+// so the binary name is the operator's grep target). A regression that
+// adds a new BuildFramework without extending this table would silently
+// land in the `default` (auto) branch and produce a non-Railpack-aware
+// log tail that the customer can't act on.
+func TestBuildArgv(t *testing.T) {
+	workdir := "/build/src"
+	outdir := "/build/out"
+	cases := []struct {
+		name string
+		fw   api.BuildFramework
+		want []string
+	}{
+		{
+			name: "dockerfile → buildctl",
+			fw:   api.FrameworkDockerfile,
+			want: []string{
+				"buildctl", "build",
+				"--frontend", "dockerfile",
+				"--local", "context=" + workdir,
+				"--local", "dockerfile=" + workdir,
+				"--output", "type=oci,dest=" + outdir + "/image.tar",
+			},
+		},
+		{
+			name: "node → railpack --plan node",
+			fw:   api.FrameworkRailpackNode,
+			want: []string{"railpack", "build", outdir, "--plan", "node"},
+		},
+		{
+			name: "python → railpack --plan python",
+			fw:   api.FrameworkRailpackPython,
+			want: []string{"railpack", "build", outdir, "--plan", "python"},
+		},
+		{
+			name: "go → railpack --plan go",
+			fw:   api.FrameworkRailpackGo,
+			want: []string{"railpack", "build", outdir, "--plan", "go"},
+		},
+		{
+			name: "auto → railpack --plan auto (default branch)",
+			fw:   api.FrameworkAuto,
+			want: []string{"railpack", "build", outdir, "--plan", "auto"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildArgv(api.BuildManifest{
+				Framework: tc.fw,
+				Workdir:   workdir,
+				OutDir:    outdir,
+			})
+			if !equalSlice(got, tc.want) {
+				t.Errorf("buildArgv(%q) = %v, want %v", tc.fw, got, tc.want)
+			}
+		})
+	}
+}
+
+func equalSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

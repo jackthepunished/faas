@@ -44,12 +44,20 @@ var eventsChannels = []string{
 // (dashboard) or an API key (CLI), resolves the account, then dumps
 // every relevant pg_notify frame to the client as `event: <kind>`
 // frames until the client disconnects.
+//
+// API-key callers must hold at least the "read" scope; session-cookie
+// callers are implicitly admin. IAM-1, ADR-034.
 func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		acct, ok := resolveEventsCaller(r, s)
+		acct, key, ok := resolveEventsCaller(r, s)
 		if !ok {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 				"Unauthorized", "session cookie or API key required"))
+			return
+		}
+		if key != nil && !principalHasScope(principal{Acct: acct, Key: key}, []string{api.ScopeAdmin, api.ScopeRead}) {
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
+				"Insufficient scope", "event stream requires the read or admin scope"))
 			return
 		}
 		ownedApps := s.buildOwnedAppCache(r.Context(), acct.ID)
@@ -99,25 +107,27 @@ func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 }
 
 // resolveEventsCaller accepts either a session cookie (dashboard) or
-// an API key (CLI), pulling the matching account off the request.
-// Returns the account + true; or false if neither auth path matched.
-func resolveEventsCaller(r *http.Request, s *server) (state.Account, bool) {
+// an API key (CLI), pulling the matching account + key off the request.
+// The key is nil when the caller authenticated via session cookie (in
+// which case the caller is implicitly admin). Returns the account,
+// key, and true; or false if neither auth path matched.
+func resolveEventsCaller(r *http.Request, s *server) (state.Account, *state.APIKey, bool) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		if env, err := s.sessions.Verify(c.Value); err == nil {
 			if acct, err := s.store.AccountByID(r.Context(), env.AccountID); err == nil && acct.Active() {
-				return acct, true
+				return acct, nil, true
 			}
 		}
 	}
 	if h := r.Header.Get("Authorization"); len(h) > 7 && h[:7] == "Bearer " {
 		tok := h[7:]
 		if api.ValidAPIKeyFormat(tok) {
-			if acct, err := s.store.AccountByKeyHash(r.Context(), api.HashAPIKey(tok)); err == nil && acct.Active() {
-				return acct, true
+			if acct, key, err := s.store.AuthenticateKey(r.Context(), api.HashAPIKey(tok)); err == nil && acct.Active() {
+				return acct, &key, true
 			}
 		}
 	}
-	return state.Account{}, false
+	return state.Account{}, nil, false
 }
 
 // buildOwnedAppCache returns a lookup set of app IDs that belong to

@@ -64,3 +64,13 @@ func TestDockerfileFixture_Shape(t *testing.T) {
 	assertFixtureContains(t, DockerfileFixture(t),
 		"Dockerfile", "faas-build-token")
 }
+
+func TestGoFixture_Shape(t *testing.T) {
+	assertFixtureContains(t, GoFixture(t),
+		"go.mod", "main.go", "faas-build-token")
+}
+
+func TestGoDockerfileFixture_Shape(t *testing.T) {
+	assertFixtureContains(t, GoDockerfileFixture(t),
+		"Dockerfile", "go.mod", "main.go", "faas-build-token")
+}

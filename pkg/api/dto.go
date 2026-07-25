@@ -14,7 +14,7 @@ import (
 type CreateAppRequest struct {
 	Slug           string `json:"slug"`
 	Type           string `json:"type,omitempty"`    // "app" (default) | "function"
-	Runtime        string `json:"runtime,omitempty"` // node22|python312 for functions
+	Runtime        string `json:"runtime,omitempty"` // node22|python312|go124 for functions
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
@@ -75,6 +75,21 @@ type AppResponse struct {
 	// The DTO reuses the existing api.AppManifest (defined in
 	// appmanifest.go) so the wire shape stays a single source of truth.
 	Manifest AppManifest `json:"manifest"`
+	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
+	// roadmap) is the per-app outbound CIDR allowlist. Each entry
+	// is the canonical CIDR string form: v4 ("1.2.3.0/24") or v6
+	// ("2001:db8::/32"). The v4-mapped v6 form ("::ffff:1.2.3.0/120")
+	// is silently rewritten to its v4 form at PATCH time by
+	// validateUpdateApp, so the read-back never carries a
+	// "::ffff:" prefix. Materialised as `[]` (never `null`) at
+	// the conversion boundary (cmd/apid/handlers.go::appResponse)
+	// so Free / Hobby and pre-PATCH apps always have a predictable
+	// JSON shape — the per-netns renderer treats the empty list as
+	// "no allowlist rule" (the chain falls back to default-accept).
+	// The list is first-seen-wins-dedup'd at write time; the read
+	// order matches insertion order. NOT in `required:` because the
+	// empty-slice case is the contract.
+	EgressAllowlist []string `json:"egress_allowlist"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
@@ -135,22 +150,29 @@ type AccountLimits struct {
 
 // APIKeyResponse is an API key returned to the customer. The plaintext
 // appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
-// + label + last_used_at + id are returned thereafter.
+// + label + scopes + last_used_at + id are returned thereafter. Scopes is
+// the explicit permission set attached to the key (e.g. ["admin"],
+// ["read"], ["write"]); see ADR-034.
 type APIKeyResponse struct {
-	ID         string `json:"id"`
-	Prefix     string `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
-	Label      string `json:"label,omitempty"`
-	LastUsedAt string `json:"last_used_at,omitempty"`
-	CreatedAt  string `json:"created_at"`
+	ID         string   `json:"id"`
+	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
+	Label      string   `json:"label,omitempty"`
+	Scopes     []string `json:"scopes"`
+	LastUsedAt string   `json:"last_used_at,omitempty"`
+	CreatedAt  string   `json:"created_at"`
 	// Plaintext appears ONLY on the create response, never persisted.
 	Plaintext string `json:"plaintext,omitempty"`
 }
 
 // CreateKeyRequest is the body of POST /v1/keys. Label is optional
 // (max 100 chars per spec); empty label is allowed and renders as
-// `{}` so the server's optional-field handling stays in scope.
+// `{}` so the server's optional-field handling stays in scope. Scopes
+// is the requested permission set; the server validates each entry
+// against the allowed vocabulary (admin, read, write) and defaults to
+// ["admin"] when omitted so existing callers keep full access. See ADR-034.
 type CreateKeyRequest struct {
-	Label string `json:"label,omitempty"`
+	Label  string   `json:"label,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the
@@ -328,13 +350,17 @@ type UsageExportResponse struct {
 
 // APIKeyExportResponse is one row in the export's API key slice.
 // The plaintext key never appears here (and never reappears after
-// the create response, per §4.2). Only the prefix + label + timestamps.
+// the create response, per §4.2). Only the prefix + label + scopes +
+// timestamps. Scopes is included so the customer's GDPR export carries
+// the full audit trail of which keys had which permissions at the
+// moment of export (ADR-034).
 type APIKeyExportResponse struct {
-	ID        string `json:"id"`
-	Prefix    string `json:"prefix"`
-	Label     string `json:"label,omitempty"`
-	CreatedAt string `json:"created_at"`
-	LastUsed  string `json:"last_used_at,omitempty"`
+	ID        string   `json:"id"`
+	Prefix    string   `json:"prefix"`
+	Label     string   `json:"label,omitempty"`
+	Scopes    []string `json:"scopes"`
+	CreatedAt string   `json:"created_at"`
+	LastUsed  string   `json:"last_used_at,omitempty"`
 }
 
 // GdprAuditExportResponse is one row of the customer's own GDPR audit

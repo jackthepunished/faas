@@ -383,6 +383,16 @@ func (c *Client) CreateCron(ctx context.Context, slug string, req CreateCronRequ
 	var out CronResponse
 	return out, c.do(ctx, "POST", "/v1/crons", req, &out)
 }
+
+// UpdateCron edits a cron's schedule/path/enabled. Pointer-based
+// fields let the caller distinguish "unset" from "explicit zero" —
+// matches the partial-update shape of Client.UpdateApp. The wire
+// method is PATCH; the idempotency-key auto-mint covers this call
+// (TestDo_MutatingCallsCarryIdempotencyKey in client_test.go).
+func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronRequest) (CronResponse, error) {
+	var out CronResponse
+	return out, c.do(ctx, "PATCH", "/v1/crons/"+id, req, &out)
+}
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
@@ -479,13 +489,17 @@ func (c *Client) GetInvocation(ctx context.Context, id string) (Invocation, erro
 }
 
 // API keys.
+//
+// CreateKey accepts an explicit scopes slice. Pass nil to preserve the
+// historical "full access" behavior (the server defaults nil to
+// ["admin"]). See ADR-034 for the scope vocabulary.
 func (c *Client) ListKeys(ctx context.Context) ([]APIKeyResponse, error) {
 	var out []APIKeyResponse
 	return out, c.do(ctx, "GET", "/v1/keys", nil, &out)
 }
-func (c *Client) CreateKey(ctx context.Context, label string) (APIKeyResponse, error) {
+func (c *Client) CreateKey(ctx context.Context, label string, scopes []string) (APIKeyResponse, error) {
 	var out APIKeyResponse
-	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label}, &out)
+	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label, Scopes: scopes}, &out)
 }
 func (c *Client) DeleteKey(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/keys/"+id, nil, nil)

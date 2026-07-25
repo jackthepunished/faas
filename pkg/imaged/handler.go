@@ -67,6 +67,12 @@ type Handler struct {
 	// functionRunnerPython312Path mirrors functionRunnerNode22Path for the
 	// python312 runtime (FAAS_FUNCTION_RUNNER_PYTHON312).
 	functionRunnerPython312Path string
+	// functionRunnerGo124Path mirrors functionRunnerNode22Path for the
+	// go124 runtime (FAAS_FUNCTION_RUNNER_GO124). The runner binary
+	// itself is a static Go executable; the customer's compiled handler
+	// (also a static Go binary, built by Railpack) lives at /app/handler
+	// in the layer and is exec'd per request by the runner.
+	functionRunnerGo124Path string
 	// deployBaseRefOverride replaces the per-runtime base ref during
 	// aboveBaseLayers. See WithDeployBaseRef — test-only seam.
 	deployBaseRefOverride string
@@ -112,6 +118,15 @@ func (h *Handler) WithFunctionRunnerNode22(p string) *Handler {
 // WithFunctionRunnerPython312 mirrors WithFunctionRunnerNode22 for python312.
 func (h *Handler) WithFunctionRunnerPython312(p string) *Handler {
 	h.functionRunnerPython312Path = p
+	return h
+}
+
+// WithFunctionRunnerGo124 mirrors WithFunctionRunnerNode22 for go124.
+// The runner binary at the wired path is the static Go executable built
+// from guest/runners/go124; cmd/imaged passes the path through
+// FAAS_FUNCTION_RUNNER_GO124. Empty in unit tests.
+func (h *Handler) WithFunctionRunnerGo124(p string) *Handler {
+	h.functionRunnerGo124Path = p
 	return h
 }
 
@@ -519,7 +534,7 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// doesn't carry the runtime — keeps older clients working.
 		runtime = dep.Handler
 	}
-	if runtime != RuntimeNode22 && runtime != RuntimePython312 {
+	if runtime != RuntimeNode22 && runtime != RuntimePython312 && runtime != RuntimeGo124 {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "unsupported runtime: "+runtime)
 		return fmt.Errorf("imaged: unsupported function runtime %q", runtime)
 	}
@@ -533,13 +548,21 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
 		return fmt.Errorf("imaged: %s", msg)
 	}
+	// Per-runtime handler path. The default `/app/<runtime>` works for
+	// runtimes whose handler binary carries the runtime name (go124's
+	// static binary lives at /app/handler — see the Go branch below).
+	// The python312 and node22 branches override because their
+	// handlers ship with a language-specific extension (.py / .js).
+	// A new runtime that needs a different path adds its own branch;
+	// the default is no longer a `.js` stub so a runtime omission
+	// can't silently produce `/app/<runtime>.js`.
 	manifest := api.AppManifest{
 		Port:    api.DefaultAppPort,
 		Healthz: "/healthz",
 		Entrypoint: []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
-			"--handler", "/app/" + runtime + ".js", // python312 uses handler.py; node22 uses node22.js
+			"--handler", "/app/" + runtime,
 		},
 	}
 	if runtime == RuntimePython312 {
@@ -547,6 +570,29 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
 			"--handler", "/app/handler.py",
+		}
+	}
+	if runtime == RuntimeNode22 {
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/node22.js",
+		}
+	}
+	if runtime == RuntimeGo124 {
+		// The customer's handler is a static Go binary (Railpack's go
+		// plan emits CGO_ENABLED=0 by default), so the runner execs
+		// the file directly with no interpreter argument. The path
+		// is `/app/handler` (the default above) and pinned by
+		// guest/runners/go124/main_test.go::TestGoRunnerHandlerDefault
+		// so a default-flag drift surfaces at unit-test time, not
+		// on first wake. The branch is left here as a tripwire — if
+		// the default ever needs to differ for Go, it lives next to
+		// the other per-runtime overrides.
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/handler",
 		}
 	}
 	if err := manifest.Validate(); err != nil {
@@ -590,6 +636,8 @@ func (h *Handler) runnerPathFor(runtime string) string {
 		return h.functionRunnerNode22Path
 	case RuntimePython312:
 		return h.functionRunnerPython312Path
+	case RuntimeGo124:
+		return h.functionRunnerGo124Path
 	}
 	return ""
 }
@@ -603,6 +651,8 @@ func runtimeToEnvSuffix(runtime string) string {
 		return "NODE22"
 	case RuntimePython312:
 		return "PYTHON312"
+	case RuntimeGo124:
+		return "GO124"
 	}
 	return runtime
 }

@@ -72,7 +72,7 @@ func seedMemStoreFullAccount(t *testing.T, m *MemStore) (acctID string) {
 	if err := m.UpsertAppSecret(ctx, acct.ID, app.ID, "STRIPE_KEY", []byte("ct")); err != nil {
 		t.Fatalf("UpsertAppSecret: %v", err)
 	}
-	if _, err := m.CreateAPIKey(ctx, acct.ID, []byte("deadbeefcafebabe"), "test"); err != nil {
+	if _, err := m.CreateAPIKey(ctx, acct.ID, []byte("deadbeefcafebabe"), "test", []string{"admin"}); err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 	if err := m.RecordStripePushHour(ctx, acct.ID, time.Now().UTC().Truncate(time.Hour)); err != nil {

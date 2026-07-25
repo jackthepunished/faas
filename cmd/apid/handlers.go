@@ -84,9 +84,9 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if typ != state.AppTypeApp && typ != state.AppTypeFunction {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Invalid type", "type must be app or function")
 	}
-	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" {
+	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" && req.Runtime != "go124" {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-			"Invalid runtime", "functions require runtime node22 or python312")
+			"Invalid runtime", "functions require runtime node22, python312, or go124")
 	}
 	ram := req.RAMMB
 	if ram == 0 {
@@ -190,6 +190,16 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 }
 
 func (s *server) appResponse(a state.App) api.AppResponse {
+	// EgressAllowlist is materialised as a non-nil empty slice so
+	// the JSON shape is `[]` (never `null`) regardless of plan /
+	// pre-PATCH state. prefix.String() is the canonical form
+	// ("1.2.3.0/24", "fe80::/10"); validateUpdateApp has already
+	// rewritten any "::ffff:" v4-mapped entry to its v4 form by
+	// the time it lands in the store, so we never see one here.
+	ea := make([]string, 0, len(a.EgressAllowlist))
+	for _, p := range a.EgressAllowlist {
+		ea = append(ea, p.String())
+	}
 	return api.AppResponse{
 		ID: a.ID, Slug: a.Slug, Type: string(a.Type), Runtime: a.Runtime,
 		RAMMB: a.RAMMB, MaxConcurrency: a.MaxConcurrency, IdleTimeoutS: a.IdleTimeoutS,
@@ -205,6 +215,7 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 			Healthz:    a.Manifest.Healthz,
 			User:       a.Manifest.User,
 		},
+		EgressAllowlist: ea,
 	}
 }
 

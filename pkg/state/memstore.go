@@ -264,6 +264,23 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 	return k, nil
 }
 
+// AuthenticateKey mirrors the key+account lookup the apid auth
+// middleware needs. Single lock acquisition; returns ErrNotFound when
+// the hash has no matching key. See ADR-034.
+func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keyByHash[hex.EncodeToString(hash)]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	acct, ok := m.accounts[k.AccountID]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	return acct, k, nil
+}
+
 func (m *MemStore) UpdateAccountPlan(_ context.Context, id string, plan api.Plan) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -395,14 +412,14 @@ func (m *MemStore) ListAllAccounts(_ context.Context) ([]Account, error) {
 
 // --- API keys ---------------------------------------------------------------
 
-func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string) (APIKey, error) {
+func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h := hex.EncodeToString(hash)
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
 	}
-	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, CreatedAt: time.Now()}
+	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, Scopes: scopes, CreatedAt: time.Now()}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
 	return k, nil

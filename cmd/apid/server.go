@@ -346,50 +346,54 @@ func (noopNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) 
 // New routes append here; do not introduce per-feature sub-muxes.
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
-	// Account.
-	mux.HandleFunc("GET /v1/account", s.authLimited(s.whoami))
-	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.idempotent(s.changePlan)))
+	// Account. The /v1/account/plan change is destructive across the
+	// whole account, so it requires the admin scope; the read-only
+	// /v1/account carries the method default (read or admin).
+	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.whoami)))
+	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin)(s.idempotent(s.changePlan))))
 	// G6 account self-service (spec §17 G6, ADR-021). /v1/account/dpa
 	// is intentionally mounted without s.auth — the DPA is a public
 	// artefact a prospect reads before signing up. The export + delete
 	// + restore paths sit behind s.auth but pass the
 	// deleted_pending carve-out in isAccountScopedPath so a customer
 	// can take a final export or cancel during the 30-day grace.
-	mux.HandleFunc("GET /v1/account/export", s.auth(s.exportAccount))
-	mux.HandleFunc("DELETE /v1/account", s.auth(s.idempotent(s.deleteAccount)))
-	mux.HandleFunc("POST /v1/account/restore", s.auth(s.restoreAccount))
+	// DELETE /v1/account is admin-only — losing the account is
+	// irreversible.
+	mux.HandleFunc("GET /v1/account/export", s.auth(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.exportAccount)))
+	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.idempotent(s.deleteAccount))))
+	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
 
 	// Apps.
-	mux.HandleFunc("GET /v1/apps", s.authLimited(s.listApps))
-	mux.HandleFunc("POST /v1/apps", s.authLimited(s.idempotent(s.createApp)))
-	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.getApp))
-	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.updateApp))
-	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.deleteApp))
+	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listApps)))
+	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createApp))))
+	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getApp)))
+	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPatch))(s.updateApp)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteApp)))
 
 	// Deployments.
-	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.idempotent(s.createDeployment)))
-	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.getDeployment))
-	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.streamDeploymentLogs))
-	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.idempotent(s.rollbackApp)))
-	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.parkApp))
-	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.wakeApp))
-	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.idempotent(s.renameApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createDeployment))))
+	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getDeployment)))
+	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.streamDeploymentLogs)))
+	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.rollbackApp))))
+	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.parkApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.wakeApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/rename", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.renameApp))))
 
 	// Instances (read-only here; schedd is the writer).
-	mux.HandleFunc("GET /v1/apps/{slug}/instances", s.authLimited(s.listInstances))
-	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.streamAppLogs))
+	mux.HandleFunc("GET /v1/apps/{slug}/instances", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listInstances)))
+	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.streamAppLogs)))
 
 	// Custom domains.
-	mux.HandleFunc("GET /v1/domains", s.authLimited(s.listDomains))
-	mux.HandleFunc("POST /v1/domains", s.authLimited(s.idempotent(s.createDomain)))
-	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.deleteDomain))
+	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listDomains)))
+	mux.HandleFunc("POST /v1/domains", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createDomain))))
+	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteDomain)))
 
 	// Crons.
-	mux.HandleFunc("GET /v1/crons", s.authLimited(s.listCrons))
-	mux.HandleFunc("POST /v1/crons", s.authLimited(s.idempotent(s.createCron)))
-	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.updateCron))
-	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.deleteCron))
+	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listCrons)))
+	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.createCron))))
+	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPatch))(s.updateCron)))
+	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteCron)))
 
 	// Move 2: event-driven surface (handlers_invocations.go).
 	// Charged routes take idempotent so retries are safe; the long-poll
@@ -401,34 +405,42 @@ func (s *server) handler() http.Handler {
 	// parser. The Move 2 routes use the `action` segment form so the
 	// mux can register them. The wire shape matches the spec-level
 	// intent (`queueSend`, `queueReceive`, `queueAck` handlers).
-	mux.HandleFunc("POST /v1/apps/{slug}/invoke", s.authLimited(s.invokeApp))
-	mux.HandleFunc("POST /v1/apps/{slug}/invoke/async", s.authLimited(s.idempotent(s.invokeAppAsync)))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/send", s.authLimited(s.idempotent(s.queueSend)))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/receive", s.authLimited(s.queueReceive))
-	mux.HandleFunc("POST /v1/apps/{slug}/queues/{id}/ack", s.authLimited(s.idempotent(s.queueAck)))
-	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.idempotent(s.delayedTaskCreate)))
-	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.listInvocations))
-	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.getInvocation))
-	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.delayedTaskGet))
-	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.delayedTaskCancel))
+	//
+	// IAM-1 (ADR-034): every Move 2 route gets the same per-method
+	// scope default as the rest of /v1/* — invoke/send/ack/create are
+	// write, receive/get/list are read. None are admin-only because
+	// they're the customer-facing event surface; the existing
+	// adminAllows email gate still narrows /v1/compute-nodes separately.
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.invokeApp)))
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke/async", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.invokeAppAsync))))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/send", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.queueSend))))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/receive", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.queueReceive)))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/{id}/ack", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.queueAck))))
+	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPost))(s.idempotent(s.delayedTaskCreate))))
+	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listInvocations)))
+	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getInvocation)))
+	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.delayedTaskGet)))
+	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.delayedTaskCancel)))
 
-	// API keys.
-	mux.HandleFunc("GET /v1/keys", s.authLimited(s.listKeys))
-	mux.HandleFunc("POST /v1/keys", s.authLimited(s.createKey))
-	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.deleteKey))
+	// API keys. Minting and revoking keys are admin-only — a leaked
+	// write-scoped key must not be able to grant itself more scopes.
+	// Listing is read.
+	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listKeys)))
+	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.createKey)))
+	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteKey)))
 
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.
-	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.listSecrets))
-	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.setSecret))
-	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.deleteSecret))
+	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listSecrets)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(http.MethodPut, api.ScopeAdmin, api.MethodDefaultScope(http.MethodPut))(s.setSecret)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin, api.MethodDefaultScope(http.MethodDelete))(s.deleteSecret)))
 
 	// Usage.
-	mux.HandleFunc("GET /v1/usage", s.authLimited(s.getUsage))
-	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.usageSummary))
+	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.getUsage)))
+	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.usageSummary)))
 
 	// Account-scoped deployments list (M7.5 dashboard).
-	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.listDeployments))
+	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin, api.MethodDefaultScope(http.MethodGet))(s.listDeployments)))
 
 	// Stripe webhook (no auth — Stripe signs requests; for M5 we accept
 	// unsigned and trust the network boundary; ADR-007 hardening later).
@@ -444,14 +456,15 @@ func (s *server) handler() http.Handler {
 
 	// Operator admin surface (issue #98 / ADR-028). Auth lives in
 	// s.adminAllows (email allowlist via FAAS_ADMIN_EMAILS); handlers
-	// 403 every request when the allowlist is empty. authLimited
-	// wraps the per-IP bucket so the routes share the spec §11
-	// 10/min/IP budget with the rest of /v1/* — a brute-force on
-	// admin routes costs the attacker the same budget they'd burn
-	// trying customer keys.
-	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.listComputeNodes))
-	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.idempotent(s.createOrUpdateComputeNode)))
-	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.deleteComputeNode))
+	// 403 every request when the allowlist is empty. The scope
+	// check is layered on top so a non-admin key never reaches the
+	// adminAllows handler. authLimited wraps the per-IP bucket so
+	// the routes share the spec §11 10/min/IP budget with the rest
+	// of /v1/* — a brute-force on admin routes costs the attacker
+	// the same budget they'd burn trying customer keys.
+	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin)(s.listComputeNodes)))
+	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.idempotent(s.createOrUpdateComputeNode))))
+	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteComputeNode)))
 
 	// M7.5 SSE live-update (ADR-011). Handles session-cookie OR
 	// API-key auth itself — the cookie path is for the dashboard,
@@ -737,7 +750,74 @@ func (s *server) cliAuthSubmitChain(h http.Handler) http.Handler {
 }
 
 // accountHandler is a handler that has already resolved the caller's account.
+//
+// The principal (Account + APIKey + scopes) is stashed in the request
+// context by s.auth; middlewares that need to inspect scopes (the
+// requireScope wrapper) read it back via principalFrom. Handlers
+// themselves only need the Account and continue to receive it as the
+// third argument, so this change is invisible to the 38 existing
+// accountHandler bodies. See ADR-034.
 type accountHandler func(w http.ResponseWriter, r *http.Request, acct state.Account)
+
+// principal is the authenticated caller. Key is nil when the caller
+// authenticated via the dashboard session cookie (in which case the
+// caller is implicitly treated as having the "admin" scope by
+// requireScope). See ADR-034.
+type principal struct {
+	Acct state.Account
+	Key  *state.APIKey
+}
+
+type ctxKey int
+
+const principalCtxKey ctxKey = iota
+
+// principalFrom returns the principal stashed in r.Context() by s.auth.
+// Returns ok=false if s.auth did not run (e.g. tests that wire a
+// handler directly to httptest).
+func principalFrom(r *http.Request) (principal, bool) {
+	v := r.Context().Value(principalCtxKey)
+	if v == nil {
+		return principal{}, false
+	}
+	p, ok := v.(principal)
+	return p, ok
+}
+
+// withPrincipal returns a context carrying the principal.
+func withPrincipal(ctx context.Context, p principal) context.Context {
+	return context.WithValue(ctx, principalCtxKey, p)
+}
+
+// principalHasScope reports whether the principal carries at least one
+// of the allowed scopes. Session-cookie principals (Key == nil) are
+// implicitly admin. An empty allowed set is a no-op (the caller didn't
+// ask for any scope check, e.g. internal routes).
+//
+// INVARIANT: this helper is called only from requireScope, which
+// guarantees the principal was populated by s.auth. The Key==nil branch
+// relies on that — it short-circuits before consulting allowed, so a
+// direct call here without going through the auth middleware would let
+// unauthenticated requests reach the handler. Callers other than
+// requireScope must guard with principalFrom(...) != (principal{}, true)
+// first.
+func principalHasScope(p principal, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if p.Key == nil {
+		// Session-cookie auth = human at the dashboard = full access.
+		return true
+	}
+	for _, want := range allowed {
+		for _, have := range p.Key.Scopes {
+			if have == want {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // auth authenticates by API-key hash and rejects inactive accounts (spec §11).
 //
@@ -751,11 +831,17 @@ type accountHandler func(w http.ResponseWriter, r *http.Request, acct state.Acco
 // All other routes still 402 with CodeBillingPastDue during grace
 // because the work surface (deploy, build, park live instances) is
 // already torn down.
+//
+// On success, the resolved principal{Acct, Key} is stashed in r.Context()
+// via withPrincipal. The accountHandler that wraps s.auth reads the
+// Account out of the principal; the requireScope wrapper reads the
+// scopes. Session-cookie auth produces a principal with Key == nil
+// (treated as implicit admin by the scope check). See ADR-034.
 func (s *server) auth(next accountHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok := bearerToken(r)
 		if api.ValidAPIKeyFormat(tok) {
-			acct, err := s.store.AccountByKeyHash(r.Context(), api.HashAPIKey(tok))
+			acct, key, err := s.store.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
 			if err == nil {
 				if !acct.Active() {
 					if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
@@ -764,6 +850,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 						return
 					}
 				}
+				r = r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
 				next(w, r, acct)
 				return
 			}
@@ -780,6 +867,8 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 							return
 						}
 					}
+					// Key stays nil; session cookie = implicit admin.
+					r = r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil}))
 					next(w, r, acct)
 					return
 				}
@@ -788,6 +877,38 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 			"Unauthorized", "provide a valid API key as a Bearer token or sign in via session cookie"))
+	}
+}
+
+// requireScope returns a middleware that enforces the API-key scope
+// vocabulary on the route. The principal must have at least one of the
+// allowed scopes; session-cookie callers are implicitly admin. The
+// middleware runs after s.auth (which stashes the principal) so it
+// composes inside the auth wrappers as:
+//
+//	s.authLimited(s.requireScope(http.MethodPost, "admin", "write")(s.handler))
+//
+// Use api.MethodDefaultScope(r.Method) for the per-method default
+// (read for GET, write for everything else). Add "admin" explicitly to
+// require operator-level access on top of the method default. See ADR-034.
+func (s *server) requireScope(allowed ...string) func(accountHandler) accountHandler {
+	return func(next accountHandler) accountHandler {
+		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
+			p, ok := principalFrom(r)
+			if !ok {
+				// requireScope must run AFTER s.auth. If the principal is
+				// missing, the route wiring is broken — fail closed.
+				api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeCapacity,
+					"auth-context missing", "requireScope must be wrapped inside s.auth / s.authLimited"))
+				return
+			}
+			if !principalHasScope(p, allowed) {
+				api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
+					"Insufficient scope", "this endpoint requires one of: "+strings.Join(allowed, ",")))
+				return
+			}
+			next(w, r, acct)
+		}
 	}
 }
 

@@ -19,6 +19,12 @@ const (
 	FrameworkRailpackNode BuildFramework = "railpack_node"
 	// FrameworkRailpackPython uses railpack with the Python plan.
 	FrameworkRailpackPython BuildFramework = "railpack_python"
+	// FrameworkRailpackGo uses railpack with the Go plan. Static-binary
+	// output lands in the layer at /app/server (app mode) or /app/handler
+	// (function mode, per imaged.handleDeployment). The runner shim is
+	// only used for function deploys; the app path execs the binary
+	// directly via AppManifest.Entrypoint.
+	FrameworkRailpackGo BuildFramework = "railpack_go"
 	// FrameworkDockerfile uses buildctl with the dockerfile frontend.
 	FrameworkDockerfile BuildFramework = "dockerfile"
 	// FrameworkAuto lets railpack auto-detect (Node vs Python).
