@@ -2,6 +2,8 @@ package cgroupstats
 
 import (
 	"bufio"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -135,7 +137,14 @@ func (r *Reader) Instances() ([]string, error) {
 	base := filepath.Join(r.root, fcvm.ParentCgroup)
 	entries, err := os.ReadDir(base)
 	if err != nil {
-		return nil, nil // missing slice → no instances; not an error
+		// Missing slice (cold-boot race, transient teardown) is
+		// not an error — the poller renders an empty snapshot
+		// and the wire rollup collapses. Other errors propagate
+		// so the caller can log them.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
@@ -165,12 +174,22 @@ func (r *Reader) Instances() ([]string, error) {
 // Malformed files (missing key, non-numeric value, no newline) return
 // ok=false rather than panicking — cgroup leaves can briefly hold
 // stale content during destroy.
+//
+// Path is vetted by the caller: it lives under
+// /sys/fs/cgroup/<slice>/<instance>/, where <instance> is the
+// jailer's per-VM directory name. The instance id is not
+// customer-supplied (it is the cgroup directory the jailer created
+// at VM boot and tore down at VM destroy), so bare os.Open is
+// safe — the symlink/non-regular guard that openCustomerFile
+// enforces is irrelevant on the host's cgroup v2 mount. The
+// errcheck ignore below pairs with the doc: we cannot meaningfully
+// act on a Close error from a /sys read.
 func readCPUUsageUsec(path string) (uint64, bool) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:forbidigo // vetted cgroup path, see comment above
 	if err != nil {
 		return 0, false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	// cpu.stat lines are short; the default 64 KiB buffer is plenty.
 	for sc.Scan() {

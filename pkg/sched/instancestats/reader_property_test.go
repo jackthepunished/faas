@@ -115,10 +115,13 @@ func TestProperty_Reader_SnapshotForApp_AllRowsMatch(t *testing.T) {
 	go func() {
 		defer done.Done()
 		for i := 0; i < iters; i++ {
-			app := "app-A"
-			if i%3 == 1 {
+			var app string
+			switch i % 3 {
+			case 0:
+				app = "app-A"
+			case 1:
 				app = "app-B"
-			} else if i%3 == 2 {
+			case 2:
 				app = "app-C"
 			}
 			rows := []InstanceStat{

@@ -195,7 +195,7 @@ func TestLoop_FirstTickFiresBeforeInterval(t *testing.T) {
 		select {
 		case <-instStatsTick(tk):
 			loop.runInstanceStats(context.Background())
-		case <-time.After(deadline.Sub(time.Now())):
+		case <-time.After(time.Until(deadline)):
 		}
 	}
 	// First Tick (manual) + at least 3 ticker-driven Ticks
