@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -137,9 +141,10 @@ func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 // TestAuditEvents_AccountDeletionScheduledEmitsEvent (IAM-4) drives
 // DELETE /v1/account and asserts the events row carries kind =
 // "account.deletion_scheduled" with data.via == "rest". The dashboard
-// form path (data.via == "dashboard") is covered separately at
-// integration level — the seam is the scheduleDeletion via parameter
-// (cmd/apid/handlers_account.go).
+// form path (data.via == "dashboard") is covered by
+// TestAuditEvents_DashboardDeleteEmitsEventWithViaDashboard below —
+// the seam is the scheduleDeletion(ctx, acct, via) parameter at
+// handlers_account.go:90 which both call sites pass into.
 func TestAuditEvents_AccountDeletionScheduledEmitsEvent(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	rec := e.do(t, http.MethodDelete, "/v1/account", nil, nil)
@@ -301,7 +306,7 @@ func TestAuditEvents_GetEndpointReturnsRow(t *testing.T) {
 	if target == nil {
 		t.Fatal("no key.created row to fetch")
 	}
-	idStr := jsonNumber(target.ID)
+	idStr := strconv.FormatInt(target.ID, 10)
 	getRec := e.do(t, http.MethodGet, "/v1/audit-events/"+idStr, nil, nil)
 	if getRec.Code != http.StatusOK {
 		t.Fatalf("GET /v1/audit-events/%s: code=%d body=%s", idStr, getRec.Code, getRec.Body.String())
@@ -344,13 +349,217 @@ func TestAuditEvents_GetEndpointCrossAccount404(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}).WithOpsMetrics(wire.NewOpsMetrics("apid"))
 	h := srv.handler()
-	idStr := jsonNumber(rowsA[0].ID)
+	idStr := strconv.FormatInt(rowsA[0].ID, 10)
 	req := httptest.NewRequest(http.MethodGet, "/v1/audit-events/"+idStr, nil)
 	req.Header.Set("Authorization", "Bearer "+ptB)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("cross-account GET code = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated drives
+// the full device-code flow (POST /v1/cli-auth/code → claim → POST
+// /v1/cli-auth/exchange) and asserts BOTH audit rows landed:
+//   - key.created with data.key_id == minted key's id and data.scopes
+//     carrying the default scope set
+//   - auth.login with data.method == "cli_code"
+//
+// A single test exercises both Emit calls in the happy-path exchange
+// because they share the only success branch where the CLI's principal
+// lands on the account (handlers_cli_auth.go:155-164). Failure paths
+// are covered separately by the existing TestExchangeCliAuthCode_*
+// family — we only need to prove the audit emit fires when the
+// handler returns 200.
+func TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated(t *testing.T) {
+	srv, store := newCliAuthTestServer(t)
+
+	// Seed an account so the claim binds to it.
+	acct, err := store.CreateAccount(t.Context(), "cli-audit@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// Step 1: CLI mints a code.
+	minted := mintCliAuthCodeForTest(t, srv)
+
+	// Step 2 + 3: simulate the dashboard claim (we use the store
+	// directly to keep the test focused on the audit emission in
+	// step 4 — the claim path is exercised by TestPostCliAuthPage_*).
+	if err := store.ClaimCliAuthCode(t.Context(), mustHashCode(t, minted.Code), acct.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Step 4: CLI polls. This is the success branch where both Emit
+	// calls fire.
+	body, _ := json.Marshal(api.CliAuthExchangeRequest{Code: minted.Code})
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/cli-auth/exchange", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	srv.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exchange: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp api.CliAuthExchangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode exchange response: %v", err)
+	}
+	if !api.ValidAPIKeyFormat(resp.Plaintext) {
+		t.Fatalf("plaintext %q is not a valid api key", resp.Plaintext)
+	}
+
+	// Now assert both rows landed and are subject-pinned to acct.ID.
+	rows, err := store.ListEvents(t.Context(), acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+
+	var keyCreated, authLogin *state.Event
+	for i := range rows {
+		switch rows[i].Kind {
+		case "key.created":
+			keyCreated = &rows[i]
+		case "auth.login":
+			authLogin = &rows[i]
+		}
+	}
+	if keyCreated == nil {
+		t.Fatalf("no key.created row; rows=%+v", rows)
+	}
+	if authLogin == nil {
+		t.Fatalf("no auth.login row; rows=%+v", rows)
+	}
+
+	// Subject pinning: both rows scoped to acct.ID.
+	wantSubject := uuidStringOf(acct.ID)
+	if keyCreated.Subject == nil || keyCreated.Subject.String() != wantSubject {
+		t.Errorf("key.created Subject = %v, want %s", keyCreated.Subject, wantSubject)
+	}
+	if authLogin.Subject == nil || authLogin.Subject.String() != wantSubject {
+		t.Errorf("auth.login Subject = %v, want %s", authLogin.Subject, wantSubject)
+	}
+
+	// key.created carries the new key_id AND the default scopes.
+	var keyData map[string]any
+	if err := json.Unmarshal(keyCreated.Data, &keyData); err != nil {
+		t.Fatalf("key.created Data not JSON: %v", err)
+	}
+	keyID, _ := keyData["key_id"].(string)
+	if len(keyID) != 32 {
+		t.Errorf("key.created Data.key_id = %q, want 32 hex chars", keyID)
+	}
+	scopes, _ := keyData["scopes"].([]any)
+	if len(scopes) == 0 {
+		t.Errorf("key.created Data.scopes missing: %+v", keyData)
+	}
+
+	// auth.login carries method=cli_code (the only method this path
+	// can produce — there's no session-cookie or password variant).
+	var loginData map[string]any
+	if err := json.Unmarshal(authLogin.Data, &loginData); err != nil {
+		t.Fatalf("auth.login Data not JSON: %v", err)
+	}
+	if loginData["method"] != "cli_code" {
+		t.Errorf("auth.login Data.method = %v, want cli_code", loginData["method"])
+	}
+
+	// Ordering invariant (load-bearing — handbook §6 / ADR-035):
+	// key.created must precede auth.login so the customer's timeline
+	// reads "first I minted a key, then I logged in" rather than the
+	// reverse. The handler emits in that order, the events table
+	// appends in arrival order, so we check by ID monotonicity.
+	if authLogin.ID <= keyCreated.ID {
+		t.Errorf("auth.login.ID=%d must be greater than key.created.ID=%d (event ordering)",
+			authLogin.ID, keyCreated.ID)
+	}
+}
+
+// TestAuditEvents_DashboardDeleteEmitsEventWithViaDashboard covers
+// the dashboard form path (POST /dashboard/account/delete). The
+// same business-logic core (s.scheduleDeletion) is used by both this
+// route and the REST DELETE /v1/account; the only thing that varies
+// is the `via` parameter, which the handler passes through to
+// audit.Emit. So the regression we're guarding against is "the
+// dashboard path forgot to thread `via` from the route handler down
+// to scheduleDeletion" — a bug class that would silently mark
+// every dashboard deletion as data.via == "rest".
+//
+// We build a session-authed handler inline rather than reuse
+// newAuthedDashboardServer because that helper doesn't return the
+// MemStore (we need it to read events back out without a GET round
+// trip). All other seams (mgr.Issue, middleware.CookieNameAuthenticated,
+// sessionCookie, sessionCookieLifetime) are imported from the
+// existing handlers_dashboard / handlers_auth / middleware / session
+// packages.
+func TestAuditEvents_DashboardDeleteEmitsEventWithViaDashboard(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(t.Context(), "del@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("session manager: %v", err)
+	}
+	sid, err := mgr.Issue(acct.ID)
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newServerWithDeps(store, log, "example.com", noopNotifier{}, "",
+		noopMailer{}, stubGithubdClient{}, mgr, nil, 15*time.Minute, "").handler()
+
+	// Drive GET /dashboard/account to mint a fresh sealed envelope
+	// (the faas_csrf cookie + csrf_token form-value pair are bound
+	// to (action="delete", subject=acct.ID) at render time).
+	csrfCookie, deleteToken, _ := renderDashboardAccount(t, h, &http.Cookie{Name: sessionCookie, Value: sid})
+	if deleteToken == "" {
+		t.Fatal("rendered /dashboard/account is missing the delete csrf_token")
+	}
+
+	// POST /dashboard/account/delete.
+	form := url.Values{}
+	form.Set(middleware.FormFieldName, deleteToken)
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/account/delete", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sid})
+	req.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: csrfCookie})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("POST /dashboard/account/delete: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Assert the audit row landed with data.via == "dashboard".
+	// The REST path test (TestAuditEvents_AccountDeletionScheduledEmitsEvent)
+	// already guards data.via == "rest"; together the two tests
+	// prove the via parameter is threaded correctly from both call
+	// sites through s.scheduleDeletion into the audit payload.
+	rows, err := store.ListEvents(t.Context(), acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var found *state.Event
+	for i := range rows {
+		if rows[i].Kind == "account.deletion_scheduled" {
+			found = &rows[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no account.deletion_scheduled row from dashboard path; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not JSON: %v", err)
+	}
+	if data["via"] != "dashboard" {
+		t.Errorf("Data.via = %v, want dashboard (REST path TestAuditEvents_AccountDeletionScheduledEmitsEvent covers \"rest\")",
+			data["via"])
+	}
+	if found.Subject == nil || found.Subject.String() != uuidStringOf(acct.ID) {
+		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(acct.ID))
 	}
 }
 
@@ -411,30 +620,3 @@ func (f *failingAuditStore) AppendEvent(ctx context.Context, actor, kind string,
 type failingAuditErr struct{}
 
 func (*failingAuditErr) Error() string { return "simulated AppendEvent failure" }
-
-// jsonNumber formats an int64 the same way state.Event.ID is wired:
-// the apid handler reads PathValue("id") as a string and re-parses
-// it back to int64. Using FormatInt + "10" keeps the test path
-// identical to the production path.
-func jsonNumber(n int64) string {
-	const digits = "0123456789"
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = digits[n%10]
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}

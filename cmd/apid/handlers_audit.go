@@ -105,8 +105,9 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 
 	// Over-read to honor the since + kind_prefix filters at the
 	// application layer. The composite index (subject, at desc) makes
-	// this O(limit) regardless of the table size — the planner walks
-	// the index in reverse and stops after 200 rows.
+	// the SQL query return the 200 newest rows for the account in
+	// O(200) regardless of the table size; the in-Go filter walks
+	// that window and stops as soon as the limit is filled.
 	rows, err := s.store.ListEvents(r.Context(), acct.ID, listAuditEventsOverRead)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list audit events"))
@@ -135,6 +136,12 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 // primary key of the events row. Cross-account lookups 404 the same
 // way an unknown id does, so a customer cannot enumerate other
 // accounts' row counts by ID-probing.
+//
+// The mux route is "GET /v1/audit-events/{id}", so r.PathValue("id")
+// is always non-empty here — the empty-string branch below is a
+// defensive check that should never fire in production; it stays as
+// belt-and-braces in case a future mount re-registers the path
+// without a {id} segment.
 func (s *server) getAuditEvent(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
 	if id == "" {

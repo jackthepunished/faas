@@ -498,9 +498,11 @@ func listGdprRequestsForAccountExport(ctx context.Context, st state.Store, accou
 // at the same instant preserve the order they were fetched (gdpr
 // first, then events).
 //
-// The function caps the merged result at 2000 rows (1000 from each
-// source, after dedup of the input sizes) so the bundle stays bounded
-// for power customers — same posture as listGdprRequestsForAccountExport.
+// The merge itself is unbounded w.r.t. its inputs; the bound lives on
+// the upstream list helpers (listGdprRequestsForAccountExport and
+// listEventsForAccountExport both cap at 1000 rows), so the merged
+// result is ≤ 2000 rows for any account. Same posture as
+// listGdprRequestsForAccountExport.
 func mergeAuditTrail(gdpr, events []api.GdprAuditExportResponse) []api.GdprAuditExportResponse {
 	out := make([]api.GdprAuditExportResponse, 0, len(gdpr)+len(events))
 	i, j := 0, 0
