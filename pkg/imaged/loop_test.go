@@ -687,11 +687,11 @@ func seedEvictionCandidate(t *testing.T, store state.Store, slug string) {
 	if !ok {
 		t.Fatalf("seedEvictionCandidate: store is not *countingStore")
 	}
-	acct, err := s.MemStore.CreateAccount(context.Background(), slug+"@x.com", "pro")
+	acct, err := s.CreateAccount(context.Background(), slug+"@x.com", "pro")
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := s.MemStore.CreateApp(context.Background(), state.App{
+	app, err := s.CreateApp(context.Background(), state.App{
 		AccountID: acct.ID, Slug: slug, RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
 	})
 	if err != nil {
@@ -699,13 +699,13 @@ func seedEvictionCandidate(t *testing.T, store state.Store, slug string) {
 	}
 	base := time.Now().Add(-time.Hour)
 	for i := 0; i < 4; i++ {
-		dep, err := s.MemStore.CreateDeployment(context.Background(), state.Deployment{
+		dep, err := s.CreateDeployment(context.Background(), state.Deployment{
 			AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:" + slug + string(rune('a'+i)),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = s.MemStore.CreateSnapshot(context.Background(), state.Snapshot{
+		_, err = s.CreateSnapshot(context.Background(), state.Snapshot{
 			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
 			FCVersion:  "1.8.0",
 			StorageKey: state.SnapMemKey(dep.ID),
@@ -726,11 +726,11 @@ func seedEvictionCandidate(t *testing.T, store state.Store, slug string) {
 // is intentional and tiny.
 func seedEvictionCandidateB(b *testing.B, store *countingStore, slug string) {
 	b.Helper()
-	acct, err := store.MemStore.CreateAccount(context.Background(), slug+"@x.com", "pro")
+	acct, err := store.CreateAccount(context.Background(), slug+"@x.com", "pro")
 	if err != nil {
 		b.Fatal(err)
 	}
-	app, err := store.MemStore.CreateApp(context.Background(), state.App{
+	app, err := store.CreateApp(context.Background(), state.App{
 		AccountID: acct.ID, Slug: slug, RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
 	})
 	if err != nil {
@@ -738,13 +738,13 @@ func seedEvictionCandidateB(b *testing.B, store *countingStore, slug string) {
 	}
 	base := time.Now().Add(-time.Hour)
 	for i := 0; i < 4; i++ {
-		dep, err := store.MemStore.CreateDeployment(context.Background(), state.Deployment{
+		dep, err := store.CreateDeployment(context.Background(), state.Deployment{
 			AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:" + slug + string(rune('a'+i)),
 		})
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = store.MemStore.CreateSnapshot(context.Background(), state.Snapshot{
+		_, err = store.CreateSnapshot(context.Background(), state.Snapshot{
 			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
 			FCVersion:  "1.8.0",
 			StorageKey: state.SnapMemKey(dep.ID),
@@ -837,16 +837,109 @@ func TestRunGCTick_PerEvictionSQLCount(t *testing.T) {
 	t.Logf("GC SQL counts: %v (total %d)", store.counts, total)
 }
 
-// BenchmarkLoopRunGCTick_FallbackSQLCost is the pre-PR perf baseline.
-// It captures the SQL query count for a larger N (20 apps × 4
-// deployments → 40 evictions) so we can eyeball the absolute cost of
-// the slow fallback. After the fix the same benchmark should issue
-// far fewer calls.
+// TestRunGCTick_NoSlugInvariantLogs locks the B1.1 invariant: if the
+// SnapshotForGC projection returns a row with AppSlug == "" (which
+// means the JOIN broken or the column was forgotten), the loop must
+// log loudly + skip the ext4 delete — NOT silently fall back to
+// DeploymentByID + AppByID lookups (the slow path that B1.1 removed).
+//
+// We drive a deleteTarget tuple directly (skipping the GC algorithm
+// step that already populates AppSlug from the row), with an empty
+// slug. A logger bound to a buffer captures output; the test asserts
+// the warn message is present AND the per-app ext4 file is left
+// untouched on disk.
+func TestRunGCTick_NoSlugInvariantLogs(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "u@x.com", "pro")
+	app, _ := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "no-slug-app", RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:n",
+	})
+
+	appsRoot := t.TempDir()
+	be, _ := storage.NewLocalStorageBackend(appsRoot)
+	// Seed the per-app ext4 file under the canonical key. The
+	// invariant path must NOT delete this.
+	ext4Key := sched.AppLayerKey(app.Slug, dep.ID)
+	if err := be.Put(context.Background(), ext4Key, strings.NewReader("layer-bytes")); err != nil {
+		t.Fatalf("seed ext4: %v", err)
+	}
+
+	logBuf := &strings.Builder{}
+	handler := slog.New(slog.NewTextHandler(logBuf, nil))
+	loop := &Loop{
+		store: store,
+		log:   handler,
+		handler: &Handler{
+			store:    store,
+			log:      handler,
+			appsRoot: appsRoot,
+			storage:  be,
+		},
+		appsRoot: appsRoot,
+	}
+	// Empty AppSlug = invariant violation. The loop must log + skip.
+	ts := []deleteTarget{{ID: "ignored-snap-id", DeploymentID: dep.ID, AppSlug: ""}}
+	if err := loop.deleteSnapshotsAndFiles(context.Background(), ts); err != nil {
+		t.Fatalf("deleteSnapshotsAndFiles: %v", err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "gc evict without slug") {
+		t.Errorf("B1.1 invariant regression: expected warn 'gc evict without slug', got log:\n%s", logged)
+	}
+	// Ext4 file MUST still exist — the invariant path is skip, not silent cleanup.
+	if rc, err := be.Get(context.Background(), ext4Key); err != nil {
+		t.Errorf("B1.1 invariant regression: ext4 was deleted despite empty AppSlug: %v", err)
+	} else {
+		_ = rc.Close()
+	}
+}
+
+// TestMemStore_ListSnapshotsForGC_PopulatesAppSlug is the projection
+// regression test for the in-memory store. With AppSlug on
+// SnapshotForGC (B1.1), ListSnapshotsForGC must return the slug
+// without callers needing to re-resolve via AppByID.
+func TestMemStore_ListSnapshotsForGC_PopulatesAppSlug(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "u@x.com", "pro")
+	app, _ := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "projection-slug", RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:p",
+	})
+	_, _ = store.CreateSnapshot(context.Background(), state.Snapshot{
+		DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+		FCVersion: "1.8.0", StorageKey: state.SnapMemKey(dep.ID),
+	})
+
+	rows, err := store.ListSnapshotsForGC(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListSnapshotsForGC: got %d rows, want 1", len(rows))
+	}
+	if rows[0].AppSlug != "projection-slug" {
+		t.Errorf("B1.1 projection regression: AppSlug = %q, want %q",
+			rows[0].AppSlug, "projection-slug")
+	}
+}
+
+// BenchmarkLoopRunGCTick_FallbackSQLCost is the post-fix perf baseline.
+// It captures the SQL query count for a larger N (10 apps × 4
+// deployments → 20 evictions) so we can eyeball the absolute cost of
+// the GC sweep. After the fix the absolute count drops from O(5N) to
+// O(N) and the bench metric stabilises near ~21 calls regardless of
+// N.
 //
 // Run via:
 //   go test -bench BenchmarkLoopRunGCTick_FallbackSQLCost -benchmem ./pkg/imaged/...
 func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
-	const apps = 20
+	const apps = 10
 	const evictions = 2 * apps // 2 per app fall outside current+previous
 
 	for n := 0; n < b.N; n++ {

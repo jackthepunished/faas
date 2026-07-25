@@ -2038,9 +2038,12 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			DeploymentID: s.DeploymentID,
 			AppID:        app.ID,
 			AccountID:    app.AccountID,
-			FCVersion:    s.FCVersion,
-			MemBytes:     s.MemBytes,
-			DiskBytes:    s.DiskBytes,
+			// B1.1: forward the slug so imaged's GC doesn't have to
+			// re-resolve it per eviction (was O(2N) extra SQL).
+			AppSlug: app.Slug,
+			FCVersion: s.FCVersion,
+			MemBytes:  s.MemBytes,
+			DiskBytes: s.DiskBytes,
 			// #96 / ADR-025 axis 2: forward the canonical storage
 			// key so imaged's GC loop can Storage.Delete under it
 			// without a second hop through Snapshot.

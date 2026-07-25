@@ -2039,9 +2039,13 @@ func (s *PgStore) MarkSnapshotStale(ctx context.Context, snapshotID string) erro
 // ListLiveSnapshotStats is: the GC algorithm is O(N) per tick and a 10k
 // fleet is plenty for the v1 box (the 452 GB budget fires well before that).
 // Raise this when we go multi-box.
+//
+// B1.1 (issue #195): also selects a.slug so the GC loop can build the
+// apps/<slug>/<dep>.ext4 storage key without re-issuing a
+// DeploymentByID + AppByID round-trip per eviction.
 func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, error) {
 	rows, err := s.pool.Query(ctx,
-		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text,
+		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text, a.slug,
 		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at
 		   from snapshots s
 		   join deployments d on d.id = s.deployment_id
@@ -2057,7 +2061,7 @@ func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, erro
 	var out []SnapshotForGC
 	for rows.Next() {
 		var r SnapshotForGC
-		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID,
+		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID, &r.AppSlug,
 			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt); err != nil {
 			return nil, err
 		}
