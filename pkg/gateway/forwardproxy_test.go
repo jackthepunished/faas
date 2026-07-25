@@ -70,6 +70,14 @@ func (f *fakeVmmdClient) Ping(context.Context, *vmmdpb.PingRequest, ...grpc.Call
 	panic("Ping: not stubbed")
 }
 
+// UpdateEgressAllowlist (tier-2 PR-B) — the gateway hot path
+// doesn't drive the in-place patch. Panics so a future test
+// that actually exercises this RPC from the gateway side fails
+// loudly (rather than silently returning a stubbed success).
+func (f *fakeVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEgressAllowlistRequest, ...grpc.CallOption) (*vmmdpb.UpdateEgressAllowlistAck, error) {
+	panic("UpdateEgressAllowlist: not stubbed")
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

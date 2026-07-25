@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -206,31 +207,33 @@ func TestMailAdapter_SurfacesSenderError(t *testing.T) {
 // TestLoginSetsSessionAndSendsNoEmail pins the post-#165 contract:
 // POST /login authenticates the user by setting the faas_sid session
 // cookie synchronously and sends NO login email. The mailer stays
-// wired for dunning/quota mail; the login path itself stays silent.
+// wired for password-reset / dunning / quota mail; the login path
+// itself stays silent.
 //
-// Post-#165 (issue #165, ADR-032) the login path requires a valid
-// X-Dashboard-Key header (a pre-existing "web-console" API key from
-// the buggy pre-#165 deploy). The test seeds such a key, exercises
-// the legitimate happy path, and asserts:
+// Post-#165 PR #2 (issue #165, ADR-032) the login path is email +
+// password (Argon2id). The test seeds an account with a password
+// row, exercises the legitimate happy path, and asserts:
 //
 //   - HTTP 200 (the customer signed in).
 //   - faas_sid cookie set.
-//   - No email sent (the legacy magic-link dispatch is gone).
-//   - No api_key field in the response body (the #165 leak path is
-//     closed; the response never carries a key, on success or
+//   - No email sent (password login is silent; the mailer fires
+//     only on /login/forgot).
+//   - No api_key field in the response body (the #165 leak path
+//     is closed; the response never carries a key, on success or
 //     failure).
 func TestLoginSetsSessionAndSendsNoEmail(t *testing.T) {
 	const email = "user@example.com"
+	const password = "correct-horse-battery-staple"
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(context.Background(), email, api.PlanFree)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, hash, err := api.GenerateAPIKey()
+	phc, err := auth.Encode(password)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "web-console"); err != nil {
+	if err := store.SetAccountPassword(context.Background(), acct.ID, phc); err != nil {
 		t.Fatal(err)
 	}
 	rec := &recordingSender{}
@@ -238,10 +241,9 @@ func TestLoginSetsSessionAndSendsNoEmail(t *testing.T) {
 	srv.mailer = newMailerAdapter(rec)
 	h := srv.handler()
 
-	form := url.Values{"email": {email}}
+	form := url.Values{"email": {email}, "password": {password}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set(dashboardKeyHeader, plaintext)
 	recHTTP := httptest.NewRecorder()
 	h.ServeHTTP(recHTTP, req)
 	if recHTTP.Code != http.StatusOK {

@@ -118,7 +118,7 @@ func TestAccountByKeyHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash := []byte("0123456789abcdef")
-	if _, err := m.CreateAPIKey(ctx, acc.ID, hash, "laptop"); err != nil {
+	if _, err := m.CreateAPIKey(ctx, acc.ID, hash, "laptop", []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -143,7 +143,7 @@ func TestCreateAndDeleteAPIKey(t *testing.T) {
 	acc, _ := m.CreateAccount(ctx, "k@example.com", api.PlanHobby)
 
 	hash := []byte("deadbeef")
-	k, err := m.CreateAPIKey(ctx, acc.ID, hash, "ci")
+	k, err := m.CreateAPIKey(ctx, acc.ID, hash, "ci", []string{"admin"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -169,10 +169,10 @@ func TestCreateAPIKeyDuplicateHash(t *testing.T) {
 	a2, _ := m.CreateAccount(ctx, "a2@x.com", api.PlanFree)
 
 	hash := []byte("samehash")
-	if _, err := m.CreateAPIKey(ctx, a1.ID, hash, "first"); err != nil {
+	if _, err := m.CreateAPIKey(ctx, a1.ID, hash, "first", []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.CreateAPIKey(ctx, a2.ID, hash, "second"); err == nil {
+	if _, err := m.CreateAPIKey(ctx, a2.ID, hash, "second", []string{"admin"}); err == nil {
 		t.Fatal("duplicate hash must error")
 	}
 }
@@ -189,7 +189,7 @@ func TestDeleteAPIKeyNotFoundAndCrossAccount(t *testing.T) {
 	}
 
 	// cross-account: key belongs to a1, a2 asks to delete
-	k, _ := m.CreateAPIKey(ctx, a1.ID, []byte("h"), "lbl")
+	k, _ := m.CreateAPIKey(ctx, a1.ID, []byte("h"), "lbl", []string{"admin"})
 	if err := m.DeleteAPIKey(ctx, a2.ID, k.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cross-account delete: want ErrNotFound, got %v", err)
 	}
@@ -726,6 +726,155 @@ func TestMemStore_GitHubBinding_RejectsConflict(t *testing.T) {
 	err = store.RecordGitHubBinding(context.Background(), app2.ID, 1, "octo/api", "main")
 	if err == nil {
 		t.Fatal("expected conflict error when second app tries to bind same (install_id, repo)")
+	}
+}
+
+// --- Account passwords + OAuth links (issue #165 / ADR-032 PR #2) --------
+
+// TestMemStore_AccountPassword_RoundTrip pins the upsert / read /
+// delete cycle on the Argon2id PHC store. The postLogin handler
+// depends on this exact shape:
+//   - SetAccountPassword persists the PHC verbatim (the package
+//     parses the embedded m/t/p at verify time).
+//   - AccountPasswordByAccountID returns ErrNotFound for the
+//     no-row case so the handler can branch into the
+//     anti-enumeration Argon2id pad (pkg/auth.DummyPHC).
+//   - DeleteAccountPassword is idempotent.
+func TestMemStore_AccountPassword_RoundTrip(t *testing.T) {
+	store := NewMemStore()
+	acct, err := store.CreateAccount(context.Background(), "alice@example.com", "free")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No row yet → ErrNotFound (the postLogin no-row branch).
+	if _, err := store.AccountPasswordByAccountID(context.Background(), acct.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("AccountPasswordByAccountID on missing row err = %v, want ErrNotFound", err)
+	}
+
+	// Set the hash.
+	const phc = "$argon2id$v=19$m=65536,t=1,p=2$AAAA$BBBB"
+	if err := store.SetAccountPassword(context.Background(), acct.ID, phc); err != nil {
+		t.Fatalf("SetAccountPassword: %v", err)
+	}
+
+	// Read back.
+	got, err := store.AccountPasswordByAccountID(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatalf("AccountPasswordByAccountID: %v", err)
+	}
+	if got != phc {
+		t.Errorf("AccountPasswordByAccountID = %q, want %q (round-trip broken)", got, phc)
+	}
+
+	// Upsert: SetAccountPassword overwrites in place.
+	const phc2 = "$argon2id$v=19$m=65536,t=1,p=2$CCCC$DDDD"
+	if err := store.SetAccountPassword(context.Background(), acct.ID, phc2); err != nil {
+		t.Fatalf("SetAccountPassword (upsert): %v", err)
+	}
+	got, err = store.AccountPasswordByAccountID(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatalf("AccountPasswordByAccountID (post-upsert): %v", err)
+	}
+	if got != phc2 {
+		t.Errorf("AccountPasswordByAccountID after upsert = %q, want %q", got, phc2)
+	}
+
+	// Delete is idempotent.
+	if err := store.DeleteAccountPassword(context.Background(), acct.ID); err != nil {
+		t.Errorf("DeleteAccountPassword: %v", err)
+	}
+	if err := store.DeleteAccountPassword(context.Background(), acct.ID); err != nil {
+		t.Errorf("DeleteAccountPassword second call should be idempotent: %v", err)
+	}
+	if _, err := store.AccountPasswordByAccountID(context.Background(), acct.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("post-delete AccountPasswordByAccountID err = %v, want ErrNotFound", err)
+	}
+
+	// Empty arguments → ErrInvalidArgument (the caller bug surface).
+	if err := store.SetAccountPassword(context.Background(), "", phc); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("SetAccountPassword with empty account_id err = %v, want ErrInvalidArgument", err)
+	}
+	if err := store.SetAccountPassword(context.Background(), acct.ID, ""); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("SetAccountPassword with empty hash err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// TestMemStore_OAuthLink_RoundTrip pins the (provider, subject) →
+// account_id lookup. The §11 anti-takeover invariant is the
+// composite PK on the table; the MemStore mirrors it via the
+// (provider + "\x00" + subject) map key. A second UpsertOAuthLink
+// with a DIFFERENT account_id but the SAME (provider, sub) returns
+// ErrConflict — that's the in-memory equivalent of the database PK
+// rejection.
+func TestMemStore_OAuthLink_RoundTrip(t *testing.T) {
+	store := NewMemStore()
+	acct1, err := store.CreateAccount(context.Background(), "alice@example.com", "free")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct2, err := store.CreateAccount(context.Background(), "bob@example.com", "free")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bind alice to (google, sub-1).
+	if err := store.UpsertOAuthLink(context.Background(), acct1.ID, "google", "sub-1", "alice@example.com", true); err != nil {
+		t.Fatalf("UpsertOAuthLink (alice): %v", err)
+	}
+
+	// Read back.
+	got, err := store.OAuthLinkByProviderSubject(context.Background(), "google", "sub-1")
+	if err != nil {
+		t.Fatalf("OAuthLinkByProviderSubject: %v", err)
+	}
+	if got.AccountID != acct1.ID {
+		t.Errorf("AccountID = %q, want %q", got.AccountID, acct1.ID)
+	}
+	if !got.EmailVerified {
+		t.Errorf("EmailVerified = false, want true (was set on insert)")
+	}
+	if got.Email != "alice@example.com" {
+		t.Errorf("Email = %q, want alice@example.com", got.Email)
+	}
+
+	// Same account re-binds with a refreshed email → overwrites
+	// in place (CreatedAt preserved, Email + EmailVerified updated).
+	originalCreated := got.CreatedAt
+	if err := store.UpsertOAuthLink(context.Background(), acct1.ID, "google", "sub-1", "alice-renamed@example.com", true); err != nil {
+		t.Fatalf("UpsertOAuthLink (re-bind by same account): %v", err)
+	}
+	got, err = store.OAuthLinkByProviderSubject(context.Background(), "google", "sub-1")
+	if err != nil {
+		t.Fatalf("OAuthLinkByProviderSubject (post re-bind): %v", err)
+	}
+	if got.Email != "alice-renamed@example.com" {
+		t.Errorf("Email after re-bind = %q, want alice-renamed@example.com", got.Email)
+	}
+	if !got.CreatedAt.Equal(originalCreated) {
+		t.Errorf("CreatedAt = %v, want %v (re-bind should preserve CreatedAt)", got.CreatedAt, originalCreated)
+	}
+
+	// DIFFERENT account claiming (google, sub-1) → ErrConflict.
+	err = store.UpsertOAuthLink(context.Background(), acct2.ID, "google", "sub-1", "bob@example.com", true)
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("UpsertOAuthLink (bob stealing alice's sub) err = %v, want ErrConflict (§11 anti-takeover closure)", err)
+	}
+
+	// DIFFERENT provider with the same subject string → no conflict
+	// (the PK is composite, not on sub alone).
+	if err := store.UpsertOAuthLink(context.Background(), acct1.ID, "github", "sub-1", "alice@example.com", true); err != nil {
+		t.Errorf("UpsertOAuthLink (alice github/sub-1) err = %v, want nil (different provider, no collision)", err)
+	}
+
+	// ErrNotFound for unbound subject.
+	if _, err := store.OAuthLinkByProviderSubject(context.Background(), "google", "sub-unbound"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("OAuthLinkByProviderSubject on unbound err = %v, want ErrNotFound", err)
+	}
+
+	// Empty arguments → ErrInvalidArgument.
+	if err := store.UpsertOAuthLink(context.Background(), "", "google", "sub-x", "x@example.com", true); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("UpsertOAuthLink with empty account_id err = %v, want ErrInvalidArgument", err)
 	}
 }
 

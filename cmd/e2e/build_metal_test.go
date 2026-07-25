@@ -126,6 +126,25 @@ func TestBuildMetal(t *testing.T) {
 		// distinguishes it from a Railpack-only run.
 		assertBuildDoneSubstring(t, h, buildID, "buildctl")
 	})
+	t.Run("go124-tarball", func(t *testing.T) {
+		// Railpack `--plan go` path. The detector sees go.mod at the
+		// root, MapFramework dispatches to FrameworkRailpackGo, and
+		// guest-init runs `railpack build <out> --plan go`. The build
+		// log carries the railpack binary's stdout (which echoes the
+		// plan name), so a substring match pins the dispatch.
+		buildID := runBuildSubtest(t, h, pool, key, "goapp", "go-app", GoFixture(t), false)
+		assertBuildDoneSubstring(t, h, buildID, "railpack")
+		assertOCIImage(t, h, buildID)
+	})
+	t.Run("go124-dockerfile-tarball", func(t *testing.T) {
+		// Multi-stage scratch build via buildctl — exercises the
+		// Dockerfile framework even for the new runtime. The customer's
+		// Dockerfile carries the go build + scratch copy; buildctl
+		// produces the OCI image. Same substring check as the
+		// dockerfile-tarball subtest above.
+		buildID := runBuildSubtest(t, h, pool, key, "godfapp", "go-dockerfile-app", GoDockerfileFixture(t), true)
+		assertBuildDoneSubstring(t, h, buildID, "buildctl")
+	})
 }
 
 // runBuildSubtest drives a single end-to-end build, then asserts the

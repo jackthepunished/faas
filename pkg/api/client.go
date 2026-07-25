@@ -45,6 +45,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -381,18 +383,123 @@ func (c *Client) CreateCron(ctx context.Context, slug string, req CreateCronRequ
 	var out CronResponse
 	return out, c.do(ctx, "POST", "/v1/crons", req, &out)
 }
+
+// UpdateCron edits a cron's schedule/path/enabled. Pointer-based
+// fields let the caller distinguish "unset" from "explicit zero" —
+// matches the partial-update shape of Client.UpdateApp. The wire
+// method is PATCH; the idempotency-key auto-mint covers this call
+// (TestDo_MutatingCallsCarryIdempotencyKey in client_test.go).
+func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronRequest) (CronResponse, error) {
+	var out CronResponse
+	return out, c.do(ctx, "PATCH", "/v1/crons/"+id, req, &out)
+}
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// --- Event-driven surface (Move 2) -----------------------------------------
+//
+// The 10 routes exposed under /v1/apps/{slug}/invoke[/async],
+// /v1/apps/{slug}/queues/{send,receive,{id}/ack},
+// /v1/apps/{slug}/delayed-tasks, /v1/delayed-tasks/{id}, and
+// /v1/invocations[/{id}]. Names follow the spec's natural verb, not
+// the route path — see cmd/sdk-coverage/main.go::methodRouteMap for
+// the explicit rename table.
+
+// InvokeApp synchronously invokes an app and long-polls for the
+// result. Timeout is bounded by the server (5s on Free, 30s on paid
+// plans); the call returns 504 long_poll_timeout if the cap elapses
+// before the row reaches a terminal state.
+func (c *Client) InvokeApp(ctx context.Context, slug string, req InvokeRequest) (InvokeResponse, error) {
+	var out InvokeResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/invoke", req, &out)
+}
+
+// InvokeAppAsync enqueues the invocation and returns 202 + id + the
+// status URL. The drain picks the row up on the next 1s tick.
+func (c *Client) InvokeAppAsync(ctx context.Context, slug string, req InvokeRequest) (AsyncInvokeResponse, error) {
+	var out AsyncInvokeResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/invoke/async", req, &out)
+}
+
+// QueueSend enqueues a payload on the per-app FIFO queue. Cap-checked
+// against the plan's MaxQueueDepth at the handler.
+func (c *Client) QueueSend(ctx context.Context, slug string, req QueueSendRequest) (QueueSendResponse, error) {
+	var out QueueSendResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/send", req, &out)
+}
+
+// QueueReceive long-polls for the next dispatched row on the queue.
+// 30s server-side cap; on timeout returns (zero, ErrLongPollTimeout)
+// — caller is expected to retry. Stays open across the app's
+// dispatched rows until one lands or the cap elapses.
+func (c *Client) QueueReceive(ctx context.Context, slug string) (QueueReceiveResponse, error) {
+	var out QueueReceiveResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/receive", nil, &out)
+}
+
+// AckQueueRow is a no-op state change (the row is already completed
+// when invocation_done fires) — idempotent; a re-ack returns 204.
+func (c *Client) AckQueueRow(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/"+id+"/ack", nil, nil)
+}
+
+// CreateDelayedTask schedules a delayed-task row to fire at the
+// given future timestamp. Cap-checked against MaxDelayedTasksPerApp.
+func (c *Client) CreateDelayedTask(ctx context.Context, slug string, req DelayedTaskRequest) (DelayedTaskResponse, error) {
+	var out DelayedTaskResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/delayed-tasks", req, &out)
+}
+
+// GetDelayedTask returns a single delayed-task by id. Account-scoped
+// — cross-account reads surface 404, not 200 with a foreign row.
+func (c *Client) GetDelayedTask(ctx context.Context, id string) (DelayedTaskResponse, error) {
+	var out DelayedTaskResponse
+	return out, c.do(ctx, "GET", "/v1/delayed-tasks/"+id, nil, &out)
+}
+
+// CancelDelayedTask cancels a pending delayed-task. Idempotent — a
+// re-cancel on a terminal row returns 404 invocation_not_found.
+func (c *Client) CancelDelayedTask(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/delayed-tasks/"+id, nil, nil)
+}
+
+// ListInvocations paginates the account's invocations by `?before=<id>`
+// (the LAST id of the returned slice). Defaults to 20 per page.
+func (c *Client) ListInvocations(ctx context.Context, before string, limit int) (ListInvocationsResponse, error) {
+	var out ListInvocationsResponse
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/invocations"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetInvocation returns a single invocation by id. Account-scoped.
+func (c *Client) GetInvocation(ctx context.Context, id string) (Invocation, error) {
+	var out Invocation
+	return out, c.do(ctx, "GET", "/v1/invocations/"+id, nil, &out)
+}
+
 // API keys.
+//
+// CreateKey accepts an explicit scopes slice. Pass nil to preserve the
+// historical "full access" behavior (the server defaults nil to
+// ["admin"]). See ADR-034 for the scope vocabulary.
 func (c *Client) ListKeys(ctx context.Context) ([]APIKeyResponse, error) {
 	var out []APIKeyResponse
 	return out, c.do(ctx, "GET", "/v1/keys", nil, &out)
 }
-func (c *Client) CreateKey(ctx context.Context, label string) (APIKeyResponse, error) {
+func (c *Client) CreateKey(ctx context.Context, label string, scopes []string) (APIKeyResponse, error) {
 	var out APIKeyResponse
-	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label}, &out)
+	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label, Scopes: scopes}, &out)
 }
 func (c *Client) DeleteKey(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/keys/"+id, nil, nil)
@@ -411,6 +518,72 @@ func (c *Client) ExchangeCliAuthCode(ctx context.Context, code string) (CliAuthE
 	var out CliAuthExchangeResponse
 	return out, c.do(ctx, "POST", "/v1/cli-auth/exchange",
 		CliAuthExchangeRequest{Code: code}, &out)
+}
+
+// Dashboard auth (issue #165, ADR-032 PR #2). The SDK uses these
+// against a tokenless Client (NewClient returns one with token="");
+// the auth flows issue a session cookie but the SDK does not consume
+// it — the dashboard cookie is the only auth artifact on the browser
+// side. Programmatic auth stays on the device-code flow above, where
+// the customer can mint a real api_key via the dashboard after
+// signing in.
+//
+// PasswordSignup creates an account (if the email is unbound) and
+// signs the caller in. The same response shape as PasswordLogin:
+// {account_id, plan}, no api_key. Anti-enumeration: a colliding
+// signup attempt returns 401 invalid_credentials, not 409 — the
+// SDK and the CLI render the same generic "sign in failed" copy.
+func (c *Client) PasswordSignup(ctx context.Context, email, password string) (PasswordLoginResponse, error) {
+	var out PasswordLoginResponse
+	return out, c.do(ctx, "POST", "/signup",
+		PasswordSignupRequest{Email: email, Password: password}, &out)
+}
+
+// PasswordLogin signs the caller in with email + password. The
+// success response does NOT carry an API key — the session cookie is
+// the only auth artifact. The SDK does not consume the cookie; the
+// caller is expected to follow the 302 redirect or to exchange the
+// session via the device-code flow for API access.
+func (c *Client) PasswordLogin(ctx context.Context, email, password string) (PasswordLoginResponse, error) {
+	var out PasswordLoginResponse
+	return out, c.do(ctx, "POST", "/login",
+		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// RequestPasswordReset mints a password-reset email. The server
+// always returns 200 with an identical body regardless of whether the
+// email is bound to an account, so the surface does not leak account
+// presence. The full reset URL is sent via the platform's mailer
+// (recorded in mail_wiring_test.go); the SDK caller never sees the
+// token.
+func (c *Client) RequestPasswordReset(ctx context.Context, email string) error {
+	return c.do(ctx, "POST", "/login/forgot",
+		PasswordResetRequest{Email: email}, nil)
+}
+
+// ConfirmPasswordReset consumes a one-shot reset token and sets the
+// new password. The token is the base64url-encoded value from the
+// email link (NOT the SHA-256 hash the server stored). A replay
+// (already-consumed token) returns 410 reset_token_invalid.
+func (c *Client) ConfirmPasswordReset(ctx context.Context, token, newPassword string) error {
+	return c.do(ctx, "POST", "/auth/reset",
+		PasswordResetConfirm{Token: token, NewPassword: newPassword}, nil)
+}
+
+// SetPassword updates the password on the currently authenticated
+// account. Reachable only after Bearer auth (the dashboard session
+// cookie is interchangeable with the bearer token via
+// sessionAuthFor). Used by OAuth-only customers to opt into password
+// login.
+func (c *Client) SetPassword(ctx context.Context, password string) error {
+	return c.do(ctx, "POST", "/dashboard/account/set-password",
+		SetPasswordRequest{Password: password}, nil)
+}
+
+// Logout clears the dashboard session. Idempotent — clearing a
+// non-existent session is a no-op.
+func (c *Client) Logout(ctx context.Context) error {
+	return c.do(ctx, "POST", "/logout", nil, nil)
 }
 
 // Secrets (spec §11/G2). Plaintext VALUE never leaves the caller

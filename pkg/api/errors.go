@@ -101,19 +101,24 @@ func (p *Problem) WithDocs(url string) *Problem {
 // Stable error codes (spec Appendix A, UX spec §7). Keep in sync with docs and
 // the CLI's exit-code mapping.
 const (
-	CodePlanLimitApps     = "plan_limit_apps"
-	CodePlanLimitRAM      = "plan_limit_ram"
-	CodePlanLimitConcur   = "plan_limit_concurrency"
-	CodeSourceTooLarge    = "source_too_large"
-	CodeSourceInvalid     = "source_invalid"
-	CodeAppLayerTooBig    = "app_layer_too_large"
-	CodeBuildUndetected   = "build_undetected"
-	CodeBuildOOM          = "build_oom"
-	CodeBuildTimeout      = "build_timeout"
-	CodeQuotaExhausted    = "quota_exhausted"
-	CodeBillingPastDue    = "billing_past_due"
-	CodeCapacity          = "capacity_unavailable"
-	CodeUnauthorized      = "unauthorized"
+	CodePlanLimitApps   = "plan_limit_apps"
+	CodePlanLimitRAM    = "plan_limit_ram"
+	CodePlanLimitConcur = "plan_limit_concurrency"
+	CodeSourceTooLarge  = "source_too_large"
+	CodeSourceInvalid   = "source_invalid"
+	CodeAppLayerTooBig  = "app_layer_too_large"
+	CodeBuildUndetected = "build_undetected"
+	CodeBuildOOM        = "build_oom"
+	CodeBuildTimeout    = "build_timeout"
+	CodeQuotaExhausted  = "quota_exhausted"
+	CodeBillingPastDue  = "billing_past_due"
+	CodeCapacity        = "capacity_unavailable"
+	CodeUnauthorized    = "unauthorized"
+	// CodeForbidden is returned when the authenticated principal lacks
+	// the scope required by the route (IAM-1, ADR-034). Distinct from
+	// CodeUnauthorized so a customer can tell "I need to log in" from
+	// "my key does not have permission for this endpoint".
+	CodeForbidden         = "insufficient_scope"
 	CodeNotFound          = "not_found"
 	CodeValidation        = "validation_failed"
 	CodeConflict          = "conflict"
@@ -638,4 +643,88 @@ func ErrInvocationNotFound(id string) *Problem {
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
 		WithDocs("https://docs.DOMAIN/event-driven#invocations")
+}
+
+// ErrLongPollTimeout is returned by the long-poll handlers (sync
+// invoke, queueReceive) when the server-side wait budget ran out.
+// Distinct code so the CLI can retry transparently — a 504 Gateway
+// Timeout would force the customer to disambiguate "server is down"
+// from "no event yet, retry". The HTTP status is 504 (the SLO is
+// server-side); the body type is the only ordering.
+func ErrLongPollTimeout() *Problem {
+	return NewProblem(http.StatusGatewayTimeout, "long_poll_timeout",
+		"Long-poll wait budget ran out",
+		"the server waited for the configured long-poll window and the event did not arrive; retry.").
+		WithDocs("https://docs.DOMAIN/event-driven#long-poll")
+}
+
+// ErrInvalidScheduledAt is returned when a delayed-task POST carries a
+// scheduled_at that is in the past (or zero). The handler uses time.Now()
+// as the source of truth so a clock-skewed client gets a 400 rather than
+// a row that fires immediately on insert.
+func ErrInvalidScheduledAt() *Problem {
+	return NewProblem(http.StatusBadRequest, "invalid_scheduled_at",
+		"Invalid scheduled_at",
+		"scheduled_at must be a future timestamp; the server clock rejected the value").
+		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
+}
+
+// --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
+
+// ErrInvalidCredentials is the 401 returned by POST /login (and the
+// colliding /signup anti-enumeration path). The body is identical
+// whether the email is unbound, the password is wrong, or the account
+// has no password row — the spec §11 anti-enumeration invariant. The
+// constant-time Argon2id pad on the no-account path closes the timing
+// oracle; the response body and the wire status are the same on both
+// branches.
+func ErrInvalidCredentials() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeInvalidCredentials,
+		"Sign in failed",
+		"email or password is incorrect.").
+		WithDocs("https://docs.DOMAIN/auth/sign-in")
+}
+
+// ErrEmailNotVerified is the 401 returned by the Google / GitHub OAuth
+// callback when the provider's profile has no primary verified email.
+// Distinct from invalid_credentials because the customer can fix it
+// upstream (verify the email on the provider) and retry. We never
+// mint an unverified session.
+func ErrEmailNotVerified(provider string) *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeEmailNotVerified,
+		"Email not verified",
+		fmt.Sprintf("the %s account's primary email is not verified; verify it on the provider and retry.", provider)).
+		WithDocs("https://docs.DOMAIN/auth/oauth")
+}
+
+// ErrPasswordTooWeak is the 400 returned by POST /signup and POST
+// /auth/reset when the password fails the NIST-style floor (≥12 chars,
+// no complexity rules). The Detail names the rule so the form can
+// highlight which constraint tripped.
+func ErrPasswordTooWeak(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodePasswordTooWeak,
+		"Password too weak", reason).
+		WithDocs("https://docs.DOMAIN/auth/password")
+}
+
+// ErrResetTokenInvalid is the 410 returned by GET / POST /auth/reset
+// when the token doesn't exist (unknown / typo'd / already consumed).
+// 410 Gone is the right status: the resource was a one-shot and is
+// no longer addressable.
+func ErrResetTokenInvalid() *Problem {
+	return NewProblem(http.StatusGone, CodeResetTokenInvalid,
+		"Reset link invalid",
+		"this password-reset link is unknown or has already been used.").
+		WithDocs("https://docs.DOMAIN/auth/reset")
+}
+
+// ErrResetTokenExpired is the 410 returned by GET / POST /auth/reset
+// when the token has aged past the 15-minute TTL. Same 410 as the
+// invalid-token case but distinct code so the dashboard can render
+// "link expired, request a new one" vs "link is invalid".
+func ErrResetTokenExpired() *Problem {
+	return NewProblem(http.StatusGone, CodeResetTokenExpired,
+		"Reset link expired",
+		"this password-reset link has expired; request a new one.").
+		WithDocs("https://docs.DOMAIN/auth/reset")
 }

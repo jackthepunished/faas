@@ -180,7 +180,11 @@ type Store interface {
 	MarkDunningStep(ctx context.Context, accountID string, from, to AccountStatus) error
 
 	// API keys.
-	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string) (APIKey, error)
+	// CreateAPIKey persists a new key row. Scopes is the explicit set of
+	// authorization scopes attached to the key (e.g. "admin", "read",
+	// "write"); see ADR-034. The store does not validate the scope
+	// vocabulary — that is the apid handler's responsibility.
+	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error)
 	DeleteAPIKey(ctx context.Context, accountID, keyID string) error
 	ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error)
 	// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used
@@ -188,6 +192,13 @@ type Store interface {
 	// operator investigating "who signed in as alice?" can identify
 	// which key authenticated. Returns ErrNotFound if no row matches.
 	APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
+	// AuthenticateKey resolves a bearer token to the matching account
+	// AND key in a single Store call. This is the canonical lookup for
+	// the apid auth middleware (cmd/apid server.go s.auth) — it avoids
+	// AccountByKeyHash + APIKeyByHash being two round-trips and ensures
+	// the principal is assembled atomically. Returns ErrNotFound when
+	// the hash has no matching key.
+	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
@@ -202,6 +213,34 @@ type Store interface {
 	IssueLoginToken(ctx context.Context, tokenHash []byte, accountID string, expiresAt time.Time) error
 	ConsumeLoginToken(ctx context.Context, tokenHash []byte) (string, error)
 	DeleteOldLoginTokens(ctx context.Context, before time.Time) (int64, error)
+
+	// Account passwords (issue #165 / ADR-032 PR #2). The Argon2id
+	// PHC hash lives in the account_passwords side table; OAuth-only
+	// accounts have no row. SetAccountPassword upserts the hash
+	// (overwriting any prior hash for the same account — the
+	// password-set path). AccountPasswordByAccountID returns the
+	// stored hash or ErrNotFound (the postLogin handler uses the
+	// ErrNotFound branch as the trigger for the anti-enumeration
+	// Argon2id pad). DeleteAccountPassword removes the row (used by
+	// the G6 hard-delete path on account removal and reserved for a
+	// future "switch to OAuth-only" opt-out).
+	SetAccountPassword(ctx context.Context, accountID, phc string) error
+	AccountPasswordByAccountID(ctx context.Context, accountID string) (string, error)
+	DeleteAccountPassword(ctx context.Context, accountID string) error
+
+	// OAuth links (issue #165 / ADR-032 PR #2). The (provider,
+	// provider_subject) composite primary key is the §11
+	// anti-takeover invariant: one OAuth subject binds to exactly
+	// one account, period. UpsertOAuthLink is the "first party to
+	// bind a sub owns the row" path: a re-bind by the same account
+	// updates the email/email_verified snapshot, a re-bind by a
+	// different account is rejected by the PK at the database floor.
+	// OAuthLinkByProviderSubject is the sub-first lookup the OAuth
+	// callback runs on every handshake to decide whether the
+	// incoming sub belongs to an existing account or whether to
+	// create a fresh one.
+	UpsertOAuthLink(ctx context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error
+	OAuthLinkByProviderSubject(ctx context.Context, provider, providerSubject string) (OAuthLink, error)
 
 	// CLI auth codes (spec §2.2 device-code flow). The mint + peek +
 	// claim + consume cycle mirrors the magic-link primitives but with
@@ -467,8 +506,19 @@ type Store interface {
 	CancelInvocation(ctx context.Context, id string) error
 	// ListInvocationsForAccount is the dashboard's "recent invocations"
 	// view; pagination cursor is the same opaque `before` convention used
-	// by ListDeployments.
-	ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before time.Time) ([]Invocation, error)
+	// by ListDeployments. The cursor is an Invocation.ID (uuid) — the
+	// handler pages by ?before=<id>; "" means "start from the newest".
+	// Move 2 cursor change: was time.Time (drifted across equal-second
+	// rows); id is stable across ties.
+	ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before string) ([]Invocation, error)
+	// ListInvocationsForApp is the per-app filtered variant used by
+	// deleteApp's GC sweep (cancel every pending/dispatching row before
+	// the app row goes away). Index-backed by `invocations_app_pending_idx`
+	// (migrations/00030_invocations.sql) when the states filter is the
+	// partial-index predicate (pending + dispatching); for other state
+	// combinations the planner falls back to a sequential scan, which is
+	// fine for the rare delete path.
+	ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error)
 	// CountInstanceInvocationsInMinute is the meter's join key: it counts
 	// dispatched rows for (instance, minute) so SampleAndRoll can set
 	// usage_minutes.requests = N on each rolling minute. Index-backed by

@@ -95,6 +95,16 @@ type MemStore struct {
 	// dashboard claims the code; the claim statement fills it in
 	// atomically. See pkg/state/types.go CliAuthCode.
 	cliAuthCodes map[string]CliAuthCode
+	// accountPasswords is keyed by account_id (issue #165 / ADR-032).
+	// OAuth-only accounts have no row; the absence of a row is the
+	// signal that an OAuth-only flow is required to mint a session.
+	accountPasswords map[string]AccountPassword
+	// oauthLinks is keyed by (provider + "\x00" + provider_subject)
+	// so the §11 anti-takeover invariant (one OAuth subject per
+	// account) is enforceable in-memory the same way the composite
+	// PK enforces it in Postgres. NUL separator is safe — neither
+	// Google subs nor GitHub IDs contain it.
+	oauthLinks map[string]OAuthLink
 	// deploymentLogs is keyed by deployment_id; the inner slice is
 	// append-ordered (which matches the Postgres seq order). MemStore
 	// mirrors the bigserial PK by appending + assigning a monotonic
@@ -200,6 +210,8 @@ func NewMemStore() *MemStore {
 		instances:      map[string]Instance{},
 		loginTokens:    map[string]LoginToken{},
 		cliAuthCodes:   map[string]CliAuthCode{},
+		accountPasswords: map[string]AccountPassword{},
+		oauthLinks:       map[string]OAuthLink{},
 		deploymentLogs: map[string][]LogEntry{},
 		deploymentSeq:  map[string]int64{},
 		snapshots:      []Snapshot{},
@@ -209,6 +221,7 @@ func NewMemStore() *MemStore {
 		idem:           map[string]idemEntry{},
 		// stripeByCustomer is the reverse-lookup map AccountByProviderCustomerID
 		// walks; populated by UpdateAccountProviderCustomerID.
+
 		stripeByCustomer: map[string]string{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
@@ -305,6 +318,23 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 		return APIKey{}, ErrNotFound
 	}
 	return k, nil
+}
+
+// AuthenticateKey mirrors the key+account lookup the apid auth
+// middleware needs. Single lock acquisition; returns ErrNotFound when
+// the hash has no matching key. See ADR-034.
+func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keyByHash[hex.EncodeToString(hash)]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	acct, ok := m.accounts[k.AccountID]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	return acct, k, nil
 }
 
 func (m *MemStore) UpdateAccountPlan(_ context.Context, id string, plan api.Plan) error {
@@ -438,14 +468,14 @@ func (m *MemStore) ListAllAccounts(_ context.Context) ([]Account, error) {
 
 // --- API keys ---------------------------------------------------------------
 
-func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string) (APIKey, error) {
+func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h := hex.EncodeToString(hash)
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
 	}
-	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, CreatedAt: time.Now()}
+	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, Scopes: scopes, CreatedAt: time.Now()}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
 	return k, nil
@@ -1528,8 +1558,10 @@ func (m *MemStore) CancelInvocation(_ context.Context, id string) error {
 }
 
 // ListInvocationsForAccount is the dashboard's unified history read.
-// MemStore returns rows ordered CreatedAt DESC for any caller.
-func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, _ time.Time) ([]Invocation, error) {
+// MemStore returns rows ordered CreatedAt DESC (with ID as tie-breaker)
+// for any caller. The `before` cursor is an Invocation.ID; an empty
+// string means "start from the newest".
+func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string, limit int, before string) ([]Invocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Invocation
@@ -1538,10 +1570,65 @@ func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string
 			out = append(out, inv)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	// Apply the cursor: drop everything at-or-after the cursor row
+	// (we want strictly older). MemStore is single-process so a linear
+	// scan is fine.
+	if before != "" {
+		var cursorIdx = -1
+		for i, inv := range out {
+			if inv.ID == before {
+				cursorIdx = i
+				break
+			}
+		}
+		if cursorIdx >= 0 {
+			out = out[cursorIdx+1:]
+		}
+		// If the cursor isn't in the page (already GC'd, expired),
+		// PgStore falls back to the inner SELECT; MemStore returns the
+		// full page, which is the cheap-and-cheerful answer.
+	}
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+// ListInvocationsForApp is the per-app filtered variant used by
+// deleteApp's GC sweep. An empty `states` slice returns all rows for
+// the app; otherwise the row's state must match one of the filter
+// values. MemStore is single-process so a linear scan is fine.
+func (m *MemStore) ListInvocationsForApp(_ context.Context, appID string, states ...InvocationState) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stateSet := make(map[InvocationState]struct{}, len(states))
+	for _, s := range states {
+		stateSet[s] = struct{}{}
+	}
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.AppID != appID {
+			continue
+		}
+		if len(stateSet) > 0 {
+			if _, ok := stateSet[inv.State]; !ok {
+				continue
+			}
+		}
+		out = append(out, inv)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
@@ -2785,6 +2872,119 @@ func (m *MemStore) DeleteOldLoginTokens(_ context.Context, before time.Time) (in
 		}
 	}
 	return removed, nil
+}
+
+// SetAccountPassword upserts the Argon2id PHC hash for an account.
+// One row per account_id — the PK rejects a duplicate INSERT, so a
+// racing concurrent SetAccountPassword against the same account
+// would lose at the database floor; the MemStore upsert mirrors that
+// by overwriting the prior row inside the lock.
+//
+// phc is the PHC wire format produced by pkg/auth.Encode. The MemStore
+// stores it verbatim; pkg/auth.Verify parses the embedded m/t/p at
+// verify time so a future parameter bump is transparent.
+//
+// UpdatedAt is stamped here so the "rotate hash on login" PR #2.5
+// hardening has a stable reference. Defaulted to time.Now() when the
+// caller passes a zero hash; the zero hash is otherwise a programming
+// error and surfaces as a returned error.
+func (m *MemStore) SetAccountPassword(_ context.Context, accountID, phc string) error {
+	if accountID == "" {
+		return ErrInvalidArgument
+	}
+	if phc == "" {
+		return ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.accountPasswords == nil {
+		m.accountPasswords = map[string]AccountPassword{}
+	}
+	m.accountPasswords[accountID] = AccountPassword{
+		AccountID: accountID,
+		Hash:      phc,
+		UpdatedAt: time.Now(),
+	}
+	return nil
+}
+
+// AccountPasswordByAccountID returns the stored Argon2id PHC hash
+// for an account, or ErrNotFound when no row exists. The postLogin
+// handler uses ErrNotFound as the trigger for the anti-enumeration
+// Argon2id pad (pkg/auth.DummyPHC) so the response time on unknown
+// email matches the response time on known email + wrong password.
+func (m *MemStore) AccountPasswordByAccountID(_ context.Context, accountID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.accountPasswords[accountID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return row.Hash, nil
+}
+
+// DeleteAccountPassword removes the Argon2id row for an account.
+// Idempotent: deleting a row that doesn't exist is not an error
+// (matches the pgx Exec semantics — a DELETE with zero affected
+// rows returns nil). Used by the G6 hard-delete path's cleanup
+// hooks and reserved for a future "switch to OAuth-only" opt-out.
+func (m *MemStore) DeleteAccountPassword(_ context.Context, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.accountPasswords, accountID)
+	return nil
+}
+
+// UpsertOAuthLink writes the (provider, provider_subject) → account
+// row. The §11 anti-takeover invariant is the database composite PK
+// in Postgres; the MemStore mirrors it via the (provider+"\x00"+sub)
+// map key — a second UpsertOAuthLink with the SAME provider/sub
+// overwrites in place (same account re-binding, e.g. an email change
+// refreshes the link's email field), and a second UpsertOAuthLink
+// with a DIFFERENT account_id but the SAME provider/sub returns
+// ErrConflict — that's the in-memory equivalent of Postgres' PK
+// rejection. The OAuth callback (handlers_google.go / handlers_github.go)
+// relies on this so a stolen email cannot bind to a second account.
+func (m *MemStore) UpsertOAuthLink(_ context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error {
+	if accountID == "" || provider == "" || providerSubject == "" {
+		return ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.oauthLinks == nil {
+		m.oauthLinks = map[string]OAuthLink{}
+	}
+	key := provider + "\x00" + providerSubject
+	if existing, ok := m.oauthLinks[key]; ok && existing.AccountID != accountID {
+		return ErrConflict
+	}
+	now := time.Now()
+	if existing, ok := m.oauthLinks[key]; ok {
+		now = existing.CreatedAt // preserve CreatedAt on update
+	}
+	m.oauthLinks[key] = OAuthLink{
+		Provider:        provider,
+		ProviderSubject: providerSubject,
+		AccountID:       accountID,
+		Email:           email,
+		EmailVerified:   emailVerified,
+		CreatedAt:       now,
+	}
+	return nil
+}
+
+// OAuthLinkByProviderSubject returns the link for a (provider, sub)
+// pair, or ErrNotFound when no row matches. The OAuth callback runs
+// this on every handshake; the sub-first lookup is the §11
+// anti-takeover closure (the first party to bind a sub owns the row).
+func (m *MemStore) OAuthLinkByProviderSubject(_ context.Context, provider, providerSubject string) (OAuthLink, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.oauthLinks[provider+"\x00"+providerSubject]
+	if !ok {
+		return OAuthLink{}, ErrNotFound
+	}
+	return row, nil
 }
 
 // IssueCliAuthCode stores a freshly-minted code's SHA-256 hash with

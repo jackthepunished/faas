@@ -1069,6 +1069,7 @@ func TestTemplates_MaterializeContainsExpectedFiles(t *testing.T) {
 		"cron-example":    {"handler.js", "package.json", "README.md"},
 		"function-node":   {"handler.js", "package.json", "README.md"},
 		"function-python": {"handler.py", "requirements.txt", "README.md"},
+		"function-go":     {"main.go", "README.md"},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -30,6 +30,7 @@ import (
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
+	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -50,7 +51,7 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 	} else if err != nil {
 		return err
 	}
-	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev")
+	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev", api.DefaultScopes())
 	if err != nil && !errors.Is(err, state.ErrConflict) {
 		return err
 	}
@@ -147,6 +148,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 			},
 		})
 		go func() { _ = graceLoop.Run(ctx) }()
+		// Login-token cleanup (issue #165 PR #2, ADR-032). The
+		// login_tokens table backs password-reset (15-min TTL) and
+		// the legacy magic-link surface PR #1 removed. The
+		// /login/forgot → POST /auth/reset pair is the only
+		// production caller — we run a 24h ticker so the table
+		// stays bounded by (rate of reset requests) × 15min.
+		// pkg/logintoken mirrors pkg/grace (same Run / RunOnce
+		// shape) so the lifecycle is consistent with the G6 grace
+		// timer above.
+		loginTokenCleanup := logintoken.New(logintoken.Params{
+			Store: srv.store,
+			Log:   log,
+		})
+		go func() { _ = loginTokenCleanup.Run(ctx) }()
 	}
 	return runWithDeps(ctx, log, deps)
 }
@@ -426,4 +441,11 @@ func (p pgNotifier) Notify(ctx context.Context, channel, payload string) error {
 // Postgres pool. Returns immediately if no channels are requested.
 func (p pgNotifier) Subscribe(ctx context.Context, channels []string) (<-chan db.Notification, func(), error) {
 	return db.Subscribe(ctx, p.pool, channels)
+}
+
+// WaitFor is the Move 2 long-poll sibling: per-request LISTEN + predicate
+// filter. Thin wrapper around db.WaitForNotification so the Notifier
+// interface stays the only thing the handlers depend on.
+func (p pgNotifier) WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error) {
+	return db.WaitForNotification(ctx, p.pool, channel, predicate, timeout)
 }

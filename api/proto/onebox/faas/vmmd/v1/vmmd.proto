@@ -68,6 +68,23 @@ service Vmmd {
   // from the caller. See pkg/overlay.DialContext and schedd's
   // heartbeat goroutine (issue #98).
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) lets
+  // schedd push a fresh per-app egress allowlist into every live
+  // netns the vmmd owns without tearing the netns down. The
+  // caller passes app_id + the new allowlist (already v4/v6
+  // partitioned upstream; the wire is a single repeated string
+  // matching the AppSpec.egress_allowlist field 7). vmmd walks
+  // its live-instance map and applies the new nft rule in-place
+  // via `nft -a list chain` + handle delete + insert at the same
+  // offset, reverting to the prior argv snapshot on any error.
+  // This is the closure of "live-instance drift" (ADR-033 §Context
+  // "the next bigger item"). Idempotent: an empty allowlist
+  // flips the chain policy back to accept, a re-pushed identical
+  // allowlist is a no-op. Non-blocking on success; the caller
+  // uses pg_notify as the delivery mechanism (cmd/schedd egress
+  // drift subscriber, pkg/sched/egress_drift.go).
+  rpc UpdateEgressAllowlist(UpdateEgressAllowlistRequest) returns (UpdateEgressAllowlistAck);
 }
 
 // AppSpec flattens what the caller knows about an app. vmmd stores none of
@@ -116,6 +133,17 @@ message AppSpec {
   // 00033). Plan-gated upstream (Free/Hobby always empty); see
   // pkg/api/limits.go::EgressAllowlistAllowed.
   repeated string egress_allowlist = 7;
+  // app_id (tier-2 PR-B) is the apps.id UUID the instance is being
+  // woken for. vmmd stores it on the live Instance so the
+  // UpdateEgressAllowlist RPC can walk its live map by app
+  // instead of by instance — schedd pushes a single per-app
+  // patch, vmmd fans it out to every live instance of the app.
+  // Required by CreateColdBoot (the deploy pipeline always knows
+  // the app); required by CreateFromSnapshot for parity (the
+  // scheduler resolves app → Instance.app_id upstream, so an
+  // empty field here is a contract violation surfaced as
+  // InvalidArgument).
+  string app_id = 8;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -346,3 +374,30 @@ message ForwardHTTPResponse {
 message HeartbeatRequest {}
 
 message HeartbeatResponse {}
+
+// UpdateEgressAllowlistRequest is the input to UpdateEgressAllowlist.
+// app_id is the instances.app_id (the app whose live instances
+// need the new ruleset). egress_allowlist is the new per-app
+// outbound IP allowlist in the same shape as AppSpec.egress_allowlist
+// (a comma-free repeated string of CIDRs; v4 + v6 mixed allowed;
+// the renderer partitions by prefix.Addr().Is4()). Empty list
+// = clear the allowlist (the chain-policy flips back to accept).
+//
+// The wire does not include an `egress_allowlist_version` field —
+// the in-place patch is the only contract; cold boot on snapshot
+// restore re-reads the column on every Wake, so any drift between
+// the snapshot age and the column is repaired by the next Wake
+// without a version handshake on the hot path.
+message UpdateEgressAllowlistRequest {
+  string app_id = 1;
+  repeated string egress_allowlist = 2;
+}
+
+// UpdateEgressAllowlistAck is the empty success response. On
+// failure vmmd returns a gRPC status (Unavailable when no live
+// instances match app_id; Internal when the in-place nft patch
+// failed AND the revert to the prior argv snapshot also failed —
+// the live netns is then in an undefined state and the caller
+// is expected to Park + ColdBoot the affected instances, which
+// the schedd watchdog does on its next tick).
+message UpdateEgressAllowlistAck {}

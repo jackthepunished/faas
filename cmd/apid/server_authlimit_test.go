@@ -255,7 +255,7 @@ func TestPostLoginLimitBlocksEleventhAttempt(t *testing.T) {
 
 	fire := func() int {
 		rec := httptest.NewRecorder()
-		body := "email=alice%40example.com"
+		body := "email=alice%40example.com&password=any-password-1234567890"
 		req := httptest.NewRequest(http.MethodPost, "/login",
 			strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -299,7 +299,7 @@ func TestPostLoginLimit_SharedBucketWithGetLogin(t *testing.T) {
 	}
 	firePOST := func() int {
 		rec := httptest.NewRecorder()
-		body := "email=alice%40example.com"
+		body := "email=alice%40example.com&password=any-password-1234567890"
 		req := httptest.NewRequest(http.MethodPost, "/login",
 			strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")

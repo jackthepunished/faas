@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,9 +22,10 @@ import (
 // Subcommand names — lifted to constants so goconst stops flagging the
 // repeated "list"/"add"/"rm" string literals in the dispatch tables below.
 const (
-	subList = "list"
-	subAdd  = "add"
-	subRm   = "rm"
+	subList   = "list"
+	subAdd    = "add"
+	subUpdate = "update"
+	subRm     = "rm"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -53,6 +56,16 @@ const (
 	// goconst stops flagging the repeated "apps" / "status" / etc.
 	// literals. Tests intentionally keep the literal form.
 	dispatchApps = "apps"
+
+	// Plural deployments list (mirrors dispatchApps shape). User runs
+	// `faas deployments` to list; pagination flags live on the handler.
+	dispatchDeployments = "deployments"
+
+	// Singular deployment-get. Lifted so the dispatch literal stays
+	// constant-named (goconst); the constant does NOT route through
+	// appSlugFallback — the dispatch table places it before the
+	// "app" case so `faas deployment <id>` is never read as an app slug.
+	dispatchDeployment = "deployment"
 )
 
 // cmdApp implements `faas app <slug>` (GET /v1/apps/{slug}), `faas app <slug>
@@ -133,6 +146,16 @@ func cmdApp(args []string) int {
 		} else {
 			fmt.Printf("%-30s %d\n", "min instances:", a.MinInstances)
 		}
+		// ADR-031 + ADR-032: surface the per-app outbound CIDR
+		// allowlist in the text-mode `faas app <slug>` output so a
+		// customer can verify their PATCH round-tripped without
+		// dropping into --json. Print only when non-empty — empty
+		// is the Free/Hobby default and "no row" output is
+		// misleading.
+		if len(a.EgressAllowlist) > 0 {
+			fmt.Printf("%-30s %s\n", "egress allowlist:",
+				strings.Join(a.EgressAllowlist, ", "))
+		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
 	}
@@ -202,9 +225,9 @@ func cmdDeployTarball(args []string) int {
 	image := fs.String("image", "", "digest-pinned image reference")
 	tarball := fs.String("tarball", "", "path to source archive (tar.gz)")
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
-	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python)")
+	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python|function-go)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
-	runtime := fs.String("runtime", "", "function runtime (node22|python312)")
+	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
 	if err := fs.Parse(args); err != nil {
@@ -243,6 +266,14 @@ func cmdDeployTarball(args []string) int {
 		case "function-python":
 			*runtime = "python312"
 			*handler = "handler.handler"
+		case "function-go":
+			// The customer's handler is a static Go binary; the
+			// --handler wire field is vestigial for go124 (the imaged
+			// manifest locks the entrypoint to /app/handler). We set
+			// a non-empty value so the multipart writer doesn't skip
+			// the field, but the value is never read by the runtime.
+			*runtime = "go124"
+			*handler = "handler.go"
 		}
 		f, err := os.CreateTemp("", "faas-template-*.tar.gz")
 		if err != nil {
@@ -445,10 +476,10 @@ func cmdDomains(args []string) int {
 	return 1
 }
 
-// cmdCrons: list/add/rm.
+// cmdCrons: list/add/update/rm.
 func cmdCrons(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: faas crons <list|add|rm> [args]", "crons")
+		PrintUsage(os.Stderr, "usage: faas crons <list|add|update|rm> [args]", "crons")
 		return 1
 	}
 	switch args[0] {
@@ -505,6 +536,8 @@ func cmdCrons(args []string) int {
 		}
 		PrintOK(osStdout, "Cron scheduled: %s %s", c.Schedule, c.Path)
 		return 0
+	case subUpdate:
+		return cmdCronsUpdate(args[1:])
 	case subRm:
 		if len(args) != 2 {
 			PrintUsage(os.Stderr, "usage: faas crons rm <id>", "crons")
@@ -522,6 +555,109 @@ func cmdCrons(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "unknown crons subcommand %q\n", args[0])
 	return 1
+}
+
+// cronIDPattern is the 32-hex shape used by the API for cron ids
+// (CronResponse.ID, the path segment of /v1/crons/{id}). Mirrors
+// deploymentIDPattern — same 32-hex convention across the platform.
+var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+
+// renderCronState writes the human multi-line state block for one
+// cron. Routes through io.Writer so tests can capture the body via
+// the osStdout seam (same pattern as renderDeploymentRow in
+// commands_deployments.go). Widths assume short schedule / path /
+// boolean fields; no id-style left-pad because cron ids aren't
+// shown on the update block — the "Updated cron <id>" line above
+// already names the row.
+func renderCronState(w io.Writer, c api.CronResponse) {
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "schedule:", c.Schedule)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "path:", c.Path)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "enabled:", strconv.FormatBool(c.Enabled))
+}
+
+// cmdCronsUpdate implements `faas crons update <id> [--schedule EXPR]
+// [--path PATH] [--enable|--disable]`. Partial-update semantics:
+// every flag is optional, but at least one patch field must be set
+// (the server happily no-ops an empty body and emits a cron-changed
+// notification — a footgun we'd rather catch at the CLI). Uses
+// fs.Visit to distinguish "unset" from explicit-zero so a customer
+// can pass `--path ""` to clear the path without being re-defaulted
+// to `/`. The `--enable|--disable` pair is mutually exclusive;
+// --schedule is locally shape-checked (5 whitespace tokens) to match
+// the server's validCron so a bad expression fails fast.
+func cmdCronsUpdate(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	id := args[0]
+	if !cronIDPattern.MatchString(id) {
+		PrintUsage(os.Stderr, "usage: faas crons update <id>   (id is 32 hex chars)", "crons")
+		return 1
+	}
+	fs := flag.NewFlagSet("crons-update", flag.ContinueOnError)
+	schedule := fs.String("schedule", "", "cron expression (5 fields)")
+	path := fs.String("path", "", "request path")
+	enable := fs.Bool("enable", false, "enable the cron")
+	disable := fs.Bool("disable", false, "disable the cron")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	if *enable && *disable {
+		PrintUsage(os.Stderr, "usage: faas crons update --enable | --disable (mutually exclusive)", "crons")
+		return 1
+	}
+	// Reject no-fields-set early; the server otherwise no-ops and
+	// emits a cron-changed notification — a footgun we'd rather
+	// catch at the CLI before a pointless network round-trip.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if !explicit["schedule"] && !explicit["path"] && !explicit["enable"] && !explicit["disable"] {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	// Local schedule shape check (5 whitespace tokens) mirrors the
+	// server's validCron so a bad expression fails fast. We do NOT
+	// validate field ranges — that's the scheduler's job.
+	if explicit["schedule"] && len(strings.Fields(*schedule)) != 5 {
+		PrintFail(os.Stderr, "Invalid --schedule %q (expected 5 fields, e.g. \"*/15 * * * *\")", *schedule)
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	var req api.UpdateCronRequest
+	if explicit["schedule"] {
+		s := *schedule
+		req.Schedule = &s
+	}
+	if explicit["path"] {
+		p := *path
+		req.Path = &p
+	}
+	if explicit["enable"] {
+		v := true
+		req.Enabled = &v
+	}
+	if explicit["disable"] {
+		v := false
+		req.Enabled = &v
+	}
+	updated, err := client.UpdateCron(context.Background(), id, req)
+	if err != nil {
+		return printErr("Update failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(updated))
+	}
+	PrintOK(osStdout, "Updated cron %s", updated.ID)
+	renderCronState(osStdout, updated)
+	return 0
 }
 
 // cmdKeys: list/add/rm. Adding returns the plaintext token once (spec §2.2).
@@ -556,7 +692,7 @@ func cmdKeys(args []string) int {
 		if err != nil {
 			return printErr("Not logged in", err)
 		}
-		k, err := client.CreateKey(context.Background(), args[1])
+		k, err := client.CreateKey(context.Background(), args[1], nil)
 		if err != nil {
 			return printErr("Create failed", err)
 		}

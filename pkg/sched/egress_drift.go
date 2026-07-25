@@ -1,0 +1,191 @@
+package sched
+
+// tier-2 PR-B (ADR-031 + ADR-033): live-instance drift consumer.
+//
+// PATCH /v1/apps/{slug} updates apps.egress_allowlist (the per-app
+// outbound IP allowlist). apid emits NotifyAppChanged with
+// kind="updated"; schedd's main loop currently logs the payload
+// and moves on. ADR-033 §Context "the next bigger item" calls
+// out the gap: a running netns keeps its old ruleset until the
+// next Wake, so an operator that shrinks a Free → Pro allowlist
+// sees the new CIDRs accepted by the new Wake but the old
+// allowlist still in effect on every live instance until each
+// one cycles.
+//
+// This subscriber closes the gap: it consumes the same
+// app_changed feed, filters to kind="updated", looks up the
+// current EgressAllowlist on the apps row, enumerates every
+// live instance of the app (across all compute nodes), and
+// pushes the new allowlist to each owning vmmd via
+// RoutedVMM.UpdateEgressAllowlist. vmmd applies the patch
+// in-place via incremental nft delete-by-handle + add (no
+// netns teardown, no cold-wake tax).
+//
+// Shape parallels pkg/sched/deletion_subscriber.go: drain
+// goroutine over an already-opened <-chan db.Notification, no
+// reconnect bookkeeping here (cmd/schedd owns the dial lifecycle
+// via deps.subscribeEgressDrift, the same shape as
+// deps.subscribeDeletion). Idempotency rides on vmmd: a set-
+// equal allowlist is a no-op on the vmmd side (samePrefixSet
+// short-circuit), so a redelivered event is safe. A redelivered
+// event that lands mid-write just refreshes the same baseline.
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+
+	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// EgressDriftSubscriber consumes NotifyAppChanged with
+// kind="updated" and fans the per-app egress allowlist out to
+// every vmmd that owns a live instance of the app. Idempotent on
+// the vmmd side; the subscriber never writes to the instances
+// table (the engine + watchdog own that) and never wakes or
+// parks anything.
+type EgressDriftSubscriber struct {
+	engine *Engine
+	router RoutedVMM
+	log    *slog.Logger
+}
+
+// NewEgressDriftSubscriber wires the consumer. router is the
+// VMMRouter the engine already holds; the subscriber is
+// read-only on the engine (it pulls AppByID + ListInstancesForApp
+// via the store) and write-only on the router.
+func NewEgressDriftSubscriber(engine *Engine, router RoutedVMM, log *slog.Logger) *EgressDriftSubscriber {
+	return &EgressDriftSubscriber{engine: engine, router: router, log: log}
+}
+
+// Run drains an already-opened channel until ctx is cancelled or
+// the channel closes. Returns ctx.Err() on cancellation; any
+// in-flight handle() call is given time to finish by the
+// channel's natural delivery pacing.
+func (e *EgressDriftSubscriber) Run(ctx context.Context, ch <-chan db.Notification) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case n, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			e.handle(ctx, n)
+		}
+	}
+}
+
+// handle is the per-message work unit. Parse, filter, walk,
+// fan-out. Each step logs on failure but never propagates —
+// the loop must outlive a transient bad event (the same "never
+// return" policy as DeletionSubscriber.handle).
+func (e *EgressDriftSubscriber) handle(ctx context.Context, n db.Notification) {
+	if n.Channel != db.NotifyAppChanged {
+		// Defensive: callers generally Subscribe to a single
+		// channel, but a wider-list caller could route
+		// unrelated traffic here. Ignore to avoid re-fanning
+		// on a misrouted payload.
+		return
+	}
+	var payload struct {
+		Kind string `json:"kind"`
+		// AppID is the apps.id UUID. Slug is informational
+		// (logs only).
+		AppID string `json:"app_id"`
+		Slug  string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(n.Payload), &payload); err != nil {
+		e.log.Warn("schedd: egress drift bad payload",
+			"channel", n.Channel, "err", err, "payload_first_64", first64(n.Payload))
+		return
+	}
+	// kind filter: only "updated" carries an egress_allowlist
+	// mutation. "deleted", "renamed", "parked", "woken" are
+	// ignored — those are domain events the deletion / route
+	// flush / watchdog consumers handle.
+	if payload.Kind != "updated" {
+		return
+	}
+	if payload.AppID == "" {
+		e.log.Warn("schedd: egress drift empty app_id in payload",
+			"channel", n.Channel, "payload", n.Payload)
+		return
+	}
+	e.fanOut(ctx, payload.AppID, payload.Slug)
+}
+
+// fanOut reads the current EgressAllowlist, enumerates every
+// live instance, and pushes the allowlist to each owning
+// vmmd. Each per-node call is independent — a failure on one
+// node logs and continues (the next reconcile picks up the
+// missing node).
+func (e *EgressDriftSubscriber) fanOut(ctx context.Context, appID, slug string) {
+	// Re-read the column on every event so the patch reflects
+	// the post-commit state, not the in-flight snapshot the
+	// apid handler held when it emitted the notification.
+	// Cheap — AppByID is one indexed lookup; even with 100k
+	// apps this is sub-millisecond.
+	app, err := e.engine.store.AppByID(ctx, appID)
+	if err != nil {
+		e.log.Warn("schedd: egress drift app read failed",
+			"app", appID, "slug", slug, "err", err)
+		return
+	}
+	allowlist := app.EgressAllowlist
+
+	// ListInstancesForApp returns every row the app owns,
+	// ordered by started_at desc. We filter to live states
+	// (RUNNING / WAKING / COLD_BOOTING) and dedupe by node
+	// so a vmmd that hosts 3 instances of the app receives
+	// one call, not three — the per-app fan-out on vmmd's
+	// side is the responsibility of pkg/fcvm.Manager.
+	rows, err := e.engine.store.ListInstancesForApp(ctx, appID)
+	if err != nil {
+		e.log.Warn("schedd: egress drift list instances failed",
+			"app", appID, "slug", slug, "err", err)
+		return
+	}
+	// Track the set of nodes we've already pushed to this
+	// tick — the in-place patch is per-app, not per-instance.
+	seen := make(map[string]struct{}, len(rows))
+	pushed := 0
+	for _, ins := range rows {
+		if !state.IsLive(ins.State) {
+			continue
+		}
+		if ins.NodeID == "" {
+			// Pre-#97 fixture or test row. Skip — without a
+			// nodeID we can't route; the next reconcile
+			// (or a Park + ColdBoot) will re-anchor the
+			// row to a real node.
+			continue
+		}
+		if _, ok := seen[ins.NodeID]; ok {
+			continue
+		}
+		seen[ins.NodeID] = struct{}{}
+		if err := e.router.UpdateEgressAllowlist(ctx, ins.NodeID, appID, allowlist); err != nil {
+			// Log and continue. The next reconcile
+			// (next PATCH, or the watchdog's Park + ColdBoot
+			// on a stuck instance) re-anchors the vmmd's
+			// live-instance map.
+			e.log.Warn("schedd: egress drift vmmd update failed",
+				"app", appID, "slug", slug,
+				"node", ins.NodeID, "err", err)
+			continue
+		}
+		pushed++
+	}
+	if pushed == 0 {
+		e.log.Debug("schedd: egress drift observed with no live instances",
+			"app", appID, "slug", slug, "allowlist_len", len(allowlist))
+		return
+	}
+	e.log.Info("schedd: egress drift fanned out",
+		"app", appID, "slug", slug,
+		"allowlist_len", len(allowlist),
+		"live_instances", len(rows),
+		"nodes_pushed", pushed)
+}

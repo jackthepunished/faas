@@ -15,15 +15,17 @@ package imaged
 const (
 	BaseRefNode22    = "ghcr.io/onebox-faas/runner-node22:latest"
 	BaseRefPython312 = "ghcr.io/onebox-faas/runner-python312:latest"
+	BaseRefGo124     = "ghcr.io/onebox-faas/runner-go124:latest"
 	BaseRefMinimal   = "ghcr.io/onebox-faas/base-minimal:latest"
 	BaseRefBuilder   = "ghcr.io/onebox-faas/builder-base:latest"
 
 	// Runtime names are the values stored on state.App.Runtime. They map
-	// 1:1 to the runner shims in guest/runners/{node22,python312}. Naming
-	// them as constants keeps the baseRefFor switch and the production
-	// callers (cmd/imaged's deploy path) in lockstep.
+	// 1:1 to the runner shims in guest/runners/{node22,python312,go124}.
+	// Naming them as constants keeps the baseRefFor switch and the
+	// production callers (cmd/imaged's deploy path) in lockstep.
 	RuntimeNode22    = "node22"
 	RuntimePython312 = "python312"
+	RuntimeGo124     = "go124"
 )
 
 // baseRefFor returns the canonical base image reference for a runtime. The
@@ -34,6 +36,8 @@ func baseRefFor(runtime string) string {
 		return BaseRefNode22
 	case RuntimePython312:
 		return BaseRefPython312
+	case RuntimeGo124:
+		return BaseRefGo124
 	default:
 		return BaseRefMinimal
 	}

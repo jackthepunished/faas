@@ -165,7 +165,7 @@ func TestDo_MutatingCallsCarryIdempotencyKey(t *testing.T) {
 			return err
 		}},
 		{"DeleteCron", func(c *Client) error { return c.DeleteCron(context.Background(), "1") }},
-		{"CreateKey", func(c *Client) error { _, err := c.CreateKey(context.Background(), "lbl"); return err }},
+		{"CreateKey", func(c *Client) error { _, err := c.CreateKey(context.Background(), "lbl", nil); return err }},
 		{"DeleteKey", func(c *Client) error { return c.DeleteKey(context.Background(), "1") }},
 		{"SetSecret", func(c *Client) error { return c.SetSecret(context.Background(), "x", "K", "v") }},
 		{"UnsetSecret", func(c *Client) error { return c.UnsetSecret(context.Background(), "x", "K") }},

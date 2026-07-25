@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -73,6 +74,47 @@ type Drain struct {
 	// far past the SLO; long enough that the drain doesn't fan out a
 	// hot loop on a stuck backend.
 	retryAfterSeconds int
+	// accts caches Active(account_id) lookups for the suspended-skip
+	// check (Move 2). One entry per account; the 5s TTL collapses the
+	// 64-row batch's per-row AccountByID into ≤0.2 RPS at Meta's
+	// "everyone suspends at once" worst case.
+	accts *acctCache
+}
+
+// acctCache is a tiny TTL map. Move 2 hardware-plan: the suspended-account
+// check needs to avoid 64 AccountByID round-trips per batch under steady
+// load. Five seconds is the natural window — same order as the per-app
+// plan cache (cmd/apid uses a 5 s memo) and short enough that a
+// reactivation lands within a SLO.
+type acctCache struct {
+	mu  sync.Mutex
+	now func() time.Time
+	m   map[string]acctCacheEntry
+}
+
+type acctCacheEntry struct {
+	active    bool
+	expiresAt time.Time
+}
+
+func newAcctCache(now func() time.Time) *acctCache {
+	return &acctCache{now: now, m: map[string]acctCacheEntry{}}
+}
+
+func (c *acctCache) get(accountID string) (acctCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[accountID]
+	if !ok || !c.now().Before(e.expiresAt) {
+		return acctCacheEntry{}, false
+	}
+	return e, true
+}
+
+func (c *acctCache) put(accountID string, active bool, expiresAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[accountID] = acctCacheEntry{active: active, expiresAt: expiresAt}
 }
 
 // DrainOption configures the Drain without leaking every field to the
@@ -102,6 +144,9 @@ func NewDrain(store state.Store, engine *Engine, opts ...DrainOption) *Drain {
 	for _, o := range opts {
 		o(d)
 	}
+	// acctCache is wired last so it adopts the Drain's now() injection
+	// (tests use WithDrainNow to exercise TTL boundaries). Move 2.
+	d.accts = newAcctCache(d.now)
 	return d
 }
 
@@ -197,7 +242,20 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 			return
 		}
 	}
-	// 2. Claim.
+	// 2. Account Active gate. The cron path has this (loop.go:580);
+	// the drain needs it too because rows queued while the account was
+	// Active may sit in 'pending' across a suspension (Free goes past
+	// due → suspended). Cap+Activeness = the complete per-app gate.
+	// 5-minute backoff is short enough that a reactivation lands within
+	// a SLO; long enough that we don't churn cycles on a suspended
+	// account.
+	if !d.isAccountActive(ctx, inv.AppID) {
+		_ = d.store.FailInvocation(ctx, inv.ID, "account suspended", 5*time.Minute)
+		d.log.Info("drain: account suspended; deferred",
+			"inv", inv.ID, "app_id", inv.AppID)
+		return
+	}
+	// 3. Claim.
 	if _, err := d.store.ClaimInvocation(ctx, inv.ID, "", d.wakeLeaseSeconds); err != nil {
 		// Already-claimed (MemStore ErrNotFound, PgStore race): the
 		// "skip locked" path caught us on the next LIST. Skip.
@@ -306,4 +364,36 @@ func (d *Drain) isOverDelayedCap(ctx context.Context, appID string) bool {
 		return false
 	}
 	return n >= limits.MaxDelayedTasksPerApp
+}
+
+// isAccountActive is the suspended-account gate for the drain. Mirrors
+// the cron loop's `if !acct.Active() { continue }` at loop.go:580 —
+// rows queued while the account was Active may sit in 'pending' across
+// a suspension; the drain must not dispatch them.
+//
+// Caching: a 5s TTL on `account_id → Active` drops the per-row
+// AccountByID round-trip to one per batch per account. The TTL is
+// shorter than the suspended-skip's 5-minute backoff so a reactivation
+// is honoured within the next tick (1s safety ticker).
+//
+// Fail-open: a transient lookup error returns `true` (Active). The
+// drain's Cron sibling uses the same fail-open stance — never block the
+// platform on a Postgres hiccup. The cron path's fail-open is the
+// reason this is also fail-open: the cron loop's gate is the only
+// reason the cron path is one less spot-check away from a "kill switch"
+// regression.
+func (d *Drain) isAccountActive(ctx context.Context, appID string) bool {
+	app, err := d.engine.Store().AppByID(ctx, appID)
+	if err != nil {
+		return true
+	}
+	if cached, ok := d.accts.get(app.AccountID); ok {
+		return cached.active
+	}
+	acct, err := d.engine.Store().AccountByID(ctx, app.AccountID)
+	if err != nil {
+		return true
+	}
+	d.accts.put(app.AccountID, acct.Active(), d.now().Add(5*time.Second))
+	return acct.Active()
 }

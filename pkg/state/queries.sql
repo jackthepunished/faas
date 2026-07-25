@@ -24,15 +24,19 @@ update accounts set plan = $2 where id = $1;
 update accounts set status = $2 where id = $1;
 
 -- name: CreateAPIKey :one
-insert into api_keys (account_id, key_sha256, label)
-values ($1, $2, $3)
-returning id, account_id, key_sha256, coalesce(label, ''), created_at;
+-- scopes is $4 (text[]). The handler is responsible for validating the
+-- scope vocabulary; the store does not. See ADR-034.
+insert into api_keys (account_id, key_sha256, label, scopes)
+values ($1, $2, $3, $4)
+returning id, account_id, key_sha256, coalesce(label, ''), scopes, created_at;
 
 -- name: DeleteAPIKey :exec
 delete from api_keys where id = $1 and account_id = $2;
 
 -- name: ListAPIKeys :many
-select id, account_id, key_sha256, coalesce(label, ''), created_at
+-- scopes is the auth permission set surfaced to the dashboard and the
+-- /v1/keys listing. See ADR-034.
+select id, account_id, key_sha256, coalesce(label, ''), scopes, created_at
 from api_keys where account_id = $1 order by created_at desc;
 
 -- name: TouchKeyLastUsed :exec

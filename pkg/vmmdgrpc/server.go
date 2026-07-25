@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
@@ -42,6 +43,15 @@ type VmmdAPI interface {
 	// (not in pkg/vmmdgrpc/forward.go) so the Server struct's
 	// interface check catches a Manager wiring gap at compile time.
 	NetnsFor(instance string) (string, bool)
+	// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) walks
+	// the live-instance map and applies the new per-app egress
+	// allowlist in-place via incremental nft patch. Idempotent: an
+	// empty allowlist flips the chain policy back to accept; an
+	// allowlist equal to the cached prior one is a no-op. schedd
+	// invokes this from the egress-drift subscriber
+	// (pkg/sched/egress_drift.go) on every pg_notify app_changed
+	// payload with kind="updated".
+	UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error
 }
 
 // Server implements vmmdpb.VmmdServer.
@@ -251,6 +261,34 @@ func (s *Server) Ping(_ context.Context, _ *vmmdpb.PingRequest) (*vmmdpb.PingRes
 		FcVersion:  s.fcVer,
 		ServerTime: timestamppb.Now(),
 	}, nil
+}
+
+// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) walks the
+// vmmd's live-instance map and applies the new per-app egress
+// allowlist in-place via incremental nft patch (Manager.UpdateEgressAllowlist).
+// Empty allowlist = clear the rule and let chain-policy default
+// accept do its work. Idempotent on a redelivered identical
+// allowlist (no-op). Schedd invokes this from the egress-drift
+// subscriber on every pg_notify app_changed payload with
+// kind="updated"; failures bubble up as Unavailable so schedd
+// logs + retries on its next reconcile.
+func (s *Server) UpdateEgressAllowlist(ctx context.Context, req *vmmdpb.UpdateEgressAllowlistRequest) (*vmmdpb.UpdateEgressAllowlistAck, error) {
+	const op = "UpdateEgressAllowlist"
+	start := time.Now()
+	defer func() { s.ops.Observe(op, time.Since(start), nil) }()
+	if req.GetAppId() == "" {
+		return nil, grpcerr.ToStatus(toProblem(api.NewProblem(int(codes.InvalidArgument),
+			api.CodeValidation, "Missing app_id", "app_id is required").
+			WithDocs("https://docs/DOMAIN/vmmd#update-egress-allowlist")))
+	}
+	allowlist, err := toEgressAllowlist(req.GetEgressAllowlist())
+	if err != nil {
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	if err := s.vmm.UpdateEgressAllowlist(ctx, req.GetAppId(), allowlist); err != nil {
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
 }
 
 // toProblem lifts a plain error to *api.Problem if it isn't one already.

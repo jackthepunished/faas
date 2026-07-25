@@ -29,7 +29,7 @@ build: guest-runners ## Build every daemon + function runners into ./bin
 # ext4 when the deploy's runtime matches (cmd/imaged wires
 # FAAS_FUNCTION_RUNNER_NODE22 / FAAS_FUNCTION_RUNNER_PYTHON312 to the
 # resulting paths). Build matrix matches guest/init.
-GUEST_RUNNERS := node22 python312
+GUEST_RUNNERS := node22 python312 go124
 .PHONY: guest-runners
 guest-runners: ## Build function-runner shims into ./bin/runners/<runtime>/faas-runner
 	@mkdir -p $(BINDIR)/runners

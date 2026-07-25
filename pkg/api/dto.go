@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 type CreateAppRequest struct {
 	Slug           string `json:"slug"`
 	Type           string `json:"type,omitempty"`    // "app" (default) | "function"
-	Runtime        string `json:"runtime,omitempty"` // node22|python312 for functions
+	Runtime        string `json:"runtime,omitempty"` // node22|python312|go124 for functions
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
@@ -74,6 +75,21 @@ type AppResponse struct {
 	// The DTO reuses the existing api.AppManifest (defined in
 	// appmanifest.go) so the wire shape stays a single source of truth.
 	Manifest AppManifest `json:"manifest"`
+	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
+	// roadmap) is the per-app outbound CIDR allowlist. Each entry
+	// is the canonical CIDR string form: v4 ("1.2.3.0/24") or v6
+	// ("2001:db8::/32"). The v4-mapped v6 form ("::ffff:1.2.3.0/120")
+	// is silently rewritten to its v4 form at PATCH time by
+	// validateUpdateApp, so the read-back never carries a
+	// "::ffff:" prefix. Materialised as `[]` (never `null`) at
+	// the conversion boundary (cmd/apid/handlers.go::appResponse)
+	// so Free / Hobby and pre-PATCH apps always have a predictable
+	// JSON shape — the per-netns renderer treats the empty list as
+	// "no allowlist rule" (the chain falls back to default-accept).
+	// The list is first-seen-wins-dedup'd at write time; the read
+	// order matches insertion order. NOT in `required:` because the
+	// empty-slice case is the contract.
+	EgressAllowlist []string `json:"egress_allowlist"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
@@ -134,22 +150,29 @@ type AccountLimits struct {
 
 // APIKeyResponse is an API key returned to the customer. The plaintext
 // appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
-// + label + last_used_at + id are returned thereafter.
+// + label + scopes + last_used_at + id are returned thereafter. Scopes is
+// the explicit permission set attached to the key (e.g. ["admin"],
+// ["read"], ["write"]); see ADR-034.
 type APIKeyResponse struct {
-	ID         string `json:"id"`
-	Prefix     string `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
-	Label      string `json:"label,omitempty"`
-	LastUsedAt string `json:"last_used_at,omitempty"`
-	CreatedAt  string `json:"created_at"`
+	ID         string   `json:"id"`
+	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
+	Label      string   `json:"label,omitempty"`
+	Scopes     []string `json:"scopes"`
+	LastUsedAt string   `json:"last_used_at,omitempty"`
+	CreatedAt  string   `json:"created_at"`
 	// Plaintext appears ONLY on the create response, never persisted.
 	Plaintext string `json:"plaintext,omitempty"`
 }
 
 // CreateKeyRequest is the body of POST /v1/keys. Label is optional
 // (max 100 chars per spec); empty label is allowed and renders as
-// `{}` so the server's optional-field handling stays in scope.
+// `{}` so the server's optional-field handling stays in scope. Scopes
+// is the requested permission set; the server validates each entry
+// against the allowed vocabulary (admin, read, write) and defaults to
+// ["admin"] when omitted so existing callers keep full access. See ADR-034.
 type CreateKeyRequest struct {
-	Label string `json:"label,omitempty"`
+	Label  string   `json:"label,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
 }
 
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the
@@ -242,6 +265,79 @@ type DeploymentListResponse struct {
 	NextBefore string               `json:"next_before,omitempty"`
 }
 
+// --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
+
+// OAuthProvider is the issuer name used by the dashboard OAuth flows
+// (the email/identity brokers). The set is intentionally closed — adding
+// a new provider is a Store + handler + OpenAPI change, not a config
+// flag. "google" and "github" are wired in PR #2.
+type OAuthProvider string
+
+const (
+	OAuthProviderGoogle OAuthProvider = "google"
+	OAuthProviderGitHub OAuthProvider = "github"
+)
+
+// PasswordLoginRequest is the body of POST /login. The email is the
+// canonical handle (lowercase + trim — the handler runs the same
+// canonicalisation the account-create path uses so an "alice@example.com
+// vs ALICE@example.com" login pair collapses to one row). Password is
+// the plaintext the client sent over TLS; the Argon2id verify is in
+// pkg/auth.Verify and runs on the server only.
+type PasswordLoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// PasswordLoginResponse is what POST /login (and POST /signup) return
+// on success. The session cookie rides on the Set-Cookie header — the
+// body deliberately carries NO api_key field. Pre-#165 (PR #1) the
+// response minted a "web-console" key and returned it in the body; that
+// was the takeover surface. The SDK path is the device-code CLI
+// (MintCliAuthCode / ExchangeCliAuthCode), not a login-bundled key, so
+// removing the field here doesn't break programmatic auth.
+type PasswordLoginResponse struct {
+	AccountID string `json:"account_id"`
+	Plan      string `json:"plan"`
+}
+
+// PasswordSignupRequest is the body of POST /signup. Same shape as
+// PasswordLoginRequest — we accept the same argon2id-shaped ciphertext
+// at signup and re-verify at login, so the handler-side error
+// equivalence ("wrong password" vs "no account" vs "weak password") is
+// kept intact under the same JSON keys.
+type PasswordSignupRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// PasswordResetRequest is the body of POST /login/forgot. The email
+// is optional — the same-shape internal handler is hit by the form
+// page (no body) and the SDK (email in body). The handler always
+// returns 200 with an identical body and identical timing whether or
+// not the email exists, so the surface does not leak account presence.
+type PasswordResetRequest struct {
+	Email string `json:"email,omitempty"`
+}
+
+// PasswordResetConfirm is the body of POST /auth/reset. Token is the
+// 32-byte value the email link carried (base64url-encoded, NOT the
+// SHA-256 hash the server stored). NewPassword is the plaintext the
+// user is opting into; the server Argon2id-encodes it server-side and
+// runs ConsumeLoginToken atomically so a replay returns 410.
+type PasswordResetConfirm struct {
+	Token       string `json:"token"`
+	NewPassword string `json:"new_password"`
+}
+
+// SetPasswordRequest is the body of POST /dashboard/account/set-password.
+// Lets OAuth-only users opt into password login. Same shape as the
+// reset-confirm NewPassword field — the handler runs auth
+// (sessionAuth) before encoding, so this is an authenticated surface.
+type SetPasswordRequest struct {
+	Password string `json:"password"`
+}
+
 // UsageSummaryResponse is the roll-up for the current month (or any
 // month passed as a query param). Used by the dashboard usage page so
 // the customer sees a single number ("used X of Y GB-h, overage $Z")
@@ -327,13 +423,17 @@ type UsageExportResponse struct {
 
 // APIKeyExportResponse is one row in the export's API key slice.
 // The plaintext key never appears here (and never reappears after
-// the create response, per §4.2). Only the prefix + label + timestamps.
+// the create response, per §4.2). Only the prefix + label + scopes +
+// timestamps. Scopes is included so the customer's GDPR export carries
+// the full audit trail of which keys had which permissions at the
+// moment of export (ADR-034).
 type APIKeyExportResponse struct {
-	ID        string `json:"id"`
-	Prefix    string `json:"prefix"`
-	Label     string `json:"label,omitempty"`
-	CreatedAt string `json:"created_at"`
-	LastUsed  string `json:"last_used_at,omitempty"`
+	ID        string   `json:"id"`
+	Prefix    string   `json:"prefix"`
+	Label     string   `json:"label,omitempty"`
+	Scopes    []string `json:"scopes"`
+	CreatedAt string   `json:"created_at"`
+	LastUsed  string   `json:"last_used_at,omitempty"`
 }
 
 // GdprAuditExportResponse is one row of the customer's own GDPR audit
@@ -406,4 +506,115 @@ type StatusPage struct {
 	// "degraded: <reason>" so an operator tailing the JSON can tell
 	// at a glance why a snapshot is or isn't trustworthy.
 	Source string `json:"source"`
+}
+
+// --- Move 2: event-driven surface response shapes ----------------------------
+//
+// AsyncInvokeResponse is the 202-side of POST /v1/apps/{slug}/invoke/async.
+// StatusURL is the well-known read endpoint so the dashboard (and the
+// SDK) can poll without parsing the id.
+type AsyncInvokeResponse struct {
+	ID        string `json:"id"`
+	StatusURL string `json:"status_url"`
+}
+
+// InvokeResponse is the sync-side of POST /v1/apps/{slug}/invoke.
+// Status is the final row state (one of "completed" | "failed"
+// | "cancelled"); Result is the per-app payload the drain stamped
+// (nil while pending, populated by drain.emitDone).
+type InvokeResponse struct {
+	ID     string          `json:"id"`
+	Status string          `json:"status"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+// QueueSendResponse is returned on POST /v1/apps/{slug}/queues/invocations:send.
+// 201 Created with the new id; the customer pairs this with the
+// /receive long-poll.
+type QueueSendResponse struct {
+	ID string `json:"id"`
+}
+
+// QueueReceiveResponse is returned on POST /v1/apps/{slug}/queues/invocations:receive.
+// 200 with the dequeued row's payload + result; 204 on timeout.
+type QueueReceiveResponse struct {
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
+	Result  json.RawMessage `json:"result,omitempty"`
+}
+
+// DelayedTaskResponse is the create/get shape for delayed tasks.
+// ScheduledAt is the customer-facing UTC dispatch time; State is
+// populated on get, omitted on create (always "pending" there).
+type DelayedTaskResponse struct {
+	ID          string    `json:"id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	State       string    `json:"state,omitempty"`
+}
+
+// ListInvocationsResponse lives in cmd/apid because pkg/api cannot
+// import pkg/state (cyclic). The handler-local type is `[]state.Invocation`
+// — the wire shape is identical, only the package differs.
+
+// InvokeRequest is the body for POST /v1/apps/{slug}/invoke[/async].
+// Method defaults to POST; path defaults to `/` (the handler fills
+// defaults; the zero values are not persisted).
+type InvokeRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Headers json.RawMessage `json:"headers,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Path    string          `json:"path,omitempty"`
+}
+
+// QueueSendRequest is the body for POST /v1/apps/{slug}/queues/send.
+// Cap-checked against MaxQueueDepth at the handler.
+type QueueSendRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// DelayedTaskRequest is the body for POST /v1/apps/{slug}/delayed-tasks.
+// ScheduledAt must be in the future (UTC); the handler rejects past
+// timestamps with invalid_scheduled_at.
+type DelayedTaskRequest struct {
+	Payload     json.RawMessage `json:"payload,omitempty"`
+	ScheduledAt time.Time       `json:"scheduled_at"`
+}
+
+// Invocation is the SDK-side mirror of state.Invocation. The wire
+// is the same JSON the handler emits (writeJSON(w, 200, inv) where
+// inv is a state.Invocation), but pkg/api cannot import pkg/state
+// (import cycle — state pkg is the lowest layer). The mirror is
+// exhaustive: every field with a JSON tag on state.Invocation gets a
+// typed row here so the SDK gets proper Go types and JSON tags. The
+// name `Invocation` matches the OpenAPI schema (api/openapi.yaml
+// `Invocation`) so the spec_compliance test sees a 1:1 mapping.
+type Invocation struct {
+	ID             string          `json:"id"`
+	AppID          string          `json:"app_id"`
+	AccountID      string          `json:"account_id"`
+	InstanceID     string          `json:"instance_id,omitempty"`
+	Source         string          `json:"source"`
+	State          string          `json:"state"`
+	Method         string          `json:"method"`
+	Path           string          `json:"path"`
+	Payload        json.RawMessage `json:"payload"`
+	Headers        json.RawMessage `json:"headers"`
+	DueAt          time.Time       `json:"due_at"`
+	ScheduledAt    *time.Time      `json:"scheduled_at,omitempty"`
+	AckURL         string          `json:"ack_url,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	ReceivedAt     *time.Time      `json:"received_at,omitempty"`
+	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
+	Attempts       int             `json:"attempts"`
+	LastError      string          `json:"last_error,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// ListInvocationsResponse is the wire shape for GET /v1/invocations.
+// The handler emits a `[]state.Invocation` under the `invocations`
+// key; here we declare the same shape with the SDK-side mirror type
+// so pkg/api stays decoupled from pkg/state.
+type ListInvocationsResponse struct {
+	Invocations []Invocation `json:"invocations"`
 }

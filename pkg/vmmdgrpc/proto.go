@@ -41,6 +41,12 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// vmmd translates CIDRs into netns.Config.EgressAllowlist on
 		// Wake. Empty slice = no allowlist rule (current behaviour).
 		EgressAllowlist: app.GetEgressAllowlist(),
+		// tier-2 PR-B: schedd fans UpdateEgressAllowlist out by
+		// app_id, so the live Instance needs to remember which app
+		// it was woken for. The scheduler already knows the app
+		// when it calls CreateFromSnapshot; passing it on the wire
+		// means vmmd doesn't have to round-trip back to apid.
+		AppID: app.GetAppId(),
 	}
 	if snap != nil {
 		// #96 / ADR-025 axis 2 (slice 3) — mem_path is gone from the
@@ -95,6 +101,12 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// ADR-031: see toWakeRequest for the rationale; cold-boot
 		// mirrors it so deploy primes the same egress policy.
 		EgressAllowlist: app.GetEgressAllowlist(),
+		// tier-2 PR-B: see toWakeRequest. The cold-boot path is
+		// the first boot of a deploy; setting AppID here means
+		// the very first UpdateEgressAllowlist fan-out finds the
+		// instance via m.live[].AppID without a separate
+		// bootstrap path.
+		AppID: app.GetAppId(),
 	}, nil
 }
 
@@ -150,4 +162,32 @@ func addrOrEmpty(a netip.Addr) string {
 		return ""
 	}
 	return a.String()
+}
+
+// toEgressAllowlist parses the wire's repeated string of CIDR
+// literals into the netip.Prefix slice Manager.UpdateEgressAllowlist
+// consumes. The wire carries the same shape as
+// AppSpec.egress_allowlist (field 7), so the renderer partition
+// (prefix.Addr().Is4()) works unchanged. A malformed entry is
+// rejected with a typed Problem: the DB trigger and the apid
+// validator already enforce v4-or-v6 + non-/0 upstream — a bad
+// entry here is a contract violation that the manager surfaces
+// with InvalidArgument rather than silently dropping the rule.
+func toEgressAllowlist(ss []string) ([]netip.Prefix, error) {
+	if len(ss) == 0 {
+		return nil, nil
+	}
+	out := make([]netip.Prefix, 0, len(ss))
+	for _, s := range ss {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, api.NewProblem(int(codes.InvalidArgument),
+				api.CodeValidation,
+				"Invalid egress_allowlist entry",
+				err.Error(),
+			)
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }

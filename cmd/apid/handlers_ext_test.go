@@ -14,12 +14,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -275,6 +277,12 @@ func TestUpdateAppEgressAllowlist_V6AcceptedOnPro(t *testing.T) {
 // TestUpdateAppEgressAllowlist_MixedAcceptedOnPro: a mixed v4 + v6
 // allowlist must be accepted (ADR-032). The renderer partitions
 // into two argvs; the handler does not need to know.
+//
+// PR-C: strengthened to assert exact values + insertion order,
+// mirroring the v6-only test above (which only ever sent a single
+// entry so order was trivial). The mixed list is the natural
+// mirror for the v4-mapped dedup test below — both share the
+// "list crosses families" shape and need first-seen-wins pinning.
 func TestUpdateAppEgressAllowlist_MixedAcceptedOnPro(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	id := mustSeedApp(t, e, "pro-mixed")
@@ -288,8 +296,14 @@ func TestUpdateAppEgressAllowlist_MixedAcceptedOnPro(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppByID: %v", err)
 	}
-	if len(app.EgressAllowlist) != 2 {
-		t.Fatalf("allowlist len = %d, want 2: %+v", len(app.EgressAllowlist), app.EgressAllowlist)
+	want := []string{"1.2.3.0/24", "fe80::/10"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
 	}
 }
 
@@ -322,6 +336,236 @@ func TestUpdateAppEgressAllowlist_TooLong(t *testing.T) {
 		EgressAllowlist: &many,
 	}, nil)
 	assertProblem(t, rec, 400, api.CodeEgressAllowlistTooLong)
+}
+
+// --- PR-C v4-mapped canonicalisation + dedup -----------------------------
+//
+// The validateUpdateApp loop was extended in PR-C to (a) rewrite
+// `::ffff:V4ADDR/N` to its canonical v4 form (`V4ADDR/(N-96)`),
+// (b) de-duplicate entries after canonicalisation. The tests
+// below pin each branch. The pattern mirrors the existing v6-only
+// and mixed tests above: PATCH → AppByID → assert exact stored
+// string form.
+
+// TestUpdateAppEgressAllowlist_V4MappedCanonicalised: a single
+// v4-mapped v6 entry is rewritten to its v4 form. PATCH
+// `::ffff:1.2.3.0/120` → 200; AppByID reads back `1.2.3.0/24`.
+// This is the happy-path pin for the rewrite branch.
+func TestUpdateAppEgressAllowlist_V4MappedCanonicalised(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:1.2.3.0/120"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if len(app.EgressAllowlist) != 1 || app.EgressAllowlist[0].String() != "1.2.3.0/24" {
+		t.Fatalf("allowlist = %+v, want [1.2.3.0/24]", app.EgressAllowlist)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedMixed_Dedup: an input list
+// that contains BOTH the v4 form and the v4-mapped form of the
+// same prefix must collapse to a single entry after
+// canonicalisation. Order is first-seen-wins — the surviving
+// entry keeps the position of the FIRST occurrence. Also pins
+// that a v4 entry + an unrelated v6 entry + the v4-mapped
+// equivalent of the v4 entry ends up as [v4, v6].
+func TestUpdateAppEgressAllowlist_V4MappedMixed_Dedup(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped-mixed")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-mixed", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24", "::ffff:1.2.3.0/120", "8.8.8.0/24"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	want := []string{"1.2.3.0/24", "8.8.8.0/24"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
+	}
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedBelowV4Min: a v4-mapped
+// entry that would canonicalise to a v4 prefix wider than /8
+// (the v4 floor enforced by the DB trigger) is rejected at the
+// handler with a more actionable message than the trigger's
+// generic constraint error. `::ffff:0.0.0.0/96` canonically maps
+// to v4 /0 (rejected); `::ffff:0.1.0.0/104` maps to v4 /8 (the
+// boundary, accepted by the next test).
+func TestUpdateAppEgressAllowlist_V4MappedBelowV4Min(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-v4mapped-floor")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-floor", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:0.0.0.0/96"},
+	}, nil)
+	assertProblem(t, rec, 400, api.CodeInvalidEgressAllowlist)
+}
+
+// TestUpdateAppEgressAllowlist_V4MappedAtV4S8: the /8 boundary
+// is the FLOOR. PATCH `::ffff:1.2.3.0/104` → 200; AppByID
+// reads back `1.0.0.0/8`. The host bits get masked off by /8
+// (1.2.3.0 round-downs to 1.0.0.0) — that is a property of the
+// prefix length, not the canonicalisation. Pins that the handler
+// agrees with the DB trigger on the floor and applies Masked()
+// after the Unmap.
+func TestUpdateAppEgressAllowlist_V4MappedAtV4S8(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-v4mapped-s8")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-v4mapped-s8", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"::ffff:1.2.3.0/104"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if len(app.EgressAllowlist) != 1 || app.EgressAllowlist[0].String() != "1.0.0.0/8" {
+		t.Fatalf("allowlist = %+v, want [1.0.0.0/8]", app.EgressAllowlist)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_DedupPreservesFirstSeenOrder: the
+// dedup branch is independent of v4-mapped canonicalisation —
+// plain duplicates are also collapsed. The remaining entries
+// keep insertion order (first-seen wins). Pins that the handler
+// does NOT sort before persisting (a sort would change
+// observable behaviour across repeat PATCHes).
+func TestUpdateAppEgressAllowlist_DedupPreservesFirstSeenOrder(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	id := mustSeedApp(t, e, "pro-dedup-order")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-dedup-order", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"8.8.8.0/24", "1.2.3.0/24", "8.8.8.0/24"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	app, err := e.store.AppByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	want := []string{"8.8.8.0/24", "1.2.3.0/24"}
+	if len(app.EgressAllowlist) != len(want) {
+		t.Fatalf("allowlist len = %d, want %d: %+v", len(app.EgressAllowlist), len(want), app.EgressAllowlist)
+	}
+	for i, p := range app.EgressAllowlist {
+		if p.String() != want[i] {
+			t.Errorf("allowlist[%d] = %q, want %q", i, p.String(), want[i])
+		}
+	}
+}
+
+// --- PR-C read-path: AppResponse surfaces EgressAllowlist -----------------
+//
+// PR-C added EgressAllowlist []string to api.AppResponse. The tests
+// below pin the read path: field is materialised in the JSON body
+// (never `null`), populated from state.App.EgressAllowlist, and
+// reflects the persisted canonical form. The pattern mirrors the
+// v6-only write test above: PATCH → GET → assert body shape.
+
+// TestGetApp_SurfacesEgressAllowlist: PATCH a 3-entry mixed list,
+// then GET and assert the JSON body has egress_allowlist as a
+// 3-element array of the canonical strings (no `::ffff:` after
+// PR-C's rewrite). Catches DTO field missing, appResponse
+// population bug, JSON tag mismatch.
+func TestGetApp_SurfacesEgressAllowlist(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "get-surface")
+	rec := e.do(t, "PATCH", "/v1/apps/get-surface", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24", "8.8.8.0/24", "fe80::/10"},
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	rec = e.do(t, "GET", "/v1/apps/get-surface", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		EgressAllowlist []string `json:"egress_allowlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal GET body: %v; body: %s", err, rec.Body.String())
+	}
+	want := []string{"1.2.3.0/24", "8.8.8.0/24", "fe80::/10"}
+	if len(got.EgressAllowlist) != len(want) {
+		t.Fatalf("egress_allowlist len = %d, want %d (body: %s)", len(got.EgressAllowlist), len(want), rec.Body.String())
+	}
+	for i, e := range got.EgressAllowlist {
+		if e != want[i] {
+			t.Errorf("egress_allowlist[%d] = %q, want %q", i, e, want[i])
+		}
+	}
+}
+
+// TestGetApp_EmptyAllowlistSerializesAsArray: a Free plan (the
+// default) has no allowlist; the GET response must serialise
+// egress_allowlist as `[]` (never `null`). This is the
+// load-bearing pin against `omitempty` on the AppResponse field —
+// without it, a future refactor that adds `omitempty` would
+// silently regress the dashboard parser.
+func TestGetApp_EmptyAllowlistSerializesAsArray(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "get-empty-free")
+	rec := e.do(t, "GET", "/v1/apps/get-empty-free", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	// Body must contain the literal "egress_allowlist":[] —
+	// substring search avoids pulling in a JSON parser.
+	if !strings.Contains(rec.Body.String(), `"egress_allowlist":[]`) {
+		t.Errorf("expected egress_allowlist:[] in GET body, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"egress_allowlist":null`) {
+		t.Errorf("egress_allowlist serialised as null (omitempty regression); got: %s", rec.Body.String())
+	}
+}
+
+// TestGetApp_PostPatchEmptyAllowlist: a Pro plan PATCHing []
+// (the "clear" sentinel) must read back [] on GET. Pins the
+// contract that explicit-clear and never-set have the same wire
+// shape — both `[]`, not `null`, not the prior list.
+func TestGetApp_PostPatchEmptyAllowlist(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "get-clear")
+	// First PATCH populates the list.
+	if rec := e.do(t, "PATCH", "/v1/apps/get-clear", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{"1.2.3.0/24"},
+	}, nil); rec.Code != 200 {
+		t.Fatalf("initial PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	// Second PATCH clears it.
+	if rec := e.do(t, "PATCH", "/v1/apps/get-clear", api.UpdateAppRequest{
+		EgressAllowlist: &[]string{},
+	}, nil); rec.Code != 200 {
+		t.Fatalf("clear PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	rec := e.do(t, "GET", "/v1/apps/get-clear", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"egress_allowlist":[]`) {
+		t.Errorf("expected egress_allowlist:[] after clear, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"egress_allowlist":null`) {
+		t.Errorf("egress_allowlist serialised as null; got: %s", rec.Body.String())
+	}
 }
 
 // --- CRUD coverage for handlers_ext.go (slice 2) ----------------------------
@@ -1298,5 +1542,281 @@ func TestStripePaymentFailed_SuspendedIsNoOp(t *testing.T) {
 	}
 	if n := len(mailer.snapshot()); n != 0 {
 		t.Errorf("mailer.snapshot() = %d, want 0 (suspended accounts must not receive PaymentFailedBody)", n)
+	}
+}
+
+// --- Move 2: event-driven surface tests -------------------------------------
+//
+// These tests pin the customer-facing HTTP surface for the Move 1
+// invocations backend. They use MemStore (no Postgres) so the assertions
+// stay on the handler-level contract. The long-poll handlers
+// (invokeApp, queueReceive) use setupWithNotifier with a hook that
+// injects a synthetic payload so the test doesn't hang on a real
+// LISTEN connection.
+
+// TestAsyncInvoke_AcceptedWithId confirms POST /v1/apps/{slug}/invoke/async
+// returns 202 + a populated id, and the row lands in the invocations table
+// with source='async_invoke'.
+func TestAsyncInvoke_AcceptedWithId(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/invoke/async", api.InvokeRequest{
+		Method:  "POST",
+		Path:    "/webhook",
+		Payload: json.RawMessage(`{"hello":"world"}`),
+	}, nil)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp api.AsyncInvokeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ID == "" {
+		t.Fatalf("response.id is empty")
+	}
+	if resp.StatusURL != "/v1/invocations/"+resp.ID {
+		t.Errorf("status_url = %q, want /v1/invocations/%s", resp.StatusURL, resp.ID)
+	}
+	// Round-trip the row.
+	inv, err := e.store.InvocationByID(context.Background(), resp.ID)
+	if err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if inv.Source != state.InvocationAsyncInvoke {
+		t.Errorf("source = %v, want async_invoke", inv.Source)
+	}
+	if inv.State != state.InvocationPending {
+		t.Errorf("state = %v, want pending", inv.State)
+	}
+}
+
+// TestAsyncInvoke_FreeRejected confirms the Free-plan gate fires before
+// any row is written. The 403 carries the feature_not_allowed code so a
+// clear SDK message can be surfaced.
+func TestAsyncInvoke_FreeRejected(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/invoke/async", api.InvokeRequest{}, nil)
+
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if prob.Code != "plan_feature_gated" {
+		t.Errorf("code = %q, want plan_feature_gated", prob.Code)
+	}
+}
+
+// TestQueueSend_RejectsAtLimit confirms the plan's MaxQueueDepth cap is
+// enforced on the way in. Hobby's cap is 5; the 6th send is a 403 with
+// the plan_queue_depth code.
+func TestQueueSend_RejectsAtLimit(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "myapp")
+
+	// 5 successful sends.
+	for i := 0; i < 5; i++ {
+		rec := e.do(t, "POST", "/v1/apps/myapp/queues/send", api.QueueSendRequest{
+			Payload: json.RawMessage(`{"i":` + strconv.Itoa(i) + `}`),
+		}, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("send %d: status = %d, want 201; body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+	// 6th send is rejected.
+	rec := e.do(t, "POST", "/v1/apps/myapp/queues/send", api.QueueSendRequest{}, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "plan_queue_depth" {
+		t.Errorf("code = %q, want plan_queue_depth", prob.Code)
+	}
+	if prob.Limit != nil && *prob.Limit != 5 {
+		t.Errorf("limit = %v, want 5", prob.Limit)
+	}
+}
+
+// TestQueueReceive_TimeoutReturns204 confirms the long-poll returns a
+// clean 204 (no body) when the server-side budget elapses without a
+// matching notification. The setupWithNotifier hook returns
+// db.ErrWaitTimeout so the handler falls into the timeout branch.
+func TestQueueReceive_TimeoutReturns204(t *testing.T) {
+	e := setupWithNotifier(t, api.PlanPro, func(_ context.Context, _ string, _ func(string) bool, _ time.Duration) (string, error) {
+		return "", db.ErrWaitTimeout
+	})
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/queues/receive", nil, nil)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", rec.Body.String())
+	}
+}
+
+// TestDelayedTaskCreate_PayloadTooLarge confirms the
+// MaxSourceBytesPerInvocation cap is enforced per-plan. Hobby's cap is
+// 64 KB; a 70 KB payload is a 413.
+func TestDelayedTaskCreate_PayloadTooLarge(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "myapp")
+
+	big := make([]byte, 70*1024)
+	for i := range big {
+		big[i] = 'a'
+	}
+	rec := e.do(t, "POST", "/v1/apps/myapp/delayed-tasks", api.DelayedTaskRequest{
+		Payload:     json.RawMessage(`{"blob":"` + string(big) + `"}`),
+		ScheduledAt: time.Now().Add(time.Hour).UTC(),
+	}, nil)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "plan_source_bytes" {
+		t.Errorf("code = %q, want plan_source_bytes", prob.Code)
+	}
+}
+
+// TestDelayedTaskCreate_PastSchedAt confirms the handler rejects a
+// scheduled_at in the past with 400 + invalid_scheduled_at.
+func TestDelayedTaskCreate_PastSchedAt(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/delayed-tasks", api.DelayedTaskRequest{
+		Payload:     json.RawMessage(`{}`),
+		ScheduledAt: time.Now().Add(-time.Hour).UTC(),
+	}, nil)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "invalid_scheduled_at" {
+		t.Errorf("code = %q, want invalid_scheduled_at", prob.Code)
+	}
+}
+
+// TestDeleteApp_CancelsPendingInvocations confirms the deleteApp GC
+// cancels pending/dispatching invocations before the app row is
+// removed. A terminal (completed) row is left untouched.
+func TestDeleteApp_CancelsPendingInvocations(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "myapp")
+
+	// 3 pending delayed-tasks.
+	pendingIDs := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+			AppID:       appID,
+			AccountID:   e.acct.ID,
+			Source:      state.InvocationDelayedTask,
+			Payload:     json.RawMessage(`{}`),
+			DueAt:       time.Now().Add(time.Hour),
+			ScheduledAt: ptrTime2(time.Now().Add(time.Hour)),
+		})
+		if err != nil {
+			t.Fatalf("seed pending: %v", err)
+		}
+		pendingIDs = append(pendingIDs, inv.ID)
+	}
+	// 1 completed row — must survive the delete.
+	completed, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     appID,
+		AccountID: e.acct.ID,
+		Source:    state.InvocationDelayedTask,
+		Payload:   json.RawMessage(`{}`),
+		DueAt:     time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("seed completed: %v", err)
+	}
+	// Synthesise a completed row: Claim (pending→dispatching) then
+	// Complete (dispatching→completed). The drain drives this transition
+	// in production; the test inlines the same hand-off so the row
+	// lands in `completed` state and the GC path leaves it alone.
+	claimed, err := e.store.ClaimInvocation(context.Background(), completed.ID, "inst_test", 60)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := e.store.CompleteInvocation(context.Background(), claimed.ID, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+
+	rec := e.do(t, "DELETE", "/v1/apps/myapp", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Pending rows are cancelled.
+	for _, id := range pendingIDs {
+		inv, err := e.store.InvocationByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("invocation %s not found: %v", id, err)
+		}
+		if inv.State != state.InvocationCancelled {
+			t.Errorf("invocation %s state = %v, want cancelled", id, inv.State)
+		}
+	}
+	// Completed row is untouched.
+	inv, err := e.store.InvocationByID(context.Background(), completed.ID)
+	if err != nil {
+		t.Fatalf("completed invocation not found: %v", err)
+	}
+	if inv.State != state.InvocationCompleted {
+		t.Errorf("completed state = %v, want completed (must not be GC'd)", inv.State)
+	}
+}
+
+// ptrTime2 is a tiny adapter so the test seeds a *time.Time for
+// ScheduledAt without a nil-check at the call site.
+func ptrTime2(t time.Time) *time.Time { return &t }
+
+// TestGetInvocation_NotFoundAcrossAccount confirms a cross-account
+// read returns 404 (the privacy contract — no ownership leak).
+func TestGetInvocation_NotFoundAcrossAccount(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "myapp")
+
+	// Seed an invocation on a different account.
+	other, err := e.store.CreateAccount(context.Background(), "intruder@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     appID,
+		AccountID: other.ID,
+		Source:    state.InvocationAsyncInvoke,
+		Payload:   json.RawMessage(`{}`),
+		DueAt:     time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("seed inv: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/invocations/"+inv.ID, nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 }

@@ -798,7 +798,7 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 		if gerr != nil {
 			h.T.Fatalf("e2etest: generate API key: %v", gerr)
 		}
-		if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e"); err != nil {
+		if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.DefaultScopes()); err != nil {
 			h.T.Logf("e2etest: store API key (already exists, ignoring): %v", err)
 		}
 		return pt
@@ -807,7 +807,7 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 	if err != nil {
 		h.T.Fatalf("e2etest: generate API key: %v", err)
 	}
-	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e"); err != nil {
+	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.DefaultScopes()); err != nil {
 		h.T.Fatalf("e2etest: store API key: %v", err)
 	}
 	return pt

@@ -117,8 +117,10 @@ The sampling/quota shapes are in `cmd/meterd` and
 `pkg/billing/stripe`, the dunning state machine is
 `pkg/state.MarkAccountDeletionPending` (ADR-021), GB-h = plan RAM
 + 8 MB per running second is in `pkg/meter`. Functions:
-`guest/runners/node22` + `guest/runners/python312` (handler
-contract per spec §4.9). Cron: `pkg/sched/cron.go`, single-flight
+`guest/runners/{node22,python312,go124}` (handler
+contract per spec §4.9; `go124` is a new runtime — apps deploy
+with a static binary emitted by Railpack's go plan, functions
+reuse the per-request subprocess model). Cron: `pkg/sched/cron.go`, single-flight
 per scheduled fire, loop-tested in `cron_loop_test.go`. Email:
 `pkg/mail` interface with Resend + Postmark backends (gap G4).
 

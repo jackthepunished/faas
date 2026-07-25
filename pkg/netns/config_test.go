@@ -230,12 +230,15 @@ func TestNftCommandsPublishGuestPort(t *testing.T) {
 func TestNftCommandsEnforceEgressPolicy(t *testing.T) {
 	rules := flatten(testConfig().NftCommands())
 	// §11 ship-blocking egress denies, scoped to the guest side (iifname tap0) so
-	// the inbound DNAT path (iifname vp7) is never affected. CGN (100.64.0.0/10)
-	// is included for symmetry with pkg/netns.DefaultHostPolicy.ForwardDenyCIDRs.
+	// the inbound DNAT path (iifname vp7) is never affected. The list comes
+	// from NewDefaultDenySet() so adding a new CIDR is mechanically covered
+	// (PR-A, ADR-034 added 6to4 + Teredo; this test would have silently
+	// regressed without the typed DenySet).
+	denySet := NewDefaultDenySet()
 	wants := []string{
-		"iifname tap0 tcp dport { 25, 465, 587 } drop",                                                            // deny SMTP (spam/abuse)
-		"iifname tap0 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop", // deny RFC1918 + link-local/metadata + CGN
-		"iifname tap0 ip6 daddr { fe80::/10, fc00::/7, ff00::/8, ::1/128, ::/128 } drop",                          // deny IPv6 link-local + ULA + multicast + unspecified (ADR-023)
+		"iifname tap0 tcp dport { " + denySet.SMTPPortsCommaSet() + " } drop",
+		"iifname tap0 ip daddr { " + denySet.V4CommaSet() + " } drop",
+		"iifname tap0 ip6 daddr { " + denySet.V6CommaSet() + " } drop",
 	}
 	for _, w := range wants {
 		if !strings.Contains(rules, w) {
@@ -248,6 +251,67 @@ func TestNftCommandsEnforceEgressPolicy(t *testing.T) {
 		line := strings.Join(cmd, " ")
 		if strings.Contains(line, "daddr") && strings.Contains(line, "drop") && !strings.Contains(line, "iifname tap0") {
 			t.Errorf("egress daddr-drop not scoped to the guest side: %q", line)
+		}
+	}
+}
+
+// TestNftCommandsEnforceEgressPolicy_PerEntry pins every DenySet
+// entry individually so an entry the renderer silently dropped
+// would surface as a single t.Errorf per missed CIDR. The exact-
+// string fixture above pins the rendered argv; this test pins the
+// DATA so an edit to NewDefaultDenySet() that changes the slice
+// but forgets to re-render the argv is caught here.
+//
+// Iterates Entries (the provenance-bearing view) so the test stays
+// in lockstep with the source list — adding a new CIDR to
+// NewDefaultDenySet() is mechanically covered. Also asserts the
+// per-family argv family keyword matches Family.String() so a
+// v4 entry can't accidentally land in an `ip6 daddr` rule.
+func TestNftCommandsEnforceEgressPolicy_PerEntry(t *testing.T) {
+	cmds := testConfig().NftCommands()
+	rules := flatten(cmds)
+	denySet := NewDefaultDenySet()
+
+	for _, e := range denySet.Entries {
+		// The rendered argv uses `ip daddr { ... } drop` for v4 and
+		// `ip6 daddr { ... } drop` for v6. Both must contain the
+		// entry's Prefix.String(). The substring check would also
+		// succeed for a sub-string match in a larger CIDR; instead
+		// the test relies on NewDefaultDenySet() returning prefixes
+		// that are unique enough that a stray match is impossible.
+		needle := e.Prefix.String()
+		if !strings.Contains(rules, needle) {
+			t.Errorf("DenySet entry %s (%s) missing from NftCommands; check denyV4Set / denyV6Set render path",
+				needle, e.SourceADR)
+		}
+	}
+
+	// Family-keyword gate: a v4 entry must appear inside an
+	// `ip daddr` argv, not an `ip6 daddr` argv, and vice versa.
+	// Scans each argv individually — a slice-wide substring check
+	// would silently pass if both family argvs shared the CIDR
+	// (impossible today, but the future-proofing cost is one
+	// nested loop).
+	for _, argv := range cmds {
+		line := strings.Join(argv, " ")
+		if !strings.Contains(line, "daddr") || !strings.Contains(line, "drop") {
+			continue
+		}
+		isV4 := strings.Contains(line, "ip daddr") && !strings.Contains(line, "ip6 daddr")
+		isV6 := strings.Contains(line, "ip6 daddr")
+		if !isV4 && !isV6 {
+			t.Errorf("daddr-drop argv has neither `ip daddr` nor `ip6 daddr` keyword: %q", line)
+		}
+		for _, e := range denySet.Entries {
+			if !strings.Contains(line, e.Prefix.String()) {
+				continue
+			}
+			if e.Family == FamilyV4 && !isV4 {
+				t.Errorf("v4 entry %s in non-v4 argv: %q", e.Prefix, line)
+			}
+			if e.Family == FamilyV6 && !isV6 {
+				t.Errorf("v6 entry %s in non-v6 argv: %q", e.Prefix, line)
+			}
 		}
 	}
 }
@@ -711,7 +775,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 
 	// Empty: nothing emitted.
 	empty := testConfig() // zero-value EgressAllowlist
-	if got := empty.forwardAllowlistRule(nft); got != nil {
+	if got := empty.ForwardAllowlistRule(nft); got != nil {
 		t.Errorf("empty EgressAllowlist: helper returned %v, want nil", got)
 	}
 
@@ -719,7 +783,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 	one := testConfig()
 	one.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
 	wantOne := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24 } accept`
-	if got := strings.Join(one.forwardAllowlistRule(nft), " "); got != wantOne {
+	if got := strings.Join(one.ForwardAllowlistRule(nft), " "); got != wantOne {
 		t.Errorf("single v4 CIDR:\n got  %s\n want %s", got, wantOne)
 	}
 
@@ -731,16 +795,16 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 		netip.MustParsePrefix("9.9.9.0/24"),
 	}
 	wantMany := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24,8.8.8.0/24,9.9.9.0/24 } accept`
-	if got := strings.Join(many.forwardAllowlistRule(nft), " "); got != wantMany {
+	if got := strings.Join(many.ForwardAllowlistRule(nft), " "); got != wantMany {
 		t.Errorf("multiple v4 CIDRs:\n got  %s\n want %s", got, wantMany)
 	}
 
 	// v4-only partition: a v6-only EgressAllowlist produces NO v4
-	// rule (the v6 half is emitted by forwardAllowlistRule6). This
+	// rule (the v6 half is emitted by ForwardAllowlistRule6). This
 	// is the ADR-032 family split: each chain reads its own slice.
 	v6Only := testConfig()
 	v6Only.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("fe80::/10")}
-	if got := v6Only.forwardAllowlistRule(nft); got != nil {
+	if got := v6Only.ForwardAllowlistRule(nft); got != nil {
 		t.Errorf("v6-only input on v4 helper: got %v, want nil", got)
 	}
 
@@ -751,7 +815,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 		netip.MustParsePrefix("fe80::/10"),
 	}
 	wantMixedV4 := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24 } accept`
-	if got := strings.Join(mixed.forwardAllowlistRule(nft), " "); got != wantMixedV4 {
+	if got := strings.Join(mixed.ForwardAllowlistRule(nft), " "); got != wantMixedV4 {
 		t.Errorf("mixed input on v4 helper:\n got  %s\n want %s", got, wantMixedV4)
 	}
 }
@@ -762,14 +826,14 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 // a v4 entry produces nil here because the v4 helper owns it).
 //
 // Internal to NftCommands — do not invoke from anywhere else. The
-// helper signature mirrors forwardAllowlistRule so the per-family
+// helper signature mirrors ForwardAllowlistRule so the per-family
 // symmetric test pattern is grep-able.
 func TestForwardAllowlistRule6Helper(t *testing.T) {
 	nx := []string{"ip", "netns", "exec", "fc-test", "nft"}
 	nft := func(parts ...string) []string { return append(append([]string{}, nx...), parts...) }
 
 	// Empty: nothing emitted.
-	if got := testConfig().forwardAllowlistRule6(nft); got != nil {
+	if got := testConfig().ForwardAllowlistRule6(nft); got != nil {
 		t.Errorf("empty EgressAllowlist: helper returned %v, want nil", got)
 	}
 
@@ -777,7 +841,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 	one := testConfig()
 	one.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("fe80::/10")}
 	wantOne := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10 } accept`
-	if got := strings.Join(one.forwardAllowlistRule6(nft), " "); got != wantOne {
+	if got := strings.Join(one.ForwardAllowlistRule6(nft), " "); got != wantOne {
 		t.Errorf("single v6 CIDR:\n got  %s\n want %s", got, wantOne)
 	}
 
@@ -788,7 +852,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 		netip.MustParsePrefix("2001:db8::/32"),
 	}
 	wantMany := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10,2001:db8::/32 } accept`
-	if got := strings.Join(many.forwardAllowlistRule6(nft), " "); got != wantMany {
+	if got := strings.Join(many.ForwardAllowlistRule6(nft), " "); got != wantMany {
 		t.Errorf("multiple v6 CIDRs:\n got  %s\n want %s", got, wantMany)
 	}
 
@@ -796,7 +860,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 	// rule. Symmetric to the v4 helper's v6-only case above.
 	v4Only := testConfig()
 	v4Only.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
-	if got := v4Only.forwardAllowlistRule6(nft); got != nil {
+	if got := v4Only.ForwardAllowlistRule6(nft); got != nil {
 		t.Errorf("v4-only input on v6 helper: got %v, want nil", got)
 	}
 
@@ -807,7 +871,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 		netip.MustParsePrefix("fe80::/10"),
 	}
 	wantMixedV6 := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10 } accept`
-	if got := strings.Join(mixed.forwardAllowlistRule6(nft), " "); got != wantMixedV6 {
+	if got := strings.Join(mixed.ForwardAllowlistRule6(nft), " "); got != wantMixedV6 {
 		t.Errorf("mixed input on v6 helper:\n got  %s\n want %s", got, wantMixedV6)
 	}
 }

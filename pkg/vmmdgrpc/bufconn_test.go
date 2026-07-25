@@ -37,8 +37,11 @@ type fakeVMM struct {
 	// reports for an instance. nil returns ("", false) — the default
 	// success path (every Wake results in a known netns) is wired below.
 	netnsFn func(instance string) (string, bool)
-	live    int
-	leased  int
+	// updateAllowlistFn (tier-2 PR-B) lets the UpdateEgressAllowlist
+	// handler test decide what the fake reports. nil = success.
+	updateAllowlistFn func(ctx context.Context, appID string, allowlist []netip.Prefix) error
+	live              int
+	leased            int
 }
 
 func (f *fakeVMM) Wake(ctx context.Context, req fcvm.WakeRequest) (*fcvm.Instance, error) {
@@ -101,6 +104,17 @@ func (f *fakeVMM) ExportDirFor(instance string) string {
 		return f.exportDirFn(instance)
 	}
 	return ""
+}
+
+// UpdateEgressAllowlist (tier-2 PR-B) — default success; the
+// UpdateEgressAllowlist handler test wires updateAllowlistFn to
+// inject errors. The fake records nothing; the test asserts on
+// the gRPC return code, not on internal state.
+func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error {
+	if f.updateAllowlistFn != nil {
+		return f.updateAllowlistFn(ctx, appID, allowlist)
+	}
+	return nil
 }
 
 func (f *fakeVMM) LiveCount() int   { return f.live }
