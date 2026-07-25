@@ -136,6 +136,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		CacheDir:    cfg.CacheDir,
 		MetricsAddr: cfg.MetricsAddr,
 	}, log).WithOpsMetrics(ops)
+	// builderd.New instantiates its own *Cache from cfg.CacheDir;
+	// we construct a sibling Cache at the same root for the GC loop
+	// (Cache.Sweep is pure filesystem, no shared state with Builderd).
+	cache := builderdpkg.NewCache(cfg.CacheDir)
 
 	notifCh, err := db.SubscribeWithReconnect(ctx, pool, []string{
 		db.NotifyBuildQueued,
@@ -192,6 +196,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		reapThreshold = 15 * time.Minute
 	}
 	go builderdpkg.ReaperLoop(ctx, store, reapInterval, reapThreshold, log)
+
+	// Build cache GC (issue #196 B2.1). Content-addressed cache at
+	// cfg.CacheDir grows forever as builds accumulate; a daily sweep
+	// enforces TTL + size cap (defaults: 30 days, 50 GiB). The sweep
+	// is pure filesystem work — a sibling Cache instance pointed at
+	// the same root is enough; no shared state with Builderd is
+	// needed.
+	gcInterval := cfg.CacheGCSweepInterval
+	if gcInterval <= 0 {
+		gcInterval = 24 * time.Hour
+	}
+	go builderdpkg.CacheGCSweepLoop(ctx, cache, gcInterval, cfg.CacheMaxBytes, cfg.CacheMaxAge, log)
 
 	for {
 		select {

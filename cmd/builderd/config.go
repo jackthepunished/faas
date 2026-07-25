@@ -81,6 +81,21 @@ type Config struct {
 	// crashes can leave rows with started_at several minutes in
 	// the past deliberately.
 	StuckBuildThreshold time.Duration `toml:"stuck_build_threshold"`
+	// CacheMaxBytes is the ceiling on the build cache disk usage
+	// (issue #196 B2.1). Once exceeded, the GC sweep evicts
+	// oldest-first until under cap. 0 disables the size cap. Default
+	// 50 GB matches the spec fleet budget (CLAUDE.md).
+	CacheMaxBytes int64 `toml:"cache_max_bytes"`
+	// CacheMaxAge is the TTL for cache entries (B2.1). Entries
+	// older than this are evicted on every sweep tick, regardless
+	// of total size. 0 disables the TTL. Default 30 days, matching
+	// api.DefaultInstanceRetention (the only "old enough to forget"
+	// threshold the platform has today).
+	CacheMaxAge time.Duration `toml:"cache_max_age"`
+	// CacheGCSweepInterval is the cadence of the cache GC loop (B2.1).
+	// Zero falls back to 24 hours in main.go — daily is the right
+	// frequency for a slow disk-bleed control.
+	CacheGCSweepInterval time.Duration `toml:"cache_gc_sweep_interval"`
 }
 
 // ResolveVMMTarget returns the dial target for vmmd. VMMTarget wins
@@ -111,6 +126,13 @@ func LoadConfig(path string) (*Config, error) {
 		PollInterval:            2 * time.Second,
 		StuckBuildSweepInterval: 10 * time.Minute,
 		StuckBuildThreshold:     15 * time.Minute,
+		// B2.1 (issue #196): cache GC. 50 GB cap matches the spec
+		// fleet budget. 30-day TTL matches the only other retention
+		// constant the platform has (api.DefaultInstanceRetention).
+		// 24h sweep cadence is the right frequency for a slow bleed.
+		CacheMaxBytes:        50 << 30, // 50 GiB
+		CacheMaxAge:          30 * 24 * time.Hour,
+		CacheGCSweepInterval: 24 * time.Hour,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
