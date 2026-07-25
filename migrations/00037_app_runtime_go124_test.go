@@ -1,21 +1,23 @@
 //go:build !no_pg
 
-// Migration-apply test for 00035 (Go 1.24 runtime support on both
+// Migration-apply test for 00037 (Go 1.24 runtime support on both
 // function and app surfaces). Pins the runtime CHECK widening:
 //
-//   1. The migration set applies cleanly through 00035.
+//   1. The migration set applies cleanly through 00037.
 //   2. A new function app with `runtime: go124` round-trips.
 //   3. The widened constraint accepts 'go124' alongside the older
 //      two runtimes.
 //   4. A bogus runtime (e.g. 'ruby33') is still rejected with
 //      SQLSTATE 23514 against `apps_runtime_check`.
 //
-// Slot note: 00035 is the next free slot after 00034
-// (`00034_paddle_overage_dedupe.sql` already on main). The migration
-// is slot-agnostic — if a parallel PR claims 00035 first, renumber
-// per the precedent set by PRs #153, #159, #175, #179
-// (`make test` runs `TestMigrationsContiguous/UniquePrefixes` and is
-// the source of truth, not `ls migrations/` in a worktree).
+// Slot note: 00037 is the next free slot after 00036
+// (`00036_api_key_scopes.sql` landed on main between plan approval
+// and PR push — see CLAUDE.md "Migration slot renumber at PR
+// creation"). The migration is slot-agnostic — if a parallel PR
+// claims 00037 first, renumber per the precedent set by PRs #153,
+// #159, #175, #179 (`make test` runs
+// `TestMigrationsContiguous/UniquePrefixes` and is the source of
+// truth, not `ls migrations/` in a worktree).
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -33,21 +35,21 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00035_AppRuntimeGo124(t *testing.T) {
+func TestMigrations_00037_AppRuntimeGo124(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00035. A regression that drops a slot between
-	// 1 and 35 surfaces here before the per-assertion pins.
+	// (1) Apply through 00037. A regression that drops a slot between
+	// 1 and 37 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 35)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 37)", err)
 	}
 
 	// (2) Seed an account. The literal UUIDs are fixed across reruns
 	// so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000035',
+		values ('00000000-0000-0000-0000-000000000037',
 		        'go124-runtime-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -58,8 +60,8 @@ func TestMigrations_00035_AppRuntimeGo124(t *testing.T) {
 	// primary acceptance: the widened CHECK accepts 'go124'.
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, runtime, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000035',
-		        '00000000-0000-0000-0000-000000000035',
+		values ('00000000-0000-0000-0000-000000000037',
+		        '00000000-0000-0000-0000-000000000037',
 		        'go124-function-test', 'function', 'go124', 256, 1, 30, 'active', now())
 	`); err != nil {
 		t.Fatalf("insert function app with runtime=go124: %v", err)
@@ -69,7 +71,7 @@ func TestMigrations_00035_AppRuntimeGo124(t *testing.T) {
 	// collapse to a sibling runtime).
 	var runtime string
 	if err := pool.QueryRow(ctx, `
-		select runtime from apps where id = '00000000-0000-0000-0000-000000000035'
+		select runtime from apps where id = '00000000-0000-0000-0000-000000000037'
 	`).Scan(&runtime); err != nil {
 		t.Fatalf("read runtime: %v", err)
 	}
@@ -81,16 +83,16 @@ func TestMigrations_00035_AppRuntimeGo124(t *testing.T) {
 	// widening did not regress node22 / python312.
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, runtime, ram_mb, max_concurrency, status, created_at)
-		values ('00000000-0000-0000-0000-000000000135',
-		        '00000000-0000-0000-0000-000000000035',
+		values ('00000000-0000-0000-0000-000000000137',
+		        '00000000-0000-0000-0000-000000000037',
 		        'node22-still-allowed', 'function', 'node22', 256, 1, 'active', now())
 	`); err != nil {
 		t.Errorf("regression: node22 was rejected by widened CHECK: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, runtime, ram_mb, max_concurrency, status, created_at)
-		values ('00000000-0000-0000-0000-000000000235',
-		        '00000000-0000-0000-0000-000000000035',
+		values ('00000000-0000-0000-0000-000000000237',
+		        '00000000-0000-0000-0000-000000000037',
 		        'python312-still-allowed', 'function', 'python312', 256, 1, 'active', now())
 	`); err != nil {
 		t.Errorf("regression: python312 was rejected by widened CHECK: %v", err)
@@ -101,8 +103,8 @@ func TestMigrations_00035_AppRuntimeGo124(t *testing.T) {
 	// known runtime strings, not "any value" with a hole punched.
 	_, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, runtime, ram_mb, max_concurrency, status, created_at)
-		values ('00000000-0000-0000-0000-000000000335',
-		        '00000000-0000-0000-0000-000000000035',
+		values ('00000000-0000-0000-0000-000000000337',
+		        '00000000-0000-0000-0000-000000000037',
 		        'ruby33-should-fail', 'function', 'ruby33', 256, 1, 'active', now())
 	`)
 	if err == nil {

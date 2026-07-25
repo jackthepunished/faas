@@ -1,3 +1,4 @@
+-- filename: 00037_app_runtime_go124.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Widen the apps.runtime CHECK to allow 'go124' (Go 1.24) alongside

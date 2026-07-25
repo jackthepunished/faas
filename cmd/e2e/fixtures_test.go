@@ -150,9 +150,9 @@ func main() {
 }
 `
 	files := map[string]string{
-		"go.mod":          goMod,
-		"main.go":         mainGo,
-		".faas-fixture":   "go124\n",
+		"go.mod":           goMod,
+		"main.go":          mainGo,
+		".faas-fixture":    "go124\n",
 		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
 	}
 	return buildTarGz(t, files)
@@ -195,10 +195,10 @@ func main() {
 		"EXPOSE 3000\n" +
 		"CMD [\"/app/server\"]\n"
 	files := map[string]string{
-		"Dockerfile":      dockerfile,
-		"go.mod":          goMod,
-		"main.go":         mainGo,
-		".faas-fixture":   "go124-dockerfile\n",
+		"Dockerfile":       dockerfile,
+		"go.mod":           goMod,
+		"main.go":          mainGo,
+		".faas-fixture":    "go124-dockerfile\n",
 		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
 	}
 	return buildTarGz(t, files)
