@@ -182,12 +182,24 @@ func pollShadowLog(t *testing.T, h *e2etest.Harness, acctID string, wantHits int
 }
 
 // filterShadowLogLines parses the meterd log buffer for lines
-// that match the shadow shape: prefix + `account=<id>` +
-// `mb_seconds=<expected>`. Returns the matching lines in
+// that match the shadow shape: prefix + the seeded account id
+// + `mb_seconds=<expected>`. Returns the matching lines in
 // buffer order. The harness's shared buffer (cmd.Stdout ==
 // cmd.Stderr per pkg/e2etest/harness.go:620-621) means we may
 // see partial lines during concurrent writes — the per-line
 // scan tolerates that by only emitting complete lines.
+//
+// The meterd daemon (and every cmd/* daemon) uses slog's JSON
+// handler in production, so log lines render as
+//
+//	{"time":"…","level":"INFO","msg":"meter: push usage",
+//	 "account":"<uuid>","hour":"…","code":"ok","mb_seconds":950400}
+//
+// The assertion is against the daemon's wire format, NOT the
+// `discardLog()` text format used by the in-process tests. The
+// filter accepts both formats so the same helper works for
+// `go test -v` runs (which pipe through testing's text logger
+// sometimes) and CI runs (which always use JSON).
 //
 // `expected` is the exact mb_seconds value the plan calls for
 // (shadowPerHour == 950_400). A future refactor that splits
@@ -197,17 +209,24 @@ func filterShadowLogLines(logs, prefix, acctID string, expected int64) []string 
 	if logs == "" {
 		return nil
 	}
-	want := fmt.Sprintf("account=%s", acctID)
+	// JSON form: "account":"<id>" — the colon + quotes are
+	// reliable substrings even when the value contains a `-`.
+	wantJSON := fmt.Sprintf(`"account":%q`, acctID)
+	// Text form: account=<id> (used by slog.TestHandler in
+	// in-process tests).
+	wantText := fmt.Sprintf("account=%s", acctID)
+	// mb_seconds is a JSON number (no quotes) and a text key=value.
 	wantMB := fmt.Sprintf("mb_seconds=%d", expected)
+	wantMBJSON := fmt.Sprintf(`"mb_seconds":%d`, expected)
 	var out []string
 	for _, line := range strings.Split(logs, "\n") {
 		if !strings.Contains(line, prefix) {
 			continue
 		}
-		if !strings.Contains(line, want) {
+		if !strings.Contains(line, wantJSON) && !strings.Contains(line, wantText) {
 			continue
 		}
-		if !strings.Contains(line, wantMB) {
+		if !strings.Contains(line, wantMB) && !strings.Contains(line, wantMBJSON) {
 			continue
 		}
 		out = append(out, line)
