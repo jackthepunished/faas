@@ -448,8 +448,12 @@ sometimes implied they were closed; they aren't.
 
 - **#144** — `NftResetCommands` missing ip6 reset (snapshot-restore
   Wake fails on second add).
-- **#146** — host egress chain deny lines are dead-code; PR #128 /
-  #151 did **not** close this.
+- ~~**#146** — host egress chain deny lines were dead-code; the
+  forward-chain ordering fix in PR #128 / #151 closed the original
+  bug, and the remaining audit (shared catalog provenance + OCI
+  6to4/Teredo + cross-renderer invariant + generated operator
+  artifact) closed in PR-D. See `docs/denylist.md` and
+  `pkg/netns/denylist_external_test.go::TestAllThreeConsumersAgreeOnDenySet`.~~
 - **#147** — `stripeWebhook customer.subscription.updated` should
   validate `Plan` via `api.Plan.Valid()`.
 - **#148** — `bootstrap.sh` should pin the Go toolchain via
