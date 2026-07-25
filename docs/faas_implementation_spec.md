@@ -423,6 +423,21 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | build queue wait p95 | < 60 s | > 300 s warn |
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
+| `schedd_instance_cpu_pct{app,node}` | max over siblings | > 90 sustained page (hot loop) |
+| `schedd_instance_rss_mb{app,node}` | sum over siblings | > plan × max_concurrency page |
+| `schedd_instance_inflight_requests{app,node}` | sum over siblings | > max_concurrency × 2 page |
+| `schedd_instance_stats_collect_seconds` p95 | < 0.05 s | > 0.2 s warn (dialer saturation) |
+| `schedd_instance_stats_partial_errors_total{node}` | 0 | > 5 / min page (vmmd unreachable) |
+
+The four `schedd_instance_*` gauges (ADR-033, issue #170) are the
+new per-`(app,node)` rolled-up surfaces — max CPU, sum RSS, sum
+inflight — emitted by schedd's per-instance metrics poller at
+5 Hz. Per-instance data lives in the in-memory
+`pkg/sched/instancestats.Reader`; the wire side is rolled up
+explicitly because per-instance Prometheus cardinality is
+unbounded under the §6.2 fan-out invariant. Future scale policy
+work (#171 reaper, #169 scale-up trigger) reads from the Reader
+directly, not from Prometheus.
 
 **SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — one box (until Gate A) is stated honestly on the status page.
 
@@ -503,6 +518,7 @@ Conventions (agents: treat as lint): errors wrapped with `%w` + operation contex
 | G5 | **CLI auth UX** — `faas login` undefined | v1: browser-paste flow (dashboard shows key, CLI stores in OS keychain). OAuth device flow later | M5 |
 | G6 | **GDPR self-serve** — export + delete endpoints absent (policy exists in founding doc, mechanics don't) | `GET /v1/account/export` (JSON bundle) and `DELETE /v1/account` (dunning-style staged deletion, 30-day grace); DPA template in docs site | M8 |
 | G7 | **Long-lived connections vs idle reaper** — an app holding one websocket never parks | Rule: open connections count as activity (reaper checks conntrack for the instance); document that persistent connections bill as resident GB-h — the meter already handles it correctly | M4 (one line in schedd) |
+| G9 | **Per-instance observability gap** — schedd cannot see CPU/RSS/inflight/last-request per VM; #171 reaper and #169 scale-up trigger are blind | **PR-A (issue #170, ADR-033) lands the read-only surface:** schedd polls per-instance at 5 Hz, populates an in-memory `instancestats.Reader` for future scale policy code, emits `{app,node}`-rolled-up gauges. **PR-B (deferred)** populates the vmmd side: `ActivityTracker` keyed by instance id, `pkg/vmmdgrpc/stats.go` extracts the Stats handler, `pkg/vmmdgrpc/forward.go` wraps the bridge call in `Begin`/`defer done()`. PR-B is a hot-path mutation on vmmd's forward — kept behind a separate PR boundary for review hygiene. #171 and #169 read from the Reader in subsequent PRs | M8 |
 
 ---
 
