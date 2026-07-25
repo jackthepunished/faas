@@ -57,9 +57,13 @@ type InstanceStat struct {
 	// (state.Instances.AppID). Empty rows are not published.
 	AppID string
 	// CPUPct is the host cgroup CPU percent for the most recent
-	// interval (cpu.stat usage_usec delta / wall clock, *100). NaN
-	// or 0 with CPU=Unknown is the "first sample" sentinel.
-	// Valid only when CPU == Valid.
+	// interval. The schedd-side poller does not compute the
+	// rate; vmmd (PR-B) owns the cumulative-counter → rate
+	// conversion and ships the per-tick value over Stats.
+	// PR-A treats a nil-on-wire as the "absent this tick"
+	// sentinel — the poller stamps CPU=Unknown and the wire
+	// rollup excludes the row. Valid only when CPU == Valid;
+	// zero or NaN with CPU=Unknown is the sentinel shape.
 	CPUPct float64
 	// RSSMB is cgroup memory.current, in MiB. NaN or 0 with
 	// RSS=Unknown is the "absent this tick" sentinel.
@@ -82,10 +86,15 @@ type InstanceStat struct {
 	// row. Future freshness gating (Reader.PruneOlderThan) reads
 	// this; today's poller always stamps it.
 	SampledAt time.Time
-	// CPU is the validity of CPUPct. Unknown on the first
-	// sample; Valid thereafter (until a regression / cgroup
-	// recreation forces a baseline reset, which the poller
-	// detects and re-stamps Unknown for one tick).
+	// CPU is the validity of CPUPct. PR-A semantics: Unknown
+	// when the wire reports nil (vmmd-side `usage_usec` is
+	// empty / non-Linux / transient cgroup miss), Valid when
+	// the wire emits a value. The "regression / cgroup
+	// recreation forces a baseline reset" branch lives in PR-B
+	// — PR-A treats nil-on-the-wire as Unknown and lets the
+	// rollup drop the row, without keeping a previous-sample
+	// baseline. The Stale value is reserved for #172's
+	// StatsFreshness budget; today the poller never stamps it.
 	CPU Validity
 	// RSS is the validity of RSSMB. Unknown on a transient
 	// cgroup miss; Valid otherwise.

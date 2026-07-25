@@ -227,10 +227,15 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			CPUPct:           math.NaN(),
 			RSSMB:            math.NaN(),
 		}
-		// CPU: cumulative counter; produce a rate only on the
-		// second+ sample. A regression in usage_usec or a new
-		// cgroup forces a baseline reset (Unknown for one
-		// tick).
+		// CPU: the wire is a CPUPct *float64. PR-A treats
+		// nil as the "absent this tick" sentinel — the
+		// poller stamps Unknown and the wire rollup excludes
+		// the row. There is no previous-sample baseline in
+		// PR-A; cumulative-counter regression detection
+		// (usage_usec going backwards) lives in PR-B's
+		// Stats handler (it can correlate with a firecracker
+		// rebuild on the vmmd side). PR-A's own contract is
+		// narrower: nil → Unknown, non-nil → Valid.
 		if in.CPUPct != nil {
 			// The wire is DoubleValue: the wrapper is
 			// nil when absent, populated when present.
