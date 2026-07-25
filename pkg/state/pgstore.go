@@ -59,7 +59,7 @@ var _ Store = (*PgStore)(nil)
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at`,
+		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at`,
 		email, string(plan))
 	acct, err := scanAccount(row)
 	if err != nil {
@@ -76,19 +76,19 @@ func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan
 
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where id = $1`, id)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where id = $1`, id)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where email = $1`, email)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where email = $1`, email)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select a.id, a.email, a.plan, a.status, coalesce(a.stripe_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at
+		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at
 		 from accounts a join api_keys k on k.account_id = a.id where k.key_sha256 = $1`, hash)
 	return scanAccount(row)
 }
@@ -154,13 +154,13 @@ func (s *PgStore) UpdateAccountStatus(ctx context.Context, id string, status Acc
 	return err
 }
 
-// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID on the
-// account row. Schema carries a unique index on stripe_customer_id so a
+// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
+// account row. Schema carries a unique index on provider_customer_id so a
 // second customer picking up an old ID would fail at the DB; MemStore
 // mirrors that with the same shape (single-value index map).
-func (s *PgStore) UpdateAccountStripeCustomerID(ctx context.Context, id, stripeCustomerID string) error {
+func (s *PgStore) UpdateAccountProviderCustomerID(ctx context.Context, id, stripeCustomerID string) error {
 	tag, err := s.pool.Exec(ctx,
-		`update accounts set stripe_customer_id = $2 where id = $1`,
+		`update accounts set provider_customer_id = $2 where id = $1`,
 		id, stripeCustomerID)
 	if err != nil {
 		return err
@@ -189,25 +189,25 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 	return nil
 }
 
-// AccountByStripeCustomerID resolves the account behind a Stripe webhook
+// AccountByProviderCustomerID resolves the account behind a Stripe webhook
 // payload. The unique index makes this O(log n); MemStore does it with a
 // map.
-func (s *PgStore) AccountByStripeCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
+func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
-		 from accounts where stripe_customer_id = $1`,
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		 from accounts where provider_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
 }
 
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
-// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
+// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
 // reused (ADR-025 — column rename is a separate migration PR), so the
 // underlying UPDATE is identical; the dedicated method name keeps the
 // Paddle call sites self-documenting.
 func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error {
 	tag, err := s.pool.Exec(ctx,
-		`update accounts set stripe_customer_id = $2 where id = $1`,
+		`update accounts set provider_customer_id = $2 where id = $1`,
 		id, paddleCustomerID)
 	if err != nil {
 		return err
@@ -223,14 +223,14 @@ func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleC
 // as the Stripe path (the rename is a separate PR per ADR-025); the
 // dedicated method name keeps the Paddle call sites self-documenting.
 func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return s.AccountByStripeCustomerID(ctx, paddleCustomerID)
+	return s.AccountByProviderCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts returns every account. Meterd walks this on the quota
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(stripe_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
 		 from accounts order by created_at`)
 	if err != nil {
 		return nil, err
@@ -262,7 +262,7 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 	a := Account{}
 	var planStr, statusStr string
 	var deletionAt, lastWarnAt, pastDueAt *time.Time
-	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.StripeCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt); err != nil {
+	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt); err != nil {
 		return Account{}, err
 	}
 	a.Plan = api.Plan(planStr)
@@ -2624,16 +2624,19 @@ func (s *PgStore) RecordStripePushHour(ctx context.Context, accountID string, ho
 	return err
 }
 
-// HasPaddleOverageMonth is the dedupe gate the meterd daily pusher
-// reads before issuing the Paddle CreateTransaction POST. Backed by
-// a unique index on (account_id, month) in the paddle_overage_dedupe
-// table (added in migration 00034). `month` is a calendar-month
-// start — the caller (pkg/billing/paddle/usage.go calendarMonthStart)
-// is responsible for normalising to the 1st of the month at 00:00 UTC.
+// HasPaddleOverageMonth is the legacy month-scoped dedupe gate kept on
+// the state.Store interface for back-compat with PR #179 callers.
+// Migration 00039 replaced the month-keyed PK with a per-window PK
+// `(account_id, window_start)`; the legacy pair therefore now keys on
+// `window_start` and accepts any hour-aligned timestamp (the
+// calendar-month start at 00:00 UTC is itself a valid window). New
+// callers (post-#204 meterd pusher) must use ClaimPaddleOverageWindow
+// + CompletePaddleOverageWindow — those carry the pending/completed
+// claim state machine this legacy pair does not.
 func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
-		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and month = $2)`,
+		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and window_start = $2)`,
 		accountID, month.UTC()).Scan(&exists)
 	if err != nil {
 		return false, err
@@ -2641,15 +2644,153 @@ func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, m
 	return exists, nil
 }
 
-// RecordPaddleOverageMonth inserts the dedupe row. ON CONFLICT DO
-// NOTHING so a redelivered (account, month) is idempotent — same shape
-// as RecordStripePushHour one method above.
+// RecordPaddleOverageMonth inserts a 'completed' dedupe row on the
+// new window-keyed PK. Same ON CONFLICT DO NOTHING idempotency as
+// RecordStripePushHour — preserved for callers that still pass the
+// calendar-month start (which is itself a valid windowStart).
 func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error {
 	_, err := s.pool.Exec(ctx,
-		`insert into paddle_overage_dedupe (account_id, month) values ($1, $2)
-		 on conflict (account_id, month) do nothing`,
+		`insert into paddle_overage_dedupe (account_id, window_start, state) values ($1, $2, 'completed')
+		 on conflict (account_id, window_start) do nothing`,
 		accountID, month.UTC())
 	return err
+}
+
+// ClaimPaddleOverageWindow atomically claims the (account_id,
+// window_start) row. The shape mirrors ClaimInvocation
+// (pgstore.go:1297): an INSERT … ON CONFLICT DO NOTHING creates the
+// row in 'completed' default state, then an UPDATE … SET state='pending'
+// WHERE state IS NULL OR (state='pending' AND claimed_at < now() - interval
+// …) flips it to pending. The RETURNING carries the row state back so
+// the caller can distinguish "I claimed it" from "another pod holds it"
+// from "row already exists and is completed" (which is a stale
+// pre-PR-#204 row that the caller should treat as a fresh re-claim).
+//
+// Backing schema: paddle_overage_dedupe, primary key (account_id,
+// window_start), state column with check constraint
+// (state IN ('pending','completed')). Migration 00037 introduced
+// the per-window PK and the pending/completed state column.
+func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, claimedBy string, lease time.Duration) (bool, error) {
+	windowStart = windowStart.UTC()
+	leaseSeconds := int64(lease.Seconds())
+	if leaseSeconds < 1 {
+		leaseSeconds = 1
+	}
+
+	// Step 1: ensure the row exists. ON CONFLICT DO NOTHING is a no-op
+	// when the row already exists — both the "fresh" path (no row)
+	// and the "already claimed" path (row exists) leave us with a
+	// row we can attempt to UPDATE. The RETURNING is intentionally
+	// omitted because the next step is the actual claim.
+	if _, err := s.pool.Exec(ctx,
+		`insert into paddle_overage_dedupe (account_id, window_start, state, claimed_at, claimed_by)
+		 values ($1, $2, 'completed', now(), $3)
+		 on conflict (account_id, window_start) do nothing`,
+		accountID, windowStart, claimedBy,
+	); err != nil {
+		return false, fmt.Errorf("paddle dedupe upsert acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+
+	// Step 2: atomic claim. Either the row is fresh (state='completed'
+	// from the upsert above, claimed_at is now()) and we flip it to
+	// pending, OR the row is a stale-pending claim from a crashed pod
+	// (claimed_at older than the lease) and we steal it. Either way,
+	// the RETURNING tells us we won the race.
+	var claimed bool
+	err := s.pool.QueryRow(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'pending',
+		       claimed_at = now(),
+		       claimed_by = $3
+		 where account_id = $1
+		   and window_start = $2
+		   and (claimed_at is null
+		        or claimed_at < now() - make_interval(secs => $4))
+		 returning true`,
+		accountID, windowStart, claimedBy, leaseSeconds,
+	).Scan(&claimed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Another pod holds a non-stale claim. Skip.
+			return false, nil
+		}
+		return false, fmt.Errorf("paddle dedupe claim acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+	return claimed, nil
+}
+
+// CompletePaddleOverageWindow transitions (account_id, window_start)
+// from pending to completed after a successful SDK POST. Only the
+// pod that holds the claim (state='pending') is allowed to flip; a
+// foreign caller (or one whose lease expired and the row was
+// reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
+// the caller can decide how to react. mb_seconds is stamped for ops
+// debugging — the merchant dashboard line item already carries the
+// value in CustomData.
+func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
+	windowStart = windowStart.UTC()
+	tag, err := s.pool.Exec(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'completed',
+		       pushed_at = now()
+		 where account_id = $1
+		   and window_start = $2
+		   and state = 'pending'`,
+		accountID, windowStart,
+	)
+	if err != nil {
+		return fmt.Errorf("paddle dedupe complete acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Row is in 'completed' state (someone else completed — could be
+		// a retried POST that landed on the merchant dashboard via
+		// Idempotency-Key collapse), OR the row doesn't exist (caller
+		// skipped Claim). Either way, the terminal state is correct
+		// and we don't want to alert.
+		//
+		// We do still want to stamp the mb_seconds for ops — re-do
+		// the UPDATE without the state filter, gated on a NOT EXISTS
+		// precheck so we don't clobber a different pending claim.
+		if _, err := s.pool.Exec(ctx,
+			`update paddle_overage_dedupe
+			   set pushed_at = now()
+			 where account_id = $1
+			   and window_start = $2
+			   and state = 'completed'`,
+			accountID, windowStart,
+		); err != nil {
+			return fmt.Errorf("paddle dedupe complete refresh acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+		}
+		return nil
+	}
+	_ = mbSeconds // currently not stamped on the row; CustomData carries the merchant-side value
+	return nil
+}
+
+// ReapStalePaddleOverageClaims resets pending rows whose claimed_at
+// is older than olderThan, returning them to the claimable pool.
+// Called from meterd boot before the first push tick; safe to call
+// again on a tick (idempotent inside the lease window). The RETURNING
+// count is informational — the caller logs it but does not branch on
+// the value.
+func (s *PgStore) ReapStalePaddleOverageClaims(ctx context.Context, olderThan time.Duration) (int, error) {
+	olderThanSeconds := int64(olderThan.Seconds())
+	if olderThanSeconds < 1 {
+		olderThanSeconds = 1
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'completed',
+		       claimed_at = null,
+		       claimed_by = null
+		 where state = 'pending'
+		   and claimed_at < now() - make_interval(secs => $1)`,
+		olderThanSeconds,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("paddle dedupe reap olderThan=%s: %w", olderThan, err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // --- idempotency -------------------------------------------------------------
@@ -3019,6 +3160,14 @@ func scanSnapshot(row pgx.Row) (Snapshot, error) {
 // callers don't need to know about pgerrcode.
 var ErrConflict = errors.New("state: conflict")
 
+// ErrInvalidArgument is returned when a Store method receives a
+// required-empty argument (empty account_id, empty hash, etc).
+// Distinct from ErrNotFound so callers can map empty-input bugs to
+// 400 (validation) rather than 404 (missing row). Used by the
+// MemStore side of the password / OAuth-link primitives introduced
+// for issue #165 / ADR-032.
+var ErrInvalidArgument = errors.New("state: invalid argument")
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -3163,6 +3312,101 @@ func (s *PgStore) DeleteOldLoginTokens(ctx context.Context, before time.Time) (i
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// SetAccountPassword upserts the Argon2id PHC hash for an account.
+// ON CONFLICT (account_id) DO UPDATE so a password change / set
+// flow replaces the prior hash atomically. The PK on account_id is
+// the floor — a racing concurrent SetAccountPassword on the same
+// account is linearised at the database; the ON CONFLICT branch
+// keeps the second writer's hash instead of dropping it (mirrors
+// the MemStore overwrite-under-lock).
+//
+// phc is the PHC wire format from pkg/auth.Encode. UpdatedAt is
+// stamped by `now()` so the "rotate hash on login" PR #2.5
+// hardening has a stable reference.
+func (s *PgStore) SetAccountPassword(ctx context.Context, accountID, phc string) error {
+	if accountID == "" || phc == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into account_passwords (account_id, hash, updated_at)
+		 values ($1, $2, now())
+		 on conflict (account_id) do update
+		   set hash = excluded.hash,
+		       updated_at = excluded.updated_at`,
+		accountID, phc)
+	return mapErr(err)
+}
+
+// AccountPasswordByAccountID returns the stored Argon2id PHC hash
+// for an account, or ErrNotFound when no row exists. Used by the
+// postLogin handler as the trigger for the anti-enumeration
+// Argon2id pad (pkg/auth.DummyPHC).
+func (s *PgStore) AccountPasswordByAccountID(ctx context.Context, accountID string) (string, error) {
+	var phc string
+	err := s.pool.QueryRow(ctx,
+		`select hash from account_passwords where account_id = $1`, accountID,
+	).Scan(&phc)
+	if err != nil {
+		return "", mapErr(err)
+	}
+	return phc, nil
+}
+
+// DeleteAccountPassword removes the Argon2id row for an account.
+// Idempotent (DELETE with zero affected rows is not an error);
+// matches the MemStore's delete-on-missing semantics.
+func (s *PgStore) DeleteAccountPassword(ctx context.Context, accountID string) error {
+	if accountID == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`delete from account_passwords where account_id = $1`, accountID)
+	return mapErr(err)
+}
+
+// UpsertOAuthLink writes the (provider, provider_subject) → account
+// row. The composite PK enforces the §11 anti-takeover invariant:
+// re-bind by the SAME account updates email/email_verified in place
+// (ON CONFLICT ... DO UPDATE with WHERE account_id = excluded.account_id,
+// so a different account attempting to claim the same (provider, sub)
+// pair triggers the unique-violation → ErrConflict path). The
+// account_id equality check inside the WHERE clause is the load-bearing
+// bit: without it, an attacker with the same email could overwrite
+// the victim's link row. The dashboard refreshes its own email on
+// Google account-rename; the WHERE clause keeps that case working.
+func (s *PgStore) UpsertOAuthLink(ctx context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error {
+	if accountID == "" || provider == "" || providerSubject == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into oauth_links (provider, provider_subject, account_id, email, email_verified)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (provider, provider_subject) do update
+		   set email = excluded.email,
+		       email_verified = excluded.email_verified
+		 where oauth_links.account_id = excluded.account_id`,
+		provider, providerSubject, accountID, email, emailVerified)
+	return mapErr(err)
+}
+
+// OAuthLinkByProviderSubject returns the link for a (provider, sub)
+// pair, or ErrNotFound when no row matches. The OAuth callback runs
+// this on every handshake; the sub-first lookup is the §11
+// anti-takeover closure (the first party to bind a sub owns the row).
+func (s *PgStore) OAuthLinkByProviderSubject(ctx context.Context, provider, providerSubject string) (OAuthLink, error) {
+	var link OAuthLink
+	err := s.pool.QueryRow(ctx,
+		`select provider, provider_subject, account_id, email, email_verified, created_at
+		   from oauth_links
+		  where provider = $1 and provider_subject = $2`,
+		provider, providerSubject,
+	).Scan(&link.Provider, &link.ProviderSubject, &link.AccountID, &link.Email, &link.EmailVerified, &link.CreatedAt)
+	if err != nil {
+		return OAuthLink{}, mapErr(err)
+	}
+	return link, nil
 }
 
 // IssueCliAuthCode persists a freshly-minted code's SHA-256 hash with

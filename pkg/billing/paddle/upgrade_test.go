@@ -47,7 +47,7 @@ func TestCreateUpgradeTransaction_MissingMonthlyPrice(t *testing.T) {
 		client:  mustNewSandboxSDK(t, "pdl_test_e2e"),
 		catalog: &priceCatalog{planMonthly: map[api.Plan]string{}, planOverage: map[api.Plan]string{}, planCustomers: map[api.Plan]string{}},
 	}
-	_, _, err := p.CreateUpgradeTransaction(context.Background(), state.Account{StripeCustomerID: "ctm_abc"}, api.PlanPro)
+	_, _, err := p.CreateUpgradeTransaction(context.Background(), state.Account{ProviderCustomerID: "ctm_abc"}, api.PlanPro)
 	if err == nil {
 		t.Fatalf("expected error when monthly price is missing, got nil")
 	}
@@ -80,8 +80,8 @@ func TestCreateUpgradeTransaction_HappyPath(t *testing.T) {
 		// Wire-shape assertions — pins the SDK request shape so a
 		// future refactor cannot silently drop the idem key, the
 		// CustomerID, or the kind tag.
-		if acct.StripeCustomerID != customerID {
-			t.Errorf("CustomerID = %q, want %q", acct.StripeCustomerID, customerID)
+		if acct.ProviderCustomerID != customerID {
+			t.Errorf("CustomerID = %q, want %q", acct.ProviderCustomerID, customerID)
 		}
 		if target != api.PlanPro {
 			t.Errorf("targetPlan = %q, want %q", target, api.PlanPro)
@@ -89,7 +89,7 @@ func TestCreateUpgradeTransaction_HappyPath(t *testing.T) {
 		return "txn_test_123", checkoutURL, nil
 	}
 
-	txnID, url, err := p.CreateUpgradeTransaction(context.Background(), state.Account{StripeCustomerID: customerID}, api.PlanPro)
+	txnID, url, err := p.CreateUpgradeTransaction(context.Background(), state.Account{ProviderCustomerID: customerID}, api.PlanPro)
 	if err != nil {
 		t.Fatalf("CreateUpgradeTransaction: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestCreateUpgradeTransaction_EmptyCheckoutError(t *testing.T) {
 		return "", "", errors.New("paddle: CreateTransaction returned empty checkout")
 	}
 
-	_, _, err := p.CreateUpgradeTransaction(context.Background(), state.Account{StripeCustomerID: "ctm_xyz"}, api.PlanPro)
+	_, _, err := p.CreateUpgradeTransaction(context.Background(), state.Account{ProviderCustomerID: "ctm_xyz"}, api.PlanPro)
 	if err == nil {
 		t.Fatalf("expected error on empty checkout, got nil")
 	}

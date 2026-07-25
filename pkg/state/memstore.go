@@ -35,6 +35,31 @@ type paddleOverageKey struct {
 	month     time.Time
 }
 
+// paddleOverageWindowKey is the (account, window) claim key the
+// per-window Paddle overage pusher uses. `windowStart` is
+// hour.UTC().Truncate(Hour), mirroring stripePushKey's `hour`
+// normalization. The window-scoped grain matches the meterd loop's
+// UsageByHour read and the underlying schema's
+// (account_id, window_start) PK from migration 00037.
+type paddleOverageWindowKey struct {
+	accountID   string
+	windowStart time.Time
+}
+
+// paddleOverageClaimState is the in-memory mirror of the
+// paddle_overage_dedupe row's claim metadata. Mirrors the
+// (state, claimed_at, claimed_by) tuple from migration 00037 so
+// MemStore parity tests can exercise every branch of
+// ClaimPaddleOverageWindow + CompletePaddleOverageWindow +
+// ReapStalePaddleOverageClaims without standing up Postgres.
+type paddleOverageClaimState struct {
+	claimedBy    string
+	claimedAt    time.Time
+	completed    bool
+	pushedAt     time.Time
+	mbSecondsSum int64
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -70,6 +95,16 @@ type MemStore struct {
 	// dashboard claims the code; the claim statement fills it in
 	// atomically. See pkg/state/types.go CliAuthCode.
 	cliAuthCodes map[string]CliAuthCode
+	// accountPasswords is keyed by account_id (issue #165 / ADR-032).
+	// OAuth-only accounts have no row; the absence of a row is the
+	// signal that an OAuth-only flow is required to mint a session.
+	accountPasswords map[string]AccountPassword
+	// oauthLinks is keyed by (provider + "\x00" + provider_subject)
+	// so the §11 anti-takeover invariant (one OAuth subject per
+	// account) is enforceable in-memory the same way the composite
+	// PK enforces it in Postgres. NUL separator is safe — neither
+	// Google subs nor GitHub IDs contain it.
+	oauthLinks map[string]OAuthLink
 	// deploymentLogs is keyed by deployment_id; the inner slice is
 	// append-ordered (which matches the Postgres seq order). MemStore
 	// mirrors the bigserial PK by appending + assigning a monotonic
@@ -87,7 +122,7 @@ type MemStore struct {
 	usageByMonth []Usage
 	idem         map[string]idemEntry
 	// stripeByCustomer is the reverse-lookup index used by
-	// AccountByStripeCustomerID; keyed by Stripe `cus_…` ID.
+	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
 	// gdprRequests is the in-memory mirror of the gdpr_requests ledger
 	// row. MemStore does not auto-cascade on DeleteAccount (the
@@ -105,6 +140,16 @@ type MemStore struct {
 	// stripePushHours but at the calendar-month grain because the
 	// Paddle overage push fires at month-rollover rather than hourly.
 	paddleOverageMonths map[paddleOverageKey]struct{}
+	// paddleOverageWindows tracks the (account, window) per-window
+	// claim state for the Paddle overage push. Replaces
+	// paddleOverageMonths after the fix-PR for PR #204 review
+	// findings (the month-scoped pair underbilled customers after
+	// the first positive window of the month because the meterd loop
+	// reads UsageByHour — window-scoped — but the dedupe row was
+	// keyed by calendarMonthStart — month-scoped). The per-window
+	// shape mirrors stripePushHours and the underlying schema's
+	// (account_id, window_start) PK from migration 00037.
+	paddleOverageWindows map[paddleOverageWindowKey]paddleOverageClaimState
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
@@ -152,28 +197,31 @@ type usageMinute struct {
 // Production (PgStore) gets the same row from the migration.
 func NewMemStore() *MemStore {
 	m := &MemStore{
-		accounts:       map[string]Account{},
-		keys:           map[string]APIKey{},
-		keyByHash:      map[string]APIKey{},
-		apps:           map[string]App{},
-		githubBindings: map[string]GitHubBinding{},
-		deployments:    map[string]Deployment{},
-		builds:         map[string]Build{},
-		domains:        map[string]CustomDomain{},
-		crons:          map[string]Cron{},
-		invocations:    map[string]Invocation{},
-		instances:      map[string]Instance{},
-		loginTokens:    map[string]LoginToken{},
-		cliAuthCodes:   map[string]CliAuthCode{},
-		deploymentLogs: map[string][]LogEntry{},
-		deploymentSeq:  map[string]int64{},
-		snapshots:      []Snapshot{},
-		events:         []Event{},
-		usage:          []usageMinute{},
-		usageByMonth:   []Usage{},
-		idem:           map[string]idemEntry{},
-		// stripeByCustomer is the reverse-lookup map AccountByStripeCustomerID
-		// walks; populated by UpdateAccountStripeCustomerID.
+		accounts:         map[string]Account{},
+		keys:             map[string]APIKey{},
+		keyByHash:        map[string]APIKey{},
+		apps:             map[string]App{},
+		githubBindings:   map[string]GitHubBinding{},
+		deployments:      map[string]Deployment{},
+		builds:           map[string]Build{},
+		domains:          map[string]CustomDomain{},
+		crons:            map[string]Cron{},
+		invocations:      map[string]Invocation{},
+		instances:        map[string]Instance{},
+		loginTokens:      map[string]LoginToken{},
+		cliAuthCodes:     map[string]CliAuthCode{},
+		accountPasswords: map[string]AccountPassword{},
+		oauthLinks:       map[string]OAuthLink{},
+		deploymentLogs:   map[string][]LogEntry{},
+		deploymentSeq:    map[string]int64{},
+		snapshots:        []Snapshot{},
+		events:           []Event{},
+		usage:            []usageMinute{},
+		usageByMonth:     []Usage{},
+		idem:             map[string]idemEntry{},
+		// stripeByCustomer is the reverse-lookup map AccountByProviderCustomerID
+		// walks; populated by UpdateAccountProviderCustomerID.
+
 		stripeByCustomer: map[string]string{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
@@ -181,9 +229,17 @@ func NewMemStore() *MemStore {
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
 		// paddleOverageMonths is the per-(account, month) dedupe set
-		// the meterd daily pusher reads/writes.
+		// the meterd daily pusher reads/writes. Kept for back-compat
+		// with the deprecated state.Store month-scoped pair; new code
+		// paths use paddleOverageWindows below.
 		paddleOverageMonths: map[paddleOverageKey]struct{}{},
-		secrets:             map[secretKey]AppSecret{},
+		// paddleOverageWindows is the per-(account, window) claim
+		// state map the meterd pusher uses post-PR-#204. Migration
+		// 00037 added the (account_id, window_start) PK + state
+		// column to paddle_overage_dedupe; this in-memory mirror
+		// keeps the MemStore parity tests in lockstep.
+		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
+		secrets:              map[secretKey]AppSecret{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -305,19 +361,19 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 	return nil
 }
 
-// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID. MemStore
+// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID. MemStore
 // keeps an index map for O(1) webhook lookup; PgStore mirrors with a
 // schema-level unique index (added in Slice 2's migration).
-func (m *MemStore) UpdateAccountStripeCustomerID(_ context.Context, id, stripeCustomerID string) error {
+func (m *MemStore) UpdateAccountProviderCustomerID(_ context.Context, id, stripeCustomerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
 		return ErrNotFound
 	}
-	a.StripeCustomerID = stripeCustomerID
+	a.ProviderCustomerID = stripeCustomerID
 	m.accounts[id] = a
-	// Maintain the reverse-lookup map for AccountByStripeCustomerID.
+	// Maintain the reverse-lookup map for AccountByProviderCustomerID.
 	for k, v := range m.stripeByCustomer {
 		if v == id && k != stripeCustomerID {
 			delete(m.stripeByCustomer, k)
@@ -344,10 +400,10 @@ func (m *MemStore) UpdateAccountStripeSubscriptionItem(_ context.Context, id, su
 	return nil
 }
 
-// AccountByStripeCustomerID is the reverse-lookup the Stripe webhook
+// AccountByProviderCustomerID is the reverse-lookup the Stripe webhook
 // uses to find the account behind an event's `customer` field. O(1) via
 // the index map; PgStore implements this with a unique index.
-func (m *MemStore) AccountByStripeCustomerID(_ context.Context, stripeCustomerID string) (Account, error) {
+func (m *MemStore) AccountByProviderCustomerID(_ context.Context, stripeCustomerID string) (Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id, ok := m.stripeByCustomer[stripeCustomerID]
@@ -361,8 +417,8 @@ func (m *MemStore) AccountByStripeCustomerID(_ context.Context, stripeCustomerID
 	return a, nil
 }
 
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
-// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
+// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
 // reused (ADR-025 — column rename is a separate migration PR), so the
 // underlying field + reverse-lookup map are the same; the dedicated
 // method name keeps the Paddle call sites self-documenting.
@@ -373,7 +429,7 @@ func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCu
 	if !ok {
 		return ErrNotFound
 	}
-	a.StripeCustomerID = paddleCustomerID // column is reused per ADR-025
+	a.ProviderCustomerID = paddleCustomerID // column is reused per ADR-025
 	m.accounts[id] = a
 	// Maintain the reverse-lookup map. Same map as the Stripe path —
 	// a single deployment uses one provider, so the prefix-stripped
@@ -394,7 +450,7 @@ func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCu
 // keeps the Paddle call sites self-documenting and leaves the door
 // open for a column-rename PR to swap bodies without touching callers.
 func (m *MemStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return m.AccountByStripeCustomerID(ctx, paddleCustomerID)
+	return m.AccountByProviderCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts walks the account map under the store mutex. The
@@ -2605,6 +2661,97 @@ func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string,
 	return nil
 }
 
+// ClaimPaddleOverageWindow mirrors PgStore.ClaimPaddleOverageWindow
+// against the in-memory map. Three branches:
+//
+//   - row absent: insert a pending claim, return claimed=true.
+//   - row pending + claimed_at within lease: another pod holds it;
+//     return claimed=false without mutating state.
+//   - row pending + claimed_at older than lease: steal the claim,
+//     refresh claimed_at + claimed_by, return claimed=true.
+//   - row completed: refresh the claim as a fresh pending row so
+//     the caller can re-POST (the underlying SQL upsert in
+//     PgStore handles this by re-INSERT with state='completed'
+//     then UPDATE; in-memory we just flip to pending).
+//
+// The lock is held for the full check-then-mutate because the
+// MemStore is single-process; PgStore relies on the SQL engine's
+// atomic UPDATE for the same guarantee.
+func (m *MemStore) ClaimPaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, claimedBy string, lease time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageWindows == nil {
+		m.paddleOverageWindows = map[paddleOverageWindowKey]paddleOverageClaimState{}
+	}
+	key := paddleOverageWindowKey{accountID: accountID, windowStart: windowStart.UTC()}
+	now := time.Now().UTC()
+	state, ok := m.paddleOverageWindows[key]
+	if !ok {
+		m.paddleOverageWindows[key] = paddleOverageClaimState{
+			claimedBy: claimedBy,
+			claimedAt: now,
+		}
+		return true, nil
+	}
+	// Row exists. Either completed (re-claim path) or pending
+	// (race path; only steal if stale).
+	if !state.completed && now.Sub(state.claimedAt) < lease {
+		// Fresh pending claim from another pod — skip.
+		return false, nil
+	}
+	state.claimedBy = claimedBy
+	state.claimedAt = now
+	m.paddleOverageWindows[key] = state
+	return true, nil
+}
+
+// CompletePaddleOverageWindow mirrors PgStore.CompletePaddleOverageWindow.
+// A foreign caller (one whose lease expired and the row was
+// reaped+re-claimed) sees no state change because the state is no
+// longer in 'pending' under its claimed_by — but we don't error
+// because the terminal state is already correct (someone else
+// completed).
+func (m *MemStore) CompletePaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageWindows == nil {
+		return nil
+	}
+	key := paddleOverageWindowKey{accountID: accountID, windowStart: windowStart.UTC()}
+	state, ok := m.paddleOverageWindows[key]
+	if !ok {
+		// No row → caller skipped Claim. No-op.
+		return nil
+	}
+	now := time.Now().UTC()
+	state.completed = true
+	state.pushedAt = now
+	state.mbSecondsSum = mbSeconds
+	m.paddleOverageWindows[key] = state
+	return nil
+}
+
+// ReapStalePaddleOverageClaims mirrors PgStore.ReapStalePaddleOverageClaims.
+// Resets pending rows whose claimed_at is older than olderThan,
+// returning them to the claimable pool. Returns the count reset
+// (informational).
+func (m *MemStore) ReapStalePaddleOverageClaims(_ context.Context, olderThan time.Duration) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageWindows == nil {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	n := 0
+	for k, state := range m.paddleOverageWindows {
+		if !state.completed && now.Sub(state.claimedAt) >= olderThan {
+			delete(m.paddleOverageWindows, k)
+			n++
+		}
+	}
+	return n, nil
+}
+
 type appHourKey struct {
 	AccountID string
 	AppID     string
@@ -2725,6 +2872,119 @@ func (m *MemStore) DeleteOldLoginTokens(_ context.Context, before time.Time) (in
 		}
 	}
 	return removed, nil
+}
+
+// SetAccountPassword upserts the Argon2id PHC hash for an account.
+// One row per account_id — the PK rejects a duplicate INSERT, so a
+// racing concurrent SetAccountPassword against the same account
+// would lose at the database floor; the MemStore upsert mirrors that
+// by overwriting the prior row inside the lock.
+//
+// phc is the PHC wire format produced by pkg/auth.Encode. The MemStore
+// stores it verbatim; pkg/auth.Verify parses the embedded m/t/p at
+// verify time so a future parameter bump is transparent.
+//
+// UpdatedAt is stamped here so the "rotate hash on login" PR #2.5
+// hardening has a stable reference. Defaulted to time.Now() when the
+// caller passes a zero hash; the zero hash is otherwise a programming
+// error and surfaces as a returned error.
+func (m *MemStore) SetAccountPassword(_ context.Context, accountID, phc string) error {
+	if accountID == "" {
+		return ErrInvalidArgument
+	}
+	if phc == "" {
+		return ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.accountPasswords == nil {
+		m.accountPasswords = map[string]AccountPassword{}
+	}
+	m.accountPasswords[accountID] = AccountPassword{
+		AccountID: accountID,
+		Hash:      phc,
+		UpdatedAt: time.Now(),
+	}
+	return nil
+}
+
+// AccountPasswordByAccountID returns the stored Argon2id PHC hash
+// for an account, or ErrNotFound when no row exists. The postLogin
+// handler uses ErrNotFound as the trigger for the anti-enumeration
+// Argon2id pad (pkg/auth.DummyPHC) so the response time on unknown
+// email matches the response time on known email + wrong password.
+func (m *MemStore) AccountPasswordByAccountID(_ context.Context, accountID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.accountPasswords[accountID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return row.Hash, nil
+}
+
+// DeleteAccountPassword removes the Argon2id row for an account.
+// Idempotent: deleting a row that doesn't exist is not an error
+// (matches the pgx Exec semantics — a DELETE with zero affected
+// rows returns nil). Used by the G6 hard-delete path's cleanup
+// hooks and reserved for a future "switch to OAuth-only" opt-out.
+func (m *MemStore) DeleteAccountPassword(_ context.Context, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.accountPasswords, accountID)
+	return nil
+}
+
+// UpsertOAuthLink writes the (provider, provider_subject) → account
+// row. The §11 anti-takeover invariant is the database composite PK
+// in Postgres; the MemStore mirrors it via the (provider+"\x00"+sub)
+// map key — a second UpsertOAuthLink with the SAME provider/sub
+// overwrites in place (same account re-binding, e.g. an email change
+// refreshes the link's email field), and a second UpsertOAuthLink
+// with a DIFFERENT account_id but the SAME provider/sub returns
+// ErrConflict — that's the in-memory equivalent of Postgres' PK
+// rejection. The OAuth callback (handlers_google.go / handlers_github.go)
+// relies on this so a stolen email cannot bind to a second account.
+func (m *MemStore) UpsertOAuthLink(_ context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error {
+	if accountID == "" || provider == "" || providerSubject == "" {
+		return ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.oauthLinks == nil {
+		m.oauthLinks = map[string]OAuthLink{}
+	}
+	key := provider + "\x00" + providerSubject
+	if existing, ok := m.oauthLinks[key]; ok && existing.AccountID != accountID {
+		return ErrConflict
+	}
+	now := time.Now()
+	if existing, ok := m.oauthLinks[key]; ok {
+		now = existing.CreatedAt // preserve CreatedAt on update
+	}
+	m.oauthLinks[key] = OAuthLink{
+		Provider:        provider,
+		ProviderSubject: providerSubject,
+		AccountID:       accountID,
+		Email:           email,
+		EmailVerified:   emailVerified,
+		CreatedAt:       now,
+	}
+	return nil
+}
+
+// OAuthLinkByProviderSubject returns the link for a (provider, sub)
+// pair, or ErrNotFound when no row matches. The OAuth callback runs
+// this on every handshake; the sub-first lookup is the §11
+// anti-takeover closure (the first party to bind a sub owns the row).
+func (m *MemStore) OAuthLinkByProviderSubject(_ context.Context, provider, providerSubject string) (OAuthLink, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.oauthLinks[provider+"\x00"+providerSubject]
+	if !ok {
+		return OAuthLink{}, ErrNotFound
+	}
+	return row, nil
 }
 
 // IssueCliAuthCode stores a freshly-minted code's SHA-256 hash with

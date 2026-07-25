@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,9 +22,10 @@ import (
 // Subcommand names — lifted to constants so goconst stops flagging the
 // repeated "list"/"add"/"rm" string literals in the dispatch tables below.
 const (
-	subList = "list"
-	subAdd  = "add"
-	subRm   = "rm"
+	subList   = "list"
+	subAdd    = "add"
+	subUpdate = "update"
+	subRm     = "rm"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -142,6 +145,16 @@ func cmdApp(args []string) int {
 			fmt.Printf("%-30s %s\n", "min instances:", "scale to zero")
 		} else {
 			fmt.Printf("%-30s %d\n", "min instances:", a.MinInstances)
+		}
+		// ADR-031 + ADR-032: surface the per-app outbound CIDR
+		// allowlist in the text-mode `faas app <slug>` output so a
+		// customer can verify their PATCH round-tripped without
+		// dropping into --json. Print only when non-empty — empty
+		// is the Free/Hobby default and "no row" output is
+		// misleading.
+		if len(a.EgressAllowlist) > 0 {
+			fmt.Printf("%-30s %s\n", "egress allowlist:",
+				strings.Join(a.EgressAllowlist, ", "))
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
@@ -463,10 +476,10 @@ func cmdDomains(args []string) int {
 	return 1
 }
 
-// cmdCrons: list/add/rm.
+// cmdCrons: list/add/update/rm.
 func cmdCrons(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: faas crons <list|add|rm> [args]", "crons")
+		PrintUsage(os.Stderr, "usage: faas crons <list|add|update|rm> [args]", "crons")
 		return 1
 	}
 	switch args[0] {
@@ -523,6 +536,8 @@ func cmdCrons(args []string) int {
 		}
 		PrintOK(osStdout, "Cron scheduled: %s %s", c.Schedule, c.Path)
 		return 0
+	case subUpdate:
+		return cmdCronsUpdate(args[1:])
 	case subRm:
 		if len(args) != 2 {
 			PrintUsage(os.Stderr, "usage: faas crons rm <id>", "crons")
@@ -540,6 +555,109 @@ func cmdCrons(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "unknown crons subcommand %q\n", args[0])
 	return 1
+}
+
+// cronIDPattern is the 32-hex shape used by the API for cron ids
+// (CronResponse.ID, the path segment of /v1/crons/{id}). Mirrors
+// deploymentIDPattern — same 32-hex convention across the platform.
+var cronIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+
+// renderCronState writes the human multi-line state block for one
+// cron. Routes through io.Writer so tests can capture the body via
+// the osStdout seam (same pattern as renderDeploymentRow in
+// commands_deployments.go). Widths assume short schedule / path /
+// boolean fields; no id-style left-pad because cron ids aren't
+// shown on the update block — the "Updated cron <id>" line above
+// already names the row.
+func renderCronState(w io.Writer, c api.CronResponse) {
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "schedule:", c.Schedule)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "path:", c.Path)
+	_, _ = fmt.Fprintf(w, "  %-10s %s\n", "enabled:", strconv.FormatBool(c.Enabled))
+}
+
+// cmdCronsUpdate implements `faas crons update <id> [--schedule EXPR]
+// [--path PATH] [--enable|--disable]`. Partial-update semantics:
+// every flag is optional, but at least one patch field must be set
+// (the server happily no-ops an empty body and emits a cron-changed
+// notification — a footgun we'd rather catch at the CLI). Uses
+// fs.Visit to distinguish "unset" from explicit-zero so a customer
+// can pass `--path ""` to clear the path without being re-defaulted
+// to `/`. The `--enable|--disable` pair is mutually exclusive;
+// --schedule is locally shape-checked (5 whitespace tokens) to match
+// the server's validCron so a bad expression fails fast.
+func cmdCronsUpdate(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	id := args[0]
+	if !cronIDPattern.MatchString(id) {
+		PrintUsage(os.Stderr, "usage: faas crons update <id>   (id is 32 hex chars)", "crons")
+		return 1
+	}
+	fs := flag.NewFlagSet("crons-update", flag.ContinueOnError)
+	schedule := fs.String("schedule", "", "cron expression (5 fields)")
+	path := fs.String("path", "", "request path")
+	enable := fs.Bool("enable", false, "enable the cron")
+	disable := fs.Bool("disable", false, "disable the cron")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	if *enable && *disable {
+		PrintUsage(os.Stderr, "usage: faas crons update --enable | --disable (mutually exclusive)", "crons")
+		return 1
+	}
+	// Reject no-fields-set early; the server otherwise no-ops and
+	// emits a cron-changed notification — a footgun we'd rather
+	// catch at the CLI before a pointless network round-trip.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if !explicit["schedule"] && !explicit["path"] && !explicit["enable"] && !explicit["disable"] {
+		PrintUsage(os.Stderr, "usage: faas crons update <id> [--schedule EXPR] [--path PATH] [--enable|--disable]", "crons")
+		return 1
+	}
+	// Local schedule shape check (5 whitespace tokens) mirrors the
+	// server's validCron so a bad expression fails fast. We do NOT
+	// validate field ranges — that's the scheduler's job.
+	if explicit["schedule"] && len(strings.Fields(*schedule)) != 5 {
+		PrintFail(os.Stderr, "Invalid --schedule %q (expected 5 fields, e.g. \"*/15 * * * *\")", *schedule)
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	var req api.UpdateCronRequest
+	if explicit["schedule"] {
+		s := *schedule
+		req.Schedule = &s
+	}
+	if explicit["path"] {
+		p := *path
+		req.Path = &p
+	}
+	if explicit["enable"] {
+		v := true
+		req.Enabled = &v
+	}
+	if explicit["disable"] {
+		v := false
+		req.Enabled = &v
+	}
+	updated, err := client.UpdateCron(context.Background(), id, req)
+	if err != nil {
+		return printErr("Update failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(updated))
+	}
+	PrintOK(osStdout, "Updated cron %s", updated.ID)
+	renderCronState(osStdout, updated)
+	return 0
 }
 
 // cmdKeys: list/add/rm. Adding returns the plaintext token once (spec §2.2).

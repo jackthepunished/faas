@@ -60,6 +60,12 @@ tags:
     description: Per-app sealed secrets (sealed at rest).
   - name: usage
     description: Usage roll-up and metering.
+  - name: auth
+    description: |
+      Dashboard authentication (issue #165 PR #2, ADR-032).
+      Email + password (Argon2id), Google OAuth, GitHub OAuth,
+      password reset, session lifecycle. Cookies carry the session
+      artifact; the device-code flow is the SDK programmatic-auth path.
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
 
@@ -186,6 +192,337 @@ paths:
                 example: {"id":"0123456789abcdef0123456789abcdef","email":"ops@example.com","plan":"hobby","status":"active","limits":{"plan":"hobby","ram_mb":256,"max_concurrency":2,"deployed_apps":3,"included_gb_hours":50,"app_layer_max_mb":512},"usage_gb_hours":1.234,"app_count":3,"github_install_id":null}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409': { $ref: '#/components/responses/ConflictDelete' }
+
+  # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────────
+
+  /login:
+    post:
+      tags: [auth]
+      operationId: passwordLogin
+      summary: Email + password sign-in.
+      description: |
+        Verifies the email + password against the `account_passwords`
+        row (Argon2id, PHC string). Sets the `faas_sid` session
+        cookie on success. The response body carries only
+        `{account_id, plan}` — no API key. The SDK's device-code
+        flow is the programmatic-auth path; the dashboard cookie is
+        the only auth artifact on the browser side.
+
+        Anti-enumeration: unbound email, wrong password, and
+        passwordless (OAuth-only) accounts all return 401
+        `invalid_credentials` with the same body. Every code path
+        runs one Argon2id verify under identical parameters so the
+        timing oracle stays closed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+      responses:
+        '200':
+          description: |
+            Signed in. The `Set-Cookie: faas_sid=…` header carries
+            the session cookie.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: |
+                `faas_sid=<sealed-session>; HttpOnly; Secure;
+                SameSite=Lax`. 7-day fixed lifetime.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordLoginResponse'
+                example: {"account_id":"0123456789abcdef0123456789abcdef","plan":"hobby"}
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /signup:
+    post:
+      tags: [auth]
+      operationId: passwordSignup
+      summary: Create account with email + password.
+      description: |
+        Creates an account and signs the caller in. On a colliding
+        email + matching password, the call is idempotent and signs
+        in. On a colliding email + different password, the response
+        is 401 `invalid_credentials` (never 409 — the surface
+        forbids account enumeration).
+
+        Password floor: 12 characters (NIST-style; no complexity
+        rules).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordSignupRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordSignupRequest'
+      responses:
+        '200':
+          description: Account created (or reused) and signed in.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: |
+                `faas_sid=<sealed-session>; HttpOnly; SameSite=Lax`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordLoginResponse'
+        '400':
+          description: Password too weak (≥12 chars required).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /login/forgot:
+    post:
+      tags: [auth]
+      operationId: passwordForgot
+      summary: Request a password-reset email.
+      description: |
+        Always returns 200 with the same body regardless of
+        whether the email is bound to an account. The reset URL
+        is mailed via the platform's outbound mailer; the response
+        never leaks account presence.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '200':
+          description: Request accepted. The reset email is sent if the address is registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/reset:
+    get:
+      tags: [auth]
+      operationId: passwordResetForm
+      summary: Render the password-reset form.
+      description: |
+        Validates the token shape; renders the
+        `password_reset_form.html` template on a valid token.
+        Invalid / expired / consumed tokens return 410 Gone.
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+          description: |
+            Base64url-encoded 32-byte token from the reset email.
+      responses:
+        '200':
+          description: Token is valid; renders the form.
+          content:
+            text/html:
+              schema: { type: string }
+        '410': { $ref: '#/components/responses/ResetTokenInvalid' }
+    post:
+      tags: [auth]
+      operationId: passwordResetConfirm
+      summary: Submit a new password against a reset token.
+      description: |
+        Atomically consumes the token (one-shot, replay returns
+        410), Argon2id-encodes the new password, sets it on the
+        account, and signs the caller in.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirm'
+      responses:
+        '302':
+          description: |
+            Password set. Redirects to `/dashboard/`. `Set-Cookie:
+            faas_sid=…` is set.
+          headers:
+            Location:
+              schema: { type: string, example: "/dashboard/" }
+        '400':
+          description: New password is too weak (≥12 chars required).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410': { $ref: '#/components/responses/ResetTokenInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/google:
+    get:
+      tags: [auth]
+      operationId: googleAuthRedirect
+      summary: GitHub-style Google OAuth 2.0 consent redirect.
+      description: |
+        Sets a 16-byte CSRF state cookie scoped to
+        `/v1/auth/google/callback` and 302s to the Google consent
+        screen. The callback consumes the state cookie, exchanges
+        the code at `oauth2.googleapis.com/token`, fetches the
+        userinfo, and verifies `email_verified=true` before
+        minting a session (issue #165 PR #2, ADR-032).
+      responses:
+        '302':
+          description: Redirect to Google consent.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        '500':
+          description: OAuth misconfigured (GOOGLE_CLIENT_ID unset).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/auth/google/callback:
+    get:
+      tags: [auth]
+      operationId: googleAuthCallback
+      summary: Google OAuth 2.0 callback.
+      description: |
+        Verifies state, exchanges the code, fetches the profile,
+        enforces `email_verified=true`, and signs the user in.
+        Sub-first lookup against `oauth_links` enforces the §11
+        anti-takeover invariant.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+          description: |
+            Authorization code returned by Google on the consent
+            redirect. Single-use; exchanged at
+            `oauth2.googleapis.com/token`.
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+          description: |
+            CSRF state token. Must match the `faas_google_state`
+            cookie set on the consent redirect. Mismatch returns
+            401 `csrf_mismatch`.
+      responses:
+        '302':
+          description: |
+            Redirect to `WEBSITE_URL` or `/`. `Set-Cookie:
+            faas_sid=…` is set.
+        '401':
+          description: Google email not verified at the upstream.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/github:
+    get:
+      tags: [auth]
+      operationId: githubAuthRedirect
+      summary: GitHub OAuth 2.0 consent redirect.
+      description: |
+        Sets a 16-byte CSRF state cookie scoped to
+        `/v1/auth/github/callback` and 302s to the GitHub consent
+        with `scope=read:user user:email`. The callback requires
+        a primary && verified email before minting a session
+        (issue #165 PR #2, ADR-032).
+      responses:
+        '302':
+          description: Redirect to GitHub consent.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        '500':
+          description: OAuth misconfigured (GITHUB_CLIENT_ID unset).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/auth/github/callback:
+    get:
+      tags: [auth]
+      operationId: githubAuthCallback
+      summary: GitHub OAuth 2.0 callback.
+      description: |
+        Verifies state, exchanges the code, fetches `/user` and
+        `/user/emails`, filters the primary && verified email,
+        and signs the user in. Sub-first lookup against
+        `oauth_links` enforces the §11 anti-takeover invariant.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+          description: |
+            Authorization code returned by GitHub on the consent
+            redirect. Single-use; exchanged at
+            `github.com/login/oauth/access_token`.
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+          description: |
+            CSRF state token. Must match the `faas_github_state`
+            cookie set on the consent redirect. Mismatch returns
+            401 `csrf_mismatch`.
+      responses:
+        '302':
+          description: |
+            Redirect to `WEBSITE_URL` or `/` after a successful
+            GitHub OAuth handshake. `Set-Cookie: faas_sid=…` is set.
+        '401':
+          description: GitHub account has no primary && verified email.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /dashboard/account/set-password:
+    post:
+      tags: [auth]
+      operationId: setPassword
+      summary: Set a password on the authenticated account.
+      description: |
+        Authenticated. Lets OAuth-only customers opt into password
+        login. The same Argon2id path as `/auth/reset`, anchored
+        to the session's account rather than a reset token.
+      parameters:
+        - $ref: '#/components/parameters/CookieSession'
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SetPasswordRequest'
+      responses:
+        '302':
+          description: Password set. Redirects to `/dashboard/account/`.
+          headers:
+            Location:
+              schema: { type: string, example: "/dashboard/account/" }
+        '400':
+          description: Chosen password is too weak (≥12 chars required).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ─── Apps ─────────────────────────────────────────────────────────────────
 
@@ -1144,6 +1481,17 @@ components:
         surface the prefix.
 
   parameters:
+    CookieSession:
+      name: faas_sid
+      in: cookie
+      required: false
+      schema: { type: string }
+      description: |
+        Dashboard session cookie. Sealed; opaque to the client
+        (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+        The browser sets it automatically on `/login` / `/signup`;
+        the SDK uses the device-code flow instead and never sets
+        this cookie.
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -1172,6 +1520,60 @@ components:
       description: Secret key. Must start with a letter; A-Z, 0-9, underscore.
 
   schemas:
+
+    # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────
+
+    PasswordLoginRequest:
+      description: "Email + password for sign-in. Email is canonicalised server-side (lowercase + trim)."
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 12, maxLength: 256 }
+
+    PasswordLoginResponse:
+      description: |
+        Successful sign-in. The session cookie is set via
+        `Set-Cookie: faas_sid=…`; the body carries only
+        `{account_id, plan}`. No API key is ever returned on
+        login (issue #165, PR #2).
+      type: object
+      required: [account_id, plan]
+      properties:
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        plan: { type: string, enum: [free, hobby, pro, scale] }
+
+    PasswordSignupRequest:
+      description: "Email + password for signup. Same shape as PasswordLoginRequest so the create-or-claim race detection reuses the verifier."
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 12, maxLength: 256 }
+
+    PasswordResetRequest:
+      description: "Email for a password-reset request. Optional — the form-page path submits no body; the SDK sends the email."
+      type: object
+      properties:
+        email: { type: string, format: email }
+
+    PasswordResetConfirm:
+      description: |
+        Token + new password for the password-reset submission.
+        Token is the base64url-encoded 32-byte value from the
+        email link (NOT the SHA-256 hash the server stores).
+      type: object
+      required: [token, new_password]
+      properties:
+        token: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+        new_password: { type: string, minLength: 12, maxLength: 256 }
+
+    SetPasswordRequest:
+      description: "New password for the authenticated account. Lets OAuth-only customers opt into password login."
+      type: object
+      required: [password]
+      properties:
+        password: { type: string, minLength: 12, maxLength: 256 }
 
     # ─── Account ──────────────────────────────────────────────────────────
 
@@ -1300,7 +1702,7 @@ components:
     # ─── Apps ─────────────────────────────────────────────────────────────
 
     AppResponse:
-      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, and last-deploy pointer."
+      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, and per-app outbound CIDR allowlist (ADR-031 + ADR-032)."
       type: object
       required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest]
       properties:
@@ -1315,6 +1717,22 @@ components:
         status: { type: string , example: "active"}
         url: { type: string, format: uri }
         manifest: { $ref: '#/components/schemas/AppManifest' }
+        # ADR-031 + ADR-032 (tier-2 network follow-ups, PR-C):
+        # the per-app outbound CIDR allowlist. Each entry is a
+        # canonical CIDR string — v4 ("1.2.3.0/24") or v6
+        # ("2001:db8::/32"). v4-mapped v6 form ("::ffff:1.2.3.0/120")
+        # is silently rewritten to its v4 form at PATCH time by
+        # validateUpdateApp, so the read-back never carries a
+        # "::ffff:" prefix. Always present (serialised as `[]`
+        # when empty, never `null`); NOT in `required:` so the
+        # empty case stays the contract for Free/Hobby.
+        egress_allowlist:
+          description: "Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6 (`2001:db8::/32`). v4-mapped v6 form (`::ffff:1.2.3.0/120`) is silently canonicalised to its v4 form at write time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies."
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9a-fA-F:./]+$'
+            example: 1.2.3.0/24
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -1337,17 +1755,23 @@ components:
         max_concurrency: { type: [integer, "null"] }
         min_instances: { type: [integer, "null"], minimum: 0 }
         # ADR-031 (tier-2 of the network roadmap): per-app
-        # outbound IPv4 allowlist. Replace-mode semantics:
+        # outbound CIDR allowlist. Replace-mode semantics:
         # omitted → no change; non-null array → atomic
         # overwrite (empty array clears). Pro/Scale only;
         # Free/Hobby PATCH → 403 plan_egress_allowlist_not_
         # allowed. Plan caps: Pro 16 entries, Scale 64.
+        # PR-C widens the pattern from IPv4-only to v4+v6
+        # (ADR-032 already shipped the handler-side acceptance
+        # but the spec wasn't updated; pre-PR-C the validator
+        # was permissive relative to the spec, allowing
+        # `::ffff:1.2.3.0/120` because the spec said "forbid
+        # `:`" while the handler said "accept v6").
         egress_allowlist:
-          description: "IPv4 CIDR allowlist; empty array clears to chain-default-accept."
+          description: "v4 or v6 CIDR allowlist; empty array clears to chain-default-accept."
           type: array
           items:
             type: string
-            pattern: '^[0-9./]+$'
+            pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
 
     RenameAppRequest:
@@ -1737,6 +2161,18 @@ components:
 
     Unauthorized:
       description: 'code: unauthorized'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    InvalidCredentials:
+      description: 'code: invalid_credentials — wrong email or password. Drafted for the dashboard auth surface (issue #165 PR #2, ADR-032).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    ResetTokenInvalid:
+      description: 'code: reset_token_invalid | reset_token_expired — the password-reset token is unknown, already consumed, or expired.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

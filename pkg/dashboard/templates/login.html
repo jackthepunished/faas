@@ -9,23 +9,37 @@
     :root { color-scheme: light dark; }
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
     .flash { background: #fff8c5; padding: 0.5rem 1rem; border: 1px solid #e2cf6e; margin: 1rem 0; }
+    .error { background: #fde7e9; padding: 0.5rem 1rem; border: 1px solid #e0a3aa; margin: 1rem 0; }
     main { padding: 2rem 0; }
     h1 { margin-top: 0; }
     form { display: grid; gap: 0.5rem; max-width: 360px; }
     input, button { padding: 0.5rem 0.7rem; font: inherit; }
     button { cursor: pointer; }
+    .providers { display: grid; gap: 0.5rem; max-width: 360px; margin-top: 1.5rem; }
+    .oauth-link { text-decoration: none; padding: 0.5rem 0.7rem; border: 1px solid #ccc; border-radius: 4px; display: block; text-align: center; }
+    .oauth-link:hover { background: #f0f0f0; }
+    .forgot { margin-top: 0.5rem; font-size: 0.9em; }
   </style>
 </head>
 <body>
-  {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+  {{if .Flash}}
+    {{if index .Data "Error"}}<div class="error">{{.Flash}}</div>{{else}}<div class="flash">{{.Flash}}</div>{{end}}
+  {{end}}
   <main>
     <h1>{{.Title}}</h1>
     <form method="POST" action="/login">
       <label for="email">Email</label>
       <input id="email" name="email" type="email" required autocomplete="email">
-      <button type="submit">Send magic link</button>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required autocomplete="current-password" minlength="12">
+      <button type="submit">Sign in</button>
+      <p class="forgot"><a href="/login/forgot">Forgot password?</a></p>
     </form>
-    <p>Slice-3 wires the magic-link transport. Slice-2 placeholder.</p>
+    <p>No account? <a href="/signup">Sign up</a></p>
+    <div class="providers">
+      <a class="oauth-link" href="/v1/auth/google">Sign in with Google</a>
+      <a class="oauth-link" href="/v1/auth/github">Sign in with GitHub</a>
+    </div>
   </main>
 </body>
 </html>

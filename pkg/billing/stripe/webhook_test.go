@@ -109,7 +109,7 @@ func TestPushUsageRecord_DedupesHour(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
-	if err := store.UpdateAccountStripeCustomerID(ctx, acct.ID, "cus_test"); err != nil {
+	if err := store.UpdateAccountProviderCustomerID(ctx, acct.ID, "cus_test"); err != nil {
 		t.Fatalf("stripe id: %v", err)
 	}
 
@@ -135,17 +135,17 @@ func TestPushUsageRecord_DedupesHour(t *testing.T) {
 	}
 }
 
-// TestAccountByStripeCustomerID_RoundTrip: after UpdateAccountStripeCustomerID,
-// AccountByStripeCustomerID returns the same account.
-func TestAccountByStripeCustomerID_RoundTrip(t *testing.T) {
+// TestAccountByProviderCustomerID_RoundTrip: after UpdateAccountProviderCustomerID,
+// AccountByProviderCustomerID returns the same account.
+func TestAccountByProviderCustomerID_RoundTrip(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
 	acct, _ := store.CreateAccount(ctx, "rt@example.com", "hobby")
-	if err := store.UpdateAccountStripeCustomerID(ctx, acct.ID, "cus_rt"); err != nil {
+	if err := store.UpdateAccountProviderCustomerID(ctx, acct.ID, "cus_rt"); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	got, err := store.AccountByStripeCustomerID(ctx, "cus_rt")
+	got, err := store.AccountByProviderCustomerID(ctx, "cus_rt")
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
@@ -154,12 +154,12 @@ func TestAccountByStripeCustomerID_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestAccountByStripeCustomerID_NotFound: unknown Stripe customer returns
+// TestAccountByProviderCustomerID_NotFound: unknown Stripe customer returns
 // ErrNotFound (the same sentinel both backends emit).
-func TestAccountByStripeCustomerID_NotFound(t *testing.T) {
+func TestAccountByProviderCustomerID_NotFound(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
-	_, err := store.AccountByStripeCustomerID(context.Background(), "cus_unknown")
+	_, err := store.AccountByProviderCustomerID(context.Background(), "cus_unknown")
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}

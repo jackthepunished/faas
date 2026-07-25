@@ -51,7 +51,7 @@ clock-skew tolerance.
 ## Cutover procedure (Stripe → Paddle)
 
 1. **Inventory the existing customer mappings.** Stripe
-   `cus_…` values live in `accounts.stripe_customer_id`. Paddle uses
+   `cus_…` values live in `accounts.provider_customer_id`. Paddle uses
    `ctm_…`. The column is **reused** for both providers per ADR-032
    (the rename to `provider_customer_id` is a separate follow-up PR).
    New Paddle customers get fresh `ctm_…` IDs on first checkout; there
@@ -97,7 +97,7 @@ the legacy `stripe.Client`.
 | Boot fails with `paddle EnsurePlanProducts: …`             | Network egress to `api.paddle.com` blocked (or `api.sandbox.paddle.com` if sandbox=1). Check `iptables` + `FAAS_BRIDGE_OUTBOUND`. |
 | Webhook returns 503                                        | `FAAS_PADDLE_WEBHOOK_SECRET` is empty. Provider refuses to verify.            |
 | Webhook returns 400 (`code: validation_failed`)            | Signature mismatch (wrong secret in dashboard) or clock skew > 5 min.         |
-| `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.stripe_customer_id`). 200 stops Paddle from retrying; check the customer mapping. |
+| `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`). 200 stops Paddle from retrying; check the customer mapping. |
 | `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). |
 
 ## Secret rotation

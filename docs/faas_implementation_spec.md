@@ -200,7 +200,7 @@ create table accounts (
   email citext unique not null,
   plan text not null default 'free',            -- free|hobby|pro|scale
   status text not null default 'active',        -- active|past_due|suspended|deleted_pending
-  stripe_customer_id text unique,
+  provider_customer_id text unique,
   created_at timestamptz not null default now()
 );
 

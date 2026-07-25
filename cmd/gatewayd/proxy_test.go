@@ -233,10 +233,32 @@ func TestIsApidPath_TableDriven(t *testing.T) {
 		{"/login/", true},
 		{"/loginfoo", false},
 
-		// /auth/verify
+		// /signup (PR #180 — issue #165 PR #2 password surface).
+		// Sibling anchored root of /login; matches exact + subtree.
+		{"/signup", true},
+		{"/signup/", true},
+		{"/signupfoo", false},
+
+		// /login/forgot (PR #180). Subtree of /login; the anchored
+		// /login root already proxies it. apid's own router decides
+		// whether the path is a real route.
+		{"/login/forgot", true},
+		{"/login/forgot/", true},
+		{"/login/forgotfoo", true}, // falls under /login subtree
+
+		// /auth/verify (legacy magic-link consume, M7.5).
 		{"/auth/verify", true},
 		{"/auth/verify/", true},
 		{"/auth/verifyother", false},
+
+		// /auth/reset (PR #180 — issue #165 PR #2 password reset).
+		// Sibling anchored root of /auth/verify; matches exact +
+		// subtree. /auth/reset/anything reaches apid; /auth/resetfoo
+		// does NOT (anchor regression, review finding #6).
+		{"/auth/reset", true},
+		{"/auth/reset/", true},
+		{"/auth/reset/abc", true},
+		{"/auth/resetfoo", false},
 
 		// /logout
 		{"/logout", true},

@@ -50,6 +50,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// Provider name literals (FAAS_BILLING_PROVIDER). Hoisted to constants
+// so goconst sees one definition per value across LoadProviderForAPID
+// + LoadProviderForMeterd + the README + the env-var docs string.
+const (
+	providerStripe = "stripe"
+	providerPaddle = "paddle"
+)
+
 // LoadProviderForAPID returns a billing.Provider for apid's webhook
 // ingress + changePlan handler.
 //
@@ -65,10 +73,19 @@ import (
 //     populated before the first /v1/webhooks/paddle POST can land.
 //     Returns the provider + the literal "paddle" even if the catalog
 //     hydration fails — the catalog hydrates lazily on the first
-//     CreateUpgradeTransaction / FlushOverageNow call, and a transient
+//     CreateUpgradeTransaction / PushUsageRecord call, and a transient
 //     Paddle outage at boot must not take down apid (the webhook
 //     ingress is independent of the catalog). Returns the provider +
 //     the literal "paddle".
+//
+// (Note: the prior comment text mentioned a "FlushOverageNow" method.
+// That method never existed — the overage push path used an in-memory
+// pendingOverage sync.Map keyed by account, which was deleted in the
+// big-Paddle-enablement PR. The path is now stateless per-push:
+// PushUsageRecord sums the durable usage_minutes rows on every call
+// and POSTs directly. No FlushNow API, no accumulator, no rehydration
+// on boot — the Idempotency-Key header + the cross-process dedupe
+// row collapse to the same one-bill-per-(account, month) outcome.)
 //
 //   - Any other value → error so a typo fails the boot loudly.
 //
@@ -77,9 +94,9 @@ import (
 // racing the process exit.
 func LoadProviderForAPID(ctx context.Context, env func(string) string, log *slog.Logger) (billing.Provider, string, error) {
 	switch env("FAAS_BILLING_PROVIDER") {
-	case "", "stripe":
-		return nil, "stripe", nil
-	case "paddle":
+	case "", providerStripe:
+		return nil, providerStripe, nil
+	case providerPaddle:
 		apiKey := env("FAAS_PADDLE_API_KEY")
 		webhookSecret := env("FAAS_PADDLE_WEBHOOK_SECRET")
 		sandbox := env("FAAS_PADDLE_SANDBOX") == "1" || env("FAAS_PADDLE_SANDBOX") == "true"
@@ -101,7 +118,7 @@ func LoadProviderForAPID(ctx context.Context, env func(string) string, log *slog
 			log.Warn("billing: paddle EnsurePlanProducts failed at boot — upgrade 402 will degrade to 500 until next run",
 				"err", err)
 		}
-		return p, "paddle", nil
+		return p, providerPaddle, nil
 	default:
 		return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", env("FAAS_BILLING_PROVIDER"))
 	}
@@ -129,9 +146,9 @@ func LoadProviderForAPID(ctx context.Context, env func(string) string, log *slog
 // it eagerly runs EnsurePlanProducts at boot.
 func LoadProviderForMeterd(env func(string) string, store state.Store, dedupe stripe.PushDedupe, log *slog.Logger) (billing.Provider, string, error) {
 	switch env("FAAS_BILLING_PROVIDER") {
-	case "", "stripe":
-		return stripe.NewClient(store, dedupe, env("STRIPE_API_KEY"), env("STRIPE_WEBHOOK_SECRET"), log), "stripe", nil
-	case "paddle":
+	case "", providerStripe:
+		return stripe.NewClient(store, dedupe, env("STRIPE_API_KEY"), env("STRIPE_WEBHOOK_SECRET"), log), providerStripe, nil
+	case providerPaddle:
 		apiKey := env("FAAS_PADDLE_API_KEY")
 		sandbox := env("FAAS_PADDLE_SANDBOX") == "1" || env("FAAS_PADDLE_SANDBOX") == "true"
 		// meterd doesn't need the webhook secret (no ingress in meterd).
@@ -140,7 +157,7 @@ func LoadProviderForMeterd(env func(string) string, store state.Store, dedupe st
 		// added in the same PR) — mirrors how the Stripe branch above
 		// passes the same `store` as its PushDedupe.
 		p := paddle.NewProviderWithDedupe(apiKey, sandbox, log, store)
-		return p, "paddle", nil
+		return p, providerPaddle, nil
 	default:
 		return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", env("FAAS_BILLING_PROVIDER"))
 	}

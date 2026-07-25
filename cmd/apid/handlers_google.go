@@ -21,9 +21,11 @@ const (
 	googleAuthStateCookie = "faas_google_state"
 	googleAuthPath        = "/v1/auth/google"
 	googleCallbackPath    = "/v1/auth/google/callback"
-	// schemeHTTPS is the value of the X-Forwarded-Proto header (and the
-	// tld of the redirect scheme) when the request was served over TLS.
-	// Lifted to a const so goconst doesn't flag the repeated literal.
+	// schemeHTTP + schemeHTTPS are the URL schemes used in the OAuth
+	// redirect / domain helper. Lifted to package-level consts so
+	// goconst doesn't flag the repeated literals across the auth
+	// handlers (handlers_github.go, handlers_auth_login.go).
+	schemeHTTP  = "http"
 	schemeHTTPS = "https"
 )
 
@@ -68,7 +70,7 @@ func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request
 	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}
@@ -116,7 +118,7 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
 	if redirectURI == "" {
 		host := r.Host
-		scheme := "http"
+		scheme := schemeHTTP
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 			scheme = schemeHTTPS
 		}
@@ -181,8 +183,21 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Provision or fetch account
-	acct, err := s.provisionOrFetchGoogleAccount(r.Context(), googleUser.Email)
+	// Enforce email_verified (issue #165 PR #2, ADR-032). The pre-#165
+	// handler parsed VerifiedEmail but never checked it; a Google
+	// account with an unverified primary email could mint a session.
+	// We never mint an unverified session — the customer can verify
+	// the email on Google's side and retry.
+	if !googleUser.VerifiedEmail {
+		api.WriteProblem(w, api.ErrEmailNotVerified("google"))
+		return
+	}
+
+	// Provision or fetch account. The full googleUser struct is
+	// passed so the helper can do a sub-first lookup against the
+	// oauth_links table — the §11 anti-takeover invariant
+	// (one OAuth subject binds to one account, period).
+	acct, err := s.provisionOrFetchGoogleAccount(r.Context(), googleUser)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Account Error", err.Error()))
 		return
@@ -214,13 +229,52 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 	http.Redirect(w, r, redirectTarget, http.StatusFound)
 }
 
-func (s *server) provisionOrFetchGoogleAccount(ctx context.Context, email string) (state.Account, error) {
-	email = strings.TrimSpace(strings.ToLower(email))
+func (s *server) provisionOrFetchGoogleAccount(ctx context.Context, info GoogleUserInfo) (state.Account, error) {
+	email := strings.TrimSpace(strings.ToLower(info.Email))
+
+	// Sub-first lookup (spec §11 anti-takeover invariant, issue #165
+	// PR #2). The (provider, sub) composite is the primary key on
+	// oauth_links; the first party to bind a sub owns the row.
+	// A later password-account with the same email cannot claim
+	// the link — see pkg/state/pgstore.go::UpsertOAuthLink.
+	if link, err := s.store.OAuthLinkByProviderSubject(ctx, "google", info.ID); err == nil {
+		acct, err := s.store.AccountByID(ctx, link.AccountID)
+		if err == nil {
+			return acct, nil
+		}
+		// Link references a missing account: fall through to
+		// email-based recovery. The link was created against a
+		// deleted account; the row stays orphaned or will be
+		// re-bound below.
+	}
+
+	// Sub not bound. Check email — if a legacy account (pre-#165,
+	// pre-OAuth) already exists at this email, we bind the link to
+	// it. This is the "user had a password account, then signs in
+	// with Google" case.
 	acct, err := s.store.AccountByEmail(ctx, email)
 	if err == nil {
+		// Bind the link to the existing account. UpsertOAuthLink
+		// returns ErrConflict on a different-account re-bind
+		// (handled by the sub-first lookup above), so this is
+		// safe.
+		if err := s.store.UpsertOAuthLink(ctx, acct.ID, "google", info.ID, email, info.VerifiedEmail); err != nil {
+			s.log.Error("google.upsert_link", "err", err)
+		}
 		return acct, nil
 	}
 
-	// Account does not exist yet: Provision new account
-	return s.store.CreateAccount(ctx, email, api.PlanFree)
+	// Neither sub nor email is bound: create a fresh account on
+	// the Free plan and bind the link.
+	created, err := s.store.CreateAccount(ctx, email, api.PlanFree)
+	if err != nil {
+		return state.Account{}, err
+	}
+	if err := s.store.UpsertOAuthLink(ctx, created.ID, "google", info.ID, email, info.VerifiedEmail); err != nil {
+		// The link is the §11 invariant. Log but don't fail the
+		// sign-in — the customer can re-trigger the bind on the
+		// next login.
+		s.log.Error("google.upsert_link", "err", err)
+	}
+	return created, nil
 }

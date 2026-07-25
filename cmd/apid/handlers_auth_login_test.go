@@ -24,8 +24,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -52,7 +54,7 @@ func TestLogin_ArbitraryEmailDoesNotSetSession(t *testing.T) {
 	// store — the bug fires whether or not the account is present,
 	// because pre-#165 the handler auto-created it.
 	const victim = "victim@example.com"
-	form := url.Values{"email": {victim}}
+	form := url.Values{"email": {victim}, "password": {"any-password-1234567890"}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// Deliberately do NOT set X-Dashboard-Key.
@@ -101,7 +103,7 @@ func TestLogin_UnknownEmailWithoutKeyCollapsesTo401(t *testing.T) {
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
 	h := srv.handler()
 
-	form := url.Values{"email": {"ghost@example.com"}}
+	form := url.Values{"email": {"ghost@example.com"}, "password": {"any-password-1234567890"}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -119,11 +121,11 @@ func TestLogin_UnknownEmailWithoutKeyCollapsesTo401(t *testing.T) {
 	}
 }
 
-// TestLogin_InvalidKeyFormatReturns401 covers the cheap pre-check
-// path: a header that does not match the api_key format returns
-// 401 before the store is touched. Confirms the handler does not
-// leak "valid email, malformed key" as a distinct response.
-func TestLogin_InvalidKeyFormatReturns401(t *testing.T) {
+// TestLogin_EmptyPasswordReturns400 covers the input-shape pre-check
+// path: a POST /login with a missing password field returns 400
+// before the Argon2id verify runs. Confirms the handler does not
+// leak "valid email, missing password" as a distinct response.
+func TestLogin_EmptyPasswordReturns400(t *testing.T) {
 	store := state.NewMemStore()
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
 	h := srv.handler()
@@ -131,56 +133,46 @@ func TestLogin_InvalidKeyFormatReturns401(t *testing.T) {
 	form := url.Values{"email": {"alice@example.com"}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set(dashboardKeyHeader, "not-a-real-key")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("/login status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("/login status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	if got := body["code"]; got != api.CodeInvalidCredentials {
-		t.Errorf("code = %v, want %q", got, api.CodeInvalidCredentials)
+	if got := body["code"]; got != api.CodeValidation {
+		t.Errorf("code = %v, want %q", got, api.CodeValidation)
 	}
 }
 
-// TestLogin_KeyResolvesButEmailMismatchReturns401 covers the
-// email/key mismatch path: a valid-format key resolves to a
-// real account, but the submitted form email doesn't match the
-// account's email. The handler must collapse this to 401
-// invalid_credentials with the same body as the no-match case —
-// an attacker must not learn that the key is valid for some
-// other account.
-func TestLogin_KeyResolvesButEmailMismatchReturns401(t *testing.T) {
+// TestLogin_BoundEmailPasswordMismatchReturns401 covers the wrong-
+// password path: alice has an account with a real password, but
+// the form submits the wrong password. The handler must collapse
+// to 401 invalid_credentials with the same body as the no-account
+// path — an attacker must not learn that the email is bound.
+func TestLogin_BoundEmailPasswordMismatchReturns401(t *testing.T) {
 	store := state.NewMemStore()
-	// Seed: account alice@example.com with a valid "web-console"
-	// key (the label matters because that's the only key category
-	// the legacy path minted).
 	acct, err := store.CreateAccount(context.Background(), "alice@example.com", api.PlanFree)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, hash, err := api.GenerateAPIKey()
+	phc, err := auth.Encode("correct-horse-battery-staple")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "web-console", api.DefaultScopes()); err != nil {
+	if err := store.SetAccountPassword(context.Background(), acct.ID, phc); err != nil {
 		t.Fatal(err)
 	}
 
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
 	h := srv.handler()
 
-	// Submit form email "mallory@example.com" but a valid key
-	// belonging to alice. The handler must NOT issue a session
-	// for mallory.
-	form := url.Values{"email": {"mallory@example.com"}}
+	form := url.Values{"email": {"alice@example.com"}, "password": {"wrong-password-1234567890"}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set(dashboardKeyHeader, plaintext)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -189,8 +181,8 @@ func TestLogin_KeyResolvesButEmailMismatchReturns401(t *testing.T) {
 	}
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == sessionCookie && c.Value != "" {
-			t.Errorf("faas_sid cookie set on email/key mismatch; " +
-				"a stolen key + a different email must not grant a session")
+			t.Errorf("faas_sid cookie set on wrong-password /login; " +
+				"the §11 anti-enumeration pad must not surface a session")
 		}
 	}
 	var body map[string]any
@@ -202,38 +194,34 @@ func TestLogin_KeyResolvesButEmailMismatchReturns401(t *testing.T) {
 	}
 }
 
-// TestLogin_ValidKeyAndMatchingEmailIssuesSessionAndNoAPIKeyInBody
-// is the happy-path counterpart to the bug regression. It exercises
-// the legitimate sign-in for a pre-#165 customer: the customer's
-// own email + their pre-existing "web-console" API key → 200 +
-// faas_sid session cookie + body {status, account} with NO api_key.
-//
-// This is the contract PR #1 ships to existing customers: their
-// flow still works (they had a web-console key from before), the
-// surface no longer mints new keys, and the body never reveals a
-// key (the customer already holds theirs from the buggy deploy).
-func TestLogin_ValidKeyAndMatchingEmailIssuesSessionAndNoAPIKeyInBody(t *testing.T) {
+// TestLogin_ValidPasswordIssuesSessionAndNoAPIKeyInBody is the
+// happy-path counterpart to the bug regression. PR #2 replaces
+// the X-Dashboard-Key path with email + password (Argon2id). The
+// response body is {account_id, plan} — NO api_key field. The
+// pre-#165 handler returned the freshly minted key here, which
+// made the takeover reproducible in a single curl.
+func TestLogin_ValidPasswordIssuesSessionAndNoAPIKeyInBody(t *testing.T) {
 	store := state.NewMemStore()
 	const email = "alice@example.com"
 	acct, err := store.CreateAccount(context.Background(), email, api.PlanFree)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, hash, err := api.GenerateAPIKey()
+	const password = "correct-horse-battery-staple"
+	phc, err := auth.Encode(password)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "web-console", api.DefaultScopes()); err != nil {
+	if err := store.SetAccountPassword(context.Background(), acct.ID, phc); err != nil {
 		t.Fatal(err)
 	}
 
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
 	h := srv.handler()
 
-	form := url.Values{"email": {email}}
+	form := url.Values{"email": {email}, "password": {password}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set(dashboardKeyHeader, plaintext)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -253,7 +241,9 @@ func TestLogin_ValidKeyAndMatchingEmailIssuesSessionAndNoAPIKeyInBody(t *testing
 	}
 
 	// Body MUST NOT have api_key. Even on a successful login, the
-	// response must not leak a key — the customer already has one.
+	// response must not leak a key — the SDK uses the device-code
+	// flow for API access, and the dashboard cookie is the only
+	// auth artifact on the browser side.
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode body: %v", err)
@@ -262,8 +252,8 @@ func TestLogin_ValidKeyAndMatchingEmailIssuesSessionAndNoAPIKeyInBody(t *testing
 		t.Errorf("response body has api_key field on valid login; " +
 			"this is the #165 leak path")
 	}
-	if got := body["status"]; got != "ok" {
-		t.Errorf("status = %v, want \"ok\"", got)
+	if got := body["account_id"]; got != acct.ID {
+		t.Errorf("account_id = %v, want %q", got, acct.ID)
 	}
 }
 
@@ -276,7 +266,7 @@ func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
 	h := srv.handler()
 
-	form := url.Values{"email": {"newcomer@example.com"}}
+	form := url.Values{"email": {"newcomer@example.com"}, "password": {"any-password-1234567890"}}
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -293,5 +283,103 @@ func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 	}
 	if len(accts) != 0 {
 		t.Errorf("auto-created %d account(s) on a 401 /login; this is the #165 root cause", len(accts))
+	}
+}
+
+// TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths pins the
+// §11 anti-enumeration closure. The handler's three failure modes
+// (unbound email, OAuth-only account with no password row, wrong
+// password) all run exactly one Argon2id verify against identical
+// parameters — the timing oracle must be closed so an attacker
+// cannot distinguish "no such account" from "wrong password" by
+// response time.
+//
+// We measure wall-time for each failure mode and assert the slowest
+// is within 3x the fastest. The Argon2id verify dominates the budget
+// (m=64MiB, t=1, p=2 → ~50ms on the EX44); the surrounding
+// store-lookup overhead is sub-millisecond. A regression that
+// short-circuits the no-account path with `if err != nil { return }
+// ` would re-open the timing oracle and trip this test.
+func TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths(t *testing.T) {
+	store := state.NewMemStore()
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+
+	// Pre-seed: one OAuth-only account (no password row), one
+	// password account with a real Argon2id hash.
+	oauthOnly, err := store.CreateAccount(context.Background(), "oauth-only@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pwAcct, err := store.CreateAccount(context.Background(), "pw-user@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountPassword(context.Background(), pwAcct.ID,
+		"$argon2id$v=19$m=65536,t=1,p=2$IWe/FcOEMwkECtSQIvrVzQ$KKo93VKUFEZKsJPb2ovaTfi0MbZQdU4EWw7DjfV9j1c"); err != nil {
+		t.Fatal(err)
+	}
+	const password = "any-password-1234567890"
+
+	// Warm: one verify of the dummy PHC so the runtime cost is
+	// paid before the first measurement (argon2.IDKey can JIT on
+	// the first call; this keeps the timing assertion honest).
+	_, _ = auth.Verify(auth.DummyPHC, "warmup-not-measured")
+
+	measure := func(label, email string) time.Duration {
+		t0 := time.Now()
+		_, ok := srv.verifyPasswordOrPad(context.Background(), email, password)
+		d := time.Since(t0)
+		if ok {
+			t.Fatalf("%s: verifyPasswordOrPad returned ok=true (want false)", label)
+		}
+		return d
+	}
+
+	// Run each path three times and take the minimum; OS scheduler
+	// jitter dominates a single sample on shared CI runners.
+	minOf := func(label, email string) time.Duration {
+		var m time.Duration = 1 << 62
+		for i := 0; i < 3; i++ {
+			if d := measure(label, email); d < m {
+				m = d
+			}
+		}
+		return m
+	}
+
+	unbound := minOf("unbound", "ghost@example.com")
+	noRow := minOf("no-row", oauthOnly.Email)
+	wrongPW := minOf("wrong-password", pwAcct.Email)
+	t.Logf("timing pad: unbound=%s no-row=%s wrong-pw=%s", unbound, noRow, wrongPW)
+
+	// All three should be within 3x of each other. The Argon2id
+	// verify (~50ms on the EX44) dominates the budget; a 3x ratio
+	// accommodates a 2x Argon2id cost variance and ~1x store-lookup
+	// overhead. The pre-#165 handler's `if err != nil { return }`
+	// path would finish in microseconds and trip this assertion by
+	// orders of magnitude.
+	slowest := unbound
+	if noRow > slowest {
+		slowest = noRow
+	}
+	if wrongPW > slowest {
+		slowest = wrongPW
+	}
+	fastest := unbound
+	if noRow < fastest {
+		fastest = noRow
+	}
+	if wrongPW < fastest {
+		fastest = wrongPW
+	}
+	if fastest == 0 {
+		// Argon2id should always cost >0; if a future shortcut
+		// makes the verify free, fail loudly so the timing-pad
+		// regression is caught at the assertion, not at the
+		// production timing oracle.
+		t.Fatalf("fastest path measured 0ns; Argon2id cost has been bypassed on one of the three paths")
+	}
+	if ratio := float64(slowest) / float64(fastest); ratio > 3.0 {
+		t.Errorf("timing pad: slowest/fastest = %.2fx, want < 3x (the §11 anti-enumeration closure has been short-circuited on one path)", ratio)
 	}
 }

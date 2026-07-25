@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -41,32 +43,74 @@ type Provider struct {
 	client        *paddle.SDK
 	log           *slog.Logger
 	catalog       *priceCatalog
-	// pendingOverage accumulates mb_seconds between month-rollovers,
-	// keyed by acct.ID. PushUsageRecord adds to it on every non-rollover
-	// call; month-rollover triggers flushOverageLocked which emits the
-	// prior-month line item. Mutex serializes the per-account
-	// accumulation.
-	pendingOverage sync.Map // map[string]*overageAccumulator
-	flushFn        FlushFn  // test seam; nil → defaultFlushLocked (production)
+	// flushFn is the test seam defaultFlushLocked is reached through.
+	// nil → defaultFlushLocked (production). The seam matters: the PR
+	// that introduced the stateless per-push shape (this PR) needed a
+	// way to assert "no SDK POST fired" without standing up a real
+	// *paddle.SDK, and counter stubs are the cheapest way to do that.
+	//
+	// Kept on the Provider (not on a constructor-level opts struct) so
+	// the test code can swap flushFn on a single constructed instance
+	// instead of re-constructing the whole provider per test case.
+	flushFn FlushFn
 	// dedupe is the state-store-backed cross-process gate consulted
 	// before each Paddle CreateTransaction POST and stamped after.
 	// nil → within-process dedupe only (apid's path; apid never pushes
-	// overage, so the only accumulator is meterd's). meterd wires it
-	// via NewProviderWithDedupe so a crash between POST and stamp
-	// cannot cause a second POST on the next process boot.
+	// overage, so the only writer is meterd's). meterd wires it via
+	// NewProviderWithDedupe so a crash between POST and stamp cannot
+	// cause a second POST on the next process boot.
 	dedupe PaddleOverageDedupe
 	// createUpgradeTxnFn is the seam CreateUpgradeTransaction delegates
 	// to. Tests substitute a counter/recorder stub so they can assert
 	// the SDK request shape (price handle, CustomData, Idempotency-Key
 	// tag) without standing up a full *paddle.SDK. nil → the default
-	// production body (same call shape as defaultFlushLocked).
+	// production body (defaultCreateUpgradeTxn).
 	createUpgradeTxnFn CreateUpgradeTxnFn
 	now                func() time.Time
+	// instanceID is the free-form identity stamp passed into
+	// ClaimPaddleOverageWindow — used by ops to identify which
+	// process holds the claim when a stuck row is investigated.
+	// Stable for the life of the process (computed once at
+	// construction); not a uniqueness constraint, the
+	// (account_id, window_start) PK is.
+	instanceID string
+}
+
+// paddleOverageLease is the lease window for a ClaimPaddleOverageWindow
+// row. Long enough to absorb a slow Paddle POST (p99 historically
+// < 30s); short enough that a crashed pod's claim is reaped within
+// one boot-cycle of any peer. Configurable later via env if needed.
+const paddleOverageLease = 5 * time.Minute
+
+// claimedBy returns the per-process identity stamp used to mark
+// paddle_overage_dedupe rows in the claimed_by column. Falls back
+// to a static sentinel if HOSTNAME / POD_NAME are unset so dev
+// hosts still produce a non-empty value for ops debugging.
+func (p *Provider) claimedBy() string {
+	if p.instanceID != "" {
+		return p.instanceID
+	}
+	if h := os.Getenv("HOSTNAME"); h != "" {
+		return h
+	}
+	if h := os.Getenv("POD_NAME"); h != "" {
+		return h
+	}
+	return "paddle-push"
 }
 
 // NewProvider wires the Paddle v5 SDK. sandbox=true →
 // api.sandbox.paddle.com (operator's free sandbox); false →
 // api.paddle.com (production).
+//
+// The SDK is initialized with a custom HTTP client whose Transport
+// is wrapped by NewIdempotencyRT — every Writes request the SDK
+// emits (CreateTransaction, etc.) flows through the wrapper, which
+// copies X-Transit-Id (set by the SDK from paddle.ContextWithTransitID)
+// as Idempotency-Key on POST /transactions. See transport.go for the
+// full design rationale. The paddle-go-sdk/v5@v5.2.0 SDK exposes
+// paddle.WithClient(c client.HTTPDoer) for this — the *http.Client
+// we pass satisfies that interface via its Do method.
 //
 // Catalog + time hooks are initialized lazily so tests can construct
 // without live configuration. EnsurePlanProducts must be called
@@ -78,10 +122,11 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) *
 	}
 	var client *paddle.SDK
 	var err error
+	httpClient := &http.Client{Transport: NewIdempotencyRT(http.DefaultTransport)}
 	if sandbox {
-		client, err = paddle.NewSandbox(apiKey)
+		client, err = paddle.NewSandbox(apiKey, paddle.WithClient(httpClient))
 	} else {
-		client, err = paddle.New(apiKey)
+		client, err = paddle.New(apiKey, paddle.WithClient(httpClient))
 	}
 	if err != nil {
 		// NewSandbox / New only fail on programmer error (invalid
@@ -113,6 +158,65 @@ func NewProviderWithDedupe(apiKey string, sandbox bool, log *slog.Logger, dedupe
 	p := NewProvider(apiKey, "", sandbox, log)
 	p.dedupe = dedupe
 	return p
+}
+
+// NewProviderForTest is the test-only constructor that returns a
+// *Provider with a stubbed SDK client. Tests inject a flushFn stub
+// so the SDK is never invoked. Used by pkg/meter's
+// TestPushHour_PaddleDispatchHitsPaddleHistogram to construct a real
+// *paddle.Provider concrete type — providerOpsFor's type-switch
+// dispatches on concrete type, so the dispatch seam is only
+// exercisable with a real *Provider value, not a test fake satisfying
+// only the Provider interface.
+//
+// The SDK is constructed as &paddle.SDK{} (non-nil, zero-value) so
+// PushUsageRecord's pre-SDK guards (ErrNoAPIKey on nil client) pass
+// through. The flushFn stub intercepts before any real SDK call.
+// The apiKey is unused (no real init). The log is required so the
+// test caller controls the slog sink; nil falls back to slog.Default().
+func NewProviderForTest(log *slog.Logger) *Provider {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Provider{
+		apiKey:  "test-key",
+		client:  &paddle.SDK{}, // non-nil placeholder; never invoked (flushFn stub intercepts)
+		log:     log,
+		catalog: &priceCatalog{planMonthly: map[api.Plan]string{}, planOverage: map[api.Plan]string{}, planCustomers: map[api.Plan]string{}},
+		now:     time.Now,
+	}
+}
+
+// FlushFnForTest swaps in a flushFn stub. Tests use this to
+// substitute the production defaultFlushLocked with a counter or
+// recorder so the SDK is never invoked. Lives at package scope
+// (not on the *Provider) so test packages from outside this
+// directory can reach for it without exposing the field directly.
+//
+// Mirrors the pattern at pkg/billing/stripe/client.go where the
+// SDK push is also seam-driven for testability.
+func (p *Provider) FlushFnForTest(fn FlushFn) {
+	p.flushFn = fn
+}
+
+// SetOveragePriceForTest primes the catalog's planOverage entry for
+// a plan, bypassing EnsurePlanProducts (which requires a live SDK).
+// Tests use this to construct a Provider that reaches defaultFlushLocked
+// without standing up a real catalog hydration.
+func (p *Provider) SetOveragePriceForTest(plan api.Plan, priceID string) {
+	p.catalog.mu.Lock()
+	defer p.catalog.mu.Unlock()
+	if p.catalog.planOverage == nil {
+		p.catalog.planOverage = map[api.Plan]string{}
+	}
+	p.catalog.planOverage[plan] = priceID
+}
+
+// SetDedupeForTest swaps the dedupe gate. nil disables the gate —
+// useful when the test wants to exercise the flushFn directly
+// without driving the claim state machine.
+func (p *Provider) SetDedupeForTest(d PaddleOverageDedupe) {
+	p.dedupe = d
 }
 
 // Compile-time conformance to billing.Provider. Adding a method to the
@@ -148,33 +252,50 @@ func (p *Provider) ensurePlansAndPrices(ctx context.Context) error {
 	return p.ensureProducts(ctx)
 }
 
-// PushUsageRecord: per-hour int64 mb_seconds accumulation that
-// flushes the prior month's value to Paddle as a flat-rate line
-// item when the calendar month rolls over. Paddle Billing v2 has
-// no equivalent of Stripe's metered subscription_item — the
-// closest shape is a single Transactions POST with a price_id
-// (the overage line item) and quantity 1.
+// PushUsageRecord: per-push stateless overage flush. Paddle Billing v2
+// has no equivalent of Stripe's metered subscription_item — the shape
+// is a single Transactions POST with a price_id (the overage line item)
+// and quantity 1. The meterd pusher loop sums that month's mb_seconds
+// from usage_minutes rows on every tick and calls this with the sum.
+//
+// The pre-SDK guards (no apiKey, negative qty, missing overage price)
+// return sentinels from usage.go so the classifier at errors.go can
+// map them to stable Prometheus labels. Adding a new pre-SDK failure
+// mode requires adding a sentinel + a label — the closed label set is
+// the dashboard's panel surface, so the change is deliberate.
 //
 // Concurrency: meter (cmd/meterd) calls this from a single loop
 // goroutine; apid's webhook handler does not. The meter's loop
 // holds a single contract: at most one outstanding call per
-// (acct.ID, hour-or-month). Tests pin that contract.
+// (acct.ID, month). Tests pin that contract.
 //
-// Idempotency: each Cross-Month flush carries an Idempotency-Key
-// header derived from (acct.ID, prior-month) so a redelivered month-
-// rollover is a no-op — the same pattern Stripe's Idempotency-Key
-// contract translates to directly (PR #1 surface).
+// Idempotency: each call carries an Idempotency-Key header derived
+// from (acct.ID, month) via the NewIdempotencyRT wrapper installed
+// at NewProvider. The cross-process dedupe gate (HasPaddleOverageMonth
+// / RecordPaddleOverageMonth) collapses on the same shape so a
+// redelivered month — across a meterd restart or a stripe-vs-paddle
+// test path — is a no-op before the SDK is invoked. Paddle's API
+// server may not honor Idempotency-Key today (SDK team is working
+// on native support); the header presence is observable on the wire
+// for ops debugging and is forward-compat.
 func (p *Provider) PushUsageRecord(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	if p.client == nil {
-		return fmt.Errorf("paddle: SDK not initialized")
+		return fmt.Errorf("%w (account %s)", ErrNoAPIKey, acct.ID)
 	}
 	if acct.Email == "" {
 		return errors.New("paddle: PushUsageRecord requires acct.Email")
 	}
 	if mbSeconds < 0 {
-		return errors.New("paddle: PushUsageRecord rejects negative mb_seconds")
+		return fmt.Errorf("paddle: PushUsageRecord: %w (account %s, qty %d)", ErrNegativeMBSeconds, acct.ID, mbSeconds)
 	}
-	return p.accumulateOverage(ctx, acct, hour, mbSeconds)
+	if mbSeconds == 0 {
+		// Defensive: meterd pusher loop filters 0-sum pushes before
+		// calling us, but the guard is here for future callers (tests,
+		// other ingress paths). flushOverageLocked has the same guard so
+		// both surfaces are idempotent on 0.
+		return nil
+	}
+	return p.flushOverageLocked(ctx, acct, hour, mbSeconds)
 }
 
 // VerifyWebhook: HMAC-SHA256 over "<unix>:<body>" with the

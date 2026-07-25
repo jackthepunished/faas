@@ -88,10 +88,10 @@ type Account struct {
 	Email  string
 	Plan   api.Plan
 	Status AccountStatus
-	// StripeCustomerID is the per-account `cus_…` returned by Stripe when
+	// ProviderCustomerID is the per-account `cus_…` returned by Stripe when
 	// the customer signs up (spec §4.7). The unique index makes it a
 	// stable webhook lookup key.
-	StripeCustomerID string
+	ProviderCustomerID string
 	// StripeSubscriptionItem is the per-account `si_…` (metered
 	// subscription item) that meterd pushes hourly usage against
 	// (issue #52, §4.7). Empty until pkg/billing/stripe::EnsureCustomer
@@ -564,6 +564,47 @@ type CliAuthCode struct {
 	AccountID  string // empty until ClaimCliAuthCode
 	ExpiresAt  time.Time
 	ConsumedAt *time.Time
+}
+
+// AccountPassword is one row of the account_passwords table
+// (issue #165 / ADR-032 PR #2). It carries the Argon2id PHC string
+// for an account that has set a password. OAuth-only accounts have
+// no row — the absence of a row is the signal that an OAuth-only
+// flow is required to mint a session on that account.
+//
+// Hash is the PHC wire format ($argon2id$v=19$m=...,t=...,p=...$<salt>$<hash>),
+// produced by pkg/auth.Encode. The Argon2id parameters (memory,
+// time, threads) are EMBEDDED in the stored string so a future
+// parameter bump is a no-op migration.
+//
+// UpdatedAt is stamped at every SetAccountPassword call. A future
+// "rotate hash on login" hardening (PR #2.5 follow-up) reads this
+// to decide whether to re-hash.
+type AccountPassword struct {
+	AccountID string
+	Hash      string
+	UpdatedAt time.Time
+}
+
+// OAuthLink is one row of the oauth_links table (issue #165 /
+// ADR-032 PR #2). It binds an OAuth (provider, subject) pair to
+// exactly one account_id. The composite primary key on the table
+// enforces the §11 anti-takeover invariant: one OAuth subject maps
+// to one account, period.
+//
+// Email is captured at link time so the dashboard can render "this
+// Google account is bound" without a re-fetch. EmailVerified is a
+// snapshot of the provider's email_verified value at link time.
+// Once true at link, the row stays; a future "re-verify" flow can
+// refresh EmailVerified (ADR-032 "Open follow-ups"). Per spec §11,
+// no session is ever minted with EmailVerified=false at link time.
+type OAuthLink struct {
+	Provider        string // "google" | "github" | (future providers)
+	ProviderSubject string // Google's `sub`, GitHub's numeric `id`
+	AccountID       string
+	Email           string
+	EmailVerified   bool
+	CreatedAt       time.Time
 }
 
 // LogEntry is one line of build output for a deployment (slice 5).

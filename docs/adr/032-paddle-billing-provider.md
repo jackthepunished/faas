@@ -41,9 +41,9 @@ those).
    `billing_portal_url` or `paddle_checkout_url`+`tx_id` is set on the
    RFC 7807 Problem extensions.
 
-3. **`accounts.stripe_customer_id` is reused for the Paddle
+3. **`accounts.provider_customer_id` is reused for the Paddle
    `ctm_…` customer id.** A column rename
-   (`stripe_customer_id` → `provider_customer_id`) is a separate, smaller
+   (`provider_customer_id` → `provider_customer_id`) is a separate, smaller
    migration PR — out of scope here to keep this PR reviewable in
    ~10 minutes. The state.Store mirror methods
    `AccountByPaddleCustomerID` + `UpdateAccountPaddleCustomerID` are
@@ -84,7 +84,7 @@ those).
 ### Negative / deferred
 
 - The column-rename is a follow-up. Until then, the
-  `accounts.stripe_customer_id` column carries the Paddle `ctm_…` value,
+  `accounts.provider_customer_id` column carries the Paddle `ctm_…` value,
   and any grep against the column name produces false positives. The
   dedicated `AccountByPaddleCustomerID` / `UpdateAccountPaddleCustomerID`
   methods keep the call sites self-documenting.

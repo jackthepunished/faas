@@ -668,3 +668,63 @@ func ErrInvalidScheduledAt() *Problem {
 		"scheduled_at must be a future timestamp; the server clock rejected the value").
 		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
 }
+
+// --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
+
+// ErrInvalidCredentials is the 401 returned by POST /login (and the
+// colliding /signup anti-enumeration path). The body is identical
+// whether the email is unbound, the password is wrong, or the account
+// has no password row — the spec §11 anti-enumeration invariant. The
+// constant-time Argon2id pad on the no-account path closes the timing
+// oracle; the response body and the wire status are the same on both
+// branches.
+func ErrInvalidCredentials() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeInvalidCredentials,
+		"Sign in failed",
+		"email or password is incorrect.").
+		WithDocs("https://docs.DOMAIN/auth/sign-in")
+}
+
+// ErrEmailNotVerified is the 401 returned by the Google / GitHub OAuth
+// callback when the provider's profile has no primary verified email.
+// Distinct from invalid_credentials because the customer can fix it
+// upstream (verify the email on the provider) and retry. We never
+// mint an unverified session.
+func ErrEmailNotVerified(provider string) *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeEmailNotVerified,
+		"Email not verified",
+		fmt.Sprintf("the %s account's primary email is not verified; verify it on the provider and retry.", provider)).
+		WithDocs("https://docs.DOMAIN/auth/oauth")
+}
+
+// ErrPasswordTooWeak is the 400 returned by POST /signup and POST
+// /auth/reset when the password fails the NIST-style floor (≥12 chars,
+// no complexity rules). The Detail names the rule so the form can
+// highlight which constraint tripped.
+func ErrPasswordTooWeak(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodePasswordTooWeak,
+		"Password too weak", reason).
+		WithDocs("https://docs.DOMAIN/auth/password")
+}
+
+// ErrResetTokenInvalid is the 410 returned by GET / POST /auth/reset
+// when the token doesn't exist (unknown / typo'd / already consumed).
+// 410 Gone is the right status: the resource was a one-shot and is
+// no longer addressable.
+func ErrResetTokenInvalid() *Problem {
+	return NewProblem(http.StatusGone, CodeResetTokenInvalid,
+		"Reset link invalid",
+		"this password-reset link is unknown or has already been used.").
+		WithDocs("https://docs.DOMAIN/auth/reset")
+}
+
+// ErrResetTokenExpired is the 410 returned by GET / POST /auth/reset
+// when the token has aged past the 15-minute TTL. Same 410 as the
+// invalid-token case but distinct code so the dashboard can render
+// "link expired, request a new one" vs "link is invalid".
+func ErrResetTokenExpired() *Problem {
+	return NewProblem(http.StatusGone, CodeResetTokenExpired,
+		"Reset link expired",
+		"this password-reset link has expired; request a new one.").
+		WithDocs("https://docs.DOMAIN/auth/reset")
+}
