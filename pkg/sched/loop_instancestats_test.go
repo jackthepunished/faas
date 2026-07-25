@@ -30,10 +30,10 @@ import (
 // implementation the loop tests can drive. Counts Tick calls;
 // optional error injection per call; interval is fixed.
 type fakeInstStats struct {
-	mu      sync.Mutex
-	ticks   atomic.Int64
+	mu       sync.Mutex
+	ticks    atomic.Int64
 	interval time.Duration
-	err     error
+	err      error
 }
 
 func (f *fakeInstStats) Tick(_ context.Context) error {

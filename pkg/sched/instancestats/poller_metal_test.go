@@ -106,7 +106,7 @@ func TestMetalStats_CgroupStatsReadsRealKernelFiles(t *testing.T) {
 	requireCgroupV2Mount(t)
 	reader := cgroupstats.NewWithDefaults()
 	instance := "_test_cgroupstats_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	const cpuUsage uint64 = 1_500_000 // 1.5s of cumulative usage
+	const cpuUsage uint64 = 1_500_000   // 1.5s of cumulative usage
 	const rss int64 = 256 * 1024 * 1024 // 256 MiB
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, cpuUsage, rss)
 	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join("/sys/fs/cgroup", "faas-tenant.slice", instance)) })

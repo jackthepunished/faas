@@ -52,8 +52,8 @@ import (
 // map. Mirrors the heartbeat test's fakeDialer shape (issue #120).
 type statsFakeDialer struct {
 	mu      sync.Mutex
-	dials   []string  // targetURLs in Dial call order
-	closed  int       // number of VMM clients closed by the poller
+	dials   []string // targetURLs in Dial call order
+	closed  int      // number of VMM clients closed by the poller
 	dialErr map[string]error
 	stats   map[string]*sched.StatsSnapshot // targetURL → snapshot
 }
@@ -655,7 +655,7 @@ func TestPoller_UnknownInstanceFiltered(t *testing.T) {
 				Instances: []sched.VMInstanceStat{
 					{InstanceID: known.ID, ResidentBytes: ptrI64(64 * 1024 * 1024)},
 					{InstanceID: "ghost-id", ResidentBytes: ptrI64(64 * 1024 * 1024)}, // not in store
-					{InstanceID: "", ResidentBytes: ptrI64(64 * 1024 * 1024)},          // empty id
+					{InstanceID: "", ResidentBytes: ptrI64(64 * 1024 * 1024)},         // empty id
 				},
 			},
 		},

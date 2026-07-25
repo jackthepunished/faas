@@ -228,8 +228,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Outbound ForwardHTTP count in flight, per (app, node) — sum over live siblings (issue #170 / PR-A). Load rollup.",
 	}, []string{"app", "node"})
 	instanceStatsCollectDur := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: prefix + "_instance_stats_collect_seconds",
-		Help: "Per-Tick wall-clock duration of the instancestats poller (issue #170 / PR-A). Buckets sized to the 200 ms polling interval.",
+		Name:    prefix + "_instance_stats_collect_seconds",
+		Help:    "Per-Tick wall-clock duration of the instancestats poller (issue #170 / PR-A). Buckets sized to the 200 ms polling interval.",
 		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0},
 	})
 	instanceStatsPartialErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -459,10 +459,10 @@ func (m *OpsMetrics) ReplaceInstanceStats(rows []InstanceStatRow, dur time.Durat
 	// Roll into per-(app,node) buckets. The map key is the
 	// (app, node) tuple — same string form used as the Prom label.
 	type acc struct {
-		maxCPU   float64
-		hasCPU   bool
-		sumRSS   float64
-		sumInfl  int64
+		maxCPU  float64
+		hasCPU  bool
+		sumRSS  float64
+		sumInfl int64
 	}
 	rolled := make(map[string]*acc, len(rows))
 	for _, r := range rows {

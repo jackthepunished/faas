@@ -15,7 +15,7 @@
 //   - Poller: the periodic worker. Mirrors pkg/sched.Heartbeat
 //     (Dialer, Tick, Run, dial-per-node, partial-failure tolerated).
 //     Cadence is DefaultStatsInterval (200 ms — issue #170's 5 Hz
-//     + 250 ms spike-capture acceptance).
+//   - 250 ms spike-capture acceptance).
 //   - Dialer: an indirection over the per-node VMM. The poller
 //     dials fresh per Tick (no caching) so vmmd conn churn
 //     stays bounded by the dialer — same pattern PR #120
