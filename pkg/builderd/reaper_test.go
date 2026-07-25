@@ -55,7 +55,7 @@ func newReaperFixture(t *testing.T) (state.Store, *state.MemStore, string) {
 // status='failed' + failure_class='timeout' + finished_at stamped.
 func TestReaperLoop_SweepsStuckRow(t *testing.T) {
 	store, ms, buildID := newReaperFixture(t)
-	
+
 	ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-10*time.Minute))
 
 	runReaperOnce(t, store, 5*time.Minute)
@@ -82,7 +82,7 @@ func TestReaperLoop_SweepsStuckRow(t *testing.T) {
 // exceed the threshold.
 func TestReaperLoop_LeavesFreshRowsAlone(t *testing.T) {
 	store, ms, buildID := newReaperFixture(t)
-	
+
 	// Backdate only 1 minute; threshold is 5 minutes. Row is still
 	// "in flight" by the threshold's definition.
 	ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-1*time.Minute))
@@ -115,7 +115,7 @@ func TestReaperLoop_ThresholdParam(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store, ms, buildID := newReaperFixture(t)
-			
+
 			ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-tc.backdate))
 
 			runReaperOnce(t, store, tc.threshold)
@@ -135,7 +135,7 @@ func TestReaperLoop_ThresholdParam(t *testing.T) {
 // the second tick matches 0 rows.
 func TestReaperLoop_IdempotentSecondTick(t *testing.T) {
 	store, ms, buildID := newReaperFixture(t)
-	
+
 	ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-10*time.Minute))
 
 	runReaperOnce(t, store, 5*time.Minute)
@@ -164,7 +164,7 @@ func TestReaperLoop_IdempotentSecondTick(t *testing.T) {
 // reaper sweep from resurrecting a 'failed(timeout)' row.
 func TestReaperLoop_LateMarkSucceededCannotResurrect(t *testing.T) {
 	store, ms, buildID := newReaperFixture(t)
-	
+
 	ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-10*time.Minute))
 
 	// Step 1: reaper sweeps.
@@ -251,7 +251,7 @@ func runReaperOnce(t *testing.T, store state.Store, threshold time.Duration) {
 // SweepStuckRunningBuilds call wouldn't surface.
 func TestReaperLoop_GoroutineSmoke(t *testing.T) {
 	store, ms, buildID := newReaperFixture(t)
-	
+
 	ms.SetBuildStartedAtForTest(buildID, time.Now().Add(-10*time.Minute))
 
 	ctx, cancel := context.WithCancel(context.Background())

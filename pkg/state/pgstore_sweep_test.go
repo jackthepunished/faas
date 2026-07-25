@@ -168,4 +168,3 @@ func TestUpdateBuildStatus_CASGuard_PgStore(t *testing.T) {
 		t.Error("CAS guard regression: failed → succeeded allowed (should be rejected)")
 	}
 }
-

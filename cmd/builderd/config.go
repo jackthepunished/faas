@@ -102,13 +102,13 @@ func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
-		VMMDSocket:            "/run/faas/vmmd.sock",
-		CacheDir:              "/var/cache/faas/builds",
-		BuilderBase:           "/srv/fc/base/builder-base.ext4",
-		BuildDriveDir:         "/var/lib/faas/build-drive",
-		BuildExportDir:        "/var/lib/faas/build-out",
-		ScheddMetricsURL:      "http://127.0.0.1:9090/metrics/fcvm",
-		PollInterval:          2 * time.Second,
+		VMMDSocket:              "/run/faas/vmmd.sock",
+		CacheDir:                "/var/cache/faas/builds",
+		BuilderBase:             "/srv/fc/base/builder-base.ext4",
+		BuildDriveDir:           "/var/lib/faas/build-drive",
+		BuildExportDir:          "/var/lib/faas/build-out",
+		ScheddMetricsURL:        "http://127.0.0.1:9090/metrics/fcvm",
+		PollInterval:            2 * time.Second,
 		StuckBuildSweepInterval: 10 * time.Minute,
 		StuckBuildThreshold:     15 * time.Minute,
 	}

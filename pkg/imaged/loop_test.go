@@ -937,7 +937,8 @@ func TestMemStore_ListSnapshotsForGC_PopulatesAppSlug(t *testing.T) {
 // N.
 //
 // Run via:
-//   go test -bench BenchmarkLoopRunGCTick_FallbackSQLCost -benchmem ./pkg/imaged/...
+//
+//	go test -bench BenchmarkLoopRunGCTick_FallbackSQLCost -benchmem ./pkg/imaged/...
 func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
 	const apps = 10
 	const evictions = 2 * apps // 2 per app fall outside current+previous
@@ -952,12 +953,12 @@ func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
 		gcCh := make(chan time.Time, 1)
 		gcCh <- time.Unix(0, 0)
 		loop := &Loop{
-			store:    store,
-			log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-			now:      func() time.Time { return time.Unix(0, 0) },
+			store:     store,
+			log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			now:       func() time.Time { return time.Unix(0, 0) },
 			lvUsedPct: func(ctx context.Context) (float64, error) { return 50.0, nil },
-			appsRoot: appsRoot,
-			gcCh:     gcCh,
+			appsRoot:  appsRoot,
+			gcCh:      gcCh,
 			handler: &Handler{
 				store:    store,
 				log:      slog.New(slog.NewTextHandler(io.Discard, nil)),

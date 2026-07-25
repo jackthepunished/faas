@@ -2109,7 +2109,7 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			AccountID:    app.AccountID,
 			// B1.1: forward the slug so imaged's GC doesn't have to
 			// re-resolve it per eviction (was O(2N) extra SQL).
-			AppSlug: app.Slug,
+			AppSlug:   app.Slug,
 			FCVersion: s.FCVersion,
 			MemBytes:  s.MemBytes,
 			DiskBytes: s.DiskBytes,
