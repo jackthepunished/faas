@@ -53,6 +53,16 @@ const (
 	// goconst stops flagging the repeated "apps" / "status" / etc.
 	// literals. Tests intentionally keep the literal form.
 	dispatchApps = "apps"
+
+	// Plural deployments list (mirrors dispatchApps shape). User runs
+	// `faas deployments` to list; pagination flags live on the handler.
+	dispatchDeployments = "deployments"
+
+	// Singular deployment-get. Lifted so the dispatch literal stays
+	// constant-named (goconst); the constant does NOT route through
+	// appSlugFallback — the dispatch table places it before the
+	// "app" case so `faas deployment <id>` is never read as an app slug.
+	deploymentSlugFallback = "deployment"
 )
 
 // cmdApp implements `faas app <slug>` (GET /v1/apps/{slug}), `faas app <slug>

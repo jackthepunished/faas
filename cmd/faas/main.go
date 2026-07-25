@@ -24,6 +24,8 @@ Commands:
   logout       Remove the stored token
   whoami       Show the authenticated account
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
+  deployments  List deployments (--limit N | --before C | --all)
+  deployment   Get one deployment (<id>)
   apps         List your apps
   apps ls      Alias for 'faas apps'
   apps -q      Delete an app
@@ -114,6 +116,14 @@ func run(args []string) int {
 			return cmdAppsRm(args[2:])
 		}
 		return cmdApps()
+	case dispatchDeployments:
+		// `faas deployments [--limit N|--before C|--all]` — list.
+		// Place before appSlugFallback so the singular never shadows it.
+		return cmdDeployments(args[1:])
+	case deploymentSlugFallback:
+		// `faas deployment <id>` — get one. Must come before appSlugFallback
+		// so the singular is never misread as an app slug.
+		return cmdDeployment(args[1:])
 	case appSlugFallback:
 		// Routes to cmdAppDispatch which knows the new scale/rename
 		// subcommand form and falls back to the legacy flag-form
