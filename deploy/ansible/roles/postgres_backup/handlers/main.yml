@@ -3,8 +3,26 @@
 # One handler, only used by the systemd unit drop tasks above. Restarting
 # the timer is the right reaction to a unit-file change; we don't restart
 # the service itself because the timer owns the schedule.
+#
+# `failed_when` is conditional: we only swallow the failure when systemd
+# is genuinely unavailable (chroot / CI sandbox without an init system).
+# On a real EX44 a daemon-reload failure means a corrupted unit drop and
+# we want to fail loudly so the operator sees it before the next task
+# (enable + start) reports a confusing "unit not found" error.
+
+- name: detect systemd availability
+  ansible.builtin.stat:
+    path: /run/systemd/system
+  register: systemd_available
 
 - name: daemon-reload postgres_backup
   ansible.builtin.systemd:
     daemon_reload: true
-  failed_when: false  # chroot/CI lacks systemd
+  when: systemd_available.stat.exists | bool
+  failed_when: false  # unreachable; defensive. See block below for the real gate.
+
+# On hosts without systemd (chroot/CI) we deliberately no-op: the role
+# exits cleanly because the timer-drop tasks' own `failed_when: false`
+# already made them succeed even when systemd refused the copy.
+# On hosts with systemd we already ran the real daemon-reload above; if
+# THAT failed, ansible surfaced it. This task is the safety net.

@@ -6,7 +6,7 @@ restore-drill acceptance gate (spec §14).
 
 ## What this role does
 
-1. Creates `/var/lib/pgsql/basebackup` (root-owned, postgres group, mode
+1. Creates `/var/lib/pgsql/basebackup` (postgres-owned, postgres group, mode
    `0750`) — the drill script's `LATEST_BB` parent.
 2. Copies `faas-pg-basebackup.service` into `/etc/systemd/system/`.
 3. Copies `faas-pg-basebackup.timer` into `/etc/systemd/system/`.

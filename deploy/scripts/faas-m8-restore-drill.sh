@@ -112,6 +112,7 @@ fi
 
 heading "0.5/7 Stamp host.age into basebackup (preserves sealed secrets)"
 [[ -f "$HOST_KEY" ]] || fail "$HOST_KEY missing — refusing to drill (vmmd hasn't initialized the host key yet?)"
+[[ -f "$HOST_PUB" ]] || fail "$HOST_PUB missing — refusing to drill (run 'make bootstrap' to (re)initialize the host age identity)"
 SHA_PRE="$(sha256sum "$HOST_KEY" | awk '{print $1}')"
 install -m 0400 "$HOST_KEY"  "$LATEST_BB/host.age"
 install -m 0444 "$HOST_PUB" "$LATEST_BB/host.age.pub"
