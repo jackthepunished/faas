@@ -42,11 +42,11 @@ var (
 	// covers RFC1918 / link-local / metadata via the per-netns
 	// chain; these are the client-side hardening extras.
 	ociOnlyDenyCIDRsV4 = []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/8"),    // unspecified
-		netip.MustParsePrefix("127.0.0.0/8"),  // loopback
-		netip.MustParsePrefix("192.0.0.0/24"), // IETF protocol assignments
+		netip.MustParsePrefix("0.0.0.0/8"),     // unspecified
+		netip.MustParsePrefix("127.0.0.0/8"),   // loopback
+		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
 		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking
-		netip.MustParsePrefix("240.0.0.0/4"),  // reserved
+		netip.MustParsePrefix("240.0.0.0/4"),   // reserved
 	}
 )
 
