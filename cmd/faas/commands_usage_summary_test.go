@@ -273,6 +273,44 @@ func TestCmdUsage_NoPositional_DispatchesToList(t *testing.T) {
 	}
 }
 
+// TestCmdUsage_FlagLeading_DispatchesToList pins the back-compat
+// promise from the PR description: `faas usage --month 2026-06`
+// (the documented legacy invocation) must continue to work — the
+// dispatcher forwards flag-leading args to cmdUsageList rather than
+// rejecting them as "unknown usage subcommand". PR #220 review caught
+// a regression here (strict dispatcher rejected --month as a
+// positional); this test fails on the broken version and passes on
+// the fix.
+func TestCmdUsage_FlagLeading_DispatchesToList(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		switch r.URL.Path {
+		case "/v1/usage":
+			_ = json.NewEncoder(w).Encode(api.UsageResponse{
+				AppID: "a1", Requests: 1, MBSeconds: 1, IncludedGBHours: 5,
+			})
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdUsage([]string{"--month", "2026-06"}); code != 0 {
+		t.Errorf("cmdUsage --month 2026-06 = %d, want 0", code)
+	}
+	if gotPath != "/v1/usage" {
+		t.Errorf("path = %q, want /v1/usage (per-app list, flag-forwarded)", gotPath)
+	}
+	if gotQuery != "month=2026-06" {
+		t.Errorf("query = %q, want month=2026-06", gotQuery)
+	}
+}
+
 // TestCmdUsage_UnknownSubcommand_ReturnsOne pins strict dispatch:
 // `faas usage bogus` must exit 1 with `unknown usage subcommand`
 // on stderr. Matches cmdCrons / cmdDomains / cmdKeys conventions

@@ -720,18 +720,24 @@ func cmdKeys(args []string) int {
 
 // cmdUsage: dispatcher for `faas usage [summary]`.
 //
-//	faas usage               → cmdUsageList  (per-app rows, current month)
-//	faas usage --month X     → cmdUsageList  (per-app rows, explicit month)
-//	faas usage summary       → cmdUsageSummary (account roll-up, current month)
-//	faas usage summary --month X → cmdUsageSummary (account roll-up, explicit month)
+//	faas usage                          → cmdUsageList  (per-app rows, current month)
+//	faas usage --month YYYY-MM          → cmdUsageList  (per-app rows, explicit month)
+//	faas usage summary                  → cmdUsageSummary (account roll-up, current month)
+//	faas usage summary --month YYYY-MM  → cmdUsageSummary (account roll-up, explicit month)
 //
-// Strict dispatch matches cmdCrons / cmdDomains / cmdKeys — an unknown
-// positional returns 1 with `unknown usage subcommand "..."`. The
-// legacy "ignore positionals" behavior was never useful and is now
-// replaced.
+// Strict positional dispatch matches cmdCrons / cmdDomains / cmdKeys:
+// an unknown positional returns 1 with `unknown usage subcommand "..."`.
+// Flag-leading args (e.g. `--month`) are forwarded to cmdUsageList so
+// the legacy `faas usage --month YYYY-MM` invocation keeps working —
+// the PR description's "back-compat" promise. Forwarding any flag-like
+// arg to the leaf FlagSet also preserves its normal unknown-flag
+// handling (cmdUsageList exits 1 on `--bogus`).
 func cmdUsage(args []string) int {
 	if len(args) == 0 {
 		return cmdUsageList(nil)
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return cmdUsageList(args)
 	}
 	switch args[0] {
 	case subSummary:
