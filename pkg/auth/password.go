@@ -248,11 +248,11 @@ func parsePHC(phc string) (mem uint32, time uint32, threads uint8, salt, hash []
 	}
 	salt, err = base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
-		return 0, 0, 0, nil, nil, fmt.Errorf("%w: salt b64: %v", ErrMalformedPHC, err)
+		return 0, 0, 0, nil, nil, fmt.Errorf("salt b64: %w", errors.Join(ErrMalformedPHC, err))
 	}
 	hash, err = base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil {
-		return 0, 0, 0, nil, nil, fmt.Errorf("%w: hash b64: %v", ErrMalformedPHC, err)
+		return 0, 0, 0, nil, nil, fmt.Errorf("hash b64: %w", errors.Join(ErrMalformedPHC, err))
 	}
 	return m, t, uint8(p), salt, hash, nil
 }

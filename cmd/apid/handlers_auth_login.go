@@ -56,6 +56,21 @@ const (
 	setPasswordPath    = "/dashboard/account/set-password"
 	logoutPathPublic   = "/logout"
 
+	// schemeHTTP is the URL scheme used for the loopback dev path
+	// and as the default in sendPasswordResetEmail; schemeHTTPS
+	// (declared in handlers_google.go:27) is the TLS / X-Forwarded-Proto
+	// match. Lifted to a const so goconst doesn't flag the repeated
+	// literal across the auth surface.
+	schemeHTTP = "http"
+
+	// domainUnset is the sentinel value apid uses to mean
+	// "no canonical domain configured" — distinct from "" (which
+	// triggers the dev-mode defaults in other handlers). The
+	// forgot-password path treats both the empty string and
+	// domainUnset as "use the request Host verbatim" so a misconfigured
+	// dev deploy never mails out a "DOMAIN" link.
+	domainUnset = "DOMAIN"
+
 	// passwordResetTTL is how long a reset token stays valid. 15 min
 	// matches industry convention (NIST SP 800-63B password recovery
 	// guidance) and is short enough that a leaked email doesn't
@@ -226,12 +241,12 @@ func (s *server) sendPasswordResetEmail(ctx context.Context, r *http.Request, ac
 		s.log.Error("forgot_password.issue_token", "err", err)
 		return
 	}
-	scheme := "http"
+	scheme := schemeHTTP
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
 		scheme = schemeHTTPS
 	}
 	host := r.Host
-	if s.domain != "" && s.domain != "DOMAIN" {
+	if s.domain != "" && s.domain != domainUnset {
 		// Use the configured domain verbatim — the email link should
 		// always point at the canonical hostname, not the loopback
 		// the request arrived on.
