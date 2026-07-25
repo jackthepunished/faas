@@ -23,10 +23,11 @@ import (
 // Subcommand names — lifted to constants so goconst stops flagging the
 // repeated "list"/"add"/"rm" string literals in the dispatch tables below.
 const (
-	subList   = "list"
-	subAdd    = "add"
-	subUpdate = "update"
-	subRm     = "rm"
+	subList    = "list"
+	subAdd     = "add"
+	subUpdate  = "update"
+	subRm      = "rm"
+	subSummary = "summary"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -718,9 +719,40 @@ func cmdKeys(args []string) int {
 	return 1
 }
 
-// cmdUsage: GET /v1/usage?month=YYYY-MM. Defaults to the current month.
+// cmdUsage: dispatcher for `faas usage [summary]`.
+//
+//	faas usage                          → cmdUsageList  (per-app rows, current month)
+//	faas usage --month YYYY-MM          → cmdUsageList  (per-app rows, explicit month)
+//	faas usage summary                  → cmdUsageSummary (account roll-up, current month)
+//	faas usage summary --month YYYY-MM  → cmdUsageSummary (account roll-up, explicit month)
+//
+// Strict positional dispatch matches cmdCrons / cmdDomains / cmdKeys:
+// an unknown positional returns 1 with `unknown usage subcommand "..."`.
+// Flag-leading args (e.g. `--month`) are forwarded to cmdUsageList so
+// the legacy `faas usage --month YYYY-MM` invocation keeps working —
+// the PR description's "back-compat" promise. Forwarding any flag-like
+// arg to the leaf FlagSet also preserves its normal unknown-flag
+// handling (cmdUsageList exits 1 on `--bogus`).
 func cmdUsage(args []string) int {
-	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
+	if len(args) == 0 {
+		return cmdUsageList(nil)
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return cmdUsageList(args)
+	}
+	switch args[0] {
+	case subSummary:
+		return cmdUsageSummary(args[1:])
+	}
+	PrintUsage(os.Stderr, "usage: faas usage [--month YYYY-MM] | faas usage summary [--month YYYY-MM]", "usage")
+	fmt.Fprintf(os.Stderr, "unknown usage subcommand %q\n", args[0])
+	return 1
+}
+
+// cmdUsageList: GET /v1/usage?month=YYYY-MM. Defaults to the current
+// month. Per-app rows (UsageResponse — AppID, MBSeconds, Requests).
+func cmdUsageList(args []string) int {
+	fs := flag.NewFlagSet("usage-list", flag.ContinueOnError)
 	month := fs.String("month", "", "month (YYYY-MM); default: current month")
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -739,8 +771,56 @@ func cmdUsage(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(u))
 	}
-	fmt.Printf("App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
+	_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
 	return 0
+}
+
+// cmdUsageSummary: GET /v1/usage/summary?month=YYYY-MM. Account-wide
+// roll-up (used / included / overage / overage cost). Distinct from
+// cmdUsageList which returns per-app rows.
+//
+// Default-month behavior matches the SDK contract: an unset
+// --month passes "" through and the server defaults to the
+// current month. We deliberately don't fs.Visit for explicit
+// --month "" because the server treats "" and "unset" the same
+// (issue #64 family: avoid four lines for unobservable behavior).
+func cmdUsageSummary(args []string) int {
+	fs := flag.NewFlagSet("usage-summary", flag.ContinueOnError)
+	month := fs.String("month", "", "month (YYYY-MM); default: current month")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	s, err := client.UsageSummary(context.Background(), *month)
+	if err != nil {
+		return printErr("Request failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(s))
+	}
+	renderUsageSummary(osStdout, s)
+	return 0
+}
+
+// renderUsageSummary writes the account roll-up to w as a 5-row
+// labelled block (matches the dashboard's usage page). Width = 13
+// (longest label is "Overage cost"). GB-hour precision %.3f
+// (matches cmdUsageList). Cents is integer.
+//
+// The customer-facing label is "Overage cost" — the wire field is
+// `overage_cents` (cents, integer) but the dashboard labels it
+// "overage cost" and the customer is reading the value, not the
+// unit. The label here matches the dashboard.
+func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
+	const labelWidth = 13
+	_, _ = fmt.Fprintf(w, "  %-*s %s\n", labelWidth, "Month:", s.Month)
+	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB-hours\n", labelWidth, "Used:", s.UsedGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %d GB-hours\n", labelWidth, "Included:", s.IncludedGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB-hours\n", labelWidth, "Overage:", s.OverageGBHours)
+	_, _ = fmt.Fprintf(w, "  %-*s %d cents\n", labelWidth, "Overage cost:", s.OverageCents)
 }
 
 func boolPtr(b bool) *bool { return &b }

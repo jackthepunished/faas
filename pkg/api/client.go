@@ -505,6 +505,40 @@ func (c *Client) DeleteKey(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/keys/"+id, nil, nil)
 }
 
+// Audit events (IAM-4, ADR-035). The events table is append-only
+// (spec §5), so this surface is read-only by design. since and
+// kindPrefix are optional — pass empty strings to read the full
+// 50-row default window. limit is bounded server-side at 100; values
+// larger are silently capped per the same convention as ListSecrets.
+
+// ListAuditEvents returns the caller's auth audit events newest-first.
+func (c *Client) ListAuditEvents(ctx context.Context, since, kindPrefix string, limit int) (ListAuditEventsResponse, error) {
+	var out ListAuditEventsResponse
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if kindPrefix != "" {
+		q.Set("kind_prefix", kindPrefix)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/audit-events"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAuditEvent fetches a single auth audit event by id. Cross-account
+// lookups 404 the same way unknown ids do, so a caller cannot enumerate
+// other accounts' row counts by id-probing.
+func (c *Client) GetAuditEvent(ctx context.Context, id string) (AuditEventResponse, error) {
+	var out AuditEventResponse
+	return out, c.do(ctx, "GET", "/v1/audit-events/"+id, nil, &out)
+}
+
 // CLI auth device-code flow (spec §2.2).
 
 // MintCliAuthCode anonymously mints a fresh device code.
@@ -604,6 +638,19 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, error) {
 	var out UsageResponse
 	return out, c.do(ctx, "GET", "/v1/usage?month="+month, nil, &out)
+}
+
+// UsageSummary returns the account-wide monthly roll-up
+// (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
+// Distinct from GetUsage which returns per-app rows; empty month falls
+// back to the server's default (current month).
+func (c *Client) UsageSummary(ctx context.Context, month string) (UsageSummaryResponse, error) {
+	var out UsageSummaryResponse
+	path := "/v1/usage/summary"
+	if month != "" {
+		path += "?month=" + month
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // ListDeployments returns a single page of deployments with a

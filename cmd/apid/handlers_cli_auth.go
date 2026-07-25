@@ -149,6 +149,20 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 		`{"kind":"created","account":"`+accountID+`","key":"`+k.ID+`"}`)
 	h.log.Info("cli_auth.exchanged", "account", accountID, "key", k.ID)
 
+	// IAM-4 (ADR-035): record the auto-minted key. subject =
+	// account_id (the owner of the key), not the key id — matches
+	// the existing NotifyKeyChanged payload convention.
+	h.srv.audit.Emit(r.Context(), "key.created", &accountID, map[string]any{
+		"key_id": k.ID,
+		"scopes": api.DefaultScopes(),
+	})
+	// IAM-4 (ADR-035): the exchange itself is an auth.login
+	// success from the customer's perspective. The CLI never set a
+	// cookie; the key is the credential that follows.
+	h.srv.audit.Emit(r.Context(), "auth.login", &accountID, map[string]any{
+		"method": "cli_code",
+	})
+
 	acct, err := h.srv.store.AccountByID(r.Context(), accountID)
 	if err != nil {
 		h.log.Error("cli_auth.account_lookup", "err", err)
@@ -268,7 +282,12 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// by email first to give a stable account_id for existing
 	// customers; only create if the email is unknown.
 	acct, err := h.srv.store.AccountByEmail(r.Context(), email)
-	if errors.Is(err, state.ErrNotFound) {
+	// IAM-4 (ADR-035): capture whether this claim created a new
+	// account; the audit emit below carries it as data.auto_created
+	// so a customer can answer "did someone sign up with my email
+	// today?" from the GDPR export.
+	autoCreated := errors.Is(err, state.ErrNotFound)
+	if autoCreated {
 		acct, err = h.srv.store.CreateAccount(r.Context(), email, api.PlanFree)
 		if err != nil {
 			// Log only the operation path; the err.Error() string is
@@ -324,6 +343,15 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 		Secure:   h.domain != "",
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(h.srv.sessions.MaxAge().Seconds()),
+	})
+	// IAM-4 (ADR-035): record the dashboard-side claim of a CLI auth
+	// code. data.auto_created=true iff this was the first time we saw
+	// the email (CreateAccount path above). The audit row lets an
+	// operator answer "which email auto-created an account today?"
+	// without grepping slog.
+	h.srv.audit.Emit(r.Context(), "auth.login", &acct.ID, map[string]any{
+		"method":       "cli_code",
+		"auto_created": autoCreated,
 	})
 	http.Redirect(w, r, cliAuthDashboard, http.StatusFound)
 }

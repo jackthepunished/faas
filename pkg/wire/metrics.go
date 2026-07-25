@@ -42,6 +42,11 @@ type OpsMetrics struct {
 	// succeeding but the events row isn't being written — the state
 	// row is the source of truth, so this is observation-only.
 	eventsWriteFail prometheus.Counter
+	// auditWriteFail: introduced in IAM-4 (ADR-035) for the apid-side
+	// auth audit emit. Mirrors eventsWriteFail — a failed audit write
+	// logs Warn and increments the counter; the auth action has
+	// already returned 200, so this is observation-only.
+	auditWriteFail prometheus.Counter
 	// stripePushDur: introduced in feat/m7-stripe-push-observability.
 	// Per-push latency to Stripe, labelled by terminal result code.
 	// Distinct from the dur histogram (which labels by op only) because
@@ -137,6 +142,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
 	})
+	auditWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_audit_write_failures_total",
+		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written. The handler has already returned 200; this is observation-only.",
+	})
 	stripePushDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_stripe_push_duration_seconds",
 		Help: "Per-push latency to Stripe, labelled by terminal result code (ok on success, or a stripe.ClassifyPushError label on failure).",
@@ -194,7 +203,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_sse_clients",
 		Help: "Number of currently open /v1/events SSE connections (Move 3, M7.5 prep). The dashboard's per-page EventSource is one connection; the CLI's faas tail is another. Zero is the idle value.",
 	})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, sseClients)
+	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, sseClients)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -245,6 +254,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                   dur,
 		watchdogKills:         watchdogKills,
 		eventsWriteFail:       eventsWriteFail,
+		auditWriteFail:        auditWriteFail,
 		stripePushDur:         stripePushDur,
 		paddlePushDur:         paddlePushDur,
 		buildDur:              buildDur,
@@ -269,6 +279,15 @@ func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter
 // only signals observability debt. See also commit 4.
 func (m *OpsMetrics) EventsWriteFailures() prometheus.Counter {
 	return m.eventsWriteFail
+}
+
+// AuditWriteFailures returns the unlabelled counter for IAM-4
+// (ADR-035) auth audit emits whose events row could not be written.
+// The handler has already returned 200 to the customer; this counter
+// only signals observability debt. Same posture as
+// EventsWriteFailures.
+func (m *OpsMetrics) AuditWriteFailures() prometheus.Counter {
+	return m.auditWriteFail
 }
 
 // WakeIDV4Fallback returns the unlabelled counter the wake_id mint

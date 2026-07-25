@@ -436,15 +436,27 @@ type APIKeyExportResponse struct {
 	LastUsed  string   `json:"last_used_at,omitempty"`
 }
 
-// GdprAuditExportResponse is one row of the customer's own GDPR audit
-// trail as surfaced in the export bundle. CompletedAt is empty when
-// the action is still in flight (a delete row whose grace window
-// hasn't lapsed yet); the export consumer can correlate the row
-// against the deletion_requested_at timestamp on the Account envelope.
+// GdprAuditExportResponse is one row of the customer's own audit trail
+// as surfaced in the export bundle. Two row kinds live here:
+//
+//   - source="gdpr"   — a self-service GDPR action (export/delete/restore
+//     from the gdpr_requests table). Action is "export" | "delete" |
+//     "restore"; CompletedAt is empty when the action is still in
+//     flight.
+//   - source="event"  — a security event from the events table (IAM-4,
+//     ADR-035). Kind is the namespaced event kind (e.g. "auth.login",
+//     "key.created"); Data is the original jsonb payload.
+//
+// Rows from both sources are interleaved by timestamp descending in
+// the bundle so a reviewer sees one ordered timeline. Existing GDPR
+// consumers can ignore unknown fields per the standard JSON rule.
 type GdprAuditExportResponse struct {
-	Action      string `json:"action"` // "export" | "delete" | "restore"
-	RequestedAt string `json:"requested_at"`
-	CompletedAt string `json:"completed_at,omitempty"`
+	Source      string          `json:"source"`           // "gdpr" | "event"
+	Action      string          `json:"action,omitempty"` // "export" | "delete" | "restore" (gdpr)
+	RequestedAt string          `json:"requested_at"`     // RFC 3339 (event.at for source="event")
+	CompletedAt string          `json:"completed_at,omitempty"`
+	Kind        string          `json:"kind,omitempty"` // auth.*|key.*|account.*|secret.* (event)
+	Data        json.RawMessage `json:"data,omitempty"` // kind-specific payload (event)
 }
 
 // AppSecretExportResponse is one row in the export's app_secrets slice.
@@ -617,4 +629,35 @@ type Invocation struct {
 // so pkg/api stays decoupled from pkg/state.
 type ListInvocationsResponse struct {
 	Invocations []Invocation `json:"invocations"`
+}
+
+// --- IAM-4 (ADR-035) — auth audit event surface -----------------------------
+//
+// AuditEventResponse is one row of the customer's own security event
+// timeline. The kind taxonomy is documented in
+// docs/adr/035-auth-audit-events.md; common values include
+// "auth.login", "auth.logout", "key.created", "key.deleted",
+// "secret.set", "secret.deleted", "account.plan_changed",
+// "account.deletion_scheduled", "account.deletion_restored".
+//
+// Subject is the account_id the event was recorded against (string,
+// not the raw uuid UUID type — pkg/api stays string-typed for wire
+// stability). Data is the raw jsonb the apid auditor wrote; the schema
+// varies by kind and is documented per-kind in the ADR.
+type AuditEventResponse struct {
+	ID      string          `json:"id"`    // bigint as string
+	At      string          `json:"at"`    // RFC 3339
+	Actor   string          `json:"actor"` // "apid" today; "schedd" for state-transition events
+	Kind    string          `json:"kind"`
+	Subject string          `json:"subject,omitempty"` // account_id (uuid string form)
+	Data    json.RawMessage `json:"data"`
+}
+
+// ListAuditEventsResponse is the wire shape for GET /v1/audit-events.
+// Limit echoes the effective limit applied by the handler (capped at
+// 100), so the SDK can display "showing 50 of N" without re-issuing
+// the request.
+type ListAuditEventsResponse struct {
+	Events []AuditEventResponse `json:"events"`
+	Limit  int                  `json:"limit"`
 }

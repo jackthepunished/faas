@@ -222,6 +222,14 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 
 	s.log.Info("google oauth sign-in successful", "email", logsanitize.Field(googleUser.Email), "account_id", acct.ID)
 
+	// IAM-4 (ADR-035): record the auth.login success. Mirrors the
+	// existing slog line: the audit row carries the same email so
+	// operators correlating slog and audit see one identifier.
+	s.audit.Emit(r.Context(), "auth.login", &acct.ID, map[string]any{
+		"method": "google",
+		"email":  googleUser.Email,
+	})
+
 	redirectTarget := os.Getenv("WEBSITE_URL")
 	if redirectTarget == "" {
 		redirectTarget = "/"
