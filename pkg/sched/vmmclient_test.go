@@ -99,6 +99,13 @@ func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	return nil
 }
 
+// InstancePID (M8 §11) — the sched test rig never drives the
+// SeccompStatus path; cmd/e2e/sec11_seccomp_e2e_test.go dials
+// vmmd directly. Returns (0, false) so any test that accidentally
+// hits the codepath fails fast with NotFound instead of getting
+// a phantom PID.
+func (f *fakeVMM) InstancePID(instance string) (int, bool) { return 0, false }
+
 // newClient stands up a vmmdgrpc.Server on bufconn and returns a sched.VMMClient
 // dialed to it.
 func newClient(t *testing.T, fake *fakeVMM) *sched.VMMClient {

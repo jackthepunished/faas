@@ -31,6 +31,7 @@ const (
 	Vmmd_ForwardHTTP_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTP"
 	Vmmd_Heartbeat_FullMethodName             = "/onebox.faas.vmmd.v1.Vmmd/Heartbeat"
 	Vmmd_UpdateEgressAllowlist_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/UpdateEgressAllowlist"
+	Vmmd_SeccompStatus_FullMethodName         = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
 )
 
 // VmmdClient is the client API for Vmmd service.
@@ -101,6 +102,22 @@ type VmmdClient interface {
 	// uses pg_notify as the delivery mechanism (cmd/schedd egress
 	// drift subscriber, pkg/sched/egress_drift.go).
 	UpdateEgressAllowlist(ctx context.Context, in *UpdateEgressAllowlistRequest, opts ...grpc.CallOption) (*UpdateEgressAllowlistAck, error)
+	// SeccompStatus (M8 §11 — jailer seccomp assertion) reports the
+	// Linux kernel seccomp state of the jailer child process backing
+	// this instance. Spec §11: "Firecracker's default seccomp filter
+	// is in place" — jailer is the only parent of the firecracker
+	// process, and jailer applies the seccomp filter via
+	// --seccomp-filter=<path>. The handler reads /proc/<pid>/status
+	// outside the vmmd process and reports the Seccomp: line (0 =
+	// disabled, 1 = strict, 2 = filter) plus the filter instruction
+	// count when in filter mode. Empty Instance returns InvalidArgument.
+	// The presence of a freshly-installed filter (filter_len > 0) is
+	// the e2e tripwire: a jailer upgrade that drops the filter is
+	// caught here before the snapshot can be considered trustworthy.
+	// Not in the hot path — Invoke is from the cmd/e2e seccomp gate
+	// and from Prometheus scrapes keyed on the new
+	// firecracker_seccomp_status metric.
+	SeccompStatus(ctx context.Context, in *SeccompStatusRequest, opts ...grpc.CallOption) (*SeccompStatusResponse, error)
 }
 
 type vmmdClient struct {
@@ -201,6 +218,16 @@ func (c *vmmdClient) UpdateEgressAllowlist(ctx context.Context, in *UpdateEgress
 	return out, nil
 }
 
+func (c *vmmdClient) SeccompStatus(ctx context.Context, in *SeccompStatusRequest, opts ...grpc.CallOption) (*SeccompStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SeccompStatusResponse)
+	err := c.cc.Invoke(ctx, Vmmd_SeccompStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VmmdServer is the server API for Vmmd service.
 // All implementations must embed UnimplementedVmmdServer
 // for forward compatibility.
@@ -269,6 +296,22 @@ type VmmdServer interface {
 	// uses pg_notify as the delivery mechanism (cmd/schedd egress
 	// drift subscriber, pkg/sched/egress_drift.go).
 	UpdateEgressAllowlist(context.Context, *UpdateEgressAllowlistRequest) (*UpdateEgressAllowlistAck, error)
+	// SeccompStatus (M8 §11 — jailer seccomp assertion) reports the
+	// Linux kernel seccomp state of the jailer child process backing
+	// this instance. Spec §11: "Firecracker's default seccomp filter
+	// is in place" — jailer is the only parent of the firecracker
+	// process, and jailer applies the seccomp filter via
+	// --seccomp-filter=<path>. The handler reads /proc/<pid>/status
+	// outside the vmmd process and reports the Seccomp: line (0 =
+	// disabled, 1 = strict, 2 = filter) plus the filter instruction
+	// count when in filter mode. Empty Instance returns InvalidArgument.
+	// The presence of a freshly-installed filter (filter_len > 0) is
+	// the e2e tripwire: a jailer upgrade that drops the filter is
+	// caught here before the snapshot can be considered trustworthy.
+	// Not in the hot path — Invoke is from the cmd/e2e seccomp gate
+	// and from Prometheus scrapes keyed on the new
+	// firecracker_seccomp_status metric.
+	SeccompStatus(context.Context, *SeccompStatusRequest) (*SeccompStatusResponse, error)
 	mustEmbedUnimplementedVmmdServer()
 }
 
@@ -305,6 +348,9 @@ func (UnimplementedVmmdServer) Heartbeat(context.Context, *HeartbeatRequest) (*H
 }
 func (UnimplementedVmmdServer) UpdateEgressAllowlist(context.Context, *UpdateEgressAllowlistRequest) (*UpdateEgressAllowlistAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateEgressAllowlist not implemented")
+}
+func (UnimplementedVmmdServer) SeccompStatus(context.Context, *SeccompStatusRequest) (*SeccompStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SeccompStatus not implemented")
 }
 func (UnimplementedVmmdServer) mustEmbedUnimplementedVmmdServer() {}
 func (UnimplementedVmmdServer) testEmbeddedByValue()              {}
@@ -489,6 +535,24 @@ func _Vmmd_UpdateEgressAllowlist_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vmmd_SeccompStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SeccompStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).SeccompStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_SeccompStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).SeccompStatus(ctx, req.(*SeccompStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Vmmd_ServiceDesc is the grpc.ServiceDesc for Vmmd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -531,6 +595,10 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateEgressAllowlist",
 			Handler:    _Vmmd_UpdateEgressAllowlist_Handler,
+		},
+		{
+			MethodName: "SeccompStatus",
+			Handler:    _Vmmd_SeccompStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

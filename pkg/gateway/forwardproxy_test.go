@@ -78,6 +78,16 @@ func (f *fakeVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEg
 	panic("UpdateEgressAllowlist: not stubbed")
 }
 
+// SeccompStatus (M8 §11) — the gateway hot path doesn't poll
+// seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
+// vmmd socket directly to assert the filter is in place. Panics
+// so a future test that accidentally couples the gateway hot
+// path to seccomp state fails loudly instead of silently
+// returning a stub.
+func (f *fakeVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusRequest, ...grpc.CallOption) (*vmmdpb.SeccompStatusResponse, error) {
+	panic("SeccompStatus: not stubbed")
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

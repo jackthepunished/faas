@@ -9,10 +9,15 @@
 package vmmdgrpc
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
@@ -52,6 +57,14 @@ type VmmdAPI interface {
 	// (pkg/sched/egress_drift.go) on every pg_notify app_changed
 	// payload with kind="updated".
 	UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error
+	// InstancePID (M8 §11 — seccomp assertion) returns the host PID
+	// of the running jailer child for instance, or (0, false) if
+	// the instance is not currently alive. The SeccompStatus gRPC
+	// handler reads /proc/<pid>/status to verify the jailer default
+	// seccomp filter is in place. Defined on VmmdAPI (not on
+	// pkg/fcvm.Manager) so the handler reads through the narrow
+	// seam the Manager already exposes — no new Manager method.
+	InstancePID(instance string) (int, bool)
 }
 
 // Server implements vmmdpb.VmmdServer.
@@ -289,6 +302,144 @@ func (s *Server) UpdateEgressAllowlist(ctx context.Context, req *vmmdpb.UpdateEg
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
+}
+
+// SeccompStatus (M8 §11) reports the kernel seccomp state of the
+// jailer child backing instance. Sequence:
+//  1. Resolve the running jailer PID via VmmdAPI.InstancePID.
+//     Unknown instance → NotFound (the e2e tripwire wants "no
+//     instance" to be visible on the wire, not silently absorbed).
+//  2. Read /proc/<pid>/status from the vmmd process (the test
+//     reads again from the e2e process; both should agree because
+//     they read the same kernel state — the tripwire is about the
+//     value, not the reader).
+//  3. Parse the `Seccomp:` and `Seccomp_filters:` lines (kernel
+//     text format; the kernel writes them in this order). Map
+//     0/1/2 to "disabled"/"strict"/"filter" (the kernel's own
+//     mode names).
+//
+// Empty instance is InvalidArgument — distinguishes "operator
+// forgot the field" from "operator named a dead instance" so the
+// gRPC code surfaces the diagnosis. The handler does not call
+// into Manager (seccomp is a per-process kernel attribute, not a
+// Manager concern); the wire is the only contract.
+func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusRequest) (*vmmdpb.SeccompStatusResponse, error) {
+	const op = "SeccompStatus"
+	start := time.Now()
+	defer func() { s.ops.Observe(op, time.Since(start), nil) }()
+
+	if req.GetInstance() == "" {
+		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.InvalidArgument),
+			api.CodeValidation, "Missing instance", "instance is required").
+			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+	}
+	pid, ok := s.vmm.InstancePID(req.GetInstance())
+	if !ok {
+		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.NotFound),
+			api.CodeNotFound, "Instance not alive", fmt.Sprintf("instance %q is not alive on this vmmd", req.GetInstance())).
+			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+	}
+
+	mode, filterLen, err := readSeccompStatus(pid)
+	if err != nil {
+		// Don't fail the gRPC call with Internal — the e2e needs
+		// the wire to be OK so the response carries the
+		// diagnostic message. The presence of Error is the
+		// failure signal the test asserts on.
+		return &vmmdpb.SeccompStatusResponse{
+			Instance: req.GetInstance(),
+			Pid:      int32(pid),
+			Mode:     "unknown",
+			Error:    err.Error(),
+		}, nil
+	}
+	return &vmmdpb.SeccompStatusResponse{
+		Instance:  req.GetInstance(),
+		Pid:       int32(pid),
+		Mode:      mode,
+		FilterLen: int32(filterLen),
+	}, nil
+}
+
+// readSeccompStatus parses /proc/<pid>/status and returns (mode, filterLen, err).
+// Mode is the human-readable equivalent of the kernel's Seccomp integer
+// ("disabled" / "strict" / "filter"). filterLen is the number of distinct
+// BPF filter programs attached to the process (the `Seccomp_filters:` line).
+// An error means the file couldn't be read or the kernel didn't write the
+// expected lines — the handler maps that to Error="…" in the response.
+func readSeccompStatus(pid int) (string, int, error) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return "", 0, fmt.Errorf("open /proc/%d/status: %w", pid, err)
+	}
+	defer f.Close()
+	mode, filterLen, err := parseSeccompLines(f)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse /proc/%d/status: %w", pid, err)
+	}
+	return mode, filterLen, nil
+}
+
+// parseSeccompLines is the Read-from-text twin of readSeccompStatus.
+// Exposed so the in-process test (seccomp_test.go) can pin the
+// kernel-ABI parser without spinning up a real /proc/<pid>/status.
+// The two functions MUST stay in sync — if they diverge, the
+// cross-process e2e catches the drift.
+func parseSeccompLines(r io.Reader) (string, int, error) {
+	var mode string
+	var filterLen int
+	haveMode, haveFilter := false, false
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "Seccomp:"):
+			// Line format: "Seccomp:         2" (kernel pads with spaces).
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return "", 0, fmt.Errorf("malformed Seccomp line: %q", line)
+			}
+			n, err := strconv.Atoi(fields[1])
+			if err != nil {
+				return "", 0, fmt.Errorf("parse Seccomp value %q: %w", fields[1], err)
+			}
+			switch n {
+			case 0:
+				mode = "disabled"
+			case 1:
+				mode = "strict"
+			case 2:
+				mode = "filter"
+			default:
+				return "", 0, fmt.Errorf("unknown Seccomp value %d", n)
+			}
+			haveMode = true
+		case strings.HasPrefix(line, "Seccomp_filters:"):
+			// Line format: "Seccomp_filters: 1" (kernel writes this
+			// only when Seccomp is 2; missing line is fine if the
+			// mode is 0/1).
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return "", 0, fmt.Errorf("malformed Seccomp_filters line: %q", line)
+			}
+			n, err := strconv.Atoi(fields[1])
+			if err != nil {
+				return "", 0, fmt.Errorf("parse Seccomp_filters value %q: %w", fields[1], err)
+			}
+			filterLen = n
+			haveFilter = true
+		}
+		if haveMode && haveFilter {
+			break
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", 0, fmt.Errorf("scan: %w", err)
+	}
+	if !haveMode {
+		return "", 0, fmt.Errorf("no Seccomp line (kernel too old?)")
+	}
+	return mode, filterLen, nil
 }
 
 // toProblem lifts a plain error to *api.Problem if it isn't one already.

@@ -75,6 +75,16 @@ type VMM interface {
 	// be empty — implementations MUST treat that as a no-op so apps without
 	// secrets skip the mount/umount cycle entirely.
 	StageSecretsEnv(instance string, jsonBlob []byte) error
+	// InstancePID returns the host PID of the running jailer child for
+	// instance, or (0, false) if the instance is not currently alive on
+	// this vmmd. M8 §11: the SeccompStatus gRPC handler reads
+	// /proc/<pid>/status to verify the jailer default seccomp filter is
+	// in place. The bool distinguishes "instance never woke" (caller
+	// should return NotFound) from "instance woke but Pid is 0"
+	// (defensive — never expected in production because jailer always
+	// children firecracker; the bool trips the test before the handler
+	// does).
+	InstancePID(instance string) (int, bool)
 }
 
 // Paths locates the kernel and base images on disk (spec §8). Injected so tests
@@ -616,6 +626,18 @@ func (m *Manager) ExportDirFor(instance string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.exportDirs[instance]
+}
+
+// InstancePID delegates to the underlying VMM. M8 §11: the
+// SeccompStatus gRPC handler reads /proc/<pid>/status to verify
+// the jailer default seccomp filter is in place. The method is
+// defined on the VMM interface itself (not as a Manager-owned
+// lookup) because the PID is private to JailerVMM — propagating
+// it through Manager would just bounce a return value. The
+// Manager-to-VMM hop is one level of indirection, but it's the
+// hop that keeps JailerVMM's bookkeeping internal.
+func (m *Manager) InstancePID(instance string) (int, bool) {
+	return m.vmm.InstancePID(instance)
 }
 
 // NetnsFor returns the network namespace name (fc-<instance>) the

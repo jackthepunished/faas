@@ -85,6 +85,23 @@ service Vmmd {
   // uses pg_notify as the delivery mechanism (cmd/schedd egress
   // drift subscriber, pkg/sched/egress_drift.go).
   rpc UpdateEgressAllowlist(UpdateEgressAllowlistRequest) returns (UpdateEgressAllowlistAck);
+
+  // SeccompStatus (M8 §11 — jailer seccomp assertion) reports the
+  // Linux kernel seccomp state of the jailer child process backing
+  // this instance. Spec §11: "Firecracker's default seccomp filter
+  // is in place" — jailer is the only parent of the firecracker
+  // process, and jailer applies the seccomp filter via
+  // --seccomp-filter=<path>. The handler reads /proc/<pid>/status
+  // outside the vmmd process and reports the Seccomp: line (0 =
+  // disabled, 1 = strict, 2 = filter) plus the filter instruction
+  // count when in filter mode. Empty Instance returns InvalidArgument.
+  // The presence of a freshly-installed filter (filter_len > 0) is
+  // the e2e tripwire: a jailer upgrade that drops the filter is
+  // caught here before the snapshot can be considered trustworthy.
+  // Not in the hot path — Invoke is from the cmd/e2e seccomp gate
+  // and from Prometheus scrapes keyed on the new
+  // firecracker_seccomp_status metric.
+  rpc SeccompStatus(SeccompStatusRequest) returns (SeccompStatusResponse);
 }
 
 // AppSpec flattens what the caller knows about an app. vmmd stores none of
@@ -419,3 +436,41 @@ message UpdateEgressAllowlistRequest {
 // is expected to Park + ColdBoot the affected instances, which
 // the schedd watchdog does on its next tick).
 message UpdateEgressAllowlistAck {}
+
+// SeccompStatusRequest is the input to SeccompStatus. Instance is
+// the compute_node-relative instance id (instances.id). vmmd
+// resolves the running jailer child PID from its live map; an
+// unknown instance returns NotFound (not InvalidArgument — the
+// handler distinguishes "missing from the wire" from "missing on
+// the host" so the e2e can diagnose the wrong row vs the wrong
+// box).
+message SeccompStatusRequest {
+  string instance = 1;
+}
+
+// SeccompStatusResponse mirrors /proc/<pid>/status. Mode is the
+// human-readable equivalent of the kernel's Seccomp integer
+// ("disabled" for 0, "strict" for 1, "filter" for 2). FilterLen is
+// the Seccomp_filters count from the same procfs line — the
+// kernel-reported number of distinct BPF filter programs
+// attached to the process. For a freshly-installed jailer default
+// filter this is 1; 0 means "filter mode but no program" and is
+// the failure mode the e2e asserts against. Pid is the host PID
+// of the jailer child (the only firecracker parent), surfaced so
+// operators can `cat /proc/<pid>/status` themselves from the
+// dashboard. Error is non-empty only when the handler could not
+// read /proc — the wire is well-defined and the gRPC status is
+// also set, but the e2e prefers the message to a non-OK code
+// because the absence of a filter is the assertion target, not
+// the gRPC envelope.
+message SeccompStatusResponse {
+  string instance = 1;
+  int32  pid      = 2;
+  // disabled | strict | filter
+  string mode     = 3;
+  int32  filter_len = 4;
+  // Empty on success. Non-empty on read failure (e.g. process
+  // already reaped) — distinguishes "no seccomp filter installed"
+  // (Mode="filter", FilterLen=0) from "can't tell" (Error set).
+  string error    = 5;
+}

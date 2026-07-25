@@ -87,6 +87,11 @@ type fakeVMM struct {
 	// G2 secrets staging.
 	stagedSecrets   []stagedSecret
 	stageSecretsErr error
+	// pids is the InstancePID source-of-truth for the M8 §11
+	// SeccompStatus path. Tests that want the gRPC handler to
+	// return a real (pid, true) register one here; the default
+	// (empty map) makes the handler return NotFound.
+	pids map[string]int
 }
 
 type stagedSecret struct {
@@ -290,6 +295,21 @@ func (v *fakeVMM) StageSecretsEnv(_ string, jsonBlob []byte) error {
 	v.stagedSecrets = append(v.stagedSecrets, stagedSecret{blob: append([]byte(nil), jsonBlob...)})
 	v.mu.Unlock()
 	return v.stageSecretsErr
+}
+
+// InstancePID is the in-process fake for the M8 §11 SeccompStatus
+// path. fakeVMM never spawns a real process, so the canonical
+// "test a real jailing" path is the cmd/e2e sec11_seccomp test
+// (which boots vmmd as a subprocess and reads /proc/<pid>/status
+// back). The fake answers (0, false) for unknown instances and
+// (pids[instance], true) for instances the test has registered
+// via boot — tests that want to drive the gRPC handler through
+// the fake should set pids before invoking the handler.
+func (v *fakeVMM) InstancePID(instance string) (int, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	p, ok := v.pids[instance]
+	return p, ok
 }
 
 func (v *fakeVMM) restoredInstance(id string) bool {

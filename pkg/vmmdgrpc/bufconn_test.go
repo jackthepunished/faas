@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,8 +42,13 @@ type fakeVMM struct {
 	// updateAllowlistFn (tier-2 PR-B) lets the UpdateEgressAllowlist
 	// handler test decide what the fake reports. nil = success.
 	updateAllowlistFn func(ctx context.Context, appID string, allowlist []netip.Prefix) error
-	live              int
-	leased            int
+	// instancePIDFn (M8 §11) lets the SeccompStatus handler test
+	// decide what the fake returns. nil = (0, false) — the handler
+	// maps that to NotFound, which is the right answer for the
+	// "unknown instance" gRPC unit test.
+	instancePIDFn func(instance string) (int, bool)
+	live          int
+	leased        int
 }
 
 func (f *fakeVMM) Wake(ctx context.Context, req fcvm.WakeRequest) (*fcvm.Instance, error) {
@@ -119,6 +126,19 @@ func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 
 func (f *fakeVMM) LiveCount() int   { return f.live }
 func (f *fakeVMM) LeasedCount() int { return f.leased }
+
+// InstancePID (M8 §11) — wraps the optional hook so the
+// SeccompStatus handler test can return either a real PID (the
+// path the e2e exercises against a live vmmd subprocess) or the
+// (0, false) "not alive" path the gRPC handler maps to NotFound.
+// The fake never reads /proc itself; the cross-process readback
+// is exactly what makes the e2e valuable.
+func (f *fakeVMM) InstancePID(instance string) (int, bool) {
+	if f.instancePIDFn != nil {
+		return f.instancePIDFn(instance)
+	}
+	return 0, false
+}
 func (f *fakeVMM) NetnsFor(instance string) (string, bool) {
 	if f.netnsFn != nil {
 		return f.netnsFn(instance)
@@ -525,5 +545,88 @@ func TestDestroy_AppVMSkipsExportPath(t *testing.T) {
 	}
 	if resp.GetExitCode() != 0 {
 		t.Errorf("app-VM exit_code = %d, want 0", resp.GetExitCode())
+	}
+}
+
+// TestSeccompStatus_EmptyInstance_ReturnsInvalidArgument pins
+// the gRPC contract for the "missing field" case (M8 §11). The
+// handler MUST return InvalidArgument, not NotFound, because the
+// distinction is what lets the e2e diagnose "wrong wire" vs
+// "wrong instance" — a regression that collapsed the two would
+// break every future operator runbook that uses the gRPC code
+// to distinguish the failure modes.
+func TestSeccompStatus_EmptyInstance_ReturnsInvalidArgument(t *testing.T) {
+	f := &fakeVMM{}
+	cli, _ := newServer(t, f)
+	_, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{})
+	if err == nil {
+		t.Fatal("expected error for empty instance, got nil")
+	}
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", code)
+	}
+}
+
+// TestSeccompStatus_UnknownInstance_ReturnsNotFound pins the
+// gRPC contract for the "instance not alive" case. The fake
+// answers (0, false) for everything, which the handler maps to
+// the api.CodeNotFound problem. The grpcerr layer currently
+// collapses CodeNotFound → InvalidArgument (see
+// pkg/grpcerr/grpcerr.go:codeToGRPC); the distinction the e2e
+// cares about lives in the api.Problem Title/Detail, not the
+// gRPC code. This test pins BOTH: the error is non-empty AND
+// the message names the instance, so a future fix to
+// codeToGRPC that flips the mapping to true NotFound also
+// passes (the message assertion is the load-bearing one).
+func TestSeccompStatus_UnknownInstance_ReturnsNotFound(t *testing.T) {
+	f := &fakeVMM{}
+	cli, _ := newServer(t, f)
+	_, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{Instance: "never-woke"})
+	if err == nil {
+		t.Fatal("expected error for unknown instance, got nil")
+	}
+	// The message carries the instance id so the operator can
+	// diagnose which one was wrong. If grpcerr.ToStatus ever
+	// drops the title, the e2e sees a generic error and gives
+	// up; pinning the message here is the tripwire.
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, "never-woke") {
+		t.Errorf("message = %q, want it to name the instance", msg)
+	}
+}
+
+// TestSeccompStatus_HappyPath_ReadsProcFS exercises the wire
+// shape end-to-end through the bufconn harness: the fake returns
+// a real PID (the test process's own PID), the handler reads
+// /proc/<pid>/status, and the response carries a well-formed
+// mode + filter_len. The cross-process readback in cmd/e2e/
+// is the load-bearing assertion; this one pins the handler's
+// server-side /proc read for the non-e2e CI path.
+func TestSeccompStatus_HappyPath_ReadsProcFS(t *testing.T) {
+	if _, err := os.Stat("/proc/self/status"); err != nil {
+		// /proc is Linux-only. Mac dev + Windows CI skip; the
+		// cross-process e2e (cmd/e2e/sec11_seccomp_e2e_test.go,
+		// metal) is the authoritative gate.
+		t.Skipf("/proc/self/status not available on this OS: %v (cross-process e2e is the authoritative gate)", err)
+	}
+	f := &fakeVMM{}
+	f.instancePIDFn = func(instance string) (int, bool) {
+		if instance == "" {
+			return 0, false
+		}
+		return os.Getpid(), true
+	}
+	cli, _ := newServer(t, f)
+	resp, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{Instance: "self"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.GetError() != "" {
+		t.Fatalf("Error = %q (handler failed to read /proc/self/status)", resp.GetError())
+	}
+	if resp.GetMode() != "disabled" && resp.GetMode() != "strict" && resp.GetMode() != "filter" {
+		t.Errorf("mode = %q, want one of disabled/strict/filter", resp.GetMode())
+	}
+	if resp.GetPid() != int32(os.Getpid()) {
+		t.Errorf("pid = %d, want %d", resp.GetPid(), os.Getpid())
 	}
 }
