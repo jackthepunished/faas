@@ -1099,18 +1099,18 @@ func mapStripeTypeToEventType(t string) billing.EventType {
 }
 
 // lookupAccountByStripeID is a thin wrapper around
-// state.Store.AccountByStripeCustomerID. The reverse index lives on the
+// state.Store.AccountByProviderCustomerID. The reverse index lives on the
 // Store so the webhook stays O(1) regardless of account count (MemStore
 // uses a map; PgStore uses a unique index).
 func (s *server) lookupAccountByStripeID(ctx context.Context, stripeID string) (state.Account, error) {
 	if stripeID == "" {
 		return state.Account{}, errors.New("apid: empty stripe customer id")
 	}
-	return s.store.AccountByStripeCustomerID(ctx, stripeID)
+	return s.store.AccountByProviderCustomerID(ctx, stripeID)
 }
 
 // lookupAccountByPaddleID is the Paddle counterpart to
-// lookupAccountByStripeID. The accounts.stripe_customer_id column is
+// lookupAccountByStripeID. The accounts.provider_customer_id column is
 // reused (ADR-025 — column rename is a separate migration PR), so the
 // underlying store method is a 1-line pass-through; the dedicated
 // helper name keeps the Paddle call sites self-documenting.

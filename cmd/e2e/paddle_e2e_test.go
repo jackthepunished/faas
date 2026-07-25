@@ -125,7 +125,7 @@ func TestPaddle_TransactionPaid_RestoresPastDueToActive(t *testing.T) {
 
 	// Seed an account in past_due state with a customer id that
 	// matches the webhook's data.customer_id. The pre-PR-#3
-	// stripe_customer_id column is reused per ADR-025 — the same
+	// provider_customer_id column is reused per ADR-025 — the same
 	// column carries the Paddle ctm_… id.
 	acct, err := store.CreateAccount(ctx, "paddle-paid@example.com", api.PlanHobby)
 	if err != nil {

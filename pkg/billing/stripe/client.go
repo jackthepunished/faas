@@ -115,7 +115,7 @@ func NewClient(store state.Store, dedupe PushDedupe, apiKey, secret string, log 
 // while PR #3 lands the provider-dispatch wiring at the meterd call
 // site).
 func (c *Client) PushUsageRecord(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
-	if acct.StripeCustomerID == "" || acct.StripeSubscriptionItem == "" {
+	if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
 		// No customer / subscription yet — skip silently. Either
 		// field being empty means there's no Stripe surface to bill
 		// against; the missing subscription_item case is the
@@ -147,7 +147,7 @@ func (c *Client) PushUsageRecord(ctx context.Context, acct state.Account, hour t
 // not assume a non-nil record on a successful return. The sandbox test
 // pattern is: err == nil && record != nil && record.Quantity == want.
 func (c *Client) PushUsageRecordSumWithID(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) (*stripe.UsageRecord, error) {
-	if acct.StripeCustomerID == "" || acct.StripeSubscriptionItem == "" {
+	if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
 		// Same skip as PushUsageRecord — pending customers are a no-op.
 		return nil, nil
 	}

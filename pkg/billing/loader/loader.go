@@ -73,10 +73,19 @@ const (
 //     populated before the first /v1/webhooks/paddle POST can land.
 //     Returns the provider + the literal "paddle" even if the catalog
 //     hydration fails — the catalog hydrates lazily on the first
-//     CreateUpgradeTransaction / FlushOverageNow call, and a transient
+//     CreateUpgradeTransaction / PushUsageRecord call, and a transient
 //     Paddle outage at boot must not take down apid (the webhook
 //     ingress is independent of the catalog). Returns the provider +
 //     the literal "paddle".
+//
+// (Note: the prior comment text mentioned a "FlushOverageNow" method.
+// That method never existed — the overage push path used an in-memory
+// pendingOverage sync.Map keyed by account, which was deleted in the
+// big-Paddle-enablement PR. The path is now stateless per-push:
+// PushUsageRecord sums the durable usage_minutes rows on every call
+// and POSTs directly. No FlushNow API, no accumulator, no rehydration
+// on boot — the Idempotency-Key header + the cross-process dedupe
+// row collapse to the same one-bill-per-(account, month) outcome.)
 //
 //   - Any other value → error so a typo fails the boot loudly.
 //

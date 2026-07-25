@@ -544,10 +544,10 @@ func TestAppendUsagePerInstanceMinute(t *testing.T) {
 	}
 }
 
-// TestAccountByStripeCustomerID_NotFound: pkg/state.Store.AccountByStripeCustomerID
+// TestAccountByProviderCustomerID_NotFound: pkg/state.Store.AccountByProviderCustomerID
 // lands in Slice 2 (pkg/billing/stripe). When that method is added this test
 // should be moved to pkg/state/memstore_test.go and extended. For now
 // we skip — the slice-2 PR adds the assertion.
-func TestAccountByStripeCustomerID_NotFound(t *testing.T) {
-	t.Skip("AccountByStripeCustomerID is added in Slice 2; this test is the migration target")
+func TestAccountByProviderCustomerID_NotFound(t *testing.T) {
+	t.Skip("AccountByProviderCustomerID is added in Slice 2; this test is the migration target")
 }

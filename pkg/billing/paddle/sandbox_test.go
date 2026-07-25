@@ -113,11 +113,11 @@ func TestCreateCustomer_PostsToPaddleSandbox(t *testing.T) {
 }
 
 // TestPushOverageTransaction_PostsToPaddleSandbox exercises the
-// overage accumulator against the live sandbox. Drops a tiny
-// mb_seconds number into PushUsageRecord and asserts no error
-// (the prior-month line item shape is internal to the accumulator;
-// the second call within the same month is a no-op so we don't
-// drain the sandbox account's billing balance).
+// overage path against the live sandbox. Drops a tiny mb_seconds
+// number into PushUsageRecord and asserts no error (the
+// stateless per-push shape means a single POST fires per call;
+// the (acct, month) Idempotency-Key suppresses sandbox-side
+// double-bills between test runs that hit the same calendar month).
 func TestPushOverageTransaction_PostsToPaddleSandbox(t *testing.T) {
 	key := requireSandbox(t)
 	p := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -125,7 +125,7 @@ func TestPushOverageTransaction_PostsToPaddleSandbox(t *testing.T) {
 	// EnsurePlanProducts runs first so the overage price handle is
 	// in the catalog; the catalog lookup is what would otherwise
 	// fail with "overage price missing for plan=hobby" in
-	// usage.go:67.
+	// usage.go's defaultFlushLocked.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := p.EnsurePlanProducts(ctx); err != nil {
@@ -138,8 +138,8 @@ func TestPushOverageTransaction_PostsToPaddleSandbox(t *testing.T) {
 		Plan:  api.PlanHobby,
 	}
 	priorMonth := time.Now().UTC().Add(-31 * 24 * time.Hour) // land safely in the prior-month bucket
-	if err := p.accumulateOverage(context.Background(), acct, priorMonth, 1024); err != nil {
-		t.Fatalf("accumulateOverage: %v", err)
+	if err := p.PushUsageRecord(context.Background(), acct, priorMonth, 1024); err != nil {
+		t.Fatalf("PushUsageRecord: %v", err)
 	}
 }
 

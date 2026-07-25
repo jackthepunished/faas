@@ -2,8 +2,8 @@ package paddle
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/PaddleHQ/paddle-go-sdk/v5"
@@ -11,133 +11,65 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// overageAccumulator is the per-account month-bucket that
-// PushUsageRecord accumulates into. flushOverageLocked drains it as
-// a flat-rate line item (quantity=1) with an Idempotency-Key
-// recorded in the request's CustomData so the merchant dashboard
-// audit trail includes a stable per-month identifier.
+// Sentinel errors for the pre-SDK guard failures. The classifier in
+// errors.go uses errors.Is to map these to stable Prometheus labels
+// instead of string-fragment matching — adding a sentinel is the
+// supported way to introduce a new pre-SDK failure mode.
 //
-// Dedupe contract (reviewed in PR #158):
+// Mirrors pkg/billing/stripe/usage.go:17-30 (the Stripe pair):
 //
-//   - Within-process, the `flushed` flag is the source of truth —
-//     repeated calls in the same month become no-ops once the first
-//     POST returns.
-//   - Cross-process (apid restart between flush and `flushed=true`
-//     stamp) is NOT covered today. PR #3's apid dispatch will route
-//     the webhook handler's PushUsageRecord + meterd's pusher
-//     through state.Store-backed dedupe (mirrors
-//     pkg/stripex::HasStripePushHour / RecordStripePushHour — see
-//     pkg/state/store.go:617 for the interface and
-//     pkg/state/pgstore.go:1953 for the implementation).
-//   - The paddle-go-sdk/v5@v5.2.0 SDK does NOT expose Idempotency-Key
-//     as a request option. Today the idem key is recorded in
-//     CustomData only; a HTTP-transport injection is the durable
-//     fix and should land alongside the state-store dedupe.
-type overageAccumulator struct {
-	mu        sync.Mutex
-	acct      state.Account
-	month     time.Time // truncated to month via calendarMonthStart
-	mbSeconds int64
-	flushed   bool // set after a successful flushOverageLocked for this month
-	lastFlush time.Time
-}
+//   - ErrNoAPIKey / stripe.ErrNoAPIKey
+//   - ErrNegativeMBSeconds / stripe.ErrNegativeQuantity
+//     (Paddle wire quantity is 1; the guard is on the int64
+//     mb_seconds input, not on wire quantity, so the name differs)
+//   - ErrOveragePriceMissing — Paddle-specific; no Stripe analog
+//     because Stripe's metered subscription_item is provisioned
+//     once and reused, while Paddle's overage price handle is
+//     looked up per push from the boot-time catalog. If
+//     EnsurePlanProducts has not populated the catalog, the
+//     push fails fast with this sentinel before the SDK is
+//     invoked.
+var (
+	ErrNoAPIKey            = errors.New("paddle: cannot push usage without apiKey")
+	ErrNegativeMBSeconds   = errors.New("paddle: negative mb_seconds")
+	ErrOveragePriceMissing = errors.New("paddle: overage price missing for plan")
+)
 
-// accumulateOverage inserts mb_seconds into the (acct, month) bucket.
-// Cross-month boundary hands prior-month to flushOverageLocked
-// (drained inline before the new bucket opens) — meter pushes one
-// (acct, hour) per minute so the boundary case is rare but real.
+// flushOverageLocked is the cross-process claim state machine +
+// SDK post for one (account, window) push. Stateless: no in-memory
+// accumulator. Each call's `hour` argument is the meterd tick's
+// timestamp; the window start is derived via
+// windowStartFromHour (hour.UTC().Truncate(Hour), mirroring the
+// stripe_push_dedupe grain).
 //
-// monthStart pins to the calendar month containing `hour` (UTC):
-// Jan 31 23:59 + 1 minute → bucket key Feb 1 00:00 (different bucket,
-// triggers a flush of Jan). The unit test
-// TestAccumulateOverage_CrossMonthFlush exercises a Feb→Mar boundary
-// that the original Truncate(30*24h) math got wrong in 28-/29-day months.
-func (p *Provider) accumulateOverage(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
-	monthStart := calendarMonthStart(hour.UTC())
-
-	v, _ := p.pendingOverage.LoadOrStore(acct.ID, &overageAccumulator{
-		acct:  acct,
-		month: monthStart,
-	})
-	acc := v.(*overageAccumulator)
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
-
-	// If this mb_seconds falls into a different calendar month than
-	// the accumulator's current month, drain the prior month first.
-	if !acc.month.Equal(monthStart) && acc.mbSeconds > 0 && !acc.flushed {
-		if err := p.flushOverageLocked(ctx, acc); err != nil {
-			return fmt.Errorf("paddle: flush prior-month overage account=%s: %w", acct.ID, err)
-		}
-	}
-	acc.acct = acct
-	acc.month = monthStart
-	acc.mbSeconds += mbSeconds
-	return nil
-}
-
-// calendarMonthStart returns the first instant of t's UTC calendar
-// month. Pulled out so the math is testable without driving the
-// accumulator mutex. Reference values: Feb 1, Mar 1, the leap-day
-// edge (Feb 29 in leap years), and the Dec → Jan year boundary.
+// The PR #204-era Has/Record gate has been replaced by the
+// pending/completed claim from migration 00037 + state.Store
+// claim methods. The atomic claim is the durable guard against
+// double-billing across processes (Has→POST→Record was a TOCTOU
+// race that the per-process loop could not close). The window-
+// scoped grain matches the meterd loop's UsageByHour read,
+// closing the underbilling defect where the first positive
+// window of the month POSTed but every subsequent window was
+// skipped.
 //
-// (Reviewer ask: the previous Truncate(30*24h).Truncate(time.Hour)
-// only accidentally produced a month boundary on 30-day months —
-// February pushed Feb 28 23:59 would bucket into the Jan 30 line,
-// which then never flushed against Feb's actual month. The replaced
-// function below is the correct one.)
-func calendarMonthStart(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
-}
-
-// flushOverageLocked posts the current bucket as a Paddle Transactions
-// item with quantity 1 and the overage price handle from
-// planOverage[plan]. Idempotent: a redelivered month gets the same
-// Idempotency-Key so the SDK (and Paddle) collapse it.
-//
-// Cross-process dedupe (state.Store-backed paddle.PaddleOverageDedupe):
-// if `p.dedupe` is wired, we read the (acct, month) gate BEFORE the
-// SDK POST and write it AFTER a successful POST. A meterd that
-// crashed between a prior month's POST and the in-process `flushed`
-// stamp has flushed the month on Paddle's side but lost the flag;
-// the next process boot's HasPaddleOverageMonth returns true and
-// short-circuits the POST. The within-process `acc.flushed` flag
-// stays as the same-process gate so a second PushUsageRecord in the
-// same meterd boot does not re-`Has`-check the store.
-//
-// Residual risk: the window between the SDK POST committing and
-// RecordPaddleOverageMonth returning nil is the same TOCTOU Stripe
-// has, but Paddle has no external Idempotency-Key header in this SDK
-// version — the post-POST record is the only guard. Bounded by
-// meterd's daily cadence and the Paddle `transaction.completed`
-// webhook surface; a double-bill is visible on the merchant dashboard
-// on the next reconciliation. The state-machine alternative was
-// rejected for over-engineering at the current risk profile.
-//
-// `p.flushFn` is the seam tests use to substitute a counter stub
-// without standing up a full *paddle.SDK (the SDK has no recorder
-// interface). Production paths never touch it. Same pattern as
-// `time.Now` swappable, kept local to the file.
-func (p *Provider) flushOverageLocked(ctx context.Context, acc *overageAccumulator) error {
-	if acc.flushed {
+// Defensive zero-sum guard lives here too — flushOverageLocked is
+// reachable from PushUsageRecord after the pre-SDK guards (which
+// already short-circuit on 0) and from any future caller that
+// wants to bypass the guards. Idempotent no-op on 0.
+func (p *Provider) flushOverageLocked(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
+	if mbSeconds == 0 {
 		return nil
 	}
-	// Normalise once so the Has + Record branches share the value.
-	// Cheap (one time.Date call) but keeps the call sites uniform.
-	var monthStart time.Time
+	windowStart := windowStartFromHour(hour.UTC())
 	if p.dedupe != nil {
-		monthStart = calendarMonthStart(acc.month.UTC())
-		already, err := p.dedupe.HasPaddleOverageMonth(ctx, acc.acct.ID, monthStart)
+		claimed, err := p.dedupe.ClaimPaddleOverageWindow(ctx, acct.ID, windowStart, p.claimedBy(), paddleOverageLease)
 		if err != nil {
-			return fmt.Errorf("paddle: dedupe has month=%s acct=%s: %w",
-				monthStart.Format("2006-01"), acc.acct.ID, err)
+			return fmt.Errorf("paddle: dedupe claim window=%s acct=%s: %w",
+				windowStart.Format(time.RFC3339), acct.ID, err)
 		}
-		if already {
-			// Another process (or a prior boot) already flushed this
-			// month. Mark the in-process accumulator so the next push
-			// doesn't re-check the store either.
-			acc.flushed = true
-			acc.lastFlush = p.now()
+		if !claimed {
+			// Another pod holds a non-stale claim for this window.
+			// Skip the SDK POST; the holder will Complete it.
 			return nil
 		}
 	}
@@ -145,53 +77,107 @@ func (p *Provider) flushOverageLocked(ctx context.Context, acc *overageAccumulat
 	if flusher == nil {
 		flusher = defaultFlushLocked
 	}
-	if err := flusher(ctx, p, acc); err != nil {
+	if err := flusher(ctx, p, acct, windowStart, mbSeconds); err != nil {
 		return err
 	}
 	if p.dedupe != nil {
-		if err := p.dedupe.RecordPaddleOverageMonth(ctx, acc.acct.ID, monthStart); err != nil {
-			return fmt.Errorf("paddle: dedupe record month=%s acct=%s: %w",
-				monthStart.Format("2006-01"), acc.acct.ID, err)
+		if err := p.dedupe.CompletePaddleOverageWindow(ctx, acct.ID, windowStart, mbSeconds); err != nil {
+			return fmt.Errorf("paddle: dedupe complete window=%s acct=%s: %w",
+				windowStart.Format(time.RFC3339), acct.ID, err)
 		}
 	}
-	acc.flushed = true
-	acc.lastFlush = p.now()
 	return nil
 }
 
-// FlushFn is the seam `flushOverageLocked` delegates to. Each call
+// windowStartFromHour returns the [start, start+1h) window
+// containing t. Pulled out so the math is testable without driving
+// the claim gate. Mirrors the stripe_push_dedupe grain at
+// pkg/billing/stripe/client.go so the two providers share the same
+// hourly windowing. UTC-normalized so a future caller that
+// forgets to normalize cannot create a phantom row.
+//
+// (Note: PR #179-era code used calendarMonthStart here, which
+// underbilled every account after the first positive window of the
+// month because the meterd loop reads UsageByHour — window-scoped —
+// but the dedupe row was keyed by month. The fix-PR rewrote this
+// to per-window grain and added the claim state machine to make
+// the cross-process race safe.)
+func windowStartFromHour(t time.Time) time.Time {
+	return t.Truncate(time.Hour)
+}
+
+// calendarMonthStart returns the first instant of t's UTC calendar
+// month. Kept for backwards compatibility with the PR #179-era
+// test fixtures that pin the math; the production dedupe grain is
+// per-window (windowStartFromHour), but the merchant-dashboard
+// CustomData["month"] still stamps the calendar-month string.
+// Reference values: Feb 1, Mar 1, the leap-day edge
+// (Feb 29 in leap years), and the Dec → Jan year boundary.
+func calendarMonthStart(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+// FlushFn is the seam flushOverageLocked delegates to. Each call
 // builds the actual `CreateTransaction` SDK request and returns an
-// error; a test stub can substitute a counter to drive cross-month
+// error; a test stub can substitute a counter to drive cross-window
 // flush semantics in unit tests without the SDK.
 //
 // Keep this signature stable — tests reach for it directly via
-// provider.flushFn.
-type FlushFn func(ctx context.Context, p *Provider, acc *overageAccumulator) error
+// provider.flushFn. The third argument's name is `windowStart` to
+// match the per-window dedupe grain; semantically it's still a
+// time.Time (callers that read calendarMonthStart semantics must
+// update their assertions).
+type FlushFn func(ctx context.Context, p *Provider, acct state.Account, windowStart time.Time, mbSeconds int64) error
 
 // defaultFlushLocked is the production FlushFn: looks up the
 // overage price handle for the account's plan, posts a quantity-1
-// Transactions line item with the (acct, month) Idempotency-Key
-// stamped into CustomData.
-func defaultFlushLocked(ctx context.Context, p *Provider, acc *overageAccumulator) error {
-	priceID := p.overagePriceForPlan(acc.acct.Plan)
+// Transactions line item with the (acct, windowStart)
+// Idempotency-Key stamped into CustomData AND forwarded as a
+// transport-level Idempotency-Key HTTP header via the wrapper at
+// transport.go.
+//
+// The Idempotency-Key injection happens via the SDK's
+// ContextWithTransitID (which the SDK stamps as X-Transit-Id on
+// the outbound request); our RoundTripper at transport.go reads
+// X-Transit-Id and copies it as Idempotency-Key on POST /transactions.
+// Paddle's API server may not honor the header today (SDK team is
+// working on native support); the header is observable on the
+// wire for ops debugging and is forward-compat.
+//
+// CustomData["month"] is stamped with the calendar-month string
+// (not the windowStart) so the merchant dashboard line items stay
+// aggregated by month — this matches the operator-visible billing
+// model and is independent of the per-window dedupe grain.
+func defaultFlushLocked(ctx context.Context, p *Provider, acct state.Account, windowStart time.Time, mbSeconds int64) error {
+	priceID := p.overagePriceForPlan(acct.Plan)
 	if priceID == "" {
-		return fmt.Errorf("paddle: overage price missing for plan=%s — EnsurePlanProducts must run first", acc.acct.Plan)
+		return fmt.Errorf("%w (plan=%s)", ErrOveragePriceMissing, acct.Plan)
 	}
-	idem := fmt.Sprintf("faas-overage-%s-%s", acc.acct.ID, acc.month.Format("2006-01"))
-	qty := 1
-	customerID := acc.acct.StripeCustomerID // column name stale per ADR-025
+	monthStr := calendarMonthString(windowStart)
+	idem := fmt.Sprintf("faas-overage-%s-%s", acct.ID, windowStart.Format(time.RFC3339))
+	customerID := acct.ProviderCustomerID // acct.ProviderCustomerID carries Stripe cus_… or Paddle ctm_… — same column, provider-discriminated by value shape per ADR-032.
+
+	// Stamp the transit ID on the context. The SDK's internal/client
+	// (client.go:98-101) reads this and sets X-Transit-Id on the
+	// outbound request; our transport wrapper copies it as
+	// Idempotency-Key on POST /transactions. Single source of truth
+	// for the idempotency value across the SDK header + our injected
+	// header + the CustomData field.
+	ctx = paddle.ContextWithTransitID(ctx, idem)
+
 	_, err := p.client.CreateTransaction(ctx, &paddle.CreateTransactionRequest{
 		CustomerID: &customerID,
 		Items: []paddle.CreateTransactionItems{{
 			TransactionItemFromCatalog: &paddle.TransactionItemFromCatalog{
 				PriceID:  priceID,
-				Quantity: qty,
+				Quantity: 1,
 			},
 		}},
 		CustomData: paddle.CustomData{
-			"faas_account_id":      acc.acct.ID,
-			"month":                acc.month.Format("2006-01"),
-			"mb_seconds":           fmt.Sprintf("%d", acc.mbSeconds),
+			"faas_account_id":      acct.ID,
+			"month":                monthStr,
+			"window_start":         windowStart.Format(time.RFC3339),
+			"mb_seconds":           fmt.Sprintf("%d", mbSeconds),
 			"faas_paddle_idem_key": idem,
 		},
 	})
@@ -199,6 +185,14 @@ func defaultFlushLocked(ctx context.Context, p *Provider, acc *overageAccumulato
 		return fmt.Errorf("paddle: CreateTransaction: %w", err)
 	}
 	return nil
+}
+
+// calendarMonthString returns the "2006-01" calendar-month string
+// for a window-start timestamp. Used by defaultFlushLocked to
+// stamp CustomData["month"] without re-doing the calendar math in
+// every caller. UTC-normalized.
+func calendarMonthString(t time.Time) string {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC).Format("2006-01")
 }
 
 // overagePriceForPlan returns the overage line-item price handle for

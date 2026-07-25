@@ -16,6 +16,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/migrations"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
@@ -95,5 +96,36 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 	// apply would leave (nRows - 1) short of len(files).
 	if nRows-1 != int64(len(files)) {
 		t.Errorf("goose_db_version applied rows - 1 (sentinel) = %d, embedded migration count = %d; some migrations failed to apply silently", nRows-1, len(files))
+	}
+
+	// Fresh-install schema pin: a fresh-DB apply must end with the
+	// accounts table carrying provider_customer_id (not
+	// stripe_customer_id) — the rename in 00040 is part of the
+	// same apply sequence. Catches the failure mode PR #204 shipped:
+	// a hand-edit to migration 00001 that left the rename target
+	// column absent on a clean DB, causing 00040's ALTER TABLE to
+	// fail with "column does not exist". ApplyAndWalk only checked
+	// version-table row counts before; this assertion pins the
+	// post-rename schema shape.
+	assertColumnRenamed(t, pool, "accounts", "provider_customer_id")
+}
+
+// assertColumnRenamed fails the test if `table` does not have
+// `column` after the migration apply. The query uses
+// information_schema.columns which is the same source pg_dump uses
+// for schema introspection, so it's the canonical "did the rename
+// land?" probe. A schema with the OLD column name (or both) fails
+// fast with the offending column list.
+func assertColumnRenamed(t *testing.T, pool *pgxpool.Pool, table, column string) {
+	t.Helper()
+	var x int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT 1 FROM information_schema.columns
+		 WHERE table_schema = current_schema()
+		   AND table_name = $1
+		   AND column_name = $2`,
+		table, column,
+	).Scan(&x); err != nil {
+		t.Fatalf("fresh-install schema check: table %q does not have column %q after migrations applied; the rename migration (00040) did not land on this DB (err=%v). This is the failure mode PR #204 shipped — migration 00001 was hand-edited to the new column name and 00040's RENAME statement then failed with 'column does not exist'.", table, column, err)
 	}
 }

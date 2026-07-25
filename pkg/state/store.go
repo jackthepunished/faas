@@ -73,22 +73,22 @@ type Store interface {
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error
 	UpdateAccountStatus(ctx context.Context, id string, status AccountStatus) error
-	// UpdateAccountStripeCustomerID records the Stripe `cus_…` ID on the
+	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
 	// account row so the webhook + push paths can join. Idempotent — a
 	// repeat call with the same value is a no-op (ADR-010, Slice 2).
-	UpdateAccountStripeCustomerID(ctx context.Context, id, stripeCustomerID string) error
+	UpdateAccountProviderCustomerID(ctx context.Context, id, stripeCustomerID string) error
 	// UpdateAccountStripeSubscriptionItem records the Stripe metered
 	// subscription item ID (si_…) so meterd's hourly push knows
 	// where to POST UsageRecord (issue #52, M7). Empty until the
 	// customer's first subscription.created webhook lands.
 	UpdateAccountStripeSubscriptionItem(ctx context.Context, id, subItem string) error
-	// AccountByStripeCustomerID resolves an account from the Stripe customer
+	// AccountByProviderCustomerID resolves an account from the Stripe customer
 	// ID. The webhook is the only caller; backed by an index in production
 	// (deferred). Returns ErrNotFound for unknown customers.
-	AccountByStripeCustomerID(ctx context.Context, stripeCustomerID string) (Account, error)
+	AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error)
 	// UpdateAccountPaddleCustomerID records the Paddle `ctm_…` ID on the
 	// account row so the Paddle webhook can join. Mirrors
-	// UpdateAccountStripeCustomerID; the existing stripe_customer_id
+	// UpdateAccountProviderCustomerID; the existing provider_customer_id
 	// column is reused per ADR-025 (the column name is on the
 	// documented stale-names list — the rename is a separate, smaller
 	// migration PR). Stripe cus_… and Paddle ctm_… values are
@@ -97,7 +97,7 @@ type Store interface {
 	// not per-row).
 	UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error
 	// AccountByPaddleCustomerID resolves an account from the Paddle
-	// customer ID. Same body as AccountByStripeCustomerID — the lookup
+	// customer ID. Same body as AccountByProviderCustomerID — the lookup
 	// is against the same column. Kept as a named entry (not a thin
 	// wrapper from the call sites) so the Paddle webhook code path
 	// reads self-documentingly and the column-rename PR can swap
@@ -805,8 +805,46 @@ type Store interface {
 	// shape is (account_id, month) instead of (account_id, hour) because
 	// the Paddle overage push fires at month-rollover rather than hourly
 	// (paddle-go-sdk/v5 has no metered-subscription equivalent to Stripe).
+	//
+	// Deprecated: the month-scoped pair below is superseded by the
+	// per-window ClaimPaddleOverageWindow + CompletePaddleOverageWindow
+	// pair. The PK mismatch between PR #204's meterd loop (window-scoped
+	// UsageByHour reads) and the month-scoped dedupe row underbilled
+	// every account after its first positive window of the month. New
+	// callers must use the window-scoped pair. Kept on the interface for
+	// back-compat with PR #179 callers; will be removed once no
+	// production code paths call them.
 	HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error)
 	RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error
+
+	// ClaimPaddleOverageWindow atomically claims the (acct, window)
+	// pair for the calling pod. Returns claimed=true only if this
+	// caller now owns the window and must proceed to POST; another
+	// pod holds the row otherwise (and the caller must skip the
+	// POST). windowStart is hour.UTC().Truncate(Hour). claimedBy is
+	// a free-form ops-debugging string (pod hostname or ULID); not
+	// part of the unique constraint. lease is the freshness window
+	// for reaping stale-pending rows (5 min in production); a
+	// pending row whose claimed_at is older than lease is fair game
+	// for re-claim. Mirrors the ClaimInvocation pattern at
+	// pgstore.go:1297.
+	ClaimPaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, claimedBy string, lease time.Duration) (claimed bool, err error)
+	// CompletePaddleOverageWindow transitions the row from pending
+	// to completed after a successful SDK POST. Only the pod that
+	// holds the claim (state='pending' with matching claimed_by) is
+	// allowed to complete; a foreign caller sees 0 rows updated
+	// and gets ErrClaimLost so the meterd can decide whether to
+	// alert or silently drop. mb_seconds is stamped on the row for
+	// ops debugging (the merchant dashboard already has the value
+	// in CustomData).
+	CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error
+	// ReapStalePaddleOverageClaims resets pending rows whose
+	// claimed_at is older than olderThan so the next push tick can
+	// re-claim them. Returns the number of rows reset (informational;
+	// not a load-bearing return value for the caller). Called from
+	// meterd boot before the first Loop.Tick. Idempotent: re-running
+	// it inside the lease window is a no-op.
+	ReapStalePaddleOverageClaims(ctx context.Context, olderThan time.Duration) (int, error)
 
 	// Idempotency (spec §4.2: Idempotency-Key stored 24 h).
 	GetIdempotent(ctx context.Context, accountID, key string) (status int, body []byte, err error)
