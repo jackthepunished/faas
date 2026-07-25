@@ -548,23 +548,30 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
 		return fmt.Errorf("imaged: %s", msg)
 	}
-	// Per-runtime handler path. The default `/app/<runtime>` works for
-	// runtimes whose handler binary carries the runtime name (go124's
-	// static binary lives at /app/handler — see the Go branch below).
-	// The python312 and node22 branches override because their
-	// handlers ship with a language-specific extension (.py / .js).
-	// A new runtime that needs a different path adds its own branch;
-	// the default is no longer a `.js` stub so a runtime omission
-	// can't silently produce `/app/<runtime>.js`.
+	// Per-runtime handler path. The baseline is `/app/node22.js` —
+	// matches the node22 runner's `--handler` default at
+	// guest/runners/node22/main.go so the round-trip works without an
+	// override. python312 and go124 override because their handlers
+	// ship under different filenames: `/app/handler.py` for python
+	// (the .py suffix matters), `/app/handler` for the Go static
+	// binary (Railpack's --plan go emits CGO_ENABLED=0). The go124
+	// branch is also a tripwire: an unknown runtime that ever slips
+	// past the allow-list above would silently produce
+	// `/app/node22.js` and the runner would exec the wrong file on
+	// first wake. Pin: TestBuildFunctionLayer_Runtimes in
+	// handler_test.go asserts every runtime's argv verbatim.
 	manifest := api.AppManifest{
 		Port:    api.DefaultAppPort,
 		Healthz: "/healthz",
 		Entrypoint: []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
-			"--handler", "/app/" + runtime,
+			"--handler", "/app/node22.js",
 		},
 	}
+	// node22 has no explicit override here — its `/app/node22.js`
+	// matches the default above. Adding `case RuntimeNode22 { ... }`
+	// for symmetry would silently diverge from the runner default.
 	if runtime == RuntimePython312 {
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
@@ -572,23 +579,15 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--handler", "/app/handler.py",
 		}
 	}
-	if runtime == RuntimeNode22 {
-		manifest.Entrypoint = []string{
-			"/usr/local/bin/faas-runner",
-			"--runtime", runtime,
-			"--handler", "/app/node22.js",
-		}
-	}
 	if runtime == RuntimeGo124 {
 		// The customer's handler is a static Go binary (Railpack's go
 		// plan emits CGO_ENABLED=0 by default), so the runner execs
 		// the file directly with no interpreter argument. The path
-		// is `/app/handler` (the default above) and pinned by
+		// `/app/handler` is independent of the node22 baseline above
+		// and pinned by
 		// guest/runners/go124/main_test.go::TestGoRunnerHandlerDefault
 		// so a default-flag drift surfaces at unit-test time, not
-		// on first wake. The branch is left here as a tripwire — if
-		// the default ever needs to differ for Go, it lives next to
-		// the other per-runtime overrides.
+		// on first wake.
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,

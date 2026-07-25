@@ -970,3 +970,377 @@ func TestOCIPullMetrics_LegacyFallback(t *testing.T) {
 		}
 	}
 }
+
+// ---- Tier 1 follow-up (post PR #201) ---------------------------------------
+//
+// PR #201 added the go124 runtime to baseRefFor / runnerPathFor /
+// runtimeToEnvSuffix / buildFunctionLayer. These tests pin those switch arms
+// at unit-test speed so a runtime omission surfaces here rather than on first
+// wake. PR #201 also shipped a node22/handler.js default-flag inconsistency
+// (the runner default is now /app/node22.js) — the buildFunctionLayer branch
+// collapse is verified here too. See docs/runtimes/go124.md for the per-runtime
+// handler-path contract.
+
+// newFunctionTestHarness is the function-deploy twin of newTestHarness. It
+// creates a Type=Function app with the supplied runtime pinned (so
+// buildFunctionLayer reads app.Runtime rather than the dep.Handler fallback)
+// and a tarball deployment. The function-deploy path cannot share the image
+// harness because the app.Type switch in handleDeployment is load-bearing.
+//
+// The harness is intentionally small — every caller explicitly wires the
+// matching WithFunctionRunner* setter so the table rows stay legible.
+func newFunctionTestHarness(t *testing.T, plan api.Plan, runtime string) *testHarness {
+	t.Helper()
+	s := state.NewMemStore()
+	acct, err := s.CreateAccount(context.Background(), "u@example.com", plan)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	ram := 256
+	if lim, ok := api.LimitsFor(plan); ok && lim.RAMMB > 0 {
+		ram = lim.RAMMB
+	}
+	app, err := s.CreateApp(context.Background(), state.App{
+		AccountID:      acct.ID,
+		Slug:           "fn-app-" + runtime,
+		Type:           state.AppTypeFunction,
+		Runtime:        runtime,
+		RAMMB:          ram,
+		IdleTimeoutS:   30,
+		MaxConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp(function): %v", err)
+	}
+	dep, err := s.CreateDeployment(context.Background(), state.Deployment{
+		AppID:      app.ID,
+		Kind:       state.DeploymentKindTarball,
+		SourcePath: "/tmp/source-" + runtime + ".tgz",
+		Handler:    runtime,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(function): %v", err)
+	}
+	appsR := t.TempDir()
+	return &testHarness{
+		store: s, notif: &fakeNotifier{}, bld: &fakeBuilder{},
+		app: app, dep: dep, acct: acct, appsR: appsR,
+	}
+}
+
+// TestBaseRefFor_Runtimes pins the host-side runtime → base image
+// translation. The go124 row is the regression net for PR #201: a silent
+// omission in baseRefFor would have shipped a go124 app against
+// base-minimal, breaking the two-drive diff_ids math at first wake.
+func TestBaseRefFor_Runtimes(t *testing.T) {
+	cases := []struct {
+		name    string
+		runtime string
+		want    string
+	}{
+		{"node22 → node22 base", RuntimeNode22, BaseRefNode22},
+		{"python312 → python312 base", RuntimePython312, BaseRefPython312},
+		{"go124 → go124 base (PR #201 row)", RuntimeGo124, BaseRefGo124},
+		{"empty runtime → minimal base", "", BaseRefMinimal},
+		{"unknown runtime → minimal base", "ruby33", BaseRefMinimal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := baseRefFor(tc.runtime); got != tc.want {
+				t.Errorf("baseRefFor(%q) = %q, want %q", tc.runtime, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunnerPathFor_Runtimes pins the per-runtime function-runner binary
+// path switch. The go124 row is the regression net for PR #201's
+// WithFunctionRunnerGo124 wiring. Sentinel paths make cross-wiring visible:
+// if a future refactor swaps the go124 case body for the node22 case body,
+// the assertion still fails because each branch owns a distinct value.
+func TestRunnerPathFor_Runtimes(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     func(h *Handler)
+		runtime string
+		want    string
+	}{
+		{"node22 → node22Path", func(h *Handler) { h.WithFunctionRunnerNode22("/runners/node22") }, RuntimeNode22, "/runners/node22"},
+		{"python312 → python312Path", func(h *Handler) { h.WithFunctionRunnerPython312("/runners/python312") }, RuntimePython312, "/runners/python312"},
+		{"go124 → go124Path (PR #201 row)", func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") }, RuntimeGo124, "/runners/go124"},
+		{"empty runtime → \"\"", func(h *Handler) {}, "", ""},
+		{"unknown runtime → \"\"", func(h *Handler) {}, "ruby33", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := New(state.NewMemStore(), &fakeNotifier{}, fakePuller{}, &fakeBuilder{}, "./init", t.TempDir(), silentLogger())
+			tc.set(h)
+			if got := h.runnerPathFor(tc.runtime); got != tc.want {
+				t.Errorf("runnerPathFor(%q) = %q, want %q", tc.runtime, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRuntimeToEnvSuffix_Runtimes pins the per-runtime env-var suffix used
+// in the fail-loud error message ("set FAAS_FUNCTION_RUNNER_<SUFFIX> on the
+// imaged unit"). The go124 row is the regression net for PR #201: a
+// silent drop of the GO124 case would have produced
+// FAAS_FUNCTION_RUNNER_go124 in the error and confused operators looking
+// for the documented FAAS_FUNCTION_RUNNER_GO124 knob.
+func TestRuntimeToEnvSuffix_Runtimes(t *testing.T) {
+	cases := []struct {
+		name    string
+		runtime string
+		want    string
+	}{
+		{"node22 → NODE22", RuntimeNode22, "NODE22"},
+		{"python312 → PYTHON312", RuntimePython312, "PYTHON312"},
+		{"go124 → GO124 (PR #201 row)", RuntimeGo124, "GO124"},
+		{"unknown runtime → unchanged", "ruby33", "ruby33"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runtimeToEnvSuffix(tc.runtime); got != tc.want {
+				t.Errorf("runtimeToEnvSuffix(%q) = %q, want %q", tc.runtime, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildFunctionLayer_Runtimes sweeps all three supported function
+// runtimes end-to-end through buildFunctionLayer. It is the regression net
+// for both the go124 branch (PR #201) and the node22 branch collapse (this
+// PR). Each row pins:
+//
+//  1. one Builder.Build call
+//  2. FunctionRunnerPath = row's sentinel
+//  3. TarballPath = dep.SourcePath
+//  4. Layers empty (function deploys use the tarball, not blobs)
+//  5. manifest argv = [/usr/local/bin/faas-runner --runtime R --handler H]
+//  6. manifest.Port = api.DefaultAppPort
+//  7. manifest.Healthz = "/healthz"
+//
+// If the collapse in Phase 2 ever causes a runtime to lose its explicit
+// handler-path branch, the per-row assertion catches it at unit-test speed.
+func TestBuildFunctionLayer_Runtimes(t *testing.T) {
+	cases := []struct {
+		name        string
+		runtime     string
+		runnerPath  string
+		handlerPath string
+		wire        func(h *Handler)
+	}{
+		{
+			name:        "node22",
+			runtime:     RuntimeNode22,
+			runnerPath:  "/runners/node22",
+			handlerPath: "/app/node22.js",
+			wire:        func(h *Handler) { h.WithFunctionRunnerNode22("/runners/node22") },
+		},
+		{
+			name:        "python312",
+			runtime:     RuntimePython312,
+			runnerPath:  "/runners/python312",
+			handlerPath: "/app/handler.py",
+			wire:        func(h *Handler) { h.WithFunctionRunnerPython312("/runners/python312") },
+		},
+		{
+			name:        "go124",
+			runtime:     RuntimeGo124,
+			runnerPath:  "/runners/go124",
+			handlerPath: "/app/handler",
+			wire:        func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFunctionTestHarness(t, api.PlanHobby, tc.runtime)
+			handler := New(h.store, h.notif, fakePuller{}, h.bld, "./init", h.appsR, silentLogger())
+			tc.wire(handler)
+
+			if err := handler.buildFunctionLayer(context.Background(), h.app, h.dep, h.acct); err != nil {
+				t.Fatalf("buildFunctionLayer(%s): %v", tc.runtime, err)
+			}
+
+			if got, _ := h.store.DeploymentByID(context.Background(), h.dep.ID); got.Status != state.DeployImaging {
+				t.Errorf("status = %s, want imaging", got.Status)
+			}
+			if len(h.bld.calls) != 1 {
+				t.Fatalf("Builder.Build calls = %d, want 1", len(h.bld.calls))
+			}
+			in := h.bld.calls[0]
+			if in.FunctionRunnerPath != tc.runnerPath {
+				t.Errorf("FunctionRunnerPath = %q, want %q", in.FunctionRunnerPath, tc.runnerPath)
+			}
+			if in.TarballPath != h.dep.SourcePath {
+				t.Errorf("TarballPath = %q, want %q (dep.SourcePath)", in.TarballPath, h.dep.SourcePath)
+			}
+			if len(in.Layers) != 0 {
+				t.Errorf("Layers = %d readers, want 0 (function deploys use the tarball)", len(in.Layers))
+			}
+
+			wantArgv := []string{
+				"/usr/local/bin/faas-runner",
+				"--runtime", tc.runtime,
+				"--handler", tc.handlerPath,
+			}
+			if got := in.Manifest.Entrypoint; !equalStrings(got, wantArgv) {
+				t.Errorf("Manifest.Entrypoint = %v, want %v", got, wantArgv)
+			}
+			if in.Manifest.Port != api.DefaultAppPort {
+				t.Errorf("Manifest.Port = %d, want %d", in.Manifest.Port, api.DefaultAppPort)
+			}
+			if in.Manifest.Healthz != "/healthz" {
+				t.Errorf("Manifest.Healthz = %q, want \"/healthz\"", in.Manifest.Healthz)
+			}
+		})
+	}
+}
+
+// equalStrings is a tiny helper kept here so the table assertion above is
+// readable without pulling reflect.DeepEqual into the call.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestBuildFunctionLayer_MissingRunnerFailsLoud exercises the per-runtime
+// fail-loud path: a runtime wired without its matching FAAS_FUNCTION_RUNNER_*
+// binary must transition the deployment to failed, surface the operator-
+// facing knob name in the error, and never call Builder.Build. The go124
+// row is the regression net for PR #201 — the FAAS_FUNCTION_RUNNER_GO124
+// env-var name MUST appear in the error message so operators can find it
+// without grepping the source.
+func TestBuildFunctionLayer_MissingRunnerFailsLoud(t *testing.T) {
+	cases := []struct {
+		name        string
+		runtime     string
+		wantEnvKnob string
+	}{
+		{"node22", RuntimeNode22, "FAAS_FUNCTION_RUNNER_NODE22"},
+		{"python312", RuntimePython312, "FAAS_FUNCTION_RUNNER_PYTHON312"},
+		{"go124 (PR #201 row)", RuntimeGo124, "FAAS_FUNCTION_RUNNER_GO124"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFunctionTestHarness(t, api.PlanHobby, tc.runtime)
+			// Intentionally do NOT wire the matching runner path.
+			handler := New(h.store, h.notif, fakePuller{}, h.bld, "./init", h.appsR, silentLogger())
+
+			err := handler.buildFunctionLayer(context.Background(), h.app, h.dep, h.acct)
+			if err == nil {
+				t.Fatal("expected error when function runner path is empty")
+			}
+			if !strings.Contains(err.Error(), tc.wantEnvKnob) {
+				t.Errorf("error %q must mention %q so operators can find the knob", err.Error(), tc.wantEnvKnob)
+			}
+			got, _ := h.store.DeploymentByID(context.Background(), h.dep.ID)
+			if got.Status != state.DeployFailed {
+				t.Errorf("status = %s, want failed", got.Status)
+			}
+			if !strings.Contains(got.Error, tc.wantEnvKnob) {
+				t.Errorf("deployment error %q must mention %q", got.Error, tc.wantEnvKnob)
+			}
+			if len(h.bld.calls) != 0 {
+				t.Errorf("Builder.Build must not run when runner path is empty; calls=%d", len(h.bld.calls))
+			}
+		})
+	}
+}
+
+// ---- App-mode Cmd regression net (PR #201 follow-up #4) -------------------
+//
+// docs/runtimes/go124.md explicitly warns that if manifestFromImageConfig
+// ever flips from reading cfg.Cmd to cfg.Entrypoint, the manifest will be
+// empty and validation will fail loudly. The two tests below pin the
+// contract at unit-test speed so a future refactor cannot silently regress
+// the Railpack go plan's emitted Cmd: ["/app/server"].
+
+// TestManifestFromImageConfig_AppModeCmd pins the positive contract: the
+// OCI image's Cmd becomes the manifest's Entrypoint verbatim. The
+// defensive-copy assertion guards against a regression where the
+// conversion aliases the input map.
+func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
+	cfg := oci.ImageConfig{
+		Cmd:        []string{"/app/server"},
+		WorkingDir: "/app",
+		Env:        map[string]string{"PORT": "3000"},
+	}
+	manifest := manifestFromImageConfig(cfg)
+
+	wantArgv := []string{"/app/server"}
+	if !equalStrings(manifest.Entrypoint, wantArgv) {
+		t.Errorf("Entrypoint = %v, want %v", manifest.Entrypoint, wantArgv)
+	}
+	if manifest.WorkingDir != "/app" {
+		t.Errorf("WorkingDir = %q, want \"/app\"", manifest.WorkingDir)
+	}
+	if manifest.Env["PORT"] != "3000" {
+		t.Errorf("Env[PORT] = %q, want \"3000\"", manifest.Env["PORT"])
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Errorf("manifest.Validate() = %v, want nil", err)
+	}
+
+	// Defensive copy: mutating cfg.Env after conversion must not leak
+	// into manifest.Env. manifestFromImageConfig goes through cloneEnv
+	// for exactly this reason.
+	cfg.Env["PORT"] = "9999"
+	if manifest.Env["PORT"] != "3000" {
+		t.Errorf("manifest.Env aliased cfg.Env (mutation leaked): PORT=%q", manifest.Env["PORT"])
+	}
+}
+
+// TestManifestFromImageConfig_NoCmdYieldsEmptyEntrypoint pins the
+// negative contract: an OCI image without Cmd must produce an empty
+// manifest (and fail loud at Validate). The imaged-side oci.ImageConfig
+// struct only exposes `Cmd` — Entrypoint is an upstream OCI concept that
+// manifestFromImageConfig deliberately ignores (Railpack emits Cmd on the
+// Go plan, not Entrypoint). The negative test guards against a future
+// refactor that flips the function to read any other field, or drops the
+// `len(cfg.Cmd) > 0` guard, which would silently produce a manifest
+// whose Entrypoint is empty.
+//
+// (The earlier test name referenced the historical doc-warning shape
+// "IgnoresOCIEntrypointWithoutCmd" — renamed here so the negative
+// contract is self-describing: no Cmd → empty entrypoint.)
+//
+// End-to-end coverage that "empty manifest → deployment failed" is
+// already provided by TestHandleDeployment_NoCmdImageSkipsLayerStream;
+// this test pins the conversion helper directly so a regression in
+// manifestFromImageConfig surfaces here, before the wire.
+func TestManifestFromImageConfig_NoCmdYieldsEmptyEntrypoint(t *testing.T) {
+	// oci.ImageConfig has only Cmd/Env/WorkingDir/ExposedPorts. An image
+	// without Cmd is the canonical misconfiguration this test pins.
+	cfg := oci.ImageConfig{
+		// Cmd intentionally absent. WorkingDir + Env are present to
+		// prove the function doesn't crash on the other fields.
+		WorkingDir: "/app",
+		Env:        map[string]string{"PORT": "3000"},
+	}
+	manifest := manifestFromImageConfig(cfg)
+
+	if len(manifest.Entrypoint) != 0 {
+		t.Errorf("Entrypoint = %v, want empty (cfg.Cmd absent)", manifest.Entrypoint)
+	}
+	// WorkingDir + Env still flow through — defensive-copy is preserved.
+	if manifest.WorkingDir != "/app" {
+		t.Errorf("WorkingDir = %q, want \"/app\"", manifest.WorkingDir)
+	}
+	if manifest.Env["PORT"] != "3000" {
+		t.Errorf("Env[PORT] = %q, want \"3000\"", manifest.Env["PORT"])
+	}
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("manifest.Validate() = nil, want non-nil for empty entrypoint")
+	} else if !strings.Contains(err.Error(), "empty entrypoint") {
+		t.Errorf("Validate error %q must mention \"empty entrypoint\"", err.Error())
+	}
+}

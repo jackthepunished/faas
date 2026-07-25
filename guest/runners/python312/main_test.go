@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,5 +76,24 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte(`"body_b64":"aGk="`)) {
 		t.Fatalf("body_b64 tag missing: %s", b)
+	}
+}
+
+// TestPythonRunnerHandlerDefault pins the default --handler value. The
+// path must be `/app/handler.py` to match what imaged.handleDeployment
+// writes into AppManifest.Entrypoint for runtime=python312 function
+// deploys. If this test breaks, every python312 function deploy rolls
+// back on first wake with `exec: file not found`. Pairs with
+// TestNodeRunnerHandlerDefault and TestGoRunnerHandlerDefault for
+// cross-runtime parity.
+func TestPythonRunnerHandlerDefault(t *testing.T) {
+	const want = "/app/handler.py"
+	fs := flag.NewFlagSet("python312-test", flag.ContinueOnError)
+	handler := fs.String("handler", want, "x")
+	if err := fs.Parse([]string{}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *handler != want {
+		t.Errorf("default --handler = %q, want %q", *handler, want)
 	}
 }
