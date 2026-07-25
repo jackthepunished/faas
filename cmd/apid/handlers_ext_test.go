@@ -199,7 +199,7 @@ func TestUpdateAppAutoscaleRPS_FreeGate(t *testing.T) {
 // the explicit-disable form (the Set bit is set, so the column
 // gets overwritten to 0). It must round-trip as 200, NOT 422 — the
 // only invalid value is negative. The PG CHECK constraint
-// `apps_autoscale_target_rps_positive` enforces `> 0 OR NULL`; we
+// `apps_autoscale_target_rps_nonneg` enforces `>= 0 OR NULL`; we
 // rely on the apid-side validation to reject negatives before they
 // reach the DB.
 func TestUpdateAppAutoscaleRPS_HobbyZero(t *testing.T) {
