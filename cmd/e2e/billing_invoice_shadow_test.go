@@ -144,6 +144,23 @@ func seedShadowAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, t0
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
+	// PushUsageRecord short-circuits on empty ProviderCustomerID or
+	// StripeSubscriptionItem (client.go:118-125 — returns nil silently,
+	// before the dedupe row at line 136 is stamped). The e2e wants the
+	// SDK path to actually fire so the dedupe assertion is meaningful AND
+	// the pusher's "meter: push usage code=ok" log line is the success
+	// path, not the silent-skip path. Stamp the test customer + sub
+	// item; the dummy key still gives a 401 from the real Stripe API
+	// (or a sandbox-mode no-op depending on the SDK's key validator),
+	// but the dedupe stamp at line 136 fires on whatever path the SDK
+	// takes, success or error.
+	if err := store.UpdateAccountProviderCustomerID(ctx, acct.ID, "cus_test_e2e_dummy"); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
+	}
+	if err := store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, "si_test_e2e_dummy"); err != nil {
+		t.Fatalf("UpdateAccountStripeSubscriptionItem: %v", err)
+	}
+
 	for h := int64(0); h < shadowHours; h++ {
 		minute := t0.Add(time.Duration(h) * time.Hour)
 		if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID, minute, shadowPerHour, 1); err != nil {
