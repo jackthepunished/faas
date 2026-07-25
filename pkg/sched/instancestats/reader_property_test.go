@@ -153,37 +153,44 @@ func TestProperty_Reader_SnapshotForApp_AllRowsMatch(t *testing.T) {
 	}
 }
 
-// PropertyReader_SnapshotForInstance_RoundTrips: a writer that
-// updates the same instance id with rotating values; a reader that
-// continuously snapshots that id and asserts "either the row
-// matches one of the canonical values, or no row is found". A torn
-// read would surface as a row whose CPUPct/RSSMB combination is
-// not in the canonical set.
+// TestProperty_Reader_SnapshotForInstance_RoundTrips exercises
+// SnapshotForInstance's consistency contract: any row a reader
+// observes for a given instance id must correspond to one of the
+// canonical (CPUPct, RSSMB, SampledAt) tuples the writer wrote. A
+// torn read where the underlying slice was partially overwritten
+// would surface as a row whose tuple is NOT in the canonical set —
+// that is the assertion. Because the writer writes each canonical
+// tuple atomically (the *atomic.Pointer[[]InstanceStat] Replace is
+// a single pointer swap) and the reader does a single pointer
+// load per call, any visible row must be a complete prior write —
+// not a slice stitched from two successive Replace calls.
 func TestProperty_Reader_SnapshotForInstance_RoundTrips(t *testing.T) {
 	r := NewReader()
 	const iters = 500
-	now := time.Now()
+	base := time.Now()
 	var done sync.WaitGroup
 	done.Add(2)
 
 	var writerDone atomic.Bool
 	var readerFailures atomic.Int64
 
-	// Canonical values: three distinct (CPUPct, RSSMB) pairs the
-	// writer rotates through. The reader's invariant: any observed
-	// row for the queried instance must equal one of these three.
-	canonical := []struct {
-		cpu, rss float64
-	}{
-		{10, 100}, {20, 200}, {30, 300},
+	// Canonical values: three distinct (CPUPct, RSSMB, SampledAt)
+	// tuples the writer rotates through. Each iter stamps a fresh
+	// SampledAt (base + i*time.Microsecond) so a torn slice would
+	// mix SampledAt with the previous iter's CPUPct/RSSMB — a tuple
+	// not in the canonical set. The reader's invariant: any observed
+	// row for the queried instance must equal one of these three
+	// tuples.
+	canonical := []InstanceStat{
+		{AppID: "app1", InstanceID: "i-1", CPUPct: 10, RSSMB: 100, SampledAt: base},
+		{AppID: "app1", InstanceID: "i-1", CPUPct: 20, RSSMB: 200, SampledAt: base.Add(1 * time.Microsecond)},
+		{AppID: "app1", InstanceID: "i-1", CPUPct: 30, RSSMB: 300, SampledAt: base.Add(2 * time.Microsecond)},
 	}
 	go func() {
 		defer done.Done()
 		for i := 0; i < iters; i++ {
 			v := canonical[i%len(canonical)]
-			r.Replace([]InstanceStat{
-				{AppID: "app1", InstanceID: "i-1", SampledAt: now, CPUPct: v.cpu, RSSMB: v.rss},
-			})
+			r.Replace([]InstanceStat{v})
 		}
 		writerDone.Store(true)
 	}()
@@ -196,7 +203,7 @@ func TestProperty_Reader_SnapshotForInstance_RoundTrips(t *testing.T) {
 			}
 			match := false
 			for _, v := range canonical {
-				if row.CPUPct == v.cpu && row.RSSMB == v.rss {
+				if row.CPUPct == v.CPUPct && row.RSSMB == v.RSSMB && row.SampledAt.Equal(v.SampledAt) {
 					match = true
 					break
 				}

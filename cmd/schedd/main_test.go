@@ -92,7 +92,7 @@ vmmd_tls_cert_path = "/some/cert"
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); err == nil {
 		t.Fatal("expected partial vmmd_tls_* cluster to fail at boot")
@@ -107,7 +107,7 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 		listen:     func(context.Context, string, *tls.Config, string) (net.Listener, error) { return nil, wantErr },
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); !errors.Is(err, wantErr) {
@@ -139,9 +139,7 @@ func TestMain_AttachesInstanceStats(t *testing.T) {
 	log := discardLog()
 	ops := wire.NewOpsMetrics("schedd")
 	reader := instancestats.NewReader()
-	dialer := instancestats.DialerFunc(func(_ context.Context, _ string, _ *tls.Config) (sched.VMM, error) {
-		return stubVMM{}, nil
-	})
+	dialer := instancestats.DialerFunc(stubDialVMM)
 	poller := instancestats.NewPoller(state.NewMemStore(), dialer, nil, reader, ops, log)
 
 	// Reader is non-nil + empty (no Replace yet).
@@ -189,7 +187,7 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    func(context.Context, string, *tls.Config) (sched.VMM, error) { return stubVMM{}, nil },
+		dialVMM:    stubDialVMM,
 		listen: func(_ context.Context, target string, _ *tls.Config, _ string) (net.Listener, error) {
 			t2, err := wire.ParseTarget(target)
 			if err != nil {
@@ -213,6 +211,15 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("run did not return within 3s of cancel")
 	}
+}
+
+// stubDialVMM is the canonical no-op dialer for the wiring tests
+// (no VM is booted, no net dial happens). Every runDeps in this
+// file uses it so the runDeps literal stays one line per knob;
+// production main.go passes deps.dialVMM, which is the real
+// overlay.Dial.
+func stubDialVMM(context.Context, string, *tls.Config) (sched.VMM, error) {
+	return stubVMM{}, nil
 }
 
 // stubVMM is a no-op sched.VMM for the wiring tests (no VM is booted).

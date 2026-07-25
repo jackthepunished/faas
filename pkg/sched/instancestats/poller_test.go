@@ -221,14 +221,14 @@ func TestPoller_PartialNodeFailure(t *testing.T) {
 	seedInstance(t, store, "app1", live.ID)
 	_ = seedInstance(t, store, "app2", dead.ID)
 
-	cpu := 42.0
-	rss := int64(256 * 1024 * 1024)
+	cpuVal := 42.0
+	rssVal := int64(256 * 1024 * 1024)
 	dialer := &statsFakeDialer{
 		dialErr: map[string]error{dead.TargetURL: errors.New("dial refused")},
 		stats: map[string]*sched.StatsSnapshot{
 			live.TargetURL: {
 				Instances: []sched.VMInstanceStat{
-					{InstanceID: insLive.ID, CPUPct: ptrF64(cpu), ResidentBytes: ptrI64(rss), InflightRequests: 2},
+					{InstanceID: insLive.ID, CPUPct: ptrF64(cpuVal), ResidentBytes: ptrI64(rssVal), InflightRequests: 2},
 				},
 			},
 		},
@@ -776,14 +776,15 @@ func TestPoller_TableDriven(t *testing.T) {
 	})
 }
 
-// TestPoller_NaNPassesThroughWireRollup pins that the poller
-// passes NaN for Unknown CPU/RSSMB values straight through to
-// the wire side (where the rollup drops them). This decouples
-// the (app, node) gauge emission from the per-row Reader
-// semantics — the Reader records the validity tag (CPU/RSS
-// Unknown), the wire side emits NaN so the Prometheus client
-// registry's encoder can drop the sample cleanly.
-func TestPoller_NaNPassesThroughWireRollup(t *testing.T) {
+// TestPoller_KeepsRowOnAllUnknown pins that the poller does NOT
+// drop a row when the wire returns nil for both CPUPct and
+// ResidentBytes. The Reader's contract is "a snapshot per live
+// instance, even if every metric is Unknown" — the scale-up /
+// reaper code (#169 / #171) needs the row to know the instance
+// exists and to skip it cleanly when its metrics are absent.
+// Dropping it would create a phantom scale-up signal ("instance
+// disappeared") on the very first tick.
+func TestPoller_KeepsRowOnAllUnknown(t *testing.T) {
 	store := state.NewMemStore()
 	_, live := seedTwoNodes(t, store)
 	ins := seedInstance(t, store, "app1", live.ID)
@@ -792,34 +793,50 @@ func TestPoller_NaNPassesThroughWireRollup(t *testing.T) {
 		stats: map[string]*sched.StatsSnapshot{
 			live.TargetURL: {
 				Instances: []sched.VMInstanceStat{
-					// Both nil → both Unknown → both NaN.
+					// Both nil → both Unknown.
 					{InstanceID: ins.ID},
 				},
 			},
 		},
 	}
-	// We can't easily intercept the wire rollup without scraping
-	// the metrics registry. The wire code itself is unit-tested
-	// in pkg/wire/metrics_instancestats_test.go
-	// (TestOpsMetrics_ReplaceInstanceStats_NaNExcludedFromRollup).
-	// Here we only assert the poller doesn't drop the row — the
-	// Reader still records a fresh sample with Unknown tags.
 	p := NewPoller(store, dialer, nil, NewReader(), nil, nilLogger())
 	if err := p.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 	row := p.Reader.SnapshotAll()
 	if len(row) != 1 {
-		t.Fatalf("SnapshotAll len = %d, want 1", len(row))
+		t.Fatalf("SnapshotAll len = %d, want 1 (poller must keep all-unknown rows)", len(row))
 	}
 	if row[0].CPU != Unknown || row[0].RSS != Unknown {
 		t.Errorf("row = %+v, want CPU=RSS=Unknown", row[0])
 	}
-	// And the wire rollup should produce NO NaN samples.
+}
+
+// TestPoller_WireRollupExcludesNaN pins that when the poller
+// hands a row with all-Unknown metrics to the wire side, the
+// Prometheus scrape body never contains the literal "NaN".
+// The wire rollup drops NaN before max/sum so the gauge
+// encoder never sees it; a regression here would surface as a
+// scrape that breaks Prometheus parsers (NaN in OpenMetrics is
+// permitted but most production scrapers refuse it).
+func TestPoller_WireRollupExcludesNaN(t *testing.T) {
+	store := state.NewMemStore()
+	_, live := seedTwoNodes(t, store)
+	ins := seedInstance(t, store, "app1", live.ID)
+
+	dialer := &statsFakeDialer{
+		stats: map[string]*sched.StatsSnapshot{
+			live.TargetURL: {
+				Instances: []sched.VMInstanceStat{
+					{InstanceID: ins.ID},
+				},
+			},
+		},
+	}
 	m := wire.NewOpsMetrics("schedd")
-	p.Metrics = m
+	p := NewPoller(store, dialer, nil, NewReader(), m, nilLogger())
 	if err := p.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 2: %v", err)
+		t.Fatalf("Tick: %v", err)
 	}
 	body := scrapeMetrics(t, m)
 	if strings.Contains(body, " NaN") {
