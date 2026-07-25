@@ -130,6 +130,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
+		// Move 3 (M7.5 prep): bridge pg_notify → in-process broadcaster.
+		// Runs as a background goroutine for the daemon's lifetime; the
+		// SubscribeWithReconnect wrapper reconnects across Postgres
+		// restarts. Fails fast at boot if the initial Subscribe errors
+		// — the dashboard SSE surfaces the gap rather than silently
+		// producing empty frames. Lives in this closure (not runWithDeps)
+		// because production-run holds the *pgxpool.Pool and the test
+		// seam in runWithDeps doesn't.
+		go sseFanIn(ctx, log, pool, srv.events, nil)
 		startDNSPoller(ctx, srv, log)
 		// G6 grace timer (spec §17 G6, ADR-021): the 30-day deletion
 		// grace sweep lives in apid (not meterd) because the write

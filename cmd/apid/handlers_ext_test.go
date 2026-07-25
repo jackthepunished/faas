@@ -1820,3 +1820,64 @@ func TestGetInvocation_NotFoundAcrossAccount(t *testing.T) {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestStreamAppLogs_NotImplementedFrame pins the Move 3 stub wire
+// shape: GET /v1/apps/{slug}/logs MUST return text/event-stream with
+// the two frames the SDK decoder parses:
+//
+//	event: not_implemented
+//	data: {"reason":"vmmd Logs(req) gRPC pending — Move 4"}
+//
+//	event: end
+//	data: {}
+//
+// The order matters — the SDK consumes frames line-by-line via the
+// typed Event/Data split (pkg/api/sse.go:Event) and treats `end` as
+// the terminal sentinel. A future Move 4 implementation that
+// subscribes to vmmd's Logs(req) gRPC stream replaces the body of
+// streamAppLogs but MUST keep the same opening protocol so existing
+// SDK consumers parse the new frames identically.
+//
+// Locks the contract for: SDK happy path
+// (pkg/api/client_test.go::TestStreamAppLogs_HappyPath), the dashboard
+// per-app log button (no 404), and a future Move 4 implementation
+// that upgrades the body.
+func TestStreamAppLogs_NotImplementedFrame(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "stub-logs")
+	appID := mustSeedApp(t, e, "stub-logs-app")
+	// The handler's `ListInstancesForApp` check requires at least one
+	// row — otherwise it 404s with "no running instance". A stopped
+	// instance satisfies the existence check (the stub doesn't read
+	// the row's state column).
+	if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/apps/stub-logs-app/logs?follow=0", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	body := rec.Body.String()
+	// Frame 1: not_implemented signal. The reason text is part of the
+	// SDK's stable contract — a customer reading the docs sees it as
+	// the canonical "this isn't built yet" message.
+	if !strings.Contains(body, "event: not_implemented\ndata: {\"reason\":\"vmmd Logs(req) gRPC pending — Move 4\"}") {
+		t.Errorf("body missing not_implemented frame:\n%s", body)
+	}
+	// Frame 2: terminal sentinel. SDK consumers with a structured-
+	// frame loop exit on `event: end`.
+	if !strings.Contains(body, "event: end\ndata: {}") {
+		t.Errorf("body missing end frame:\n%s", body)
+	}
+	// Order: not_implemented must precede end so the SDK's decoder
+	// surfaces the reason before the consumer's loop exits.
+	niIdx := strings.Index(body, "event: not_implemented")
+	endIdx := strings.Index(body, "event: end")
+	if niIdx < 0 || endIdx < 0 || niIdx >= endIdx {
+		t.Errorf("frame order wrong: not_implemented@%d end@%d", niIdx, endIdx)
+	}
+}
