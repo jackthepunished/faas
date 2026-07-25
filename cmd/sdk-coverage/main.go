@@ -55,6 +55,20 @@ var routeExclude = map[string]bool{
 	"POST /v1/cli-auth/exchange": true,
 	"GET /status/slo.json":       true,
 	"GET /status":                true,
+
+	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
+	// device-code flow for programmatic auth; the dashboard cookie
+	// is the browser-only auth artifact. These routes are 302
+	// redirects, HTML form posts, or session-cookie endpoints — none
+	// of which the Bearer-auth SDK models. The CookieSession header
+	// on responses is documented but the SDK's surface is the typed
+	// Lgoin/Signup/Reset/SetPassword/Logout wrappers below.
+	"GET /v1/auth/google":          true, // 302 to Google consent (browser-only)
+	"GET /v1/auth/google/callback": true, // 302 to dashboard (browser-only)
+	"GET /v1/auth/github":          true, // 302 to GitHub consent (browser-only)
+	"GET /v1/auth/github/callback": true, // 302 to dashboard (browser-only)
+	"GET /auth/reset":              true, // HTML form render (browser-only)
+	"POST /logout":                 true, // dashboard form post (browser-only); SDK's Logout wraps the same handler as a convenience
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire
@@ -70,6 +84,7 @@ var sdkMethodExclude = map[string]bool{
 	"MintCliAuthCode":     true, // anonymous device-code mint; route excluded above
 	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
 	"GetStatusSLO":        true, // public status; route excluded above
+	"Logout":              true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
 }
 
 // methodRouteMap pins the routes whose natural SDK verb doesn't
@@ -115,6 +130,7 @@ var methodRouteMap = map[string]string{
 	"POST /v1/domains":                     "CreateDomain",
 	"GET /v1/keys":                         "ListKeys",
 	"POST /v1/keys":                        "CreateKey",
+
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and
@@ -129,6 +145,17 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/delayed-tasks/{id}":        "CancelDelayedTask",
 	"GET /v1/invocations":                  "ListInvocations",
 	"GET /v1/invocations/{id}":             "GetInvocation",
+
+	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
+	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
+	// SDK named these methods deliberately after the user-facing action
+	// (PasswordLogin vs PostLogin, etc.) — pin them so the gate stays
+	// the spec's source of truth.
+	"POST /login":                          "PasswordLogin",
+	"POST /signup":                         "PasswordSignup",
+	"POST /login/forgot":                   "RequestPasswordReset",
+	"POST /auth/reset":                     "ConfirmPasswordReset",
+	"POST /dashboard/account/set-password": "SetPassword",
 }
 
 func main() {

@@ -60,6 +60,12 @@ tags:
     description: Per-app sealed secrets (sealed at rest).
   - name: usage
     description: Usage roll-up and metering.
+  - name: auth
+    description: |
+      Dashboard authentication (issue #165 PR #2, ADR-032).
+      Email + password (Argon2id), Google OAuth, GitHub OAuth,
+      password reset, session lifecycle. Cookies carry the session
+      artifact; the device-code flow is the SDK programmatic-auth path.
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
 
@@ -356,7 +362,7 @@ paths:
             Location:
               schema: { type: string, example: "/dashboard/" }
         '400':
-          description: Password too weak (≥12 chars required).
+          description: New password is too weak (≥12 chars required).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -402,17 +408,25 @@ paths:
           in: query
           required: true
           schema: { type: string }
+          description: |
+            Authorization code returned by Google on the consent
+            redirect. Single-use; exchanged at
+            `oauth2.googleapis.com/token`.
         - name: state
           in: query
           required: true
           schema: { type: string }
+          description: |
+            CSRF state token. Must match the `faas_google_state`
+            cookie set on the consent redirect. Mismatch returns
+            401 `csrf_mismatch`.
       responses:
         '302':
           description: |
             Redirect to `WEBSITE_URL` or `/`. `Set-Cookie:
             faas_sid=…` is set.
         '401':
-          description: Email not verified.
+          description: Google email not verified at the upstream.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -456,17 +470,25 @@ paths:
           in: query
           required: true
           schema: { type: string }
+          description: |
+            Authorization code returned by GitHub on the consent
+            redirect. Single-use; exchanged at
+            `github.com/login/oauth/access_token`.
         - name: state
           in: query
           required: true
           schema: { type: string }
+          description: |
+            CSRF state token. Must match the `faas_github_state`
+            cookie set on the consent redirect. Mismatch returns
+            401 `csrf_mismatch`.
       responses:
         '302':
           description: |
-            Redirect to `WEBSITE_URL` or `/`. `Set-Cookie:
-            faas_sid=…` is set.
+            Redirect to `WEBSITE_URL` or `/` after a successful
+            GitHub OAuth handshake. `Set-Cookie: faas_sid=…` is set.
         '401':
-          description: Email not verified.
+          description: GitHub account has no primary && verified email.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -496,7 +518,7 @@ paths:
             Location:
               schema: { type: string, example: "/dashboard/account/" }
         '400':
-          description: Password too weak (≥12 chars required).
+          description: Chosen password is too weak (≥12 chars required).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -1459,6 +1481,17 @@ components:
         surface the prefix.
 
   parameters:
+    CookieSession:
+      name: faas_sid
+      in: cookie
+      required: false
+      schema: { type: string }
+      description: |
+        Dashboard session cookie. Sealed; opaque to the client
+        (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+        The browser sets it automatically on `/login` / `/signup`;
+        the SDK uses the device-code flow instead and never sets
+        this cookie.
     IdempotencyKey:
       name: Idempotency-Key
       in: header
