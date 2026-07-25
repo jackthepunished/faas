@@ -1,6 +1,16 @@
 # ADR-023 · IPv6 tenant egress policy
 
-- **Status:** accepted
+- **Status:** accepted (Superseded in part by PR-D — see note below)
+- **Superseded (in part, PR-D):** the original "no shared subpackage"
+  rationale (L65-68 above: "not worth the import path for two
+  consumers") is reversed in practice — the shared egress catalog now
+  lives in `pkg/netns/denylist.go::NewDefaultDenySet()` and is
+  consumed by per-netns, host, and OCI renderers. The reversal was the
+  cheapest way to keep three enforcement surfaces in lock-step
+  (ADR-034 §Consequences; PR-D audit for issue #146). The IPv6 family
+  split itself (`fe80::/10`, `fc00::/7`, `ff00::/8`, `::1`, `::`)
+  remains authoritative; only the "no shared subpackage" decision is
+  reversed.
 - **Date:** 2026-07-20
 - **Decision:** Extend the tenant egress denylist (spec §11) to IPv6 by
   rendering a sibling `ip6 daddr { … } drop` line in the host firewall's

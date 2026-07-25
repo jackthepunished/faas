@@ -18,13 +18,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
@@ -630,4 +633,185 @@ func cmdDashboard(args []string) int {
 		return 0
 	}
 	return 0
+}
+
+// --- tail / queue tail -----------------------------------------------------
+
+// cmdQueueDispatch routes `faas queue <sub>` to the right handler.
+// Today only `tail` ships; future subcommands (`ls`, `purge`) land
+// here so the dispatch table stays in one place.
+func cmdQueueDispatch(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: faas queue <subcommand> [args]\n\n  tail <slug>    long-poll the queue and print dequeued rows", "queue")
+		return 1
+	}
+	switch args[0] {
+	case "tail":
+		return cmdQueueTail(args[1:])
+	default:
+		PrintUsage(os.Stderr, "usage: faas queue <subcommand> [args]\n\n  tail <slug>    long-poll the queue and print dequeued rows", "queue")
+		return 1
+	}
+}
+
+// cmdTail subscribes to /v1/events and prints one line per
+// `invocation_done` frame: "<invocation_id> <app_slug> <state>". Exits
+// 130 on Ctrl-C so a chained shell command can detect a deliberate
+// interrupt (POSIX 128 + SIGINT(2)); exits 0 on a clean SSE close.
+//
+// Authentication is the dashboard Bearer token; apid's
+// eventsFrameForAccount filter (handlers_events.go:148-167) ensures the
+// caller only sees their own account's invocations. There is no
+// escalation path — a customer's `faas tail` will never see another
+// customer's frames.
+//
+// Move 3 / M7.5 prep: the dashboard uses the same /v1/events route via
+// the browser EventSource; this command is the CLI twin.
+func cmdTail(args []string) int {
+	fs := flag.NewFlagSet("tail", flag.ContinueOnError)
+	onlySlug := fs.String("app", "", "filter to a single app slug (optional)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: faas tail [--app <slug>]", "tail")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	body, err := client.StreamEvents(ctx)
+	if err != nil {
+		return printErr("Could not open events stream", err)
+	}
+	defer func() { _ = body.Close() }()
+
+	dec := api.NewDecoder(body)
+	dec.SetCloseFn(body.Close)
+	defer func() { _ = dec.Close() }()
+
+	_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
+	for {
+		select {
+		case <-ctx.Done():
+			return 130
+		case e, ok := <-dec.Events():
+			if !ok {
+				return 0
+			}
+			if e.Event != "invocation_done" {
+				continue
+			}
+			var p struct {
+				InvocationID string `json:"invocation_id"`
+				AppID        string `json:"app_id"`
+				AppSlug      string `json:"app_slug"`
+				State        string `json:"state"`
+			}
+			if err := json.Unmarshal([]byte(e.Data), &p); err != nil {
+				// Unparseable frame — print raw so the customer
+				// can see it; the next frame is independent.
+				_, _ = fmt.Fprintln(osStdout, e.Data)
+				continue
+			}
+			if *onlySlug != "" && p.AppSlug != *onlySlug && p.AppID != *onlySlug {
+				continue
+			}
+			display := p.AppSlug
+			if display == "" {
+				display = p.AppID
+			}
+			_, _ = fmt.Fprintf(osStdout, "%s %s %s\n", p.InvocationID, display, p.State)
+		case err := <-dec.Errors():
+			if err != nil && !errors.Is(err, io.EOF) {
+				PrintWarn(os.Stderr, "stream closed: %v", err)
+				return 3
+			}
+			return 0
+		}
+	}
+}
+
+// cmdQueueTail long-polls POST /v1/apps/{slug}/queues/invocations:receive
+// and prints one line per dequeued row: "<id> <payload-or-pretty>". On
+// the 30s server-side timeout the client sleeps 500 ms and retries; on
+// Ctrl-C the context cancels and the in-flight HTTP request aborts
+// within ~50 ms.
+//
+// This is the customer's "watch the queue drain" surface for §4.5
+// webhook-style use cases: enqueue rows from any producer, tail on
+// the consumer side, see payloads land in real time without polling
+// the invocations read API.
+//
+// Move 3 / M7.5 prep: pairs with faas queue send; together they form
+// the UX surface for queues without forcing the customer to learn
+// long-poll semantics.
+func cmdQueueTail(args []string) int {
+	if len(args) != 1 {
+		PrintUsage(os.Stderr, "usage: faas queue tail <slug>", "queue")
+		return 1
+	}
+	slug := args[0]
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	_, _ = fmt.Fprintf(osStdout, "Tailing queue for %s… Ctrl-C to exit.\n", slug)
+	for {
+		select {
+		case <-ctx.Done():
+			return 130
+		default:
+		}
+		// Use a per-call deadline slightly under the server-side 30s
+		// cap so a hung connection returns before Ctrl-C has to wait
+		// for the OS TCP keepalive. 25s leaves headroom for the
+		// apid-side pg_notify fan-in latency.
+		callCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		row, err := client.QueueReceive(callCtx, slug)
+		cancel()
+		if err != nil {
+			if isLongPollTimeout(err) {
+				// 30s with no rows — normal idle, retry.
+				continue
+			}
+			if errors.Is(err, context.Canceled) {
+				return 130
+			}
+			PrintWarn(os.Stderr, "queue receive failed: %v", err)
+			return 3
+		}
+		payload := strings.TrimSpace(string(row.Payload))
+		if payload == "" || !json.Valid(row.Payload) {
+			_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
+		} else {
+			var pretty any
+			if json.Unmarshal(row.Payload, &pretty) == nil {
+				buf, _ := json.MarshalIndent(pretty, "", "  ")
+				_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, string(buf))
+			} else {
+				_, _ = fmt.Fprintf(osStdout, "%s %s\n", row.ID, payload)
+			}
+		}
+	}
+}
+
+// isLongPollTimeout recognises the apid ErrLongPollTimeout sentinel
+// without importing the package's internal Problem type — we only
+// need the *APIError.Problem.Code to discriminate.
+func isLongPollTimeout(err error) bool {
+	var ae *api.APIError
+	if errors.As(err, &ae) {
+		return ae.Problem.Code == "long_poll_timeout"
+	}
+	return false
 }

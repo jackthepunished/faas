@@ -3,14 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- ux_spec §6.3 — refresh the badge periodically so a user
-       staring at the page sees ◌ sleeping flip to ⟳ waking → ●
-       running when traffic lands. Server-rendered; no JS build
-       (HTMX polling is a follow-up if we need sub-second
-       fidelity). -->
-  <meta http-equiv="refresh" content="10">
+  <!-- ux_spec §6.3 + Move 3 — the badge list reacts to /v1/events
+       pushes via the htmx SSE extension instead of a meta refresh
+       poll. EventSource auto-reconnects on transient drops. -->
   <title>{{.Title}} — onebox faas</title>
   <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer></script>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
@@ -34,7 +32,7 @@
     .badge.dim      { background: #f3f4f6; color: #6b7280; }
   </style>
 </head>
-<body>
+<body hx-ext="sse" sse-connect="/v1/events">
   <header>
     <strong>onebox faas</strong>
     <nav>
@@ -45,7 +43,7 @@
       <a href="/dashboard/account">Account</a>
     </nav>
   </header>
-  <main>
+  <main hx-trigger="sse:app_changed, sse:deployment_changed, sse:instance_changed, sse:invocation_done" hx-get="/dashboard/apps" hx-swap="innerHTML" hx-select="main" hx-push-url="false">
     <h1>{{.Title}}</h1>
     {{if .Data}}
       {{$items := .Data}}

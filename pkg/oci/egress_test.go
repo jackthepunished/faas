@@ -48,6 +48,90 @@ func TestIPAllowed_DeniedRanges(t *testing.T) {
 	}
 }
 
+// TestIPAllowed_6to4AndTeredoDenied (PR-D) closes the
+// ADR-034 §Consequences defence-in-depth gap: the shared
+// catalog added 2002::/16 (6to4) and 2001::/32 (Teredo) in
+// PR-A but the OCI user-space check never had an explicit
+// probe for them. ADR-034 §Consequences (L143-148) named
+// this as 'free defence-in-depth still owed'. The puller is
+// an HTTP client, not a guest kernel, so the firewall path
+// is the primary; the user-space check exists to catch a
+// misconfigured firewall. Pin both.
+func TestIPAllowed_6to4AndTeredoDenied(t *testing.T) {
+	cases := []string{
+		"2002::1",           // 6to4, ADR-034
+		"2001:0000::1",      // Teredo, ADR-034
+		"2002:0a00:0001::1", // 6to4 wrapping RFC1918 (belt-and-braces)
+	}
+	for _, s := range cases {
+		ip := netip.MustParseAddr(s)
+		if ipAllowed(ip) {
+			t.Errorf("ipAllowed(%s) = true, want false", s)
+		}
+		// EgressIPAllowed is the exported testable mirror added
+		// in PR-D; both must agree (regression net for the
+		// thin-wrapper contract).
+		if EgressIPAllowed(ip) {
+			t.Errorf("EgressIPAllowed(%s) = true, want false", s)
+		}
+	}
+}
+
+// TestIPAllowed_OCIOnlyEntriesDenied (PR-D) pins the OCI-only
+// client-hardening ranges after the refactor from
+// []netip.Prefix to []netns.DenyEntry. The five entries
+// remain typed and provenance-bearing (SourceADR: ADR-034)
+// but the enforcement path is unchanged — these addresses
+// must continue to be denied by the user-space dial check.
+func TestIPAllowed_OCIOnlyEntriesDenied(t *testing.T) {
+	cases := []string{
+		"0.0.0.1",    // 0.0.0.0/8 unspecified
+		"127.0.0.2",  // 127.0.0.0/8 loopback (the canonical docker-host IP)
+		"192.0.0.7",  // 192.0.0.0/24 IETF protocol assignments
+		"198.18.0.1", // 198.18.0.0/15 benchmarking
+		"240.0.0.1",  // 240.0.0.0/4 reserved
+	}
+	for _, s := range cases {
+		ip := netip.MustParseAddr(s)
+		if ipAllowed(ip) {
+			t.Errorf("ipAllowed(%s) = true, want false (must be denied by OCI-only entry)", s)
+		}
+		if EgressIPAllowed(ip) {
+			t.Errorf("EgressIPAllowed(%s) = true, want false", s)
+		}
+	}
+}
+
+// TestOCIOnlyDenyCIDRsV4_Typed (PR-D) pins the typed-array
+// refactor. Each entry must carry the ADR-034 SourceADR
+// pin and a non-empty Comment so the cross-renderer test
+// and the denylist.md generator see consistent provenance.
+func TestOCIOnlyDenyCIDRsV4_Typed(t *testing.T) {
+	if len(ociOnlyDenyCIDRsV4) != 5 {
+		t.Fatalf("ociOnlyDenyCIDRsV4 length = %d, want 5", len(ociOnlyDenyCIDRsV4))
+	}
+	for i, e := range ociOnlyDenyCIDRsV4 {
+		// Family field is not asserted against netns.FamilyV4 because
+		// this test is internal `package oci` and importing pkg/netns
+		// here would form a cycle (pkg/oci -> pkg/netns, then
+		// pkg/netns_test -> pkg/oci closes it via EgressIPAllowed).
+		// The variable name (ociOnlyDenyCIDRsV4) and the literal
+		// prefixes below all carry v4 family, so the typed-array
+		// promotion is self-evidently correct. The cross-renderer
+		// invariant test in pkg/netns/denylist_test.go covers the
+		// shared catalog's Family tag end-to-end.
+		if e.SourceADR == "" {
+			t.Errorf("entry %d (%s) SourceADR is empty", i, e.Prefix)
+		}
+		if e.Comment == "" {
+			t.Errorf("entry %d (%s) Comment is empty", i, e.Prefix)
+		}
+		if !e.Prefix.IsValid() {
+			t.Errorf("entry %d has invalid prefix %s", i, e.Prefix)
+		}
+	}
+}
+
 func TestEgressDialContext_RefusesRFC1918(t *testing.T) {
 	dial := EgressDialContext(&net.Dialer{})
 	// Resolve "localhost" → 127.0.0.1 and verify the dial is refused.

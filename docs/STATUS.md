@@ -450,8 +450,12 @@ sometimes implied they were closed; they aren't.
 
 - **#144** — `NftResetCommands` missing ip6 reset (snapshot-restore
   Wake fails on second add).
-- **#146** — host egress chain deny lines are dead-code; PR #128 /
-  #151 did **not** close this.
+- ~~**#146** — host egress chain deny lines were dead-code; the
+  forward-chain ordering fix in PR #128 / #151 closed the original
+  bug, and the remaining audit (shared catalog provenance + OCI
+  6to4/Teredo + cross-renderer invariant + generated operator
+  artifact) closed in PR-D. See `docs/denylist.md` and
+  `pkg/netns/denylist_external_test.go::TestAllThreeConsumersAgreeOnDenySet`.~~ *(closed by PR-D — moved to the closed list below)*
 - **#147** — `stripeWebhook customer.subscription.updated` should
   validate `Plan` via `api.Plan.Valid()`.
 - **#148** — `bootstrap.sh` should pin the Go toolchain via
@@ -461,5 +465,10 @@ sometimes implied they were closed; they aren't.
   URL-path digest (spec's digest-pinned immutability).
 - **#125** — `sqlc-check` in the CI bundle to prevent sqlc source
   drift.
+
+#### Closed via PRs (full audit entry in PR-D)
+
+- **#146** — closed by PR-D. See `docs/denylist.md` and
+  `pkg/netns/denylist_external_test.go::TestAllThreeConsumersAgreeOnDenySet`.
 - **#90** — document `/v1/*` as a permanent platform path
   reservation (issue #85 follow-up).

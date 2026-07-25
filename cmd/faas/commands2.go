@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1034,8 +1035,12 @@ func validateRepoSlug(s string) error {
 	return nil
 }
 
-// cmdLogs: tail app or deployment logs via SSE. Minimal client-side parser;
-// we just print lines with a timestamp prefix.
+// cmdLogs: tail app or deployment logs via SSE. Move 3 swaps the
+// hand-rolled sseLineReader for the SDK's typed Decoder
+// (pkg/api/sse.go) so the same parser powers faas logs, faas tail,
+// and faas queue tail. signal.NotifyContext on os.Interrupt makes
+// Ctrl-C tear down the in-flight request within ~50 ms instead of
+// waiting for the body Close to be GC'd.
 func cmdLogs(args []string) int {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "follow new lines")
@@ -1052,7 +1057,8 @@ func cmdLogs(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow)
 	if err != nil {
 		var ae *APIError
@@ -1063,92 +1069,36 @@ func cmdLogs(args []string) int {
 		return printErr("Could not reach the API", err)
 	}
 	defer func() { _ = body.Close() }()
-	dec := newSSELineReader(body)
+	dec := api.NewDecoder(body)
+	dec.SetCloseFn(body.Close)
+	defer func() { _ = dec.Close() }()
 	for {
-		line, err := dec.Next()
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			// Ctrl-C. Exit cleanly with status 130 (the
+			// shell's standard for SIGINT exit).
+			return 130
+		case e, ok := <-dec.Events():
+			if !ok {
+				return 0
+			}
+			if e.Event == "not_implemented" {
+				fmt.Fprintln(os.Stderr, "vmmd Logs(req) gRPC pending — Move 4")
+				return 0
+			}
+			if e.Event == "end" {
+				return 0
+			}
+			if e.Data != "" {
+				fmt.Println(e.Data)
+			}
+		case err := <-dec.Errors():
 			if errors.Is(err, io.EOF) {
 				return 0
 			}
 			return printErr("Stream closed", err)
 		}
-		fmt.Println(line)
 	}
-}
-
-// sseLineReader peels "data: <line>\n\n" off a text/event-stream.
-type sseLineReader struct {
-	r   io.Reader
-	buf []byte
-}
-
-func newSSELineReader(r io.Reader) *sseLineReader { return &sseLineReader{r: r} }
-
-func (s *sseLineReader) Next() (string, error) {
-	for {
-		prefix, err := s.readUntil(":")
-		if err != nil {
-			return "", err
-		}
-		if prefix != "data" {
-			continue
-		}
-		// consume " " after the colon, then read until \n
-		_, _ = s.readByte() // ' '
-		line, err := s.readUntil("\n")
-		if err != nil {
-			return "", err
-		}
-		// drain trailing blank line (\n\n)
-		_, _ = s.readByte()
-		return line, nil
-	}
-}
-
-func (s *sseLineReader) readByte() (byte, error) {
-	for len(s.buf) == 0 {
-		if err := s.fill(); err != nil {
-			return 0, err
-		}
-	}
-	b := s.buf[0]
-	s.buf = s.buf[1:]
-	return b, nil
-}
-
-func (s *sseLineReader) readUntil(delim string) (string, error) {
-	var b strings.Builder
-	for {
-		for _, d := range delim {
-			_ = d
-		}
-		idx := strings.Index(string(s.buf), delim)
-		if idx >= 0 {
-			b.Write(s.buf[:idx])
-			s.buf = s.buf[idx+len(delim):]
-			return b.String(), nil
-		}
-		b.Write(s.buf)
-		s.buf = nil
-		if err := s.fill(); err != nil {
-			if errors.Is(err, io.EOF) && b.Len() > 0 {
-				return b.String(), nil
-			}
-			return b.String(), err
-		}
-	}
-}
-
-func (s *sseLineReader) fill() error {
-	tmp := make([]byte, 1024)
-	n, err := s.r.Read(tmp)
-	if n > 0 {
-		s.buf = append(s.buf, tmp[:n]...)
-	}
-	if err == io.EOF && len(s.buf) > 0 {
-		return nil
-	}
-	return err
 }
 
 // streamDeployLogs opens GET /v1/deployments/{id}/logs?follow=1 and
@@ -1176,49 +1126,67 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 		return 3
 	}
 	defer func() { _ = body.Close() }()
-	dec := newSSELineReader(body)
+	dec := api.NewDecoder(body)
+	dec.SetCloseFn(body.Close)
+	defer func() { _ = dec.Close() }()
+streamLoop:
 	for {
-		line, err := dec.Next()
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			return 130
+		case e, ok := <-dec.Events():
+			if !ok {
+				break streamLoop
+			}
+			// Move 3: switch on the typed Event name. The decoder
+			// preserves `event: <name>` so a single parser handles
+			// all four frame shapes this stream emits (log, status,
+			// end, error) plus heartbeat comments.
+			switch e.Event {
+			case "log":
+				var entry struct {
+					Line string `json:"line"`
+				}
+				if json.Unmarshal([]byte(e.Data), &entry) == nil && entry.Line != "" {
+					fmt.Println(entry.Line)
+				}
+			case statusLiteral:
+				var status struct {
+					Status string `json:"status"`
+				}
+				if json.Unmarshal([]byte(e.Data), &status) == nil &&
+					(status.Status == statusLive || status.Status == "failed") {
+					if status.Status == statusLive {
+						PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", dep.AppID)
+						printDeployColdWakeSentence()
+						return 0
+					}
+					return renderDeployFailure(dep)
+				}
+			case "end":
+				var end struct {
+					Reason string `json:"reason"`
+				}
+				if json.Unmarshal([]byte(e.Data), &end) == nil && end.Reason != "" {
+					PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
+				}
+				break streamLoop
+			case "error":
+				PrintWarn(os.Stderr, "stream closed; follow manually: faas logs --deployment %s", dep.ID)
+				return 3
+			default:
+				// Unknown frame shape — print raw so the customer can see it.
+				if e.Data != "" {
+					fmt.Println(e.Data)
+				}
+			}
+		case err := <-dec.Errors():
 			if errors.Is(err, io.EOF) {
-				break
+				break streamLoop
 			}
 			PrintWarn(os.Stderr, "stream closed; follow manually: faas logs --deployment %s", dep.ID)
 			return 3
 		}
-		// event:log frames — JSON LogEntry with a `line` field.
-		var entry struct {
-			Line string `json:"line"`
-		}
-		if json.Unmarshal([]byte(line), &entry) == nil && entry.Line != "" {
-			fmt.Println(entry.Line)
-			continue
-		}
-		// event:status terminal frame.
-		var status struct { //nolint:goconst
-			Status string `json:"status"` //nolint:goconst
-		}
-		if json.Unmarshal([]byte(line), &status) == nil &&
-			(status.Status == statusLive || status.Status == "failed") {
-			if status.Status == statusLive {
-				PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", dep.AppID)
-				printDeployColdWakeSentence()
-				return 0
-			}
-			return renderDeployFailure(dep)
-		}
-		// event:end backstop frame from apid's 10-min timeout.
-		// Render a clean message instead of dumping the raw SSE
-		// envelope on stdout.
-		var end struct {
-			Reason string `json:"reason"`
-		}
-		if json.Unmarshal([]byte(line), &end) == nil && end.Reason != "" {
-			PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
-			break
-		}
-		// Unknown frame shape — print raw so the customer can see it.
-		fmt.Println(line)
 	}
 	// Stream ended without a terminal frame — try one GetDeployment
 	// poll so a fast build that raced the SSE open isn't reported as

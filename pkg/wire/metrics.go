@@ -117,6 +117,14 @@ type OpsMetrics struct {
 	// "scale-up aggressiveness" diagnostic. Unlabelled: every
 	// observation has the same shape.
 	scaleUpAdmitRPS prometheus.Histogram
+	// sseClients: live count of open /v1/events SSE connections
+	// (Move 3, M7.5 prep). Unlabelled — the §12 panel is "how many
+	// concurrent dashboard viewers" and the per-plan split is
+	// observable from existing apid_ops_total{op="events"} + the
+	// plan from /v1/account, not a separate label. The gauge is
+	// incremented in handlers_events.go at the top of the handler
+	// and decremented via defer. Zero is the expected idle value.
+	sseClients prometheus.Gauge
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -225,7 +233,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// ceiling catches pathological cases.
 		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000},
 	})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS)
+	sseClients := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_sse_clients",
+		Help: "Number of currently open /v1/events SSE connections (Move 3, M7.5 prep). The dashboard's per-page EventSource is one connection; the CLI's faas tail is another. Zero is the idle value.",
+	})
+	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS, sseClients)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -296,6 +308,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		imagedOCIPull:         imagedOCIPull,
 		scaleUpDecisions:      scaleUpDecisions,
 		scaleUpAdmitRPS:       scaleUpAdmitRPS,
+		sseClients:            sseClients,
 	}
 }
 
@@ -330,6 +343,16 @@ func (m *OpsMetrics) AuditWriteFailures() prometheus.Counter {
 // breaks the time-ordering invariant the partial index is built on.
 func (m *OpsMetrics) WakeIDV4Fallback() prometheus.Counter {
 	return m.wakeIDV4Fallback
+}
+
+// SSEClients returns the gauge apid's /v1/events handler increments
+// at the top of the connection (defer Dec) so the §12 panel sees the
+// number of currently-open dashboard EventSource + CLI faas tail
+// connections. Move 3 / M7.5 prep. The returned gauge is shared
+// across every caller (the Gauge is a singleton, not a vec) and
+// the handler's Add(1)/Add(-1) is the only producer.
+func (m *OpsMetrics) SSEClients() prometheus.Gauge {
+	return m.sseClients
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor

@@ -356,11 +356,11 @@ func TestCmdDeploy_HappyPath(t *testing.T) {
 			// Fake-apid "live" terminal frame so the CLI exits 0.
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, _ := w.(http.Flusher)
-			_, _ = fmt.Fprint(w, "data: {\"line\":\"building...\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: log\ndata: {\"line\":\"building...\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
-			_, _ = fmt.Fprint(w, "data: {\"status\":\"live\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -393,7 +393,7 @@ func TestCmdDeploy_HappyPath_PrintsColdWakeSentence(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, _ := w.(http.Flusher)
-			_, _ = fmt.Fprint(w, "data: {\"status\":\"live\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -440,7 +440,7 @@ func TestCmdDeploy_AppAlreadyExists(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, _ := w.(http.Flusher)
-			_, _ = fmt.Fprint(w, "data: {\"status\":\"live\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -533,7 +533,7 @@ func TestCmdDeploy_StreamBrokenRecoversViaGetDeployment(t *testing.T) {
 				flusher, _ := w.(http.Flusher)
 				// No terminal frame; just `event: end`. Forces the
 				// CLI to fall back to GetDeployment.
-				_, _ = fmt.Fprint(w, "data: {\"reason\":\"timeout\"}\n\n")
+				_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -563,7 +563,7 @@ func TestCmdDeploy_StreamBrokenRecoversViaGetDeployment(t *testing.T) {
 			case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
 				w.Header().Set("Content-Type", "text/event-stream")
 				flusher, _ := w.(http.Flusher)
-				_, _ = fmt.Fprint(w, "data: {\"reason\":\"timeout\"}\n\n")
+				_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -1215,7 +1215,7 @@ func TestCmdDeploy_Recovery_PrintsColdWakeSentence(t *testing.T) {
 			flusher, _ := w.(http.Flusher)
 			// No terminal frame; `event: end` forces the CLI to
 			// poll GetDeployment (terminalExitForDeployment path).
-			_, _ = fmt.Fprint(w, "data: {\"reason\":\"timeout\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}

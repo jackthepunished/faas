@@ -1482,6 +1482,17 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 	statusTicker := time.NewTicker(2 * time.Second)
 	defer statusTicker.Stop()
 
+	// Move 3: one-shot backstop timer (replaces per-iteration
+	// time.After(10*time.Minute), which was never reaping the timer
+	// on a busy stream — the select arm would re-allocate a fresh
+	// timer every pass and the 10-min cap was effectively a
+	// "10-min-after-last-event" cap, not an absolute cap). Reset
+	// only on terminal status / client disconnect; the busy
+	// subscriber never resets, so a build that keeps emitting
+	// never escapes the cap if the status poll ever flakes.
+	backstop := time.NewTimer(10 * time.Minute)
+	defer backstop.Stop()
+
 	for {
 		// Done status short-circuits the tail. deployment status flips
 		// to live/failed via NotifyDeploymentChanged; the dashboard
@@ -1520,7 +1531,7 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			if flusher != nil {
 				flusher.Flush()
 			}
-		case <-time.After(10 * time.Minute):
+		case <-backstop.C:
 			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
@@ -1546,26 +1557,34 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 }
 
 // streamAppLogs streams the running instance's stdout/stderr ring buffer.
-// Implementation note: the in-memory stub emits a placeholder until vmmd
-// exposes a Logs gRPC stream (planned for the follow-up PR). Spec §12 lists
-// per-app logs as a separate stream from build logs.
+// Move 3 stub: the vmmd Logs(req) gRPC stream is the real implementation
+// (pkg/fcvm/vmmd exposes a per-instance ring buffer). Until that lands,
+// emit a `not_implemented` frame and a terminal `end` so the SDK
+// contract (pkg/api/logs.go::StreamAppLogs) keeps returning a 200 with
+// parseable frames and the dashboard's per-app log button doesn't 404.
+// Move 4 replaces the body.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
 		return
 	}
-	instances, err := s.store.ListInstancesForApp(ctx(r), app.ID)
-	if err != nil || len(instances) == 0 {
+	if _, err := s.store.ListInstancesForApp(ctx(r), app.ID); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 			"No running instance", "the app is parked; wake it first"))
 		return
 	}
 	startSSE(w)
-	// Stub: emit a single heartbeat. The real implementation dials vmmd
-	// gRPC Logs(req) and tails the per-instance ring buffer (M5 follow-up).
-	_, _ = fmt.Fprintf(w, "event: log\ndata: {\"instance\":\"%s\",\"line\":\"app is running\"}\n\n",
-		instances[0].ID)
-	w.(http.Flusher).Flush()
+	flusher, _ := w.(http.Flusher)
+	// Two frames then close: a not_implemented signal so a client can
+	// distinguish "not built yet" from "empty stream" + a terminal
+	// `end` so consumers with a structured-frame loop exit cleanly
+	// (the build-tailing streamDeployLogs pattern at
+	// cmd/faas/commands2.go uses the same `end` sentinel).
+	_, _ = fmt.Fprint(w, "event: not_implemented\ndata: {\"reason\":\"vmmd Logs(req) gRPC pending — Move 4\"}\n\n")
+	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // startSSE sets the SSE response headers and disables write timeouts for the

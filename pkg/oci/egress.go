@@ -36,19 +36,65 @@ import (
 // plus a pull to a loopback is exactly the regression the user-space
 // check is meant to catch. The OCI-only entries are listed in
 // ociOnlyDenyCIDRs and union'd at dial time.
-var (
-	// ociOnlyDenyCIDRs are ranges the OCI puller denies in addition
-	// to the shared netns.DefaultDenySet. The host firewall already
-	// covers RFC1918 / link-local / metadata via the per-netns
-	// chain; these are the client-side hardening extras.
-	ociOnlyDenyCIDRsV4 = []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/8"),     // unspecified
-		netip.MustParsePrefix("127.0.0.0/8"),   // loopback
-		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
-		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking
-		netip.MustParsePrefix("240.0.0.0/4"),   // reserved
-	}
-)
+// ociOnlyDenyCIDRsV4 are ranges the OCI puller denies in addition
+// to the shared netns.DefaultDenySet. The host firewall already
+// covers RFC1918 / link-local / metadata via the per-netns
+// chain; these are the client-side hardening extras (PR-D).
+//
+// Typed as []netns.DenyEntry so each entry carries the same
+// ADR-backed provenance the shared catalog uses. The SourceADR
+// pin is ADR-034 (the PR-A slice that introduced the typed
+// catalog); the rationale follows the OCI-only rationale that
+// lived as inline comments before the refactor. These entries
+// are deliberately NOT in netns.NewDefaultDenySet() — they are
+// process-level hardening, not platform-wide policy, and the
+// host firewall / per-netns renderer do not need them.
+// OCIOnlyDenyCIDRsV4 returns a copy of the OCI-only client-hardening
+// entries as provenance-bearing netns.DenyEntry records. Exported
+// (PR-D feedback) so cmd/denylist-md can consume the typed slice
+// directly instead of maintaining a duplicate literal table — the
+// previous shape had a silent drift surface (a future edit to
+// ociOnlyDenyCIDRsV4 below would not auto-update the generated
+// docs/denylist.md). The accessor returns a copy so the caller
+// cannot mutate the runtime union. Read-only contract.
+func OCIOnlyDenyCIDRsV4() []netns.DenyEntry {
+	out := make([]netns.DenyEntry, len(ociOnlyDenyCIDRsV4))
+	copy(out, ociOnlyDenyCIDRsV4)
+	return out
+}
+
+var ociOnlyDenyCIDRsV4 = []netns.DenyEntry{
+	{
+		Family:    netns.FamilyV4,
+		Prefix:    netip.MustParsePrefix("0.0.0.0/8"),
+		SourceADR: "ADR-034",
+		Comment:   "unspecified IPv4 source range (defence-in-depth)",
+	},
+	{
+		Family:    netns.FamilyV4,
+		Prefix:    netip.MustParsePrefix("127.0.0.0/8"),
+		SourceADR: "ADR-034",
+		Comment:   "loopback range; OCI puller runs outside tenant netns",
+	},
+	{
+		Family:    netns.FamilyV4,
+		Prefix:    netip.MustParsePrefix("192.0.0.0/24"),
+		SourceADR: "ADR-034",
+		Comment:   "IETF protocol assignments",
+	},
+	{
+		Family:    netns.FamilyV4,
+		Prefix:    netip.MustParsePrefix("198.18.0.0/15"),
+		SourceADR: "ADR-034",
+		Comment:   "benchmarking range",
+	},
+	{
+		Family:    netns.FamilyV4,
+		Prefix:    netip.MustParsePrefix("240.0.0.0/4"),
+		SourceADR: "ADR-034",
+		Comment:   "reserved IPv4 range",
+	},
+}
 
 // deniedCIDRs builds the OCI deny set as the union of the shared
 // netns.DefaultDenySet + the OCI-only extras above. Built once at
@@ -62,7 +108,15 @@ var (
 		base := netns.NewDefaultDenySet()
 		out := make([]netip.Prefix, 0, len(base.V4DenyCIDRs)+len(ociOnlyDenyCIDRsV4))
 		out = append(out, base.V4DenyCIDRs...)
-		out = append(out, ociOnlyDenyCIDRsV4...)
+		// OCI-only entries are typed netns.DenyEntry (PR-D); the
+		// enforcement path needs raw prefixes so we project Prefix
+		// out at union time. Provenance (SourceADR, Comment) is
+		// preserved on the typed slice and surfaces in the
+		// generated docs/denylist.md; the runtime deny check is
+		// unchanged.
+		for _, e := range ociOnlyDenyCIDRsV4 {
+			out = append(out, e.Prefix)
+		}
 		return out
 	}()
 	deniedCIDRv6 = func() []netip.Prefix {
@@ -166,6 +220,17 @@ func ipAllowed(ip netip.Addr) bool {
 	}
 	return true
 }
+
+// EgressIPAllowed reports whether addr is permitted by the OCI
+// puller's egress policy. It is the testable mirror of the
+// internal ipAllowed predicate (PR-D) and exists so external
+// packages — notably pkg/netns_test — can assert the shared
+// catalog is consumed by the OCI dialer without exposing the
+// internal slices or the resolver/dial plumbing. Adding a new
+// catalog entry to netns.NewDefaultDenySet() is automatically
+// picked up here because deniedCIDRv4 / deniedCIDRv6 are built
+// from that source at init.
+func EgressIPAllowed(addr netip.Addr) bool { return ipAllowed(addr) }
 
 // ErrEgressDenied is returned (wrapped) when a dial target violates the
 // §11 policy. Callers can errors.Is against it.
