@@ -11,8 +11,11 @@
 //   2. The CHECK constraint added by 00044 rejects an INSERT with an
 //      out-of-vocabulary scope.
 //
-//   3. Four `key.scopes_changed` audit rows landed with the right
-//      from/to payload (actor='migration').
+//   3. Three `key.scopes_changed` audit rows landed with the right
+//      from/to payload (actor='migration'). The {admin}-only seed is
+//      untouched by the snapshot CTE predicate
+//      `scopes && ARRAY['read','write']`, so it produces no audit
+//      row — exactly 3 is the expected count for a 4-seed setup.
 //
 // Build tag mirrors apply_walk_test.go:4 — set FAAS_SKIP_PG_TESTS=1
 // locally to skip.
@@ -61,25 +64,26 @@ func TestMigrations_00044_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 		{"aaa3", []string{"write"}},
 		{"aaa4", []string{"read", "write", "admin"}},
 	}
-	for _, s := range seeds {
-		// Re-encode the hash to bytes[] so the column NOT NULL check passes.
-		_, _ = pool.Exec(ctx, `
-			insert into api_keys (id, account_id, key_sha256, label, scopes)
-			values ($1, $2, decode($3, 'hex'), $4, $5)
-			on conflict (id) do update set scopes = excluded.scopes
-		`, "00000000-0000-0000-0000-00000000"+s.hashHex, acctID, s.hashHex+"00000000000000000000000000000000000000000000000000000000", "legacy-"+s.hashHex, sortedStrings(s.scopes))
-	}
-
-	// (3) Now disable the constraint (added by 00044) to apply the
-	// backfill SQL literally — the constraint is exactly what we're
-	// testing here. We do the round-trip the way the deployment
-	// pipeline would: drop the constraint, apply the backfill CTE,
-	// re-add the constraint. (For convenience below we test the
-	// backfill shape via a fresh CREATE TABLE copy where the
-	// constraint isn't yet present.)
+	// (3) Now disable the constraint (added by 00044) so the
+	// pre-migration `{read}` and `{write}` rows can be seeded. The
+	// backfill CTE is exactly what we're testing here — we don't
+	// want the constraint to filter them out at INSERT time. We do
+	// the round-trip the way the deployment pipeline would: drop the
+	// constraint, apply the backfill CTE, re-add the constraint.
 	if _, err := pool.Exec(ctx,
 		`ALTER TABLE api_keys DROP CONSTRAINT IF EXISTS api_keys_scopes_vocab_chk`); err != nil {
 		t.Fatalf("drop chk for setup: %v", err)
+	}
+
+	for _, s := range seeds {
+		// Re-encode the hash to bytes[] so the column NOT NULL check passes.
+		if _, err := pool.Exec(ctx, `
+			insert into api_keys (id, account_id, key_sha256, label, scopes)
+			values ($1, $2, decode($3, 'hex'), $4, $5)
+			on conflict (id) do update set scopes = excluded.scopes
+		`, "00000000-0000-0000-0000-00000000"+s.hashHex, acctID, s.hashHex+"00000000000000000000000000000000000000000000000000000000", "legacy-"+s.hashHex, sortedStrings(s.scopes)); err != nil {
+			t.Fatalf("seed %s: %v", s.hashHex, err)
+		}
 	}
 	// Apply the backfill CTE literally (mirrors migrations/00044.sql).
 	if _, err := pool.Exec(ctx, `
@@ -96,9 +100,11 @@ func TestMigrations_00044_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 		           SELECT array_agg(DISTINCT v)
 		             FROM unnest(
 		                 ARRAY_CAT(
-		                     CASE WHEN 'admin' = ANY(s.old_scopes) THEN ARRAY['admin']::text[] ELSE ARRAY[]::text[] END,
-		                     CASE WHEN 'write' = ANY(s.old_scopes) THEN ARRAY['deploy:write','secrets:write']::text[] ELSE ARRAY[]::text[] END,
-		                     CASE WHEN 'read'  = ANY(s.old_scopes) THEN ARRAY['apps:read','usage:read','secrets:read']::text[] ELSE ARRAY[]::text[] END
+		                     ARRAY_CAT(
+		                         CASE WHEN 'admin' = ANY(s.old_scopes) THEN ARRAY['admin']::text[] ELSE ARRAY[]::text[] END,
+		                         CASE WHEN 'write' = ANY(s.old_scopes) THEN ARRAY['deploy:write','secrets:write']::text[] ELSE ARRAY[]::text[] END
+		                     ),
+		                     CASE WHEN 'read' = ANY(s.old_scopes) THEN ARRAY['apps:read','usage:read','secrets:read']::text[] ELSE ARRAY[]::text[] END
 		                 )
 		             ) AS v
 		           )
@@ -106,7 +112,7 @@ func TestMigrations_00044_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 		     WHERE k.id = s.id
 		     RETURNING k.id, k.account_id, k.scopes AS new_scopes, s.old_scopes
 		)
-		INSERT INTO events (actor, kind, subject_id, data)
+		INSERT INTO events (actor, kind, subject, data)
 		SELECT 'migration', 'key.scopes_changed', account_id,
 		       jsonb_build_object('key_id', id, 'from', old_scopes, 'to', new_scopes)
 		  FROM backfilled
@@ -161,15 +167,56 @@ func TestMigrations_00044_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 		t.Fatalf("expected chk violation for unknown scope")
 	}
 
-	// (6) Audit rows landed.
-	var n int
-	if err := pool.QueryRow(ctx,
-		`select count(*) from events where actor = 'migration' and kind = 'key.scopes_changed' and subject_id = $1`,
-		acctID).Scan(&n); err != nil {
-		t.Fatalf("count audit: %v", err)
+	// (6) Audit rows landed with the correct from/to payload. The query
+	// orders by sorted-from, so wantAudit must be in the same order
+	// for row-by-row comparison.
+	wantAudit := []struct {
+		from []string
+		to   []string
+	}{
+		// sorted-from "admin,read,write" — the {read,write,admin} seed
+		{[]string{"admin", "read", "write"}, []string{"admin", "apps:read", "deploy:write", "secrets:read", "secrets:write", "usage:read"}},
+		// sorted-from "read" — the {read} seed
+		{[]string{"read"}, []string{"apps:read", "secrets:read", "usage:read"}},
+		// sorted-from "write" — the {write} seed
+		{[]string{"write"}, []string{"deploy:write", "secrets:write"}},
 	}
-	if n != 3 { // 3 rows had read|write in them; the {admin} row was untouched
-		t.Errorf("expected 3 key.scopes_changed rows, got %d", n)
+	rows, err = pool.Query(ctx, `
+		select array( select jsonb_array_elements_text(data->'from') order by 1 ),
+		       array( select jsonb_array_elements_text(data->'to') order by 1 )
+		  from events
+		 where actor = 'migration' and kind = 'key.scopes_changed' and subject = $1
+		 order by array_to_string(array( select jsonb_array_elements_text(data->'from') order by 1 ), ',')
+	`, acctID)
+	if err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	got := []struct {
+		from []string
+		to   []string
+	}{}
+	for rows.Next() {
+		var from, to []string
+		if err := rows.Scan(&from, &to); err != nil {
+			rows.Close()
+			t.Fatalf("scan audit: %v", err)
+		}
+		got = append(got, struct {
+			from []string
+			to   []string
+		}{from, to})
+	}
+	rows.Close()
+	if len(got) != len(wantAudit) {
+		t.Fatalf("audit row count = %d, want %d", len(got), len(wantAudit))
+	}
+	for i, want := range wantAudit {
+		if !equalSets(got[i].from, want.from) {
+			t.Errorf("audit[%d] from = %v, want %v", i, got[i].from, want.from)
+		}
+		if !equalSets(got[i].to, want.to) {
+			t.Errorf("audit[%d] to = %v, want %v", i, got[i].to, want.to)
+		}
 	}
 }
 

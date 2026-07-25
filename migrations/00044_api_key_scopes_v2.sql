@@ -47,10 +47,17 @@ backfilled AS (
        SET scopes = (
            SELECT array_agg(DISTINCT v)
              FROM unnest(
+                 -- ARRAY_CAT is binary-only in Postgres; chain to merge
+                 -- the three branch outputs. The CASE expressions
+                 -- return empty arrays when the corresponding legacy
+                 -- scope is absent, so unnest produces only the
+                 -- scopes this row should gain.
                  ARRAY_CAT(
-                     CASE WHEN 'admin' = ANY(s.old_scopes) THEN ARRAY['admin']::text[] ELSE ARRAY[]::text[] END,
-                     CASE WHEN 'write' = ANY(s.old_scopes) THEN ARRAY['deploy:write','secrets:write']::text[] ELSE ARRAY[]::text[] END,
-                     CASE WHEN 'read'  = ANY(s.old_scopes) THEN ARRAY['apps:read','usage:read','secrets:read']::text[] ELSE ARRAY[]::text[] END
+                     ARRAY_CAT(
+                         CASE WHEN 'admin' = ANY(s.old_scopes) THEN ARRAY['admin']::text[] ELSE ARRAY[]::text[] END,
+                         CASE WHEN 'write' = ANY(s.old_scopes) THEN ARRAY['deploy:write','secrets:write']::text[] ELSE ARRAY[]::text[] END
+                     ),
+                     CASE WHEN 'read' = ANY(s.old_scopes) THEN ARRAY['apps:read','usage:read','secrets:read']::text[] ELSE ARRAY[]::text[] END
                  )
              ) AS v
            )
@@ -58,7 +65,7 @@ backfilled AS (
      WHERE k.id = s.id
      RETURNING k.id, k.account_id, k.scopes AS new_scopes, s.old_scopes
 )
-INSERT INTO events (actor, kind, subject_id, data)
+INSERT INTO events (actor, kind, subject, data)
 SELECT 'migration', 'key.scopes_changed', account_id,
        jsonb_build_object('key_id', id, 'from', old_scopes, 'to', new_scopes)
   FROM backfilled;

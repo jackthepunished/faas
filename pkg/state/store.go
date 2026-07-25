@@ -200,6 +200,17 @@ type Store interface {
 	// carrying the dismissed permission set, so operators can
 	// answer "what just got revoked?" without re-deriving it from
 	// logs. Returns ErrNotFound when no matching row exists.
+	//
+	// **NOT atomic with audit emission.** This method issues a
+	// single DELETE...RETURNING; the subsequent AppendEvent call in
+	// the handler is a separate statement and round-trip. If the
+	// audit INSERT fails (network blip, schema drift), the key is
+	// gone but no `key.deleted` row exists. Callers MUST handle this
+	// partial-failure mode — the IAM-1 handler in cmd/apid logs a
+	// WARN via apid_audit_write_failures_total and accepts the
+	// loss-of-audit-row risk. A future tx-wrapper method
+	// (DeleteAPIKeyReturningAudited) could close this gap; today,
+	// document the trade-off.
 	DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error)
 	ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error)
 	// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used
