@@ -145,6 +145,14 @@ var methodRouteMap = map[string]string{
 	"GET /v1/invocations":                  "ListInvocations",
 	"GET /v1/invocations/{id}":             "GetInvocation",
 
+	// IAM-4 (ADR-035) audit log surface. The auto-derivation would
+	// otherwise produce names with literal hyphens ("GetAudit-events",
+	// "GetAudit-eventsId") because the spec path uses an unhyphenated
+	// root resource; the explicit map drops the hyphen and conforms to
+	// the SDK's flat resource naming.
+	"GET /v1/audit-events":      "ListAuditEvents",
+	"GET /v1/audit-events/{id}": "GetAuditEvent",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action
