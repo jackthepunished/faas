@@ -75,6 +75,21 @@ type AppResponse struct {
 	// The DTO reuses the existing api.AppManifest (defined in
 	// appmanifest.go) so the wire shape stays a single source of truth.
 	Manifest AppManifest `json:"manifest"`
+	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
+	// roadmap) is the per-app outbound CIDR allowlist. Each entry
+	// is the canonical CIDR string form: v4 ("1.2.3.0/24") or v6
+	// ("2001:db8::/32"). The v4-mapped v6 form ("::ffff:1.2.3.0/120")
+	// is silently rewritten to its v4 form at PATCH time by
+	// validateUpdateApp, so the read-back never carries a
+	// "::ffff:" prefix. Materialised as `[]` (never `null`) at
+	// the conversion boundary (cmd/apid/handlers.go::appResponse)
+	// so Free / Hobby and pre-PATCH apps always have a predictable
+	// JSON shape — the per-netns renderer treats the empty list as
+	// "no allowlist rule" (the chain falls back to default-accept).
+	// The list is first-seen-wins-dedup'd at write time; the read
+	// order matches insertion order. NOT in `required:` because the
+	// empty-slice case is the contract.
+	EgressAllowlist []string `json:"egress_allowlist"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

@@ -1300,7 +1300,7 @@ components:
     # ─── Apps ─────────────────────────────────────────────────────────────
 
     AppResponse:
-      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, and last-deploy pointer."
+      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, and per-app outbound CIDR allowlist (ADR-031 + ADR-032)."
       type: object
       required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest]
       properties:
@@ -1315,6 +1315,22 @@ components:
         status: { type: string , example: "active"}
         url: { type: string, format: uri }
         manifest: { $ref: '#/components/schemas/AppManifest' }
+        # ADR-031 + ADR-032 (tier-2 network follow-ups, PR-C):
+        # the per-app outbound CIDR allowlist. Each entry is a
+        # canonical CIDR string — v4 ("1.2.3.0/24") or v6
+        # ("2001:db8::/32"). v4-mapped v6 form ("::ffff:1.2.3.0/120")
+        # is silently rewritten to its v4 form at PATCH time by
+        # validateUpdateApp, so the read-back never carries a
+        # "::ffff:" prefix. Always present (serialised as `[]`
+        # when empty, never `null`); NOT in `required:` so the
+        # empty case stays the contract for Free/Hobby.
+        egress_allowlist:
+          description: "Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6 (`2001:db8::/32`). v4-mapped v6 form (`::ffff:1.2.3.0/120`) is silently canonicalised to its v4 form at write time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies."
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9a-fA-F:./]+$'
+            example: 1.2.3.0/24
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -1337,17 +1353,23 @@ components:
         max_concurrency: { type: [integer, "null"] }
         min_instances: { type: [integer, "null"], minimum: 0 }
         # ADR-031 (tier-2 of the network roadmap): per-app
-        # outbound IPv4 allowlist. Replace-mode semantics:
+        # outbound CIDR allowlist. Replace-mode semantics:
         # omitted → no change; non-null array → atomic
         # overwrite (empty array clears). Pro/Scale only;
         # Free/Hobby PATCH → 403 plan_egress_allowlist_not_
         # allowed. Plan caps: Pro 16 entries, Scale 64.
+        # PR-C widens the pattern from IPv4-only to v4+v6
+        # (ADR-032 already shipped the handler-side acceptance
+        # but the spec wasn't updated; pre-PR-C the validator
+        # was permissive relative to the spec, allowing
+        # `::ffff:1.2.3.0/120` because the spec said "forbid
+        # `:`" while the handler said "accept v6").
         egress_allowlist:
-          description: "IPv4 CIDR allowlist; empty array clears to chain-default-accept."
+          description: "v4 or v6 CIDR allowlist; empty array clears to chain-default-accept."
           type: array
           items:
             type: string
-            pattern: '^[0-9./]+$'
+            pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
 
     RenameAppRequest:
