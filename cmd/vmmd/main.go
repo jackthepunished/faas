@@ -26,6 +26,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -63,21 +64,39 @@ type runDeps struct {
 	loadHostKey    func(path string) (*age.X25519Identity, error)
 	genAndSaveKey  func(path string) (*age.X25519Identity, error)
 	writeRecipient func(path string, id *age.X25519Identity) error
+	// popCounters: PR-E egress-deny poll seam. nil → netns.PopCounters
+	// (metal) / netns.PopCounters non-metal stub (unit tests on dev box).
+	// Tests inject a stub map-returning func to drive runEgressPoll
+	// without shelling out to nft.
+	popCounters popCountersFunc
+	// egressPollInterval: PR-E override for runEgressPoll's cadence.
+	// nil → EgressPollInterval (15s). Tests inject a 1ms cadence so the
+	// loop ticks fast enough to be observable in a unit test.
+	egressPollInterval *time.Duration
+	// startEgressPoll: PR-E seam. nil → start the production goroutine
+	// bound to ctx + ops + popCounters + log. Tests inject a no-op to
+	// skip the loop entirely, or a callback to observe the seam args.
+	startEgressPoll func(ctx context.Context, ops *wire.OpsMetrics, pop popCountersFunc, interval time.Duration, log *slog.Logger)
 }
 
 func defaultDeps() runDeps {
 	return runDeps{
-		configPath:      envOr("FAAS_VMMD_CONFIG", "/etc/faas/vmmd.toml"),
-		detectFC:        fcvm.DetectFirecrackerVersion,
-		listen:          wire.ListenAs,
-		openDB:          db.Open,
-		openStore:       state.NewPgStore,
-		detectOverlayIP: defaultDetectOverlayIP,
-		loadHostKey:     secretbox.LoadHostKey,
-		genAndSaveKey:   secretbox.GenerateAndSaveHostKey,
-		writeRecipient:  secretbox.WriteRecipientFile,
+		configPath:         envOr("FAAS_VMMD_CONFIG", "/etc/faas/vmmd.toml"),
+		detectFC:           fcvm.DetectFirecrackerVersion,
+		listen:             wire.ListenAs,
+		openDB:             db.Open,
+		openStore:          state.NewPgStore,
+		detectOverlayIP:    defaultDetectOverlayIP,
+		loadHostKey:        secretbox.LoadHostKey,
+		genAndSaveKey:      secretbox.GenerateAndSaveHostKey,
+		writeRecipient:     secretbox.WriteRecipientFile,
+		popCounters:        netns.PopCounters,
+		egressPollInterval: durationPtr(EgressPollInterval),
+		startEgressPoll:    nil, // defaultDeps() leaves nil so the runtime branch can detect "use production"
 	}
 }
+
+func durationPtr(d time.Duration) *time.Duration { return &d }
 
 // envOr returns the value of env key, or fallback when unset/empty.
 // Named envOr to avoid colliding with any same-named helper in
@@ -255,6 +274,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("grpc listening", "addr", listenTarget, "service", vmmdpb.Vmmd_ServiceDesc.ServiceName)
 		serveErr <- gsrv.Serve(lis)
 	}()
+
+	// PR-E egress-deny counter poll adapter. Reads `nft list counters`
+	// every EgressPollInterval (15 s by default) and emits the per-CIDR
+	// delta as <daemon>_egress_deny_total{cidr,family}. Tests inject
+	// startEgressPoll to skip the loop or capture the seam args; nil
+	// means "start the production goroutine". The interval is
+	// parameterised so a unit test can drive the loop at sub-second
+	// cadence (see cmd/vmmd/poller_test.go::TestRunEgressPoll_DeltaOnSecondTick).
+	interval := EgressPollInterval
+	if deps.egressPollInterval != nil {
+		interval = *deps.egressPollInterval
+	}
+	pop := deps.popCounters
+	if pop == nil {
+		pop = netns.PopCounters
+	}
+	if deps.startEgressPoll != nil {
+		deps.startEgressPoll(ctx, ops, pop, interval, log)
+	} else {
+		go runEgressPoll(ctx, ops, pop, interval, log)
+	}
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

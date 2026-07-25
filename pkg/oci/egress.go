@@ -63,6 +63,34 @@ func OCIOnlyDenyCIDRsV4() []netns.DenyEntry {
 	return out
 }
 
+// OCIOnlyDenyCounterLabels returns the (counterName, family) tuples
+// for every OCI-only client-hardening entry. The paired projection
+// exists so cmd/imaged can pre-instantiate the imaged-side mirror
+// counter without importing pkg/netns directly (depguard boundary:
+// pkg/oci is the only egress-policy surface non-vmmd daemons are
+// allowed to depend on). The catalog portion of the labels is
+// already pre-instantiated by wire.NewOpsMetrics("imaged"); this
+// helper adds the OCI-only extras on top.
+func OCIOnlyDenyCounterLabels() []CounterLabel {
+	out := make([]CounterLabel, 0, len(ociOnlyDenyCIDRsV4))
+	for _, e := range ociOnlyDenyCIDRsV4 {
+		out = append(out, CounterLabel{
+			CounterName: netns.DropCounterName(e.Family, e.Prefix.String()),
+			Family:      e.Family.String(),
+		})
+	}
+	return out
+}
+
+// CounterLabel is the (CounterName, Family) pair that the imaged
+// /metrics counter expects. Returned by OCIOnlyDenyCounterLabels so
+// the OCI package is the only place the catalog-projection logic
+// lives.
+type CounterLabel struct {
+	CounterName string
+	Family      string
+}
+
 var ociOnlyDenyCIDRsV4 = []netns.DenyEntry{
 	{
 		Family:    netns.FamilyV4,
@@ -103,25 +131,50 @@ var ociOnlyDenyCIDRsV4 = []netns.DenyEntry{
 // editorial pass will decide whether the OCI-only entries deserve
 // to land on the host side too; today the union is the cheapest
 // contract that closes the regression.
+//
+// PR-E: the union preserves the typed DenyEntry records (with
+// CounterName) instead of projecting to bare Prefix. The runtime
+// deny check (ipAllowed) walks the typed slice for parity with
+// netns policy.go's per-CIDR rule shape; the EgressDenyHook
+// receives the matched entry's CounterName so the imaged-side
+// metric has a stable, catalog-derived label.
 var (
-	deniedCIDRv4 = func() []netip.Prefix {
+	deniedEntriesV4 = func() []netns.DenyEntry {
 		base := netns.NewDefaultDenySet()
-		out := make([]netip.Prefix, 0, len(base.V4DenyCIDRs)+len(ociOnlyDenyCIDRsV4))
-		out = append(out, base.V4DenyCIDRs...)
-		// OCI-only entries are typed netns.DenyEntry (PR-D); the
-		// enforcement path needs raw prefixes so we project Prefix
-		// out at union time. Provenance (SourceADR, Comment) is
-		// preserved on the typed slice and surfaces in the
-		// generated docs/denylist.md; the runtime deny check is
-		// unchanged.
+		out := make([]netns.DenyEntry, 0, len(base.V4DenyCIDRs)+len(ociOnlyDenyCIDRsV4))
+		// Project the shared catalog's v4 entries (which already have
+		// CounterName from netns.NewDefaultDenySet) into the union.
+		for _, e := range base.Entries {
+			if e.Family != netns.FamilyV4 {
+				continue
+			}
+			out = append(out, e)
+		}
+		// OCI-only entries come from a typed slice but have no
+		// CounterName (they're not in the catalog). Synthesise a
+		// stable name using the same sanitize rule the catalog uses
+		// so the metric label is deterministic across runs.
 		for _, e := range ociOnlyDenyCIDRsV4 {
-			out = append(out, e.Prefix)
+			out = append(out, netns.DenyEntry{
+				Family:      e.Family,
+				Prefix:      e.Prefix,
+				CounterName: netns.DropCounterName(e.Family, e.Prefix.String()),
+				SourceADR:   e.SourceADR,
+				Comment:     e.Comment,
+			})
 		}
 		return out
 	}()
-	deniedCIDRv6 = func() []netip.Prefix {
+	deniedEntriesV6 = func() []netns.DenyEntry {
 		base := netns.NewDefaultDenySet()
-		return append([]netip.Prefix{}, base.V6DenyCIDRs...)
+		out := make([]netns.DenyEntry, 0, len(base.V6DenyCIDRs))
+		for _, e := range base.Entries {
+			if e.Family != netns.FamilyV6 {
+				continue
+			}
+			out = append(out, e)
+		}
+		return out
 	}()
 )
 
@@ -164,6 +217,18 @@ func EgressDialContext(parent *net.Dialer) func(ctx context.Context, network, ad
 			}
 			addr = addr.Unmap()
 			if !ipAllowed(addr) {
+				// PR-E: surface the matched catalog entry to the
+				// EgressDenyHook so cmd/imaged can emit a labelled
+				// counter (oci_egress_deny_total{cidr,family}) —
+				// matches the vmmd-side per-CIDR deny counter
+				// emitted by the nft poll adapter. nil hook is safe
+				// (no-op) so existing callers that don't care about
+				// the metric keep working unchanged.
+				if EgressDenyHook != nil {
+					if entry := matchedDenyEntry(addr); entry.CounterName != "" {
+						EgressDenyHook(addr, entry.CounterName, entry.Family.String())
+					}
+				}
 				// ADR-021: lift the egress-denial failure mode to a
 				// sentinel that pkg/api.SentinelToCode maps to the
 				// RFC 7807 CodeImageEgressDenied (security-class
@@ -199,7 +264,7 @@ func NewEgressHTTPClient() *http.Client {
 
 // ipAllowed reports whether ip is in a publicly routable range. It is the
 // single place the egress policy is enforced; add a new denied range to
-// deniedCIDRv4 / deniedCIDRv6 and the test in egress_test.go picks it up.
+// deniedEntriesV4 / deniedEntriesV6 and the test in egress_test.go picks it up.
 func ipAllowed(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
@@ -207,18 +272,42 @@ func ipAllowed(ip netip.Addr) bool {
 	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
 		return false
 	}
-	var denied []netip.Prefix
-	if ip.Is4() || ip.Is4In6() {
-		denied = deniedCIDRv4
-	} else {
-		denied = deniedCIDRv6
+	denied := deniedEntriesV4
+	if !ip.Is4() && !ip.Is4In6() {
+		denied = deniedEntriesV6
 	}
-	for _, p := range denied {
-		if p.Contains(ip) {
+	for _, e := range denied {
+		if e.Prefix.Contains(ip) {
 			return false
 		}
 	}
 	return true
+}
+
+// matchedDenyEntry walks the OCI deny union (preserving typed DenyEntry
+// records with CounterName) and returns the first entry whose prefix
+// contains ip. The zero DenyEntry is returned when no match is found
+// (which ipAllowed has already verified cannot happen at the call
+// sites that invoke this helper).
+//
+// Used by EgressDialContext to feed EgressDenyHook a stable CounterName
+// for the metric label; without this helper the hook would only see the
+// raw target address, which has unbounded cardinality (every public IP
+// the OCI puller touches becomes a separate series).
+func matchedDenyEntry(ip netip.Addr) netns.DenyEntry {
+	if !ip.IsValid() {
+		return netns.DenyEntry{}
+	}
+	denied := deniedEntriesV4
+	if !ip.Is4() && !ip.Is4In6() {
+		denied = deniedEntriesV6
+	}
+	for _, e := range denied {
+		if e.Prefix.Contains(ip) {
+			return e
+		}
+	}
+	return netns.DenyEntry{}
 }
 
 // EgressIPAllowed reports whether addr is permitted by the OCI
@@ -228,10 +317,35 @@ func ipAllowed(ip netip.Addr) bool {
 // catalog is consumed by the OCI dialer without exposing the
 // internal slices or the resolver/dial plumbing. Adding a new
 // catalog entry to netns.NewDefaultDenySet() is automatically
-// picked up here because deniedCIDRv4 / deniedCIDRv6 are built
+// picked up here because deniedEntriesV4 / deniedEntriesV6 are built
 // from that source at init.
 func EgressIPAllowed(addr netip.Addr) bool { return ipAllowed(addr) }
 
 // ErrEgressDenied is returned (wrapped) when a dial target violates the
 // §11 policy. Callers can errors.Is against it.
 var ErrEgressDenied = errors.New("oci: egress denied")
+
+// EgressDenyHook is the PR-E dialer-side observability hook: invoked
+// from EgressDialContext when a target address is denied by the
+// user-space egress policy (nftables does NOT see this path — the
+// dialer refuses before any kernel-layer counter could fire). The
+// hook is set once at imaged startup; nil is safe and the dialer
+// silently skips the metric emit (preserves the pre-PR-E behaviour
+// for any caller that hasn't wired the hook yet).
+//
+// Parameters:
+//
+//   - target is the denied IP that triggered the refusal. The hook
+//     is invoked with the post-Unmap() form (v4-in-v6 collapse).
+//   - counterName is the catalog-derived DenyEntry.CounterName
+//     (e.g. "drop_v4_10_0_0_0_8") — a stable, bounded label.
+//   - family is the nft family keyword for the matching entry
+//     ("ip" / "ip6") — same convention as netns.Family.String().
+//
+// Concurrency: the dialer is called concurrently by every imaged
+// goroutine. Hooks MUST be safe for concurrent invocation; the
+// typical wiring is a Prometheus counter Inc() (atomic on the
+// caller's side). The hook is invoked from inside the dialer
+// goroutine BEFORE the dial error is returned, so a slow hook
+// delays the dial — keep the hook fast (counter Inc only).
+var EgressDenyHook func(target netip.Addr, counterName, family string)

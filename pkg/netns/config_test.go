@@ -234,15 +234,31 @@ func TestNftCommandsEnforceEgressPolicy(t *testing.T) {
 	// from NewDefaultDenySet() so adding a new CIDR is mechanically covered
 	// (PR-A, ADR-034 added 6to4 + Teredo; this test would have silently
 	// regressed without the typed DenySet).
+	//
+	// PR-E changed the per-CIDR deny lines from aggregate
+	// `ip daddr { <cidrs> } drop` to per-CIDR
+	// `ip daddr <cidr> counter name "<name>" drop` (one rule per
+	// entry, each with a counter attachment). The SMTP port line
+	// shape is unchanged. The aggregate fixtures below would falsely
+	// fail, so the test walks every catalog entry and asserts the
+	// per-CIDR line.
 	denySet := NewDefaultDenySet()
 	wants := []string{
 		"iifname tap0 tcp dport { " + denySet.SMTPPortsCommaSet() + " } drop",
-		"iifname tap0 ip daddr { " + denySet.V4CommaSet() + " } drop",
-		"iifname tap0 ip6 daddr { " + denySet.V6CommaSet() + " } drop",
 	}
 	for _, w := range wants {
 		if !strings.Contains(rules, w) {
 			t.Errorf("egress policy missing %q\ngot:\n%s", w, rules)
+		}
+	}
+	// Per-CIDR deny lines.
+	for _, e := range denySet.Entries {
+		daddrKW := "iifname tap0 ip daddr " + e.Prefix.String() + " counter name"
+		if e.Family == FamilyV6 {
+			daddrKW = "iifname tap0 ip6 daddr " + e.Prefix.String() + " counter name"
+		}
+		if !strings.Contains(rules, daddrKW) {
+			t.Errorf("per-CIDR egress deny %q missing\ngot:\n%s", daddrKW, rules)
 		}
 	}
 	// The denies must be guest-originated only; a daddr drop without an iifname

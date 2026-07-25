@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/netns"
 )
 
 func TestIPAllowed_PublicAllowed(t *testing.T) {
@@ -160,6 +163,115 @@ func TestEgressDialContext_RefusesMetadataIP(t *testing.T) {
 	}
 	if !errors.Is(err, ErrImageEgressDenied) {
 		t.Errorf("egress dial IMDS err = %v, want errors.Is(_, ErrImageEgressDenied) true", err)
+	}
+}
+
+// TestEgressDenyHook_CalledOnDenial (PR-E) — installs a hook and
+// asserts the dialer invokes it when a target address is denied.
+// The hook receives the catalog-derived CounterName (e.g.
+// `drop_v4_10_0_0_0_8`) so the imaged-side counter increments with
+// the same label set the vmmd poll adapter uses — the cross-renderer
+// observability contract.
+//
+// The hook is a package-level var, so tests that install it MUST
+// restore the previous value via t.Cleanup to avoid leaking state
+// into the rest of the suite.
+func TestEgressDenyHook_CalledOnDenial(t *testing.T) {
+	prev := EgressDenyHook
+	t.Cleanup(func() { EgressDenyHook = prev })
+
+	type call struct {
+		target      netip.Addr
+		counterName string
+		family      string
+	}
+	var got []call
+	EgressDenyHook = func(target netip.Addr, counterName, family string) {
+		got = append(got, call{target, counterName, family})
+	}
+
+	dial := EgressDialContext(&net.Dialer{})
+	_, err := dial(context.Background(), "tcp", "10.0.0.1:80")
+	if err == nil {
+		t.Fatal("dial to 10.0.0.1 should be denied")
+	}
+	if len(got) != 1 {
+		t.Fatalf("EgressDenyHook called %d times, want 1: %+v", len(got), got)
+	}
+	if got[0].counterName != "drop_v4_10_0_0_0_8" {
+		t.Errorf("EgressDenyHook counterName = %q, want %q",
+			got[0].counterName, "drop_v4_10_0_0_0_8")
+	}
+	if got[0].family != "ip" {
+		t.Errorf("EgressDenyHook family = %q, want %q", got[0].family, "ip")
+	}
+	if got[0].target.String() != "10.0.0.1" {
+		t.Errorf("EgressDenyHook target = %s, want 10.0.0.1", got[0].target)
+	}
+}
+
+// TestEgressDenyHook_NotCalledOnAllow — the hook must NOT fire when
+// the dial passes the ipAllowed check. The hook is the deny-side
+// observability seam, not a dial-success hook.
+//
+// 1.1.1.1 is a public IP literal — ipAllowed returns true, so the
+// loop walks past the hook site and lands in parent.DialContext,
+// which fails on a sandboxed CI runner with "no route to host" or
+// similar. We don't care whether the dial itself succeeds; we only
+// care that the hook was not invoked.
+func TestEgressDenyHook_NotCalledOnAllow(t *testing.T) {
+	prev := EgressDenyHook
+	t.Cleanup(func() { EgressDenyHook = prev })
+
+	called := 0
+	EgressDenyHook = func(netip.Addr, string, string) { called++ }
+
+	dial := EgressDialContext(&net.Dialer{})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _ = dial(ctx, "tcp", "1.1.1.1:80")
+	if called != 0 {
+		t.Errorf("EgressDenyHook fired %d times for a public-IP dial, want 0", called)
+	}
+}
+
+// TestMatchedDenyEntry_PrefixLookup — exercises the helper that
+// maps a denied IP back to the catalog entry's CounterName. The
+// helper is package-internal (matchedDenyEntry) and is the source
+// of the (cidr, family) label pair the hook receives.
+func TestMatchedDenyEntry_PrefixLookup(t *testing.T) {
+	cases := []struct {
+		ip           string
+		wantName     string
+		wantFamily   string
+		wantSourceAD string
+	}{
+		{"10.0.0.1", "drop_v4_10_0_0_0_8", "ip", "spec-§11"},
+		{"172.16.0.1", "drop_v4_172_16_0_0_12", "ip", "spec-§11"},
+		{"169.254.169.254", "drop_v4_169_254_0_0_16", "ip", "spec-§11"},
+		{"192.168.1.1", "drop_v4_192_168_0_0_16", "ip", "spec-§11"},
+		// OCI-only extras — loopback hits the OCI-only 127/8 entry,
+		// not the shared catalog (the catalog doesn't have 127/8).
+		{"127.0.0.1", netns.DropCounterName(netns.FamilyV4, "127.0.0.0/8"), "ip", "ADR-034"},
+		// v6 cases
+		{"fe80::1", "drop_v6_fe80___10", "ip6", "ADR-023"},
+		{"2002::1", "drop_v6_2002___16", "ip6", "ADR-034"},
+	}
+	for _, c := range cases {
+		ip := netip.MustParseAddr(c.ip)
+		got := matchedDenyEntry(ip)
+		if got.CounterName != c.wantName {
+			t.Errorf("matchedDenyEntry(%s).CounterName = %q, want %q",
+				c.ip, got.CounterName, c.wantName)
+		}
+		if got.Family.String() != c.wantFamily {
+			t.Errorf("matchedDenyEntry(%s).Family = %q, want %q",
+				c.ip, got.Family.String(), c.wantFamily)
+		}
+		if got.SourceADR != c.wantSourceAD {
+			t.Errorf("matchedDenyEntry(%s).SourceADR = %q, want %q",
+				c.ip, got.SourceADR, c.wantSourceAD)
+		}
 	}
 }
 

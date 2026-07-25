@@ -110,11 +110,15 @@ func sampleAddrInPrefix(p netip.Prefix) netip.Addr {
 	return masked.Addr()
 }
 
-// rowHasCIDRDeny scans the flattened argv for a rule row of the shape
-// `<daddrKW> { ... <cidr> ... } drop`. The argv is row-delimited; each
-// row is a full nft call. A regression that drops the CIDR, swaps
-// the family tag, or short-circuits to `accept` instead of `drop`
-// surfaces here.
+// rowHasCIDRDeny scans the flattened argv for a rule row that denies
+// <cidr>. PR-E changed the per-CIDR shape from `<daddrKW> { ... <cidr> ... } drop`
+// (one rule per family, aggregate set) to `<daddrKW> <cidr> counter name "<name>" drop`
+// (one rule per CIDR with a named counter attached). The helper matches
+// the post-PR-E shape: a row that contains the daddrKW token, the cidr
+// token, AND ends in `counter name "<name>" drop` (where name is matched
+// separately via rowHasCIDRWithCounter). rowHasCIDRDeny is the
+// no-counter-name variant — the counter-name pin lives in
+// TestAllThreeConsumersAgreeOnDenySet below via rowHasCIDRWithCounter.
 func rowHasCIDRDeny(argv, daddrKW, cidr string) bool {
 	for _, row := range strings.Split(argv, "\n") {
 		if !strings.Contains(row, daddrKW) {
@@ -123,7 +127,52 @@ func rowHasCIDRDeny(argv, daddrKW, cidr string) bool {
 		if !strings.Contains(row, cidr) {
 			continue
 		}
-		if !strings.Contains(row, "} drop") {
+		// Per-CIDR rules end with `counter name "<x>" drop` — the
+		// presence of "drop" alone is not enough (the established/
+		// related accept rule row might contain the CIDR as part
+		// of an exception clause). Require the counter-name suffix
+		// shape so the regression net only fires on deny rules.
+		if !strings.Contains(row, "counter name") {
+			continue
+		}
+		if !strings.HasSuffix(strings.TrimSpace(row), "drop") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// rowHasCIDRWithCounter is the PR-E counterpart to rowHasCIDRDeny:
+// scans argv rows for a per-CIDR deny rule that ALSO attaches the
+// given CounterName. The argv is space-joined (no quoting preserved
+// — config.go emits the name as a bare token to `nft` via the OS
+// exec path, not via shell), so the on-the-wire shape is
+// `... <daddrKW> <cidr> counter name <counterName> drop`.
+//
+// Without this assertion a regression could keep the per-CIDR deny
+// shape but forget the counter attachment — the deny would still
+// fire, the operator would still see the rule in `nft list ruleset`,
+// but the per-CIDR Prometheus series would be empty.
+//
+// The counter name is matched as a whole-word token so a CIDR like
+// `drop_v4_10_0_0_0_8` doesn't accidentally match `drop_v4_10_0_0_0_80`.
+// We use the simpler approach: require the literal `counter name <name>`
+// substring, then check the row ends with `drop`. This keeps the helper
+// allocation-free and the assertion unambiguous.
+func rowHasCIDRWithCounter(argv, daddrKW, cidr, counterName string) bool {
+	needle := "counter name " + counterName
+	for _, row := range strings.Split(argv, "\n") {
+		if !strings.Contains(row, daddrKW) {
+			continue
+		}
+		if !strings.Contains(row, cidr) {
+			continue
+		}
+		if !strings.Contains(row, needle) {
+			continue
+		}
+		if !strings.HasSuffix(strings.TrimSpace(row), "drop") {
 			continue
 		}
 		return true
@@ -186,27 +235,58 @@ func TestAllThreeConsumersAgreeOnDenySet(t *testing.T) {
 		// interface, so any divergence between the enum and the nft
 		// keyword surfaces as a literal-string mismatch here.
 		daddrKW := e.Family.String() + " daddr"
-		daddrNeedle := daddrKW + " { "
 
 		// Per-netns sink.
 		if !rowHasCIDRDeny(perNetnsArgv, daddrKW, cidr) {
 			t.Errorf("entries[%d] (%s) missing from per-netns %q deny argv row", i, cidr, daddrKW)
 		}
+		// PR-E: also assert the counter attachment — the per-CIDR rule
+		// shape is `<daddrKW> <cidr> counter name "<CounterName>" drop`.
+		// Without this assertion a regression could keep the deny rule
+		// but lose the counter name; the rule would still fire and the
+		// deny observability panel would silently go dark.
+		if !rowHasCIDRWithCounter(perNetnsArgv, daddrKW, cidr, e.CounterName) {
+			t.Errorf("entries[%d] (%s) per-netns %q deny argv missing counter name %q",
+				i, cidr, daddrKW, e.CounterName)
+		}
 
-		// Host sink.
-		idx := strings.Index(hostFwd, daddrNeedle)
+		// Host sink. The host forward chain is a single `table inet faas`
+		// body — the deny lines are emitted one per CIDR (PR-E), each
+		// as `<daddrKW> <cidr> counter name "<CounterName>" drop`. The
+		// pre-PR-E shape used the aggregate `<daddrKW> { … } drop`; the
+		// daddrNeedle helper below expects the per-CIDR shape.
+		hostDenyNeedle := daddrKW + " " + cidr
+		idx := strings.Index(hostFwd, hostDenyNeedle)
 		if idx < 0 {
 			t.Errorf("entries[%d] (%s, %s) host forward chain missing %q deny line",
-				i, cidr, daddrKW, daddrKW)
+				i, cidr, daddrKW, hostDenyNeedle)
 			continue
 		}
-		end := strings.Index(hostFwd[idx:], " } drop")
-		if end < 0 {
-			t.Errorf("entries[%d] (%s) host %q line has no `} drop` closer", i, cidr, daddrKW)
-			continue
+		// Walk forward from the deny-line start to the end-of-line /
+		// counter-name suffix; check the counter attachment is present.
+		end := idx + len(hostDenyNeedle)
+		// Find the next newline so we don't match across CIDRs.
+		if nl := strings.Index(hostFwd[end:], "\n"); nl >= 0 {
+			end += nl
 		}
-		if !strings.Contains(hostFwd[idx:idx+end], cidr) {
-			t.Errorf("entries[%d] (%s) missing from host %q deny line", i, cidr, daddrKW)
+		line := hostFwd[idx:end]
+		if !strings.Contains(line, `counter name "`+e.CounterName+`"`) {
+			t.Errorf("entries[%d] (%s) host %q deny line missing counter name %q",
+				i, cidr, daddrKW, e.CounterName)
+		}
+		if !strings.HasSuffix(strings.TrimSpace(line), "drop") {
+			t.Errorf("entries[%d] (%s) host %q deny line does not end in `drop`",
+				i, cidr, daddrKW)
+		}
+
+		// Counter pre-declaration at table scope (host side). The
+		// policy.go renderer emits `  counter <name> {}` at the top
+		// of the `table inet faas` body — a regression that drops
+		// the pre-declaration would land an `nft: counter name "..."
+		// does not exist` error at `nft -f` time.
+		if !strings.Contains(hostRender, "  counter "+e.CounterName+" {}") {
+			t.Errorf("entries[%d] (%s) host render missing counter pre-declaration %q",
+				i, cidr, e.CounterName)
 		}
 
 		// OCI sink.

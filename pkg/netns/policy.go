@@ -119,8 +119,6 @@ func (h HostPolicy) Render() string {
 		panic("netns: HostPolicy.Render: BridgeName, PublicIface, and MasqueradeCIDR are required")
 	}
 
-	denyCIDRs := h.DenySet.V4CommaSet()
-	denyIPv6CIDRs := h.DenySet.V6CommaSet()
 	denyPorts := h.DenySet.SMTPPortsCommaSet()
 	allowPorts := joinInts(h.InputAllowTCPPorts, ",")
 
@@ -133,6 +131,18 @@ func (h HostPolicy) Render() string {
 	b.WriteString("flush ruleset\n")
 	b.WriteString("\n")
 	b.WriteString("table inet faas {\n")
+	// PR-E: pre-declare every per-CIDR drop counter at table scope so
+	// the forward-chain rules below can reference them by name. The
+	// table is `inet faas` (combined v4 + v6 family), so a single
+	// pre-declaration suffices. Same rationale as the per-netns
+	// counter declarations in Config.NftCommands (config.go); without
+	// the pre-declaration, nft v1.0.x rejects the rule's `counter name`
+	// reference and v1.1.x silently ignores the counter. The vmmd
+	// scrape adapter reads these names via `nft list counters` and
+	// surfaces per-CIDR drops on <daemon>_egress_deny_total{cidr,family}.
+	for _, e := range h.DenySet.Entries {
+		fmt.Fprintf(&b, "  counter %s {}\n", e.CounterName)
+	}
 	b.WriteString("  chain input {\n")
 	b.WriteString("    type filter hook input priority 0; policy drop;\n")
 	b.WriteString("    ct state established,related accept\n")
@@ -148,10 +158,21 @@ func (h HostPolicy) Render() string {
 	b.WriteString("    # spec §11 denylist — evaluated BEFORE the bridged-tenant broad allow\n")
 	b.WriteString("    # so tenant traffic to RFC1918 / SMTP / link-local is actually dropped at\n")
 	b.WriteString("    # the host layer; the per-netns chain is the primary block, this is defense\n")
-	b.WriteString("    # in depth.\n")
+	b.WriteString("    # in depth. PR-E renders ONE RULE per DenySet entry so each CIDR's drop\n")
+	b.WriteString("    # count is observable via `nft list counters` (the vmmd scrape adapter\n")
+	b.WriteString("    # exposes them as <daemon>_egress_deny_total{cidr,family}). The previous\n")
+	b.WriteString("    # aggregate `ip daddr { … } drop` shape produced one anonymous bucket\n")
+	b.WriteString("    # for the entire list — useless for the per-tenant / per-CIDR observability\n")
+	b.WriteString("    # question.\n")
 	fmt.Fprintf(&b, "    tcp dport { %s } drop\n", denyPorts)
-	fmt.Fprintf(&b, "    ip daddr { %s } drop\n", denyCIDRs)
-	fmt.Fprintf(&b, "    ip6 daddr { %s } drop\n", denyIPv6CIDRs)
+	for _, e := range h.DenySet.Entries {
+		family := "ip"
+		if e.Family == FamilyV6 {
+			family = "ip6"
+		}
+		fmt.Fprintf(&b, "    %s daddr %s counter name %q drop\n",
+			family, e.Prefix.String(), e.CounterName)
+	}
 	fmt.Fprintf(&b, "    iifname %q oifname %q accept\n", h.BridgeName, h.PublicIface)
 	b.WriteString("  }\n")
 	b.WriteString("\n")

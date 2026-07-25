@@ -1030,14 +1030,14 @@ func TestSetupNetworkEmitsConntrackCapRule(t *testing.T) {
 	establishedV4 := indexOfArgv(run.commands, "nft add rule ip faas forward ct state established,related accept")
 	establishedV6 := indexOfArgv(run.commands, "nft add rule ip6 faas forward ct state established,related accept")
 	smtpDrop := indexOfArgv(run.commands, "tcp dport {")
-	daddrDropV4 := indexOfArgv(run.commands, "ip daddr { 10.0.0.0/8")
-	daddrDropV6 := indexOfArgv(run.commands, "fe80::/10,")
-	// v6 needle anchors on a single CIDR inside the comma-joined
-	// set; the rendered argv flattens to one `nft` arg like
-	// `{ ::/128,::1/128,2001::/32,2002::/16,fc00::/7,fe80::/10,ff00::/8 }`
-	// so any substring starting at a comma-bounded CIDR matches.
-	// PR-A added 6to4 + Teredo, ADR-034; the substring pick is
-	// the pre-PR-A link-local entry that still ships.
+	// PR-E: per-CIDR deny lines. The cap-rule-precedes-daddr-drop
+	// ordering invariant still holds — pick the FIRST per-CIDR rule
+	// in each family. Catalog sort order (v4 prefix asc, v6 prefix
+	// asc — see NewDefaultDenySet) is the same as before, so the
+	// pre-PR-E v4 first entry (10.0.0.0/8) and v6 first entry
+	// (::/128) are still the leading per-CIDR rules.
+	daddrDropV4 := indexOfArgv(run.commands, "ip daddr 10.0.0.0/8 counter name")
+	daddrDropV6 := indexOfArgv(run.commands, "ip6 daddr ::/128 counter name")
 	if capV4 < 0 || capV6 < 0 || establishedV4 < 0 || establishedV6 < 0 || daddrDropV4 < 0 || daddrDropV6 < 0 || smtpDrop < 0 {
 		t.Fatalf("missing one or more rules in argv list: capV4=%d capV6=%d establishedV4=%d establishedV6=%d smtp=%d daddrV4=%d daddrV6=%d\n%s",
 			capV4, capV6, establishedV4, establishedV6, smtpDrop, daddrDropV4, daddrDropV6, flattenForTest(run.commands))

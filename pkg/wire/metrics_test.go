@@ -160,6 +160,114 @@ func TestOpsMetrics_NewObserversNilSafe(t *testing.T) {
 	m.ObserveImagedOCIPull("blob", "ok", time.Second)
 }
 
+// TestOpsMetrics_EgressDenyRegistryPreinstantiated (PR-E) — every
+// catalog (cidr, family) tuple must surface in /metrics from boot
+// with value 0, mirroring the OCI-pull and build histogram
+// pre-instantiation pattern. The wire test pins both the vmmd-side
+// (prefix "vmmd") collector and the imaged-side (prefix "imaged")
+// OCI mirror collector. Operators rely on the panel existing at
+// day 1 — an idle box would otherwise render the panel as "no
+// data" until at least one drop had been observed.
+func TestOpsMetrics_EgressDenyRegistryPreinstantiated(t *testing.T) {
+	cases := []struct {
+		prefix      string
+		wantCatalog []string
+		wantOCIOnly []string // only on "imaged"
+	}{
+		{
+			prefix: "vmmd",
+			// Catalog pre-instantiation covers the firewall-side counter.
+			wantCatalog: []string{
+				`vmmd_egress_deny_total{cidr="drop_v4_10_0_0_0_8",family="ip"} 0`,
+				`vmmd_egress_deny_total{cidr="drop_v6_fe80___10",family="ip6"} 0`,
+				`vmmd_egress_deny_total{cidr="drop_v6_2002___16",family="ip6"} 0`,
+			},
+		},
+		{
+			prefix: "imaged",
+			// Imaged registry also gets the OCI-mirror collector with
+			// the catalog portion pre-instantiated (OCI-only extras are
+			// pre-instantiated from cmd/imaged/main.go so wire doesn't
+			// import pkg/oci).
+			wantCatalog: []string{
+				`imaged_egress_deny_total{cidr="drop_v4_10_0_0_0_8",family="ip"} 0`,
+				`imaged_oci_egress_deny_total{cidr="drop_v4_10_0_0_0_8",family="ip"} 0`,
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.prefix, func(t *testing.T) {
+			m := wire.NewOpsMetrics(c.prefix)
+			body := render(t, m)
+			for _, want := range c.wantCatalog {
+				if !strings.Contains(body, want) {
+					t.Errorf("missing line %q in:\n%s", want, body)
+				}
+			}
+		})
+	}
+}
+
+// TestOpsMetrics_EgressDenyIncrement (PR-E) — the public
+// EgressDeny accessor increments the per-(cidr, family) counter
+// and the value surfaces in /metrics. Asserts the wire path
+// end-to-end (the cmd/vmmd poller + cmd/imaged hook both rely on
+// this).
+func TestOpsMetrics_EgressDenyIncrement(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	m.EgressDeny("drop_v4_10_0_0_0_8", "ip").Add(7)
+	body := render(t, m)
+	want := `vmmd_egress_deny_total{cidr="drop_v4_10_0_0_0_8",family="ip"} 7`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing line %q in:\n%s", want, body)
+	}
+}
+
+// TestOpsMetrics_OCIEgressDenyIncrement (PR-E) — the imaged-side
+// mirror. Only registered when prefix == "imaged"; nil-safe
+// accessor on every other prefix.
+func TestOpsMetrics_OCIEgressDenyIncrement(t *testing.T) {
+	m := wire.NewOpsMetrics("imaged")
+	m.OCIEgressDeny("drop_v4_10_0_0_0_8", "ip").Inc()
+	body := render(t, m)
+	want := `imaged_oci_egress_deny_total{cidr="drop_v4_10_0_0_0_8",family="ip"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing line %q in:\n%s", want, body)
+	}
+
+	// Non-imaged registries: the accessor returns nil (a no-op counter).
+	// The wire contract — cmd/vmmd only ever calls EgressDeny, cmd/imaged
+	// only ever calls OCIEgressDeny — is enforced by the prefix check in
+	// NewOpsMetrics, not by the accessor. Verify the accessor is safe
+	// on a non-imaged registry (no panic, no /metrics line).
+	vmmd := wire.NewOpsMetrics("vmmd")
+	if c := vmmd.OCIEgressDeny("drop_v4_10_0_0_0_8", "ip"); c != nil {
+		t.Errorf("vmmd.OCIEgressDeny = %v, want nil", c)
+	}
+	vmmdBody := render(t, vmmd)
+	// The vmmd registry must NOT have a counter NAMED oci_egress_deny_total
+	// (only the firewall-side vmmd_egress_deny_total). The HELP text for
+	// vmmd_egress_deny_total mentions "oci_egress_deny_total" in its
+	// description; substring match would falsely trip on that. Anchor
+	// the check on the metric-name declaration line.
+	if strings.Contains(vmmdBody, "# TYPE vmmd_oci_egress_deny_total counter") {
+		t.Errorf("vmmd registry should not contain vmmd_oci_egress_deny_total, got:\n%s", vmmdBody)
+	}
+}
+
+// TestOpsMetrics_EgressDenyNilSafe (PR-E) — the accessor must be
+// no-op on a nil receiver so vmmd / imaged unit tests without
+// metrics keep working (same nil-safe posture as Observe*).
+func TestOpsMetrics_EgressDenyNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.EgressDeny("drop_v4_10_0_0_0_8", "ip"); got != nil {
+		t.Errorf("nil.EgressDeny = %v, want nil", got)
+	}
+	if got := m.OCIEgressDeny("drop_v4_10_0_0_0_8", "ip"); got != nil {
+		t.Errorf("nil.OCIEgressDeny = %v, want nil", got)
+	}
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration
