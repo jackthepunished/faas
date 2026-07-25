@@ -109,6 +109,19 @@ e2e: ## End-to-end tests in cmd/e2e (needs Postgres reachable; metal subset via 
 	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set; set it to a reachable Postgres to run e2e" ; exit 1)
 	$(GO) test -race -count=1 -timeout=15m ./cmd/e2e/...
 
+.PHONY: backup-pg
+backup-pg: ## Take a Postgres base backup into /var/lib/pgsql/basebackup/basebackup-<UTC>/ (spec §14 M8)
+	@test -d /var/lib/pgsql/basebackup || (echo "/var/lib/pgsql/basebackup missing — run the postgres role first" ; exit 1)
+	@sudo -u postgres pg_basebackup -Ft -z -D /var/lib/pgsql/basebackup/basebackup-$$(date -u +%Y-%m-%dT%H%M%SZ) -P -X fetch --checkpoint=fast --label=faas-m8-nightly
+
+.PHONY: backup-restore-drill
+backup-restore-drill: ## Run the M8 restore drill end-to-end (must run on EX44 as root)
+	sudo bash deploy/scripts/faas-m8-restore-drill.sh
+
+.PHONY: lint-drill
+lint-drill: ## Static lint of the restore drill script + record template shape (spec §14 M8)
+	bash deploy/scripts/faas-m8-restore-drill_test.sh
+
 .PHONY: metal-lima
 metal-lima: ## Run metal tests locally on an M3+ Mac via Lima nested KVM (see deploy/lima/README.md)
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
