@@ -1027,11 +1027,26 @@ func (m *MemStore) BuildByDeployment(_ context.Context, deploymentID string) (Bu
 	return latest, nil
 }
 
+// UpdateBuildStatus flips the build row to a new status. Mirrors
+// PgStore.UpdateBuildStatus's CAS guard (issue #195 B1.4): terminal
+// writes (BuildSucceeded / BuildFailed) only succeed if the row is
+// still 'running'. A late-arriving markSucceeded after a reaper sweep
+// that flipped the row to 'failed(timeout)' must NOT resurrect it —
+// the guard makes UpdateBuildStatus a CAS primitive that returns
+// ErrNotFound on a no-op match (the caller logs WARN and moves on).
+//
+// Non-terminal transitions (BuildRunning, BuildQueued) are NOT
+// guarded — ClaimQueuedBuild and the legacy UpdateBuildStatus(
+// BuildRunning, started=true) path both rely on a clean queued→
+// running flip.
 func (m *MemStore) UpdateBuildStatus(_ context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.builds[id]
 	if !ok {
+		return ErrNotFound
+	}
+	if (status == BuildSucceeded || status == BuildFailed) && b.Status != BuildRunning {
 		return ErrNotFound
 	}
 	b.Status = status
@@ -1047,6 +1062,43 @@ func (m *MemStore) UpdateBuildStatus(_ context.Context, id string, status BuildS
 	}
 	m.builds[id] = b
 	return nil
+}
+
+// SweepStuckRunningBuilds mirrors PgStore.SweepStuckRunningBuilds
+// (issue #195 B1.4). Returns the number of rows flipped.
+func (m *MemStore) SweepStuckRunningBuilds(_ context.Context, threshold time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	now := time.Now()
+	for id, b := range m.builds {
+		if b.Status != BuildRunning {
+			continue
+		}
+		if b.StartedAt.IsZero() || !b.StartedAt.Before(threshold) {
+			continue
+		}
+		b.Status = BuildFailed
+		b.FailureClass = FailureTimeout
+		b.FinishedAt = now
+		m.builds[id] = b
+		n++
+	}
+	return n, nil
+}
+
+// SetBuildStartedAtForTest is a test-only hook that lets the reaper
+// tests backdate a build's started_at without touching the public
+// Create flow. Mirrors the BackdateForTest pattern on instances.
+func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.builds[id]
+	if !ok {
+		return
+	}
+	b.StartedAt = t
+	m.builds[id] = b
 }
 
 // ClaimQueuedBuild atomically flips queued → running under m.mu (PR-A

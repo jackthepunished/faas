@@ -775,6 +775,15 @@ func TestMarkSucceededAndFailed_NilOpsAreSafe(t *testing.T) {
 	}
 	start := time.Now()
 
+	// Issue #195 B1.4: UpdateBuildStatus has a CAS guard on
+	// terminal writes — markSucceeded/markFailed only succeed if the
+	// row is still 'running'. seedDeployment leaves the row as
+	// 'queued'; flip it to 'running' first so the test exercises
+	// the realistic in-flight build path.
+	if err := store.UpdateBuildStatus(context.Background(), buildID, state.BuildRunning, "", true, false); err != nil {
+		t.Fatalf("seed running: %v", err)
+	}
+
 	// markSucceeded on a typed-nil *OpsMetrics: the ObserveBuildCount
 	// + ObserveBuildDuration guards swallow the nil receiver; the
 	// store mutation still flips BuildSucceeded.
@@ -797,6 +806,10 @@ func TestMarkSucceededAndFailed_NilOpsAreSafe(t *testing.T) {
 	srcTar2 := filepath.Join(t.TempDir(), "src2.tar.gz")
 	makeTarballWithName(t, srcTar2, []string{"package.json"})
 	buildID2, depID2, _ := seedDeploymentWithSlug(t, store, srcTar2, "nil-ops-fail")
+	// Same CAS guard: flip the second row to running first.
+	if err := store.UpdateBuildStatus(context.Background(), buildID2, state.BuildRunning, "", true, false); err != nil {
+		t.Fatalf("seed running #2: %v", err)
+	}
 	b.markFailed(context.Background(), depID2, buildID2, state.FailureInfra, "nil-ops regression: infra failure path", start)
 	got2, err := store.BuildByID(context.Background(), buildID2)
 	if err != nil {

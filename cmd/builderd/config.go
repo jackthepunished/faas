@@ -67,6 +67,20 @@ type Config struct {
 	// to 2 s in main.go — well below the pg_notify RTT on the EX44
 	// (≈200 ms) so the worker is the safety net, not the primary.
 	PollInterval time.Duration `toml:"poll_interval"`
+	// StuckBuildSweepInterval is the cadence of the stuck-running
+	// build reaper (issue #195 B1.4). Zero falls back to 10 minutes
+	// in main.go — slow enough to not hammer the DB, fast enough to
+	// clean up after a one-off VM crash within an operator's
+	// attention span.
+	StuckBuildSweepInterval time.Duration `toml:"stuck_build_sweep_interval"`
+	// StuckBuildThreshold is the age past which a 'running' build
+	// is considered stuck and flipped to 'failed(timeout)' by the
+	// reaper. Default 15 minutes — wider than the 10-minute VM
+	// build timeout so a slow-but-finishing build isn't swept out
+	// from under itself. Configurable because real-world VM
+	// crashes can leave rows with started_at several minutes in
+	// the past deliberately.
+	StuckBuildThreshold time.Duration `toml:"stuck_build_threshold"`
 }
 
 // ResolveVMMTarget returns the dial target for vmmd. VMMTarget wins
@@ -88,13 +102,15 @@ func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
-		VMMDSocket:       "/run/faas/vmmd.sock",
-		CacheDir:         "/var/cache/faas/builds",
-		BuilderBase:      "/srv/fc/base/builder-base.ext4",
-		BuildDriveDir:    "/var/lib/faas/build-drive",
-		BuildExportDir:   "/var/lib/faas/build-out",
-		ScheddMetricsURL: "http://127.0.0.1:9090/metrics/fcvm",
-		PollInterval:     2 * time.Second,
+		VMMDSocket:            "/run/faas/vmmd.sock",
+		CacheDir:              "/var/cache/faas/builds",
+		BuilderBase:           "/srv/fc/base/builder-base.ext4",
+		BuildDriveDir:         "/var/lib/faas/build-drive",
+		BuildExportDir:        "/var/lib/faas/build-out",
+		ScheddMetricsURL:      "http://127.0.0.1:9090/metrics/fcvm",
+		PollInterval:          2 * time.Second,
+		StuckBuildSweepInterval: 10 * time.Minute,
+		StuckBuildThreshold:     15 * time.Minute,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
