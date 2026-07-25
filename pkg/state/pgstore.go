@@ -101,7 +101,7 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // constraint in migrations/00001_init.sql.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, last_used_at
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
 		 from api_keys where key_sha256 = $1`, hash)
 	return scanAPIKey(row)
 }
@@ -290,7 +290,7 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, last_used_at`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
 		accountID, hash, nullString(label), scopes)
 	return scanAPIKey(row)
 }
@@ -316,14 +316,14 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`delete from api_keys where id = $1 and account_id = $2
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, last_used_at`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
 		keyID, accountID)
 	return scanAPIKey(row)
 }
 
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, last_used_at from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz) from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err

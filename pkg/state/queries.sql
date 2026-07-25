@@ -28,7 +28,7 @@ update accounts set status = $2 where id = $1;
 -- scope vocabulary; the store does not. See ADR-034 rev2.
 insert into api_keys (account_id, key_sha256, label, scopes)
 values ($1, $2, $3, $4)
-returning id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, last_used_at;
+returning id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz);
 
 -- name: DeleteAPIKey :exec
 delete from api_keys where id = $1 and account_id = $2;
@@ -38,18 +38,18 @@ delete from api_keys where id = $1 and account_id = $2;
 -- statement so the handler can emit `key.deleted` audit with the
 -- dismissed scopes. list_secrets-shaped variant of DeleteAPIKey.
 delete from api_keys where id = $1 and account_id = $2
-returning id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, last_used_at;
+returning id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz);
 
 -- name: ListAPIKeys :many
 -- scopes is the auth permission set surfaced to the dashboard and the
 -- /v1/keys listing. See ADR-034 rev2.
-select id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, last_used_at
+select id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
 from api_keys where account_id = $1 order by created_at desc;
 
 -- name: APIKeyByHash :one
 -- Used by handlers_auth.go so an operator investigating "who signed in
 -- as alice?" can identify the key that authenticated. See ADR-034 rev2.
-select id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, last_used_at
+select id, account_id, key_sha256, coalesce(label, ''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
 from api_keys where key_sha256 = $1;
 
 -- name: TouchKeyLastUsed :exec
