@@ -344,7 +344,7 @@ func TestSec11_NftablesPolicyIsArtifactInSync(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux host check")
 	}
-	root := repoRootHost()
+	root := repoRoot()
 	if root == "" {
 		t.Skip("module root not reachable")
 	}
@@ -376,28 +376,6 @@ func TestSec11_NftablesPolicyIsArtifactInSync(t *testing.T) {
 }
 
 // --- helpers ------------------------------------------------------------
-
-// repoRootHost resolves the module root by walking up from cwd. Mirrors
-// the walk in pkg/e2etest/harness.go but lives here to avoid an
-// import cycle (e2etest's harness is heavyweight).
-func repoRootHost() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	dir := wd
-	for i := 0; i < 8; i++ {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
-	}
-	return ""
-}
 
 // commandLineHas reports whether /proc/cmdline contains needle.
 func commandLineHas(t *testing.T, needle string) bool {
