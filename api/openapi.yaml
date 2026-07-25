@@ -56,6 +56,8 @@ tags:
     description: Scheduled future invocations (cron-style, one-shot).
   - name: keys
     description: API key management.
+  - name: audit
+    description: Customer-facing security event timeline (IAM-4, ADR-035). Append-only; read-only.
   - name: secrets
     description: Per-app sealed secrets (sealed at rest).
   - name: usage
@@ -1378,6 +1380,100 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Audit events (IAM-4 / ADR-035) ───────────────────────────────────────
+
+  /v1/audit-events:
+    get:
+      tags: [audit]
+      operationId: listAuditEvents
+      summary: List the caller's auth audit events.
+      description: |
+        Newest-first. Returns the customer's own security event timeline:
+        logins, logouts, key mints/deletes, secret sets/deletes, plan
+        changes, and account deletion scheduling/restore.
+
+        The events table is append-only (spec §5 / §6.1). The response
+        is bounded by `limit` (default 50, max 100). For a full-history
+        pull, use `GET /v1/account/export`, which unions these events
+        with the customer's GDPR-action rows.
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Only return rows with `at >= since` (RFC 3339). Omit to read from the newest row."
+        - name: kind_prefix
+          in: query
+          schema: { type: string }
+          description: "Only return rows whose `kind` starts with this prefix (e.g. `key.` returns `key.created` and `key.deleted`)."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: "Max rows to return. Silently capped at 100."
+      responses:
+        '200':
+          description: Newest-first audit events for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListAuditEventsResponse'
+              example:
+                limit: 50
+                events:
+                  - id: "42"
+                    at: "2026-07-25T13:25:00Z"
+                    actor: apid
+                    kind: auth.login
+                    subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    data: { method: password }
+                  - id: "41"
+                    at: "2026-07-25T11:00:00Z"
+                    actor: apid
+                    kind: key.created
+                    subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    data: { key_id: "0123456789abcdef0123456789abcdef", scopes: [admin] }
+        '400':
+          description: Bad request — malformed `since` or `limit`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/audit-events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9]+$' }
+        description: "Event row id (bigint as string)."
+    get:
+      tags: [audit]
+      operationId: getAuditEvent
+      summary: Fetch one auth audit event by id.
+      description: |
+        Returns the single event with that id if and only if it
+        belongs to the caller's account. Cross-account access is
+        indistinguishable from "not found" — a customer cannot
+        enumerate other accounts' row counts by ID-probing.
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventResponse'
+              example:
+                id: "42"
+                at: "2026-07-25T13:25:00Z"
+                actor: apid
+                kind: auth.login
+                subject: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                data: { method: password }
+        '400':
+          description: Bad request — id is not a positive integer.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Usage ────────────────────────────────────────────────────────────────
 
   /v1/usage:
@@ -1680,13 +1776,16 @@ components:
         last_used_at: { type: [string, "null"], format: date-time }
 
     GdprAuditExportResponse:
-      description: "One row of the GDPR audit trail: actor, action (`export`, `delete`, `restore`), timestamp, and IP."
+      description: "One row of the customer's audit trail in the GDPR export bundle. Two row kinds live here: source=`gdpr` carries a self-service action (`export`, `delete`, `restore`); source=`event` carries a security event from the events table (IAM-4, ADR-035) with a `kind` and JSON `data` payload. The two are interleaved by timestamp descending."
       type: object
-      required: [action, requested_at]
+      required: [source, requested_at]
       properties:
+        source: { type: string, enum: [gdpr, event] }
         action: { type: string, enum: [export, delete, restore] }
         requested_at: { type: string, format: date-time }
         completed_at: { type: [string, "null"], format: date-time }
+        kind: { type: string, description: "Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `account.deletion_scheduled`." }
+        data: { type: object, additionalProperties: true, description: "Kind-specific JSON payload from the events row. Populated only when `source` = `event`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`." }
 
     AppSecretExportResponse:
       description: "One sealed secret in export form: key name, sealed ciphertext (sealed at rest per §11), version, and timestamps. Plaintext is never exported."
@@ -1976,6 +2075,53 @@ components:
           items: { type: string, enum: [admin, read, write] }
           description: "Requested permission set. Server validates each entry against the allowed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE."
           example: [read]
+
+    # ─── Audit events (IAM-4 / ADR-035) ──────────────────────────────────
+
+    AuditEventResponse:
+      description: "One row of the customer's security event timeline. The `kind` taxonomy and per-kind `data` schema are documented in `docs/adr/035-auth-audit-events.md`."
+      type: object
+      required: [id, at, actor, kind, data]
+      properties:
+        id:
+          type: string
+          description: "Audit event row id (bigint as string)."
+          example: "42"
+        at:
+          type: string
+          format: date-time
+          description: "When the event was recorded (RFC 3339, UTC)."
+          example: "2026-07-25T13:25:00Z"
+        actor:
+          type: string
+          description: "Which daemon wrote the row. `apid` for IAM-4 surface; `schedd` for state-transition events (instance wakes / parks / watchdog timeouts)."
+          example: apid
+        kind:
+          type: string
+          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
+          example: auth.login
+        subject:
+          type: string
+          description: "Account id (uuid string form) the event was recorded against. Omitted when the event has no subject (e.g. system-level)."
+          example: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+        data:
+          type: object
+          description: "Kind-specific payload. Always a JSON object; the inner shape depends on `kind`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`."
+          additionalProperties: true
+          example: { method: password }
+
+    ListAuditEventsResponse:
+      description: "Envelope for `GET /v1/audit-events`. `limit` echoes the effective limit applied by the handler so the SDK can render `showing N of M` without re-issuing the request."
+      type: object
+      required: [events, limit]
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEventResponse' }
+        limit:
+          type: integer
+          description: "Effective limit applied (always 1..100)."
+          example: 50
 
     # ─── Secrets ──────────────────────────────────────────────────────────
 

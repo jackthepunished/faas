@@ -6,20 +6,23 @@ import (
 	"time"
 )
 
-// TestRingBuffer_PerAppSum verifies the basic sliding-window sum:
-// three ticks of 10 requests each land inside a 5-bucket window →
-// AppRPS returns 30. The first tick seeds the bucket with the
-// cumulative count (10); the next two ticks add a delta of 10 each
-// to buckets 1 and 2. At base+2s, all three buckets are in the
-// window (cutoff = 2 - 5 + 1 = -2, all buckets pass).
+// TestRingBuffer_PerAppSum verifies the basic sliding-window sum.
+// Three ticks of 10 requests each — the FIRST tick seeds the
+// bucket with count=0 (so the cold-start guard is exercised) and
+// the next two ticks each add a delta of 10. At base+2s, AppRPS
+// sums 0 + 10 + 10 = 20. The first tick's "request" (cumulative
+// 10 on first sight) is intentionally NOT counted — that's the
+// whole point of the cold-start guard: a gateway that already
+// served N requests when the trigger is enabled does not surface
+// as a fake burst.
 func TestRingBuffer_PerAppSum(t *testing.T) {
 	r := NewRingBuffer(5, time.Second, time.Second)
 	base := time.Unix(1_000_000, 0)
 	r.Touch(base, map[string]int64{"app1": 10})
 	r.Touch(base.Add(time.Second), map[string]int64{"app1": 20})
 	r.Touch(base.Add(2*time.Second), map[string]int64{"app1": 30})
-	if got := r.AppRPS("app1", base.Add(2*time.Second)); got != 30 {
-		t.Errorf("AppRPS = %v, want 30", got)
+	if got := r.AppRPS("app1", base.Add(2*time.Second)); got != 20 {
+		t.Errorf("AppRPS = %v, want 20 (first-touch seed is delta=0)", got)
 	}
 }
 
@@ -46,20 +49,29 @@ func TestRingBuffer_EvictsOldBuckets(t *testing.T) {
 
 // TestRingBuffer_GatewayRestartDoesNotSpike verifies that a
 // cumulative-count regression (gatewayd restart resets the counter)
-// is clamped to 0 — the trigger must NOT see the regression as a
-// huge traffic spike. Without the clamp, a restart would feed the
-// scale-up trigger a fake burst and admit dozens of instances.
+// does NOT surface as a traffic spike. Without the clamp, a
+// restart would feed the scale-up trigger a fake burst and admit
+// dozens of instances. With the cold-boot guard, the restart
+// clears the ring + seeds the new boot with delta=0; the next
+// delta tick captures the restart's traffic.
 func TestRingBuffer_GatewayRestartDoesNotSpike(t *testing.T) {
 	r := NewRingBuffer(5, time.Second, time.Second)
 	base := time.Unix(1_000_000, 0)
-	// First observation: cumulative = 1000.
+	// First observation: cumulative = 1000. Seeded with delta=0.
 	r.Touch(base, map[string]int64{"app1": 1000})
 	// Second observation: cumulative = 5 (gatewayd restarted).
+	// Regression path: clear ring, reseed with delta=0.
 	r.Touch(base.Add(time.Second), map[string]int64{"app1": 5})
-	// Sum should be 5 (the new observation alone); the negative
-	// delta is clamped to 0.
-	if got := r.AppRPS("app1", base.Add(time.Second)); got != 5 {
-		t.Errorf("AppRPS = %v, want 5 (regression clamped to 0)", got)
+	// Sum = 0 (cold-boot guard on both seed + restart seed).
+	// The next tick captures the first post-restart delta.
+	if got := r.AppRPS("app1", base.Add(time.Second)); got != 0 {
+		t.Errorf("AppRPS = %v, want 0 (regression clears + reseeds with delta=0)", got)
+	}
+	// Third observation: cumulative = 15. Delta from lastSeen=5
+	// is 10 → bucket at base+2s gets count=10. Window sum = 10.
+	r.Touch(base.Add(2*time.Second), map[string]int64{"app1": 15})
+	if got := r.AppRPS("app1", base.Add(2*time.Second)); got != 10 {
+		t.Errorf("AppRPS after restart + 1 delta tick = %v, want 10", got)
 	}
 }
 

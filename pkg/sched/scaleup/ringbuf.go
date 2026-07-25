@@ -97,17 +97,18 @@ func (r *RingBuffer) Touch(now time.Time, counts map[string]int64) {
 	for appID, cumulative := range counts {
 		buf, ok := r.byApp[appID]
 		if !ok {
-			// First observation: seed the current bucket
-			// with the cumulative count so the first AppRPS
-			// call returns the right value. Without this,
-			// the first tick would see lastSeen=0 and report
-			// cumulative as the delta — a synthetic burst.
-			// The seeded bucket is then excluded by the
-			// cutoff in AppRPS once the window slides past
-			// it (the seed is for the "first tick" only,
-			// not a forever-fixed value).
+			// First observation: seed the bucket with delta=0
+			// and lastSeen=cumulative. Seeding with the raw
+			// cumulative value would inflate the first window
+			// (the bucket's count is what AppRPS sums) — if
+			// gatewayd has already served N requests when the
+			// trigger is enabled mid-flight, AppRPS would report
+			// N/conc for the first 5 ticks. The next Touch
+			// computes a real delta against this seeded
+			// lastSeen, so the first delta tick is correct
+			// (just one tick delayed).
 			r.byApp[appID] = &appBuffer{
-				buckets:  []bucket{{bucket: currentBucket, count: cumulative}},
+				buckets:  []bucket{{bucket: currentBucket, count: 0}},
 				lastSeen: cumulative,
 			}
 			continue
@@ -119,10 +120,13 @@ func (r *RingBuffer) Touch(now time.Time, counts map[string]int64) {
 		// per-app ring (otherwise the old bucket counts
 		// would inflate the trigger's notion of "current
 		// traffic" for the next windowSize seconds) and
-		// seed the new boot's cumulative into the current
-		// bucket.
+		// seed the new boot with lastSeen=cumulative but a
+		// delta=0 bucket — same cold-boot guard as the
+		// first-observation branch. The first delta tick
+		// after the restart will be measured from the new
+		// boot's perspective.
 		if cumulative < buf.lastSeen {
-			buf.buckets = []bucket{{bucket: currentBucket, count: cumulative}}
+			buf.buckets = []bucket{{bucket: currentBucket, count: 0}}
 			buf.lastSeen = cumulative
 			continue
 		}

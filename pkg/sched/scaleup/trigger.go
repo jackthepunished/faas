@@ -40,13 +40,6 @@ const (
 	// OutcomeNoSignal: measured signal (RPS or CPU) is below threshold,
 	// or zero instances (cold path: no per-instance signal yet).
 	OutcomeNoSignal Outcome = "no_signal"
-	// OutcomeNoCapacity: target met + headroom, but the platform
-	// cannot accommodate (RAM ceiling, ledger refusal for a non-cap
-	// reason). Currently unreachable in the production path — the
-	// only ledger refusal is the cap, which surfaces as
-	// reject_at_cap. Kept for future evolution (e.g. a per-node
-	// ceiling).
-	OutcomeNoCapacity Outcome = "no_capacity"
 )
 
 // AppStore is the read-only slice of state.Store the trigger needs.

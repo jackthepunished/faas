@@ -109,21 +109,31 @@ func parseGatewayRequestsTotal(body string) map[string]int64 {
 }
 
 // NewHTTPPromScraper constructs the production scraper with a
-// fresh *http.Client. The timeout is short (2s) because the
-// scheduler cannot afford to wait on a slow gatewayd — the trigger
-// tick is 1s.
+// shared *http.Client wrapped in an adapter so the underlying
+// transport keeps the connection to gatewayd alive across ticks.
+// Without this, every 1Hz tick would open a fresh TCP connection
+// (60 conn/min to the local listener). The timeout is short (2s)
+// because the scheduler cannot afford to wait on a slow gatewayd —
+// the trigger tick is 1s.
 func NewHTTPPromScraper(url string) *HTTPPromScraper {
 	return &HTTPPromScraper{
 		URL:    url,
-		Client: httpClientFetcher{},
+		Client: &httpClientAdapter{Client: &http.Client{Timeout: 2 * time.Second}},
 	}
 }
 
-// httpClientFetcher adapts *http.Client to the HTTPFetcher
-// interface (the client signature takes a context, the interface
-// requires it explicitly).
-type httpClientFetcher struct{}
+// httpClientAdapter bridges *http.Client to the HTTPFetcher
+// interface. *http.Client.Get takes only a URL; the interface
+// requires a context-aware signature so the caller can cancel the
+// scrape on shutdown.
+type httpClientAdapter struct {
+	Client *http.Client
+}
 
-func (httpClientFetcher) Get(ctx context.Context, url string) (*http.Response, error) {
-	return (&http.Client{Timeout: 2 * time.Second}).Get(url)
+func (a *httpClientAdapter) Get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return a.Client.Do(req)
 }

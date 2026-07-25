@@ -13,23 +13,34 @@ package imaged
 // TOML) so the box can roll a base image ahead of pinned refs and have imaged
 // track it without a code change.
 const (
-	BaseRefNode22    = "ghcr.io/onebox-faas/runner-node22:latest"
-	BaseRefPython312 = "ghcr.io/onebox-faas/runner-python312:latest"
-	BaseRefGo124     = "ghcr.io/onebox-faas/runner-go124:latest"
-	BaseRefMinimal   = "ghcr.io/onebox-faas/base-minimal:latest"
-	BaseRefBuilder   = "ghcr.io/onebox-faas/builder-base:latest"
+	BaseRefNode22      = "ghcr.io/onebox-faas/runner-node22:latest"
+	BaseRefPython312   = "ghcr.io/onebox-faas/runner-python312:latest"
+	BaseRefGo124       = "ghcr.io/onebox-faas/runner-go124:latest"
+	BaseRefGo124Alpine = "ghcr.io/onebox-faas/runner-go124-alpine:latest"
+	BaseRefMinimal     = "ghcr.io/onebox-faas/base-minimal:latest"
+	BaseRefBuilder     = "ghcr.io/onebox-faas/builder-base:latest"
 
 	// Runtime names are the values stored on state.App.Runtime. They map
 	// 1:1 to the runner shims in guest/runners/{node22,python312,go124}.
+	// go124-alpine reuses the go124 runner shim against a musl base
+	// (images/runner-go124-alpine.Dockerfile); libc only differs.
 	// Naming them as constants keeps the baseRefFor switch and the
 	// production callers (cmd/imaged's deploy path) in lockstep.
-	RuntimeNode22    = "node22"
-	RuntimePython312 = "python312"
-	RuntimeGo124     = "go124"
+	RuntimeNode22      = "node22"
+	RuntimePython312   = "python312"
+	RuntimeGo124       = "go124"
+	RuntimeGo124Alpine = "go124-alpine"
 )
 
 // baseRefFor returns the canonical base image reference for a runtime. The
 // empty runtime maps to the minimal base (plain apps, spec §4.6).
+//
+// go124-alpine is opt-in: customers who need the musl base set
+// runtime=go124-alpine explicitly. The default go124 base stays
+// bookworm (glibc) so existing deploys see no behavior change. A
+// future PR may flip the default after measuring fleet-wide
+// snapshot_fleet_avg_mb with both bases co-resident
+// (pkg/api/limits.go::FleetSnapshotAvgTargetMB = 130, alarm 160).
 func baseRefFor(runtime string) string {
 	switch runtime {
 	case RuntimeNode22:
@@ -38,6 +49,8 @@ func baseRefFor(runtime string) string {
 		return BaseRefPython312
 	case RuntimeGo124:
 		return BaseRefGo124
+	case RuntimeGo124Alpine:
+		return BaseRefGo124Alpine
 	default:
 		return BaseRefMinimal
 	}

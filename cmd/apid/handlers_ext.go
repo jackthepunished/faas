@@ -732,6 +732,13 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"created","account":"`+acct.ID+`"}`)
 	s.log.Info("key created", "key", k.ID, "account", acct.ID)
+	// IAM-4 (ADR-035): record the key mint. subject = account_id (the
+	// owner); data.scopes is the per-key permission set so the
+	// audit row can answer "who minted which scopes today?".
+	s.audit.Emit(ctx(r), "key.created", &acct.ID, map[string]any{
+		"key_id": k.ID,
+		"scopes": scopes,
+	})
 	writeJSON(w, http.StatusCreated, api.APIKeyResponse{
 		ID:        k.ID,
 		Prefix:    keyPrefix(plaintext),
@@ -772,6 +779,13 @@ func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"deleted","account":"`+acct.ID+`"}`)
+	// IAM-4 (ADR-035): record the key revocation. The handler
+	// doesn't load the key row (DeleteAPIKey is opaque), so the
+	// audit row carries just the key id; the operator can join on
+	// the events row's subject=account_id to scope by owner.
+	s.audit.Emit(ctx(r), "key.deleted", &acct.ID, map[string]any{
+		"key_id": id,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -900,6 +914,14 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 	// future relax of plan.Valid() cannot smuggle CR/LF into the audit
 	// line.
 	s.log.Info("plan changed", "account", acct.ID, "plan", logsanitize.Field(string(plan)))
+	// IAM-4 (ADR-035): record the plan transition. data carries
+	// the pre-change plan (acct.Plan) and post-change plan so the
+	// audit row is self-describing — no need to walk the gdpr ledger
+	// to find the prior state.
+	s.audit.Emit(ctx(r), "account.plan_changed", &acct.ID, map[string]any{
+		"from": string(acct.Plan),
+		"to":   string(plan),
+	})
 	writeJSON(w, http.StatusOK, api.AccountResponse{
 		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
 	})

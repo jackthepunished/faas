@@ -122,6 +122,8 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(a.srv.sessions.MaxAge().Seconds()),
 	})
+	// IAM-4 (ADR-035): record the magic-link login success.
+	a.srv.audit.Emit(r.Context(), "auth.login", &accountID, map[string]any{"method": "magic_link"})
 	http.Redirect(w, r, "/dashboard/", http.StatusFound)
 }
 
@@ -130,6 +132,19 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 // the cookie's MaxAge of zero is enough to invalidate it on the
 // client; spec §11 doesn't require a server-side kill switch.
 func (a *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
+	// IAM-4 (ADR-035): the logout handler isn't behind sessionAuth,
+	// so we resolve the account from the cookie inline so the audit
+	// row can carry subject=account_id. If the cookie is missing
+	// or invalid we still clear it (best-effort UX) and skip the
+	// emit — there's no account to attribute the action to.
+	var accountID string
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		if env, err := a.srv.sessions.Verify(c.Value); err == nil {
+			if acct, err := a.srv.store.AccountByID(r.Context(), env.AccountID); err == nil && acct.Active() {
+				accountID = acct.ID
+			}
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    "",
@@ -139,6 +154,11 @@ func (a *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+	// Emit before the redirect so the audit row is durable even if
+	// the client closes the connection on 302.
+	if accountID != "" {
+		a.srv.audit.Emit(r.Context(), "auth.logout", &accountID, nil)
+	}
 	http.Redirect(w, r, loginPath, http.StatusFound)
 }
 

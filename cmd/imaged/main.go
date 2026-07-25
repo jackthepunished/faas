@@ -154,6 +154,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		{"FAAS_FUNCTION_RUNNER_NODE22", imaged.RuntimeNode22, func(p string) { h.WithFunctionRunnerNode22(p) }},
 		{"FAAS_FUNCTION_RUNNER_PYTHON312", imaged.RuntimePython312, func(p string) { h.WithFunctionRunnerPython312(p) }},
 		{"FAAS_FUNCTION_RUNNER_GO124", imaged.RuntimeGo124, func(p string) { h.WithFunctionRunnerGo124(p) }},
+		{"FAAS_FUNCTION_RUNNER_GO124_ALPINE", imaged.RuntimeGo124Alpine, func(p string) { h.WithFunctionRunnerGo124Alpine(p) }},
 	} {
 		p := os.Getenv(kw.envKey)
 		if p == "" {

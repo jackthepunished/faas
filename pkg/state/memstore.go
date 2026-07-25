@@ -2565,6 +2565,7 @@ func (m *MemStore) AppendEvent(_ context.Context, actor, kind string, subject *s
 		subj = parseSubjectID(*subject)
 	}
 	e := Event{
+		ID:      int64(len(m.events) + 1),
 		At:      time.Now(),
 		Actor:   actor,
 		Kind:    kind,

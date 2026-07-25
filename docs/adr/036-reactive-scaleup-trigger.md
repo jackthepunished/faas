@@ -1,4 +1,4 @@
-# ADR-035 — reactive scale-up trigger (issue #169 / #172)
+# ADR-036 — reactive scale-up trigger (issue #169 / #172)
 
 Status: Accepted, 2026-07-25. Owner: @poyrazK. Closes: #169, #172.
 Related: #170 (PR #205, in flight, CPU signal source), #171 (preferential
@@ -92,7 +92,7 @@ admit. The trigger observes this as `OutcomeRejectAtCap`, NOT
 ### Metrics
 
 - `schedd_scale_up_decisions_total{app, outcome}` — counter, closed
-  label set `{admit, reject_at_cap, no_signal, no_capacity}`,
+  label set `{admit, reject_at_cap, no_signal}`,
   pre-instantiated so the rows surface in `/metrics` from boot.
 - `schedd_scale_up_admit_rps` — unlabelled histogram, per-instance
   RPS at the moment of admit. Sized to the realistic per-instance

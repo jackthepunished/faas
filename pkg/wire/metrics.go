@@ -42,6 +42,11 @@ type OpsMetrics struct {
 	// succeeding but the events row isn't being written — the state
 	// row is the source of truth, so this is observation-only.
 	eventsWriteFail prometheus.Counter
+	// auditWriteFail: introduced in IAM-4 (ADR-035) for the apid-side
+	// auth audit emit. Mirrors eventsWriteFail — a failed audit write
+	// logs Warn and increments the counter; the auth action has
+	// already returned 200, so this is observation-only.
+	auditWriteFail prometheus.Counter
 	// stripePushDur: introduced in feat/m7-stripe-push-observability.
 	// Per-push latency to Stripe, labelled by terminal result code.
 	// Distinct from the dur histogram (which labels by op only) because
@@ -100,7 +105,7 @@ type OpsMetrics struct {
 	imagedOCIPull *prometheus.HistogramVec
 	// scaleUpDecisions: per-app scale-up trigger decisions (issue #169 /
 	// #172). Counter labelled by app_id and outcome ∈ {admit,
-	// reject_at_cap, no_signal, no_capacity}. App cardinality is bounded
+	// reject_at_cap, no_signal}. App cardinality is bounded
 	// by the number of apps with autoscale configured — the trigger
 	// emits one row per decision. Outcomes are pre-instantiated so the
 	// series surface in /metrics from boot (same precedent as
@@ -142,6 +147,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
+	})
+	auditWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_audit_write_failures_total",
+		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written. The handler has already returned 200; this is observation-only.",
 	})
 	stripePushDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_stripe_push_duration_seconds",
@@ -197,14 +206,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 45, 60},
 	}, []string{"op", "result"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
-	// label set is closed ({admit, reject_at_cap, no_signal,
-	// no_capacity}); pre-instantiated below so the rows surface in
-	// /metrics from boot. App label is per-app (bounded by apps with
-	// autoscale configured) — the closed outcome set means the
-	// total series cardinality is O(autoscale-enabled apps × 4).
+	// label set is closed ({admit, reject_at_cap, no_signal});
+	// pre-instantiated below so the rows surface in /metrics from
+	// boot. App label is per-app (bounded by apps with autoscale
+	// configured) — the closed outcome set means the total series
+	// cardinality is O(autoscale-enabled apps × 3).
 	scaleUpDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_up_decisions_total",
-		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, no_capacity}; app label is the apps.id.",
+		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_scale_up_admit_rps",
@@ -216,7 +225,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// ceiling catches pathological cases.
 		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000},
 	})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS)
+	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, scaleUpDecisions, scaleUpAdmitRPS)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -268,7 +277,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// is a placeholder so the help/TYPE surfaces in /metrics before
 	// the first decision fires. Real per-app rows are added by
 	// ObserveScaleUp below.
-	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal", "no_capacity"} {
+	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal"} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
 	return &OpsMetrics{
@@ -277,6 +286,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                   dur,
 		watchdogKills:         watchdogKills,
 		eventsWriteFail:       eventsWriteFail,
+		auditWriteFail:        auditWriteFail,
 		stripePushDur:         stripePushDur,
 		paddlePushDur:         paddlePushDur,
 		buildDur:              buildDur,
@@ -302,6 +312,15 @@ func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter
 // only signals observability debt. See also commit 4.
 func (m *OpsMetrics) EventsWriteFailures() prometheus.Counter {
 	return m.eventsWriteFail
+}
+
+// AuditWriteFailures returns the unlabelled counter for IAM-4
+// (ADR-035) auth audit emits whose events row could not be written.
+// The handler has already returned 200 to the customer; this counter
+// only signals observability debt. Same posture as
+// EventsWriteFailures.
+func (m *OpsMetrics) AuditWriteFailures() prometheus.Counter {
+	return m.auditWriteFail
 }
 
 // WakeIDV4Fallback returns the unlabelled counter the wake_id mint
@@ -434,7 +453,7 @@ func (m *OpsMetrics) SetResidentGBPerCustomer(plan string, gb float64) {
 }
 
 // ObserveScaleUp records one scale-up trigger decision (issue #169 /
-// #172). Outcome ∈ {admit, reject_at_cap, no_signal, no_capacity}.
+// #172). Outcome ∈ {admit, reject_at_cap, no_signal}.
 // app is the apps.id (UUID). Safe on a nil receiver so schedd unit
 // tests without metrics keep working.
 func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
