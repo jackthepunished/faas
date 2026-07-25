@@ -73,7 +73,7 @@ func defaultCreateUpgradeTxn(ctx context.Context, p *Provider, acct state.Accoun
 	if priceID == "" {
 		return "", "", fmt.Errorf("paddle: monthly price missing for plan=%s — EnsurePlanProducts must run first", targetPlan)
 	}
-	customerID := acct.ProviderCustomerID // column name stale per ADR-025; rename is a follow-up migration PR
+	customerID := acct.ProviderCustomerID // acct.ProviderCustomerID carries Stripe cus_… or Paddle ctm_… — same column, provider-discriminated by value shape per ADR-032.
 	idem := fmt.Sprintf("faas-upgrade-%s-%s", acct.ID, targetPlan)
 
 	// Stamp the transit ID on the context. The SDK's internal/client

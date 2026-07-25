@@ -2,7 +2,9 @@ package paddle
 
 import (
 	"errors"
+	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/PaddleHQ/paddle-go-sdk/v5/pkg/paddleerr"
 )
@@ -19,53 +21,63 @@ import (
 // pusher just calls paddle.ClassifyPushError(err) and observes the
 // returned string.
 //
-// Mapping table:
+// Mapping table (alphabetized by label; see PushResultLabels for the
+// ordered closed set):
 //
-//	nil                                -> "ok"
-//	*paddleerr.Error{Status: 401,403}  -> "auth-error"
-//	*paddleerr.Error{Status: 402}      -> "card-error" (Paddle's
-//	                                       declined-payment shape —
-//	                                       merchant-side action needed)
-//	*paddleerr.Error{Status: 403}      -> "permission"
-//	*paddleerr.Error{Status: 404}      -> "invalid-request"
-//	*paddleerr.Error{Status: 422}      -> "invalid-request"
-//	*paddleerr.Error{Status: 429}      -> "rate-limit"
-//	*paddleerr.Error{Status: 4xx}      -> "invalid-request"
-//	*paddleerr.Error{Status: 502}      -> "bad-gateway"
-//	*paddleerr.Error{Status: 5xx}      -> "api-error"
-//	network/transport error            -> "api-connection"
-//	errors.Is(err, ErrNoAPIKey)        -> "no-api-key"
-//	errors.Is(err, ErrNegativeMBSeconds) -> "negative-mb-sec"
-//	*paddleerr.Error{Status: 5xx}      -> "api-error"
-//	errors.Is(err, ErrNoAPIKey)        -> "no-api-key"
-//	errors.Is(err, ErrNegativeMBSeconds) -> "negative-mb-sec"
-//	errors.Is(err, ErrOveragePriceMissing) -> "overage-price-missing"
-//	any other error                    -> "other"
+//	"api-connection"        — net.Error or *url.Error: transport-level
+//	                          failure (DNS, TCP, timeout). The Paddle
+//	                          SDK's internal/client/client.go:43-67
+//	                          constructs *url.Error{Op, URL, Err} on
+//	                          transport failures; if the SDK does not
+//	                          wrap, errors.As against net.Error matches
+//	                          the underlying *net.OpError directly.
+//	"api-error"             — *paddleerr.Error with Status 5xx (other
+//	                          than 502). Generic 5xx from the merchant
+//	                          API.
+//	"auth-error"            — *paddleerr.Error with Status 401.
+//	                          Invalid or missing API key.
+//	"bad-gateway"           — *paddleerr.Error with Status 502.
+//	                          Distinct from the broader 5xx bucket so
+//	                          ops can spot upstream proxy failures.
+//	"card-error"            — *paddleerr.Error with Status 402.
+//	                          Paddle Billing v2 doesn't use 402 for
+//	                          declined cards (those surface as webhook
+//	                          events), but the bucket is reserved for
+//	                          the merchant-side action case so any
+//	                          future 402 lands observably.
+//	"invalid-request"       — *paddleerr.Error with Status 404 / 422
+//	                          / other 4xx. SDK request shape rejected.
+//	"negative-mb-sec"       — errors.Is(_, ErrNegativeMBSeconds).
+//	                          Pre-SDK guard; Paddle's wire quantity is
+//	                          1 so the analog is the mb_seconds input,
+//	                          not the wire quantity.
+//	"no-api-key"            — errors.Is(_, ErrNoAPIKey). Pre-SDK
+//	                          guard; SDK never reached.
+//	"ok"                    — nil. The classifier returns "ok" for nil
+//	                          so the pusher can write a uniform
+//	                          ObserveCode call (no separate success
+//	                          branch).
+//	"other"                 — anything that doesn't unwrap to a known
+//	                          sentinel or paddleerr.Error and isn't a
+//	                          transport error. Genuinely unknown;
+//	                          logged with full err for triage.
+//	"overage-price-missing" — errors.Is(_, ErrOveragePriceMissing).
+//	                          Pre-SDK guard; catalog not hydrated.
+//	"permission"            — *paddleerr.Error with Status 403. Paddle
+//	                          returns 403 for permission denials
+//	                          (e.g., API key lacks transactions:write
+//	                          scope), distinct from 401.
+//	"rate-limit"            — *paddleerr.Error with Status 429.
 //
-// The errors.Is branches catch the three errors PushUsageRecord
-// synthesizes before the SDK is invoked (no apiKey, negative
-// mb_seconds, missing overage price handle) — these never become
-// *paddleerr.Error, so they need their own labels. They are matched
-// via the sentinels declared at usage.go, not by string-fragment, so
+// The pre-SDK errors.Is branches catch the failures PushUsageRecord
+// synthesizes before the network is touched. They are matched via
+// the sentinels declared at usage.go, not by string-fragment, so
 // adding context to the wrapped message (account id, qty) does not
 // change classification.
 //
-// "ok" is intentionally returned for nil so the pusher can write a
-// uniform:
-//
-//	code := paddle.ClassifyPushError(err)
-//	ops.ObserveCode("paddle", code, dur)
-//	ops.PaddlePushDuration(code).Observe(...)
-//
-// with no separate success branch — code=="" would mean "skip", which
-// is a different semantic the dashboard labels differently.
-//
-// One label diverges from the Stripe set: "negative-mb-sec" replaces
-// Stripe's "negative-quantity" because Paddle's wire quantity is 1
-// (flat-rate line item, quantity is not a user input). One label is
-// added: "overage-price-missing" for the boot-time catalog-hydration
-// case at usage.go where EnsurePlanProducts has not yet run. The
-// 12-label count is preserved for dashboard panel parity.
+// The 13-label count (one more than Stripe's 12) reflects the
+// "api-connection" addition. The dashboard panel config must be
+// updated alongside any label addition — see PushResultLabels.
 const (
 	labelOK                  = "ok"
 	labelNoAPIKey            = "no-api-key"
@@ -73,6 +85,7 @@ const (
 	labelOveragePriceMissing = "overage-price-missing"
 	labelOther               = "other"
 	labelAPIError            = "api-error"
+	labelAPIConnection       = "api-connection"
 	labelAuthError           = "auth-error"
 	labelPermission          = "permission"
 	labelCardError           = "card-error"
@@ -103,29 +116,33 @@ func ClassifyPushError(err error) string {
 		return labelOveragePriceMissing
 	}
 
+	// Transport errors — net.Error (raw *net.OpError when the SDK
+	// doesn't wrap) or *url.Error (what the SDK wraps around
+	// transport failures — see internal/client/client.go:43-67).
+	// errors.As matches both unwrapped and wrapped shapes. The
+	// "api-connection" bucket is distinct from "other" so ops can
+	// spot DNS/TCP/timeout flakes without trawling the unknown
+	// error log.
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return labelAPIConnection
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return labelAPIConnection
+	}
+
 	// SDK errors — unwrap with errors.As. The SDK's CreateTransaction
-	// (and other write methods) return *paddleerr.Error for JSON error
-	// responses. Anything that doesn't unwrap to *paddleerr.Error is
-	// either a transport-level failure (DNS, TCP, timeout — surfaced
-	// by the SDK's response_api_error_handler as the raw net.OpError
-	// without wrapping) or a genuinely unknown error. Both collapse
-	// to the same label set: api-connection for the network shape,
-	// other for the unknown shape. The Paddle SDK's error surface is
-	// less rich than Stripe's (no Error.Type taxonomy), so the
-	// connection-vs-other discrimination is best-effort — anything
-	// tagged with a known sentinel above has already been claimed.
+	// (and other write methods) return *paddleerr.Error for JSON
+	// error responses.
 	var pe *paddleerr.Error
 	if errors.As(err, &pe) {
 		return classifyPaddleSDKError(pe)
 	}
 
-	// Not a *paddleerr.Error. Could be a transport failure or a
-	// genuinely unknown error. Match Stripe's "api-connection" label
-	// for the network-failure shape (mirrors stripe.ClassifyPushError
-	// where *stripe.Error doesn't unwrap, the SDK errors also
-	// collapse; Stripe uses labelOther in that case but Paddle
-	// surfaces connection failures more often, so api-connection is
-	// the closer fit). Tests pin this behaviour.
+	// Not a *paddleerr.Error, not a transport error, not a pre-SDK
+	// sentinel — genuinely unknown. Logged at the call site with
+	// the full err for triage.
 	return labelOther
 }
 
@@ -137,15 +154,9 @@ func ClassifyPushError(err error) string {
 // request_error.
 func classifyPaddleSDKError(pe *paddleerr.Error) string {
 	switch pe.Status {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		// 401 → "auth-error", 403 → "permission". Paddle returns 403
-		// for permission denials (e.g., API key doesn't have the
-		// transactions:write scope). Note the split: 403 is "auth-error"
-		// in the Stripe classifier but Paddle uses 403 for permission
-		// distinct from 401. Same label set, slightly different cut.
-		if pe.Status == http.StatusUnauthorized {
-			return labelAuthError
-		}
+	case http.StatusUnauthorized:
+		return labelAuthError
+	case http.StatusForbidden:
 		return labelPermission
 	case http.StatusPaymentRequired:
 		// Paddle Billing v2 does not use 402 for declined cards (that's
@@ -190,8 +201,9 @@ func classifyPaddleSDKError(pe *paddleerr.Error) string {
 // panel config; do not extend ClassifyPushError's switch arms without
 // also adding the label here. The Stripe counterpart is
 // stripe.PushResultLabels at pkg/billing/stripe/errors.go:125; this set
-// matches it 1:1 except "negative-quantity" → "negative-mb-sec" and
-// the addition of "overage-price-missing" — see the package comment.
+// matches it 1:1 except "negative-quantity" → "negative-mb-sec",
+// the addition of "overage-price-missing", and the addition of
+// "api-connection" — see the package comment.
 func PushResultLabels() []string {
 	return []string{
 		labelOK,
@@ -199,6 +211,7 @@ func PushResultLabels() []string {
 		labelNegativeMBSeconds,
 		labelOveragePriceMissing,
 		labelAPIError,
+		labelAPIConnection,
 		labelAuthError,
 		labelPermission,
 		labelCardError,

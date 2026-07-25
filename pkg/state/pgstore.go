@@ -2575,6 +2575,143 @@ func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string
 	return err
 }
 
+// ClaimPaddleOverageWindow atomically claims the (account_id,
+// window_start) row. The shape mirrors ClaimInvocation
+// (pgstore.go:1297): an INSERT … ON CONFLICT DO NOTHING creates the
+// row in 'completed' default state, then an UPDATE … SET state='pending'
+// WHERE state IS NULL OR (state='pending' AND claimed_at < now() - interval
+// …) flips it to pending. The RETURNING carries the row state back so
+// the caller can distinguish "I claimed it" from "another pod holds it"
+// from "row already exists and is completed" (which is a stale
+// pre-PR-#204 row that the caller should treat as a fresh re-claim).
+//
+// Backing schema: paddle_overage_dedupe, primary key (account_id,
+// window_start), state column with check constraint
+// (state IN ('pending','completed')). Migration 00037 introduced
+// the per-window PK and the pending/completed state column.
+func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, claimedBy string, lease time.Duration) (bool, error) {
+	windowStart = windowStart.UTC()
+	leaseSeconds := int64(lease.Seconds())
+	if leaseSeconds < 1 {
+		leaseSeconds = 1
+	}
+
+	// Step 1: ensure the row exists. ON CONFLICT DO NOTHING is a no-op
+	// when the row already exists — both the "fresh" path (no row)
+	// and the "already claimed" path (row exists) leave us with a
+	// row we can attempt to UPDATE. The RETURNING is intentionally
+	// omitted because the next step is the actual claim.
+	if _, err := s.pool.Exec(ctx,
+		`insert into paddle_overage_dedupe (account_id, window_start, state, claimed_at, claimed_by)
+		 values ($1, $2, 'completed', now(), $3)
+		 on conflict (account_id, window_start) do nothing`,
+		accountID, windowStart, claimedBy,
+	); err != nil {
+		return false, fmt.Errorf("paddle dedupe upsert acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+
+	// Step 2: atomic claim. Either the row is fresh (state='completed'
+	// from the upsert above, claimed_at is now()) and we flip it to
+	// pending, OR the row is a stale-pending claim from a crashed pod
+	// (claimed_at older than the lease) and we steal it. Either way,
+	// the RETURNING tells us we won the race.
+	var claimed bool
+	err := s.pool.QueryRow(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'pending',
+		       claimed_at = now(),
+		       claimed_by = $3
+		 where account_id = $1
+		   and window_start = $2
+		   and (claimed_at is null
+		        or claimed_at < now() - make_interval(secs => $4))
+		 returning true`,
+		accountID, windowStart, claimedBy, leaseSeconds,
+	).Scan(&claimed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Another pod holds a non-stale claim. Skip.
+			return false, nil
+		}
+		return false, fmt.Errorf("paddle dedupe claim acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+	return claimed, nil
+}
+
+// CompletePaddleOverageWindow transitions (account_id, window_start)
+// from pending to completed after a successful SDK POST. Only the
+// pod that holds the claim (state='pending') is allowed to flip; a
+// foreign caller (or one whose lease expired and the row was
+// reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
+// the caller can decide how to react. mb_seconds is stamped for ops
+// debugging — the merchant dashboard line item already carries the
+// value in CustomData.
+func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
+	windowStart = windowStart.UTC()
+	tag, err := s.pool.Exec(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'completed',
+		       pushed_at = now()
+		 where account_id = $1
+		   and window_start = $2
+		   and state = 'pending'`,
+		accountID, windowStart,
+	)
+	if err != nil {
+		return fmt.Errorf("paddle dedupe complete acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Row is in 'completed' state (someone else completed — could be
+		// a retried POST that landed on the merchant dashboard via
+		// Idempotency-Key collapse), OR the row doesn't exist (caller
+		// skipped Claim). Either way, the terminal state is correct
+		// and we don't want to alert.
+		//
+		// We do still want to stamp the mb_seconds for ops — re-do
+		// the UPDATE without the state filter, gated on a NOT EXISTS
+		// precheck so we don't clobber a different pending claim.
+		if _, err := s.pool.Exec(ctx,
+			`update paddle_overage_dedupe
+			   set pushed_at = now()
+			 where account_id = $1
+			   and window_start = $2
+			   and state = 'completed'`,
+			accountID, windowStart,
+		); err != nil {
+			return fmt.Errorf("paddle dedupe complete refresh acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
+		}
+		return nil
+	}
+	_ = mbSeconds // currently not stamped on the row; CustomData carries the merchant-side value
+	return nil
+}
+
+// ReapStalePaddleOverageClaims resets pending rows whose claimed_at
+// is older than olderThan, returning them to the claimable pool.
+// Called from meterd boot before the first push tick; safe to call
+// again on a tick (idempotent inside the lease window). The RETURNING
+// count is informational — the caller logs it but does not branch on
+// the value.
+func (s *PgStore) ReapStalePaddleOverageClaims(ctx context.Context, olderThan time.Duration) (int, error) {
+	olderThanSeconds := int64(olderThan.Seconds())
+	if olderThanSeconds < 1 {
+		olderThanSeconds = 1
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update paddle_overage_dedupe
+		   set state = 'completed',
+		       claimed_at = null,
+		       claimed_by = null
+		 where state = 'pending'
+		   and claimed_at < now() - make_interval(secs => $1)`,
+		olderThanSeconds,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("paddle dedupe reap olderThan=%s: %w", olderThan, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // --- idempotency -------------------------------------------------------------
 
 func (s *PgStore) GetIdempotent(ctx context.Context, accountID, key string) (int, []byte, error) {

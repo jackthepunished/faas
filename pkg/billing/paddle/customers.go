@@ -11,8 +11,9 @@ import (
 
 // CreateCustomer: POST /customers with the account email +
 // custom_data.faas_account_id. Returns the ctm_… ID; the caller
-// (apid) writes it back via state.Store.UpdateAccountProviderCustomerID
-// — column name is intentionally stale per ADR-025.
+// (apid) writes it back via state.Store.UpdateAccountProviderCustomerID.
+// acct.ProviderCustomerID carries Stripe cus_… or Paddle ctm_… —
+// same column, provider-discriminated by value shape per ADR-032.
 //
 // Idempotency strategy: Paddle's Customers endpoint does not
 // support Idempotency-Key today. The PR #3 apid dispatch will

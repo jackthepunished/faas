@@ -80,7 +80,7 @@ func TestIdempotencyRoundTripper_InjectsHeaderOnPOSTTransactions(t *testing.T) {
 		t.Fatalf("RoundTrip: %v", err)
 	}
 	if resp != nil && resp.Body != nil {
-		if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+		_ = resp.Body.Close()
 	}
 	if got := inner.captured.Header.Get(IdempotencyKeyHeader); got != "faas-overage-acct-abc-2026-07" {
 		t.Errorf("Idempotency-Key header = %q, want %q", got, "faas-overage-acct-abc-2026-07")
@@ -196,7 +196,7 @@ func TestIdempotencyRoundTripper_DelegatesError(t *testing.T) {
 	}
 	if resp != nil {
 		if resp.Body != nil {
-			if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+			_ = resp.Body.Close()
 		}
 		t.Errorf("RoundTrip resp = %v, want nil on error", resp)
 	}
@@ -318,18 +318,22 @@ func TestShouldInjectIdempotencyKey_PathMatching(t *testing.T) {
 	}
 }
 
-// TestIdempotencyRoundTripper_RealHTTPServer — end-to-end check
-// that the wrapper is functionally equivalent to the inner
-// transport on real network IO. Uses httptest.Server as a
-// stand-in for api.paddle.com; the server-side handler asserts
+// TestIdempotencyRoundTripper_RealHTTPServer_TransportOnly —
+// end-to-end check that the wrapper is functionally equivalent to
+// the inner transport on real network IO. Uses httptest.Server as
+// a stand-in for api.paddle.com; the server-side handler asserts
 // Idempotency-Key was set on POSTs that pass through our wrapper
-// with the X-Transit-Id stamp. Note: paddle.ContextWithTransitID
-// is the SDK's API for stamping X-Transit-Id, but the SDK only
-// reads the context inside its own Client.Do wrapper — we don't
-// go through the SDK here. We set X-Transit-Id directly to
-// simulate what the SDK's wrapper would do, then assert our
-// RoundTripper copies it as Idempotency-Key.
-func TestIdempotencyRoundTripper_RealHTTPServer(t *testing.T) {
+// with the X-Transit-Id stamp. The test bypasses the Paddle SDK —
+// it exercises only the RoundTripper's HTTP plumbing. A separate
+// integration test (cmd/e2e) is the right place for SDK-level
+// end-to-end coverage; this test's scope is the transport layer
+// only. Note: paddle.ContextWithTransitID is the SDK's API for
+// stamping X-Transit-Id, but the SDK only reads the context inside
+// its own Client.Do wrapper — we don't go through the SDK here. We
+// set X-Transit-Id directly to simulate what the SDK's wrapper
+// would do, then assert our RoundTripper copies it as
+// Idempotency-Key.
+func TestIdempotencyRoundTripper_RealHTTPServer_TransportOnly(t *testing.T) {
 	t.Parallel()
 	var seenIDK string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -355,9 +359,48 @@ func TestIdempotencyRoundTripper_RealHTTPServer(t *testing.T) {
 		t.Fatalf("client.Do: %v", err)
 	}
 	if resp != nil && resp.Body != nil {
-		if resp != nil && resp.Body != nil { _ = resp.Body.Close() }
+		_ = resp.Body.Close()
 	}
 	if seenIDK != "faas-overage-acct-real-2026-07" {
 		t.Errorf("server saw Idempotency-Key = %q, want %q", seenIDK, "faas-overage-acct-real-2026-07")
+	}
+}
+
+// TestIdempotencyRoundTripper_DoesNotMutateCallerRequest —
+// regression net for the contract that an http.RoundTripper MUST
+// NOT mutate the caller's *http.Request. Per the net/http
+// RoundTripper contract, the inbound request may be reused by the
+// caller (retry middleware, test fixtures that re-issue the same
+// request). An earlier version of this wrapper mutated req.Header
+// in place; the fix-PR clones the request + Header before
+// stamping Idempotency-Key. This test pins that contract.
+func TestIdempotencyRoundTripper_DoesNotMutateCallerRequest(t *testing.T) {
+	t.Parallel()
+	inner := &recordingRoundTripper{header: okResponseHeader()}
+	rt := NewIdempotencyRT(inner)
+
+	req, err := http.NewRequestWithContext(context.Background(),
+		http.MethodPost, "https://api.paddle.com/transactions", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	req.Header.Set(TransitIDHeader, "faas-overage-acct-abc-2026-07")
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if got := req.Header.Get(IdempotencyKeyHeader); got != "" {
+		t.Errorf("caller req.Header mutated: Idempotency-Key = %q, want empty (RoundTripper must clone)", got)
+	}
+	if got := req.Header.Get(TransitIDHeader); got != "faas-overage-acct-abc-2026-07" {
+		t.Errorf("caller req.Header mutated: X-Transit-Id lost: got %q, want %q", got, "faas-overage-acct-abc-2026-07")
+	}
+	// Sanity: the inner transport still saw the cloned + stamped header.
+	if got := inner.captured.Header.Get(IdempotencyKeyHeader); got != "faas-overage-acct-abc-2026-07" {
+		t.Errorf("inner transport saw Idempotency-Key = %q, want %q", got, "faas-overage-acct-abc-2026-07")
 	}
 }

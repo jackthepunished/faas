@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -66,6 +67,36 @@ type Provider struct {
 	// production body (defaultCreateUpgradeTxn).
 	createUpgradeTxnFn CreateUpgradeTxnFn
 	now                func() time.Time
+	// instanceID is the free-form identity stamp passed into
+	// ClaimPaddleOverageWindow — used by ops to identify which
+	// process holds the claim when a stuck row is investigated.
+	// Stable for the life of the process (computed once at
+	// construction); not a uniqueness constraint, the
+	// (account_id, window_start) PK is.
+	instanceID string
+}
+
+// paddleOverageLease is the lease window for a ClaimPaddleOverageWindow
+// row. Long enough to absorb a slow Paddle POST (p99 historically
+// < 30s); short enough that a crashed pod's claim is reaped within
+// one boot-cycle of any peer. Configurable later via env if needed.
+const paddleOverageLease = 5 * time.Minute
+
+// claimedBy returns the per-process identity stamp used to mark
+// paddle_overage_dedupe rows in the claimed_by column. Falls back
+// to a static sentinel if HOSTNAME / POD_NAME are unset so dev
+// hosts still produce a non-empty value for ops debugging.
+func (p *Provider) claimedBy() string {
+	if p.instanceID != "" {
+		return p.instanceID
+	}
+	if h := os.Getenv("HOSTNAME"); h != "" {
+		return h
+	}
+	if h := os.Getenv("POD_NAME"); h != "" {
+		return h
+	}
+	return "paddle-push"
 }
 
 // NewProvider wires the Paddle v5 SDK. sandbox=true →
@@ -127,6 +158,65 @@ func NewProviderWithDedupe(apiKey string, sandbox bool, log *slog.Logger, dedupe
 	p := NewProvider(apiKey, "", sandbox, log)
 	p.dedupe = dedupe
 	return p
+}
+
+// NewProviderForTest is the test-only constructor that returns a
+// *Provider with a stubbed SDK client. Tests inject a flushFn stub
+// so the SDK is never invoked. Used by pkg/meter's
+// TestPushHour_PaddleDispatchHitsPaddleHistogram to construct a real
+// *paddle.Provider concrete type — providerOpsFor's type-switch
+// dispatches on concrete type, so the dispatch seam is only
+// exercisable with a real *Provider value, not a test fake satisfying
+// only the Provider interface.
+//
+// The SDK is constructed as &paddle.SDK{} (non-nil, zero-value) so
+// PushUsageRecord's pre-SDK guards (ErrNoAPIKey on nil client) pass
+// through. The flushFn stub intercepts before any real SDK call.
+// The apiKey is unused (no real init). The log is required so the
+// test caller controls the slog sink; nil falls back to slog.Default().
+func NewProviderForTest(log *slog.Logger) *Provider {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Provider{
+		apiKey:  "test-key",
+		client:  &paddle.SDK{}, // non-nil placeholder; never invoked (flushFn stub intercepts)
+		log:     log,
+		catalog: &priceCatalog{planMonthly: map[api.Plan]string{}, planOverage: map[api.Plan]string{}, planCustomers: map[api.Plan]string{}},
+		now:     time.Now,
+	}
+}
+
+// FlushFnForTest swaps in a flushFn stub. Tests use this to
+// substitute the production defaultFlushLocked with a counter or
+// recorder so the SDK is never invoked. Lives at package scope
+// (not on the *Provider) so test packages from outside this
+// directory can reach for it without exposing the field directly.
+//
+// Mirrors the pattern at pkg/billing/stripe/client.go where the
+// SDK push is also seam-driven for testability.
+func (p *Provider) FlushFnForTest(fn FlushFn) {
+	p.flushFn = fn
+}
+
+// SetOveragePriceForTest primes the catalog's planOverage entry for
+// a plan, bypassing EnsurePlanProducts (which requires a live SDK).
+// Tests use this to construct a Provider that reaches defaultFlushLocked
+// without standing up a real catalog hydration.
+func (p *Provider) SetOveragePriceForTest(plan api.Plan, priceID string) {
+	p.catalog.mu.Lock()
+	defer p.catalog.mu.Unlock()
+	if p.catalog.planOverage == nil {
+		p.catalog.planOverage = map[api.Plan]string{}
+	}
+	p.catalog.planOverage[plan] = priceID
+}
+
+// SetDedupeForTest swaps the dedupe gate. nil disables the gate —
+// useful when the test wants to exercise the flushFn directly
+// without driving the claim state machine.
+func (p *Provider) SetDedupeForTest(d PaddleOverageDedupe) {
+	p.dedupe = d
 }
 
 // Compile-time conformance to billing.Provider. Adding a method to the

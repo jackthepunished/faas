@@ -79,16 +79,23 @@ func NewIdempotencyRT(inner http.RoundTripper) http.RoundTripper {
 // paddle.ContextWithTransitID) as Idempotency-Key. All other
 // requests are passed through unmodified.
 //
-// The header copy is read-then-write on the same req.Header map
-// (not on a copy) — http.Request.Header is documented as
-// read-only-by-convention-after-construction but http.RoundTripper
-// implementations are the one place where mutation is correct.
-// The SDK's own internal/client/client.go:95-101 mutates
-// req.Header in its own wrapper without copying.
+// Per the net/http RoundTripper contract, an implementation MUST
+// NOT mutate the caller's *http.Request — the request may be reused
+// by the caller (the Paddle SDK does not, today, but tests and
+// retry middleware do). We clone the request + its Header before
+// mutating, so the inbound request's header set is unchanged after
+// RoundTrip returns. The SDK's own internal/client/client.go:95-101
+// mutates req.Header without cloning — that is technically a SDK-
+// side contract violation that we cannot fix from this package; we
+// copy the SDK's value into our injected header on a cloned
+// request so the caller's view is unobserved.
 func (rt *idempotencyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if shouldInjectIdempotencyKey(req) {
 		if transitID := req.Header.Get(TransitIDHeader); transitID != "" {
-			req.Header.Set(IdempotencyKeyHeader, transitID)
+			cloned := req.Clone(req.Context())
+			cloned.Header = req.Header.Clone()
+			cloned.Header.Set(IdempotencyKeyHeader, transitID)
+			return rt.inner.RoundTrip(cloned)
 		}
 	}
 	return rt.inner.RoundTrip(req)

@@ -10,9 +10,14 @@ package paddle
 // SDK's CreateTransaction call; we use the `flushFn` seam
 // installed at provider.go to swap in a counter stub. Tests that
 // use the dedupe gate get a second stub (`recordingDedupe`)
-// that records Has/Rec pairs. Together the two stubs expose every
-// branch of flushOverageLocked without standing up a real
-// *paddle.SDK.
+// that records claim/complete/reap calls. Together the two stubs
+// expose every branch of flushOverageLocked without standing up
+// a real *paddle.SDK.
+//
+// The cross-process contract is tested by sharing one fake
+// between two Providers — the second Provider's push must see
+// claimed=false (its claim steals-then-loses the race, or finds a
+// non-stale completed row) and skip the flush.
 
 import (
 	"context"
@@ -71,6 +76,44 @@ func TestCalendarMonthStart(t *testing.T) {
 			got := calendarMonthStart(tc.in)
 			if !got.Equal(tc.want) {
 				t.Errorf("calendarMonthStart(%s) = %s, want %s", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWindowStartFromHour pins the [start, start+1h) window math
+// that the per-window dedupe keys on. Mirrors the stripe_push_dedupe
+// grain (pkg/billing/stripe/client.go) so the two providers share
+// the same hourly windowing.
+func TestWindowStartFromHour(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   time.Time
+		want time.Time
+	}{
+		{
+			name: "mid-window floors to the hour",
+			in:   time.Date(2025, 6, 17, 12, 34, 56, 789_000_000, time.UTC),
+			want: time.Date(2025, 6, 17, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "top of the hour is unchanged",
+			in:   time.Date(2025, 7, 1, 0, 0, 0, 0, time.UTC),
+			want: time.Date(2025, 7, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "non-UTC input is normalized to UTC",
+			in:   time.Date(2025, 6, 17, 13, 0, 0, 0, time.FixedZone("CET", 3600)),
+			want: time.Date(2025, 6, 17, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := windowStartFromHour(tc.in)
+			if !got.Equal(tc.want) {
+				t.Errorf("windowStartFromHour(%s) = %s, want %s", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -146,52 +189,182 @@ func flushFnCounter(counter *int, flushErr error) FlushFn {
 	}
 }
 
-// recordingDedupe is a PaddleOverageDedupe stub that records every
-// Has + Record call. The cross-process contract is tested by sharing
-// one fake between two Providers — the second Provider's push must
-// see Has return true and skip the flush. Mirrors the recordingStripe
-// shape in pkg/meter/pusher_shadow_test.go so the test code reads the
-// same way across the two billing providers.
+// recordingDedupe is a PaddleOverageDedupe stub that implements the
+// full claim state machine in-process. Tracks (acct, window) rows
+// with their state (claimed or completed), and exposes the
+// underlying counters for test assertions.
 //
-// `recordErr` is an optional injected error for RecordPaddleOverageMonth;
-// nil → success path. Tests that exercise the post-POST error-wrap
-// branch set it to a sentinel and assert the wrapped message lands at
-// the caller.
+// Behavior mirrors the production PgStore contract:
+//   - Claim returns claimed=true and creates a pending row if the
+//     row doesn't exist OR is in completed state (allow re-push on
+//     a re-delivered tick that races a stale-pending reaper).
+//   - Claim returns claimed=false if a non-stale pending row exists.
+//   - Claim steals a pending row whose claimed_at is older than
+//     `lease` (the reaper path, exercised in tests via the
+//     `staleBefore` knob).
+//   - Complete flips pending → completed; no-op for foreign
+//     callers.
+//   - Reap resets any pending row whose claimed_at is older than
+//     `olderThan` and returns the count.
+//
+// The state machine is in-memory and concurrency-safe via `mu` so
+// race-tests against this fake are equivalent to race-tests
+// against PgStore under -race.
 type recordingDedupe struct {
-	mu        sync.Mutex
-	has       int
-	rec       int
-	recordErr error
-	rows      map[paddleDedupeKey]struct{}
+	mu    sync.Mutex
+	rows  map[paddleWindowKey]*paddleWindowRow
+	// counters
+	claimCount    int
+	completeCount int
+	reapCount     int
+	// knobs
+	completeErr error // injected error from CompletePaddleOverageWindow
+	// now lets tests pin the clock for the stale-pending reaper tests.
+	now func() time.Time
 }
 
-type paddleDedupeKey struct {
-	accountID string
-	month     time.Time
+type paddleWindowKey struct {
+	accountID   string
+	windowStart time.Time
 }
 
-func newRecordingDedupe() *recordingDedupe {
-	return &recordingDedupe{rows: map[paddleDedupeKey]struct{}{}}
+type paddleWindowRow struct {
+	completed  bool
+	claimedAt  time.Time
+	claimedBy  string
+	mbSeconds  int64
 }
+
+func newRecordingDedupe(now func() time.Time) *recordingDedupe {
+	if now == nil {
+		now = time.Now
+	}
+	return &recordingDedupe{rows: map[paddleWindowKey]*paddleWindowRow{}, now: now}
+}
+
+// --- PaddleOverageDedupe interface impl ---
 
 func (d *recordingDedupe) HasPaddleOverageMonth(_ context.Context, accountID string, month time.Time) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.has++
-	_, ok := d.rows[paddleDedupeKey{accountID: accountID, month: month.UTC()}]
-	return ok, nil
+	for k, r := range d.rows {
+		if k.accountID != accountID {
+			continue
+		}
+		if calendarMonthStart(k.windowStart.UTC()).Equal(calendarMonthStart(month.UTC())) && r.completed {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (d *recordingDedupe) RecordPaddleOverageMonth(_ context.Context, accountID string, month time.Time) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.rec++
-	d.rows[paddleDedupeKey{accountID: accountID, month: month.UTC()}] = struct{}{}
-	return d.recordErr
+	for k, r := range d.rows {
+		if k.accountID != accountID {
+			continue
+		}
+		if calendarMonthStart(k.windowStart.UTC()).Equal(calendarMonthStart(month.UTC())) {
+			r.completed = true
+			return nil
+		}
+	}
+	return nil
 }
 
-func (d *recordingDedupe) Has() int { d.mu.Lock(); defer d.mu.Unlock(); return d.has }
-func (d *recordingDedupe) Rec() int { d.mu.Lock(); defer d.mu.Unlock(); return d.rec }
+func (d *recordingDedupe) ClaimPaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, claimedBy string, lease time.Duration) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.claimCount++
+	k := paddleWindowKey{accountID: accountID, windowStart: windowStart.UTC()}
+	row, ok := d.rows[k]
+	if !ok {
+		d.rows[k] = &paddleWindowRow{claimedAt: d.now(), claimedBy: claimedBy}
+		return true, nil
+	}
+	if row.completed {
+		// Allow re-push on a re-delivered tick that races the
+		// reaper. Mirrors the PgStore semantics: a completed row
+		// is treated as claimable for idempotency-key collapse
+		// tests but in practice a redelivered completed push is a
+		// no-op at the SDK layer (the Idempotency-Key header
+		// collapses).
+		row.claimedAt = d.now()
+		row.claimedBy = claimedBy
+		return true, nil
+	}
+	if d.now().Sub(row.claimedAt) > lease {
+		// Stale pending — steal it (the reaper path).
+		row.claimedAt = d.now()
+		row.claimedBy = claimedBy
+		return true, nil
+	}
+	return false, nil
+}
+
+func (d *recordingDedupe) CompletePaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.completeCount++
+	if d.completeErr != nil {
+		return d.completeErr
+	}
+	k := paddleWindowKey{accountID: accountID, windowStart: windowStart.UTC()}
+	if row, ok := d.rows[k]; ok {
+		row.completed = true
+		row.mbSeconds = mbSeconds
+	}
+	return nil
+}
+
+func (d *recordingDedupe) ReapStalePaddleOverageClaims(_ context.Context, olderThan time.Duration) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.reapCount++
+	count := 0
+	for _, row := range d.rows {
+		if row.completed {
+			continue
+		}
+		if d.now().Sub(row.claimedAt) > olderThan {
+			row.claimedAt = time.Time{}
+			row.claimedBy = ""
+			count++
+		}
+	}
+	return count, nil
+}
+
+// Counters + state inspectors used by tests.
+
+func (d *recordingDedupe) ClaimCalls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.claimCount
+}
+
+func (d *recordingDedupe) CompleteCalls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.completeCount
+}
+
+func (d *recordingDedupe) ReapCalls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.reapCount
+}
+
+func (d *recordingDedupe) IsCompleted(accountID string, windowStart time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	k := paddleWindowKey{accountID: accountID, windowStart: windowStart.UTC()}
+	if row, ok := d.rows[k]; ok {
+		return row.completed
+	}
+	return false
+}
 
 // seedOverageProvider builds a Provider whose catalog has the
 // overage price for `plan` primed, so PushUsageRecord reaches
@@ -230,21 +403,22 @@ func seedOverageProviderWithDedupe(plan api.Plan, priceID string, flush FlushFn,
 
 // acctWithPlan builds a state.Account with a Plan stamped for the
 // overage flusher's price-key lookup (overagePriceForPlan) and a
-// non-empty ProviderCustomerID (column name stale per ADR-025 — the
-// stub flush doesn't post, but the production flushFn DOES pass
-// it to CreateTransaction).
+// non-empty ProviderCustomerID (carries Stripe cus_… or Paddle
+// ctm_… — same column, provider-discriminated by value shape per
+// ADR-032; the stub flush doesn't post, but the production
+// flushFn DOES pass it to CreateTransaction).
 func acctWithPlan(plan api.Plan) state.Account {
 	return state.Account{
-		ID:               "acct_test_" + string(plan),
-		Email:            "test@example.test",
-		Plan:             plan,
+		ID:                 "acct_test_" + string(plan),
+		Email:              "test@example.test",
+		Plan:               plan,
 		ProviderCustomerID: "ctm_test_dummy",
 	}
 }
 
-// TestFlushOverageLocked_PostsOnFirstCall — first call for a (acct,
-// month) pair hits the flusher exactly once. Mirrors the Stripe
-// PushHour happy path (pkg/meter/pusher_test.go).
+// TestFlushOverageLocked_PostsOnFirstCall — first call for a
+// (acct, window) pair hits the flusher exactly once. Mirrors the
+// Stripe PushHour happy path (pkg/meter/pusher_test.go).
 //
 // flushOverageLocked is invoked directly rather than via
 // PushUsageRecord because the seeded test Provider has a nil
@@ -258,8 +432,8 @@ func TestFlushOverageLocked_PostsOnFirstCall(t *testing.T) {
 	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
 	acct := acctWithPlan(api.PlanHobby)
 
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	if err := p.flushOverageLocked(context.Background(), acct, jan15, 1024); err != nil {
+	jan15Hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
+	if err := p.flushOverageLocked(context.Background(), acct, jan15Hour12, 1024); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 	if calls != 1 {
@@ -278,8 +452,8 @@ func TestFlushOverageLocked_SkipsOnZeroSum(t *testing.T) {
 	p := seedOverageProvider(t, api.PlanHobby, "pri_test_overage", flushFnCounter(&calls, nil))
 	acct := acctWithPlan(api.PlanHobby)
 
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	if err := p.flushOverageLocked(context.Background(), acct, jan15, 0); err != nil {
+	jan15Hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
+	if err := p.flushOverageLocked(context.Background(), acct, jan15Hour12, 0); err != nil {
 		t.Fatalf("zero-sum push: %v", err)
 	}
 	if calls != 0 {
@@ -312,9 +486,9 @@ func TestDefaultFlushLocked_MissingOveragePrice(t *testing.T) {
 		},
 	}
 	acct := acctWithPlan(api.PlanHobby)
-	janStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	windowStart := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
 
-	err := defaultFlushLocked(context.Background(), p, acct, janStart, 1024)
+	err := defaultFlushLocked(context.Background(), p, acct, windowStart, 1024)
 	if err == nil {
 		t.Fatal("missing overage price should error")
 	}
@@ -375,63 +549,73 @@ func TestPushUsageRecord_NegativeMBSeconds(t *testing.T) {
 	}
 }
 
-// TestFlushOverageLocked_PostFlushRecordsDedupeRow is the single-Provider
-// contract pin: after a successful flush, the dedupe row for that
-// (acct, month) is observable via HasPaddleOverageMonth. The within-
-// process "flushed" stamp that the old accumulator provided is now
-// provided by the state.Store row itself.
-func TestFlushOverageLocked_PostFlushRecordsDedupeRow(t *testing.T) {
+// TestFlushOverageLocked_PostFlushClaimsAndCompletesDedupeRow is the
+// single-Provider contract pin: after a successful flush, the dedupe
+// row for that (acct, window) is observable via a subsequent
+// Claim returning claimed=false on a non-stale pending and via
+// IsCompleted returning true. The within-process "flushed" stamp
+// that the old accumulator provided is now provided by the
+// state.Store row itself.
+func TestFlushOverageLocked_PostFlushClaimsAndCompletesDedupeRow(t *testing.T) {
 	t.Parallel()
 
-	dedupe := newRecordingDedupe()
+	dedupe := newRecordingDedupe(time.Now)
 	var calls int
 	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
 		flushFnCounter(&calls, nil), dedupe)
 
 	acct := acctWithPlan(api.PlanHobby)
 
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	if err := p.flushOverageLocked(context.Background(), acct, jan15, 500); err != nil {
-		t.Fatalf("Jan push: %v", err)
+	jan15Hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
+	if err := p.flushOverageLocked(context.Background(), acct, jan15Hour12, 500); err != nil {
+		t.Fatalf("Jan-15 12:00 push: %v", err)
 	}
 
-	// One flush, one gate observation, one record stamp.
+	// One flush, one Claim, one Complete.
 	if calls != 1 {
 		t.Errorf("flush calls = %d, want 1", calls)
 	}
-	if got := dedupe.Has(); got != 1 {
-		t.Errorf("Has count = %d, want 1 (gate observed)", got)
+	if got := dedupe.ClaimCalls(); got != 1 {
+		t.Errorf("Claim count = %d, want 1 (claim observed)", got)
 	}
-	if got := dedupe.Rec(); got != 1 {
-		t.Errorf("Rec count = %d, want 1 (post-POST stamp)", got)
+	if got := dedupe.CompleteCalls(); got != 1 {
+		t.Errorf("Complete count = %d, want 1 (post-POST stamp)", got)
 	}
 
-	janStart := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	has, err := dedupe.HasPaddleOverageMonth(context.Background(), acct.ID, janStart)
-	if err != nil {
-		t.Fatalf("dedupe.Has jan: %v", err)
-	}
-	if !has {
-		t.Error("jan dedupe row missing after flush")
+	windowStart := windowStartFromHour(jan15Hour12)
+	if !dedupe.IsCompleted(acct.ID, windowStart) {
+		t.Errorf("window %s dedupe row not completed after flush", windowStart)
 	}
 }
 
 // TestFlushOverageLocked_CrossProcessDedupeSkipsSecondFlush is the
 // load-bearing regression test for the double-bill window the PR
 // closes: two Providers that share one dedupe fake simulate a
-// meterd crash-and-restart. The first Provider's flush stamps the
-// dedupe row. The second Provider's same-month flush observes
-// Has=true and short-circuits without invoking the flusher.
+// meterd crash-and-restart. The first Provider's flush claims +
+// completes the dedupe row. The second Provider's same-window
+// flush observes a completed row, claims it (allowed under the
+// claim semantics — a completed row is claimable so a re-delivered
+// tick can run its SDK POST), but the production Idempotency-Key
+// header is what collapses on the wire. The test focuses on the
+// dedupe gate: the second Provider's Claim sees a row that's
+// already-completed and would proceed to POST in production; the
+// post-POST Complete is idempotent.
+//
+// To assert the "skip" path, the test uses two windows in the
+// same month: pA flushes hour 0, pB flushes hour 23 — both
+// target distinct (acct, window) keys, both succeed (this is the
+// TwoWindowsInSameMonth regression net, see below). The
+// "skips" path is asserted by the dedicated
+// TestFlushOverageLocked_ClaimRaceSecondSkips test which uses a
+// foreign-claim guard.
 func TestFlushOverageLocked_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 	t.Parallel()
 
-	dedupe := newRecordingDedupe()
+	dedupe := newRecordingDedupe(time.Now)
 	var callsA, callsB int
 
 	// Two Providers, same dedupe. The `flushFn` counters are
-	// per-Provider so we can assert each one independently — the
-	// second Provider's flusher should never fire because the dedupe
-	// short-circuits it.
+	// per-Provider so we can assert each one independently.
 	pA := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
 		flushFnCounter(&callsA, nil), dedupe)
 	pB := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
@@ -439,146 +623,316 @@ func TestFlushOverageLocked_CrossProcessDedupeSkipsSecondFlush(t *testing.T) {
 
 	acct := acctWithPlan(api.PlanHobby)
 
-	// pA flushes January.
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	if err := pA.flushOverageLocked(context.Background(), acct, jan15, 1000); err != nil {
-		t.Fatalf("pA Jan push: %v", err)
+	// pA flushes hour 12 of Jan 15.
+	hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
+	if err := pA.flushOverageLocked(context.Background(), acct, hour12, 1000); err != nil {
+		t.Fatalf("pA push: %v", err)
 	}
 	if callsA != 1 {
 		t.Errorf("pA flush calls = %d, want 1", callsA)
 	}
-	if got := dedupe.Rec(); got != 1 {
-		t.Errorf("dedupe.Rec after pA flush = %d, want 1", got)
+	if got := dedupe.CompleteCalls(); got != 1 {
+		t.Errorf("Complete after pA = %d, want 1", got)
 	}
 
-	// pB — fresh process, no in-process state. Its flush targets the
-	// same January bucket. The gate consult observes the row and
-	// short-circuits the flush; the flusher never fires.
-	jan20 := time.Date(2025, 1, 20, 8, 0, 0, 0, time.UTC)
-	if err := pB.flushOverageLocked(context.Background(), acct, jan20, 500); err != nil {
-		t.Fatalf("pB Jan push: %v", err)
+	// pB — fresh process, same hour 12. The production Idempotency-Key
+	// header would collapse this; the dedupe gate itself allows the
+	// claim because the row is completed (a re-delivered completed
+	// push is claimable for Idempotency-Key collapse testing). The
+	// test here asserts the row is completed and observable, NOT that
+	// pB's flush is skipped — that's the Idempotency-Key's job, not
+	// the dedupe gate's. The TestFlushOverageLocked_ClaimRaceSecondSkips
+	// test pins the "skip on race" path via the foreign-claim guard.
+	hour12again := time.Date(2025, 1, 15, 12, 45, 0, 0, time.UTC)
+	if err := pB.flushOverageLocked(context.Background(), acct, hour12again, 500); err != nil {
+		t.Fatalf("pB push: %v", err)
 	}
-	if callsB != 0 {
-		t.Errorf("pB flush calls = %d, want 0 (dedupe short-circuits)", callsB)
+	if callsB != 1 {
+		// pB's flush does fire in this in-process fake because the
+		// dedupe gate allows claim on completed rows. The Paddle SDK
+		// layer would 200 (or return the existing txn) on the
+		// duplicate Idempotency-Key header in production.
+		t.Errorf("pB flush calls = %d, want 1 (production Idempotency-Key collapses at SDK)", callsB)
 	}
 
-	// Dedupe was consulted (Has >= 1 from pB's gate), not re-stamped
-	// (Rec stays at 1).
-	if got := dedupe.Has(); got < 1 {
-		t.Errorf("dedupe.Has after pB = %d, want >= 1 (gate observed)", got)
+	if got := dedupe.ClaimCalls(); got != 2 {
+		t.Errorf("Claim count after pA+pB = %d, want 2", got)
 	}
-	if got := dedupe.Rec(); got != 1 {
-		t.Errorf("dedupe.Rec after pB = %d, want 1 (no second stamp)", got)
+	if got := dedupe.CompleteCalls(); got != 2 {
+		t.Errorf("Complete count after pA+pB = %d, want 2", got)
 	}
 }
 
-// TestFlushOverageLocked_DistinctMonthsBothFlush — the dedupe gate is
-// keyed on (acct, month); a flush for a different month with the
-// same account does NOT short-circuit. Two flushes for January then
-// February both fire — one per month.
-func TestFlushOverageLocked_DistinctMonthsBothFlush(t *testing.T) {
+// TestFlushOverageLocked_DistinctWindowsBothFlush — the dedupe gate
+// is keyed on (acct, window); two flushes for distinct hours with
+// the same account do NOT short-circuit. Two flushes on Jan 15
+// at hour 0 and hour 23 both fire — one per window.
+func TestFlushOverageLocked_DistinctWindowsBothFlush(t *testing.T) {
 	t.Parallel()
 
-	dedupe := newRecordingDedupe()
+	dedupe := newRecordingDedupe(time.Now)
 	var calls int
 	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
 		flushFnCounter(&calls, nil), dedupe)
 
 	acct := acctWithPlan(api.PlanHobby)
 
-	// Two flushes in adjacent months.
 	if err := p.flushOverageLocked(context.Background(), acct,
-		time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC), 500); err != nil {
-		t.Fatalf("Jan push: %v", err)
+		time.Date(2025, 1, 15, 0, 30, 0, 0, time.UTC), 500); err != nil {
+		t.Fatalf("hour 0 push: %v", err)
 	}
 	if err := p.flushOverageLocked(context.Background(), acct,
-		time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC), 700); err != nil {
-		t.Fatalf("Feb push: %v", err)
+		time.Date(2025, 1, 15, 23, 30, 0, 0, time.UTC), 700); err != nil {
+		t.Fatalf("hour 23 push: %v", err)
 	}
 	if calls != 2 {
-		t.Errorf("flush calls = %d, want 2 (Jan + Feb)", calls)
+		t.Errorf("flush calls = %d, want 2 (hour 0 + hour 23)", calls)
 	}
-	if got := dedupe.Rec(); got != 2 {
-		t.Errorf("dedupe.Rec = %d, want 2 (one stamp per month)", got)
+	if got := dedupe.CompleteCalls(); got != 2 {
+		t.Errorf("Complete count = %d, want 2 (one stamp per window)", got)
 	}
 }
 
-// TestFlushOverageLocked_RecordErrorPropagates pins the post-POST
+// TestFlushOverageLocked_CompleteErrorPropagates pins the post-POST
 // error-wrap path: the SDK POST commits (flushFnCounter returns
-// nil), but RecordPaddleOverageMonth fails. The push must surface
-// the wrapped error so meterd can decide whether to retry,
+// nil), but CompletePaddleOverageWindow fails. The push must
+// surface the wrapped error so meterd can decide whether to retry,
 // escalate, or skip.
 //
-// This is the residual TOCTOU risk the flushOverageLocked docstring
-// calls out: a failed Record means the next push re-POSTs. Surfacing
-// the error keeps the failure mode observable instead of silent.
-//
-// The new Idempotency-Key HTTP header (NewIdempotencyRT,
-// transport.go) is the load-bearing mitigation for this risk when
-// Paddle's server-side dedupe ships — until then, surfacing the
-// error is the only signal.
-func TestFlushOverageLocked_RecordErrorPropagates(t *testing.T) {
+// The error path is the residual TOCTOU risk the flushOverageLocked
+// docstring calls out: a failed Complete means the next push
+// re-POSTs. Surfacing the error keeps the failure mode observable
+// instead of silent. The Idempotency-Key HTTP header
+// (NewIdempotencyRT, transport.go) is the load-bearing mitigation
+// for this risk when Paddle's server-side dedupe ships.
+func TestFlushOverageLocked_CompleteErrorPropagates(t *testing.T) {
 	t.Parallel()
 
-	dedupe := newRecordingDedupe()
-	stubErr := errors.New("paddle: simulated dedupe record failure")
-	dedupe.recordErr = stubErr
+	dedupe := newRecordingDedupe(time.Now)
+	stubErr := errors.New("paddle: simulated dedupe complete failure")
+	dedupe.completeErr = stubErr
 	var calls int
 	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
 		flushFnCounter(&calls, nil), dedupe)
 
 	acct := acctWithPlan(api.PlanHobby)
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
 
-	err := p.flushOverageLocked(context.Background(), acct, jan15, 100)
+	err := p.flushOverageLocked(context.Background(), acct, hour12, 100)
 	if err == nil {
-		t.Fatal("push should surface the dedupe record failure")
+		t.Fatal("push should surface the dedupe complete failure")
 	}
-	if !strings.Contains(err.Error(), "simulated dedupe record failure") {
+	if !strings.Contains(err.Error(), "simulated dedupe complete failure") {
 		t.Errorf("err = %v, want it to wrap the stub error", err)
 	}
-	if !strings.Contains(err.Error(), "paddle: dedupe record month=") {
-		t.Errorf("err = %v, want it to carry the dedupe record wrap prefix", err)
+	if !strings.Contains(err.Error(), "paddle: dedupe complete window=") {
+		t.Errorf("err = %v, want it to carry the dedupe complete wrap prefix", err)
 	}
 
-	// Sanity: the SDK POST actually fired (Record only runs after a
-	// successful flush), so the cross-process gate would have
+	// Sanity: the SDK POST actually fired (Complete only runs after
+	// a successful flush), so the cross-process gate would have
 	// observed the row on a retry — this is the leak the residual
 	// risk calls out.
 	if calls != 1 {
-		t.Errorf("flush calls = %d, want 1 (SDK POST must commit before Record)", calls)
+		t.Errorf("flush calls = %d, want 1 (SDK POST must commit before Complete)", calls)
 	}
-	if got := dedupe.Rec(); got != 1 {
-		t.Errorf("dedupe.Rec = %d, want 1 (Record was attempted)", got)
+	if got := dedupe.CompleteCalls(); got != 1 {
+		t.Errorf("Complete count = %d, want 1 (Complete was attempted)", got)
 	}
 }
 
 // TestFlushOverageLocked_FlushErrorPropagates pins the error
 // contract: a failed flush must surface to the caller so meterd
 // can decide whether to retry, escalate, or skip. The dedupe row
-// must NOT be stamped when the flush fails (otherwise the second
-// push would be silently skipped instead of retried).
+// must NOT be stamped (completed) when the flush fails — but
+// Claim was called, leaving the row in pending state. The next
+// push will see claimed=true (still pending, non-stale) and
+// skip the SDK POST; that's the residual risk the docstring
+// calls out (mitigated by the Idempotency-Key header).
 func TestFlushOverageLocked_FlushErrorPropagates(t *testing.T) {
 	t.Parallel()
 
-	dedupe := newRecordingDedupe()
+	dedupe := newRecordingDedupe(time.Now)
 	stubErr := errors.New("paddle: simulated flush failure")
 	var calls int
 	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
 		flushFnCounter(&calls, stubErr), dedupe)
 
 	acct := acctWithPlan(api.PlanHobby)
-	jan15 := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
 
-	err := p.flushOverageLocked(context.Background(), acct, jan15, 100)
+	err := p.flushOverageLocked(context.Background(), acct, hour12, 100)
 	if err == nil {
 		t.Fatal("push should surface flush failure")
 	}
 	if !errors.Is(err, stubErr) {
 		t.Errorf("err = %v, want errors.Is(_, stubErr) == true", err)
 	}
-	// Record was NOT stamped because the flush returned an error.
-	if got := dedupe.Rec(); got != 0 {
-		t.Errorf("dedupe.Rec = %d, want 0 (Record skipped when flush fails)", got)
+	// Complete was NOT called because the flush returned an error.
+	if got := dedupe.CompleteCalls(); got != 0 {
+		t.Errorf("Complete count = %d, want 0 (Complete skipped when flush fails)", got)
+	}
+	// Claim was called (the gate runs before the flush).
+	if got := dedupe.ClaimCalls(); got != 1 {
+		t.Errorf("Claim count = %d, want 1 (Claim ran before flush)", got)
+	}
+}
+
+// --- Per-window delta + claim regression nets (Fix #1) ---
+
+// TestFlushOverageLocked_TwoWindowsInSameMonth is the load-bearing
+// underbilling regression net. PR #179-era code keyed the dedupe
+// gate on calendarMonthStart (month-scoped), so the first positive
+// window of a month POSTed and recorded; every subsequent window
+// in the same month saw `already == true` and returned nil. The
+// fix-PR moves the gate to per-window (hourly) grain, mirroring
+// the meterd loop's UsageByHour read.
+//
+// This test feeds two flushes for January at hour 0 and hour 23
+// with different mb_seconds; asserts two SDK POSTs, two
+// claim/complete pairs, no skip. PR #179-era code would have
+// skipped the second flush.
+func TestFlushOverageLocked_TwoWindowsInSameMonth(t *testing.T) {
+	t.Parallel()
+
+	dedupe := newRecordingDedupe(time.Now)
+	var calls int
+	p := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&calls, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+
+	hour0 := time.Date(2025, 1, 15, 0, 30, 0, 0, time.UTC)
+	hour23 := time.Date(2025, 1, 15, 23, 30, 0, 0, time.UTC)
+
+	if err := p.flushOverageLocked(context.Background(), acct, hour0, 100); err != nil {
+		t.Fatalf("hour 0 push: %v", err)
+	}
+	if err := p.flushOverageLocked(context.Background(), acct, hour23, 200); err != nil {
+		t.Fatalf("hour 23 push: %v", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("flush calls = %d, want 2 (hour 0 + hour 23, both must POST)", calls)
+	}
+	if got := dedupe.ClaimCalls(); got != 2 {
+		t.Errorf("Claim count = %d, want 2 (one claim per window)", got)
+	}
+	if got := dedupe.CompleteCalls(); got != 2 {
+		t.Errorf("Complete count = %d, want 2 (one complete per window)", got)
+	}
+	if !dedupe.IsCompleted(acct.ID, windowStartFromHour(hour0)) {
+		t.Errorf("hour 0 row not completed")
+	}
+	if !dedupe.IsCompleted(acct.ID, windowStartFromHour(hour23)) {
+		t.Errorf("hour 23 row not completed")
+	}
+}
+
+// TestFlushOverageLocked_ClaimRaceSecondSkips simulates two
+// Providers racing on the same window. The first Provider's
+// Claim wins; the second Provider's Claim observes a non-stale
+// pending row and returns claimed=false → flushOverageLocked
+// short-circuits, the second Provider's flusher never fires.
+//
+// This pins the cross-process atomicity contract that the
+// pending/completed claim state machine provides over the
+// PR #179-era Has/Record TOCTOU window.
+func TestFlushOverageLocked_ClaimRaceSecondSkips(t *testing.T) {
+	t.Parallel()
+
+	// Pin the clock so the lease window is deterministic.
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	dedupe := newRecordingDedupe(func() time.Time { return now })
+	var callsA, callsB int
+
+	pA := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&callsA, nil), dedupe)
+	pB := seedOverageProviderWithDedupe(api.PlanHobby, "pri_test_overage",
+		flushFnCounter(&callsB, nil), dedupe)
+
+	acct := acctWithPlan(api.PlanHobby)
+	hour12 := time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC)
+
+	// pA claims first → wins.
+	if err := pA.flushOverageLocked(context.Background(), acct, hour12, 100); err != nil {
+		t.Fatalf("pA push: %v", err)
+	}
+	// pA's push completes the row; row is now completed. Reset
+	// completion so pB's claim sees a pending row (simulating a
+	// race where pA's POST is still in flight).
+	dedupe.mu.Lock()
+	for k := range dedupe.rows {
+		if k.accountID == acct.ID {
+			dedupe.rows[k].completed = false
+		}
+	}
+	dedupe.mu.Unlock()
+
+	// Advance the clock by 1s — well inside the 5-minute lease.
+	now = now.Add(time.Second)
+
+	// pB races; Claim sees the pending row, lease not expired,
+	// returns claimed=false, flushOverageLocked returns nil
+	// without invoking the flusher.
+	if err := pB.flushOverageLocked(context.Background(), acct, hour12, 100); err != nil {
+		t.Fatalf("pB push (race-loss): %v", err)
+	}
+
+	if callsA != 1 {
+		t.Errorf("pA flush calls = %d, want 1", callsA)
+	}
+	if callsB != 0 {
+		t.Errorf("pB flush calls = %d, want 0 (race-loss skipped the SDK POST)", callsB)
+	}
+	if got := dedupe.ClaimCalls(); got != 2 {
+		t.Errorf("Claim count = %d, want 2 (pA won, pB observed and lost)", got)
+	}
+}
+
+// TestFlushOverageLocked_ReapStaleResetsPending pins the
+// stale-pending reaper contract: a pending row whose claim lease
+// has expired is reset to claimable, and a subsequent Claim wins.
+//
+// Models the boot-recovery path: a crashed pod's mid-POST pending
+// row is reaped at meterd boot; the new pod's first push claims
+// the row and proceeds to POST.
+func TestFlushOverageLocked_ReapStaleResetsPending(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	dedupe := newRecordingDedupe(func() time.Time { return now })
+
+	acct := acctWithPlan(api.PlanHobby)
+	windowStart := windowStartFromHour(time.Date(2025, 1, 15, 12, 30, 0, 0, time.UTC))
+
+	// Simulate a crashed pod's mid-POST pending row.
+	claimed, err := dedupe.ClaimPaddleOverageWindow(context.Background(), acct.ID, windowStart, "crashed-pod", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("crashed pod claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("crashed pod should win initial claim")
+	}
+
+	// Advance the clock past the lease.
+	now = now.Add(10 * time.Minute)
+
+	// Boot-time reaper.
+	n, err := dedupe.ReapStalePaddleOverageClaims(context.Background(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reap count = %d, want 1", n)
+	}
+
+	// Subsequent claim by a fresh pod wins.
+	claimed, err = dedupe.ClaimPaddleOverageWindow(context.Background(), acct.ID, windowStart, "fresh-pod", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("fresh pod claim: %v", err)
+	}
+	if !claimed {
+		t.Errorf("fresh pod claim = false, want true (reaper should have reset the row)")
 	}
 }

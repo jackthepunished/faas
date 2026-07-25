@@ -3,7 +3,9 @@ package paddle
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/PaddleHQ/paddle-go-sdk/v5/pkg/paddleerr"
@@ -88,20 +90,72 @@ func TestClassifyPushError_SDKStatusCodes(t *testing.T) {
 	}
 }
 
-// TestClassifyPushError_TransportError — anything that's not a
-// pre-SDK sentinel and not a *paddleerr.Error (transport failures,
-// net.OpError, context.Canceled, etc.) collapses to the same
-// catch-all label as a genuinely unknown error: "other". The
-// Paddle SDK's response_api_error_handler returns transport
-// errors unwrapped (no *paddleerr.Error), so errors.As fails
-// here and the classifier falls through to the catch-all. Matches
-// stripe.ClassifyPushError's behaviour at
-// pkg/billing/stripe/errors.go:88.
-func TestClassifyPushError_TransportError(t *testing.T) {
+// fakeNetError is a minimal net.Error implementation for table-driven
+// tests. Returns the configured Timeout value so the classifier
+// exercises the net.Error branch in production. The Paddle SDK
+// surfaces raw *net.OpError values that satisfy net.Error; the
+// classifier detects them via errors.As.
+type fakeNetError struct {
+	timeout bool
+}
+
+func (e *fakeNetError) Error() string   { return "fake net error" }
+func (e *fakeNetError) Timeout() bool   { return e.timeout }
+func (e *fakeNetError) Temporary() bool { return false }
+
+// TestClassifyPushError_TransportErrors — table-driven coverage for
+// the three transport-failure shapes the Paddle SDK can return:
+//
+//   - *url.Error (the SDK wraps net.OpError in this when emitting
+//     transport failures; see
+//     github.com/PaddleHQ/paddle-go-sdk/v5/internal/client/client.go:43-67).
+//   - net.Error direct (raw *net.OpError, when the SDK does not
+//     wrap — rare but observed in context-cancel paths).
+//   - Wrapped SDK error (the production fmt.Errorf("…: %w", ue) shape
+//     exercised at usage.go:174 — errors.As must still reach the
+//     inner *url.Error).
+//
+// All three route to "api-connection" so the dashboard can spot
+// DNS/TCP/timeout flakes without trawling the unknown error log.
+func TestClassifyPushError_TransportErrors(t *testing.T) {
 	t.Parallel()
-	err := errors.New("dial tcp: lookup api.paddle.com: no such host")
-	if got := ClassifyPushError(err); got != "other" {
-		t.Errorf("ClassifyPushError(transport) = %q, want %q", got, "other")
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "url.Error from SDK transport failure",
+			err:  &url.Error{Op: "Post", URL: "https://api.paddle.com/transactions", Err: errors.New("dial tcp: connection refused")},
+			want: "api-connection",
+		},
+		{
+			name: "net.Error direct (raw *net.OpError shape)",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("no such host")},
+			want: "api-connection",
+		},
+		{
+			name: "fake net.Error with Timeout() = true",
+			err:  &fakeNetError{timeout: true},
+			want: "api-connection",
+		},
+		{
+			name: "fake net.Error with Timeout() = false",
+			err:  &fakeNetError{timeout: false},
+			want: "api-connection",
+		},
+		{
+			name: "wrapped *url.Error via fmt.Errorf %w (production shape at usage.go:174)",
+			err:  fmt.Errorf("paddle: CreateTransaction: %w", &url.Error{Op: "Post", URL: "https://api.paddle.com/transactions", Err: net.ErrClosed}),
+			want: "api-connection",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyPushError(tc.err); got != tc.want {
+				t.Errorf("ClassifyPushError(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -130,6 +184,7 @@ func TestPushResultLabels_StableOrder(t *testing.T) {
 		"negative-mb-sec",
 		"overage-price-missing",
 		"api-error",
+		"api-connection",
 		"auth-error",
 		"permission",
 		"card-error",
@@ -167,6 +222,7 @@ func TestPushResultLabels_AllReachable(t *testing.T) {
 		"rate-limit":            true, // from 429
 		"bad-gateway":           true, // from 502
 		"api-error":             true, // from 5xx
+		"api-connection":        true, // from net.Error / *url.Error
 		"other":                 true, // from unknown
 	}
 	for _, label := range PushResultLabels() {
