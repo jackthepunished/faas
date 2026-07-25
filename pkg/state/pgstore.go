@@ -7,16 +7,23 @@
 // adapter that maps sqlc-style params/rows to the domain types and surfaces
 // ErrNotFound / ErrConflict at the right boundaries.
 //
-// Why not the sqlc-generated *.sql.go files? sqlc couldn't be built in this
-// environment (the pganalyze/pg_query_go dependency fails to compile on the
-// macOS SDK's _string.h). The hand-written adapter here is structured so it
-// can be swapped for the generated package one-for-one once sqlc is
-// available; the public Store surface is unchanged.
+// Why not call the sqlc-generated package directly? The hand-written adapter
+// here is the ADR-017 M5 exception. Generated output is now committed as a
+// drift baseline (pkg/state/sqlc/), but replacing these method bodies with
+// calls into the generated package is the separate M5.1 migration; the
+// public Store surface remains unchanged.
 //
-// TODO(M5.1): regenerate via `sqlc generate` against pkg/state/queries.sql
-// once the CI sqlc pin is clean on the macOS SDK. See ADR-017
-// (docs/adr/017-hand-written-pgstore.md) for the migration plan and
-// reviewer checklist.
+// `make sqlc-check` regenerates pkg/state/sqlc in CI and fails when it
+// drifts from queries.sql or schema.sql. TODO(M5.1): replace this
+// hand-written adapter's query bodies with calls into that generated
+// package. See ADR-017 (docs/adr/017-hand-written-pgstore.md) for the
+// migration plan and reviewer checklist.
+//
+// schema.sql is a snapshot produced by `make schema-dump` — it is the
+// single source-of-truth schema file sqlc consumes (sqlc v1.27.0 does not
+// merge `create table if not exists` statements across multiple migration
+// files, so pointing sqlc at migrations/ would diverge from the live
+// schema wherever a migration adds columns to an existing table).
 package state
 
 import (

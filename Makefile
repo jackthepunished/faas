@@ -221,6 +221,32 @@ migrate-up: ## Apply all pending migrations against $DATABASE_URL (idempotent)
 	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set"; exit 1)
 	@go run ./cmd/migrate
 
+# schema.sql is the merged source-of-truth schema sqlc consumes. sqlc
+# v1.27.0 does not merge `create table if not exists` statements across
+# migration files, so pointing sqlc at migrations/ would diverge from the
+# live schema wherever a migration adds columns to an existing table
+# (e.g. crons.created_at in 00002). schema-dump applies migrations
+# against an ephemeral Postgres, runs `pg_dump -s`, strips pg_dump
+# version noise, and overwrites the committed schema.sql.
+#
+# Idempotent: re-running produces byte-identical output (verified by
+# the deterministic output of pg_dump against the same migration set).
+# Requires the `migrate-up` preconditions (psql on PATH, DATABASE_URL
+# pointing at a reachable Postgres).
+.PHONY: schema-dump
+schema-dump: ## Regenerate schema.sql from a live Postgres (source of truth for sqlc)
+	@command -v psql >/dev/null 2>&1 || (echo "psql not on PATH"; exit 1)
+	@command -v pg_dump >/dev/null 2>&1 || (echo "pg_dump not on PATH; install postgresql-client"; exit 1)
+	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set"; exit 1)
+	@go run ./cmd/migrate
+	@pg_dump -s --no-owner --no-privileges --no-sync --no-tablespaces $$DATABASE_URL \
+	  | sed -E -e '/^\\(restrict|unrestrict) /d' \
+	          -e '/^-- Dumped from database version /d' \
+	          -e '/^-- Dumped by pg_dump version /d' \
+	          -e '/^-- PostgreSQL database dump complete/d' \
+	  > schema.sql
+	@echo "schema-dump: schema.sql regenerated ($$(wc -l < schema.sql) lines)"
+
 # OpenAPI spec gate. The spec is the source of truth for documentation;
 # the code is the source of truth for behavior. The gate is the bridge —
 # `make spec-check` fails the PR if anything drifts.
