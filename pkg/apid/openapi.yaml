@@ -1801,9 +1801,9 @@ components:
     # ─── Apps ─────────────────────────────────────────────────────────────
 
     AppResponse:
-      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, and per-app outbound CIDR allowlist (ADR-031 + ADR-032)."
+      description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, per-app outbound CIDR allowlist (ADR-031 + ADR-032), and reactive scale-up trigger targets (issue #169 / #172)."
       type: object
-      required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest]
+      required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest, autoscale_target_rps, autoscale_target_cpu_pct]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
@@ -1832,6 +1832,23 @@ components:
             type: string
             pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
+        # Issue #169 / #172: per-instance reactive scale-up
+        # trigger targets. 0 = "disabled" (the trigger skips
+        # this app). autoscale is enabled iff at least one of
+        # these two is non-zero (no separate boolean). Plan
+        # gated: autoscale_target_rps is Hobby/Pro/Scale;
+        # autoscale_target_cpu_pct is Pro/Scale only.
+        autoscale_target_rps:
+          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-036."
+          type: integer
+          minimum: 0
+          example: 50
+        autoscale_target_cpu_pct:
+          description: "Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-036."
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 70
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -1872,6 +1889,23 @@ components:
             type: string
             pattern: '^[0-9a-fA-F:./]+$'
             example: 1.2.3.0/24
+        # Issue #169 / #172: per-app reactive scale-up trigger
+        # targets. PATCH semantics mirror the wire DTO: omitted
+        # → no change; 0 → explicit disable. Plan gates run
+        # first (403 plan_autoscale_not_allowed) so a Free
+        # PATCHing a 50-rps value surfaces the gate, not the
+        # bounds. See ADR-036.
+        autoscale_target_rps:
+          description: "Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are 422 invalid_autoscale_target_rps."
+          type: [integer, "null"]
+          minimum: 0
+          example: 50
+        autoscale_target_cpu_pct:
+          description: "Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct."
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 100
+          example: 70
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."

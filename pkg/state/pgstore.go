@@ -338,7 +338,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
 	return scanApp(row)
 }
@@ -404,7 +405,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
 	created, err := scanApp(row)
 	if err != nil {
@@ -419,7 +421,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where id = $1`, id)
 	return scanApp(row)
 }
@@ -427,7 +430,8 @@ func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
 func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where slug = $1 and status <> 'deleted'`, slug)
 	return scanApp(row)
 }
@@ -435,7 +439,8 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where account_id = $1 and status <> 'deleted' order by created_at desc`, accountID)
 	if err != nil {
 		return nil, err
@@ -447,7 +452,8 @@ func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error)
 func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
 		 from apps where status <> 'deleted' order by created_at desc`)
 	if err != nil {
 		return nil, err
@@ -477,16 +483,21 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
 		   min_instances   = case when $9 then $10 else min_instances end,
-		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end
+		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
+		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
+		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
 		 where id = $1
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		id,
 		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
 		p.Manifest != nil, manifestBytes,
 		p.SetMinInstances, derefInt(p.MinInstances),
-		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)))
+		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
+		p.SetAutoscaleTargetRPS, derefInt(p.AutoscaleTargetRPS),
+		p.SetAutoscaleTargetCPUPct, derefInt(p.AutoscaleTargetCPUPct))
 	return scanApp(row)
 }
 
@@ -520,7 +531,8 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 		`update apps set slug = $3
 		 where account_id = $1 and slug = $2 and status <> 'deleted'
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text`,
+		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
 		accountID, oldSlug, newSlug)
 	return scanApp(row)
 }
@@ -3063,7 +3075,8 @@ func scanApp(row pgx.Row) (App, error) {
 	var manifestBytes []byte
 	var allowlistText string
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText); err != nil {
+		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
 		return App{}, mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -3083,7 +3096,8 @@ func scanApps(rows pgx.Rows) ([]App, error) {
 		var manifestBytes []byte
 		var allowlistText string
 		if err := rows.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText); err != nil {
+			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+			&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
 			return nil, err
 		}
 		a.Type = AppType(typeStr)

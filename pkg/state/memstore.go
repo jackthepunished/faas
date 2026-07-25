@@ -695,6 +695,16 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		copy(dst, src)
 		a.EgressAllowlist = dst
 	}
+	// Issue #169 / #172: per-app reactive scale-up trigger. Set
+	// distinguishes "unset" (don't touch) from "explicit zero"
+	// (disable). Apid already gated the plan and the bounds
+	// (RPS > 0, CPU in [1,100]); the store is a plain column write.
+	if p.SetAutoscaleTargetRPS {
+		a.AutoscaleTargetRPS = derefInt(p.AutoscaleTargetRPS)
+	}
+	if p.SetAutoscaleTargetCPUPct {
+		a.AutoscaleTargetCPUPct = derefInt(p.AutoscaleTargetCPUPct)
+	}
 	m.apps[id] = a
 	return a, nil
 }

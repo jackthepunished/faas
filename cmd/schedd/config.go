@@ -89,6 +89,25 @@ type Config struct {
 	// missed tick from deactivating a healthy node — keep at
 	// least 2 × Interval.
 	HeartbeatStaleness time.Duration `toml:"heartbeat_staleness"`
+
+	// GatewayMetricsURL is the absolute URL of gatewayd's /metrics
+	// endpoint (issue #169 / #172). The schedd scale-up trigger
+	// scrapes this URL every cfg.ScaleUpInterval for
+	// `gateway_requests_total{app=...}` so it can compute per-app
+	// RPS. Empty disables the trigger (Loop.WithScaleUp is not
+	// called → the ticker arm never fires). Defaults to
+	// http://127.0.0.1:9090/metrics, matching gatewayd's
+	// ControlAddr default (cmd/gatewayd/config.go).
+	GatewayMetricsURL string `toml:"gateway_metrics_url"`
+
+	// ScaleUpInterval is the per-app reactive scale-up trigger
+	// cadence. Zero or negative reverts to
+	// api.ScaleUpDecisionIntervalSeconds (1s). 1s is the right
+	// balance between "admit Nth instance before the gateway
+	// queue builds" and "don't hammer Postgres with a full app
+	// list on every tick" — the trigger reads from apps +
+	// instances per tick.
+	ScaleUpInterval time.Duration `toml:"scaleup_interval"`
 }
 
 // ResolveListenTarget returns the gRPC target schedd should bind.
@@ -133,6 +152,10 @@ func LoadConfig(path string) (*Config, error) {
 		VMMDSocket:         "/run/faas/vmmd.sock",
 		GatewaySynthSocket: "/run/faas/gatewayd-internal.sock",
 		OwnerUser:          "faas-schedd",
+		// Issue #169 / #172: default to gatewayd's loopback
+		// control listener. Empty disables the trigger (the
+		// loop with WithScaleUp(nil) skips the ticker arm).
+		GatewayMetricsURL: "http://127.0.0.1:9090/metrics",
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
