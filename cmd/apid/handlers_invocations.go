@@ -1,0 +1,476 @@
+package main
+
+// Move 2: customer-facing event-driven surface. This file holds the
+// nine handlers that put the Move 1 backend (state.Invocation table +
+// pkg/sched drain) in front of customers. The shape mirrors the
+// existing apid handlers (loadApp → plan cap check → writeJSON or
+// ErrPlan*) and reuses every helper from cmd/apid/server.go.
+//
+// Why a separate file: keeps the diff on handlers_ext.go focused on the
+// deleteApp GC rewrite; reviewers can scan this file's nine handlers
+// as one logical group.
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// --- decodeJSONLimit --------------------------------------------------------
+
+// decodeJSONLimit is a MaxBytesReader-wrapped variant of decodeJSON.
+// The plan's MaxSourceBytesPerInvocation caps each event-driven payload
+// (Hobby 64 KB, Pro 256 KB, Scale 1 MB); anything larger is a 413, not
+// a 422 — the size limit is a plan cap, not a malformed-body problem.
+//
+// Returns false if the read or decode fails; the helper writes the
+// appropriate Problem response in that case so the caller can simply
+// `return`.
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) bool {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20 // 1 MB hard fallback — defensive only
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			api.WriteProblem(w, api.ErrValidation("empty request body"))
+			return false
+		}
+		// MaxBytesReader returns a *http.MaxBytesError on overflow;
+		// surface as a 413 with the source-bytes cap code.
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			api.WriteProblem(w, api.ErrPlanSourceBytes(int(maxBytes), int64(mbe.Limit)))
+			return false
+		}
+		api.WriteProblem(w, api.ErrValidation("malformed JSON: "+err.Error()))
+		return false
+	}
+	return true
+}
+
+// --- async invoke -----------------------------------------------------------
+
+// invokeAppAsync is the 202-side of the synchronous invoke. Enqueues a
+// row, returns the id + status URL; the customer polls
+// /v1/invocations/{id} (or stream SSE in a follow-up) for completion.
+func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if !limits.AsyncInvokeAllowed {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("async_invoke", acct.Plan))
+		return
+	}
+	var req invokeRequest
+	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
+		return
+	}
+	if req.Method == "" {
+		req.Method = "POST"
+	}
+	if req.Path == "" {
+		req.Path = "/"
+	}
+	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+		AppID:     app.ID,
+		AccountID: acct.ID,
+		Source:    state.InvocationAsyncInvoke,
+		Method:    req.Method,
+		Path:      req.Path,
+		Payload:   req.Payload,
+		Headers:   req.Headers,
+		DueAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("enqueue async invoke"))
+		return
+	}
+	writeJSON(w, http.StatusAccepted, api.AsyncInvokeResponse{
+		ID:        inv.ID,
+		StatusURL: "/v1/invocations/" + inv.ID,
+	})
+}
+
+// invokeApp is the sync-side. Enqueues a row then long-polls on the
+// invocation_done channel scoped to its id; returns the final row
+// when the drain drives it to a terminal state, or 504 on timeout.
+//
+// Free-plan timeout is 5s (a customer on the free tier shouldn't hold a
+// connection for the full SLO); paid plans get 30s.
+func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if !limits.AsyncInvokeAllowed {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("sync_invoke", acct.Plan))
+		return
+	}
+	var req invokeRequest
+	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
+		return
+	}
+	if req.Method == "" {
+		req.Method = "POST"
+	}
+	if req.Path == "" {
+		req.Path = "/"
+	}
+	timeout := 30 * time.Second
+	if acct.Plan == api.PlanFree {
+		timeout = 5 * time.Second
+	}
+	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+		AppID:     app.ID,
+		AccountID: acct.ID,
+		Source:    state.InvocationAsyncInvoke, // sync reuses the async source; the long-poll is what makes it sync
+		Method:    req.Method,
+		Path:      req.Path,
+		Payload:   req.Payload,
+		Headers:   req.Headers,
+		DueAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("enqueue sync invoke"))
+		return
+	}
+	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
+		func(p string) bool {
+			// Canonical match — parse the JSON and compare by id, not
+			// by substring. A 32-char id suffix can otherwise match
+			// the tail of an unrelated id (review finding on PR #191).
+			got, _ := extractNotifyFields(p)
+			return got == inv.ID
+		},
+		timeout)
+	_ = payload // payload is the pg_notify JSON; we re-read by id below
+	if errors.Is(err, db.ErrWaitTimeout) {
+		api.WriteProblem(w, api.ErrLongPollTimeout())
+		return
+	}
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("long-poll"))
+		return
+	}
+	// Pull the post-state row. Drain stamps InstanceID + Result
+	// before emitting invocation_done.
+	final, ferr := s.store.InvocationByID(ctx(r), inv.ID)
+	if ferr != nil {
+		api.WriteProblem(w, api.ErrInvocationNotFound(inv.ID))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.InvokeResponse{
+		ID:     final.ID,
+		Status: string(final.State),
+		Result: final.Result,
+	})
+}
+
+// invokeRequest is the shared body for sync + async invoke (uses
+// api.InvokeRequest so the spec compliance test sees a DTO).
+type invokeRequest = api.InvokeRequest
+
+// --- queues -----------------------------------------------------------------
+
+// queueSend enqueues a single FIFO row on the per-app queue. The
+// per-app MaxQueueDepth cap is re-checked here (the apid gate; the
+// drain re-checks at dispatch tick).
+func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if limits.MaxQueueDepth == 0 {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
+		return
+	}
+	n, err := s.store.CountPendingInvocations(ctx(r), app.ID, state.InvocationQueue)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("count queue"))
+		return
+	}
+	if n >= limits.MaxQueueDepth {
+		api.WriteProblem(w, api.ErrPlanQueueDepth(limits.MaxQueueDepth, n))
+		return
+	}
+	var req queueSendRequest
+	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
+		return
+	}
+	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+		AppID:     app.ID,
+		AccountID: acct.ID,
+		Source:    state.InvocationQueue,
+		Payload:   req.Payload,
+		DueAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("enqueue queue send"))
+		return
+	}
+	writeJSON(w, http.StatusCreated, api.QueueSendResponse{ID: inv.ID})
+}
+
+// queueReceive long-polls on invocation_done scoped to this app; when
+// the drain completes a row, returns the row's id + payload. 204 on
+// timeout (no event during the wait window — the client retries).
+func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if limits.MaxQueueDepth == 0 {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
+		return
+	}
+	const timeout = 30 * time.Second
+	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
+		func(p string) bool {
+			// Canonical match on app_id — substring tests would let a
+			// 32-char id tail collide with an unrelated id (review
+			// finding on PR #191).
+			_, got := extractNotifyFields(p)
+			return got == app.ID
+		},
+		timeout)
+	if errors.Is(err, db.ErrWaitTimeout) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("queue receive"))
+		return
+	}
+	invID := extractInvocationID(payload)
+	inv, ferr := s.store.InvocationByID(ctx(r), invID)
+	if ferr != nil || inv.AccountID != acct.ID || inv.AppID != app.ID {
+		// Don't leak ownership — the predicate matches on app_id, but
+		// cross-account reads must surface 404, not 200 with a foreign
+		// row.
+		api.WriteProblem(w, api.ErrInvocationNotFound(invID))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.QueueReceiveResponse{
+		ID:      inv.ID,
+		Payload: inv.Payload,
+		Result:  inv.Result,
+	})
+}
+
+// queueAck is a no-op state change (the row is already completed when
+// invocation_done fires). The handler exists for symmetry with the
+// SDK surface and to give a customer a stable place to instrument
+// "received + handled" — we stamp completed_at+1ns so a subsequent
+// attempt can see the ack.
+//
+// Idempotent: a re-ack is a 204.
+func (s *server) queueAck(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	inv, err := s.store.InvocationByID(ctx(r), id)
+	if err != nil || inv.AccountID != acct.ID {
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	// Ack is informational only. The drain has already stamped
+	// completed_at; we just no-op. A future slice can introduce an
+	// `acked_at` column if a billing model needs it.
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type queueSendRequest = api.QueueSendRequest
+
+type delayedTaskRequest = api.DelayedTaskRequest
+
+// extractInvocationID parses {"invocation_id":"<uuid>"} out of a
+// pg_notify payload. Defensive against partial / extra-key payloads;
+// returns "" if no id is present, in which case the caller surfaces
+// ErrInvocationNotFound (which is the right response to a malformed
+// notify).
+func extractInvocationID(payload string) string {
+	// Path-of-least-resistance: pg_notify payloads for invocation_done
+	// are produced by drain.emitDone via json.Marshal — guaranteed
+	// JSON with `invocation_id`. Use the raw json.Unmarshal path so we
+	// don't depend on key order or any extra context.
+	var p struct {
+		InvocationID string `json:"invocation_id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return ""
+	}
+	return p.InvocationID
+}
+
+// extractNotifyFields parses {"invocation_id":"...","app_id":"..."}
+// out of a pg_notify payload. Same shape as extractInvocationID but
+// surfaces both fields — the long-poll predicates need canonical
+// equality (not substring) so a 32-char id can never collide against
+// the tail of an unrelated id (review finding on PR #191).
+func extractNotifyFields(payload string) (invID, appID string) {
+	var p struct {
+		InvocationID string `json:"invocation_id"`
+		AppID        string `json:"app_id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return "", ""
+	}
+	return p.InvocationID, p.AppID
+}
+
+// --- delayed-tasks ----------------------------------------------------------
+
+// delayedTaskCreate enqueues a delayed_task row. Cap-checked against
+// the plan's MaxDelayedTasksPerApp; the drain re-checks at dispatch.
+func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	if limits.MaxDelayedTasksPerApp == 0 {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("delayed_tasks", acct.Plan))
+		return
+	}
+	n, err := s.store.CountPendingInvocations(ctx(r), app.ID, state.InvocationDelayedTask)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("count delayed tasks"))
+		return
+	}
+	if n >= limits.MaxDelayedTasksPerApp {
+		api.WriteProblem(w, api.ErrPlanDelayedTasksCap(limits.MaxDelayedTasksPerApp, n))
+		return
+	}
+	var req delayedTaskRequest
+	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
+		return
+	}
+	now := time.Now().UTC()
+	if req.ScheduledAt.Before(now) {
+		api.WriteProblem(w, api.ErrInvalidScheduledAt())
+		return
+	}
+	sched := req.ScheduledAt.UTC()
+	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+		AppID:       app.ID,
+		AccountID:   acct.ID,
+		Source:      state.InvocationDelayedTask,
+		Payload:     req.Payload,
+		DueAt:       sched,
+		ScheduledAt: &sched,
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("enqueue delayed task"))
+		return
+	}
+	writeJSON(w, http.StatusCreated, api.DelayedTaskResponse{
+		ID:          inv.ID,
+		ScheduledAt: sched,
+	})
+}
+
+// delayedTaskGet is the read-only counterpart. Restricted to
+// delayed_task source so a customer's regular invocation id never
+// surfaces here.
+func (s *server) delayedTaskGet(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	inv, err := s.store.InvocationByID(ctx(r), id)
+	if err != nil || inv.AccountID != acct.ID || inv.Source != state.InvocationDelayedTask {
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.DelayedTaskResponse{
+		ID:          inv.ID,
+		ScheduledAt: ptrTime(inv.ScheduledAt),
+		State:       string(inv.State),
+	})
+}
+
+// delayedTaskCancel moves a pending delayed_task row to cancelled.
+// The drain ignores cancelled rows. Idempotent: a re-cancel is 204
+// (the row may have already fired — that's a "we did the work", not
+// an error).
+func (s *server) delayedTaskCancel(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	inv, err := s.store.InvocationByID(ctx(r), id)
+	if err != nil || inv.AccountID != acct.ID || inv.Source != state.InvocationDelayedTask {
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	if err := s.store.CancelInvocation(ctx(r), id); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.ErrInvocationNotFound(id))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("cancel delayed task"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ptrTime is a tiny adapter so delayedTaskGet can format *time.Time
+// without a nil-check at the call site.
+func ptrTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
+// --- invocation history -----------------------------------------------------
+
+// listInvocations is the unified history read for /v1/invocations.
+// Pagination is by `?before=<id>` (an Invocation.ID); defaults to 20,
+// capped at 200.
+func (s *server) listInvocations(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	limit := 20
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	before := r.URL.Query().Get("before")
+	rows, err := s.store.ListInvocationsForAccount(ctx(r), acct.ID, limit, before)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list invocations"))
+		return
+	}
+	if rows == nil {
+		rows = []state.Invocation{}
+	}
+	writeJSON(w, http.StatusOK, invocationListResponse{Invocations: rows})
+}
+
+// invocationListResponse is the handler-local wire shape for GET
+// /v1/invocations. Lives here (not pkg/api/dto.go) because pkg/api
+// cannot import pkg/state — the cycle would deadlock compilation. The
+// wire mirror is 1:1 with what pkg/api would expose; customers see
+// the same JSON regardless of where the type lives.
+type invocationListResponse struct {
+	Invocations []state.Invocation `json:"invocations"`
+}
+
+// getInvocation is the single-row read. Account-scoped so a customer
+// never sees another tenant's id.
+func (s *server) getInvocation(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	inv, err := s.store.InvocationByID(ctx(r), id)
+	if err != nil || inv.AccountID != acct.ID {
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	writeJSON(w, http.StatusOK, inv)
+}

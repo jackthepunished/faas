@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -359,3 +360,109 @@ func TestDrain_ReTickIsIdempotent(t *testing.T) {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestDrain_DefersSuspendedAccount pins Move 2's per-app
+// suspended-account gate. A row queued while the account was Active
+// must NOT be dispatched if the account has flipped to suspended in
+// the meantime — the drain must defer (state=pending, due_at +5m,
+// last_error contains "suspended") instead of waking and waking up
+// a stopped customer's instance.
+//
+// Without the gate, the drain would happily wake the instance,
+// trigger the wake gate, and bill a row that should never have run.
+func TestDrain_DefersSuspendedAccount(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d, store, _, _, ds := newDrainHarness(t, api.PlanHobby, true)
+
+	// Pull the seeded account, flip it to suspended.
+	apps, err := store.ListAllApps(ctx)
+	if err != nil || len(apps) == 0 {
+		t.Fatalf("ListAllApps: %v / %d apps", err, len(apps))
+	}
+	app := apps[0]
+	if err := store.UpdateAccountStatus(ctx, app.AccountID, state.AccountSuspended); err != nil {
+		t.Fatalf("UpdateAccountStatus: %v", err)
+	}
+
+	// Seed a queue row that's due now.
+	inv := seedDrainInvocation(t, store, state.InvocationQueue)
+
+	d.Tick(ctx)
+
+	// Synth must not be reached.
+	if got := ds.calls.Load(); got != 0 {
+		t.Errorf("synth calls = %d, want 0 (suspended account must not dispatch)", got)
+	}
+	got, err := store.InvocationByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("InvocationByID: %v", err)
+	}
+	// Row should be back in pending with a future due_at + a last_error.
+	if got.State != state.InvocationPending {
+		t.Errorf("state = %q, want pending (deferred)", got.State)
+	}
+	if !got.DueAt.After(time.Now().Add(4 * time.Minute)) {
+		t.Errorf("due_at = %s, want >= now+4m (5m backoff)", got.DueAt)
+	}
+	if !strings.Contains(got.LastError, "suspended") {
+		t.Errorf("last_error = %q, want contains 'suspended'", got.LastError)
+	}
+}
+
+// TestDrain_ReactivatesAfterSuspension pins the cache's expiry:
+// after the suspended-account gate defers a row, the next tick (after
+// the 5s cache TTL + the 5m suspended-backoff) must dispatch when the
+// account is reactivated. This is the "reactivation lands within a SLO"
+// property the drain's acctCache TTL is sized for.
+func TestDrain_ReactivatesAfterSuspension(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// Use a fixed clock so the acctCache TTL is deterministic.
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := &atomic.Pointer[time.Time]{}
+	clock.Store(&now)
+	d, store, _, _, ds := newDrainHarness(t, api.PlanHobby, true)
+	d.now = func() time.Time { return *clock.Load() }
+	// (the accts cache was constructed with the original now; rebuild it
+	// to ride the new clock — DrainOption-driven tests do this via
+	// WithDrainNow, but that runs before the cache is built; the cache
+	// captures d.now at construction, so we rewire inline.)
+	d.accts = newAcctCache(d.now)
+
+	// Suspend + seed.
+	apps, _ := store.ListAllApps(ctx)
+	app := apps[0]
+	if err := store.UpdateAccountStatus(ctx, app.AccountID, state.AccountSuspended); err != nil {
+		t.Fatalf("UpdateAccountStatus: %v", err)
+	}
+	inv := seedDrainInvocation(t, store, state.InvocationQueue)
+
+	// Tick 1: suspended → defer.
+	d.Tick(ctx)
+	if got := ds.calls.Load(); got != 0 {
+		t.Fatalf("tick 1 synth calls = %d, want 0 (suspended)", got)
+	}
+	// Mark the row's due_at future-dated so the next tick picks it up
+	// after reactivation.
+	if err := store.FailInvocation(ctx, inv.ID, "manual: reset for reactivation test", 1*time.Millisecond); err != nil {
+		// FailInvocation may set retryAfter=0 → failed; we want pending.
+		// If it set failed, force a re-issue via EnqueueInvocation.
+		_, _ = store.EnqueueInvocation(ctx, inv)
+	}
+
+	// Reactivate the account.
+	if err := store.UpdateAccountStatus(ctx, app.AccountID, state.AccountActive); err != nil {
+		t.Fatalf("re-activate: %v", err)
+	}
+	// Advance the clock past the acctCache TTL so the new Active read
+	// is not cached.
+	adv := now.Add(10 * time.Second)
+	clock.Store(&adv)
+
+	// Tick 2: account is now Active, cache expired, row is due → dispatch.
+	d.Tick(ctx)
+	if got := ds.calls.Load(); got != 1 {
+		t.Errorf("tick 2 synth calls = %d, want 1 (reactivated)", got)
+	}
+}

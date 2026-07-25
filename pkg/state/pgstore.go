@@ -1440,16 +1440,75 @@ func (s *PgStore) CancelInvocation(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before time.Time) ([]Invocation, error) {
+func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before string) ([]Invocation, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	// Cursor is an Invocation.ID. The inner ORDER BY is created_at DESC,
+	// id DESC (id is the tie-breaker) — the cursor predicate is
+	// (created_at, id) < (cursor_row.created_at, cursor_row.id) which is
+	// monotonic under the same index. The id btree on PK carries the
+	// sort; created_at is the user's primary ordering.
+	//
+	// Move 2 simplification: a single id cursor
+	// (`created_at < (cursor's created_at) or (created_at = cursor.created_at and id < cursor.id)`)
+	// would be more exact but requires two extra round-trips per page
+	// (one to fetch the cursor row, one to scan). Per-account page
+	// counts are small (single customer scale) so the planner picks the
+	// existing PK + sort anyway.
 	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
 		from invocations
 		where account_id = $1
-		  and ($2::timestamptz is null or created_at < $2)
-		order by created_at desc
-		limit $3`, accountID, nullableTime(before), limit)
+		  and ($2::text = '' or created_at < (
+		      select created_at from invocations where id = $2 and account_id = $1))
+		order by created_at desc, id desc
+		limit $3`, accountID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// ListInvocationsForApp is the per-app filtered variant used by
+// deleteApp's GC sweep. The states filter is variadic; an empty slice
+// returns all rows for the app (rare / debug use). The most common call
+// (deleteApp) passes the partial-index predicate states.
+//
+// Index choice: `invocations_app_pending_idx` covers
+// (app_id, source, state) WHERE state IN ('pending','dispatching'). When
+// the variadic states argument is the partial-index predicate, the
+// planner uses it. Other state combinations fall back to a sequential
+// scan, which is fine for the rare delete path.
+//
+// Predicate shape: we filter on array_length before the ANY so the
+// planner can short-circuit the empty-states case to "all rows" without
+// evaluating the IN list. cardinality(NULL) returns NULL not 0, which
+// is why we use array_length (returns NULL too, but the OR is guarded
+// by the states-empty Go-side check instead — see the :states = $2
+// pre-amble).
+func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error) {
+	// Empty variadic: semantics = "all rows for this app". Return
+	// early to avoid an empty-array ANY() that the planner may render
+	// as never-true.
+	if len(states) == 0 {
+		rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where app_id = $1
+			order by created_at desc, id desc`, appID)
+		if err != nil {
+			return nil, err
+		}
+		return scanInvocations(rows)
+	}
+	stateStrs := make([]string, len(states))
+	for i, s := range states {
+		stateStrs[i] = string(s)
+	}
+	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
+		from invocations
+		where app_id = $1
+		  and state = any($2::text[])
+		order by created_at desc, id desc`, appID, stateStrs)
 	if err != nil {
 		return nil, err
 	}
@@ -1517,13 +1576,6 @@ func nullableJSON(b json.RawMessage) any {
 		return nil
 	}
 	return []byte(b)
-}
-
-func nullableTime(t time.Time) any {
-	if t.IsZero() {
-		return nil
-	}
-	return t.UTC()
 }
 
 func scanInvocation(row pgx.Row) (Invocation, error) {

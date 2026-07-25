@@ -32,6 +32,12 @@ func (n *recordingNotifier) Notify(_ context.Context, _, payload string) error {
 func (n *recordingNotifier) Subscribe(_ context.Context, chs []string) (<-chan db.Notification, func(), error) {
 	return n.out, func() {}, nil
 }
+func (n *recordingNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) bool, _ time.Duration) (string, error) {
+	// recordingNotifier is used by SSE-path tests that don't exercise
+	// the long-poll surface; return ErrWaitTimeout so a queueReceive
+	// call degrades to a clean 204 instead of hanging.
+	return "", db.ErrWaitTimeout
+}
 func (n *recordingNotifier) publish(channel, payload string) {
 	n.out <- db.Notification{Channel: channel, Payload: payload}
 }

@@ -115,6 +115,20 @@ var methodRouteMap = map[string]string{
 	"POST /v1/domains":                     "CreateDomain",
 	"GET /v1/keys":                         "ListKeys",
 	"POST /v1/keys":                        "CreateKey",
+	// Move 2 routes — the auto-derivation produces names with literal
+	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
+	// the k8s-style hyphen; the explicit map below drops the hyphen and
+	// conforms to the SDK's flat resource naming.
+	"POST /v1/apps/{slug}/invoke":          "InvokeApp",
+	"POST /v1/apps/{slug}/invoke/async":    "InvokeAppAsync",
+	"POST /v1/apps/{slug}/queues/send":     "QueueSend",
+	"POST /v1/apps/{slug}/queues/receive":  "QueueReceive",
+	"POST /v1/apps/{slug}/queues/{id}/ack": "AckQueueRow",
+	"POST /v1/apps/{slug}/delayed-tasks":   "CreateDelayedTask",
+	"GET /v1/delayed-tasks/{id}":           "GetDelayedTask",
+	"DELETE /v1/delayed-tasks/{id}":        "CancelDelayedTask",
+	"GET /v1/invocations":                  "ListInvocations",
+	"GET /v1/invocations/{id}":             "GetInvocation",
 }
 
 func main() {

@@ -187,6 +187,28 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if !ok {
 		return
 	}
+	// Move 2: GC pending invocations for this app BEFORE the row goes
+	// away. Without this, a delayed_task can fire after deleteApp and
+	// the drain is forced to log a permanent-wake error on a row the
+	// customer has already given up on. CancelInvocation is a no-op on
+	// terminal rows (returns state.ErrNotFound) so dispatching /
+	// completed rows are untouched.
+	pending, err := s.store.ListInvocationsForApp(ctx(r), app.ID,
+		state.InvocationPending, state.InvocationDispatching)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list-inv"))
+		return
+	}
+	for _, inv := range pending {
+		if err := s.store.CancelInvocation(ctx(r), inv.ID); err != nil && !errors.Is(err, state.ErrNotFound) {
+			// Don't fail the delete on a per-row cancel error; the
+			// drain will surface the row as failed and the customer
+			// sees it in the meter. Logging at warn so it's
+			// observable.
+			s.log.Warn("deleteApp: cancel invocation",
+				"inv", inv.ID, "app", app.ID, "err", err)
+		}
+	}
 	if err := s.store.DeleteApp(ctx(r), app.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete app"))
 		return
