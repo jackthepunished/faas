@@ -694,6 +694,13 @@ func TestEngineSeedLedger(t *testing.T) {
 // before the test gives up. After the Wake fails, the ledger is
 // released and the instance row is FAILED.
 func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
+	// t.Parallel: this test and TestEnginePrime_VMMDDeadlineEnforced each
+	// block on a real 35s timer, and together they were the long pole of
+	// the whole `make test` run (70s of the package's 74.5s). They share
+	// nothing — own MemStore, own NodeLedger, own Engine — so running
+	// them concurrently halves the wait.
+	t.Parallel()
+
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
 	// Cold-boot path: no snapshot, initState = COLD_BOOTING, so the
@@ -714,7 +721,13 @@ func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Wake err = %v, want context.DeadlineExceeded", err)
 	}
-	if elapsed > ColdBootTimeout+2*time.Second {
+	// Slack is 4s rather than 2s because this test is now parallel: on a
+	// saturated 2-4 vCPU runner the post-deadline unwind (ledger release,
+	// FAILED write) queues behind other parallel tests. The assertion's
+	// job is to prove the budget is enforced at all — the fake sleeps 2×
+	// ColdBootTimeout (70s), so anything under that is a real signal and
+	// the extra 2s does not weaken the gate.
+	if elapsed > ColdBootTimeout+4*time.Second {
 		t.Errorf("Wake took %v, want ≤ ColdBootTimeout (35s) + slack", elapsed)
 	}
 	if got := e.Ledger().ResidentRAM(); got != 0 {
@@ -732,6 +745,9 @@ func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
 // RUNNING → SNAPSHOTTING → PARKED on success, but a hung vmmd should
 // leave the row FAILED with no reservation.
 func TestEnginePrime_VMMDDeadlineEnforced(t *testing.T) {
+	// t.Parallel: see TestEngineWake_VMMDColdBootDeadlineEnforced.
+	t.Parallel()
+
 	store := state.NewMemStore()
 	_, app, dep := seedApp(t, store, api.PlanHobby, 256, 2)
 	vmm := &fakeVMM{sleepFor: 2 * ColdBootTimeout}
