@@ -472,9 +472,27 @@ func (s *server) handler() http.Handler {
 	// cookie flow works without an API-key round trip.
 	mux.Handle("GET /v1/events", s.dashboardChain(s.eventsHandler(s.log)))
 
-	// Google OAuth 2.0 Auth
-	mux.HandleFunc("GET /v1/auth/google", s.renderGoogleAuthRedirect)
-	mux.HandleFunc("GET /v1/auth/google/callback", s.handleGoogleOAuthCallback)
+	// Google OAuth 2.0 Auth (issue #165 PR #2, ADR-032). Routes
+	// share the dashboard auth bucket so the §11 10/min/IP budget
+	// applies to the OAuth flow as well as the password form.
+	mux.Handle("GET /v1/auth/google", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.renderGoogleAuthRedirect)))
+	mux.Handle("GET /v1/auth/google/callback", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.handleGoogleOAuthCallback)))
+
+	// GitHub OAuth dashboard login (issue #165 PR #2, ADR-032).
+	// Not the same as /oauth/callback (the GitHub App install-bind
+	// flow at handlers_oauth.go). Shares the dashboard auth bucket
+	// with the other auth entrypoints so brute-force can't isolate
+	// one provider's flow.
+	mux.Handle("GET /v1/auth/github", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.renderGitHubAuthRedirect)))
+	mux.Handle("GET /v1/auth/github/callback", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.handleGitHubOAuthCallback)))
 
 	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd's
 	// /dashboard/* reverse-proxy (spec §11 single-public-listener).
@@ -493,9 +511,35 @@ func (s *server) handler() http.Handler {
 		// would miss the brute-force signal. Count every attempt instead.
 		CountStatuses: []int{middleware.CountEveryAttempt},
 	}, http.HandlerFunc(auth.renderLoginForm)))
+	// PR #2 (issue #165) replaces the X-Dashboard-Key fallback path
+	// with email + password (Argon2id). The new postLoginEmail wires
+	// the spec §11 anti-enumeration pad against the same
+	// dashboardAuthLimiter as the rest of the auth surface — a
+	// brute-force on /login (password path) burns the same bucket as
+	// /signup, /login/forgot, /v1/auth/google, and /v1/auth/github.
 	mux.Handle("POST /login", s.dashboardAuthChain(middleware.AuthLimitConfig{
 		CountStatuses: []int{middleware.CountEveryAttempt},
-	}, http.HandlerFunc(auth.postLogin)))
+	}, http.HandlerFunc(s.postLoginEmail)))
+	mux.Handle("POST /signup", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.postSignup)))
+	mux.Handle("POST /login/forgot", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.postForgotPassword)))
+	mux.Handle("GET /auth/reset", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		// 410 on invalid/expired token; count every attempt so an
+		// attacker can't enumerate token shapes faster than the
+		// §11 budget.
+		CountStatuses: []int{middleware.CountEveryAttempt, http.StatusGone},
+	}, http.HandlerFunc(s.renderResetForm)))
+	mux.Handle("POST /auth/reset", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt, http.StatusGone},
+	}, http.HandlerFunc(s.postReset)))
+	// POST /dashboard/account/set-password is the authed opt-in for
+	// OAuth-only customers. Behind sessionAuth so the call is anchored
+	// to a known account. NOT behind the auth-bucket — the call only
+	// succeeds when the customer already holds a session.
+	mux.Handle("POST /dashboard/account/set-password", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.postSetPassword))))
 	mux.Handle("GET /auth/verify", s.dashboardAuthChain(middleware.AuthLimitConfig{
 		// /auth/verify 401s on unknown tokens AND 410s on consumed tokens;
 		// count both so an attacker can't cycle through one-time tokens

@@ -520,6 +520,72 @@ func (c *Client) ExchangeCliAuthCode(ctx context.Context, code string) (CliAuthE
 		CliAuthExchangeRequest{Code: code}, &out)
 }
 
+// Dashboard auth (issue #165, ADR-032 PR #2). The SDK uses these
+// against a tokenless Client (NewClient returns one with token="");
+// the auth flows issue a session cookie but the SDK does not consume
+// it — the dashboard cookie is the only auth artifact on the browser
+// side. Programmatic auth stays on the device-code flow above, where
+// the customer can mint a real api_key via the dashboard after
+// signing in.
+//
+// PasswordSignup creates an account (if the email is unbound) and
+// signs the caller in. The same response shape as PasswordLogin:
+// {account_id, plan}, no api_key. Anti-enumeration: a colliding
+// signup attempt returns 401 invalid_credentials, not 409 — the
+// SDK and the CLI render the same generic "sign in failed" copy.
+func (c *Client) PasswordSignup(ctx context.Context, email, password string) (PasswordLoginResponse, error) {
+	var out PasswordLoginResponse
+	return out, c.do(ctx, "POST", "/signup",
+		PasswordSignupRequest{Email: email, Password: password}, &out)
+}
+
+// PasswordLogin signs the caller in with email + password. The
+// success response does NOT carry an API key — the session cookie is
+// the only auth artifact. The SDK does not consume the cookie; the
+// caller is expected to follow the 302 redirect or to exchange the
+// session via the device-code flow for API access.
+func (c *Client) PasswordLogin(ctx context.Context, email, password string) (PasswordLoginResponse, error) {
+	var out PasswordLoginResponse
+	return out, c.do(ctx, "POST", "/login",
+		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// RequestPasswordReset mints a password-reset email. The server
+// always returns 200 with an identical body regardless of whether the
+// email is bound to an account, so the surface does not leak account
+// presence. The full reset URL is sent via the platform's mailer
+// (recorded in mail_wiring_test.go); the SDK caller never sees the
+// token.
+func (c *Client) RequestPasswordReset(ctx context.Context, email string) error {
+	return c.do(ctx, "POST", "/login/forgot",
+		PasswordResetRequest{Email: email}, nil)
+}
+
+// ConfirmPasswordReset consumes a one-shot reset token and sets the
+// new password. The token is the base64url-encoded value from the
+// email link (NOT the SHA-256 hash the server stored). A replay
+// (already-consumed token) returns 410 reset_token_invalid.
+func (c *Client) ConfirmPasswordReset(ctx context.Context, token, newPassword string) error {
+	return c.do(ctx, "POST", "/auth/reset",
+		PasswordResetConfirm{Token: token, NewPassword: newPassword}, nil)
+}
+
+// SetPassword updates the password on the currently authenticated
+// account. Reachable only after Bearer auth (the dashboard session
+// cookie is interchangeable with the bearer token via
+// sessionAuthFor). Used by OAuth-only customers to opt into password
+// login.
+func (c *Client) SetPassword(ctx context.Context, password string) error {
+	return c.do(ctx, "POST", "/dashboard/account/set-password",
+		SetPasswordRequest{Password: password}, nil)
+}
+
+// Logout clears the dashboard session. Idempotent — clearing a
+// non-existent session is a no-op.
+func (c *Client) Logout(ctx context.Context) error {
+	return c.do(ctx, "POST", "/logout", nil, nil)
+}
+
 // Secrets (spec §11/G2). Plaintext VALUE never leaves the caller
 // except via SetSecret's body.
 func (c *Client) ListSecrets(ctx context.Context, slug string) (AppSecretListResponse, error) {
