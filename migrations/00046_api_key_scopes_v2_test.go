@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Backfill-semantics test for migration 00045 (IAM-1 / ADR-034 rev2).
+// Backfill-semantics test for migration 00046 (IAM-1 / ADR-034 rev2).
 //
 // Asserts:
 //
@@ -8,7 +8,7 @@
 //      (admin→admin, read→{apps:read,usage:read,secrets:read},
 //      write→{deploy:write,secrets:write}, union when both).
 //
-//   2. The CHECK constraint added by 00045 rejects an INSERT with an
+//   2. The CHECK constraint added by 00046 rejects an INSERT with an
 //      out-of-vocabulary scope.
 //
 //   3. Three `key.scopes_changed` audit rows landed with the right
@@ -31,11 +31,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00045_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
+func TestMigrations_00046_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply the full migration set including 00045. The backfill
+	// (1) Apply the full migration set including 00046. The backfill
 	// has already run as part of the apply; we'll insert four legacy
 	// rows directly so the test can exercise the BEFORE state without
 	// fighting the order of operations (the apply-set runs once per
@@ -45,7 +45,7 @@ func TestMigrations_00045_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 	}
 
 	// (2) Seed the four legacy rows.
-	const acctID = "00000000-0000-0000-0000-000000000045"
+	const acctID = "00000000-0000-0000-0000-000000000046"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
 		values ($1, 'iam1@example.com', 'hobby', now())
@@ -64,7 +64,7 @@ func TestMigrations_00045_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 		{"aaa3", []string{"write"}},
 		{"aaa4", []string{"read", "write", "admin"}},
 	}
-	// (3) Now disable the constraint (added by 00045) so the
+	// (3) Now disable the constraint (added by 00046) so the
 	// pre-migration `{read}` and `{write}` rows can be seeded. The
 	// backfill CTE is exactly what we're testing here — we don't
 	// want the constraint to filter them out at INSERT time. We do
@@ -85,7 +85,7 @@ func TestMigrations_00045_APIKeyScopesV2_BackfillAndCheck(t *testing.T) {
 			t.Fatalf("seed %s: %v", s.hashHex, err)
 		}
 	}
-	// Apply the backfill CTE literally (mirrors migrations/00045.sql).
+	// Apply the backfill CTE literally (mirrors migrations/00046.sql).
 	if _, err := pool.Exec(ctx, `
 		WITH snapshot AS (
 		    SELECT id, account_id, scopes AS old_scopes
