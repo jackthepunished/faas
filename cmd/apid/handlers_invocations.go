@@ -16,7 +16,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -149,7 +148,13 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
-		func(p string) bool { return strings.Contains(p, inv.ID) },
+		func(p string) bool {
+			// Canonical match — parse the JSON and compare by id, not
+			// by substring. A 32-char id suffix can otherwise match
+			// the tail of an unrelated id (review finding on PR #191).
+			got, _ := extractNotifyFields(p)
+			return got == inv.ID
+		},
 		timeout)
 	_ = payload // payload is the pg_notify JSON; we re-read by id below
 	if errors.Is(err, db.ErrWaitTimeout) {
@@ -235,7 +240,13 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 	}
 	const timeout = 30 * time.Second
 	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
-		func(p string) bool { return strings.Contains(p, app.ID) },
+		func(p string) bool {
+			// Canonical match on app_id — substring tests would let a
+			// 32-char id tail collide with an unrelated id (review
+			// finding on PR #191).
+			_, got := extractNotifyFields(p)
+			return got == app.ID
+		},
 		timeout)
 	if errors.Is(err, db.ErrWaitTimeout) {
 		w.WriteHeader(http.StatusNoContent)
@@ -302,6 +313,22 @@ func extractInvocationID(payload string) string {
 		return ""
 	}
 	return p.InvocationID
+}
+
+// extractNotifyFields parses {"invocation_id":"...","app_id":"..."}
+// out of a pg_notify payload. Same shape as extractInvocationID but
+// surfaces both fields — the long-poll predicates need canonical
+// equality (not substring) so a 32-char id can never collide against
+// the tail of an unrelated id (review finding on PR #191).
+func extractNotifyFields(payload string) (invID, appID string) {
+	var p struct {
+		InvocationID string `json:"invocation_id"`
+		AppID        string `json:"app_id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return "", ""
+	}
+	return p.InvocationID, p.AppID
 }
 
 // --- delayed-tasks ----------------------------------------------------------

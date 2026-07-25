@@ -193,17 +193,8 @@ func p50(durs []time.Duration) time.Duration {
 	return cp[len(cp)/2]
 }
 
-// unlimitedLimiter returns a Limiter whose Allow always returns true. The
-// 1k rps load test must NOT be constrained by the PlanPro default of
-// 100 rps / 500 burst that newTestHandler installs — that would 429 ~half
-// of phase B and skew measurements toward the fast 429 path.
-//
-// Production never calls WithNoop; it's a test seam guarded by a doc
-// comment. The `noop` field itself is unexported so accidental misuse is
-// a compile error.
-func unlimitedLimiter() *Limiter {
-	return NewLimiter().WithNoop()
-}
+// unlimitedLimiter is defined in limiters_test.go (non-load-tagged so
+// both handler_test.go and handler_load_test.go can share it).
 
 // Compile-time guard: catch accidental drift between api.LimitsFor and the
 // handler_test default. PlanPro's burst should be ≥ 100 so TestRateLimitReturns429

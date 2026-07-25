@@ -174,6 +174,27 @@ func (f *fakeRegistry) handleV2(w http.ResponseWriter, r *http.Request) {
 		// body. Use a stable per-request UUID so the Location header
 		// is a path the same mux can dispatch (no second handler
 		// registration; the /v2/ switch above also matches PUTs).
+		// Idempotent: if the blob is already stored (e.g. from a 401-retry
+		// re-POST after a successful PUT), return 202 without re-consuming body.
+		f.mu.Lock()
+		_, alreadyStored := f.blobs[digest]
+		if !alreadyStored {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4<<30))
+			if err != nil {
+				f.mu.Unlock()
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			sum := sha256.Sum256(body)
+			got := "sha256:" + hex.EncodeToString(sum[:])
+			if got != digest {
+				f.mu.Unlock()
+				http.Error(w, fmt.Sprintf("digest mismatch: want %s got %s", digest, got), http.StatusBadRequest)
+				return
+			}
+			f.blobs[digest] = body
+		}
+		f.mu.Unlock()
 		uploadID := fmt.Sprintf("upload-%d", time.Now().UnixNano())
 		w.Header().Set("Location", fmt.Sprintf("%s/v2/%s/blobs/uploads/%s", f.srv.URL, extractRepoFromUploadPath(path), uploadID))
 		w.WriteHeader(http.StatusAccepted)

@@ -93,6 +93,26 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 	return scanAccount(row)
 }
 
+// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used by
+// the post-login audit log (cmd/apid/handlers_auth.go) so an operator
+// investigating "who signed in as alice?" can identify which key
+// authenticated. Returns ErrNotFound when no row matches. Same O(log n)
+// index-backed lookup as AccountByKeyHash — same key_sha256 UNIQUE
+// constraint in migrations/00001_init.sql.
+func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`select id, account_id, key_sha256, coalesce(label,''), created_at
+		 from api_keys where key_sha256 = $1`, hash)
+	k := APIKey{}
+	if err := row.Scan(&k.ID, &k.AccountID, &k.Hash, &k.Label, &k.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return APIKey{}, ErrNotFound
+		}
+		return APIKey{}, mapErr(err)
+	}
+	return k, nil
+}
+
 func (s *PgStore) UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error {
 	_, err := s.pool.Exec(ctx, `update accounts set plan = $2 where id = $1`, id, string(plan))
 	return err
@@ -147,6 +167,32 @@ func (s *PgStore) AccountByStripeCustomerID(ctx context.Context, stripeCustomerI
 		 from accounts where stripe_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
+}
+
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
+// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// reused (ADR-025 — column rename is a separate migration PR), so the
+// underlying UPDATE is identical; the dedicated method name keeps the
+// Paddle call sites self-documenting.
+func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts set stripe_customer_id = $2 where id = $1`,
+		id, paddleCustomerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AccountByPaddleCustomerID is the reverse-lookup the Paddle webhook
+// uses to find the account behind a `customer_id` field. Same column
+// as the Stripe path (the rename is a separate PR per ADR-025); the
+// dedicated method name keeps the Paddle call sites self-documenting.
+func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
+	return s.AccountByStripeCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts returns every account. Meterd walks this on the quota
@@ -2553,6 +2599,34 @@ func (s *PgStore) RecordStripePushHour(ctx context.Context, accountID string, ho
 	return err
 }
 
+// HasPaddleOverageMonth is the dedupe gate the meterd daily pusher
+// reads before issuing the Paddle CreateTransaction POST. Backed by
+// a unique index on (account_id, month) in the paddle_overage_dedupe
+// table (added in migration 00034). `month` is a calendar-month
+// start — the caller (pkg/billing/paddle/usage.go calendarMonthStart)
+// is responsible for normalising to the 1st of the month at 00:00 UTC.
+func (s *PgStore) HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from paddle_overage_dedupe where account_id = $1 and month = $2)`,
+		accountID, month.UTC()).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// RecordPaddleOverageMonth inserts the dedupe row. ON CONFLICT DO
+// NOTHING so a redelivered (account, month) is idempotent — same shape
+// as RecordStripePushHour one method above.
+func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into paddle_overage_dedupe (account_id, month) values ($1, $2)
+		 on conflict (account_id, month) do nothing`,
+		accountID, month.UTC())
+	return err
+}
+
 // --- idempotency -------------------------------------------------------------
 
 func (s *PgStore) GetIdempotent(ctx context.Context, accountID, key string) (int, []byte, error) {
@@ -2989,9 +3063,9 @@ func cidrPrefixesToArray(prefixes []netip.Prefix) string {
 // On any parse failure we return an empty slice and rely on the caller
 // to fail loud — none of the consumers silently swallow a malformed
 // allowlist because (a) the API layer validates each entry with
-// netip.ParsePrefix before insert, and (b) the schema CHECK
-// (apps_egress_allowlist_v4_only) rejects bogus entries at the DB.
-// Defensive parse is belt-and-braces, not load-bearing.
+// netip.ParsePrefix before insert, and (b) the DB trigger
+// (apps_egress_allowlist_cidr, migration 00033) rejects bogus entries
+// at the schema. Defensive parse is belt-and-braces, not load-bearing.
 func cidrTextToPrefixes(text string) []netip.Prefix {
 	text = strings.TrimSpace(text)
 	if text == "{}" || text == "" {

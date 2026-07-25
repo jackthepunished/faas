@@ -26,6 +26,15 @@ type stripePushKey struct {
 	hour      time.Time
 }
 
+// paddleOverageKey is the (account, month) dedupe key the daily Paddle
+// overage pusher uses; declared above MemStore so the struct field
+// below can reference it. `month` is the calendar-month start
+// (calendarMonthStart in pkg/billing/paddle/usage.go).
+type paddleOverageKey struct {
+	accountID string
+	month     time.Time
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -34,7 +43,7 @@ type MemStore struct {
 	mu        sync.Mutex
 	accounts  map[string]Account
 	keys      map[string]APIKey
-	keyByHash map[string]string
+	keyByHash map[string]APIKey
 	apps      map[string]App
 	// githubBindings is keyed by appID. Holds the (install_id,
 	// repo_full_name, production_branch) tuple the /oauth/callback
@@ -91,6 +100,11 @@ type MemStore struct {
 	// Stripe pusher has already pushed; prevents double-billing on
 	// redelivery.
 	stripePushHours map[stripePushKey]struct{}
+	// paddleOverageMonths tracks which (account, month) pairs the daily
+	// Paddle overage pusher has already flushed; same role as
+	// stripePushHours but at the calendar-month grain because the
+	// Paddle overage push fires at month-rollover rather than hourly.
+	paddleOverageMonths map[paddleOverageKey]struct{}
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
@@ -140,7 +154,7 @@ func NewMemStore() *MemStore {
 	m := &MemStore{
 		accounts:       map[string]Account{},
 		keys:           map[string]APIKey{},
-		keyByHash:      map[string]string{},
+		keyByHash:      map[string]APIKey{},
 		apps:           map[string]App{},
 		githubBindings: map[string]GitHubBinding{},
 		deployments:    map[string]Deployment{},
@@ -166,7 +180,10 @@ func NewMemStore() *MemStore {
 		// stripePushHours is the per-(account, hour) dedupe set the
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
-		secrets:         map[secretKey]AppSecret{},
+		// paddleOverageMonths is the per-(account, month) dedupe set
+		// the meterd daily pusher reads/writes.
+		paddleOverageMonths: map[paddleOverageKey]struct{}{},
+		secrets:             map[secretKey]AppSecret{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -226,11 +243,25 @@ func (m *MemStore) AccountByEmail(_ context.Context, email string) (Account, err
 func (m *MemStore) AccountByKeyHash(_ context.Context, hash []byte) (Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	accountID, ok := m.keyByHash[hex.EncodeToString(hash)]
+	k, ok := m.keyByHash[hex.EncodeToString(hash)]
 	if !ok {
 		return Account{}, ErrNotFound
 	}
-	return m.accounts[accountID], nil
+	return m.accounts[k.AccountID], nil
+}
+
+// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used by
+// the post-login audit log (cmd/apid/handlers_auth.go) so an operator
+// investigating "who signed in as alice?" can identify which key
+// authenticated. Returns ErrNotFound when no row matches.
+func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keyByHash[hex.EncodeToString(hash)]
+	if !ok {
+		return APIKey{}, ErrNotFound
+	}
+	return k, nil
 }
 
 func (m *MemStore) UpdateAccountPlan(_ context.Context, id string, plan api.Plan) error {
@@ -313,6 +344,42 @@ func (m *MemStore) AccountByStripeCustomerID(_ context.Context, stripeCustomerID
 	return a, nil
 }
 
+// UpdateAccountPaddleCustomerID mirrors UpdateAccountStripeCustomerID
+// for the Paddle ctm_… ID. The accounts.stripe_customer_id column is
+// reused (ADR-025 — column rename is a separate migration PR), so the
+// underlying field + reverse-lookup map are the same; the dedicated
+// method name keeps the Paddle call sites self-documenting.
+func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCustomerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.StripeCustomerID = paddleCustomerID // column is reused per ADR-025
+	m.accounts[id] = a
+	// Maintain the reverse-lookup map. Same map as the Stripe path —
+	// a single deployment uses one provider, so the prefix-stripped
+	// (cus_ vs ctm_) index is unambiguous in practice.
+	for k, v := range m.stripeByCustomer {
+		if v == id && k != paddleCustomerID {
+			delete(m.stripeByCustomer, k)
+			break
+		}
+	}
+	m.stripeByCustomer[paddleCustomerID] = id
+	return nil
+}
+
+// AccountByPaddleCustomerID is the reverse-lookup the Paddle webhook
+// uses to find the account behind a `customer_id` field. Same map as
+// the Stripe path (the column is reused); the dedicated method name
+// keeps the Paddle call sites self-documenting and leaves the door
+// open for a column-rename PR to swap bodies without touching callers.
+func (m *MemStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
+	return m.AccountByStripeCustomerID(ctx, paddleCustomerID)
+}
+
 // ListAllAccounts walks the account map under the store mutex. The
 // meterd quota + Stripe-push loops both call this; bounded by the
 // customer count on the one box.
@@ -337,7 +404,7 @@ func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte
 	}
 	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, CreatedAt: time.Now()}
 	m.keys[k.ID] = k
-	m.keyByHash[h] = accountID
+	m.keyByHash[h] = k
 	return k, nil
 }
 
@@ -530,12 +597,15 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		a.MinInstances = derefInt(p.MinInstances)
 	}
 	if p.SetEgressAllowlist {
-		// ADR-031: nil-with-Set is treated as "clear to default
-		// (empty)" so the API can express "drop the allowlist back to
-		// no-list" via a PATCH with egress_allowlist:[] ; non-nil is
-		// copied verbatim. The slice is intentionally reallocated so
-		// the caller can't mutate the stored value through the slice
-		// header it holds after the call returns.
+		// ADR-031 + ADR-032: nil-with-Set is treated as "clear to
+		// default (empty)" so the API can express "drop the
+		// allowlist back to no-list" via a PATCH with
+		// egress_allowlist:[] ; non-nil is copied verbatim. The
+		// slice is intentionally reallocated so the caller can't
+		// mutate the stored value through the slice header it holds
+		// after the call returns. v4 + v6 entries share the same
+		// counter (Pro 16, Scale 64) — see
+		// pkg/api/limits.go::EgressAllowlistMaxSize.
 		src := derefPrefixes(p.EgressAllowlist)
 		dst := make([]netip.Prefix, len(src))
 		copy(dst, src)
@@ -2495,6 +2565,29 @@ func (m *MemStore) RecordStripePushHour(_ context.Context, accountID string, hou
 	return nil
 }
 
+// HasPaddleOverageMonth + RecordPaddleOverageMonth implement the
+// pkg/billing/paddle PaddleOverageDedupe interface. Mirrors the Stripe
+// pair one method above: flat set keyed by (account, month); UTC-
+// normalized on every read/write so a future caller that forgets to
+// normalize cannot create a phantom row. `month` is a calendar-month
+// start (calendarMonthStart in pkg/billing/paddle/usage.go).
+func (m *MemStore) HasPaddleOverageMonth(_ context.Context, accountID string, month time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}]
+	return ok, nil
+}
+
+func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string, month time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageMonths == nil {
+		m.paddleOverageMonths = map[paddleOverageKey]struct{}{}
+	}
+	m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}] = struct{}{}
+	return nil
+}
+
 type appHourKey struct {
 	AccountID string
 	AppID     string
@@ -2981,6 +3074,16 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for sc, acid := range m.stripeByCustomer {
 		if acid == id {
 			delete(m.stripeByCustomer, sc)
+		}
+	}
+	// Drop Paddle overage dedupe rows for this account so a redelivered
+	// grace tick doesn't observe a stale (account, month) pair. Mirrors
+	// the pgstore.go steps slice entry for paddle_overage_dedupe; the
+	// MemStore has no FK so the explicit walk is the production
+	// equivalent for tests.
+	for k := range m.paddleOverageMonths {
+		if k.accountID == id {
+			delete(m.paddleOverageMonths, k)
 		}
 	}
 	// Audit events (spec §17 G6 right-to-erasure). Drop events whose

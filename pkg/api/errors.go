@@ -48,6 +48,19 @@ type Problem struct {
 	// substituted. Optional; omitempty keeps the existing API shape
 	// unchanged for every other error code.
 	BillingPortalURL string `json:"billing_portal_url,omitempty"`
+	// PaddleCheckoutURL is set on payment_required (CodePayment) errors
+	// when the platform is running on the Paddle provider. Mirrors
+	// BillingPortalURL's shape — the customer's next action is to land
+	// on a Paddle-hosted checkout page for the target plan. Optional +
+	// omitempty so the Stripe-default response shape is unchanged.
+	// Mutually exclusive with BillingPortalURL on a single Problem: the
+	// 402 carries either billing_portal_url (Stripe) or
+	// paddle_checkout_url+tx_id (Paddle), never both.
+	PaddleCheckoutURL string `json:"paddle_checkout_url,omitempty"`
+	// TxID is the provider's transaction handle (Paddle: txn_…,
+	// Stripe: empty). The dashboard renders this as a confirmation id
+	// after the customer completes checkout. Empty on the Stripe path.
+	TxID string `json:"tx_id,omitempty"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -206,6 +219,50 @@ const (
 	// them, and returning a single code avoids probing.
 	CodeCliAuthPending     = "cli_auth_code_pending"
 	CodeCliAuthUnavailable = "cli_auth_code_unavailable"
+
+	// CodeAppConcurReached is the typed "already at max_concurrency"
+	// result from Engine.AdmitInstance (issue #168). Distinct from
+	// CodePlanLimitConcur because the gateway treats this as a benign
+	// no-op when it already has ≥1 cached target, while plan_limit
+	// (the Wake path) is always fatal to the requesting call.
+	CodeAppConcurReached = "app_concurrency_reached"
+
+	// Dashboard auth (issue #165, ADR-032). Pre-#165, POST /login
+	// auto-created an account + minted a "web-console" API key + set
+	// the session cookie on ANY email with zero verification, which
+	// was a full pre-auth account-takeover (spec §11 violation).
+	// Post-#165, the dashboard surfaces are real auth:
+	//
+	//   - invalid_credentials: 401 for both "no such email" and
+	//     "wrong password" — the two paths share the same response
+	//     body so the surface doesn't leak which case it hit. The
+	//     constant-time Argon2id pad on the no-account path closes
+	//     the timing oracle; see cmd/apid/handlers_auth.go.
+	//   - email_not_verified: 401 when a Google / GitHub OAuth
+	//     callback returns a profile whose primary email is not
+	//     verified by the provider. Distinct from invalid_credentials
+	//     because the customer can fix this by verifying the email
+	//     upstream; we never mint an unverified session.
+	//   - password_too_weak: 400 at /signup when the password fails
+	//     the NIST-style floor (≥12 chars). The Detail names the
+	//     rule so the dashboard form can highlight which constraint
+	//     tripped.
+	//   - reset_token_invalid / reset_token_expired: 410 for GET /
+	//     POST /auth/reset when the token doesn't exist (invalid)
+	//     or has aged past 15 minutes (expired). 410 Gone is the
+	//     semantically correct status: the resource was a one-shot
+	//     and is no longer addressable.
+	//   - account_exists: never returned directly. Anti-enumeration
+	//     keeps the body identical between "signed in via /signup"
+	//     and "email already taken"; the constant exists so future
+	//     surfaces (e.g. an explicit "claim this email" admin tool)
+	//     can branch on it without inventing a new code.
+	CodeInvalidCredentials = "invalid_credentials"
+	CodeEmailNotVerified   = "email_not_verified"
+	CodePasswordTooWeak    = "password_too_weak"
+	CodeResetTokenInvalid  = "reset_token_invalid"
+	CodeResetTokenExpired  = "reset_token_expired"
+	CodeAccountExists      = "account_exists"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -229,7 +286,7 @@ func StatusForCode(code string) int {
 	switch code {
 	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
 		return http.StatusForbidden
-	case CodePlanLimitConcur, CodeQuotaExhausted:
+	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -274,6 +331,12 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
+	case CodeInvalidCredentials, CodeEmailNotVerified:
+		return http.StatusUnauthorized
+	case CodePasswordTooWeak, CodeAccountExists:
+		return http.StatusBadRequest
+	case CodeResetTokenInvalid, CodeResetTokenExpired:
+		return http.StatusGone
 	default:
 		return http.StatusInternalServerError
 	}
@@ -327,6 +390,19 @@ func ErrPlanLimitConcurrency(l Limits, observed int) *Problem {
 // (RAM headroom or vCPU slots, spec §4.3). This should be near-impossible in
 // practice — admission alerts fire long before customers see it (spec §12) — so
 // it is a page for us, not just a message for them (UX spec §7).
+// ErrAppConcurrencyReached is returned by Engine.AdmitInstance when the
+// app is already at its effective max_concurrency (issue #168). The
+// gateway treats this as a benign no-op when it already has ≥1 cached
+// target; the Wire RPC carries the same information as a typed
+// at_capacity boolean so the gateway never has to parse problems.
+func ErrAppConcurrencyReached(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusTooManyRequests, CodeAppConcurReached,
+		"App concurrency reached",
+		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
+		WithLimit(int64(l.MaxConcurrency), int64(observed)).
+		WithDocs("https://docs.DOMAIN/plans#concurrency")
+}
+
 func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
@@ -483,14 +559,16 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
 }
 
-// ErrInvalidEgressAllowlist (ADR-031) is a 400 for entries that don't
-// ParsePrefix as a v4 CIDR. The detail names the offending entry so an
-// operator triaging a rejected PATCH sees exactly which line is bad.
-// v6 attempts land here too (v1 is v4 only; v6 mirror is a future ADR).
+// ErrInvalidEgressAllowlist (ADR-031 + ADR-032) is a 400 for
+// entries that don't ParsePrefix as a v4 or v6 CIDR, or that
+// have masklen /0. The detail names the offending entry so an
+// operator triaging a rejected PATCH sees exactly which line is
+// bad. ADR-032 — v6 entries are accepted alongside v4 entries;
+// the non-/0 contract is shared with the DB trigger.
 func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeInvalidEgressAllowlist,
 		"Invalid egress allowlist entry",
-		fmt.Sprintf("entry %q is not a valid IPv4 CIDR: %v.", entry, reason)).
+		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
 }
 
