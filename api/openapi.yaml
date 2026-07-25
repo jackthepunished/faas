@@ -48,6 +48,12 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: invocations
+    description: Sync / async function invocations (event-driven surface, Move 2).
+  - name: queues
+    description: Per-app FIFO queues (send / receive / ack).
+  - name: delayed_tasks
+    description: Scheduled future invocations (cron-style, one-shot).
   - name: keys
     description: API key management.
   - name: secrets
@@ -747,6 +753,236 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Event-driven surface (Move 2) ─────────────────────────────────────────
+  # Customer-facing surface for the Move 1 invocations backend. The five
+  # shapes — async_invoke, queue_send, queue_receive, queue_ack, delayed_task
+  # — share a single backing table (invocations) and a single emit
+  # (pg_notify on invocation_done). The long-poll routes (invoke,
+  # queues/receive) cap at 30s server-side; free plan invokes at 5s.
+
+  /v1/apps/{slug}/invoke:
+    post:
+      tags: [invocations]
+      operationId: invokeApp
+      summary: Sync-invoke an app; long-poll for the result.
+      description: |
+        Enqueues an invocation row and waits for the drain to drive it
+        to a terminal state. Server-side cap is 30s on paid plans, 5s
+        on Free. Returns 504 (long_poll_timeout) when the cap elapses;
+        the customer can immediately re-call /v1/invocations/{id}
+        to pick up the eventual result.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvokeRequest'
+      responses:
+        '200':
+          description: The completed invocation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvokeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PlanFeatureGated' }
+        '413': { $ref: '#/components/responses/PlanSourceBytes' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '504': { $ref: '#/components/responses/LongPollTimeout' }
+
+  /v1/apps/{slug}/invoke/async:
+    post:
+      tags: [invocations]
+      operationId: invokeAppAsync
+      summary: Async-invoke an app; returns id + status URL.
+      description: |
+        Enqueues an invocation row and returns immediately with the
+        id. The customer polls /v1/invocations/{id} (or uses the
+        dashboard SSE) for the eventual row state.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvokeRequest' }
+      responses:
+        '202':
+          description: The enqueued invocation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AsyncInvokeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PlanFeatureGated' }
+        '413': { $ref: '#/components/responses/PlanSourceBytes' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/send:
+    post:
+      tags: [queues]
+      operationId: queueSend
+      summary: Enqueue a row on the per-app FIFO queue.
+      description: |
+        Cap-checked against the plan's MaxQueueDepth (Hobby 5, Pro 25,
+        Scale 100). The drain re-checks at dispatch tick.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueSendRequest' }
+      responses:
+        '201':
+          description: The enqueued row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueSendResponse' }
+        '403': { $ref: '#/components/responses/PlanQueueDepth' }
+        '413': { $ref: '#/components/responses/PlanSourceBytes' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/receive:
+    post:
+      tags: [queues]
+      operationId: queueReceive
+      summary: Long-poll for the next dispatched row.
+      description: |
+        Returns 200 with the dequeued row, or 204 (no body) if the
+        server-side 30s budget elapses with no event. The customer
+        retries on 204.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      responses:
+        '200':
+          description: A dispatched row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueReceiveResponse' }
+        '204': { description: No row dispatched within the budget. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PlanFeatureGated' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/{id}/ack:
+    post:
+      tags: [queues]
+      operationId: queueAck
+      summary: Ack a queue row (idempotent).
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/Id32'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: No body. The ack (or a re-ack) was accepted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/delayed-tasks:
+    post:
+      tags: [delayed_tasks]
+      operationId: delayedTaskCreate
+      summary: Schedule a delayed task to fire at a future time.
+      description: |
+        Cap-checked against the plan's MaxDelayedTasksPerApp (Hobby 5,
+        Pro 50, Scale 1_000_000). The drain re-checks at dispatch.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DelayedTaskRequest' }
+      responses:
+        '201':
+          description: The newly-scheduled task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelayedTaskResponse' }
+        '400': { $ref: '#/components/responses/InvalidScheduledAt' }
+        '403': { $ref: '#/components/responses/PlanDelayedTasksCap' }
+        '413': { $ref: '#/components/responses/PlanSourceBytes' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invocations:
+    get:
+      tags: [invocations]
+      operationId: listInvocations
+      summary: List recent invocations on the account.
+      description: |
+        Paginated by `?before=<id>` (the LAST id of the returned slice).
+        Defaults to 20 per page; capped at 200.
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor — return rows whose id is strictly less than this. Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          description: "Page size; 1-200, default 20."
+      responses:
+        '200':
+          description: The page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListInvocationsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invocations/{id}:
+    get:
+      tags: [invocations]
+      operationId: getInvocation
+      summary: Read a single invocation by id (account-scoped).
+      parameters:
+        - $ref: '#/components/parameters/Id32'
+      responses:
+        '200':
+          description: The row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invocation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/delayed-tasks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [delayed_tasks]
+      operationId: delayedTaskGet
+      summary: Read a single delayed task by id.
+      responses:
+        '200':
+          description: The task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelayedTaskResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [delayed_tasks]
+      operationId: delayedTaskCancel
+      summary: Cancel a pending delayed task.
+      description: |
+        Idempotent: a re-cancel (or a cancel of an already-fired row)
+        is a 204. The drain ignores cancelled rows at dispatch.
+      responses:
+        '204': { description: No body. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── API keys ─────────────────────────────────────────────────────────────
 
   /v1/keys:
@@ -1320,6 +1556,108 @@ components:
         overage_gb_hours: { type: number }
         overage_cents: { type: integer, format: int64, description: 'Integer cents. Overages are €0.01/GB-h.' }
 
+    # ─── Event-driven surface (Move 2) ───────────────────────────────────
+
+    AsyncInvokeResponse:
+      description: "202-side of async-invoke. The id is the invocations row id; status_url is the well-known read endpoint."
+      type: object
+      required: [id, status_url]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        status_url: { type: string, example: "/v1/invocations/0123456789abcdef0123456789abcdef" }
+
+    InvokeResponse:
+      description: "Sync-invoke result. Status is the drain-driven terminal state (`completed` | `failed` | `cancelled`). Result is the original row's payload cast to JSON (omitted while still pending)."
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        status: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+        result: { type: object, additionalProperties: true }
+
+    QueueSendResponse:
+      description: "201 — body of a freshly-enqueued queue row."
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+
+    QueueReceiveResponse:
+      description: "200 — a dequeued row (the long-poll hit). 204 (no body) on timeout."
+      type: object
+      required: [id, payload]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        payload: { type: object, additionalProperties: true }
+        result: { type: object, additionalProperties: true }
+
+    DelayedTaskResponse:
+      description: "Delayed task create/get shape. ScheduledAt is the customer-facing UTC dispatch time. State is populated on get, omitted on create (always `pending` there)."
+      type: object
+      required: [id, scheduled_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        scheduled_at: { type: string, format: date-time }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+
+    Invocation:
+      description: "A single invocations row. Account-scoped; cross-account reads return 404."
+      type: object
+      required: [id, app_id, account_id, source, state, created_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        source: { type: string, enum: [async_invoke, queue, delayed_task, cron] }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+        method: { type: string }
+        path: { type: string }
+        payload: { type: object, additionalProperties: true }
+        headers: { type: object, additionalProperties: true }
+        scheduled_at: { type: [string, "null"], format: date-time }
+        due_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+        instance_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$' }
+        result: { type: [object, "null"], additionalProperties: true }
+        last_error: { type: [string, "null"] }
+        ack_url: { type: [string, "null"], description: "Optional ack URL for queueReceive consumers; populated on queue-sourced rows." }
+        attempts: { type: integer, description: "Number of dispatch attempts so far; 0 on the first try." }
+        lease_expires_at: { type: [string, "null"], format: date-time, description: "When the in-flight dispatch lease expires; null when no lease is held." }
+        received_at: { type: [string, "null"], format: date-time, description: "When the drain first claimed the row; null until claimed." }
+
+    ListInvocationsResponse:
+      description: "Page of invocations; ordered by created_at DESC, id DESC. Pass the LAST id of the returned slice as the next `?before=` to load older."
+      type: object
+      required: [invocations]
+      properties:
+        invocations:
+          type: array
+          items: { $ref: '#/components/schemas/Invocation' }
+
+    InvokeRequest:
+      description: "Body for POST /v1/apps/{slug}/invoke[/async]. Method defaults to POST; path defaults to `/`."
+      type: object
+      properties:
+        payload: { type: object, additionalProperties: true }
+        headers: { type: object, additionalProperties: true }
+        method: { type: string, default: POST }
+        path: { type: string, default: "/" }
+
+    QueueSendRequest:
+      description: "Body for POST /v1/apps/{slug}/queues/send. Cap-checked against MaxQueueDepth."
+      type: object
+      properties:
+        payload: { type: object, additionalProperties: true }
+
+    DelayedTaskRequest:
+      description: "Body for POST /v1/apps/{slug}/delayed-tasks. scheduled_at must be in the future (UTC)."
+      type: object
+      required: [scheduled_at]
+      properties:
+        payload: { type: object, additionalProperties: true }
+        scheduled_at: { type: string, format: date-time }
+
     # ─── Errors ───────────────────────────────────────────────────────────
 
     Problem:
@@ -1492,6 +1830,42 @@ components:
 
     CapacityUnavailable:
       description: 'code: capacity_unavailable — no host headroom (alerting; should be near-impossible).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanFeatureGated:
+      description: 'code: feature_not_allowed — request targets a feature the plan does not entitle (async_invoke / queues / delayed_tasks on Free).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanQueueDepth:
+      description: 'code: plan_queue_depth — per-app queue at the plan''s MaxQueueDepth.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanDelayedTasksCap:
+      description: 'code: plan_delayed_tasks_cap — per-app delayed-task count at MaxDelayedTasksPerApp.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanSourceBytes:
+      description: 'code: source_too_large — payload exceeds the plan''s MaxSourceBytesPerInvocation.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    LongPollTimeout:
+      description: 'code: long_poll_timeout — server-side long-poll budget elapsed without a terminal row.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    InvalidScheduledAt:
+      description: 'code: invalid_scheduled_at — delayed-task scheduled_at is in the past.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

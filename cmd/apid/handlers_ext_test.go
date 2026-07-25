@@ -14,12 +14,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -1298,5 +1300,281 @@ func TestStripePaymentFailed_SuspendedIsNoOp(t *testing.T) {
 	}
 	if n := len(mailer.snapshot()); n != 0 {
 		t.Errorf("mailer.snapshot() = %d, want 0 (suspended accounts must not receive PaymentFailedBody)", n)
+	}
+}
+
+// --- Move 2: event-driven surface tests -------------------------------------
+//
+// These tests pin the customer-facing HTTP surface for the Move 1
+// invocations backend. They use MemStore (no Postgres) so the assertions
+// stay on the handler-level contract. The long-poll handlers
+// (invokeApp, queueReceive) use setupWithNotifier with a hook that
+// injects a synthetic payload so the test doesn't hang on a real
+// LISTEN connection.
+
+// TestAsyncInvoke_AcceptedWithId confirms POST /v1/apps/{slug}/invoke/async
+// returns 202 + a populated id, and the row lands in the invocations table
+// with source='async_invoke'.
+func TestAsyncInvoke_AcceptedWithId(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/invoke/async", api.InvokeRequest{
+		Method:  "POST",
+		Path:    "/webhook",
+		Payload: json.RawMessage(`{"hello":"world"}`),
+	}, nil)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp api.AsyncInvokeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ID == "" {
+		t.Fatalf("response.id is empty")
+	}
+	if resp.StatusURL != "/v1/invocations/"+resp.ID {
+		t.Errorf("status_url = %q, want /v1/invocations/%s", resp.StatusURL, resp.ID)
+	}
+	// Round-trip the row.
+	inv, err := e.store.InvocationByID(context.Background(), resp.ID)
+	if err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if inv.Source != state.InvocationAsyncInvoke {
+		t.Errorf("source = %v, want async_invoke", inv.Source)
+	}
+	if inv.State != state.InvocationPending {
+		t.Errorf("state = %v, want pending", inv.State)
+	}
+}
+
+// TestAsyncInvoke_FreeRejected confirms the Free-plan gate fires before
+// any row is written. The 403 carries the feature_not_allowed code so a
+// clear SDK message can be surfaced.
+func TestAsyncInvoke_FreeRejected(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/invoke/async", api.InvokeRequest{}, nil)
+
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if prob.Code != "plan_feature_gated" {
+		t.Errorf("code = %q, want plan_feature_gated", prob.Code)
+	}
+}
+
+// TestQueueSend_RejectsAtLimit confirms the plan's MaxQueueDepth cap is
+// enforced on the way in. Hobby's cap is 5; the 6th send is a 403 with
+// the plan_queue_depth code.
+func TestQueueSend_RejectsAtLimit(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "myapp")
+
+	// 5 successful sends.
+	for i := 0; i < 5; i++ {
+		rec := e.do(t, "POST", "/v1/apps/myapp/queues/send", api.QueueSendRequest{
+			Payload: json.RawMessage(`{"i":` + strconv.Itoa(i) + `}`),
+		}, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("send %d: status = %d, want 201; body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+	// 6th send is rejected.
+	rec := e.do(t, "POST", "/v1/apps/myapp/queues/send", api.QueueSendRequest{}, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "plan_queue_depth" {
+		t.Errorf("code = %q, want plan_queue_depth", prob.Code)
+	}
+	if prob.Limit != nil && *prob.Limit != 5 {
+		t.Errorf("limit = %v, want 5", prob.Limit)
+	}
+}
+
+// TestQueueReceive_TimeoutReturns204 confirms the long-poll returns a
+// clean 204 (no body) when the server-side budget elapses without a
+// matching notification. The setupWithNotifier hook returns
+// db.ErrWaitTimeout so the handler falls into the timeout branch.
+func TestQueueReceive_TimeoutReturns204(t *testing.T) {
+	e := setupWithNotifier(t, api.PlanPro, func(_ context.Context, _ string, _ func(string) bool, _ time.Duration) (string, error) {
+		return "", db.ErrWaitTimeout
+	})
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/queues/receive", nil, nil)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", rec.Body.String())
+	}
+}
+
+// TestDelayedTaskCreate_PayloadTooLarge confirms the
+// MaxSourceBytesPerInvocation cap is enforced per-plan. Hobby's cap is
+// 64 KB; a 70 KB payload is a 413.
+func TestDelayedTaskCreate_PayloadTooLarge(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "myapp")
+
+	big := make([]byte, 70*1024)
+	for i := range big {
+		big[i] = 'a'
+	}
+	rec := e.do(t, "POST", "/v1/apps/myapp/delayed-tasks", api.DelayedTaskRequest{
+		Payload:     json.RawMessage(`{"blob":"` + string(big) + `"}`),
+		ScheduledAt: time.Now().Add(time.Hour).UTC(),
+	}, nil)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "plan_source_bytes" {
+		t.Errorf("code = %q, want plan_source_bytes", prob.Code)
+	}
+}
+
+// TestDelayedTaskCreate_PastSchedAt confirms the handler rejects a
+// scheduled_at in the past with 400 + invalid_scheduled_at.
+func TestDelayedTaskCreate_PastSchedAt(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "myapp")
+
+	rec := e.do(t, "POST", "/v1/apps/myapp/delayed-tasks", api.DelayedTaskRequest{
+		Payload:     json.RawMessage(`{}`),
+		ScheduledAt: time.Now().Add(-time.Hour).UTC(),
+	}, nil)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if prob.Code != "invalid_scheduled_at" {
+		t.Errorf("code = %q, want invalid_scheduled_at", prob.Code)
+	}
+}
+
+// TestDeleteApp_CancelsPendingInvocations confirms the deleteApp GC
+// cancels pending/dispatching invocations before the app row is
+// removed. A terminal (completed) row is left untouched.
+func TestDeleteApp_CancelsPendingInvocations(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "myapp")
+
+	// 3 pending delayed-tasks.
+	pendingIDs := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+			AppID:       appID,
+			AccountID:   e.acct.ID,
+			Source:      state.InvocationDelayedTask,
+			Payload:     json.RawMessage(`{}`),
+			DueAt:       time.Now().Add(time.Hour),
+			ScheduledAt: ptrTime2(time.Now().Add(time.Hour)),
+		})
+		if err != nil {
+			t.Fatalf("seed pending: %v", err)
+		}
+		pendingIDs = append(pendingIDs, inv.ID)
+	}
+	// 1 completed row — must survive the delete.
+	completed, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     appID,
+		AccountID: e.acct.ID,
+		Source:    state.InvocationDelayedTask,
+		Payload:   json.RawMessage(`{}`),
+		DueAt:     time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("seed completed: %v", err)
+	}
+	// Synthesise a completed row: Claim (pending→dispatching) then
+	// Complete (dispatching→completed). The drain drives this transition
+	// in production; the test inlines the same hand-off so the row
+	// lands in `completed` state and the GC path leaves it alone.
+	claimed, err := e.store.ClaimInvocation(context.Background(), completed.ID, "inst_test", 60)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := e.store.CompleteInvocation(context.Background(), claimed.ID, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+
+	rec := e.do(t, "DELETE", "/v1/apps/myapp", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Pending rows are cancelled.
+	for _, id := range pendingIDs {
+		inv, err := e.store.InvocationByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("invocation %s not found: %v", id, err)
+		}
+		if inv.State != state.InvocationCancelled {
+			t.Errorf("invocation %s state = %v, want cancelled", id, inv.State)
+		}
+	}
+	// Completed row is untouched.
+	inv, err := e.store.InvocationByID(context.Background(), completed.ID)
+	if err != nil {
+		t.Fatalf("completed invocation not found: %v", err)
+	}
+	if inv.State != state.InvocationCompleted {
+		t.Errorf("completed state = %v, want completed (must not be GC'd)", inv.State)
+	}
+}
+
+// ptrTime2 is a tiny adapter so the test seeds a *time.Time for
+// ScheduledAt without a nil-check at the call site.
+func ptrTime2(t time.Time) *time.Time { return &t }
+
+// TestGetInvocation_NotFoundAcrossAccount confirms a cross-account
+// read returns 404 (the privacy contract — no ownership leak).
+func TestGetInvocation_NotFoundAcrossAccount(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "myapp")
+
+	// Seed an invocation on a different account.
+	other, err := e.store.CreateAccount(context.Background(), "intruder@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     appID,
+		AccountID: other.ID,
+		Source:    state.InvocationAsyncInvoke,
+		Payload:   json.RawMessage(`{}`),
+		DueAt:     time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("seed inv: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/invocations/"+inv.ID, nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 }

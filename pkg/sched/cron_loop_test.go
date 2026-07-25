@@ -189,7 +189,7 @@ func TestCronDispatch_FiresOncePerBoundary(t *testing.T) {
 	// Move 1 regression: the cron path must leave a row in
 	// invocations (state=completed) for each fire. The meter reads
 	// those rows; without them cron traffic is invisible to billing.
-	rows, err := store.ListInvocationsForAccount(ctx, acct.ID, 50, time.Time{})
+	rows, err := store.ListInvocationsForAccount(ctx, acct.ID, 50, "")
 	if err != nil {
 		t.Fatalf("ListInvocationsForAccount: %v", err)
 	}

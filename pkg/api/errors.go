@@ -639,3 +639,27 @@ func ErrInvocationNotFound(id string) *Problem {
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
 		WithDocs("https://docs.DOMAIN/event-driven#invocations")
 }
+
+// ErrLongPollTimeout is returned by the long-poll handlers (sync
+// invoke, queueReceive) when the server-side wait budget ran out.
+// Distinct code so the CLI can retry transparently — a 504 Gateway
+// Timeout would force the customer to disambiguate "server is down"
+// from "no event yet, retry". The HTTP status is 504 (the SLO is
+// server-side); the body type is the only ordering.
+func ErrLongPollTimeout() *Problem {
+	return NewProblem(http.StatusGatewayTimeout, "long_poll_timeout",
+		"Long-poll wait budget ran out",
+		"the server waited for the configured long-poll window and the event did not arrive; retry.").
+		WithDocs("https://docs.DOMAIN/event-driven#long-poll")
+}
+
+// ErrInvalidScheduledAt is returned when a delayed-task POST carries a
+// scheduled_at that is in the past (or zero). The handler uses time.Now()
+// as the source of truth so a clock-skewed client gets a 400 rather than
+// a row that fires immediately on insert.
+func ErrInvalidScheduledAt() *Problem {
+	return NewProblem(http.StatusBadRequest, "invalid_scheduled_at",
+		"Invalid scheduled_at",
+		"scheduled_at must be a future timestamp; the server clock rejected the value").
+		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
+}

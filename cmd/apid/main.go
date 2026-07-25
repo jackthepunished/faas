@@ -427,3 +427,10 @@ func (p pgNotifier) Notify(ctx context.Context, channel, payload string) error {
 func (p pgNotifier) Subscribe(ctx context.Context, channels []string) (<-chan db.Notification, func(), error) {
 	return db.Subscribe(ctx, p.pool, channels)
 }
+
+// WaitFor is the Move 2 long-poll sibling: per-request LISTEN + predicate
+// filter. Thin wrapper around db.WaitForNotification so the Notifier
+// interface stays the only thing the handlers depend on.
+func (p pgNotifier) WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error) {
+	return db.WaitForNotification(ctx, p.pool, channel, predicate, timeout)
+}

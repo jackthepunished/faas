@@ -300,6 +300,57 @@ func TestValidateAppConfig(t *testing.T) {
 	}
 }
 
+// TestErrLongPollTimeout pins the status + code for the long-poll
+// handlers. Move 2 adds two long-poll surfaces (sync invoke,
+// queueReceive) which both surface this on timeout.
+func TestErrLongPollTimeout(t *testing.T) {
+	p := ErrLongPollTimeout()
+	if p.Status != http.StatusGatewayTimeout {
+		t.Errorf("Status = %d, want 504", p.Status)
+	}
+	if p.Code != "long_poll_timeout" {
+		t.Errorf("Code = %q, want long_poll_timeout", p.Code)
+	}
+	if !strings.Contains(p.DocsURL, "event-driven") {
+		t.Errorf("DocsURL = %q, want contains event-driven", p.DocsURL)
+	}
+}
+
+// TestErrInvalidScheduledAt pins the 400 + code for delayed-task create
+// with a past scheduled_at. Distinct code so the CLI can suggest a
+// future timestamp without parsing prose.
+func TestErrInvalidScheduledAt(t *testing.T) {
+	p := ErrInvalidScheduledAt()
+	if p.Status != http.StatusBadRequest {
+		t.Errorf("Status = %d, want 400", p.Status)
+	}
+	if p.Code != "invalid_scheduled_at" {
+		t.Errorf("Code = %q, want invalid_scheduled_at", p.Code)
+	}
+	if !strings.Contains(p.DocsURL, "event-driven") {
+		t.Errorf("DocsURL = %q, want contains event-driven", p.DocsURL)
+	}
+}
+
+// TestErrPlanQueueDepth_DistinctFromDelayedCap pins that the two
+// per-app caps (queue depth, delayed-task cap) have distinct codes so
+// the dashboard can render different guidance ("drain your queue" vs
+// "schedule for later").
+func TestErrPlanQueueDepth_DistinctFromDelayedCap(t *testing.T) {
+	l := MustLimitsFor(PlanHobby)
+	q := ErrPlanQueueDepth(l.MaxQueueDepth, l.MaxQueueDepth+1)
+	d := ErrPlanDelayedTasksCap(l.MaxDelayedTasksPerApp, l.MaxDelayedTasksPerApp+1)
+	if q.Code == d.Code {
+		t.Errorf("queue + delayed share code %q — must be distinct", q.Code)
+	}
+	if q.Status != http.StatusForbidden {
+		t.Errorf("queue status = %d, want 403", q.Status)
+	}
+	if d.Status != http.StatusForbidden {
+		t.Errorf("delayed status = %d, want 403", d.Status)
+	}
+}
+
 // TestProblem_PaddleExtensionMarshalled asserts the Paddle checkout
 // URL + tx_id extensions serialize correctly on a 402 — and stay
 // omitted on a Problem that doesn't carry them (so the Stripe-default
