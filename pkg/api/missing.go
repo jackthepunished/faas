@@ -9,17 +9,15 @@ import "context"
 // `pkg/api.Client.<Method>` even though `faas <subcommand>` doesn't
 // invoke it today.
 //
+// As of 2026-07-25 the only entry is UsageSummary (no `faas usage
+// summary` subcommand yet — `faas usage` calls GetUsage, the
+// per-app rows). When the CLI wraps an endpoint, MOVE its method
+// from here to client.go and delete the doc block — that's how this
+// file stays a useful inventory rather than a graveyard.
+//
 // Adding a new endpoint to api/openapi.yaml? Add a typed method here
 // first; the make sdk-check drift gate (commit 3) catches the case
 // where someone ships a route without a method.
-
-// UpdateCron edits a cron's schedule/path/enabled. Currently exposed
-// only as the partial CRUD — the CLI's `faas crons` covers
-// List/Create/Delete but not Update.
-func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronRequest) (CronResponse, error) {
-	var out CronResponse
-	return out, c.do(ctx, "PATCH", "/v1/crons/"+id, req, &out)
-}
 
 // UsageSummary returns the account-wide monthly roll-up
 // (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
