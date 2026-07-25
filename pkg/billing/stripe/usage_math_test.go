@@ -19,7 +19,7 @@ import (
 //   - Window: 24 h = 86_400 s
 //   - mbSeconds = 264 * 86_400 = 22_809_600
 //   - qty = 22_809_600 * 1000 / (1024 * 3600) = 22_809_600_000 / 3_686_400
-//         = 6186.666… → truncates to 6187 wire units
+//     = 6186.666… → truncates to 6187 wire units
 //
 // The trailing remainder (6186.666…) is the sub-milliunit gap; it is
 // dropped on purpose — see WireQuantityForMBSeconds's docstring and

@@ -355,10 +355,10 @@ func TestMonthlyUsageGB(t *testing.T) {
 // load-bearing for revenue:
 //
 //   - Free ≥ quota    → Action="stop" (hard cap; the financial model
-//                        prices against this)
+//     prices against this)
 //   - Paid ≥ quota    → Action="warn" (one event per UTC day; the
-//                        caller de-duplicates; overage accrues at
-//                        €0.01/GB-h)
+//     caller de-duplicates; overage accrues at
+//     €0.01/GB-h)
 //
 // Percent is rounded to the nearest integer and capped at 999 (so a
 // runaway instance doesn't emit a 5-digit percentage into the

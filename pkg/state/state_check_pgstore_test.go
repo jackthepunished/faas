@@ -70,10 +70,10 @@ func TestPgStore_InstancesStateCheck_AcceptsAllMachineStates(t *testing.T) {
 //
 // A future drift in either direction lands here:
 //
-//   * Go adds 'quota_evicting' to States but the migration
+//   - Go adds 'quota_evicting' to States but the migration
 //     doesn't widen the CHECK → this test fails with
 //     "literal set missing value 'quota_evicting'".
-//   * A future migration narrows the CHECK (e.g. drops 'failed'
+//   - A future migration narrows the CHECK (e.g. drops 'failed'
 //     again) → this test fails with "literal set has unexpected
 //     value 'failed' missing from States ∪ {pending}".
 //
@@ -212,8 +212,8 @@ func TestPgStore_InstancesStateCheck_RejectsInjection(t *testing.T) {
 // exactly two shapes for `CHECK (col IN (...))`, depending on
 // the literal-set cardinality:
 //
-//   * short set (≤ a few elements): `state IN ('a', 'b', 'c')`
-//   * longer set: `state = ANY (ARRAY['a'::text, 'b'::text, ...])`
+//   - short set (≤ a few elements): `state IN ('a', 'b', 'c')`
+//   - longer set: `state = ANY (ARRAY['a'::text, 'b'::text, ...])`
 //
 // (The `ANY` form always has a space between `ANY` and `(` —
 // Postgres's canonical emission. The literal-list contents also
