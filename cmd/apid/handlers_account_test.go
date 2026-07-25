@@ -429,7 +429,7 @@ func TestScheduleDeletion_EmitsAccountDeletionPending(t *testing.T) {
 	srv := newServerWithDeps(store, log, "example.com", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "")
 
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 

@@ -101,11 +101,11 @@ func TestCreateDeployment_AppNotOwned(t *testing.T) {
 	store := state.NewMemStore()
 	acctA, _ := store.CreateAccount(context.Background(), "a@x.com", api.PlanPro)
 	_, hashA, _ := api.GenerateAPIKey()
-	store.CreateAPIKey(context.Background(), acctA.ID, hashA, "a")
+	store.CreateAPIKey(context.Background(), acctA.ID, hashA, "a", api.DefaultScopes())
 
 	acctB, _ := store.CreateAccount(context.Background(), "b@x.com", api.PlanPro)
 	keyB, hashB, _ := api.GenerateAPIKey()
-	store.CreateAPIKey(context.Background(), acctB.ID, hashB, "b")
+	store.CreateAPIKey(context.Background(), acctB.ID, hashB, "b", api.DefaultScopes())
 
 	app, _ := store.CreateApp(context.Background(), state.App{
 		AccountID: acctA.ID, Slug: "a-app", Status: state.AppActive,

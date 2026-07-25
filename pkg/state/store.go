@@ -180,7 +180,11 @@ type Store interface {
 	MarkDunningStep(ctx context.Context, accountID string, from, to AccountStatus) error
 
 	// API keys.
-	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string) (APIKey, error)
+	// CreateAPIKey persists a new key row. Scopes is the explicit set of
+	// authorization scopes attached to the key (e.g. "admin", "read",
+	// "write"); see ADR-011. The store does not validate the scope
+	// vocabulary — that is the apid handler's responsibility.
+	CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error)
 	DeleteAPIKey(ctx context.Context, accountID, keyID string) error
 	ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error)
 	// APIKeyByHash resolves an api_keys row by its SHA-256 hash. Used
@@ -188,6 +192,13 @@ type Store interface {
 	// operator investigating "who signed in as alice?" can identify
 	// which key authenticated. Returns ErrNotFound if no row matches.
 	APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
+	// AuthenticateKey resolves a bearer token to the matching account
+	// AND key in a single Store call. This is the canonical lookup for
+	// the apid auth middleware (cmd/apid server.go s.auth) — it avoids
+	// AccountByKeyHash + APIKeyByHash being two round-trips and ensures
+	// the principal is assembled atomically. Returns ErrNotFound when
+	// the hash has no matching key.
+	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).

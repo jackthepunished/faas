@@ -50,7 +50,7 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 	} else if err != nil {
 		return err
 	}
-	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev")
+	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev", api.DefaultScopes())
 	if err != nil && !errors.Is(err, state.ErrConflict) {
 		return err
 	}

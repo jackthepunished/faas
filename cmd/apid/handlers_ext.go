@@ -569,16 +569,28 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 // --- api keys --------------------------------------------------------------
 
 func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	var req struct {
-		Label string `json:"label"`
-	}
+	var req api.CreateKeyRequest
 	_ = decodeJSON(r, &req)
+	scopes := req.Scopes
+	if len(scopes) == 0 {
+		// Preserve the legacy "full access" default for callers that
+		// don't yet know about scopes. New SDK releases pass scopes
+		// explicitly. See ADR-011.
+		scopes = []string{"admin"}
+	}
+	for _, sc := range scopes {
+		if !api.IsValidScope(sc) {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Unknown scope", "scopes must be one of admin, read, write; got "+sc))
+			return
+		}
+	}
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
 		return
 	}
-	k, err := s.store.CreateAPIKey(ctx(r), acct.ID, hash, req.Label)
+	k, err := s.store.CreateAPIKey(ctx(r), acct.ID, hash, req.Label, scopes)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
@@ -589,6 +601,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		ID:        k.ID,
 		Prefix:    keyPrefix(plaintext),
 		Label:     k.Label,
+		Scopes:    k.Scopes,
 		CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
 		Plaintext: plaintext,
 	})
@@ -606,6 +619,7 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 			ID:        k.ID,
 			Prefix:    keyPrefixFromHash(k.Hash),
 			Label:     k.Label,
+			Scopes:    k.Scopes,
 			CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
 		}
 		if !k.LastUsedAt.IsZero() {

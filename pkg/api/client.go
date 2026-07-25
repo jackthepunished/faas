@@ -386,13 +386,17 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 }
 
 // API keys.
+//
+// CreateKey accepts an explicit scopes slice. Pass nil to preserve the
+// historical "full access" behavior (the server defaults nil to
+// ["admin"]). See ADR-011 for the scope vocabulary.
 func (c *Client) ListKeys(ctx context.Context) ([]APIKeyResponse, error) {
 	var out []APIKeyResponse
 	return out, c.do(ctx, "GET", "/v1/keys", nil, &out)
 }
-func (c *Client) CreateKey(ctx context.Context, label string) (APIKeyResponse, error) {
+func (c *Client) CreateKey(ctx context.Context, label string, scopes []string) (APIKeyResponse, error) {
 	var out APIKeyResponse
-	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label}, &out)
+	return out, c.do(ctx, "POST", "/v1/keys", CreateKeyRequest{Label: label, Scopes: scopes}, &out)
 }
 func (c *Client) DeleteKey(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/keys/"+id, nil, nil)

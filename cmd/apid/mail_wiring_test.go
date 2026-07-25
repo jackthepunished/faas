@@ -230,7 +230,7 @@ func TestLoginSetsSessionAndSendsNoEmail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "web-console"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "web-console", api.DefaultScopes()); err != nil {
 		t.Fatal(err)
 	}
 	rec := &recordingSender{}

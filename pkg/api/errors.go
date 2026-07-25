@@ -101,19 +101,24 @@ func (p *Problem) WithDocs(url string) *Problem {
 // Stable error codes (spec Appendix A, UX spec §7). Keep in sync with docs and
 // the CLI's exit-code mapping.
 const (
-	CodePlanLimitApps     = "plan_limit_apps"
-	CodePlanLimitRAM      = "plan_limit_ram"
-	CodePlanLimitConcur   = "plan_limit_concurrency"
-	CodeSourceTooLarge    = "source_too_large"
-	CodeSourceInvalid     = "source_invalid"
-	CodeAppLayerTooBig    = "app_layer_too_large"
-	CodeBuildUndetected   = "build_undetected"
-	CodeBuildOOM          = "build_oom"
-	CodeBuildTimeout      = "build_timeout"
-	CodeQuotaExhausted    = "quota_exhausted"
-	CodeBillingPastDue    = "billing_past_due"
-	CodeCapacity          = "capacity_unavailable"
-	CodeUnauthorized      = "unauthorized"
+	CodePlanLimitApps   = "plan_limit_apps"
+	CodePlanLimitRAM    = "plan_limit_ram"
+	CodePlanLimitConcur = "plan_limit_concurrency"
+	CodeSourceTooLarge  = "source_too_large"
+	CodeSourceInvalid   = "source_invalid"
+	CodeAppLayerTooBig  = "app_layer_too_large"
+	CodeBuildUndetected = "build_undetected"
+	CodeBuildOOM        = "build_oom"
+	CodeBuildTimeout    = "build_timeout"
+	CodeQuotaExhausted  = "quota_exhausted"
+	CodeBillingPastDue  = "billing_past_due"
+	CodeCapacity        = "capacity_unavailable"
+	CodeUnauthorized    = "unauthorized"
+	// CodeForbidden is returned when the authenticated principal lacks
+	// the scope required by the route (IAM-1, ADR-011). Distinct from
+	// CodeUnauthorized so a customer can tell "I need to log in" from
+	// "my key does not have permission for this endpoint".
+	CodeForbidden         = "insufficient_scope"
 	CodeNotFound          = "not_found"
 	CodeValidation        = "validation_failed"
 	CodeConflict          = "conflict"

@@ -100,7 +100,7 @@ func seedFullAccountWithDep(t *testing.T, s *state.PgStore, ctx context.Context)
 	if err := s.UpsertAppSecret(ctx, acct.ID, app.ID, "STRIPE_KEY", []byte("ct")); err != nil {
 		return "", "", err
 	}
-	if _, err := s.CreateAPIKey(ctx, acct.ID, []byte("deadbeefcafebabe"), "test"); err != nil {
+	if _, err := s.CreateAPIKey(ctx, acct.ID, []byte("deadbeefcafebabe"), "test", []string{"admin"}); err != nil {
 		return "", "", err
 	}
 	return acct.ID, dep.ID, nil

@@ -33,7 +33,7 @@ func setup(t *testing.T, plan api.Plan) testEnv {
 		t.Fatal(err)
 	}
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.DefaultScopes()); err != nil {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_test")
