@@ -166,6 +166,27 @@ func main() {
 // subtest to pin the buildctl path for the new runtime.
 func GoDockerfileFixture(t *testing.T) []byte {
 	t.Helper()
+	return goDockerfileFixture(t, "1.24-bookworm", "go124-dockerfile")
+}
+
+// GoAlpineDockerfileFixture mirrors GoDockerfileFixture but uses
+// `FROM golang:1.24-alpine AS build` so the customer's compiled binary
+// is a fully-static musl-linked executable. Exercises the buildctl
+// path for runtime=go124-alpine (Tier 2 PR) — the produced /app/server
+// must load on a musl base (`/srv/fc/base/runner-go124-alpine.ext4`)
+// and would fail with `exec format error` against the bookworm base.
+// Used by the build_metal_test `go124-alpine-tarball` subtest.
+func GoAlpineDockerfileFixture(t *testing.T) []byte {
+	t.Helper()
+	return goDockerfileFixture(t, "1.24-alpine", "go124-alpine-dockerfile")
+}
+
+// goDockerfileFixture is the shared fixture body for the bookworm +
+// alpine go124 paths. The bookworm + alpine subtests differ only in the
+// build-stage FROM line and the .faas-fixture label (used by buildctl's
+// per-fixture cache key + the metal subtest's assertion).
+func goDockerfileFixture(t *testing.T, golangTag, label string) []byte {
+	t.Helper()
 	const goMod = "module example.com/faas-go-dockerfile-fixture\n\n" +
 		"go 1.24\n"
 	const mainGo = `package main
@@ -184,7 +205,7 @@ func main() {
 	}
 }
 `
-	dockerfile := "FROM golang:1.24-bookworm AS build\n" +
+	dockerfile := "FROM golang:" + golangTag + " AS build\n" +
 		"WORKDIR /src\n" +
 		"COPY go.mod main.go ./\n" +
 		"RUN CGO_ENABLED=0 go build -o /out/server ./\n" +
@@ -198,7 +219,7 @@ func main() {
 		"Dockerfile":       dockerfile,
 		"go.mod":           goMod,
 		"main.go":          mainGo,
-		".faas-fixture":    "go124-dockerfile\n",
+		".faas-fixture":    label + "\n",
 		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
 	}
 	return buildTarGz(t, files)

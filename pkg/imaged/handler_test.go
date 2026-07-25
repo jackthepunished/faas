@@ -1041,6 +1041,7 @@ func TestBaseRefFor_Runtimes(t *testing.T) {
 		{"node22 → node22 base", RuntimeNode22, BaseRefNode22},
 		{"python312 → python312 base", RuntimePython312, BaseRefPython312},
 		{"go124 → go124 base (PR #201 row)", RuntimeGo124, BaseRefGo124},
+		{"go124-alpine → go124-alpine base (Tier 2 PR row)", RuntimeGo124Alpine, BaseRefGo124Alpine},
 		{"empty runtime → minimal base", "", BaseRefMinimal},
 		{"unknown runtime → minimal base", "ruby33", BaseRefMinimal},
 	}
@@ -1068,6 +1069,7 @@ func TestRunnerPathFor_Runtimes(t *testing.T) {
 		{"node22 → node22Path", func(h *Handler) { h.WithFunctionRunnerNode22("/runners/node22") }, RuntimeNode22, "/runners/node22"},
 		{"python312 → python312Path", func(h *Handler) { h.WithFunctionRunnerPython312("/runners/python312") }, RuntimePython312, "/runners/python312"},
 		{"go124 → go124Path (PR #201 row)", func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") }, RuntimeGo124, "/runners/go124"},
+		{"go124-alpine → go124AlpinePath (Tier 2 PR row)", func(h *Handler) { h.WithFunctionRunnerGo124Alpine("/runners/go124-alpine") }, RuntimeGo124Alpine, "/runners/go124-alpine"},
 		{"empty runtime → \"\"", func(h *Handler) {}, "", ""},
 		{"unknown runtime → \"\"", func(h *Handler) {}, "ruby33", ""},
 	}
@@ -1097,6 +1099,7 @@ func TestRuntimeToEnvSuffix_Runtimes(t *testing.T) {
 		{"node22 → NODE22", RuntimeNode22, "NODE22"},
 		{"python312 → PYTHON312", RuntimePython312, "PYTHON312"},
 		{"go124 → GO124 (PR #201 row)", RuntimeGo124, "GO124"},
+		{"go124-alpine → GO124_ALPINE (Tier 2 PR row)", RuntimeGo124Alpine, "GO124_ALPINE"},
 		{"unknown runtime → unchanged", "ruby33", "ruby33"},
 	}
 	for _, tc := range cases {
@@ -1151,6 +1154,17 @@ func TestBuildFunctionLayer_Runtimes(t *testing.T) {
 			runnerPath:  "/runners/go124",
 			handlerPath: "/app/handler",
 			wire:        func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") },
+		},
+		{
+			// Tier 2 PR row: go124-alpine shares the runner shim
+			// (guest/runners/go124) and the customer handler path
+			// (/app/handler) with go124. Only the base image's libc
+			// differs. The argv assertion is identical to go124.
+			name:        "go124-alpine",
+			runtime:     RuntimeGo124Alpine,
+			runnerPath:  "/runners/go124-alpine",
+			handlerPath: "/app/handler",
+			wire:        func(h *Handler) { h.WithFunctionRunnerGo124Alpine("/runners/go124-alpine") },
 		},
 	}
 	for _, tc := range cases {
@@ -1228,6 +1242,7 @@ func TestBuildFunctionLayer_MissingRunnerFailsLoud(t *testing.T) {
 		{"node22", RuntimeNode22, "FAAS_FUNCTION_RUNNER_NODE22"},
 		{"python312", RuntimePython312, "FAAS_FUNCTION_RUNNER_PYTHON312"},
 		{"go124 (PR #201 row)", RuntimeGo124, "FAAS_FUNCTION_RUNNER_GO124"},
+		{"go124-alpine (Tier 2 PR row)", RuntimeGo124Alpine, "FAAS_FUNCTION_RUNNER_GO124_ALPINE"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1296,6 +1311,17 @@ func TestManifestFromImageConfig_AppModeCmd(t *testing.T) {
 	cfg.Env["PORT"] = "9999"
 	if manifest.Env["PORT"] != "3000" {
 		t.Errorf("manifest.Env aliased cfg.Env (mutation leaked): PORT=%q", manifest.Env["PORT"])
+	}
+
+	// Defensive copy on the Cmd→Entrypoint slice mapping. The OCI puller
+	// allocates cfg.Cmd fresh per call today, but the contract is
+	// fragile: a future puller that pools ImageConfig, or a future
+	// handleDeployment that normalizes cfg.Cmd in place, would silently
+	// mutate the stored manifest. slices.Clone is the fix; this assertion
+	// pins it.
+	cfg.Cmd[0] = "/mutated"
+	if manifest.Entrypoint[0] != "/app/server" {
+		t.Errorf("manifest.Entrypoint aliased cfg.Cmd (mutation leaked): Entrypoint=%v", manifest.Entrypoint)
 	}
 }
 

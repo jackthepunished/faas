@@ -145,6 +145,23 @@ func TestBuildMetal(t *testing.T) {
 		buildID := runBuildSubtest(t, h, pool, key, "godfapp", "go-dockerfile-app", GoDockerfileFixture(t), true)
 		assertBuildDoneSubstring(t, h, buildID, "buildctl")
 	})
+	t.Run("go124-alpine-tarball", func(t *testing.T) {
+		// Tier 2 PR: go124-alpine reuses the go124 dispatch path with
+		// `FROM golang:1.24-alpine AS build` (GoAlpineDockerfileFixture).
+		// The produced /app/server is a fully-static musl-linked
+		// binary; imaged's runtime=go124-alpine branch wires the same
+		// runner shim as go124 against the alpine base. The end-to-end
+		// assertion is identical to go124-dockerfile-tarball: buildctl
+		// substring + Live deployment status. The libc match (musl
+		// binary on a musl base) is exercised end-to-end on the EX44
+		// (x86_64) via `make test-metal`; on Lima (arm64) the same
+		// fixture exercises the cross-compile path. A regression that
+		// drops the alpine arm from baseRefFor / buildFunctionLayer
+		// surfaces as a deployment status of DeployFailed with
+		// `unsupported runtime: go124-alpine` in the error.
+		buildID := runBuildSubtest(t, h, pool, key, "goalpapp", "go-alpine-app", GoAlpineDockerfileFixture(t), true)
+		assertBuildDoneSubstring(t, h, buildID, "buildctl")
+	})
 }
 
 // runBuildSubtest drives a single end-to-end build, then asserts the
