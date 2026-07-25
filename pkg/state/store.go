@@ -440,6 +440,23 @@ type Store interface {
 	RequeueBuild(ctx context.Context, id string) error
 	UpdateBuildStatus(ctx context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error
 
+	// SweepStuckRunningBuilds flips every build row whose status is
+	// 'running' AND whose started_at is older than threshold to
+	// status='failed' with failure_class='timeout'. Used by the
+	// builderd reaper (issue #195 B1.4) to clean up rows left
+	// orphaned by a builder VM crash, OOM, or kernel panic that
+	// bypassed the normal markFailed / markSucceeded path.
+	//
+	// Returns the number of rows affected. Idempotent: a second
+	// call with the same threshold affects 0 rows because all
+	// matching rows are now 'failed'.
+	//
+	// The reaper only updates the build row. The owning deployment
+	// row is flipped to DeployFailed separately (issue #195 B1.5
+	// for the imaged defer path; ADR-031 for the requeue-vs-fail
+	// reconciliation).
+	SweepStuckRunningBuilds(ctx context.Context, threshold time.Time) (int, error)
+
 	// Custom domains (apid is sole writer).
 	CreateCustomDomain(ctx context.Context, domain, appID, token string) (CustomDomain, error)
 	DomainByName(ctx context.Context, domain string) (CustomDomain, error)

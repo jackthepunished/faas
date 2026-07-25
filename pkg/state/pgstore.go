@@ -945,15 +945,47 @@ func (s *PgStore) BuildByDeployment(ctx context.Context, deploymentID string) (B
 	return scanBuild(row)
 }
 
+// UpdateBuildStatus flips the build row to a new status, with an
+// optional failure_class + started/finished timestamps.
+//
+// CAS guard (issue #195 B1.4): when the requested status is a
+// TERMINAL state (BuildSucceeded or BuildFailed), the WHERE clause
+// requires the current status to be 'running'. A late-arriving
+// markSucceeded from a builderd process that finishes AFTER the
+// reaper sweep has flipped its row to 'failed(timeout)' must NOT
+// resurrect the row. With the guard, the late writer's UPDATE
+// matches 0 rows and returns ErrNotFound — the caller logs WARN and
+// moves on.
+//
+// Non-terminal transitions (BuildRunning, BuildQueued) are NOT
+// guarded — ClaimQueuedBuild and the legacy UpdateBuildStatus(
+// BuildRunning, started=true) path both rely on a clean queued→
+// running flip. The race we're guarding is exclusively the
+// terminal-write-after-reaper path.
+//
+// Same shape for MemStore (the in-process equivalent of the SQL
+// guard). FailureClass is the build's typed reason (`infra`,
+// `user_error`, `timeout`); empty string preserves the existing value.
 func (s *PgStore) UpdateBuildStatus(ctx context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error {
-	tag, err := s.pool.Exec(ctx,
-		`update builds set
+	var query string
+	if status == BuildSucceeded || status == BuildFailed {
+		// CAS guard: terminal write only succeeds if the row is
+		// still 'running'. Catches the late-markSucceeded race.
+		query = `update builds set
 		   status        = $2,
 		   failure_class = case when $3 = '' then failure_class else $3 end,
 		   started_at    = case when $4 then now() else started_at end,
 		   finished_at   = case when $5 then now() else finished_at end
-		 where id = $1`,
-		id, string(status), string(fc), started, finished)
+		 where id = $1 and status = 'running'`
+	} else {
+		query = `update builds set
+		   status        = $2,
+		   failure_class = case when $3 = '' then failure_class else $3 end,
+		   started_at    = case when $4 then now() else started_at end,
+		   finished_at   = case when $5 then now() else finished_at end
+		 where id = $1`
+	}
+	tag, err := s.pool.Exec(ctx, query, id, string(status), string(fc), started, finished)
 	if err != nil {
 		return err
 	}
@@ -961,6 +993,23 @@ func (s *PgStore) UpdateBuildStatus(ctx context.Context, id string, status Build
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SweepStuckRunningBuilds is the reaper sweep (issue #195 B1.4).
+// Returns the number of rows flipped. A partial index on
+// builds(status='running') keeps this O(matches) instead of O(table).
+func (s *PgStore) SweepStuckRunningBuilds(ctx context.Context, threshold time.Time) (int, error) {
+	tag, err := s.pool.Exec(ctx,
+		`update builds set
+		   status        = 'failed',
+		   failure_class = 'timeout',
+		   finished_at   = now()
+		 where status = 'running' and started_at < $1`,
+		threshold)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // ClaimQueuedBuild atomically transitions queued → running via a single
@@ -2064,9 +2113,13 @@ func (s *PgStore) MarkSnapshotStale(ctx context.Context, snapshotID string) erro
 // ListLiveSnapshotStats is: the GC algorithm is O(N) per tick and a 10k
 // fleet is plenty for the v1 box (the 452 GB budget fires well before that).
 // Raise this when we go multi-box.
+//
+// B1.1 (issue #195): also selects a.slug so the GC loop can build the
+// apps/<slug>/<dep>.ext4 storage key without re-issuing a
+// DeploymentByID + AppByID round-trip per eviction.
 func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, error) {
 	rows, err := s.pool.Query(ctx,
-		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text,
+		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text, a.slug,
 		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at
 		   from snapshots s
 		   join deployments d on d.id = s.deployment_id
@@ -2082,7 +2135,7 @@ func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, erro
 	var out []SnapshotForGC
 	for rows.Next() {
 		var r SnapshotForGC
-		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID,
+		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID, &r.AppSlug,
 			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt); err != nil {
 			return nil, err
 		}

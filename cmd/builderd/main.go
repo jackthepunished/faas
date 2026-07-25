@@ -178,6 +178,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	go workerLoop(ctx, b, pollInterval, log)
 
+	// Stuck-running build reaper (issue #195 B1.4). Free-function
+	// goroutine next to workerLoop; cadence + threshold come from
+	// cfg with sensible defaults set by LoadConfig. Sweeps orphaned
+	// 'running' rows that bypassed markSucceeded/markFailed (builder
+	// VM crash, OOM-kill, kernel panic).
+	reapInterval := cfg.StuckBuildSweepInterval
+	if reapInterval <= 0 {
+		reapInterval = 10 * time.Minute
+	}
+	reapThreshold := cfg.StuckBuildThreshold
+	if reapThreshold <= 0 {
+		reapThreshold = 15 * time.Minute
+	}
+	go builderdpkg.ReaperLoop(ctx, store, reapInterval, reapThreshold, log)
+
 	for {
 		select {
 		case <-ctx.Done():

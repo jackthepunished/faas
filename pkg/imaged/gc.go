@@ -63,7 +63,9 @@ func perAppKeepCurrentPrevious(rows []state.SnapshotForGC) []deleteTarget {
 			drop = append(drop, deleteTarget{
 				ID:           appRows[i].ID,
 				DeploymentID: appRows[i].DeploymentID,
-				AppSlug:      appSlugFor(rows, appRows[i].AppID),
+				// B1.1: AppSlug is on SnapshotForGC (issue #195);
+				// no per-eviction re-resolve needed.
+				AppSlug: appRows[i].AppSlug,
 			})
 		}
 	}
@@ -155,32 +157,11 @@ func evictOldestFromHeaviestAccount(rows []state.SnapshotForGC) []deleteTarget {
 	if oldest == nil {
 		return nil
 	}
-	// The slug isn't on SnapshotForGC — look it up against the input
-	// rows. Required for the appsRoot/<slug>/<depID>.ext4 path.
-	slug := appSlugFor(rows, oldest.AppID)
+	// B1.1: AppSlug is on SnapshotForGC (issue #195); no lookup
+	// against the input rows required.
 	return []deleteTarget{{
 		ID:           oldest.ID,
 		DeploymentID: oldest.DeploymentID,
-		AppSlug:      slug,
+		AppSlug:      oldest.AppSlug,
 	}}
-}
-
-// appSlugFor returns the slug for an app by scanning rows. Used by the
-// GC algorithms to populate deleteTarget.AppSlug. The input rows
-// already contain the join — no DB round-trip required. Returns "" if
-// the app ID is unknown (caller treats this as a delete with no ext4).
-func appSlugFor(rows []state.SnapshotForGC, appID string) string {
-	for _, r := range rows {
-		if r.AppID == appID {
-			// SnapshotForGC doesn't carry slug directly; it carries
-			// app_id + account_id. We need the slug for the on-disk
-			// ext4 path. The caller (Loop.deleteSnapshotsAndFiles)
-			// resolves slug by reading AppByID when it's "" — see
-			// that function. Kept here so the GC algorithms stay
-			// pure over SnapshotForGC and don't import api/state.
-			_ = r
-			return ""
-		}
-	}
-	return ""
 }
