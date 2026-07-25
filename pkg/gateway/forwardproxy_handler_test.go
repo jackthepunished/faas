@@ -79,6 +79,14 @@ func (s *stubVmmdClient) Ping(context.Context, *vmmdpb.PingRequest, ...grpc.Call
 	return &vmmdpb.PingResponse{}, nil
 }
 
+// UpdateEgressAllowlist (tier-2 PR-B) — the gateway hot path
+// doesn't drive the in-place patch; schedd's egress_drift
+// subscriber does. Returns success so the gRPC VmmdClient
+// interface stays satisfied.
+func (s *stubVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEgressAllowlistRequest, ...grpc.CallOption) (*vmmdpb.UpdateEgressAllowlistAck, error) {
+	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

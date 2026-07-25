@@ -273,7 +273,7 @@ func (c Config) NftCommands() [][]string {
 	// each rule sits inside its chain block (the ruleset's per-chain
 	// ordering — established,related accept → cap → SMTP → deny →
 	// allowlist → chain-policy — holds for both v4 and v6).
-	if rule := c.forwardAllowlistRule(nft); rule != nil {
+	if rule := c.ForwardAllowlistRule(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
 	// The per-netns table is `ip faas` (not `inet faas` — nft requires an
@@ -310,7 +310,7 @@ func (c Config) NftCommands() [][]string {
 	// a v4-only allowlist returns nil here — v6 stays at
 	// chain-policy drop (because forwardChainPolicy flips when the
 	// single field is non-empty), with no per-chain accept rule.
-	if rule := c.forwardAllowlistRule6(nft); rule != nil {
+	if rule := c.ForwardAllowlistRule6(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
 	return cmds
@@ -412,13 +412,15 @@ func (c Config) forwardChainPolicy() string {
 	return nftPolicyDrop
 }
 
-// forwardAllowlistRule (ADR-031 + ADR-032) emits the IPv4 half of
-// the per-app outbound IP allowlist accept rule, or nil when
-// EgressAllowlist is empty or contains no v4 entries (so current
-// behaviour — chain-policy accept — stays the default for any vmmd
-// that hasn't been wired, any app that didn't PATCH the list, or
-// any list that holds only v6 entries — the v6 half is emitted by
-// forwardAllowlistRule6). Shape:
+// ForwardAllowlistRule (ADR-031 + ADR-032, tier-2 PR-B: also used
+// from pkg/fcvm.Manager.UpdateEgressAllowlist for in-place netns
+// patches) emits the IPv4 half of the per-app outbound IP
+// allowlist accept rule, or nil when EgressAllowlist is empty or
+// contains no v4 entries (so current behaviour — chain-policy
+// accept — stays the default for any vmmd that hasn't been wired,
+// any app that didn't PATCH the list, or any list that holds only
+// v6 entries — the v6 half is emitted by ForwardAllowlistRule6).
+// Shape:
 //
 //	nft add rule ip faas forward
 //	  iifname "tap0" ip daddr { CIDR1,CIDR2,… } accept
@@ -431,8 +433,11 @@ func (c Config) forwardChainPolicy() string {
 // overlap), BEFORE chain-default accept (unlisted destinations
 // drop when an allowlist exists on the v4 chain).
 //
-// Internal to NftCommands — do not invoke from anywhere else.
-func (c Config) forwardAllowlistRule(nft func(...string) []string) []string {
+// Exported because Manager.UpdateEgressAllowlist renders the same
+// argv against a live netns (in-place patch) using a per-netns
+// `nft` builder; the internal NftCommands path also calls it via
+// the closure it threads.
+func (c Config) ForwardAllowlistRule(nft func(...string) []string) []string {
 	var v4 []string
 	for _, p := range c.EgressAllowlist {
 		if p.Addr().Is4() {
@@ -446,18 +451,22 @@ func (c Config) forwardAllowlistRule(nft func(...string) []string) []string {
 		"iifname", c.Tap, "ip", "daddr", "{", strings.Join(v4, ","), "}", "accept")
 }
 
-// forwardAllowlistRule6 (ADR-032 — v6 mirror of forwardAllowlistRule)
-// emits the per-app outbound IPv6 allowlist accept rule, or nil when
-// EgressAllowlist is empty or contains no v6 entries. Same shape as
-// the v4 helper but with the `ip6` family keyword and the
-// `ip6 faas forward` chain (nft rejects mixing `ip` and `ip6 daddr`
-// matches in one table — ADR-023). Order in the v6 chain: AFTER
-// the v6 lateral-movement deny (deny > allow on overlap), BEFORE
-// chain-default accept (unlisted destinations drop when an
-// allowlist exists on the v6 chain).
+// ForwardAllowlistRule6 (ADR-032 — v6 mirror of ForwardAllowlistRule;
+// tier-2 PR-B: also called from pkg/fcvm.Manager.UpdateEgressAllowlist
+// for the in-place v6 patch) emits the per-app outbound IPv6
+// allowlist accept rule, or nil when EgressAllowlist is empty or
+// contains no v6 entries. Same shape as the v4 helper but with
+// the `ip6` family keyword and the `ip6 faas forward` chain (nft
+// rejects mixing `ip` and `ip6 daddr` matches in one table —
+// ADR-023). Order in the v6 chain: AFTER the v6 lateral-movement
+// deny (deny > allow on overlap), BEFORE chain-default accept
+// (unlisted destinations drop when an allowlist exists on the v6
+// chain).
 //
-// Internal to NftCommands — do not invoke from anywhere else.
-func (c Config) forwardAllowlistRule6(nft func(...string) []string) []string {
+// Exported for the same reason as ForwardAllowlistRule: the live
+// in-place patch path runs against the same argv shape, just on
+// a different netns.
+func (c Config) ForwardAllowlistRule6(nft func(...string) []string) []string {
 	var v6 []string
 	for _, p := range c.EgressAllowlist {
 		if !p.Addr().Is4() {

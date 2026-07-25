@@ -775,7 +775,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 
 	// Empty: nothing emitted.
 	empty := testConfig() // zero-value EgressAllowlist
-	if got := empty.forwardAllowlistRule(nft); got != nil {
+	if got := empty.ForwardAllowlistRule(nft); got != nil {
 		t.Errorf("empty EgressAllowlist: helper returned %v, want nil", got)
 	}
 
@@ -783,7 +783,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 	one := testConfig()
 	one.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
 	wantOne := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24 } accept`
-	if got := strings.Join(one.forwardAllowlistRule(nft), " "); got != wantOne {
+	if got := strings.Join(one.ForwardAllowlistRule(nft), " "); got != wantOne {
 		t.Errorf("single v4 CIDR:\n got  %s\n want %s", got, wantOne)
 	}
 
@@ -795,16 +795,16 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 		netip.MustParsePrefix("9.9.9.0/24"),
 	}
 	wantMany := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24,8.8.8.0/24,9.9.9.0/24 } accept`
-	if got := strings.Join(many.forwardAllowlistRule(nft), " "); got != wantMany {
+	if got := strings.Join(many.ForwardAllowlistRule(nft), " "); got != wantMany {
 		t.Errorf("multiple v4 CIDRs:\n got  %s\n want %s", got, wantMany)
 	}
 
 	// v4-only partition: a v6-only EgressAllowlist produces NO v4
-	// rule (the v6 half is emitted by forwardAllowlistRule6). This
+	// rule (the v6 half is emitted by ForwardAllowlistRule6). This
 	// is the ADR-032 family split: each chain reads its own slice.
 	v6Only := testConfig()
 	v6Only.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("fe80::/10")}
-	if got := v6Only.forwardAllowlistRule(nft); got != nil {
+	if got := v6Only.ForwardAllowlistRule(nft); got != nil {
 		t.Errorf("v6-only input on v4 helper: got %v, want nil", got)
 	}
 
@@ -815,7 +815,7 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 		netip.MustParsePrefix("fe80::/10"),
 	}
 	wantMixedV4 := `ip netns exec fc-test nft add rule ip faas forward iifname tap0 ip daddr { 1.2.3.0/24 } accept`
-	if got := strings.Join(mixed.forwardAllowlistRule(nft), " "); got != wantMixedV4 {
+	if got := strings.Join(mixed.ForwardAllowlistRule(nft), " "); got != wantMixedV4 {
 		t.Errorf("mixed input on v4 helper:\n got  %s\n want %s", got, wantMixedV4)
 	}
 }
@@ -826,14 +826,14 @@ func TestForwardAllowlistRuleHelper(t *testing.T) {
 // a v4 entry produces nil here because the v4 helper owns it).
 //
 // Internal to NftCommands — do not invoke from anywhere else. The
-// helper signature mirrors forwardAllowlistRule so the per-family
+// helper signature mirrors ForwardAllowlistRule so the per-family
 // symmetric test pattern is grep-able.
 func TestForwardAllowlistRule6Helper(t *testing.T) {
 	nx := []string{"ip", "netns", "exec", "fc-test", "nft"}
 	nft := func(parts ...string) []string { return append(append([]string{}, nx...), parts...) }
 
 	// Empty: nothing emitted.
-	if got := testConfig().forwardAllowlistRule6(nft); got != nil {
+	if got := testConfig().ForwardAllowlistRule6(nft); got != nil {
 		t.Errorf("empty EgressAllowlist: helper returned %v, want nil", got)
 	}
 
@@ -841,7 +841,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 	one := testConfig()
 	one.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("fe80::/10")}
 	wantOne := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10 } accept`
-	if got := strings.Join(one.forwardAllowlistRule6(nft), " "); got != wantOne {
+	if got := strings.Join(one.ForwardAllowlistRule6(nft), " "); got != wantOne {
 		t.Errorf("single v6 CIDR:\n got  %s\n want %s", got, wantOne)
 	}
 
@@ -852,7 +852,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 		netip.MustParsePrefix("2001:db8::/32"),
 	}
 	wantMany := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10,2001:db8::/32 } accept`
-	if got := strings.Join(many.forwardAllowlistRule6(nft), " "); got != wantMany {
+	if got := strings.Join(many.ForwardAllowlistRule6(nft), " "); got != wantMany {
 		t.Errorf("multiple v6 CIDRs:\n got  %s\n want %s", got, wantMany)
 	}
 
@@ -860,7 +860,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 	// rule. Symmetric to the v4 helper's v6-only case above.
 	v4Only := testConfig()
 	v4Only.EgressAllowlist = []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")}
-	if got := v4Only.forwardAllowlistRule6(nft); got != nil {
+	if got := v4Only.ForwardAllowlistRule6(nft); got != nil {
 		t.Errorf("v4-only input on v6 helper: got %v, want nil", got)
 	}
 
@@ -871,7 +871,7 @@ func TestForwardAllowlistRule6Helper(t *testing.T) {
 		netip.MustParsePrefix("fe80::/10"),
 	}
 	wantMixedV6 := `ip netns exec fc-test nft add rule ip6 faas forward iifname tap0 ip6 daddr { fe80::/10 } accept`
-	if got := strings.Join(mixed.forwardAllowlistRule6(nft), " "); got != wantMixedV6 {
+	if got := strings.Join(mixed.ForwardAllowlistRule6(nft), " "); got != wantMixedV6 {
 		t.Errorf("mixed input on v6 helper:\n got  %s\n want %s", got, wantMixedV6)
 	}
 }
