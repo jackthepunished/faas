@@ -66,6 +66,40 @@ func TestCreateApp_FunctionBadRuntime(t *testing.T) {
 	}
 }
 
+// TestCreateApp_FunctionGo124Runtime is the positive pin for the
+// go124 runtime: a function app with Runtime: "go124" must be accepted
+// by the apid server-side whitelist. The wire contract is
+// cmd/apid/handlers.go (the buildApp allow-list) plus the DB CHECK
+// widened in migrations/00035_app_runtime_go124.sql. If this test
+// breaks, one of the two guards is out of sync.
+func TestCreateApp_FunctionGo124Runtime(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/apps",
+		api.CreateAppRequest{Slug: "fn-go124-rt", Type: "function", Runtime: "go124"}, nil)
+	if rec.Code != 201 {
+		t.Fatalf("function with runtime=go124: %d %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Runtime != "go124" {
+		t.Errorf("runtime round-trip = %q, want go124", out.Runtime)
+	}
+}
+
+// TestCreateApp_FunctionGo124BadRuntime is the negative pin: a
+// runtime that LOOKS like go124 but is misspelled must still be
+// rejected with 400. The allow-list is exhaustive, not "go124*".
+func TestCreateApp_FunctionGo124BadRuntime(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/apps",
+		api.CreateAppRequest{Slug: "fn-go124-bad", Type: "function", Runtime: "go124beta"}, nil)
+	if rec.Code != 400 {
+		t.Errorf("function with runtime=go124beta: %d %s, want 400", rec.Code, rec.Body)
+	}
+}
+
 func TestCreateApp_AppliesDefaults(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	rec := e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "defaults-app"}, nil)

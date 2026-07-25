@@ -19,6 +19,7 @@ type Framework string
 const (
 	FrameworkNode    Framework = "node"
 	FrameworkPython  Framework = "python"
+	FrameworkGo      Framework = "go"     // tarball contains a go.mod at the root
 	FrameworkDocker  Framework = "docker" // tarball contains a Dockerfile at the root
 	FrameworkUnknown Framework = "unknown"
 )
@@ -54,6 +55,7 @@ func (d *Detector) Detect(path string) (Framework, error) {
 	hasDocker := false
 	hasNode := false
 	hasPython := false
+	hasGo := false
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -75,6 +77,8 @@ func (d *Detector) Detect(path string) (Framework, error) {
 			hasNode = true
 		case "requirements.txt", "pyproject.toml", "pipfile", "setup.py":
 			hasPython = true
+		case "go.mod":
+			hasGo = true
 		}
 	}
 	switch {
@@ -84,6 +88,8 @@ func (d *Detector) Detect(path string) (Framework, error) {
 		return FrameworkNode, nil
 	case hasPython:
 		return FrameworkPython, nil
+	case hasGo:
+		return FrameworkGo, nil
 	}
-	return FrameworkUnknown, errors.New("detect: no package.json, requirements.txt, or Dockerfile found at tarball root")
+	return FrameworkUnknown, errors.New("detect: no package.json, requirements.txt, go.mod, or Dockerfile found at tarball root")
 }

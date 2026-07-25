@@ -14,7 +14,7 @@ import (
 type CreateAppRequest struct {
 	Slug           string `json:"slug"`
 	Type           string `json:"type,omitempty"`    // "app" (default) | "function"
-	Runtime        string `json:"runtime,omitempty"` // node22|python312 for functions
+	Runtime        string `json:"runtime,omitempty"` // node22|python312|go124 for functions
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
