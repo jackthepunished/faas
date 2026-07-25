@@ -85,6 +85,126 @@ func (a *authHandlers) renderLoginForm(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// postLogin is the PR #1 (issue #165) hardened login path.
+//
+// Pre-#165, any POST /login with a well-formed email auto-created
+// an account, minted a "web-console" API key, returned that key in
+// the response body, and set a 7-day session cookie — with zero
+// verification. That was a full pre-auth account-takeover (spec
+// §11 violation).
+//
+// Post-#165:
+//
+//   - Auto-creation is gone. Unknown email → 401 invalid_credentials.
+//   - The web-console API key mint is gone. The response body
+//     carries only `{status, account}` — no api_key field.
+//   - The ONLY way to authenticate through /login in PR #1 is to
+//     present a pre-existing "web-console" API key via the
+//     X-Dashboard-Key header. That fallback exists so the
+//     customers the buggy handler created before #165 can still
+//     reach the dashboard; PR #2 replaces it with email+password
+//     (Argon2id) and removes the header — see ADR-032.
+//
+// Why header AND email, not header alone: a leaked API key alone
+// must never be sufficient to take over a dashboard session. The
+// customer's browser still has to submit the account's email
+// alongside the key, and the session cookie is HttpOnly +
+// SameSite=Lax. The X-Dashboard-Key path is a backstop for the
+// pre-#165 customers; PR #2's email+password path replaces it.
+func (a *authHandlers) postLogin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		api.WriteProblem(w, api.ErrValidation("could not parse form body"))
+		return
+	}
+	email := strings.TrimSpace(strings.ToLower(r.FormValue("email")))
+	if email == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing email", "email is required"))
+		return
+	}
+	if !looksLikeEmail(email) {
+		api.WriteProblem(w, api.ErrValidation("email is not a well-formed address"))
+		return
+	}
+
+	// PR #1 (issue #165, ADR-032): the only remaining way to
+	// sign in via /login is a pre-existing "web-console" API key
+	// presented via the X-Dashboard-Key header. We deliberately
+	// do NOT fall back to auto-creating an account on lookup
+	// miss — that path is what made the original handler a
+	// pre-auth account-takeover.
+	key := strings.TrimSpace(r.Header.Get(dashboardKeyHeader))
+	if !api.ValidAPIKeyFormat(key) {
+		a.log.Info("login.invalid_key_format", "email", logsanitize.Field(email))
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
+			api.CodeInvalidCredentials, "Sign-in failed",
+			"provide a valid dashboard key via X-Dashboard-Key"))
+		return
+	}
+
+	acct, err := a.srv.store.AccountByKeyHash(r.Context(), api.HashAPIKey(key))
+	if err != nil {
+		// Same body as the email/key-mismatch path: anti-enumeration.
+		a.log.Info("login.key_not_found", "email", logsanitize.Field(email))
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
+			api.CodeInvalidCredentials, "Sign-in failed",
+			"invalid email or dashboard key"))
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(acct.Email), email) {
+		// The header resolved to a real account, but the
+		// submitted email doesn't match. Don't leak which is
+		// which; same body as the no-match path.
+		a.log.Info("login.email_key_mismatch", "email", logsanitize.Field(email))
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
+			api.CodeInvalidCredentials, "Sign-in failed",
+			"invalid email or dashboard key"))
+		return
+	}
+
+	// Mint session & set HttpOnly faas_sid cookie. The response
+	// body carries NO api_key (PR #1 closes issue #165 — the
+	// legacy handler returned the freshly minted key in the
+	// response, which made the takeover reproducible from a
+	// single POST /login curl).
+	cookie, err := a.srv.sessions.Issue(acct.ID)
+	if err != nil {
+		a.log.Error("login.session_issue", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			"internal_error", "Internal Error", "failed to issue session"))
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    cookie,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionCookieLifetime.Seconds()),
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	// NOTE: the response body intentionally omits `api_key`.
+	// Pre-#165 this JSON had `"api_key": "fp_live_..."` — the
+	// attacker grabbed that key and used it for full account
+	// control. The key path remains as a PR #1 fallback ONLY
+	// because pre-existing customers still hold a key from the
+	// buggy deploy and need a way back in; the response never
+	// surfaces it again.
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":  "ok",
+		"account": acct,
+	})
+
+	// IAM-4 (ADR-035): record the auth.login success. Emit after
+	// the response body is encoded — the auth has succeeded, the
+	// best-effort audit write never rolls back the action even on
+	// failure.
+	a.srv.audit.Emit(r.Context(), "auth.login", &acct.ID, map[string]any{"method": "password"})
+}
+
 // verify handles GET /auth/verify?token=…. On success, sets the
 // faas_sid cookie and redirects to /dashboard/. On replay / expiry /
 // invalid, returns 410 Gone (semantically correct: the resource was
@@ -122,6 +242,8 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(a.srv.sessions.MaxAge().Seconds()),
 	})
+	// IAM-4 (ADR-035): record the magic-link login success.
+	a.srv.audit.Emit(r.Context(), "auth.login", &accountID, map[string]any{"method": "magic_link"})
 	http.Redirect(w, r, "/dashboard/", http.StatusFound)
 }
 
@@ -130,6 +252,19 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 // the cookie's MaxAge of zero is enough to invalidate it on the
 // client; spec §11 doesn't require a server-side kill switch.
 func (a *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
+	// IAM-4 (ADR-035): the logout handler isn't behind sessionAuth,
+	// so we resolve the account from the cookie inline so the audit
+	// row can carry subject=account_id. If the cookie is missing
+	// or invalid we still clear it (best-effort UX) and skip the
+	// emit — there's no account to attribute the action to.
+	var accountID string
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		if env, err := a.srv.sessions.Verify(c.Value); err == nil {
+			if acct, err := a.srv.store.AccountByID(r.Context(), env.AccountID); err == nil && acct.Active() {
+				accountID = acct.ID
+			}
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    "",
@@ -139,6 +274,11 @@ func (a *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+	// Emit before the redirect so the audit row is durable even if
+	// the client closes the connection on 302.
+	if accountID != "" {
+		a.srv.audit.Emit(r.Context(), "auth.logout", &accountID, nil)
+	}
 	http.Redirect(w, r, loginPath, http.StatusFound)
 }
 

@@ -58,7 +58,7 @@ func (s *server) dashboardDelete(w http.ResponseWriter, r *http.Request) {
 			"Invalid CSRF token", "please reload the page and try again"))
 		return
 	}
-	if _, prob := s.scheduleDeletion(r.Context(), acct); prob != nil {
+	if _, prob := s.scheduleDeletion(r.Context(), acct, "dashboard"); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -79,7 +79,7 @@ func (s *server) dashboardRestore(w http.ResponseWriter, r *http.Request) {
 			"Invalid CSRF token", "please reload the page and try again"))
 		return
 	}
-	if _, prob := s.cancelDeletion(r.Context(), acct); prob != nil {
+	if _, prob := s.cancelDeletion(r.Context(), acct, "dashboard"); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
