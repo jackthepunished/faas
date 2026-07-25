@@ -538,13 +538,21 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
 		return fmt.Errorf("imaged: %s", msg)
 	}
+	// Per-runtime handler path. The default `/app/<runtime>` works for
+	// runtimes whose handler binary carries the runtime name (go124's
+	// static binary lives at /app/handler — see the Go branch below).
+	// The python312 and node22 branches override because their
+	// handlers ship with a language-specific extension (.py / .js).
+	// A new runtime that needs a different path adds its own branch;
+	// the default is no longer a `.js` stub so a runtime omission
+	// can't silently produce `/app/<runtime>.js`.
 	manifest := api.AppManifest{
 		Port:    api.DefaultAppPort,
 		Healthz: "/healthz",
 		Entrypoint: []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
-			"--handler", "/app/" + runtime + ".js", // python312 uses handler.py; go124 uses /app/handler (see branch below); node22 uses node22.js
+			"--handler", "/app/" + runtime,
 		},
 	}
 	if runtime == RuntimePython312 {
@@ -554,14 +562,23 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--handler", "/app/handler.py",
 		}
 	}
+	if runtime == RuntimeNode22 {
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/node22.js",
+		}
+	}
 	if runtime == RuntimeGo124 {
 		// The customer's handler is a static Go binary (Railpack's go
 		// plan emits CGO_ENABLED=0 by default), so the runner execs
 		// the file directly with no interpreter argument. The path
-		// is locked to /app/handler and pinned by
+		// is `/app/handler` (the default above) and pinned by
 		// guest/runners/go124/main_test.go::TestGoRunnerHandlerDefault
 		// so a default-flag drift surfaces at unit-test time, not
-		// on first wake.
+		// on first wake. The branch is left here as a tripwire — if
+		// the default ever needs to differ for Go, it lives next to
+		// the other per-runtime overrides.
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,

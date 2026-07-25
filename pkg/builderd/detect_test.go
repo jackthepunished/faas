@@ -113,17 +113,18 @@ func TestDetector_DockerfileBeatsGo(t *testing.T) {
 	}
 }
 
-func TestDetector_GoBeatsPython(t *testing.T) {
-	// Defensive priority pin: a root go.mod wins over a coincidental
-	// requirements.txt (the two languages should not co-occur in
-	// practice, but the priority must be explicit so a future
-	// re-ordering of the switch arms doesn't silently change the
-	// chosen build engine). The order is docker > node > python > go,
-	// so python (which is checked before go) wins; this is intentional
-	// because a requirements.txt alongside a go.mod most likely
-	// indicates a polyglot project where the Python side is the
-	// primary deploy target. (If the order ever needs to flip, this
-	// test name and its expected value are the place to change.)
+func TestDetector_PythonBeatsGo(t *testing.T) {
+	// Defensive priority pin: a root go.mod alongside a coincidental
+	// requirements.txt must resolve to python, not go. The two markers
+	// should not co-occur in practice, but the priority must be explicit
+	// so a future re-ordering of the switch arms doesn't silently change
+	// the chosen build engine. The order is docker > node > python > go
+	// (python is checked before go in the detector's switch), so python
+	// wins; this is intentional because a requirements.txt alongside a
+	// go.mod most likely indicates a polyglot project where the Python
+	// side is the primary deploy target. (If the order ever needs to
+	// flip, this test name and its expected value are the place to
+	// change.)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "src.tar.gz")
 	makeTarball(t, path, []string{"go.mod", "requirements.txt", "main.go", "app.py"})
