@@ -345,7 +345,7 @@ func prefillQueueRows(t *testing.T, h *e2etest.Harness, ctx context.Context, app
 	if err != nil {
 		t.Fatalf("AppByID: %v", err)
 	}
-	for i := 0; i < count; i++ {
+	for range count {
 		_, err := state.NewPgStore(h.Pool).EnqueueInvocation(ctx, state.Invocation{
 			AppID:     appID,
 			AccountID: app.AccountID,
@@ -356,7 +356,7 @@ func prefillQueueRows(t *testing.T, h *e2etest.Harness, ctx context.Context, app
 			DueAt:     time.Now().UTC(),
 		})
 		if err != nil {
-			t.Fatalf("EnqueueInvocation[%d]: %v", i, err)
+			t.Fatalf("EnqueueInvocation: %v", err)
 		}
 	}
 }
@@ -392,4 +392,4 @@ func pollUntilCompleted(t *testing.T, h *e2etest.Harness, key, id string, deadli
 }
 
 // silence the unused-import warning on builds that strip pgxpool.
-var _ = (*pgxpool.Pool)(nil)
+var _ pgxpool.Pool

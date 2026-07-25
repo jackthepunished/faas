@@ -158,11 +158,8 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	// Block until the schema is at the current migration target. The
 	// meterd subprocess (issue #52) reads accounts on its first tick and
 	// would otherwise race the migration — see cmd-e2e-schedd-migration-race.
-	// 36 = migrations/00036_api_key_scopes.sql (current head on origin/main).
-	// Bumped from 12 in PR #203 (M7 async-invoke e2e); the meterd-dunning
-	// and meterd-quota tests still call WaitForMigration with their own
-	// tighter targets and remain green.
-	pgtest.WaitForMigration(t, pool, 36, 10*time.Second)
+	// See e2eMigrationTarget for the head value and the bump rationale.
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
 
 	if which&APID != 0 {
 		startAPID(t, h, bin, dbURL)
@@ -171,35 +168,7 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
-		synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
-		// schedd needs to dial vmmd; on the metal tag vmmd is started below
-		// and we use the same path. On tests that skip vmmd, schedd still
-		// starts — it just warns on wake. Wire both paths so schedd config
-		// is consistent regardless of order. The synth socket is the
-		// unix-domain path schedd dials to fire synthetic cron / async-
-		// invoke envelopes through gatewayd (spec §4.4); without it the
-		// drain goroutine is silently disabled (cmd/schedd/main.go:319-345).
-		// Match the path gatewayd listens on (set via
-		// FAAS_GATEWAY_SYNTH_SOCKET below) so the dial succeeds and the
-		// drain wires up. Empty when gatewayd isn't in the Which mask so
-		// schedd falls back to its default (drain disabled, fine for tests
-		// that don't exercise async-invoke).
-		gatewaySynth := ""
-		if which&Gatewayd != 0 {
-			gatewaySynth = synthSock
-		}
-		cfgPath := filepath.Join(tmp, "schedd.toml")
-		cfg := fmt.Sprintf(
-			`socket_path = %q
-owner_user = %q
-vmmd_socket = %q
-gateway_synth_socket = %q
-`,
-			sockPath, "root", vmmdSock, gatewaySynth,
-		)
-		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
-			t.Fatalf("e2etest: write schedd.toml: %v", err)
-		}
+		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
 		)
@@ -370,6 +339,14 @@ const All = DeployWake | Meterd | Builderd
 
 const testDomain = "apps.test.example"
 
+// e2eMigrationTarget is the migration head every e2e harness boot waits
+// for. Centralised here so the next migration land only touches this one
+// constant (Start and StartWithEnv both reference it). The value MUST
+// match the highest NNNNN_<name>.sql filename under migrations/. The
+// per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
+// call pgtest.WaitForMigration with their own N and remain green.
+const e2eMigrationTarget = 36
+
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
 // RECIPIENT_PATH) so it can seal. StartWithEnv boots JUST apid — not
@@ -411,10 +388,9 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	// Gate every daemon launch on the schema arriving at the current
 	// migration target. Without this, meterd's first tick races the
 	// migration (issue #52 acceptance race; see
-	// cmd-e2e-schedd-migration-race memory). Bumped to 36 in PR #203
-	// (M7 async-invoke e2e) to match migrations/00036_api_key_scopes.sql
-	// (current head on origin/main).
-	pgtest.WaitForMigration(t, pool, 36, 10*time.Second)
+	// cmd-e2e-schedd-migration-race memory). See e2eMigrationTarget
+	// for the head value and bump history.
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
 
 	if which&APID != 0 {
 		addr := freeTCPAddr(t)
@@ -430,26 +406,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
-		// Match the Start-path synth socket so callers using
-		// StartWithEnv with both Schedd and Gatewayd in which wire up
-		// the drain. Empty when Gatewayd is absent so the drain stays
-		// disabled (the historical StartWithEnv shape).
-		gatewaySynth := ""
-		if which&Gatewayd != 0 {
-			gatewaySynth = filepath.Join(h.SockDir, "gatewayd-internal.sock")
-		}
-		cfgPath := filepath.Join(tmp, "schedd.toml")
-		cfg := fmt.Sprintf(
-			`socket_path = %q
-owner_user = %q
-vmmd_socket = %q
-gateway_synth_socket = %q
-`,
-			sockPath, "root", vmmdSock, gatewaySynth,
-		)
-		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
-			t.Fatalf("e2etest: write schedd.toml: %v", err)
-		}
+		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
 		)
@@ -485,6 +442,37 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 	h.procs = append(h.procs, startProc(t, bin, "apid", env))
 	h.APIDURL = "http://" + addr
 	waitTCP(t, addr, 10*time.Second)
+}
+
+// writeScheddConfig renders the per-test schedd.toml and writes it under
+// tmp. Returns the path to the file. The gateway_synth_socket line is
+// emitted when includeSynth is true so the drain goroutine actually
+// subscribes to invocation_due; an empty value silently disables the
+// drain (cmd/schedd/main.go:319-345) which is the correct shape for
+// tests that don't exercise async-invoke. Centralised so a future env
+// var or config knob lands in one place instead of two (Start vs
+// StartWithEnv had identical templates before PR #218).
+func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) string {
+	t.Helper()
+	sockPath := filepath.Join(h.SockDir, "schedd.sock")
+	vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
+	gatewaySynth := ""
+	if includeSynth {
+		gatewaySynth = filepath.Join(h.SockDir, "gatewayd-internal.sock")
+	}
+	cfgPath := filepath.Join(tmp, "schedd.toml")
+	cfg := fmt.Sprintf(
+		`socket_path = %q
+owner_user = %q
+vmmd_socket = %q
+gateway_synth_socket = %q
+`,
+		sockPath, "root", vmmdSock, gatewaySynth,
+	)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("e2etest: write schedd.toml: %v", err)
+	}
+	return cfgPath
 }
 
 // startGatewayd boots gatewayd in the TLS-disabled path (cfg.TLS.Disabled=true)
