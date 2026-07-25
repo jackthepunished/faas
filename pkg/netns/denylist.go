@@ -32,12 +32,21 @@ const (
 	FamilyV6
 )
 
+// Family keyword constants — nft uses `ip` for v4 and `ip6` for v6.
+// Pulled into named constants so the goconst linter stops asking
+// for them and so every call site reads as a typed symbol rather
+// than a bare string.
+const (
+	familyKeywordV4 = "ip"
+	familyKeywordV6 = "ip6"
+)
+
 func (f Family) String() string {
 	switch f {
 	case FamilyV4:
-		return "ip"
+		return familyKeywordV4
 	case FamilyV6:
-		return "ip6"
+		return familyKeywordV6
 	default:
 		return fmt.Sprintf("Family(%d)", int(f))
 	}
@@ -47,11 +56,80 @@ func (f Family) String() string {
 // Comment make the provenance machine-readable so a future "list
 // every deny line" operator tool can render the table from
 // introspection rather than a hand-maintained doc.
+//
+// CounterName is the nftables named counter attached to the deny
+// rule for this entry (PR-E). Setting it once at catalog-init time
+// keeps the name a stable contract across both renderers (the
+// per-netns argv in Config.NftCommands and the host rendered text
+// in HostPolicy.Render) and the OCI puller's hook. The naming
+// convention is `drop_v4_<sanitized>` / `drop_v6_<sanitized>`; the
+// family-tagged prefix ensures the v4 and v6 counters don't share
+// a name (the connlimit metal-test parser at
+// pkg/netns/connlimit_metal_test.go::counterPackets returns the
+// FIRST block matching a name, so a v4/v6 collision would be
+// silently mis-read). Built once via DropCounterName during
+// NewDefaultDenySet so adding a new CIDR is one literal line.
 type DenyEntry struct {
 	Family    Family
 	Prefix    netip.Prefix
 	SourceADR string
 	Comment   string
+	// CounterName is the nftables named counter attached to this
+	// entry's deny rule. Set by NewDefaultDenySet via DropCounterName;
+	// tests / callers must not hand-set it.
+	CounterName string
+}
+
+// DropCounterName returns the nftables named counter for an entry
+// of the given family. The format is `drop_v4_<sanitized>` for v4
+// and `drop_v6_<sanitized>` for v6, where `<sanitized>` is the CIDR
+// string with `.` and `/` replaced by `_`. Family is dropped because
+// the family tag is already on the prefixed word — nft scopes named
+// counters per table/chain family, but the v4+v6 counter names must
+// be globally distinct because the connlimit metal-test parser (and
+// the nft -j list counters JSON shape) returns the FIRST match by
+// name.
+//
+// The counter name is exported as a counter (not a per-netns set
+// rule) so each catalog entry is observable individually at
+// `nft list counters` and via the vmmd scrape adapter on
+// <daemon>_egress_deny_total{cidr,family}.
+//
+// nft accepts [A-Za-z0-9_-] in counter names; the security-critical
+// characters in a CIDR — `.` and `/` — are not in that set, so the
+// sanitization is deterministic and the resulting name is valid
+// nftables syntax. The longest possible name is the
+// 2001:0000:0000:0000:0000:0000:0000:0001 / 128 v6 sample
+// (sanitized: `drop_v6_2001_0000_0000_0000_0000_0000_0000_0001_128`)
+// at 50 chars — under nft's 64-char counter name ceiling.
+func DropCounterName(family Family, prefix string) string {
+	fam := "v4"
+	if family == FamilyV6 {
+		fam = "v6"
+	}
+	return sanitizeCounterName("drop_" + fam + "_" + prefix)
+}
+
+// sanitizeCounterName replaces `.`, `/`, and `:` with `_`. Underscores
+// are the only legal substitution: nft accepts [A-Za-z0-9_-] in
+// counter names, and the dot-slash-colon sanitization is the same
+// transformation the operator-facing artifact uses for safe CIDR
+// strings. The colon is the v6 separator (`2001:db8::/32`) and
+// MUST be in the filter set — omitting it would land names like
+// `drop_v6_2001:db8::_32` which nft rejects with "invalid
+// character in counter name".
+func sanitizeCounterName(s string) string {
+	// Allocate once; the result is at most len(s) bytes long.
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' || c == '/' || c == ':' {
+			b = append(b, '_')
+		} else {
+			b = append(b, c)
+		}
+	}
+	return string(b)
 }
 
 // DenySet is the typed denylist. The four slice fields are the
@@ -90,21 +168,107 @@ type DenySet struct {
 func NewDefaultDenySet() DenySet {
 	entries := []DenyEntry{
 		// IPv4 — RFC1918 + link-local/metadata + CGN (spec §11).
-		{FamilyV4, netip.MustParsePrefix("10.0.0.0/8"), "spec-§11", "RFC1918 — private network"},
-		{FamilyV4, netip.MustParsePrefix("172.16.0.0/12"), "spec-§11", "RFC1918 — private network"},
-		{FamilyV4, netip.MustParsePrefix("192.168.0.0/16"), "spec-§11", "RFC1918 — private network"},
-		{FamilyV4, netip.MustParsePrefix("169.254.0.0/16"), "spec-§11", "link-local; 169.254.169.254 = cloud metadata IMDS"},
-		{FamilyV4, netip.MustParsePrefix("100.64.0.0/10"), "RFC6598", "carrier-grade NAT"},
+		{
+			Family:      FamilyV4,
+			Prefix:      netip.MustParsePrefix("10.0.0.0/8"),
+			SourceADR:   "spec-§11",
+			Comment:     "RFC1918 — private network",
+			CounterName: DropCounterName(FamilyV4, "10.0.0.0/8"),
+		},
+		{
+			Family:      FamilyV4,
+			Prefix:      netip.MustParsePrefix("172.16.0.0/12"),
+			SourceADR:   "spec-§11",
+			Comment:     "RFC1918 — private network",
+			CounterName: DropCounterName(FamilyV4, "172.16.0.0/12"),
+		},
+		{
+			Family:      FamilyV4,
+			Prefix:      netip.MustParsePrefix("192.168.0.0/16"),
+			SourceADR:   "spec-§11",
+			Comment:     "RFC1918 — private network",
+			CounterName: DropCounterName(FamilyV4, "192.168.0.0/16"),
+		},
+		{
+			Family:      FamilyV4,
+			Prefix:      netip.MustParsePrefix("169.254.0.0/16"),
+			SourceADR:   "spec-§11",
+			Comment:     "link-local; 169.254.169.254 = cloud metadata IMDS",
+			CounterName: DropCounterName(FamilyV4, "169.254.0.0/16"),
+		},
+		{
+			Family:      FamilyV4,
+			Prefix:      netip.MustParsePrefix("100.64.0.0/10"),
+			SourceADR:   "RFC6598",
+			Comment:     "carrier-grade NAT",
+			CounterName: DropCounterName(FamilyV4, "100.64.0.0/10"),
+		},
 
 		// IPv6 — link-local + ULA + multicast + loopback + unspecified
 		// (ADR-023 + ADR-034).
-		{FamilyV6, netip.MustParsePrefix("fe80::/10"), "ADR-023", "IPv6 link-local; neighbor-table exposure to guests"},
-		{FamilyV6, netip.MustParsePrefix("fc00::/7"), "ADR-023", "IPv6 ULA (RFC4193); control-plane lateral movement"},
-		{FamilyV6, netip.MustParsePrefix("ff00::/8"), "ADR-023", "IPv6 multicast; no use case in this model"},
-		{FamilyV6, netip.MustParsePrefix("::1/128"), "ADR-023", "IPv6 loopback"},
-		{FamilyV6, netip.MustParsePrefix("::/128"), "ADR-023", "IPv6 unspecified; misconfigured or malicious"},
-		{FamilyV6, netip.MustParsePrefix("2002::/16"), "ADR-034", "6to4 (RFC3056); tunnels IPv6 over IPv4 — lateral movement into 10/8 etc."},
-		{FamilyV6, netip.MustParsePrefix("2001::/32"), "ADR-034", "Teredo (RFC4380); tunnels IPv6 over UDP/3544 — same lateral-movement risk as 6to4"},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("fe80::/10"),
+			SourceADR:   "ADR-023",
+			Comment:     "IPv6 link-local; neighbor-table exposure to guests",
+			CounterName: DropCounterName(FamilyV6, "fe80::/10"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("fc00::/7"),
+			SourceADR:   "ADR-023",
+			Comment:     "IPv6 ULA (RFC4193); control-plane lateral movement",
+			CounterName: DropCounterName(FamilyV6, "fc00::/7"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("ff00::/8"),
+			SourceADR:   "ADR-023",
+			Comment:     "IPv6 multicast; no use case in this model",
+			CounterName: DropCounterName(FamilyV6, "ff00::/8"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("::1/128"),
+			SourceADR:   "ADR-023",
+			Comment:     "IPv6 loopback",
+			CounterName: DropCounterName(FamilyV6, "::1/128"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("::/128"),
+			SourceADR:   "ADR-023",
+			Comment:     "IPv6 unspecified; misconfigured or malicious",
+			CounterName: DropCounterName(FamilyV6, "::/128"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("2002::/16"),
+			SourceADR:   "ADR-034",
+			Comment:     "6to4 (RFC3056); tunnels IPv6 over IPv4 — lateral movement into 10/8 etc.",
+			CounterName: DropCounterName(FamilyV6, "2002::/16"),
+		},
+		{
+			Family:      FamilyV6,
+			Prefix:      netip.MustParsePrefix("2001::/32"),
+			SourceADR:   "ADR-034",
+			Comment:     "Teredo (RFC4380); tunnels IPv6 over UDP/3544 — same lateral-movement risk as 6to4",
+			CounterName: DropCounterName(FamilyV6, "2001::/32"),
+		},
+	}
+
+	// Sanity: every entry has a CounterName. A future edit that
+	// drops the `CounterName:` field on a literal would silently
+	// lose the per-CIDR observability — the deny rule would still
+	// fire, the entry would still deny, but `nft list counters`
+	// would not show it. Surfacing the silent break here keeps the
+	// catalog-add path mechanical (one literal line, every field
+	// populated).
+	for i, e := range entries {
+		if e.CounterName == "" {
+			panic("netns.NewDefaultDenySet: entry " + e.Prefix.String() + " missing CounterName")
+		}
+		_ = i
 	}
 
 	// Sort Entries by family then prefix for deterministic ordering

@@ -159,3 +159,99 @@ func TestDenySetFamilyString(t *testing.T) {
 		}
 	}
 }
+
+// TestNewDefaultDenySet_CounterNamesStable — PR-E regression net.
+// Every catalog entry's CounterName must equal
+// DropCounterName(family, prefix), so:
+//
+//   - the field is set at catalog-init time (no caller can forget);
+//   - the field-on-entry approach means the cross-renderer invariant
+//     test in denylist_external_test.go can match the same name in
+//     the per-netns argv AND the host rendered text;
+//   - the vmmd scrape adapter (cmd/vmmd/poller.go) and the OCI dialer
+//     hook (pkg/oci/egress.go::EgressDenyHook) use the same label
+//     value, so the (cidr, family) series line up across the
+//     firewall-side and dialer-side counters.
+//
+// If DropCounterName ever changes format (e.g. drops the `drop_`
+// prefix, switches `_` to `-`, etc.), this test catches the catalog
+// drift immediately.
+func TestNewDefaultDenySet_CounterNamesStable(t *testing.T) {
+	d := NewDefaultDenySet()
+	for _, e := range d.Entries {
+		want := DropCounterName(e.Family, e.Prefix.String())
+		if e.CounterName != want {
+			t.Errorf("Entries{%s}: CounterName = %q, want DropCounterName(...) = %q",
+				e.Prefix, e.CounterName, want)
+		}
+		if e.CounterName == "" {
+			t.Errorf("Entries{%s}: CounterName is empty", e.Prefix)
+		}
+		// Sanitize: name must use only nft-legal characters. If a
+		// future CIDR string introduces a non-[A-Za-z0-9_-] char,
+		// the sanitize helper should grow its filter set — and
+		// this assertion will surface the drift.
+		for i := 0; i < len(e.CounterName); i++ {
+			c := e.CounterName[i]
+			ok := (c >= 'a' && c <= 'z') ||
+				(c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') ||
+				c == '_' || c == '-'
+			if !ok {
+				t.Errorf("Entries{%s}: CounterName %q has illegal char %q",
+					e.Prefix, e.CounterName, c)
+			}
+		}
+	}
+}
+
+// TestNewDefaultDenySet_CounterNamesUnique — the connlimit metal-test
+// parser (pkg/netns/connlimit_metal_test.go) returns the FIRST block
+// matching a name, so any two entries sharing a CounterName would
+// silently mis-read. The family prefix in DropCounterName makes
+// collisions impossible by construction — this test pins the
+// invariant so a future refactor that drops the family tag (e.g.
+// `drop_<sanitized>` without `v4` / `v6`) fails loudly.
+func TestNewDefaultDenySet_CounterNamesUnique(t *testing.T) {
+	d := NewDefaultDenySet()
+	seen := make(map[string]string)
+	for _, e := range d.Entries {
+		if prior, ok := seen[e.CounterName]; ok {
+			t.Errorf("CounterName collision: %q used by both %s and %s",
+				e.CounterName, prior, e.Prefix)
+			continue
+		}
+		seen[e.CounterName] = e.Prefix.String()
+	}
+}
+
+// TestDropCounterName — exercises the helper directly so a future
+// edit to the format string (e.g. dropping the `drop_` prefix,
+// switching the family tag, swapping the sanitizer char) surfaces
+// here with a clear table diff before the catalog-side test runs.
+// Note the v6 cases: the `:` separator is sanitized to `_` so the
+// resulting name is valid nftables syntax (`fe80::/10` →
+// `fe80___10` after replacing both colons and the slash).
+func TestDropCounterName(t *testing.T) {
+	cases := []struct {
+		family Family
+		prefix string
+		want   string
+	}{
+		{FamilyV4, "10.0.0.0/8", "drop_v4_10_0_0_0_8"},
+		{FamilyV4, "192.168.0.0/16", "drop_v4_192_168_0_0_16"},
+		{FamilyV6, "fe80::/10", "drop_v6_fe80___10"},
+		{FamilyV6, "::1/128", "drop_v6___1_128"},
+		{FamilyV6, "2002::/16", "drop_v6_2002___16"},
+		{FamilyV6, "fc00::/7", "drop_v6_fc00___7"},
+		{FamilyV6, "2001::/32", "drop_v6_2001___32"},
+		{FamilyV6, "::/128", "drop_v6____128"},
+	}
+	for _, c := range cases {
+		got := DropCounterName(c.family, c.prefix)
+		if got != c.want {
+			t.Errorf("DropCounterName(%v, %q) = %q, want %q",
+				c.family, c.prefix, got, c.want)
+		}
+	}
+}

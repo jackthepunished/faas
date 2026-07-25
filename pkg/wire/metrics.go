@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -111,6 +112,32 @@ type OpsMetrics struct {
 	// incremented in handlers_events.go at the top of the handler
 	// and decremented via defer. Zero is the expected idle value.
 	sseClients prometheus.Gauge
+	// egressDeny: per-CIDR drop counter for the nftables egress
+	// denylist (PR-E). Labelled by (cidr, family) — the cidr label
+	// is the DenyEntry.CounterName (e.g. "drop_v4_10_0_0_0_8") and
+	// the family is the nft family keyword ("ip" / "ip6"). The vmmd
+	// scrape adapter (cmd/vmmd/poller.go) reads `nft list counters`
+	// every 15s and emits the per-counter delta so the Prometheus
+	// series sees the rate of drops per CIDR. The imaged side uses
+	// a separate metric (oci_egress_deny_total) wired in cmd/imaged
+	// directly because the OCI dialer is user-space — nftables
+	// counters do not see it. Cardinality bounded by the catalog
+	// size (~12 v4 + 7 v6 = 19 series per renderer); closed set
+	// pre-instantiated from netns.NewDefaultDenySet() at boot so the
+	// panels surface even on an idle box.
+	egressDeny *prometheus.CounterVec
+	// ociEgressDeny: PR-E sister collector to egressDeny for the
+	// user-space OCI dialer. Registered ONLY on the imaged OpsMetrics
+	// (prefix = "imaged") so the metric surfaces as
+	// imaged_oci_egress_deny_total{cidr,family}; on every other
+	// daemon (vmmd, schedd, ...) the field stays nil. Disambiguating
+	// the metric name from egressDeny is the operator's contract: a
+	// "firewall blocked it" hit increments egressDeny on vmmd, a
+	// "dialer refused it" hit increments ociEgressDeny on imaged,
+	// and the two have different remediation paths (nftables rule
+	// vs. denylist catalog edit). Cardinality is identical to
+	// egressDeny — same catalog, same (cidr, family) label set.
+	ociEgressDeny *prometheus.CounterVec
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -203,7 +230,28 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_sse_clients",
 		Help: "Number of currently open /v1/events SSE connections (Move 3, M7.5 prep). The dashboard's per-page EventSource is one connection; the CLI's faas tail is another. Zero is the idle value.",
 	})
-	reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, sseClients)
+	egressDeny := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_egress_deny_total",
+		Help: "Per-CIDR drop counter for the nftables egress denylist (PR-E, spec §11 + §12). The cidr label is the DenyEntry.CounterName (e.g. \"drop_v4_10_0_0_0_8\") and the family label is the nft family keyword (\"ip\" / \"ip6\"). The vmmd scrape adapter (cmd/vmmd/poller.go) reads `nft list counters` every 15s and emits the per-counter delta so the Prometheus series sees the rate of drops per CIDR. The imaged-side mirror is oci_egress_deny_total on cmd/imaged's registry because the OCI dialer is user-space — nftables counters do not see it.",
+	}, []string{"cidr", "family"})
+	// PR-E sister collector for the user-space OCI dialer. Only
+	// registered when prefix == "imaged" — on every other daemon the
+	// field stays nil and the imaged-side hook in cmd/imaged/main.go
+	// must nil-check the accessor (EgressDenySeries / OCIEgressDeny)
+	// before calling. The metric name is oci_egress_deny_total so an
+	// operator can disambiguate "firewall blocked it" (this metric on
+	// vmmd) from "dialer refused it" (this metric on imaged) — they
+	// have different remediation paths.
+	var ociEgressDeny *prometheus.CounterVec
+	if prefix == "imaged" {
+		ociEgressDeny = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: prefix + "_oci_egress_deny_total",
+			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
+		}, []string{"cidr", "family"})
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, sseClients, egressDeny, ociEgressDeny)
+	} else {
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, sseClients, egressDeny)
+	}
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -248,6 +296,34 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, plan := range api.Plans {
 		residentGBPerCustomer.WithLabelValues(string(plan))
 	}
+	// Pre-instantiate every (cidr, family) label tuple from the egress
+	// denylist catalog so the counter's HELP/TYPE and zero-valued series
+	// surface in /metrics from the moment the daemon boots — same
+	// precedent as the histogram and gauge pre-instantiation above. PR-E:
+	// the catalog is closed and bounded (~12 v4 + ~7 v6 entries),
+	// sourced from netns.NewDefaultDenySet(); the cidr label is the
+	// DenyEntry.CounterName (the canonical name that vmmd's nft-poll
+	// adapter looks up in the `nft list counters` JSON output) and the
+	// family label is the nft family keyword ("ip" / "ip6") matching
+	// DenyEntry.Family.String(). Without this loop, an idle box would
+	// render the egress-deny panel as "no data" until at least one
+	// drop had been observed (a real ops hazard — operators want to see
+	// the panel exist on day one).
+	for _, e := range netns.NewDefaultDenySet().Entries {
+		egressDeny.WithLabelValues(e.CounterName, e.Family.String())
+	}
+	// PR-E: pre-instantiate the imaged-side mirror counter
+	// (oci_egress_deny_total) with the catalog entries. The OCI-only
+	// extras (loopback / 0.0.0.0/8 / IETF-assigned / benchmarking /
+	// reserved — see pkg/oci/egress.go) are pre-instantiated from
+	// cmd/imaged/main.go so pkg/wire doesn't need to import pkg/oci.
+	// The firewall-side counter above uses the SAME catalog tuples, so
+	// the two metrics share the catalog-portion of the label set.
+	if ociEgressDeny != nil {
+		for _, e := range netns.NewDefaultDenySet().Entries {
+			ociEgressDeny.WithLabelValues(e.CounterName, e.Family.String())
+		}
+	}
 	return &OpsMetrics{
 		registry:              reg,
 		ops:                   ops,
@@ -263,6 +339,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		wakeIDV4Fallback:      wakeIDV4Fallback,
 		imagedOCIPull:         imagedOCIPull,
 		sseClients:            sseClients,
+		egressDeny:            egressDeny,
+		ociEgressDeny:         ociEgressDeny,
 	}
 }
 
@@ -307,6 +385,75 @@ func (m *OpsMetrics) WakeIDV4Fallback() prometheus.Counter {
 // the handler's Add(1)/Add(-1) is the only producer.
 func (m *OpsMetrics) SSEClients() prometheus.Gauge {
 	return m.sseClients
+}
+
+// EgressDeny returns the per-(cidr, family) counter for the egress
+// denylist (PR-E). cidr is the DenyEntry.CounterName (the canonical
+// name looked up by the vmmd nft-poll adapter via `nft list counters`)
+// and family is the nft family keyword ("ip" / "ip6"). The returned
+// Counter is safe to cache; the underlying CounterVec is shared with
+// other (cidr, family) tuples. Every catalog (cidr, family) tuple is
+// pre-instantiated at boot so callers can call EgressDeny on any
+// catalog entry without a nil-Counter panic.
+//
+// PR-E caller pattern:
+//
+//	counter, err := netns.PopCounters(ctx)
+//	if err != nil { /* log + continue */ }
+//	for _, e := range netns.NewDefaultDenySet().Entries {
+//	    curr := counter[e.CounterName]
+//	    delta := curr - lastSeen[e.CounterName]
+//	    lastSeen[e.CounterName] = curr
+//	    ops.EgressDeny(e.CounterName, e.Family.String()).Add(float64(delta))
+//	}
+//
+// Safe on a nil receiver so tests without metrics keep working (matches
+// the Observe* family pattern).
+func (m *OpsMetrics) EgressDeny(cidr, family string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.egressDeny.WithLabelValues(cidr, family)
+}
+
+// EgressDenySeries returns the underlying CounterVec for callers that
+// need to iterate the closed (cidr, family) label set (e.g. an admin
+// /debug endpoint that wants to dump the full catalog of zero-valued
+// series). The CounterVec is shared with EgressDeny — use either, but
+// EgressDeny is the canonical call site for increment.
+func (m *OpsMetrics) EgressDenySeries() *prometheus.CounterVec {
+	return m.egressDeny
+}
+
+// OCIEgressDeny returns the per-(cidr, family) counter for the
+// user-space OCI dialer refusals (PR-E). Mirrors EgressDeny's
+// signature but returns nil on non-imaged OpsMetrics (the
+// ociEgressDeny collector is only registered when prefix ==
+// "imaged"). cidr is the DenyEntry.CounterName (or, for OCI-only
+// extras, netns.DropCounterName(family, prefix)) and family is the
+// nft family keyword.
+//
+// The returned Counter is safe to cache; the underlying CounterVec
+// is shared with other (cidr, family) tuples. Every catalog
+// (cidr, family) tuple is pre-instantiated at boot; the OCI-only
+// extras are pre-instantiated from cmd/imaged/main.go because
+// pkg/wire doesn't import pkg/oci (and shouldn't — pkg/oci imports
+// pkg/netns but not pkg/wire, and that direction is correct).
+//
+// Safe on a nil receiver so tests without metrics keep working.
+func (m *OpsMetrics) OCIEgressDeny(cidr, family string) prometheus.Counter {
+	if m == nil || m.ociEgressDeny == nil {
+		return nil
+	}
+	return m.ociEgressDeny.WithLabelValues(cidr, family)
+}
+
+// OCIEgressDenySeries returns the underlying CounterVec for callers
+// that need to iterate the closed (cidr, family) label set on the
+// imaged registry. nil on non-imaged OpsMetrics. Use OCIEgressDeny
+// for the canonical call site; this is for admin/debug iteration.
+func (m *OpsMetrics) OCIEgressDenySeries() *prometheus.CounterVec {
+	return m.ociEgressDeny
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor

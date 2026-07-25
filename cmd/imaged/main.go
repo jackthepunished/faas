@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -139,6 +140,21 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// files/faas.rules.yml depend on imaged_oci_pull_duration_seconds
 	// being live, not empty.)
 	ops := wire.NewOpsMetrics("imaged")
+	// PR-E: wire oci.EgressDenyHook to the imaged-side counter so
+	// the OCI dialer refusals surface as
+	// imaged_oci_egress_deny_total{cidr,family}. The hook is
+	// installed exactly once at daemon startup (the oci package
+	// holds it as a package-level var; subsequent test runs would
+	// override it but we never re-enter imaged's main in the same
+	// process). Pre-instantiate the OCI-only extras so their
+	// (cidr, family) series surface from boot (the catalog
+	// portion is already pre-instantiated inside NewOpsMetrics).
+	oci.EgressDenyHook = func(_ netip.Addr, counterName, family string) {
+		ops.OCIEgressDeny(counterName, family).Inc()
+	}
+	for _, lbl := range oci.OCIOnlyDenyCounterLabels() {
+		ops.OCIEgressDeny(lbl.CounterName, lbl.Family)
+	}
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
 		WithOpsMetrics(ops)

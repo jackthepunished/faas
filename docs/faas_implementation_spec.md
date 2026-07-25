@@ -424,6 +424,26 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
 
+### 12.1 Egress deny telemetry (PR-E)
+
+Every catalog CIDR (spec §11) carries a stable nftables named counter (`drop_v4_<sanitized>` / `drop_v6_<sanitized>`) attached to its per-CIDR deny rule. Three surfaces expose the drops as Prometheus series:
+
+| Surface | Metric name | Labels | Producer |
+|---|---|---|---|
+| Host nftables | `vmmd_egress_deny_total` | `cidr`, `family` | `cmd/vmmd/poller.go` reads `nft -j list counters` every 15 s and emits the per-counter delta |
+| Per-netns nftables | (not exported) | — | per-VM cardinality is unbounded; available via `nft list counters` on the operator box for debugging |
+| OCI user-space dialer | `imaged_oci_egress_deny_total` | `cidr`, `family` | `pkg/oci/egress.go::EgressDenyHook` invoked from `EgressDialContext` on denial; `cmd/imaged/main.go` wires the hook |
+
+The `cidr` label is the canonical `DenyEntry.CounterName` (single source of truth — `pkg/netns/denylist.go`). The `family` label is the nft family keyword (`ip` / `ip6`). Cardinality is bounded by the catalog (~12 v4 + ~7 v6 entries). Every (cidr, family) tuple is pre-instantiated at boot so an idle box renders the panel as zero-valued rather than "no data" — same precedent as the OCI-pull histogram pre-instantiation.
+
+**Sample dashboard panel**: `rate(vmmd_egress_deny_total{cidr=~"drop_v4_10_.*|drop_v4_192_168_.*"}[5m]) > 100` warns an operator that a tenant is hitting the RFC1918 drop storm — usually a misconfigured egress allowlist or a webhook firing at `http://10.x.x.x`. The OCI-side mirror (`imaged_oci_egress_deny_total`) differentiates "firewall blocked it" from "dialer refused it" — the two failure modes have different remediation paths (nftables rule vs. denylist catalog edit).
+
+**Why two metrics**: the host-side counter is read from `nft list counters` (kernel-layer drops are observable to nftables). The OCI-side counter is incremented in user-space because the OCI dialer is an HTTP client, not a guest kernel — nftables counters don't see it. Together they let an operator see whether a tenant's blocked pull hit the firewall first (host counter) or the user-space check (OCI counter).
+
+**Reset semantics**: nftables counters reset on table flush or snapshot resume (existing `faas_cap` precedent, spec §4.6). The poll adapter detects `curr < prev` and re-seeds `lastSeen` to `curr` without emitting a negative delta (Prometheus counters are monotonic — `Add(-N)` would panic).
+
+**Sampling rate**: 15 s scrape interval matches the conventional Prometheus cadence and keeps per-tenant alert latency under one minute (alert rule uses `rate()` over `1m`).
+
 **SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — one box (until Gate A) is stated honestly on the status page.
 
 Logs: journald → Loki free tier; tenant app stdout/stderr ring-buffered per instance (10 MB), surfaced via `GET /v1/apps/{app}/logs` (tail + follow).

@@ -227,6 +227,20 @@ func (c Config) NftCommands() [][]string {
 	if c.ConntrackCap > 0 {
 		add("add", "counter", "ip", "faas", "faas_cap", "{}")
 	}
+	// PR-E: counter objects for the per-CIDR lateral-movement deny
+	// rules (one per DenySet entry). Each named counter is referenced
+	// by name in the rule below so the vmmd scrape adapter can read
+	// `nft list counters` and surface per-CIDR drops on
+	// <daemon>_egress_deny_total{cidr,family}. Pre-declaration is
+	// required (same rationale as faas_cap above); the family tag
+	// in CounterName keeps the v4 and v6 counters distinct in
+	// `nft list counters` output.
+	ds := c.denySet()
+	for _, e := range ds.Entries {
+		if e.Family == FamilyV4 {
+			add("add", "counter", "ip", "faas", e.CounterName, "{}")
+		}
+	}
 	// NAT: publish :8080 to the guest; masquerade the guest's egress.
 	add("add", "chain", "ip", "faas", "prerouting", "{", "type", "nat", "hook", "prerouting", "priority", "dstnat", ";", "}")
 	add("add", "rule", "ip", "faas", "prerouting", "iifname", c.VethPeer, "tcp", "dport", port, "dnat", "to", fmt.Sprintf("%s:%d", GuestIP, AppPort))
@@ -257,10 +271,22 @@ func (c Config) NftCommands() [][]string {
 	// Lateral-movement deny (spec §11 + ADR-023 + ADR-034) — the v4
 	// half of the shared DenySet. ADR-031 reorders this list so
 	// deny > allow on overlap with the per-app EgressAllowlist accept
-	// rule below. The set is shared verbatim with the host renderer
-	// (pkg/netns/policy.go) and the OCI puller (pkg/oci/egress.go) —
-	// see pkg/netns/denylist.go.
-	add("add", "rule", "ip", "faas", "forward", "iifname", c.Tap, "ip", "daddr", "{", c.denyV4Set(), "}", "drop")
+	// rule below. Per-CIDR rules (PR-E) so each entry's drop count
+	// is observable via `nft list counters` and surfaces on
+	// <daemon>_egress_deny_total{cidr,family}. The aggregate set
+	// syntax (`ip daddr { … } drop`) did not allow per-CIDR counter
+	// attribution; nft v1.0.6+ prefers per-key rules with counter
+	// attachment. The single-counter set shape would have produced
+	// one anonymous bucket for the whole list — useless for the
+	// "which CIDR is this tenant hitting?" tenant support question.
+	for _, e := range ds.Entries {
+		if e.Family != FamilyV4 {
+			continue
+		}
+		add("add", "rule", "ip", "faas", "forward",
+			"iifname", c.Tap, "ip", "daddr", e.Prefix.String(),
+			"counter", "name", e.CounterName, "drop")
+	}
 	// ADR-031 + ADR-032 per-app egress allowlist. Placed AFTER the
 	// lateral-movement deny + SMTP drops so deny > allow on overlap
 	// (an operator typo landing a sensitive CIDR in the allowlist
@@ -288,6 +314,15 @@ func (c Config) NftCommands() [][]string {
 	if c.ConntrackCap > 0 {
 		add("add", "counter", "ip6", "faas", "faas_cap", "{}")
 	}
+	// PR-E: pre-declare the v6 per-CIDR drop counters on the v6 chain
+	// (mirror of the v4 loop above). Same dropped-counter-no-attach
+	// risk applies — these counters must exist before the rules below
+	// reference them.
+	for _, e := range ds.Entries {
+		if e.Family == FamilyV6 {
+			add("add", "counter", "ip6", "faas", e.CounterName, "{}")
+		}
+	}
 	add("add", "chain", "ip6", "faas", "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", ";", "policy", forwardPolicy, ";", "}")
 	// Accept reply traffic first (mirrors the v4 chain above) so a published
 	// request's IPv6 reply isn't dropped by the lateral-movement deny.
@@ -303,7 +338,18 @@ func (c Config) NftCommands() [][]string {
 	if rule := c.forwardConnlimitRule6(nft); rule != nil {
 		cmds = append(cmds, rule)
 	}
-	add("add", "rule", "ip6", "faas", "forward", "iifname", c.Tap, "ip6", "daddr", "{", c.denyV6Set(), "}", "drop")
+	// PR-E: per-CIDR v6 lateral-movement deny rules (mirror of the v4
+	// loop above). Same observability contract: each entry's drop count
+	// surfaces on <daemon>_egress_deny_total{cidr,family} via the
+	// vmmd's scrape adapter.
+	for _, e := range ds.Entries {
+		if e.Family != FamilyV6 {
+			continue
+		}
+		add("add", "rule", "ip6", "faas", "forward",
+			"iifname", c.Tap, "ip6", "daddr", e.Prefix.String(),
+			"counter", "name", e.CounterName, "drop")
+	}
 	// ADR-032 — per-app egress allowlist v6 mirror. Same placement
 	// contract as the v4 sibling above (AFTER deny, BEFORE
 	// chain-policy), only on the v6 chain. Empty EgressAllowlist or
@@ -314,6 +360,22 @@ func (c Config) NftCommands() [][]string {
 		cmds = append(cmds, rule)
 	}
 	return cmds
+}
+
+// denySet returns the DenySet to render against. Falls back to
+// NewDefaultDenySet() when Config.DenySet is the zero value
+// (pkg/fcvm/manager.go::Wake does not set it today — the default
+// is the only contract). PR-E promotes this single-source-of-truth
+// resolution so the per-CIDR deny loop and the conntrack-cap rule
+// use the same DenySet (no risk of the per-CIDR loop enumerating
+// one set while the cap rule reads another).
+//
+// Internal to NftCommands — do not invoke from anywhere else.
+func (c Config) denySet() DenySet {
+	if len(c.DenySet.Entries) == 0 {
+		return NewDefaultDenySet()
+	}
+	return c.DenySet
 }
 
 // denySMTPPortsSet returns the comma-joined SMTP port set used by
@@ -328,30 +390,6 @@ func (c Config) denySMTPPortsSet() string {
 		return NewDefaultDenySet().SMTPPortsCommaSet()
 	}
 	return c.DenySet.SMTPPortsCommaSet()
-}
-
-// denyV4Set is the v4 sibling of denySMTPPortsSet. Same fallback
-// semantics; the default value matches the literal list that lived
-// inline in NftCommands before the denylist refactor (PR-A,
-// ADR-034). The test in pkg/netns/config_test.go iterates over
-// NewDefaultDenySet().V4DenyCIDRs so adding a new entry here is
-// mechanically covered.
-func (c Config) denyV4Set() string {
-	if len(c.DenySet.V4DenyCIDRs) == 0 {
-		return NewDefaultDenySet().V4CommaSet()
-	}
-	return c.DenySet.V4CommaSet()
-}
-
-// denyV6Set is the v6 sibling of denyV4Set. ADR-034 adds 6to4
-// (2002::/16) + Teredo (2001::/32) to the default — the pre-PR-A
-// list was missing both, leaving two lateral-movement channels into
-// the IPv4 RFC1918 ranges through a 6to4 / Teredo tunnel endpoint.
-func (c Config) denyV6Set() string {
-	if len(c.DenySet.V6DenyCIDRs) == 0 {
-		return NewDefaultDenySet().V6CommaSet()
-	}
-	return c.DenySet.V6CommaSet()
 }
 
 // forwardConnlimitRule emits a single-element argv (or nothing when the

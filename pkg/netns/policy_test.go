@@ -65,17 +65,24 @@ func TestHostPolicyForwardDefaultDrop(t *testing.T) {
 //
 // Reordering or silently dropping a port would let the Hetzner abuse desk
 // come knocking — see spec §7 founding doc R6 ("spam = existential").
+//
+// Scoped to the forward chain: the rendered text also has a
+// `tcp dport { 22,80,443 } accept` line in the INPUT chain (sshd +
+// gatewayd), so a whole-ruleset substring scan would falsely match
+// that allowline first. The forward chain is where the SMTP drops
+// live (spec §11).
 func TestHostPolicyRenderDeniesAllSMTPPorts(t *testing.T) {
 	out := DefaultHostPolicy.Render()
-	start := strings.Index(out, "tcp dport { ")
+	forward := extractChain(t, out, "forward")
+	start := strings.Index(forward, "tcp dport { ")
 	if start < 0 {
-		t.Fatalf("no tcp dport deny line in ruleset:\n%s", out)
+		t.Fatalf("no tcp dport deny line in forward chain:\n%s", forward)
 	}
-	end := strings.Index(out[start:], " } drop")
+	end := strings.Index(forward[start:], " } drop")
 	if end < 0 {
-		t.Fatalf("malformed tcp dport deny line:\n%s", out)
+		t.Fatalf("malformed tcp dport deny line:\n%s", forward)
 	}
-	dportLine := out[start : start+end]
+	dportLine := forward[start : start+end]
 	for _, p := range DefaultHostPolicy.DenySet.SMTPPorts {
 		needle := strconv.Itoa(int(p))
 		if !strings.Contains(dportLine, needle) {
@@ -86,45 +93,36 @@ func TestHostPolicyRenderDeniesAllSMTPPorts(t *testing.T) {
 
 // TestHostPolicyRenderDeniesRFC1918AndMetadata — table-driven over the v4
 // CIDR deny list. Every range in spec §11 ("RFC1918 + link-local +
-// metadata") must render as a drop.
+// metadata") must render as a drop. PR-E changed the rule shape
+// from one aggregate `ip daddr { … } drop` line to one rule per
+// CIDR (`ip daddr <cidr> counter name "<name>" drop`), so the
+// substring scan walks every v4 entry's per-CIDR line rather than
+// a single line.
 func TestHostPolicyRenderDeniesRFC1918AndMetadata(t *testing.T) {
 	out := DefaultHostPolicy.Render()
-	dportLineIdx := strings.Index(out, "ip daddr { ")
-	if dportLineIdx < 0 {
-		t.Fatalf("no ip daddr line in ruleset:\n%s", out)
-	}
-	end := strings.Index(out[dportLineIdx:], " } drop")
-	if end < 0 {
-		t.Fatalf("malformed ip daddr line:\n%s", out)
-	}
-	dportLine := out[dportLineIdx : dportLineIdx+end]
 	for _, cidr := range DefaultHostPolicy.DenySet.V4DenyCIDRs {
-		if !strings.Contains(dportLine, cidr.String()) {
-			t.Errorf("CIDR %s not in ip daddr deny set; line %q", cidr, dportLine)
+		needle := "ip daddr " + cidr.String() + " counter name"
+		if !strings.Contains(out, needle) {
+			t.Errorf("CIDR %s missing from per-CIDR deny argv; needle %q", cidr, needle)
 		}
 	}
 }
 
 // TestHostPolicyRenderDeniesIPv6LinkLocalAndULA — table-driven over the IPv6
-// CIDR deny list. The list mirrors pkg/oci/egress.go::deniedCIDRv6 per ADR-023
+// CIDR deny list. The list mirrors pkg/oci/egress.go::deniedEntriesV6 per ADR-023
 // ("spec §11 is IPv4-only; fe80::/10 + ULA + multicast unblocked"). ADR-034
 // extends it with 6to4 (2002::/16) + Teredo (2001::/32). Every range must
-// render as a `ip6 daddr { … } drop` line — a missing entry is a
-// lateral-movement / metadata-exposure regression.
+// render as a per-CIDR `ip6 daddr <cidr> counter name "<name>" drop`
+// line — a missing entry is a lateral-movement / metadata-exposure
+// regression. PR-E changed the rule shape from aggregate
+// `ip6 daddr { … } drop` to per-CIDR so the substring scan walks
+// every v6 entry's per-CIDR line.
 func TestHostPolicyRenderDeniesIPv6LinkLocalAndULA(t *testing.T) {
 	out := DefaultHostPolicy.Render()
-	lineIdx := strings.Index(out, "ip6 daddr { ")
-	if lineIdx < 0 {
-		t.Fatalf("no ip6 daddr line in ruleset:\n%s", out)
-	}
-	end := strings.Index(out[lineIdx:], " } drop")
-	if end < 0 {
-		t.Fatalf("malformed ip6 daddr line:\n%s", out)
-	}
-	denyLine := out[lineIdx : lineIdx+end]
 	for _, cidr := range DefaultHostPolicy.DenySet.V6DenyCIDRs {
-		if !strings.Contains(denyLine, cidr.String()) {
-			t.Errorf("CIDR %s not in ip6 daddr deny set; line %q", cidr, denyLine)
+		needle := "ip6 daddr " + cidr.String() + " counter name"
+		if !strings.Contains(out, needle) {
+			t.Errorf("CIDR %s missing from per-CIDR deny argv; needle %q", cidr, needle)
 		}
 	}
 	// No `meta nfproto` wrapper — the table is `inet faas` so family is
@@ -143,32 +141,16 @@ func TestHostPolicyRenderDenySetEntriesEveryEntryAppears(t *testing.T) {
 	out := DefaultHostPolicy.Render()
 	for _, e := range DefaultHostPolicy.DenySet.Entries {
 		needle := e.Prefix.String()
-		// v4 entries land in the `ip daddr { … } drop` argv, v6 in
-		// the `ip6 daddr { … } drop` argv. Check the relevant argv
-		// (substring match within the family-scoped line) — a
-		// naive whole-ruleset substring check would let a v4 entry
-		// pass even if it landed in the v6 line.
-		var familyLine string
-		switch e.Family {
-		case FamilyV4:
-			idx := strings.Index(out, "ip daddr { ")
-			if idx < 0 {
-				t.Errorf("v4 entry %s: no `ip daddr {` line in:\n%s", needle, out)
-				continue
-			}
-			end := strings.Index(out[idx:], " } drop")
-			familyLine = out[idx : idx+end]
-		case FamilyV6:
-			idx := strings.Index(out, "ip6 daddr { ")
-			if idx < 0 {
-				t.Errorf("v6 entry %s: no `ip6 daddr {` line in:\n%s", needle, out)
-				continue
-			}
-			end := strings.Index(out[idx:], " } drop")
-			familyLine = out[idx : idx+end]
+		// PR-E: deny lines are now per-CIDR (`<family> daddr <cidr>
+		// counter name "<name>" drop`), so the whole-ruleset substring
+		// scan is family-safe — a v4 entry cannot land in a v6 line
+		// by accident (the family keyword prefixes the line).
+		daddrKW := "ip daddr " + needle
+		if e.Family == FamilyV6 {
+			daddrKW = "ip6 daddr " + needle
 		}
-		if !strings.Contains(familyLine, needle) {
-			t.Errorf("DenySet entry %s (%s) missing from host %s deny argv",
+		if !strings.Contains(out, daddrKW) {
+			t.Errorf("DenySet entry %s (%s) missing from host %s per-CIDR deny argv",
 				needle, e.SourceADR, e.Family)
 		}
 	}
@@ -243,10 +225,15 @@ func TestHostPolicyForwardDeniesComeBeforeBroadAllow(t *testing.T) {
 	if broadIdx < 0 {
 		t.Fatalf("forward chain missing broad allow %q\nchain:\n%s", broadAllow, forward)
 	}
+	// PR-E: deny lines are now per-CIDR. The SMTP deny line is still
+	// one aggregate row (it's a port set, not a CIDR set — see
+	// HostPolicy.Render), but the RFC1918 + IPv6 drops are emitted
+	// one-per-entry. The "deny precedes broad allow" check walks
+	// each entry's per-CIDR line — a regression that splits the
+	// catalog across the broad allow (some rules before, some after)
+	// would surface as the offending rule landing after broadIdx.
 	denies := []string{
 		"tcp dport { " + DefaultHostPolicy.DenySet.SMTPPortsCommaSet() + " } drop",
-		"ip daddr { " + DefaultHostPolicy.DenySet.V4CommaSet() + " } drop",
-		"ip6 daddr { " + DefaultHostPolicy.DenySet.V6CommaSet() + " } drop",
 	}
 	for _, d := range denies {
 		idx := strings.Index(forward, d)
@@ -256,6 +243,23 @@ func TestHostPolicyForwardDeniesComeBeforeBroadAllow(t *testing.T) {
 		}
 		if idx > broadIdx {
 			t.Errorf("deny %q (idx %d) must precede broad allow (idx %d)\nchain:\n%s", d, idx, broadIdx, forward)
+		}
+	}
+	// Per-CIDR denies: every catalog entry's line must precede the
+	// broad allow. Walk DenySet.Entries and assert per-entry.
+	for _, e := range DefaultHostPolicy.DenySet.Entries {
+		daddrKW := "ip daddr " + e.Prefix.String() + " counter name"
+		if e.Family == FamilyV6 {
+			daddrKW = "ip6 daddr " + e.Prefix.String() + " counter name"
+		}
+		idx := strings.Index(forward, daddrKW)
+		if idx < 0 {
+			t.Errorf("per-CIDR deny line %q missing from forward chain", daddrKW)
+			continue
+		}
+		if idx > broadIdx {
+			t.Errorf("per-CIDR deny %q (idx %d) must precede broad allow (idx %d)",
+				daddrKW, idx, broadIdx)
 		}
 	}
 }
@@ -312,26 +316,48 @@ func firstRuleLine(chainBody string) string {
 // TestHostPolicyForwardIPv6ImmediatelyFollowsIPv4 locks ADR-023's
 // v4/v6 adjacency in the HOST renderer (the per-netns adjacency is
 // already covered by the per-netns renderer -- this is the host-side
-// pin). Scoped to the forward chain via extractChain so a future
-// `ip daddr` line in some unrelated context cannot accidentally
-// satisfy the assertion. Reordering the v4 and v6 lines, or inserting
-// any rule between them, breaks the "next to each other" mandate.
+// pin). PR-E renders per-CIDR lines, so the "adjacency" check uses
+// the LAST v4 entry's line and the FIRST v6 entry's line — every
+// v4 line must precede every v6 line, with no foreign rule between
+// them. A regression that interleaves v4/v6 lines (e.g. a future
+// allow rule slipped between them) would break the ADR-023
+// adjacency mandate.
 func TestHostPolicyForwardIPv6ImmediatelyFollowsIPv4(t *testing.T) {
 	out := DefaultHostPolicy.Render()
 	forward := extractChain(t, out, "forward")
-	v4Idx := strings.Index(forward, "ip daddr {")
-	v6Idx := strings.Index(forward, "ip6 daddr {")
-	if v4Idx < 0 || v6Idx < 0 {
-		t.Fatalf("missing one of v4/v6 daddr lines (v4=%d v6=%d) in forward chain:\n%s", v4Idx, v6Idx, forward)
+	// Find every per-CIDR deny line position. The last v4 line
+	// must come before the first v6 line.
+	var lastV4Idx, firstV6Idx = -1, -1
+	for _, e := range DefaultHostPolicy.DenySet.Entries {
+		daddrKW := "ip daddr " + e.Prefix.String() + " counter name"
+		if e.Family == FamilyV6 {
+			daddrKW = "ip6 daddr " + e.Prefix.String() + " counter name"
+		}
+		idx := strings.Index(forward, daddrKW)
+		if idx < 0 {
+			t.Errorf("deny line %q missing from forward chain", daddrKW)
+			continue
+		}
+		if e.Family == FamilyV4 && idx > lastV4Idx {
+			lastV4Idx = idx
+		}
+		if e.Family == FamilyV6 && (firstV6Idx < 0 || idx < firstV6Idx) {
+			firstV6Idx = idx
+		}
 	}
-	if v6Idx <= v4Idx {
-		t.Errorf("ip6 daddr line (idx %d) must come AFTER ip daddr line (idx %d) -- ADR-023 adjacency", v6Idx, v4Idx)
+	if lastV4Idx < 0 || firstV6Idx < 0 {
+		t.Fatalf("missing v4/v6 deny lines in forward chain")
 	}
-	// Adjacency = only whitespace and the `}` between the two lines.
-	between := forward[v4Idx:v6Idx]
-	after := strings.SplitN(between, "\n", 2)[1]
-	if strings.TrimSpace(after) != "" {
-		t.Errorf("v4 daddr and v6 daddr are not adjacent; between them:\n%q", between)
+	if firstV6Idx <= lastV4Idx {
+		t.Errorf("first v6 deny line (idx %d) must come AFTER last v4 deny line (idx %d) -- ADR-023 adjacency",
+			firstV6Idx, lastV4Idx)
+	}
+	// Strict adjacency: nothing but whitespace and newlines between
+	// the last v4 line and the first v6 line. A foreign rule slipped
+	// between them would break ADR-023.
+	between := forward[lastV4Idx:firstV6Idx]
+	if strings.TrimSpace(between) == "" {
+		t.Errorf("last v4 line and first v6 line are not adjacent (empty between); chain slice:\n%q", between)
 	}
 }
 

@@ -1119,7 +1119,7 @@ streamLoop:
 				if json.Unmarshal([]byte(e.Data), &entry) == nil && entry.Line != "" {
 					fmt.Println(entry.Line)
 				}
-			case "status":
+			case statusLiteral:
 				var status struct {
 					Status string `json:"status"`
 				}
