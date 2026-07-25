@@ -59,14 +59,18 @@ func seedSweepBuild(t *testing.T, s *state.PgStore, ctx context.Context) (acctID
 	if err != nil {
 		t.Fatalf("seed app: %v", err)
 	}
+	// Tarball kind is the only one in builds_kind_check that we can also
+	// drive from CreateDeployment. Image deploys skip the builds table
+	// entirely (they go through imaged directly), so DeploymentKindImage
+	// would violate the CHECK and fail the test setup.
 	dep, err := s.CreateDeployment(ctx, state.Deployment{
-		AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:s",
+		AppID: app.ID, Kind: state.DeploymentKindTarball, SourcePath: "/tmp/source.tar.gz",
 		Status: state.DeployBuilding,
 	})
 	if err != nil {
 		t.Fatalf("seed dep: %v", err)
 	}
-	b, err := s.CreateBuild(ctx, dep.ID, state.DeploymentKindImage, 1<<20, "/tmp/log")
+	b, err := s.CreateBuild(ctx, dep.ID, state.DeploymentKindTarball, 1<<20, "/tmp/log")
 	if err != nil {
 		t.Fatalf("seed build: %v", err)
 	}
