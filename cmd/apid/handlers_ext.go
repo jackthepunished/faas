@@ -706,19 +706,11 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	var req api.CreateKeyRequest
 	_ = decodeJSON(r, &req)
-	scopes := req.Scopes
-	if len(scopes) == 0 {
-		// Preserve the legacy "full access" default for callers that
-		// don't yet know about scopes. New SDK releases pass scopes
-		// explicitly. See ADR-034.
-		scopes = []string{"admin"}
-	}
-	for _, sc := range scopes {
-		if !api.IsValidScope(sc) {
-			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-				"Unknown scope", "scopes must be one of admin, read, write; got "+sc))
-			return
-		}
+	scopes, err := api.NormalizeCreateKeyScopes(req.Scopes)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid scopes", err.Error()))
+		return
 	}
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
@@ -774,17 +766,20 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 
 func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	if err := s.store.DeleteAPIKey(ctx(r), acct.ID, id); err != nil {
+	deleted, err := s.store.DeleteAPIKeyReturning(ctx(r), acct.ID, id)
+	if err != nil {
 		s.notFound(w, "no such key")
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"deleted","account":"`+acct.ID+`"}`)
-	// IAM-4 (ADR-035): record the key revocation. The handler
-	// doesn't load the key row (DeleteAPIKey is opaque), so the
-	// audit row carries just the key id; the operator can join on
-	// the events row's subject=account_id to scope by owner.
+	// IAM-4 + IAM-1 (ADR-034 rev2 / ADR-035): record the key
+	// revocation carrying the dismissed scopes so an operator can
+	// answer "what did this key allow before it died?" without
+	// re-deriving it from logs. Single DELETE…RETURNING gives us
+	// the row shape without a pre-fetch race.
 	s.audit.Emit(ctx(r), "key.deleted", &acct.ID, map[string]any{
-		"key_id": id,
+		"key_id": deleted.ID,
+		"scopes": deleted.Scopes,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -101,7 +101,7 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // constraint in migrations/00001_init.sql.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
 		 from api_keys where key_sha256 = $1`, hash)
 	return scanAPIKey(row)
 }
@@ -116,7 +116,7 @@ func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
 // collapsing to a single SQL JOIN halves the round-trips on every
 // authenticated request. Not blocking: index hits are fast enough that
 // the perf cost is negligible at current scale. Revisit when auth
-// latency shows up on the dashboard. See ADR-034.
+// latency shows up on the dashboard. See ADR-034 rev2.
 func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
 	acct, err := s.AccountByKeyHash(ctx, hash)
 	if err != nil {
@@ -129,12 +129,18 @@ func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, AP
 	return acct, key, nil
 }
 
+// scanAPIKey reads the seven-column api_keys projection (id,
+// account_id, key_sha256, label, scopes, created_at, last_used_at).
+// Columns not enumerated in the seven-tuple (e.g. legacy callers from
+// before IAM-1) still work because every query in this package writes
+// the full seven-column list; the shared helper makes the projections
+// stay in lockstep.
 func scanAPIKey(row pgx.Row) (APIKey, error) {
 	var (
 		k         APIKey
 		hashBytes []byte
 	)
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
 		}
@@ -284,7 +290,7 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
 		accountID, hash, nullString(label), scopes)
 	return scanAPIKey(row)
 }
@@ -300,9 +306,24 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 	return nil
 }
 
+// DeleteAPIKeyReturning deletes the key and returns the row in a
+// single DELETE ... RETURNING statement (IAM-1, ADR-034 rev2). The
+// handler uses the returned row's Scopes to emit a key.deleted audit
+// event so an operator investigating "what just got revoked?" can see
+// the dismissed permission set without re-deriving it from logs.
+// Returns ErrNotFound when no matching key exists (account mismatch
+// is indistinguishable from a missing id, matching DeleteAPIKey).
+func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`delete from api_keys where id = $1 and account_id = $2
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
+		keyID, accountID)
+	return scanAPIKey(row)
+}
+
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz) from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err

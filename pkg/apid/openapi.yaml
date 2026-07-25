@@ -1338,7 +1338,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/APIKeyResponse' }
               example:
-                - {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z","requests":42}
+                - {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","scopes":["apps:read","deploy:write"],"created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
@@ -1350,7 +1350,7 @@ paths:
         and cannot be retrieved; subsequent GETs return only the prefix.
       requestBody:
         required: true
-        description: "API key creation payload — label only. Plaintext is returned exactly once in the 201 response."
+        description: "Create a new API key for the authenticated account. Plaintext is returned exactly once in the 201 response and cannot be recovered later — store it immediately. See IAM-1, ADR-034 rev2 for the scope vocabulary."
         content:
           application/json:
             schema:
@@ -1363,7 +1363,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/APIKeyResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z","requests":42}
+                example: {"id":"0123456789abcdef0123456789abcdef","prefix":"fp_live_ab","label":"ci-deploy","scopes":["apps:read","deploy:write"],"created_at":"2026-07-23T11:25:00Z","last_used_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -1760,7 +1760,7 @@ components:
         requests: { type: integer, format: int64 }
 
     APIKeyExportResponse:
-      description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034)."
+      description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
       type: object
       required: [id, prefix, scopes, created_at]
       properties:
@@ -1769,11 +1769,12 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE. See IAM-1, ADR-034."
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): `admin` is the legacy full-access scope; `apps:read` covers GETs across the apps/deployments/audit/secrets-list surface; `deploy:write` covers POST/PUT/PATCH/DELETE on apps+queues; `secrets:write` covers PUT/DELETE on /apps/{slug}/secrets/{key}; `usage:read` covers GET /v1/usage*."
           example: [admin]
         created_at: { type: string, format: date-time }
         last_used_at: { type: [string, "null"], format: date-time }
+      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-07-25T13:25:00Z", last_used_at: "2026-07-25T13:25:00Z"}
 
     GdprAuditExportResponse:
       description: "One row of the customer's audit trail in the GDPR export bundle. Two row kinds live here: source=`gdpr` carries a self-service action (`export`, `delete`, `restore`); source=`event` carries a security event from the events table (IAM-4, ADR-035) with a `kind` and JSON `data` payload. The two are interleaved by timestamp descending."
@@ -2056,25 +2057,26 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Permission set attached to the key. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers mutating requests. See IAM-1, ADR-034."
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access scope; apps:read covers GETs across the apps/deployments/audit/secrets-list surface; deploy:write covers POST/PUT/PATCH/DELETE on apps+queues; secrets:write covers PUT/DELETE on /apps/{slug}/secrets/{key}; usage:read covers GET /v1/usage*."
           example: [admin]
         last_used_at: { type: [string, "null"], format: date-time }
-        created_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time, example: "2026-07-25T13:25:00Z" }
         plaintext:
           type: [string, "null"]
           description: PRESENT ONLY on POST /v1/keys response. Never returned again.
+      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-07-25T13:25:00Z", last_used_at: "2026-07-25T13:25:00Z", plaintext: "fp_live_abcd1234567890abcdef12345678"}
 
     CreateKeyRequest:
-      description: "API key creation payload: label and scopes. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034."
+      description: "API key creation payload — label and optional scopes. Plaintext is returned exactly once in the 201 response. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034 rev2."
       type: object
       properties:
         label: { type: string, maxLength: 100 , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, read, write] }
-          description: "Requested permission set. Server validates each entry against the allowed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; `read` covers GETs; `write` covers POST/PUT/PATCH/DELETE."
-          example: [read]
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          description: "Requested permission set. Server validates each entry against the closed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; the other five cover narrower surfaces (see APIKeyResponse.scopes). See IAM-1, ADR-034 rev2."
+          example: [apps:read, deploy:write]
 
     # ─── Audit events (IAM-4 / ADR-035) ──────────────────────────────────
 
