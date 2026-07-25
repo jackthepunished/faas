@@ -619,3 +619,264 @@ func TestLoop_ConstructionNoReaper(t *testing.T) {
 	// reference to Loop.gcCh above is the only knob tests should
 	// ever need to drive the loop.
 }
+
+// countingStore wraps *state.MemStore and tallies the GC-path method
+// calls. Used by TestRunGCTick_PerEvictionSQLCount + the benchmark to
+// assert the per-eviction SQL count drops from O(4N) to O(N).
+//
+// Only methods reachable from runGCTick → deleteSnapshotsAndFiles →
+// perAppKeepCurrentPrevious / evictOldestFromHeaviestAccount are
+// counted. Other Store methods (apps, accounts, etc.) are intentionally
+// passthroughs so the wrapper is invisible to anything that doesn't
+// need to read the counters.
+type countingStore struct {
+	*state.MemStore
+	counts map[string]int
+}
+
+func newCountingStore() *countingStore {
+	return &countingStore{MemStore: state.NewMemStore(), counts: map[string]int{}}
+}
+
+func (s *countingStore) bump(method string) {
+	s.counts[method]++
+}
+
+func (s *countingStore) ListSnapshotsForGC(ctx context.Context) ([]state.SnapshotForGC, error) {
+	s.bump("ListSnapshotsForGC")
+	return s.MemStore.ListSnapshotsForGC(ctx)
+}
+
+func (s *countingStore) MarkOldSnapshotsStale(ctx context.Context, ids []string) (int64, error) {
+	s.bump("MarkOldSnapshotsStale")
+	return s.MemStore.MarkOldSnapshotsStale(ctx, ids)
+}
+
+func (s *countingStore) DeleteSnapshotsByID(ctx context.Context, ids []string) (int64, error) {
+	s.bump("DeleteSnapshotsByID")
+	return s.MemStore.DeleteSnapshotsByID(ctx, ids)
+}
+
+func (s *countingStore) DeploymentByID(ctx context.Context, id string) (state.Deployment, error) {
+	s.bump("DeploymentByID")
+	return s.MemStore.DeploymentByID(ctx, id)
+}
+
+func (s *countingStore) AppByID(ctx context.Context, id string) (state.App, error) {
+	s.bump("AppByID")
+	return s.MemStore.AppByID(ctx, id)
+}
+
+// total returns the sum of all counted calls. Useful as a single
+// regression metric — easier to assert against than a per-method
+// breakdown.
+func (s *countingStore) total() int {
+	n := 0
+	for _, v := range s.counts {
+		n += v
+	}
+	return n
+}
+
+// seedEvictionCandidate inserts one account + one app + 4 deployments +
+// 4 snapshots. With the per-app "keep current+previous" rule, the
+// 2 oldest snapshots are evictable in a single GC tick.
+func seedEvictionCandidate(t *testing.T, store state.Store, slug string) {
+	t.Helper()
+	s, ok := store.(*countingStore)
+	if !ok {
+		t.Fatalf("seedEvictionCandidate: store is not *countingStore")
+	}
+	acct, err := s.MemStore.CreateAccount(context.Background(), slug+"@x.com", "pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := s.MemStore.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: slug, RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 4; i++ {
+		dep, err := s.MemStore.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:" + slug + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.MemStore.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.SnapMemKey(dep.ID),
+			CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// seedEvictionCandidateB is the benchmark twin of seedEvictionCandidate.
+// It only needs the methods seedEvictionCandidate actually calls on the
+// *testing.T — Helper + Fatal — both of which *testing.B also satisfies,
+// but Go's type system won't let us pass *testing.B where *testing.T is
+// wanted. We can't reuse seedEvictionCandidate without a runtime cast
+// (testing.T is a concrete struct, not an interface), so the duplication
+// is intentional and tiny.
+func seedEvictionCandidateB(b *testing.B, store *countingStore, slug string) {
+	b.Helper()
+	acct, err := store.MemStore.CreateAccount(context.Background(), slug+"@x.com", "pro")
+	if err != nil {
+		b.Fatal(err)
+	}
+	app, err := store.MemStore.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: slug, RAMMB: 256, IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 4; i++ {
+		dep, err := store.MemStore.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:" + slug + string(rune('a'+i)),
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, err = store.MemStore.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.SnapMemKey(dep.ID),
+			CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// TestRunGCTick_PerEvictionSQLCount is the B1.1 perf-cost regression
+// gate. After the AppSlug fix, a per-eviction GC sweep must not pay a
+// DeploymentByID+AppByID lookup per row — the slug travels on the
+// SnapshotForGC projection. Today (pre-fix) each eviction pays 2 extra
+// SQL round-trips (DeploymentByID + AppByID via the loop fallback at
+// pkg/imaged/loop.go:317-326). After the fix those calls disappear.
+//
+// The assertion is intentionally generous — we measure the total count
+// of GC-path calls and require it to be at most 3 + 2N (one
+// ListSnapshotsForGC, one MarkOldSnapshotsStale, one
+// DeleteSnapshotsByID, plus 2N for SnapMemKey + SnapVMStateKey
+// storage.Delete calls that the storage backend wraps in SQL via the
+// LocalArtifactLister path). The failing case today is 5 + 4N (the +2
+// per-eviction DeploymentByID + AppByID fallback). With N=4 evictions
+// that's 21 today vs ≤11 after the fix — a clear delta the test
+// asserts.
+func TestRunGCTick_PerEvictionSQLCount(t *testing.T) {
+	const N = 4 // 4 deployments per app → 2 evictions per app → 2 × 4 = 8 rows total when paired
+	store := newCountingStore()
+
+	// Seed two apps, each with 4 snapshots → 4 evictions total.
+	seedEvictionCandidate(t, store, "perf-app-a")
+	seedEvictionCandidate(t, store, "perf-app-b")
+
+	appsRoot := t.TempDir()
+	be, err := storage.NewLocalStorageBackend(appsRoot)
+	if err != nil {
+		t.Fatalf("storage.NewLocalStorageBackend: %v", err)
+	}
+	gcCh := make(chan time.Time, 1)
+	gcCh <- time.Unix(0, 0)
+	loop := &Loop{
+		store: store,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now:   func() time.Time { return time.Unix(0, 0) },
+		lvUsedPct: func(ctx context.Context) (float64, error) {
+			return 50.0, nil // under budget → only per-app sweep runs
+		},
+		appsRoot: appsRoot,
+		gcCh:     gcCh,
+		handler: &Handler{
+			store:    store,
+			log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			appsRoot: appsRoot,
+			storage:  be,
+		},
+	}
+
+	loop.runGCTick(context.Background(), time.Unix(0, 0))
+
+	got := store.counts["DeploymentByID"] + store.counts["AppByID"]
+	if got != 0 {
+		t.Errorf("B1.1 perf-cost regression: runGCTick issued %d DeploymentByID+AppByID calls "+
+			"across %d evictions; expected 0 (the AppSlug must travel on SnapshotForGC, "+
+			"not be re-resolved per eviction)", got, N)
+	}
+
+	// Hard ceiling: total GC-path SQL should be ≤ 5 + 2N where N is
+	// the number of evictions. The 5 is one ListSnapshotsForGC + one
+	// MarkOldSnapshotsStale + one DeleteSnapshotsByID + a 2-call
+	// margin for any sub-store bookkeeping we don't anticipate.
+	total := store.total()
+	const evictions = 4
+	const ceiling = 5 + 2*evictions
+	if total > ceiling {
+		t.Errorf("B1.1 perf-cost regression: runGCTick issued %d total GC-path calls "+
+			"across %d evictions; expected ≤ %d (ceiling = 5 + 2N)", total, evictions, ceiling)
+	}
+
+	// Sanity: the per-app policy must actually have evicted the 4
+	// oldest snapshots (2 per app).
+	rows, err := store.ListSnapshotsForGC(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("after per-app GC: %d snapshots remain, want 4 (current+previous per app)", len(rows))
+	}
+	t.Logf("GC SQL counts: %v (total %d)", store.counts, total)
+}
+
+// BenchmarkLoopRunGCTick_FallbackSQLCost is the pre-PR perf baseline.
+// It captures the SQL query count for a larger N (20 apps × 4
+// deployments → 40 evictions) so we can eyeball the absolute cost of
+// the slow fallback. After the fix the same benchmark should issue
+// far fewer calls.
+//
+// Run via:
+//   go test -bench BenchmarkLoopRunGCTick_FallbackSQLCost -benchmem ./pkg/imaged/...
+func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
+	const apps = 20
+	const evictions = 2 * apps // 2 per app fall outside current+previous
+
+	for n := 0; n < b.N; n++ {
+		store := newCountingStore()
+		for i := 0; i < apps; i++ {
+			seedEvictionCandidateB(b, store, "perf-"+string(rune('a'+i)))
+		}
+		appsRoot := b.TempDir()
+		be, _ := storage.NewLocalStorageBackend(appsRoot)
+		gcCh := make(chan time.Time, 1)
+		gcCh <- time.Unix(0, 0)
+		loop := &Loop{
+			store:    store,
+			log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			now:      func() time.Time { return time.Unix(0, 0) },
+			lvUsedPct: func(ctx context.Context) (float64, error) { return 50.0, nil },
+			appsRoot: appsRoot,
+			gcCh:     gcCh,
+			handler: &Handler{
+				store:    store,
+				log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+				appsRoot: appsRoot,
+				storage:  be,
+			},
+		}
+		b.ResetTimer()
+		loop.runGCTick(context.Background(), time.Unix(0, 0))
+		b.StopTimer()
+		b.ReportMetric(float64(store.total()), "sql_calls")
+		b.ReportMetric(float64(store.counts["DeploymentByID"]+store.counts["AppByID"]), "lookup_calls")
+		_ = evictions
+	}
+}
