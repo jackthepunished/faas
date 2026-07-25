@@ -13,9 +13,9 @@ func TestEncodeVerifyRoundTrip(t *testing.T) {
 	cases := []string{
 		"correct-horse-battery-staple",
 		"another-valid-password-2026",
-		strings.Repeat("a", MinPasswordLen),                // exactly the floor
-		strings.Repeat("x", 128),                            // long
-		"unicode-пароль-密码-🔐-ok",                                // unicode; no rune-vs-byte split
+		strings.Repeat("a", MinPasswordLen), // exactly the floor
+		strings.Repeat("x", 128),            // long
+		"unicode-пароль-密码-🔐-ok",            // unicode; no rune-vs-byte split
 	}
 	for _, pw := range cases {
 		t.Run(pw, func(t *testing.T) {
@@ -95,24 +95,24 @@ func TestVerifyRejectsWrongPassword(t *testing.T) {
 // a guard surfaces here.
 func TestVerifyRejectsMalformedPHC(t *testing.T) {
 	cases := map[string]string{
-		"empty":                "",
-		"no_dollar_prefix":     "argon2id$v=19$m=65536,t=1,p=2$AAAA$BBBB",
-		"too_few_fields":       "$argon2id$v=19$m=65536,t=1,p=2$AAAA",
+		"empty":            "",
+		"no_dollar_prefix": "argon2id$v=19$m=65536,t=1,p=2$AAAA$BBBB",
+		"too_few_fields":   "$argon2id$v=19$m=65536,t=1,p=2$AAAA",
 		// "too_many_fields" — split() on "$" yields 7 elements
 		// (one leading empty + 6 non-empty), which is the right
 		// number for the format this package emits. To trigger the
 		// "too many" branch we need a 7th non-empty field, so the
 		// split has length 8.
-		"too_many_fields": "$argon2id$v=19$m=65536,t=1,p=2$AAAA$BBBB$CCCC$DDDD",
-		"wrong_algorithm":      "$bcrypt$v=19$m=65536,t=1,p=2$AAAA$BBBB",
-		"wrong_version":        "$argon2id$v=99$m=65536,t=1,p=2$AAAA$BBBB",
-		"params_missing_m":     "$argon2id$v=19$t=1,p=2$AAAA$BBBB",
-		"params_zero_m":        "$argon2id$v=19$m=0,t=1,p=2$AAAA$BBBB",
-		"params_zero_t":        "$argon2id$v=19$m=65536,t=0,p=2$AAAA$BBBB",
-		"params_zero_p":        "$argon2id$v=19$m=65536,t=1,p=0$AAAA$BBBB",
-		"params_huge_p":        "$argon2id$v=19$m=65536,t=1,p=99999$AAAA$BBBB",
-		"salt_invalid_b64":     "$argon2id$v=19$m=65536,t=1,p=2$%%%%$BBBB",
-		"hash_invalid_b64":     "$argon2id$v=19$m=65536,t=1,p=2$AAAA$%%%%",
+		"too_many_fields":  "$argon2id$v=19$m=65536,t=1,p=2$AAAA$BBBB$CCCC$DDDD",
+		"wrong_algorithm":  "$bcrypt$v=19$m=65536,t=1,p=2$AAAA$BBBB",
+		"wrong_version":    "$argon2id$v=99$m=65536,t=1,p=2$AAAA$BBBB",
+		"params_missing_m": "$argon2id$v=19$t=1,p=2$AAAA$BBBB",
+		"params_zero_m":    "$argon2id$v=19$m=0,t=1,p=2$AAAA$BBBB",
+		"params_zero_t":    "$argon2id$v=19$m=65536,t=0,p=2$AAAA$BBBB",
+		"params_zero_p":    "$argon2id$v=19$m=65536,t=1,p=0$AAAA$BBBB",
+		"params_huge_p":    "$argon2id$v=19$m=65536,t=1,p=99999$AAAA$BBBB",
+		"salt_invalid_b64": "$argon2id$v=19$m=65536,t=1,p=2$%%%%$BBBB",
+		"hash_invalid_b64": "$argon2id$v=19$m=65536,t=1,p=2$AAAA$%%%%",
 	}
 	for name, phc := range cases {
 		t.Run(name, func(t *testing.T) {

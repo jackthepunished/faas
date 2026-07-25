@@ -83,7 +83,7 @@ const (
 //     against DummyPHC so the timing matches the "wrong-password"
 //     path; return 401.
 //   - account exists but no password row (OAuth-only): Argon2id pad
-//     + 401.
+//   - 401.
 //   - account exists, password row exists, verify fails: 401.
 //
 // Successful verify: mint a session cookie, write a JSON body with

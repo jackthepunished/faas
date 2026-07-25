@@ -599,12 +599,12 @@ type AccountPassword struct {
 // refresh EmailVerified (ADR-032 "Open follow-ups"). Per spec §11,
 // no session is ever minted with EmailVerified=false at link time.
 type OAuthLink struct {
-	Provider         string // "google" | "github" | (future providers)
-	ProviderSubject  string // Google's `sub`, GitHub's numeric `id`
-	AccountID        string
-	Email            string
-	EmailVerified    bool
-	CreatedAt        time.Time
+	Provider        string // "google" | "github" | (future providers)
+	ProviderSubject string // Google's `sub`, GitHub's numeric `id`
+	AccountID       string
+	Email           string
+	EmailVerified   bool
+	CreatedAt       time.Time
 }
 
 // LogEntry is one line of build output for a deployment (slice 5).

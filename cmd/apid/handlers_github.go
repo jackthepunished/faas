@@ -6,17 +6,17 @@
 // unrelated to dashboard auth and lives behind sessionAuth.
 //
 // Flow:
-//   1. GET /v1/auth/github → sets a 16-byte CSRF state cookie scoped
-//      to /v1/auth/github/callback and redirects to github.com/login/
-//      oauth/authorize with the state + scope=user:email.
-//   2. GET /v1/auth/github/callback → verifies the state cookie ==
-//      query state, exchanges the code at github.com/login/oauth/
-//      access_token (Accept: application/json variant), fetches the
-//      /user profile (id + login + name + avatar), fetches /user/
-//      emails and filters to primary && verified, then runs the
-//      same provisionOrFetchOAuth helper the Google flow uses
-//      (sub-first lookup via oauth_links), mints a session cookie,
-//      and redirects to WEBSITE_URL or /.
+//  1. GET /v1/auth/github → sets a 16-byte CSRF state cookie scoped
+//     to /v1/auth/github/callback and redirects to github.com/login/
+//     oauth/authorize with the state + scope=user:email.
+//  2. GET /v1/auth/github/callback → verifies the state cookie ==
+//     query state, exchanges the code at github.com/login/oauth/
+//     access_token (Accept: application/json variant), fetches the
+//     /user profile (id + login + name + avatar), fetches /user/
+//     emails and filters to primary && verified, then runs the
+//     same provisionOrFetchOAuth helper the Google flow uses
+//     (sub-first lookup via oauth_links), mints a session cookie,
+//     and redirects to WEBSITE_URL or /.
 //
 // The state cookie is scoped to /v1/auth/github/callback so a
 // parallel Google OAuth flow can't accidentally leak the GitHub

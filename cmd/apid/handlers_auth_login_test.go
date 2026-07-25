@@ -299,7 +299,7 @@ func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 // (m=64MiB, t=1, p=2 → ~50ms on the EX44); the surrounding
 // store-lookup overhead is sub-millisecond. A regression that
 // short-circuits the no-account path with `if err != nil { return }
-//` would re-open the timing oracle and trip this test.
+// ` would re-open the timing oracle and trip this test.
 func TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths(t *testing.T) {
 	store := state.NewMemStore()
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
@@ -338,7 +338,7 @@ func TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths(t *testing.T) {
 	// Run each path three times and take the minimum; OS scheduler
 	// jitter dominates a single sample on shared CI runners.
 	minOf := func(label, email string) time.Duration {
-		var m time.Duration = 1<<62
+		var m time.Duration = 1 << 62
 		for i := 0; i < 3; i++ {
 			if d := measure(label, email); d < m {
 				m = d

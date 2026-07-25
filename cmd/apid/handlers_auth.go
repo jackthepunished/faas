@@ -20,12 +20,12 @@
 //     exchange + email_verified enforcement + sign-in.
 //  9. GET  /v1/auth/github   → 302 to GitHub consent screen.
 //  10. GET /v1/auth/github/callback → state verify + code
-//      exchange + primary-verified email filter + sign-in.
+//     exchange + primary-verified email filter + sign-in.
 //  11. POST /dashboard/account/set-password → authed opt-in for
-//      OAuth-only customers.
+//     OAuth-only customers.
 //  12. GET  /auth/verify?token=… → legacy magic-link consume
-//      (kept for compatibility; PR #2 does not return new
-//      magic-link emails).
+//     (kept for compatibility; PR #2 does not return new
+//     magic-link emails).
 //  13. POST /logout          → clears faas_sid, redirects to /login.
 //
 // sessionAuth middleware gates /dashboard/* (except /login + the
