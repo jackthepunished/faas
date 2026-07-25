@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -56,6 +58,52 @@ func (e testEnv) do(t *testing.T, method, path string, body any, hdrs map[string
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, req)
 	return rec
+}
+
+// setupWithNotifier is the Move 2 sibling of setup: lets handlers_ext_test
+// inject a programmable notifier so the long-poll handlers
+// (invokeApp, queueReceive) can be tested without a real Postgres LISTEN
+// connection. The hook returns the payload for the next WaitFor call;
+// pass nil to defer to db.ErrWaitTimeout (the noop default).
+func setupWithNotifier(t *testing.T, plan api.Plan, hook func(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error)) testEnv {
+	t.Helper()
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(), fmt.Sprintf("%s@example.com", plan), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, hash, _ := api.GenerateAPIKey()
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test"); err != nil {
+		t.Fatal(err)
+	}
+	ops := wire.NewOpsMetrics("apid_test")
+	notif := stubNotifier{hook: hook}
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", notif).WithOpsMetrics(ops)
+	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
+}
+
+// stubNotifier satisfies Notifier for Move 2 long-poll tests. Notify
+// and Subscribe are no-ops; WaitFor delegates to the test-supplied
+// hook. When the hook is nil, WaitFor returns db.ErrWaitTimeout
+// immediately — same behaviour as noopNotifier for tests that want
+// the "no event during the wait" branch.
+type stubNotifier struct {
+	hook func(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error)
+}
+
+func (s stubNotifier) Notify(_ context.Context, _, _ string) error { return nil }
+
+func (s stubNotifier) Subscribe(_ context.Context, _ []string) (<-chan db.Notification, func(), error) {
+	ch := make(chan db.Notification)
+	close(ch)
+	return ch, func() {}, nil
+}
+
+func (s stubNotifier) WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error) {
+	if s.hook == nil {
+		return "", db.ErrWaitTimeout
+	}
+	return s.hook(ctx, channel, predicate, timeout)
 }
 
 func TestWhoami(t *testing.T) {

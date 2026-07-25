@@ -184,9 +184,16 @@ type Message struct {
 // endpoint. It hands back a buffered channel of db.Notification for the
 // requested channels, plus a cancel func. The noop notifier returns an
 // empty stream that closes immediately.
+//
+// WaitFor is the Move 2 long-poll sibling used by the event-driven
+// handlers (sync invoke, queueReceive). The production notifier
+// delegates to db.WaitForNotification; the test noop returns
+// db.ErrWaitTimeout after the timeout so test fixtures stay
+// pgx-free.
 type Notifier interface {
 	Notify(ctx context.Context, channel, payload string) error
 	Subscribe(ctx context.Context, channels []string) (<-chan db.Notification, func(), error)
+	WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error)
 }
 
 func newServer(store state.Store, log *slog.Logger, domain string, notif Notifier) *server {
@@ -307,6 +314,15 @@ func (noopNotifier) Subscribe(_ context.Context, _ []string) (<-chan db.Notifica
 	return ch, func() {}, nil
 }
 
+// WaitFor is the Move 2 long-poll sibling for the noop notifier. Returns
+// db.ErrWaitTimeout after the timeout so test fixtures can exercise
+// the "no event during the wait" path without a real Postgres. The
+// SetWaitForPayload hook (cmd/apid/handlers_ext.go) lets tests
+// pre-queue a successful payload before the handler lands.
+func (noopNotifier) WaitFor(_ context.Context, _ string, _ func(payload string) bool, _ time.Duration) (string, error) {
+	return "", db.ErrWaitTimeout
+}
+
 // handler builds the full Appendix A route table (Go 1.22 method+wildcard).
 // New routes append here; do not introduce per-feature sub-muxes.
 func (s *server) handler() http.Handler {
@@ -355,6 +371,27 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/crons", s.authLimited(s.idempotent(s.createCron)))
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.updateCron))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.deleteCron))
+
+	// Move 2: event-driven surface (handlers_invocations.go).
+	// Charged routes take idempotent so retries are safe; the long-poll
+	// ones take authLimited (no idempotent — a network jitter on a
+	// long-poll is the customer's retry, not the SDK's).
+	//
+	// Path note: Go 1.22+ ServeMux requires "{id}" wildcards to end at
+	// "}" — the colon-form verbs (`invocations:send`) break the
+	// parser. The Move 2 routes use the `action` segment form so the
+	// mux can register them. The wire shape matches the spec-level
+	// intent (`queueSend`, `queueReceive`, `queueAck` handlers).
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke", s.authLimited(s.invokeApp))
+	mux.HandleFunc("POST /v1/apps/{slug}/invoke/async", s.authLimited(s.idempotent(s.invokeAppAsync)))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/send", s.authLimited(s.idempotent(s.queueSend)))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/receive", s.authLimited(s.queueReceive))
+	mux.HandleFunc("POST /v1/apps/{slug}/queues/{id}/ack", s.authLimited(s.idempotent(s.queueAck)))
+	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.idempotent(s.delayedTaskCreate)))
+	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.listInvocations))
+	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.getInvocation))
+	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.delayedTaskGet))
+	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.delayedTaskCancel))
 
 	// API keys.
 	mux.HandleFunc("GET /v1/keys", s.authLimited(s.listKeys))

@@ -92,9 +92,11 @@ var codeExclude = map[string]bool{
 // Either inline anonymous structs in handlers, or pure-documentation shapes
 // (error envelopes that don't directly mirror a Go type).
 var schemaSpecOnly = map[string]bool{
-	"ChangePlanRequest": true, // inline {Plan string} in cmd/apid/handlers_ext.go
-	"CreateKeyRequest":  true, // inline {Label string} in cmd/apid/handlers_ext.go
-	"RateLimitPlain":    true, // documentation-only shape for the authlimiter 429
+	"ChangePlanRequest":       true, // inline {Plan string} in cmd/apid/handlers_ext.go
+	"CreateKeyRequest":        true, // inline {Label string} in cmd/apid/handlers_ext.go
+	"RateLimitPlain":          true, // documentation-only shape for the authlimiter 429
+	"Invocation":              true, // mirror of pkg/state.Invocation; pkg/api can't import pkg/state (cyclic)
+	"ListInvocationsResponse": true, // handler-local wrapper in cmd/apid/handlers_invocations.go for the same reason
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.

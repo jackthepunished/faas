@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -403,4 +404,76 @@ type StatusPage struct {
 	// "degraded: <reason>" so an operator tailing the JSON can tell
 	// at a glance why a snapshot is or isn't trustworthy.
 	Source string `json:"source"`
+}
+
+// --- Move 2: event-driven surface response shapes ----------------------------
+//
+// AsyncInvokeResponse is the 202-side of POST /v1/apps/{slug}/invoke/async.
+// StatusURL is the well-known read endpoint so the dashboard (and the
+// SDK) can poll without parsing the id.
+type AsyncInvokeResponse struct {
+	ID        string `json:"id"`
+	StatusURL string `json:"status_url"`
+}
+
+// InvokeResponse is the sync-side of POST /v1/apps/{slug}/invoke.
+// Status is the final row state (one of "completed" | "failed"
+// | "cancelled"); Result is the per-app payload the drain stamped
+// (nil while pending, populated by drain.emitDone).
+type InvokeResponse struct {
+	ID     string          `json:"id"`
+	Status string          `json:"status"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+// QueueSendResponse is returned on POST /v1/apps/{slug}/queues/invocations:send.
+// 201 Created with the new id; the customer pairs this with the
+// /receive long-poll.
+type QueueSendResponse struct {
+	ID string `json:"id"`
+}
+
+// QueueReceiveResponse is returned on POST /v1/apps/{slug}/queues/invocations:receive.
+// 200 with the dequeued row's payload + result; 204 on timeout.
+type QueueReceiveResponse struct {
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
+	Result  json.RawMessage `json:"result,omitempty"`
+}
+
+// DelayedTaskResponse is the create/get shape for delayed tasks.
+// ScheduledAt is the customer-facing UTC dispatch time; State is
+// populated on get, omitted on create (always "pending" there).
+type DelayedTaskResponse struct {
+	ID          string    `json:"id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	State       string    `json:"state,omitempty"`
+}
+
+// ListInvocationsResponse lives in cmd/apid because pkg/api cannot
+// import pkg/state (cyclic). The handler-local type is `[]state.Invocation`
+// — the wire shape is identical, only the package differs.
+
+// InvokeRequest is the body for POST /v1/apps/{slug}/invoke[/async].
+// Method defaults to POST; path defaults to `/` (the handler fills
+// defaults; the zero values are not persisted).
+type InvokeRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Headers json.RawMessage `json:"headers,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Path    string          `json:"path,omitempty"`
+}
+
+// QueueSendRequest is the body for POST /v1/apps/{slug}/queues/send.
+// Cap-checked against MaxQueueDepth at the handler.
+type QueueSendRequest struct {
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// DelayedTaskRequest is the body for POST /v1/apps/{slug}/delayed-tasks.
+// ScheduledAt must be in the future (UTC); the handler rejects past
+// timestamps with invalid_scheduled_at.
+type DelayedTaskRequest struct {
+	Payload     json.RawMessage `json:"payload,omitempty"`
+	ScheduledAt time.Time       `json:"scheduled_at"`
 }
