@@ -171,8 +171,12 @@ asymmetry.
 - **Read-path exposure on `api.AppResponse`** — the API today only
   accepts `egress_allowlist` via PATCH; GET does not surface it.
   Same status as ADR-031; not in scope for this slice either.
-- **Deny-line audit (issue #146)** — adjacent hygiene PR that
-  deserves its own ADR once this slice merges.
+- **Deny-line audit (issue #146)** — resolved by PR-D. The
+  shared catalog, generated operator artifact, OCI 6to4/Teredo
+  denial coverage, ADR-034 provenance on the OCI-only
+  client-hardening ranges, and a non-metal cross-renderer
+  invariant test are now in place. See `docs/denylist.md` and
+  `pkg/netns/denylist_external_test.go::TestAllThreeConsumersAgreeOnDenySet`.
 
 ## Cross-reference
 
