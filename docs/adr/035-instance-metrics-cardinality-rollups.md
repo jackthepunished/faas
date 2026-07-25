@@ -1,6 +1,6 @@
 # ADR-035 · Per-instance metrics: {app,node} cardinality rollups (issue #170 / PR-A)
 
-- **Status:** proposed
+- **Status:** Accepted, 2026-07-25. Owner: @poyrazK. Closes: #170 (PR-A slice).
 - **Date:** 2026-07-25
 - **Decision:** The schedd's per-instance metrics surface is exposed
   on Prometheus as a **rolled-up** `{app, node}` label set — never
@@ -68,6 +68,18 @@
     the NaN. LastRequestAt falls back to `state.Instance.LastRequestAt`
     so future "instance is idle" derivations have a signal to
     consume.
+  - **Destructive-reset semantics.** `pkg/wire.OpsMetrics.ReplaceInstanceStats`
+    calls `GaugeVec.Reset()` on every Tick. A destroyed app's
+    `(app, node)` tuple stops surfacing in the next scrape — no
+    zombie sample is held out at its last value. The trade-off
+    is the lose-history one: a future Prometheus
+    `alertmanager`-style rule that expects
+    `schedd_instance_cpu_pct{app="…"}` to *decrease* on destroy
+    (with a held-out value) will be surprised. The durable view
+    lives in `events_*` audit rows + the instances table; the
+    gauge is the live view by design. Codified so the future
+    alerts PR picks a stale-aware query or relies on the
+    events stream instead.
 - **Out of scope (PR-B / future work):**
   - vmmd-side `ActivityTracker` (PR-B step 1).
   - `pkg/vmmdgrpc/stats.go` extraction + populate lease_uid / host_ip
@@ -82,3 +94,10 @@
     new Loop worker.
   - #172 config knobs (`StatsInterval`, `StatsFreshness`,
     `StatsEnabled`, future `CPUDeltaMinUSec` filter).
+  - `Validity::Stale` lands when #172's `StatsFreshness` budget
+    ships — the poller will then stamp rows whose `SampledAt` is
+    older than the budget as `Stale` rather than `Valid`. Today
+    the poller never stamps `Stale`; the enum slot is reserved
+    so adding the gate later doesn't require an InstanceStat
+    field-shape change. Pinned by
+    `reader.go::Validity` doc comment.
