@@ -59,8 +59,9 @@ var eventsChannels = []string{
 // every relevant pg_notify frame to the client as `event: <kind>`
 // frames until the client disconnects.
 //
-// API-key callers must hold at least the "read" scope; session-cookie
-// callers are implicitly admin. IAM-1, ADR-034.
+// API-key callers must hold at least the "apps:read" scope (the read
+// surface, see ScopesReadSurface); session-cookie callers are
+// implicitly admin. IAM-1, ADR-034 rev2.
 func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Move 3 / §12: apid_sse_clients tracks the number of open

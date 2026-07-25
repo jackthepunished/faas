@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -135,6 +136,39 @@ type server struct {
 	// roll back the action). nil falls back to a no-op helper so
 	// older tests can build a server without an audit handle.
 	audit *auditor
+	// touchDebounce coalesces per-key last_used_at updates (PR #232
+	// review #7). Without this, every successful bearer auth would
+	// spawn a goroutine issuing an UPDATE api_keys SET last_used_at =
+	// now(). Hot keys (gateway pinned under one key) would amplify
+	// into WAL+lock pressure. keyTouchWindow below is the
+	// minimum interval — recent touches within the window drop.
+	// Reads are lock-free via sync.Map.Load; the Store path is
+	// LoadOrStore so the first writer wins. A periodic janitor
+	// (pkg/grace) evicts old entries to bound memory.
+	touchDebounce sync.Map // map[string]time.Time
+}
+
+// keyTouchWindow is the minimum interval between per-key last_used_at
+// stamps. PR #232 review pinned this at 30s — observability doesn't need
+// sub-second resolution, and a long-enough window keeps WAL amplification
+// bounded even under sustained 1k RPS on one key.
+const keyTouchWindow = 30 * time.Second
+
+// shouldTouchKey reports whether the key's last_used_at is stale enough
+// to warrant an UPDATE. Atomic-ish via sync.Map.LoadOrStore so two
+// concurrent first-time callers don't both schedule a touch; the
+// second caller observes the freshly-stored timestamp and skips.
+func (s *server) shouldTouchKey(keyID string, now time.Time) bool {
+	last, loaded := s.touchDebounce.LoadOrStore(keyID, now)
+	if !loaded {
+		return true // first touch wins
+	}
+	if now.Sub(last.(time.Time)) < keyTouchWindow {
+		return false // recent touch — drop
+	}
+	// stale entry; CAS to refresh.
+	s.touchDebounce.Store(keyID, now)
+	return true
 }
 
 // WithOpsMetrics attaches the daemon-wide Prometheus registry. The
@@ -371,7 +405,7 @@ func (s *server) handler() http.Handler {
 	// whole account, so it requires the admin scope; the read-only
 	// /v1/account carries the method default (read or admin).
 	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.whoami)))
-	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireScope(http.MethodPatch, api.ScopeAdmin)(s.idempotent(s.changePlan))))
+	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan))))
 	// G6 account self-service (spec §17 G6, ADR-021). /v1/account/dpa
 	// is intentionally mounted without s.auth — the DPA is a public
 	// artefact a prospect reads before signing up. The export + delete
@@ -381,7 +415,7 @@ func (s *server) handler() http.Handler {
 	// DELETE /v1/account is admin-only — losing the account is
 	// irreversible.
 	mux.HandleFunc("GET /v1/account/export", s.auth(s.requireScope(api.ScopesReadSurface...)(s.exportAccount)))
-	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.idempotent(s.deleteAccount))))
+	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.deleteAccount))))
 	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(api.ScopesDeployWriteSurface...)(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
 
@@ -447,8 +481,8 @@ func (s *server) handler() http.Handler {
 	// write-scoped key must not be able to grant itself more scopes.
 	// Listing is read.
 	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listKeys)))
-	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.createKey)))
-	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteKey)))
+	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.createKey)))
+	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.deleteKey)))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
@@ -462,7 +496,7 @@ func (s *server) handler() http.Handler {
 	// over TLS; sealed server-side by handlers_secrets.go.
 	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listSecrets)))
 	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret)))
-	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteSecret)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret)))
 
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write
@@ -493,9 +527,9 @@ func (s *server) handler() http.Handler {
 	// the routes share the spec §11 10/min/IP budget with the rest
 	// of /v1/* — a brute-force on admin routes costs the attacker
 	// the same budget they'd burn trying customer keys.
-	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodGet, api.ScopeAdmin)(s.listComputeNodes)))
-	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireScope(http.MethodPost, api.ScopeAdmin)(s.idempotent(s.createOrUpdateComputeNode))))
-	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireScope(http.MethodDelete, api.ScopeAdmin)(s.deleteComputeNode)))
+	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.listComputeNodes)))
+	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.createOrUpdateComputeNode))))
+	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.deleteComputeNode)))
 
 	// M7.5 SSE live-update (ADR-011). Handles session-cookie OR
 	// API-key auth itself — the cookie path is for the dashboard,
@@ -934,11 +968,16 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 				// a panic in a 5-line goroutine implies a code bug worth
 				// surfacing in the daemon logs. Pass r.Context() to satisfy
 				// contextcheck even though the goroutine's detached ctx
-				// ignores it.
-				//nolint:contextcheck // see touchKeyLastUsed — detached is load-bearing
-				go func(parent context.Context, id string) {
-					s.touchKeyLastUsed(parent, id)
-				}(r.Context(), key.ID)
+				// ignores it. Per-key debounce (keyTouchWindow,
+				// server.touchDebounce) keeps hot keys from amplifying
+				// into 1k+ UPDATEs/sec under sustained load (PR #232
+				// review #7).
+				if s.shouldTouchKey(key.ID, time.Now()) {
+					//nolint:contextcheck // see touchKeyLastUsed — detached is load-bearing
+					go func(parent context.Context, id string) {
+						s.touchKeyLastUsed(parent, id)
+					}(r.Context(), key.ID)
+				}
 				next(w, r, acct)
 				return
 			}

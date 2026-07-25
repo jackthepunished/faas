@@ -184,6 +184,31 @@ func TestScopeMatrix(t *testing.T) {
 		}
 	})
 
+	t.Run("secrets-write-key/DELETE-secret-scope-allowed", func(t *testing.T) {
+		// Symmetric to PUT: secrets:write covers DELETE too per
+		// ADR-034 rev2. The requireScope middleware fires before
+		// loadApp, so any non-403 result (404 from a missing app
+		// is the most likely) confirms the scope check passed.
+		// This case pins the wiring bug from PR #232 review:
+		// before the fix, DELETE was gated by ScopesDeployWriteSurface
+		// which leaked admin/deploy rights into the secrets surface.
+		e := setupWithScopes(t, []string{api.ScopeSecretsWrite})
+		rec := e.do(t, http.MethodDelete, "/v1/apps/missing-app/secrets/API_TOKEN", nil, nil)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("secrets:write DELETE secret was 403: %s", rec.Body)
+		}
+	})
+
+	t.Run("deploy-write-only-key/DELETE-secret-forbidden", func(t *testing.T) {
+		// Symmetric negative: deploy:write must NOT grant DELETE
+		// on /v1/apps/{slug}/secrets/{key}. ADR-034 rev2 reserves
+		// that surface for secrets:write (and admin). A deploy-only
+		// CI key cannot rotate secrets by deletion.
+		e := setupWithScopes(t, []string{api.ScopeDeployWrite})
+		rec := e.do(t, http.MethodDelete, "/v1/apps/some-app/secrets/API_TOKEN", nil, nil)
+		assertProblem(t, rec, http.StatusForbidden, api.CodeForbidden)
+	})
+
 	t.Run("secrets-write-only-key/POST-deploy-forbidden", func(t *testing.T) {
 		e := setupWithScopes(t, []string{api.ScopeSecretsWrite})
 		rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: "elevator-app"}, nil)
