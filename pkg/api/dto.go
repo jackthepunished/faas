@@ -265,6 +265,79 @@ type DeploymentListResponse struct {
 	NextBefore string               `json:"next_before,omitempty"`
 }
 
+// --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
+
+// OAuthProvider is the issuer name used by the dashboard OAuth flows
+// (the email/identity brokers). The set is intentionally closed — adding
+// a new provider is a Store + handler + OpenAPI change, not a config
+// flag. "google" and "github" are wired in PR #2.
+type OAuthProvider string
+
+const (
+	OAuthProviderGoogle OAuthProvider = "google"
+	OAuthProviderGitHub OAuthProvider = "github"
+)
+
+// PasswordLoginRequest is the body of POST /login. The email is the
+// canonical handle (lowercase + trim — the handler runs the same
+// canonicalisation the account-create path uses so an "alice@example.com
+// vs ALICE@example.com" login pair collapses to one row). Password is
+// the plaintext the client sent over TLS; the Argon2id verify is in
+// pkg/auth.Verify and runs on the server only.
+type PasswordLoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// PasswordLoginResponse is what POST /login (and POST /signup) return
+// on success. The session cookie rides on the Set-Cookie header — the
+// body deliberately carries NO api_key field. Pre-#165 (PR #1) the
+// response minted a "web-console" key and returned it in the body; that
+// was the takeover surface. The SDK path is the device-code CLI
+// (MintCliAuthCode / ExchangeCliAuthCode), not a login-bundled key, so
+// removing the field here doesn't break programmatic auth.
+type PasswordLoginResponse struct {
+	AccountID string `json:"account_id"`
+	Plan      string `json:"plan"`
+}
+
+// PasswordSignupRequest is the body of POST /signup. Same shape as
+// PasswordLoginRequest — we accept the same argon2id-shaped ciphertext
+// at signup and re-verify at login, so the handler-side error
+// equivalence ("wrong password" vs "no account" vs "weak password") is
+// kept intact under the same JSON keys.
+type PasswordSignupRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// PasswordResetRequest is the body of POST /login/forgot. The email
+// is optional — the same-shape internal handler is hit by the form
+// page (no body) and the SDK (email in body). The handler always
+// returns 200 with an identical body and identical timing whether or
+// not the email exists, so the surface does not leak account presence.
+type PasswordResetRequest struct {
+	Email string `json:"email,omitempty"`
+}
+
+// PasswordResetConfirm is the body of POST /auth/reset. Token is the
+// 32-byte value the email link carried (base64url-encoded, NOT the
+// SHA-256 hash the server stored). NewPassword is the plaintext the
+// user is opting into; the server Argon2id-encodes it server-side and
+// runs ConsumeLoginToken atomically so a replay returns 410.
+type PasswordResetConfirm struct {
+	Token       string `json:"token"`
+	NewPassword string `json:"new_password"`
+}
+
+// SetPasswordRequest is the body of POST /dashboard/account/set-password.
+// Lets OAuth-only users opt into password login. Same shape as the
+// reset-confirm NewPassword field — the handler runs auth
+// (sessionAuth) before encoding, so this is an authenticated surface.
+type SetPasswordRequest struct {
+	Password string `json:"password"`
+}
+
 // UsageSummaryResponse is the roll-up for the current month (or any
 // month passed as a query param). Used by the dashboard usage page so
 // the customer sees a single number ("used X of Y GB-h, overage $Z")

@@ -3072,6 +3072,14 @@ func scanSnapshot(row pgx.Row) (Snapshot, error) {
 // callers don't need to know about pgerrcode.
 var ErrConflict = errors.New("state: conflict")
 
+// ErrInvalidArgument is returned when a Store method receives a
+// required-empty argument (empty account_id, empty hash, etc).
+// Distinct from ErrNotFound so callers can map empty-input bugs to
+// 400 (validation) rather than 404 (missing row). Used by the
+// MemStore side of the password / OAuth-link primitives introduced
+// for issue #165 / ADR-032.
+var ErrInvalidArgument = errors.New("state: invalid argument")
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -3216,6 +3224,101 @@ func (s *PgStore) DeleteOldLoginTokens(ctx context.Context, before time.Time) (i
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// SetAccountPassword upserts the Argon2id PHC hash for an account.
+// ON CONFLICT (account_id) DO UPDATE so a password change / set
+// flow replaces the prior hash atomically. The PK on account_id is
+// the floor — a racing concurrent SetAccountPassword on the same
+// account is linearised at the database; the ON CONFLICT branch
+// keeps the second writer's hash instead of dropping it (mirrors
+// the MemStore overwrite-under-lock).
+//
+// phc is the PHC wire format from pkg/auth.Encode. UpdatedAt is
+// stamped by `now()` so the "rotate hash on login" PR #2.5
+// hardening has a stable reference.
+func (s *PgStore) SetAccountPassword(ctx context.Context, accountID, phc string) error {
+	if accountID == "" || phc == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into account_passwords (account_id, hash, updated_at)
+		 values ($1, $2, now())
+		 on conflict (account_id) do update
+		   set hash = excluded.hash,
+		       updated_at = excluded.updated_at`,
+		accountID, phc)
+	return mapErr(err)
+}
+
+// AccountPasswordByAccountID returns the stored Argon2id PHC hash
+// for an account, or ErrNotFound when no row exists. Used by the
+// postLogin handler as the trigger for the anti-enumeration
+// Argon2id pad (pkg/auth.DummyPHC).
+func (s *PgStore) AccountPasswordByAccountID(ctx context.Context, accountID string) (string, error) {
+	var phc string
+	err := s.pool.QueryRow(ctx,
+		`select hash from account_passwords where account_id = $1`, accountID,
+	).Scan(&phc)
+	if err != nil {
+		return "", mapErr(err)
+	}
+	return phc, nil
+}
+
+// DeleteAccountPassword removes the Argon2id row for an account.
+// Idempotent (DELETE with zero affected rows is not an error);
+// matches the MemStore's delete-on-missing semantics.
+func (s *PgStore) DeleteAccountPassword(ctx context.Context, accountID string) error {
+	if accountID == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`delete from account_passwords where account_id = $1`, accountID)
+	return mapErr(err)
+}
+
+// UpsertOAuthLink writes the (provider, provider_subject) → account
+// row. The composite PK enforces the §11 anti-takeover invariant:
+// re-bind by the SAME account updates email/email_verified in place
+// (ON CONFLICT ... DO UPDATE with WHERE account_id = excluded.account_id,
+// so a different account attempting to claim the same (provider, sub)
+// pair triggers the unique-violation → ErrConflict path). The
+// account_id equality check inside the WHERE clause is the load-bearing
+// bit: without it, an attacker with the same email could overwrite
+// the victim's link row. The dashboard refreshes its own email on
+// Google account-rename; the WHERE clause keeps that case working.
+func (s *PgStore) UpsertOAuthLink(ctx context.Context, accountID, provider, providerSubject, email string, emailVerified bool) error {
+	if accountID == "" || provider == "" || providerSubject == "" {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into oauth_links (provider, provider_subject, account_id, email, email_verified)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (provider, provider_subject) do update
+		   set email = excluded.email,
+		       email_verified = excluded.email_verified
+		 where oauth_links.account_id = excluded.account_id`,
+		provider, providerSubject, accountID, email, emailVerified)
+	return mapErr(err)
+}
+
+// OAuthLinkByProviderSubject returns the link for a (provider, sub)
+// pair, or ErrNotFound when no row matches. The OAuth callback runs
+// this on every handshake; the sub-first lookup is the §11
+// anti-takeover closure (the first party to bind a sub owns the row).
+func (s *PgStore) OAuthLinkByProviderSubject(ctx context.Context, provider, providerSubject string) (OAuthLink, error) {
+	var link OAuthLink
+	err := s.pool.QueryRow(ctx,
+		`select provider, provider_subject, account_id, email, email_verified, created_at
+		   from oauth_links
+		  where provider = $1 and provider_subject = $2`,
+		provider, providerSubject,
+	).Scan(&link.Provider, &link.ProviderSubject, &link.AccountID, &link.Email, &link.EmailVerified, &link.CreatedAt)
+	if err != nil {
+		return OAuthLink{}, mapErr(err)
+	}
+	return link, nil
 }
 
 // IssueCliAuthCode persists a freshly-minted code's SHA-256 hash with

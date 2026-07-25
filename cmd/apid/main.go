@@ -30,6 +30,7 @@ import (
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
+	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -147,6 +148,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 			},
 		})
 		go func() { _ = graceLoop.Run(ctx) }()
+		// Login-token cleanup (issue #165 PR #2, ADR-032). The
+		// login_tokens table backs password-reset (15-min TTL) and
+		// the legacy magic-link surface PR #1 removed. The
+		// /login/forgot → POST /auth/reset pair is the only
+		// production caller — we run a 24h ticker so the table
+		// stays bounded by (rate of reset requests) × 15min.
+		// pkg/logintoken mirrors pkg/grace (same Run / RunOnce
+		// shape) so the lifecycle is consistent with the G6 grace
+		// timer above.
+		loginTokenCleanup := logintoken.New(logintoken.Params{
+			Store: srv.store,
+			Log:   log,
+		})
+		go func() { _ = loginTokenCleanup.Run(ctx) }()
 	}
 	return runWithDeps(ctx, log, deps)
 }

@@ -84,3 +84,108 @@
     on the no-account branch, which closes the most important
     attack (no account creation, no key mint). PR #2 ships the
     Argon2id pad when the password table lands.
+
+## PR #2 follow-up (issue #165, landed 2026-07-24)
+
+PR #2 lands the items above (schema, pkg/auth, handlers, server
+wiring, cleanup goroutine, templates, OpenAPI). This section
+records the decisions that landed in PR #2 — they are not
+re-decisions of the PR #1 surface, but details that did not need
+to be locked in until the password table and the OAuth hardening
+were concrete.
+
+### Why X-Dashboard-Key was removed only in PR #2, not PR #1
+
+PR #1 needed to close the takeover with the smallest possible
+diff. The customers the buggy handler created before #165 still
+held a `web-console` API key from that deploy, and those keys are
+the only out-of-band credential they have. Removing the header in
+PR #1 would have locked those customers out before the password
+migration was available; PR #2's sweep gate (the
+`delete from api_keys where label='web-console'` operator
+sweep documented below) clears the table only after the password
+path is in production.
+
+### The `oauth_links` PK rationale
+
+The composite primary key on `(provider, provider_subject)` is
+the §11 anti-takeover invariant in database form. The invariant
+is "one OAuth subject binds to one account, period" — without it,
+an attacker who creates a password account on `victim@example.com`
+first can claim the row when the victim signs in with Google on
+the same email (the pre-#165 OAuth flow took the email as the
+binding key). The PK plus the
+`WHERE oauth_links.account_id = excluded.account_id` clause on
+the upsert makes the second case return `ErrConflict` rather
+than overwrite.
+
+### The `login_tokens` reuse decision (vs. a new `password_reset_tokens` table)
+
+`login_tokens` has been a Store primitive since M7.5
+(`IssueLoginToken`, `ConsumeLoginToken`, `DeleteOldLoginTokens`).
+PR #1 kept the primitives alive after the magic-link was retired
+because the reuse is the cheaper path: a dedicated
+`password_reset_tokens` table is more code without adding
+security (the row schema is identical — a one-shot token with
+an expiry). The dedicated table is a single migration rename if
+a future audit demands it.
+
+### The 24h cleanup tick
+
+`pkg/logintoken` runs `DeleteOldLoginTokens` every 24h with a
+first-pass-at-startup so a daemon restart catches up. The 24h
+cadence is gross-overkill for the 15-min expiry: a tighter
+cadence would burn CPU on what is, in practice, an empty
+deletion. The 24h tick keeps the `login_tokens` table bounded
+by (rate of reset requests) × 15min.
+
+### The Argon2id constant-time pad
+
+Every login attempt runs ONE Argon2id verify under identical
+parameters (`m=65536,t=1,p=2`). The no-account path runs the
+verify against `pkg/auth.DummyPHC` (a real Argon2id hash of a
+known placeholder string). The cost is identical between
+"unbound email", "wrong password", and "no password row" — the
+three failure modes cannot be distinguished by request timing.
+The 64MiB × 1 verify is ~50ms on the EX44; under the §11
+10/min/IP bucket the worst case is 10 × 50ms = 500ms/sec/core
+of CPU, well under the 6 GB control-plane slice.
+
+### The `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` env-var addition
+
+GitHub OAuth is the new dashboard login surface (PR #2). The
+callback fetches `/user` and `/user/emails` (never trusting the
+profile's `email` field directly — that field is null when the
+customer has no public email), filters
+`primary=true && verified=true`, and rejects otherwise with 401
+`email_not_verified`. The `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET`
+env vars are required; the optional `GITHUB_REDIRECT_URI` overrides
+the default-request-hosts-derived URL.
+
+### The sweep gate (operator doc)
+
+Before X-Dashboard-Key was removed at the end of PR #2, the
+operator runs the following in a one-off SQL session:
+
+```sql
+delete from api_keys where label = 'web-console' returning id, account_id;
+```
+
+The shape (selective pre-#165 deploys only) means the row count
+is bounded by the customer count from the buggy deploy window.
+The handler code in `cmd/apid/handlers_auth.go::postLogin` was
+removed in the same PR — the only remaining code path that
+references the header is the removed function itself. `go test
+./cmd/apid/...` confirms no in-process caller.
+
+### Anti-enumeration closure
+
+The /login response is identical between "no such email", "wrong
+password", and "no password row" (401 `invalid_credentials`).
+The /signup response is identical between "new account" and
+"existing account with the same password" (200 + session cookie).
+The /signup response is 401 (NOT 409) on "existing account with
+a different password" — the surface does not leak account presence.
+The /login/forgot response is identical between "email is bound"
+and "email is unbound" (200) — the reset URL is mailed only on
+the bound branch, but the response never reveals that.

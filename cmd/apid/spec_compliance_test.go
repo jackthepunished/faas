@@ -38,6 +38,11 @@ const (
 // routeExclude lists server.go routes that are deliberately not in the
 // public OpenAPI spec. Keep this in sync with the explanatory comments in
 // server.go's handler() method. Sorted alphabetically for diff stability.
+//
+// PR #2 (issue #165, ADR-032) moved /login, /signup, /login/forgot,
+// /auth/reset, /v1/auth/google, /v1/auth/github, and
+// /dashboard/account/set-password into the public spec — the
+// dashboard auth surface is now real auth, not a backstop fallback.
 var routeExclude = map[string]bool{
 	"GET /v1/account/dpa":             true, // public markdown (no auth)
 	"POST /v1/webhooks/stripe":        true, // HMAC-signed webhook
@@ -46,12 +51,9 @@ var routeExclude = map[string]bool{
 	"POST /v1/compute-nodes":          true, // operator-only
 	"DELETE /v1/compute-nodes/{name}": true, // operator-only
 	"GET /v1/events":                  true, // SSE (cookie+Bearer, not s.auth)
-	"GET /login":                      true, // dashboard magic-link GET
-	"POST /login":                     true, // dashboard magic-link POST
-	"POST /logout":                    true, // dashboard logout
-	"GET /auth/verify":                true, // magic-link consume
-	"GET /v1/auth/google":             true, // Google OAuth 2.0 redirect
-	"GET /v1/auth/google/callback":    true, // Google OAuth 2.0 callback
+	"GET /login":                      true, // dashboard magic-link GET (HTML form, browser-only)
+	"POST /logout":                    true, // dashboard logout (HTML form, browser-only)
+	"GET /auth/verify":                true, // magic-link consume (legacy; PR #1 closed; kept for compat)
 	"GET /oauth/callback":             true, // GitHub App install callback
 	"GET /dashboard":                  true, // HTML dashboard
 	"GET /dashboard/":                 true, // HTML dashboard
@@ -87,15 +89,6 @@ var dtoExclude = map[string]bool{
 var codeExclude = map[string]bool{
 	"CodeCliAuthPending":     true, // /v1/cli-auth/* (anonymous)
 	"CodeCliAuthUnavailable": true, // /v1/cli-auth/* (anonymous)
-
-	// Password-reset codes (issue #165, ADR-032). Declared in
-	// pkg/api/errors.go ahead of PR #2 so the dashboard auth
-	// surface has a stable code vocabulary from PR #1 onward;
-	// the actual /auth/reset and /login/forgot routes that emit
-	// them land in PR #2 alongside the openapi.yaml entries that
-	// remove these from the exclude list.
-	"CodeResetTokenInvalid": true, // PR #2 emits on GET /auth/reset?token=…
-	"CodeResetTokenExpired": true, // PR #2 emits on POST /auth/reset with aged token
 }
 
 // schemaSpecOnly lists schemas that exist in the spec but have no Go DTO.
