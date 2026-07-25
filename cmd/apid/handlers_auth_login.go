@@ -152,8 +152,8 @@ func (s *server) postSignup(w http.ResponseWriter, r *http.Request) {
 				writeLoginJSON(w, existing)
 				return
 			}
-			s.log.Error("signup.create_account", "err", createErr,
-				"email", strings.ReplaceAll(strings.ReplaceAll(email, "\r", ""), "\n", ""))
+			safeEmail := strings.ReplaceAll(strings.ReplaceAll(email, "\r", ""), "\n", "")
+			s.log.Error("signup.create_account", "err", createErr, "email", safeEmail)
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
 				"internal_error", "Internal Error", "failed to create account"))
 			return
