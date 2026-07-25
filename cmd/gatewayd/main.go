@@ -48,8 +48,10 @@ var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 
 // gatewaydInternalSocket is the unix-domain socket schedd dials to
 // fire synthetic cron requests through gatewayd (spec §4.4, M7).
-// Mode 0660 group `faas` (ADR-015); only schedd can dial.
-const gatewaydInternalSocket = "/run/faas/gatewayd-internal.sock"
+// Mode 0660 group `faas` (ADR-015); only schedd can dial. Overridable
+// via FAAS_GATEWAY_SYNTH_SOCKET so the e2e harness can place it on a
+// per-test path without needing /run/faas on the host (PR #203).
+var gatewaydInternalSocket = envOrGateway("FAAS_GATEWAY_SYNTH_SOCKET", "/run/faas/gatewayd-internal.sock")
 
 // listenAddr is the public listener (TLS lands here in M8). Overridable via
 // FAAS_GATEWAY_LISTEN so the e2e harness can bind a free port without colliding
@@ -60,12 +62,17 @@ var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", ":8080")
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
 var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 
-const (
-	// controlAddr is the private control-plane listener — never reachable from
-	// the internet; bind to the loopback interface by default so an
-	// operator-prometheus scrape is the only thing that can reach it.
-	controlAddr = "127.0.0.1:9090"
-)
+// controlAddr is the private control-plane listener — never reachable from
+// the internet; bound to the loopback interface by default so an
+// operator-prometheus scrape is the only thing that can reach it. Overridable
+// via FAAS_GATEWAY_CONTROL_LISTEN so the e2e harness can pick a free port
+// (without this, two parallel harness runs would race for the hard-coded
+// 127.0.0.1:9090 — the deploy_wake_metal test is the only consumer of
+// /metrics and lives behind a metal build tag, so CI on plain ubuntu-latest
+// doesn't trip the race, but a local dev box with two concurrent invocations
+// would). The default matches the legacy constant so existing deployments
+// are unaffected.
+var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the

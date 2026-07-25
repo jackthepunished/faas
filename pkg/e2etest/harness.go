@@ -158,8 +158,11 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	// Block until the schema is at the current migration target. The
 	// meterd subprocess (issue #52) reads accounts on its first tick and
 	// would otherwise race the migration — see cmd-e2e-schedd-migration-race.
-	// 12 = migrations/00012_account_stripe_subscription_item.sql (current head).
-	pgtest.WaitForMigration(t, pool, 12, 10*time.Second)
+	// 36 = migrations/00036_api_key_scopes.sql (current head on origin/main).
+	// Bumped from 12 in PR #203 (M7 async-invoke e2e); the meterd-dunning
+	// and meterd-quota tests still call WaitForMigration with their own
+	// tighter targets and remain green.
+	pgtest.WaitForMigration(t, pool, 36, 10*time.Second)
 
 	if which&APID != 0 {
 		startAPID(t, h, bin, dbURL)
@@ -168,17 +171,31 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
+		synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
 		// schedd needs to dial vmmd; on the metal tag vmmd is started below
 		// and we use the same path. On tests that skip vmmd, schedd still
 		// starts — it just warns on wake. Wire both paths so schedd config
-		// is consistent regardless of order.
+		// is consistent regardless of order. The synth socket is the
+		// unix-domain path schedd dials to fire synthetic cron / async-
+		// invoke envelopes through gatewayd (spec §4.4); without it the
+		// drain goroutine is silently disabled (cmd/schedd/main.go:319-345).
+		// Match the path gatewayd listens on (set via
+		// FAAS_GATEWAY_SYNTH_SOCKET below) so the dial succeeds and the
+		// drain wires up. Empty when gatewayd isn't in the Which mask so
+		// schedd falls back to its default (drain disabled, fine for tests
+		// that don't exercise async-invoke).
+		gatewaySynth := ""
+		if which&Gatewayd != 0 {
+			gatewaySynth = synthSock
+		}
 		cfgPath := filepath.Join(tmp, "schedd.toml")
 		cfg := fmt.Sprintf(
 			`socket_path = %q
 owner_user = %q
 vmmd_socket = %q
+gateway_synth_socket = %q
 `,
-			sockPath, "root", vmmdSock,
+			sockPath, "root", vmmdSock, gatewaySynth,
 		)
 		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 			t.Fatalf("e2etest: write schedd.toml: %v", err)
@@ -266,35 +283,7 @@ kernel_path = %q
 	}
 
 	if which&Gatewayd != 0 {
-		addr := freeTCPAddr(t)
-		controlAddr := freeTCPAddr(t)
-		if h.ScheddSock == "" {
-			h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
-		}
-		// The harness always runs gatewayd in the TLS-disabled path
-		// (cfg.TLS.Disabled=true) so we don't have to provision a Hetzner
-		// DNS token + storage dir for metal tests. We still need the control
-		// listener bound to a known address so wake-latency assertions can
-		// scrape /metrics — drop a minimal TOML that overrides control_addr.
-		gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
-		if err := os.WriteFile(gwCfg, []byte(
-			fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\n", addr, controlAddr),
-		), 0o600); err != nil {
-			t.Fatalf("e2etest: write gatewayd.toml: %v", err)
-		}
-		env := append(testEnvCommon(dbURL),
-			"FAAS_GATEWAY_LISTEN="+addr,
-			"FAAS_GATEWAYD_CONFIG="+gwCfg,
-			"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
-			"FAAS_APPS_DOMAIN="+testDomain,
-		)
-		h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
-		h.GatewayURL = "http://" + addr
-		// Strip the leading 127.0.0.1: from controlAddr to expose the host
-		// separately (or just hand callers the full URL — keeps it simple).
-		h.GatewayControlURL = "http://" + controlAddr
-		waitTCP(t, addr, 10*time.Second)
-		waitTCP(t, controlAddr, 10*time.Second)
+		startGatewayd(t, h, bin, dbURL, nil)
 	}
 
 	if which&Meterd != 0 {
@@ -422,8 +411,10 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	// Gate every daemon launch on the schema arriving at the current
 	// migration target. Without this, meterd's first tick races the
 	// migration (issue #52 acceptance race; see
-	// cmd-e2e-schedd-migration-race memory).
-	pgtest.WaitForMigration(t, pool, 12, 10*time.Second)
+	// cmd-e2e-schedd-migration-race memory). Bumped to 36 in PR #203
+	// (M7 async-invoke e2e) to match migrations/00036_api_key_scopes.sql
+	// (current head on origin/main).
+	pgtest.WaitForMigration(t, pool, 36, 10*time.Second)
 
 	if which&APID != 0 {
 		addr := freeTCPAddr(t)
@@ -439,13 +430,22 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	if which&Schedd != 0 {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
+		// Match the Start-path synth socket so callers using
+		// StartWithEnv with both Schedd and Gatewayd in which wire up
+		// the drain. Empty when Gatewayd is absent so the drain stays
+		// disabled (the historical StartWithEnv shape).
+		gatewaySynth := ""
+		if which&Gatewayd != 0 {
+			gatewaySynth = filepath.Join(h.SockDir, "gatewayd-internal.sock")
+		}
 		cfgPath := filepath.Join(tmp, "schedd.toml")
 		cfg := fmt.Sprintf(
 			`socket_path = %q
 owner_user = %q
 vmmd_socket = %q
+gateway_synth_socket = %q
 `,
-			sockPath, "root", vmmdSock,
+			sockPath, "root", vmmdSock, gatewaySynth,
 		)
 		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 			t.Fatalf("e2etest: write schedd.toml: %v", err)
@@ -463,6 +463,9 @@ vmmd_socket = %q
 	}
 	if which&Meterd != 0 {
 		startMeterd(t, h, bin, dbURL, extraEnv)
+	}
+	if which&Gatewayd != 0 {
+		startGatewayd(t, h, bin, dbURL, extraEnv)
 	}
 	t.Cleanup(h.stop)
 	return h
@@ -482,6 +485,59 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 	h.procs = append(h.procs, startProc(t, bin, "apid", env))
 	h.APIDURL = "http://" + addr
 	waitTCP(t, addr, 10*time.Second)
+}
+
+// startGatewayd boots gatewayd in the TLS-disabled path (cfg.TLS.Disabled=true)
+// so tests don't need a Hetzner DNS token + storage dir. The control
+// listener binds to a known address so wake-latency assertions can scrape
+// /metrics; the public listener binds to the per-test free port.
+//
+// The synth unix socket (spec §4.4) is the path gatewayd listens on for
+// synthetic cron / async-invoke envelopes from schedd. It is paired with
+// the gateway_synth_socket line the Schedd block writes into the per-test
+// schedd.toml; both must use the same path or schedd's dial fails and the
+// drain goroutine is silently disabled.
+//
+// apid_loopback is wired to h.APIDURL (set by startAPID before this runs)
+// so gatewayd's apidProxy actually proxies to the per-test apid — without
+// it, gatewayd falls back to the production default http://127.0.0.1:8081
+// and a test that hits the gateway would forward to a phantom apid.
+//
+// extraEnv is appended last so a test can inject extra knobs if needed
+// (none today; mirrors startMeterd's signature).
+func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []string) {
+	t.Helper()
+	addr := freeTCPAddr(t)
+	controlAddr := freeTCPAddr(t)
+	if h.ScheddSock == "" {
+		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
+	}
+	apidLoopback := h.APIDURL
+	if apidLoopback == "" {
+		apidLoopback = "http://127.0.0.1:8081"
+	}
+	gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
+	if err := os.WriteFile(gwCfg, []byte(
+		fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\napid_loopback=%q\n",
+			addr, controlAddr, apidLoopback),
+	), 0o600); err != nil {
+		t.Fatalf("e2etest: write gatewayd.toml: %v", err)
+	}
+	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
+	env := append(testEnvCommon(dbURL),
+		"FAAS_GATEWAY_LISTEN="+addr,
+		"FAAS_GATEWAYD_CONFIG="+gwCfg,
+		"FAAS_GATEWAY_CONTROL_LISTEN="+controlAddr,
+		"FAAS_GATEWAY_SYNTH_SOCKET="+synthSock,
+		"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
+		"FAAS_APPS_DOMAIN="+testDomain,
+	)
+	env = append(env, extraEnv...)
+	h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
+	h.GatewayURL = "http://" + addr
+	h.GatewayControlURL = "http://" + controlAddr
+	waitTCP(t, addr, 10*time.Second)
+	waitTCP(t, controlAddr, 10*time.Second)
 }
 
 // testEnvCommon returns the env every daemon gets in the harness:
@@ -677,7 +733,9 @@ func freeTCPAddr(t *testing.T) string {
 	return addr
 }
 
-// waitTCP dials addr every 50ms until it accepts or deadline.
+// waitTCP dials addr every 50ms until it accepts or deadline. On timeout
+// it dumps the live daemon stdout/stderr so a CI flake has the daemon's
+// last words to bisect with (mirrors waitUnix's dumpProcs).
 func waitTCP(t *testing.T, addr string, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -689,6 +747,7 @@ func waitTCP(t *testing.T, addr string, d time.Duration) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	dumpProcs(t)
 	t.Fatalf("e2etest: %s did not accept within %s", addr, d)
 }
 
