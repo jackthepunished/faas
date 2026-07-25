@@ -71,6 +71,18 @@ update paddle_overage_dedupe
 alter table paddle_overage_dedupe
   drop constraint if exists paddle_overage_dedupe_pkey;
 
+-- Drop the NOT NULL constraint on `month`. The new PK keys on
+-- (account_id, window_start); the deprecated HasPaddleOverageMonth /
+-- RecordPaddleOverageMonth callers (kept on state.Store for
+-- back-compat with PR #179) now write (account_id, window_start,
+-- state) and have no value for `month`. Without this drop, the
+-- INSERT in RecordPaddleOverageMonth fails with
+-- SQLSTATE 23502 (`null value in column "month"…`). The column
+-- itself is retained — a future migration can drop it once the
+-- deprecated methods are removed.
+alter table paddle_overage_dedupe
+  alter column month drop not null;
+
 -- Delete legacy rows. They were keyed by (account_id, month) and
 -- would otherwise collide with the new PK semantics. The table
 -- was added in PR #179 and the only writer inserts on a
