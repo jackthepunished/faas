@@ -23,7 +23,7 @@ import (
 )
 
 // fakeRouterVMM records the per-call (instance, target) pair and
-// counts dials. It implements VMM (the four-method surface schedd
+// counts dials. It implements VMM (the six-method surface schedd
 // expects) and io.Closer so the router's lost-race path can close
 // duplicate clients.
 type fakeRouterVMM struct {
@@ -61,6 +61,17 @@ func (f *fakeRouterVMM) Ping(_ context.Context) (*PingOutcome, error) {
 	f.instanceCalls = append(f.instanceCalls, "<ping>")
 	f.mu.Unlock()
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
+}
+// Stats implements VMM (issue #170 / PR-A). Returns the empty
+// snapshot — the router test does not assert on Stats contents;
+// the dedicated vmmclient_test.go covers wire decoding. Records
+// the call so TestVMMRouter_AllSixMethodsRoute's call-count
+// assertion (one entry per method per node) holds.
+func (f *fakeRouterVMM) Stats(_ context.Context) (*StatsSnapshot, error) {
+	f.mu.Lock()
+	f.instanceCalls = append(f.instanceCalls, "<stats>")
+	f.mu.Unlock()
+	return &StatsSnapshot{}, nil
 }
 func (f *fakeRouterVMM) Close() error { return nil }
 
@@ -202,13 +213,14 @@ func TestVMMRouter_UnknownNodeReturnsCapacity(t *testing.T) {
 	}
 }
 
-// TestVMMRouter_AllFiveMethodsRoute pins that every RoutedVMM method
+// TestVMMRouter_AllSixMethodsRoute pins that every RoutedVMM method
 // goes through resolveFor (issue #97 / ADR-025 axis 3, PR #114:
-// Ping is the 5th method). A regression that special-cased
-// CreateColdBoot (e.g. forgetting to route Destroy or Ping through
-// the cache) would let Park / Evict / Heartbeat dial the legacy
+// Ping is the 5th method; issue #170 / PR-A: Stats is the 6th).
+// A regression that special-cased CreateColdBoot (e.g. forgetting to
+// route Destroy or Ping or Stats through the cache) would let Park /
+// Evict / Heartbeat / the new instancestats poller dial the legacy
 // single socket on every call — fine for one node, broken for N.
-func TestVMMRouter_AllFiveMethodsRoute(t *testing.T) {
+func TestVMMRouter_AllSixMethodsRoute(t *testing.T) {
 	targets := map[string]*fakeRouterVMM{}
 	var dials atomic.Int32
 	var mu sync.Mutex
@@ -232,8 +244,11 @@ func TestVMMRouter_AllFiveMethodsRoute(t *testing.T) {
 	if _, err := r.Ping(ctx, "n1"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := r.Stats(ctx, "n1"); err != nil {
+		t.Fatal(err)
+	}
 	if got := dials.Load(); got != 1 {
-		t.Errorf("dial count = %d, want 1 across 5 methods on the same node", got)
+		t.Errorf("dial count = %d, want 1 across 6 methods on the same node", got)
 	}
 	c := targets["unix:///n1.sock"]
 	if c == nil {
@@ -241,8 +256,8 @@ func TestVMMRouter_AllFiveMethodsRoute(t *testing.T) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if got := len(c.instanceCalls); got != 5 {
-		t.Errorf("node n1 received %d calls, want 4 (one per method)", got)
+	if got := len(c.instanceCalls); got != 6 {
+		t.Errorf("node n1 received %d calls, want 6 (one per method)", got)
 	}
 }
 

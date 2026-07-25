@@ -46,6 +46,13 @@ type VMM interface {
 	// returned FcVersion lets schedd's admin surface show
 	// per-node FC versions without a separate Stats call.
 	Ping(ctx context.Context) (*PingOutcome, error)
+	// Stats (issue #170 / PR-A, observability slice) returns the
+	// per-instance liveness + cgroup view that the schedd poller
+	// feeds into pkg/sched/instancestats. Optional pointers
+	// (ResidentBytes, CPUPct) decode the proto wrapper types —
+	// nil means "no data this sample", which the reader maps to
+	// Unknown (see docs/adr/032-instance-metrics-cardinality-rollups.md).
+	Stats(ctx context.Context) (*StatsSnapshot, error)
 	// Close releases the underlying transport. Issue #120: the
 	// heartbeat goroutine dials fresh per tick and relies on this
 	// to keep its conn churn bounded (no goroutine/conn leak).
@@ -59,6 +66,43 @@ type VMM interface {
 type PingOutcome struct {
 	FcVersion  string
 	ServerTime time.Time
+}
+
+// StatsSnapshot is the typed wrapper over vmmdpb.StatsResponse.
+// Decoupled from the proto so the schedd-side instancestats
+// package never imports pkg/api/proto. Aggregates stay on the
+// outer struct (LiveCount, LeasedCount, TotalResidentBytes);
+// per-instance rows are in VMInstanceStat.
+//
+// Issue #170 / PR-A: TotalResidentBytes and each VMInstanceStat's
+// ResidentBytes / CPUPct are *int64 / *float64 (not scalars) because
+// the wire distinguishes "absent" (first sample, non-Linux,
+// transient cgroup miss) from "real 0". The instancestats poller
+// treats absent as Unknown and excludes it from the
+// {app,node}-rolled-up Prometheus series until two valid samples
+// are observed.
+type StatsSnapshot struct {
+	LiveCount          int32
+	LeasedCount        int32
+	TotalResidentBytes *int64
+	Instances          []VMInstanceStat
+	SampledAt          time.Time
+}
+
+// VMInstanceStat is the sched-side view of vmmdpb.InstanceStats —
+// one per live VM the queried vmmd owns. InflightRequests and
+// LastRequestAt are populated by PR-B (the vmmd ActivityTracker +
+// stats handler extraction); until that lands the wire carries
+// zero / zero-time and the reader falls back to
+// state.Instance.LastRequestAt for the durable timestamp.
+type VMInstanceStat struct {
+	InstanceID       string
+	LeaseUID         int32
+	HostIP           string
+	ResidentBytes    *int64
+	CPUPct           *float64
+	InflightRequests int64
+	LastRequestAt    time.Time
 }
 
 // AppSpec is the flat set of fields vmmd needs to boot an instance (ADR-014).
@@ -264,6 +308,65 @@ func (c *VMMClient) Ping(ctx context.Context) (*PingOutcome, error) {
 		out.ServerTime = t.AsTime()
 	}
 	return out, nil
+}
+
+// Stats implements VMM (issue #170 / PR-A, observability slice).
+// Decodes the proto wrappers for TotalResidentBytes / ResidentBytes /
+// CPUPct so the schedd poller can distinguish "absent" from "real
+// 0". Empty InstanceStats rows are returned as the empty
+// VMInstanceStat{} value (all-zero fields) — the reader filters
+// those by InstanceID == "" rather than via a typed wrapper.
+func (c *VMMClient) Stats(ctx context.Context) (*StatsSnapshot, error) {
+	resp, err := c.cli.Stats(ctx, &vmmdpb.StatsRequest{})
+	if err != nil {
+		return nil, liftErr(err)
+	}
+	out := &StatsSnapshot{
+		LiveCount:   resp.GetLiveCount(),
+		LeasedCount: resp.GetLeasedCount(),
+	}
+	if v := resp.GetTotalResidentBytes(); v != nil {
+		b := v.GetValue()
+		out.TotalResidentBytes = &b
+	}
+	for _, in := range resp.GetInstances() {
+		row := vmInstanceStatFromProto(in)
+		if row.InstanceID == "" {
+			// Defensive: an empty row would silently look like a
+			// real instance with empty fields. The proto should not
+			// emit those, but if a vmmd regression does, drop it.
+			continue
+		}
+		out.Instances = append(out.Instances, row)
+	}
+	return out, nil
+}
+
+// vmInstanceStatFromProto decodes one vmmdpb.InstanceStats row into
+// the typed wrapper. Pointer fields are nil when the proto wrapper
+// is absent (the caller maps that to Unknown). InflightRequests and
+// LastRequestAt are populated by PR-B; today the wire carries
+// zero / zero-time, which the poller treats as "no signal yet"
+// and falls back to state.Instance.LastRequestAt.
+func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
+	row := VMInstanceStat{
+		InstanceID:       in.GetInstance(),
+		LeaseUID:         in.GetLeaseUid(),
+		HostIP:           in.GetHostIp(),
+		InflightRequests: in.GetInflightRequests(),
+	}
+	if v := in.GetResidentBytes(); v != nil {
+		b := v.GetValue()
+		row.ResidentBytes = &b
+	}
+	if v := in.GetCpuPct(); v != nil {
+		c := v.GetValue()
+		row.CPUPct = &c
+	}
+	if t := in.GetLastRequestAt(); t != nil {
+		row.LastRequestAt = t.AsTime()
+	}
+	return row
 }
 
 func (a AppSpec) toProto() *vmmdpb.AppSpec {

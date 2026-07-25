@@ -51,6 +51,12 @@ func (f *fakeWakeVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }
 
+// Stats implements RoutedVMM (issue #170 / PR-A). Cron tests do
+// not assert on Stats; return empty snapshot.
+func (f *fakeWakeVMM) Stats(_ context.Context, _ string) (*StatsSnapshot, error) {
+	return &StatsSnapshot{}, nil
+}
+
 // recordingSynth captures every synthesize call. The cron loop's
 // "post a synthetic request through gatewayd so metering applies" path
 // goes through this stub instead of dialing the unix socket.

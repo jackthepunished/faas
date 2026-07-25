@@ -40,12 +40,12 @@ import (
 // Each method takes nodeID as the first argument so the router can
 // forward to the right per-target vmmd connection.
 //
-// The 4-method surface mirrors VMM verbatim (CreateColdBoot,
-// CreateFromSnapshot, PauseAndSnapshot, Destroy). The router's
-// implementation looks up the per-node client by ID, dials on first
-// use, and forwards. If the ID has no row in the cache and the
-// router can't dial (e.g. an operator typo in target_url), the call
-// returns a *api.Problem with Code=Capacity — the same code the
+// The 6-method surface mirrors VMM verbatim (CreateColdBoot,
+// CreateFromSnapshot, PauseAndSnapshot, Destroy, Ping, Stats). The
+// router's implementation looks up the per-node client by ID, dials
+// on first use, and forwards. If the ID has no row in the cache and
+// the router can't dial (e.g. an operator typo in target_url), the
+// call returns a *api.Problem with Code=Capacity — the same code the
 // ledger uses for "no headroom" so the gateway's 503 mapping is
 // consistent.
 type RoutedVMM interface {
@@ -63,11 +63,16 @@ type RoutedVMM interface {
 	// HeartbeatInterval on every active compute_node; a non-error
 	// round-trip proves both gRPC socket reachability and that
 	// vmmd is responsive enough to schedule the handler. Like
-	// the other four methods, the router resolves the per-node
+	// the other five methods, the router resolves the per-node
 	// client by nodeID first (dial-once-per-target), then
 	// forwards. Returns *api.Problem Capacity on an unknown
 	// nodeID (no target_url to dial).
 	Ping(ctx context.Context, nodeID string) (*PingOutcome, error)
+	// Stats (issue #170 / PR-A, observability slice) forwards to the
+	// per-node VMM and decodes the typed wrapper. Same nodeID
+	// resolution path as the lifecycle RPCs; partial per-node failure
+	// is the poller's problem to handle (log + skip, never abort).
+	Stats(ctx context.Context, nodeID string) (*StatsSnapshot, error)
 }
 
 // DialFunc is the factory VMMRouter uses to open a per-target VMM
@@ -232,6 +237,19 @@ func (r *VMMRouter) Ping(ctx context.Context, nodeID string) (*PingOutcome, erro
 		return nil, err
 	}
 	return cli.Ping(ctx)
+}
+
+// Stats implements RoutedVMM (issue #170 / PR-A, observability
+// slice). Same resolveFor path as Ping / Destroy. Per-node dial
+// failures surface here as *api.Problem Capacity, which the
+// instancestats poller logs and skips over (partial snapshots
+// preferred to aborting the whole sweep).
+func (r *VMMRouter) Stats(ctx context.Context, nodeID string) (*StatsSnapshot, error) {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return cli.Stats(ctx)
 }
 
 // Compile-time assertion: VMMRouter satisfies the engine-facing

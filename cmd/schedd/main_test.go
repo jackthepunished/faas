@@ -171,4 +171,9 @@ func (stubVMM) Destroy(context.Context, string) error { return nil }
 func (stubVMM) Ping(context.Context) (*sched.PingOutcome, error) {
 	return &sched.PingOutcome{FcVersion: "1.10.0"}, nil
 }
+// Stats implements sched.VMM (issue #170 / PR-A). Wiring tests
+// don't observe instance metrics; return empty snapshot.
+func (stubVMM) Stats(context.Context) (*sched.StatsSnapshot, error) {
+	return &sched.StatsSnapshot{}, nil
+}
 func (stubVMM) Close() error { return nil }
