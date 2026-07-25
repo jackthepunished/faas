@@ -107,11 +107,22 @@ func sseFanIn(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool, bc *eve
 				}
 				return
 			}
-			// PublishTopic is non-blocking with per-subscriber buffers
-			// (pkg/events/broadcaster.go). The dashboard handler doesn't
-			// read TopicDeploymentLog from the broadcaster, so a busy
-			// build log stream drops on the (unread) buffer rather than
-			// back-pressuring pg_notify.
+			// Fan-in does NOT dedupe. Both the DB trigger at
+			// migrations/00031_invocations_notify.sql and the
+			// schedd drain emitDone publish invocation_done on the
+			// same transition; the per-request SSE handler in
+			// handlers_events.go sees each notification exactly once
+			// (it owns its own LISTEN session, not this shared one)
+			// and the dashboard's htmx-sse consumer is naturally
+			// idempotent (fragment re-render). The CLI's faas tail
+			// prints the same id+state line twice without harm —
+			// the dedup contract lives at the consumer, not here.
+			//
+			// PublishTopic is non-blocking with per-subscriber
+			// buffers (pkg/events/broadcaster.go). The dashboard
+			// handler doesn't read TopicDeploymentLog from the
+			// broadcaster, so a busy build log stream drops on the
+			// (unread) buffer rather than back-pressuring pg_notify.
 			bc.PublishTopic(n.Channel, []byte(n.Payload))
 		}
 	}
