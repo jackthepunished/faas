@@ -279,8 +279,15 @@ func TestCmdDeployment_JSON_SingleRecord(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &d); err != nil {
 		t.Fatalf("JSON single-record parse failed: %v\nraw: %s", err, stdout.String())
 	}
-	if d.ID != "0123456789abcdef0123456789abcdef" || d.Status != "succeeded" {
-		t.Errorf("parsed record = %+v, want id=...cdef status=succeeded", d)
+	// Pin every field on the DTO so a future rename or JSON-tag drift
+	// breaks the test (issue from PR #202 code review).
+	if d.ID != "0123456789abcdef0123456789abcdef" ||
+		d.AppID != "fedcba9876543210fedcba9876543210" ||
+		d.ImageDigest != "sha256:abc123" ||
+		d.Kind != "app" ||
+		d.Status != "succeeded" ||
+		d.CreatedAt != "2026-07-23T11:25:00Z" {
+		t.Errorf("JSON shape drift on DeploymentResponse; got %+v", d)
 	}
 }
 
@@ -319,5 +326,143 @@ func TestRun_DispatchDeployments(t *testing.T) {
 	// singular get
 	if code := run([]string{"deployment", "0123456789abcdef0123456789abcdef"}); code != 0 {
 		t.Errorf("run deployment <id> = %d, want 0", code)
+	}
+}
+
+// --- row rendering ----------------------------------------------------------
+
+// TestRenderDeploymentRow_PinsColumnLayout pins the column-count and
+// per-column widths of the human list table. If the DTO's id-length
+// ceiling changes (e.g. UUIDv7 takes over for deployments) this layout
+// has to shift and this test surfaces that. From PR #202 review.
+func TestRenderDeploymentRow_PinsColumnLayout(t *testing.T) {
+	var buf bytes.Buffer
+	renderDeploymentRow(&buf, api.DeploymentResponse{
+		ID:          "0123456789abcdef0123456789abcdef",
+		AppID:       "fedcba9876543210fedcba9876543210",
+		ImageDigest: "sha256:abc123",
+		Kind:        "app",
+		Status:      "succeeded",
+		CreatedAt:   "2026-07-23T11:25:00Z",
+	})
+	line := strings.TrimRight(buf.String(), "\n")
+	// 5 fields → 4 separators (whitespace cols are single-spaced after
+	// the %-32s/%-12s/%-10s left-pads).
+	parts := strings.Fields(line)
+	if len(parts) != 5 {
+		t.Fatalf("row column count = %d, want 5\nline: %q", len(parts), line)
+	}
+	if parts[0] != "0123456789abcdef0123456789abcdef" || parts[4] != "2026-07-23T11:25:00Z" {
+		t.Errorf("row fields drifted: %q", line)
+	}
+}
+
+// TestCmdDeployments_NonEmpty_RowsRendered validates that the human
+// output is actually captured through the osStdout seam (PR #202 review
+// found the prior `fmt.Printf` path bypassed the seam; this pins the
+// new behaviour).
+func TestCmdDeployments_NonEmpty_RowsRendered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(api.DeploymentListResponse{
+			Items: []api.DeploymentResponse{
+				{ID: "0123456789abcdef0123456789abcdef", AppID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: "succeeded", Kind: "app", CreatedAt: "2026-07-23T11:25:00Z"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	var stdout bytes.Buffer
+	oldOut := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = oldOut }()
+
+	if code := cmdDeployments(nil); code != 0 {
+		t.Errorf("cmdDeployments = %d, want 0", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "0123456789abcdef0123456789abcdef") {
+		t.Errorf("deployment id not in human output\nfull: %s", out)
+	}
+	if !strings.Contains(out, "succeeded") || !strings.Contains(out, "app") {
+		t.Errorf("status / kind not in human output\nfull: %s", out)
+	}
+}
+
+// TestCmdDeployment_HappyPath_DetailRendered pins the human single-record
+// detail block against the osStdout seam (was the same seam-bypass
+// finding as the list path).
+func TestCmdDeployment_HappyPath_DetailRendered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(api.DeploymentResponse{
+			ID:          "0123456789abcdef0123456789abcdef",
+			AppID:       "fedcba9876543210fedcba9876543210",
+			BuildID:     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			ImageDigest: "sha256:abc123",
+			Kind:        "app",
+			Status:      "succeeded",
+			CreatedAt:   "2026-07-23T11:25:00Z",
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	var stdout bytes.Buffer
+	oldOut := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = oldOut }()
+
+	if code := cmdDeployment([]string{"0123456789abcdef0123456789abcdef"}); code != 0 {
+		t.Errorf("cmdDeployment = %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"id:",
+		"app_id:",
+		"build_id:",
+		"image_digest:",
+		"kind:",
+		"status:",
+		"created_at:",
+		"0123456789abcdef0123456789abcdef",
+		"sha256:abc123",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail block missing %q\nfull: %s", want, out)
+		}
+	}
+}
+
+// --- --before forwarding ----------------------------------------------------
+
+// TestCmdDeployments_BeforeCursorForwarding pins the SDK's current
+// (broken) behaviour: `before` is concatenated unescaped onto the URL.
+// When pkg/api/client.go:441 is fixed (issue #203) this test will need
+// to flip its assertion from "raw verbatim" to "percent-encoded".
+// From PR #202 review.
+func TestCmdDeployments_BeforeCursorForwarding(t *testing.T) {
+	var seenRaw string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRaw = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	cursor := "2026-07-23T11:25:00.000000000Z"
+	if code := cmdDeployments([]string{"--before", cursor}); code != 0 {
+		t.Errorf("cmdDeployments --before = %d, want 0", code)
+	}
+	// Pin verbatim forwarding today. The expected wire form when
+	// pkg/api/client.go is fixed to net/url.Values is
+	// "before=2026-07-23T11%3A25%3A00.000000000Z" — flip then.
+	if !strings.Contains(seenRaw, "before="+cursor) {
+		t.Errorf("expected `before=<cursor>` verbatim in %q (current SDK behaviour)", seenRaw)
 	}
 }

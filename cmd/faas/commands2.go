@@ -62,7 +62,7 @@ const (
 	// constant-named (goconst); the constant does NOT route through
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `faas deployment <id>` is never read as an app slug.
-	deploymentSlugFallback = "deployment"
+	dispatchDeployment = "deployment"
 )
 
 // cmdApp implements `faas app <slug>` (GET /v1/apps/{slug}), `faas app <slug>

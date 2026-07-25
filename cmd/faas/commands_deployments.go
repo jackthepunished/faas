@@ -1,5 +1,5 @@
 // Deployments list/get commands. Two top-level subcommands dispatched
-// from main.go (cases `dispatchDeployments` and `deploymentSlugFallback`).
+// from main.go (cases `dispatchDeployments` and `dispatchDeployment`).
 //
 // Design notes (kept short so the handlers stay under the 50-line cap):
 //
@@ -19,12 +19,18 @@
 //   - `faas deployment <id>` validates the 32-hex shape locally so
 //     `--json` users get `validation_failed` instead of a 404. The
 //     server enforces the same shape.
+//
+// Field set tracks pkg/api/dto.go:86 DeploymentResponse verbatim; update
+// the human table when the DTO grows (e.g. commit_sha when function
+// runners land). The OpenAPI example block is currently stale against
+// the DTO; spec cleanup is a separate PR.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 
@@ -37,6 +43,24 @@ import (
 // Local validation lets the CLI return a fast validation_failed error
 // instead of a 404 round-trip — UX §3.3 "first error is the right one".
 var deploymentIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+
+// deploymentRowFmt is the human list-table column layout. Widths assume
+// 32-hex deployment ids (32 chars), 32-hex app ids (32 chars), short
+// status strings ("succeeded" / "failed" / "rolling_out"), and the
+// app/function kind discriminator. If the DTO grows an id longer than
+// 32 hex chars this layout has to shift; covered by
+// TestRenderDeploymentRow pin on the column count.
+const deploymentRowFmt = "%-32s %-32s %-12s %-10s %s\n"
+
+// renderDeploymentRow writes one deployment row to w. The fmt.Printf
+// inside writes to os.Stdout by default; tests that need the rendered
+// row in a buffer must use the osStdout package seam (see
+// commands_test.go for the equivalent helper). The Fprintf return is
+// intentionally discarded: writer failures (closed pipe, broken TTY)
+// are unrecoverable here, matching writeStatus / output.go's convention.
+func renderDeploymentRow(w io.Writer, d api.DeploymentResponse) {
+	_, _ = fmt.Fprintf(w, deploymentRowFmt, d.ID, d.AppID, d.Status, d.Kind, d.CreatedAt)
+}
 
 // cmdDeployments implements `faas deployments [--limit N] [--before C] [--all]`.
 // Mirrors cmdApps (commands.go:251) except pagination is exposed.
@@ -75,11 +99,11 @@ func cmdDeployments(args []string) int {
 	}
 	if len(page.Items) == 0 {
 		_, _ = fmt.Fprintln(osStdout, "No deployments yet.")
-		_, _ = fmt.Fprintln(os.Stdout, "Deploy one: `faas deploy --tarball path/to/source.tar.gz` (or `faas deploy --image <ref>`).")
+		_, _ = fmt.Fprintln(osStdout, "Deploy one: `faas deploy --tarball path/to/source.tar.gz` (or `faas deploy --image <ref>`).")
 		return 0
 	}
 	for _, d := range page.Items {
-		fmt.Printf("%-32s %-32s %-12s %-10s %s\n", d.ID, d.AppID, d.Status, d.Kind, d.CreatedAt)
+		renderDeploymentRow(osStdout, d)
 	}
 	if page.NextBefore != "" {
 		_, _ = fmt.Fprintf(osStdout, "... more — pass --before %s\n", page.NextBefore)
@@ -100,11 +124,11 @@ func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
 		return jsonOut(writeJSON(items))
 	}
 	if len(items) == 0 {
-		_, _ = fmt.Fprintln(os.Stdout, "No deployments yet.")
+		_, _ = fmt.Fprintln(osStdout, "No deployments yet.")
 		return 0
 	}
 	for _, d := range items {
-		fmt.Printf("%-32s %-32s %-12s %-10s %s\n", d.ID, d.AppID, d.Status, d.Kind, d.CreatedAt)
+		renderDeploymentRow(osStdout, d)
 	}
 	return 0
 }
@@ -133,20 +157,20 @@ func cmdDeployment(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(d))
 	}
-	fmt.Printf("%-14s %s\n", "id:", d.ID)
-	fmt.Printf("%-14s %s\n", "app_id:", d.AppID)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "id:", d.ID)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "app_id:", d.AppID)
 	if d.BuildID != "" {
-		fmt.Printf("%-14s %s\n", "build_id:", d.BuildID)
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "build_id:", d.BuildID)
 	}
-	fmt.Printf("%-14s %s\n", "image_digest:", d.ImageDigest)
-	fmt.Printf("%-14s %s\n", "kind:", d.Kind)
-	fmt.Printf("%-14s %s\n", "status:", d.Status)
-	fmt.Printf("%-14s %s\n", "created_at:", d.CreatedAt)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "image_digest:", d.ImageDigest)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "kind:", d.Kind)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "status:", d.Status)
+	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "created_at:", d.CreatedAt)
 	if d.Error != "" {
-		fmt.Printf("%-14s %s\n", "error:", d.Error)
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "error:", d.Error)
 	}
 	if d.ErrorCode != "" {
-		fmt.Printf("%-14s %s\n", "error_code:", d.ErrorCode)
+		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "error_code:", d.ErrorCode)
 	}
 	return 0
 }

@@ -120,7 +120,7 @@ func run(args []string) int {
 		// `faas deployments [--limit N|--before C|--all]` — list.
 		// Place before appSlugFallback so the singular never shadows it.
 		return cmdDeployments(args[1:])
-	case deploymentSlugFallback:
+	case dispatchDeployment:
 		// `faas deployment <id>` — get one. Must come before appSlugFallback
 		// so the singular is never misread as an app slug.
 		return cmdDeployment(args[1:])
