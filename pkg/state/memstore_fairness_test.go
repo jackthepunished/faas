@@ -39,7 +39,7 @@ func seedFairnessFixture(t *testing.T, buildsPerAccount int) (m *MemStore, accou
 		accounts[i] = acct.ID
 		appIDs[i] = app.ID
 
-		buildIDsByAcct[acct.ID] = make([]string, buildsPerAccount)
+		buildIDsByAcct[acct.ID] = make([]string, 0, buildsPerAccount)
 		for b := 0; b < buildsPerAccount; b++ {
 			dep, err := m.CreateDeployment(context.Background(), Deployment{
 				AppID:       app.ID,
@@ -119,7 +119,7 @@ func TestMemStore_ClaimNextQueuedBuildWithFairness_NoStarvationWhenAllRecent(t *
 // the next claim must NOT pick any of A's queued builds. B or C
 // builds must win.
 func TestMemStore_ClaimNextQueuedBuildWithFairness_PreferQuietAccount(t *testing.T) {
-	m, accounts, _, _ := seedFairnessFixture(t, 3) // 3 builds per account, 9 total
+	m, accounts, _, buildIDsByAcct := seedFairnessFixture(t, 3) // 3 builds per account, 9 total
 
 	// Mark A as recently-claimed so the fairness filter excludes it.
 	if err := m.RecordRecentBuildClaim(context.Background(), accounts[0], uuid.NewString()); err != nil {
@@ -145,9 +145,19 @@ func TestMemStore_ClaimNextQueuedBuildWithFairness_PreferQuietAccount(t *testing
 		}
 	}
 
-	// Now A's 3 builds should still be queued (untouched).
-	for _, bid := range []string{"", "", ""} {
-		_ = bid // placeholder; the real assertion is below
+	// Now A's 3 builds must still be BuildQueued — the fairness filter
+	// must not delete, mark-failed, or otherwise touch rows it skipped.
+	// (The upper-loop asserts none of A was *picked*; this loop asserts
+	// they remained *eligible* for the next fairness window. Together
+	// they pin both halves of the B2.2 promise.)
+	for _, bid := range buildIDsByAcct[accounts[0]] {
+		b, err := m.BuildByID(context.Background(), bid)
+		if err != nil {
+			t.Fatalf("BuildByID(%s): %v", bid, err)
+		}
+		if b.Status != BuildQueued {
+			t.Errorf("A's build %s status = %s, want queued (fairness filter must not touch skipped rows)", bid, b.Status)
+		}
 	}
 }
 

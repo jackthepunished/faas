@@ -1098,3 +1098,62 @@ func TestProcessNext_FairnessWindow_PreferQuietAccount(t *testing.T) {
 		t.Errorf("A's build status = %s, want queued (fairness should have skipped A's queued row)", post.Status)
 	}
 }
+
+// failingRecordStore embeds *state.MemStore and overrides only
+// RecordRecentBuildClaim to always error. It's the seam for the
+// "record is best-effort" invariant: a transient DB outage on the
+// recent_build_claims insert must NOT fail the build.
+type failingRecordStore struct {
+	*state.MemStore
+}
+
+func (f *failingRecordStore) RecordRecentBuildClaim(_ context.Context, _, _ string) error {
+	return errors.New("simulated record failure")
+}
+
+// TestProcessNext_RecordRecentBuildClaim_FailureDoesNotFailBuild pins
+// the B2.2 critical-invariant #2 (record is best-effort): when
+// RecordRecentBuildClaim errors after a successful claim, the build
+// itself still reaches BuildSucceeded. processClaimedBuild's
+// warn-log-on-error path is the only correct behavior — the claim
+// must NOT be rolled back, the deployment must NOT be flipped to
+// failed, and the cache-hit short-circuit must still resolve to a
+// terminal-success state.
+func TestProcessNext_RecordRecentBuildClaim_FailureDoesNotFailBuild(t *testing.T) {
+	store := &failingRecordStore{MemStore: state.NewMemStore()}
+	src := filepath.Join(t.TempDir(), "src.tar.gz")
+	makeTarballWithName(t, src, []string{"package.json", "index.js"})
+	buildID, _, _ := seedDeploymentWithSlug(t, store.MemStore, src, fmt.Sprintf("record-fail-%s", uuid.NewString()[:6]))
+
+	// Pre-cache the source so the pipeline short-circuits at the
+	// cache-hit branch (which writes deployment rootfs and skips VM spawn).
+	cacheRoot := t.TempDir()
+	c := NewCache(cacheRoot)
+	srcCopy := filepath.Join(t.TempDir(), "layer.ext4")
+	if err := os.WriteFile(srcCopy, []byte("pre-cached layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := hashFile(src)
+	if err := c.Store(hash, FrameworkNode, srcCopy, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	ops := wire.NewOpsMetrics("builderd")
+	bld := New(store, &fakeNotifier{}, &fakeVM{}, c, NewDetector(), nil,
+		Config{BuildTimeoutSeconds: 1, FairnessWindow: 30 * time.Second},
+		slog.New(slog.NewTextHandler(io.Discard, nil))).WithOpsMetrics(ops)
+
+	if _, err := bld.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext must succeed even when RecordRecentBuildClaim fails: %v", err)
+	}
+	// Build must reach BuildSucceeded — the record failure must NOT
+	// have rolled back the claim or flipped the deployment to failed.
+	post, _ := store.BuildByID(context.Background(), buildID)
+	if post.Status != state.BuildSucceeded {
+		t.Errorf("build status = %s, want succeeded (record failure must not poison the build)", post.Status)
+	}
+	dep, _ := store.DeploymentByID(context.Background(), post.DeploymentID)
+	if dep.Status == state.DeployFailed {
+		t.Errorf("deployment flipped to failed on record error; want unchanged")
+	}
+}
