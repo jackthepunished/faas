@@ -29,7 +29,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -496,4 +495,3 @@ func writeLoginJSON(w http.ResponseWriter, acct state.Account) {
 // Keep the imports tidy — these helpers are referenced by the
 // future test surface and the README expansion; the imports stay
 // green so gofmt doesn't flag them on a future edit.
-var _ = subtle.ConstantTimeCompare

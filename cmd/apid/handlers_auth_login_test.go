@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
@@ -282,5 +283,103 @@ func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 	}
 	if len(accts) != 0 {
 		t.Errorf("auto-created %d account(s) on a 401 /login; this is the #165 root cause", len(accts))
+	}
+}
+
+// TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths pins the
+// §11 anti-enumeration closure. The handler's three failure modes
+// (unbound email, OAuth-only account with no password row, wrong
+// password) all run exactly one Argon2id verify against identical
+// parameters — the timing oracle must be closed so an attacker
+// cannot distinguish "no such account" from "wrong password" by
+// response time.
+//
+// We measure wall-time for each failure mode and assert the slowest
+// is within 3x the fastest. The Argon2id verify dominates the budget
+// (m=64MiB, t=1, p=2 → ~50ms on the EX44); the surrounding
+// store-lookup overhead is sub-millisecond. A regression that
+// short-circuits the no-account path with `if err != nil { return }
+//` would re-open the timing oracle and trip this test.
+func TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths(t *testing.T) {
+	store := state.NewMemStore()
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+
+	// Pre-seed: one OAuth-only account (no password row), one
+	// password account with a real Argon2id hash.
+	oauthOnly, err := store.CreateAccount(context.Background(), "oauth-only@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pwAcct, err := store.CreateAccount(context.Background(), "pw-user@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountPassword(context.Background(), pwAcct.ID,
+		"$argon2id$v=19$m=65536,t=1,p=2$IWe/FcOEMwkECtSQIvrVzQ$KKo93VKUFEZKsJPb2ovaTfi0MbZQdU4EWw7DjfV9j1c"); err != nil {
+		t.Fatal(err)
+	}
+	const password = "any-password-1234567890"
+
+	// Warm: one verify of the dummy PHC so the runtime cost is
+	// paid before the first measurement (argon2.IDKey can JIT on
+	// the first call; this keeps the timing assertion honest).
+	_, _ = auth.Verify(auth.DummyPHC, "warmup-not-measured")
+
+	measure := func(label, email string) time.Duration {
+		t0 := time.Now()
+		_, ok := srv.verifyPasswordOrPad(context.Background(), email, password)
+		d := time.Since(t0)
+		if ok {
+			t.Fatalf("%s: verifyPasswordOrPad returned ok=true (want false)", label)
+		}
+		return d
+	}
+
+	// Run each path three times and take the minimum; OS scheduler
+	// jitter dominates a single sample on shared CI runners.
+	minOf := func(label, email string) time.Duration {
+		var m time.Duration = 1<<62
+		for i := 0; i < 3; i++ {
+			if d := measure(label, email); d < m {
+				m = d
+			}
+		}
+		return m
+	}
+
+	unbound := minOf("unbound", "ghost@example.com")
+	noRow := minOf("no-row", oauthOnly.Email)
+	wrongPW := minOf("wrong-password", pwAcct.Email)
+	t.Logf("timing pad: unbound=%s no-row=%s wrong-pw=%s", unbound, noRow, wrongPW)
+
+	// All three should be within 3x of each other. The Argon2id
+	// verify (~50ms on the EX44) dominates the budget; a 3x ratio
+	// accommodates a 2x Argon2id cost variance and ~1x store-lookup
+	// overhead. The pre-#165 handler's `if err != nil { return }`
+	// path would finish in microseconds and trip this assertion by
+	// orders of magnitude.
+	slowest := unbound
+	if noRow > slowest {
+		slowest = noRow
+	}
+	if wrongPW > slowest {
+		slowest = wrongPW
+	}
+	fastest := unbound
+	if noRow < fastest {
+		fastest = noRow
+	}
+	if wrongPW < fastest {
+		fastest = wrongPW
+	}
+	if fastest == 0 {
+		// Argon2id should always cost >0; if a future shortcut
+		// makes the verify free, fail loudly so the timing-pad
+		// regression is caught at the assertion, not at the
+		// production timing oracle.
+		t.Fatalf("fastest path measured 0ns; Argon2id cost has been bypassed on one of the three paths")
+	}
+	if ratio := float64(slowest) / float64(fastest); ratio > 3.0 {
+		t.Errorf("timing pad: slowest/fastest = %.2fx, want < 3x (the §11 anti-enumeration closure has been short-circuited on one path)", ratio)
 	}
 }
