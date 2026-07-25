@@ -35,10 +35,13 @@
 -- Mirrors the ClaimInvocation pattern at pkg/state/pgstore.go:1297.
 --
 -- Slot discipline: per migration-slot-renumber-at-pr-creation,
--- 00037 was confirmed free on origin/main (00036_paddle_* etc.
--- are unused). The previous PR #204 plan called this 00036; the
--- fix-PR renumbers again because 00035_instances_state_check_realigns.sql
--- had landed on main in the meantime.
+-- 00041 was the next free slot on origin/main after the merge of
+-- PR #180 (which occupied 00038_oauth_links + 00039_account_passwords).
+-- The original PR #204 plan called this 00036; the fix-PR renumbered
+-- once to 00037, then again to 00039 after PR #180's 00035/36/37
+-- landed on main, then a third time to 00041 after PR #180's
+-- 00038/00039 landed on main. Each renumber is captured in the
+-- squash-commit history of feat/paddle-full-enable.
 
 alter table paddle_overage_dedupe
   add column if not exists window_start timestamptz,

@@ -100,16 +100,13 @@ func TestMigrationsApplyAndWalk(t *testing.T) {
 
 	// Fresh-install schema pin: a fresh-DB apply must end with the
 	// accounts table carrying provider_customer_id (not
-	// stripe_customer_id) — the rename in 00038 (originally 00035 in
-	// PR #204, but slots 35/36/37 are taken on origin/main by
-	// 00035_instances_state_check_realigns.sql /
-	// 00036_api_key_scopes.sql / 00037_app_runtime_go124.sql) is
-	// part of the same apply sequence. Catches the failure mode
-	// PR #204 shipped: a hand-edit to migration 00001 that left
-	// the rename target column absent on a clean DB, causing 00038's
-	// ALTER TABLE to fail with "column does not exist". ApplyAndWalk
-	// only checked version-table row counts before; this assertion
-	// pins the post-rename schema shape.
+	// stripe_customer_id) — the rename in 00040 is part of the
+	// same apply sequence. Catches the failure mode PR #204 shipped:
+	// a hand-edit to migration 00001 that left the rename target
+	// column absent on a clean DB, causing 00040's ALTER TABLE to
+	// fail with "column does not exist". ApplyAndWalk only checked
+	// version-table row counts before; this assertion pins the
+	// post-rename schema shape.
 	assertColumnRenamed(t, pool, "accounts", "provider_customer_id")
 }
 
@@ -129,6 +126,6 @@ func assertColumnRenamed(t *testing.T, pool *pgxpool.Pool, table, column string)
 		   AND column_name = $2`,
 		table, column,
 	).Scan(&x); err != nil {
-		t.Fatalf("fresh-install schema check: table %q does not have column %q after migrations applied; the rename migration (00036) did not land on this DB (err=%v). This is the failure mode PR #204 shipped — migration 00001 was hand-edited to the new column name and 00036's RENAME statement then failed with 'column does not exist'.", table, column, err)
+		t.Fatalf("fresh-install schema check: table %q does not have column %q after migrations applied; the rename migration (00040) did not land on this DB (err=%v). This is the failure mode PR #204 shipped — migration 00001 was hand-edited to the new column name and 00040's RENAME statement then failed with 'column does not exist'.", table, column, err)
 	}
 }
