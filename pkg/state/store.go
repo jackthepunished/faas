@@ -73,6 +73,48 @@ type Store interface {
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error
 	UpdateAccountStatus(ctx context.Context, id string, status AccountStatus) error
+
+	// MFA (issue #186 / IAM-2).
+	// GetMFASecrets returns the sealed TOTP secret and the SHA-256
+	// recovery-code hashes for the account. Returns ErrNotFound when
+	// the account has never enrolled (mfa_enrolled_at IS NULL OR the
+	// secret was never written). MemStore synthesizes the same shape
+	// off the in-memory Account.
+	GetMFASecrets(ctx context.Context, id string) (encrypted []byte, recoveryHashes [][]byte, err error)
+	// SetMFASecret writes the sealed secret + recovery-code hashes
+	// WITHOUT stamping mfa_enrolled_at. Called by /v1/account/mfa/enroll:
+	// the secret lives in the row while the user types the first
+	// code, and the next /confirm is the "enrolled" point. Overwrites
+	// any prior enrollment state (idempotent re-enroll).
+	SetMFASecret(ctx context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error
+	// UpdateMFARecoveryCodes writes the recovery-code hash slice
+	// WITHOUT touching mfa_secret_encrypted. Used by the
+	// consume-recovery-code path: the sealed secret is preserved
+	// across consumes (the customer can still TOTP-verify after
+	// burning their last recovery code), while the hash array
+	// shrinks. Returns ErrNotFound when the account is missing.
+	UpdateMFARecoveryCodes(ctx context.Context, id string, recoveryHashes [][]byte) error
+	// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+	// mfa_required = false. Idempotent on retry. Returns ErrNotFound
+	// when the row is missing — the handler must surface 404 then.
+	MarkMFAEnrolled(ctx context.Context, id string) error
+	// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash,
+	// and mfa_enrolled_at. Does NOT touch mfa_required — the
+	// chokepoints (plan upgrade / card attached / 2nd deploy) re-set
+	// it on the next trigger. The reason string is reserved for the
+	// audit Emit log; the store does not persist it.
+	ClearMFA(ctx context.Context, id string, reason string) error
+	// SetMFARequired writes the mfa_required flag. Best-effort: the
+	// audit Emit fires only after the call returns nil. Idempotent
+	// on repeat (no-op when the value is already what was requested).
+	SetMFARequired(ctx context.Context, id string, required bool) error
+	// CountDeployments returns the total number of deployment rows
+	// for the account across all apps. Used by the 2nd-deploy
+	// auto-flip chokepoint (issue #186): when the count is already
+	// ≥ 1 and the about-to-be-created deployment would push it past
+	// 1, we set mfa_required=true. Empty on a fresh account.
+	CountDeployments(ctx context.Context, id string) (int, error)
+
 	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
 	// account row so the webhook + push paths can join. Idempotent — a
 	// repeat call with the same value is a no-op (ADR-010, Slice 2).

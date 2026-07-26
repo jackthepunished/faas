@@ -917,6 +917,18 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
+	// IAM-2 (issue #186): plan-upgrade chokepoint. Crossing the
+	// free|hobby → pro|scale boundary arms mfa_required so the
+	// customer's next login flips to mfa_pending. Re-fetched
+	// `updated` carries the post-change plan in case a future
+	// change moves the live row state; mfaFlipOnUpgrade only
+	// needs the old/new pair, which we still have here.
+	if mfaFlipOnUpgrade(acct.Plan, plan) {
+		s.flipMFARequiredIfUnenrolled(ctx(r), updated, "plan_upgrade", map[string]any{
+			"from": string(acct.Plan),
+			"to":   string(plan),
+		})
+	}
 	writeJSON(w, http.StatusOK, api.AccountResponse{
 		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
 	})

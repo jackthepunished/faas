@@ -195,6 +195,168 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 	return nil
 }
 
+// --- MFA (IAM-2, issue #186) -------------------------------------------------
+//
+// Selectively projected to keep the existing scanAccountCols path
+// unchanged. The four mfa_* columns are read by their own helper
+// (scanAccountMFA) so the 8 existing SELECT sites don't need to
+// grow. The five write paths are short enough to be inline.
+
+// GetMFASecrets returns the sealed TOTP secret and the SHA-256
+// recovery-code hashes. Returns ErrNotFound when the row is missing
+// OR the secret column is NULL (the customer has never enrolled).
+// A NULL mfa_secret_encrypted is a definitional "not enrolled" —
+// the CHECK constraint accounts_mfa_enrolled_shape_chk forbids the
+// enrolled-without-secret shape, so falling back to ErrNotFound on
+// any inconsistency is safe.
+func (s *PgStore) GetMFASecrets(ctx context.Context, id string) ([]byte, [][]byte, error) {
+	var (
+		secret []byte
+		hashes [][]byte
+	)
+	row := s.pool.QueryRow(ctx,
+		`select mfa_secret_encrypted, mfa_recovery_codes_hash
+		   from accounts where id = $1`, id)
+	if err := row.Scan(&secret, &hashes); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, mapErr(err)
+	}
+	if secret == nil {
+		return nil, nil, ErrNotFound
+	}
+	return secret, hashes, nil
+}
+
+// SetMFASecret writes the sealed secret + recovery-code hashes
+// WITHOUT stamping mfa_enrolled_at. Idempotent re-enrollment:
+// overwrites any prior state. The bytea[] round-trip goes through
+// pgx's native [][]byte codec (the same one used by 00016 for
+// app_secrets.acl_groups), so no pq.Array wrapper is needed.
+func (s *PgStore) SetMFASecret(ctx context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_secret_encrypted = $2,
+		        mfa_recovery_codes_hash = $3
+		  where id = $1`,
+		id, encrypted, recoveryHashes)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateMFARecoveryCodes writes the recovery-code hash slice
+// without touching mfa_secret_encrypted. Used by the
+// consume-recovery-code path: the sealed secret is preserved
+// across consumes (the customer can still TOTP-verify after
+// burning their last recovery code), while the hash array
+// shrinks.
+func (s *PgStore) UpdateMFARecoveryCodes(ctx context.Context, id string, recoveryHashes [][]byte) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_recovery_codes_hash = $2
+		  where id = $1`,
+		id, recoveryHashes)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+// mfa_required = false. The two columns flip together so the
+// requireMFA middleware sees (MFARequired=false && MFAEnrolled=true)
+// the moment the row is visible — the audit Emit fires only after
+// this returns nil.
+func (s *PgStore) MarkMFAEnrolled(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_enrolled_at = now(),
+		        mfa_required = false
+		  where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash, and
+// mfa_enrolled_at. The `reason` argument is logged by the caller
+// (handlers_mfa.go) and not stored — the events table is the audit
+// trail. mfa_required is intentionally untouched: the chokepoints
+// re-set it on the next trigger.
+func (s *PgStore) ClearMFA(ctx context.Context, id string, reason string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_secret_encrypted = null,
+		        mfa_recovery_codes_hash = null,
+		        mfa_enrolled_at = null
+		  where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetMFARequired writes the mfa_required flag. Best-effort; the
+// audit Emit fires only after this returns nil. The UNIQUE check
+// on (id) is implicit (id is the PK); an unknown id surfaces as
+// ErrNotFound via RowsAffected.
+func (s *PgStore) SetMFARequired(ctx context.Context, id string, required bool) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts set mfa_required = $2 where id = $1`, id, required)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CountDeployments returns the total deployment count for the
+// account across all apps. The 2nd-deploy chokepoint fires when
+// this returns >= 1 (the about-to-be-created deployment would be
+// the 2nd). "deployments" is the right table because the spec's
+// "2nd deploy of any single app" maps to "deployment count for the
+// account crosses 1" — the per-app invariant is enforced by app
+// concurrency, not by this counter. We join through apps because
+// deployments has no account_id column (only app_id). Status
+// 'failed' + 'superseded' are excluded: a failed build counts as
+// nothing, and a superseded deployment is one that was already
+// replaced. The remaining four statuses ('pending','building',
+// 'imaging','live') are the live workload the chokepoint cares
+// about. Index-backed via apps_account_idx (account_id, status).
+func (s *PgStore) CountDeployments(ctx context.Context, id string) (int, error) {
+	var n int
+	row := s.pool.QueryRow(ctx,
+		`select count(*)::int
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where a.account_id = $1
+		    and d.status not in ('failed','superseded')`, id)
+	if err := row.Scan(&n); err != nil {
+		return 0, mapErr(err)
+	}
+	return n, nil
+}
+
+// --- end MFA -----------------------------------------------------------------
+
 // AccountByProviderCustomerID resolves the account behind a Stripe webhook
 // payload. The unique index makes this O(log n); MemStore does it with a
 // map.

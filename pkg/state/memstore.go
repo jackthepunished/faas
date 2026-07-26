@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -371,6 +372,152 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 	m.accounts[id] = a
 	return nil
 }
+
+// --- MFA (IAM-2, issue #186) -------------------------------------------------
+//
+// In-memory parallel of PgStore's MFA Store methods. The Account
+// fields MFAEnrolledAt / MFASecretEncrypted / MFARecoveryCodesHash
+// / MFARequired land on the struct in pkg/state/types.go; the
+// methods below are the load-bearing writers + one count helper.
+
+// GetMFASecrets returns the sealed TOTP secret + recovery-code
+// hashes. Returns ErrNotFound when the row is missing OR the secret
+// column is NULL (the customer has never enrolled). Mirrors
+// PgStore.GetMFASecrets.
+func (m *MemStore) GetMFASecrets(_ context.Context, id string) ([]byte, [][]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if a.MFASecretEncrypted == nil {
+		return nil, nil, ErrNotFound
+	}
+	// Defensive copy: callers (handlers_mfa.go) treat the slice as
+	// read-only, but the consume path mutates MFARecoveryCodesHash
+	// in place. Sharing the backing array would race against
+	// concurrent SetMFASecret calls from a re-enroll flow.
+	hashes := make([][]byte, len(a.MFARecoveryCodesHash))
+	for i, h := range a.MFARecoveryCodesHash {
+		hashes[i] = slices.Clone(h)
+	}
+	return slices.Clone(a.MFASecretEncrypted), hashes, nil
+}
+
+// SetMFASecret writes the sealed secret + recovery-code hashes
+// WITHOUT stamping mfa_enrolled_at. Idempotent re-enrollment.
+func (m *MemStore) SetMFASecret(_ context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFASecretEncrypted = slices.Clone(encrypted)
+	a.MFARecoveryCodesHash = make([][]byte, len(recoveryHashes))
+	for i, h := range recoveryHashes {
+		a.MFARecoveryCodesHash[i] = slices.Clone(h)
+	}
+	m.accounts[id] = a
+	return nil
+}
+
+// UpdateMFARecoveryCodes writes the recovery-code hash slice
+// without touching mfa_secret_encrypted. See the Store interface
+// doc for the rationale (the consume path keeps the secret live
+// so the customer can still TOTP-verify after burning codes).
+func (m *MemStore) UpdateMFARecoveryCodes(_ context.Context, id string, recoveryHashes [][]byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFARecoveryCodesHash = make([][]byte, len(recoveryHashes))
+	for i, h := range recoveryHashes {
+		a.MFARecoveryCodesHash[i] = slices.Clone(h)
+	}
+	m.accounts[id] = a
+	return nil
+}
+
+// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+// mfa_required = false. Idempotent on retry.
+func (m *MemStore) MarkMFAEnrolled(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	a.MFAEnrolledAt = &now
+	a.MFARequired = false
+	m.accounts[id] = a
+	return nil
+}
+
+// ClearMFA nulls the secret + recovery-codes + enrolled_at. Does
+// NOT touch mfa_required — the chokepoints re-arm it. The `reason`
+// argument is reserved for the caller-side audit log; the store
+// does not persist it.
+func (m *MemStore) ClearMFA(_ context.Context, id string, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFASecretEncrypted = nil
+	a.MFARecoveryCodesHash = nil
+	a.MFAEnrolledAt = nil
+	m.accounts[id] = a
+	return nil
+}
+
+// SetMFARequired writes the policy flag. Idempotent on repeat.
+func (m *MemStore) SetMFARequired(_ context.Context, id string, required bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFARequired = required
+	m.accounts[id] = a
+	return nil
+}
+
+// CountDeployments returns the total deployment count for the
+// account, excluding 'failed' + 'superseded' (those don't count
+// toward the live workload). Mirrors PgStore's join through apps.
+// The MemStore doesn't maintain an app-status sub-index, so this
+// is O(apps + deployments) — fine for the test harness' < 1000
+// rows; the PgStore is index-backed.
+func (m *MemStore) CountDeployments(_ context.Context, id string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owned := make(map[string]struct{})
+	for _, a := range m.apps {
+		if a.AccountID == id && a.Status != AppDeleted {
+			owned[a.ID] = struct{}{}
+		}
+	}
+	n := 0
+	for _, d := range m.deployments {
+		if _, ok := owned[d.AppID]; !ok {
+			continue
+		}
+		if d.Status == DeployFailed || d.Status == DeploySuperseded {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// --- end MFA -----------------------------------------------------------------
 
 // UpdateAccountProviderCustomerID records the Stripe `cus_…` ID. MemStore
 // keeps an index map for O(1) webhook lookup; PgStore mirrors with a

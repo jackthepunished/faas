@@ -164,6 +164,11 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 			api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 			return
 		}
+		// IAM-2 (issue #186): 2nd-deploy chokepoint. Same wiring
+		// as the image branch in handlers.go::createDeployment.
+		// The deployment row is now visible; if the new count
+		// is >= 2, arm mfa_required for the next login.
+		s.maybeFlipMFAOnDeploy(ctx(r), acct)
 		// Spool the log file alongside the source so builderd can write to
 		// it directly. The path is created lazily so empty log_path stays
 		// safe for image: deploys.
