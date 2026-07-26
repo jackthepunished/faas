@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Backfill-semantics test for migration 00050 (PR #340 follow-up).
+// Backfill-semantics test for migration 00051 (PR #340 follow-up).
 //
 // Asserts the non-partial index crons_app_full_idx (app_id) exists on
 // crons after the migration set applies. The companion partial index
@@ -20,7 +20,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00050_CronsAppFullIdx_LandsNonPartialIndex(t *testing.T) {
+func TestMigrations_00051_CronsAppFullIdx_LandsNonPartialIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

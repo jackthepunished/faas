@@ -1,12 +1,9 @@
 -- +goose Up
--- +goose StatementBegin
+-- Non-partial index on crons(app_id). Background:
 --
--- 00050_crons_app_full_idx.sql — non-partial index on crons(app_id).
---
--- Background: migration 00002 created a *partial* index
---   crons_app_idx (app_id) WHERE enabled
--- to accelerate schedd's 1-minute ListEnabledCrons scan. PR #340 added
--- CreateCronIfUnderQuota, which runs
+-- Migration 00002 created a *partial* index crons_app_idx (app_id) WHERE
+-- enabled to accelerate schedd's 1-minute ListEnabledCrons scan. PR #340
+-- added CreateCronIfUnderQuota, which runs
 --   select count(*) from crons where app_id = $1
 -- to enforce the per-app cron cap (Free 0, Hobby 5, Pro 20, Scale 100).
 -- A partial index WHERE enabled doesn't help that count: a customer
@@ -20,12 +17,9 @@
 -- count predicate because we count *all* rows for the app). The
 -- existing partial index stays because schedd's scan still needs it.
 --
--- Slot 00050 is free (last shipped: 00049_account_mfa.sql).
---
--- +goose StatementEnd
+-- Slot 00051 is free (last shipped: 00050_github_bindings_account.sql
+-- landed via PR #325 after this PR branched).
 create index if not exists crons_app_full_idx on crons (app_id);
 
 -- +goose Down
--- +goose StatementBegin
 drop index if exists crons_app_full_idx;
--- +goose StatementEnd
