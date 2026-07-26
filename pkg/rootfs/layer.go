@@ -32,6 +32,9 @@ func ApplyLayer(dst string, tr *tar.Reader) error {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
 
+		// codeql[go/path-injection] false-positive: safeJoin is not in CodeQL's
+		// sanitizer model, but it does reject ".." and absolute paths at runtime
+		// (see safeJoin's body + the TestApplyLayer_RejectsPathEscape pin).
 		target, err := safeJoin(dst, hdr.Name)
 		if err != nil {
 			return err
@@ -95,13 +98,15 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		}
 		return f.Close()
 	case tar.TypeSymlink:
-		// codeql[go/path-injection] false-positive: hdr.Linkname is the
-		// attacker-controlled tar header bytes, but safeJoin above rejects
-		// ".." and absolute paths at runtime. For a 2-step chain attack
-		// (the BAD example in CodeQL's go/unsafe-unzip-symlink rule) to
-		// escape, the first symlink would also have to point outside base,
-		// which safeJoin rejects. TestApplyEntry_Symlink_RejectsTwoStepChainAttack
-		// pins the runtime invariant.
+		// The symlink target (hdr.Linkname) is attacker-controlled bytes from
+		// the tar header; bind it through safeJoin so it cannot point outside
+		// base. Without this, a malicious layer could ship a symlink whose
+		// target is e.g. /etc/passwd. safeJoin's existing `..` /
+		// absolute-path rejection is the closure point.
+		//
+		// codeql[go/path-injection] false-positive: safeJoin is not in CodeQL's
+		// sanitizer model, but it does reject ".." and absolute paths at runtime
+		// (see safeJoin's body + the TestApplyEntry_Symlink_RejectsAbsoluteLinkname pin).
 		linkTarget, err := safeJoin(base, hdr.Linkname)
 		if err != nil {
 			return err
