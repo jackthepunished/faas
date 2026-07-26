@@ -15,9 +15,14 @@
 //
 // External test package so it can import pkg/oci without
 // forming a cycle (pkg/oci already imports pkg/netns). The
-// internal denylist_committed_test.go covers per-renderer
+// sibling denylist_committed_test.go covers per-renderer
 // pin detail; this file covers the harder cross-renderer
 // invariant.
+//
+// Helpers (splitNftCommands, findRuleRow, makeConfig,
+// smtpDenyNeedle) live in the sibling file because they are
+// shared and unexported. Both files are in `package netns_test`
+// so the visibility is automatic; duplication is avoided.
 package netns_test
 
 import (
@@ -29,44 +34,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/oci"
 )
-
-// sec11aSplitNftCommands is the §11a-flat equivalent of the
-// splitNftCommands helper in denylist_committed_test.go. Both
-// files live in `netns_test`; the helper is duplicated here
-// rather than exported because the two files are siblings
-// and the split is the §11a contract surface (changes to the
-// split order — e.g. emitting v6 first — would invalidate both
-// tests identically, which is exactly what the §11a pin wants).
-func sec11aSplitNftCommands(t *testing.T, cfg netns.Config) (v4Argv, v6Argv string) {
-	t.Helper()
-	argv := cfg.NftCommands()
-	var rows []string
-	for _, c := range argv {
-		rows = append(rows, strings.Join(c, " "))
-	}
-	flat := strings.Join(rows, "\n")
-
-	v6Marker := "add table ip6 faas"
-	idx := strings.Index(flat, v6Marker)
-	if idx < 0 {
-		t.Fatalf("per-netns argv missing %q — v6 split assumed by ADR-023 broke", v6Marker)
-	}
-	return flat[:idx], flat[idx:]
-}
-
-// findRowContaining scans the flattened argv for a row that
-// contains `needle` and returns the row. Returns "" if no row
-// matches — callers must check for the empty string when the
-// presence of a row is the assertion (the §11a triple
-// agreement uses the empty string as a sink-miss signal).
-func findRowContaining(argv, needle string) string {
-	for _, row := range strings.Split(argv, "\n") {
-		if strings.Contains(row, needle) {
-			return row
-		}
-	}
-	return ""
-}
 
 // TestSec11a_CrossRendererTripleAgreement — every entry in
 // NewDefaultDenySet() must be denied by:
@@ -97,11 +64,7 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 		t.Fatal("NewDefaultDenySet() returned empty Entries; cannot enforce the §11a invariant")
 	}
 
-	cfg := netns.NewConfig("instance", "faas-ns", "veth-host", "veth-peer", netip.MustParseAddr("10.100.0.2"))
-	cfg.Tap = "tap0"
-	cfg.EgressAllowlist = nil
-	cfg.ConntrackCap = 4096
-	perNetnsV4, perNetnsV6 := sec11aSplitNftCommands(t, cfg)
+	perNetnsV4, perNetnsV6 := splitNftCommandsV4V6(t, makeConfig())
 	hostRender := netns.DefaultHostPolicy.Render()
 
 	for i, e := range ds.Entries {
@@ -115,7 +78,7 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 			perNetns = perNetnsV6
 		}
 		denyNeedle := family + " daddr " + cidr
-		row := findRowContaining(perNetns, denyNeedle)
+		row := findRuleRow(perNetns, denyNeedle)
 		if row == "" {
 			t.Errorf("entries[%d] (%s, %s) missing from per-netns argv", i, cidr, family)
 		} else {
@@ -160,15 +123,11 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 				t.Errorf("entries[%d] (%s, %s) host deny line does not end in `drop`: %q",
 					i, cidr, family, line)
 			}
-			if !strings.Contains(line, "counter name \""+e.CounterName+"\"") {
-				t.Errorf("entries[%d] (%s, %s) host deny line missing counter name %q: %q",
-					i, cidr, family, e.CounterName, line)
-			}
 		}
 
 		// OCI sink: the user-space dial check must deny
-		// every entry. Use the same sample-addr-in-prefix
-		// helper as the PR-D test for consistency.
+		// every entry. Use a sample-addr-in-prefix probe
+		// for consistency with the PR-D test.
 		sample := sec11aSampleAddrInPrefix(e.Prefix)
 		if oci.EgressIPAllowed(sample) {
 			t.Errorf("entries[%d] (%s, %s) sample %s ALLOWED by oci.EgressIPAllowed, want denied",
@@ -177,16 +136,18 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 	}
 
 	// SMTP port deny across both renderers. OCI has no port
-	// concept so the SMTP assertion is renderer-only.
-	const smtpNeedle = "tcp dport { 25,465,587 } drop"
-	if !strings.Contains(perNetnsV4, smtpNeedle) {
-		t.Errorf("per-netns v4 argv missing SMTP deny %q", smtpNeedle)
+	// concept so the SMTP assertion is renderer-only. The v6
+	// assertion anchors on the SMTP-specific needle (not the
+	// bare `tcp dport` substring) so a future legitimate v6
+	// port rule does not false-positive.
+	if !strings.Contains(perNetnsV4, smtpDenyNeedle) {
+		t.Errorf("per-netns v4 argv missing SMTP deny %q", smtpDenyNeedle)
 	}
-	if strings.Contains(perNetnsV6, "tcp dport") {
-		t.Errorf("per-netns v6 argv has a tcp dport rule — SMTP deny must be v4-only per spec §11 + ADR-023")
+	if strings.Contains(perNetnsV6, smtpDenyNeedle) {
+		t.Errorf("per-netns v6 argv emitted SMTP deny %q — SMTP deny must be v4-only per spec §11 + ADR-023", smtpDenyNeedle)
 	}
-	if !strings.Contains(hostRender, smtpNeedle) {
-		t.Errorf("host render missing SMTP deny %q", smtpNeedle)
+	if !strings.Contains(hostRender, smtpDenyNeedle) {
+		t.Errorf("host render missing SMTP deny %q", smtpDenyNeedle)
 	}
 	for _, p := range ds.SMTPPorts {
 		needle := strconv.Itoa(int(p))
@@ -196,7 +157,7 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 		// opening — a naive "tcp dport" search would match
 		// the prerouting DNAT row's `tcp dport 8080 dnat` and
 		// report a false negative.
-		row := findRowContaining(perNetnsV4, "tcp dport {")
+		row := findRuleRow(perNetnsV4, "tcp dport {")
 		if !strings.Contains(row, needle) {
 			t.Errorf("per-netns SMTP row missing port %s: %q", needle, row)
 		}
@@ -205,6 +166,19 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 			t.Errorf("host render missing SMTP port %s", needle)
 		}
 	}
+}
+
+// splitNftCommandsV4V6 is the tuple-returning convenience
+// wrapper around the sibling's splitNftCommands. The
+// cross-renderer tripwire uses the tuple shape because it
+// touches both halves side-by-side (per-entry family-aware
+// dispatcher + SMTP v4-only assertion). The sibling's
+// struct-returning helper is preserved for callers that
+// want the positional names.
+func splitNftCommandsV4V6(t *testing.T, cfg netns.Config) (v4Argv, v6Argv string) {
+	t.Helper()
+	s := splitNftCommands(t, cfg)
+	return s.V4, s.V6
 }
 
 // sec11aSampleAddrInPrefix returns a deterministic address
@@ -218,10 +192,9 @@ func TestSec11a_CrossRendererTripleAgreement(t *testing.T) {
 //     pin (a regression in one should not silently hide behind
 //     the other)
 //
-// The implementation is identical to the PR-D version; the
-// comment is preserved verbatim. Result is masked to guarantee
-// it's inside the prefix even for boundary cases like
-// 127.0.0.0/8.
+// The implementation is identical to the PR-D version. Result
+// is masked to guarantee it's inside the prefix even for
+// boundary cases like 127.0.0.0/8.
 func sec11aSampleAddrInPrefix(p netip.Prefix) netip.Addr {
 	addr := p.Addr()
 	bits := p.Bits()

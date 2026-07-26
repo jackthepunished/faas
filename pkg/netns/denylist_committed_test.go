@@ -20,12 +20,16 @@
 // the v4-only SMTP contract, and the host-policy / per-netns
 // argv parity.
 //
-// Mirrors the package layout of denylist_test.go (internal, no
-// `netns_test` package) — keep the wire-shape pins in this
-// package so the helpers stay close to the renderer they assert
-// against. The cross-renderer triple-agreement pin lives in
-// denylist_external_e2e_test.go (package netns_test) so it can
-// import pkg/oci without forming a cycle.
+// Sibling file: denylist_external_sec11a_test.go carries the
+// cross-renderer triple-agreement pin (the per-CIDR deny must
+// be present in all three enforcement surfaces — per-netns argv,
+// host DefaultHostPolicy.Render(), and oci.EgressIPAllowed).
+// That sibling lives in `package netns_test` so it can import
+// pkg/oci without forming a cycle (pkg/oci already imports
+// pkg/netns). The shared helpers below (splitNftCommands,
+// findRuleRow, makeConfig) are unexported and reused by both
+// files; both live in `package netns_test` so the visibility
+// is automatic.
 package netns_test
 
 import (
@@ -37,25 +41,36 @@ import (
 	"github.com/onebox-faas/faas/pkg/netns"
 )
 
-// v4DenySetAndV6DenySet are the two flat argv subsets used by
-// the per-netns renderer. The renderer emits one ip faas table
-// containing the v4 deny rules (ADR-023 v4 split) and one
-// ip6 faas table containing the v6 deny rules. Splitting them
-// at the test boundary lets the §11a pins assert "v4-only
-// SMTP" and "v4-only RFC1918" without leaking assertions across
-// the family boundary.
+// splitArgv is the v4 / v6 split of the per-netns ruleset.
+// The per-netns renderer emits one ip faas table containing
+// the v4 deny rules (ADR-023 v4 split) and one ip6 faas table
+// containing the v6 deny rules. Splitting them at the test
+// boundary lets the §11a pins assert "v4-only SMTP" and
+// "v4-only RFC1918" without leaking assertions across the
+// family boundary.
 type splitArgv struct {
 	V4 string
 	V6 string
 }
 
 // splitNftCommands renders Config.NftCommands and splits the
-// flattened argv on the `table ip faas` / `table ip6 faas`
-// declarations. ADR-023 emits the v4 table first, then the v6
-// table — matched on the bare literal `table ip faas` so the
-// `counter ip faas <name> {}` and `chain ip faas prerouting …`
-// rows fall on the v4 side. Anything after the v6 declaration
-// is the v6 side.
+// flattened argv on the `add table ip6 faas` declaration. ADR-023
+// emits the v4 table first, then the v6 table — and every v4
+// chain block (counters, prerouting DNAT, postrouting MASQUERADE,
+// forward chain, established/related accept, SMTP port drop,
+// per-CIDR deny rules, per-CIDR allowlist) lands contiguously
+// before the v6 marker. The asymmetry is by construction: the
+// split is "anything before the v6 marker is v4 argv, anything
+// from the v6 marker onward is v6 argv". A future refactor that
+// intersperses v4 and v6 blocks would break the split — this
+// is intentional, because such a refactor would also break
+// ADR-023's "no mixed ip + ip6 in one table" rule and the trip
+// belongs on the wire-shape pin, not silently absorbed here.
+//
+// The SMTP-port deny is emitted inside the v4 forward chain
+// block (config.go:270), so it falls on the v4 side of the
+// split — which is what TestSec11a_PerNetnsArgvSMTPDenyIsV4Only
+// depends on.
 func splitNftCommands(t *testing.T, cfg netns.Config) splitArgv {
 	t.Helper()
 	argv := cfg.NftCommands()
@@ -65,17 +80,12 @@ func splitNftCommands(t *testing.T, cfg netns.Config) splitArgv {
 	}
 	flat := strings.Join(rows, "\n")
 
-	v6Marker := "add table ip6 faas"
+	const v6Marker = "add table ip6 faas"
 	idx := strings.Index(flat, v6Marker)
 	if idx < 0 {
 		t.Fatalf("per-netns argv missing %q — v6 split assumed by ADR-023 broke", v6Marker)
 	}
-	// The v4 argv includes the v4 table declaration up to (but not
-	// including) the v6 table declaration. The v6 argv starts at
-	// the v6 table declaration.
-	v4 := flat[:idx]
-	v6 := flat[idx:]
-	return splitArgv{V4: v4, V6: v6}
+	return splitArgv{V4: flat[:idx], V6: flat[idx:]}
 }
 
 // makeConfig returns a Config with the typical Wake-time shape
@@ -90,6 +100,34 @@ func makeConfig() netns.Config {
 	cfg.ConntrackCap = 4096
 	return cfg
 }
+
+// findRuleRow scans the flattened argv for a row that contains
+// `needle` and returns the full row. Returns "" if no row
+// matches — callers must check for the empty string when the
+// presence of a row is the assertion (the §11a pins use the
+// empty string as a "row not found" signal).
+//
+// Used by the per-row qualifier assertions (iifname tap0, dnat,
+// etc.) so the §11a pins don't trip on a substring that matches
+// an unrelated rule.
+func findRuleRow(argv, needle string) string {
+	for _, row := range strings.Split(argv, "\n") {
+		if strings.Contains(row, needle) {
+			return row
+		}
+	}
+	return ""
+}
+
+// smtpDenyNeedle is the post-ADR-034 comma-only form of the
+// SMTP port deny (the bare form `{ 25, 465, 587 }` with spaces
+// is rejected by modern nft — see memory
+// `nft-cidr-set-comma-required`). Every §11a SMTP-related
+// assertion anchors on this exact needle so a regression that
+// adds a legitimate v6 port rule (e.g. an outbound HTTPS
+// allowlist on a specific port) does not false-positive on
+// the "v6 must not have any tcp dport rule" check.
+const smtpDenyNeedle = "tcp dport { 25,465,587 } drop"
 
 // TestSec11a_PerNetnsArgvContainsEveryDenyCIDR — every entry in
 // NewDefaultDenySet().Entries must be in the per-netns argv AND
@@ -135,8 +173,7 @@ func TestSec11a_PerNetnsArgvContainsEveryDenyCIDR(t *testing.T) {
 // must be emitted on the v4 forward chain, matched on
 // `iifname tap0` (the guest-originated side), and the port set
 // must be the comma-only form (post-ADR-034 / nft-cidr-set-comma-required
-// memory; the bare form `{ 25, 465, 587 }` with spaces is
-// rejected by modern nft).
+// memory).
 //
 // Caught regressions:
 //   - Refactor that drops the SMTP line from the v4 forward chain
@@ -145,14 +182,13 @@ func TestSec11a_PerNetnsArgvContainsEveryDenyCIDR(t *testing.T) {
 //     could SYN to a host-loopback SMTP port successfully)
 func TestSec11a_PerNetnsArgvContainsSMTPDeny(t *testing.T) {
 	argv := splitNftCommands(t, makeConfig())
-	const needle = "tcp dport { 25,465,587 } drop"
-	if !strings.Contains(argv.V4, needle) {
-		t.Errorf("v4 forward chain missing SMTP deny %q", needle)
+	if !strings.Contains(argv.V4, smtpDenyNeedle) {
+		t.Errorf("v4 forward chain missing SMTP deny %q", smtpDenyNeedle)
 	}
 	// The line must be on the iifname=tap0 side so it ONLY
 	// matches guest-originated packets. Pull the rule row and
 	// assert iifname tap0 is on the same row.
-	row := findRuleRow(argv.V4, needle)
+	row := findRuleRow(argv.V4, smtpDenyNeedle)
 	if !strings.Contains(row, "iifname") || !strings.Contains(row, "tap0") {
 		t.Errorf("SMTP deny row missing iifname tap0 qualifier: %q", row)
 	}
@@ -164,18 +200,22 @@ func TestSec11a_PerNetnsArgvContainsSMTPDeny(t *testing.T) {
 // v4-only at the wire-shape layer prevents an accidental "fix"
 // that adds an IPv6 SMTP line without an ADR.
 //
+// The v6 assertion anchors on the SMTP-specific needle (not the
+// bare `tcp dport` substring) so a future legitimate v6 port
+// rule (e.g. an outbound HTTPS allowlist on a specific port)
+// does not false-positive.
+//
 // Caught regressions:
 //   - Someone "improves" coverage by adding an IPv6 SMTP mirror
 //   - Renderer refactor that merges the v4 and v6 chains into
 //     one table and the SMTP rule ends up dropping v6 too
 func TestSec11a_PerNetnsArgvSMTPDenyIsV4Only(t *testing.T) {
 	argv := splitNftCommands(t, makeConfig())
-	const needle = "tcp dport { 25,465,587 } drop"
-	if !strings.Contains(argv.V4, needle) {
+	if !strings.Contains(argv.V4, smtpDenyNeedle) {
 		t.Errorf("v4 forward chain missing SMTP deny (v4-only invariant broken)")
 	}
-	if strings.Contains(argv.V6, "tcp dport") {
-		t.Errorf("v6 forward chain has a tcp dport rule — SMTP deny must be v4-only per spec §11 + ADR-023")
+	if strings.Contains(argv.V6, smtpDenyNeedle) {
+		t.Errorf("v6 forward chain emitted SMTP deny %q — SMTP deny must be v4-only per spec §11 + ADR-023", smtpDenyNeedle)
 	}
 }
 
@@ -310,22 +350,7 @@ func TestSec11a_HostPolicyRenderMirrorsPerNetnsArgv(t *testing.T) {
 
 	// The SMTP port deny must be in the host render in the
 	// comma-only form.
-	const smtpNeedle = "tcp dport { 25,465,587 } drop"
-	if !strings.Contains(host, smtpNeedle) {
-		t.Errorf("host render missing SMTP deny %q", smtpNeedle)
+	if !strings.Contains(host, smtpDenyNeedle) {
+		t.Errorf("host render missing SMTP deny %q", smtpDenyNeedle)
 	}
-}
-
-// findRuleRow scans the flattened argv for a row that contains
-// `needle` and returns the full row. Used by the per-row
-// qualifier assertions (iifname tap0, dnat, etc.) so the §11a
-// pins don't trip on a substring that matches an unrelated
-// rule.
-func findRuleRow(argv, needle string) string {
-	for _, row := range strings.Split(argv, "\n") {
-		if strings.Contains(row, needle) {
-			return row
-		}
-	}
-	return ""
 }
