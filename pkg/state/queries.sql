@@ -207,7 +207,7 @@ delete from crons where id = $1 and app_id = $2;
 
 -- name: ListCronsForApp :many
 select id, app_id, schedule, path, enabled, created_at
-from crons where app_id = $1 order by created_at;
+from crons where app_id = $1 order by created_at desc;
 
 -- name: ListEnabledCrons :many
 select id, app_id, schedule, path, enabled, created_at
