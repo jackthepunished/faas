@@ -11,12 +11,16 @@ import "github.com/poyrazK/faas-go/internal/api"
 // any quota change there is canonical, and the SDK's Limits type
 // is the wire form.
 type (
-	Plan   = api.Plan
+	// Plan wraps api.Plan — identity-preserving alias so a customer
+	// can use faas.Plan anywhere an api.Plan is expected.
+	Plan = api.Plan
+	// Limits wraps api.Limits — same identity guarantee as Plan.
 	Limits = api.Limits
 )
 
-// Plans lists every plan low-to-high. Re-exported for callers that
-// need to iterate plans (e.g. a dashboard upgrade page).
+// Plans wraps api.Plans ([]Plan low-to-high) so callers iterating
+// plans (e.g. a dashboard upgrade page) don't have to import
+// internal/api.
 var Plans = api.Plans
 
 // Plan enum re-exports.
@@ -40,13 +44,13 @@ const (
 	ScopeUsageRead    = api.ScopeUsageRead
 )
 
-// IsValidScope reports whether s is in the allowed scope vocabulary.
-// Re-exported for symmetry; canonical definition is in internal/api.
+// IsValidScope wraps api.IsValidScope (canonical definition). Use the
+// faas re-export so callers don't have to import internal/api.
 func IsValidScope(s string) bool { return api.IsValidScope(s) }
 
-// NormalizeCreateKeyScopes validates, defaults, and dedupes a slice
-// of requested scopes for the CreateKey method. Re-exported for the
-// same reason as IsValidScope.
+// NormalizeCreateKeyScopes wraps api.NormalizeCreateKeyScopes:
+// validates, defaults, and dedupes a slice of requested scopes for
+// the CreateKey method.
 func NormalizeCreateKeyScopes(requested []string) ([]string, error) {
 	return api.NormalizeCreateKeyScopes(requested)
 }

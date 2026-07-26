@@ -99,18 +99,22 @@ if err != nil {
 
 ## Options
 
+> **Three options are reserved until PR 12.** `WithBaseURL`,
+> `WithToken`, and `WithDeployTimeout` return
+> `errOptionUnsupported` today — the internal SDK's
+> `baseURL` / `token` / `deployHTTP` fields are unexported and
+> can't be mutated through the public wrapper yet. PR 12 promotes
+> those fields and un-deprecates these options. Until then, callers
+> needing to switch base URL, rotate a token, or set a deploy
+> timeout must reconstruct the `Client` via `NewClient`.
+
 ```go
 c, err := faas.NewClient(baseURL, token,
     faas.WithHTTPClient(myHTTPClient),           // custom transport
-    faas.WithRetry(3, 200*time.Millisecond),     // bounded retry on 5xx/429
-    faas.WithLogger(slog.Default()),              // request/response logging
+    faas.WithRetry(3, 200*time.Millisecond),     // bounded retry on 5xx/429 (PR 4)
+    faas.WithLogger(slog.Default()),              // request/response logging (PR 4)
 )
 ```
-
-`WithBaseURL`, `WithToken`, and `WithDeployTimeout` are reserved
-slots that will land in PR 12 (when the internal SDK's unexported
-fields are promoted). Today they return an `errOptionUnsupported`
-error so the limitation is explicit.
 
 ## Local development
 

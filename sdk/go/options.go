@@ -43,10 +43,16 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithRetry reserves the retry option slot. PR 4 wires the actual
-// exponential-backoff round-tripper. Today the call is a no-op
-// returning nil so the API surface is stable.
+// exponential-backoff round-tripper; today the parameters are stored
+// on the Client so the PR 4 wiring can read them without refactoring
+// the signature. A negative max is treated as zero (no retries).
 func WithRetry(max int, backoff time.Duration) Option {
 	return func(c *Client) error {
+		if max < 0 {
+			max = 0
+		}
+		c.retryMax = max
+		c.retryBackoff = backoff
 		return nil
 	}
 }
@@ -55,11 +61,15 @@ func WithRetry(max int, backoff time.Duration) Option {
 // tests that point the same Client at multiple sandboxes, and for
 // environment switching (staging vs production).
 //
-// PR 3 limitation: the internal Client's baseURL field is unexported;
+// Deprecated: the internal Client's baseURL field is unexported;
 // the option returns errOptionUnsupported. Until PR 12 lands, callers
-// needing to switch base URL should reconstruct the Client.
+// needing to switch base URL should reconstruct the Client. The
+// Deprecated tag is for the option's current "always returns an
+// error" shape, not the underlying concept — PR 12 will un-deprecate
+// it.
 func WithBaseURL(u string) Option {
 	return func(c *Client) error {
+		_ = u
 		return errOptionUnsupported{option: "WithBaseURL"}
 	}
 }
@@ -68,10 +78,11 @@ func WithBaseURL(u string) Option {
 // Client. Useful for long-lived daemons that mint short-lived
 // session tokens.
 //
-// PR 3 limitation: same as WithBaseURL — the internal token field
-// is unexported. The option returns errOptionUnsupported.
+// Deprecated: the internal token field is unexported. The option
+// returns errOptionUnsupported; PR 12 will un-deprecate it.
 func WithToken(token string) Option {
 	return func(c *Client) error {
+		_ = token
 		return errOptionUnsupported{option: "WithToken"}
 	}
 }
@@ -79,23 +90,26 @@ func WithToken(token string) Option {
 // WithDeployTimeout sets the upload HTTP client timeout. The default
 // is 30s. Pass a longer duration for multi-MB tarball deploys.
 //
-// PR 3 limitation: the internal Client's deployHTTP field is
-// unexported. The option returns errOptionUnsupported; callers
-// needing a non-default timeout today must construct via
+// Deprecated: the internal Client's deployHTTP field is unexported,
+// so this option returns errOptionUnsupported. Callers needing a
+// non-default timeout today must construct via
 // NewClientWithDeployTimeout (re-exported as a free function — see
-// the package-level alias once PR 12 lands).
+// the package-level alias once PR 12 lands). The Deprecated tag is
+// for the option's current "always returns an error" shape, not
+// the underlying concept — PR 12 will un-deprecate it.
 func WithDeployTimeout(d time.Duration) Option {
 	return func(c *Client) error {
-		if d <= 0 {
-			return nil
-		}
+		_ = d // accepted for future PR 12 wiring; today any value errors.
 		return errOptionUnsupported{option: "WithDeployTimeout"}
 	}
 }
 
 // WithLogger attaches a slog.Logger for request/response logging.
-// A nil logger is a no-op. The logger is invoked once per request
-// with structured attributes (PR 4 will install the wiring).
+// A nil logger is a no-op. The logger is stored on the Client; PR 4
+// will install the actual logging round-tripper that invokes it
+// once per request with structured attributes. Until PR 4 lands the
+// logger is held but unused — no test should depend on observing
+// log output yet.
 func WithLogger(log *slog.Logger) Option {
 	return func(c *Client) error {
 		if log == nil {
@@ -105,15 +119,3 @@ func WithLogger(log *slog.Logger) Option {
 		return nil
 	}
 }
-
-// noopLogger is the default slog logger used when WithLogger is not
-// supplied. It discards every record; callers without WithLogger
-// see no output.
-func noopLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(noopWriter{}, &slog.HandlerOptions{Level: slog.LevelError}))
-}
-
-// noopWriter discards every Write.
-type noopWriter struct{}
-
-func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }

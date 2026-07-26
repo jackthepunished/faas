@@ -45,7 +45,7 @@ func (e *APIError) Unwrap() error {
 		return ErrSentinelNotFound
 	case CodeUnauthorized:
 		return ErrSentinelUnauthorized
-	case "rate_limited":
+	case CodeRateLimited:
 		return ErrSentinelRateLimited
 	case CodeCapacity:
 		return ErrSentinelCapacity

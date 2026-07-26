@@ -69,4 +69,5 @@ const (
 	CodeResetTokenInvalid             = api.CodeResetTokenInvalid
 	CodeResetTokenExpired             = api.CodeResetTokenExpired
 	CodeAccountExists                 = api.CodeAccountExists
+	CodeRateLimited                   = api.CodeRateLimited
 )

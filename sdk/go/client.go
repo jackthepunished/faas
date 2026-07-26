@@ -2,6 +2,7 @@ package faas
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/poyrazK/faas-go/internal/api"
 )
@@ -18,8 +19,15 @@ import (
 type Client struct {
 	*api.Client
 	// log is the slog logger attached via WithLogger. nil means
-	// "no logging"; the Client substitutes a no-op logger on read.
+	// "no logging"; PR 4 installs the actual logging round-tripper
+	// that invokes it.
 	log *slog.Logger
+	// retryMax and retryBackoff are set by WithRetry. PR 4 wires
+	// the actual retry round-tripper that reads them. Stored on
+	// the Client (not in package-level vars) so each Client gets
+	// its own policy without a global.
+	retryMax     int
+	retryBackoff time.Duration
 }
 
 // NewClient builds a Client for baseURL with the given bearer token.
@@ -45,18 +53,25 @@ func NewClient(baseURL, token string, opts ...Option) (*Client, error) {
 	// deployHTTP) without ever exposing those internals.
 	c := &Client{Client: inner}
 
-	// Install the idempotency round-tripper BEFORE the option chain
-	// runs so that any HTTP client set via WithHTTPClient wraps the
-	// idempotency shim — the shim is the innermost transport, so it
-	// injects the Idempotency-Key header before any retry or auth
-	// middleware the caller layers on top.
-	c.Client.HTTPClient().Transport = newIdempotencyRoundTripper(c.Client.HTTPClient().Transport)
-
+	// Run the option chain FIRST. WithHTTPClient replaces
+	// HTTPClient().Transport with the caller's; the idempotency
+	// shim must be installed AFTER that so it sits inside the
+	// caller's transport (innermost), injecting the Idempotency-Key
+	// header before the caller's retry or auth middleware runs.
+	// Installing the shim first would let WithHTTPClient overwrite
+	// it with the caller's Transport — silently dropping the opt-in
+	// key contract for callers who pass &http.Client{Timeout: …}.
 	for _, opt := range opts {
 		if err := opt(c); err != nil {
 			return nil, err
 		}
 	}
+
+	// Install the idempotency round-tripper LAST. It wraps whatever
+	// Transport the option chain left behind (the caller's custom
+	// Transport, or http.DefaultTransport if WithHTTPClient wasn't
+	// supplied) so the opt-in key contract holds in both cases.
+	c.Client.HTTPClient().Transport = newIdempotencyRoundTripper(c.Client.HTTPClient().Transport)
 
 	return c, nil
 }
@@ -67,8 +82,9 @@ func NewClient(baseURL, token string, opts ...Option) (*Client, error) {
 type APIError = api.APIError
 
 // Problem is re-exported as a type alias. It carries the canonical
-// RFC 7807 fields (Status, Code, Title, Detail, Type, Instance) plus
-// the platform-specific extensions (Limit, Observed, Docs).
+// RFC 7807 fields (Type, Title, Status, Code, Detail) plus the
+// platform-specific extensions (Limit, Observed, DocsURL,
+// BillingPortalURL, PaddleCheckoutURL, TxID).
 type Problem = api.Problem
 
 // ErrNoBody is re-exported as a value alias so errors.Is(err,

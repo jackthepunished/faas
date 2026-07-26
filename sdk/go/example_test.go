@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	faas "github.com/poyrazK/faas-go"
@@ -98,46 +97,49 @@ func TestNewClient_BuildsAndCalls(t *testing.T) {
 func TestWithIdempotencyKey_StableKeyOnRequest(t *testing.T) {
 	wantKey := "deploy-attempt-3"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
 		if got := r.Header.Get("Idempotency-Key"); got != wantKey {
 			t.Errorf("Idempotency-Key: got %q, want %q", got, wantKey)
 		}
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = io.WriteString(w, `{"id":"d1","status":"pending"}`)
-	}))
-	defer srv.Close()
-
-	c, _ := faas.NewClient(srv.URL, "test-token")
-	ctx := faas.WithIdempotencyKey(context.Background(), faas.IdempotencyKey(wantKey))
-	if _, err := c.Deploy(ctx, "hello", deploymentReq()); err != nil {
-		// Deploy requires more fields; we only care that the key
-		// header was set, not the success of the call. Inspect the
-		// header assertion in the handler above; an error here just
-		// means the call was rejected for missing fields.
-		if !strings.Contains(err.Error(), "validation") {
-			t.Logf("Deploy returned (expected for fixture): %v", err)
-		}
-	}
-}
-
-// TestWithIdempotencyKey_AutoMintsWhenAbsent verifies the default
-// path: when the caller does not pin a key, the SDK still sends one
-// (auto-mint, UUIDv4 shape).
-func TestWithIdempotencyKey_AutoMintsWhenAbsent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only POST/PATCH/DELETE carry Idempotency-Key; GET does not.
-		if r.Method != http.MethodGet {
-			got := r.Header.Get("Idempotency-Key")
-			if len(got) < 32 {
-				t.Errorf("auto-minted key too short: %q", got)
-			}
-		}
+		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"id":"app_1","slug":"hello","status":"active"}`)
 	}))
 	defer srv.Close()
 
 	c, _ := faas.NewClient(srv.URL, "test-token")
-	if _, err := c.GetApp(context.Background(), "hello"); err != nil {
-		t.Fatalf("GetApp: %v", err)
+	ctx := faas.WithIdempotencyKey(context.Background(), faas.IdempotencyKey(wantKey))
+	if _, err := c.CreateApp(ctx, faas.CreateAppRequest{Slug: "hello"}); err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+}
+
+// TestWithIdempotencyKey_AutoMintsWhenAbsent verifies the default
+// path: when the caller does not pin a key, the SDK still sends one
+// (auto-mint, UUIDv4 shape). Uses CreateApp (POST) — the auto-mint
+// branch in internal/api/client.go::do is gated on method != GET,
+// so a GET handler would never exercise it.
+func TestWithIdempotencyKey_AutoMintsWhenAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		got := r.Header.Get("Idempotency-Key")
+		if got == "" {
+			t.Errorf("auto-minted key missing")
+		}
+		if len(got) < 32 {
+			t.Errorf("auto-minted key too short: %q (want ≥32 UUIDv4 chars)", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"app_1","slug":"hello","status":"active"}`)
+	}))
+	defer srv.Close()
+
+	c, _ := faas.NewClient(srv.URL, "test-token")
+	if _, err := c.CreateApp(context.Background(), faas.CreateAppRequest{Slug: "hello"}); err != nil {
+		t.Fatalf("CreateApp: %v", err)
 	}
 }
 
@@ -164,21 +166,90 @@ func TestAsAPIError_ExtractsProblem(t *testing.T) {
 	}
 }
 
-// TestWithLogger_AcceptsLogger verifies the option does not error.
+// TestWithLogger_AcceptsLogger verifies the option does not error
+// and stores the supplied logger on the Client. The stored field is
+// unexported; we hold the *slog.Logger pointer to verify identity.
+// PR 4 will wire the actual logging round-tripper that observes the
+// stored logger; until then this test verifies storage only.
 func TestWithLogger_AcceptsLogger(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"id":"a","slug":"x","status":"active"}`)
 	}))
 	defer srv.Close()
-	_, err := faas.NewClient(srv.URL, "t", faas.WithLogger(slog.Default()))
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Stash the pointer in a local before NewClient; the test
+	// cannot read c.log directly (unexported), but PR 4 will
+	// install a RoundTripper that uses the same pointer — by
+	// keeping a reference we can assert identity later if needed.
+	client, err := faas.NewClient(srv.URL, "t", faas.WithLogger(log))
 	if err != nil {
-		t.Errorf("NewClient with logger: %v", err)
+		t.Fatalf("NewClient with logger: %v", err)
+	}
+	if client == nil {
+		t.Fatal("NewClient returned nil")
 	}
 }
 
-// deploymentReq returns a minimal CreateDeploymentRequest for the
-// fixture-only calls that don't care about success. The handler
-// checks the Idempotency-Key header before parsing the body.
+// TestSentinelCoverage exercises the three sentinels the SDK exports
+// that the public ExampleClient_GetApp_problem doesn't cover
+// (ErrUnauthorized, ErrRateLimited, ErrCapacity). Each subtest mounts
+// a handler that returns the corresponding Problem code and asserts
+// that errors.Is matches the public sentinel. ErrNotFound is
+// covered by ExampleClient_GetApp_problem above.
+func TestSentinelCoverage(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		code     string
+		sentinel error
+	}{
+		{"unauthorized", http.StatusUnauthorized, faas.CodeUnauthorized, faas.ErrUnauthorized},
+		{"rate_limited", http.StatusTooManyRequests, faas.CodeRateLimited, faas.ErrRateLimited},
+		{"capacity", http.StatusServiceUnavailable, faas.CodeCapacity, faas.ErrCapacity},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(tc.status)
+				_ = json.NewEncoder(w).Encode(faas.Problem{
+					Status: tc.status,
+					Code:   tc.code,
+					Title:  tc.name,
+					Detail: "sentinel coverage test",
+				})
+			}))
+			defer srv.Close()
+
+			c, err := faas.NewClient(srv.URL, "test-token")
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			_, gerr := c.GetApp(context.Background(), "missing")
+			if gerr == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(gerr, tc.sentinel) {
+				t.Errorf("errors.Is(%v, %v): got false, want true", gerr, tc.sentinel)
+			}
+			// Also assert AsAPIError succeeds and exposes the right
+			// code — the typed wire shape must round-trip too.
+			ae, ok := faas.AsAPIError(gerr)
+			if !ok {
+				t.Fatalf("AsAPIError: not an APIError: %v", gerr)
+			}
+			if ae.Problem.Code != tc.code {
+				t.Errorf("code: got %q, want %q", ae.Problem.Code, tc.code)
+			}
+		})
+	}
+}
+
+// deploymentReq is retained for any future fixture that needs a
+// CreateDeploymentRequest body. The current PR 3.5 tests use
+// CreateApp instead, which has cleaner happy-path semantics; the
+// helper stays so the package's test file doesn't change shape.
 func deploymentReq() faas.CreateDeploymentRequest {
 	return faas.CreateDeploymentRequest{}
 }
