@@ -195,14 +195,19 @@ func (c *Client) WriteCheck(ctx context.Context, repoFullName, commitSHA string,
 // real install, verified=false on a forged/unknown id (404 from
 // api.github.com); transport errors come back as a non-nil err so
 // the dashboard renders the right "couldn't reach GitHub" UX.
-func (c *Client) VerifyInstallation(ctx context.Context, installationID int64) (verified bool, defaultBranch string, err error) {
+//
+// PR-B: expectedLogin carries the §11 ownership assertion; accountLogin
+// on the response is empty when verified=false (the apid handler must
+// not learn whether a forged install_id exists).
+func (c *Client) VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (verified bool, accountLogin string, defaultBranch string, err error) {
 	resp, err := c.cli.VerifyInstallation(ctx, &githubdpb.VerifyInstallationRequest{
 		InstallationId: installationID,
+		ExpectedLogin:  expectedLogin,
 	})
 	if err != nil {
-		return false, "", liftErr(err)
+		return false, "", "", liftErr(err)
 	}
-	return resp.GetVerified(), resp.GetDefaultBranch(), nil
+	return resp.GetVerified(), resp.GetAccountLogin(), resp.GetDefaultBranch(), nil
 }
 
 // liftErr converts a githubd gRPC error back into the platform's

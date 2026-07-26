@@ -34,7 +34,10 @@ type GithubdClient interface {
 	// VerifyInstallation is the "trust on first contact" check
 	// called by /oauth/callback before persisting any binding
 	// (review finding #1+#2 closure for the M7.5 OAuth path).
-	VerifyInstallation(ctx context.Context, installationID int64) (verified bool, defaultBranch string, err error)
+	// PR-B: expectedLogin carries the §11 ownership assertion; the
+	// response includes the install's account_login so the apid
+	// handler can audit-log it.
+	VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (verified bool, accountLogin string, defaultBranch string, err error)
 	Close() error
 }
 
@@ -123,8 +126,8 @@ func (stubGithubdClient) WriteCheck(context.Context, string, string, CheckPhase,
 // integration not configured" page rather than a hard 500, since
 // "Connect GitHub" is a slice 8 capability and the v1.0 launch can
 // ship without it.
-func (stubGithubdClient) VerifyInstallation(context.Context, int64) (bool, string, error) {
-	return false, "", errGithubdNotReady
+func (stubGithubdClient) VerifyInstallation(context.Context, int64, string) (bool, string, string, error) {
+	return false, "", "", errGithubdNotReady
 }
 
 // Close is a no-op for the stub.
@@ -188,8 +191,8 @@ func (l *liveClient) WriteCheck(ctx context.Context, repoFullName, commitSHA str
 }
 
 // VerifyInstallation passes through to githubdgrpc.Client.VerifyInstallation.
-func (l *liveClient) VerifyInstallation(ctx context.Context, installationID int64) (bool, string, error) {
-	return l.c.VerifyInstallation(ctx, installationID)
+func (l *liveClient) VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (bool, string, string, error) {
+	return l.c.VerifyInstallation(ctx, installationID, expectedLogin)
 }
 
 // newGithubdClient is the slice-1 constructor: returns the stub. Slice 7

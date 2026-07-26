@@ -36,6 +36,41 @@ func (e *QuotaError) Is(target error) bool {
 // Concrete instances are *QuotaError so handlers can read limit/observed.
 var ErrQuotaExceeded = errors.New("state: deployed-app quota exceeded")
 
+// CronQuotaScope names the cap that CreateCronIfUnderQuota tripped on.
+// The handler renders different copy per scope so the customer can tell
+// whether to delete a cron from this app (Scope="app") or from one of
+// the account's other apps (Scope="account").
+type CronQuotaScope string
+
+const (
+	// CronQuotaScopeApp is set when limits.CronLimitPerApp was reached.
+	CronQuotaScopeApp CronQuotaScope = "app"
+	// CronQuotaScopeAccount is set when limits.CronLimitPerAccount was reached.
+	CronQuotaScopeAccount CronQuotaScope = "account"
+)
+
+// CronQuotaError is returned by CreateCronIfUnderQuota when either
+// cap (per-app or per-account) is reached. Distinct from QuotaError
+// because it carries Scope, and we want errors.Is to match a cron-
+// specific sentinel rather than overloading the deployed-apps chain.
+type CronQuotaError struct {
+	Scope    CronQuotaScope
+	Limit    int
+	Observed int
+}
+
+func (e *CronQuotaError) Error() string {
+	return fmt.Sprintf("state: cron quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is allows errors.Is(err, ErrCronQuotaExceeded) to match any *CronQuotaError.
+func (e *CronQuotaError) Is(target error) bool {
+	return target == ErrCronQuotaExceeded
+}
+
+// ErrCronQuotaExceeded is the sentinel callers compare against via errors.Is.
+var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -420,6 +455,38 @@ type Store interface {
 	// hit wins; apid is the canonical owner of bindings so this is
 	// not a contention point in practice.
 	InstallationIDForRepo(ctx context.Context, repoFullName string) (int64, error)
+	// UpsertGithubInstallBinding persists the (account → app →
+	// installation, repo, branch) edge with a deterministic
+	// bindingID so the dashboard's bind flow is idempotent on retry
+	// (PR-B, ADR-012 closure). Returns the bindingID; writes the
+	// linked_at timestamp so the dashboard's "connected on" pill
+	// has a single source. The (account_id, binding_id) unique
+	// partial index (migration 00050) rejects duplicate binds under
+	// the same account.
+	UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error
+	// DeleteGithubInstallBinding clears the bind columns on an app.
+	// Idempotent: returns nil even if no binding was present
+	// (so the dashboard's "unbind" action is safe to retry). Returns
+	// ErrNotFound if the app itself doesn't exist.
+	DeleteGithubInstallBinding(ctx context.Context, appID string) error
+	// GetGithubInstallBindingForApp returns the bind row for an
+	// app, scoped by accountID (so a forged session cannot read
+	// another tenant's binding). Returns ErrNotFound when the app
+	// isn't bound OR the bind belongs to a different account. The
+	// pre-PR-B GitHubBindingForApp is account-agnostic; PR-B uses
+	// the new method on the apid/githubd read paths.
+	GetGithubInstallBindingForApp(ctx context.Context, appID, accountID string) (GitHubBinding, error)
+	// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+	// lookup githubd's push receiver uses to find the owning app.
+	// Returns ErrNotFound when no app is bound to (repo, branch).
+	// Uses the (repo, branch) partial index added in 00047.
+	GithubInstallBindingForRepoBranch(ctx context.Context, repoFullName, productionBranch string) (GitHubBinding, error)
+	// ListGithubInstallBindingsForAccount is the dashboard's hydrate
+	// path: given an account_id, return every bind the account
+	// currently owns. The map is keyed by appID so the dashboard's
+	// per-app lookup is O(1). Uses the
+	// apps_github_install_account_idx partial index.
+	ListGithubInstallBindingsForAccount(ctx context.Context, accountID string) (map[string]GitHubBinding, error)
 
 	// Deployments.
 	// CreateDeployment atomically inserts a new pending deployment row
@@ -504,6 +571,15 @@ type Store interface {
 	// wire and vmmd resolves it via Storage.Get before staging the chroot.
 	SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error
 
+	// SetDeploymentSourceURL records the canonical upstream URL +
+	// commit SHA the build was triggered from (Tier 3 / issue #197
+	// B3.10 schema half, migrations/00047). Populated by githubd's
+	// CreateDeployment callback. Empty values are accepted (an
+	// image: deploy with no upstream URL is a normal case). The
+	// reader is build_provenance (Phase 2) which surfaces the
+	// values at GET /v1/builds/{id}/provenance.
+	SetDeploymentSourceURL(ctx context.Context, id, sourceURL, commitSHA string) error
+
 	// Builds (apid creates the queued row; builderd writes status, spec §9).
 	CreateBuild(ctx context.Context, deploymentID string, kind DeploymentKind, sourceBytes int64, logPath string) (Build, error)
 	BuildByID(ctx context.Context, id string) (Build, error)
@@ -550,6 +626,28 @@ type Store interface {
 	RequeueBuild(ctx context.Context, id string) error
 	UpdateBuildStatus(ctx context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error
 
+	// CreateBuildProvenance persists the post-mortem "what ran?"
+	// record for a successful Build (ADR-038, Tier 3 / issue #197
+	// B3.1). Called by builderd's recordProvenance helper at the two
+	// markSucceeded sites; ON CONFLICT (build_id) DO UPDATE makes
+	// redelivery safe — a LISTEN race between apid and imaged's
+	// reaper must not double-row.
+	//
+	// Builderd's failure path is best-effort: a failed INSERT is
+	// logged at WARN and the build still succeeds (the builds row is
+	// authoritative for customer-visible success/fail). The reader
+	// (apid GET /v1/builds/{id}/provenance) renders 404 when the
+	// row is missing — the customer-visible surface is "missing
+	// provenance for build X" rather than "build X failed".
+	CreateBuildProvenance(ctx context.Context, prov BuildProvenance) error
+	// BuildProvenanceByBuildID resolves the row by build_id. Returns
+	// ErrNotFound when the build has no provenance row — either a
+	// pre-PR build, or a successful build whose populator INSERT
+	// failed and was logged at WARN. Backs apid's GET
+	// /v1/builds/{id}/provenance route + the `faas build provenance`
+	// CLI command.
+	BuildProvenanceByBuildID(ctx context.Context, buildID string) (BuildProvenance, error)
+
 	// SweepStuckRunningBuilds flips every build row whose status is
 	// 'running' AND whose started_at is older than threshold to
 	// status='failed' with failure_class='timeout'. Used by the
@@ -577,6 +675,18 @@ type Store interface {
 
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
+	// CreateCronIfUnderQuota inserts a cron iff the per-app and
+	// per-account caps (limits.CronLimitPerApp / CronLimitPerAccount)
+	// are not yet reached. The per-app count is authoritative under
+	// an apps FOR UPDATE row lock; the per-account count is a
+	// follow-up under the same tx so two concurrent POSTs for the
+	// same account cannot both pass the account cap. Returns:
+	//   - (Cron{}, *CronQuotaError) when either cap trips
+	//   - (Cron{}, ErrNotFound) when the app row is missing or deleted
+	// apid's createCron handler routes through this; schedd's
+	// dispatch loop and existing tests still call CreateCron
+	// (uncapped) because they bypass the customer-facing path.
+	CreateCronIfUnderQuota(ctx context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error)
 	CronByID(ctx context.Context, id string) (Cron, error)
 	// UpdateCron mutates the optional fields of a cron row. nil pointers
 	// leave the field untouched. createdAt is supported because schedd's

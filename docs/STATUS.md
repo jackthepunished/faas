@@ -121,7 +121,11 @@ The sampling/quota shapes are in `cmd/meterd` and
 contract per spec §4.9; `go124` is a new runtime — apps deploy
 with a static binary emitted by Railpack's go plan, functions
 reuse the per-request subprocess model). Cron: `pkg/sched/cron.go`, single-flight
-per scheduled fire, loop-tested in `cron_loop_test.go`. Email:
+per scheduled fire, loop-tested in `cron_loop_test.go`. Cron caps (per-app
+and per-account, Free gated to 402) live in `pkg/api/limits.go` and are
+enforced by `apid`'s `createCron` under an apps `FOR UPDATE` row lock
+(mirrors `CreateAppIfUnderQuota`); store-side check at
+`pkg/state.PgStore::CreateCronIfUnderQuota`. Email:
 `pkg/mail` interface with Resend + Postmark backends (gap G4).
 
 **Billing-provider extraction (PR #155)** — the Stripe

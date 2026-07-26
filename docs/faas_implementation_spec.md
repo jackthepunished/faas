@@ -131,7 +131,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 - **Aggressive reaper (ADR-038, issue #171):** every 10 s, *alongside* the idle reaper, a fast-cooldown path parks the surplus above `max(min_instances, desired + 1)` where `desired = ceil(windowed_rps / autoscale_target_rps)` from a per-app 5 × 1 s rolling RPS mirror (`pkg/sched/recentload/`). The `+1` is a hysteresis buffer so a brief RPS wobble doesn't wake-then-park. Scope: apps with `max_concurrency > 1` and `autoscale_target_rps > 0`; single-instance apps and apps without an autoscale target stay on the idle reaper only. Per-tick cap of 8 parks per app to prevent a single tick from blocking the reaper for `8 × ~150 ms ≈ 1.2 s` during a sudden scale-down storm. Default ON; `FAAS_REAPER_AGGRESSIVE=false` (schedd.toml `reaper_aggressive = false`) disables in-place — the mirror, metric, and audit row stay live so diagnosis continues. G7 (OpenConns > 0) and `MinInstanceAge` (30 s) protections still apply. Acceptance: 5-instance burst → 0 rps parks back to ≤ `min_instances + 1` within 30 s (three 10 s ticks). Audit row `events.kind='reaper_scale_down'` is emitted once per app per tick that parks ≥ 1 instance with `{app, desired, parked[], reason: "traffic_dropped", now}` in `data jsonb`.
 - **Eviction (RAM pressure > 80 % of the 85 % target):** park instances LRU by last request; never evict an instance younger than 30 s; Scale plan evicted last.
 - **Free-tier disk reaper:** free apps with zero requests for 14 days → snapshot + rootfs moved to object storage, state `EVICTED_COLD` (redeploy = one click, re-flatten from stored image). This is the founding doc's ceiling-protection policy (§9.7 there).
-- **Cron:** `crons` table; fire = synthetic `POST` through gatewayd (so metering/limits apply identically).
+- **Cron:** `crons` table; fire = synthetic `POST` through gatewayd (so metering/limits apply identically). Per-app and per-account caps are enforced in `apid`'s `createCron` under an apps `FOR UPDATE` row lock (mirrors `CreateAppIfUnderQuota`); Free plan is gated to 402 `plan_crons_not_allowed` because the per-app cap is 0. See `pkg/api/limits.go::CronLimitPerApp` / `CronLimitPerAccount`.
 - Single process, single writer to `instances` — no distributed locking on one box. Multi-node later = shard apps by node, one schedd per node, `apid` routes writes (interface kept narrow deliberately: `EnsureInstance`, `Park`, `Evict`).
 
 ### 4.4 `vmmd` — microVM supervisor
@@ -505,6 +505,20 @@ The `cidr` label is the canonical `DenyEntry.CounterName` (single source of trut
 **Reset semantics**: nftables counters reset on table flush or snapshot resume (existing `faas_cap` precedent, spec §4.6). The poll adapter detects `curr < prev` and re-seeds `lastSeen` to `curr` without emitting a negative delta (Prometheus counters are monotonic — `Add(-N)` would panic).
 
 **Sampling rate**: 15 s scrape interval matches the conventional Prometheus cadence and keeps per-tenant alert latency under one minute (alert rule uses `rate()` over `1m`).
+
+### 12.3 Traffic anomaly detection (issue #303, ADR-039)
+
+The apid counter `apid_request_total{account_id, route, code}` (issue #303) is the per-request total — paired with `apid_request_failures_total{account_id, route}` (issue #278) for the per-account error-rate view. Both counters share the same `accountLabelSet` (issue #278) so a customer is represented by the same `account_id` in both, or by `__other__` in both. The `code` label is added on the new counter so the error-rate alert variant can run off the same counter; this is a deliberate asymmetry from `apid_request_failures_total` (no `code` since failures are by definition `err`) reconciled in a follow-up PR.
+
+The §12 "traffic anomaly" feature reads this counter through a dedicated `faas_anomaly_baseline` recording-rule group (above the existing `faas_slo` group in `deploy/ansible/roles/prometheus/files/faas.rules.yml`). Methodology and thresholds are decided in ADR-039; the alert family is `traffic_anomaly` and the existing `family`-based inhibition / silencing rules compose with it. Four alerts fan out symmetric (rate / error-rate) × (spike / drop) at the route level and the account level, each with a `runbook_url` to `docs/runbooks/FaasTrafficAnomaly.md`.
+
+Per-customer drill-down PromQL (see the runbook for the full set):
+
+```
+sum by (route) (rate(apid_request_total{account_id="<uuid>"}[5m]))
+```
+
+The `account_id="__other__"` series is the bounded overflow bucket — drill-down on this means the customer is past the 10 000 admission cap, and the operator must check the daemon slog for the original id (issue #278).
 
 **SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — one box (until Gate A) is stated honestly on the status page.
 

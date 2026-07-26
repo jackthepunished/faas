@@ -922,6 +922,221 @@ func (s *PgStore) InstallationIDForRepo(ctx context.Context, repoFullName string
 	return installID, nil
 }
 
+// UpsertGithubInstallBinding persists the (account → app → install,
+// repo, branch) edge on the apps row. PR-B (ADR-012 closure). The
+// (account_id, binding_id) unique partial index added in migration
+// 00047 makes the upsert idempotent on retry: a second call with the
+// same payload overwrites the prior values without a new row.
+//
+// The zero/empty BindingID is rejected so the dashboard's bind flow
+// always carries a deterministic id (it builds "bind-<appID>-<repo>"
+// client-side). A blank appID returns ErrNotFound rather than a
+// silent 0-row update so the dashboard's "app not found" path
+// stays correct.
+func (s *PgStore) UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error {
+	if b.AppID == "" {
+		return ErrNotFound
+	}
+	if b.BindingID == "" {
+		return fmt.Errorf("state: BindingID required")
+	}
+	if b.AccountID == "" {
+		return fmt.Errorf("state: AccountID required")
+	}
+	if b.LinkedAt.IsZero() {
+		b.LinkedAt = time.Now()
+	}
+	_, err := s.pool.Exec(ctx,
+		`update apps
+		 set github_install_id = $2,
+		     github_repo_full_name = $3,
+		     github_production_branch = $4,
+		     github_install_binding_id = $5,
+		     github_install_account_id = $6,
+		     github_install_linked_at = $7
+		 where id = $1`,
+		b.AppID, b.InstallID, nullString(b.RepoFullName), nullString(b.ProductionBranch),
+		b.BindingID, b.AccountID, b.LinkedAt,
+	)
+	return err
+}
+
+// DeleteGithubInstallBinding clears the (install, repo, branch,
+// binding, account, linked_at) columns on an app. Idempotent: a
+// no-prior-binding row updates zero rows and returns nil so the
+// dashboard's "unbind" action is safe to retry. Returns ErrNotFound
+// when the app row itself is missing — the caller can distinguish
+// "not bound" from "app not found".
+func (s *PgStore) DeleteGithubInstallBinding(ctx context.Context, appID string) error {
+	if appID == "" {
+		return ErrNotFound
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update apps
+		 set github_install_id = null,
+		     github_repo_full_name = null,
+		     github_production_branch = null,
+		     github_install_binding_id = null,
+		     github_install_account_id = null,
+		     github_install_linked_at = null
+		 where id = $1`,
+		appID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetGithubInstallBindingForApp returns the (appID, accountID)
+// bind row. accountID scopes the lookup so a forged session cannot
+// read another tenant's binding — when the app is bound but to a
+// different account, returns ErrNotFound. The (unbound app) case
+// also returns ErrNotFound. Uses the apps_account_idx composite
+// index (apps.account_id, apps.status) for the account check.
+func (s *PgStore) GetGithubInstallBindingForApp(ctx context.Context, appID, accountID string) (GitHubBinding, error) {
+	if appID == "" || accountID == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	var b GitHubBinding
+	var installID *int64
+	var branch *string
+	var bindingID *string
+	var linkedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select id, github_install_id, github_repo_full_name, github_production_branch,
+		        github_install_binding_id, github_install_account_id, github_install_linked_at
+		 from apps
+		 where id = $1
+		   and account_id = $2
+		   and github_install_id is not null`, appID, accountID,
+	).Scan(&b.AppID, &installID, &b.RepoFullName, &branch, &bindingID, &b.AccountID, &linkedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GitHubBinding{}, ErrNotFound
+		}
+		return GitHubBinding{}, err
+	}
+	if installID != nil {
+		b.InstallID = *installID
+	}
+	if branch != nil {
+		b.ProductionBranch = *branch
+	}
+	if bindingID != nil {
+		b.BindingID = *bindingID
+	}
+	if linkedAt != nil {
+		b.LinkedAt = *linkedAt
+	}
+	return b, nil
+}
+
+// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+// lookup. githubd's push receiver uses it to find the owning app
+// from a (repo, branch) push. Uses the
+// apps_github_install_repo_branch_idx partial index from migration
+// 00047. Returns ErrNotFound when no app is bound to that pair.
+func (s *PgStore) GithubInstallBindingForRepoBranch(ctx context.Context, repoFullName, productionBranch string) (GitHubBinding, error) {
+	if repoFullName == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	if productionBranch == "" {
+		productionBranch = "main"
+	}
+	var b GitHubBinding
+	var installID *int64
+	var branch *string
+	var accountID *string
+	var bindingID *string
+	var linkedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select id, github_install_account_id, github_install_binding_id, github_install_linked_at,
+		        github_install_id, github_repo_full_name, github_production_branch
+		 from apps
+		 where github_repo_full_name = $1
+		   and github_production_branch = $2
+		   and github_install_id is not null
+		 limit 1`, repoFullName, productionBranch,
+	).Scan(&b.AppID, &accountID, &bindingID, &linkedAt, &installID, &b.RepoFullName, &branch)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GitHubBinding{}, ErrNotFound
+		}
+		return GitHubBinding{}, err
+	}
+	if installID == nil {
+		return GitHubBinding{}, ErrNotFound
+	}
+	b.InstallID = *installID
+	if accountID != nil {
+		b.AccountID = *accountID
+	}
+	if bindingID != nil {
+		b.BindingID = *bindingID
+	}
+	if linkedAt != nil {
+		b.LinkedAt = *linkedAt
+	}
+	if branch != nil {
+		b.ProductionBranch = *branch
+	}
+	return b, nil
+}
+
+// ListGithubInstallBindingsForAccount returns the map[appID]GitHubBinding
+// the dashboard uses to render the per-app bind state. Uses the
+// apps_github_install_account_idx partial index. Returns an empty
+// (non-nil) map when the account has no bindings.
+func (s *PgStore) ListGithubInstallBindingsForAccount(ctx context.Context, accountID string) (map[string]GitHubBinding, error) {
+	out := make(map[string]GitHubBinding)
+	if accountID == "" {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, github_install_id, github_repo_full_name, github_production_branch,
+		        github_install_binding_id, github_install_linked_at
+		 from apps
+		 where github_install_account_id = $1
+		   and github_install_id is not null`, accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b GitHubBinding
+		b.AccountID = accountID
+		var installID *int64
+		var branch *string
+		var bindingID *string
+		var linkedAt *time.Time
+		if err := rows.Scan(&b.AppID, &installID, &b.RepoFullName, &branch, &bindingID, &linkedAt); err != nil {
+			return nil, err
+		}
+		if installID != nil {
+			b.InstallID = *installID
+		}
+		if branch != nil {
+			b.ProductionBranch = *branch
+		}
+		if bindingID != nil {
+			b.BindingID = *bindingID
+		}
+		if linkedAt != nil {
+			b.LinkedAt = *linkedAt
+		}
+		out[b.AppID] = b
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // --- deployments -------------------------------------------------------------
 
 // CreateDeployment writes a pending deployment row only if the parent app is
@@ -1024,14 +1239,22 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	//    the app cannot transition to AppDeleted between Steps 1 and 4
 	//    (COMMIT). If INSERT fails, the prior UPDATE at Step 2 is rolled
 	//    back by the defer.
+	// Tier 3 (issue #197 B3.10) — include source_url / commit_sha in the
+	// new-row insert so the Deployment DTO Scan in scanDeployment has the
+	// 15 destinations it expects (the failing test
+	// TestPgStore_InstancesStateCheck_RejectsInjection got "got 13 and 15"
+	// before this fix). Both columns are nullable; empty string on the
+	// write side mirrors the rest of the read-side coalesce shape.
 	row := tx.QueryRow(ctx,
-		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, status)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'pending')
+		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha, status)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
 		 returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		           coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		           status, coalesce(error,''), coalesce(error_code,''), created_at`,
+		           status, coalesce(error,''), coalesce(error_code,''), created_at,
+		           coalesce(source_url,''), coalesce(commit_sha,'')`,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
-		nullString(d.Handler), nullString(d.LogPath))
+		nullString(d.Handler), nullString(d.LogPath),
+		nullString(d.SourceURL), nullString(d.CommitSHA))
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -1047,7 +1270,8 @@ func (s *PgStore) DeploymentByID(ctx context.Context, id string) (Deployment, er
 		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at
+		        status, coalesce(error,''), coalesce(error_code,''), created_at,
+		        coalesce(source_url,''), coalesce(commit_sha,'')
 		 from deployments where id = $1`, id)
 	return scanDeploymentWithRootfs(row)
 }
@@ -1056,7 +1280,8 @@ func (s *PgStore) LatestDeployment(ctx context.Context, appID string) (Deploymen
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at
+		        status, coalesce(error,''), coalesce(error_code,''), created_at,
+		        coalesce(source_url,''), coalesce(commit_sha,'')
 		 from deployments where app_id = $1 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
 }
@@ -1066,7 +1291,8 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at
+		        status, coalesce(error,''), coalesce(error_code,''), created_at,
+		        coalesce(source_url,''), coalesce(commit_sha,'')
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
 	return scanDeploymentWithRootfs(row)
 }
@@ -1075,7 +1301,8 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at
+		        status, coalesce(error,''), coalesce(error_code,''), created_at,
+		        coalesce(source_url,''), coalesce(commit_sha,'')
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
@@ -1111,14 +1338,16 @@ func (s *PgStore) ListDeploymentsForApp(ctx context.Context, appID string, limit
 		rows, err = s.pool.Query(ctx,
 			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at
+			        status, coalesce(error,''), coalesce(error_code,''), created_at,
+			        coalesce(source_url,''), coalesce(commit_sha,'')
 			 from deployments where app_id = $1 order by created_at desc limit $2 offset $3`,
 			appID, limit, offset)
 	} else {
 		rows, err = s.pool.Query(ctx,
 			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
 			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at
+			        status, coalesce(error,''), coalesce(error_code,''), created_at,
+			        coalesce(source_url,''), coalesce(commit_sha,'')
 			 from deployments where app_id = $1 order by created_at desc offset $2`,
 			appID, offset)
 	}
@@ -1147,7 +1376,8 @@ func (s *PgStore) ListDeploymentsForAccount(ctx context.Context, accountID strin
 		rows, err = s.pool.Query(ctx,
 			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
 			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at
+			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 order by d.created_at desc limit $2`,
 			accountID, limit)
@@ -1155,7 +1385,8 @@ func (s *PgStore) ListDeploymentsForAccount(ctx context.Context, accountID strin
 		rows, err = s.pool.Query(ctx,
 			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
 			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at
+			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 and d.created_at < $2
 			 order by d.created_at desc limit $3`,
@@ -1210,6 +1441,35 @@ func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string,
 	return nil
 }
 
+// SetDeploymentSourceURL stamps the upstream URL + commit SHA on a
+// deployment (Tier 3 / issue #197 B3.10 schema half, migrations/00047).
+// Populated by githubd's CreateDeployment callback once the deployment
+// row exists. Phase 2 (provenance) reads source_url + commit_sha from
+// the deployment row when stamping build_provenance.source_url, so
+// the two phases don't have to re-derive from the trigger.
+//
+// Both columns are nullable; passing empty strings is the normal case
+// for image: deploys that don't have an upstream commit. The
+// commit_sha length cap (64) is enforced by the DB CHECK
+// (deployments_commit_sha_len_chk); a too-long value surfaces here
+// as the same error the DB would have raised, so a unit-test path
+// that goes through memstore and a production path that goes through
+// pgstore both fail the same way.
+func (s *PgStore) SetDeploymentSourceURL(ctx context.Context, id, sourceURL, commitSHA string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set source_url = $2, commit_sha = $3
+		  where id = $1`,
+		id, nullString(sourceURL), nullString(commitSHA))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetDeploymentFailed is the failure-specific helper ADR-021 introduced
 // alongside the deployments.error_code column. Status is pinned to
 // 'failed' (no caller choice — use UpdateDeploymentStatus for other
@@ -1228,7 +1488,8 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 		  returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		            coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 		            coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		            status, coalesce(error,''), coalesce(error_code,''), created_at`,
+		            status, coalesce(error,''), coalesce(error_code,''), created_at,
+		            coalesce(source_url,''), coalesce(commit_sha,'')`,
 		id, nullString(message), nullString(code))
 	return scanDeploymentWithRootfs(row)
 }
@@ -1308,6 +1569,76 @@ func (s *PgStore) UpdateBuildStatus(ctx context.Context, id string, status Build
 		return ErrNotFound
 	}
 	return nil
+}
+
+// CreateBuildProvenance stamps the post-mortem "what ran?" row for a
+// successful Build (ADR-038, Tier 3 / issue #197 B3.1). The
+// `ON CONFLICT (build_id) DO UPDATE` clause makes a redelivered
+// build (LISTEN race between the apid write path and imaged's
+// reaper; PR-A's redelivery dedupe) idempotent — the row is updated
+// in place with the same values rather than failing with 23505.
+//
+// Builderd is best-effort: a failed call returns the error and
+// logs at WARN inside pkg/builderd.recordProvenance. The build
+// itself still succeeds (the builds row is the authoritative
+// customer-visible transition; provenance is metadata). The apid
+// reader renders 404 when the row is missing — a paging event
+// whose root cause is "populator INSERT failed", not "build
+// failed".
+//
+// The columns stamped cover all spec §9 fields; nullable ones use
+// nullString so an empty input maps to NULL (e.g. cache-hit builds
+// have empty buildkit_version / railpack_version / base_digest).
+func (s *PgStore) CreateBuildProvenance(ctx context.Context, prov BuildProvenance) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into build_provenance
+		   (build_id, buildkit_version, railpack_version, base_digest, source_sha256,
+		    source_url, commit_sha, plan, runner_digest, builder_node_id,
+		    started_at, finished_at, sbom_storage_key)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		 on conflict (build_id) do update set
+		   buildkit_version = excluded.buildkit_version,
+		   railpack_version = excluded.railpack_version,
+		   base_digest      = excluded.base_digest,
+		   source_sha256    = excluded.source_sha256,
+		   source_url       = excluded.source_url,
+		   commit_sha       = excluded.commit_sha,
+		   plan             = excluded.plan,
+		   runner_digest    = excluded.runner_digest,
+		   builder_node_id  = excluded.builder_node_id,
+		   started_at       = excluded.started_at,
+		   finished_at      = excluded.finished_at,
+		   sbom_storage_key = excluded.sbom_storage_key`,
+		prov.BuildID,
+		nullString(prov.BuildkitVer),
+		nullString(prov.RailpackVer),
+		nullString(prov.BaseDigest),
+		prov.SourceSHA256,
+		nullString(prov.SourceURL),
+		nullString(prov.CommitSHA),
+		nullString(prov.Plan),
+		nullString(prov.RunnerDigest),
+		nullString(prov.BuilderNodeID),
+		prov.StartedAt,
+		prov.FinishedAt,
+		nullString(prov.SBOMStorageKey),
+	)
+	return err
+}
+
+// BuildProvenanceByBuildID resolves the row by build_id. Returns
+// ErrNotFound when the build has no provenance row — a pre-PR
+// build, or a successful build whose populator INSERT failed and
+// was logged at WARN inside builderd. The apid handler turns
+// ErrNotFound into 404 with code=build_provenance_not_found.
+func (s *PgStore) BuildProvenanceByBuildID(ctx context.Context, buildID string) (BuildProvenance, error) {
+	row := s.pool.QueryRow(ctx,
+		`select id, build_id, coalesce(buildkit_version,''), coalesce(railpack_version,''),
+		        coalesce(base_digest,''), source_sha256, coalesce(source_url,''), coalesce(commit_sha,''),
+		        coalesce(plan,''), coalesce(runner_digest,''), coalesce(builder_node_id,''),
+		        started_at, finished_at, coalesce(sbom_storage_key,'')
+		   from build_provenance where build_id = $1`, buildID)
+	return scanBuildProvenance(row)
 }
 
 // SweepStuckRunningBuilds is the reaper sweep (issue #195 B1.4).
@@ -1576,6 +1907,104 @@ func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, 
 	c := Cron{}
 	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 		return Cron{}, mapErr(err)
+	}
+	return c, nil
+}
+
+// CreateCronIfUnderQuota is the customer-facing variant of
+// CreateCron that enforces the per-app and per-account caps under
+// an apps FOR UPDATE row lock (mirrors CreateAppIfUnderQuota). The
+// per-app cap is checked first because the lock is on the apps row,
+// not the account row; two concurrent POSTs for different apps on the
+// same account serialise through the per-account count read inside
+// the same tx.
+//
+// Failure modes:
+//   - *CronQuotaError when either cap trips (Scope names which).
+//   - ErrNotFound when the app row is gone or already deleted.
+//   - mapErr-wrapped unique-violation on a future uuid collision
+//     (today crons.id is gen_random_uuid() default; left as future-
+//     proof so the surface doesn't change when a uuid scheme lands).
+//
+// The lock uses apps_pkey (id) — no extra index needed.
+func (s *PgStore) CreateCronIfUnderQuota(ctx context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Cron{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent apps row. SELECT 1 + FOR UPDATE keeps the lock
+	//    acquisition in one round-trip; the FOR UPDATE blocks any
+	//    concurrent createCron for the same app until COMMIT/ROLLBACK.
+	//    apps_pkey serves the lock search.
+	var locked int
+	err = tx.QueryRow(ctx,
+		`select 1 from apps where id = $1 and status <> 'deleted' for update`, appID,
+	).Scan(&locked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Cron{}, ErrNotFound
+		}
+		return Cron{}, fmt.Errorf("state: lock app %s: %w", appID, err)
+	}
+
+	// 2. Per-app count, authoritative under the lock. crons_app_idx
+	//    (app_id) WHERE enabled (migration 00002) covers this for the
+	//    common case; disabled crons still count toward the cap.
+	var appCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from crons where app_id = $1`, appID,
+	).Scan(&appCount); err != nil {
+		return Cron{}, fmt.Errorf("state: count crons for app %s: %w", appID, err)
+	}
+	if appCount >= limits.CronLimitPerApp {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeApp,
+			Limit:    limits.CronLimitPerApp,
+			Observed: appCount,
+		}
+	}
+
+	// 3. Per-account count under the same tx. account_id is read off
+	//    the apps row we just locked (no second round-trip to
+	//    accounts). The join through apps excludes deleted apps so
+	//    their cron rows don't poison the cap.
+	var accountID string
+	if err := tx.QueryRow(ctx,
+		`select account_id from apps where id = $1`, appID,
+	).Scan(&accountID); err != nil {
+		return Cron{}, fmt.Errorf("state: read account_id for app %s: %w", appID, err)
+	}
+	var accountCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from crons c
+		 join apps a on a.id = c.app_id
+		 where a.account_id = $1 and a.status <> 'deleted'`,
+		accountID,
+	).Scan(&accountCount); err != nil {
+		return Cron{}, fmt.Errorf("state: count crons for account %s: %w", accountID, err)
+	}
+	if accountCount >= limits.CronLimitPerAccount {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeAccount,
+			Limit:    limits.CronLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	// 4. Insert under the same lock. mapErr wraps unique-violation
+	//    in ErrConflict for future-proofing.
+	row := tx.QueryRow(ctx,
+		`insert into crons (app_id, schedule, path, enabled) values ($1, $2, $3, $4)
+		 returning id, app_id, schedule, path, enabled, created_at`,
+		appID, schedule, path, enabled)
+	c := Cron{}
+	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
+		return Cron{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Cron{}, fmt.Errorf("state: commit create cron: %w", err)
 	}
 	return c, nil
 }
@@ -3534,7 +3963,8 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 	var kind, statusStr string
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
-		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt); err != nil {
+		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
+		&d.SourceURL, &d.CommitSHA); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
@@ -3556,7 +3986,8 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&rootfsPath, &rootfsKey, &d.RootfsBytes,
-		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt); err != nil {
+		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
+		&d.SourceURL, &d.CommitSHA); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
@@ -3573,7 +4004,8 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		var kind, statusStr string
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
-			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt); err != nil {
+			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
+			&d.SourceURL, &d.CommitSHA); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
@@ -3600,6 +4032,25 @@ func scanBuild(row pgx.Row) (Build, error) {
 	b.Status = BuildStatus(statusStr)
 	b.FailureClass = FailureClass(fc)
 	return b, nil
+}
+
+// scanBuildProvenance reads a build_provenance row into the
+// BuildProvenance struct (ADR-038). All columns except id, build_id,
+// source_sha256, started_at, finished_at are COALESCEd to empty
+// string on the read side so the struct's text fields stay
+// valid (avoiding a nil-deref if a future migration loosens a
+// NOT NULL).
+func scanBuildProvenance(row pgx.Row) (BuildProvenance, error) {
+	p := BuildProvenance{}
+	if err := row.Scan(
+		&p.ID, &p.BuildID, &p.BuildkitVer, &p.RailpackVer,
+		&p.BaseDigest, &p.SourceSHA256, &p.SourceURL, &p.CommitSHA,
+		&p.Plan, &p.RunnerDigest, &p.BuilderNodeID,
+		&p.StartedAt, &p.FinishedAt, &p.SBOMStorageKey,
+	); err != nil {
+		return BuildProvenance{}, mapErr(err)
+	}
+	return p, nil
 }
 
 func scanDomains(rows pgx.Rows) ([]CustomDomain, error) {

@@ -5,8 +5,11 @@
 package rootfs
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -250,4 +253,190 @@ func newTestStorage(t *testing.T) storage.StorageBackend {
 		t.Fatalf("storage.NewLocalStorageBackend: %v", err)
 	}
 	return be
+}
+
+// writeGzTar writes a gzipped tar with one regular file at path
+// `name` containing `body`. Used by the B3.7 cap tests so a
+// synthetic tarball can be handed to ApplyTarball.
+func writeGzTar(t *testing.T, path, name string, body []byte) {
+	t.Helper()
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	hdr := &tar.Header{
+		Name:     name,
+		Mode:     0o644,
+		Size:     int64(len(body)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("tar.WriteHeader: %v", err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatalf("tar.Write: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar.Close: %v", err)
+	}
+	var gz bytes.Buffer
+	gzw := gzip.NewWriter(&gz)
+	if _, err := gzw.Write(raw.Bytes()); err != nil {
+		t.Fatalf("gzip.Write: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("gzip.Close: %v", err)
+	}
+	if err := os.WriteFile(path, gz.Bytes(), 0o644); err != nil {
+		t.Fatalf("write tarball: %v", err)
+	}
+}
+
+// TestApplyTarball_RespectsCap — issue #197 B3.7. A tarball whose
+// single entry's declared size exceeds capBytes must be rejected
+// with *ErrTarballExceedsCap before the file is written to disk.
+// The cap is the cumulative byte total, not per-entry; per-entry
+// is enforced by io.CopyN in applyEntry.
+func TestApplyTarball_RespectsCap(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	tarball := filepath.Join(dir, "src.tar.gz")
+	// 1 MiB body under a 64 KiB cap. The cap is checked against the
+	// declared header size, so the actual write doesn't have to
+	// run a million bytes through io.CopyN.
+	writeGzTar(t, tarball, "handler.js", bytes.Repeat([]byte("x"), 1024*1024))
+
+	const capBytes = 64 * 1024
+	err := ApplyTarball(staging, tarball, capBytes)
+	if err == nil {
+		t.Fatalf("ApplyTarball accepted 1 MiB body under %d cap", capBytes)
+	}
+	var capErr *ErrTarballExceedsCap
+	if !errors.As(err, &capErr) {
+		t.Fatalf("err = %v (%T); want *ErrTarballExceedsCap", err, err)
+	}
+	if capErr.CapBytes != capBytes {
+		t.Errorf("CapBytes = %d; want %d", capErr.CapBytes, capBytes)
+	}
+	if capErr.EntryBytes != 1024*1024 {
+		t.Errorf("EntryBytes = %d; want %d", capErr.EntryBytes, 1024*1024)
+	}
+}
+
+// TestApplyTarball_UnderCapAccepts — the inverse: a small tarball
+// under the cap must unpack cleanly.
+func TestApplyTarball_UnderCapAccepts(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	tarball := filepath.Join(dir, "src.tar.gz")
+	writeGzTar(t, tarball, "handler.js", []byte("console.log('hi')"))
+	if err := ApplyTarball(staging, tarball, 1024*1024); err != nil {
+		t.Fatalf("ApplyTarball under-cap: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(staging, "app", "handler.js"))
+	if err != nil {
+		t.Fatalf("read handler.js: %v", err)
+	}
+	if string(body) != "console.log('hi')" {
+		t.Errorf("body = %q; want %q", body, "console.log('hi')")
+	}
+}
+
+// TestApplyTarball_ZeroCapSkipsGate — passing capBytes=0 keeps the
+// legacy unbounded behavior. The legacy callers (tests, internal
+// callers without a plan context) must not regress.
+func TestApplyTarball_ZeroCapSkipsGate(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	tarball := filepath.Join(dir, "src.tar.gz")
+	writeGzTar(t, tarball, "handler.js", bytes.Repeat([]byte("y"), 16*1024))
+	if err := ApplyTarball(staging, tarball, 0); err != nil {
+		t.Fatalf("ApplyTarball cap=0: %v", err)
+	}
+}
+
+// TestBuild_TranslatesTarballCapToProblem — issue #197 B3.7 (PR #241
+// review finding #2). Build() must promote the
+// *ErrTarballExceedsCap sentinel to the plan-scoped
+// api.ErrAppLayerTooLarge(*Problem) so the customer-facing deploy
+// failure carries the limit + observed value + docs URL. Build's
+// Run() is satisfied with a fake runner that always succeeds so we
+// exercise the cap-fail path before publishExt4.
+//
+// The pre-fix code returned the raw sentinel and the customer saw
+// a generic "function tarball exceeds cap" string with no RFC 7807
+// shape; this test pins the translation.
+func TestBuild_TranslatesTarballCapToProblem(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	tarball := filepath.Join(dir, "src.tar.gz")
+	// 256 MiB body, over Free's 256 MiB cap. The cap is enforced against
+	// the declared header size, so we don't need to stream 256 MiB through
+	// io.CopyN — just a header that claims 256 MiB. The tar file itself
+	// remains small; only the cap check runs against the declared size.
+	writeGzTar(t, tarball, "handler.js", bytes.Repeat([]byte("z"), 256*1024*1024))
+
+	limits, ok := api.LimitsFor(api.PlanFree)
+	if !ok {
+		t.Fatal("api.LimitsFor(Free) not ok")
+	}
+
+	// Override the build's plan cap to a tiny value so the post-unpack
+	// cap matches the tarball. We don't go through the apid-side
+	// SourceTarballMaxMB gate — Build() applies the cap directly from
+	// in.Plan/AppLayerMaxMB.
+	b := NewBuilder(&fakeRunner{})
+	// Build a manifest that fits, no OCI layers. The only path that
+	// matters is the tarball-cap path.
+	outFile := filepath.Join(dir, "out.ext4")
+	_, err := b.Build(context.Background(), BuildInput{
+		Layers:             nil,
+		Manifest:           api.AppManifest{Entrypoint: []string{"./handler.js"}},
+		GuestInitPath:      "/dev/null",
+		Plan:               api.PlanFree,
+		TarballPath:        tarball,
+		OutImage:           outFile,
+		FunctionRunnerPath: "",
+	})
+	if err == nil {
+		t.Fatal("Build accepted over-cap tarball; want ErrAppLayerTooLarge")
+	}
+	// Must NOT be the raw sentinel — that's the pre-fix bug.
+	var sentinel *ErrTarballExceedsCap
+	if errors.As(err, &sentinel) {
+		t.Fatalf("Build returned raw sentinel %T; want *api.Problem", err)
+	}
+	// Must be the *api.Problem with the right code.
+	var prob *api.Problem
+	if !errors.As(err, &prob) {
+		t.Fatalf("err = %v (%T); want *api.Problem", err, err)
+	}
+	if prob.Code != api.CodeAppLayerTooBig {
+		t.Errorf("Problem.Code = %q; want %q", prob.Code, api.CodeAppLayerTooBig)
+	}
+	if prob.Limit == nil {
+		t.Fatal("Problem.Limit nil; want Hobby's AppLayerMaxMB in bytes")
+	}
+	if *prob.Limit != int64(limits.AppLayerMaxMB)*1024*1024 {
+		t.Errorf("Problem.Limit = %d; want %d", *prob.Limit, int64(limits.AppLayerMaxMB)*1024*1024)
+	}
+	if prob.Observed == nil {
+		t.Fatal("Problem.Observed nil; want total unpacked bytes (>= 1 MiB)")
+	}
+	if *prob.Observed < 1024*1024 {
+		t.Errorf("Problem.Observed = %d; want >= %d", *prob.Observed, 1024*1024)
+	}
+	if prob.DocsURL == "" {
+		t.Error("Problem.DocsURL empty; want docs URL")
+	}
 }

@@ -122,6 +122,33 @@ type CreateDeploymentRequest struct {
 	Image string `json:"image,omitempty"` // registry.DOMAIN/...@sha256:...
 }
 
+// BuildProvenanceResponse is the public surface of build_provenance
+// (ADR-038, Tier 3 / issue #197 B3.10-read half). Field names mirror
+// the table columns with snake_case naming so the customer-visible
+// JSON stays self-documenting on a `curl`.
+//
+// Fields are nullable strings; empty values map to "" so the customer
+// reads "buildkit_version = \"\"" for a pre-Phase-3 build that the
+// populator hasn't back-filled. The dashboard branches on
+// `sbom_storage_key != ""` to enable the "Download SBOM" link;
+// every other field is observational metadata for audits.
+type BuildProvenanceResponse struct {
+	ID             string `json:"id"`
+	BuildID        string `json:"build_id"`
+	BuildkitVer    string `json:"buildkit_version"`
+	RailpackVer    string `json:"railpack_version"`
+	BaseDigest     string `json:"base_digest"`
+	SourceSHA256   string `json:"source_sha256"`
+	SourceURL      string `json:"source_url"`
+	CommitSHA      string `json:"commit_sha"`
+	Plan           string `json:"plan"`
+	RunnerDigest   string `json:"runner_digest"`
+	BuilderNodeID  string `json:"builder_node_id"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at"`
+	SBOMStorageKey string `json:"sbom_storage_key"`
+}
+
 // DeploymentResponse is a deployment as returned by the API.
 type DeploymentResponse struct {
 	ID          string `json:"id"`
@@ -761,4 +788,43 @@ type AuditEventResponse struct {
 type ListAuditEventsResponse struct {
 	Events []AuditEventResponse `json:"events"`
 	Limit  int                  `json:"limit"`
+}
+
+// --- GitHub install bind picker (PR-B; §11) ---------------------------------
+//
+// InstallBindRequest is the body for both POST /v1/install/repos/list
+// and POST /v1/apps/{slug}/install/bind. ProductionBranch is
+// optional — when omitted, githubd uses the install's default_branch
+// from /installations/{id}.
+//
+// RepoFullName matches GitHub's owner/name shape (e.g. "octocat/
+// hello-world"). The pattern is enforced server-side in handlers_install_github.go
+// but kept loose here so the SDK can serialise any GitHub-shaped
+// string the dashboard holds.
+type InstallBindRequest struct {
+	InstallationID   int64  `json:"installation_id"`
+	RepoFullName     string `json:"repo_full_name"`
+	ProductionBranch string `json:"production_branch,omitempty"`
+}
+
+// InstallBindResponse is the body the dashboard parses after a
+// successful bind. BindingID is the deterministic
+// "bind-<appID>-<repo>" form RealService.BindAppRepo emits; audit
+// log entries reference it directly.
+type InstallBindResponse struct {
+	BindingID        string `json:"binding_id"`
+	RepoFullName     string `json:"repo_full_name"`
+	ProductionBranch string `json:"production_branch"`
+}
+
+// RepoResponse is one repo visible to the user's GitHub App
+// installation, as returned by githubd's
+// /user/installations/{id}/repositories. Carries only the fields the
+// dashboard bind picker renders; no nested owner object (the
+// install URL already disambiguates).
+type RepoResponse struct {
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+	Private       bool   `json:"private"`
 }

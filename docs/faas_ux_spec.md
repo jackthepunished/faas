@@ -123,7 +123,7 @@ faas secrets set|ls|rm  <app> KEY[=VALUE]                     sealed env (impl g
 faas domains add|ls|rm  <app> <domain>                        Pro+; prints the CNAME to set
 faas env pull|push                                            local .env ↔ app config
 faas connect github                                           link a repo (→ §5)
-faas cron add|ls|rm     <app> "<schedule>" <path>
+faas cron add|ls|rm     <app> "<schedule>" <path>                   (Hobby+; Free → upgrade)
 faas open <app>         · faas dashboard                      open web surfaces
 faas status                                                   platform status page
 ```

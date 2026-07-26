@@ -32,6 +32,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/imaged"
 	"github.com/onebox-faas/faas/pkg/oci"
@@ -85,6 +86,29 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	store := state.NewPgStore(pool)
 	builder := rootfs.NewBuilder(wire.ExecRunner{})
 
+	// ADR-038 / Tier 3 phase 3: validate the build-attestation
+	// signing key at startup. The path defaults to
+	// /etc/faas/secrets/sign.key (root:root 0400 or 0440);
+	// FAAS_SIGN_KEY overrides for test harnesses + dev boxes
+	// that don't have the canonical path. Fail-loud on
+	// missing/insecure perms — silent insecure boots are the
+	// failure mode ADR-038 §Consequences Compatibility calls
+	// out. The actual signer is constructed below (after
+	// storage is wired) via cosign.NewLocalSigner, which does
+	// its own LoadPrivateKeyFile call — the parse is cheap
+	// (PKCS8 in-memory, the previous read is cached by the
+	// kernel), but holding the path string here also lets
+	// NewLocalSigner own the single Load path.
+	signKeyPath := envOr("FAAS_SIGN_KEY", cosign.DefaultSignKeyPath)
+	// Eager mode check: fail-loud BEFORE we touch storage or
+	// the DB pool so a missing sign.key gets the operator-facing
+	// "run `faas keys init`" message without a confusing
+	// storage-dial error stacked on top.
+	if _, err := os.Stat(signKeyPath); err != nil {
+		return fmt.Errorf("imaged: sign key %q: %w (run `faas keys init` to provision)", signKeyPath, err)
+	}
+	log.Info("imaged: build attestation sign key present", "key", signKeyPath)
+
 	// Real registry v2 puller: resolves an image deploy's digest-pinned
 	// reference against the public registry. The HTTP transport enforces
 	// the egress denylist (RFC1918 / link-local / metadata / CGN / SMTP)
@@ -131,6 +155,18 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		log.Info("imaged: storage backend = local", "fc_root", envOr("FAAS_STORAGE_ROOT", "/srv/fc"),
 			"apps_root", appsRoot)
 	}
+
+	// ADR-038: now that storage is wired, construct the production
+	// LocalSigner. NewLocalSigner owns the canonical LoadPrivateKeyFile
+	// call (mode check + PKCS8 parse); the earlier os.Stat guard above
+	// is the eager fail-loud so a missing sign.key gets the
+	// operator-facing "run `faas keys init`" message BEFORE the
+	// storage-backend dial errors confuse the failure surface.
+	signer, err := cosign.NewLocalSigner(signKeyPath, storageBackend, log)
+	if err != nil {
+		return fmt.Errorf("imaged: build signer: %w", err)
+	}
+	builder.WithSigner(signer)
 	// One per-daemon Prometheus registry, shared by the handler
 	// (OCI-pull observations inside aboveBaseLayers + buildImageLayer)
 	// and the /metrics listener below. PR #132 constructed two
@@ -218,11 +254,14 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	}
 	basePath := envOr("FAAS_BUILDER_BASE_PATH", "/srv/fc/base/builder-base.ext4")
 	// #96 / ADR-025 axis 2: EnsureBaseExt4 publishes via the StorageBackend
-	// under sched.BaseKey / sched.BaseDigestKey. basePath is kept as a
-	// resolution target (LocalStorageBackend joins it under FAAS_STORAGE_ROOT)
-	// for one release — the migration slice flips to key-only.
-	baseKey := sched.BaseKey("builder")
-	digestKey := sched.BaseDigestKey("builder")
+	// under sched.BaseKeyForArch / sched.BaseDigestKeyForArch, partitioned
+	// by the imaged binary's host arch (issue #197 B3.3). basePath is kept
+	// as a resolution target (LocalStorageBackend joins it under
+	// FAAS_STORAGE_ROOT) for one release — the migration slice flips to
+	// key-only.
+	arch := imaged.BuilderArch()
+	baseKey := sched.BaseKeyForArch("builder", arch)
+	digestKey := sched.BaseDigestKeyForArch("builder", arch)
 	baseRes, err := h.EnsureBaseExt4(ctx, baseRef, baseKey, digestKey, basePath)
 	if err != nil {
 		return fmt.Errorf("imaged: stage builder base %s → %s: %w", baseRef, basePath, err)
@@ -246,6 +285,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 
 	log.Info("imaged ready",
 		"min_layer_mb", rootfs.MinLayerMB,
+		"arch", arch,
 		"builder_base_path", basePath,
 		"builder_base_ref", baseRef,
 		"builder_base_digest", baseRes.ConfigDigest,

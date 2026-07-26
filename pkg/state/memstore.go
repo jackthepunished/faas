@@ -78,8 +78,14 @@ type MemStore struct {
 	githubBindings map[string]GitHubBinding
 	deployments    map[string]Deployment
 	builds         map[string]Build
-	domains        map[string]CustomDomain
-	crons          map[string]Cron
+	// buildProvenance is the ADR-038 "what ran?" record keyed by
+	// build_id (mirrors build_provenance.build_id UNIQUE). MemStore
+	// holds the same idempotent-replace semantics as PgStore's
+	// ON CONFLICT (build_id) DO UPDATE so a redelivered build
+	// overwrites the same row instead of doubling.
+	buildProvenance map[string]BuildProvenance
+	domains         map[string]CustomDomain
+	crons           map[string]Cron
 	// invocations is the Move 1 event-shaped queue (async_invoke,
 	// queue, delayed_task, cron). MemStore mirrors PgStore's `select
 	// ... for update skip locked` semantics by serialising every access
@@ -126,7 +132,7 @@ type MemStore struct {
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
 	// invoices is the in-memory mirror of the `invoices` table
-	// (migration 00048, issue #259). PR A reads via
+	// (migration 00050, issue #259). PR A reads via
 	// ListInvoicesForAccount; PR B adds the writer
 	// (UpsertInvoice via webhook ingestion). Seeded by tests for
 	// parity-with-pgstore checks.
@@ -218,13 +224,17 @@ type usageMinute struct {
 // Production (PgStore) gets the same row from the migration.
 func NewMemStore() *MemStore {
 	m := &MemStore{
-		accounts:         map[string]Account{},
-		keys:             map[string]APIKey{},
-		keyByHash:        map[string]APIKey{},
-		apps:             map[string]App{},
-		githubBindings:   map[string]GitHubBinding{},
-		deployments:      map[string]Deployment{},
-		builds:           map[string]Build{},
+		accounts:       map[string]Account{},
+		keys:           map[string]APIKey{},
+		keyByHash:      map[string]APIKey{},
+		apps:           map[string]App{},
+		githubBindings: map[string]GitHubBinding{},
+		deployments:    map[string]Deployment{},
+		builds:         map[string]Build{},
+		// buildProvenance is the ADR-038 "what ran?" map keyed by
+		// build_id (mirrors the build_provenance.build_id UNIQUE).
+		// Starts empty; CreateBuildProvenance fills it.
+		buildProvenance:  map[string]BuildProvenance{},
 		domains:          map[string]CustomDomain{},
 		crons:            map[string]Cron{},
 		invocations:      map[string]Invocation{},
@@ -1045,6 +1055,103 @@ func (m *MemStore) InstallationIDForRepo(_ context.Context, repoFullName string)
 	return 0, ErrNotFound
 }
 
+// UpsertGithubInstallBinding mirrors PgStore. The in-memory map is
+// keyed by appID so a second call with the same AppID overwrites.
+// Returns ErrNotFound when the appID doesn't exist.
+func (m *MemStore) UpsertGithubInstallBinding(_ context.Context, b GitHubBinding) error {
+	if b.AppID == "" {
+		return ErrNotFound
+	}
+	if b.BindingID == "" {
+		return fmt.Errorf("state: BindingID required")
+	}
+	if b.AccountID == "" {
+		return fmt.Errorf("state: AccountID required")
+	}
+	if b.LinkedAt.IsZero() {
+		b.LinkedAt = time.Now()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[b.AppID]; !ok {
+		return ErrNotFound
+	}
+	m.githubBindings[b.AppID] = b
+	return nil
+}
+
+// DeleteGithubInstallBinding clears the binding for an app.
+// Idempotent: a no-prior-binding appID updates zero rows and
+// returns nil. Returns ErrNotFound only when the app row itself is
+// missing (matches PgStore's contract).
+func (m *MemStore) DeleteGithubInstallBinding(_ context.Context, appID string) error {
+	if appID == "" {
+		return ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[appID]; !ok {
+		return ErrNotFound
+	}
+	delete(m.githubBindings, appID)
+	return nil
+}
+
+// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+// lookup. Mirrors PgStore. Returns ErrNotFound when no app is bound.
+func (m *MemStore) GithubInstallBindingForRepoBranch(_ context.Context, repoFullName, productionBranch string) (GitHubBinding, error) {
+	if repoFullName == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	if productionBranch == "" {
+		productionBranch = "main"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.githubBindings {
+		if b.RepoFullName == repoFullName && b.ProductionBranch == productionBranch && b.InstallID != 0 {
+			return b, nil
+		}
+	}
+	return GitHubBinding{}, ErrNotFound
+}
+
+// ListGithubInstallBindingsForAccount returns the per-account bind
+// map keyed by appID. Mirrors PgStore.
+func (m *MemStore) ListGithubInstallBindingsForAccount(_ context.Context, accountID string) (map[string]GitHubBinding, error) {
+	out := make(map[string]GitHubBinding)
+	if accountID == "" {
+		return out, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for appID, b := range m.githubBindings {
+		if b.AccountID == accountID && b.InstallID != 0 {
+			out[appID] = b
+		}
+	}
+	return out, nil
+}
+
+// GetGithubInstallBindingForApp mirrors PgStore. accountID scopes
+// the lookup so a forged session can't read another tenant's binding:
+// if the row exists but is bound to a different account, returns
+// ErrNotFound (the same response an unbound app returns, so the
+// caller can't distinguish "not bound" from "wrong account").
+// Returns ErrNotFound when appID or accountID is empty.
+func (m *MemStore) GetGithubInstallBindingForApp(_ context.Context, appID, accountID string) (GitHubBinding, error) {
+	if appID == "" || accountID == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.githubBindings[appID]
+	if !ok || b.InstallID == 0 || b.AccountID != accountID {
+		return GitHubBinding{}, ErrNotFound
+	}
+	return b, nil
+}
+
 // --- Deployments ------------------------------------------------------------
 
 // CreateDeployment mirrors PgStore.CreateDeployment's active-app gate
@@ -1281,6 +1388,29 @@ func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, 
 	return nil
 }
 
+// SetDeploymentSourceURL mirrors the pgstore / migrations/00047 column pair
+// (Tier 3 / issue #197 B3.10). Empty strings are accepted (an image:
+// deploy with no upstream URL is the common case). commit_sha is
+// length-bounded at the DB layer (deployments_commit_sha_len_chk); the
+// memstore enforces the same 64-char cap to keep behaviour aligned
+// with PgStore (otherwise unit tests would let through values the DB
+// would reject, hiding a bug class).
+func (m *MemStore) SetDeploymentSourceURL(_ context.Context, id, sourceURL, commitSHA string) error {
+	if commitSHA != "" && len(commitSHA) > 64 {
+		return fmt.Errorf("state: commit_sha length %d exceeds 64", len(commitSHA))
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.SourceURL = sourceURL
+	d.CommitSHA = commitSHA
+	m.deployments[id] = d
+	return nil
+}
+
 // SetDeploymentFailed mirrors PgStore.SetDeploymentFailed (ADR-021):
 // status pinned to 'failed'; error_code is the RFC 7807 code lifted
 // from pkg/api.SentinelToCode; error keeps the free-text message.
@@ -1373,6 +1503,40 @@ func (m *MemStore) UpdateBuildStatus(_ context.Context, id string, status BuildS
 	}
 	m.builds[id] = b
 	return nil
+}
+
+// CreateBuildProvenance mirrors PgStore.CreateBuildProvenance
+// (ADR-038, Tier 3 / issue #197 B3.1). Idempotent: re-creating a
+// row for an existing build_id overwrites the existing entry in
+// place (mirrors ON CONFLICT (build_id) DO UPDATE). Empty BuildID
+// is a programming error and returns an error so a unit-test path
+// surfaces it instead of producing a malformed key.
+//
+// The build row existence is NOT checked — the populator calls
+// this from a context where the build_id has just been claimed
+// (succeeded), and the schema FK ensures a referential guarantee
+// at the DB level. The MemStore shape trusts the caller.
+func (m *MemStore) CreateBuildProvenance(_ context.Context, prov BuildProvenance) error {
+	if prov.BuildID == "" {
+		return errors.New("state: build_provenance BuildID empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.buildProvenance[prov.BuildID] = prov
+	return nil
+}
+
+// BuildProvenanceByBuildID mirrors PgStore.BuildProvenanceByBuildID.
+// Returns ErrNotFound when no row exists for the build_id — the
+// apid handler renders 404 with code=build_provenance_not_found.
+func (m *MemStore) BuildProvenanceByBuildID(_ context.Context, buildID string) (BuildProvenance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.buildProvenance[buildID]
+	if !ok {
+		return BuildProvenance{}, ErrNotFound
+	}
+	return p, nil
 }
 
 // SweepStuckRunningBuilds mirrors PgStore.SweepStuckRunningBuilds
@@ -1667,6 +1831,69 @@ func (m *MemStore) CreateCron(_ context.Context, appID, schedule, path string, e
 		return Cron{}, fmt.Errorf("state: cron for unknown app %q", appID)
 	}
 	c := Cron{ID: newID(), AppID: appID, Schedule: schedule, Path: path, Enabled: enabled, CreatedAt: time.Now()}
+	m.crons[c.ID] = c
+	return c, nil
+}
+
+// CreateCronIfUnderQuota is the customer-facing variant of
+// CreateCron that enforces the per-app and per-account caps. The
+// MemStore uses a single process-wide mutex so the count-then-insert
+// is implicitly serialised (no TOCTOU); the predicate matches the
+// PgStore one so handler logic stays identical across store backends.
+//
+// Failure modes mirror PgStore:
+//   - *CronQuotaError when either cap trips.
+//   - ErrNotFound when the app row is gone or AppDeleted.
+//   - ErrConflict on a future uuid collision.
+func (m *MemStore) CreateCronIfUnderQuota(_ context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.Status == AppDeleted {
+		return Cron{}, ErrNotFound
+	}
+	// 1. Per-app count. Disabled crons still count toward the cap so
+	//    toggling isn't a way to bypass it.
+	appCount := 0
+	for _, c := range m.crons {
+		if c.AppID == appID {
+			appCount++
+		}
+	}
+	if appCount >= limits.CronLimitPerApp {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeApp,
+			Limit:    limits.CronLimitPerApp,
+			Observed: appCount,
+		}
+	}
+	// 2. Per-account count. Excludes deleted apps so their crons don't
+	//    poison the cap.
+	accountCount := 0
+	for _, c := range m.crons {
+		a, exists := m.apps[c.AppID]
+		if !exists || a.Status == AppDeleted {
+			continue
+		}
+		if a.AccountID == app.AccountID {
+			accountCount++
+		}
+	}
+	if accountCount >= limits.CronLimitPerAccount {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeAccount,
+			Limit:    limits.CronLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+	c := Cron{
+		ID:        newID(),
+		AppID:     appID,
+		Schedule:  schedule,
+		Path:      path,
+		Enabled:   enabled,
+		CreatedAt: time.Now(),
+	}
 	m.crons[c.ID] = c
 	return c, nil
 }

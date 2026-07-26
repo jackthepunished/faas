@@ -145,8 +145,12 @@ func TestVerifyInstallation_Unimplemented(t *testing.T) {
 // envelope. This is the regression test for review finding #2: the
 // apid-side handler MUST receive a real verified=true/false from
 // githubd's api.github.com round-trip, not a hardcoded false.
+//
+// PR-B extends the test to cover the §11 ownership proof: the
+// expected_login round-trips through the proto envelope, and the
+// account_login field is returned on the response.
 func TestVerifyInstallation_PassesThrough(t *testing.T) {
-	svc := &verifyingSvc{verified: true, defaultBranch: "main"}
+	svc := &verifyingSvc{verified: true, accountLogin: "alice", defaultBranch: "main"}
 	srv := grpc.NewServer()
 	githubdgrpc.New(svc, wire.NewOpsMetrics("githubd_test_verify"), nil).Register(srv)
 	lis := bufconn.Listen(1024 * 1024)
@@ -163,7 +167,10 @@ func TestVerifyInstallation_PassesThrough(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	cli := githubdpb.NewGithubdClient(conn)
-	resp, err := cli.VerifyInstallation(context.Background(), &githubdpb.VerifyInstallationRequest{InstallationId: 99})
+	resp, err := cli.VerifyInstallation(context.Background(), &githubdpb.VerifyInstallationRequest{
+		InstallationId: 99,
+		ExpectedLogin:  "alice",
+	})
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -173,8 +180,14 @@ func TestVerifyInstallation_PassesThrough(t *testing.T) {
 	if resp.GetDefaultBranch() != "main" {
 		t.Errorf("default_branch = %q, want main", resp.GetDefaultBranch())
 	}
+	if resp.GetAccountLogin() != "alice" {
+		t.Errorf("account_login = %q, want alice", resp.GetAccountLogin())
+	}
 	if svc.gotInstallID != 99 {
 		t.Errorf("installation_id passed to svc = %d, want 99", svc.gotInstallID)
+	}
+	if svc.gotExpected != "alice" {
+		t.Errorf("expected_login passed to svc = %q, want alice", svc.gotExpected)
 	}
 }
 
@@ -185,13 +198,16 @@ type verifyingSvc struct {
 	githubdgrpc.UnimplementedService
 
 	verified      bool
+	accountLogin  string
 	defaultBranch string
 	gotInstallID  int64
+	gotExpected   string
 }
 
-func (v *verifyingSvc) VerifyInstallation(installationID int64) (bool, string, error) {
+func (v *verifyingSvc) VerifyInstallation(installationID int64, expectedLogin string) (bool, string, string, error) {
 	v.gotInstallID = installationID
-	return v.verified, v.defaultBranch, nil
+	v.gotExpected = expectedLogin
+	return v.verified, v.accountLogin, v.defaultBranch, nil
 }
 
 // TestClientRoundTrip confirms pkg/githubdgrpc.Client (apid's handle)

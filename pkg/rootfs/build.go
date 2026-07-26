@@ -1,7 +1,9 @@
 package rootfs
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -41,14 +43,46 @@ type Runner interface {
 	Run(ctx context.Context, argv []string) error
 }
 
+// Signer signs a published artifact. Wired via WithSigner (nil-safe;
+// nil = no signing — unit tests + the legacy OutImage path). The
+// production wiring is *cosign.LocalSigner from cmd/imaged; ADR-038
+// §Decision names this as the platform's build-attestation seam.
+//
+// Sign is called once per publishExt4 / publishBaseExt4 after the
+// Storage.Put succeeds. The signer owns the storage backend and the
+// sig-key derivation — pkg/rootfs only supplies the canonical
+// layerKey + sigKey pair.
+//
+// Per-key contract: the signer MUST be safe to call from many
+// goroutines (imaged builds layers concurrently per spec §4.6
+// per-app layer write path).
+type Signer interface {
+	Sign(ctx context.Context, layerKey, sigKey string) error
+}
+
 // Builder assembles app layers.
 type Builder struct {
 	run Runner
+	// signer is optional; nil = no signing (legacy / tests).
+	// Wired via WithSigner at cmd/imaged startup; never nil-checked
+	// inline (signer == nil short-circuits in publishExt4 +
+	// publishBaseExt4).
+	signer Signer
 }
 
 // NewBuilder wires a Builder with the command runner used for mkfs.
 func NewBuilder(run Runner) *Builder {
 	return &Builder{run: run}
+}
+
+// WithSigner attaches the build-attestation signer. Called from
+// cmd/imaged after loading /etc/faas/secrets/sign.key (fail-loud
+// at startup per ADR-038 §Consequences). Passing nil clears the
+// signer (unit tests + the legacy OutImage path that never
+// publishes to Storage).
+func (b *Builder) WithSigner(s Signer) *Builder {
+	b.signer = s
+	return b
 }
 
 // BuildInput is one app-layer build.
@@ -126,8 +160,27 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 	// /usr/local/bin/faas-runner. Both default to no-op for the plain
 	// image path so existing callers don't change.
 	if in.TarballPath != "" {
-		if err := ApplyTarball(staging, in.TarballPath); err != nil {
-			return BuildResult{}, fmt.Errorf("rootfs: apply function tarball: %w", err)
+		// Issue #197 B3.7: cap the function tarball's cumulative unpacked
+		// size at the plan's app-layer cap. The apid-side upload cap
+		// (SourceTarballMaxMB) guards the on-disk tarball size; this cap
+		// guards the post-unpack size so a small gzipped tarball can't
+		// expand past the plan limit.
+		capBytes := int64(limits.AppLayerMaxMB) * 1024 * 1024
+		if err := ApplyTarball(staging, in.TarballPath, capBytes); err != nil {
+			// Promote the sentinel to the plan-scoped RFC 7807 Problem
+			// so the customer-facing deploy failure carries the limit +
+			// observed value + docs URL instead of a generic "function
+			// tarball exceeds cap" string. The post-unpack observed size
+			// is `Written + Entry` — the total that would have been
+			// written had we not aborted (matches the message at the
+			// ErrTarballExceedsCap site). Mirrors CheckCap's
+			// api.ErrAppLayerTooLarge return at size.go:74 so callers
+			// see the same Problem shape for both cap violations.
+			var capErr *ErrTarballExceedsCap
+			if errors.As(err, &capErr) {
+				return BuildResult{}, api.ErrAppLayerTooLarge(limits, capErr.WrittenBytes+capErr.EntryBytes)
+			}
+			return BuildResult{}, err
 		}
 	}
 	if in.FunctionRunnerPath != "" {
@@ -218,6 +271,20 @@ func (b *Builder) publishExt4(ctx context.Context, in BuildInput, staging string
 	if err := in.Storage.Put(ctx, in.StorageKey, f); err != nil {
 		return fmt.Errorf("rootfs: publish %q: %w", in.StorageKey, err)
 	}
+	// ADR-038: sign the published ext4 so schedd's cold-boot verify
+	// (pkg/cosign.LocalVerifier) can detect tampering. Signing
+	// failure is build-fatal — an unsigned layer cannot be cold-
+	// booted; the verify side rejects with code=sig_invalid. We
+	// don't surface a softer fallback (e.g. skip signing and let
+	// the customer hit 503 on first wake) because the gap from
+	// "no signature written" to "schedd accepted the unsigned
+	// layer" is the compromise path the sig is meant to close.
+	if b.signer != nil {
+		sigKey := "sigs/" + in.StorageKey + ".sig"
+		if err := b.signer.Sign(ctx, in.StorageKey, sigKey); err != nil {
+			return fmt.Errorf("rootfs: sign %q: %w", in.StorageKey, err)
+		}
+	}
 	return nil
 }
 
@@ -282,8 +349,27 @@ func InjectGuestInit(staging, guestInitPath string) error {
 // (handler.js / handler.py). Path-escape protection reuses the
 // ApplyLayerGz allowlist so a malicious tarball can't escape /app.
 //
+// capBytes is the cumulative unpacked-size cap (issue #197 B3.7). The
+// apid-side upload cap (SourceTarballMaxMB) guards the ON-DISK tarball
+// size, but a gzipped tarball can expand dramatically when unpacked
+// (the customer uploads node_modules and the layer blows past the
+// drive1 cap). Pass 0 to skip the cap (legacy callers + tests).
+//
+// Returns ErrTarballExceedsCap (errors.As-detectable) when the
+// cumulative unpacked bytes exceed capBytes. The cap is enforced
+// after each entry so a 10 GB tarball is rejected without writing the
+// full 10 GB to disk — the per-entry io.CopyN in applyEntry is the
+// inner bound, this is the outer bound. The cap is on DECLARED tar
+// header sizes, not actual streamed bytes: a malicious tarball
+// declaring hdr.Size=1 with a 1 GB body would only consume the
+// declared 1 byte toward the cap (the io.CopyN is the inner
+// streamer-side guard). Build() above promotes the sentinel to
+// api.ErrAppLayerTooLarge(*Problem) with the plan in context;
+// direct callers (e.g. unit tests) can errors.As against
+// *ErrTarballExceedsCap to inspect WrittenBytes / EntryBytes.
+//
 //nolint:forbidigo // tarballPath is the apid-spooled path under spoolRoot() that already passed apid's validateTarballShape (in cmd/apid/deploy_inputs.go) — bytes are validated before builderd opens them; symlink-attack on the open itself is impossible because apid wrote the file via os.Create above with a fresh random id. The "customer" framing in the doc comment refers to the *contents* of the tarball (handler code), not the file path on disk.
-func ApplyTarball(staging, tarballPath string) error {
+func ApplyTarball(staging, tarballPath string, capBytes int64) error {
 	f, err := os.Open(tarballPath)
 	if err != nil {
 		return fmt.Errorf("rootfs: open tarball: %w", err)
@@ -293,7 +379,82 @@ func ApplyTarball(staging, tarballPath string) error {
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		return err
 	}
-	return ApplyLayerGz(appDir, f)
+	if capBytes <= 0 {
+		return ApplyLayerGz(appDir, f)
+	}
+	return applyTarballWithCap(appDir, f, capBytes)
+}
+
+// ErrTarballExceedsCap is the sentinel returned by ApplyTarball when a
+// function tarball's cumulative unpacked bytes exceed the cap. Callers
+// can errors.As against it to translate to the plan-scoped
+// api.ErrAppLayerTooLarge Problem.
+//
+// The cap is on DECLARED tar header sizes (issue #197 B3.7); a
+// tarball whose entries lie about hdr.Size would under-report toward
+// the cap but still be bounded by the per-entry io.CopyN inner
+// guard. See ApplyTarball's doc for the full story.
+type ErrTarballExceedsCap struct {
+	WrittenBytes int64
+	EntryBytes   int64
+	CapBytes     int64
+}
+
+func (e *ErrTarballExceedsCap) Error() string {
+	return fmt.Sprintf("function tarball exceeds cap: %d bytes written, %d declared in next entry, %d cap", e.WrittenBytes, e.EntryBytes, e.CapBytes)
+}
+
+// Is implements errors.Is so callers can promote with errors.Is(err, &ErrTarballExceedsCap{}).
+func (e *ErrTarballExceedsCap) Is(target error) bool {
+	_, ok := target.(*ErrTarballExceedsCap)
+	return ok
+}
+
+// applyTarballWithCap is the cap-aware variant of ApplyTarball. It
+// streams the tar, accumulates each entry's declared Size into
+// `written`, and bails with *ErrTarballExceedsCap once the running
+// total overshoots capBytes. Symlinks and char devices contribute 0
+// bytes (no file system allocation); the cap is on the on-disk size
+// post-unpack, which is what the AppLayerMaxMB limit already
+// constrains.
+func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("rootfs: gzip: %w", err)
+	}
+	defer func() { _ = zr.Close() }()
+	tr := tar.NewReader(zr)
+	var written int64
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("rootfs: read tar: %w", err)
+		}
+		// Symlinks / char devices / fifos / hardlinks don't allocate
+		// on-disk bytes for the consumer's quota. Cap is on the
+		// post-unpack size, which is what AppLayerMaxMB enforces.
+		if hdr.Typeflag == tar.TypeReg {
+			if written+hdr.Size > capBytes {
+				return &ErrTarballExceedsCap{
+					WrittenBytes: written,
+					EntryBytes:   hdr.Size,
+					CapBytes:     capBytes,
+				}
+			}
+			written += hdr.Size
+		}
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
+		target, err := safeJoin(dst, hdr.Name)
+		if err != nil {
+			return err
+		}
+		if err := applyEntry(dst, target, hdr, tr); err != nil {
+			return err
+		}
+	}
 }
 
 // InjectFunctionRunner copies the function runner binary at

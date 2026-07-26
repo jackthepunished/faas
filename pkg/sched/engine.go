@@ -59,6 +59,19 @@ const (
 	DestroyTimeout = 10 * time.Second
 )
 
+// LayerVerifier checks that a cold-boot layer's signature is
+// valid. The local interface keeps pkg/sched decoupled from
+// pkg/cosign (the verifier impl); the production wiring is
+// *cosign.LocalVerifier, constructed in cmd/schedd/main.go.
+//
+// Returning *api.Problem with code=sig_invalid means "refuse to
+// boot this layer" — the engine transitions the deployment to
+// DeployFailed and returns 503 to gatewayd. Any other error is a
+// transient I/O failure; the caller decides whether to retry.
+type LayerVerifier interface {
+	Verify(ctx context.Context, layerKey, sigKey string) error
+}
+
 // bootTimeout returns the §6.1 budget for a vmmd call when the row is
 // in the given state. Unknown states get the cold-boot budget
 // (conservative); never returns zero.
@@ -116,6 +129,14 @@ type Engine struct {
 	fcVer  string // running Firecracker version — snapshots load only on a match (ADR-005)
 	log    *slog.Logger
 	ops    *wire.OpsMetrics // nil is tolerated by KillStuck (skip the counter increment)
+	// verifier is the build-attestation verifier (ADR-038 / Tier 3
+	// phase 3). Wired via WithVerifier after NewEngine returns;
+	// nil means "skip verification" — kept for the unit tests
+	// that never reach the wake site (the schedule-load and
+	// watchdog tests exercise only Ledger + StateMachine). The
+	// production path (cmd/schedd/main.go) fails to start if the
+	// verifier is nil — see WithVerifier's doc.
+	verifier LayerVerifier
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
@@ -207,6 +228,17 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 // counter. Returns the engine for builder-style wiring.
 func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 	e.ops = ops
+	return e
+}
+
+// WithVerifier attaches the build-attestation verifier. Production
+// wiring is in cmd/schedd/main.go (which fails to start on a
+// nil / missing pub-key path). Tests that never reach the wake
+// site (scheduler-load + watchdog tests) leave this nil — the
+// verify call is gated on `e.verifier != nil` so the absence is
+// benign for the unit-test surface.
+func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
+	e.verifier = v
 	return e
 }
 
@@ -523,6 +555,45 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	}
 	release()
 
+	// ADR-038 / Tier 3 phase 3: cold-boot layer attestation. The
+	// layer key in spec is the same key imaged signed in
+	// pkg/rootfs/publishExt4 — verify reads the sig from storage
+	// and checks ECDSA-P-256 over SHA-256(layer). On mismatch the
+	// verifier returns *api.Problem with code=sig_invalid; we
+	// transition the deployment to DeployFailed (spec §6 failure
+	// path) and surface the same Problem to the caller — the
+	// gateway renders it as 503.
+	if e.verifier != nil {
+		if err := e.verifier.Verify(ctx, spec.LayerKey, "sigs/"+spec.LayerKey+".sig"); err != nil {
+			var p *api.Problem
+			if errors.As(err, &p) && p.Code == api.CodeSigInvalid {
+				e.log.Warn("wake: rejecting tampered layer",
+					"app", appID, "layer", spec.LayerKey, "err", err)
+				e.transitionWithKind(ctx, bootInput.insID, appID, state.StateFailed, "wake_boot_error", "sig_invalid")
+				e.ledger.Release(bootInput.insID)
+				return WakeResult{}, err
+			}
+			// Transient I/O — fail the boot but don't mark the
+			// layer compromised. Same shape as the vmmd
+			// round-trip failure path below: transition + release.
+			// Wrap in a *api.Problem so gatewayd's writeWakeError
+			// sees a Problem (and therefore writes through to the
+			// client with Retry-After) instead of falling through
+			// to its ErrCapacity fallback that lacks the header
+			// (review finding #1a on PR #322). The detail
+			// preserves the underlying storage error verbatim so
+			// log greps still find it.
+			e.log.Warn("wake: verifier i/o error",
+				"app", appID, "layer", spec.LayerKey, "err", err)
+			e.transitionWithKind(ctx, bootInput.insID, appID, state.StateFailed, "wake_boot_error", "sig_verify_io")
+			e.ledger.Release(bootInput.insID)
+			return WakeResult{}, api.NewProblem(503, api.CodeCapacity,
+				"signature verification storage error",
+				fmt.Sprintf("verifier I/O error for layer %q: %v (retry shortly)", spec.LayerKey, err)).
+				WithHeader("Retry-After", "5")
+		}
+	}
+
 	// ── Phase 3: drop the lock, do the slow vmmd RPC ──────────────
 	var out *WakeOutcome
 	bootCtx, cancel := context.WithTimeout(ctx, e.budgetFor(bootInput.initState))
@@ -831,6 +902,38 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		// wake.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
 	}
+	// ADR-038 / Tier 3 phase 3: same verify path as Wake. Prime
+	// is the deploy-pipeline first boot; a tampered layer here
+	// means imaged shipped something that should never have been
+	// allowed out, so the verifier rejection transitions the
+	// deployment to DeployFailed the same way. The sig key
+	// derivation matches pkg/rootfs/publishExt4's
+	// "sigs/<layerKey>.sig" convention.
+	if e.verifier != nil {
+		if err := e.verifier.Verify(ctx, spec.LayerKey, "sigs/"+spec.LayerKey+".sig"); err != nil {
+			var p *api.Problem
+			if errors.As(err, &p) && p.Code == api.CodeSigInvalid {
+				e.log.Warn("prime: rejecting tampered layer",
+					"app", appID, "layer", spec.LayerKey, "err", err)
+				e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_sig_invalid")
+				e.ledger.Release(ins.ID)
+				return err
+			}
+			// Transient I/O — same Retry-After shape as the Wake
+			// branch. Wrap as a Problem so gatewayd's writeWakeError
+			// flushes both status + header in one path (review
+			// finding #1a on PR #322).
+			e.log.Warn("prime: verifier i/o error",
+				"app", appID, "layer", spec.LayerKey, "err", err)
+			e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_sig_verify_io")
+			e.ledger.Release(ins.ID)
+			return api.NewProblem(503, api.CodeCapacity,
+				"signature verification storage error",
+				fmt.Sprintf("verifier I/O error for layer %q: %v (retry shortly)", spec.LayerKey, err)).
+				WithHeader("Retry-After", "5")
+		}
+	}
+
 	// Per-call deadline (commit 1, spec §6.1). Same rationale as Wake:
 	// Prime's vmmd call gets the ColdBootTimeout budget — a Prime
 	// that takes longer is dead and the operator should restart

@@ -418,7 +418,7 @@ func (a *grpcSvcAdapter) WriteCheck(repoFullName, commitSHA string, phase github
 // a silent false because the webhook svc has no OAuth credentials
 // and we don't want a misconfigured wiring to silently 200 an
 // unverified install_id.
-func (a *grpcSvcAdapter) VerifyInstallation(installationID int64) (bool, string, error) {
-	a.svc.Log.Warn("githubd grpc VerifyInstallation via webhook svc (no OAuth)", "installation_id", installationID)
-	return false, "", fmt.Errorf("githubd: VerifyInstallation requires the slice-8 OAuth path (install=%d)", installationID)
+func (a *grpcSvcAdapter) VerifyInstallation(installationID int64, expectedLogin string) (bool, string, string, error) {
+	a.svc.Log.Warn("githubd grpc VerifyInstallation via webhook svc (no OAuth)", "installation_id", installationID, "expected_login", expectedLogin)
+	return false, "", "", fmt.Errorf("githubd: VerifyInstallation requires the slice-8 OAuth path (install=%d)", installationID)
 }

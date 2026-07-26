@@ -431,6 +431,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeployment))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
+	// Builds (ADR-038). The provenance route is the only /v1/builds
+	// surface today; deployments.id remains the parent resource.
+	// Build:read scope (api.ScopesReadSurface) gates the read.
+	mux.HandleFunc("GET /v1/builds/{id}/provenance", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildProvenance)))
 	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.rollbackApp)))))
 	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.parkApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.wakeApp))))
@@ -644,6 +648,16 @@ func (s *server) handler() http.Handler {
 	mux.Handle("GET /dashboard/", s.dashboardChain(s.sessionAuth(s.dashboardHandler(s.log))))
 	mux.Handle("GET /dashboard", s.dashboardChain(s.sessionAuth(s.dashboardHandler(s.log))))
 
+	// PR-B bind picker UX (handlers_install_github.go). Both routes
+	// are cookie-session-authenticated (NOT API-key auth — the
+	// dashboard renders them, no Bearer token is in scope) and
+	// share the §11 middleware stack via dashboardChain. They live
+	// under /v1/* so cmd/gatewayd/proxy.go:isApidPath already
+	// forwards them; the §11 anti-takeover proof (session.github_login
+	// == install.account.login) is enforced in the handlers.
+	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
+	mux.Handle("POST /v1/apps/{slug}/install/bind", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.bindAppToRepo))))
+
 	// G6 dashboard delete/restore (spec §17 G6, ADR-021). Both POSTs
 	// require the confirm_token form field (validated inside the
 	// handler) and sit behind sessionAuth so the call is anchored to
@@ -774,6 +788,28 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			op = "unmatched"
 		}
 		s.ops.Observe(op, time.Since(start), observeErrFromStatus(rec.status))
+		// Issue #303 / ADR-039: feed the per-customer request-total
+		// counter on every request (success and failure). The counter
+		// is the per-request total — paired with requestFailures
+		// (status >= 400 only) for the error-rate view. The §12
+		// traffic-anomaly recording rules (faas_apid_request_rate_5m,
+		// _error_rate_5m, _3d_baseline, _ratio) read from this
+		// counter plus the code label. The code label is derived
+		// observeErrFromStatus-style: 2xx/3xx → "ok", 4xx/5xx → "err".
+		//
+		// account_id resolution reuses the same principalFrom(r)
+		// chain as RequestFailureFor below — empty resolves to
+		// "anonymous" via the bounded admission set; ids past the cap
+		// collapse to "__other__". The two counters share the same
+		// accountLabelSet so a customer is represented by their real
+		// id in both, or by "__other__" in both.
+		{
+			acct := "anonymous"
+			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+				acct = p.Acct.ID
+			}
+			s.ops.RequestTotalFor(r, rec.status, acct).Inc()
+		}
 		// Issue #278: also feed the per-customer request-failure
 		// counter when the response status indicates a client or
 		// server error. 4xx/5xx are the signal; 1xx-3xx never count.

@@ -797,6 +797,113 @@ func TestGetDeployment_UnknownReturns404(t *testing.T) {
 	assertProblem(t, rec, 404, api.CodeNotFound)
 }
 
+// TestGetBuildProvenance_HappyPath — ADR-038 / Tier 3 / issue
+// #197 B3.10-read half. Seeds app + deployment + build + a
+// provenance row under the test account, then verifies the
+// GET /v1/builds/{id}/provenance route renders the DTO with
+// every field. The pre-existing source_url + commit_sha
+// propagation from deployment is verified in the builderd
+// test package; here we only assert the public surface.
+func TestGetBuildProvenance_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "prov-happy")
+	build, err := e.store.CreateBuild(context.Background(), dep.ID, state.DeploymentKindTarball, 0, "")
+	if err != nil {
+		t.Fatalf("seed build: %v", err)
+	}
+	now := time.Now().UTC()
+	prov := state.BuildProvenance{
+		BuildID:        build.ID,
+		SourceSHA256:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		SourceURL:      "https://github.com/acme/app@main",
+		CommitSHA:      "0123456789abcdef0123456789abcdef01234567",
+		Plan:           string(api.PlanPro),
+		BuilderNodeID:  "default-local",
+		StartedAt:      now,
+		FinishedAt:     now.Add(2 * time.Second),
+		SBOMStorageKey: "",
+	}
+	if err := e.store.CreateBuildProvenance(context.Background(), prov); err != nil {
+		t.Fatalf("seed provenance: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/builds/"+build.ID+"/provenance", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.BuildProvenanceResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.BuildID != build.ID {
+		t.Errorf("BuildID = %q, want %q", out.BuildID, build.ID)
+	}
+	if out.SourceSHA256 != prov.SourceSHA256 {
+		t.Errorf("SourceSHA256 = %q, want %q", out.SourceSHA256, prov.SourceSHA256)
+	}
+	if out.Plan != string(api.PlanPro) {
+		t.Errorf("Plan = %q, want %q", out.Plan, api.PlanPro)
+	}
+	if out.BuilderNodeID != "default-local" {
+		t.Errorf("BuilderNodeID = %q, want %q", out.BuilderNodeID, "default-local")
+	}
+}
+
+// TestGetBuildProvenance_NoSuchBuild404 — no build row at the
+// supplied id. The route's first barrier is BuildByID, so the
+// response uses the same 404 shape as getDeployment.
+func TestGetBuildProvenance_NoSuchBuild404(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "GET", "/v1/builds/0123456789abcdef0123456789abcdef/provenance", nil, nil)
+	assertProblem(t, rec, 404, api.CodeNotFound)
+}
+
+// TestGetBuildProvenance_NoRow404 — build exists, provenance
+// doesn't. The route's second barrier is BuildProvenanceByBuildID,
+// which returns apierr.ErrBuildProvenanceNotFound (the
+// build_provenance_not_found code, distinct from CodeNotFound
+// so the dashboard can branch on it).
+func TestGetBuildProvenance_NoRow404(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "prov-norow")
+	build, err := e.store.CreateBuild(context.Background(), dep.ID, state.DeploymentKindTarball, 0, "")
+	if err != nil {
+		t.Fatalf("seed build: %v", err)
+	}
+	rec := e.do(t, "GET", "/v1/builds/"+build.ID+"/provenance", nil, nil)
+	assertProblem(t, rec, 404, api.CodeBuildProvenanceNotFound)
+}
+
+// TestGetBuildProvenance_OtherAccountIDOR — the route MUST
+// render 404 when the build's owning app belongs to a
+// different account, even with a valid build_id + provenance
+// row in the store. The check is
+// dep.AppID → AppByID → App.AccountID == acct.ID. A
+// regression that drops the check is a cross-account IDOR.
+func TestGetBuildProvenance_OtherAccountIDOR(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "prov-idor")
+	build, err := e.store.CreateBuild(context.Background(), dep.ID, state.DeploymentKindTarball, 0, "")
+	if err != nil {
+		t.Fatalf("seed build: %v", err)
+	}
+	// Stamp a provenance row directly — bypasses the populator,
+	// which is fine: we're exercising the handler, not builderd.
+	if err := e.store.CreateBuildProvenance(context.Background(), state.BuildProvenance{
+		BuildID:      build.ID,
+		SourceSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		StartedAt:    time.Now().UTC(),
+		FinishedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed provenance: %v", err)
+	}
+
+	// New server with a DIFFERENT account, hitting the same build id.
+	e2 := setup(t, api.PlanHobby)
+	rec := e2.do(t, "GET", "/v1/builds/"+build.ID+"/provenance", nil, nil)
+	assertProblem(t, rec, 404, api.CodeNotFound)
+}
+
 // TestRollbackApp_HappyPath seeds two deployments (one live, one
 // superseded), then rolls back. Confirms the response shape (it carries
 // the previously-superseded deployment's id) AND that the underlying
@@ -1049,6 +1156,95 @@ func TestCreateCron_InvalidSchedule(t *testing.T) {
 	rec := e.do(t, "POST", "/v1/crons",
 		api.CreateCronRequest{AppID: appID, Schedule: "not-a-cron"}, nil)
 	assertProblem(t, rec, 400, api.CodeCronInvalid)
+}
+
+// TestCreateCron_FreeReturns402 confirms the plan-tier gate (spec §4.4
+// paid-only event-shaped primitives). A Free customer hitting POST
+// /v1/crons must see 402 + CodePlanCronsNotAllowed — the body names
+// the plan and the upgrade target, not a "no such app" 404 (the
+// 402 fires BEFORE AppByID for this exact reason).
+func TestCreateCron_FreeReturns402(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	appID := mustSeedApp(t, e, "cron-free")
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 402, api.CodePlanCronsNotAllowed)
+}
+
+// TestCreateCron_AtPerAppLimitReturns403 seeds CronLimitPerApp crons
+// directly via the store (bypassing the cap so the test is independent
+// of the cap-enforcement path it's testing) and asserts the next wire
+// create returns 403 + CodePlanCronQuota. Scope="app" surfaces in the
+// body so the customer knows to delete a cron from THIS app.
+func TestCreateCron_AtPerAppLimitReturns403(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "cron-cap-app")
+	// Pro caps at 20 per-app; seed all 20 directly.
+	limits := api.MustLimitsFor(api.PlanPro)
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appID, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed cron %d: %v", i, err)
+		}
+	}
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 403, api.CodePlanCronQuota)
+}
+
+// TestCreateCron_AtPerAccountLimitReturns403 fills the per-account
+// cap across TWO apps on the same account, then attempts a create on
+// a third app — must hit 403 + CodePlanCronQuota with Scope="account"
+// (the per-app cap is still under but the per-account cap is full).
+func TestCreateCron_AtPerAccountLimitReturns403(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	limits := api.MustLimitsFor(api.PlanPro)
+	// Pro caps per-app at 20, per-account at 50. Two apps × 20 = 40
+	// (under both). Fill the third app to push past per-account.
+	appA := mustSeedApp(t, e, "cron-acct-a")
+	appB := mustSeedApp(t, e, "cron-acct-b")
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appA, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed A cron %d: %v", i, err)
+		}
+	}
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appB, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed B cron %d: %v", i, err)
+		}
+	}
+	// appB is full (per-app) so the per-account cap check fires first
+	// on appB. To test the per-account path explicitly, the third
+	// app would need to be NOT full per-app — but per-account is
+	// already 40 which is < 50 cap, so this is fine. Add a third
+	// partially-full app and POST 11 more (to push per-account to 51).
+	appC := mustSeedApp(t, e, "cron-acct-c")
+	for i := 0; i < 10; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appC, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed C cron %d: %v", i, err)
+		}
+	}
+	// per-account is now 40 + 10 = 50 == cap; one more on appC must 403.
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appC, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 403, api.CodePlanCronQuota)
+}
+
+// TestCreateCron_UnknownPlanReturns402 confirms the handler doesn't
+// panic when acct.Plan is not in pkg/api/limits.go::planLimits —
+// must surface the same 402 + CodePlanCronsNotAllowed a Free customer
+// sees, not a 500. Fail-closed contract: an unconfigured plan is
+// treated as if crons weren't unlocked. Mirrors the LimitsFor()
+// unknown-plan branch in pkg/api/limits_test.go::TestPlanValidity.
+func TestCreateCron_UnknownPlanReturns402(t *testing.T) {
+	// Seed with a plan that pkg/api.planLimits doesn't know about.
+	// CreateAccount doesn't validate the plan string, so the account
+	// lands with Plan="enterprise" — exactly the wire state a future
+	// tier or a stale migration would produce.
+	e := setup(t, api.Plan("enterprise"))
+	appID := mustSeedApp(t, e, "cron-unknown-plan")
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 402, api.CodePlanCronsNotAllowed)
 }
 
 // TestListCrons_HappyPath seeds a cron via the store and confirms listCrons

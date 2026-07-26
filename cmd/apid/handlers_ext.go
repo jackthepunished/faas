@@ -609,6 +609,23 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)"))
 		return
 	}
+	// Plan-tier gate (spec §4.4 / paid-only event-shaped primitives).
+	// Fires BEFORE AppByID so a Free customer gets a clean 402 rather
+	// than a 404 (no app can be theirs anyway, but the wire shape
+	// matters: the 402 carries the upgrade-to-Hobby copy the dashboard
+	// renders). The store-level check still reads CronLimitPerApp==0
+	// as a fail-closed defence in depth.
+	//
+	// Use LimitsFor (not MustLimitsFor) so an unknown acct.Plan — a
+	// future tier that hasn't been added to pkg/api/limits.go yet, or
+	// a migration that wrote a stale plan value — surfaces as a clean
+	// 402 rather than a process panic → 500. Fail-closed: an unknown
+	// plan is treated as if crons weren't unlocked.
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok || limits.CronLimitPerApp == 0 {
+		api.WriteProblem(w, api.ErrPlanCronsNotAllowed(acct.Plan))
+		return
+	}
 	app, err := s.store.AppByID(ctx(r), req.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
@@ -622,9 +639,17 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	if path == "" {
 		path = "/"
 	}
-	c, err := s.store.CreateCron(ctx(r), req.AppID, req.Schedule, path, enabled)
+	c, err := s.store.CreateCronIfUnderQuota(ctx(r), req.AppID, req.Schedule, path, enabled, limits)
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("could not create cron"))
+		var qe *state.CronQuotaError
+		switch {
+		case errors.As(err, &qe):
+			api.WriteProblem(w, api.ErrPlanCronQuota(acct.Plan, string(qe.Scope), qe.Limit, qe.Observed))
+		case errors.Is(err, state.ErrNotFound):
+			s.notFound(w, "no such app")
+		default:
+			api.WriteProblem(w, api.ErrCapacity("could not create cron"))
+		}
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"created","app_id":"`+app.ID+`"}`)
@@ -1242,6 +1267,30 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	}
 }
 
+// buildProvenanceResponse renders a state.BuildProvenance as the
+// public DTO (ADR-038). Field-by-field mirror; timestamps render
+// as RFC3339 UTC strings. Empty strings (cache-hit builds today;
+// pre-Phase-3 builds once Phase 3 ships) pass through as-is so the
+// customer can branch on <field> != "".
+func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProvenanceResponse {
+	return api.BuildProvenanceResponse{
+		ID:             p.ID,
+		BuildID:        p.BuildID,
+		BuildkitVer:    p.BuildkitVer,
+		RailpackVer:    p.RailpackVer,
+		BaseDigest:     p.BaseDigest,
+		SourceSHA256:   p.SourceSHA256,
+		SourceURL:      p.SourceURL,
+		CommitSHA:      p.CommitSHA,
+		Plan:           p.Plan,
+		RunnerDigest:   p.RunnerDigest,
+		BuilderNodeID:  p.BuilderNodeID,
+		StartedAt:      p.StartedAt.UTC().Format(time.RFC3339),
+		FinishedAt:     p.FinishedAt.UTC().Format(time.RFC3339),
+		SBOMStorageKey: p.SBOMStorageKey,
+	}
+}
+
 func instanceResponse(ins state.Instance) api.InstanceResponse {
 	r := api.InstanceResponse{
 		ID:           ins.ID,
@@ -1735,4 +1784,44 @@ func startSSE(w http.ResponseWriter) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
+}
+
+// getBuildProvenance returns the ADR-038 provenance row for a build
+// (Tier 3 / issue #197 B3.10-read half). Two-step ownership check:
+// BuildByID → DeploymentByID → AppByID, comparing App.AccountID against
+// the requesting account. A mismatch renders 404 with the same
+// envelope getDeployment uses ("no such build") so IDOR probes
+// can't enumerate cross-account build ids (security round-4 finding).
+//
+// A build with no provenance row (pre-PR build, or successful
+// build whose populator INSERT failed and was logged at WARN
+// inside builderd.recordProvenance) renders 404 with code
+// build_provenance_not_found — distinct from "no such build"
+// so the customer can branch on the difference.
+//
+// Per ADR-034 rev2 the route is gated by the same `build:read`
+// scope the rest of the build surface uses.
+func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	build, err := s.store.BuildByID(ctx(r), id)
+	if err != nil {
+		s.notFound(w, "no such build")
+		return
+	}
+	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
+	if err != nil {
+		s.notFound(w, "no such build")
+		return
+	}
+	app, err := s.store.AppByID(ctx(r), dep.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such build")
+		return
+	}
+	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrBuildProvenanceNotFound())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.buildProvenanceResponse(prov))
 }

@@ -238,10 +238,20 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Mint session cookie. IAM-2: stamp mfa_pending=true if the
-	// account has the policy flag set but has not yet enrolled.
-	// Same flip as handlers_google.go; see the comment there.
-	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
+	// Mint session cookie.
+	//
+	// IAM-2: stamp mfa_pending=true if the account has the policy
+	// flag set but has not yet enrolled. Same flip as
+	// handlers_google.go; see the comment there.
+	//
+	// PR-B §11 ownership proof: the dashboard session must carry the
+	// GitHub login we just verified, so the /oauth/callback handler
+	// can compare it to the install's account.login. SealGithubLogin
+	// seals the envelope with both the mfa_pending flag AND the
+	// github_login field in a single crypto round (no double-seal).
+	// The cookie shape is unchanged for callers that don't read
+	// either field (both JSON tags are `omitempty`).
+	cookie, err := s.sessions.SealGithubLogin(acct.ID, githubUser.Login, mfaEnrollRequired(acct))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

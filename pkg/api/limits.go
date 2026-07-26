@@ -122,6 +122,24 @@ type Limits struct {
 	MaxSourceBytesPerInvocation int
 	AsyncInvokeAllowed          bool
 
+	// Cron limits (spec §4.4 / event-shaped surface). Two independent
+	// caps; both populated for every plan, Free is 0/0 so the
+	// per-store check returns QuotaError immediately. The handler
+	// also gates Free to 402 via ErrPlanCronsNotAllowed before
+	// reaching the store; the store still reads 0/0 from Limits
+	// and refuses (defence in depth).
+	//
+	// CronLimitPerApp caps how many crons a single app may hold at
+	// any moment.
+	//
+	// CronLimitPerAccount caps how many crons an account may hold
+	// across all its apps. Independent of CronLimitPerApp — the
+	// per-account cap defends against the N-apps-times-cap-per-app
+	// bypass. Both enforced under the same apps-row lock in
+	// pkg/state.PgStore.CreateCronIfUnderQuota.
+	CronLimitPerApp     int
+	CronLimitPerAccount int
+
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
 	// allowlist opt-out because the abuse-desk use case is a
@@ -151,10 +169,14 @@ type Limits struct {
 //	Scale 100/20 / 1024 / 1500
 var planLimits = map[Plan]Limits{
 	PlanFree: {
-		Plan:                PlanFree,
-		DeployedApps:        1,
-		MaxConcurrency:      1,
-		RAMMB:               128,
+		Plan:           PlanFree,
+		DeployedApps:   1,
+		MaxConcurrency: 1,
+		RAMMB:          128,
+		// AppLayerMaxMB 256 — Free is the lowest cap tier; spec §1 ("App-
+		// layer build ... Free 256 MB") and the limits table both read 256
+		// (PR #241 spec-drift audit, 2026-07-26). This is a no-op
+		// alignment comment; the value was 256 before this audit too.
 		AppLayerMaxMB:       256,
 		SourceTarballMaxMB:  100,
 		VCPU:                2,
@@ -178,6 +200,12 @@ var planLimits = map[Plan]Limits{
 		// up" trigger on a 1-concurrency plan is meaningless.
 		ScaleUpTargetRPSAllowed: false,
 		ScaleUpTargetCPUAllowed: false,
+		// Cron: Free has no crons (spec §4.4 paid-only, like async
+		// invoke). Handler returns 402 ErrPlanCronsNotAllowed before
+		// the store is touched; the 0/0 here is a defence-in-depth
+		// value the store still reads.
+		CronLimitPerApp:     0,
+		CronLimitPerAccount: 0,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -207,6 +235,12 @@ var planLimits = map[Plan]Limits{
 		// without a min_instances floor" is unbounded on Hobby.
 		ScaleUpTargetRPSAllowed: true,
 		ScaleUpTargetCPUAllowed: false,
+		// Cron: Hobby gets a small per-app budget (5) and a per-account
+		// budget that absorbs ~2 Hobby-tier apps (10). Tracks the
+		// Hobby apps cap (5) with headroom for the cron-example
+		// template's tutorials.
+		CronLimitPerApp:     5,
+		CronLimitPerAccount: 10,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -240,6 +274,12 @@ var planLimits = map[Plan]Limits{
 		// min_instances floor" cost shape.
 		ScaleUpTargetRPSAllowed: true,
 		ScaleUpTargetCPUAllowed: true,
+		// Cron: Pro gets 20 per-app and 50 per-account. The per-app
+		// ceiling is 4× Hobby (5→20); the per-account ceiling is 5×
+		// Hobby (10→50) — slightly steeper because Pro customers
+		// run more apps (25) than Hobby (5).
+		CronLimitPerApp:     20,
+		CronLimitPerAccount: 50,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -271,6 +311,12 @@ var planLimits = map[Plan]Limits{
 		EgressAllowlistMaxSize: 64,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,
+		// Cron: Scale gets 100 per-app and 500 per-account. 5× Pro's
+		// per-app ceiling (20→100) and 10× Pro's per-account ceiling
+		// (50→500); the per-account figure absorbs 5× Scale-tier apps
+		// at the per-app cap, the typical SaaS fan-out.
+		CronLimitPerApp:         100,
+		CronLimitPerAccount:     500,
 		ScaleUpTargetCPUAllowed: true,
 	},
 }
@@ -585,6 +631,32 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// CronLimitPerApp returns the per-app cron cap for the plan (spec §4.4).
+// 0 for Free (the handler returns 402 ErrPlanCronsNotAllowed before
+// the store is touched) and a positive value for Hobby/Pro/Scale.
+// Unknown plans fail closed (return 0) — same contract as
+// EgressAllowlistMaxSize above.
+func (p Plan) CronLimitPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CronLimitPerApp
+}
+
+// CronLimitPerAccount returns the per-account cron cap for the plan
+// (spec §4.4). Independent of CronLimitPerApp — defends against the
+// N-apps-times-cap-per-app bypass. 0 for Free; positive for paid
+// tiers. Unknown plans fail closed (return 0) — same contract as
+// CronLimitPerApp above.
+func (p Plan) CronLimitPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CronLimitPerAccount
 }
 
 // ScaleUpTargetRPSAllowed reports whether the plan may set

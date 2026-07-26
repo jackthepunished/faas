@@ -79,10 +79,28 @@ var listenAddr = envOr("FAAS_APID_LISTEN", "127.0.0.1:8081")
 // registry to the public network — series like apid_ops_total{op,code}
 // leak auth-rejection rates and per-route traffic shape (review
 // finding #1 on PR #132). Loopback bind is safe because the local
-// Prometheus scrapes from the box itself. Set FAAS_APID_METRICS_ADDR=
-// to disable the listener (unit tests that don't want a port reserved).
-// Mirrors cmd/builderd/main.go's MetricsAddr pattern (PR #124).
-var metricsAddr = envOr("FAAS_APID_METRICS_ADDR", "127.0.0.1:9101")
+// Prometheus scrapes from the box itself.
+//
+// Empty FAAS_APID_METRICS_ADDR disables the listener. This is the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback (line 63), which is right for FAAS_APID_LISTEN (where
+// empty means "no override, use the default port") but wrong here
+// (where empty means "skip the listener entirely"). os.LookupEnv
+// distinguishes "unset" (fall through to the default) from
+// "explicitly empty" (skip), so the e2e harness can stamp
+// `FAAS_APID_METRICS_ADDR=` and avoid the 127.0.0.1:9101 bind race
+// against a sibling or zombie apid run. Mirrors cmd/builderd/main.go's
+// MetricsAddr pattern (PR #124).
+var metricsAddr = func() string {
+	v, ok := os.LookupEnv("FAAS_APID_METRICS_ADDR")
+	if ok && v == "" {
+		return "" // explicit-empty = disable
+	}
+	if !ok || v == "" {
+		return "127.0.0.1:9101"
+	}
+	return v
+}()
 
 // runDeps is the DI seam for run — same pattern as vmmd / gatewayd so we can
 // exercise the listener lifecycle without binding :8081 from tests.
