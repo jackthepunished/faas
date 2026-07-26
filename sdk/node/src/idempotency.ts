@@ -6,15 +6,18 @@
 //     `Idempotency-Key` header. The server replays the same response
 //     for the same key within 24h (apid's idempotency middleware).
 //   * GET/HEAD skip the header — the server doesn't dedupe reads.
-//   * Default behaviour: the SDK auto-mints a UUIDv4-shaped key on
-//     every mutating call.
-//   * Opt-in: callers can pin a stable key via `withIdempotencyKey`
+//   * Default behaviour: the SDK auto-mints a fresh UUIDv4 on EVERY
+//     mutating attempt (per-attempt, not per-call) so the server's
+//     24h replay window sees a fresh retry budget per attempt.
+//   * Opt-in: callers can pin a stable key via `client.setIdempotencyKey`
 //     for retry semantics that survive across processes (CI deploys,
-//     idempotent batch jobs, etc.).
+//     idempotent batch jobs, etc.). The key is process-wide, attached
+//     to the FaaSClient instance, and reset on the next mutating call
+//     unless the caller sets it again.
 //
-// The async-local-storage wire-in is a placeholder for a PR 11
-// follow-up if the docs team requests it; today the explicit
-// `OpenAPI.HEADERS['Idempotency-Key']` default is sufficient.
+// The async-local-storage wire-in (per-call key without touching
+// the FaaSClient instance) is deferred to a doc-driven follow-up;
+// today the explicit `setIdempotencyKey` is sufficient.
 
 import { randomUUID } from 'node:crypto';
 
@@ -49,21 +52,4 @@ export const MUTATING_METHODS = new Set([
 /** Pure predicate: does this HTTP method require an Idempotency-Key? */
 export function isMutating(method: string): boolean {
   return MUTATING_METHODS.has(method.toUpperCase());
-}
-
-/**
- * Placeholder for a future AsyncLocalStorage-based key wire-in.
- * Today the wrapper reads `OpenAPI.HEADERS['Idempotency-Key']`
- * (which `FaaSClient` sets at construction time) so per-call keys
- * require rebuilding the client. This function exists so a future
- * PR can swap the impl without changing call sites:
- *
- *     const key = withIdempotencyKey(ctx, 'stable-key');
- *     await streamSse(resp, signal); // future: reads key from ctx
- *
- * Returns the key unchanged today; PR 11 may upgrade it to a
- * `AsyncResource<IdempotencyKey>` wrapper.
- */
-export function withIdempotencyKey(_ctx: unknown, key: IdempotencyKey): IdempotencyKey {
-  return key;
 }

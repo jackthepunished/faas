@@ -68,7 +68,6 @@ export {
   MUTATING_METHODS,
   isMutating,
   mintIdempotencyKey,
-  withIdempotencyKey,
   type IdempotencyKey,
 } from './idempotency.js';
 
