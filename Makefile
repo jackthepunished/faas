@@ -3,6 +3,7 @@
 
 GO      ?= go
 PKGS    := ./...
+COVERAGE_DIR := coverage
 DAEMONS := apid gatewayd schedd vmmd builderd imaged meterd faas githubd hostage-gen
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
@@ -82,6 +83,15 @@ proto-normalize: proto
 .PHONY: test
 test: ## Unit tests — must pass on any machine, no KVM needed
 	$(GO) test -race -count=1 $(PKGS)
+
+.PHONY: test-state-coverage
+test-state-coverage: ## Assert pkg/state package coverage ≥ 70%. Needs DATABASE_URL pointing at a reachable Postgres; PgStore tests skip cleanly otherwise.
+	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set — PgStore tests will skip; package total will only reflect MemStore coverage." ; )
+	$(GO) test -race -count=1 -covermode=atomic -coverprofile=$(COVERAGE_DIR)/state.out ./pkg/state/...
+	@total=$$($(GO) tool cover -func=$(COVERAGE_DIR)/state.out | awk '/^total/ {print substr($$3,1,length($$3)-1)}') ; \
+	awk -v t="$$total" 'BEGIN { exit (t+0 >= 70 ? 0 : 1) }' \
+		&& echo "pkg/state coverage: $$total% ✓ (target ≥ 70%)" \
+		|| (echo "pkg/state coverage: $$total% ✗ (target ≥ 70%)"; exit 1)
 
 .PHONY: migrations-check
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up
