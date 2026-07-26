@@ -1,8 +1,13 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00049_account_credits.sql — issue #279 (BILLING: refunds / credits /
+-- 00054_account_credits.sql — issue #279 (BILLING: refunds / credits /
 -- overage-cap toggle).
+--
+-- Slot renumbered 00049 → 00054 after PR #341 (state coverage 70) landed
+-- `00049_account_mfa.sql` on main. Walking past the collision keeps both
+-- migrations safe; the previous renumbers (00050 → 00051 → 00053 → 00054)
+-- are documented in memory `migration-slot-collisions-across-prs.md`.
 --
 -- Adds three concerns in one transaction so a partial failure can't
 -- leave the billing surface half-built:

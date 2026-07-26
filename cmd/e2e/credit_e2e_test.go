@@ -49,7 +49,7 @@ func TestE2E_CreditIssue_AdminKey(t *testing.T) {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	pgtest.WaitForMigration(t, pool, 50, 10*time.Second) // issue #279 landed at slot 50
+	pgtest.WaitForMigration(t, pool, 54, 10*time.Second) // issue #279 landed at slot 54
 
 	// The admin allowlist is read from FAAS_ADMIN_EMAILS by apid at
 	// boot (cmd/apid/main.go:349). The harness seeds accounts whose
@@ -159,7 +159,7 @@ func TestE2E_CreditIssue_NonAdminForbidden(t *testing.T) {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	pgtest.WaitForMigration(t, pool, 50, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, 54, 10*time.Second)
 
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID,
 		[]string{"FAAS_ADMIN_EMAILS=e2e+hobby+admin@test.example"})
