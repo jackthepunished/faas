@@ -217,12 +217,10 @@ func TestAuditWriteDuration_PreInstantiated(t *testing.T) {
 func TestRequestFailureFor_ExtractsRouteFromPattern(t *testing.T) {
 	m := wire.NewOpsMetrics("apid")
 	const id = "acct-route-pattern"
-	// Matched route: r.Pattern is the mux pattern. status is passed
-	// through but does not affect the route label; the failure
-	// counter's code label is fixed at "err".
+	// Matched route: r.Pattern is the mux pattern.
 	matched := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
 	matched.Pattern = "GET /v1/test"
-	m.RequestFailureFor(matched, http.StatusBadRequest, id).Inc()
+	m.RequestFailureFor(matched, id).Inc()
 	body := render(t, m)
 	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="GET /v1/test"} 1`, id)) {
 		t.Errorf("matched route: missing expected series in:\n%s", body)
@@ -233,65 +231,14 @@ func TestRequestFailureFor_ExtractsRouteFromPattern(t *testing.T) {
 	// per call).
 	unmatched := httptest.NewRequest(http.MethodGet, "/wp-login.php", nil)
 	unmatched.Pattern = ""
-	m.RequestFailureFor(unmatched, http.StatusBadRequest, id).Inc()
+	m.RequestFailureFor(unmatched, id).Inc()
 	body = render(t, m)
 	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="unmatched"} 1`, id)) {
 		t.Errorf("unmatched route: missing expected series in:\n%s", body)
 	}
 }
 
-// TestRequestFailureForExtractsCodeFromStatus pins the
-// `code="err"` invariant on the failure counter (issue #303 follow-up
-// to PR #336 — closes the asymmetry with apid_request_total which
-// has code ∈ {ok, err}). The accessor signature now takes a `status`
-// argument for API symmetry with RequestTotalFor, but the code label
-// is fixed at "err" — failures by definition have code="err", and the
-// canonical counter for a non-err code is RequestTotalFor, not
-// RequestFailureFor.
-//
-// The status argument is accepted but unused: gating on status is
-// the caller's responsibility (see observeWrap in cmd/apid/server.go,
-// which only calls RequestFailureFor inside an `if rec.status >=
-// http.StatusBadRequest` block). The accessor does not panic or
-// emit a code="ok" series for status < 400 — it routes everything
-// through code="err" because the failure counter is, by definition,
-// the failure counter.
-func TestRequestFailureForExtractsCodeFromStatus(t *testing.T) {
-	m := wire.NewOpsMetrics("apid")
-	const id = "acct-fail-code"
-
-	// status >= 400 → failure counter increments with code="err".
-	fail := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
-	fail.Pattern = "GET /v1/test"
-	m.RequestFailureFor(fail, http.StatusInternalServerError, id).Inc()
-
-	body := render(t, m)
-	wantFail := fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="GET /v1/test"} 1`, id)
-	if !strings.Contains(body, wantFail) {
-		t.Errorf("expected failure series %q in:\n%s", wantFail, body)
-	}
-
-	// status < 400 must NOT mint a code="ok" series on the failure
-	// counter — the failure counter is the failure counter. Even
-	// though the caller is supposed to gate on status >= 400 (and
-	// observeWrap does), the accessor must be defensive: passing a
-	// 200 here is a programming error, not an opportunity to start
-	// emitting success metrics on the failure counter.
-	ok := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
-	ok.Pattern = "GET /v1/test"
-	m.RequestFailureFor(ok, http.StatusOK, id).Inc()
-
-	body = render(t, m)
-	if strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="ok"`, id)) {
-		t.Errorf("failure counter must never emit code=\"ok\"; body was:\n%s", body)
-	}
-	// No `code="ok"` series on the failure counter, period — pin that
-	// the closed label set is {"err"} for failures.
-	if strings.Contains(body, `apid_request_failures_total{code="ok"`) {
-		t.Errorf("failure counter must never emit any code=\"ok\" series; body was:\n%s", body)
-	}
-}
-
+// readSingle is a tiny helper to scrape a single counter value out
 // of the apid /metrics text. Fails the test if the line is absent.
 func readSingle(t *testing.T, m *wire.OpsMetrics, line string) float64 {
 	t.Helper()

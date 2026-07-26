@@ -719,12 +719,11 @@ func (m *OpsMetrics) RequestFailure(accountID, route string) prometheus.Counter 
 // resolves to "anonymous" ; ids past the capacity collapse to
 // "__other__". Safe on a nil receiver so callers can call it
 // without a nil-check at the top of the helper, mirroring the
-// Observe* family pattern. The status argument is accepted for API
-// symmetry with RequestTotalFor (so observeWrap can call both with
-// the same rec.status argument), but the code label is fixed at
-// "err" — failures by definition have code="err", and the canonical
-// counter for a non-err code is RequestTotalFor, not RequestFailureFor.
-func (m *OpsMetrics) RequestFailureFor(r *http.Request, status int, accountID string) prometheus.Counter {
+// Observe* family pattern. The failure counter's `code` label is
+// closed-set at "err" — failures by definition have code="err";
+// the canonical counter for any other status is RequestTotalFor,
+// not RequestFailureFor.
+func (m *OpsMetrics) RequestFailureFor(r *http.Request, accountID string) prometheus.Counter {
 	if m == nil {
 		return nil
 	}

@@ -1,0 +1,145 @@
+# Synthetic time-series fixture for the error-rate alerts (ADR-039
+# §Open follow-ups, shipped in the issue #303 follow-up PR).
+#
+# What this exercises:
+#   1. FaasErrorRateSpike — `max(faas_apid_error_rate_ratio:by_route)
+#      > 2` for 10m. The error-rate-ratio recording rule is
+#      `5m / clamp_min(3d_baseline, 0.001)`.
+#   2. FaasErrorRateDrop — `(ratio < 0.5) and (5m > 0.001)` for 15m.
+#      The `> 0.001 err/s` guard prevents the rule from firing on
+#      routes that simply had no recent failures.
+#
+# Why this is the canonical synthetic-fixture test for the literal
+# #303 follow-up scope: TestFaasRulesSyntax validates the rule file
+# parse-only; TestFaasAnomalyScoreEval pins the platform-drift
+# aggregator. This file pins the missing two pieces — error-rate
+# spike / drop alerts at the threshold level. No daemon-side state,
+# no live apid instance required — pure rule-engine evaluation.
+#
+# Fixture shape note (mirrors anomaly_score.test.yml): the 3d
+# trailing-baseline subquery extrapolates to zero outside the data
+# window, so feeding 10h of zero baseline yields a baseline of ~0
+# and a ratio of `clamp_min(current / 0.001)` which is large. This
+# pins the spike direction without needing 3d of synthetic data.
+# For the drop test we feed 3d of steady errors then drop to near
+# zero in the last 5m, producing ratio < 0.5 with the `5m > 0.001`
+# guard still satisfied.
+#
+# Build tag: integration. Skipped on plain `go test` runs because
+# promtool may not be installed on the dev box; CI installs it
+# explicitly. The convention matches the existing TestFaasRulesSyntax
+# precedent.
+
+rule_files:
+  - ../../../deploy/ansible/roles/prometheus/files/faas.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ──────────────────────────────────────────────────────────────
+  # Test 1 — error-rate spike. The `max(...ratio) > 2` expression
+  # must evaluate true after a sustained burst, and the 10m `for:`
+  # window must have elapsed for the alert to be active.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "error-rate burst → FaasErrorRateSpike fires"
+    input_series:
+      # 10h zero baseline — the 3d subquery extrapolates to ~0.
+      # Then 25m of errors with no successful traffic → ratio is
+      # `error_rate_5m / clamp_min(0.001)` which is very large
+      # (>2) for the spike alert.
+      - series: 'apid_request_total{account_id="acct-spike",route="GET /v1/test",code="err"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-spike",route="GET /v1/test",code="ok"}'
+        values: '0+0x1250'
+    alert_rule_test:
+      # eval_time = 10h+15m = 15m past the spike start (spike runs
+      # t=10h..t=10h25m). The `for: 10m` window elapsed from the
+      # expression's first true evaluation at t=10h+5m; the alert
+      # is now active.
+      #
+      # NOTE: the alert's expression is `max(...)` over a vector
+      # with no group-by, so the resulting series carries NO labels
+      # other than the static labels declared in `labels:` (severity,
+      # component, family, mode, direction, metric). The `route`
+      # label is intentionally absent — `max` strips it. The
+      # annotation's `{{ $labels.route }}` interpolates to empty.
+      - eval_time: 10h15m
+        alertname: FaasErrorRateSpike
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: apid
+              family: traffic_anomaly
+              mode: fleet
+              direction: spike
+              metric: error_rate
+            exp_annotations:
+              summary: "Error rate > 2x 3-day baseline (route )"
+              description: "Route  has had its error rate above 2x its 3d trailing average for 10m. Cross-check apid_request_failures_total{account_id,route,code} for the per-account view. Common causes: upstream dependency (Postgres, Stripe, Paddle) starting to 5xx, customer-deploy regression, or auth-secret rotation that produced a wave of 401s."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 2 — error-rate drop. Steady errors for 10h followed by a
+  # drop. The `5m > 0.001` guard requires sustained enough traffic
+  # that the drop isn't just "route is idle". We feed 10h of
+  # 0.3-per-30s errors (>>0.001 err/s), then in the eval window
+  # half-flap (0.05-per-30s errors) so the ratio halves.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "error-rate drop → FaasErrorRateDrop fires"
+    input_series:
+      # Steady 0.3-per-30s errors for 10h, then 0.05-per-30s
+      # errors for 30m. The 5m window at eval_time sees ~0.0017
+      # err/s (>0.001 guard satisfied) and the ratio is ~0.17
+      # (<0.5 trigger satisfied). 25m into the drop window the
+      # alert's 15m `for:` has elapsed.
+      - series: 'apid_request_total{account_id="acct-drop",route="GET /v1/test",code="err"}'
+        values: '0+0.3x1200 0+0.05x60'
+      - series: 'apid_request_total{account_id="acct-drop",route="GET /v1/test",code="ok"}'
+        values: '0+0x1260'
+    alert_rule_test:
+      # eval_time = 10h+20m — 20m past the drop start. The 15m
+      # `for:` window has elapsed. The drop alert's expression
+      # `(ratio < 0.5) and (5m > 0.001)` does NOT aggregate, so
+      # the resulting series carries the `route` label from the
+      # underlying recording rule. Contrasts with the spike alert
+      # above which uses `max(...)`.
+      - eval_time: 10h20m
+        alertname: FaasErrorRateDrop
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: apid
+              family: traffic_anomaly
+              mode: fleet
+              direction: drop
+              metric: error_rate
+              route: "GET /v1/test"
+            exp_annotations:
+              summary: "Error rate < 0.5x 3-day baseline (route GET /v1/test)"
+              description: "Route GET /v1/test has had its error rate below 50% of its 3d trailing average for 15m while still handling > 0.001 err/s (so it's not idle). Common causes: customer rolled back a misconfigured deploy, scanner traffic stopped, or upstream patch fixed an outage. The `> 0.001 err/s` guard prevents the rule from firing on routes that simply had no recent failures (the baseline would be ~0 and the ratio undefined)."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 3 — negative case. Steady low traffic with no error-rate
+  # change must NOT fire either alert.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "steady traffic → neither error-rate alert fires"
+    input_series:
+      # Sustained 0.05-per-30s errors for the whole window — the
+      # ratio is ~1.0 (no spike, no drop). The `5m > 0.001 err/s`
+      # guard is satisfied but the ratio is between 0.5 and 2.0,
+      # outside both alert thresholds.
+      - series: 'apid_request_total{account_id="acct-steady",route="GET /v1/test",code="err"}'
+        values: '0+0.05x1260'
+      - series: 'apid_request_total{account_id="acct-steady",route="GET /v1/test",code="ok"}'
+        values: '0+0x1260'
+    alert_rule_test:
+      - eval_time: 10h15m
+        alertname: FaasErrorRateSpike
+        # No exp_alerts → assert the alert is NOT active.
+      - eval_time: 10h15m
+        alertname: FaasErrorRateDrop
+        # No exp_alerts → assert the alert is NOT active.
