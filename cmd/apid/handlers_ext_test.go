@@ -1122,6 +1122,24 @@ func TestCreateCron_AtPerAccountLimitReturns403(t *testing.T) {
 	assertProblem(t, rec, 403, api.CodePlanCronQuota)
 }
 
+// TestCreateCron_UnknownPlanReturns402 confirms the handler doesn't
+// panic when acct.Plan is not in pkg/api/limits.go::planLimits —
+// must surface the same 402 + CodePlanCronsNotAllowed a Free customer
+// sees, not a 500. Fail-closed contract: an unconfigured plan is
+// treated as if crons weren't unlocked. Mirrors the LimitsFor()
+// unknown-plan branch in pkg/api/limits_test.go::TestPlanValidity.
+func TestCreateCron_UnknownPlanReturns402(t *testing.T) {
+	// Seed with a plan that pkg/api.planLimits doesn't know about.
+	// CreateAccount doesn't validate the plan string, so the account
+	// lands with Plan="enterprise" — exactly the wire state a future
+	// tier or a stale migration would produce.
+	e := setup(t, api.Plan("enterprise"))
+	appID := mustSeedApp(t, e, "cron-unknown-plan")
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 402, api.CodePlanCronsNotAllowed)
+}
+
 // TestListCrons_HappyPath seeds a cron via the store and confirms listCrons
 // returns it. Direct store insert keeps the test self-contained — the
 // HTTP create path is already covered above.

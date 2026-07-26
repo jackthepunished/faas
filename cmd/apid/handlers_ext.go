@@ -614,8 +614,14 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	// matters: the 402 carries the upgrade-to-Hobby copy the dashboard
 	// renders). The store-level check still reads CronLimitPerApp==0
 	// as a fail-closed defence in depth.
-	limits := api.MustLimitsFor(acct.Plan)
-	if limits.CronLimitPerApp == 0 {
+	//
+	// Use LimitsFor (not MustLimitsFor) so an unknown acct.Plan — a
+	// future tier that hasn't been added to pkg/api/limits.go yet, or
+	// a migration that wrote a stale plan value — surfaces as a clean
+	// 402 rather than a process panic → 500. Fail-closed: an unknown
+	// plan is treated as if crons weren't unlocked.
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok || limits.CronLimitPerApp == 0 {
 		api.WriteProblem(w, api.ErrPlanCronsNotAllowed(acct.Plan))
 		return
 	}
