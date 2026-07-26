@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/netip"
 	"os"
 	"strconv"
@@ -357,7 +358,7 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 		Instance:  req.GetInstance(),
 		Pid:       int32(pid),
 		Mode:      mode,
-		FilterLen: int32(filterLen),
+		FilterLen: filterLen,
 	}, nil
 }
 
@@ -367,7 +368,7 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 // BPF filter programs attached to the process (the `Seccomp_filters:` line).
 // An error means the file couldn't be read or the kernel didn't write the
 // expected lines — the handler maps that to Error="…" in the response.
-func readSeccompStatus(pid int) (string, int, error) {
+func readSeccompStatus(pid int) (string, int32, error) {
 	// /proc/<pid>/status is a kernel-managed procfs path — not a
 	// customer-supplied path — so the openCustomerFile symlink/
 	// non-regular guard doesn't apply. The lint forbidigo rule
@@ -395,9 +396,9 @@ func readSeccompStatus(pid int) (string, int, error) {
 // production — a duplicated parser silently drifts when the
 // kernel format changes, and the cross-process test would then
 // disagree with vmmd's view. Single source of truth lives here.
-func ParseSeccompLines(r io.Reader) (string, int, error) {
+func ParseSeccompLines(r io.Reader) (string, int32, error) {
 	var mode string
-	var filterLen int
+	var filterLen int32
 	haveMode, haveFilter := false, false
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -436,7 +437,15 @@ func ParseSeccompLines(r io.Reader) (string, int, error) {
 			if err != nil {
 				return "", 0, fmt.Errorf("parse Seccomp_filters value %q: %w", fields[1], err)
 			}
-			filterLen = n
+			// Bound-check before narrowing to int32. The kernel reports
+			// the number of distinct BPF filter programs attached; in
+			// practice this is 1 (the jailer's policy). A value that
+			// doesn't fit in int32 is either a kernel bug or a forged
+			// /proc — fail loud rather than silently truncate.
+			if n > math.MaxInt32 {
+				return "", 0, fmt.Errorf("Seccomp_filters value %d overflows int32", n)
+			}
+			filterLen = int32(n)
 			haveFilter = true
 		}
 		if haveMode && haveFilter {

@@ -275,7 +275,7 @@ func readProcStatus(t *testing.T, pid int) string {
 // ("unknown", 0) — the same behaviour the previous inline parser
 // had for malformed input, so a missing Seccomp line in /proc
 // surfaces as a kernel regression rather than a test panic.
-func parseSeccomp(body string) (mode string, filterLen int) {
+func parseSeccomp(body string) (mode string, filterLen int32) {
 	mode, filterLen, err := vmmdgrpc.ParseSeccompLines(strings.NewReader(body))
 	if err != nil {
 		return "unknown", 0

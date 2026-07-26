@@ -90,7 +90,7 @@ func TestParseSeccompLines_AllKnownModes(t *testing.T) {
 			if mode != tc.wantMode {
 				t.Errorf("mode = %q, want %q", mode, tc.wantMode)
 			}
-			if filter != tc.wantFilter {
+			if filter != int32(tc.wantFilter) {
 				t.Errorf("filter = %d, want %d", filter, tc.wantFilter)
 			}
 		})
