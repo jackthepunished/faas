@@ -1,4 +1,4 @@
-package grace
+package grace_test
 
 // G6 grace-timer tests (spec §17 G6, ADR-021). Drives pkg/grace.RunOnce
 // against an in-memory MemStore and a recording notifier + mailer so
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/grace"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -64,20 +65,42 @@ func makeNotifier(rec *recordingNotifier) func(context.Context, string, string) 
 	}
 }
 
+// runOnceInterval is the Interval passed to params() in tests that
+// drive RunOnce directly. RunOnce never reads the ticker Interval,
+// so any positive value works; one hour is the same value Run would
+// use under load and keeps a future reader from wondering "why 1h?".
+const runOnceInterval = time.Hour
+
+// Sentinel errors used by the error-injection tests. The RunOnce
+// callers assert errors.Is so the assertion survives a string rename;
+// the Run ticker test asserts against the slog-rendered message text,
+// which is a different contract (the operator-visible log line).
+var (
+	errListAllBoom    = errors.New("boom")
+	errGdprAuditBoom  = errors.New("audit db down")
+	errNotifierBoom   = errors.New("pg_notify down")
+	errMailerBoom     = errors.New("postmark 503")
+	errHardDeleteBoom = errors.New("fk violation")
+)
+
 // nowFrozen returns a clock fixed at t. RunOnce's "past grace?"
-// branch reads g.p.Now(), so freezing it lets us drive the cutoff
+// branch reads Params.Now, so freezing it lets us drive the cutoff
 // deterministically.
 func nowFrozen(t time.Time) func() time.Time {
 	return func() time.Time { return t }
 }
 
-// params assembles a fully-stubbed Params around store.
-func params(store state.Store, mailer Sender, notif func(context.Context, string, string) error, now func() time.Time) Params {
-	return Params{
+// params assembles a fully-stubbed Params around store. interval is
+// what the constructor's `Interval <= 0` default branch overrides; the
+// tests pass a positive value so the constructed Grace uses it as-is.
+// now is the clock the sweep reads; RunOnce tests pin it to a frozen
+// timestamp so the cutoff is deterministic.
+func params(store state.Store, mailer grace.Sender, notif func(context.Context, string, string) error, now func() time.Time, interval time.Duration) grace.Params {
+	return grace.Params{
 		Store:    store,
 		Mailer:   mailer,
 		Now:      now,
-		Interval: time.Hour, // ignored by RunOnce
+		Interval: interval,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Notif:    notif,
 	}
@@ -106,7 +129,7 @@ func TestRunOnce_DeletesOverdueRow(t *testing.T) {
 	}
 
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -133,7 +156,7 @@ func TestRunOnce_SkipsRowWithinGrace(t *testing.T) {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
 
-	g := New(params(store, mailer, makeNotifier(notif), time.Now))
+	g := grace.New(params(store, mailer, makeNotifier(notif), time.Now, runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -161,7 +184,7 @@ func TestRunOnce_IdempotentOnSecondTick(t *testing.T) {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("first RunOnce: %v", err)
 	}
@@ -188,7 +211,7 @@ func TestRunOnce_SwallowsErrNotFound(t *testing.T) {
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Errorf("RunOnce returned %v, want nil (ErrNotFound must be swallowed)", err)
 	}
@@ -206,7 +229,7 @@ func TestRunOnce_OnlyDeletesPendingAccounts(t *testing.T) {
 	notif := &recordingNotifier{}
 	acct := seedAccount(t, store) // fresh, status=active
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -229,7 +252,7 @@ func TestRunOnce_DefaultNowDoesNotDeleteFreshRow(t *testing.T) {
 	if err := store.MarkAccountDeletionPending(context.Background(), acct.ID); err != nil {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
-	g := New(params(store, mailer, makeNotifier(notif), nil)) // nil Now → time.Now
+	g := grace.New(params(store, mailer, makeNotifier(notif), nil, runOnceInterval)) // nil Now → time.Now
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -267,7 +290,7 @@ func TestRunOnce_RestoredAccountSurvivesTick(t *testing.T) {
 	// RunOnce with the clock past grace. The conditional DELETE inside
 	// the timer's DeleteAccount call must match zero rows.
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -299,7 +322,7 @@ func TestNew_PanicOnNilStore(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("New(Params{}) did not panic")
+			t.Fatal("grace.New(grace.Params{}) did not panic")
 		}
 		msg, ok := r.(string)
 		if !ok {
@@ -310,7 +333,7 @@ func TestNew_PanicOnNilStore(t *testing.T) {
 				msg, "grace: Params.Store is required")
 		}
 	}()
-	_ = New(Params{})
+	_ = grace.New(grace.Params{})
 }
 
 // TestNew_DefaultsLogMailerNotifAndNoopSend — the constructor must
@@ -327,14 +350,18 @@ func TestNew_DefaultsLogMailerNotifAndNoopSend(t *testing.T) {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
 
-	// Only Store populated. Interval/Now/Log/Mailer/Notif are all
-	// nil → defaults fire.
-	g := New(Params{
-		Store: store,
-	})
-
+	// Only Store, Now, and Interval populated. Interval is positive so
+	// the constructor's `Interval <= 0` default branch does not fire
+	// (that's the branch we intentionally leave at 0% — see
+	// grace-interval-default-branch-decision memory). Log, Mailer, and
+	// Notif are nil → defaults fire (slog.Default, noopSender,
+	// swallow-and-return-nil closure).
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g.p.Now = nowFrozen(future)
+	g := grace.New(grace.Params{
+		Store:    store,
+		Now:      nowFrozen(future),
+		Interval: runOnceInterval,
+	})
 
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce with default Sender/Notifier: %v", err)
@@ -352,15 +379,15 @@ func TestNew_DefaultsLogMailerNotifAndNoopSend(t *testing.T) {
 // upward unchanged.
 func TestRunOnce_ListAllAccountsError(t *testing.T) {
 	store := &stubStore{
-		Store:           state.NewMemStore(),
-		listAllErr:      errors.New("boom"),
+		Store:      state.NewMemStore(),
+		listAllErr: errListAllBoom,
 	}
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
-	g := New(params(store, mailer, makeNotifier(notif), time.Now))
+	g := grace.New(params(store, mailer, makeNotifier(notif), time.Now, runOnceInterval))
 	err := g.RunOnce(context.Background())
-	if err == nil || err.Error() != "boom" {
-		t.Errorf("RunOnce returned %v, want boom", err)
+	if !errors.Is(err, errListAllBoom) {
+		t.Errorf("RunOnce returned %v, want errListAllBoom", err)
 	}
 	if len(notif.channels) != 0 {
 		t.Errorf("notifier fired despite ListAllAccounts error: %v", notif.channels)
@@ -377,8 +404,8 @@ func TestRunOnce_ListAllAccountsError(t *testing.T) {
 // GDPR ledger stamp).
 func TestRunOnce_CompleteGdprRequestError(t *testing.T) {
 	store := &stubStore{
-		Store:                 state.NewMemStore(),
-		completeGdprErr:       errors.New("audit db down"),
+		Store:           state.NewMemStore(),
+		completeGdprErr: errGdprAuditBoom,
 	}
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
@@ -387,7 +414,7 @@ func TestRunOnce_CompleteGdprRequestError(t *testing.T) {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce returned %v, want nil (CompleteGdprRequest error must be swallowed)", err)
 	}
@@ -415,9 +442,9 @@ func TestRunOnce_NotifierError(t *testing.T) {
 	}
 	future := time.Now().Add(31 * 24 * time.Hour)
 	failing := func(_ context.Context, _, _ string) error {
-		return errors.New("pg_notify down")
+		return errNotifierBoom
 	}
-	g := New(params(store, mailer, failing, nowFrozen(future)))
+	g := grace.New(params(store, mailer, failing, nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce returned %v, want nil (Notifier error must be swallowed)", err)
 	}
@@ -434,14 +461,14 @@ func TestRunOnce_NotifierError(t *testing.T) {
 // or mailer side effects raise out of RunOnce.
 func TestRunOnce_MailerError(t *testing.T) {
 	store := state.NewMemStore()
-	mailer := &failingSender{err: errors.New("postmark 503")}
+	mailer := &failingSender{err: errMailerBoom}
 	notif := &recordingNotifier{}
 	acct := seedAccount(t, store)
 	if err := store.MarkAccountDeletionPending(context.Background(), acct.ID); err != nil {
 		t.Fatalf("MarkAccountDeletionPending: %v", err)
 	}
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(params(store, mailer, makeNotifier(notif), nowFrozen(future)))
+	g := grace.New(params(store, mailer, makeNotifier(notif), nowFrozen(future), runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce returned %v, want nil (Mailer error must be swallowed)", err)
 	}
@@ -462,10 +489,10 @@ func TestRun_CancelsCleanly(t *testing.T) {
 	store := state.NewMemStore()
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
-	g := New(params(store, mailer, makeNotifier(notif), time.Now))
-	// Override Interval to one hour so no tick fires during the test;
-	// we're proving the ctx.Done() branch.
-	g.p.Interval = time.Hour
+	// A one-hour Interval means no tick fires during the test; we're
+	// proving the ctx.Done() branch. Using the constant fails open
+	// without a Params seam.
+	g := grace.New(params(store, mailer, makeNotifier(notif), time.Now, time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -491,12 +518,12 @@ func TestRun_CancelsCleanly(t *testing.T) {
 func TestRun_TickInvokesRunOnce(t *testing.T) {
 	store := &stubStore{
 		Store:      state.NewMemStore(),
-		listAllErr: errors.New("boom"),
+		listAllErr: errListAllBoom,
 	}
 	logBuf := &safeBuffer{}
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
-	g := New(Params{
+	g := grace.New(grace.Params{
 		Store:    store,
 		Mailer:   mailer,
 		Interval: time.Millisecond,
@@ -509,9 +536,11 @@ func TestRun_TickInvokesRunOnce(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- g.Run(ctx) }()
 
-	// Wait long enough for ≥1 tick (interval is 1 ms; 50 ms is generous
-	// on busy CI where the ticker goroutine can be starved briefly).
-	time.Sleep(50 * time.Millisecond)
+	// Wait long enough for ≥1 tick (interval is 1 ms; 100 ms is generous
+	// on busy CI where the ticker goroutine can be starved briefly — see
+	// iam-2-testmfarecover-concurrentburn-flake memory for prior CI flakes
+	// with a 50ms wait window).
+	time.Sleep(100 * time.Millisecond)
 	cancel()
 
 	select {
@@ -545,7 +574,7 @@ func TestRunOnce_SkipsPendingRowWithNilDeletionRequestedAt(t *testing.T) {
 	}
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
-	g := New(params(store, mailer, makeNotifier(notif), time.Now))
+	g := grace.New(params(store, mailer, makeNotifier(notif), time.Now, runOnceInterval))
 	if err := g.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce returned %v, want nil", err)
 	}
@@ -566,7 +595,7 @@ func TestRunOnce_SkipsPendingRowWithNilDeletionRequestedAt(t *testing.T) {
 func TestRunOnce_LogsHardDeleteError(t *testing.T) {
 	store := &stubStore{
 		Store:            state.NewMemStore(),
-		deleteAccountErr: errors.New("fk violation"),
+		deleteAccountErr: errHardDeleteBoom,
 	}
 	mailer := &recordingSender{}
 	notif := &recordingNotifier{}
@@ -576,7 +605,7 @@ func TestRunOnce_LogsHardDeleteError(t *testing.T) {
 	}
 	logBuf := &safeBuffer{}
 	future := time.Now().Add(31 * 24 * time.Hour)
-	g := New(Params{
+	g := grace.New(grace.Params{
 		Store:    store,
 		Mailer:   mailer,
 		Interval: time.Hour,
@@ -623,10 +652,10 @@ func (f *failingSender) Send(_ context.Context, _ []string, _, _ string) error {
 // for testing grace-side error paths without standing up Postgres.
 type stubStore struct {
 	state.Store
-	completeGdprErr error
+	completeGdprErr  error
 	deleteAccountErr error
-	listAllErr      error
-	listAllAccounts []state.Account
+	listAllErr       error
+	listAllAccounts  []state.Account
 }
 
 func (s *stubStore) ListAllAccounts(ctx context.Context) ([]state.Account, error) {
