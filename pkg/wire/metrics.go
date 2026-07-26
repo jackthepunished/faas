@@ -495,7 +495,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	commonCollectors := []prometheus.Collector{
 		ops, dur, watchdogKills, eventsWriteFail, auditWriteFail,
 		auditWriteDur, requestFailures, requestTotal, stripePushDur, paddlePushDur,
-		buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback,
+		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
+		wakeIDV4Fallback,
 		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
@@ -517,9 +518,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
-	} else {
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
+		commonCollectors = append(commonCollectors, ociEgressDeny)
 	}
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
