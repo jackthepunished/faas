@@ -502,7 +502,7 @@ func (s *server) handler() http.Handler {
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write
 	// CI key doesn't need them. usage:read is the right knob here.
-mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage))))
+	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage))))
 	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.usageSummary))))
 	// Billing history (issue #259). Listing one's own invoices is the
 	// same access tier as usage/summary — usage:read is enough.
