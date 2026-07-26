@@ -815,6 +815,20 @@ func (s *server) handler() http.Handler {
 	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
 	mux.Handle("POST /v1/apps/{slug}/install/bind", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.bindAppToRepo))))
 
+	// PR-C: /oauth/code-callback is the user-to-server OAuth callback
+	// (the "Connect GitHub" button flow). Sibling of /oauth/callback
+	// (the GitHub App install callback). Like /oauth/callback, it
+	// sits behind sessionAuth + dashboardChain — cookie-scoped,
+	// no Bearer token, same §11 middleware stack. See
+	// handlers_oauth_code_callback.go for the full rationale on
+	// why this is a separate route from /oauth/callback.
+	mux.Handle("GET "+oauthCodeCallbackPath, s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.renderOAuthCodeCallback))))
+	// /dashboard/install/connect mints the CSRF state cookie and
+	// redirects the dashboard's "Connect GitHub" button to GitHub's
+	// authorize URL. POST so it can't be triggered by an opportunistic
+	// <img src=…> (defense-in-depth against CSRF-on-GET).
+	mux.Handle("POST /dashboard/install/connect", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.startConnectGitHub))))
+
 	// G6 dashboard delete/restore (spec §17 G6, ADR-021). Both POSTs
 	// require the confirm_token form field (validated inside the
 	// handler) and sit behind sessionAuth so the call is anchored to

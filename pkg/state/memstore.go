@@ -88,6 +88,10 @@ type MemStore struct {
 	// handler writes after verifying the install against api.github.com
 	// (review findings #1 + #2 closure, ADR-012).
 	githubBindings map[string]GitHubBinding
+	// githubInstalls is the durable OAuth handshake state per
+	// account (PR-C). Keyed by accountID so the cold-start rehydrate
+	// path in pkg/githubd/realservice.go can look up by account.
+	githubInstalls map[string]GitHubInstall
 	deployments    map[string]Deployment
 	builds         map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
@@ -269,6 +273,7 @@ func NewMemStore() *MemStore {
 		keyByHash:      map[string]APIKey{},
 		apps:           map[string]App{},
 		githubBindings: map[string]GitHubBinding{},
+		githubInstalls: map[string]GitHubInstall{},
 		deployments:    map[string]Deployment{},
 		builds:         map[string]Build{},
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
@@ -1190,6 +1195,43 @@ func (m *MemStore) ListGithubInstallBindingsForAccount(_ context.Context, accoun
 		}
 	}
 	return out, nil
+}
+
+// UpsertGitHubInstall persists the durable OAuth handshake state
+// (PR-C). Idempotent on (AccountID) by map insert; the AccountID
+// FK isn't enforced in MemStore (in-memory), but the upsert still
+// rejects empty AccountID / AuditGithubLogin so test parity with
+// PgStore holds.
+func (m *MemStore) UpsertGitHubInstall(_ context.Context, inst GitHubInstall) error {
+	if inst.AccountID == "" {
+		return ErrNotFound
+	}
+	if inst.AuditGithubLogin == "" {
+		return fmt.Errorf("state: AuditGithubLogin required (§11 paper trail)")
+	}
+	if inst.SealedAt.IsZero() {
+		inst.SealedAt = time.Now()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.githubInstalls[inst.AccountID] = inst
+	return nil
+}
+
+// GitHubInstallForAccount returns the durable install row for an
+// account. Returns ErrNotFound on miss so the caller can distinguish
+// "no OAuth handshake yet" from a transient read failure.
+func (m *MemStore) GitHubInstallForAccount(_ context.Context, accountID string) (GitHubInstall, error) {
+	if accountID == "" {
+		return GitHubInstall{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.githubInstalls[accountID]
+	if !ok {
+		return GitHubInstall{}, ErrNotFound
+	}
+	return inst, nil
 }
 
 // GetGithubInstallBindingForApp mirrors PgStore. accountID scopes

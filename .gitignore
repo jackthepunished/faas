@@ -38,3 +38,4 @@ vmlinux-*
 /apid
 /schedd
 /vmmd
+/githubd

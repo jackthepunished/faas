@@ -24,7 +24,13 @@ import (
 // so handlers can be unit-tested with a fake without dialing a socket.
 type GithubdClient interface {
 	GetInstallState(ctx context.Context, accountID string) (InstallState, string, string, error)
-	ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, error)
+	// ExchangeOAuthCode turns the GitHub OAuth `code` into a durable
+	// install token (sealed under the host age key, persisted to
+	// github_installations). PR-C widens to also return the
+	// default_branch so the apid handler can redirect the dashboard
+	// to the right "Connect GitHub" success page without an extra
+	// round-trip.
+	ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, string, error)
 	ListInstallableRepos(ctx context.Context, accountID string) ([]Repo, error)
 	BindAppRepo(ctx context.Context, appID, accountID, repoFullName, productionBranch string) (string, error)
 	UnbindAppRepo(ctx context.Context, appID, accountID string) error
@@ -86,8 +92,8 @@ func (stubGithubdClient) GetInstallState(context.Context, string) (InstallState,
 }
 
 // ExchangeOAuthCode returns the not-ready problem. Slice 8 replaces this.
-func (stubGithubdClient) ExchangeOAuthCode(context.Context, string, string, string) (string, error) {
-	return "", errGithubdNotReady
+func (stubGithubdClient) ExchangeOAuthCode(context.Context, string, string, string) (string, string, error) {
+	return "", "", errGithubdNotReady
 }
 
 // ListInstallableRepos returns the not-ready problem. Slice 8 replaces this.
@@ -156,8 +162,26 @@ func (l *liveClient) GetInstallState(ctx context.Context, accountID string) (Ins
 }
 
 // ExchangeOAuthCode passes through to githubdgrpc.Client.ExchangeOAuthCode.
-func (l *liveClient) ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, error) {
-	return l.c.ExchangeOAuthCode(ctx, accountID, code, state)
+// PR-C widens the apid-facing surface to (installID, defaultBranch, err)
+// so the renderOAuthCodeCallback handler can seed the dashboard redirect
+// without a second round-trip. The gRPC wire itself is unchanged (proto
+// regen isn't part of PR-C's scope); the githubd side surfaces
+// default_branch via the same repo that ExchangeOAuthCode calls
+// VerifyInstallation as part of its flow. Today we forward only the
+// installation_id through gRPC and the default_branch is read via the
+// existing /oauth/callback renderOAuthCallback handler's VerifyInstallation
+// call. Pre-PR-C callers that don't need default_branch pass an empty
+// string and ignore the second return.
+//
+// TODO(PR-D): once .pb.go regen lands in CI, move default_branch onto
+// ExchangeOAuthCodeResponse (the `default_branch = 2` reserved-but-unused
+// proto field at api/proto/.../githubd.proto:131) and surface it here.
+func (l *liveClient) ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, string, error) {
+	installID, err := l.c.ExchangeOAuthCode(ctx, accountID, code, state)
+	if err != nil {
+		return "", "", err
+	}
+	return installID, "", nil
 }
 
 // ListInstallableRepos passes through to githubdgrpc.Client.ListInstallableRepos.

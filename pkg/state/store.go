@@ -552,6 +552,26 @@ type Store interface {
 	// apps_github_install_account_idx partial index.
 	ListGithubInstallBindingsForAccount(ctx context.Context, accountID string) (map[string]GitHubBinding, error)
 
+	// UpsertGitHubInstall persists the OAuth handshake state for one
+	// account's GitHub App install (PR-C). Idempotent on (AccountID)
+	// via ON CONFLICT (account_id) DO UPDATE so a retry of the OAuth
+	// flow doesn't crash on the unique-PK constraint. The account row
+	// itself must exist (the FK enforces this); pre-CASCADE deletes
+	// of an account surface as ErrNotFound here so the caller can
+	// distinguish "account doesn't exist" from a transient write
+	// failure.
+	UpsertGitHubInstall(ctx context.Context, inst GitHubInstall) error
+	// GitHubInstallForAccount returns the durable install row for an
+	// account. Used by githubd's cold-start rehydrate path
+	// (RealService.ensureInstallToken): when TokenCache is empty
+	// (process restart), unseal the SealedToken only if
+	// TokenExpiresAt > now()+30s; otherwise the cold path mints a
+	// fresh install token and re-seals. Returns ErrNotFound when the
+	// account hasn't completed the OAuth handshake yet — the
+	// dashboard's bind picker hydrates off this signal to decide
+	// whether to render the "Connect GitHub" button vs the bind list.
+	GitHubInstallForAccount(ctx context.Context, accountID string) (GitHubInstall, error)
+
 	// Deployments.
 	// CreateDeployment atomically inserts a new pending deployment row
 	// for the given app. When the app already has a pending or live

@@ -58,3 +58,29 @@ type BindingsStore interface {
 	// Returns ErrNotFound when no app is bound to the repo.
 	InstallationIDForRepo(ctx context.Context, repoFullName string) (int64, error)
 }
+
+// StoreInstalls is the durable GitHub App install-state surface
+// (PR-C, audit-gap closure). Pre-PR-C the install state lived in
+// RealService's in-memory `s.installs` map; PR-C demotes that map
+// to a read-through cache and pushes the durable state into the
+// github_installations Postgres table (migration 00051). The
+// githubd daemon stays persistence-agnostic — the concrete adapter
+// that bridges pkg/state.PgStore lives in cmd/githubd/main.go.
+//
+// Implementations MUST be safe for concurrent use.
+type StoreInstalls interface {
+	// Upsert persists the OAuth handshake state for one account's
+	// install. Idempotent on (AccountID) via the table's PK +
+	// ON CONFLICT DO UPDATE; the OAuth flow can retry without
+	// crashing on the unique constraint. SealedToken is the
+	// age-encrypted install token (the "ghs_…" form, sealed by
+	// githubd via pkg/secretbox.SealOne before persisting).
+	Upsert(ctx context.Context, inst state.GitHubInstall) error
+	// ForAccount returns the durable install row, or ErrNotFound
+	// when the account hasn't completed the OAuth handshake yet.
+	// Used by RealService.ensureInstallToken's cold-start rehydrate
+	// path: when TokenCache is empty (process restart), unseal the
+	// SealedToken only if TokenExpiresAt > now()+30s; otherwise the
+	// cold path mints a fresh install token and re-seals.
+	ForAccount(ctx context.Context, accountID string) (state.GitHubInstall, error)
+}

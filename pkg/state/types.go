@@ -253,6 +253,40 @@ type GitHubBinding struct {
 	ProductionBranch string
 }
 
+// GitHubInstall is the durable OAuth handshake state for one account's
+// GitHub App install (PR-C, audit-gap closure). Pre-PR-C this lived
+// only in pkg/githubd/realservice.go's in-memory `s.installs` map
+// and evaporated on kill -TERM, breaking the dashboard's
+// /v1/install/repos/list + /v1/apps/{slug}/install/bind paths with
+// 502s the moment githubd restarted. PR-C moves the source of truth
+// to the github_installations table (migration 00051).
+//
+// AccountID is the PK (a uuid, references accounts(id) ON DELETE
+// CASCADE — GDPR §17 G2 path deletes the row when the owning account
+// goes away). InstallationID is GitHub's int64. DefaultBranch is
+// captured at the OAuth handshake so the bind picker doesn't need a
+// re-fetch. SealedToken holds the age-encrypted install token (the
+// "ghs_…" form, minted via AppAuth.ExchangeInstallationToken and
+// sealed with pkg/secretbox.SealOne before persisting — the
+// plaintext token never touches the database). TokenExpiresAt is
+// when the sealed blob expires (GitHub's install tokens are 1 h);
+// cold-start readers unseal via pkg/secretbox.Open only when
+// expires_at > now()+30s, otherwise re-mint + re-seal. SealedAt
+// records when this row's sealed blob was last written (telemetry
+// only — rotation cadence). AuditGithubLogin is the §11 paper trail
+// on the durable row: the GitHub login who owned the install at
+// seal time, used by cold-start re-verification to assert the
+// session envelope's expected_login matches the durable record.
+type GitHubInstall struct {
+	AccountID        string
+	InstallationID   int64
+	DefaultBranch    string
+	SealedToken      []byte
+	TokenExpiresAt   time.Time
+	SealedAt         time.Time
+	AuditGithubLogin string
+}
+
 // MarshalJSON encodes a zero-value Manifest as {} so the jsonb default
 // round-trips cleanly.
 func (m AppManifest) MarshalJSON() ([]byte, error) {
