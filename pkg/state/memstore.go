@@ -1664,6 +1664,69 @@ func (m *MemStore) CreateCron(_ context.Context, appID, schedule, path string, e
 	return c, nil
 }
 
+// CreateCronIfUnderQuota is the customer-facing variant of
+// CreateCron that enforces the per-app and per-account caps. The
+// MemStore uses a single process-wide mutex so the count-then-insert
+// is implicitly serialised (no TOCTOU); the predicate matches the
+// PgStore one so handler logic stays identical across store backends.
+//
+// Failure modes mirror PgStore:
+//   - *CronQuotaError when either cap trips.
+//   - ErrNotFound when the app row is gone or AppDeleted.
+//   - ErrConflict on a future uuid collision.
+func (m *MemStore) CreateCronIfUnderQuota(_ context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.Status == AppDeleted {
+		return Cron{}, ErrNotFound
+	}
+	// 1. Per-app count. Disabled crons still count toward the cap so
+	//    toggling isn't a way to bypass it.
+	appCount := 0
+	for _, c := range m.crons {
+		if c.AppID == appID {
+			appCount++
+		}
+	}
+	if appCount >= limits.CronLimitPerApp {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeApp,
+			Limit:    limits.CronLimitPerApp,
+			Observed: appCount,
+		}
+	}
+	// 2. Per-account count. Excludes deleted apps so their crons don't
+	//    poison the cap.
+	accountCount := 0
+	for _, c := range m.crons {
+		a, exists := m.apps[c.AppID]
+		if !exists || a.Status == AppDeleted {
+			continue
+		}
+		if a.AccountID == app.AccountID {
+			accountCount++
+		}
+	}
+	if accountCount >= limits.CronLimitPerAccount {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeAccount,
+			Limit:    limits.CronLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+	c := Cron{
+		ID:        newID(),
+		AppID:     appID,
+		Schedule:  schedule,
+		Path:      path,
+		Enabled:   enabled,
+		CreatedAt: time.Now(),
+	}
+	m.crons[c.ID] = c
+	return c, nil
+}
+
 func (m *MemStore) CronByID(_ context.Context, id string) (Cron, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

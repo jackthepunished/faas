@@ -12,25 +12,34 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// Free/Hobby rows below omit them intentionally — mirrors the
 		// MinInstancesAllowed row shape.
 		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096,
-			MaxQueueDepth: 0, MaxDelayedTasksPerApp: 0, MaxSourceBytesPerInvocation: 0, AsyncInvokeAllowed: false},
+			MaxQueueDepth: 0, MaxDelayedTasksPerApp: 0, MaxSourceBytesPerInvocation: 0, AsyncInvokeAllowed: false,
+			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
+			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
+			CronLimitPerApp: 0, CronLimitPerAccount: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			MaxQueueDepth: 5, MaxDelayedTasksPerApp: 5, MaxSourceBytesPerInvocation: 64 * 1024, AsyncInvokeAllowed: true,
 			// Issue #169 / #172: Hobby unlocks RPS target only (CPU is
 			// gated on Pro+ for cost reasons).
-			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: false},
+			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: false,
+			// Cron: Hobby gets 5 per-app and 10 per-account.
+			CronLimitPerApp: 5, CronLimitPerAccount: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MinInstancesAllowed: true,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
-			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true},
+			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
+			// Cron: Pro gets 20 per-app and 50 per-account.
+			CronLimitPerApp: 20, CronLimitPerAccount: 50},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MinInstancesAllowed: true,
 			MaxQueueDepth: 100, MaxDelayedTasksPerApp: 1_000_000, MaxSourceBytesPerInvocation: 1024 * 1024, AsyncInvokeAllowed: true,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
-			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true},
+			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
+			// Cron: Scale gets 100 per-app and 500 per-account.
+			CronLimitPerApp: 100, CronLimitPerAccount: 500},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -81,6 +90,8 @@ func TestPlansAreMonotonic(t *testing.T) {
 			{"IdleTimeoutS", lo.IdleTimeoutS, hi.IdleTimeoutS},
 			{"RateLimitRPS", lo.RateLimitRPS, hi.RateLimitRPS},
 			{"EgressMbit", lo.EgressMbit, hi.EgressMbit},
+			{"CronLimitPerApp", lo.CronLimitPerApp, hi.CronLimitPerApp},
+			{"CronLimitPerAccount", lo.CronLimitPerAccount, hi.CronLimitPerAccount},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {
@@ -215,6 +226,32 @@ func TestPlanEgressAllowlistMonotonic(t *testing.T) {
 	scale := MustLimitsFor(PlanScale).EgressAllowlistMaxSize
 	if scale < pro {
 		t.Errorf("Scale EgressAllowlistMaxSize=%d < Pro=%d — Scale must keep the larger CIDR budget", scale, pro)
+	}
+}
+
+// TestPlanCronLimits pins the cron cap per plan (spec §4.4). Free is
+// 0/0 (handler returns 402 before the store is touched); Hobby gets
+// 5 per-app / 10 per-account; Pro 20/50; Scale 100/500. Unknown plans
+// must fail closed (return 0) so a missing row never silently unlocks
+// crons — same contract as EgressAllowlistMaxSize above.
+func TestPlanCronLimits(t *testing.T) {
+	cases := []struct {
+		plan                    Plan
+		wantPerApp, wantPerAcct int
+	}{
+		{PlanFree, 0, 0},
+		{PlanHobby, 5, 10},
+		{PlanPro, 20, 50},
+		{PlanScale, 100, 500},
+		{Plan("unknown"), 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.CronLimitPerApp(); got != c.wantPerApp {
+			t.Errorf("%s.CronLimitPerApp() = %d, want %d", c.plan, got, c.wantPerApp)
+		}
+		if got := c.plan.CronLimitPerAccount(); got != c.wantPerAcct {
+			t.Errorf("%s.CronLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
 	}
 }
 

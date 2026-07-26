@@ -36,6 +36,41 @@ func (e *QuotaError) Is(target error) bool {
 // Concrete instances are *QuotaError so handlers can read limit/observed.
 var ErrQuotaExceeded = errors.New("state: deployed-app quota exceeded")
 
+// CronQuotaScope names the cap that CreateCronIfUnderQuota tripped on.
+// The handler renders different copy per scope so the customer can tell
+// whether to delete a cron from this app (Scope="app") or from one of
+// the account's other apps (Scope="account").
+type CronQuotaScope string
+
+const (
+	// CronQuotaScopeApp is set when limits.CronLimitPerApp was reached.
+	CronQuotaScopeApp CronQuotaScope = "app"
+	// CronQuotaScopeAccount is set when limits.CronLimitPerAccount was reached.
+	CronQuotaScopeAccount CronQuotaScope = "account"
+)
+
+// CronQuotaError is returned by CreateCronIfUnderQuota when either
+// cap (per-app or per-account) is reached. Distinct from QuotaError
+// because it carries Scope, and we want errors.Is to match a cron-
+// specific sentinel rather than overloading the deployed-apps chain.
+type CronQuotaError struct {
+	Scope    CronQuotaScope
+	Limit    int
+	Observed int
+}
+
+func (e *CronQuotaError) Error() string {
+	return fmt.Sprintf("state: cron quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is allows errors.Is(err, ErrCronQuotaExceeded) to match any *CronQuotaError.
+func (e *CronQuotaError) Is(target error) bool {
+	return target == ErrCronQuotaExceeded
+}
+
+// ErrCronQuotaExceeded is the sentinel callers compare against via errors.Is.
+var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -577,6 +612,18 @@ type Store interface {
 
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
+	// CreateCronIfUnderQuota inserts a cron iff the per-app and
+	// per-account caps (limits.CronLimitPerApp / CronLimitPerAccount)
+	// are not yet reached. The per-app count is authoritative under
+	// an apps FOR UPDATE row lock; the per-account count is a
+	// follow-up under the same tx so two concurrent POSTs for the
+	// same account cannot both pass the account cap. Returns:
+	//   - (Cron{}, *CronQuotaError) when either cap trips
+	//   - (Cron{}, ErrNotFound) when the app row is missing or deleted
+	// apid's createCron handler routes through this; schedd's
+	// dispatch loop and existing tests still call CreateCron
+	// (uncapped) because they bypass the customer-facing path.
+	CreateCronIfUnderQuota(ctx context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error)
 	CronByID(ctx context.Context, id string) (Cron, error)
 	// UpdateCron mutates the optional fields of a cron row. nil pointers
 	// leave the field untouched. createdAt is supported because schedd's
