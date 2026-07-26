@@ -1,27 +1,37 @@
-// Package mail — MFA lifecycle bodies (issue #329, IAM-2 follow-up).
+// Package mail — MFA lifecycle bodies (issues #329 + #328,
+// IAM-2 follow-up).
 //
-// Three templates cover the customer-visible side of MFA lifecycle:
-//   - RecoveryCodeBurnedBody — sent when /v1/account/mfa/recover succeeds
-//     (one of the customer's recovery codes was used).
+// Two templates land in this file as part of the 5-PR
+// pre-launch security/MFA sprint. A third is forecast but
+// staged for PR 2:
+//
+//   - RecoveryCodeBurnedBody — sent when /v1/account/mfa/recover
+//     succeeds (one of the customer's recovery codes was used).
+//     This file's only PRODUCTION-WIRED body in the PR #329 diff.
 //   - MFADisableEmailRequestedBody — sent when
-//     /v1/account/mfa/disable-email is invoked; the body contains the
-//     confirm link with the 24h cool-down backstop (issue #328). Lands
-//     in PR 2 of the sprint plan.
-//   - MFADisableEmailConfirmedBody — sent after the 24h cool-down
-//     succeeds and MFA is cleared. Optional "your MFA is now disabled"
-//     confirmation. Lands in PR 2.
+//     /v1/account/mfa/disable-email is invoked; the body
+//     contains the confirm link with the 24h cool-down backstop
+//     (issue #328). Lands as a STAGED template in PR #329 (PR 1
+//     of the sprint) so the package stays tidy; wired into the
+//     HTTP path in PR 2 (issue #328).
+//   - MFADisableEmailConfirmedBody — sent after the 24h
+//     cool-down succeeds and MFA is cleared. Lands alongside
+//     the disable-email HTTP wiring in PR 2; does NOT live in
+//     this file yet (adding now would orphan a template the
+//     sprint hasn't reached).
 //
-// All three follow the spec's "plaintext only, no HTML alt" convention
-// (see pkg/mail/account.go file header for the rationale). Subject
-// lines are short enough to render fully in every mail client's
-// summary view.
+// All three follow the spec's "plaintext only, no HTML alt"
+// convention (see pkg/mail/account.go file header for the
+// rationale). Subject lines are short enough to render fully
+// in every mail client's summary view.
 //
-// CR/LF sanitisation (CWE-117): every customer-controlled email that
-// could land in an outbound body goes through safeRecipient. The
-// dashboard renders these on the customer-facing side, so a hostile
-// email change must not be able to inject CR/LF into the SMTP body.
-// slog's own sanitiser (pkg/logsanitize.Field on msg.To) keeps the
-// log line independently safe — same dual-defence pattern as the
+// CR/LF sanitisation (CWE-117): every customer-controlled email
+// that could land in an outbound body goes through safeRecipient.
+// The dashboard renders these on the customer-facing side, so a
+// hostile email change must not be able to inject CR/LF into
+// the SMTP body. slog's own sanitiser
+// (pkg/logsanitize.Field on msg.To) keeps the log line
+// independently safe — same dual-defence pattern as the
 // account.go templates.
 
 package mail
