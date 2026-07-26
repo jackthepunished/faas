@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/e2etest"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -121,7 +123,7 @@ func TestIAM3SessionsMatrixPg(t *testing.T) {
 
 	t.Run("revoke_sibling_blocks_sibling", func(t *testing.T) {
 		// (2) A revokes B. 204. A still works. B's next request 401s.
-		if status := cookieDelete(t, client, h.APIDURL, cookieA, "/v1/auth/sessions/"+sidB); status != http.StatusNoContent {
+		if status := cookieDelete(t, client, h.APIDURL, mgr, acct.ID, cookieA, "/v1/auth/sessions/"+sidB); status != http.StatusNoContent {
 			t.Fatalf("revoke status = %d, want 204", status)
 		}
 		// A still works.
@@ -142,7 +144,7 @@ func TestIAM3SessionsMatrixPg(t *testing.T) {
 		// (3) Mint a third sibling. Revoke-all-except-A. A still
 		// works. The third sibling is dead.
 		_, sidC := issueSessionForTest(t, store, mgr, acct.ID, "198.51.100.30", "iam3-C-ua")
-		raw, status := cookiePost(t, client, h.APIDURL, cookieA, "/v1/auth/sessions/revoke_all", nil)
+		raw, status := cookiePost(t, client, h.APIDURL, mgr, acct.ID, cookieA, "/v1/auth/sessions/revoke_all", nil)
 		if status != http.StatusOK {
 			t.Fatalf("revoke_all status = %d, want 200 (body=%s)", status, raw)
 		}
@@ -169,7 +171,7 @@ func TestIAM3SessionsMatrixPg(t *testing.T) {
 
 	t.Run("logout_clears_cookie", func(t *testing.T) {
 		// (4) Logout: 204, cookie cleared, row revoked.
-		resp, err := cookiePostWithResp(t, client, h.APIDURL, cookieA, "/v1/auth/logout", nil)
+		resp, err := cookiePostWithResp(t, client, h.APIDURL, mgr, acct.ID, cookieA, "/v1/auth/logout", nil)
 		if err != nil {
 			t.Fatalf("logout: %v", err)
 		}
@@ -299,12 +301,60 @@ func cookieList(t *testing.T, c *http.Client, base string, cookie *http.Cookie) 
 	return raw, resp.StatusCode
 }
 
+// csrfActionForPath mirrors the IAM-3 CSRF action names in
+// handlers_sessions.go so the e2e can mint matching tokens. GET
+// routes aren't CSRF-gated; only the three mutating routes are.
+func csrfActionForPath(method, path string) string {
+	if method == http.MethodDelete && strings.HasPrefix(path, "/v1/auth/sessions/") &&
+		!strings.HasSuffix(path, "/revoke_all") {
+		return "auth.session.revoke"
+	}
+	if method == http.MethodPost && strings.HasSuffix(path, "/v1/auth/sessions/revoke_all") {
+		return "auth.sessions.revoke_all"
+	}
+	if method == http.MethodPost && strings.HasSuffix(path, "/v1/auth/logout") {
+		return "auth.logout"
+	}
+	return ""
+}
+
+// injectCSRFCookieAndField adds the faas_csrf cookie (carrying the
+// AEAD-bound token) and a `csrf_token` JSON-body field with the
+// same opaque value, matching the CSRF verify path in
+// pkg/middleware.VerifyAuthenticated (form-or-JSON body transport).
+// Mutates req.Body + ContentLength so the JSON decoder downstream
+// still sees the original payload.
+func injectCSRFCookieAndField(req *http.Request, tok string) {
+	req.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: tok})
+	body := []byte(`{"csrf_token":"` + tok + `"}`)
+	req.Header.Set("Content-Type", "application/json")
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+}
+
+// withCSRFIfNeeded mints + injects a CSRF token for mutating
+// routes. No-op for GET paths (and any path not gated by
+// csrfActionForPath).
+func withCSRFIfNeeded(t *testing.T, c *http.Client, base string, mgr *session.Manager, accountID, method, path string, req *http.Request) {
+	t.Helper()
+	action := csrfActionForPath(method, path)
+	if action == "" {
+		return
+	}
+	tok, err := middleware.IssueForAuthenticated(mgr, action, accountID)
+	if err != nil {
+		t.Fatalf("issue CSRF for action %q: %v", action, err)
+	}
+	injectCSRFCookieAndField(req, tok)
+}
+
 // cookieDelete runs DELETE /v1/auth/sessions/{id} with the given
 // cookie. Returns the status code.
-func cookieDelete(t *testing.T, c *http.Client, base string, cookie *http.Cookie, path string) int {
+func cookieDelete(t *testing.T, c *http.Client, base string, mgr *session.Manager, accountID string, cookie *http.Cookie, path string) int {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodDelete, base+path, nil)
 	req.AddCookie(cookie)
+	withCSRFIfNeeded(t, c, base, mgr, accountID, http.MethodDelete, path, req)
 	resp, err := c.Do(req)
 	if err != nil {
 		t.Fatalf("delete %s: %v", path, err)
@@ -315,9 +365,9 @@ func cookieDelete(t *testing.T, c *http.Client, base string, cookie *http.Cookie
 }
 
 // cookiePost runs POST path with the given cookie + nil body.
-func cookiePost(t *testing.T, c *http.Client, base string, cookie *http.Cookie, path string, body any) ([]byte, int) {
+func cookiePost(t *testing.T, c *http.Client, base string, mgr *session.Manager, accountID string, cookie *http.Cookie, path string, body any) ([]byte, int) {
 	t.Helper()
-	resp, err := cookiePostWithResp(t, c, base, cookie, path, body)
+	resp, err := cookiePostWithResp(t, c, base, mgr, accountID, cookie, path, body)
 	if err != nil {
 		t.Fatalf("post %s: %v", path, err)
 	}
@@ -328,7 +378,7 @@ func cookiePost(t *testing.T, c *http.Client, base string, cookie *http.Cookie, 
 
 // cookiePostWithResp returns the full response so the caller can
 // inspect Set-Cookie headers (logout clears the cookie).
-func cookiePostWithResp(t *testing.T, c *http.Client, base string, cookie *http.Cookie, path string, body any) (*http.Response, error) {
+func cookiePostWithResp(t *testing.T, c *http.Client, base string, mgr *session.Manager, accountID string, cookie *http.Cookie, path string, body any) (*http.Response, error) {
 	t.Helper()
 	var r io.Reader
 	if body != nil {
@@ -343,6 +393,7 @@ func cookiePostWithResp(t *testing.T, c *http.Client, base string, cookie *http.
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.AddCookie(cookie)
+	withCSRFIfNeeded(t, c, base, mgr, accountID, http.MethodPost, path, req)
 	return c.Do(req)
 }
 
