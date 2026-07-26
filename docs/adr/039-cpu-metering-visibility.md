@@ -158,7 +158,7 @@ files. This PR makes zero moves in that direction.
 
 - **New**: `pkg/fcvm/cpustats/` (Cache + Observe + Snapshot +
   Lookup + Forget + Reset), `cmd/vmmd/cpu_poller.go`,
-  `migrations/00050_usage_minutes_cpu.sql`,
+  `migrations/00054_usage_minutes_cpu.sql`,
   `pkg/meter/sampler_cpu_test.go`,
   `pkg/vmmdgrpc/stats_cache_test.go`,
   `pkg/fcvm/cpustats/cache_metal_test.go` (//go:build metal).

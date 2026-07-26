@@ -3175,7 +3175,7 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 // deltas need to be summed into the row. The pusher (meter → billing)
 // deduplicates on a coarser window — the additive merge is safe
 // end-to-end. See pkg/state/pgstore.go::AppendUsage and
-// migrations/00050_usage_minutes_cpu.sql for the production rationale.
+// migrations/00054_usage_minutes_cpu.sql for the production rationale.
 func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
