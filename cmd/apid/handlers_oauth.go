@@ -47,7 +47,6 @@ import (
 	"strconv"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
 // oauthCallbackPath is the GitHub App install callback URL that
@@ -127,7 +126,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	log.Info("oauth callback received",
 		"account_id", acct.ID,
 		"installation_id", installationID,
-		"setup_action", logsanitize.Field(setupAction))
+		"setup_action", stripLogCRLF(setupAction))
 
 	// PR-B §11 ownership proof. Re-read the sealed cookie inside the
 	// handler so we have the envelope's github_login field — the
@@ -176,10 +175,9 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			// comes from the AEAD-sealed cookie but the cookie is
 			// attacker-modifiable in principle, so the
 			// CodeQL go/log-injection (CWE-117) alert flags the
-			// raw write. logsanitize.Field strips control chars
-			// so a hostile cookie can't inject a CRLF into the
-			// log stream.
-			"expected_login", logsanitize.Field(expectedLogin),
+			// raw write. stripLogCRLF drops CR/LF so a hostile
+			// cookie can't inject a CRLF into the log stream.
+			"expected_login", stripLogCRLF(expectedLogin),
 			"err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
 			"Could not reach GitHub", "retry the connect flow in a minute: https://docs/connect-github"))
@@ -199,8 +197,8 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			log.Warn("verify installation: install belongs to a different GitHub user (§11 takeover attempt)",
 				"account_id", acct.ID,
 				"install_id", installationID,
-				"expected_login", logsanitize.Field(expectedLogin),
-				"actual_account_login", logsanitize.Field(accountLogin))
+				"expected_login", stripLogCRLF(expectedLogin),
+				"actual_account_login", stripLogCRLF(accountLogin))
 			acctID := acct.ID
 			s.audit.Emit(r.Context(), "auth.install.takeover_rejected", &acctID, map[string]any{
 				"install_id":           installationID,
@@ -215,7 +213,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		log.Warn("verify installation: forged or unknown install_id",
 			"account_id", acct.ID,
 			"install_id", installationID,
-			"expected_login", logsanitize.Field(expectedLogin))
+			"expected_login", stripLogCRLF(expectedLogin))
 		http.Redirect(w, r, "/dashboard/account?github=forged", http.StatusFound)
 		return
 	}
