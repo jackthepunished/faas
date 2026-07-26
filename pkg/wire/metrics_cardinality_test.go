@@ -285,7 +285,6 @@ func TestRequestTotalSharesAdmissionSet(t *testing.T) {
 	// The series is independent of the failure counter (different
 	// counter), but the admission must still surface the same id.
 	m.RequestTotal(id, "GET /v1/rt", "err").Inc()
-	body = render(t, m)
 	if got := readSingle(t, m, fmt.Sprintf(`apid_request_total{account_id=%q,code="err",route="GET /v1/rt"}`, id)); got != 1 {
 		t.Errorf("err-code request_total = %v, want 1", got)
 	}
