@@ -398,9 +398,18 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 
 	if which&APID != 0 {
 		addr := freeTCPAddr(t)
+		// Empty FAAS_APID_METRICS_ADDR disables the metrics listener
+		// (cmd/apid/main.go:425). Without this override the daemon
+		// tries to bind 127.0.0.1:9101 and — when a prior apid run
+		// (or a sibling daemon from a different test) is still
+		// holding the port — exits with `bind: address already in use`
+		// before the main HTTP listener is reached. The e2e harness
+		// doesn't scrape /metrics; the scrape observer is still wired
+		// into the main mux so the dashboard panels stay accurate.
 		env := append(testEnvCommon(dbURL),
 			"FAAS_APID_LISTEN="+addr,
 			"FAAS_APPS_DOMAIN="+testDomain,
+			"FAAS_APID_METRICS_ADDR=",
 		)
 		env = append(env, extraEnv...)
 		h.procs = append(h.procs, startProc(t, bin, "apid", env))
