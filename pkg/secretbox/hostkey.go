@@ -4,16 +4,17 @@
 //
 //   - Plaintext VALUE never enters logs. apid accepts plaintext over TLS,
 //     seals it with the host X25519 recipient, and stores the ciphertext.
-//   - host.age sits at /etc/faas/secrets/host.age. vmmd reads it (root)
-//     when injecting per-wake secrets into the jailer chroot; apid reads
-//     it (via the `faas` group, mode 0440) to unseal the TOTP secret for
-//     /verify + /confirm + /recover + /disable (IAM-2 / issue #186). The
-//     pre-MFA shape was root:root 0400 (only vmmd), which made MFA a
-//     boot-time impossibility — the host age key had to be readable by
-//     both daemons. The 0440 mode is "owner can write, group + owner
-//     can read" — every other group is locked out, and the file is not
-//     world-readable. No other service user besides faas (apid's primary
-//     group) can read it.
+//   - host.age sits at /etc/faas/secrets/host.age, mode 0400 root:root
+//     (spec §11). vmmd reads it (root) when injecting per-wake secrets
+//     into the jailer chroot. apid does NOT read it on disk — instead
+//     systemd's LoadCredential=faas_host_age_identity (see
+//     deploy/systemd/faas-apid.service) copies the file into the apid
+//     unit's credential dir owned by faas-apid:faas, so apid's MFA
+//     handlers (/verify + /confirm + /recover + /disable, IAM-2 /
+//     issue #186) can unseal the TOTP secret without ever opening the
+//     0400 root:root file. The on-disk mode and the apid-read path are
+//     independent — that decoupling is what lets us hold the 0400
+//     contract even though apid needs to consume the identity.
 //   - Per-wake injection: vmmd loopback-mounts drive1 and writes
 //     /etc/faas/secrets.env (JSON), which guest-init reads after pivot_root.
 //     The on-disk format is plain because vmmd is the only root component
@@ -53,9 +54,8 @@ var ErrRecipientInsecurePerms = errors.New("secretbox: host.age.pub permissions 
 
 // DefaultHostKeyPath is where vmmd looks for (and auto-generates) the host
 // X25519 identity on first boot. Spec §11: secrets in /etc/faas/secrets/,
-// mode 0440 root:faas so apid (running as the faas-apid user with primary
-// group faas) can read it for MFA unseal. The 0440 mode is the minimum
-// needed to keep vmmd (root) and apid (faas group) in the read set.
+// mode 0400 root:root. apid reads via systemd LoadCredential, not the
+// on-disk file — see the package docstring above for the decoupling.
 const DefaultHostKeyPath = "/etc/faas/secrets/host.age"
 
 // ErrHostKeyInsecurePerms is returned by LoadHostKey when the file's mode
@@ -121,26 +121,27 @@ func LoadHostKey(path string) (*age.X25519Identity, error) {
 }
 
 // GenerateAndSaveHostKey creates a new X25519 identity, writes its textual
-// representation to path with mode 0440, and returns the identity. Called
+// representation to path with mode 0400, and returns the identity. Called
 // by vmmd on first boot when LoadHostKey returns ErrHostKeyNotFound.
 //
-// File mode is 0440 — owner (root, vmmd) + group (faas, apid) can read.
-// Other groups + other are locked out: the only two privileged services
-// on the box that should ever see this key are vmmd (which writes
-// per-wake secrets.env) and apid (which unseals the TOTP secret for
-// MFA handlers). The 0440 mode is the minimum that lets both daemons
-// run without sudo / without going through root per request, while
-// keeping every other service user locked out.
+// File mode is 0400 root:root — spec §11 literal. The on-disk file is
+// only readable by vmmd (root), which is exactly the threat model: a
+// single root component owns the secret material. apid reads the
+// identity through systemd's LoadCredential=faas_host_age_identity
+// (see deploy/systemd/faas-apid.service), which copies the file into
+// the unit's credential dir owned by faas-apid:faas. The on-disk
+// mode and the credential-dir mode are independent — apid never
+// touches /etc/faas/secrets/host.age directly.
 //
 // On a fresh box this is the bootstrap moment: vmmd is the only root
 // component, so it owns key generation. apid never generates — it
-// consumes the recipient + identity.
+// consumes the recipient + identity via LoadCredential.
 func GenerateAndSaveHostKey(path string) (*age.X25519Identity, error) {
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		return nil, fmt.Errorf("secretbox: generate host key: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(id.String()), 0o440); err != nil {
+	if err := os.WriteFile(path, []byte(id.String()), 0o400); err != nil {
 		return nil, fmt.Errorf("secretbox: write host key %q: %w", path, err)
 	}
 	return id, nil

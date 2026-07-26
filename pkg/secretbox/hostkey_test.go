@@ -23,9 +23,9 @@ func TestLoadHostKeyMissing(t *testing.T) {
 }
 
 // TestGenerateAndSaveRoundTrip writes a key, loads it back, asserts
-// Recipient() matches the original. Mode 0440 (owner+group read) must
-// be honored so apid (in the faas group) can unseal the TOTP secret
-// for IAM-2 / issue #186 MFA handlers without going through root.
+// Recipient() matches the original. Mode 0400 root:root (spec §11
+// literal). apid reads the identity through systemd LoadCredential,
+// not the on-disk file — see the package docstring in hostkey.go.
 func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "host.age")
@@ -33,13 +33,13 @@ func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate+save: %v", err)
 	}
-	// Mode: 0440 owner+group read; everyone else locked out.
+	// Mode: 0400 owner-read; everyone else locked out.
 	st, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := st.Mode().Perm(); perm != 0o440 {
-		t.Errorf("mode=%o want 0o440", perm)
+	if perm := st.Mode().Perm(); perm != 0o400 {
+		t.Errorf("mode=%o want 0o400", perm)
 	}
 	// Reload and compare recipient.
 	id2, err := LoadHostKey(path)
@@ -53,8 +53,8 @@ func TestGenerateAndSaveRoundTrip(t *testing.T) {
 
 // TestRecipientFileRoundTrip covers the vmmd-writes-pub / apid-reads-pub
 // handshake. The recipient file is 0444 (public); the identity file is
-// 0440 root:faas (private — vmmd + apid only). vmmd owns the writer
-// side of both.
+// 0400 root:root (private — vmmd only; apid reads via LoadCredential).
+// vmmd owns the writer side of both.
 func TestRecipientFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	idPath := filepath.Join(dir, "host.age")

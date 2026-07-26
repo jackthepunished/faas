@@ -289,16 +289,21 @@ su - faas -s /bin/bash -c "DATABASE_URL='postgres:///faas?host=/run/postgresql&u
 ok "Migrations applied"
 
 # ─── 11b. Host age key (IAM-2 / issue #186) ─────────────────────────────────
-# vmmd normally writes host.age on first boot with mode 0440 root:faas,
-# but vmmd is NOT deployed on DigitalOcean (no /dev/kvm) — bootstrap.sh
-# has to generate the key here so MFA handlers (/verify, /confirm,
-# /recover, /disable) have an identity to unseal TOTP secrets with.
-# `hostage-gen` is built by `make build` next to apid (cmd/hostage-gen)
-# and calls secretbox.GenerateAndSaveHostKey + WriteRecipientFile
-# internally so the on-disk shape is byte-identical to vmmd's first-
-# boot path. Per the IAM-2 review, the file is 0440 root:faas — owner
-# (root) + group (faas, apid's primary group) read; everyone else
-# locked out.
+# vmmd normally writes host.age on first boot with mode 0400 root:root
+# (spec §11), but vmmd is NOT deployed on DigitalOcean (no /dev/kvm) —
+# bootstrap.sh has to generate the key here so MFA handlers (/verify,
+# /confirm, /recover, /disable) have an identity to unseal TOTP
+# secrets with. `hostage-gen` is built by `make build` next to apid
+# (cmd/hostage-gen) and calls secretbox.GenerateAndSaveHostKey +
+# WriteRecipientFile internally so the on-disk shape is byte-identical
+# to vmmd's first-boot path. The file is 0400 root:root — only the
+# owner (root, via vmmd) can read it on disk; apid consumes the
+# identity through systemd's LoadCredential=faas_host_age_identity
+# (deploy/systemd/faas-apid.service), which copies the file into
+# the apid unit's credential dir owned by faas-apid:faas. The on-disk
+# mode and the apid-read path are independent — that decoupling is
+# what lets us hold the 0400 contract even though apid needs to
+# unseal MFA envelopes.
 #
 # Without this step the MFA handlers 503 CodeCapacity on every step-
 # up, locking mfa_pending customers out of every account-scoped route.
@@ -307,10 +312,11 @@ HOST_AGE_PUB="${SECRETS_DIR}/host.age.pub"
 if [[ -x "${FAAS_BIN}/hostage-gen" ]]; then
   if [[ ! -f "${HOST_AGE_PATH}" ]]; then
     "${FAAS_BIN}/hostage-gen" "${HOST_AGE_PATH}" "${HOST_AGE_PUB}"
-    chown root:faas "${HOST_AGE_PATH}" "${HOST_AGE_PUB}"
-    chmod 0440 "${HOST_AGE_PATH}"
+    chown root:root "${HOST_AGE_PATH}"
+    chown root:faas "${HOST_AGE_PUB}"
+    chmod 0400 "${HOST_AGE_PATH}"
     chmod 0444 "${HOST_AGE_PUB}"
-    ok "host.age written to ${HOST_AGE_PATH} (0440 root:faas)"
+    ok "host.age written to ${HOST_AGE_PATH} (0400 root:root)"
     ok "host.age.pub written to ${HOST_AGE_PUB} (0444 root:faas)"
   else
     # Drift check: re-bootstrap must not silently rotate the key
@@ -319,10 +325,10 @@ if [[ -x "${FAAS_BIN}/hostage-gen" ]]; then
     # explicitly if they mean to.
     HA_MODE=$(stat -c '%a' "${HOST_AGE_PATH}")
     HA_OWNER=$(stat -c '%U:%G' "${HOST_AGE_PATH}")
-    if [[ "${HA_MODE}" != "440" || "${HA_OWNER}" != "root:faas" ]]; then
-      chown root:faas "${HOST_AGE_PATH}"
-      chmod 0440 "${HOST_AGE_PATH}"
-      ok "host.age perms repaired (was ${HA_MODE} ${HA_OWNER}, now 0440 root:faas)"
+    if [[ "${HA_MODE}" != "400" || "${HA_OWNER}" != "root:root" ]]; then
+      chown root:root "${HOST_AGE_PATH}"
+      chmod 0400 "${HOST_AGE_PATH}"
+      ok "host.age perms repaired (was ${HA_MODE} ${HA_OWNER}, now 0400 root:root)"
     else
       ok "host.age already present with correct perms (refusing to rotate)"
     fi
