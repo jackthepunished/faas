@@ -199,7 +199,13 @@ func TestPg_CoverageInstanceStatePaths(t *testing.T) {
 	if err := s.UpdateInstanceState(ctx, "missing", string(state.StateRunning)); err == nil {
 		t.Fatal("missing instance update should error")
 	}
-	if _, err := s.LiveDeployment(ctx, deployment.ID); err != nil {
+	if _, err := s.LiveDeployment(ctx, deployment.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("live deployment before status=live = %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, deployment.ID); err != nil {
 		t.Fatal(err)
+	}
+	if got, err := s.LiveDeployment(ctx, deployment.ID); err != nil || got.ID != deployment.ID {
+		t.Fatalf("live deployment after mark = %+v, %v", got, err)
 	}
 }

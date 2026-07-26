@@ -134,17 +134,11 @@ func TestMemStoreCoveragePaddleAndInvoices(t *testing.T) {
 	if n, err := m.ReapStalePaddleOverageClaims(ctx, time.Hour); err != nil || n != 0 {
 		t.Fatalf("reap fresh = %d, %v", n, err)
 	}
-	staleKey := paddleOverageWindowKey{accountID: account.ID, windowStart: window}
-	m.paddleOverageWindows[staleKey] = paddleOverageClaimState{
-		claimedBy: "pod-a", claimedAt: time.Now().Add(-2 * time.Hour), completed: true,
-	}
+	m.SetPaddleOverageClaimForTest(account.ID, window, "pod-a", time.Now().Add(-2*time.Hour), true)
 	if n, err := m.ReapStalePaddleOverageClaims(ctx, time.Hour); err != nil || n != 0 {
 		t.Fatalf("reap completed = %d, %v", n, err)
 	}
-	staleKey2 := paddleOverageWindowKey{accountID: account.ID, windowStart: window.Add(time.Hour)}
-	m.paddleOverageWindows[staleKey2] = paddleOverageClaimState{
-		claimedBy: "pod-a", claimedAt: time.Now().Add(-2 * time.Hour),
-	}
+	m.SetPaddleOverageClaimForTest(account.ID, window.Add(time.Hour), "pod-a", time.Now().Add(-2*time.Hour), false)
 	if n, err := m.ReapStalePaddleOverageClaims(ctx, time.Hour); err != nil || n != 1 {
 		t.Fatalf("reap stale pending = %d, %v", n, err)
 	}

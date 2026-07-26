@@ -104,8 +104,12 @@ func TestMemStoreCoverageSecretsAndDunning(t *testing.T) {
 	if _, err := m.ListAppSecrets(ctx, "wrong", app.ID); err != nil {
 		t.Fatalf("cross-account list = %v", err)
 	}
+	// UpsertAppSecret currently does not validate that appID belongs to
+	// accountID (the FK lives in SQL, not the in-memory check). Document
+	// the intentional behavior so a future hardening that starts
+	// validating has a single place to flip.
 	if err := m.UpsertAppSecret(ctx, account.ID, "missing-app", "ENV", []byte("ct")); err != nil {
-		t.Fatalf("upsert no validate = %v", err)
+		t.Fatalf("upsert no-validate = %v", err)
 	}
 	if err := m.DeleteAppSecret(ctx, account.ID, app.ID, "ENV"); err != nil {
 		t.Fatal(err)
@@ -138,8 +142,16 @@ func TestMemStoreCoverageSecretsAndDunning(t *testing.T) {
 	if err := m.MarkDunningStep(ctx, account.ID, AccountActive, AccountPastDue); err != nil {
 		t.Fatal(err)
 	}
+	first, err := m.AccountByID(ctx, account.ID)
+	if err != nil || first.PastDueAt == nil {
+		t.Fatalf("first stamp = %+v, %v", first.PastDueAt, err)
+	}
 	if err := m.MarkDunningStep(ctx, account.ID, AccountPastDue, AccountPastDue); err != nil {
 		t.Fatalf("from==to backfill: %v", err)
+	}
+	second, err := m.AccountByID(ctx, account.ID)
+	if err != nil || second.PastDueAt == nil || !second.PastDueAt.Equal(*first.PastDueAt) {
+		t.Fatalf("backfill must preserve stamp: first=%v second=%v", first.PastDueAt, second.PastDueAt)
 	}
 	if err := m.MarkDunningStep(ctx, "missing", AccountActive, AccountPastDue); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("dunning missing = %v", err)

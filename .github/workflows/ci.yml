@@ -375,6 +375,14 @@ jobs:
           # standard idiom for any package exercising goroutines.
           go test -race -count=1 -coverprofile=coverage/cover.out -covermode=atomic ./...
 
+      - name: pkg/state coverage gate
+        # Re-runs the focused profile and fails the job if the package
+        # total drops below 70%. Wired here so the gate fires on every
+        # PR (and push-to-main) that reaches the coverage job — Codecov's
+        # per-component status is informational; this step is the
+        # blocking enforcement.
+        run: make test-state-coverage
+
       - name: upload to Codecov
         uses: codecov/codecov-action@v7
         with:

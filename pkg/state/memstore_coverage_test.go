@@ -295,11 +295,19 @@ func TestMemStoreCoverageInstancesSnapshotsAndNodes(t *testing.T) {
 	if _, err := m.CreateComputeNode(ctx, ComputeNode{Name: node.Name}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate node = %v", err)
 	}
+	before, err := m.ListComputeNodes(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := m.MarkComputeNodeInactive(ctx, node.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := m.ListComputeNodes(ctx, false); len(got) != 1 {
-		t.Fatalf("active nodes includes default = %+v", got)
+	after, err := m.ListComputeNodes(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before)-1 {
+		t.Fatalf("inactive filtered one node: before=%d after=%d", len(before), len(after))
 	}
 	if err := m.SetComputeNodeActive(ctx, node.ID, true); err != nil {
 		t.Fatal(err)
