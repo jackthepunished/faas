@@ -512,7 +512,7 @@ func TestObserveWrap_RequestFailure_AuthenticatedLabel(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, e)
-	want := fmt.Sprintf(`apid_test_request_failures_total{account_id=%q,route="POST /v1/apps"} 1`, e.acct.ID)
+	want := fmt.Sprintf(`apid_test_request_failures_total{account_id=%q,code="err",route="POST /v1/apps"} 1`, e.acct.ID)
 	if !strings.Contains(body, want) {
 		t.Errorf("metrics body missing authenticated request-failure series %q:\n%s", want, body)
 	}
@@ -533,7 +533,7 @@ func TestObserveWrap_RequestFailure_AnonymousLabel(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, e)
-	want := `apid_test_request_failures_total{account_id="anonymous",route="GET /v1/account"} 1`
+	want := `apid_test_request_failures_total{account_id="anonymous",code="err",route="GET /v1/account"} 1`
 	if !strings.Contains(body, want) {
 		t.Errorf("metrics body missing anonymous request-failure series %q:\n%s", want, body)
 	}
@@ -555,7 +555,7 @@ func TestObserveWrap_RequestFailure_UnmatchedRoute(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, e)
-	want := `apid_test_request_failures_total{account_id="anonymous",route="unmatched"} 2`
+	want := `apid_test_request_failures_total{account_id="anonymous",code="err",route="unmatched"} 2`
 	if !strings.Contains(body, want) {
 		t.Errorf("metrics body missing unmatched request-failure series %q:\n%s", want, body)
 	}

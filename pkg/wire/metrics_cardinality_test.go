@@ -85,7 +85,7 @@ func TestAccountLabel_OverflowsToOther(t *testing.T) {
 	// one wouldn't see the other.
 	m.RequestFailure("real-overflow-3", "GET /v1/test").Inc()
 	body = render(t, m)
-	if !strings.Contains(body, `apid_request_failures_total{account_id="__other__",route="GET /v1/test"} 1`) {
+	if !strings.Contains(body, `apid_request_failures_total{account_id="__other__",code="err",route="GET /v1/test"} 1`) {
 		t.Errorf("expected __other__ series on request-failure metric; body was:\n%s", body)
 	}
 	// The audit counter must NOT have advanced from the cross-metric
@@ -133,7 +133,7 @@ func TestAccountLabel_SharedBetweenMetrics(t *testing.T) {
 	body := render(t, m)
 	for _, want := range []string{
 		fmt.Sprintf(`apid_audit_write_failures_total{account_id=%q} 1`, id),
-		fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="GET /v1/test"} 1`, id),
+		fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="GET /v1/test"} 1`, id),
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing shared series %q in:\n%s", want, body)
@@ -222,7 +222,7 @@ func TestRequestFailureFor_ExtractsRouteFromPattern(t *testing.T) {
 	matched.Pattern = "GET /v1/test"
 	m.RequestFailureFor(matched, id).Inc()
 	body := render(t, m)
-	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="GET /v1/test"} 1`, id)) {
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="GET /v1/test"} 1`, id)) {
 		t.Errorf("matched route: missing expected series in:\n%s", body)
 	}
 	// Unmatched route: r.Pattern is "" (the 404 path a URL scanner
@@ -233,7 +233,7 @@ func TestRequestFailureFor_ExtractsRouteFromPattern(t *testing.T) {
 	unmatched.Pattern = ""
 	m.RequestFailureFor(unmatched, id).Inc()
 	body = render(t, m)
-	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="unmatched"} 1`, id)) {
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="unmatched"} 1`, id)) {
 		t.Errorf("unmatched route: missing expected series in:\n%s", body)
 	}
 }
@@ -277,7 +277,7 @@ func TestRequestTotalSharesAdmissionSet(t *testing.T) {
 	if !strings.Contains(body, want) {
 		t.Errorf("missing request_total series %q in:\n%s", want, body)
 	}
-	wantFail := fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="GET /v1/rt"} 1`, id)
+	wantFail := fmt.Sprintf(`apid_request_failures_total{account_id=%q,code="err",route="GET /v1/rt"} 1`, id)
 	if !strings.Contains(body, wantFail) {
 		t.Errorf("missing request_failures series %q in:\n%s", wantFail, body)
 	}
@@ -294,7 +294,7 @@ func TestRequestTotalSharesAdmissionSet(t *testing.T) {
 	body = render(t, m)
 	for _, want := range []string{
 		`apid_request_total{account_id="anonymous",code="ok",route="GET /v1/anon"} 1`,
-		`apid_request_failures_total{account_id="anonymous",route="GET /v1/anon"} 1`,
+		`apid_request_failures_total{account_id="anonymous",code="err",route="GET /v1/anon"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("anonymous-id series missing %q in:\n%s", want, body)
@@ -323,7 +323,7 @@ func TestRequestTotalOverflowsToSharedOther(t *testing.T) {
 	body := render(t, m)
 	for _, want := range []string{
 		`apid_request_total{account_id="__other__",code="ok",route="GET /v1/o"} 1`,
-		`apid_request_failures_total{account_id="__other__",route="GET /v1/o"} 1`,
+		`apid_request_failures_total{account_id="__other__",code="err",route="GET /v1/o"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("__other__-shared series missing %q in:\n%s", want, body)

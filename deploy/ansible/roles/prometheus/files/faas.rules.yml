@@ -85,6 +85,24 @@ groups:
           /
           clamp_min(faas_apid_error_rate_3d_baseline:by_route, 0.001)
 
+      # Per-account anomaly score (issue #303 follow-up). The 3d-baseline
+      # math that FaasTrafficSpikeAccount computes inline in its `expr`
+      # is lifted here so the FaasTrafficAnomaly aggregator alert can
+      # read a precomputed series rather than recomputing the ratio on
+      # every alert evaluation. Bounded by the accountLabelSet admission
+      # primitive (10 000 + "__other__") — the per-account fan-out is
+      # O(active customers), not unbounded.
+      - record: faas_apid_anomaly_score:by_account
+        expr: |
+          sum by (account_id) (rate(apid_request_total[5m]))
+          /
+          clamp_min(
+            avg_over_time(
+              sum by (account_id) (rate(apid_request_total[5m]))[3d:5m]
+            ),
+            0.001
+          )
+
   - name: faas_slo
     interval: 30s
     rules:
@@ -451,4 +469,73 @@ groups:
         annotations:
           summary: "Account {{ $labels.account_id }} traffic < 0.1x its 3d average"
           description: "Customer {{ $labels.account_id }} has been below 10% of its 3d trailing average for 30m. Longer `for:` than the spike rule because quiet customers are common and 30m crosses a real outage from a normal lull. account_id=\"__other__\" is the bounded overflow bucket (issue #278) — drill-down on it means the customer is past the 10k admission cap."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+      # Platform-wide traffic drift (issue #303 follow-up). Fires when
+      # 10+ accounts simultaneously cross 2.0x their 3d baseline —
+      # the literal acceptance criterion from the issue body. The
+      # `unless on (account_id)` clause excludes the __other__ overflow
+      # bucket so the count only includes real customer ids; if many
+      # customers pile up at the admission cap, the alert fires on the
+      # admitted ones only and the operator follows the per-account
+      # drill-down to find the overflow.
+      - alert: FaasTrafficAnomaly
+        expr: |
+          (
+            count(
+              faas_apid_anomaly_score:by_account > 2
+            )
+            unless on (account_id)
+            faas_apid_anomaly_score:by_account{account_id="__other__"}
+          ) >= 10
+        for: 10m
+        labels:
+          severity: page
+          component: apid
+          family: traffic_anomaly
+          mode: platform
+          direction: drift
+        annotations:
+          summary: "{{ $value }} accounts simultaneously crossed 2x 3d baseline"
+          description: "Platform-wide traffic drift: {{ $value }} accounts are above 2x their 3d trailing average for 10m. Indicates either coordinated customer behavior (rare), a global scan/burst, or a misconfigured dashboard / refresh loop. Drill-down via the 'Anomaly spikes (last 7d)' panel (id 90 on faas-fleet-m8) for the top-20 accounts by peak anomaly score."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+      # Error-rate spike / drop (ADR-039 §Open follow-ups). The recording
+      # rules (faas_apid_error_rate_5m:by_route, _3d_baseline, _ratio)
+      # already existed from PR #336; the alert blocks are the missing
+      # piece. Thresholds (2x spike, 0.5x drop) are deliberately tighter
+      # than the request-rate counterparts (3x / 0.2x) because error-rate
+      # is more sensitive — a small absolute spike in 5xx is a larger
+      # signal than a small absolute spike in 2xx traffic.
+      - alert: FaasErrorRateSpike
+        expr: max(faas_apid_error_rate_ratio:by_route) > 2
+        for: 10m
+        labels:
+          severity: page
+          component: apid
+          family: traffic_anomaly
+          mode: fleet
+          direction: spike
+          metric: error_rate
+        annotations:
+          summary: "Error rate > 2x 3-day baseline (route {{ $labels.route }})"
+          description: "Route {{ $labels.route }} has had its error rate above 2x its 3d trailing average for 10m. Cross-check apid_request_failures_total{account_id,route,code} for the per-account view. Common causes: upstream dependency (Postgres, Stripe, Paddle) starting to 5xx, customer-deploy regression, or auth-secret rotation that produced a wave of 401s."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+      - alert: FaasErrorRateDrop
+        expr: |
+          (faas_apid_error_rate_ratio:by_route < 0.5)
+          and
+          (faas_apid_error_rate_5m:by_route > 0.001)
+        for: 15m
+        labels:
+          severity: page
+          component: apid
+          family: traffic_anomaly
+          mode: fleet
+          direction: drop
+          metric: error_rate
+        annotations:
+          summary: "Error rate < 0.5x 3-day baseline (route {{ $labels.route }})"
+          description: "Route {{ $labels.route }} has had its error rate below 50% of its 3d trailing average for 15m while still handling > 0.001 err/s (so it's not idle). Common causes: customer rolled back a misconfigured deploy, scanner traffic stopped, or upstream patch fixed an outage. The `> 0.001 err/s` guard prevents the rule from firing on routes that simply had no recent failures (the baseline would be ~0 and the ratio undefined)."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
