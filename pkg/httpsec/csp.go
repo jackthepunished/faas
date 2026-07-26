@@ -11,10 +11,17 @@
 package httpsec
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"log/slog"
 	"net/http"
 	"strings"
 )
+
+// nonceLen is the byte count fed into base64.RawURLEncoding; 16 bytes
+// produces a 22-char URL-safe nonce, well above the 128-bit floor CSP
+// recommends.
+const nonceLen = 16
 
 // BuildCSPForTest exposes the unexported buildCSP to the test
 // package without exposing it on the public API. Test-only seam:
@@ -30,7 +37,13 @@ var BuildCSPForTest = buildCSP
 // and the per-request nonce. Issue #249 keeps the dashboard's
 // htmx.org@2.0.4 and htmx-ext-sse@2.2.2 scripts served from
 // unpkg.com — the alternative (self-hosting) is tracked as a future
-// ADR. SRI hashes would tighten this further.
+// ADR.
+//
+// TODO(security): pin SRI hashes on the <script src="…unpkg.com…">
+// tags so a compromised unpkg.com response cannot inject arbitrary
+// script. The hashes are content-addressed, so they stay valid
+// across the version pin (htmx.org@2.0.4 / htmx-ext-sse@2.2.2) and
+// the SRI check fails if the file is tampered with on the CDN.
 var cspScriptHosts = []string{"https://unpkg.com"}
 
 // cspFormActionHosts is the form-action host list. Today no client-
@@ -101,13 +114,14 @@ func buildCSP(nonce string) string {
 // correlate the request without recovering the value.
 func Nonce(gate func(*http.Request) bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonce := newNonceOrLog(slog.Default())
-		if nonce == "0000000000000000000000" {
-			// rand.Read failed; surface to the structured log so
-			// the operator sees it. signOf (first 6 chars) keeps
-			// the full nonce out of any log line.
-			slog.Default().Warn("httpsec: nonce degraded",
-				"path", r.URL.Path, "nonce_fp", signOf(nonce))
+		nonce, ok := mintNonce(r.URL.Path)
+		if !ok {
+			// rand.Read failed; fall back to the zero nonce. The
+			// browser will refuse inline scripts that carry a
+			// zero-nonce match against the page's CSP, but the
+			// page still renders and operators see the alert in
+			// their structured logs.
+			nonce = zeroNonce
 		}
 		r = r.WithContext(WithNonce(r.Context(), nonce))
 		if gate != nil && gate(r) {
@@ -115,4 +129,34 @@ func Nonce(gate func(*http.Request) bool, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// zeroNonce is the literal 22-zero string returned on a rare
+// rand.Read failure. Constant so the failure-path test can pin it
+// and operators can grep for it in their logs.
+const zeroNonce = "0000000000000000000000"
+
+// mintNonce returns a fresh 22-character URL-safe nonce and
+// reports success. On rand.Read failure it logs once (path +
+// 6-char fingerprint of the zero nonce, never the full value) and
+// returns ok=false so the caller can substitute the zero nonce.
+func mintNonce(path string) (string, bool) {
+	var b [nonceLen]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		slog.Default().Error("httpsec: rand.Read failed; nonce degraded to zeros",
+			"err", err, "path", path, "nonce_fp", zeroNonce[:6])
+		return zeroNonce, false
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), true
+}
+
+// NewNonce returns a fresh 22-character URL-safe nonce. Public so
+// unit tests and any future caller (e.g. a future build-time
+// pre-renderer) can mint nonces without going through the
+// middleware. On the rare rand.Read failure it returns the zero
+// nonce rather than panicking in the caller's hot path; callers
+// that need the failure signal should use mintNonce directly.
+func NewNonce() string {
+	n, _ := mintNonce("")
+	return n
 }

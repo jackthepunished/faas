@@ -25,10 +25,10 @@ const (
 	// until the §11 policy review finalises.
 	ValueHSTSMaxAge = "max-age=31536000; includeSubDomains"
 
-	ValueXFrameOptions           = "DENY"
-	ValueXContentTypeOptions     = "nosniff"
-	ValueReferrerPolicy          = "strict-origin-when-cross-origin"
-	ValuePermissionsPolicy       = "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+	ValueXFrameOptions       = "DENY"
+	ValueXContentTypeOptions = "nosniff"
+	ValueReferrerPolicy      = "strict-origin-when-cross-origin"
+	ValuePermissionsPolicy   = "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
 )
 
 // HSTSEnabled gates Strict-Transport-Security. Default true; flipped

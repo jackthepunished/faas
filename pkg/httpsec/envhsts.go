@@ -19,9 +19,9 @@ import "strings"
 // Anything else → true (safe default).
 func HSTSEnabledFromEnv(getenv func(string) string) bool {
 	switch strings.ToLower(strings.TrimSpace(getenv("FAAS_HSTS_ENABLED"))) {
-	case envHSTSTrueOff, envHSTSYesOff, envHSTSOnOff, envHSTSEmptyOff, envHSTSOneOff:
+	case envHSTSTrue, envHSTSYes, envHSTSOn, envHSTSEmpty, envHSTSOne:
 		return true
-	case envHSTSFalseOff, envHSTSNoOff, envHSTSOffOff, envHSTSZeroOff:
+	case envHSTSFalse, envHSTSNo, envHSTSOff, envHSTSZero:
 		return false
 	default:
 		return true
@@ -32,14 +32,14 @@ func HSTSEnabledFromEnv(getenv func(string) string) bool {
 // in prod" tweak only has to flip the switch literal — the truthy /
 // falsy membership stays self-documenting at the call site.
 const (
-	envHSTSEmptyOff = ""     // value: ""
-	envHSTSOneOff   = "1"    // value: "1"
-	envHSTSTrueOff  = "true" // value: "true"
-	envHSTSYesOff   = "yes"  // value: "yes"
-	envHSTSOnOff    = "on"   // value: "on"
+	envHSTSEmpty = ""     // value: ""
+	envHSTSOne   = "1"    // value: "1"
+	envHSTSTrue  = "true" // value: "true"
+	envHSTSYes   = "yes"  // value: "yes"
+	envHSTSOn    = "on"   // value: "on"
 
-	envHSTSZeroOff  = "0"     // value: "0"
-	envHSTSFalseOff = "false" // value: "false"
-	envHSTSNoOff    = "no"    // value: "no"
-	envHSTSOffOff   = "off"   // value: "off"
+	envHSTSZero  = "0"     // value: "0"
+	envHSTSFalse = "false" // value: "false"
+	envHSTSNo    = "no"    // value: "no"
+	envHSTSOff   = "off"   // value: "off"
 )

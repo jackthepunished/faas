@@ -157,7 +157,7 @@ func TestHttpsec_HSTSEnabledEnvHelper(t *testing.T) {
 		raw  string
 		want bool
 	}{
-		{"", true},             // default
+		{"", true}, // default
 		{"1", true},
 		{"true", true},
 		{"TRUE", true},

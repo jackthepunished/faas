@@ -4,10 +4,13 @@
 //
 // The harness is the standard `setup(t, plan)` from server_test.go:
 // in-memory store, noopNotifier, real `srv.handler()` whose outer
-// wrapper is `httpsec.Static(httpsec.Nonce(apidAlwaysGate, ...))`.
+// wrapper is
+//
+//	httpsec.Static(httpsec.Nonce(func(*http.Request) bool { return true }, ...))
+//
 // The point is to catch a wiring regression between the middleware
-// and the rest of the server (e.g. a future handler that reseting
-// headers, or a future wrappper that runs before the security chain).
+// and the rest of the server (e.g. a future handler that resets
+// headers, or a future wrapper that runs before the security chain).
 
 package main
 
@@ -41,8 +44,8 @@ func TestHttpsec_StaticHeadersOnAllPaths(t *testing.T) {
 
 	// Hoist the account + key out of the loop so the per-path
 	// subtests share one auth token. MemStore rejects duplicate
-	// emails, so creating inside the loop would fail on the second
-	// subtest.
+	// emails (see pkg/state/memstore.go CreateAccount), so creating
+	// inside the loop would fail on the second subtest.
 	acct, err := store.CreateAccount(context.Background(),
 		"httpsec@example.com", api.PlanFree)
 	if err != nil {

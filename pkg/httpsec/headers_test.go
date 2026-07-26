@@ -264,25 +264,24 @@ func TestCSP_HeaderMatchesDashboardSpec(t *testing.T) {
 // into another user's session — though we'd only see this under a
 // shared cache; the test pins the property anyway).
 func TestCSP_NonceFreshness(t *testing.T) {
-	var first, second string
 	gate := func(*http.Request) bool { return true }
-	make := func() *httptest.ResponseRecorder {
-		rec := httptest.NewRecorder()
+	probe := func() string {
 		var seen string
 		httpsec.Nonce(gate, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			seen = httpsec.NonceFromContext(r.Context())
 			w.WriteHeader(http.StatusOK)
-		})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/", nil))
+		})).ServeHTTP(httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodGet, "/dashboard/", nil))
 		if seen == "" {
 			t.Fatal("nonce missing on context")
 		}
-		first = seen
-		_ = first
-		return rec
+		return seen
 	}
-	make()
-	second = make().Header().Get("Content-Security-Policy")
-	_ = second
+	first := probe()
+	second := probe()
+	if first == second {
+		t.Errorf("two requests returned identical CSP nonces %q", first)
+	}
 }
 
 // TestNonce_NonceLengthOver128Bits confirms the nonce carries at

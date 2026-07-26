@@ -160,3 +160,63 @@ func TestRender_NoNonceRendersCleanly(t *testing.T) {
 		t.Errorf("body missing login form\n--- body ---\n%s", rec.Body.String())
 	}
 }
+
+// TestRender_AccountNoInlineOnclick pins the inline-onclick refactor
+// (issue #249 / spec §11). Browsers do not propagate `nonce` onto
+// event-handler attributes, so the original
+//
+//	<button onclick="return confirm('...')">
+//
+// would silently break the delete-account confirm prompt the
+// moment CSP ships. The refactor moves the prompt into a per-page
+// `<script nonce="…">` block that wires addEventListener on a
+// form identified by id="account-delete-form". This test pins:
+//   - the form carries the id (so the addEventListener hook can
+//     find it),
+//   - the rendered output contains NO `onclick=` attributes
+//     (no inline event handlers at all, so a future regression
+//     in a different template is caught too),
+//   - the per-page `<script nonce="…">` block contains the confirm
+//     prompt wiring.
+func TestRender_AccountNoInlineOnclick(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const nonce = "nonceSmokeTest1234567ab" // 22 chars
+	page := dashboard.Page{
+		Title: "Account",
+		Body:  "account",
+		Account: &dashboard.AccountView{
+			ID:       "acct-1",
+			Email:    "jane@example.test",
+			Plan:     "pro",
+			AppCount: 1,
+		},
+		Data: dashboard.AccountData{
+			ShowDelete: true,
+		},
+	}
+	if err := dashboard.Render(rec, log, nonce, page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	// The danger-zone form must carry the id the addEventListener
+	// hook is bound to.
+	if !strings.Contains(body, `id="account-delete-form"`) {
+		t.Errorf("account delete form missing id\n--- body ---\n%s", body)
+	}
+	// No inline event handlers — that would defeat strict CSP.
+	if strings.Contains(body, "onclick=") {
+		t.Errorf("account template still carries an inline onclick attr\n--- body ---\n%s", body)
+	}
+	// The per-page <script nonce=…> block must contain the confirm
+	// prompt wiring so the user still sees the dialog.
+	if !strings.Contains(body, `nonce="`+nonce+`"`) {
+		t.Errorf("per-page script block missing nonce attr\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, "addEventListener") {
+		t.Errorf("per-page script block missing addEventListener wiring\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, "Schedule your account for permanent deletion in 30 days?") {
+		t.Errorf("per-page script block missing confirm copy\n--- body ---\n%s", body)
+	}
+}
