@@ -281,6 +281,12 @@ const (
 	CodeResetTokenInvalid  = "reset_token_invalid"
 	CodeResetTokenExpired  = "reset_token_expired"
 	CodeAccountExists      = "account_exists"
+
+	// CodeRateLimited is the wire string the authlimiter middleware
+	// emits on a 429. It is plain-text, not a Problem-shaped body, so
+	// the SDK's *APIError.Unwrap path uses it as the lookup key when
+	// surfacing the rate-limited sentinel — see apierror.go::Unwrap.
+	CodeRateLimited = "rate_limited"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
