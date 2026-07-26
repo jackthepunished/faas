@@ -3,6 +3,7 @@
 
 export type { APIKeyExportResponse } from './APIKeyExportResponse.js';
 export type { APIKeyResponse } from './APIKeyResponse.js';
+export type { AccountCreditResponse } from './AccountCreditResponse.js';
 export type { AccountDeletionResponse } from './AccountDeletionResponse.js';
 export type { AccountExportResponse } from './AccountExportResponse.js';
 export type { AccountLimits } from './AccountLimits.js';

@@ -7,6 +7,7 @@ export { CancelablePromise, CancelError } from './core/CancelablePromise.js';
 export { OpenAPI } from './core/OpenAPI.js';
 export type { OpenAPIConfig } from './core/OpenAPI.js';
 
+export type { AccountCreditResponse } from './models/AccountCreditResponse.js';
 export type { AccountDeletionResponse } from './models/AccountDeletionResponse.js';
 export type { AccountExportResponse } from './models/AccountExportResponse.js';
 export type { AccountLimits } from './models/AccountLimits.js';
@@ -81,6 +82,7 @@ export type { UsageResponse } from './models/UsageResponse.js';
 export type { UsageSummaryResponse } from './models/UsageSummaryResponse.js';
 
 export { AccountService } from './services/AccountService.js';
+export { AdminService } from './services/AdminService.js';
 export { AppsService } from './services/AppsService.js';
 export { AuditService } from './services/AuditService.js';
 export { AuthService } from './services/AuthService.js';
