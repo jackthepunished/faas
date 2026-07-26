@@ -327,6 +327,109 @@ jobs:
         working-directory: sdk/go
         run: go test -count=1 ./...
 
+  # fakeapid fixture (issue #266, PR 4). The cross-language smoke
+  # fixture for the public SDKs — a stdlib-only Go binary that
+  # mimics apid's surface so Node (PR 5) and Python (PR 6) SDKs
+  # can smoke-test against a real HTTP process. The fixture must
+  # build + test cleanly with no external deps; this gate fails
+  # the PR if a regression breaks the wire shape.
+  #
+  # Mirrors sdk-go: same GO_VERSION, no services, no path filters
+  # (the existing convention is "no filter" so we don't accidentally
+  # skip the gate when a non-sdk change touches the workflow).
+  # PR 5/6 will invoke this job's pre-built ./bin/fakeapid from
+  # their own `-tags smoke_bin` runs to assert artifact
+  # compatibility (see sdk/fakeapid/main_bin_test.go).
+  sdk-fakeapid:
+    name: sdk-fakeapid (Go stdlib fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No Go cache: the fixture module has zero external deps
+          # (no go.sum), so cache hit rate is zero anyway.
+      - name: go build
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: go test
+        working-directory: sdk/fakeapid
+        run: go test -count=1 -race ./...
+
+  # PR 5 (issue #266, Node SDK). Two jobs: gen asserts the
+  # committed generated tree matches a fresh regen (dirty-diff gate
+  # per ADR-013); smoke runs the smoke suite against the fakeapid
+  # fixture built inline (no shared artifact upload).
+  #
+  # No path filters — matches sdk-go / sdk-fakeapid precedent so the
+  # gate fires whenever the workflow runs.
+  sdk-gen-node:
+    name: sdk-gen-node (regenerate + dirty-diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: gen:check (regenerate + assert clean diff)
+        working-directory: sdk/node
+        run: |
+          npm run gen:check || {
+            echo "::error::sdk/node/src/generated is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
+            exit 1
+          }
+
+  sdk-smoke-node:
+    name: sdk-smoke-node (Node SDK against fakeapid fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: build fakeapid fixture
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: smoke test
+        working-directory: sdk/node
+        run: npm run test:smoke
+
+  sdk-unit-node:
+    name: sdk-unit-node (Node SDK unit tests, no fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: unit tests
+        working-directory: sdk/node
+        run: npm run test:unit
+
   coverage:
     services:
       postgres:
