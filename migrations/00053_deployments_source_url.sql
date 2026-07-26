@@ -1,7 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00051_deployments_source_url.sql — Tier 3 (issue #197 B3.10 schema half).
+-- 00053_deployments_source_url.sql — Tier 3 (issue #197 B3.10 schema half).
+--
+-- Slot 53 was free on main at PR-#322 landing time; we renumbered from
+-- 51 to 53 to avoid colliding with migrations/00051_crons_app_full_idx.sql
+-- (PR #340), which also wanted 51. See PR #345 (CI slot-collision fix).
 --
 -- Adds two columns to deployments:
 --
