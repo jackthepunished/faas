@@ -34,6 +34,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
 // installBindRequest is the POST body for both endpoints. JSON
@@ -107,7 +108,11 @@ func (s *server) listInstallableRepos(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("listInstallableRepos: verify installation failed",
 			"op", op, "account_id", acct.ID,
 			"install_id", req.InstallationID,
-			"expected_login", expectedLogin, "err", err)
+			// expected_login flows from the session cookie and is
+			// therefore attacker-controllable in principle; sanitize
+			// to defeat Log entries created from user input
+			// (CodeQL go/log-injection, CWE-117).
+			"expected_login", logsanitize.Field(expectedLogin), "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
 			"Could not reach GitHub", "retry in a minute: https://docs/connect-github"))
 		return
@@ -120,8 +125,8 @@ func (s *server) listInstallableRepos(w http.ResponseWriter, r *http.Request) {
 			s.log.Warn("listInstallableRepos: install belongs to a different GitHub user",
 				"op", op, "account_id", acct.ID,
 				"install_id", req.InstallationID,
-				"expected_login", expectedLogin,
-				"actual_account_login", accountLogin)
+				"expected_login", logsanitize.Field(expectedLogin),
+				"actual_account_login", logsanitize.Field(accountLogin))
 			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "forged",
 				"This installation belongs to a different GitHub user",
 				"the install is bound to a different GitHub identity than the one you signed in with"))
@@ -209,7 +214,11 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("bindAppToRepo: verify installation failed",
 			"op", op, "account_id", acct.ID,
 			"install_id", req.InstallationID,
-			"expected_login", expectedLogin, "err", err)
+			// expected_login flows from the session cookie and is
+			// therefore attacker-controllable in principle; sanitize
+			// to defeat Log entries created from user input
+			// (CodeQL go/log-injection, CWE-117).
+			"expected_login", logsanitize.Field(expectedLogin), "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
 			"Could not reach GitHub", "retry in a minute: https://docs/connect-github"))
 		return
@@ -220,8 +229,8 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 				"op", op, "account_id", acct.ID,
 				"app_id", app.ID,
 				"install_id", req.InstallationID,
-				"expected_login", expectedLogin,
-				"actual_account_login", accountLogin)
+				"expected_login", logsanitize.Field(expectedLogin),
+				"actual_account_login", logsanitize.Field(accountLogin))
 			acctID := acct.ID
 			s.audit.Emit(r.Context(), "auth.install.takeover_rejected", &acctID, map[string]any{
 				"install_id":           req.InstallationID,
@@ -238,7 +247,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("bindAppToRepo: forged or unknown install_id",
 			"op", op, "account_id", acct.ID,
 			"install_id", req.InstallationID,
-			"expected_login", expectedLogin)
+			"expected_login", logsanitize.Field(expectedLogin))
 		http.Redirect(w, r, "/dashboard/account?github=forged", http.StatusFound)
 		return
 	}

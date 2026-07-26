@@ -172,7 +172,14 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		log.Warn("verify installation failed",
 			"account_id", acct.ID,
 			"install_id", installationID,
-			"expected_login", expectedLogin,
+			// expected_login is the session's github_login; it
+			// comes from the AEAD-sealed cookie but the cookie is
+			// attacker-modifiable in principle, so the
+			// CodeQL go/log-injection (CWE-117) alert flags the
+			// raw write. logsanitize.Field strips control chars
+			// so a hostile cookie can't inject a CRLF into the
+			// log stream.
+			"expected_login", logsanitize.Field(expectedLogin),
 			"err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
 			"Could not reach GitHub", "retry the connect flow in a minute: https://docs/connect-github"))
@@ -192,8 +199,8 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			log.Warn("verify installation: install belongs to a different GitHub user (§11 takeover attempt)",
 				"account_id", acct.ID,
 				"install_id", installationID,
-				"expected_login", expectedLogin,
-				"actual_account_login", accountLogin)
+				"expected_login", logsanitize.Field(expectedLogin),
+				"actual_account_login", logsanitize.Field(accountLogin))
 			acctID := acct.ID
 			s.audit.Emit(r.Context(), "auth.install.takeover_rejected", &acctID, map[string]any{
 				"install_id":           installationID,
@@ -208,7 +215,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		log.Warn("verify installation: forged or unknown install_id",
 			"account_id", acct.ID,
 			"install_id", installationID,
-			"expected_login", expectedLogin)
+			"expected_login", logsanitize.Field(expectedLogin))
 		http.Redirect(w, r, "/dashboard/account?github=forged", http.StatusFound)
 		return
 	}
