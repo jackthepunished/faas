@@ -1,0 +1,135 @@
+# Synthetic time-series fixture for the per-account anomaly score
+# recording rule and the FaasTrafficAnomaly 10+-accounts alert
+# (issue #303 follow-up to PR #336 / ADR-039).
+#
+# What this exercises:
+#   1. faas_apid_anomaly_score:by_account — the per-account ratio of
+#      current 5m rate to 3d trailing average. PR #336 computed this
+#      inline in the per-account alerts; the follow-up lifts it into
+#      a recording rule so FaasTrafficAnomaly can read from a
+#      precomputed series rather than recomputing on every eval.
+#   2. FaasTrafficAnomaly — the count(...) >= 10 alert. It must fire
+#      on a synthetic 10-account coordinated burst (acceptance #3 of
+#      issue #303) and must NOT fire on a single-account burst.
+#
+# Why this is the canonical synthetic-fixture test (acceptance #5 of
+# issue #303): the rule file itself is validated by TestFaasRulesSyntax
+# via `promtool check rules` (parse-only); this test feeds real samples
+# through the recording-rule engine and asserts the alert opens at
+# the configured threshold. No daemon-side state, no live apid
+# instance required — pure rule-engine evaluation.
+#
+# Fixture shape note: the rule's 3d-trailing-baseline subquery
+# (`avg_over_time(.[3d:5m])`) is exercised by feeding 10h of zero
+# baseline then a 5m spike. The subquery extrapolates to zero outside
+# the data window, the baseline is therefore ~0, the ratio is
+# `clamp_min(current / 0.001)` which is large, every active account
+# crosses the 2.0 threshold, and the 10-account coordinated burst
+# triggers the alert. The single-account burst produces count=1 < 10
+# and the alert does NOT fire. This pins the alert's threshold and
+# aggregator logic without needing 3d of synthetic data (which would
+# be ~26M samples × 22 series — too large for promtool).
+
+rule_files:
+  - ../../../deploy/ansible/roles/prometheus/files/faas.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ──────────────────────────────────────────────────────────────
+  # Test 1 — 10-account coordinated burst → FaasTrafficAnomaly
+  # fires.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "10-account coordinated burst → FaasTrafficAnomaly fires"
+    input_series:
+      # 10h zero baseline = 1200 samples (1200 × 30s = 10h), then a
+      # 5m spike = 10 samples. Total 1210 samples per series.
+      - series: 'apid_request_total{account_id="acct-01",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-01",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-02",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-02",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-03",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-03",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-04",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-04",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-05",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-05",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-06",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-06",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-07",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-07",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-08",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-08",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-09",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-09",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="acct-10",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-10",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      # __other__ overflow bucket — present at baseline but does not
+      # cross the threshold. Pin that the alert's `unless on
+      # (account_id)` clause excludes it from the page-trigger count.
+      - series: 'apid_request_total{account_id="__other__",route="GET /v1/test",code="ok"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="__other__",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+    alert_rule_test:
+      # eval_time = 10h + 15m places us 15m after the spike starts
+      # (spike: t=10h..t=10h25m, 25m long). The 5m rate window sees
+      # the spike rate (0.3 per 30s = 0.01 rps) and the 3d trailing
+      # subquery extrapolates to zero. The ratio is ~3 (>2.0
+      # threshold) for all 10 accounts. The alert's 10m `for:`
+      # window has elapsed from when the expression first evaluated
+      # true (at t=10h+5m). The alert must be active.
+      - eval_time: 10h15m
+        alertname: FaasTrafficAnomaly
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: apid
+              family: traffic_anomaly
+              mode: platform
+              direction: drift
+            exp_annotations:
+              summary: "10 accounts simultaneously crossed 2x 3d baseline"
+              description: "Platform-wide traffic drift: 10 accounts are above 2x their 3d trailing average for 10m. Indicates either coordinated customer behavior (rare), a global scan/burst, or a misconfigured dashboard / refresh loop. Drill-down via the 'Anomaly spikes (last 7d)' panel (id 90 on faas-fleet-m8) for the top-20 accounts by peak anomaly score."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 2 — single-account burst. Only one account crosses 2.0;
+  # the alert must NOT fire because count(...) = 1 < 10.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "single-account burst → FaasTrafficAnomaly does NOT fire"
+    input_series:
+      - series: 'apid_request_total{account_id="acct-solo",route="GET /v1/test",code="ok"}'
+        values: '0+0x1200 0+0.3x50'
+      - series: 'apid_request_total{account_id="acct-solo",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="__other__",route="GET /v1/test",code="ok"}'
+        values: '0+0x1250'
+      - series: 'apid_request_total{account_id="__other__",route="GET /v1/test",code="err"}'
+        values: '0+0x1250'
+    alert_rule_test:
+      - eval_time: 10h15m
+        alertname: FaasTrafficAnomaly
+        # No exp_alerts → assert the alert is NOT active.

@@ -1,9 +1,10 @@
 // Tests that the canonical Grafana dashboard at
 // deploy/grafana/faas-fleet.json is valid JSON and that the panels
-// introduced by issue #303 / ADR-039 (ids 80, 81, 82, 83) are present
-// with non-empty PromQL expressions. The repo has no precedent for
-// dashboard JSON validation; the only related test pattern is the
-// per-component emitter-side scrape test in
+// introduced by issue #303 / ADR-039 (ids 80, 81, 82, 83) and the
+// issue #303 follow-up panel (id 90, "Anomaly spikes (last 7d)") are
+// present with non-empty PromQL expressions. The repo has no
+// precedent for dashboard JSON validation; the only related test
+// pattern is the per-component emitter-side scrape test in
 // pkg/wire/metrics_cardinality_test.go. The validation is
 // intentionally narrow — it parses the JSON, locates each new panel
 // by `id`, and asserts the first `targets[].expr` is non-empty. It
@@ -60,7 +61,7 @@ func TestFaasFleetDashboardParses(t *testing.T) {
 	// non-empty PromQL expression. The ids are stable contract:
 	// review-future contributors must add new panels with new ids
 	// rather than reusing these, so the assertions stay accurate.
-	for _, want := range []int{80, 81, 82, 83} {
+	for _, want := range []int{80, 81, 82, 83, 90} {
 		var found *panel
 		for i := range root.Panels {
 			if root.Panels[i].ID == want {

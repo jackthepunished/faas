@@ -51,8 +51,9 @@ ACCOUNT_ID="<paste from /v1/account>"
 curl -fsS --data-urlencode "query=rate(apid_audit_write_failures_total{account_id=\"${ACCOUNT_ID}\"}[5m])" \
   'http://127.0.0.1:9090/api/v1/query'
 
-# Their request-failure stream (companion counter, same label)
-curl -fsS --data-urlencode "query=sum by (route) (rate(apid_request_failures_total{account_id=\"${ACCOUNT_ID}\"}[5m]))" \
+# Their request-failure stream (companion counter, same label;
+# code="err" is the invariant — see ADR-039 §Consequences)
+curl -fsS --data-urlencode "query=sum by (route) (rate(apid_request_failures_total{account_id=\"${ACCOUNT_ID}\",code=\"err\"}[5m]))" \
   'http://127.0.0.1:9090/api/v1/query'
 
 # Their audit-write latency p95

@@ -835,7 +835,7 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
 				acct = p.Acct.ID
 			}
-			s.ops.RequestFailureFor(r, acct).Inc()
+			s.ops.RequestFailureFor(r, rec.status, acct).Inc()
 		}
 	})
 }

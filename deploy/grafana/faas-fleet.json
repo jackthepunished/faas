@@ -485,6 +485,34 @@
         "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Anomaly spikes (last 7d)",
+      "id": 90,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 80},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "topk(20, max_over_time(faas_apid_anomaly_score:by_account{account_id!=\"__other__\"}[7d]) > 2)", "legendFormat": "{{account_id}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 2},
+              {"color": "red", "value": 5}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ],
   "refresh": "30s",
