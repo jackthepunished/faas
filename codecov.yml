@@ -79,10 +79,18 @@ component_management:
         - pkg/grpcerr/**
         - pkg/vmmdgrpc/**
         - api/proto/**
-    - component_id: state
+    - component_id: state_runtime
+      paths:
+        - pkg/sched/**
+    - component_id: pkg_state
       paths:
         - pkg/state/**
-        - pkg/sched/**
+      statuses:
+        - type: project
+          target: 70%
+          threshold: 2%
+          informational: false
+          only_pulls: false
 
 ignore:
   - "**/*.pb.go"

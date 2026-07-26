@@ -3,6 +3,7 @@
 
 GO      ?= go
 PKGS    := ./...
+COVERAGE_DIR := coverage
 DAEMONS := apid gatewayd schedd vmmd builderd imaged meterd faas githubd hostage-gen
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
@@ -82,6 +83,21 @@ proto-normalize: proto
 .PHONY: test
 test: ## Unit tests — must pass on any machine, no KVM needed
 	$(GO) test -race -count=1 $(PKGS)
+
+.PHONY: test-state-coverage
+test-state-coverage: ## Assert pkg/state coverage ≥ 70% (excluding generated pkg/state/sqlc/**). Needs DATABASE_URL pointing at a reachable Postgres; PgStore tests skip cleanly otherwise.
+	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set — PgStore tests will skip; package total will only reflect MemStore coverage." ; )
+	$(GO) test -race -count=1 -covermode=atomic -coverprofile=$(COVERAGE_DIR)/state.out ./pkg/state/...
+	@total=$$(awk '/^github\.com\/.*\/pkg\/state\// { \
+		if ($$0 ~ /pkg\/state\/sqlc\//) next; \
+		split($$0, a, " "); n=split(a[1], b, ":"); file=b[1]; \
+		count=a[length(a)]+0; stmts=a[length(a)-1]+0; \
+		tot_stmts += stmts; \
+		if (count > 0) tot_hit += stmts; \
+	} END { if (tot_stmts > 0) printf "%.1f", tot_hit*100/tot_stmts; else print "0.0" }' $(COVERAGE_DIR)/state.out) ; \
+	awk -v t="$$total" 'BEGIN { exit (t+0 >= 70 ? 0 : 1) }' \
+		&& echo "pkg/state coverage: $$total% ✓ (target ≥ 70%, excluding generated pkg/state/sqlc/**)" \
+		|| (echo "pkg/state coverage: $$total% ✗ (target ≥ 70%, excluding generated pkg/state/sqlc/**)"; exit 1)
 
 .PHONY: migrations-check
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up

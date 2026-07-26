@@ -3200,6 +3200,23 @@ func (m *MemStore) ReapStalePaddleOverageClaims(_ context.Context, olderThan tim
 	return n, nil
 }
 
+// SetPaddleOverageClaimForTest fabricates a claim row at the given
+// state. Used by the reap/foreign-claim tests to plant rows that the
+// production API alone cannot construct (a stale, foreign-owned claim
+// with no recent activity). Not invoked by production code; documents
+// the seam so a future refactor can rename the internal map without
+// rewriting the test contract.
+func (m *MemStore) SetPaddleOverageClaimForTest(accountID string, windowStart time.Time, claimedBy string, claimedAt time.Time, completed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.paddleOverageWindows == nil {
+		m.paddleOverageWindows = map[paddleOverageWindowKey]paddleOverageClaimState{}
+	}
+	m.paddleOverageWindows[paddleOverageWindowKey{accountID: accountID, windowStart: windowStart.UTC()}] = paddleOverageClaimState{
+		claimedBy: claimedBy, claimedAt: claimedAt, completed: completed,
+	}
+}
+
 type appHourKey struct {
 	AccountID string
 	AppID     string
