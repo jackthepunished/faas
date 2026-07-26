@@ -23,12 +23,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -261,6 +264,18 @@ func TestRealService_ExchangeOAuthCode_MakesRealAPICall(t *testing.T) {
 	if !strings.HasPrefix(string(inst.SealedToken), "age-encryption.org/v1") {
 		t.Errorf("SealedToken prefix = %q, want age-encryption.org/v1", inst.SealedToken[:32])
 	}
+	// Unseal round-trip — a regression that wrote a hand-stamped
+	// plain-text blob starting with the magic prefix would pass the
+	// HasPrefix check above but fail here. Pinned against the
+	// githubd installTokenSealKey so a future envelope-key rename
+	// trips this test instead of a silent production downgrade.
+	env, oerr := secretbox.Open(ident, inst.SealedToken)
+	if oerr != nil {
+		t.Fatalf("unseal SealedToken: %v", oerr)
+	}
+	if got, ok := env[installTokenSealKey]; !ok || got != "ghs_install_xyz" {
+		t.Errorf("unsealed value = %q, want %q", got, "ghs_install_xyz")
+	}
 	if inst.AuditGithubLogin != "octocat" {
 		t.Errorf("AuditGithubLogin = %q, want octocat", inst.AuditGithubLogin)
 	}
@@ -319,14 +334,18 @@ func TestRealService_ExchangeOAuthCode_TransitFailureReturnsErr(t *testing.T) {
 // installation_id overwrites the first row.
 func TestRealService_ExchangeOAuthCode_AlreadyInstalledUpserts(t *testing.T) {
 	ident, recipient := newTestAgeKeypair(t)
-	var firstHit = true
+	var hitCount atomic.Int64
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/login/oauth/access_token":
 			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "user-tok"})
 		case "/user/installations":
+			// atomic counter is incremented on every request so the
+			// handler's read races safely with the test goroutine's
+			// future writes. After the first call, /user/installations
+			// returns install id 2 instead of 1.
 			id := float64(1)
-			if !firstHit {
+			if hitCount.Add(1) > 1 {
 				id = 2
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -334,14 +353,17 @@ func TestRealService_ExchangeOAuthCode_AlreadyInstalledUpserts(t *testing.T) {
 			})
 		case "/app/installations/1/access_tokens", "/app/installations/2/access_tokens":
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"token":       "ghs_x",
-				"expires_at":  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				"token":      "ghs_x",
+				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 			})
 		default:
 			if strings.HasPrefix(r.URL.Path, "/app/installations/") {
-				// /app/installations/{id} (verify)
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":1,"account":{"login":"octocat"}}`))
+				// /app/installations/{id} (verify) — echo the id so the
+				// test can assert the round-trip (the production code
+				// trusts the verify endpoint's id, so a stub that
+				// always returns id=1 would mask a regression).
+				idStr := strings.TrimPrefix(r.URL.Path, "/app/installations/")
+				_, _ = w.Write([]byte(`{"id":` + idStr + `,"account":{"login":"octocat"},"default_branch":"main"}`))
 				return
 			}
 			w.WriteHeader(http.StatusNotFound)
@@ -356,7 +378,6 @@ func TestRealService_ExchangeOAuthCode_AlreadyInstalledUpserts(t *testing.T) {
 	if _, _, err := svc.ExchangeOAuthCode("acct-1", "code-1", "state-1"); err != nil {
 		t.Fatalf("first exchange: %v", err)
 	}
-	firstHit = false
 	if _, _, err := svc.ExchangeOAuthCode("acct-1", "code-2", "state-2"); err != nil {
 		t.Fatalf("second exchange: %v", err)
 	}
@@ -421,8 +442,8 @@ func TestRealService_EnsureInstallToken_ColdStart(t *testing.T) {
 	if token != rawToken {
 		t.Errorf("token = %q, want %q (cold-start rehydrate should return the unsealed value)", token, rawToken)
 	}
-	if fake.installTokenCalls > 0 {
-		t.Errorf("expected 0 install-token mints on cold-start (sealed token still valid); got %d", fake.installTokenCalls)
+	if fake.installTokenCallsCount() > 0 {
+		t.Errorf("expected 0 install-token mints on cold-start (sealed token still valid); got %d", fake.installTokenCallsCount())
 	}
 }
 
@@ -469,8 +490,8 @@ func TestRealService_EnsureInstallToken_RotatesExpired(t *testing.T) {
 	if token != "ghs_rotated_token" {
 		t.Errorf("token = %q, want ghs_rotated_token", token)
 	}
-	if fake.installTokenCalls != 1 {
-		t.Errorf("install-token mint count = %d, want 1 (rotation)", fake.installTokenCalls)
+	if fake.installTokenCallsCount() != 1 {
+		t.Errorf("install-token mint count = %d, want 1 (rotation)", fake.installTokenCallsCount())
 	}
 	// Store row was updated.
 	got, err := istore.ForAccount(context.Background(), "acct-1")
@@ -757,12 +778,19 @@ type fakeGithubOpts struct {
 	expiresAt              string
 	appID                  string
 	trackInstallTokenCalls bool
+	// verifyLogin is the account.login the /app/installations/{id}
+	// verify endpoint echoes back. Defaults to "octocat" so the
+	// PR-B §11 happy path holds; tests that want to exercise the
+	// mismatch branch set it explicitly.
+	verifyLogin string
+	// verifyBranch is the default_branch the verify endpoint
+	// echoes back. Defaults to defaultProductionBranch ("main").
+	verifyBranch string
 }
 
 type fakeGithubServer struct {
 	*httptest.Server
-	mu                 sync.Mutex
-	installTokenCalls  int
+	installTokenCalls  atomic.Int64
 	trackInstallTokens bool
 }
 
@@ -775,6 +803,12 @@ type fakeGithubServer struct {
 //   - POST /app/installations/{id}/access_tokens → {token,expires_at}
 func newFakeGithubServer(t *testing.T, opts fakeGithubOpts) *fakeGithubServer {
 	t.Helper()
+	if opts.verifyLogin == "" {
+		opts.verifyLogin = "octocat"
+	}
+	if opts.verifyBranch == "" {
+		opts.verifyBranch = defaultProductionBranch
+	}
 	srv := &fakeGithubServer{trackInstallTokens: opts.trackInstallTokenCalls}
 	srv.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -785,22 +819,40 @@ func newFakeGithubServer(t *testing.T, opts fakeGithubOpts) *fakeGithubServer {
 			_ = json.NewEncoder(w).Encode(map[string]any{"installations": opts.installs})
 		case strings.HasPrefix(r.URL.Path, "/app/installations/") && strings.HasSuffix(r.URL.Path, "/access_tokens") && r.Method == http.MethodPost:
 			if srv.trackInstallTokens {
-				srv.mu.Lock()
-				srv.installTokenCalls++
-				srv.mu.Unlock()
+				srv.installTokenCalls.Add(1)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"token":      opts.installToken,
 				"expires_at": opts.expiresAt,
 			})
 		case strings.HasPrefix(r.URL.Path, "/app/installations/") && r.Method == http.MethodGet:
-			// /app/installations/{id} verify
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "account": map[string]any{"login": "octocat"}})
+			// /app/installations/{id} verify. Echo the requested id
+			// back so tests that compare IDs see the round-trip; pin
+			// the login + default_branch via opts so the §11 mismatch
+			// branch can be modelled.
+			idStr := strings.TrimPrefix(r.URL.Path, "/app/installations/")
+			id, perr := strconv.ParseInt(idStr, 10, 64)
+			if perr != nil {
+				id = 0
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":             id,
+				"account":        map[string]any{"login": opts.verifyLogin},
+				"default_branch": opts.verifyBranch,
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	return srv
+}
+
+// installTokenCallsCount reads the atomic counter; safe to call
+// after the test's last network call without coordinating with
+// the deferred Close() (the counter is atomic so the read is
+// race-free even if a stale handler is still incrementing).
+func (s *fakeGithubServer) installTokenCallsCount() int64 {
+	return s.installTokenCalls.Load()
 }
 
 // newTestAppAuth builds an AppAuth wired to a httptest.Server. The

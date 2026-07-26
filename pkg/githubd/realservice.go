@@ -269,15 +269,36 @@ func (s *RealService) ExchangeOAuthCode(accountID, code, stateStr string) (strin
 		return "", "", fmt.Errorf("githubd: seal install token: %w", err)
 	}
 
-	defaultBranch := instPayload.RepositorySelection // fallback
-	_ = defaultBranch                                 // set below from the install payload's account default
-	// instPayload has AccountLogin but not DefaultBranch in the
-	// /app/installations/{id} response. The PR-B verify path
-	// captures DefaultBranch via a separate GET; for now, reuse
-	// the GitHub App convention (most installs default to "main"
-	// post-2020). PR-D's webhook path will fetch the repo's
-	// default_branch at bind time.
+	// default_branch: the /app/installations/{id} verify response
+	// doesn't carry the install's default branch (per GitHub's API
+	// surface — that's a per-repo field, not a per-install field).
+	// Capture-time options for PR-C:
+	//
+	//   1. (chosen) store the GitHub App convention "main" as a
+	//      best-effort seed. The bind path will refresh this from
+	//      ListInstallableRepos at /v1/apps/{slug}/install/bind
+	//      time, where the per-repo default_branch is available.
+	//   2. (deferred) do a 4th round-trip to
+	//      /app/installations/{id}/repositories to capture the
+	//      first repo's default_branch at handshake time. PR-D
+	//      scope — adds latency to the OAuth handshake.
+	//
+	// PR-C review finding #1 was originally framed as "the verify
+	// payload carries DefaultBranch" — that was wrong; the field
+	// doesn't exist on the Installation struct. The fix is the
+	// bind-path refresh, not a different field reference here.
 	branch := defaultProductionBranch
+
+	// Verified-side login for the §11 audit trail. The
+	// /user/installations response is the user-claimed login; the
+	// /app/installations/{id} verify response is the authoritative
+	// one. PR-C review finding #13: audit paper trails must point
+	// at the verified identity, not the user-claimed one, so a
+	// forged login can't poison the paper trail.
+	auditLogin := instPayload.AccountLogin
+	if auditLogin == "" {
+		auditLogin = pick.Account.Login
+	}
 
 	if err := s.Installs.Upsert(context.Background(), state.GitHubInstall{
 		AccountID:        accountID,
@@ -285,7 +306,7 @@ func (s *RealService) ExchangeOAuthCode(accountID, code, stateStr string) (strin
 		DefaultBranch:    branch,
 		SealedToken:      sealed,
 		TokenExpiresAt:   expiresAt,
-		AuditGithubLogin: pick.Account.Login,
+		AuditGithubLogin: auditLogin,
 	}); err != nil {
 		return "", "", fmt.Errorf("githubd: persist install state: %w", err)
 	}
@@ -317,11 +338,13 @@ func (s *RealService) ExchangeOAuthCode(accountID, code, stateStr string) (strin
 
 	// Audit event: token sealed + persisted. Fires AFTER the store
 	// write succeeds, so a failed upsert doesn't generate a
-	// misleading "sealed" line.
+	// misleading "sealed" line. github_login is the verified-side
+	// login (from /app/installations/{id}) so the audit trail
+	// reflects the install, not the user-claimed login.
 	if s.Audit != nil {
 		s.Audit("auth.install.token_sealed", accountID, map[string]any{
 			"install_id":      pick.ID,
-			"github_login":    pick.Account.Login,
+			"github_login":    auditLogin,
 			"token_expires":   expiresAt.Format(time.RFC3339),
 			"sealed_bytes":    len(sealed),
 		})
