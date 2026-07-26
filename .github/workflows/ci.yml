@@ -295,6 +295,38 @@ jobs:
         # correct install location for the local-dev `go install` path.
         run: make spec-check
 
+  # Go SDK build + test gate (issue #266, PR 2). The SDK is a nested
+  # Go module at sdk/go/ (module github.com/poyrazK/faas-go). The
+  # daemon's `make test` walks the daemon's package tree only; the
+  # SDK module needs its own gate so a regression in sdk/go/internal/api/*
+  # fails the PR. Decoupled from `test` for the same reasons as
+  # spec-check: short, parallel, no shared cache needed.
+  #
+  # Steps mirror the daemon's local recipe:
+  #   cd sdk/go && go build ./... && go test ./... && go vet ./...
+  # No postgres, no KVM, no test database — the SDK is hermetic.
+  sdk-go:
+    name: sdk-go build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No Go cache: the SDK module has zero external deps (no
+          # go.sum), so cache hit rate is zero anyway. Self-contained
+          # job, no shared downloads with `test` / `unit-tests`.
+      - name: go build
+        working-directory: sdk/go
+        run: go build ./...
+      - name: go vet
+        working-directory: sdk/go
+        run: go vet ./...
+      - name: go test
+        working-directory: sdk/go
+        run: go test -count=1 ./...
+
   coverage:
     services:
       postgres:
