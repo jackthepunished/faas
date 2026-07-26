@@ -269,13 +269,15 @@ func TestPgStoreCurrentMonthOverageCents_Formula(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	appID := uuid.NewString()
+	instID := uuid.NewString()
 	// 1200 cents = 12 GB-h. 12 GB-h = 12 * 1024 * 3600 = 44_236_800
 	// mb_seconds. The CENTS=mb_seconds*100/3600 derivation lands
 	// 43_200_000 mb_seconds at exactly 1200 cents.
 	const wantCents = int64(1200)
 	mbSeconds := wantCents * 3600 / 100
 	now := time.Now().UTC()
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now, mbSeconds, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, now, mbSeconds, 0); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	got, err := store.CurrentMonthOverageCents(ctx, acct.ID)
@@ -293,9 +295,11 @@ func TestPgStoreCurrentMonthOverageCents_PreviousMonthExcluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	appID := uuid.NewString()
+	instID := uuid.NewString()
 	now := time.Now().UTC()
 	prevMonth := time.Date(now.Year(), now.Month()-1, 15, 12, 0, 0, 0, time.UTC)
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", prevMonth, 3_600_000, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonth, 3_600_000, 0); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	got, err := store.CurrentMonthOverageCents(ctx, acct.ID)
