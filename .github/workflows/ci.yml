@@ -45,15 +45,17 @@ env:
   VACUUM_VERSION: "0.29.10"
   VACUUM_SHA256_LINUX_AMD64: "84a596d5f88dd42f6f020376e5d2c2a29e6e51cc4b5614828f03dda122457a03"
   # sqlc is the Postgres→Go query layer used by `make sqlc-check` (issue
-  # #125). Both the version and SHA-256 pin are mirrored from the v1.27.0
+  # #125). Both the version and SHA-256 pin are mirrored from the v1.31.1
   # GitHub release — never bump one without the other. The Makefile also
   # has a `make sqlc` guard for local devs; CI uses the binary download
   # because the `go install` path cross-compiles sqlc (with its cgo
-  # pganalyze/pg_query_go tree) from source on every cold runner (~30 s).
+  # pganalyze/pg_query_go tree) from source on every cold runner (~30 s)
+  # and v1.31.1's go.mod requires Go >= 1.26, which the ubuntu-latest
+  # runner (Go 1.25.12) cannot satisfy under GOTOOLCHAIN=local.
   # Same supply-chain pin pattern as vacuum above and every binary in the
   # EX44 ansible roles.
-  SQLC_VERSION: "1.27.0"
-  SQLC_SHA256_LINUX_AMD64: "f56954667ca54dce79a9246aa8b01b734f5deb6d2064f630f98cebe4fb4b8933"
+  SQLC_VERSION: "1.31.1"
+  SQLC_SHA256_LINUX_AMD64: "497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354"
 
 jobs:
   # Three parallel jobs (PR #167) so the long poles — unit tests (~4:20)
