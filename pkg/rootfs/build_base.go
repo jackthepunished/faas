@@ -142,6 +142,19 @@ func (b *Builder) publishBaseExt4(ctx context.Context, in BaseBuildInput, stagin
 	if err := in.Storage.Put(ctx, in.StorageKey, f); err != nil {
 		return fmt.Errorf("rootfs: publish base %q: %w", in.StorageKey, err)
 	}
+	// ADR-038: mirror publishExt4's sign call. The base sig lives
+	// at sigs/<StorageKey>.sig — same convention as the app-layer
+	// path; schedd's verify side derives the sig key from the
+	// layer key the same way (sigs/<layerKey>.sig). imaged's
+	// startup restages + signs the base on first run if no sig
+	// exists (see pkg/imaged/base_stage.go); app layers re-sign on
+	// the next deploy.
+	if b.signer != nil {
+		sigKey := "sigs/" + in.StorageKey + ".sig"
+		if err := b.signer.Sign(ctx, in.StorageKey, sigKey); err != nil {
+			return fmt.Errorf("rootfs: sign base %q: %w", in.StorageKey, err)
+		}
+	}
 	return nil
 }
 

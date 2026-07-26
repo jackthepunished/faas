@@ -32,6 +32,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/imaged"
 	"github.com/onebox-faas/faas/pkg/oci"
@@ -85,6 +86,22 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	store := state.NewPgStore(pool)
 	builder := rootfs.NewBuilder(wire.ExecRunner{})
 
+	// ADR-038 / Tier 3 phase 3: validate the build-attestation
+	// signing key at startup. The path defaults to
+	// /etc/faas/secrets/sign.key (root:root 0400); FAAS_SIGN_KEY
+	// overrides for test harnesses + dev boxes that don't have
+	// the canonical path. Fail-loud on missing/insecure perms —
+	// silent insecure boots are the failure mode ADR-038
+	// §Consequences Compatibility calls out. LoadPrivateKeyFile
+	// stat-checks the file mode; the parsed *ecdsa.PrivateKey is
+	// discarded (the real signer is constructed after the storage
+	// backend is wired below).
+	signKeyPath := envOr("FAAS_SIGN_KEY", cosign.DefaultSignKeyPath)
+	if _, err := cosign.LoadPrivateKeyFile(signKeyPath); err != nil {
+		return fmt.Errorf("imaged: load sign key %q: %w (run `faas keys init` to provision)", signKeyPath, err)
+	}
+	log.Info("imaged: build attestation sign key loaded", "key", signKeyPath)
+
 	// Real registry v2 puller: resolves an image deploy's digest-pinned
 	// reference against the public registry. The HTTP transport enforces
 	// the egress denylist (RFC1918 / link-local / metadata / CGN / SMTP)
@@ -131,6 +148,21 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		log.Info("imaged: storage backend = local", "fc_root", envOr("FAAS_STORAGE_ROOT", "/srv/fc"),
 			"apps_root", appsRoot)
 	}
+
+	// ADR-038: now that storage is wired, construct the production
+	// LocalSigner. LoadPrivateKeyFile above already verified the key
+	// shape + perms; NewLocalSigner re-parses (cheap, no I/O aside
+	// from the read the caller already did — and the PKCS8 parser
+	// is in-memory). This double-parse keeps the
+	// fail-loud-on-missing-key path independent of storage
+	// availability — an operator with a missing key gets the
+	// "run `faas keys init`" message BEFORE the storage-backend
+	// dial errors confuse the failure surface.
+	signer, err := cosign.NewLocalSigner(signKeyPath, storageBackend)
+	if err != nil {
+		return fmt.Errorf("imaged: build signer: %w", err)
+	}
+	builder.WithSigner(signer)
 	// One per-daemon Prometheus registry, shared by the handler
 	// (OCI-pull observations inside aboveBaseLayers + buildImageLayer)
 	// and the /metrics listener below. PR #132 constructed two

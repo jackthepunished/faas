@@ -43,14 +43,46 @@ type Runner interface {
 	Run(ctx context.Context, argv []string) error
 }
 
+// Signer signs a published artifact. Wired via WithSigner (nil-safe;
+// nil = no signing — unit tests + the legacy OutImage path). The
+// production wiring is *cosign.LocalSigner from cmd/imaged; ADR-038
+// §Decision names this as the platform's build-attestation seam.
+//
+// Sign is called once per publishExt4 / publishBaseExt4 after the
+// Storage.Put succeeds. The signer owns the storage backend and the
+// sig-key derivation — pkg/rootfs only supplies the canonical
+// layerKey + sigKey pair.
+//
+// Per-key contract: the signer MUST be safe to call from many
+// goroutines (imaged builds layers concurrently per spec §4.6
+// per-app layer write path).
+type Signer interface {
+	Sign(ctx context.Context, layerKey, sigKey string) error
+}
+
 // Builder assembles app layers.
 type Builder struct {
 	run Runner
+	// signer is optional; nil = no signing (legacy / tests).
+	// Wired via WithSigner at cmd/imaged startup; never nil-checked
+	// inline (signer == nil short-circuits in publishExt4 +
+	// publishBaseExt4).
+	signer Signer
 }
 
 // NewBuilder wires a Builder with the command runner used for mkfs.
 func NewBuilder(run Runner) *Builder {
 	return &Builder{run: run}
+}
+
+// WithSigner attaches the build-attestation signer. Called from
+// cmd/imaged after loading /etc/faas/secrets/sign.key (fail-loud
+// at startup per ADR-038 §Consequences). Passing nil clears the
+// signer (unit tests + the legacy OutImage path that never
+// publishes to Storage).
+func (b *Builder) WithSigner(s Signer) *Builder {
+	b.signer = s
+	return b
 }
 
 // BuildInput is one app-layer build.
@@ -238,6 +270,20 @@ func (b *Builder) publishExt4(ctx context.Context, in BuildInput, staging string
 	defer func() { _ = f.Close() }()
 	if err := in.Storage.Put(ctx, in.StorageKey, f); err != nil {
 		return fmt.Errorf("rootfs: publish %q: %w", in.StorageKey, err)
+	}
+	// ADR-038: sign the published ext4 so schedd's cold-boot verify
+	// (pkg/cosign.LocalVerifier) can detect tampering. Signing
+	// failure is build-fatal — an unsigned layer cannot be cold-
+	// booted; the verify side rejects with code=sig_invalid. We
+	// don't surface a softer fallback (e.g. skip signing and let
+	// the customer hit 503 on first wake) because the gap from
+	// "no signature written" to "schedd accepted the unsigned
+	// layer" is the compromise path the sig is meant to close.
+	if b.signer != nil {
+		sigKey := "sigs/" + in.StorageKey + ".sig"
+		if err := b.signer.Sign(ctx, in.StorageKey, sigKey); err != nil {
+			return fmt.Errorf("rootfs: sign %q: %w", in.StorageKey, err)
+		}
 	}
 	return nil
 }

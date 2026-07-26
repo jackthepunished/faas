@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
@@ -31,6 +32,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 )
@@ -212,6 +214,32 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("schedd: init engine: %w", err)
 	}
 	engine.WithOpsMetrics(ops)
+
+	// ADR-038 / Tier 3 phase 3: load the build-attestation
+	// verification pub key at startup. Defaults to
+	// /etc/faas/secrets/sign-pub.pem (root:root 0444);
+	// FAAS_SIGN_PUB overrides for test harnesses. Fail-loud on
+	// missing/insecure perms — silent insecure boots are the
+	// failure mode ADR-038 §Consequences Compatibility calls out.
+	//
+	// The verifier also needs the storage backend (to read the
+	// layer + sig blobs during verification). schedd resolves
+	// the same way imaged does — the env-driven fork
+	// (FAAS_STORAGE_BACKEND) keeps a remote OCI distribution
+	// backend transparent. vmmd does the storage.Get on the
+	// chroot mount path; schedd reads the sig blob directly via
+	// the same key the imaged signer wrote under.
+	signPubPath := envOr("FAAS_SIGN_PUB", cosign.DefaultSignPubPath)
+	storageBackend, err := storage.BackendFromEnv()
+	if err != nil {
+		return fmt.Errorf("schedd: storage backend: %w", err)
+	}
+	verifier, err := cosign.NewLocalVerifier(signPubPath, storageBackend)
+	if err != nil {
+		return fmt.Errorf("schedd: load sign pub %q: %w (run `faas keys init` on imaged's host if missing)", signPubPath, err)
+	}
+	log.Info("schedd: build attestation verifier ready", "pub", signPubPath)
+	engine.WithVerifier(verifier)
 
 	// Rebuild admission accounting from any instances still live from a prior
 	// run before we start admitting new wakes.

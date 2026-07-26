@@ -137,6 +137,12 @@ const (
 	CodeHandlerMissing    = "handler_missing"
 	CodeImageRequired     = "image_required"
 	CodeDeployFailed      = "deploy_failed"
+	// CodeSigInvalid is returned by schedd when the layer's
+	// signature fails verification (or is missing) on cold-boot.
+	// The deployment transitions to DeployFailed with this code;
+	// the wake that triggered the verify returns 503 to gatewayd
+	// with the same code. ADR-038 §Consequences Compatibility.
+	CodeSigInvalid = "sig_invalid"
 	CodeNoRollbackTarget  = "no_rollback_target"
 
 	// CodePayment is the 402 response when an API-only plan change requires
