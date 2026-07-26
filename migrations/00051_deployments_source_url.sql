@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00047_deployments_source_url.sql — Tier 3 (issue #197 B3.10 schema half).
+-- 00051_deployments_source_url.sql — Tier 3 (issue #197 B3.10 schema half).
 --
 -- Adds two columns to deployments:
 --

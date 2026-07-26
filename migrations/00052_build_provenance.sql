@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00048_build_provenance.sql — Tier 3 / issue #197 B3.1 + B3.10-read half.
+-- 00052_build_provenance.sql — Tier 3 / issue #197 B3.1 + B3.10-read half.
 --
 -- Adds the `build_provenance` table: one row per `builds.id` that
 -- records what actually ran and where. The populator lands in this

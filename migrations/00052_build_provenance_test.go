@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00048 (build_provenance table, issue #197
+// Migration-apply test for 00052 (build_provenance table, issue #197
 // B3.1). Pins the column shape + UNIQUE constraint:
 //
-//  1. Migration applies cleanly through 00048.
+//  1. Migration applies cleanly through 00052.
 //  2. The table exists with all expected columns and the canonical
 //     types (uuid PK, uuid FK, text fields, timestamptz NOT NULL on
 //     started_at + finished_at, text nullable on the rest).
@@ -32,11 +32,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00048_BuildProvenance(t *testing.T) {
+func TestMigrations_00052_BuildProvenance(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00048.
+	// (1) Apply through 00052.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 48)", err)
 	}

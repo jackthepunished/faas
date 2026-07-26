@@ -1,7 +1,7 @@
 // ADR-038 / Tier 3 / issue #197 B3.1 — MemStore round-trip for
 // build_provenance. Mirrors memstore_source_url_test.go shape
 // (Create → read). The pgstore coverage lives in
-// migrations/00048_build_provenance_test.go (the schema + UNIQUE
+// migrations/00052_build_provenance_test.go (the schema + UNIQUE
 // + FK are exercised at the DB level; we don't replicate them
 // here because MemStore holds the same idempotent-replace
 // semantics in a single map keyed by build_id).

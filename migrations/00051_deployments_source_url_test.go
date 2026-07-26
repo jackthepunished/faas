@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Schema test for migration 00047 (Tier 3 B3.10 schema half).
+// Schema test for migration 00051 (Tier 3 B3.10 schema half).
 //
 // Asserts:
 //
@@ -12,7 +12,7 @@
 //        - a 65-char string (over-length)
 //        - a 64-char non-hex string (e.g. 64 × 'g')
 //        - a 6-char string (under-length; empty-string-with-no-NULL)
-//      The CHECK was added in 00047 (it didn't exist before); this is
+//      The CHECK was added in 00051 (it didn't exist before); this is
 //      the "constraint actually fires" guard.
 //
 //   3. Existing deployments rows (from before the migration) are
@@ -40,7 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00047_DeploymentsSourceURL(t *testing.T) {
+func TestMigrations_00051_DeploymentsSourceURL(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
