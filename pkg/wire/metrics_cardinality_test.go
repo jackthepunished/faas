@@ -254,3 +254,163 @@ func readSingle(t *testing.T, m *wire.OpsMetrics, line string) float64 {
 	t.Fatalf("line %q not found in:\n%s", line, body)
 	return 0
 }
+
+// TestRequestTotalSharesAdmissionSet pins the contract that
+// apid_request_total{account_id,route,code} (issue #303, ADR-038)
+// shares the same accountLabelSet as apid_request_failures_total
+// and apid_audit_write_failures_total. The three metrics have to
+// represent a customer by the same label so an operator looking at
+// one metric can drill down to the same customer in the others —
+// divergent admission would silently scatter the customer story
+// across dashboards.
+func TestRequestTotalSharesAdmissionSet(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	// Real id: both counters must surface the same label.
+	const id = "shared-acct-rt"
+	m.RequestTotal(id, "GET /v1/rt", "ok").Inc()
+	m.RequestFailure(id, "GET /v1/rt").Inc()
+	body := render(t, m)
+	// Prometheus client lib emits labels in alphabetical order
+	// (account_id, code, route) regardless of the order they were
+	// declared or supplied.
+	want := fmt.Sprintf(`apid_request_total{account_id=%q,code="ok",route="GET /v1/rt"} 1`, id)
+	if !strings.Contains(body, want) {
+		t.Errorf("missing request_total series %q in:\n%s", want, body)
+	}
+	wantFail := fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="GET /v1/rt"} 1`, id)
+	if !strings.Contains(body, wantFail) {
+		t.Errorf("missing request_failures series %q in:\n%s", wantFail, body)
+	}
+	// Second Inc on the requestTotal counter (different code path).
+	// The series is independent of the failure counter (different
+	// counter), but the admission must still surface the same id.
+	m.RequestTotal(id, "GET /v1/rt", "err").Inc()
+	if got := readSingle(t, m, fmt.Sprintf(`apid_request_total{account_id=%q,code="err",route="GET /v1/rt"}`, id)); got != 1 {
+		t.Errorf("err-code request_total = %v, want 1", got)
+	}
+	// Empty id: must resolve to "anonymous" in both.
+	m.RequestTotal("", "GET /v1/anon", "ok").Inc()
+	m.RequestFailure("", "GET /v1/anon").Inc()
+	body = render(t, m)
+	for _, want := range []string{
+		`apid_request_total{account_id="anonymous",code="ok",route="GET /v1/anon"} 1`,
+		`apid_request_failures_total{account_id="anonymous",route="GET /v1/anon"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anonymous-id series missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestRequestTotalOverflowsToSharedOther pins the contract that ids
+// past the accountLabelSet cap collapse to "__other__" in BOTH
+// apid_request_total and apid_request_failures_total. The shared
+// overflow bucket is the load-bearing primitive for the per-account
+// alert rules in ADR-038 — without it, a single customer's
+// catastrophic traffic would either grow the TSDB series set
+// unbounded or split across multiple series.
+func TestRequestTotalOverflowsToSharedOther(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	const cap = 10_000
+	// Fill the admission set via the audit counter (cheapest, doesn't
+	// disturb the requestTotal/requestFailures counter rows).
+	for i := 0; i < cap; i++ {
+		m.AuditWriteFailures(fmt.Sprintf("real-%05d", i))
+	}
+	// 10 001st id lands in __other__ via every accessor.
+	m.RequestTotal("real-overflow-rt", "GET /v1/o", "ok").Inc()
+	m.RequestFailure("real-overflow-rf", "GET /v1/o").Inc()
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_request_total{account_id="__other__",code="ok",route="GET /v1/o"} 1`,
+		`apid_request_failures_total{account_id="__other__",route="GET /v1/o"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("__other__-shared series missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestRequestTotalForExtractsRouteAndCode pins the canonical
+// HTTP-path accessor (issue #303, ADR-038) — the route label is
+// read from r.Pattern with the reserved "unmatched" fallback, and
+// the code label is derived from the response status via
+// wire.CodeFromStatus (2xx/3xx → "ok", 4xx/5xx → "err"). Owning
+// the extraction inside the accessor means callers cannot
+// accidentally pass a raw URL path or the wrong status code.
+func TestRequestTotalForExtractsRouteAndCode(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	const id = "acct-rt-pattern"
+	// Matched route, 200 OK.
+	matched := httptest.NewRequest(http.MethodGet, "/v1/rt", nil)
+	matched.Pattern = "GET /v1/rt"
+	m.RequestTotalFor(matched, http.StatusOK, id).Inc()
+	body := render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_total{account_id=%q,code="ok",route="GET /v1/rt"} 1`, id)) {
+		t.Errorf("matched + 200: missing expected series in:\n%s", body)
+	}
+	// Matched route, 500 err.
+	matchedInternal := httptest.NewRequest(http.MethodGet, "/v1/rt", nil)
+	matchedInternal.Pattern = "GET /v1/rt"
+	m.RequestTotalFor(matchedInternal, http.StatusInternalServerError, id).Inc()
+	body = render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_total{account_id=%q,code="err",route="GET /v1/rt"} 1`, id)) {
+		t.Errorf("matched + 500: missing expected series in:\n%s", body)
+	}
+	// Unmatched route, 404. route collapses to "unmatched"; code is
+	// "err" since 404 >= 400.
+	unmatched := httptest.NewRequest(http.MethodGet, "/wp-login.php", nil)
+	unmatched.Pattern = ""
+	m.RequestTotalFor(unmatched, http.StatusNotFound, id).Inc()
+	body = render(t, m)
+	unmatchedWant := fmt.Sprintf(`apid_request_total{account_id=%q,code="err",route="unmatched"} 1`, id)
+	if !strings.Contains(body, unmatchedWant) {
+		t.Errorf("unmatched + 404: missing expected series in:\n%s", body)
+	}
+}
+
+// TestCodeFromStatus pins the closed code label set {ok, err}.
+// 2xx/3xx → "ok"; 4xx/5xx → "err". 1xx is treated as "err" (a 1xx
+// status is a protocol-level intermediate response — if it's the
+// final status, something is wrong). The branch is the same shape
+// observeErrFromStatus uses in cmd/apid/server.go for apid_ops_total.
+func TestCodeFromStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   string
+	}{
+		{http.StatusOK, "ok"},
+		{http.StatusNoContent, "ok"},
+		{http.StatusMovedPermanently, "ok"},
+		{http.StatusBadRequest, "err"},
+		{http.StatusUnauthorized, "err"},
+		{http.StatusNotFound, "err"},
+		{http.StatusInternalServerError, "err"},
+		{0, "err"}, // Connection failure / status never written.
+	} {
+		if got := wire.CodeFromStatus(tc.status); got != tc.want {
+			t.Errorf("CodeFromStatus(%d) = %q, want %q", tc.status, got, tc.want)
+		}
+	}
+}
+
+// TestRequestTotalPreInstantiated asserts the closed (account_id,
+// route, code) tuples surface from the first scrape so the §12
+// traffic-anomaly panels and alert rules never see "no data" on an
+// idle daemon. The reserved pairs include the same bypass buckets
+// the requestFailures counter uses (anonymous, unmatched) plus the
+// two closed code values.
+func TestRequestTotalPreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_request_total{account_id="anonymous",code="ok",route="unmatched"} 0`,
+		`apid_request_total{account_id="anonymous",code="err",route="unmatched"} 0`,
+		`apid_request_total{account_id="__other__",code="ok",route="unmatched"} 0`,
+		`apid_request_total{account_id="__other__",code="err",route="unmatched"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-instantiated series %q in:\n%s", want, body)
+		}
+	}
+}
