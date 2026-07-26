@@ -754,3 +754,41 @@ func TestCmdDeployTarball_NoFlags_EmptyCwdFriendlyError(t *testing.T) {
 		t.Errorf("stderr missing friendly error; got:\n%s", out)
 	}
 }
+
+// TestCmdDeployTarball_NoFlags_DockerfileAndPackageJson pins precedence when
+// both a Dockerfile and a package.json are at the cwd root: dockerfile flag
+// must be set (Dockerfile wins, matching pkg/builderd.Detector) AND runtime
+// must remain empty (App-type deploy so the server's builderd detects
+// authoritatively).
+func TestCmdDeployTarball_NoFlags_DockerfileAndPackageJson(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "Dockerfile"), []byte("FROM scratch"), 0o644); err != nil {
+		t.Fatalf("seed Dockerfile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed package.json: %v", err)
+	}
+	t.Chdir(cwd)
+	slug := deriveName()
+
+	var gotDockerfile, gotSource int32
+	var gotRuntime string
+	srv := zeroConfigDeployServer(t, slug, &gotDockerfile, &gotSource, &gotRuntime)
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball(nil); code != 0 {
+		t.Fatalf("cmdDeployTarball(nil) = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&gotDockerfile) != 1 {
+		t.Error("dockerfile flag not set when Dockerfile + package.json both present; Dockerfile must win")
+	}
+	if atomic.LoadInt32(&gotSource) != 1 {
+		t.Error("fake apid never received a `source` file part")
+	}
+	if gotRuntime != "" {
+		t.Errorf("runtime = %q, want empty (App-type deploy)", gotRuntime)
+	}
+}

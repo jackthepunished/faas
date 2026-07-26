@@ -357,7 +357,7 @@ func cmdDeployTarball(args []string) int {
 		if fw == fwDocker {
 			*dockerfile = true
 		}
-		fmt.Fprintf(os.Stderr, "Detected %s project in %s, packing %d file(s)…\n",
+		PrintProgress(os.Stderr, "detected %s project in %s, packing %d file(s)",
 			fw, filepath.Base(cwd), n)
 		*tarball = path
 	}

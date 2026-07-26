@@ -89,6 +89,8 @@ func detectFramework(srcDir string) framework {
 			continue
 		}
 		switch strings.ToLower(e.Name()) {
+		// Keep in sync with pkg/builderd/detect.go — the rule intentionally
+		// mirrors the server-side detector; if you change one, change both.
 		case "dockerfile":
 			hasDocker = true
 		case "package.json":
@@ -112,37 +114,44 @@ func detectFramework(srcDir string) framework {
 	return fwUnknown
 }
 
+// zeroConfigSourceCapMB is the conservative per-plan floor used by the
+// zero-config preflight: the server will reject anything above this on
+// Free/Hobby (see pkg/api/limits.go: SourceTarballMaxMB). We don't have the
+// customer's plan on the wire without a GetAccount round-trip; the floor is
+// the safest choice because a zero-config abort on Free is much better UX
+// than a slow upload that ends in a 413. Customers on Pro/Scale who exceed
+// 100 MB but fit within 250 MB should pass --tarball of a hand-built archive.
+const zeroConfigSourceCapMB = 100
+
 // packDirToTarGz walks srcDir and writes a gzipped tar archive to destPath. The
 // archive's single top-level directory is filepath.Base(srcDir), preserving the
 // invariant apid's validateTarballShape depends on (one project root). Symlinks,
 // hardlinks and device nodes are rejected — apid rejects them too, so failing
 // fast in the CLI is strictly better UX. Regular files are streamed with a fixed
-// mtime for reproducibility. Returns the count of regular files archived.
+// mtime for reproducibility, and each file is read through a LimitReader
+// capped at zeroConfigSourceCapMB so a single runaway file aborts early
+// instead of materialising its full size into the tar. After the archive is
+// written the on-disk size is re-checked against the cap (gzip compression
+// can change the byte count either way). Returns the count of regular files
+// archived.
 //
 // The gzip→tar→walk shape mirrors cmd/faas/templates/embed.go:TarGz.
-func packDirToTarGz(srcDir, destPath string) (fileCount int, err error) {
+func packDirToTarGz(srcDir, destPath string) (regularFileCount int, err error) {
 	root := filepath.Base(srcDir)
 
 	f, err := os.Create(destPath)
 	if err != nil {
 		return 0, fmt.Errorf("create archive %s: %w", destPath, err)
 	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close archive: %w", cerr)
-		}
-	}()
 	gz := gzip.NewWriter(f)
-	defer func() {
-		if cerr := gz.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close gzip: %w", cerr)
-		}
-	}()
 	tw := tar.NewWriter(gz)
 	defer func() {
-		if cerr := tw.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close tar: %w", cerr)
-		}
+		// Defer must close in tar→gzip→file order so gzip's trailer flushes
+		// to disk before the file's Close. Idempotent: Close on a
+		// previously-closed writer returns an error we ignore.
+		_ = tw.Close()
+		_ = gz.Close()
+		_ = f.Close()
 	}()
 
 	// Collect first, sort, then write — a deterministic archive order makes
@@ -177,7 +186,7 @@ func packDirToTarGz(srcDir, destPath string) (fileCount int, err error) {
 		}
 		mode := info.Mode()
 		if mode&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing to pack symlink %q (unpack the target or use --tarball)", relSlash)
+			return fmt.Errorf("symlink %q is not allowed in source tarballs (apid rejects symlink entries) — remove the symlink or pass --tarball of an archive you built yourself", relSlash)
 		}
 		if !d.IsDir() && !mode.IsRegular() {
 			return fmt.Errorf("refusing to pack irregular file %q (device/socket/pipe)", relSlash)
@@ -212,9 +221,28 @@ func packDirToTarGz(srcDir, destPath string) (fileCount int, err error) {
 		if err := copyRegular(tw, e.abs); err != nil {
 			return 0, err
 		}
-		fileCount++
+		regularFileCount++
 	}
-	return fileCount, nil
+	// Final size check. Close gzip→tar before statting so the on-disk size
+	// is the actual packed size (gzip writes its trailer at Close). Close
+	// is idempotent — the defer above also calls them on any return path.
+	if err := tw.Close(); err != nil {
+		_ = gz.Close()
+		return 0, fmt.Errorf("close tar: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return 0, fmt.Errorf("close gzip: %w", err)
+	}
+	st, err := os.Stat(destPath)
+	if err != nil {
+		return 0, fmt.Errorf("stat packed tarball: %w", err)
+	}
+	const capBytes = zeroConfigSourceCapMB * 1024 * 1024
+	if st.Size() > capBytes {
+		return 0, fmt.Errorf("packed cwd is %d MB, over the %d MB zero-config cap; trim large files or pass --tarball of a hand-built archive",
+			st.Size()/(1024*1024), zeroConfigSourceCapMB)
+	}
+	return regularFileCount, nil
 }
 
 // copyRegular streams one regular file into the tar writer. It routes through
@@ -222,14 +250,26 @@ func packDirToTarGz(srcDir, destPath string) (fileCount int, err error) {
 // than a bare os.Open, both to satisfy the cmd/faas os.Open tripwire and
 // because the walked paths are customer-supplied (TOCTOU: a path Lstat'd as
 // regular during the walk could be swapped for a symlink before we read it).
+//
+// The stream is wrapped in a LimitReader at zeroConfigSourceCapMB so a single
+// runaway file (a 2 GB raw dataset committed by accident) aborts early with
+// a clear error instead of streaming gigabytes through gzip→tar. The cap
+// matches the Free/Hobby floor; Pro/Scale customers who deliberately commit
+// larger files should pass --tarball of a hand-built archive.
 func copyRegular(tw *tar.Writer, abs string) error {
 	f, err := openCustomerFile(abs)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", abs, err)
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := io.Copy(tw, f); err != nil {
+	n, err := io.Copy(tw, f)
+	if err != nil {
 		return fmt.Errorf("copy %s: %w", abs, err)
+	}
+	const warnBytes = zeroConfigSourceCapMB * 1024 * 1024
+	if n >= warnBytes {
+		return fmt.Errorf("refusing to pack %s: %d bytes >= %d MB per-file cap (untracked large file? pass --tarball of a hand-built archive)",
+			filepath.Base(abs), n, zeroConfigSourceCapMB)
 	}
 	return nil
 }
@@ -237,7 +277,9 @@ func copyRegular(tw *tar.Writer, abs string) error {
 // autoPackCwd is the zero-config entry point: it packs srcDir into a fresh temp
 // tarball, detects the framework, and returns everything the deploy path needs.
 // The caller owns the returned path and must os.Remove it. On any error the
-// temp file (if created) is removed before returning.
+// temp file (if created) is removed before returning. fileCount is the count
+// of regular files archived — NOT the server-side entry count, which includes
+// directory entries (see cmd/apid/deploy_inputs.go:maxSourceFiles).
 func autoPackCwd(srcDir string) (tarballPath string, fw framework, fileCount int, err error) {
 	f, err := os.CreateTemp("", "faas-cwd-*.tar.gz")
 	if err != nil {

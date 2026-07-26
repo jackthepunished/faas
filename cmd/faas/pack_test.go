@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	crypto_rand "crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,6 +22,18 @@ func writeFile(t *testing.T, dir, rel, content string) {
 		t.Fatalf("mkdir %s: %v", p, err)
 	}
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+}
+
+// writeFileBytes writes raw bytes to a path (helper for size-cap tests that
+// need to materialise files of arbitrary size).
+func writeFileBytes(t *testing.T, p string, b []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", p, err)
+	}
+	if err := os.WriteFile(p, b, 0o644); err != nil {
 		t.Fatalf("write %s: %v", p, err)
 	}
 }
@@ -184,6 +198,87 @@ func TestPackDirToTarGz_EmptyDir(t *testing.T) {
 	}
 	// Archive must still be a valid, readable gzip tar (possibly zero entries).
 	_ = tarEntries(t, dest)
+}
+
+// TestPackDirToTarGz_TotalSizeCap pins the zero-config zeroConfigSourceCapMB
+// preflight: a cwd that packs to > cap must surface a friendly error before
+// any HTTP round-trip. Uses many small files so per-file is not the trigger.
+// Bytes are crypto/random so gzip can't compress them away.
+func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("size-cap test materialises > 100 MB; skip in -short mode")
+	}
+	dir := t.TempDir()
+	const oneMiB = 1024 * 1024
+	// 110 × 1 MiB of crypto-random bytes (110 MiB raw, ~110 MiB after gzip).
+	// Each file is well under the per-file cap (100 MiB), so the total-cap
+	// stat check is what trips.
+	const totalFiles = zeroConfigSourceCapMB + 10
+	for i := 0; i < totalFiles; i++ {
+		chunk := make([]byte, oneMiB)
+		if _, err := io.ReadFull(crypto_rand.Reader, chunk); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+		writeFileBytes(t, filepath.Join(dir, fmt.Sprintf("chunk-%04d.bin", i)), chunk)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	_, err := packDirToTarGz(dir, dest)
+	if err == nil {
+		t.Fatal("packDirToTarGz should reject total size > cap, got nil error")
+	}
+	if !strings.Contains(err.Error(), "zero-config cap") {
+		t.Errorf("expected friendly total-cap error; got %v", err)
+	}
+}
+
+// TestPackDirToTarGz_PerFileCap pins the per-file guard inside copyRegular: a
+// single file >= cap must be rejected while still being streamed, instead of
+// materialising the whole thing into the gzip writer first.
+func TestPackDirToTarGz_PerFileCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("per-file cap test materialises a > cap file")
+	}
+	dir := t.TempDir()
+	huge := make([]byte, zeroConfigSourceCapMB*1024*1024)
+	if _, err := io.ReadFull(crypto_rand.Reader, huge); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	writeFileBytes(t, filepath.Join(dir, "blob.bin"), huge)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	_, err := packDirToTarGz(dir, dest)
+	if err == nil {
+		t.Fatal("packDirToTarGz should reject a single file >= per-file cap, got nil")
+	}
+	if !strings.Contains(err.Error(), "per-file cap") {
+		t.Errorf("expected per-file cap error; got %v", err)
+	}
+}
+
+// TestPackDirToTarGz_JustUnderTotalCap passes when the packed tarball sits
+// predictably under cap — pins that the preflight doesn't false-positive.
+// ~50 MiB raw (compressible to a fraction under cap).
+func TestPackDirToTarGz_JustUnderTotalCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("size-cap test materialises near-cap; skip in -short mode")
+	}
+	dir := t.TempDir()
+	// 50 MiB raw, written as one file under the per-file cap. Far enough
+	// from zeroConfigSourceCapMB (100 MB) that gzip compression won't
+	// matter — even if it expands slightly the tarball stays well under
+	// cap.
+	const fiftyMiB = 50 * 1024 * 1024
+	chunk := make([]byte, fiftyMiB)
+	if _, err := io.ReadFull(crypto_rand.Reader, chunk); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	writeFileBytes(t, filepath.Join(dir, "well_under.bin"), chunk)
+
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest); err != nil {
+		t.Fatalf("packDirToTarGz well under cap, want pass; got %v", err)
+	}
 }
 
 func TestAutoPackCwd(t *testing.T) {
