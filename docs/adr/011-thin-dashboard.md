@@ -19,5 +19,7 @@
 
 ## Re-evaluation triggers
 
-- **M8 hardening (§11 checklist):** if §11 fuzzing finds dashboard-side XSS that server-rendered HTML can't mitigate, the answer is to add a strict CSP header + per-session CSRF token, NOT to migrate to a SPA. SPA is rejected for the duration of v1.
+- **M8 hardening (§11 checklist):** if §11 fuzzing finds dashboard-side XSS that server-rendered HTML can't mitigate, the answer is to add a strict CSP header + per-session CSRF token, NOT to migrate to a SPA. SPA is rejected for the duration of v1.[^1]
 - **Gate-A multi-host (spec §16):** the dashboard reverse-proxy currently lives in gatewayd. At Gate-A we may split gatewayd into gatewayd-public + gatewayd-internal — the dashboard proxy segment moves to internal, the public listener gets only TLS termination. No spec change here; ADR-018 (gRPC surface) is the relevant precedent.
+
+[^1]: Fulfilled by issue #249 / `pkg/httpsec` (2026-07-26). Strict CSP with per-request nonce + X-Frame-Options / X-Content-Type-Options / Referrer-Policy / Permissions-Policy / HSTS landed on the public listener ahead of fuzzing needing it. Implementation lives in `pkg/httpsec`; dashboard renderer stamps `nonce="{{.Nonce}}"` on every `<script>` and `<style>` tag. The inline `onclick="return confirm(…)"` on the delete-account button was refactored to a per-page `<script nonce="…">` block because browsers don't propagate `nonce` onto event-handler attributes. See spec §11 "Response headers" for the wire values.
