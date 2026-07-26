@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -1288,5 +1289,75 @@ func TestTransitionWithKind_EmitsRowWakeID(t *testing.T) {
 	// The JSON must carry wake_id matching the row.
 	if !strings.Contains(parkedPayload, `"wake_id":"`+res.WakeID+`"`) {
 		t.Errorf("parked payload missing row wake_id %q; got %s", res.WakeID, parkedPayload)
+	}
+}
+
+// TestProperty_EngineReaper_BurstToIdle30s (issue #171) pins
+// the §4.3 acceptance gate on the engine: a 5-instance burst
+// that drops to 0 rps must park back to ≤ min_instances + 1
+// within 30 s of the traffic drop. The test drives Loop with a
+// fake clock + 5-min mirror bucket so it's robust to
+// sub-second drift, exactly the same way loop_test.go does for
+// the per-tick integration tests.
+//
+// Reuses fakeVMM (per invariants-property-test-fakevmm-reuse
+// memory note) so no KVM is needed.
+func TestProperty_EngineReaper_BurstToIdle30s(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// min_instances=1, autoscale_target_rps=10. After the burst
+	// drops to 0 rps, the loop must park 4 instances back down to
+	// ≤ 2 (min_instances + 1 hysteresis buffer) within 3 reaper
+	// ticks. The test simulates the elapsed time by advancing the
+	// fake clock per tick.
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetMinInstances:       true,
+		MinInstances:          intPtr(1),
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	wakeN(t, engine, app.ID, 5)
+
+	// Mirror: 5-min bucket so the test is robust to sub-second
+	// drift; the traffic sequence (100, 0) lands in the same
+	// window. Production wires a 1s bucket; tests benefit from
+	// being clock-aligned.
+	scraper := &fakeScaleUpScraper{}
+	now := time.Now().Add(35 * time.Second) // past MinInstanceAge (30s)
+	clock := func() time.Time { return now }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+
+	// Phase 1: serve 100 rps for 10 s (1 seed + 1 mid-window touch).
+	scraper.set(map[string]int64{app.ID: 100})
+	mirror.Touch(context.Background(), now)
+	now = now.Add(10 * time.Second)
+	mirror.Touch(context.Background(), now)
+
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true)
+
+	// Phase 2: traffic drops to 0. Touch the mirror with a
+	// cumulative that DROPS below lastSeen so the ring resets.
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), now.Add(time.Second))
+
+	// Three reaper ticks (10s apart in production; the test
+	// advances `now` to simulate the elapsed 30 s and re-runs
+	// the loop body). After the third tick the running set must
+	// be ≤ min_instances + 1 = 2.
+	for tick := 1; tick <= 3; tick++ {
+		now = now.Add(10 * time.Second)
+		loop.runReaper(context.Background())
+	}
+
+	running := liveCount(t, store, app.ID)
+	if running > 2 {
+		t.Errorf("running = %d after 30s of 0 rps, want ≤ 2 (min_instances + 1 buffer)", running)
 	}
 }
