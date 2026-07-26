@@ -279,17 +279,21 @@ func mkAggressive(app, id string, lastSeen time.Duration, open int64, minInst in
 	now := time.Now()
 	return InstanceInfo{
 		Instance: id, AppID: app, Plan: api.PlanPro,
-		State: state.StateRunning,
-		LastRequest: now.Add(-lastSeen),
-		Started: now.Add(-time.Hour),
-		OpenConns: open,
+		State:        state.StateRunning,
+		LastRequest:  now.Add(-lastSeen),
+		Started:      now.Add(-time.Hour),
+		OpenConns:    open,
 		MinInstances: minInst,
 	}
 }
 
 // TestReapAggressive_ParkToBuffer pins the headline acceptance
-// scenario: 5 instances, desired=0, floor=1. The +1 hysteresis
-// buffer keeps one warm, so 4 are parked; the freshest survives.
+// scenario: 4 instances, desired=0, floor=1. The +1 hysteresis
+// buffer keeps one warm, so 3 are parked; the freshest survives.
+// (The 5-instance headline is covered end-to-end by
+// TestLoopReaperAggressiveScalesDownOnDrop + the property test
+// TestProperty_EngineReaper_BurstToIdle30s; the pure unit test
+// sticks to 4 to keep the assertion small and explicit.)
 func TestReapAggressive_ParkToBuffer(t *testing.T) {
 	now := time.Now()
 	instances := []InstanceInfo{
@@ -365,9 +369,9 @@ func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
 	now := time.Now()
 	fresh := InstanceInfo{
 		Instance: "fresh", AppID: "app1", Plan: api.PlanPro,
-		State: state.StateRunning,
-		LastRequest: now.Add(-time.Hour),
-		Started: now.Add(-10 * time.Second), // younger than MinInstanceAge (30s)
+		State:        state.StateRunning,
+		LastRequest:  now.Add(-time.Hour),
+		Started:      now.Add(-10 * time.Second), // younger than MinInstanceAge (30s)
 		MinInstances: 0,
 	}
 	instances := []InstanceInfo{
@@ -424,5 +428,70 @@ func TestReapAggressive_ZeroTarget_ClampsToFloor(t *testing.T) {
 	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
 	if !equalSet(got, []string{"oldest", "older", "mid"}) {
 		t.Fatalf("got %v, want [oldest older mid] (floor 2 + 3 extra)", got)
+	}
+}
+
+// TestReapAggressive_TwoApps: pins the per-app grouping loop and
+// the per-app sort comparator. Two apps in the same snapshot, each
+// with surplus. The function must park from each independently —
+// no cross-app pollution from the candidate sort, and the output
+// must be a union of both apps' parks (no double-counting, no
+// missing row).
+func TestReapAggressive_TwoApps(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		// appA: 3 instances, desired=0, floor=1 → limit=1, extra=2.
+		mkAggressive("appA", "appA_oldest", 2*time.Hour, 0, 1),
+		mkAggressive("appA", "appA_older", 90*time.Minute, 0, 1),
+		mkAggressive("appA", "appA_newest", 60*time.Minute, 0, 1),
+		// appB: 4 instances, desired=1, floor=0 → limit=2, extra=2.
+		mkAggressive("appB", "appB_oldest", 3*time.Hour, 0, 0),
+		mkAggressive("appB", "appB_older", 2*time.Hour, 0, 0),
+		mkAggressive("appB", "appB_newer", 90*time.Minute, 0, 0),
+		mkAggressive("appB", "appB_newest", 60*time.Minute, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{
+		"appA": 0,
+		"appB": 1,
+	})
+	want := []string{"appA_oldest", "appA_older", "appB_oldest", "appB_older"}
+	if !equalSet(got, want) {
+		t.Fatalf("two apps: got %v, want %v", got, want)
+	}
+}
+
+// TestReapAggressive_FloorExceedsRunning: pins the "extra <= 0"
+// branch. desired=0, floor=10, running=3. limit=max(10, 0+1)=10,
+// extra=3-10=-7 → no park. The candidate sort is never invoked,
+// but the function must not panic on the negative extra.
+func TestReapAggressive_FloorExceedsRunning(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "a", time.Hour, 0, 10),
+		mkAggressive("app1", "b", 45*time.Minute, 0, 10),
+		mkAggressive("app1", "c", 30*time.Minute, 0, 10),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Fatalf("floor (10) > running (3): got %v, want empty", got)
+	}
+}
+
+// TestReapAggressive_EmptyCandidates: pins the "extra > len(candidates)"
+// clamp. All instances are protected (OpenConns > 0 OR fresh).
+// desired=0, floor=0, running=3, candidates=0. limit=max(0, 0+1)=1,
+// extra=3-1=2, but len(candidates)=0 → no park. The function must
+// NOT panic on the empty sort slice and must NOT return phantom IDs.
+func TestReapAggressive_EmptyCandidates(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "open", 45*time.Minute, 3, 0),
+		mkAggressive("app1", "fresh", time.Hour, 0, 0), // fresh is set by override below
+	}
+	// Override Started so the second instance is MinInstanceAge-young.
+	instances[1].Started = now.Add(-10 * time.Second)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Fatalf("all candidates protected: got %v, want empty", got)
 	}
 }

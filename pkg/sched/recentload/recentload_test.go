@@ -175,3 +175,52 @@ func TestRecentLoad_ScrapeErrorKeepsPreviousRing(t *testing.T) {
 type errFake struct{}
 
 func (errFake) Error() string { return "synthetic scrape failure" }
+
+// TestRecentLoad_RestartClearsRing (issue #171 review finding):
+// the production code path treats `cumulative < lastSeen` as
+// gatewayd restart and clears the per-app ring so the new
+// window's first delta is measured from the new boot's
+// perspective. Without this, a single cumulative drop would
+// inflate the delta to MAX_INT and cause extreme scale-up +
+// scale-down thrashing downstream.
+func TestRecentLoad_RestartClearsRing(t *testing.T) {
+	// Mutable cumulative value the closure reads on each Tick.
+	cum := int64(0)
+	scr := &fakeScraper{fn: func(ctx context.Context) (map[string]int64, error) {
+		return map[string]int64{"app1": cum}, nil
+	}}
+	r := New(scr, 5, time.Second)
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	// Tick 1: cumulative=100, delta=100, seed bucket.
+	cum = 100
+	r.Touch(context.Background(), base)
+	if rps := r.RecentRPS("app1", base); rps != 0 {
+		t.Errorf("after first Touch: RecentRPS = %v, want 0 (delta in seed bucket only)", rps)
+	}
+
+	// Tick 2: cumulative=150, delta=50, bucket sum=50.
+	cum = 150
+	r.Touch(context.Background(), base.Add(time.Second))
+	if rps := r.RecentRPS("app1", base.Add(time.Second)); rps != 50 {
+		t.Errorf("after second Touch: RecentRPS = %v, want 50", rps)
+	}
+
+	// Tick 3: gatewayd restart — cumulative drops to 5. Mirror
+	// must clear the ring and treat the new observation as the
+	// boot point.
+	cum = 5
+	r.Touch(context.Background(), base.Add(2*time.Second))
+	// Brand-new bucket, count=0 (no delta yet — the bucket is
+	// just reseeded).
+	if rps := r.RecentRPS("app1", base.Add(2*time.Second)); rps != 0 {
+		t.Errorf("after restart reseed: RecentRPS = %v, want 0 (ring cleared)", rps)
+	}
+
+	// Tick 4: cumulative=25, delta=20, bucket sum=20.
+	cum = 25
+	r.Touch(context.Background(), base.Add(3*time.Second))
+	if rps := r.RecentRPS("app1", base.Add(3*time.Second)); rps != 20 {
+		t.Errorf("after restart+1 tick: RecentRPS = %v, want 20 (post-restart delta)", rps)
+	}
+}

@@ -31,21 +31,21 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool       *pgxpool.Pool
-	engine     *Engine
-	log        *slog.Logger
-	gateway    GatewaySynth
-	now        func() time.Time
-	flowCounts FlowCounter
-	ops        *wire.OpsMetrics // issue #171 shared registry; nil safe
-	watchdog   *Watchdog           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention  *Retention          // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat  *Heartbeat          // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	instStats  InstanceStatsPoller // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup    *scaleup.Trigger    // issue #169 / #172 reactive scale-up trigger; nil opts out
-	recentLoad *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
-	reaperAggressive bool           // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap  int              // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	pool             *pgxpool.Pool
+	engine           *Engine
+	log              *slog.Logger
+	gateway          GatewaySynth
+	now              func() time.Time
+	flowCounts       FlowCounter
+	ops              *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -520,6 +520,14 @@ func (l *Loop) runScaleUp(ctx context.Context) {
 // swallowed (the mirror keeps its previous ring; the reaper sees
 // stale-but-non-zero, the safer direction). Exported as a method
 // so tests drive a single tick without spinning up Run.
+//
+// Note: we use `time.Now()` here (not `l.now()`) because the
+// 1 s mirror cadence is wall-clock driven — the reaper's decision
+// tick is the only place that hooks the fake clock for test
+// determinism (runReaper → l.now() at loop.go:593). The mirror's
+// own behaviour under a frozen clock is exercised by the
+// per-tick integration tests (TestLoopReaperAggressive*) which
+// drive Touch directly with the frozen value.
 func (l *Loop) runRecentLoad(ctx context.Context) {
 	if l.recentLoad == nil {
 		return
@@ -591,6 +599,17 @@ func (l *Loop) runReaper(ctx context.Context) {
 		}
 	}
 	now := l.now()
+	// snapshot is a point-in-time view of every instance on the
+	// box. The three selectors below (ReapIdle, ReapAggressive,
+	// SelectEvictions) all read from this same slice. IMPORTANT:
+	// the snapshot does NOT reflect state changes made by the
+	// Engine.Park / Engine.Evict calls below — those selectors
+	// are stateless over a []InstanceInfo. For scale-down flows
+	// this is benign (each successful Park reduces the resident
+	// set and the next selector sees a smaller pool via the store,
+	// not the snapshot). For test determinism this is also why
+	// `now := l.now()` (vs `time.Now()`) was lifted here: the
+	// integration tests pin all selectors to the same instant.
 	var snapshot []InstanceInfo
 	for _, a := range apps {
 		plan := api.Plan("")
@@ -668,6 +687,15 @@ func (l *Loop) runReaper(ctx context.Context) {
 // behaviour is unit-testable without a clock / DB round-trip on
 // the full reaper body.
 func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, now time.Time) {
+	// Build an instance → app_id map once so the per-app park
+	// grouping below is O(N+M) instead of O(N×M) (issue #171 review
+	// finding: the re-scan was N walks of the snapshot for every
+	// parked ID). Cheap, deterministic, and replaces a linear scan
+	// inside what could become a 100-app reaper tick.
+	instanceToApp := make(map[string]string, len(snapshot))
+	for _, s := range snapshot {
+		instanceToApp[s.Instance] = s.AppID
+	}
 	// consideredAppIDs: every autoscale-enabled multi-instance app
 	// gets exactly one metric observation per tick (either `park`
 	// or `keep`). Apps absent from this set fall outside the
@@ -709,14 +737,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	parkByApp := map[string][]string{}
 	if len(desiredByApp) > 0 {
 		for _, id := range ReapAggressive(now, snapshot, desiredByApp) {
-			// Find the app_id for this instance from the snapshot.
-			var appID string
-			for _, s := range snapshot {
-				if s.Instance == id {
-					appID = s.AppID
-					break
-				}
-			}
+			appID := instanceToApp[id]
 			if appID == "" {
 				continue
 			}
@@ -762,11 +783,11 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 // transitionWithKind posture on events table errors).
 func (l *Loop) emitScaleDownAudit(ctx context.Context, appID string, desired int, parked []string, now time.Time) {
 	data, err := json.Marshal(map[string]any{
-		"app":          appID,
-		"desired":      desired,
-		"parked":       parked,
-		"reason":       "traffic_dropped",
-		"now":          now.UTC().Format(time.RFC3339Nano),
+		"app":     appID,
+		"desired": desired,
+		"parked":  parked,
+		"reason":  "traffic_dropped",
+		"now":     now.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		l.log.Warn("reaper: marshal scale-down audit", "err", err)

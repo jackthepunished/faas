@@ -47,11 +47,11 @@ type bucket struct {
 
 // RecentLoad is the per-app RPS mirror.
 type RecentLoad struct {
-	mu       sync.Mutex
+	mu         sync.Mutex
 	windowSize int
 	bucketSize time.Duration
-	scraper   PromScraper
-	byApp     map[string]*appWindow
+	scraper    PromScraper
+	byApp      map[string]*appWindow
 }
 
 // New constructs the mirror. windowSize is the number of buckets

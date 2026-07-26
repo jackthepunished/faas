@@ -456,6 +456,13 @@ identifier. Empty-app labels are pre-instantiated for both `park`/`keep`
 and `admit`/`reject_at_cap`/`no_signal` so the panel exists at day 1 on
 an idle box (precedent: OCI-pull histogram in `pkg/wire/metrics.go`).
 
+The `scale_up` row is owned by ADR-037 (reactive scale-up trigger, issue
+#169 / #172). The `scale_down` row is owned by ADR-038 (issue #171, this
+PR). They are symmetric by design — the same Prometheus registry, the
+same outcome-pre-instantiation pattern, the same card-label cardinality
+bound. An operator can read both rows side-by-side at
+`/metrics` after a single box has seen traffic.
+
 Why paired: `scale_up` shows "traffic is asking for more", `scale_down`
 shows "the cooldown path is keeping the box tight". A box with frequent
 `scale_up` + `scale_down` flips is a customer with bursty traffic and a
