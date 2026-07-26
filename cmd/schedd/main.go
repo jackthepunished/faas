@@ -69,6 +69,14 @@ type runDeps struct {
 	// tests that want a sub-second cadence. Zero falls back to the
 	// production default (30s).
 	heartbeatInterval time.Duration
+	// signPubPath overrides FAAS_SIGN_PUB / cosign.DefaultSignPubPath
+	// for tests. ADR-038 / Tier 3 phase 3: the verifier loads the pub
+	// PEM at startup and fails loud on missing/insecure perms. A unit
+	// test that boots run() needs a valid temp file here, otherwise
+	// the verifier step returns before any of the test's stubbed
+	// deps (listen, dialVMM, etc.) get a chance to run. nil/empty
+	// means the production envOr fallback fires.
+	signPubPath string
 }
 
 func defaultDeps() runDeps {
@@ -229,7 +237,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// backend transparent. vmmd does the storage.Get on the
 	// chroot mount path; schedd reads the sig blob directly via
 	// the same key the imaged signer wrote under.
-	signPubPath := envOr("FAAS_SIGN_PUB", cosign.DefaultSignPubPath)
+	signPubPath := deps.signPubPath
+	if signPubPath == "" {
+		signPubPath = envOr("FAAS_SIGN_PUB", cosign.DefaultSignPubPath)
+	}
 	storageBackend, err := storage.BackendFromEnv()
 	if err != nil {
 		return fmt.Errorf("schedd: storage backend: %w", err)
