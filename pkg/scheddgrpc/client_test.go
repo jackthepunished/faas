@@ -253,18 +253,19 @@ func TestClientParkInstance_NotFound(t *testing.T) {
 
 // TestClientParkInstance_PlainErrorPassesThrough documents the
 // other side of the same boundary: a non-NotFound error from the
-// engine surfaces to the Client as a gRPC status with code
-// Internal (the wire shape the server's `status.Error(codes.Internal, err.Error())`
-// call produces). The meterd quota loop distinguishes this from
-// the NotFound case by checking the gRPC code, not by string
-// matching the error.
+// engine is wrapped by the Server into a gRPC status with code
+// Internal (server.go:157: `status.Error(codes.Internal, err.Error())`)
+// and the resulting wire status is what the Client surfaces back.
+// The meterd quota loop distinguishes this from the NotFound case
+// by checking the gRPC code, not by string matching the error.
 //
-// The Client itself does NOT lift the error to *api.Problem (only
-// the specific NotFound case is unwrapped). liftErr on a status
-// whose `details` carry no api.Problem returns the status
-// unchanged — which is what meterd wants here, so a non-NotFound
-// failure is a 500-shaped error the caller treats as a hard
-// failure rather than a benign no-op.
+// Note: it is the Server, not the Client, that does the wrapping.
+// The Client's liftErr on a status whose `details` carry no
+// api.Problem returns the status unchanged (liftErr only unwraps
+// the specific NotFound case via `errors.Is(err, state.ErrNotFound)`
+// in client.go:142-146). A future refactor that lifts ALL errors
+// to *api.Problem at the Client layer would break this test and
+// the meterd boundary it pins.
 func TestClientParkInstance_PlainErrorPassesThrough(t *testing.T) {
 	c := newClient(t, &fakeEngine{
 		parkFn: func(context.Context, string, string) error {

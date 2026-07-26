@@ -69,9 +69,13 @@ func TestVerify_RejectsEmptyAccountID(t *testing.T) {
 }
 
 // testKey returns a deterministic 32-byte key for the white-box
-// tests in this file. Mirrors the helper in manager_test.go but
-// lives next to the caller because `package session` cannot
-// import test helpers from `package session_test`.
+// tests in this file. Mirrors the `key(t)` helper in
+// manager_test.go but lives next to the caller as a deliberate
+// style choice: every white-box test file in the project is
+// self-contained, so a future reader scanning this file knows
+// they don't need to grep the rest of the package to understand
+// it. The duplication is one byte of crypto noise (a 32-byte
+// zero-pattern key), not a real test surface.
 func testKey(t *testing.T) []byte {
 	t.Helper()
 	k := make([]byte, 32)

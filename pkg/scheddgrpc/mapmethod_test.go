@@ -31,7 +31,11 @@ func TestMapMethod(t *testing.T) {
 		// server.go:163-164 describes — better a slow cold boot
 		// than a panicking switch.
 		{"unknown enum defaults to cold boot", vmmdpb.WakeMethod(999), scheddpb.WakeMethod_WAKE_COLD_BOOT},
-		{"zero value defaults to cold boot", vmmdpb.WakeMethod(0), scheddpb.WakeMethod_WAKE_COLD_BOOT},
+		// WAKE_COLD_BOOT is proto value 0 in vmmdpb; this case
+		// pins the "0 == COLD_BOOT" wire mapping (not "0 == unset")
+		// so a future proto reorder that flips the enum doesn't
+		// silently change the schedd wire shape.
+		{"WAKE_COLD_BOOT (proto value 0) maps to cold boot", vmmdpb.WakeMethod(0), scheddpb.WakeMethod_WAKE_COLD_BOOT},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

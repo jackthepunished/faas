@@ -15,9 +15,15 @@ import (
 )
 
 // noopEngine is a SchedAPI implementation that returns zero values
-// for every method. Lives next to the test that uses it (the
-// bufconn tests use their own fakeEngine in the `scheddgrpc_test`
-// package; this one is for in-package white-box tests).
+// for every method. Lives next to the test that uses it.
+//
+// Intentionally a separate type from the `fakeEngine` defined in
+// bufconn_test.go (line 28). That one is in `package scheddgrpc_test`
+// and powers the bufconn integration tests; this one is in
+// `package scheddgrpc` and is the in-package white-box stub.
+// Sharing the definition would require a third test package and
+// a non-test helper file in the production tree — the cost
+// outweighs the value of de-duplicating 12 lines of stub code.
 type noopEngine struct{}
 
 func (noopEngine) Wake(context.Context, string) (sched.WakeResult, error) {
@@ -37,12 +43,12 @@ func (noopEngine) ParkWithReason(context.Context, string, string) error { return
 // because ad-hoc test harnesses and the /test/throwaway scripts
 // sometimes don't carry a metrics registry. A panic here would
 // kill a daemon boot.
+//
+// The test is a plain call + nil check; the panic guarantee
+// falls out of "if New panics, the test fails". No
+// `defer recover()` ceremony — that's the wrong shape for a
+// non-recovering expected outcome.
 func TestServerNew_NilOpsUsesDefault(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("New panicked with nil ops: %v", r)
-		}
-	}()
 	s := New(noopEngine{}, nil, nil)
 	if s == nil {
 		t.Fatal("New returned nil Server")

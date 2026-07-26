@@ -466,6 +466,19 @@ func TestSealGithubLogin_HappyPath(t *testing.T) {
 	if env.MfaPending {
 		t.Errorf("MfaPending = true, want false")
 	}
+	// Time bounds: a sealed cookie must carry a non-zero IssuedAt
+	// and an ExpiresAt strictly in the future, otherwise the
+	// dashboard session would expire before the user reaches the
+	// first page load. Same shape as TestIssue_And_Verify_RoundTrip.
+	if env.IssuedAt.IsZero() {
+		t.Errorf("IssuedAt = zero; envelope not stamped")
+	}
+	if !env.ExpiresAt.After(env.IssuedAt) {
+		t.Errorf("ExpiresAt = %v, want > IssuedAt = %v", env.ExpiresAt, env.IssuedAt)
+	}
+	if env.ExpiresAt.Before(time.Now()) {
+		t.Errorf("ExpiresAt = %v, want in the future", env.ExpiresAt)
+	}
 }
 
 // TestSealGithubLogin_RejectsEmptyAccountID covers the
