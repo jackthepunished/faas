@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}} — onebox faas</title>
-  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
-  <style>
+  <script src="https://unpkg.com/htmx.org@2.0.4" nonce="{{.Nonce}}" defer></script>
+  <style nonce="{{.Nonce}}">
     :root { color-scheme: light dark; }
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
     header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
@@ -103,13 +103,27 @@
           {{if .Data.ShowDelete}}
             <hr>
             <p><strong>Delete account</strong> &mdash; schedules permanent deletion in 30 days. You can cancel within the grace period by clicking "Restore" below or running <code>faas account restore</code>.</p>
-            <form method="POST" action="/dashboard/account/delete">
+            <form id="account-delete-form" method="POST" action="/dashboard/account/delete">
               <input type="hidden" name="csrf_token" value="{{.Data.DeleteConfirmToken}}">
-              <button type="submit" class="btn-danger"
-                onclick="return confirm('Schedule your account for permanent deletion in 30 days?')">
+              <button type="submit" class="btn-danger">
                 Delete account
               </button>
             </form>
+            <script nonce="{{.Nonce}}">
+              // Browsers do not honor `nonce` on event-handler attributes
+              // (issue #249 / spec §11 — strict CSP). Wire the confirm
+              // prompt via addEventListener so the inline code is accepted
+              // under the page's Content-Security-Policy header.
+              (function () {
+                var form = document.getElementById('account-delete-form');
+                if (!form) return;
+                form.addEventListener('submit', function (ev) {
+                  if (!window.confirm('Schedule your account for permanent deletion in 30 days?')) {
+                    ev.preventDefault();
+                  }
+                });
+              })();
+            </script>
           {{end}}
 
           {{if .Data.ShowRestore}}
