@@ -21,6 +21,7 @@ export type { AppSecretResponse } from './models/AppSecretResponse.js';
 export type { AsyncInvokeResponse } from './models/AsyncInvokeResponse.js';
 export type { AuditEventResponse } from './models/AuditEventResponse.js';
 export type { BuildExportResponse } from './models/BuildExportResponse.js';
+export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.js';
 export type { ChangePlanRequest } from './models/ChangePlanRequest.js';
 export type { CookieSession } from './models/CookieSession.js';
 export type { CreateAppRequest } from './models/CreateAppRequest.js';

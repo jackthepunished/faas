@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { BuildProvenanceResponse } from '../models/BuildProvenanceResponse.js';
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
@@ -214,6 +215,50 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Get build provenance.
+   * Returns the ADR-038 `build_provenance` row for a single build.
+   * Each successful build produces exactly one provenance row
+   * (builderd's populator runs at the `markSucceeded` sites); the
+   * row is the customer-visible "what ran?" record: buildkit /
+   * railpack version, base / runner digests, source URL + commit
+   * SHA, plan, builder node ID, and the build's started_at /
+   * finished_at timestamps.
+   *
+   * A 404 with `code=build_provenance_not_found` is returned when
+   * the build exists but no provenance row landed (the populator
+   * logs a WARN inside builderd on a failed INSERT — the build
+   * itself still succeeded). A 404 with `code=not_found` is
+   * returned when no build row matches the id, or when the
+   * build's owning app belongs to a different account.
+   *
+   * @returns BuildProvenanceResponse The build provenance row, with every field populated. Empty strings indicate a column the populator hasn't filled yet (the schema half of Phase 2 is in this PR; cosign / SBOM populate the rest in Phase 3).
+   * @throws ApiError
+   */
+  public static getBuildProvenance({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<BuildProvenanceResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/builds/{id}/provenance',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Either the build row is missing, OR the build exists but the populator INSERT failed (code=build_provenance_not_found).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

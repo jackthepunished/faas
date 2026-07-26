@@ -15,6 +15,7 @@ export type { AppSecretResponse } from './AppSecretResponse.js';
 export type { AsyncInvokeResponse } from './AsyncInvokeResponse.js';
 export type { AuditEventResponse } from './AuditEventResponse.js';
 export type { BuildExportResponse } from './BuildExportResponse.js';
+export type { BuildProvenanceResponse } from './BuildProvenanceResponse.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
 export type { CookieSession } from './CookieSession.js';
 export type { CreateAppRequest } from './CreateAppRequest.js';
