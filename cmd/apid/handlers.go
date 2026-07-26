@@ -70,6 +70,19 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// slug in logsanitize.Field so the audit line is one-event-per-line
 	// regardless of what a future refactor of validSlug does.
 	s.log.Info("app created", "app", created.ID, "slug", logsanitize.Field(created.Slug), "account", acct.ID)
+	// IAM-4 (issue #291): record the app creation. Runtime is
+	// omitted from the data map when empty (AppTypeApp has no
+	// runtime) so the row stays minimal. The audit row never
+	// reaches the structured-log sink, so logsanitize is not
+	// needed here — CodeQL go/log-injection only fires on slog.
+	s.audit.Emit(ctx(r), "app.created", &acct.ID, map[string]any{
+		"app_id":          created.ID,
+		"slug":            created.Slug,
+		"type":            string(created.Type),
+		"ram_mb":          created.RAMMB,
+		"max_concurrency": created.MaxConcurrency,
+		"runtime":         created.Runtime,
+	})
 	writeJSON(w, http.StatusCreated, s.appResponse(created))
 }
 
@@ -192,6 +205,18 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// here means the log statement stays safe regardless of upstream changes.
 	// d.ID and app.ID are server-generated UUIDs — no sanitize needed.
 	s.log.Info("deployment created", "deployment", d.ID, "app", app.ID, "ref", logsanitize.Field(req.Image))
+	// IAM-4 (issue #291): record the deployment. data.supersedes
+	// is the previous deployment_id (PR-B: read before the
+	// CreateDeployment tx via LatestDeployment, line 167 in the
+	// pre-PR-#340 layout). Empty when this is the first deploy
+	// on the app — dashboards can distinguish "first deploy"
+	// from "supersede" without inspecting app history.
+	s.audit.Emit(ctx(r), "app.deployed", &acct.ID, map[string]any{
+		"app_id":        app.ID,
+		"deployment_id": d.ID,
+		"ref":           req.Image,
+		"supersedes":    prev.ID,
+	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
 

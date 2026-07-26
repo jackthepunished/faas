@@ -620,3 +620,603 @@ func (f *failingAuditStore) AppendEvent(ctx context.Context, actor, kind string,
 type failingAuditErr struct{}
 
 func (*failingAuditErr) Error() string { return "simulated AppendEvent failure" }
+
+// --- issue #291 customer-facing audit emission ---------------------------
+//
+// Each test below drives one mutation route end-to-end and asserts the
+// events row landed via the auditor.Emit seam with the documented data
+// payload. The pattern mirrors TestAuditEvents_KeyMintEmitsEvent above:
+// drive the wire path, read events back via e.store.ListEvents, find the
+// row by Kind, JSON-decode Data, assert the field set.
+//
+// All 13 subtests run against the in-process MemStore; the auditor seam
+// is store-agnostic (cmd/apid/audit.go:79), so PG parity is inherited
+// from the existing TestAuditEvents_* suite.
+
+var digestFor = "sha256:" + repeat("a", 64)
+
+// seedAppForAudit POST /v1/apps and returns the api.AppResponse so the
+// test caller has the ID + slug for downstream routes. Pro plan gives
+// the default 5 deployed-apps, 5 concurrency, and 256 MB — a no-quota
+// choice so the audit test stays focused on emissions, not gating.
+func seedAppForAudit(t *testing.T, e testEnv, slug string) api.AppResponse {
+	t.Helper()
+	rec := e.do(t, http.MethodPost, "/v1/apps", api.CreateAppRequest{Slug: slug}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed app %q: code=%d body=%s", slug, rec.Code, rec.Body.String())
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode seed app: %v", err)
+	}
+	return out
+}
+
+func seedDeploymentForAudit(t *testing.T, e testEnv, slug string) string {
+	t.Helper()
+	rec := e.do(t, http.MethodPost, "/v1/apps/"+slug+"/deployments",
+		api.CreateDeploymentRequest{Image: "registry.example.com/x@" + digestFor}, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("seed deploy for %q: code=%d body=%s", slug, rec.Code, rec.Body.String())
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode seed deploy: %v", err)
+	}
+	return out.ID
+}
+
+// findEventByKind scans a ListEvents result for the first row matching
+// kind. Returns nil when no row exists. Mirrors the inline loop used in
+// TestAuditEvents_KeyMintEmitsEvent so the helper stays tight.
+func findEventByKind(rows []state.Event, kind string) *state.Event {
+	for i := range rows {
+		if rows[i].Kind == kind {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+// TestAuditEvents_AppCreatedEmitsEvent (issue #291) drives POST
+// /v1/apps and asserts the auditor records app.created with the
+// expected payload (app_id, slug, type, runtime, ram_mb,
+// max_concurrency).
+func TestAuditEvents_AppCreatedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, http.MethodPost, "/v1/apps",
+		api.CreateAppRequest{Slug: "audit-app-create", Type: "app"}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/apps: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var created api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "app.created")
+	if found == nil {
+		t.Fatalf("no app.created event row; rows=%+v", rows)
+	}
+	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) {
+		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != created.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], created.ID)
+	}
+	if data["slug"] != "audit-app-create" {
+		t.Errorf("Data.slug = %v, want audit-app-create", data["slug"])
+	}
+	if data["type"] != "app" {
+		t.Errorf("Data.type = %v, want app", data["type"])
+	}
+	if v, _ := data["ram_mb"].(float64); v != float64(created.RAMMB) {
+		t.Errorf("Data.ram_mb = %v, want %d", data["ram_mb"], created.RAMMB)
+	}
+	if v, _ := data["max_concurrency"].(float64); v != float64(created.MaxConcurrency) {
+		t.Errorf("Data.max_concurrency = %v, want %d", data["max_concurrency"], created.MaxConcurrency)
+	}
+}
+
+// TestAuditEvents_AppDeployedEmitsEvent (issue #291) drives a first
+// POST /v1/apps/{slug}/deployments and asserts app.deployed with
+// supersedes == "" (no prior deployment on this app).
+func TestAuditEvents_AppDeployedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-app-deploy")
+	depID := seedDeploymentForAudit(t, e, app.Slug)
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	// Two rows are expected: app.created (from seedAppForAudit) and
+	// app.deployed. Pick the second kind specifically.
+	found := findEventByKind(rows, "app.deployed")
+	if found == nil {
+		t.Fatalf("no app.deployed event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["deployment_id"] != depID {
+		t.Errorf("Data.deployment_id = %v, want %s", data["deployment_id"], depID)
+	}
+	if data["ref"] != "registry.example.com/x@"+digestFor {
+		t.Errorf("Data.ref = %v", data["ref"])
+	}
+	if data["supersedes"] != "" {
+		t.Errorf("Data.supersedes = %v, want \"\" (first deploy on this app)", data["supersedes"])
+	}
+}
+
+// TestAuditEvents_AppDeployedEmitsSupersedesOnSecondDeploy covers the
+// pre-PR #340 PR-B path: the second deployment carries
+// data.supersedes == first_deployment.ID.
+func TestAuditEvents_AppDeployedEmitsSupersedesOnSecondDeploy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-app-supersede")
+	firstDep := seedDeploymentForAudit(t, e, app.Slug)
+	secondDep := seedDeploymentForAudit(t, e, app.Slug)
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	// Find the SECOND app.deployed row (newest first per listAuditEvents
+	// ordering). Walk events newest-first to ensure we picked the second.
+	var found *state.Event
+	for i := range rows {
+		if rows[i].Kind == "app.deployed" {
+			var data map[string]any
+			_ = json.Unmarshal(rows[i].Data, &data)
+			if data["deployment_id"] == secondDep {
+				found = &rows[i]
+				break
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("no app.deployed row for second deployment %s; rows=%+v", secondDep, rows)
+	}
+	var data map[string]any
+	_ = json.Unmarshal(found.Data, &data)
+	if data["supersedes"] != firstDep {
+		t.Errorf("Data.supersedes = %v, want %s (first deployment)", data["supersedes"], firstDep)
+	}
+}
+
+// TestAuditEvents_AppUpdatedEmitsEvent (issue #291) drives PATCH
+// /v1/apps/{slug} with a RAMMB change and asserts app.updated carries
+// old + new payloads per user choice.
+func TestAuditEvents_AppUpdatedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-app-update")
+	// Pro plan caps RAMMB at 512. The default for Pro is already
+	// 512 so we drop to Hobby's 256 to exercise an in-plan change
+	// without hitting the validate ceiling. Pins the seam that
+	// the audit row fires for any successful PATCH, not just a
+	// value increase.
+	originalRAM := app.RAMMB
+	newRAM := 256
+
+	ram := newRAM
+	rec := e.do(t, http.MethodPatch, "/v1/apps/"+app.Slug,
+		api.UpdateAppRequest{RAMMB: &ram}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH /v1/apps/%s: code=%d body=%s", app.Slug, rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "app.updated")
+	if found == nil {
+		t.Fatalf("no app.updated event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["slug"] != app.Slug {
+		t.Errorf("Data.slug = %v, want %s", data["slug"], app.Slug)
+	}
+	oldMap, ok := data["old"].(map[string]any)
+	if !ok {
+		t.Fatalf("Data.old missing or wrong type: %+v", data)
+	}
+	newMap, ok := data["new"].(map[string]any)
+	if !ok {
+		t.Fatalf("Data.new missing or wrong type: %+v", data)
+	}
+	if v, _ := oldMap["ram_mb"].(float64); v != float64(originalRAM) {
+		t.Errorf("Data.old.ram_mb = %v, want %d", oldMap["ram_mb"], originalRAM)
+	}
+	if v, _ := newMap["ram_mb"].(float64); v != float64(newRAM) {
+		t.Errorf("Data.new.ram_mb = %v, want %d", newMap["ram_mb"], newRAM)
+	}
+	// Only ram_mb should be present — a schedule-only PATCH would
+	// not include unrelated fields. Pins the per-field capture
+	// invariant.
+	if _, present := oldMap["max_concurrency"]; present {
+		t.Errorf("Data.old.max_concurrency present on RAMMB-only patch: %+v", oldMap)
+	}
+}
+
+// TestAuditEvents_AppDeletedEmitsEvent (issue #291) drives DELETE
+// /v1/apps/{slug} and asserts app.deleted with app_id + slug.
+func TestAuditEvents_AppDeletedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-app-delete")
+
+	rec := e.do(t, http.MethodDelete, "/v1/apps/"+app.Slug, nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /v1/apps/%s: code=%d body=%s", app.Slug, rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "app.deleted")
+	if found == nil {
+		t.Fatalf("no app.deleted event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["slug"] != app.Slug {
+		t.Errorf("Data.slug = %v, want %s", data["slug"], app.Slug)
+	}
+}
+
+// TestAuditEvents_AppRolledBackEmitsEvent (issue #291) drives
+// /v1/apps/{slug}/rollback with two seeded deployments (the second
+// live) and asserts app.rolled_back records from=retired_id,
+// to=promoted_id.
+func TestAuditEvents_AppRolledBackEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-app-rollback")
+	// LatestSupersededDeployment only returns rows that already have
+	// status="superseded". MemStore's MarkDeploymentSuperseded
+	// implements that, so seed → mark superseded → mark live to
+	// give the rollback path a target.
+	firstDep := seedDeploymentForAudit(t, e, app.Slug)
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), firstDep); err != nil {
+		t.Fatalf("MarkDeploymentSuperseded: %v", err)
+	}
+	secondDep := seedDeploymentForAudit(t, e, app.Slug)
+	if err := e.store.MarkDeploymentLive(context.Background(), secondDep); err != nil {
+		t.Fatalf("MarkDeploymentLive: %v", err)
+	}
+
+	rec := e.do(t, http.MethodPost, "/v1/apps/"+app.Slug+"/rollback", nil, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /v1/apps/%s/rollback: code=%d body=%s", app.Slug, rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "app.rolled_back")
+	if found == nil {
+		t.Fatalf("no app.rolled_back event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["from"] != secondDep {
+		t.Errorf("Data.from = %v, want %s (current live deployment)", data["from"], secondDep)
+	}
+	if data["to"] != firstDep {
+		t.Errorf("Data.to = %v, want %s (rollback target)", data["to"], firstDep)
+	}
+}
+
+// TestAuditEvents_DomainAddedEmitsEvent (issue #291) drives POST
+// /v1/domains and asserts domain.added with app_id + lowercased
+// domain (the canonical form stored on the row).
+func TestAuditEvents_DomainAddedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-domain-add")
+
+	rec := e.do(t, http.MethodPost, "/v1/domains",
+		api.CreateCustomDomainRequest{AppID: app.ID, Domain: "Audit-Domain.COM"}, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /v1/domains: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "domain.added")
+	if found == nil {
+		t.Fatalf("no domain.added event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["domain"] != "audit-domain.com" {
+		t.Errorf("Data.domain = %v, want audit-domain.com (lowercased canonical)", data["domain"])
+	}
+}
+
+// TestAuditEvents_DomainRemovedEmitsEvent (issue #291) drives DELETE
+// /v1/domains/{domain} and asserts domain.removed.
+func TestAuditEvents_DomainRemovedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-domain-remove")
+	rec := e.do(t, http.MethodPost, "/v1/domains",
+		api.CreateCustomDomainRequest{AppID: app.ID, Domain: "audit-domain-remove.com"}, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /v1/domains seed: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	delRec := e.do(t, http.MethodDelete, "/v1/domains/audit-domain-remove.com", nil, nil)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /v1/domains/audit-domain-remove.com: code=%d body=%s", delRec.Code, delRec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "domain.removed")
+	if found == nil {
+		t.Fatalf("no domain.removed event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["domain"] != "audit-domain-remove.com" {
+		t.Errorf("Data.domain = %v, want audit-domain-remove.com", data["domain"])
+	}
+}
+
+// TestAuditEvents_CronCreatedEmitsEvent (issue #291) drives POST
+// /v1/crons and asserts cron.created with cron_id, app_id, schedule,
+// path, enabled. Sits AFTER PR #340's plan gate (handlers_ext.go)
+// — see TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit for
+// the negative invariant.
+func TestAuditEvents_CronCreatedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-cron-create")
+
+	rec := e.do(t, http.MethodPost, "/v1/crons",
+		api.CreateCronRequest{AppID: app.ID, Schedule: "*/5 * * * *", Path: "/tick"}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/crons: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var created api.CronResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "cron.created")
+	if found == nil {
+		t.Fatalf("no cron.created event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["cron_id"] != created.ID {
+		t.Errorf("Data.cron_id = %v, want %s", data["cron_id"], created.ID)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	if data["schedule"] != "*/5 * * * *" {
+		t.Errorf("Data.schedule = %v", data["schedule"])
+	}
+	if data["path"] != "/tick" {
+		t.Errorf("Data.path = %v", data["path"])
+	}
+	if v, _ := data["enabled"].(bool); !v {
+		t.Errorf("Data.enabled = %v, want true", data["enabled"])
+	}
+}
+
+// TestAuditEvents_CronUpdatedEmitsEvent (issue #291) drives PATCH
+// /v1/crons/{id} with a schedule change and asserts cron.updated
+// carries old + new payloads per user choice.
+func TestAuditEvents_CronUpdatedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-cron-update")
+
+	createRec := e.do(t, http.MethodPost, "/v1/crons",
+		api.CreateCronRequest{AppID: app.ID, Schedule: "*/5 * * * *", Path: "/tick"}, nil)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("seed cron: code=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created api.CronResponse
+	_ = json.Unmarshal(createRec.Body.Bytes(), &created)
+
+	newSched := "*/15 * * * *"
+	patchRec := e.do(t, http.MethodPatch, "/v1/crons/"+created.ID,
+		api.UpdateCronRequest{Schedule: &newSched}, nil)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("PATCH /v1/crons/%s: code=%d body=%s", created.ID, patchRec.Code, patchRec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "cron.updated")
+	if found == nil {
+		t.Fatalf("no cron.updated event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["cron_id"] != created.ID {
+		t.Errorf("Data.cron_id = %v, want %s", data["cron_id"], created.ID)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+	oldMap, ok := data["old"].(map[string]any)
+	if !ok {
+		t.Fatalf("Data.old missing or wrong type: %+v", data)
+	}
+	newMap, ok := data["new"].(map[string]any)
+	if !ok {
+		t.Fatalf("Data.new missing or wrong type: %+v", data)
+	}
+	if oldMap["schedule"] != "*/5 * * * *" {
+		t.Errorf("Data.old.schedule = %v", oldMap["schedule"])
+	}
+	if newMap["schedule"] != "*/15 * * * *" {
+		t.Errorf("Data.new.schedule = %v", newMap["schedule"])
+	}
+	// Schedule-only patch — path / enabled must NOT appear on
+	// either side. Pins the per-field capture invariant.
+	if _, present := oldMap["path"]; present {
+		t.Errorf("Data.old.path present on schedule-only patch: %+v", oldMap)
+	}
+}
+
+// TestAuditEvents_CronDeletedEmitsEvent (issue #291) drives DELETE
+// /v1/crons/{id} and asserts cron.deleted with cron_id + app_id.
+func TestAuditEvents_CronDeletedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-cron-delete")
+
+	createRec := e.do(t, http.MethodPost, "/v1/crons",
+		api.CreateCronRequest{AppID: app.ID, Schedule: "*/5 * * * *", Path: "/tick"}, nil)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("seed cron: code=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created api.CronResponse
+	_ = json.Unmarshal(createRec.Body.Bytes(), &created)
+
+	delRec := e.do(t, http.MethodDelete, "/v1/crons/"+created.ID, nil, nil)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /v1/crons/%s: code=%d body=%s", created.ID, delRec.Code, delRec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := findEventByKind(rows, "cron.deleted")
+	if found == nil {
+		t.Fatalf("no cron.deleted event row; rows=%+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["cron_id"] != created.ID {
+		t.Errorf("Data.cron_id = %v, want %s", data["cron_id"], created.ID)
+	}
+	if data["app_id"] != app.ID {
+		t.Errorf("Data.app_id = %v, want %s", data["app_id"], app.ID)
+	}
+}
+
+// TestAuditEvents_ListEndpointRespectsKindPrefixFilterForAppFamily
+// (issue #291) drives the GET /v1/audit-events?kind_prefix=app. read
+// path and asserts both app.created + app.deployed come back (no
+// auth.* / key.* / etc.). Confirms the existing kind_prefix filter
+// works for the new family unchanged.
+func TestAuditEvents_ListEndpointRespectsKindPrefixFilterForAppFamily(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-list-prefix")
+	_ = seedDeploymentForAudit(t, e, app.Slug)
+	// Also seed a key.created row so we have a non-app event to
+	// exclude — proves the filter is real, not a no-op.
+	keyRec := e.do(t, http.MethodPost, "/v1/keys",
+		api.CreateKeyRequest{Label: "audit-prefix-key", Scopes: []string{api.ScopeAppsRead}}, nil)
+	if keyRec.Code != http.StatusCreated {
+		t.Fatalf("seed key: code=%d body=%s", keyRec.Code, keyRec.Body.String())
+	}
+
+	rec := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=app.", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?kind_prefix=app.: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var list api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Exactly two rows expected: app.created + app.deployed.
+	if len(list.Events) != 2 {
+		t.Fatalf("got %d events, want 2 (app.created + app.deployed); events=%+v", len(list.Events), list.Events)
+	}
+	seen := map[string]bool{}
+	for _, ev := range list.Events {
+		if !strings.HasPrefix(ev.Kind, "app.") {
+			t.Errorf("event %q leaked past kind_prefix=app. filter", ev.Kind)
+		}
+		seen[ev.Kind] = true
+	}
+	if !seen["app.created"] || !seen["app.deployed"] {
+		t.Errorf("missing kind in filter result: got %+v, want app.created + app.deployed", seen)
+	}
+}
+
+// TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit (issue #291
+// + PR #340) pins the seam-invariant that the 402 plan gate fires
+// BEFORE the auditor.Emit call. A Free plan hitting POST /v1/crons
+// must NOT produce a cron.created audit row, otherwise the audit log
+// would track rejected attempts alongside accepted ones.
+func TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	app := seedAppForAudit(t, e, "audit-free-cron")
+
+	rec := e.do(t, http.MethodPost, "/v1/crons",
+		api.CreateCronRequest{AppID: app.ID, Schedule: "*/5 * * * *", Path: "/tick"}, nil)
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("Free plan POST /v1/crons: code=%d body=%s, want 402",
+			rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if found := findEventByKind(rows, "cron.created"); found != nil {
+		t.Errorf("Free plan 402 must NOT emit cron.created, found: %+v", found)
+	}
+}

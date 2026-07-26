@@ -292,6 +292,33 @@ create table events (                            -- audit log, append-only
 
 Conventions: every state column has a CHECK constraint; every table with `account_id` gets a composite index leading with it; all money math in integer cents/millicents — never floats.
 
+### 5.1 Audit event taxonomy (`events.kind`)
+
+The `events` table (DDL above) backs two emitters: **schedd** (state-transition events from `pkg/sched/engine.go`) and **apid** (the IAM-4 surface documented in [`docs/adr/035-auth-audit-events.md`](../adr/035-auth-audit-events.md)). The kind namespace is `<daemon>.<family>.<verb>`; per-daemon prefixes are bounded by ADR-035's audit-tagging convention so a dashboard filter never has to special-case.
+
+The list below covers **all** customer-facing kinds as of PR #291. Prior kinds (`auth.*`, `account.*`, `key.*`, `secret.*`) are defined in ADR-035 and are the source of truth — duplicated here for self-containment.
+
+| Kind | Emitted from | Data payload |
+|---|---|---|
+| `auth.login`, `auth.logout`, `auth.login_failed` | apid `handlers_auth.go` | per ADR-035 |
+| `key.created`, `key.deleted` | apid `handlers_ext.go::createKey`, `deleteKey`, `exchangeCliAuthCode` | `{key_id, scopes}` |
+| `secret.set`, `secret.deleted` | apid `handlers_secrets.go` | per ADR-035 |
+| `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored` | apid `handlers_account.go`, `handlers_ext.go::changePlan` | `{from, to}` / `{via}` |
+| `app.created` | apid `handlers.go::createApp` | `{app_id, slug, type, runtime, ram_mb, max_concurrency}` |
+| `app.deployed` | apid `handlers.go::createDeployment` | `{app_id, deployment_id, ref, supersedes}` — `supersedes=""` on the first deploy |
+| `app.updated` | apid `handlers_ext.go::updateApp` | `{app_id, slug, old, new}` — `old`/`new` only carry the fields the caller actually patched (PR #340 per-field capture invariant) |
+| `app.deleted` | apid `handlers_ext.go::deleteApp` | `{app_id, slug}` — soft delete; snapshot GC follows per §9 |
+| `app.rolled_back` | apid `handlers_ext.go::rollbackApp` | `{app_id, from: deployment_id, to: deployment_id}` |
+| `domain.added` | apid `handlers_ext.go::createDomain` | `{app_id, domain}` — `domain` is the canonical lowercased form stored on the row |
+| `domain.removed` | apid `handlers_ext.go::deleteDomain` | `{app_id, domain}` |
+| `cron.created` | apid `handlers_ext.go::createCron` | `{cron_id, app_id, schedule, path, enabled}` — only emitted on the success path; the PR #340 plan-tier gate (402) suppresses this row for Free accounts |
+| `cron.updated` | apid `handlers_ext.go::updateCron` | `{cron_id, app_id, old, new}` |
+| `cron.deleted` | apid `handlers_ext.go::deleteCron` | `{cron_id, app_id}` |
+
+**Failure semantics (ADR-035).** Audit emission is best-effort. An `AppendEvent` failure logs Warn, increments `apid_audit_write_failures_total`, and returns. The mutation that produced the audit emit is **never** rolled back (read the audit row as observation, not source of truth). The customer-facing list endpoint `GET /v1/audit-events?kind_prefix=<family>.` filters server-side by `events.kind` prefix; `kind_prefix=app.` returns only `app.*` rows, `kind_prefix=cron.` only `cron.*`, etc., unchanged by the new families.
+
+**4xx invariant.** Failed (4xx) mutations do NOT emit — the audit row is a success signal. PR #340 introduced a 402 plan-tier gate on `POST /v1/crons`; that gate fires before `s.store.CreateCronIfUnderQuota`, so a Free customer hitting POST /v1/crons gets a 402 and the `cron.created` row is never written. `cmd/apid/handlers_audit_test.go::TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit` pins this invariant end-to-end.
+
 ---
 
 ## 6. Instance lifecycle
