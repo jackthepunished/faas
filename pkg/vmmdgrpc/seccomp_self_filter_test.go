@@ -70,6 +70,17 @@ var allowFilter = bpfInsn{
 // Returns the error from the underlying syscall so the test can
 // t.Skip cleanly if the kernel refuses (e.g. seccomp disabled at
 // boot in a container).
+//
+// Idempotency caveat: the kernel rejects replacing a non-trivial
+// filter with a DIFFERENT one (EACCES). Calling installSelfFilter
+// twice in the same binary is fine here only because every caller
+// in this file installs the same allowFilter — the BPF instruction
+// is identical, so the second install is a benign restart of the
+// same filter. If a future test in this file ever installs a
+// different filter, it must either come last or use
+// SECCOMP_FILTER_FLAG_TSYNC / SECCOMP_SET_MODE_FILTER with
+// SECCOMP_FILTER_FLAG_SPEC_ALLOW — or the kernel will skip the
+// test with EACCES.
 func installSelfFilter(t *testing.T) {
 	t.Helper()
 	// PR_SET_NO_NEW_PRIVS is required before seccomp(2) accepts any
@@ -80,6 +91,70 @@ func installSelfFilter(t *testing.T) {
 	progPtr := uintptr(unsafe.Pointer(&allowFilter))
 	if _, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, 0, progPtr); errno != 0 {
 		t.Skipf("seccomp(SECCOMP_SET_MODE_FILTER) refused: %v (kernel may have seccomp disabled)", errno)
+	}
+}
+
+// TestSeccompStatus_WireAgreesWithLocalProcRead mirrors the wire-vs-local
+// tripwire shape at the in-process layer: install the filter, call
+// SeccompStatus over bufconn, AND independently parse /proc/self/status
+// via vmmdgrpc.ParseSeccompLines, then assert the two readers agree.
+//
+// The cross-process e2e (cmd/e2e/sec11_seccomp_e2e_test.go, //go:build
+// metal) is the only place that reads /proc/<pid>/status from a
+// DIFFERENT process than the gRPC handler — that is the property
+// that makes the wire-vs-local tripwire load-bearing. Here both
+// readers run in the same process, so the tripwire is narrower:
+// catches a handler-side parser drift that returns different
+// (mode, filterLen) than the same kernel state read via the exported
+// ParseSeccompLines. The kernel-state-with-different-reader property
+// stays the metal e2e's job.
+//
+// Runs first in the file (before TestSeccompStatus_SelfInFilterMode)
+// so a local-read sanity-check failure localises here. If the Go
+// runtime ever installs an unrelated filter before this test runs,
+// the local mode read returns something other than "filter" and
+// the test fatals with a clear "sanity check" message — preferable
+// to the stricter assertion failing first with a confusing diff.
+func TestSeccompStatus_WireAgreesWithLocalProcRead(t *testing.T) {
+	installSelfFilter(t)
+
+	// Local read first (mirrors what the cross-process e2e does:
+	// read /proc/<pid>/status from a process that does NOT own
+	// the gRPC handler, asserting the kernel state independently).
+	localBody, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatalf("read /proc/self/status: %v", err)
+	}
+	localMode, localFilter, err := vmmdgrpc.ParseSeccompLines(strings.NewReader(string(localBody)))
+	if err != nil {
+		t.Fatalf("local ParseSeccompLines: %v", err)
+	}
+	if localMode != "filter" {
+		t.Fatalf("local mode = %q, want %q (sanity check: did installSelfFilter take effect?)", localMode, "filter")
+	}
+
+	// Wire read: same kernel state, but read via the gRPC handler.
+	f := &fakeVMM{}
+	f.instancePIDFn = func(instance string) (int, bool) {
+		if instance == "" {
+			return 0, false
+		}
+		return os.Getpid(), true
+	}
+	cli, _ := newServer(t, f)
+	resp, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{Instance: "self"})
+	if err != nil {
+		t.Fatalf("SeccompStatus: %v", err)
+	}
+	if resp.GetError() != "" {
+		t.Fatalf("Error = %q", resp.GetError())
+	}
+
+	if got := resp.GetMode(); got != localMode {
+		t.Errorf("wire mode = %q, local mode = %q (handler and direct reader disagree — kernel-state readback drift)", got, localMode)
+	}
+	if got := resp.GetFilterLen(); got != localFilter {
+		t.Errorf("wire FilterLen = %d, local FilterLen = %d (handler and direct reader disagree — Seccomp_filters: parse drift)", got, localFilter)
 	}
 }
 
@@ -125,60 +200,5 @@ func TestSeccompStatus_SelfInFilterMode_ReturnsFilter(t *testing.T) {
 	}
 	if got := resp.GetPid(); got != int32(os.Getpid()) {
 		t.Errorf("pid = %d, want %d", got, os.Getpid())
-	}
-}
-
-// TestSeccompStatus_WireAgreesWithLocalProcRead — the wire-vs-local
-// tripwire the cross-process e2e (cmd/e2e/sec11_seccomp_e2e_test.go)
-// asserts against a real jailer. This test mirrors the same
-// shape in-process: install the filter, call SeccompStatus over
-// bufconn, AND independently parse /proc/self/status from the
-// test using vmmdgrpc.ParseSeccompLines, then assert the two
-// readers agree.
-//
-// Catches the "the wire says filter+0 but /proc says filter+1"
-// kind of drift: a future refactor that, say, accidentally drops
-// the Seccomp_filters: line read, or rounds the count, would
-// diverge the two readers here.
-func TestSeccompStatus_WireAgreesWithLocalProcRead(t *testing.T) {
-	installSelfFilter(t)
-
-	// Local read first (mirrors what the cross-process e2e does:
-	// read /proc/<pid>/status from a process that does NOT own
-	// the gRPC handler, asserting the kernel state independently).
-	localBody, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		t.Fatalf("read /proc/self/status: %v", err)
-	}
-	localMode, localFilter, err := vmmdgrpc.ParseSeccompLines(strings.NewReader(string(localBody)))
-	if err != nil {
-		t.Fatalf("local ParseSeccompLines: %v", err)
-	}
-	if localMode != "filter" {
-		t.Fatalf("local mode = %q, want %q (sanity check: did installSelfFilter take effect?)", localMode, "filter")
-	}
-
-	// Wire read: same kernel state, but read via the gRPC handler.
-	f := &fakeVMM{}
-	f.instancePIDFn = func(instance string) (int, bool) {
-		if instance == "" {
-			return 0, false
-		}
-		return os.Getpid(), true
-	}
-	cli, _ := newServer(t, f)
-	resp, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{Instance: "self"})
-	if err != nil {
-		t.Fatalf("SeccompStatus: %v", err)
-	}
-	if resp.GetError() != "" {
-		t.Fatalf("Error = %q", resp.GetError())
-	}
-
-	if got := resp.GetMode(); got != localMode {
-		t.Errorf("wire mode = %q, local mode = %q (handler and direct reader disagree — kernel-state readback drift)", got, localMode)
-	}
-	if got := resp.GetFilterLen(); got != localFilter {
-		t.Errorf("wire FilterLen = %d, local FilterLen = %d (handler and direct reader disagree — Seccomp_filters: parse drift)", got, localFilter)
 	}
 }

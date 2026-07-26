@@ -1143,11 +1143,11 @@ func TestSetupNetworkEgressZeroDisablesTc(t *testing.T) {
 // on every-PR CI.
 func TestWakeWritesMemoryMaxAfterBringUp(t *testing.T) {
 	for _, planMB := range []int{128, 256, 512, 1024} {
-		t.Run(itoa(planMB)+"MB", func(t *testing.T) {
+		t.Run(fmt.Sprintf("%dMB", planMB), func(t *testing.T) {
 			run, vmm := &fakeRunner{}, &fakeVMM{}
 			m := newTestManager(run, vmm)
 
-			instID := "cgroup-order-" + itoa(planMB)
+			instID := fmt.Sprintf("cgroup-order-%d", planMB)
 			r := req(instID)
 			r.MemSizeMiB = planMB
 
