@@ -227,8 +227,8 @@ type Event struct {
 	AmountCents int64
 
 	// Currency is the provider's three-letter currency code (Stripe:
-	// string(r.Currency); Paddle: "USD"). Empty when the event
-	// carries no monetary value.
+	// string(r.Currency)). Empty when the event carries no monetary
+	// value or the provider did not populate it.
 	Currency string
 
 	// ProviderRefundID is the provider's refund handle (Stripe: re_…).

@@ -94,9 +94,26 @@ func TestIssueCredit_HappyPath(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("account_credits rows = %d, want 1", len(rows))
 	}
-	// Audit row is verified by the audit-emit log inside the cmd/apid
-	// audit surface; AssertNotFound would require access to the
-	// Notifier. The audit-emit log is the contract.
+	// Audit row — the auditor's Emit is best-effort, so a happy-path
+	// test must inspect the events table to know the row actually
+	// landed (and not just that Emit returned without panicking).
+	events, err := e.store.ListEvents(context.Background(), target.ID, 50)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var found *state.Event
+	for i := range events {
+		if events[i].Kind == "credit.issued" {
+			found = &events[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("credit.issued audit row missing for account %s", target.ID)
+	}
+	if found.Actor != "apid" {
+		t.Errorf("audit Actor = %q, want apid", found.Actor)
+	}
 }
 
 func TestIssueCredit_NonAdminScopeForbidden(t *testing.T) {

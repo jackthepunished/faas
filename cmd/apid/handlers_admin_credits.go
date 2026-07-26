@@ -87,6 +87,10 @@ func (s *server) issueCredit(w http.ResponseWriter, r *http.Request, acct state.
 		AccountID:      targetID,
 		CentsRemaining: req.Cents,
 		Reason:         req.Reason,
+		// ExpiresAt is intentionally never set on issuance — the
+		// operator cannot set expires_at via the API today; the
+		// column is reserved for a future consumption-reducer follow-up
+		// that may want to attach an auto-expiry to a goodwill credit.
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create credit"))

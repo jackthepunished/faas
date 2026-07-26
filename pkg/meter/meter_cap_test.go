@@ -240,6 +240,54 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 	}
 }
 
+// TestRunQuotaOnce_OverageCapAtCap — pins the boundary semantics:
+// monthCents == capCents IS treated as a hit (the implementation
+// uses `>=`). An off-by-one fix would silently flip the behaviour
+// here, so the test pins the equality.
+func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	acct := makeAccount(t, ctx, store, api.PlanScale)
+	store.SetOverageCapCentsForTest(acct.ID, 500) // cents
+
+	// Exactly 500 cents of derived overage.
+	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0); err != nil {
+		t.Fatalf("append usage: %v", err)
+	}
+
+	ops := wire.NewOpsMetrics("meter_test_cap_boundary")
+	loop := meter.NewLoop(
+		store,
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil,
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	// Equality IS a cap hit: counter goes 0 → 1.
+	hitLine := `meter_test_cap_boundary_billing_cap_exceeded_total{plan="scale"} 1`
+	if !strings.Contains(body, hitLine) {
+		t.Fatalf("boundary (monthCents == capCents) should count as a cap hit; expected line %q:\n%s", hitLine, body)
+	}
+}
+
 // errCapStore wraps MemStore so LoadAllOverageCapCents returns an
 // error. Used by TestRunQuotaOnce_OverageCapLoadFailure. Other
 // methods fall through to the embedded MemStore so the quota ladder
