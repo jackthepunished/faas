@@ -381,3 +381,30 @@ sdk-smoke-node: ## Build fakeapid fixture + run Node SDK smoke test
 sdk-unit-node: ## Run Node SDK unit tests (no fixture required)
 	@cd sdk/node && npm ci && npm run test:unit
 
+.PHONY: sdk-gen-python
+sdk-gen-python: ## Regenerate sdk/python/faas_sdk from api/openapi.yaml
+	@cd sdk/python && .venv/bin/python scripts/gen.py
+
+.PHONY: sdk-gen-python-check
+sdk-gen-python-check: ## Regenerate + assert clean diff (CI's `sdk-gen-python` job)
+	@cd sdk/python && .venv/bin/python scripts/gen.py
+	@git diff --exit-code -- sdk/python/faas_sdk/
+
+.PHONY: sdk-gen-python-twice
+sdk-gen-python-twice: ## Determinism check: regen twice, must produce zero diff
+	@cd sdk/python && .venv/bin/python scripts/gen.py
+	@cd sdk/python && .venv/bin/python scripts/gen.py
+	@git diff --exit-code -- sdk/python/faas_sdk/
+	@echo "sdk-gen-python-twice: OK"
+
+.PHONY: sdk-smoke-python
+sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests
+	@cd sdk/fakeapid && go build -o bin/fakeapid .
+	@cd sdk/python && .venv/bin/python -m pip install --quiet -e .
+	@cd sdk/python && .venv/bin/python -m pip install --quiet pytest pytest-asyncio
+	@cd sdk/python && .venv/bin/python -m pytest tests/ --ignore=tests/debug_chain.py
+
+.PHONY: sdk-unit-python
+sdk-unit-python: ## Run Python SDK unit tests (no fixture required)
+	@cd sdk/python && .venv/bin/python -m pytest tests/test_client.py tests/test_sse.py
+

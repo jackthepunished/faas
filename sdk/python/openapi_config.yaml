@@ -1,0 +1,27 @@
+# openapi-python-client configuration for faas_sdk (v0.25.1).
+#
+# 0.25.1's ConfigFile accepts only:
+#   class_overrides, content_type_overrides, project_name_override,
+#   package_name_override, package_version_override,
+#   use_path_prefixes_for_title_model_names, post_hooks,
+#   docstrings_on_attributes, field_prefix, generate_all_tags,
+#   http_timeout, literal_enums.
+#
+# We deliberately set:
+#   * `project_name_override` + `package_name_override` = `faas_sdk`
+#     so the wheel metadata and import name match.
+#   * `package_version_override` = `0.1.0` — single source of truth.
+#   * `field_prefix: ''` — drops the `field_` prefix the generator
+#     defaults to. The Node SDK also dropped this (`Date`, not `field_date`).
+#   * `literal_enums: true` — emits `Literal["a", "b"]` unions so
+#     `problem.code == "not_found"` is statically typed.
+#   * `use_path_prefixes_for_title_model_names: false` — keeps model
+#     names short (`GetAppsResponse`, not `AppsGetAppsResponse`).
+#   * `docstrings_on_attributes: true` — useful for codegen review.
+project_name_override: faas_sdk
+package_name_override: faas_sdk
+package_version_override: '0.1.0'
+use_path_prefixes_for_title_model_names: false
+field_prefix: ''
+literal_enums: true
+docstrings_on_attributes: true
