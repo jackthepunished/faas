@@ -31,6 +31,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -160,7 +161,7 @@ func (s *server) dashboardDPA(w http.ResponseWriter, r *http.Request) {
 			Markdown: string(body),
 		},
 	}
-	if err := dashboard.Render(w, s.log, page); err != nil {
+	if err := dashboard.Render(w, s.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		s.log.Error("dashboard: dpa render failed", "err", err)
 	}
 }

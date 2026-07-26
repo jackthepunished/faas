@@ -38,6 +38,14 @@ type Page struct {
 	// /login + /auth/*; dashboardAuth rejects unauthed requests for the
 	// rest of /dashboard/*.
 	Account *AccountView
+	// Nonce is the per-request CSP nonce minted by the
+	// httpsec.Nonce middleware (cmd/apid/server.go). Render stamps it
+	// onto every <script> and <style> tag inside the rendered HTML so
+	// the browser accepts the inline code under the page's
+	// Content-Security-Policy header. Empty string is tolerated (the
+	// template renders the tags without a nonce attribute) so unit
+	// tests don't need to mint a nonce; production always sets it.
+	Nonce string
 	// Body is the per-page template name (without the .html suffix).
 	// Render looks up templates/<Body>.html inside the layout.
 	Body string
@@ -207,9 +215,18 @@ type AccountData struct {
 // and caches the parsed tree in a sync.Once — the hot path is a
 // single Execute call.
 //
+// nonce is the per-request CSP nonce minted by httpsec.Nonce
+// (cmd/apid/server.go). Render stamps it onto page.Nonce so every
+// <script> and <style> tag inside the layout and body template can
+// emit `nonce="…"` via {{.Nonce}}. Empty nonce is allowed (unit
+// tests pass "") and the templates render the tags without a nonce
+// attribute — production always supplies a value via
+// httpsec.NonceFromContext.
+//
 // Body is the per-page template name ("index", "apps_list", …). It
 // MUST be present under templates/ or Render writes a 500 problem.
-func Render(w http.ResponseWriter, log *slog.Logger, page Page) error {
+func Render(w http.ResponseWriter, log *slog.Logger, nonce string, page Page) error {
+	page.Nonce = nonce
 	if page.Body == "" {
 		page.Body = "index"
 	}

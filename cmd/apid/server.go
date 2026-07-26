@@ -16,6 +16,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -707,7 +708,18 @@ func (s *server) handler() http.Handler {
 	// Nil s.ops (no metrics wired) = no-op passthrough. Includes
 	// the spec routes above so SDK codegen hits show up on the
 	// §12 dashboard's per-route latency panel.
-	return s.observeWrap(mux)
+	//
+	// Issue #249 / spec §11: security response headers sit OUTERMOST
+	// (above observeWrap) so every status code carries them — even
+	// the ones observeWrap synthesizes on panic. httpsec.Static sets
+	// the five static headers; httpsec.Nonce mints a per-request CSP
+	// nonce and stamps it on the context that dashboard.Render reads
+	// to mark up <script>/<style> tags. apid serves only dashboard
+	// + JSON so the gate is unconditionally true.
+	return httpsec.Static(httpsec.Nonce(
+		func(*http.Request) bool { return true },
+		s.observeWrap(mux),
+	))
 }
 
 // observeWrap returns the mux wrapped in an observe middleware that
