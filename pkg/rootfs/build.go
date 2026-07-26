@@ -436,7 +436,7 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
 		// Symlinks / char devices / fifos / hardlinks don't allocate
 		// on-disk bytes for the consumer's quota. Cap is on the
 		// post-unpack size, which is what AppLayerMaxMB enforces.
-		if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
+		if hdr.Typeflag == tar.TypeReg {
 			if written+hdr.Size > capBytes {
 				return &ErrTarballExceedsCap{
 					WrittenBytes: written,

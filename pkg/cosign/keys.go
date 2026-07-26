@@ -130,6 +130,11 @@ func newBigInt(b []byte) *big.Int {
 // message includes the path. The keys live at /etc/faas/secrets/
 // and are read once at daemon startup; performance is irrelevant.
 func readFile(path string) ([]byte, error) {
+	//nolint:forbidigo // vetted-id path: the only callers pass /etc/faas/secrets/{sign.key,sign-pub.pem}
+	// (mode 0400/0444 per LoadPrivateKeyFile + LoadPublicKeyFile) and operator paths
+	// passed via --sign-key / --verify-key CLI flags. Both are daemon-side secrets —
+	// the customer-file path guard (cmd/faas/commands5.go::openCustomerFile) is a
+	// different surface and not applicable here.
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

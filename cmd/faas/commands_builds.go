@@ -118,6 +118,9 @@ func printProvenance(w io.Writer, p api.BuildProvenanceResponse) {
 		{"sbom_storage_key", p.SBOMStorageKey},
 	}
 	for _, r := range rows {
+		//nolint:errcheck // tabular printer writes to a typed writer; a failed Fprintf
+		// at the tab stop is no different from a panic mid-row for the operator — both
+		// show up as a malformed output and the CLI will exit non-zero on the parse below.
 		fmt.Fprintf(w, "%-22s %s\n", r.label+":", r.value)
 	}
 }

@@ -11,6 +11,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -97,7 +98,7 @@ func TestMemStore_BuildProvenance_NotFound(t *testing.T) {
 	// into 404 with code=build_provenance_not_found. Pin the
 	// exact sentinel.
 	_, err := m.BuildProvenanceByBuildID(ctx, build.ID)
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("BuildProvenanceByBuildID err = %v, want ErrNotFound", err)
 	}
 }

@@ -8,6 +8,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -88,7 +89,7 @@ func TestMemStore_Deployment_SourceURL_CommitSHALengthCap(t *testing.T) {
 func TestMemStore_Deployment_SourceURL_NotFound(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()
-	if err := m.SetDeploymentSourceURL(ctx, "no-such-id", "url", "sha"); err != ErrNotFound {
+	if err := m.SetDeploymentSourceURL(ctx, "no-such-id", "url", "sha"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing deployment: got %v, want ErrNotFound", err)
 	}
 }
