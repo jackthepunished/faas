@@ -220,6 +220,40 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasBuildSuccessLow.md"
 
       # ─────────────────────────────────────────────────────────────────
+      # apid audit-write failures (IAM-4 / ADR-035, issue #278).
+      #
+      # The audit emit is best-effort by design: the auth action has
+      # already returned 200 to the customer by the time AppendEvent
+      # runs, so a failed insert logs WARN and bumps this counter
+      # without rolling back the action. A sustained non-zero rate
+      # therefore means audit rows are silently missing while customer
+      # traffic looks healthy — a ticket-tier operational signal, not
+      # a page-tier outage.
+      #
+      # `sum(...)` (no `by (account_id)`) on purpose: a single
+      # misbehaving customer firing hundreds of failures/sec should
+      # trip the alert just as a Postgres outage would. The per-account
+      # breakdown is in the metric itself for the runbook drill-down.
+      #
+      # Threshold: > 5 failures/min over the rolling 5m window. The
+      # issue acceptance calls for "rate exceeds 5/min over 5m"; we
+      # use the standard `for: 5m` to debounce transient blips (a
+      # single INSERT retry race). `severity: warn` because audit
+      # rows missing ≠ customer action failing.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasApidAuditWriteFailures
+        expr: sum(rate(apid_audit_write_failures_total[5m])) > (5 / 60)
+        for: 5m
+        labels:
+          severity: warn
+          component: apid
+          family: audit_write
+        annotations:
+          summary: "apid audit writes failing above 5/min"
+          description: "The apid audit event append failure rate has exceeded 5 failures per minute over the rolling 5-minute window for 5m. Audit rows may be missing even though customer actions continue to succeed (best-effort per ADR-035). Drill down per-account via the runbook; sustained failures point at the events table, Postgres WAL, or the connection pool."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasApidAuditWriteFailures.md"
+
+      # ─────────────────────────────────────────────────────────────────
       # Daemon liveness — every scrape target should be up.
       # 2m is tight: a single scrape miss (15s) does not trip it; a
       # crashed daemon trips it within one evaluation cycle after restart.

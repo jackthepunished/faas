@@ -598,7 +598,7 @@ func TestAuditEvents_FailingStoreDoesNotRollback(t *testing.T) {
 		t.Errorf("API keys = %d, want ≥2 (audit failure must not roll back create)", len(keys))
 	}
 	// Counter incremented.
-	if got := testutil.ToFloat64(e.ops.AuditWriteFailures()); got < 1 {
+	if got := testutil.ToFloat64(e.ops.AuditWriteFailures(e.acct.ID)); got < 1 {
 		t.Errorf("audit_write_failures = %v, want ≥1", got)
 	}
 }

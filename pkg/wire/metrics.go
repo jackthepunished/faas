@@ -17,6 +17,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -72,8 +73,39 @@ type OpsMetrics struct {
 	// auditWriteFail: introduced in IAM-4 (ADR-035) for the apid-side
 	// auth audit emit. Mirrors eventsWriteFail — a failed audit write
 	// logs Warn and increments the counter; the auth action has
-	// already returned 200, so this is observation-only.
-	auditWriteFail prometheus.Counter
+	// already returned 200, so this is observation-only. Labelled by
+	// account_id (issue #278) so an operator can graph a single
+	// customer's audit-write failure stream. The label value is
+	// resolved through accountLabel — see accountLabelSet — which
+	// bounds the cardinality at maxAccountLabelValues; overflow
+	// collapses to "__other__" so the Prometheus TSDB series set
+	// stays bounded over the daemon's lifetime.
+	auditWriteFail *prometheus.CounterVec
+	// auditWriteDur: latency of state.Store.AppendEvent on the apid
+	// audit seam, labelled by result ∈ {ok, failed} (issue #278). The
+	// histogram covers the failure-path latency distribution so an
+	// operator can distinguish a Postgres outage (slow AppendEvent,
+	// many failures) from a transient insert race (fast failures).
+	// Buckets sized for the single-row INSERT round-trip; distinct
+	// from the control-plane dur histogram whose sub-millisecond
+	// buckets are wrong for a Postgres call.
+	auditWriteDur *prometheus.HistogramVec
+	// requestFailures: HTTP requests completed with status >= 400,
+	// labelled by account_id and the route template (issue #278).
+	// The route label reuses r.Pattern (the Go mux pattern, e.g.
+	// "GET /v1/apps/{slug}") so cardinality is bounded by the route
+	// table, not by URL paths — same precedent as apid_ops_total{op}
+	// (PR #132). account_id flows through accountLabel as for the
+	// audit counter; the two metrics share the same admission set so
+	// an account is either represented by its real id in both, or by
+	// "__other__" in both.
+	requestFailures *prometheus.CounterVec
+	// accountLabels: the bounded admission set shared by the
+	// account_id-labelled metrics above. See accountLabelSet docs
+	// for the fixed-capacity, non-evicting contract — an evicting
+	// LRU would let evicted ids re-admit later and grow the series
+	// set unbounded over process lifetime.
+	accountLabels *accountLabelSet
 	// stripePushDur: introduced in feat/m7-stripe-push-observability.
 	// Per-push latency to Stripe, labelled by terminal result code.
 	// Distinct from the dur histogram (which labels by op only) because
@@ -241,10 +273,38 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
 	})
-	auditWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
+	auditWriteFail := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_audit_write_failures_total",
-		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written. The handler has already returned 200; this is observation-only.",
-	})
+		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written, labelled by account_id. The handler has already returned 200; this is observation-only. account_id=\"__other__\" is the bounded admission overflow bucket — operators must check daemon slog for the original id (issue #278).",
+	}, []string{"account_id"})
+	auditWriteDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_audit_write_failures_duration_seconds",
+		Help: "Latency of state.Store.AppendEvent on the apid audit seam, labelled by terminal result {ok, failed}. Sized for the single-row INSERT round-trip (issue #278).",
+		// Sub-millisecond for cached/healthy calls; the long tail (1s,
+		// 2.5s, 5s) catches Postgres stalls so the operator can
+		// distinguish a transient insert race from a database outage.
+		Buckets: []float64{
+			0.001, 0.005, 0.01, 0.025, 0.05,
+			0.1, 0.25, 0.5, 1, 2.5, 5,
+		},
+	}, []string{"result"})
+	// Pre-instantiate the closed result label set so the histogram's
+	// HELP/TYPE and zero-valued buckets surface in /metrics from
+	// boot — same precedent as stripePushDur / buildDur.
+	for _, result := range []string{"ok", "failed"} {
+		auditWriteDur.WithLabelValues(result)
+	}
+	requestFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_request_failures_total",
+		Help: "HTTP requests completed with status >= 400, labelled by account_id and the route template (issue #278). account_id=\"anonymous\" is the unauthenticated path; account_id=\"__other__\" is the bounded admission overflow bucket. route is r.Pattern (e.g. \"GET /v1/apps/{slug}\") or \"unmatched\" for paths the mux did not dispatch.",
+	}, []string{"account_id", "route"})
+	// Reserved label values: anonymous for unauthenticated traffic,
+	// __other__ for the bounded overflow. Both are admitted at boot
+	// without consuming capacity, and both are always re-admitted on
+	// collision-free lookups (accountLabelSet reservedAllow).
+	auditWriteFail.WithLabelValues(anonymousAccountLabel)
+	auditWriteFail.WithLabelValues(otherAccountLabel)
+	requestFailures.WithLabelValues(anonymousAccountLabel, "unmatched")
 	stripePushDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_stripe_push_duration_seconds",
 		Help: "Per-push latency to Stripe, labelled by terminal result code (ok on success, or a stripe.ClassifyPushError label on failure).",
@@ -374,9 +434,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, auditWriteDur, requestFailures, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
 	} else {
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, auditWriteDur, requestFailures, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
 	}
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -473,6 +533,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		watchdogKills:              watchdogKills,
 		eventsWriteFail:            eventsWriteFail,
 		auditWriteFail:             auditWriteFail,
+		auditWriteDur:              auditWriteDur,
+		requestFailures:            requestFailures,
+		accountLabels:              newAccountLabelSet(maxAccountLabelValues),
 		stripePushDur:              stripePushDur,
 		paddlePushDur:              paddlePushDur,
 		buildDur:                   buildDur,
@@ -509,13 +572,50 @@ func (m *OpsMetrics) EventsWriteFailures() prometheus.Counter {
 	return m.eventsWriteFail
 }
 
-// AuditWriteFailures returns the unlabelled counter for IAM-4
-// (ADR-035) auth audit emits whose events row could not be written.
-// The handler has already returned 200 to the customer; this counter
-// only signals observability debt. Same posture as
-// EventsWriteFailures.
-func (m *OpsMetrics) AuditWriteFailures() prometheus.Counter {
-	return m.auditWriteFail
+// AuditWriteFailures returns the per-account counter for IAM-4
+// (ADR-035) auth audit emits whose events row could not be written
+// (issue #278). The handler has already returned 200 to the
+// customer; this counter only signals observability debt. Same
+// posture as EventsWriteFailures.
+//
+// accountID flows through the bounded admission set (accountLabel):
+// empty/nil resolves to "anonymous" (unauthenticated, never billed);
+// new ids above the capacity return the counter labelled "__other__"
+// so the Prometheus TSDB series set stays bounded. Repeated calls
+// for the same accountID return the same underlying Counter — safe
+// to call from the hot path.
+func (m *OpsMetrics) AuditWriteFailures(accountID string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditWriteFail.WithLabelValues(m.accountLabel(accountID))
+}
+
+// AuditWriteFailureDuration returns the per-result observer for the
+// audit-write latency histogram (issue #278). result ∈ {ok, failed};
+// "ok" is the AppendEvent-success branch, "failed" is the AppendEvent
+// failure branch. The histogram covers the single-row INSERT
+// round-trip so an operator can distinguish a Postgres outage (slow
+// AppendEvent, many failures) from a transient insert race (fast
+// failures). Safe to cache; the underlying HistogramVec is shared.
+func (m *OpsMetrics) AuditWriteFailureDuration(result string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.auditWriteDur.WithLabelValues(result)
+}
+
+// RequestFailure returns the per-(account, route) counter for HTTP
+// requests completed with status >= 400 (issue #278). route is the
+// Go mux pattern (e.g. "GET /v1/apps/{slug}") or "unmatched" for
+// paths the mux did not dispatch. accountID is resolved through the
+// bounded admission set (accountLabel) — empty resolves to
+// "anonymous"; ids past the capacity collapse to "__other__".
+func (m *OpsMetrics) RequestFailure(accountID, route string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.requestFailures.WithLabelValues(m.accountLabel(accountID), route)
 }
 
 // WakeIDV4Fallback returns the unlabelled counter the wake_id mint
@@ -884,6 +984,122 @@ func (m *OpsMetrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{
 		Registry: m.registry,
 	})
+}
+
+// maxAccountLabelValues caps the per-OpsMetrics account-label
+// admission set (issue #278). Sized to comfortably exceed the
+// Scale-plan 100-deploy upper bound while staying inside Prometheus'
+// "tens of thousands of series per metric" guideline. Above the
+// cap, new ids collapse to otherAccountLabel ("__other__") so the
+// TSDB series set stays bounded over the daemon's lifetime. The cap
+// is shared across every account_id-labelled counter —
+// AuditWriteFailures and RequestFailure see the same admission set
+// so a customer is either represented by their real id in both, or
+// by "__other__" in both.
+const maxAccountLabelValues = 10_000
+
+// anonymousAccountLabel is the reserved account_id for traffic that
+// arrives without a resolvable principal (e.g. a 401 before
+// authentication finishes). Always admitted without consuming real
+// capacity, and always re-admitted on collision-free lookups so
+// accountLabelSet is free to evict the underlying set across a
+// restart.
+const anonymousAccountLabel = "anonymous"
+
+// otherAccountLabel is the reserved account_id for traffic whose
+// account_id exceeded the admission cap (issue #278). Always
+// admitted without consuming real capacity. Operators must check
+// the daemon slog for the original id when an account lands here —
+// the metric label is intentionally lossy.
+const otherAccountLabel = "__other__"
+
+// accountLabelSet is the bounded admission set that backs every
+// account_id-labelled metric in OpsMetrics (issue #278). The set is
+// deliberately a plain map+mutex, not an LRU: an evicting LRU would
+// let evicted ids re-admit later and grow the Prometheus TSDB
+// series set unbounded over the daemon's lifetime. The map is
+// initialized once per OpsMetrics in NewOpsMetrics; the mutex is
+// the only synchronisation primitive and is held only across the
+// lookup/insert path. Prometheus Counter/Histogram increments
+// happen outside the critical section.
+//
+// Reserved values (anonymousAccountLabel, otherAccountLabel) are
+// admitted at boot without consuming capacity and are always
+// re-admitted on lookup. Real account ids consume capacity once and
+// are never evicted in process — the daemon restart is the only
+// path that resets the set.
+type accountLabelSet struct {
+	mu       sync.Mutex
+	admitted map[string]struct{}
+	cap      int
+}
+
+// newAccountLabelSet constructs an admission set with the given
+// capacity. capacity must be > 0; the call panics otherwise to fail
+// loud at boot rather than silently allow unbounded admission.
+//
+// Returns a pointer because accountLabelSet contains a sync.Mutex;
+// returning by value would copy the lock (govet copylocks).
+func newAccountLabelSet(capacity int) *accountLabelSet {
+	if capacity <= 0 {
+		panic("wire: accountLabelSet capacity must be positive")
+	}
+	s := &accountLabelSet{
+		admitted: make(map[string]struct{}, capacity),
+		cap:      capacity,
+	}
+	// Reserved values don't count against the cap, but pre-admitting
+	// them at construction means accountLabel() doesn't need a
+	// special branch for them — the lookup short-circuits through
+	// the same map.
+	s.admitted[anonymousAccountLabel] = struct{}{}
+	s.admitted[otherAccountLabel] = struct{}{}
+	return s
+}
+
+// admit resolves an account id to its label value (issue #278).
+// Empty input normalizes to anonymousAccountLabel. Reserved values
+// (anonymousAccountLabel, otherAccountLabel) are always admitted.
+// Real ids are admitted up to the capacity; further ids collapse to
+// otherAccountLabel without ever consuming capacity, and the
+// underlying map is never resized past cap.
+//
+// Concurrency: holds mu across the lookup+insert. The hot path is
+// the "already admitted" lookup, which is O(1) and never inserts.
+// The Prometheus increment happens at the call site AFTER admit
+// returns, so it is outside the critical section.
+//
+// Pointer receiver: the type contains a sync.Mutex, so copying the
+// value would duplicate the lock. accountLabelSet is constructed
+// once per OpsMetrics in NewOpsMetrics and held as a pointer field.
+func (s *accountLabelSet) admit(accountID string) string {
+	switch accountID {
+	case "":
+		return anonymousAccountLabel
+	case anonymousAccountLabel, otherAccountLabel:
+		return accountID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.admitted[accountID]; ok {
+		return accountID
+	}
+	if len(s.admitted) >= s.cap {
+		return otherAccountLabel
+	}
+	s.admitted[accountID] = struct{}{}
+	return accountID
+}
+
+// accountLabel exposes the admission set as an OpsMetrics method so
+// callers don't need to know the underlying type. Safe on a nil
+// receiver — returns the input unchanged for the daemon paths that
+// don't wire an OpsMetrics (unit tests, see handlers_audit_test).
+func (m *OpsMetrics) accountLabel(accountID string) string {
+	if m == nil || m.accountLabels == nil {
+		return accountID
+	}
+	return m.accountLabels.admit(accountID)
 }
 
 // RenderSeconds is a tiny helper for callers that want to hand-format a

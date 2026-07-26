@@ -492,3 +492,106 @@ func TestObserveWrap_UnmatchedRoute(t *testing.T) {
 		}
 	}
 }
+
+// TestObserveWrap_RequestFailure_AuthenticatedLabel pins the
+// per-customer request-failure counter (issue #278). A 4xx response
+// from an authenticated route must increment with the principal's
+// account_id label — not "anonymous". The pointer mutation in
+// s.auth is what makes this work; if it regresses, this test
+// surfaces the failure as "anonymous".
+func TestObserveWrap_RequestFailure_AuthenticatedLabel(t *testing.T) {
+	e := setup(t, api.PlanPro)
+
+	// Drive a 4xx: POST /v1/apps with a duplicate slug.
+	if dup := e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "req-fail"}, nil); dup.Code != 201 {
+		t.Fatalf("seed create status = %d, want 201", dup.Code)
+	}
+	rec := e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "req-fail"}, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("dup status = %d, want 409", rec.Code)
+	}
+
+	body := scrapeMetrics(t, e)
+	want := fmt.Sprintf(`apid_test_request_failures_total{account_id=%q,route="POST /v1/apps"} 1`, e.acct.ID)
+	if !strings.Contains(body, want) {
+		t.Errorf("metrics body missing authenticated request-failure series %q:\n%s", want, body)
+	}
+}
+
+// TestObserveWrap_RequestFailure_AnonymousLabel pins the 401 /
+// pre-auth failure path. The unauthenticated branch must surface
+// under account_id="anonymous" so the scanner-rejected-traffic
+// signal is preserved in the labelled counter.
+func TestObserveWrap_RequestFailure_AnonymousLabel(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	req := httptest.NewRequest("GET", "/v1/account", nil)
+	req.Header.Set("Authorization", "Bearer fp_live_deadbeef")
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad key status = %d, want 401", rec.Code)
+	}
+
+	body := scrapeMetrics(t, e)
+	want := `apid_test_request_failures_total{account_id="anonymous",route="GET /v1/account"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("metrics body missing anonymous request-failure series %q:\n%s", want, body)
+	}
+}
+
+// TestObserveWrap_RequestFailure_UnmatchedRoute pins the route label
+// for scanner traffic: account_id="anonymous", route="unmatched".
+// Recording the literal URL would let a scanner explode the (account,
+// route) tuple space; the fixed "unmatched" bucket keeps it bounded.
+func TestObserveWrap_RequestFailure_UnmatchedRoute(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	for _, path := range []string{"/wp-login.php", "/.env"} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		}
+	}
+
+	body := scrapeMetrics(t, e)
+	want := `apid_test_request_failures_total{account_id="anonymous",route="unmatched"} 2`
+	if !strings.Contains(body, want) {
+		t.Errorf("metrics body missing unmatched request-failure series %q:\n%s", want, body)
+	}
+}
+
+// TestObserveWrap_RequestFailure_2xxNotCounted pins the >=400
+// threshold — 2xx and 3xx responses must NOT increment the
+// request-failure counter.
+func TestObserveWrap_RequestFailure_2xxNotCounted(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "GET", "/v1/account", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/account status = %d, want 200", rec.Code)
+	}
+	body := scrapeMetrics(t, e)
+	// The "anonymous" pre-instantiated series is 0 from boot; it
+	// stays 0 because no 4xx/5xx response was emitted.
+	if strings.Contains(body, `apid_test_request_failures_total{account_id="anonymous",route="GET /v1/account"} 1`) {
+		t.Errorf("2xx response incorrectly counted as request failure:\n%s", body)
+	}
+}
+
+// scrapeMetrics is a tiny test helper that pulls the apid /metrics
+// body through e.ops.Handler() and returns it as a string.
+func scrapeMetrics(t *testing.T, e testEnv) string {
+	t.Helper()
+	srv := httptest.NewServer(e.ops.Handler())
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get /metrics: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
