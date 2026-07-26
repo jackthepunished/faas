@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -71,6 +72,10 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderUsage(w, r, log, acct)
 		case path == "/dashboard/billing":
 			s.renderBilling(w, r, log, acct)
+		case path == "/dashboard/pricing":
+			s.renderPricing(w, r, log, acct)
+		case path == "/dashboard/invoices":
+			s.renderInvoices(w, r, log, acct)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
 		default:
@@ -319,6 +324,160 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
+}
+
+// renderPricing renders /dashboard/pricing — a four-column plan
+// comparison driven entirely by pkg/api/limits.go. Money is integer
+// millicents upstream; we divide by 1000 at render time only and
+// format with %d.%02d (CLAUDE.md Money: integer cents/millicents —
+// no float math on money).
+func (s *server) renderPricing(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderPricing: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	plans := make([]dashboard.PricingPlanView, 0, len(api.Plans))
+	for _, p := range api.Plans {
+		l := api.MustLimitsFor(p)
+		plans = append(plans, dashboard.PricingPlanView{
+			Plan:                    string(p),
+			PriceFormatted:          formatPriceEuros(l.PriceMillicents),
+			Highlighted:             p == acct.Plan,
+			DeployedApps:            l.DeployedApps,
+			MaxConcurrency:          l.MaxConcurrency,
+			RAMMB:                   l.RAMMB,
+			AppLayerMaxMB:           l.AppLayerMaxMB,
+			SourceTarballMaxMB:      l.SourceTarballMaxMB,
+			IdleTimeoutS:            l.IdleTimeoutS,
+			IncludedGBHours:         int64(l.IncludedGBHours),
+			RateLimitRPS:            l.RateLimitRPS,
+			RateLimitBurst:          l.RateLimitBurst,
+			EgressMbit:              l.EgressMbit,
+			SecretCountMax:          l.SecretCountMax,
+			AsyncInvokeAllowed:      l.AsyncInvokeAllowed,
+			MinInstancesAllowed:     l.MinInstancesAllowed,
+			ScaleUpTargetRPSAllowed: l.ScaleUpTargetRPSAllowed,
+			ScaleUpTargetCPUAllowed: l.ScaleUpTargetCPUAllowed,
+			EgressAllowlistAllowed:  l.EgressAllowlistAllowed,
+			EgressAllowlistMaxSize:  l.EgressAllowlistMaxSize,
+		})
+	}
+	page := dashboard.Page{Title: "Pricing", Body: "pricing", Account: dashboardAccountView(view, appCount), Data: dashboard.PricingData{Plans: plans}}
+	if err := dashboard.Render(w, log, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// renderInvoices renders /dashboard/invoices — the account's billing
+// history (issue #259). Optional ?month=YYYY-MM filter and ?before
+// cursor pagination, mirroring the API handler's parsing. Bad input
+// is silently dropped (the dashboard is forgiving; the API enforces
+// RFC 7807). The handlers are intentionally kept small enough to fit
+// the 50-line guideline via parseInvoiceMonth / parseInvoiceBefore.
+func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderInvoices: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	monthStr, monthPtr := parseInvoiceMonth(r.URL.Query().Get("month"))
+	before := parseInvoiceBefore(r.URL.Query().Get("before"))
+	rows, err := s.store.ListInvoicesForAccount(r.Context(), acct.ID, monthPtr, before, 25)
+	if err != nil {
+		log.Warn("dashboard renderInvoices: list invoices", "account_id", acct.ID, "err", err)
+		renderProblem(w, log, err)
+		return
+	}
+	items := make([]dashboard.InvoiceRow, 0, len(rows))
+	for _, inv := range rows {
+		items = append(items, dashboard.InvoiceRow{
+			ID:             inv.ID,
+			Number:         inv.Number,
+			Provider:       inv.Provider,
+			Status:         inv.Status,
+			Period:         inv.PeriodEnd.Format("2006-01"),
+			TotalFormatted: formatCentsEuros(inv.TotalCents),
+			Currency:       inv.Currency,
+			PDFAvailable:   inv.PDFAvailable,
+		})
+	}
+	nextBefore := ""
+	if len(rows) == 25 && len(items) > 0 {
+		nextBefore = rows[len(rows)-1].PeriodEnd.UTC().Format(time.RFC3339Nano)
+	}
+	page := dashboard.Page{Title: "Invoices", Body: "invoices", Account: dashboardAccountView(view, appCount), Data: dashboard.InvoicesData{
+		Month: monthStr, Items: items, NextBefore: nextBefore,
+	}}
+	if err := dashboard.Render(w, log, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// parseInvoiceMonth parses the dashboard's optional month query.
+// Returns (echoed-string, parsed-pointer). Bad input echoes empty so
+// the form re-renders cleanly without surfacing the validation error
+// (the API surfaces the RFC 7807 problem; the dashboard is forgiving).
+func parseInvoiceMonth(raw string) (string, *time.Time) {
+	if raw == "" {
+		return "", nil
+	}
+	m, err := time.Parse("2006-01", raw)
+	if err != nil {
+		return "", nil
+	}
+	return raw, &m
+}
+
+// parseInvoiceBefore parses the dashboard's optional before cursor.
+// Empty → zero time. Bad input → zero time (forgiving; matches the
+// dashboard's behaviour for month). The API is strict; the dashboard
+// is a thin read surface, not a validator.
+func parseInvoiceBefore(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// formatPriceEuros converts integer millicents (1 cent = 1000
+// millicents) into the dashboard's "€X.YY" string, or "Free" when
+// the price is zero. This is the only place float math on money
+// happens — at the human display edge (CLAUDE.md Money).
+func formatPriceEuros(millicents int64) string {
+	if millicents == 0 {
+		return "Free"
+	}
+	cents := millicents / 1000
+	euros := cents / 100
+	rem := cents % 100
+	if rem < 0 {
+		rem = -rem
+	}
+	return fmt.Sprintf("€%d.%02d", euros, rem)
+}
+
+// formatCentsEuros converts integer cents (the invoice total unit)
+// into the dashboard's "€X.YY" string. Distinct from
+// formatPriceEuros (which takes millicents and collapses €0 to
+// "Free" for the pricing page). formatCentsEuros is for invoice
+// rows where €0 means "a real €0 invoice" (refund / void / draft)
+// and must display as "€0.00", not as "Free".
+func formatCentsEuros(cents int64) string {
+	euros := cents / 100
+	rem := cents % 100
+	if rem < 0 {
+		rem = -rem
+	}
+	return fmt.Sprintf("€%d.%02d", euros, rem)
 }
 
 // renderAccount renders /dashboard/account — API keys (list + create
