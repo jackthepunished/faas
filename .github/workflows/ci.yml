@@ -448,16 +448,10 @@ jobs:
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
 
   sqlc-check:
-    # Drift gate between pkg/state/queries.sql (sqlc source of truth)
-    # and the generated pkg/state/sqlc/* baseline (issue #125). Mirrors
-    # the migrations-check shape: same ubuntu-latest runner, same
-    # setup-go cache, but no Postgres service — sqlc parses the
-    # committed schema.sql statically and generates against a tmpdir
-    # copy of queries.sql + schema.sql + sqlc.yaml. ADR-017 keeps the
-    # PgStore hand-written until M5.1; this gate does NOT yet prove
-    # semantic parity between pgstore.go and queries.sql — it
-    # verifies the generated package stays in sync with the canonical
-    # sqlc source.
+    # Drift gate between queries.sql + schema.sql and the committed
+    # pkg/state/sqlc/* baseline (issue #125). ADR-017 keeps PgStore
+    # hand-written until M5.1; this checks generated drift only, not
+    # semantic parity between pgstore.go and queries.sql.
     name: sqlc-check (generated drift)
     runs-on: ubuntu-latest
     timeout-minutes: 5

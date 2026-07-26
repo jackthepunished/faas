@@ -1,29 +1,12 @@
-// Package state — Postgres-backed Store (spec §5, ADR-006, CLAUDE.md
-// "SQL via sqlc only").
+// pgstore.go is the ADR-017 hand-written M5 adapter. It implements the
+// Store interface against the Postgres schema in migrations/*.sql; the SQL
+// itself lives in queries.sql so sqlc.yaml is the canonical source. This
+// file is the thin adapter that maps sqlc-style params/rows to the domain
+// types and surfaces ErrNotFound / ErrConflict at the right boundaries.
 //
-// pgstore.go implements the Store interface against the Postgres schema in
-// migrations/*.sql. The SQL itself lives in queries.sql so the codegen
-// tooling (sqlc.yaml) is the canonical source — this file is the thin
-// adapter that maps sqlc-style params/rows to the domain types and surfaces
-// ErrNotFound / ErrConflict at the right boundaries.
-//
-// Why not call the sqlc-generated package directly? The hand-written adapter
-// here is the ADR-017 M5 exception. Generated output is now committed as a
-// drift baseline (pkg/state/sqlc/), but replacing these method bodies with
-// calls into the generated package is the separate M5.1 migration; the
-// public Store surface remains unchanged.
-//
-// `make sqlc-check` regenerates pkg/state/sqlc in CI and fails when it
-// drifts from queries.sql or schema.sql. TODO(M5.1): replace this
-// hand-written adapter's query bodies with calls into that generated
-// package. See ADR-017 (docs/adr/017-hand-written-pgstore.md) for the
-// migration plan and reviewer checklist.
-//
-// schema.sql is a snapshot produced by `make schema-dump` — it is the
-// single source-of-truth schema file sqlc consumes (sqlc v1.27.0 does not
-// merge `create table if not exists` statements across multiple migration
-// files, so pointing sqlc at migrations/ would diverge from the live
-// schema wherever a migration adds columns to an existing table).
+// `make sqlc-check` regenerates pkg/state/sqlc/ in CI and fails when it
+// drifts from queries.sql + schema.sql. TODO(M5.1): replace this adapter's
+// query bodies with calls into the generated package. See ADR-017.
 package state
 
 import (

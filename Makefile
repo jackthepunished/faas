@@ -198,30 +198,26 @@ SQLC     ?= $(GOBIN)/sqlc
 SQLC_VER ?= v1.27.0
 
 .PHONY: sqlc
-sqlc: ## Install sqlc at the pinned version
-	@if command -v $(SQLC) >/dev/null 2>&1 && $(SQLC) version | grep -q $(SQLC_VER); then \
-	  echo "sqlc $(SQLC_VER) already installed"; \
-	else \
-	  GOFLAGS='' GOBIN=$$(go env GOPATH)/bin go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER); \
-	fi
+sqlc: ## Install sqlc at the pinned version (idempotent)
+	@if command -v $(SQLC) >/dev/null 2>&1; then \
+	  $(SQLC) version 2>&1 | grep -q $(SQLC_VER) && { echo "sqlc $(SQLC_VER) installed"; exit 0; }; \
+	fi; \
+	GOFLAGS='' GOBIN=$(or $(GOBIN),$(shell go env GOPATH)/bin) go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER)
 
 .PHONY: sqlc-generate
 sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.go from queries.sql + schema.sql
 	$(SQLC) generate
 
 .PHONY: sqlc-check
-sqlc-check: ## CI gate: verify checked-in sqlc output matches what would be regenerated
-	@$(MAKE) sqlc > /tmp/faas-sqlc-check.out 2>&1 || (cat /tmp/faas-sqlc-check.out; exit 1)
-	@tmp=$$(mktemp -d); \
+sqlc-check: sqlc ## CI gate: verify checked-in sqlc output matches what would be regenerated
+	@set -e; tmp=$$(mktemp -d); \
 	  trap 'rm -rf "$$tmp"' EXIT; \
 	  mkdir -p "$$tmp/pkg/state"; \
-	  cp sqlc.yaml "$$tmp/"; \
+	  cp sqlc.yaml schema.sql "$$tmp/"; \
 	  cp pkg/state/queries.sql "$$tmp/pkg/state/"; \
-	  cp schema.sql "$$tmp/"; \
-	  (cd "$$tmp" && $(SQLC) generate) || \
-	    (echo "sqlc-check: sqlc generation failed (see $$tmp for the live generate output)"; exit 1); \
+	  (cd "$$tmp" && $(SQLC) generate); \
 	  diff -r pkg/state/sqlc "$$tmp/pkg/state/sqlc" || \
-	    (echo "sqlc-check: generated pkg/state/sqlc/*.go is out of sync with queries.sql or schema.sql; run 'make sqlc-generate' and commit the diff"; exit 1)
+	    { echo "sqlc-check: generated pkg/state/sqlc/*.go is out of sync with queries.sql or schema.sql; run 'make sqlc-generate' and commit the diff"; exit 1; }
 	@echo "sqlc-check: OK"
 
 .PHONY: migrate-up
@@ -232,22 +228,12 @@ migrate-up: ## Apply all pending migrations against $DATABASE_URL (idempotent)
 
 # schema.sql is the merged source-of-truth schema sqlc consumes. sqlc
 # v1.27.0 does not merge `create table if not exists` statements across
-# migration files, so pointing sqlc at migrations/ would diverge from the
-# live schema wherever a migration adds columns to an existing table
-# (e.g. crons.created_at in 00002). schema-dump applies migrations
-# against an ephemeral Postgres, runs `pg_dump -s`, strips pg_dump
-# version noise, and overwrites the committed schema.sql.
-#
-# Idempotent: re-running produces byte-identical output (verified by
-# the deterministic output of pg_dump against the same migration set).
-# Requires the `migrate-up` preconditions (psql on PATH, DATABASE_URL
-# pointing at a reachable Postgres).
+# migration files, so pointing sqlc at migrations/ diverges from the live
+# schema wherever a migration adds columns to an existing table. Idempotent:
+# re-running produces byte-identical output.
 .PHONY: schema-dump
-schema-dump: ## Regenerate schema.sql from a live Postgres (source of truth for sqlc)
-	@command -v psql >/dev/null 2>&1 || (echo "psql not on PATH"; exit 1)
+schema-dump: migrate-up ## Regenerate schema.sql from a live Postgres (source of truth for sqlc)
 	@command -v pg_dump >/dev/null 2>&1 || (echo "pg_dump not on PATH; install postgresql-client"; exit 1)
-	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set"; exit 1)
-	@go run ./cmd/migrate
 	@pg_dump -s --no-owner --no-privileges --no-sync --no-tablespaces $$DATABASE_URL \
 	  | sed -E -e '/^\\(restrict|unrestrict) /d' \
 	          -e '/^-- Dumped from database version /d' \
