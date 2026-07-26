@@ -35,6 +35,8 @@ import (
 
 	"github.com/pquerna/otp/totp"
 
+	"github.com/google/uuid"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -108,7 +110,17 @@ func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mf
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := mgr.Issue(acct.ID)
+	// IAM-3 (ADR-036): mint a sessions row + seal the cookie with
+	// sid + accountID + mfaPending so requireSessionCookie
+	// accepts the cookie and the four session handlers can read
+	// the current sid off the context. The login path is the
+	// same shape (issueDashboardSession → IssueWithSession).
+	mfaPending := mfaEnrollRequired(acct)
+	mfaSid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), mfaSid, acct.ID, "192.0.2.20", "mfa-test-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	token, err := mgr.IssueWithSession(mfaSid, acct.ID, mfaPending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,9 +266,26 @@ func injectCSRFToken(body []byte, tok string) []byte {
 // the way the login handlers would after a chokepoint flipped
 // mfa_required. Returns a fresh cookie the test can pin on the
 // next request.
+//
+// IAM-3 (ADR-036): the cookie must carry a sid backed by a
+// live sessions row, otherwise requireSessionCookie rejects it
+// with CodeSessionExpired. We look up the row created by
+// setupWithMFA and re-issue the envelope stamped with the same
+// sid — the same shape /v1/account/mfa/verify uses to clear
+// mfa_pending without creating a second row.
 func (e mfaTestEnv) mfaIssueWithPending(t *testing.T, pending bool) *http.Cookie {
 	t.Helper()
-	tok, err := e.mgr.IssueWithMFAFlag(e.acct.ID, pending)
+	// Reuse the existing sid from setupWithMFA: list this
+	// account's sessions and pick the most recent. The cookie
+	// is the only handle that connects the test to the row,
+	// and we have no sessionFrom() helper here, so we walk
+	// the store. With only one row expected, this is O(1).
+	rows, err := e.store.ListSessions(context.Background(), e.acct.ID)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("ListSessions: %v, rows=%d", err, len(rows))
+	}
+	sid := rows[0].ID
+	tok, err := e.mgr.IssueWithSession(sid, e.acct.ID, pending)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -352,6 +352,50 @@ type Store interface {
 	ConsumeLoginToken(ctx context.Context, tokenHash []byte) (string, error)
 	DeleteOldLoginTokens(ctx context.Context, before time.Time) (int64, error)
 
+	// Dashboard sessions (IAM-3, issue #187 + #244 merged). One row per
+	// successful dashboard login; the cookie envelope carries the row's
+	// id as `sid`. Bearer API keys never touch this table (the cookie
+	// branch of s.auth is the only caller). Revocation is `revoked_at !=
+	// nil`; the revocation methods are account-scoped at the SQL level so
+	// IDOR is a persistence invariant — a cross-account revoke returns
+	// false (the handler maps to 404), never 403.
+	//
+	// CreateSession persists a new row for the freshly-minted sid.
+	// Caller has already generated the uuid (the envelope seal needs the
+	// same value). Returns ErrConflict when the sid already exists (uuid
+	// collision — astronomically rare; the handler surfaces 500).
+	//
+	// GetSession looks up by primary key. Returns ErrNotFound when the
+	// row is gone (sid was never issued OR was DELETEd by an op); the
+	// apid cookie branch maps that to 401 CodeSessionExpired.
+	//
+	// RevokeSession atomically stamps revoked_at = now() iff (a) the row
+	// exists, (b) it belongs to accountID, and (c) it is not already
+	// revoked. Returns true on a real write, false on a no-op
+	// (already-revoked / wrong-account / missing). The boolean lets the
+	// handler map false to 404 without leaking cross-account existence.
+	// Idempotent on a same-sid repeat call.
+	//
+	// ListSessions returns every active row for accountID, newest first.
+	// Used by GET /v1/auth/sessions so the dashboard can render "this
+	// is my phone / my laptop".
+	//
+	// RevokeAllSessions revokes every active row for accountID except
+	// the supplied sid (the calling session). Returns the count of
+	// rows affected. Idempotent (a repeat call with the same currentSid
+	// returns 0 once siblings are gone).
+	//
+	// TouchSessionLastSeen stamps last_seen_at = now(). Best-effort fire-
+	// and-forget on the apid cookie branch (5-minute debounce) — failures
+	// are logged but never reject the request. Touch is allowed on
+	// revoked rows (observability-only signal, not authorization).
+	CreateSession(ctx context.Context, id, accountID, issuedIP, issuedUA string) (Session, error)
+	GetSession(ctx context.Context, id string) (Session, error)
+	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
+	ListSessions(ctx context.Context, accountID string) ([]Session, error)
+	RevokeAllSessions(ctx context.Context, accountID, exceptID string) (int, error)
+	TouchSessionLastSeen(ctx context.Context, id string) error
+
 	// Account passwords (issue #165 / ADR-032 PR #2). The Argon2id
 	// PHC hash lives in the account_passwords side table; OAuth-only
 	// accounts have no row. SetAccountPassword upserts the hash

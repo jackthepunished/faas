@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -93,16 +94,37 @@ var mfaAllowlist = []string{
 	"/v1/account/mfa/verify",
 	"/v1/account/mfa/recover",
 	"/v1/account/mfa/disable",
+	// IAM-3 (ADR-036) — a customer whose session is mfa_pending
+	// must still be able to list / revoke their active sessions.
+	// The /v1/auth/sessions/{id} route (any uuid) is matched by
+	// the prefix check in isMFAAllowlisted below, not by a literal
+	// entry. Same Go 1.22 mux shape as the wildcard-route pattern:
+	// the route table registers "DELETE /v1/auth/sessions/{id}"
+	// and the request lands on r.URL.Path = the literal UUID,
+	// never the route pattern.
+	"/v1/auth/logout",
+	"/v1/auth/sessions",
+	"/v1/auth/sessions/revoke_all",
 }
 
 // isMFAAllowlisted is the predicate requireMFA calls on
-// r.URL.Path. Returns true for any path in mfaAllowlist. False
-// on every other session-cookie route, which 403s CodeMFARequired.
+// r.URL.Path. Returns true for any path in mfaAllowlist OR for
+// the wildcard /v1/auth/sessions/{id} (matched by prefix — see
+// mfaAllowlist comment). False on every other session-cookie
+// route, which 403s CodeMFARequired.
 func isMFAAllowlisted(path string) bool {
 	for _, p := range mfaAllowlist {
 		if p == path {
 			return true
 		}
+	}
+	// Wildcard DELETE /v1/auth/sessions/{id}. The Go 1.22 mux
+	// delivers r.URL.Path as the actual requested UUID, not the
+	// pattern, so a literal-equality check against the entry
+	// would never match — the prefix match accepts ANY uuid
+	// under the prefix.
+	if strings.HasPrefix(path, "/v1/auth/sessions/") && path != "/v1/auth/sessions/revoke_all" {
+		return true
 	}
 	return false
 }

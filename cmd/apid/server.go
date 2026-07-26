@@ -162,6 +162,12 @@ type server struct {
 	// LoadOrStore so the first writer wins. A periodic janitor
 	// (pkg/grace) evicts old entries to bound memory.
 	touchDebounce sync.Map // map[string]time.Time
+	// sessionTouch is the IAM-3 (ADR-036) per-sid debounce map for
+	// last_seen_at UPDATEs. Distinct from touchDebounce (which
+	// gates per-key api_keys.last_used_at). Same sync.Map idiom;
+	// memory bounded by fresh sids in the 5-min window. Read by
+	// requireSessionCookie in the cookie branch of s.auth.
+	sessionTouch sessionTouchDebounce
 }
 
 // keyTouchWindow is the minimum interval between per-key last_used_at
@@ -488,6 +494,21 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.deleteAccount))))
 	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(api.ScopesDeployWriteSurface...)(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
+
+	// IAM-3 server-side session revocation (ADR-036, issue #187
+	// + #244 merged). All four routes sit behind s.auth but
+	// WITHOUT authLimited — session management is rare and
+	// counting 401s would only alarm on a customer who typed
+	// their password wrong twice. The MFA allowlist (see
+	// mfa_middleware.go) covers these routes, so a customer
+	// whose session is mfa_pending can still list and revoke
+	// devices (a "lock everything else down" panic path). The
+	// wildcard DELETE /v1/auth/sessions/{id} is matched by the
+	// prefix-check seam in isMFAAllowlisted.
+	mux.HandleFunc("POST /v1/auth/logout", s.auth(s.requireMFA(s.logout)))
+	mux.HandleFunc("GET /v1/auth/sessions", s.auth(s.requireMFA(s.listSessions)))
+	mux.HandleFunc("DELETE /v1/auth/sessions/{id}", s.auth(s.requireMFA(s.revokeSession)))
+	mux.HandleFunc("POST /v1/auth/sessions/revoke_all", s.auth(s.requireMFA(s.revokeAllSessions)))
 
 	// Apps.
 	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listApps))))
@@ -1190,6 +1211,47 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 		// Session cookie authentication (faas_sid) for Web Dashboard
 		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 			if env, err := s.sessions.Verify(c.Value); err == nil {
+				// IAM-3 (ADR-036) cross-validate the AEAD-bound
+				// sid against the live sessions row. Empty sid ==
+				// pre-rollout cookie (revoked). Missing/revoked row
+				// == the migration's kill switch. Account-mismatch
+				// is defensive (AEAD should bind).
+				sess, handled, sessCheckErr := requireSessionCookie(
+					w, r, env, s.store, s.audit, s.log, &s.sessionTouch,
+				)
+				if sessCheckErr != nil {
+					// Err from requireSessionCookie is reserved
+					// for unexpected lookup failures; today it
+					// never returns one (the helper funnels
+					// state.ErrNotFound to a 401). Treat as fail-
+					// closed.
+					if s.log != nil {
+						s.log.Warn("session cross-check error",
+							"path", r.URL.Path, "error", sessCheckErr.Error())
+					}
+					clearSessionCookie(w, r)
+					api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
+						api.CodeSessionExpired, "Session expired",
+						"session validation failed; sign in again"))
+					return
+				}
+				if handled {
+					// 401 already written.
+					return
+				}
+				// sess carries the validated row. Stamp it onto
+				// the request context here so the four
+				// /v1/auth/sessions* handlers can read its id
+				// without re-querying. Each r.WithContext re-reads
+				// r.Context() so the chain accumulates (session →
+				// principal → mfa-pending) without losing prior
+				// stamps. contextcheck fires on the r.Context()
+				// re-reads but the seam is documented (withSession
+				// is the public function; r.Context() is the
+				// inherited parent).
+				//nolint:contextcheck // documented seam: r.Context() is the inherited parent; withSession/withPrincipal are the wrappers.
+				r = r.WithContext(withSession(r.Context(), sess))
+				//nolint:contextcheck // see above.
 				if acct, err := s.store.AccountByID(r.Context(), env.AccountID); err == nil {
 					if !acct.Active() {
 						if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
@@ -1199,7 +1261,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 						}
 					}
 					// Key stays nil; session cookie = implicit admin.
-					// Pointer-mutation (`*r = ...`) is load-bearing —
+// Pointer-mutation (`*r = ...`) is load-bearing —
 					// observeWrap is the outermost middleware in the
 					// chain and reads the principal via principalFrom(r);
 					// a non-mutating rebind would be invisible to

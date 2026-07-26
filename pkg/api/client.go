@@ -345,6 +345,35 @@ func (c *Client) PostAccountMfaDisable(ctx context.Context, req MFADisableReques
 	return out, c.do(ctx, "POST", "/v1/account/mfa/disable", req, &out)
 }
 
+// IAM-3 server-side session revocation (ADR-036, issue #187 + #244
+// merged). The dashboard's "Active sessions" panel is driven by
+// these four endpoints. All four require the session cookie —
+// API keys bypass session tracking per the IAM-3 design decision
+// (bearer keys never create or query the sessions table).
+//
+// Each method ignores 204 No Content; the SDK surfaces either a
+// structured response (for List + RevokeAll) or just the error
+// (for Logout + RevokeSession). The CLI's `faas logout` and
+// `faas sessions` subcommands wrap these.
+
+func (c *Client) PostAccountLogout(ctx context.Context) error {
+	return c.do(ctx, "POST", "/v1/auth/logout", struct{}{}, nil)
+}
+
+func (c *Client) GetAccountSessions(ctx context.Context) (SessionListResponse, error) {
+	var out SessionListResponse
+	return out, c.do(ctx, "GET", "/v1/auth/sessions", nil, &out)
+}
+
+func (c *Client) DeleteAccountSession(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/auth/sessions/"+id, SessionsRevokeRequest{}, nil)
+}
+
+func (c *Client) PostAccountSessionsRevokeAll(ctx context.Context) (SessionsRevokeAllResponse, error) {
+	var out SessionsRevokeAllResponse
+	return out, c.do(ctx, "POST", "/v1/auth/sessions/revoke_all", struct{}{}, &out)
+}
+
 // ListApps returns the account's apps.
 func (c *Client) ListApps(ctx context.Context) ([]AppResponse, error) {
 	var out []AppResponse

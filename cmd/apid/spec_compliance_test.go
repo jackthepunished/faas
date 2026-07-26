@@ -33,6 +33,7 @@ const (
 	manifestFile  = "appmanifest.go"
 	cliauthFile   = "cliauth.go"
 	mfaFile       = "mfa.go"
+	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
 	errorsFile    = "errors.go"
 )
 
@@ -81,6 +82,7 @@ var dtoExclude = map[string]bool{
 	"CliAuthExchangeResponse": true, // POST /v1/cli-auth/exchange
 	"CliAuthStatus":           true, // enum used by CLI auth
 	"StatusPage":              true, // GET /status/slo.json (public status)
+	"SessionsRevokeRequest":   true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -463,6 +465,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),
 		filepath.Join(root, "pkg", "api", mfaFile),
+		filepath.Join(root, "pkg", "api", sessionsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
 	}
 	dtos, err := scanDTOs(files)

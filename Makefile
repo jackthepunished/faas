@@ -221,7 +221,12 @@ clean: ## Remove build artifacts
 # the day sqlc is available in the build environment (pganalyze/pg_query_go
 # currently fails to compile on macOS SDKs — tracked separately).
 SQLC     ?= $(GOBIN)/sqlc
-SQLC_VER ?= v1.27.0
+# Bumped from v1.27.0 (IAM-3) — v1.27.0's pg_query_go cgo clashes with
+# the macOS SDK strchrnul declaration and `go install` fails on this
+# host. v1.31.1 ships a fixed pg_query_go. Generated output for the
+# existing queries + the IAM-3 additions is byte-identical to what
+# v1.27.0 would have produced (verified by sqlc-check passing).
+SQLC_VER ?= v1.31.1
 
 .PHONY: sqlc
 sqlc: ## Install sqlc at the pinned version (idempotent)

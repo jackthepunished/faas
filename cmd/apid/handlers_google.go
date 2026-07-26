@@ -223,12 +223,10 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Issue Session Cookie. IAM-2: stamp mfa_pending=true if the
-	// account has the policy flag set but has not yet enrolled.
-	// The requireMFA middleware (cmd/apid/mfa_middleware.go) reads
-	// the flag off the envelope and 403s every protected route
-	// until /v1/account/mfa/enroll+confirm lands.
-	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
+	// Issue Session Cookie. IAM-2 mfa_pending stamp preserved;
+	// IAM-3 (ADR-036) mints a sid + creates the sessions row +
+	// emits auth.session.created via the unified helper.
+	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "google")
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

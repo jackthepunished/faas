@@ -24,17 +24,21 @@ import (
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+
+	"github.com/google/uuid"
 )
 
 // reissueWithMFAFlag issues a fresh cookie with mfa_pending set
-// to the desired value. We exercise the same IssueWithMFAFlag
-// path the login handlers use after a plan-upgrade chokepoint
-// flips mfa_required.
-func reissueWithMFAFlag(t *testing.T, mgr *session.Manager, accountID string, pending bool) *http.Cookie {
+// to the desired value. The cookie must carry a sid backed by a
+// live sessions row, otherwise requireSessionCookie rejects it
+// with CodeSessionExpired (IAM-3 / ADR-036). The login handlers
+// use the same IssueWithSession path after a plan-upgrade
+// chokepoint flips mfa_required.
+func reissueWithMFAFlag(t *testing.T, mgr *session.Manager, sid, accountID string, pending bool) *http.Cookie {
 	t.Helper()
-	tok, err := mgr.IssueWithMFAFlag(accountID, pending)
+	tok, err := mgr.IssueWithSession(sid, accountID, pending)
 	if err != nil {
-		t.Fatalf("IssueWithMFAFlag: %v", err)
+		t.Fatalf("IssueWithSession: %v", err)
 	}
 	return &http.Cookie{Name: sessionCookie, Value: tok}
 }
@@ -99,9 +103,14 @@ func cookieDoCSRF(t *testing.T, h http.Handler, cookie *http.Cookie, csrfMgr *se
 // setupMW spins up a server with an ephemeral session manager
 // (no in-process age key — the middleware tests don't exercise
 // the seal path) and a no-op ops registry. Returns the server
-// handler plus the account + manager so the test can mint
-// cookies with custom mfa_pending values.
-func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state.Account, *session.Manager) {
+// handler plus the account + manager + sid so the test can
+// mint cookies with custom mfa_pending values.
+//
+// IAM-3 (ADR-036): the sid is stamped into a fresh sessions
+// row so requireSessionCookie accepts the resulting cookie. The
+// login helpers do the same — there is no path where the cookie
+// branch accepts a sid-less envelope.
+func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state.Account, *session.Manager, string) {
 	t.Helper()
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(context.Background(),
@@ -118,11 +127,16 @@ func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state
 	if err != nil {
 		t.Fatal(err)
 	}
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acct.ID,
+		"192.0.2.30", "mfa-mw-test-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
 	ops := wire.NewOpsMetrics("apid_mfa_middleware_test")
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
-		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
-	return srv.handler(), acct, mgr
+		nil, 15*60_000_000_000, "").WithOpsMetrics(ops)
+	return srv.handler(), acct, mgr, sid
 }
 
 // --- the matrix ------------------------------------------------------------
@@ -169,8 +183,8 @@ func TestRequireMFA_BearerBypasses(t *testing.T) {
 // 403 path: a session cookie stamped mfa_pending=true hitting a
 // non-allowlisted route returns 403 CodeMFARequired.
 func TestRequireMFA_PendingSessionBlocksNonAllowlist(t *testing.T) {
-	h, acct, mgr := setupMW(t, api.PlanPro, true)
-	pendingCookie := reissueWithMFAFlag(t, mgr, acct.ID, true)
+	h, acct, mgr, sid := setupMW(t, api.PlanPro, true)
+	pendingCookie := reissueWithMFAFlag(t, mgr, sid, acct.ID, true)
 
 	for _, path := range []string{"/v1/apps", "/v1/usage", "/v1/keys"} {
 		rec := cookieDo(t, h, pendingCookie, http.MethodGet, path, nil)
@@ -193,8 +207,8 @@ func TestRequireMFA_PendingSessionBlocksNonAllowlist(t *testing.T) {
 // middleware tests don't wire an age recipient, which /enroll
 // requires to seal the secret).
 func TestRequireMFA_PendingSessionAllowedOnAllowlist(t *testing.T) {
-	h, acct, mgr := setupMW(t, api.PlanPro, true)
-	pendingCookie := reissueWithMFAFlag(t, mgr, acct.ID, true)
+	h, acct, mgr, sid := setupMW(t, api.PlanPro, true)
+	pendingCookie := reissueWithMFAFlag(t, mgr, sid, acct.ID, true)
 
 	// Each row is a (/method, /path, body) check. None should be
 	// 403. The exact status depends on the body — the loader
@@ -224,8 +238,8 @@ func TestRequireMFA_PendingSessionAllowedOnAllowlist(t *testing.T) {
 // the bug class where a future edit drops the `if !pending`
 // short-circuit.
 func TestRequireMFA_ClearedSessionPassesThrough(t *testing.T) {
-	h, acct, mgr := setupMW(t, api.PlanPro, false)
-	clearedCookie := reissueWithMFAFlag(t, mgr, acct.ID, false)
+	h, acct, mgr, sid := setupMW(t, api.PlanPro, false)
+	clearedCookie := reissueWithMFAFlag(t, mgr, sid, acct.ID, false)
 
 	rec := cookieDo(t, h, clearedCookie, http.MethodGet, "/v1/apps", nil)
 	if rec.Code == http.StatusForbidden {
@@ -238,8 +252,8 @@ func TestRequireMFA_ClearedSessionPassesThrough(t *testing.T) {
 // branches on this exact string to render the "complete MFA"
 // prompt.
 func TestRequireMFA_403BodyShape(t *testing.T) {
-	h, acct, mgr := setupMW(t, api.PlanPro, true)
-	pendingCookie := reissueWithMFAFlag(t, mgr, acct.ID, true)
+	h, acct, mgr, sid := setupMW(t, api.PlanPro, true)
+	pendingCookie := reissueWithMFAFlag(t, mgr, sid, acct.ID, true)
 
 	rec := cookieDo(t, h, pendingCookie, http.MethodGet, "/v1/apps", nil)
 	if rec.Code != http.StatusForbidden {

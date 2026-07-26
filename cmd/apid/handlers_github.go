@@ -257,20 +257,23 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Mint session cookie.
-	//
-	// IAM-2: stamp mfa_pending=true if the account has the policy
-	// flag set but has not yet enrolled. Same flip as
-	// handlers_google.go; see the comment there.
-	//
-	// PR-B §11 ownership proof: the dashboard session must carry the
-	// GitHub login we just verified, so the /oauth/callback handler
-	// can compare it to the install's account.login. SealGithubLogin
-	// seals the envelope with both the mfa_pending flag AND the
-	// github_login field in a single crypto round (no double-seal).
-	// The cookie shape is unchanged for callers that don't read
-	// either field (both JSON tags are `omitempty`).
-	cookie, err := s.sessions.SealGithubLogin(acct.ID, githubUser.Login, mfaEnrollRequired(acct))
+// Mint session cookie.
+//
+// IAM-2: stamp mfa_pending=true if the account has the policy
+// flag set but has not yet enrolled. Same flip as
+// handlers_google.go; see the comment there.
+//
+// PR-B §11 ownership proof: the dashboard session must carry the
+// GitHub login we just verified, so the /oauth/callback handler
+// can compare it to the install's account.login. The IAM-3 path
+// seals the envelope with mfa_pending AND github_login AND sid in
+// a single crypto round (no double-seal). The cookie shape is
+// unchanged for callers that don't read any of the three fields
+// (all three JSON tags are `omitempty`).
+//
+// IAM-3 (ADR-039) goes through the unified helper so the sessions
+// row is created + auth.session.created is emitted.
+cookie, _, err := s.issueDashboardSessionWithGithub(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "github", githubUser.Login)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

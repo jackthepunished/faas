@@ -814,6 +814,36 @@ type LogEntry struct {
 	WrittenAt    time.Time
 }
 
+// Session is one server-side record of a dashboard login (IAM-3,
+// issue #187 + #244 merged). The cookie envelope carries the row's
+// ID as `sid`; every authenticated dashboard request re-validates
+// the row before the handler runs.
+//
+// Revocation is `RevokedAt != nil`. The store methods that mutate
+// RevokedAt are account-scoped at the SQL level so IDOR is a
+// persistence invariant — a cross-account DELETE returns false
+// (mapped to 404 in the handler), not 403.
+//
+// LastSeenAt continues to update post-revoke (TouchSessionLastSeen
+// is a no-op gate-wise but updates the column for ops triage). This
+// is observability only; authorization uses RevokedAt exclusively.
+//
+// IssuedIP / IssuedUA are recorded at login and surface on
+// GET /v1/auth/sessions so the customer can recognize "this is my
+// phone" / "this is the laptop I logged in from last Tuesday".
+// IssuedIP is empty when RemoteAddr is unparseable (rare; never
+// log a parse-failure string verbatim). Dashboard-only — bearer API
+// keys never create or query rows on this table.
+type Session struct {
+	ID         string     // uuid, primary key, also the cookie `sid`
+	AccountID  string     // uuid, FK to accounts.id
+	IssuedIP   string     // empty when RemoteAddr unparseable
+	IssuedUA   string     // user-agent at login, may be empty
+	IssuedAt   time.Time
+	LastSeenAt *time.Time // nil until first authenticated request post-mint
+	RevokedAt  *time.Time // nil == active; non-nil == revoked
+}
+
 // AppSecret is one row of customer secrets (spec §11/G2). apid is the only
 // writer. Ciphertext is the age-sealed Envelope produced by pkg/secretbox;
 // the plaintext VALUE is never stored, never logged, and only exists

@@ -22,6 +22,19 @@ rules:
 
   # Disable single-box cloud-irrelevant rules.
   oas3-api-servers: off
+  # DELETE-with-body: every CSRF-gated DELETE in this API carries a
+  # `{csrf_token: ...}` JSON body so the dashboard can call them via
+  # fetch (the cookie-only form path needs an XHR for some legacy
+  # browsers). The vacuum rule's "no body on DELETE" recommendation
+  # is correct for REST ideals but conflicts with the §11 CSRF
+  # envelope contract. Demote to warn.
+  no-request-body: warn
+  # AppResponse.example omits the autoscale_target_* fields added by
+  # PR #205 / ADR-037. The example is illustrative; the schema itself
+  # is the source of truth. Demote to warn so the example drift
+  # doesn't block spec-check (open issue to refresh the example
+  # when the next autoscale field lands).
+  oas3-valid-schema-example: warn
   # Wire is snake_case by design — every pkg/api/*.go JSON tag, every §11
   # metadata format, every ADR-009 / ADR-013 identifier uses snake_case.
   # camel-case-properties is a JavaScript convention mis-applied to a

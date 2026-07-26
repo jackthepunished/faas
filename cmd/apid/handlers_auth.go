@@ -120,7 +120,12 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mfaPending := mfaEnrollRequired(acct)
-	cookie, err := a.srv.sessions.IssueWithMFAFlag(accountID, mfaPending)
+	// IAM-3 (ADR-036): the magic-link verify path now mints a sid
+	// + creates the sessions row + emits auth.session.created
+	// through the unified helper. The route never reaches the
+	// dashboardAuthChain (it lives outside s.auth) so this is the
+	// only authoritative stamp the verify path leaves.
+	cookie, _, err := a.srv.issueDashboardSession(r.Context(), r, accountID, mfaPending, "magic_link")
 	if err != nil {
 		a.log.Error("auth.verify.issue_session", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)

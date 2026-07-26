@@ -575,8 +575,42 @@ func SetMFAIdentity(f func() *age.X25519Identity) { mfaIdentity = f }
 // pass false even if the account still has mfa_required set
 // (the customer is enrolled; the policy flag can stay armed
 // for the future).
+//
+// IAM-3 (ADR-036, issue #187 + #244 merged): this path REUSES
+// the existing sid — it reads the current state.Session out of
+// the request context (stamped by requireSessionCookie in the
+// cookie branch of s.auth) and seals a new envelope with the
+// SAME sid and the flipped mfaPending. No second sessions row
+// is created; the row's last_seen_at is bumped by the debounce
+// touch in requireSessionCookie just before this call lands.
 func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool) error {
-	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaPending)
+	current, ok := sessionFrom(r)
+	if !ok {
+		// requireSessionCookie didn't stamp a session — wiring
+		// is broken (the handler reached this code via a route
+		// that didn't run s.auth's cookie branch). Fall back to
+		// a sid-less envelope; the next request will 401
+		// CodeSessionExpired and force a fresh login.
+		if s.log != nil {
+			s.log.Warn("reissueSessionCookie: no session in context — issuing sid-less envelope",
+				"path", r.URL.Path, "account", acct.ID)
+		}
+		cookie, err := s.sessions.IssueWithSession("", acct.ID, mfaPending)
+		if err != nil {
+			return err
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookie,
+			Value:    cookie,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(s.sessions.MaxAge().Seconds()),
+		})
+		return nil
+	}
+	cookie, err := s.sessions.IssueWithSession(current.ID, acct.ID, mfaPending)
 	if err != nil {
 		return err
 	}

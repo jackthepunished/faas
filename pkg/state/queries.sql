@@ -279,3 +279,55 @@ update builds set
   started_at = case when $4::boolean then now() else started_at end,
   finished_at = case when $5::boolean then now() else finished_at end
 where id = $1;
+
+-- name: CreateSession :one
+-- IAM-3 (ADR-036, issue #187 + #244 merged). One row per dashboard login.
+-- Caller has already generated the uuid (the envelope seal needs the same
+-- value). issued_ip is an inet ('' cast to NULL means "RemoteAddr
+-- unparseable" — surfaced as "" on read by coalesce(host(...))).
+insert into sessions (id, account_id, issued_ip, issued_ua)
+values ($1, $2, nullif($3, '')::inet, nullif($4, ''))
+returning id, account_id,
+          coalesce(host(issued_ip), '') as issued_ip,
+          coalesce(issued_ua, '') as issued_ua,
+          issued_at, last_seen_at, revoked_at;
+
+-- name: GetSession :one
+-- Primary-key lookup; called on every authenticated dashboard request.
+-- sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
+select id, account_id,
+       coalesce(host(issued_ip), '') as issued_ip,
+       coalesce(issued_ua, '') as issued_ua,
+       issued_at, last_seen_at, revoked_at
+from sessions where id = $1;
+
+-- name: RevokeSession :one
+-- Account-scoped atomic stamp. WHERE includes account_id so a
+-- cross-account DELETE returns 0 rows (handler maps false → 404) —
+-- IDOR is a persistence invariant, not a handler check.
+-- coalesce(revoked_at, now()) makes the call idempotent on already
+-- revoked rows (returns 0 rows).
+update sessions set revoked_at = coalesce(revoked_at, now())
+where id = $1 and account_id = $2 and revoked_at is null
+returning id;
+
+-- name: ListSessions :many
+-- Active rows only, newest first. Partial index keeps the scan tight.
+select id, account_id,
+       coalesce(host(issued_ip), '') as issued_ip,
+       coalesce(issued_ua, '') as issued_ua,
+       issued_at, last_seen_at, revoked_at
+from sessions where account_id = $1 and revoked_at is null
+order by issued_at desc;
+
+-- name: RevokeAllSessions :many
+-- Revokes every active row for accountID except the supplied sid
+-- (the calling session). Returns the revoked ids for audit.
+update sessions set revoked_at = now()
+where account_id = $1 and id <> $2 and revoked_at is null
+returning id;
+
+-- name: TouchSessionLastSeen :exec
+-- Best-effort, fire-and-forget. Allowed on revoked rows (observability
+-- signal only; not authorization). pgx interface returns nothing.
+update sessions set last_seen_at = now() where id = $1;
