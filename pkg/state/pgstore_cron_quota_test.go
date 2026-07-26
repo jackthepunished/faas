@@ -66,15 +66,19 @@ func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 	limits := api.MustLimitsFor(api.PlanPro) // 20/app, 50/acct
 	acct, _, _ := seedLiveDeploy(t, s, ctx)
 
-	// Two more apps on the same account.
+	// Two more apps on the same account. Apps carry CHECK
+	// constraints (apps_max_concurrency_check, etc.) so we set the
+	// same shape as seedLiveDeploy's App row.
 	appARec, err := s.CreateApp(ctx, state.App{
 		AccountID: acct, Slug: "cron-acct-a", Type: state.AppTypeFunction,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp A: %v", err)
 	}
 	appBRec, err := s.CreateApp(ctx, state.App{
 		AccountID: acct, Slug: "cron-acct-b", Type: state.AppTypeFunction,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp B: %v", err)
@@ -100,6 +104,7 @@ func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 	// method on a third app must trip the account arm.
 	appCRec, err := s.CreateApp(ctx, state.App{
 		AccountID: acct, Slug: "cron-acct-c", Type: state.AppTypeFunction,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp C: %v", err)
