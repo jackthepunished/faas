@@ -229,6 +229,64 @@ func (c *Client) RestoreAccount(ctx context.Context) (AccountResponse, error) {
 	return out, c.do(ctx, "POST", "/v1/account/restore", nil, &out)
 }
 
+// MFA (IAM-2, issue #186) — TOTP second-factor on the dashboard.
+// The server returns the otpauth URL + scratch codes ONCE on
+// EnrollMFA; the customer must complete ConfirmMFA before the server
+// stamps mfa_enrolled_at. VerifyMFA is the step-up route for an
+// already-enrolled customer whose session cookie is mfa_pending.
+// RecoverMFA burns a recovery code; DisableMFA clears MFA state
+// (re-auth via password or recovery_code). All five require the
+// session cookie — API keys bypass MFA per the IAM-2 decision.
+
+// EnrollMFA starts enrollment. The plaintext TOTP secret + QR +
+// 10 recovery codes are returned exactly once. The caller is
+// responsible for rendering the QR + showing the codes to the
+// customer — the server-side blob is sealed at rest under the
+// host age key, and subsequent /enroll calls overwrite the
+// secret without re-surfacing the plaintexts.
+func (c *Client) PostAccountMfaEnroll(ctx context.Context) (MFAEnrollResponse, error) {
+	var out MFAEnrollResponse
+	return out, c.do(ctx, "POST", "/v1/account/mfa/enroll", MFAEnrollRequest{}, &out)
+}
+
+// ConfirmMFA finishes enrollment with the customer's first 6-digit
+// TOTP code. On success the server stamps mfa_enrolled_at, clears
+// mfa_required, and re-issues the session cookie without
+// mfa_pending. Idempotent on retry.
+func (c *Client) PostAccountMfaConfirm(ctx context.Context, req MFAConfirmRequest) (MFAConfirmResponse, error) {
+	var out MFAConfirmResponse
+	return out, c.do(ctx, "POST", "/v1/account/mfa/confirm", req, &out)
+}
+
+// VerifyMFA steps up an mfa_pending session for an already-enrolled
+// customer. Does NOT re-stamp mfa_enrolled_at — only re-issues the
+// session cookie without mfa_pending.
+func (c *Client) PostAccountMfaVerify(ctx context.Context, req MFAVerifyRequest) (MFAVerifyResponse, error) {
+	var out MFAVerifyResponse
+	return out, c.do(ctx, "POST", "/v1/account/mfa/verify", req, &out)
+}
+
+// RecoverMFA burns a recovery code to regain access when the
+// customer's TOTP device is lost. The matching hash is removed
+// from the stored set; subsequent calls with the same code return
+// 401. If the burn would consume the last code, the handler refuses
+// and the caller should fall back to DisableMFA via password.
+func (c *Client) PostAccountMfaRecover(ctx context.Context, req MFARecoverRequest) (MFARecoverResponse, error) {
+	var out MFARecoverResponse
+	return out, c.do(ctx, "POST", "/v1/account/mfa/recover", req, &out)
+}
+
+// DisableMFA opts out of MFA. The request body must include exactly
+// one of Password or RecoveryCode — both empty and both set return
+// 400 CodeValidation. On success the server clears
+// mfa_secret_encrypted + mfa_recovery_codes_hash + mfa_enrolled_at;
+// mfa_required is left as-is so the plan-upgrade / 2nd-deploy
+// chokepoints can re-arm on the next trigger.
+func (c *Client) PostAccountMfaDisable(ctx context.Context, req MFADisableRequest) (MFADisableResponse, error) {
+	var out MFADisableResponse
+	return out, c.do(ctx, "POST", "/v1/account/mfa/disable", req, &out)
+}
+
 // ListApps returns the account's apps.
 func (c *Client) ListApps(ctx context.Context) ([]AppResponse, error) {
 	var out []AppResponse
