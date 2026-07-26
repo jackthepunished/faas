@@ -623,3 +623,134 @@ func TestCmdDeployTarball_SymlinkRejectedWithBadTarballTitle(t *testing.T) {
 
 // errBoom is the launcher-error sentinel used by the fallback tests.
 var errBoom = errors.New("simulated opener failure")
+
+// zeroConfigDeployServer returns a fake apid that satisfies the full
+// no-flag deploy path: CreateApp → POST deployment → SSE log stream with a
+// terminal `live` frame so streamDeployLogs exits 0. It records the multipart
+// form fields it saw on the deployment POST via the returned pointers.
+func zeroConfigDeployServer(t *testing.T, slug string, gotDockerfile, gotSource *int32, gotRuntime *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			// New app (200 with body) — the swallow-at-409 path is
+			// covered elsewhere; here a clean create is fine.
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a1", Slug: slug})
+		case r.URL.Path == "/v1/apps/"+slug+"/deployments" && r.Method == http.MethodPost:
+			if err := r.ParseMultipartForm(32 << 20); err != nil {
+				t.Errorf("ParseMultipartForm: %v", err)
+			}
+			if r.FormValue("dockerfile") == "true" {
+				atomic.StoreInt32(gotDockerfile, 1)
+			}
+			if gotRuntime != nil {
+				*gotRuntime = r.FormValue("runtime")
+			}
+			if f, _, err := r.FormFile("source"); err == nil {
+				atomic.StoreInt32(gotSource, 1)
+				_ = f.Close()
+			}
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: slug})
+		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+}
+
+// TestCmdDeployTarball_NoFlags_PacksCwd pins issue #313: `faas deploy` with no
+// source flag packs the current directory, detects the framework, and uploads
+// it as an App deploy (runtime unset). Uses t.Chdir, so it must NOT run
+// t.Parallel().
+func TestCmdDeployTarball_NoFlags_PacksCwd(t *testing.T) {
+	cwd := t.TempDir()
+	// A node project. The app slug is derived from the cwd basename, which is
+	// a random temp name; we deploy against whatever deriveName produces.
+	if err := os.WriteFile(filepath.Join(cwd, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "index.js"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed index.js: %v", err)
+	}
+	t.Chdir(cwd)
+	slug := deriveName()
+
+	var gotDockerfile, gotSource int32
+	var gotRuntime string
+	srv := zeroConfigDeployServer(t, slug, &gotDockerfile, &gotSource, &gotRuntime)
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball(nil); code != 0 {
+		t.Fatalf("cmdDeployTarball(nil) = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&gotSource) != 1 {
+		t.Error("fake apid never received a `source` file part")
+	}
+	if atomic.LoadInt32(&gotDockerfile) != 0 {
+		t.Error("dockerfile flag was set for a node project; want unset")
+	}
+	if gotRuntime != "" {
+		t.Errorf("runtime = %q, want empty (App-type deploy)", gotRuntime)
+	}
+}
+
+// TestCmdDeployTarball_NoFlags_DockerfileSetsFlag pins that a Dockerfile at the
+// cwd root flips the multipart dockerfile field to true. Uses t.Chdir → no
+// t.Parallel().
+func TestCmdDeployTarball_NoFlags_DockerfileSetsFlag(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "Dockerfile"), []byte("FROM scratch"), 0o644); err != nil {
+		t.Fatalf("seed Dockerfile: %v", err)
+	}
+	t.Chdir(cwd)
+	slug := deriveName()
+
+	var gotDockerfile, gotSource int32
+	srv := zeroConfigDeployServer(t, slug, &gotDockerfile, &gotSource, nil)
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball(nil); code != 0 {
+		t.Fatalf("cmdDeployTarball(nil) = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&gotDockerfile) != 1 {
+		t.Error("dockerfile flag not set for a Dockerfile project")
+	}
+}
+
+// TestCmdDeployTarball_NoFlags_EmptyCwdFriendlyError pins that a directory with
+// no recognisable source fails with exit 1 and a helpful message rather than a
+// wall of expected markers.
+func TestCmdDeployTarball_NoFlags_EmptyCwdFriendlyError(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "README.md"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("seed README: %v", err)
+	}
+	t.Chdir(cwd)
+
+	stderr, restore := captureStderr(t)
+	defer restore()
+
+	t.Setenv("FAAS_API", "http://127.0.0.1:1") // must never be dialled
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball(nil); code != 1 {
+		t.Fatalf("cmdDeployTarball(nil) = %d, want 1", code)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "No deployable source found") {
+		t.Errorf("stderr missing friendly error; got:\n%s", out)
+	}
+}

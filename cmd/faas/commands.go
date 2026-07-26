@@ -190,8 +190,9 @@ func finalizeLogin(ctx context.Context, c *Client, plaintext string, acct api.Ac
 	if apps, err := c.ListApps(ctx); err == nil && len(apps) == 0 {
 		_, _ = fmt.Fprintln(osStdout, "")
 		_, _ = fmt.Fprintln(osStdout, "You're in. Next step — deploy your first app:")
-		_, _ = fmt.Fprintln(osStdout, "  faas deploy --template hello-node    # start from an embedded template")
-		_, _ = fmt.Fprintln(osStdout, "  faas deploy --tarball <path.tar.gz>  # or ship your own source")
+		_, _ = fmt.Fprintln(osStdout, "  cd my-project && faas deploy         # auto-detect & ship the current directory")
+		_, _ = fmt.Fprintln(osStdout, "  faas deploy --template hello-node    # or start from an embedded template")
+		_, _ = fmt.Fprintln(osStdout, "  faas deploy --tarball <path.tar.gz>  # or ship a prebuilt archive")
 	}
 	return 0
 }
