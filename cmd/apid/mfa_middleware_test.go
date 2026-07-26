@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -41,15 +42,29 @@ func reissueWithMFAFlag(t *testing.T, mgr *session.Manager, accountID string, pe
 // cookieDo builds a request with the given cookie + body and
 // runs it through the handler chain. body=nil means no body;
 // the Content-Type header is set only when a body is present.
+// When csrfMgr is non-nil and the route gates on CSRF (per
+// issue #186 Finding #7), it injects the matching token so the
+// inner handler reaches its body-decoding branch instead of
+// short-circuiting with 403 "Invalid CSRF token".
 func cookieDo(t *testing.T, h http.Handler, cookie *http.Cookie, method, path string, body any) *httptest.ResponseRecorder {
+	return cookieDoCSRF(t, h, cookie, nil, "", method, path, body)
+}
+
+// cookieDoCSRF is the explicit-shape variant used by tests that
+// have the session.Manager in scope (the middleware tests pass
+// it through here so the CSRF token's subject matches the
+// cookie's account_id).
+func cookieDoCSRF(t *testing.T, h http.Handler, cookie *http.Cookie, csrfMgr *session.Manager, csrfAcctID, method, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader io.Reader
+	rawBody := []byte(nil)
 	if body != nil {
-		raw, err := json.Marshal(body)
+		var err error
+		rawBody, err = json.Marshal(body)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		reader = bytes.NewReader(raw)
+		reader = bytes.NewReader(rawBody)
 	}
 	req := httptest.NewRequest(method, path, reader)
 	if body != nil {
@@ -57,6 +72,24 @@ func cookieDo(t *testing.T, h http.Handler, cookie *http.Cookie, method, path st
 	}
 	if cookie != nil {
 		req.AddCookie(cookie)
+		// CSRF: only when a manager is supplied AND the route
+		// gates on CSRF. The middleware tests that don't care
+		// about inner handler bodies (e.g. testing the 403
+		// surface) leave csrfMgr nil and skip this branch.
+		if csrfMgr != nil {
+			if action := csrfAction(path); action != "" {
+				tok, err := middleware.IssueForAuthenticated(csrfMgr, action, csrfAcctID)
+				if err != nil {
+					t.Fatalf("issue CSRF for %s: %v", action, err)
+				}
+				req.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: tok})
+				if len(rawBody) > 0 && rawBody[0] == '{' {
+					wrapped := injectCSRFToken(rawBody, tok)
+					req.Body = io.NopCloser(bytes.NewReader(wrapped))
+					req.ContentLength = int64(len(wrapped))
+				}
+			}
+		}
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -77,7 +110,7 @@ func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state
 		t.Fatal(err)
 	}
 	if mfaRequired {
-		if err := store.SetMFARequired(context.Background(), acct.ID, true); err != nil {
+		if _, err := store.SetMFARequired(context.Background(), acct.ID, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -108,7 +141,7 @@ func TestRequireMFA_BearerBypasses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetMFARequired(context.Background(), acct.ID, true); err != nil {
+	if _, err := store.SetMFARequired(context.Background(), acct.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	pt, hash, err := api.GenerateAPIKey()
@@ -177,7 +210,7 @@ func TestRequireMFA_PendingSessionAllowedOnAllowlist(t *testing.T) {
 		{http.MethodPost, "/v1/account/mfa/disable", api.MFADisableRequest{}},
 	}
 	for _, c := range allowlist {
-		rec := cookieDo(t, h, pendingCookie, c.method, c.path, c.body)
+		rec := cookieDoCSRF(t, h, pendingCookie, mgr, acct.ID, c.method, c.path, c.body)
 		if rec.Code == http.StatusForbidden {
 			t.Errorf("allowlist %s %s: 403 (CodeMFARequired leaked); body=%s",
 				c.method, c.path, rec.Body)

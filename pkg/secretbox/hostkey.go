@@ -4,9 +4,16 @@
 //
 //   - Plaintext VALUE never enters logs. apid accepts plaintext over TLS,
 //     seals it with the host X25519 recipient, and stores the ciphertext.
-//   - host.age sits at /etc/faas/secrets/host.age (root:root 0400). Only
-//     vmmd reads it; apid uses the matching public recipient (extracted from
-//     the identity at startup) to seal, and never sees the private half.
+//   - host.age sits at /etc/faas/secrets/host.age. vmmd reads it (root)
+//     when injecting per-wake secrets into the jailer chroot; apid reads
+//     it (via the `faas` group, mode 0440) to unseal the TOTP secret for
+//     /verify + /confirm + /recover + /disable (IAM-2 / issue #186). The
+//     pre-MFA shape was root:root 0400 (only vmmd), which made MFA a
+//     boot-time impossibility — the host age key had to be readable by
+//     both daemons. The 0440 mode is "owner can write, group + owner
+//     can read" — every other group is locked out, and the file is not
+//     world-readable. No other service user besides faas (apid's primary
+//     group) can read it.
 //   - Per-wake injection: vmmd loopback-mounts drive1 and writes
 //     /etc/faas/secrets.env (JSON), which guest-init reads after pivot_root.
 //     The on-disk format is plain because vmmd is the only root component
@@ -16,7 +23,7 @@
 // What lives here
 //
 //   - hostkey.go — load/save the host identity to /etc/faas/secrets/host.age;
-//     expose the recipient (string) and the identity (for vmmd to unseal).
+//     expose the recipient (string) and the identity (for vmmd + apid).
 //   - seal.go     — Seal / Open round-trip on an arbitrary env map.
 //
 // Wire shape: the on-disk envelope is age's standard format (Stanza header +
@@ -45,8 +52,10 @@ import (
 var ErrRecipientInsecurePerms = errors.New("secretbox: host.age.pub permissions allow write/exec/setuid to non-owner")
 
 // DefaultHostKeyPath is where vmmd looks for (and auto-generates) the host
-// X25519 identity on first boot. Spec §11: secrets in /etc/faas/secrets/
-// root:root 0400.
+// X25519 identity on first boot. Spec §11: secrets in /etc/faas/secrets/,
+// mode 0440 root:faas so apid (running as the faas-apid user with primary
+// group faas) can read it for MFA unseal. The 0440 mode is the minimum
+// needed to keep vmmd (root) and apid (faas group) in the read set.
 const DefaultHostKeyPath = "/etc/faas/secrets/host.age"
 
 // ErrHostKeyNotFound is returned by LoadHostKey when the file is missing.
@@ -56,9 +65,10 @@ var ErrHostKeyNotFound = errors.New("secretbox: host key not found")
 
 // LoadHostKey parses an age-format X25519 identity from path. The file is
 // expected to be the raw "AGE-SECRET-KEY-1..." string (age's standard
-// textual representation), mode 0400 in production but mode is not enforced
-// here — the host key's filesystem permissions are an ansible / Makefile
-// concern, not a runtime check.
+// textual representation). Production mode is 0440 root:faas but mode is
+// not enforced here — the host key's filesystem permissions are an
+// ansible / bootstrap.sh concern, not a runtime check. LoadHostKey never
+// opens a file writable by anyone outside the file's owner.
 func LoadHostKey(path string) (*age.X25519Identity, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -78,18 +88,26 @@ func LoadHostKey(path string) (*age.X25519Identity, error) {
 }
 
 // GenerateAndSaveHostKey creates a new X25519 identity, writes its textual
-// representation to path with mode 0400, and returns the identity. Called by
-// vmmd on first boot when LoadHostKey returns ErrHostKeyNotFound.
+// representation to path with mode 0440, and returns the identity. Called
+// by vmmd on first boot when LoadHostKey returns ErrHostKeyNotFound.
+//
+// File mode is 0440 — owner (root, vmmd) + group (faas, apid) can read.
+// Other groups + other are locked out: the only two privileged services
+// on the box that should ever see this key are vmmd (which writes
+// per-wake secrets.env) and apid (which unseals the TOTP secret for
+// MFA handlers). The 0440 mode is the minimum that lets both daemons
+// run without sudo / without going through root per request, while
+// keeping every other service user locked out.
 //
 // On a fresh box this is the bootstrap moment: vmmd is the only root
-// component, so it owns key generation. apid never generates — it consumes
-// the recipient string.
+// component, so it owns key generation. apid never generates — it
+// consumes the recipient + identity.
 func GenerateAndSaveHostKey(path string) (*age.X25519Identity, error) {
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		return nil, fmt.Errorf("secretbox: generate host key: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(id.String()), 0o400); err != nil {
+	if err := os.WriteFile(path, []byte(id.String()), 0o440); err != nil {
 		return nil, fmt.Errorf("secretbox: write host key %q: %w", path, err)
 	}
 	return id, nil

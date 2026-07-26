@@ -68,6 +68,13 @@ tags:
       Email + password (Argon2id), Google OAuth, GitHub OAuth,
       password reset, session lifecycle. Cookies carry the session
       artifact; the device-code flow is the SDK programmatic-auth path.
+  - name: mfa
+    description: |
+      TOTP MFA on dashboard sessions (IAM-2, issue #186). Five
+      POST endpoints: enroll (one-shot secret + recovery codes),
+      confirm (first TOTP code), verify (step-up for an
+      mfa_pending session), recover (burn a recovery code), and
+      disable (opt-out via password or recovery code).
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
 
@@ -258,7 +265,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/MFAConfirmResponse' }
         '401':
-          description: Invalid code.
+          description: Invalid TOTP code.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -2499,6 +2506,168 @@ components:
         (`pkg/middleware/authlimit.go`, around line 200). All other 429s
         return a `Problem` with `code: plan_limit_concurrency` or
         `code: quota_exhausted`.
+    # ------------------------------------------------------------------ MFA
+    # IAM-2 (issue #186): TOTP MFA on dashboard sessions. The five
+    # /v1/account/mfa/* routes and their wire shapes live here so
+    # SDK codegen + the dashboard renderer agree on the field set.
+    #
+    # The server returns the plaintext TOTP secret + recovery codes
+    # EXACTLY ONCE on /enroll; the server-side blob is sealed at rest
+    # under the host age key (same seal as app_secrets). Recovery
+    # codes are 10-char base32 strings stored as SHA-256 hashes — the
+    # plaintext never reappears on the wire after /enroll.
+
+    MFAEnrollRequest:
+      description: |
+        Empty body — the customer brings only their session cookie.
+        Kept as a real struct (not `additionalProperties: false`) so
+        `{}` decodes cleanly without a "no JSON object" parse error.
+      type: object
+      additionalProperties: false
+
+    MFAEnrollResponse:
+      description: |
+        One-shot enrollment payload. Returned exactly once on
+        /enroll. The server persists `mfa_secret_encrypted` (sealed)
+        and `mfa_recovery_codes_hash` (SHA-256d); subsequent calls
+        to /enroll overwrite the secret + codes but do NOT
+        re-surface the plaintexts to the dashboard.
+      type: object
+      required: [otpauth_url, secret, qr_code_png_base64, recovery_codes]
+      properties:
+        otpauth_url:
+          type: string
+          description: |
+            Standard `otpauth://totp/...` URL with the issuer = FaaS.
+            The customer's authenticator app ingests this on its own;
+            the dashboard also embeds the QR for camera-based setup.
+          example: 'otpauth://totp/FaaS:alice@example.com?secret=JBSWY3DPEHPK3PXP&issuer=FaaS'
+        secret:
+          type: string
+          pattern: '^[A-Z2-7]{32}$'
+          description: |
+            Base32-encoded TOTP secret, 32 chars (no padding). Same
+            value embedded in the otpauth URL; surfaced here so the
+            dashboard can render the secret directly for
+            copy-paste into an authenticator app that doesn't read
+            URLs.
+        qr_code_png_base64:
+          type: string
+          format: byte
+          description: |
+            Base64-encoded PNG bytes of the QR code (256×256). The
+            server base64-encodes the raw PNG for JSON transport;
+            the dashboard decodes the string back to bytes before
+            rendering it in an `<img>` tag. The authenticator scans
+            the decoded PNG.
+        recovery_codes:
+          type: array
+          items: { type: string, pattern: '^[A-Z0-9]{10}$' }
+          minItems: 10
+          maxItems: 10
+          description: |
+            Ten single-use 10-character base32 strings. The
+            dashboard renders them in the "save these somewhere"
+            step. Each code is hashed (SHA-256) before storage;
+            the plaintext never reappears.
+
+    MFAConfirmRequest:
+      description: Body for /confirm — a single 6-digit TOTP code.
+      type: object
+      required: [totp]
+      properties:
+        totp:
+          type: string
+          pattern: '^[0-9]{6}$'
+          description: 6-digit rotating code from the authenticator app.
+        csrf_token:
+          type: string
+          description: |
+            Dashboard CSRF token. The dashboard sets a
+            `faas_csrf` cookie on every authenticated response; the
+            same value rides in this JSON-body field so
+            `pkg/middleware.VerifyAuthenticated` can compare them.
+            The token is opaque to the wire (sealed session
+            reference); size matches the cookie value.
+
+    MFAConfirmResponse:
+      description: |
+        Empty success body. The meaningful side effect is the
+        `Set-Cookie: faas_sid=…` header — re-issued without the
+        `mfa_pending` flag — and the stamp of `mfa_enrolled_at`.
+      type: object
+      additionalProperties: false
+
+    MFAVerifyRequest:
+      description: |
+        Body for /verify — same 6-digit code as /confirm. The
+        account is already enrolled; the verify path does NOT re-
+        stamp enrolled_at, only re-issues the cookie without
+        mfa_pending.
+      type: object
+      required: [totp]
+      properties:
+        totp: { type: string, pattern: '^[0-9]{6}$' }
+        csrf_token:
+          type: string
+          description: |
+            Dashboard CSRF token (absorbed from the body for
+            parity with /confirm; /verify is not token-gated
+            because the TOTP code itself IS the second factor).
+
+    MFAVerifyResponse:
+      description: Empty success body. Same semantics as /confirm response.
+      type: object
+      additionalProperties: false
+
+    MFARecoverRequest:
+      description: |
+        Body for /recover — one of the 10 recovery codes the
+        customer received on /enroll. The hash is removed from
+        the stored set; subsequent /recover calls with the same
+        code return 401.
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, pattern: '^[A-Z0-9]{10}$' }
+        csrf_token:
+          type: string
+          description: Dashboard CSRF token for the recover mutation.
+
+    MFARecoverResponse:
+      description: |
+        Empty success body. Side effects: the matching hash is
+        removed from `mfa_recovery_codes_hash`; the session cookie
+        is re-issued without `mfa_pending`.
+      type: object
+      additionalProperties: false
+
+    MFADisableRequest:
+      description: |
+        Body for /disable. Exactly one of `password` or
+        `recovery_code` is required — both empty and both set are
+        rejected with 400 CodeValidation. Password is verified
+        against the existing `account_passwords.hash`; the
+        recovery code is consumed (one-time).
+      type: object
+      properties:
+        password: { type: string, minLength: 12, maxLength: 256 }
+        recovery_code: { type: string, pattern: '^[A-Z0-9]{10}$' }
+        csrf_token:
+          type: string
+          description: Dashboard CSRF token for the disable mutation.
+      # `oneOf` would express the constraint declaratively, but the
+      # handler enforces the XOR on the server side and returns the
+      # actionable 400; we leave the schema lax so a misbehaving
+      # client can still get the descriptive error.
+
+    MFADisableResponse:
+      description: |
+        Empty success body. Side effects: mfa_secret_encrypted,
+        mfa_recovery_codes_hash, and mfa_enrolled_at are all NULL.
+        mfa_required is left as-is so the chokepoints can re-arm.
+      type: object
+      additionalProperties: false
 
   responses:
 
@@ -2678,143 +2847,3 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
         text/plain:
           schema: { $ref: '#/components/schemas/RateLimitPlain' }
-
-    # ------------------------------------------------------------------ MFA
-    # IAM-2 (issue #186): TOTP MFA on dashboard sessions. The five
-    # /v1/account/mfa/* routes and their wire shapes live here so
-    # SDK codegen + the dashboard renderer agree on the field set.
-    #
-    # The server returns the plaintext TOTP secret + recovery codes
-    # EXACTLY ONCE on /enroll; the server-side blob is sealed at rest
-    # under the host age key (same seal as app_secrets). Recovery
-    # codes are 10-char base32 strings stored as SHA-256 hashes — the
-    # plaintext never reappears on the wire after /enroll.
-
-    MFAEnrollRequest:
-      description: |
-        Empty body — the customer brings only their session cookie.
-        Kept as a real struct (not `additionalProperties: false`) so
-        `{}` decodes cleanly without a "no JSON object" parse error.
-      type: object
-      additionalProperties: false
-
-    MFAEnrollResponse:
-      description: |
-        One-shot enrollment payload. Returned exactly once on
-        /enroll. The server persists `mfa_secret_encrypted` (sealed)
-        and `mfa_recovery_codes_hash` (SHA-256d); subsequent calls
-        to /enroll overwrite the secret + codes but do NOT
-        re-surface the plaintexts to the dashboard.
-      type: object
-      required: [otpauth_url, secret, qr_code_png_base64, recovery_codes]
-      properties:
-        otpauth_url:
-          type: string
-          description: |
-            Standard `otpauth://totp/...` URL with the issuer = FaaS.
-            The customer's authenticator app ingests this on its own;
-            the dashboard also embeds the QR for camera-based setup.
-          example: 'otpauth://totp/FaaS:alice@example.com?secret=JBSWY3DPEHPK3PXP&issuer=FaaS'
-        secret:
-          type: string
-          pattern: '^[A-Z2-7]{32}$'
-          description: |
-            Base32-encoded TOTP secret, 32 chars (no padding). Same
-            value embedded in the otpauth URL; surfaced here so the
-            dashboard can render the secret directly for
-            copy-paste into an authenticator app that doesn't read
-            URLs.
-        qr_code_png_base64:
-          type: array
-          items: { type: integer }
-          description: |
-            PNG bytes of the QR code (256×256). The dashboard base64-
-            encodes for JSON transport; the authenticator scans the
-            PNG directly.
-        recovery_codes:
-          type: array
-          items: { type: string, pattern: '^[A-Z0-9]{10}$' }
-          minItems: 10
-          maxItems: 10
-          description: |
-            Ten single-use 10-character base32 strings. The
-            dashboard renders them in the "save these somewhere"
-            step. Each code is hashed (SHA-256) before storage;
-            the plaintext never reappears.
-
-    MFAConfirmRequest:
-      description: Body for /confirm — a single 6-digit TOTP code.
-      type: object
-      required: [totp]
-      properties:
-        totp:
-          type: string
-          pattern: '^[0-9]{6}$'
-          description: 6-digit rotating code from the authenticator app.
-
-    MFAConfirmResponse:
-      description: |
-        Empty success body. The meaningful side effect is the
-        `Set-Cookie: faas_sid=…` header — re-issued without the
-        `mfa_pending` flag — and the stamp of `mfa_enrolled_at`.
-      type: object
-      additionalProperties: false
-
-    MFAVerifyRequest:
-      description: |
-        Body for /verify — same 6-digit code as /confirm. The
-        account is already enrolled; the verify path does NOT re-
-        stamp enrolled_at, only re-issues the cookie without
-        mfa_pending.
-      type: object
-      required: [totp]
-      properties:
-        totp: { type: string, pattern: '^[0-9]{6}$' }
-
-    MFAVerifyResponse:
-      description: Empty success body. Same semantics as /confirm response.
-      type: object
-      additionalProperties: false
-
-    MFARecoverRequest:
-      description: |
-        Body for /recover — one of the 10 recovery codes the
-        customer received on /enroll. The hash is removed from
-        the stored set; subsequent /recover calls with the same
-        code return 401.
-      type: object
-      required: [code]
-      properties:
-        code: { type: string, pattern: '^[A-Z0-9]{10}$' }
-
-    MFARecoverResponse:
-      description: |
-        Empty success body. Side effects: the matching hash is
-        removed from `mfa_recovery_codes_hash`; the session cookie
-        is re-issued without `mfa_pending`.
-      type: object
-      additionalProperties: false
-
-    MFADisableRequest:
-      description: |
-        Body for /disable. Exactly one of `password` or
-        `recovery_code` is required — both empty and both set are
-        rejected with 400 CodeValidation. Password is verified
-        against the existing `account_passwords.hash`; the
-        recovery code is consumed (one-time).
-      type: object
-      properties:
-        password: { type: string, minLength: 12, maxLength: 256 }
-        recovery_code: { type: string, pattern: '^[A-Z0-9]{10}$' }
-      # `oneOf` would express the constraint declaratively, but the
-      # handler enforces the XOR on the server side and returns the
-      # actionable 400; we leave the schema lax so a misbehaving
-      # client can still get the descriptive error.
-
-    MFADisableResponse:
-      description: |
-        Empty success body. Side effects: mfa_secret_encrypted,
-        mfa_recovery_codes_hash, and mfa_enrolled_at are all NULL.
-        mfa_required is left as-is so the chokepoints can re-arm.
-      type: object
-      additionalProperties: false

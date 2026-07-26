@@ -23,7 +23,9 @@ func TestLoadHostKeyMissing(t *testing.T) {
 }
 
 // TestGenerateAndSaveRoundTrip writes a key, loads it back, asserts
-// Recipient() matches the original. Mode 0400 must be honored.
+// Recipient() matches the original. Mode 0440 (owner+group read) must
+// be honored so apid (in the faas group) can unseal the TOTP secret
+// for IAM-2 / issue #186 MFA handlers without going through root.
 func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "host.age")
@@ -31,13 +33,13 @@ func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate+save: %v", err)
 	}
-	// Mode: 0400 only owner can read.
+	// Mode: 0440 owner+group read; everyone else locked out.
 	st, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := st.Mode().Perm(); perm != 0o400 {
-		t.Errorf("mode=%o want 0o400", perm)
+	if perm := st.Mode().Perm(); perm != 0o440 {
+		t.Errorf("mode=%o want 0o440", perm)
 	}
 	// Reload and compare recipient.
 	id2, err := LoadHostKey(path)
@@ -51,7 +53,8 @@ func TestGenerateAndSaveRoundTrip(t *testing.T) {
 
 // TestRecipientFileRoundTrip covers the vmmd-writes-pub / apid-reads-pub
 // handshake. The recipient file is 0444 (public); the identity file is
-// 0400 (private). vmmd is the only writer of both.
+// 0440 root:faas (private — vmmd + apid only). vmmd owns the writer
+// side of both.
 func TestRecipientFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	idPath := filepath.Join(dir, "host.age")
@@ -99,8 +102,10 @@ func TestLoadRecipientMissing(t *testing.T) {
 //
 // Cases: writable for group, writable for other, setuid, setgid, sticky,
 // and exec for owner. Each must fail with ErrRecipientInsecurePerms in the
-// chain. Sanity cases (0400, 0444, 0440) must succeed — those are the
-// production modes.
+// chain. Sanity cases (0400, 0444, 0440, 0600) must succeed — those are
+// the production-permitted shapes (0444 is the public-key default; 0400
+// / 0440 / 0600 / 0640 / 0604 cover tighter perms in case the operator
+// chooses to harden further).
 func TestLoadRecipient_RejectsInsecurePerms(t *testing.T) {
 	id, err := GenerateAndSaveHostKey(filepath.Join(t.TempDir(), "host.age"))
 	if err != nil {

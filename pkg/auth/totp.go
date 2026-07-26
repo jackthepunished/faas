@@ -27,11 +27,14 @@
 //     than 3 verify attempts per 30 s window from the same code.
 //
 // Recovery codes are a separate concern. SHA-256 (not Argon2id)
-// because the codes are 80-bit random base32 — the entropy is in the
-// code, not the hash function. The slice is bounded at 10 codes per
-// enrollment, so the per-verify cost is 320 hash comparisons, which
-// is negligible against the cold-boot wake budget the rest of the
-// platform budgets.
+// because the codes carry their own entropy: 50 bits per code (10
+// chars × 5 bits/char over the customer-visible base32 alphabet
+// A-Z + 2-7), from an 80-bit CSPRNG source (10 random bytes) that
+// is base32-encoded and truncated to the 10 visible characters.
+// Argon2id's cost is unjustified at this entropy floor — the
+// per-verify work is bounded at 10 SHA-256 compares against the
+// stored hash slice, which is negligible against the cold-boot
+// wake budget the rest of the platform budgets.
 
 package auth
 
@@ -138,15 +141,17 @@ func VerifyCode(secret, code string) bool {
 // chars each, no padding) plus the SHA-256 hashes of the same
 // plaintexts. The plaintexts are returned to the dashboard ONCE
 // (the enroll response); the hashes are what /v1/account/mfa/recover
-// compares against. 80 bits of entropy per code (10 random bytes)
-// is enough that brute-forcing a 10-entry hash table from a leaked
-// blob is computationally infeasible without offline storage of the
-// plaintexts — which never leaves the customer's account.
+// compares against.
 //
-// The 10-char truncation drops the last 4 base32 chars (20 bits of
-// the encoding); the underlying 80-bit entropy is preserved. The
-// customer types the 10 visible chars; the hash is over those 10
-// chars uppercase.
+// Entropy breakdown: 10 bytes of CSPRNG source = 80 bits; the
+// base32-no-padding encoding of 10 bytes is 16 chars; we truncate to
+// 10 chars (50 bits customer-visible — 10 × 5 bits/char over the
+// base32 alphabet A-Z + 2-7). 50 bits is enough that brute-forcing
+// a 10-entry hash table from a leaked blob is computationally
+// infeasible without offline storage of the plaintexts, which never
+// leaves the customer's account. The CSPRNG draws 80 bits so we
+// don't bias the alphabet by reading fewer source bytes (a 50-bit
+// draw under-produces characters outside the visible alphabet).
 func NewRecoveryCodes(n int) (plaintexts []string, hashes [][]byte, err error) {
 	plaintexts = make([]string, n)
 	hashes = make([][]byte, n)

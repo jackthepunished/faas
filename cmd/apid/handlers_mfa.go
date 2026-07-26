@@ -27,6 +27,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -45,15 +46,33 @@ var mfaRecipient func() *age.X25519Recipient
 // directly to inject an in-memory recipient.
 func SetMFARecipient(f func() *age.X25519Recipient) { mfaRecipient = f }
 
-// consumeRecoveryCodeSelector abstracts the single-row
-// transactional bytea[] update the consume path needs.
-// PgStore does this with SELECT FOR UPDATE + UPDATE inside a
-// pgx transaction; MemStore serialises via the existing mutex.
-// Tests inject a stub to drive the success / miss paths without
+// consumeRecoveryCodeSelector abstracts the atomic consume
+// primitive Store.ConsumeRecoveryCode. PgStore does this with
+// SELECT FOR UPDATE + UPDATE inside a pgx transaction; MemStore
+// serialises via the existing mutex. The returned `lastCode` is
+// true iff the consumed code was the last remaining one — the
+// handler refuses to burn it and prompts for the password
+// instead, so the customer still has a way in. Tests inject a
+// stub to drive the success / miss / lastCode paths without
 // touching a real DB.
 type consumeRecoveryCodeSelector interface {
-	GetMFASecrets(ctx context.Context, id string) ([]byte, [][]byte, error)
-	UpdateMFARecoveryCodes(ctx context.Context, id string, recoveryHashes [][]byte) error
+	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+}
+
+// matchRecoveryCodeSelector abstracts the Store.MatchRecoveryCode
+// read-only primitive. Same reasoning as the consume selector
+// above — the handlers depend on the interface, the tests
+// substitute a stub. PgStore + MemStore both implement it.
+type matchRecoveryCodeSelector interface {
+	MatchRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+}
+
+// matchRecoveryCode is a thin wrapper over Store.MatchRecoveryCode
+// so the handler signature stays the same shape as
+// consumeRecoveryCode. Tests inject the stub via the local
+// interface.
+func matchRecoveryCode(ctx context.Context, st matchRecoveryCodeSelector, accountID string, presented []byte) (matched bool, lastCode bool, err error) {
+	return st.MatchRecoveryCode(ctx, accountID, presented)
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -135,7 +154,19 @@ func (s *server) mfaEnroll(w http.ResponseWriter, r *http.Request, acct state.Ac
 // success body exactly once (the side-effects on the cookie +
 // the store stamp are the load-bearing bits, and the dashboard
 // reads the response status alone).
+//
+// CSRF (issue #186 review finding #7): the dashboard sends the
+// CSRF token in the JSON body's `csrf_token` sibling. The
+// verify call must run BEFORE decodeJSON so the body's
+// io.ReadAll-then-restore invariant in extractRequestToken
+// (pkg/middleware/csrf.go) holds — decodeJSON on a body that
+// Verify already peeked would observe an empty stream.
 func (s *server) mfaConfirm(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if err := middleware.VerifyAuthenticated(s.sessions, r, "mfa_confirm", acct.ID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeValidation,
+			"Invalid CSRF token", "please reload the page and try again"))
+		return
+	}
 	var req api.MFAConfirmRequest
 	if err := decodeJSON(r, &req); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -207,7 +238,16 @@ func (s *server) mfaVerify(w http.ResponseWriter, r *http.Request, acct state.Ac
 // dance so two concurrent /recover requests can't both think
 // they burned the same code. (Defense in depth — the dashboard
 // disables the form while one request is in flight.)
+//
+// CSRF (issue #186 review finding #7): a recovery consumes a
+// stored code (a state-changing side effect) — same
+// verify-before-decodeJSON contract as /confirm.
 func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if err := middleware.VerifyAuthenticated(s.sessions, r, "mfa_recover", acct.ID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeValidation,
+			"Invalid CSRF token", "please reload the page and try again"))
+		return
+	}
 	var req api.MFARecoverRequest
 	if err := decodeJSON(r, &req); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -215,21 +255,45 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	presented := auth.HashRecoveryCode(req.Code)
-	matched, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
+	// Step 1: MatchRecoveryCode checks the hash WITHOUT mutating.
+	// This lets us refuse the burn on the customer's last code
+	// (issue #186 review Finding #5 — the prior shape burned
+	// first, then noticed lastCode=true, leaving the customer
+	// with zero codes despite the 409 wire response). With this
+	// split, the refuse path is atomic — the store is unchanged.
+	matched, lastCode, err := matchRecoveryCode(r.Context(), s.store, acct.ID, presented)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
 				"Invalid code", "no matching recovery code"))
 			return
 		}
-		s.log.Error("mfa.recover.consume", "err", err.Error())
-		api.WriteProblem(w, api.ErrCapacity("could not consume recovery code"))
+		s.log.Error("mfa.recover.match", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not match recovery code"))
 		return
 	}
 	if !matched {
 		s.audit.Emit(r.Context(), "account.mfa_recover_failed", &acct.ID, map[string]any{"reason": "code_mismatch"})
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
 			"Invalid code", "no matching recovery code"))
+		return
+	}
+	if lastCode {
+		// Refuse to burn the only remaining code: the customer
+		// would otherwise be locked out with no way back in.
+		// The store still has the code (matched-then-not-burnt).
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
+			"Last recovery code",
+			"burning the only remaining code would lock you out — use /v1/account/mfa/disable with your password instead"))
+		return
+	}
+	// Step 2: consume the code now that we know the burn is
+	// safe (matched AND not lastCode). The ConsumeRecoveryCode
+	// race contract still holds — two concurrent /recover calls
+	// on the same account serialise via SELECT FOR UPDATE.
+	if _, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented); err != nil {
+		s.log.Error("mfa.recover.consume", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not consume recovery code"))
 		return
 	}
 	if err := s.reissueSessionCookie(w, r, acct, false); err != nil {
@@ -250,7 +314,23 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 // mfa_enrolled_at. Leaves mfa_required untouched so the
 // chokepoints (plan upgrade / card attach / 2nd deploy) can
 // re-arm on the next trigger.
+//
+// CSRF (issue #186 review finding #7): ClearMFA is irreversible
+// from the customer's perspective (re-enroll is the only path
+// back), so the CSRF gate sits between the cookie issuance and
+// any state change.
+//
+// Helper extraction (issue #186 review finding polish):
+// the password-verify and recovery-consume branches are
+// extracted to disableByPassword / disableByRecoveryCode so the
+// top-level handler stays under the 50-line rule (CLAUDE.md
+// "Handlers ≤ 50 lines").
 func (s *server) mfaDisable(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if err := middleware.VerifyAuthenticated(s.sessions, r, "mfa_disable", acct.ID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeValidation,
+			"Invalid CSRF token", "please reload the page and try again"))
+		return
+	}
 	var req api.MFADisableRequest
 	if err := decodeJSON(r, &req); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -265,42 +345,18 @@ func (s *server) mfaDisable(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 
-	if hasPassword {
-		// Re-authenticate via the existing password hash. The
-		// auth.Verify helper in pkg/auth/password.go is the
-		// same path /login uses; we don't roll our own PHC
-		// compare. An empty hash (no password set on the
-		// account) is a 401 — the customer must set a
-		// password before using the password-disable path.
-		hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
-		if err != nil || hash == "" {
-			s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "no_password"})
-			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
-				"Invalid credentials", "password not set on this account"))
+	switch {
+	case hasPassword:
+		if !s.disableByPassword(w, r, acct, req.Password) {
 			return
 		}
-		ok, err := auth.Verify(hash, req.Password)
-		if err != nil || !ok {
-			s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "password_mismatch"})
-			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
-				"Invalid credentials", "password did not match"))
-			return
-		}
-	} else {
-		// Recovery-code path: consume one code. Same helper as
-		// /recover. The customer burning a code to disable
-		// is functionally equivalent to burning it to recover.
-		presented := auth.HashRecoveryCode(req.RecoveryCode)
-		matched, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
-		if err != nil || !matched {
-			s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "code_mismatch"})
-			api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
-				"Invalid code", "no matching recovery code"))
+	default:
+		if !s.disableByRecoveryCode(w, r, acct, req.RecoveryCode) {
 			return
 		}
 	}
 
-	if err := s.store.ClearMFA(r.Context(), acct.ID, "user_disable"); err != nil {
+	if err := s.store.ClearMFA(r.Context(), acct.ID); err != nil {
 		s.log.Error("mfa.disable.clear", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not clear MFA state"))
 		return
@@ -311,6 +367,48 @@ func (s *server) mfaDisable(w http.ResponseWriter, r *http.Request, acct state.A
 	}
 	s.audit.Emit(r.Context(), "account.mfa_disabled", &acct.ID, map[string]any{"method": method})
 	writeJSON(w, http.StatusOK, api.MFADisableResponse{})
+}
+
+// disableByPassword re-authenticates the customer via their
+// stored password hash (PHC compare, same helper /login uses).
+// Returns true on a successful verify; false after writing a
+// 401 problem to w on a failure path. The audit Emit fires
+// before each 401 so brute-force attempts leave a trail in the
+// events table.
+func (s *server) disableByPassword(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
+	hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
+	if err != nil || hash == "" {
+		s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "no_password"})
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
+			"Invalid credentials", "password not set on this account"))
+		return false
+	}
+	ok, err := auth.Verify(hash, presented)
+	if err != nil || !ok {
+		s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "password_mismatch"})
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
+			"Invalid credentials", "password did not match"))
+		return false
+	}
+	return true
+}
+
+// disableByRecoveryCode consumes one of the customer's stored
+// recovery codes. Identical helper to /recover; the only
+// difference is the surrounding audit taxonomy (disable vs
+// recover). We deliberately burn the LAST code on this path —
+// the customer is about to ClearMFA anyway, so the locked-out
+// terminal state from /recover doesn't apply here.
+func (s *server) disableByRecoveryCode(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
+	presentedHash := auth.HashRecoveryCode(presented)
+	matched, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presentedHash)
+	if err != nil || !matched {
+		s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "code_mismatch"})
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
+			"Invalid code", "no matching recovery code"))
+		return false
+	}
+	return true
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -325,7 +423,7 @@ func (s *server) mfaDisable(w http.ResponseWriter, r *http.Request, acct state.A
 // (The helper shape mirrors readAppSecret in handlers_secrets.go
 // — same idea, separate seal key/value.)
 func readSealedSecret(s *server, w http.ResponseWriter, r *http.Request, accountID string) string {
-	encrypted, _, err := s.store.GetMFASecrets(r.Context(), accountID)
+	encrypted, err := s.store.ReadMFASecret(r.Context(), accountID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
@@ -393,61 +491,32 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 	return nil
 }
 
-// consumeRecoveryCode loads the account's recovery-code hashes,
-// searches for a match against `presented`, and writes back the
-// slice minus the matched index. Returns matched=true if a
-// matching hash was removed; matched=false on no-match; and
-// state.ErrNotFound when the account row is missing or has
-// never enrolled.
+// consumeRecoveryCode is a thin wrapper over Store.ConsumeRecoveryCode
+// that exists so the handler tests can stub the consume path via the
+// minimal `consumeRecoveryCodeSelector` interface without faking a
+// full Store. PgStore + MemStore both implement
+// `ConsumeRecoveryCode(ctx, id, presented) (matched, lastCode, err)`
+// directly, so the wrapper just forwards.
 //
-// Single-row serialization: MemStore mutex; PgStore wraps the
-// read+write in a tx with SELECT FOR UPDATE on accounts so two
-// concurrent /recover requests on the same account can't both
-// burn the same code.
+// Returns:
 //
-// (Re-declared from a minimal interface so the handler test
-// can stub it without faking a full Store.)
-func consumeRecoveryCode(ctx context.Context, st consumeRecoveryCodeSelector, accountID string, presented []byte) (bool, error) {
-	_, hashes, err := st.GetMFASecrets(ctx, accountID)
-	if err != nil {
-		return false, err
-	}
-	for i, h := range hashes {
-		// Constant-time comparison per hash. 10 entries × 32 B
-		// is negligible against the cold-boot wake budget.
-		if sha256Equal(h, presented) {
-			next := make([][]byte, 0, len(hashes)-1)
-			next = append(next, hashes[:i]...)
-			next = append(next, hashes[i+1:]...)
-			// UpdateMFARecoveryCodes preserves the sealed secret
-			// — the customer can still TOTP-verify after burning
-			// every recovery code. SetMFASecret would nil the
-			// secret and break the verify path on a burned-last-
-			// code account.
-			if err := st.UpdateMFARecoveryCodes(ctx, accountID, next); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// sha256Equal is a constant-time byte slice comparison. Lives
-// here rather than in pkg/auth because it's only used by the
-// recovery-code consume path; adding it to pkg/auth would
-// invite a future caller to compare arbitrary byte strings and
-// call it "secure" without checking that the slices are
-// well-padded. The 32 B shape is the contract.
-func sha256Equal(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
+//   - matched=true,  lastCode=true   — a code was burned; it was the
+//     last remaining one (the caller should refuse the burn and
+//     prompt the customer to use a password instead, except when
+//     the caller's intent is to ClearMFA immediately afterward, in
+//     which case the burn is welcome).
+//   - matched=true,  lastCode=false  — a code was burned; more remain
+//   - matched=false, lastCode=false  — no match (the customer typed
+//     a wrong code, or replayed an already-burned one)
+//   - err == state.ErrNotFound       — account row missing
+//
+// Single-row serialization is guaranteed by the Store: MemStore holds
+// m.mu over the whole read+compare+write; PgStore wraps it in a tx
+// with SELECT … FOR UPDATE on accounts. Two concurrent /recover
+// requests on the same account cannot both observe and burn the same
+// hash.
+func consumeRecoveryCode(ctx context.Context, st consumeRecoveryCodeSelector, accountID string, presented []byte) (matched bool, lastCode bool, err error) {
+	return st.ConsumeRecoveryCode(ctx, accountID, presented)
 }
 
 // --- auto-flip chokepoints --------------------------------------------------
@@ -461,14 +530,15 @@ func sha256Equal(a, b []byte) bool {
 //     backed resource?", and Hobby still has no card
 //     requirement.
 //   - Card attached (provider_customer_id freshly stamped).
-//   - 2nd deploy (account already has >= 1 active deployment
-//     before the about-to-be-created one).
+//   - 2nd deploy (account-wide post-insert deployment count
+//     >= 2 — the just-created row plus at least one prior).
 //
 // The chokepoints are best-effort: a SetMFARequired failure
 // logs at WARN and continues — the customer's primary action
 // (plan change / card attach / deploy) lands regardless. The
-// audit Emit fires only on success so a redelivered webhook
-// doesn't double-record the chokepoint.
+// audit Emit fires only when the row actually changed (the
+// SetMFARequired `changed` return is true), so a redelivered
+// webhook doesn't double-record the chokepoint.
 
 // mfaFlipOnUpgrade is the plan-upgrade predicate. Returns
 // true iff the customer is moving from a no-card-required
@@ -487,18 +557,22 @@ func mfaFlipOnUpgrade(old, new api.Plan) bool {
 }
 
 // mfaFlipOnDeploy is the 2nd-deploy predicate. Returns
-// true iff the customer has at least one already-active
-// deployment before the about-to-be-created one lands.
-// `currentCount` is the count before the new deployment;
-// the threshold is "the new deploy would be the 2nd or
-// later", so currentCount >= 1 fires.
-func mfaFlipOnDeploy(currentCount int) bool { return currentCount >= 1 }
+// true iff the customer's account-wide deployment count
+// AFTER the about-to-be-created one is ≥ 2. The chokepoint
+// caller (maybeFlipMFAOnDeploy) runs AFTER CreateDeployment
+// has already inserted the new row, so a count of 2 means
+// this customer's deploy is the 2nd or later across all
+// apps they own. Free accounts never trip this —
+// CreateAppIfUnderQuota blocks at app #2 — so the chokepoint
+// only matters for Hobby / Pro / Scale customers.
+func mfaFlipOnDeploy(currentCount int) bool { return currentCount >= 2 }
 
 // flipMFARequiredIfUnenrolled sets mfa_required=true on the
-// account iff the customer has not yet enrolled. Idempotent
-// on repeat: the second call returns nil from SetMFARequired
-// (PgStore + MemStore both treat the same value as no-op),
-// and the audit Emit fires only on a fresh flip.
+// account iff the customer has not yet enrolled. The audit Emit
+// fires only when SetMFARequired reports `changed=true`; a
+// redelivered webhook (or a second chokepoint firing in the
+// same request) returns changed=false and emits nothing,
+// avoiding duplicate rows in the audit log.
 //
 // The `reason` argument drives the audit `data` shape —
 // one of "plan_upgrade", "card_attached", "second_deploy".
@@ -513,8 +587,15 @@ func (s *server) flipMFARequiredIfUnenrolled(ctx context.Context, acct state.Acc
 	if acct.MFAEnrolled() {
 		return
 	}
-	if err := s.store.SetMFARequired(ctx, acct.ID, true); err != nil {
+	changed, err := s.store.SetMFARequired(ctx, acct.ID, true)
+	if err != nil {
 		s.log.Warn("mfa_required set failed", "account", acct.ID, "reason", reason, "err", err.Error())
+		return
+	}
+	if !changed {
+		// Row already carried mfa_required=true (a prior chokepoint
+		// ran, or a webhook was redelivered). Suppress the duplicate
+		// audit row.
 		return
 	}
 	data := map[string]any{"reason": reason}

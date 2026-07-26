@@ -378,35 +378,83 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 // In-memory parallel of PgStore's MFA Store methods. The Account
 // fields MFAEnrolledAt / MFASecretEncrypted / MFARecoveryCodesHash
 // / MFARequired land on the struct in pkg/state/types.go; the
-// methods below are the load-bearing writers + one count helper.
+// methods below are the load-bearing writers + the consume-atomically
+// helper + one count helper.
 
-// GetMFASecrets returns the sealed TOTP secret + recovery-code
-// hashes. Returns ErrNotFound when the row is missing OR the secret
-// column is NULL (the customer has never enrolled). Mirrors
-// PgStore.GetMFASecrets.
-func (m *MemStore) GetMFASecrets(_ context.Context, id string) ([]byte, [][]byte, error) {
+// ConsumeRecoveryCode atomically matches `presented` against the
+// stored SHA-256 recovery-code hashes and removes the matching hash
+// from the array. MemStore runs the read + compare + mutate + write
+// under one m.mu acquisition so two concurrent /recover calls on
+// the same account cannot both observe and burn the same hash.
+// See pkg/state/pgstore.go::ConsumeRecoveryCode for the Postgres
+// precedent; the contract is identical.
+//
+// Returns:
+//   - (false, false, ErrNotFound) when the row is missing
+//   - (false, false, nil)         when no hash matched
+//   - (true, lastCode, nil)       on success; lastCode is true iff
+//     exactly one hash remained
+func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
-		return nil, nil, ErrNotFound
+		return false, false, ErrNotFound
 	}
-	if a.MFASecretEncrypted == nil {
-		return nil, nil, ErrNotFound
-	}
-	// Defensive copy: callers (handlers_mfa.go) treat the slice as
-	// read-only, but the consume path mutates MFARecoveryCodesHash
-	// in place. Sharing the backing array would race against
-	// concurrent SetMFASecret calls from a re-enroll flow.
-	hashes := make([][]byte, len(a.MFARecoveryCodesHash))
+	matchedIdx := -1
 	for i, h := range a.MFARecoveryCodesHash {
-		hashes[i] = slices.Clone(h)
+		if Sha256Equal(h, presented) {
+			matchedIdx = i
+			break
+		}
 	}
-	return slices.Clone(a.MFASecretEncrypted), hashes, nil
+	if matchedIdx < 0 {
+		return false, false, nil
+	}
+	lastCode = len(a.MFARecoveryCodesHash) == 1
+	next := make([][]byte, 0, len(a.MFARecoveryCodesHash)-1)
+	next = append(next, a.MFARecoveryCodesHash[:matchedIdx]...)
+	next = append(next, a.MFARecoveryCodesHash[matchedIdx+1:]...)
+	a.MFARecoveryCodesHash = next
+	m.accounts[id] = a
+	return true, lastCode, nil
+}
+
+// MatchRecoveryCode tests a presented SHA-256 hash against the
+// stored set WITHOUT mutating. Used by /recover to refuse-the-burn
+// on the customer's last code (issue #186 review Finding #5). On
+// MemStore the read lock + the absence of any write make this a
+// pure projection of ConsumeRecoveryCode minus the mutation.
+func (m *MemStore) MatchRecoveryCode(_ context.Context, id string, presented []byte) (bool, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return false, false, ErrNotFound
+	}
+	for _, h := range a.MFARecoveryCodesHash {
+		if Sha256Equal(h, presented) {
+			return true, len(a.MFARecoveryCodesHash) == 1, nil
+		}
+	}
+	return false, false, nil
 }
 
 // SetMFASecret writes the sealed secret + recovery-code hashes
 // WITHOUT stamping mfa_enrolled_at. Idempotent re-enrollment.
+func (m *MemStore) ReadMFASecret(_ context.Context, id string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if a.MFASecretEncrypted == nil {
+		return nil, ErrNotFound
+	}
+	return slices.Clone(a.MFASecretEncrypted), nil
+}
+
 func (m *MemStore) SetMFASecret(_ context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -415,25 +463,6 @@ func (m *MemStore) SetMFASecret(_ context.Context, id string, encrypted []byte, 
 		return ErrNotFound
 	}
 	a.MFASecretEncrypted = slices.Clone(encrypted)
-	a.MFARecoveryCodesHash = make([][]byte, len(recoveryHashes))
-	for i, h := range recoveryHashes {
-		a.MFARecoveryCodesHash[i] = slices.Clone(h)
-	}
-	m.accounts[id] = a
-	return nil
-}
-
-// UpdateMFARecoveryCodes writes the recovery-code hash slice
-// without touching mfa_secret_encrypted. See the Store interface
-// doc for the rationale (the consume path keeps the secret live
-// so the customer can still TOTP-verify after burning codes).
-func (m *MemStore) UpdateMFARecoveryCodes(_ context.Context, id string, recoveryHashes [][]byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	a, ok := m.accounts[id]
-	if !ok {
-		return ErrNotFound
-	}
 	a.MFARecoveryCodesHash = make([][]byte, len(recoveryHashes))
 	for i, h := range recoveryHashes {
 		a.MFARecoveryCodesHash[i] = slices.Clone(h)
@@ -459,10 +488,9 @@ func (m *MemStore) MarkMFAEnrolled(_ context.Context, id string) error {
 }
 
 // ClearMFA nulls the secret + recovery-codes + enrolled_at. Does
-// NOT touch mfa_required — the chokepoints re-arm it. The `reason`
-// argument is reserved for the caller-side audit log; the store
-// does not persist it.
-func (m *MemStore) ClearMFA(_ context.Context, id string, reason string) error {
+// NOT touch mfa_required — the chokepoints re-arm it. The audit Emit
+// is the caller's job; the events table is the audit trail.
+func (m *MemStore) ClearMFA(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
@@ -476,17 +504,25 @@ func (m *MemStore) ClearMFA(_ context.Context, id string, reason string) error {
 	return nil
 }
 
-// SetMFARequired writes the policy flag. Idempotent on repeat.
-func (m *MemStore) SetMFARequired(_ context.Context, id string, required bool) error {
+// SetMFARequired writes the policy flag and reports whether the row
+// actually changed. The chokepoint callers use `changed` to suppress
+// a duplicate audit Emit when a redelivered webhook (or a second
+// chokepoint firing in the same request) requests the same value
+// the row already carries. Mirrors the `WHERE mfa_required <> $2`
+// guard in PgStore.SetMFARequired.
+func (m *MemStore) SetMFARequired(_ context.Context, id string, required bool) (changed bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
-		return ErrNotFound
+		return false, ErrNotFound
+	}
+	if a.MFARequired == required {
+		return false, nil
 	}
 	a.MFARequired = required
 	m.accounts[id] = a
-	return nil
+	return true, nil
 }
 
 // CountDeployments returns the total deployment count for the

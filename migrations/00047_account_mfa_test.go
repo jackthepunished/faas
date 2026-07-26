@@ -151,3 +151,74 @@ func TestMigrations_00047_AccountMFA_ShapeAndCheck(t *testing.T) {
 		t.Errorf("partial index returned %d rows for required+unenrolled", cnt)
 	}
 }
+
+// TestMigrations_00047_AccountMFA_BurnOutAllowed pins Review
+// Finding #5: a customer who has burned every recovery code is
+// still enrolled (mfa_enrolled_at IS NOT NULL, secret present,
+// codes empty). The pre-fix CHECK
+// `coalesce(array_length(mfa_recovery_codes_hash, 1), 0) > 0`
+// would have rejected this terminal state and locked the customer
+// out of /disable. The post-fix CHECK accepts the empty-array
+// shape so the customer can /disable via password and ClearMFA
+// the row.
+func TestMigrations_00047_AccountMFA_BurnOutAllowed(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.Open(t)
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
+
+	const acctID = "00000000-0000-0000-0000-000000000148"
+	if _, err := pool.Exec(ctx, `
+		insert into accounts (id, email, plan, created_at)
+		values ($1, 'iam2-burnout@example.com', 'free', now())
+		on conflict (id) do nothing
+	`, acctID); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// Enrolled + secret + ZERO recovery codes. This is the
+	// terminal state after the customer burned every code and
+	// before they hit /disable. Must pass the CHECK.
+	if _, err := pool.Exec(ctx, `
+		update accounts
+		   set mfa_enrolled_at = now(),
+		       mfa_secret_encrypted = decode('deadbeef', 'hex'),
+		       mfa_recovery_codes_hash = '{}'::bytea[]
+		 where id = $1
+	`, acctID); err != nil {
+		t.Fatalf("enrolled + zero codes should be allowed, got: %v", err)
+	}
+
+	// ClearMFA then takes the row to the all-NULL shape, which the
+	// CHECK also accepts.
+	if _, err := pool.Exec(ctx, `
+		update accounts
+		   set mfa_enrolled_at = null,
+		       mfa_secret_encrypted = null,
+		       mfa_recovery_codes_hash = null
+		 where id = $1
+	`, acctID); err != nil {
+		t.Fatalf("ClearMFA-equivalent update should be allowed, got: %v", err)
+	}
+}
+
+// TestMigrations_00047_AccountMFA_ReApplyIsIdempotent pins Review
+// Finding #12: a box with a half-applied migration (constraint or
+// index already in place) must not crash on the second `goose up`.
+// The constraint is wrapped in a `do $$ ... exception when
+// duplicate_object then null; end $$` block, and the index uses
+// `create index if not exists`.
+func TestMigrations_00047_AccountMFA_ReApplyIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.Open(t)
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("first MigrateUp: %v", err)
+	}
+	// Second pass: the constraint + index already exist; the
+	// idempotence guards must make this a no-op rather than an
+	// error.
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("second MigrateUp (idempotence check): %v", err)
+	}
+}

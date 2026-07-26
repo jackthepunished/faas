@@ -66,15 +66,28 @@ type MFAEnrollResponse struct {
 
 // MFAConfirmRequest is the body for /confirm. Totp is the
 // 6-digit code from the customer's authenticator app.
+//
+// CSRFToken is the dashboard's CSRF token (issue #186 review
+// Finding #7). The /confirm handler does NOT consume it —
+// VerifyAuthenticated runs first and the token is absorbed
+// from the body only for decodeJSON's DisallowUnknownFields
+// check to pass. A drop of this field would surface as a 400
+// "malformed JSON body" instead of a 403 "Invalid CSRF token",
+// which would mask the real attack signal.
 type MFAConfirmRequest struct {
-	Totp string `json:"totp"`
+	Totp      string `json:"totp"`
+	CSRFToken string `json:"csrf_token,omitempty"`
 }
 
 // MFAVerifyRequest is the body for /verify. Same shape as
 // /confirm but a separate type so the OpenAPI doc lists them
-// separately.
+// separately. /verify is NOT CSRF-gated (the TOTP code IS
+// the second factor), but the CSRFToken field is still
+// absorbed so decodeJSON doesn't trip over the dashboard's
+// always-set cookie.
 type MFAVerifyRequest struct {
-	Totp string `json:"totp"`
+	Totp      string `json:"totp"`
+	CSRFToken string `json:"csrf_token,omitempty"`
 }
 
 // MFADisableRequest is the body for /disable. Exactly one of
@@ -84,11 +97,13 @@ type MFAVerifyRequest struct {
 type MFADisableRequest struct {
 	Password     string `json:"password,omitempty"`
 	RecoveryCode string `json:"recovery_code,omitempty"`
+	CSRFToken    string `json:"csrf_token,omitempty"`
 }
 
 // MFARecoverRequest is the body for /recover.
 type MFARecoverRequest struct {
-	Code string `json:"code"`
+	Code      string `json:"code"`
+	CSRFToken string `json:"csrf_token,omitempty"`
 }
 
 // MFAConfirmResponse / MFAVerifyResponse / MFADisableResponse
