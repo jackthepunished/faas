@@ -28,6 +28,25 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 # (gap G2 — sealed at rest, dec only by systemd EnvironmentFile).
 EnvironmentFile=/etc/faas/sealed.env
 
+# Session signing key (security review A4). LoadCredential surfaces
+# /etc/faas/secrets/session.key inside the unit's credentials dir;
+# Environment reads it back into FAAS_SESSION_KEY so apid's existing
+# os.Getenv("FAAS_SESSION_KEY") loader path is unchanged. This keeps
+# the key out of /etc/faas/sealed.env — every other control-plane
+# daemon reads sealed.env but does NOT read this credential, so the
+# 32-byte key never enters their environment.
+LoadCredential=faas_session_key:/etc/faas/secrets/session.key
+Environment=FAAS_SESSION_KEY=%d/faas_session_key
+# Host age identity (IAM-2 / issue #186). apid reads the private
+# half of the host X25519 key to unseal TOTP secrets during
+# /verify + /confirm + /recover + /disable. The file is
+# /etc/faas/secrets/host.age, mode 0440 root:faas (per
+# pkg/secretbox/hostkey.go:97). Without this env var the MFA
+# handlers 503 CodeCapacity and every mfa_pending session locks
+# the customer out indefinitely.
+LoadCredential=faas_host_age_identity:/etc/faas/secrets/host.age
+Environment=FAAS_HOST_AGE_IDENTITY_PATH=%d/faas_host_age_identity
+
 # Hardening baseline.
 NoNewPrivileges=yes
 ProtectSystem=strict

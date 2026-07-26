@@ -30,6 +30,7 @@ import (
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -125,6 +126,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		return fmt.Errorf("apid: migrate: %w", err)
 	}
+
+	// Issue #249 / spec §11: gate Strict-Transport-Security on
+	// FAAS_HSTS_ENABLED. Default true; dev mode can flip to false.
+	// RFC 6797 §7.2 says UAs ignore HSTS on plain HTTP, so the knob
+	// is purely cosmetic — but emitting it on a dev plaintext loop
+	// back listener confuses operators reading the headers.
+	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(os.Getenv))
 
 	deps := defaultDeps()
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
@@ -375,6 +383,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("host age recipient loaded", "path", recipientPath)
 	} else {
 		log.Warn("FAAS_HOST_AGE_RECIPIENT_PATH unset — secrets PUT will return 503")
+	}
+
+	// MFA (IAM-2, issue #186): load the host age identity so
+	// /v1/account/mfa/confirm and /verify can unseal the TOTP
+	// secret. Same key file vmmd reads on wake. The identity
+	// stays in-process; we never log it or write it to disk.
+	// FAAS_HOST_AGE_IDENTITY_PATH is required only when MFA is
+	// in use — without it, /enroll still works (recipient-only)
+	// but /confirm /verify /disable /recover all 503.
+	if identityPath := deps.getenv("FAAS_HOST_AGE_IDENTITY_PATH"); identityPath != "" {
+		ident, err := secretbox.LoadHostKey(identityPath)
+		if err != nil {
+			return fmt.Errorf("apid: load host age identity %q: %w", identityPath, err)
+		}
+		SetMFARecipient(func() *age.X25519Recipient { return ident.Recipient() })
+		SetMFAIdentity(func() *age.X25519Identity { return ident })
+		log.Info("host age identity loaded for MFA", "path", identityPath)
+	} else {
+		log.Warn("FAAS_HOST_AGE_IDENTITY_PATH unset — MFA /confirm, /verify, /disable, /recover will return 503")
 	}
 
 	// Optional pre-listen hook (DNS poller in production; nil in tests).

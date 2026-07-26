@@ -40,6 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -285,7 +286,7 @@ func (s *server) renderResetForm(w http.ResponseWriter, r *http.Request) {
 		Title: "Reset password",
 		Body:  "password_reset_form",
 	}
-	if err := dashboard.Render(w, s.log, page); err != nil {
+	if err := dashboard.Render(w, s.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		s.log.Error("dashboard render reset form", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}
@@ -471,8 +472,16 @@ func (s *server) verifyPasswordOrPad(ctx context.Context, email, password string
 // and sets the HttpOnly + SameSite=Lax faas_sid cookie. The
 // Secure flag is set when the request arrived via TLS or when the
 // X-Forwarded-Proto header pins it (the loopback dev path is HTTP).
+//
+// IAM-2 (issue #186): the cookie is stamped with MfaPending=true
+// when the account is mfa_required && !mfa_enrolled. The requireMFA
+// middleware (cmd/apid/mfa_middleware.go) reads the flag off the
+// envelope via withMFAPending; every protected route 403s
+// CodeMFARequired while the cookie is pending. The mfaEnrollRequired
+// predicate is the same one used by the OAuth callbacks so all
+// five cookie-issue paths agree on the policy.
 func (s *server) issueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	cookie, err := s.sessions.Issue(acct.ID)
+	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
 	if err != nil {
 		s.log.Error("auth.session_issue", "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,

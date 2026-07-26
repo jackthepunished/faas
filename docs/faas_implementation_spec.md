@@ -407,6 +407,21 @@ Concurrency and RAM interaction (the R1 discipline, mechanized): builder VMs are
 **Patch policy:** Firecracker/kernel CVE affecting guest isolation = same-day; everything else = weekly window. Subscribe to firecracker-microvm security advisories; drill the FC-upgrade-invalidates-snapshots path (it's routine, not an incident — ADR-005).
 **Abuse:** signup requires email verification + one of (card, GitHub account ≥ 30 days); crypto-mining heuristic = sustained cpu.stat throttled + 100 % for > 15 min on Free/Hobby → auto-park + review queue; AUP bans mining, scanning, spam relaying.
 
+**Response headers (issue #249):** every response leaving the public listener (gatewayd :443) and the apid loopback listener carries the six hardening headers below. Mounted by `pkg/httpsec` at the outermost wrapper of both daemons. The static set (HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy) runs on every response; Content-Security-Policy is gated so it only fires on apid-handled URLs (customer-app responses keep the customer's own CSP).
+
+| Header | Value | Notes |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | UAs ignore HSTS on plain HTTP per RFC 6797 §7.2 — cosmetic on dev plaintext listener. Disable via `FAAS_HSTS_ENABLED=false`. No `preload` until §11 policy review finalises. |
+| `X-Frame-Options` | `DENY` | The dashboard is the only HTML surface; clicks are never meant to be framed. |
+| `X-Content-Type-Options` | `nosniff` | Stops the browser guessing MIME on `/v1/*` responses. |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Sends only the origin on cross-origin navigations; full URL on same-origin. |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), usb=(), payment=()` | No browser feature is currently used by the dashboard; explicit close. |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'nonce-{rand}' https://unpkg.com; style-src 'self' 'nonce-{rand}'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://*.stripe.com https://billing.faas.example` | Per-request 128-bit nonce (base64-URL, 22 chars). Minted by `pkg/httpsec.Nonce`; consumed by `pkg/dashboard.Render` which stamps `nonce="…"` on every `<script>` and `<style>` tag. `https://unpkg.com` is on the `script-src` list because every dashboard template loads `htmx.org@2.0.4` (and SSE pages additionally load `htmx-ext-sse@2.2.2`) from there. SRI hashes pending as a separate ADR. |
+
+The CSP gate is `cmd/gatewayd/proxy.go::isApidPath` for gatewayd and an unconditional `func(*http.Request) bool { return true }` for apid (apid serves only dashboard + JSON). The platform never emits CSP on a customer-app response — those apps govern their own CSP.
+
+The inline `onclick="return confirm(…)"` in `pkg/dashboard/templates/account.html` was refactored to a per-page `<script nonce="…">` block using `addEventListener`. Browsers do not propagate `nonce` onto event-handler attributes, so leaving the inline handler in place would silently disable the delete-account confirm prompt the moment CSP ships.
+
 ---
 
 ## 12. Observability and SLOs

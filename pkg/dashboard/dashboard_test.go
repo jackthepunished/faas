@@ -20,7 +20,7 @@ func TestRender_Layout(t *testing.T) {
 		Title: "Overview",
 		Body:  "index",
 	}
-	if err := dashboard.Render(rec, log, page); err != nil {
+	if err := dashboard.Render(rec, log, "", page); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if rec.Code != http.StatusOK {
@@ -52,7 +52,7 @@ func TestRender_LoginBody(t *testing.T) {
 		Title: "Sign in",
 		Body:  "login",
 	}
-	if err := dashboard.Render(rec, log, page); err != nil {
+	if err := dashboard.Render(rec, log, "", page); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if !strings.Contains(rec.Body.String(), `<form method="POST" action="/login"`) {
@@ -66,7 +66,7 @@ func TestRender_MissingTemplate(t *testing.T) {
 	rec := httptest.NewRecorder()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	page := dashboard.Page{Title: "Nope", Body: "does_not_exist"}
-	if err := dashboard.Render(rec, log, page); err == nil {
+	if err := dashboard.Render(rec, log, "", page); err == nil {
 		t.Fatal("expected error for missing template")
 	}
 }
@@ -76,7 +76,7 @@ func TestRender_Flash(t *testing.T) {
 	rec := httptest.NewRecorder()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	page := dashboard.Page{Title: "Sign in", Body: "index", Flash: "Check your email"}
-	if err := dashboard.Render(rec, log, page); err != nil {
+	if err := dashboard.Render(rec, log, "", page); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if !strings.Contains(rec.Body.String(), "Check your email") {
@@ -102,7 +102,7 @@ func TestRender_AccountView(t *testing.T) {
 			AppCount: 3,
 		},
 	}
-	if err := dashboard.Render(rec, log, page); err != nil {
+	if err := dashboard.Render(rec, log, "", page); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	body := rec.Body.String()
@@ -110,5 +110,113 @@ func TestRender_AccountView(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
 		}
+	}
+}
+
+// TestRender_StampsNonceOnScriptAndStyle confirms Render copies the
+// nonce argument onto page.Nonce so the templates emit
+// `nonce="..."` on every <script> and <style> tag the CSP
+// (httpsec) middleware requires. The HTTP server already sets the
+// Content-Security-Policy header; this test pins the matching
+// template attribute so the browser accepts the inline code under
+// strict CSP.
+//
+// Issue #249 closes here: a missing stamp would silently block every
+// dashboard's HTMX bootstrap.
+func TestRender_StampsNonceOnScriptAndStyle(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const nonce = "abc123XYZ-_abc123XYZ-" // 22 chars, URL-safe base64
+	page := dashboard.Page{
+		Title: "Overview",
+		Body:  "index",
+	}
+	if err := dashboard.Render(rec, log, nonce, page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	// Every <script src="…"> must carry the nonce attribute.
+	if !strings.Contains(body, `nonce="`+nonce+`"`) {
+		t.Errorf("body missing nonce=%q on script/style\n--- body ---\n%s", nonce, body)
+	}
+}
+
+// TestRender_NoNonceRendersCleanly confirms Render tolerates an empty
+// nonce (unit-test path) without panicking. The output may carry
+// `nonce=""` literally — that's harmless on its own and the browser
+// still accepts the inline tag because the empty nonce doesn't match
+// any CSP `nonce-…` directive in the page's header. Production
+// always supplies a real nonce via httpsec.NonceFromContext so
+// `nonce=""` never reaches the wire.
+func TestRender_NoNonceRendersCleanly(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{Title: "Sign in", Body: "login"}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	// Smoke: the page still renders and includes the form.
+	if !strings.Contains(rec.Body.String(), `<form method="POST" action="/login"`) {
+		t.Errorf("body missing login form\n--- body ---\n%s", rec.Body.String())
+	}
+}
+
+// TestRender_AccountNoInlineOnclick pins the inline-onclick refactor
+// (issue #249 / spec §11). Browsers do not propagate `nonce` onto
+// event-handler attributes, so the original
+//
+//	<button onclick="return confirm('...')">
+//
+// would silently break the delete-account confirm prompt the
+// moment CSP ships. The refactor moves the prompt into a per-page
+// `<script nonce="…">` block that wires addEventListener on a
+// form identified by id="account-delete-form". This test pins:
+//   - the form carries the id (so the addEventListener hook can
+//     find it),
+//   - the rendered output contains NO `onclick=` attributes
+//     (no inline event handlers at all, so a future regression
+//     in a different template is caught too),
+//   - the per-page `<script nonce="…">` block contains the confirm
+//     prompt wiring.
+func TestRender_AccountNoInlineOnclick(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const nonce = "nonceSmokeTest1234567ab" // 22 chars
+	page := dashboard.Page{
+		Title: "Account",
+		Body:  "account",
+		Account: &dashboard.AccountView{
+			ID:       "acct-1",
+			Email:    "jane@example.test",
+			Plan:     "pro",
+			AppCount: 1,
+		},
+		Data: dashboard.AccountData{
+			ShowDelete: true,
+		},
+	}
+	if err := dashboard.Render(rec, log, nonce, page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	// The danger-zone form must carry the id the addEventListener
+	// hook is bound to.
+	if !strings.Contains(body, `id="account-delete-form"`) {
+		t.Errorf("account delete form missing id\n--- body ---\n%s", body)
+	}
+	// No inline event handlers — that would defeat strict CSP.
+	if strings.Contains(body, "onclick=") {
+		t.Errorf("account template still carries an inline onclick attr\n--- body ---\n%s", body)
+	}
+	// The per-page <script nonce=…> block must contain the confirm
+	// prompt wiring so the user still sees the dialog.
+	if !strings.Contains(body, `nonce="`+nonce+`"`) {
+		t.Errorf("per-page script block missing nonce attr\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, "addEventListener") {
+		t.Errorf("per-page script block missing addEventListener wiring\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, "Schedule your account for permanent deletion in 30 days?") {
+		t.Errorf("per-page script block missing confirm copy\n--- body ---\n%s", body)
 	}
 }

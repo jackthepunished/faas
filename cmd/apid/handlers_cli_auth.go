@@ -36,6 +36,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -191,12 +192,12 @@ func (h *cliAuthHandlers) exchangeCliAuthCode(w http.ResponseWriter, r *http.Req
 func (h *cliAuthHandlers) renderCliAuthPage(w http.ResponseWriter, r *http.Request) {
 	hash, ok := normalizeCliAuthCode(r.URL.Query().Get("code"))
 	if !ok {
-		h.renderCliAuthError(w, "Code looks malformed", "Codes are 8 characters, like ABCD-1234.")
+		h.renderCliAuthError(w, r, "Code looks malformed", "Codes are 8 characters, like ABCD-1234.")
 		return
 	}
 	status, _, err := h.srv.store.PeekCliAuthCode(r.Context(), hash)
 	if err != nil || status != api.CliAuthStatusPending {
-		h.renderCliAuthError(w, "Code unavailable", "This code is expired or already used.")
+		h.renderCliAuthError(w, r, "Code unavailable", "This code is expired or already used.")
 		return
 	}
 	// The hidden field carries the normalized (dash-less) RAW code so
@@ -229,7 +230,7 @@ func (h *cliAuthHandlers) renderCliAuthPage(w http.ResponseWriter, r *http.Reque
 			"CSRFToken": token,
 		},
 	}
-	if err := dashboard.Render(w, h.log, page); err != nil {
+	if err := dashboard.Render(w, h.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		h.log.Error("cli_auth.render", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}
@@ -256,12 +257,12 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// Resolve the code first so we can pass it as the CSRF subject.
 	rawCode := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(r.FormValue("code")), "-", ""))
 	if rawCode == "" {
-		h.renderCliAuthError(w, "Missing fields", "Both an 8-character code and an email are required.")
+		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
 		return
 	}
 	hash, ok := normalizeCliAuthCode(rawCode)
 	if !ok {
-		h.renderCliAuthError(w, "Missing fields", "Both an 8-character code and an email are required.")
+		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
 		return
 	}
 	// CSRF guard (review finding A1). Cookie + form value must be a
@@ -269,12 +270,12 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// cross-site POST lacks the cookie and is rejected here before
 	// any account lookup or claim.
 	if err := middleware.VerifyAnonymous(h.srv.sessions, r, "cli-auth", rawCode); err != nil {
-		h.renderCliAuthError(w, "Invalid form", "Please reload the page and try again.")
+		h.renderCliAuthError(w, r, "Invalid form", "Please reload the page and try again.")
 		return
 	}
 	email := strings.TrimSpace(strings.ToLower(r.FormValue("email")))
 	if !looksLikeEmail(email) {
-		h.renderCliAuthError(w, "Missing fields", "Both an 8-character code and an email are required.")
+		h.renderCliAuthError(w, r, "Missing fields", "Both an 8-character code and an email are required.")
 		return
 	}
 
@@ -297,7 +298,7 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 			// error path and CodeQL conservatively taints it from
 			// the email arg.
 			h.log.Error("cli_auth.create_account", "path", "create")
-			h.renderCliAuthError(w, "Could not sign you up", "Please try again.")
+			h.renderCliAuthError(w, r, "Could not sign you up", "Please try again.")
 			return
 		}
 		// codeql[go/log-injection] false-positive: acct.ID is server-generated via newID() (hex of crypto/rand{16}); CodeQL's taint engine conservatively tracks the email argument through CreateAccount into the returned Account struct, but acct.ID itself is not user-controllable. Mirrors the precedent in cmd/apid/handlers.go:67.
@@ -314,11 +315,11 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// transitions pending → consumed + account_id in one SQL.
 	if err := h.srv.store.ClaimCliAuthCode(r.Context(), hash, acct.ID); err != nil {
 		if errors.Is(err, state.ErrConflict) {
-			h.renderCliAuthError(w, "Code already used", "Restart 'faas login' to get a new code.")
+			h.renderCliAuthError(w, r, "Code already used", "Restart 'faas login' to get a new code.")
 			return
 		}
 		if errors.Is(err, state.ErrNotFound) {
-			h.renderCliAuthError(w, "Code expired", "Restart 'faas login' to get a new code.")
+			h.renderCliAuthError(w, r, "Code expired", "Restart 'faas login' to get a new code.")
 			return
 		}
 		h.log.Error("cli_auth.claim", "err", err)
@@ -329,7 +330,11 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 		`{"hash":"`+hex.EncodeToString(hash)+`"}`)
 
 	// Issue a session cookie so the browser is logged in too.
-	cookie, err := h.srv.sessions.Issue(acct.ID)
+	// IAM-2: stamp mfa_pending=true if the account is
+	// mfa_required && !mfa_enrolled. The /cli-auth page is on the
+	// dashboardAuthChain (not gated by s.auth), so the customer
+	// can re-render the post-claim page even while pending.
+	cookie, err := h.srv.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
 	if err != nil {
 		h.log.Error("cli_auth.issue_session", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)
@@ -358,14 +363,14 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 
 // renderCliAuthError renders the cli_auth template with the error
 // flag set, so the form is replaced with a banner.
-func (h *cliAuthHandlers) renderCliAuthError(w http.ResponseWriter, title, detail string) {
+func (h *cliAuthHandlers) renderCliAuthError(w http.ResponseWriter, r *http.Request, title, detail string) {
 	page := dashboard.Page{
 		Title: title,
 		Body:  "cli_auth",
 		Flash: detail,
 		Data:  map[string]any{"Error": true},
 	}
-	if err := dashboard.Render(w, h.log, page); err != nil {
+	if err := dashboard.Render(w, h.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		h.log.Error("cli_auth.render_error", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}

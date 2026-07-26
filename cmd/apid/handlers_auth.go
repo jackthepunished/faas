@@ -43,6 +43,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -79,7 +80,7 @@ func (a *authHandlers) renderLoginForm(w http.ResponseWriter, r *http.Request) {
 		Title: "Sign in",
 		Body:  "login",
 	}
-	if err := dashboard.Render(w, a.log, page); err != nil {
+	if err := dashboard.Render(w, a.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		a.log.Error("dashboard render login form", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}
@@ -107,7 +108,19 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "link expired or already used", http.StatusGone)
 		return
 	}
-	cookie, err := a.srv.sessions.Issue(accountID)
+	// IAM-2 (issue #186): fetch the account so we can stamp the
+	// mfa-pending flag on the cookie when the policy requires it.
+	// A missing account is a token-mismatch race (the row was
+	// hard-deleted between token mint and verify); treat as 410
+	// Gone, matching the expired-token path above.
+	acct, err := a.srv.store.AccountByID(r.Context(), accountID)
+	if err != nil {
+		a.log.Info("auth.verify.account_missing", "err", err, "account", accountID)
+		http.Error(w, "link expired or already used", http.StatusGone)
+		return
+	}
+	mfaPending := mfaEnrollRequired(acct)
+	cookie, err := a.srv.sessions.IssueWithMFAFlag(accountID, mfaPending)
 	if err != nil {
 		a.log.Error("auth.verify.issue_session", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)
@@ -123,7 +136,13 @@ func (a *authHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(a.srv.sessions.MaxAge().Seconds()),
 	})
 	// IAM-4 (ADR-035): record the magic-link login success.
-	a.srv.audit.Emit(r.Context(), "auth.login", &accountID, map[string]any{"method": "magic_link"})
+	// IAM-2: extend the data shape with mfa_pending so the
+	// dashboard audit list can pivot "which logins landed while
+	// the account was required but unenrolled?".
+	a.srv.audit.Emit(r.Context(), "auth.login", &accountID, map[string]any{
+		"method":      "magic_link",
+		"mfa_pending": mfaPending,
+	})
 	http.Redirect(w, r, "/dashboard/", http.StatusFound)
 }
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -124,6 +125,12 @@ type MemStore struct {
 	// stripeByCustomer is the reverse-lookup index used by
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
+	// invoices is the in-memory mirror of the `invoices` table
+	// (migration 00048, issue #259). PR A reads via
+	// ListInvoicesForAccount; PR B adds the writer
+	// (UpsertInvoice via webhook ingestion). Seeded by tests for
+	// parity-with-pgstore checks.
+	invoices map[string]Invoice
 	// gdprRequests is the in-memory mirror of the gdpr_requests ledger
 	// row. MemStore does not auto-cascade on DeleteAccount (the
 	// production pgstore does), but AppendGdprRequest rows here are
@@ -230,6 +237,9 @@ func NewMemStore() *MemStore {
 		// walks; populated by UpdateAccountProviderCustomerID.
 
 		stripeByCustomer: map[string]string{},
+		// invoices starts empty; PR A reads it via ListInvoicesForAccount,
+		// PR B writes via UpsertInvoice (webhook ingestion).
+		invoices: map[string]Invoice{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
 		// recentClaims is the B2.2 fairness mirror; starts empty so
@@ -371,6 +381,188 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 	m.accounts[id] = a
 	return nil
 }
+
+// --- MFA (IAM-2, issue #186) -------------------------------------------------
+//
+// In-memory parallel of PgStore's MFA Store methods. The Account
+// fields MFAEnrolledAt / MFASecretEncrypted / MFARecoveryCodesHash
+// / MFARequired land on the struct in pkg/state/types.go; the
+// methods below are the load-bearing writers + the consume-atomically
+// helper + one count helper.
+
+// ConsumeRecoveryCode atomically matches `presented` against the
+// stored SHA-256 recovery-code hashes and removes the matching hash
+// from the array. MemStore runs the read + compare + mutate + write
+// under one m.mu acquisition so two concurrent /recover calls on
+// the same account cannot both observe and burn the same hash.
+// See pkg/state/pgstore.go::ConsumeRecoveryCode for the Postgres
+// precedent; the contract is identical.
+//
+// Returns:
+//   - (false, false, ErrNotFound) when the row is missing
+//   - (false, false, nil)         when no hash matched
+//   - (true, lastCode, nil)       on success; lastCode is true iff
+//     exactly one hash remained
+func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return false, false, ErrNotFound
+	}
+	matchedIdx := -1
+	for i, h := range a.MFARecoveryCodesHash {
+		if Sha256Equal(h, presented) {
+			matchedIdx = i
+			break
+		}
+	}
+	if matchedIdx < 0 {
+		return false, false, nil
+	}
+	lastCode = len(a.MFARecoveryCodesHash) == 1
+	next := make([][]byte, 0, len(a.MFARecoveryCodesHash)-1)
+	next = append(next, a.MFARecoveryCodesHash[:matchedIdx]...)
+	next = append(next, a.MFARecoveryCodesHash[matchedIdx+1:]...)
+	a.MFARecoveryCodesHash = next
+	m.accounts[id] = a
+	return true, lastCode, nil
+}
+
+// MatchRecoveryCode tests a presented SHA-256 hash against the
+// stored set WITHOUT mutating. Used by /recover to refuse-the-burn
+// on the customer's last code (issue #186 review Finding #5). On
+// MemStore the read lock + the absence of any write make this a
+// pure projection of ConsumeRecoveryCode minus the mutation.
+func (m *MemStore) MatchRecoveryCode(_ context.Context, id string, presented []byte) (bool, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return false, false, ErrNotFound
+	}
+	for _, h := range a.MFARecoveryCodesHash {
+		if Sha256Equal(h, presented) {
+			return true, len(a.MFARecoveryCodesHash) == 1, nil
+		}
+	}
+	return false, false, nil
+}
+
+// SetMFASecret writes the sealed secret + recovery-code hashes
+// WITHOUT stamping mfa_enrolled_at. Idempotent re-enrollment.
+func (m *MemStore) ReadMFASecret(_ context.Context, id string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if a.MFASecretEncrypted == nil {
+		return nil, ErrNotFound
+	}
+	return slices.Clone(a.MFASecretEncrypted), nil
+}
+
+func (m *MemStore) SetMFASecret(_ context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFASecretEncrypted = slices.Clone(encrypted)
+	a.MFARecoveryCodesHash = make([][]byte, len(recoveryHashes))
+	for i, h := range recoveryHashes {
+		a.MFARecoveryCodesHash[i] = slices.Clone(h)
+	}
+	m.accounts[id] = a
+	return nil
+}
+
+// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+// mfa_required = false. Idempotent on retry.
+func (m *MemStore) MarkMFAEnrolled(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	a.MFAEnrolledAt = &now
+	a.MFARequired = false
+	m.accounts[id] = a
+	return nil
+}
+
+// ClearMFA nulls the secret + recovery-codes + enrolled_at. Does
+// NOT touch mfa_required — the chokepoints re-arm it. The audit Emit
+// is the caller's job; the events table is the audit trail.
+func (m *MemStore) ClearMFA(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	a.MFASecretEncrypted = nil
+	a.MFARecoveryCodesHash = nil
+	a.MFAEnrolledAt = nil
+	m.accounts[id] = a
+	return nil
+}
+
+// SetMFARequired writes the policy flag and reports whether the row
+// actually changed. The chokepoint callers use `changed` to suppress
+// a duplicate audit Emit when a redelivered webhook (or a second
+// chokepoint firing in the same request) requests the same value
+// the row already carries. Mirrors the `WHERE mfa_required <> $2`
+// guard in PgStore.SetMFARequired.
+func (m *MemStore) SetMFARequired(_ context.Context, id string, required bool) (changed bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if a.MFARequired == required {
+		return false, nil
+	}
+	a.MFARequired = required
+	m.accounts[id] = a
+	return true, nil
+}
+
+// CountDeployments returns the total deployment count for the
+// account, excluding 'failed' + 'superseded' (those don't count
+// toward the live workload). Mirrors PgStore's join through apps.
+// The MemStore doesn't maintain an app-status sub-index, so this
+// is O(apps + deployments) — fine for the test harness' < 1000
+// rows; the PgStore is index-backed.
+func (m *MemStore) CountDeployments(_ context.Context, id string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owned := make(map[string]struct{})
+	for _, a := range m.apps {
+		if a.AccountID == id && a.Status != AppDeleted {
+			owned[a.ID] = struct{}{}
+		}
+	}
+	n := 0
+	for _, d := range m.deployments {
+		if _, ok := owned[d.AppID]; !ok {
+			continue
+		}
+		if d.Status == DeployFailed || d.Status == DeploySuperseded {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// --- end MFA -----------------------------------------------------------------
 
 // UpdateAccountProviderCustomerID records the Stripe `cus_…` ID. MemStore
 // keeps an index map for O(1) webhook lookup; PgStore mirrors with a
@@ -2774,6 +2966,65 @@ func (m *MemStore) UsageByMonth(_ context.Context, accountID string, month time.
 		}
 	}
 	return out, nil
+}
+
+// ListInvoicesForAccount mirrors pgstore's contract. Ordering is
+// (period_end DESC, id DESC) — same as the SQL index. The month filter
+// uses the same half-open UTC range as the SQL case. Empty when the
+// account has no rows; nil and len-zero are both acceptable per the
+// handler's `make([]api.Invoice, 0, len(rows))` guard.
+func (m *MemStore) ListInvoicesForAccount(_ context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 25
+	}
+	var monthStart, monthEnd time.Time
+	if month != nil {
+		monthStart = time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+		monthEnd = monthStart.AddDate(0, 1, 0)
+	}
+	var all []Invoice
+	for _, inv := range m.invoices {
+		if inv.AccountID != accountID {
+			continue
+		}
+		if month != nil && (inv.PeriodEnd.Before(monthStart) || !inv.PeriodEnd.Before(monthEnd)) {
+			continue
+		}
+		if !before.IsZero() && !inv.PeriodEnd.Before(before) {
+			continue
+		}
+		all = append(all, inv)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if !all[i].PeriodEnd.Equal(all[j].PeriodEnd) {
+			return all[i].PeriodEnd.After(all[j].PeriodEnd)
+		}
+		return all[i].ID > all[j].ID
+	})
+	if limit > 0 && limit < len(all) {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+// SeedInvoiceForTest is the test-only seam PR A's listInvoices
+// handler tests use to plant invoice rows directly. PR B wires
+// UpsertInvoice via the webhook path; until then, no production
+// code calls this. Same `*_ForTest` naming as SetPastDueAtForTest
+// / SetDeletionRequestedAtForTest — production-audit friendly and
+// not on the Store interface, so ad-hoc writers cannot appear.
+func (m *MemStore) SeedInvoiceForTest(inv Invoice) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inv.ID == "" {
+		inv.ID = "inv-" + inv.ProviderInvoiceID
+	}
+	if inv.Currency == "" {
+		inv.Currency = "eur"
+	}
+	m.invoices[inv.ID] = inv
 }
 
 // UsageByHour returns the per-app usage rows whose minute ∈ [start, end).

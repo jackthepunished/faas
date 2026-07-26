@@ -118,10 +118,46 @@ type Account struct {
 	// suspended → deleted_pending transitions. NULL on accounts that
 	// have never been past_due.
 	PastDueAt *time.Time
+	// MFAEnrolledAt is stamped by /v1/account/mfa/confirm on the first
+	// successful TOTP verification. NULL = never enrolled. The gate
+	// the login handlers check is (MFARequired && MFAEnrolledAt == nil)
+	// — issued as an mfa_pending session cookie. See ADR-035 and the
+	// IAM-2 plan in issue #186.
+	MFAEnrolledAt *time.Time
+	// MFASecretEncrypted is the age-sealed base32 TOTP secret produced
+	// by pkg/auth/totp.GenerateSecret and sealed in pkg/secretbox
+	// (same host age key as app_secrets). The plaintext never enters
+	// logs or audit; the envelope is decrypted only inside the verify
+	// handler. NULL when MFAEnrolledAt is NULL. CHECK constraint
+	// accounts_mfa_enrolled_shape_chk enforces the (enrolled ⇒
+	// secret+recovery present) shape at the DB layer.
+	MFASecretEncrypted []byte
+	// MFARecoveryCodesHash is the array of SHA-256 hashes of the
+	// customer's 10 single-use recovery codes. Consumed (and removed)
+	// by /v1/account/mfa/recover via SELECT FOR UPDATE + UPDATE,
+	// because Postgres bytea[] has no array-diffing write. Stored as
+	// bytea[] so the consume path is a single-row serialised update.
+	MFARecoveryCodesHash [][]byte
+	// MFARequired is the policy flag set by the three chokepoints:
+	// plan upgrade, card attached, 2nd deploy. The customer clears it
+	// only by completing /enroll + /confirm (MarkMFAEnrolled flips it
+	// to false on the first successful confirm) or by /disable. API
+	// keys ignore this column per the IAM-2 design decision (keys are
+	// already cryptographically scoped).
+	MFARequired bool
 }
 
 // Active reports whether the account may deploy (not suspended/deleted).
 func (a Account) Active() bool { return a.Status == AccountActive || a.Status == AccountPastDue }
+
+// MFAEnrolled reports whether the customer has at least one
+// successful TOTP confirmation. Distinct from MFARequired: a
+// customer who has enrolled is no longer blocked even if a future
+// plan change again sets MFARequired=true. The LATCH is on
+// MFAEnrolled, not MFARequired — the chokepoints set required=true,
+// the customer clears it once via /confirm, and the chokepoints
+// re-arm on the next trigger.
+func (a Account) MFAEnrolled() bool { return a.MFAEnrolledAt != nil }
 
 // APIKey is a hashed, account-scoped credential. Scopes is the set of
 // authorization scopes attached to the key (e.g. "admin", "read", "write");
@@ -478,6 +514,39 @@ type Usage struct {
 	Month     time.Time // truncated to month
 	MBSeconds int64
 	Requests  int64
+}
+
+// Invoice is one persisted invoice from a billing provider (issue #259,
+// BILLING: plan comparison + invoice history). Rows arrive via the
+// webhook ingestion path (PR B); the read API and dashboard read this
+// table. Per-account filter is enforced by the Store method that
+// returns this type — never expose the cross-account scan.
+//
+// Money is integer cents in the provider's currency; the financial
+// model distills to EUR at the API edge. Currency is preserved per
+// row so future multi-currency support can land without a backfill.
+//
+// HostedURL is intentionally NOT exposed on the read surface — the
+// column lives in invoices.hosted_url for PR-B audit only. Provider
+// invoice URLs and PDF URLs are session-scoped; we never hand them to
+// the customer via this API.
+type Invoice struct {
+	ID                string
+	AccountID         string
+	Provider          string // "stripe" | "paddle"
+	ProviderInvoiceID string
+	Number            string
+	Status            string // "draft" | "open" | "paid" | "uncollectible" | "void"
+	PeriodStart       time.Time
+	PeriodEnd         time.Time
+	SubtotalCents     int64
+	TaxCents          int64
+	TotalCents        int64
+	AmountPaidCents   int64
+	Currency          string
+	PDFAvailable      bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // UpdateAppParams is the partial-update payload for PATCH /v1/apps/{slug}.

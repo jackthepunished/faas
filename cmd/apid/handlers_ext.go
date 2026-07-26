@@ -917,6 +917,18 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
+	// IAM-2 (issue #186): plan-upgrade chokepoint. Crossing the
+	// free|hobby → pro|scale boundary arms mfa_required so the
+	// customer's next login flips to mfa_pending. Re-fetched
+	// `updated` carries the post-change plan in case a future
+	// change moves the live row state; mfaFlipOnUpgrade only
+	// needs the old/new pair, which we still have here.
+	if mfaFlipOnUpgrade(acct.Plan, plan) {
+		s.flipMFARequiredIfUnenrolled(ctx(r), updated, "plan_upgrade", map[string]any{
+			"from": string(acct.Plan),
+			"to":   string(plan),
+		})
+	}
 	writeJSON(w, http.StatusOK, api.AccountResponse{
 		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
 	})
@@ -1057,6 +1069,26 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 // VerifyWebhook returns the normalized enum directly.
 func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) {
 	switch ev.Type {
+	case billing.EventSubscriptionCreated:
+		// IAM-2 (issue #186) card-attached chokepoint. The
+		// customer's first successful subscription event is the
+		// "real customer with payment" boundary — flipping the
+		// flag here means a customer who lands on the platform
+		// via a Stripe Checkout flow is gated to MFA enrollment
+		// on next login. SubscriptionUpdated (the periodic
+		// plan-change ping) does NOT re-fire — Stripe and Paddle
+		// both redeliver it on every plan change, and the audit
+		// log would double up. Re-fetch `acct` carries the
+		// post-event status for the chokepoint's enrolled check.
+		fresh, err := s.store.AccountByID(ctx, acct.ID)
+		if err != nil {
+			s.log.Warn("card_attached chokepoint account fetch failed",
+				"account", acct.ID, "err", err.Error())
+		} else {
+			s.flipMFARequiredIfUnenrolled(ctx, fresh, "card_attached", map[string]any{
+				"provider": "stripe_or_paddle",
+			})
+		}
 	case billing.EventSubscriptionCanceled:
 		_ = s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountSuspended)
 	case billing.EventPaymentFailed:
@@ -1348,6 +1380,102 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 		OverageGBHours:  overage,
 		OverageCents:    overageCents,
 	})
+}
+
+// listInvoices serves GET /v1/invoices — issue #259 invoice history.
+// Account-scoped: the authenticated principal is the only source of
+// accountID. Pagination is RFC3339Nano cursor (period_end DESC); month
+// is an optional "YYYY-MM" filter (half-open UTC range). Empty history
+// returns 200 with an empty items array, never 404.
+func (s *server) listInvoices(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	monthPtr, before, limit, perr := parseInvoiceListParams(r)
+	if perr != nil {
+		api.WriteProblem(w, perr)
+		return
+	}
+	rows, err := s.store.ListInvoicesForAccount(ctx(r), acct.ID, monthPtr, before, limit)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list invoices"))
+		return
+	}
+	resp := api.InvoiceListResponse{Items: make([]api.Invoice, 0, len(rows))}
+	for _, inv := range rows {
+		resp.Items = append(resp.Items, invoiceResponse(inv))
+	}
+	if len(rows) == limit && len(resp.Items) > 0 {
+		// Same emit convention as listDeployments: format the last
+		// row's period_end as RFC3339Nano so the handler can hand
+		// the value back unchanged as `before` on the next request.
+		resp.NextBefore = resp.Items[len(resp.Items)-1].PeriodEnd.UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseInvoiceListParams parses the GET /v1/invoices query string.
+// Returns the structured (problem, nil) pair on validation failure so
+// the handler can write through without duplicating the WriteProblem
+// boilerplate. month filter is optional; limit is clamped 1..100
+// (default 25). On bad limit we thread the limit + observed values
+// into the Problem so RFC 7807 consumers can surface actionable
+// guidance (CLAUDE.md "limit errors include limit + observed + docs").
+func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time, limit int, err *api.Problem) {
+	const limitMax = 100
+	limit = 25
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > limitMax {
+			observed := int64(0)
+			if perr == nil {
+				observed = int64(n)
+			}
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad limit", "expected 1..100").
+				WithLimit(int64(limitMax), observed).
+				WithDocs("https://docs.DOMAIN/billing#invoices")
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("month"); v != "" {
+		m, perr := time.Parse("2006-01", v)
+		if perr != nil {
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad month", "expected YYYY-MM")
+		}
+		month = &m
+	}
+	if v := r.URL.Query().Get("before"); v != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, v); perr == nil {
+			before = t
+		} else if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+			before = t
+		} else {
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad cursor", "expected RFC3339 timestamp")
+		}
+	}
+	return month, before, limit, nil
+}
+
+// invoiceResponse maps state.Invoice to the API DTO. Direct field
+// pass-through — the state row is already in the on-the-wire shape,
+// except HostedURL which is intentionally dropped (PR-B audit only).
+func invoiceResponse(inv state.Invoice) api.Invoice {
+	return api.Invoice{
+		ID:                inv.ID,
+		Provider:          inv.Provider,
+		ProviderInvoiceID: inv.ProviderInvoiceID,
+		Number:            inv.Number,
+		Status:            inv.Status,
+		PeriodStart:       inv.PeriodStart,
+		PeriodEnd:         inv.PeriodEnd,
+		SubtotalCents:     inv.SubtotalCents,
+		TaxCents:          inv.TaxCents,
+		TotalCents:        inv.TotalCents,
+		AmountPaidCents:   inv.AmountPaidCents,
+		Currency:          inv.Currency,
+		PDFAvailable:      inv.PDFAvailable,
+		CreatedAt:         inv.CreatedAt,
+	}
 }
 
 // --- small helpers ---------------------------------------------------------
