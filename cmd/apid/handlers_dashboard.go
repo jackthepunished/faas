@@ -21,6 +21,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -92,7 +93,7 @@ func (s *server) renderIndex(w http.ResponseWriter, r *http.Request, log *slog.L
 		DeployedAppCount: av.AppCount,
 		Plan:             string(acct.Plan),
 	}}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }
@@ -159,7 +160,7 @@ func (s *server) renderAppsList(w http.ResponseWriter, r *http.Request, log *slo
 	// finding #5: avoid a second SQL round-trip when we already
 	// have the data).
 	page := dashboard.Page{Title: "Apps", Body: "apps_list", Account: dashboardAccountView(view, len(apps)), Data: items}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }
@@ -254,7 +255,7 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		Crons:           cronItems,
 		RecentInstances: recentItems,
 	}}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }
@@ -292,7 +293,7 @@ func (s *server) renderUsage(w http.ResponseWriter, r *http.Request, log *slog.L
 		OverageGBHours:  max(0, used-float64(included)),
 		UsedPct:         pct,
 	}}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }
@@ -315,7 +316,7 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 		AppLayer: limits.AppLayerMaxMB,
 		IdleSec:  limits.IdleTimeoutS,
 	}}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }
@@ -401,7 +402,7 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 		data.FlashSurface = "Account restored. Welcome back."
 	}
 	page := dashboard.Page{Title: "Account", Body: "account", Account: dashboardAccountView(view, appCount), Data: data}
-	if err := dashboard.Render(w, log, page); err != nil {
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
 }

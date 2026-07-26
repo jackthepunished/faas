@@ -16,6 +16,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -153,6 +154,15 @@ type server struct {
 // sub-second resolution, and a long-enough window keeps WAL amplification
 // bounded even under sustained 1k RPS on one key.
 const keyTouchWindow = 30 * time.Second
+
+// apidAlwaysGate is the httpsec.Nonce CSP gate for apid. Unlike
+// gatewayd (which uses cmd/gatewayd/proxy.isApidPath to skip CSP on
+// customer-app responses), apid serves only dashboard + API JSON,
+// so CSP is unconditional. Returning true makes every response
+// carry a Content-Security-Policy header. The signature still takes
+// *http.Request to match the gatewayd gate's shape, so a future
+// "API responses skip CSP" optimisation is a one-line change here.
+func apidAlwaysGate(*http.Request) bool { return true }
 
 // shouldTouchKey reports whether the key's last_used_at is stale enough
 // to warrant an UPDATE. Atomic-ish via sync.Map.LoadOrStore so two
@@ -707,7 +717,16 @@ func (s *server) handler() http.Handler {
 	// Nil s.ops (no metrics wired) = no-op passthrough. Includes
 	// the spec routes above so SDK codegen hits show up on the
 	// §12 dashboard's per-route latency panel.
-	return s.observeWrap(mux)
+	//
+	// Issue #249 / spec §11: security response headers sit OUTERMOST
+	// (above observeWrap) so every status code carries them — even
+	// the ones observeWrap synthesizes on panic. httpsec.Static sets
+	// the five static headers; httpsec.Nonce mints a per-request CSP
+	// nonce and stamps it on the context that dashboard.Render reads
+	// to mark up <script>/<style> tags. apid serves only dashboard
+	// + JSON so CSP is unconditional (no customer-app path to
+	// protect).
+	return httpsec.Static(httpsec.Nonce(apidAlwaysGate, s.observeWrap(mux)))
 }
 
 // observeWrap returns the mux wrapped in an observe middleware that

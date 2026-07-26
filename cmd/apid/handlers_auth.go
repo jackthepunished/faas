@@ -43,6 +43,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -79,7 +80,7 @@ func (a *authHandlers) renderLoginForm(w http.ResponseWriter, r *http.Request) {
 		Title: "Sign in",
 		Body:  "login",
 	}
-	if err := dashboard.Render(w, a.log, page); err != nil {
+	if err := dashboard.Render(w, a.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		a.log.Error("dashboard render login form", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}
