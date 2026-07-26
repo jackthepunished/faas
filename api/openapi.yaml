@@ -62,6 +62,12 @@ tags:
     description: Per-app sealed secrets (sealed at rest).
   - name: usage
     description: Usage roll-up and metering.
+  - name: admin
+    description: |
+      Operator-only routes (issue #279). Two-layer auth: the
+      Bearer must carry the admin scope AND the caller's email
+      must be in FAAS_ADMIN_EMAILS. CLI surface:
+      `faas admin credit <account_uuid> <cents> --reason <text>`.
   - name: auth
     description: |
       Dashboard authentication (issue #165 PR #2, ADR-032).
@@ -1928,6 +1934,50 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Operator credits (issue #279) ─────────────────────────────────────
+  # Admin-only endpoint that issues a positive-cents credit to a
+  # customer account. Two-layer auth: api.ScopesAdminOnly scope on
+  # the API key AND the caller's email in the FAAS_ADMIN_EMAILS
+  # allowlist. Idempotent on the Idempotency-Key header (24 h
+  # dedupe). The credit is integer cents (CLAUDE.md "never float
+  # on money") and the reason text is 3..500 chars (auditable).
+  /v1/admin/accounts/{id}/credits:
+    post:
+      tags: [admin]
+      operationId: issueAccountCredit
+      summary: Issue a positive-cents credit to an account (admin-only).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Target account UUID.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cents, reason]
+              properties:
+                cents:  { type: integer, minimum: 1, description: 'Credit amount in EUR cents (integer).' }
+                reason: { type: string,  minLength: 3, maxLength: 500, description: 'Operator-supplied audit reason.' }
+      responses:
+        '201':
+          description: Credit issued. Returns the new credit row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountCreditResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — call requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
   # `apid` embeds api/openapi.yaml at build time and serves the same bytes
   # customers see in the repo. The /json variant re-emits the spec in JSON
@@ -2488,6 +2538,24 @@ components:
         started_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time }
         sbom_storage_key: { type: [string, "null"], description: "Phase 3 populator fills this from `syft` output. Empty string when not yet populated." }
+
+    AccountCreditResponse:
+      description: |
+        One row in the account_credits table (issue #279). cents_remaining
+        is the integer-cents balance still available; consumption
+        decrements it (the consumption reducer lands in a follow-up
+        PR). expires_at is RFC 3339 when set; absent (or null) means
+        the credit is valid until fully consumed. reason is the
+        operator-supplied audit text (3..500 chars).
+      type: object
+      required: [id, account_id, cents_remaining, reason, created_at]
+      properties:
+        id:             { type: string, format: uuid }
+        account_id:     { type: string, format: uuid }
+        cents_remaining: { type: integer, minimum: 0 }
+        reason:         { type: string, minLength: 3, maxLength: 500 }
+        created_at:     { type: string, format: date-time }
+        expires_at:     { type: [string, "null"], format: date-time }
 
     CreateDeploymentRequest:
       description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload."

@@ -1038,6 +1038,40 @@ type Store interface {
 	// responsibility (handler clamps at 25 default). The returned
 	// slice is empty (not nil) when the account has no rows.
 	ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error)
+
+	// Account credits (issue #279). The handler is the only writer to
+	// account_credits + credit_ledger; meterd reads overage_cap_cents
+	// on every quota tick. CreateAccountCredit inserts a new positive
+	// balance and returns the row with the DB-assigned id and
+	// created_at. ListAccountCredits reads the account's balance
+	// rows; onlyActive filters to (cents_remaining > 0) and (expires_at
+	// is null OR expires_at > now()) — the active set the consumption
+	// reducer will use once it lands. CreateCreditLedgerEntry is the
+	// append-only audit row — paired one-to-one with the issuance
+	// (and later, with consumption). GetAccountOverageCapCents
+	// returns (cents, true) when the column is set, (0, false, nil)
+	// when NULL; the handler treats (cents=0, ok=true) as "no
+	// overage allowed" and (ok=false) as "no cap".
+	CreateAccountCredit(ctx context.Context, c AccountCredit) (AccountCredit, error)
+	ListAccountCredits(ctx context.Context, accountID string, onlyActive bool) ([]AccountCredit, error)
+	CreateCreditLedgerEntry(ctx context.Context, e CreditLedgerEntry) error
+	GetAccountOverageCapCents(ctx context.Context, accountID string) (int64, bool, error)
+	// LoadAllOverageCapCents returns every (account_id, cap) tuple in
+	// one round-trip. meterd's quota tick walks all accounts every
+	// minute and would otherwise issue N single-row reads; the bulk
+	// read keeps the per-tick cost at one round-trip. Drops accounts
+	// whose overage_cap_cents is NULL — the caller treats them as "no
+	// cap". Returned map is keyed by account_id; cents is the integer
+	// monthly ceiling (≥ 0).
+	LoadAllOverageCapCents(ctx context.Context) (map[string]int64, error)
+	// CurrentMonthOverageCents returns the account's derived overage
+	// in integer cents for the current UTC month. 1 GB-h = 100 cents
+	// at €0.01/GB-h (CLAUDE.md: integer cents only, never float).
+	// meterd consults this on every quota tick to decide whether the
+	// overage row should be capped. The PgStore implementation sums
+	// usage_minutes.mb_seconds since the UTC month start and converts
+	// to cents; the MemStore mirrors the formula in Go.
+	CurrentMonthOverageCents(ctx context.Context, accountID string) (int64, error)
 	// UsageByHour returns the per-app usage rows whose minute ∈ [start,
 	// end). The Stripe pusher calls this hourly to compute the billable
 	// GB-RAM-hours for the past hour (spec §4.7, ADR-010). MemStore scans

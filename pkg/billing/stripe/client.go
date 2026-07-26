@@ -247,19 +247,35 @@ func (c *Client) VerifyWebhook(payload []byte, headers map[string]string, tolera
 				Status           string `json:"status"`
 				Plan             string `json:"plan"`
 				SubscriptionItem string `json:"subscription_item"`
+				// charge.refunded payload (issue #279):
+				ID             string `json:"id"`
+				AmountRefunded int64  `json:"amount_refunded"`
+				Currency       string `json:"currency"`
+				Refunded       bool   `json:"refunded"`
 			} `json:"object"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		return billing.Event{}, fmt.Errorf("stripe: parse webhook body: %w", err)
 	}
-	return billing.Event{
+	out := billing.Event{
 		Type:           mapStripeEventType(ev.Type),
 		CustomerID:     ev.Data.Object.Customer,
 		PlanID:         ev.Data.Object.Plan,
 		SubscriptionID: ev.Data.Object.Subscription,
 		Raw:            bytes.Clone(payload),
-	}, nil
+	}
+	// For charge.refunded the Object IS the charge (Stripe's payload
+	// shape: data.object.{id, amount_refunded, currency, refunded}).
+	// amount_refunded is in millicents — convert to cents for the
+	// billing.Event (which is always in cents; CLAUDE.md "no float on
+	// money"). Integer math only.
+	if ev.Type == "charge.refunded" {
+		out.ChargeID = ev.Data.Object.ID
+		out.Currency = ev.Data.Object.Currency
+		out.AmountCents = ev.Data.Object.AmountRefunded / 10
+	}
+	return out, nil
 }
 
 // CreateUpgradeTransaction is the Stripe stub for the billing.Provider
@@ -276,6 +292,59 @@ func (c *Client) VerifyWebhook(payload []byte, headers map[string]string, tolera
 // the full contract.
 func (c *Client) CreateUpgradeTransaction(_ context.Context, _ state.Account, _ api.Plan) (string, string, error) {
 	return "", "", nil
+}
+
+// Refund issues a refund against the named charge. amountCents is
+// converted to millicents (×10) before being handed to the Stripe SDK
+// because Stripe's Amount field is millicents (CLAUDE.md: integer
+// cents/millicents; no float on money). The Idempotency-Key, if
+// present on the context, is forwarded to Refunds.New so a network
+// retry returns the same `re_…` id rather than creating a duplicate
+// refund. apid stamps the operator's request's Idempotency-Key
+// header onto the ctx before calling (cmd/apid/handlers_admin_credits.go).
+//
+// Returns a wrapped *stripe.Error when Stripe rejects the call
+// (e.g. amount_too_large, charge_already_refunded, charge_not_found).
+// Today the apid handler maps any non-nil error to a 502 Problem;
+// finer-grained mapping (e.g. amount_too_large → 400) is a follow-up.
+func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64) (*billing.RefundResult, error) {
+	params := &stripe.RefundParams{
+		Charge: stripe.String(chargeID),
+		Amount: stripe.Int64(amountCents * 10), // cents → millicents
+	}
+	if k, ok := idempotencyKeyFromContext(ctx); ok {
+		params.IdempotencyKey = stripe.String(k)
+	}
+	r, err := c.api.Refunds.New(params)
+	if err != nil {
+		return nil, fmt.Errorf("stripe: refund charge=%s amount_cents=%d: %w", chargeID, amountCents, err)
+	}
+	return &billing.RefundResult{
+		ProviderRefundID: r.ID,
+		ChargeID:         chargeID,
+		AmountCents:      amountCents,
+		Currency:         string(r.Currency),
+	}, nil
+}
+
+// idempotencyKeyContextKey is the unexported context-key the apid
+// handler uses to forward the request's Idempotency-Key header to
+// Refund. Centralized so the apid path and the SDK path agree on
+// the key without importing the same context-key in two places.
+type idempotencyKeyContextKey struct{}
+
+// idempotencyKeyFromContext reads the key set on ctx by the apid
+// handler. The bool return distinguishes a missing key from an
+// empty key; the helper is the only caller-side seam today because
+// the apid path doesn't currently invoke Stripe Refund (operator
+// credits are server-internal; the Stripe Refund seam is reserved
+// for a future Stripe-initiated refund flow).
+func idempotencyKeyFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(idempotencyKeyContextKey{}).(string)
+	if !ok || v == "" {
+		return "", false
+	}
+	return v, true
 }
 
 // mapStripeEventType translates Stripe's `type` strings into the
@@ -296,6 +365,8 @@ func mapStripeEventType(t string) billing.EventType {
 		return billing.EventPaymentSucceeded
 	case "invoice.payment_failed":
 		return billing.EventPaymentFailed
+	case "charge.refunded":
+		return billing.EventRefundProcessed
 	default:
 		return billing.EventUnknown
 	}

@@ -594,6 +594,45 @@ type Invoice struct {
 	UpdatedAt         time.Time
 }
 
+// AccountCredit is one positive-cents balance issued by an operator
+// via POST /v1/admin/accounts/{id}/credits (issue #279). cents_remaining
+// is decremented at consumption time (the consumption reducer is the
+// PR #323 invoice-finalization follow-up; this PR only lands the
+// issuance surface). Cents is integer — never float on money (CLAUDE.md).
+//
+// @migration 00049 creates this table. expires_at is optional; a NULL
+// expiry means the credit is valid until fully consumed. The active
+// partial index (where cents_remaining > 0) speeds up the
+// "consume next credit" query when the consumption reducer lands.
+type AccountCredit struct {
+	ID             string
+	AccountID      string
+	CentsRemaining int64
+	Reason         string
+	CreatedAt      time.Time
+	ExpiresAt      *time.Time
+}
+
+// CreditLedgerEntry is one immutable row in the append-only audit log
+// of credit deltas (issue #279). One row is inserted per issuance
+// (delta positive) and per consumption (delta negative, when the
+// consumption reducer lands). The handler always supplies a reason
+// text and the operator account ID as actor; the row is never
+// updated or deleted by code convention (no surface grants a write).
+//
+// @migration 00049 creates this table. ON DELETE CASCADE on account_id
+// and credit_id so GDPR DeleteAccount scrubs both tables in the same
+// transaction that scrubs the rest of the customer's data.
+type CreditLedgerEntry struct {
+	ID         string
+	AccountID  string
+	CreditID   string
+	DeltaCents int64
+	Reason     string
+	Actor      string
+	CreatedAt  time.Time
+}
+
 // UpdateAppParams is the partial-update payload for PATCH /v1/apps/{slug}.
 // Nil pointers mean "leave unchanged" (only the slug/ram/idle/concurrency/
 // min_instances/status fields are user-mutable; type and runtime are

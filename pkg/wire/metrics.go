@@ -177,6 +177,15 @@ type OpsMetrics struct {
 	// in the pre-instantiation loop below so every plan label surfaces
 	// in /metrics from the moment the daemon boots.
 	residentGBPerCustomer *prometheus.GaugeVec
+	// billingCapExceededTotal: counter incremented by meterd's quota
+	// tick every time the per-account overage_cap_cents is met and
+	// the overage-row insert is skipped (issue #279). Labelled by
+	// plan ∈ {free, hobby, pro, scale} so the §12 dashboard can
+	// surface "how many accounts are at the cap right now" per plan.
+	// A non-zero rate is informational: a cap-hit account is
+	// operating as designed (the customer hit the operator-set
+	// monthly ceiling), not a failure mode.
+	billingCapExceededTotal *prometheus.CounterVec
 	// imagedOCIPull: per-call latency of imaged's OCI registry pulls
 	// (manifest, config, blob, above-base). Sized to api.OCIPullTimeoutSeconds
 	// (60 s); the 5 s control-plane bucket is wrong for the multi-second
@@ -391,6 +400,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_resident_gb_per_customer",
 		Help: "Monthly GB-RAM-hours divided by paying-customer count, per plan (ADR-031). Spec §12 target 0.305 (≈312 MB/customer); > 0.45 warns. Emitted by meterd once per ResidencyInterval.",
 	}, []string{"plan"})
+	billingCapExceededTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_billing_cap_exceeded_total",
+		Help: "Count of meterd quota ticks where accounts.overage_cap_cents was met and the overage-row insert was skipped (issue #279). Per-plan label so the §12 dashboard can split cap hits across plans. A non-zero rate is informational: a cap-hit account is operating as designed (the customer hit the operator-set monthly ceiling), not a failure mode.",
+	}, []string{"plan"})
 	wakeIDV4Fallback := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_wake_id_v4_fallback_total",
 		Help: "Count of wake_id mints where uuid.NewV7 returned an error and the engine fell back to uuid.New (v4). Any non-zero rate indicates a broken crypto/rand subsystem and breaks the time-ordering invariant the instances_wake_id_app_idx partial index is built on. Should never increment in production.",
@@ -504,7 +517,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		commonCollectors = append(commonCollectors, ociEgressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
+	} else {
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
 	}
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
@@ -559,6 +574,13 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// least one plan tick has fired (ADR-031).
 	for _, plan := range api.Plans {
 		residentGBPerCustomer.WithLabelValues(string(plan))
+	}
+	// Pre-instantiate the closed plan set for the billingCapExceeded
+	// counter (issue #279). Same precedent as residentGBPerCustomer
+	// above. An idle box with no cap-hits would otherwise render the
+	// §12 dashboard panel as "no data" until the first cap hit.
+	for _, plan := range api.Plans {
+		billingCapExceededTotal.WithLabelValues(string(plan))
 	}
 	// Pre-instantiate every (cidr, family) label tuple from the egress
 	// denylist catalog so the counter's HELP/TYPE and zero-valued series
@@ -620,6 +642,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		buildDur:                   buildDur,
 		buildQueueWait:             buildQueueWait,
 		residentGBPerCustomer:      residentGBPerCustomer,
+		billingCapExceededTotal:    billingCapExceededTotal,
 		wakeIDV4Fallback:           wakeIDV4Fallback,
 		imagedOCIPull:              imagedOCIPull,
 		instanceCPUPct:             instanceCPUPct,
@@ -1020,6 +1043,20 @@ func (m *OpsMetrics) SetResidentGBPerCustomer(plan string, gb float64) {
 		return
 	}
 	m.residentGBPerCustomer.WithLabelValues(plan).Set(gb)
+}
+
+// BillingCapExceededTotal is the per-plan counter the meterd quota
+// tick increments every time accounts.overage_cap_cents is met and
+// the overage-row insert is skipped (issue #279). Labelled by plan
+// ∈ {free, hobby, pro, scale}. A non-zero rate is informational: a
+// cap-hit account is operating as designed (the customer hit the
+// operator-set monthly ceiling), not a failure mode. Safe on a nil
+// receiver so meterd unit tests without metrics keep working.
+func (m *OpsMetrics) BillingCapExceededTotal(plan string) {
+	if m == nil {
+		return
+	}
+	m.billingCapExceededTotal.WithLabelValues(plan).Inc()
 }
 
 // ReplaceInstanceStats rewrites the per-{app,node} instance-stats

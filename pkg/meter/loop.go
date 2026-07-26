@@ -191,16 +191,53 @@ func (l *Loop) runQuotaTicks(ctx context.Context) error {
 	}
 }
 
-// runQuotaOnce is exported as RunQuotaOnce so tests can step it without
-// spinning the ticker. Production's only caller is runQuotaTicks.
+// RunQuotaOnce is the test seam for the per-account quota loop. It
+// runs a single tick of the quota sweep without spinning the ticker,
+// so cap tests can pin the synthetic clock and assert the
+// meterd_billing_cap_exceeded_total counter incremented. Production
+// callers must use Run, which schedules runQuotaTicks on the
+// configured QuotaInterval.
+func (l *Loop) RunQuotaOnce(ctx context.Context) {
+	l.runQuotaOnce(ctx)
+}
+
+// runQuotaOnce is exposed to tests via the RunQuotaOnce thin wrapper
+// below so the ticker doesn't have to spin. Production's only caller
+// is runQuotaTicks.
+//
+// Issue #279 PR A: a per-account overage cap (`accounts.overage_cap_cents`,
+// opt-in) sits in front of the existing free/paid ladder. The cap is
+// loaded once per tick (one round-trip) and consulted per account;
+// accounts at-or-past the cap skip the overage-row insert path
+// inside EnforceQuota and the meterd_billing_cap_exceeded_total
+// counter is incremented with the plan label. The cap is advisory
+// for overage only — in-budget usage continues to accumulate and
+// the Free hard-stop / paid warning ladder is unchanged.
 func (l *Loop) runQuotaOnce(ctx context.Context) {
 	accounts, err := l.store.ListAllAccounts(ctx)
 	if err != nil {
 		l.log.Warn("meter: quota list_accounts", "err", err)
 		return
 	}
+	capCache, err := l.store.LoadAllOverageCapCents(ctx)
+	if err != nil {
+		// Fail-open: a transient read failure must not skip the
+		// quota ladder. Log once and proceed with no caps.
+		l.log.Warn("meter: overage cap load failed", "err", err)
+		capCache = map[string]int64{}
+	}
 	now := l.now()
 	for _, acct := range accounts {
+		capCents, ok := capCache[acct.ID]
+		if ok && capCents >= 0 {
+			monthCents, err := l.store.CurrentMonthOverageCents(ctx, acct.ID)
+			if err != nil {
+				l.log.Warn("meter: overage read failed", "account", acct.ID, "err", err)
+			} else if monthCents >= capCents {
+				l.ops.BillingCapExceededTotal(string(acct.Plan))
+				continue
+			}
+		}
 		usages, err := MonthUsageForAccount(ctx, l.store, acct.ID, now)
 		if err != nil {
 			l.log.Warn("meter: quota usage_by_month", "account", acct.ID, "err", err)

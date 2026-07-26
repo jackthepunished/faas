@@ -489,6 +489,13 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.createKey))))
 	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteKey))))
 
+	// Operator-only billing surface (issue #279). The admin allowlist
+	// is enforced inside the handler (adminAllows), not just at the
+	// middleware — a leaked admin key from a non-operator account
+	// would otherwise be able to issue credits.
+	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
+
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
 	// cookie (implicitly admin) or any API key carrying {admin,
