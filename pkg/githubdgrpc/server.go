@@ -32,7 +32,14 @@ type Service interface {
 	// configured GitHub App. apid's /oauth/callback handler calls this
 	// before persisting the binding, so a forged callback cannot claim
 	// an install_id the customer doesn't own (review finding #2).
-	VerifyInstallation(installationID int64) (verified bool, defaultBranch string, err error)
+	//
+	// PR-B §11 ownership proof: when expectedLogin is non-empty, the
+	// install's account.login MUST match for verified=true. Returns
+	// accountLogin (the install's actual GitHub login) on the success
+	// path so the apid handler can audit-log it. On mismatch
+	// (verified=false, err=nil) accountLogin is empty so a forged
+	// caller cannot learn whether the install exists.
+	VerifyInstallation(installationID int64, expectedLogin string) (verified bool, accountLogin string, defaultBranch string, err error)
 }
 
 // Server implements githubdpb.GithubdServer. It wraps a Service so
@@ -189,13 +196,16 @@ func (s *Server) WriteCheck(ctx context.Context, req *githubdpb.WriteCheckReques
 // Called by apid's /oauth/callback handler before persisting a binding
 // (review finding #1+#2 closure); githubd mints the App JWT and
 // confirms the installation_id actually exists for the configured
-// GitHub App. A forged callback without a real install returns
-// verified=false (or a non-nil err); the dashboard treats both as
-// "401 the user, don't persist".
+// GitHub App. PR-B adds the §11 ownership proof: req.GetExpectedLogin
+// (when non-empty) must match the install's account.login.
+//
+// A forged callback without a real install returns verified=false
+// (or a non-nil err); the dashboard treats both as "401 the user,
+// don't persist".
 func (s *Server) VerifyInstallation(ctx context.Context, req *githubdpb.VerifyInstallationRequest) (*githubdpb.VerifyInstallationResponse, error) {
 	const op = "VerifyInstallation"
 	start := time.Now()
-	verified, defaultBranch, err := s.svc.VerifyInstallation(req.GetInstallationId())
+	verified, accountLogin, defaultBranch, err := s.svc.VerifyInstallation(req.GetInstallationId(), req.GetExpectedLogin())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, toStatusErr(err)
@@ -203,6 +213,7 @@ func (s *Server) VerifyInstallation(ctx context.Context, req *githubdpb.VerifyIn
 	return &githubdpb.VerifyInstallationResponse{
 		Verified:      verified,
 		DefaultBranch: defaultBranch,
+		AccountLogin:  accountLogin,
 	}, nil
 }
 
@@ -274,6 +285,6 @@ func (UnimplementedService) WriteCheck(string, string, CheckPhase, string, strin
 // review finding #2). The slice-1 / test build keeps returning
 // Unimplemented so the round-trip exercises the gRPC plumbing
 // without committing to the verify-via-GitHub-API shape.
-func (UnimplementedService) VerifyInstallation(int64) (bool, string, error) {
-	return false, "", status.Error(codes.Unimplemented, "githubd: VerifyInstallation not yet wired (slice 8)")
+func (UnimplementedService) VerifyInstallation(int64, string) (bool, string, string, error) {
+	return false, "", "", status.Error(codes.Unimplemented, "githubd: VerifyInstallation not yet wired (slice 8)")
 }

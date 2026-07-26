@@ -75,11 +75,23 @@ service Githubd {
   // #2 closure). githubd mints the App JWT + GETs
   // /app/installations/{id}; the response includes the install's
   // default_branch (used to seed BindAppRepo on the success path).
+  //
+  // PR-B adds expected_login: when non-empty, githubd returns
+  // verified=false if the install's account.login does not match.
+  // This closes the §11 install-takeover hole where any logged-in
+  // FaaS account could adopt any installation_id the GitHub App
+  // knew about (review finding #2 only closed the
+  // install-belongs-to-the-app half; the install-belongs-to-the-user
+  // half lands here).
   rpc VerifyInstallation(VerifyInstallationRequest) returns (VerifyInstallationResponse);
 }
 
 message VerifyInstallationRequest {
   int64 installation_id = 1;
+  // expected_login is the GitHub login the caller asserts owns the
+  // install. Empty = no §11 ownership check (the pre-PR-B wire shape,
+  // preserved for back-compat with in-flight callers).
+  string expected_login = 2;
 }
 message VerifyInstallationResponse {
   bool   verified       = 1; // false ⇒ caller should 401/403 the dashboard

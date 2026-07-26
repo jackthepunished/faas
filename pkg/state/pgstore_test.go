@@ -197,6 +197,175 @@ func TestPg_LiveDeploymentAndListAllApps(t *testing.T) {
 	}
 }
 
+// TestPg_UpsertGithubInstallBinding_PersistsAllColumns locks the PR-B
+// write path: every column added in migration 00050 is stamped
+// atomically, and a second call with the same payload is idempotent
+// (the (account_id, binding_id) unique partial index makes the
+// upsert a no-op for duplicate work).
+func TestPg_UpsertGithubInstallBinding_PersistsAllColumns(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctID, appID, _ := seedLiveDeploy(t, s, ctx)
+
+	linked := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	bind := state.GitHubBinding{
+		AppID:            appID,
+		AccountID:        acctID,
+		BindingID:        "bind-pg-1",
+		InstallID:        42,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		LinkedAt:         linked,
+	}
+	if err := s.UpsertGithubInstallBinding(ctx, bind); err != nil {
+		t.Fatalf("UpsertGithubInstallBinding: %v", err)
+	}
+
+	// Round-trip via the reverse-lookup path (uses the
+	// (repo, branch) partial index).
+	got, err := s.GithubInstallBindingForRepoBranch(ctx, "octo/api", "main")
+	if err != nil {
+		t.Fatalf("GithubInstallBindingForRepoBranch: %v", err)
+	}
+	if got.AppID != appID {
+		t.Errorf("AppID = %q, want %q", got.AppID, appID)
+	}
+	if got.AccountID != acctID {
+		t.Errorf("AccountID = %q, want %q", got.AccountID, acctID)
+	}
+	if got.BindingID != "bind-pg-1" {
+		t.Errorf("BindingID = %q, want bind-pg-1", got.BindingID)
+	}
+	if got.InstallID != 42 {
+		t.Errorf("InstallID = %d, want 42", got.InstallID)
+	}
+	if got.ProductionBranch != "main" {
+		t.Errorf("ProductionBranch = %q, want main", got.ProductionBranch)
+	}
+	if !got.LinkedAt.Equal(linked) {
+		t.Errorf("LinkedAt = %v, want %v", got.LinkedAt, linked)
+	}
+
+	// Idempotent: re-apply with the same payload, no error, columns
+	// stay (the unique index makes the upsert a no-op for repeat work).
+	if err := s.UpsertGithubInstallBinding(ctx, bind); err != nil {
+		t.Errorf("repeat UpsertGithubInstallBinding: %v", err)
+	}
+	got2, err := s.GithubInstallBindingForRepoBranch(ctx, "octo/api", "main")
+	if err != nil {
+		t.Fatalf("reverse-lookup after repeat: %v", err)
+	}
+	if got2.BindingID != "bind-pg-1" {
+		t.Errorf("after repeat: BindingID = %q, want bind-pg-1", got2.BindingID)
+	}
+}
+
+// TestPg_DeleteGithubInstallBinding_ClearsColumns pins the unbinding
+// path. The migration's (account_id, binding_id) partial index lets
+// us verify the post-delete state without an extra index lookup.
+func TestPg_DeleteGithubInstallBinding_ClearsColumns(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctID, appID, _ := seedLiveDeploy(t, s, ctx)
+
+	bind := state.GitHubBinding{
+		AppID:            appID,
+		AccountID:        acctID,
+		BindingID:        "bind-pg-del",
+		InstallID:        7,
+		RepoFullName:     "octo/del",
+		ProductionBranch: "main",
+		LinkedAt:         time.Now(),
+	}
+	if err := s.UpsertGithubInstallBinding(ctx, bind); err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+	if err := s.DeleteGithubInstallBinding(ctx, appID); err != nil {
+		t.Fatalf("DeleteGithubInstallBinding: %v", err)
+	}
+
+	// Reverse-lookup now returns ErrNotFound (install_id is NULL).
+	_, err := s.GithubInstallBindingForRepoBranch(ctx, "octo/del", "main")
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("after delete: err = %v, want ErrNotFound", err)
+	}
+
+	// Idempotent: second delete returns nil (app row exists, just no
+	// binding to clear). Unknown appID returns ErrNotFound so the
+	// dashboard's "unbind" handler can distinguish.
+	if err := s.DeleteGithubInstallBinding(ctx, appID); err != nil {
+		t.Errorf("repeat delete (still same app): err = %v, want nil", err)
+	}
+	if err := s.DeleteGithubInstallBinding(ctx, "00000000-0000-0000-0000-000000000000"); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("delete on unknown app: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPg_ListGithubInstallBindingsForAccount_ScopesByAccount pins the
+// dashboard's hydrate path: bindings under account A must not leak
+// into account B's listing, and the result is keyed by appID.
+func TestPg_ListGithubInstallBindingsForAccount_ScopesByAccount(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctA, appA, _ := seedLiveDeploy(t, s, ctx)
+	// seedLiveDeploy uses a hardcoded email "u@example.com"; create
+	// acctB with a unique email so the unique-key doesn't reject the
+	// second insert.
+	acctBRec, err := s.CreateAccount(ctx, "list-b-"+strconv.FormatInt(time.Now().UnixNano(), 10)+"@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+	appBRec, err := s.CreateApp(ctx, state.App{
+		AccountID: acctBRec.ID, Slug: "pg-app-b-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		Type: state.AppTypeApp, RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp B: %v", err)
+	}
+	acctB, appB := acctBRec.ID, appBRec.ID
+
+	// Bind appA under acctA and appB under acctB.
+	if err := s.UpsertGithubInstallBinding(ctx, state.GitHubBinding{
+		AppID: appA, AccountID: acctA, BindingID: "bind-A",
+		InstallID: 1, RepoFullName: "octo/A", ProductionBranch: "main",
+		LinkedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert A: %v", err)
+	}
+	if err := s.UpsertGithubInstallBinding(ctx, state.GitHubBinding{
+		AppID: appB, AccountID: acctB, BindingID: "bind-B",
+		InstallID: 2, RepoFullName: "octo/B", ProductionBranch: "main",
+		LinkedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert B: %v", err)
+	}
+
+	gotA, err := s.ListGithubInstallBindingsForAccount(ctx, acctA)
+	if err != nil {
+		t.Fatalf("ListA: %v", err)
+	}
+	if len(gotA) != 1 {
+		t.Fatalf("acctA: len = %d, want 1", len(gotA))
+	}
+	if _, ok := gotA[appA]; !ok {
+		t.Errorf("acctA: missing appA")
+	}
+	if _, ok := gotA[appB]; ok {
+		t.Errorf("acctA: leaked appB")
+	}
+
+	gotB, err := s.ListGithubInstallBindingsForAccount(ctx, acctB)
+	if err != nil {
+		t.Fatalf("ListB: %v", err)
+	}
+	if len(gotB) != 1 {
+		t.Fatalf("acctB: len = %d, want 1", len(gotB))
+	}
+	if _, ok := gotB[appB]; !ok {
+		t.Errorf("acctB: missing appB")
+	}
+	if _, ok := gotB[appA]; ok {
+		t.Errorf("acctB: leaked appA")
+	}
+}
+
 // TestPg_SetAppMinInstances_RoundTrip mirrors TestSetAppMinInstances_RoundTrip
 // in app_min_instances_test.go to lock PgStore parity for ux_spec §6.5.
 // The MemStore test catches the API shape; this test catches the SQL.

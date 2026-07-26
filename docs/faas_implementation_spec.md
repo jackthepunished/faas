@@ -506,6 +506,20 @@ The `cidr` label is the canonical `DenyEntry.CounterName` (single source of trut
 
 **Sampling rate**: 15 s scrape interval matches the conventional Prometheus cadence and keeps per-tenant alert latency under one minute (alert rule uses `rate()` over `1m`).
 
+### 12.3 Traffic anomaly detection (issue #303, ADR-039)
+
+The apid counter `apid_request_total{account_id, route, code}` (issue #303) is the per-request total — paired with `apid_request_failures_total{account_id, route}` (issue #278) for the per-account error-rate view. Both counters share the same `accountLabelSet` (issue #278) so a customer is represented by the same `account_id` in both, or by `__other__` in both. The `code` label is added on the new counter so the error-rate alert variant can run off the same counter; this is a deliberate asymmetry from `apid_request_failures_total` (no `code` since failures are by definition `err`) reconciled in a follow-up PR.
+
+The §12 "traffic anomaly" feature reads this counter through a dedicated `faas_anomaly_baseline` recording-rule group (above the existing `faas_slo` group in `deploy/ansible/roles/prometheus/files/faas.rules.yml`). Methodology and thresholds are decided in ADR-039; the alert family is `traffic_anomaly` and the existing `family`-based inhibition / silencing rules compose with it. Four alerts fan out symmetric (rate / error-rate) × (spike / drop) at the route level and the account level, each with a `runbook_url` to `docs/runbooks/FaasTrafficAnomaly.md`.
+
+Per-customer drill-down PromQL (see the runbook for the full set):
+
+```
+sum by (route) (rate(apid_request_total{account_id="<uuid>"}[5m]))
+```
+
+The `account_id="__other__"` series is the bounded overflow bucket — drill-down on this means the customer is past the 10 000 admission cap, and the operator must check the daemon slog for the original id (issue #278).
+
 **SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — one box (until Gate A) is stated honestly on the status page.
 
 Logs: journald → Loki free tier; tenant app stdout/stderr ring-buffered per instance (10 MB), surfaced via `GET /v1/apps/{app}/logs` (tail + follow).

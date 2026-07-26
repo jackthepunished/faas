@@ -56,6 +56,12 @@ type Envelope struct {
 	IssuedAt   time.Time `json:"issued_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	MfaPending bool      `json:"mfa_pending,omitempty"`
+	// GithubLogin is the GitHub login the session was last stamped
+	// with (PR-B §11 ownership proof). Empty when the session was
+	// issued before PR-B or the user never went through
+	// /v1/auth/github. omitempty so pre-PR-B cookies decode to
+	// "" without a key-mismatch error.
+	GithubLogin string `json:"github_login,omitempty"`
 }
 
 // NewManager builds a Manager from a 32-byte key + a session lifetime.
@@ -169,6 +175,49 @@ func (m *Manager) IssueWithMFAFlag(accountID string, mfaPending bool) (string, e
 // function (not a method) so the requireMFA middleware can read
 // the verified Envelope without reaching into the Manager.
 func IsMFAPending(env Envelope) bool { return env.MfaPending }
+
+// SealGithubLogin mints a new cookie carrying the same (accountID,
+// issued_at, expires_at) triple as a fresh Issue, but with the
+// GithubLogin field populated. Used by /v1/auth/github after a
+// successful login so the §11 ownership check on /oauth/callback
+// succeeds for the same user that just authenticated.
+//
+// mfaPending is the IAM-2 flag — IssueWithMFAFlag's argument, kept
+// here so the GitHub handler can seal a cookie that carries both
+// the §11 login AND the mfa_pending bit in a single crypto round
+// (no double-seal). The mfa_pending JSON tag is `omitempty`, so
+// false produces a cookie byte-for-byte indistinguishable from a
+// pre-IAM-2 envelope for every existing browser.
+//
+// We mint a NEW cookie rather than mutating the existing one
+// because the AEAD's nonce must be unique per seal; reuse would
+// also work (the user can hold two cookies simultaneously) but
+// means the dashboard has to clear the old one. apid's handler
+// does the Set-Cookie dance, so this method is the seal-only
+// primitive the handler calls.
+func (m *Manager) SealGithubLogin(accountID, githubLogin string, mfaPending bool) (string, error) {
+	if accountID == "" {
+		return "", fmt.Errorf("session: accountID required")
+	}
+	now := m.now()
+	env := Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		GithubLogin: githubLogin,
+	}
+	plaintext, err := json.Marshal(env)
+	if err != nil {
+		return "", fmt.Errorf("session: marshal envelope: %w", err)
+	}
+	nonce := make([]byte, m.gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("session: random nonce: %w", err)
+	}
+	sealed := m.gcm.Seal(nonce, nonce, plaintext, nil)
+	return base64.RawURLEncoding.EncodeToString(sealed), nil
+}
 
 // ErrInvalid is returned by Verify when the cookie is malformed,
 // forged, or expired. Callers should clear the cookie on this error.
