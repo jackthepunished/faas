@@ -1350,6 +1350,93 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 	})
 }
 
+// listInvoices serves GET /v1/invoices — issue #259 invoice history.
+// Account-scoped: the authenticated principal is the only source of
+// accountID. Pagination is RFC3339Nano cursor (period_end DESC); month
+// is an optional "YYYY-MM" filter (half-open UTC range). Empty history
+// returns 200 with an empty items array, never 404.
+func (s *server) listInvoices(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	monthPtr, before, limit, perr := parseInvoiceListParams(r)
+	if perr != nil {
+		api.WriteProblem(w, perr)
+		return
+	}
+	rows, err := s.store.ListInvoicesForAccount(ctx(r), acct.ID, monthPtr, before, limit)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list invoices"))
+		return
+	}
+	resp := api.InvoiceListResponse{Items: make([]api.Invoice, 0, len(rows))}
+	for _, inv := range rows {
+		resp.Items = append(resp.Items, invoiceResponse(inv))
+	}
+	if len(rows) == limit && len(resp.Items) > 0 {
+		// Same emit convention as listDeployments: format the last
+		// row's period_end as RFC3339Nano so the handler can hand
+		// the value back unchanged as `before` on the next request.
+		resp.NextBefore = resp.Items[len(resp.Items)-1].PeriodEnd.UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseInvoiceListParams parses the GET /v1/invoices query string.
+// Returns the structured (problem, nil) pair on validation failure so
+// the handler can write through without duplicating the WriteProblem
+// boilerplate. month filter is optional; limit is clamped 1..100
+// (default 25).
+func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time, limit int, err *api.Problem) {
+	limit = 25
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > 100 {
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad limit", "1..100")
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("month"); v != "" {
+		m, perr := time.Parse("2006-01", v)
+		if perr != nil {
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad month", "expected YYYY-MM")
+		}
+		month = &m
+	}
+	if v := r.URL.Query().Get("before"); v != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, v); perr == nil {
+			before = t
+		} else if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+			before = t
+		} else {
+			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad cursor", "expected RFC3339 timestamp")
+		}
+	}
+	return month, before, limit, nil
+}
+
+// invoiceResponse maps state.Invoice to the API DTO. Direct field
+// pass-through — the state row is already in the on-the-wire shape.
+func invoiceResponse(inv state.Invoice) api.Invoice {
+	return api.Invoice{
+		ID:                inv.ID,
+		Provider:          inv.Provider,
+		ProviderInvoiceID: inv.ProviderInvoiceID,
+		Number:            inv.Number,
+		Status:            inv.Status,
+		PeriodStart:       inv.PeriodStart,
+		PeriodEnd:         inv.PeriodEnd,
+		SubtotalCents:     inv.SubtotalCents,
+		TaxCents:          inv.TaxCents,
+		TotalCents:        inv.TotalCents,
+		AmountPaidCents:   inv.AmountPaidCents,
+		Currency:          inv.Currency,
+		PDFAvailable:      inv.PDFAvailable,
+		HostedURL:         inv.HostedURL,
+		CreatedAt:         inv.CreatedAt,
+	}
+}
+
 // --- small helpers ---------------------------------------------------------
 
 func randomToken(nBytes int) string {

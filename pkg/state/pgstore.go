@@ -2743,6 +2743,108 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	return out, rows.Err()
 }
 
+// ListInvoicesForAccount returns the account's invoices, newest first,
+// ordered by (period_end DESC, id DESC) for deterministic pagination.
+// The handler clamps limit (default 25, max 100); the SQL uses the same
+// $1..$N split as ListDeploymentsForAccount.
+//
+// Month filtering (when month != nil) applies a half-open UTC range
+// [month, month+1mo) to period_end — same convention as UsageByMonth's
+// date_trunc('month', ...) guard, sidestepping the session-TZ compare
+// trap (memory: pkg-state-usage-monthly-tz-compare).
+//
+// Cursor (before) is strict-less on period_end only. The id tie-break
+// is implicit in the unique index ordering; rows sharing the same
+// period_end may appear at the page boundary if a customer has multiple
+// invoices for the same provider-period. Acceptable for the v1
+// surface — added this comment so the next reader does not silently
+// "fix" the cursor without introducing a compound id cursor.
+func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	switch {
+	case month != nil && before.IsZero():
+		monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+		monthEnd := monthStart.AddDate(0, 1, 0)
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, hosted_url, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end <  $3
+			  order by period_end desc, id desc
+			  limit $4`,
+			accountID, monthStart, monthEnd, limit)
+	case month != nil && !before.IsZero():
+		monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+		monthEnd := monthStart.AddDate(0, 1, 0)
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, hosted_url, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end <  $3
+			    and period_end < $4
+			  order by period_end desc, id desc
+			  limit $5`,
+			accountID, monthStart, monthEnd, before, limit)
+	case month == nil && !before.IsZero():
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, hosted_url, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end < $2
+			  order by period_end desc, id desc
+			  limit $3`,
+			accountID, before, limit)
+	default: // month == nil && before.IsZero()
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, hosted_url, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			  order by period_end desc, id desc
+			  limit $2`,
+			accountID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Invoice
+	for rows.Next() {
+		var inv Invoice
+		if err := rows.Scan(
+			&inv.ID, &inv.AccountID, &inv.Provider, &inv.ProviderInvoiceID,
+			&inv.Number, &inv.Status,
+			&inv.PeriodStart, &inv.PeriodEnd,
+			&inv.SubtotalCents, &inv.TaxCents, &inv.TotalCents, &inv.AmountPaidCents,
+			&inv.Currency, &inv.PDFAvailable, &inv.HostedURL,
+			&inv.CreatedAt, &inv.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
 // UsageByHour returns per-app usage rolled up from the per-minute rows
 // in the [start, end) window. The Stripe pusher calls this hourly;
 // (start, end) is the [now-1h, now) hour window so the SQL is an

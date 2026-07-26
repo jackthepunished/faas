@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} — onebox faas</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 980px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    .muted { color: #888; }
+    .form-row { display: flex; gap: 0.5rem; align-items: end; margin-bottom: 1rem; }
+    .form-row label { font-size: 0.85rem; }
+    .form-row input { font: inherit; padding: 0.25rem 0.4rem; }
+    .yes::before { content: "✓"; color: #2b7a78; }
+    .no::before  { content: "—"; color: #888; }
+    nav a.current { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Invoices</h1>
+    <form method="get" action="/dashboard/invoices" class="form-row">
+      <label>Month (YYYY-MM)
+        <input type="text" name="month" value="{{.Data.Month}}" placeholder="2026-07" pattern="\d{4}-\d{2}">
+      </label>
+      <button type="submit">Filter</button>
+      <a href="/dashboard/invoices">Clear</a>
+    </form>
+    {{if .Data.Items}}
+    <table>
+      <thead>
+        <tr>
+          <th>Number</th>
+          <th>Provider</th>
+          <th>Period</th>
+          <th>Status</th>
+          <th>Total</th>
+          <th>Currency</th>
+          <th>PDF</th>
+        </tr>
+      </thead>
+      <tbody>
+      {{range .Data.Items}}
+        <tr>
+          <td>{{.Number}}{{if .HostedURL}} <a href="{{.HostedURL}}" rel="noopener" target="_blank">↗</a>{{end}}</td>
+          <td>{{.Provider}}</td>
+          <td>{{.Period}}</td>
+          <td>{{.Status}}</td>
+          <td>{{.TotalFormatted}}</td>
+          <td>{{.Currency}}</td>
+          <td>{{if .PDFAvailable}}<span class="yes"></span>{{else}}<span class="no"></span>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{if .Data.NextBefore}}
+    <p><a href="/dashboard/invoices?before={{.Data.NextBefore}}{{if .Data.Month}}&month={{.Data.Month}}{{end}}">Older →</a></p>
+    {{end}}
+    {{else}}
+    <p class="muted">No invoices yet. Invoices appear after your first provider-side billing cycle.</p>
+    {{end}}
+  </main>
+  <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>
+</body>
+</html>

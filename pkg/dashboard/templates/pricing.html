@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} — onebox faas</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 1100px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.95rem; }
+    th { background: #f5f5f5; }
+    .price { font-weight: 600; font-size: 1.05rem; }
+    .current { outline: 2px solid #2b7a78; }
+    .yes::before { content: "✓"; color: #2b7a78; }
+    .no::before  { content: "—"; color: #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Plan comparison</h1>
+    <p>Prices in EUR, billed monthly. GB-hours are RAM × hours per calendar month. Overage is €0.01/GB-h.</p>
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          {{range .Data.Plans}}
+            <th{{if .Highlighted}} class="current"{{end}}>{{.Plan}}{{if .Highlighted}} <small>(Your plan)</small>{{end}}</th>
+          {{end}}
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>Price / month</th>
+          {{range .Data.Plans}}<td class="price">{{.PriceFormatted}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Deployed apps</th>
+          {{range .Data.Plans}}<td>{{.DeployedApps}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Max concurrency</th>
+          {{range .Data.Plans}}<td>{{.MaxConcurrency}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>RAM MB / app</th>
+          {{range .Data.Plans}}<td>{{.RAMMB}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>App layer cap (MB)</th>
+          {{range .Data.Plans}}<td>{{.AppLayerMaxMB}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Source tarball cap (MB)</th>
+          {{range .Data.Plans}}<td>{{.SourceTarballMaxMB}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Idle timeout (sec)</th>
+          {{range .Data.Plans}}<td>{{.IdleTimeoutS}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Included GB-hours / month</th>
+          {{range .Data.Plans}}<td>{{.IncludedGBHours}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Rate limit (RPS / burst)</th>
+          {{range .Data.Plans}}<td>{{.RateLimitRPS}} / {{.RateLimitBurst}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Egress (Mbit)</th>
+          {{range .Data.Plans}}<td>{{.EgressMbit}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Secret cap (count)</th>
+          {{range .Data.Plans}}<td>{{.SecretCountMax}}</td>{{end}}
+        </tr>
+        <tr>
+          <th>Async invoke</th>
+          {{range .Data.Plans}}<td{{if .AsyncInvokeAllowed}} class="yes"{{else}} class="no"{{end}}></td>{{end}}
+        </tr>
+        <tr>
+          <th>Min-instances floor</th>
+          {{range .Data.Plans}}<td{{if .MinInstancesAllowed}} class="yes"{{else}} class="no"{{end}}></td>{{end}}
+        </tr>
+        <tr>
+          <th>Autoscale on RPS</th>
+          {{range .Data.Plans}}<td{{if .ScaleUpTargetRPSAllowed}} class="yes"{{else}} class="no"{{end}}></td>{{end}}
+        </tr>
+        <tr>
+          <th>Autoscale on CPU</th>
+          {{range .Data.Plans}}<td{{if .ScaleUpTargetCPUAllowed}} class="yes"{{else}} class="no"{{end}}></td>{{end}}
+        </tr>
+        <tr>
+          <th>Egress allowlist</th>
+          {{range .Data.Plans}}
+            <td>
+              {{if .EgressAllowlistAllowed}}
+                <span class="yes"></span> ({{.EgressAllowlistMaxSize}} entries)
+              {{else}}
+                <span class="no"></span>
+              {{end}}
+            </td>
+          {{end}}
+        </tr>
+      </tbody>
+    </table>
+    <p>Switch plan from the CLI: <code>faas account set-plan &lt;plan&gt;</code>. Free customers can park and cold-wake apps indefinitely.</p>
+  </main>
+  <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>
+</body>
+</html>

@@ -24,6 +24,8 @@
       <a href="/dashboard/apps">Apps</a>
       <a href="/dashboard/usage">Usage</a>
       <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
       <a href="/dashboard/account">Account</a>
     </nav>
   </header>
@@ -38,6 +40,7 @@
         <tr><th>Idle reaper (sec)</th><td>{{.Data.IdleSec}}</td></tr>
       </table>
       <p>Stripe customer portal redirects ship in the post-M7.5 add-on. Today, change plan via the CLI: <code>faas account set-plan &lt;plan&gt;</code>.</p>
+      <p>See <a href="/dashboard/pricing">plan comparison</a> or your <a href="/dashboard/invoices">invoice history</a>.</p>
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

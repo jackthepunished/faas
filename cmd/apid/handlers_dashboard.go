@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -70,6 +71,10 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderUsage(w, r, log, acct)
 		case path == "/dashboard/billing":
 			s.renderBilling(w, r, log, acct)
+		case path == "/dashboard/pricing":
+			s.renderPricing(w, r, log, acct)
+		case path == "/dashboard/invoices":
+			s.renderInvoices(w, r, log, acct)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
 		default:
@@ -318,6 +323,142 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 	if err := dashboard.Render(w, log, page); err != nil {
 		renderProblem(w, log, err)
 	}
+}
+
+// renderPricing renders /dashboard/pricing — a four-column plan
+// comparison driven entirely by pkg/api/limits.go. Money is integer
+// millicents upstream; we divide by 1000 at render time only and
+// format with %.2f (CLAUDE.md Money: integer cents/millicents).
+func (s *server) renderPricing(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderPricing: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	plans := make([]dashboard.PricingPlanView, 0, len(api.Plans))
+	for _, p := range api.Plans {
+		l := api.MustLimitsFor(p)
+		plans = append(plans, dashboard.PricingPlanView{
+			Plan:                    string(p),
+			PriceFormatted:          formatPriceEuros(l.PriceMillicents),
+			Highlighted:             p == acct.Plan,
+			DeployedApps:            l.DeployedApps,
+			MaxConcurrency:          l.MaxConcurrency,
+			RAMMB:                   l.RAMMB,
+			AppLayerMaxMB:           l.AppLayerMaxMB,
+			SourceTarballMaxMB:      l.SourceTarballMaxMB,
+			IdleTimeoutS:            l.IdleTimeoutS,
+			IncludedGBHours:         int64(l.IncludedGBHours),
+			RateLimitRPS:            l.RateLimitRPS,
+			RateLimitBurst:          l.RateLimitBurst,
+			EgressMbit:              l.EgressMbit,
+			SecretCountMax:          l.SecretCountMax,
+			AsyncInvokeAllowed:      l.AsyncInvokeAllowed,
+			MinInstancesAllowed:     l.MinInstancesAllowed,
+			ScaleUpTargetRPSAllowed: l.ScaleUpTargetRPSAllowed,
+			ScaleUpTargetCPUAllowed: l.ScaleUpTargetCPUAllowed,
+			EgressAllowlistAllowed:  l.EgressAllowlistAllowed,
+			EgressAllowlistMaxSize:  l.EgressAllowlistMaxSize,
+		})
+	}
+	page := dashboard.Page{Title: "Pricing", Body: "pricing", Account: dashboardAccountView(view, appCount), Data: dashboard.PricingData{Plans: plans}}
+	if err := dashboard.Render(w, log, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// renderInvoices renders /dashboard/invoices — the account's billing
+// history (issue #259). Optional ?month=YYYY-MM filter and ?before
+// cursor pagination, mirroring the API handler's parsing.
+func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderInvoices: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	monthStr := r.URL.Query().Get("month")
+	var monthPtr *time.Time
+	if monthStr != "" {
+		m, perr := time.Parse("2006-01", monthStr)
+		if perr == nil {
+			monthPtr = &m
+		} else {
+			monthStr = ""
+		}
+	}
+	before := time.Time{}
+	if v := r.URL.Query().Get("before"); v != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, v); perr == nil {
+			before = t
+		} else if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+			before = t
+		}
+	}
+	rows, err := s.store.ListInvoicesForAccount(r.Context(), acct.ID, monthPtr, before, 25)
+	if err != nil {
+		log.Warn("dashboard renderInvoices: list invoices", "account_id", acct.ID, "err", err)
+		renderProblem(w, log, err)
+		return
+	}
+	items := make([]dashboard.InvoiceRow, 0, len(rows))
+	for _, inv := range rows {
+		items = append(items, dashboard.InvoiceRow{
+			ID:             inv.ID,
+			Number:         inv.Number,
+			Provider:       inv.Provider,
+			Status:         inv.Status,
+			Period:         inv.PeriodEnd.Format("2006-01"),
+			TotalFormatted: formatCentsEuros(inv.TotalCents),
+			Currency:       inv.Currency,
+			PDFAvailable:   inv.PDFAvailable,
+			HostedURL:      inv.HostedURL,
+		})
+	}
+	nextBefore := ""
+	if len(rows) == 25 && len(items) > 0 {
+		nextBefore = rows[len(rows)-1].PeriodEnd.UTC().Format(time.RFC3339Nano)
+	}
+	page := dashboard.Page{Title: "Invoices", Body: "invoices", Account: dashboardAccountView(view, appCount), Data: dashboard.InvoicesData{
+		Month: monthStr, Items: items, NextBefore: nextBefore,
+	}}
+	if err := dashboard.Render(w, log, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// formatPriceEuros converts integer millicents (1 cent = 1000
+// millicents) into the dashboard's "€X.YY" string, or "Free" when
+// the price is zero. This is the only place float math on money
+// happens — at the human display edge (CLAUDE.md Money).
+func formatPriceEuros(millicents int64) string {
+	if millicents == 0 {
+		return "Free"
+	}
+	cents := millicents / 1000
+	euros := cents / 100
+	rem := cents % 100
+	if rem < 0 {
+		rem = -rem
+	}
+	return fmt.Sprintf("€%d.%02d", euros, rem)
+}
+
+// formatCentsEuros converts integer cents (the invoice total unit)
+// into the dashboard's "€X.YY" string. Distinct from
+// formatPriceEuros (which takes millicents) to avoid the implicit
+// factor in the call site.
+func formatCentsEuros(cents int64) string {
+	if cents == 0 {
+		return "Free"
+	}
+	euros := cents / 100
+	rem := cents % 100
+	if rem < 0 {
+		rem = -rem
+	}
+	return fmt.Sprintf("€%d.%02d", euros, rem)
 }
 
 // renderAccount renders /dashboard/account — API keys (list + create

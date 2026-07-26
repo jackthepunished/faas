@@ -160,6 +160,8 @@ func run(args []string) int {
 		// `faas usage summary [--month X]` → account roll-up.
 		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
+	case "invoices":
+		return cmdInvoices(args[1:])
 	case "logs":
 		return cmdLogs(args[1:])
 	case "tail":

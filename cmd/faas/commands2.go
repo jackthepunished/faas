@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/onebox-faas/faas/cmd/faas/templates"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -834,6 +835,87 @@ func cmdUsageSummary(args []string) int {
 	}
 	renderUsageSummary(osStdout, s)
 	return 0
+}
+
+// cmdInvoices: GET /v1/invoices?month=YYYY-MM&before=RFC3339Nano&limit=N
+// (issue #259). Surfaces the account's billing history in the same
+// text/JSON dual-mode as cmdUsageSummary. --month is validated locally
+// before the HTTP call so an invalid value exits non-zero without a
+// server round-trip (matches the "auth/usage" exit-code convention).
+func cmdInvoices(args []string) int {
+	fs := flag.NewFlagSet("invoices", flag.ContinueOnError)
+	month := fs.String("month", "", "billing month (YYYY-MM); default: all months")
+	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
+	limit := fs.Int("limit", 25, "page size (1..100)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *month != "" {
+		if _, err := time.Parse("2006-01", *month); err != nil {
+			fmt.Fprintln(os.Stderr, "faas: invalid --month, expected YYYY-MM")
+			return 2
+		}
+	}
+	if *limit < 1 || *limit > 100 {
+		fmt.Fprintln(os.Stderr, "faas: invalid --limit, expected 1..100")
+		return 2
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	page, err := client.ListInvoices(context.Background(), *month, *before, *limit)
+	if err != nil {
+		return printErr("Request failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(page))
+	}
+	renderInvoices(osStdout, page)
+	return 0
+}
+
+// renderInvoices writes the account's invoice page as a tabular
+// block. Widths are tuned for the typical Stripe + Paddle label set;
+// PDF cell renders Y when available, - otherwise. The hosted PDF URL
+// is never printed — only the public hosted_url is in the response,
+// and we don't echo it from the CLI so the customer has to click
+// through to the provider portal via the dashboard.
+func renderInvoices(w io.Writer, page api.InvoiceListResponse) {
+	if len(page.Items) == 0 {
+		_, _ = fmt.Fprintln(w, "No invoices.")
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  ID                                NUMBER              PROVIDER PERIOD   STATUS  TOTAL      CUR PDF")
+	for _, inv := range page.Items {
+		cents := inv.TotalCents
+		if cents < 0 {
+			cents = -cents
+		}
+		total := fmt.Sprintf("%d.%02d", cents/100, cents%100)
+		pdf := "-"
+		if inv.PDFAvailable {
+			pdf = "Y"
+		}
+		_, _ = fmt.Fprintf(w, "  %-33s %-19s %-8s %-7s %-6s %-10s %-3s %s\n",
+			inv.ID, trunc(inv.Number, 19), inv.Provider, inv.PeriodEnd.Format("2006-01"),
+			inv.Status, "€"+total, inv.Currency, pdf)
+	}
+	if page.NextBefore != "" {
+		_, _ = fmt.Fprintf(w, "\n  next page: faas invoices --before %s\n", page.NextBefore)
+	}
+}
+
+// trunc clamps s to at most n runes, appending "…" when truncated.
+func trunc(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	runes := []rune(s)
+	if n <= 1 {
+		return string(runes[:n])
+	}
+	return string(runes[:n-1]) + "…"
 }
 
 // renderUsageSummary writes the account roll-up to w as a 5-row

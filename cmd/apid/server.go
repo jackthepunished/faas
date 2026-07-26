@@ -503,6 +503,9 @@ func (s *server) handler() http.Handler {
 	// CI key doesn't need them. usage:read is the right knob here.
 	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage)))
 	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.usageSummary)))
+	// Billing history (issue #259). Listing one's own invoices is the
+	// same access tier as usage/summary — usage:read is enough.
+	mux.HandleFunc("GET /v1/invoices", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.listInvoices)))
 
 	// Account-scoped deployments list (M7.5 dashboard).
 	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listDeployments)))
