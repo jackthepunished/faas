@@ -156,9 +156,9 @@ func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) er
 // the meterd sampler reads. Defined here so pkg/meter doesn't reach
 // into the protobuf package directly. Issue #279 / PR-B.
 type InstanceStatsRow struct {
-	InstanceID string
-	AppID      string
-	NodeID     string
+	InstanceID   string
+	AppID        string
+	NodeID       string
 	CPUUsageUsec uint64
 	// CPUValid mirrors instancestats.Validity (0 = Valid, 1 =
 	// Unknown). Callers MUST skip rows where CPUValid != 0.

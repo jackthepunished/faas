@@ -106,11 +106,11 @@ type StatsSnapshot struct {
 // zero / zero-time and the reader falls back to
 // state.Instance.LastRequestAt for the durable timestamp.
 type VMInstanceStat struct {
-	InstanceID       string
-	LeaseUID         int32
-	HostIP           string
-	ResidentBytes    *int64
-	CPUPct           *float64
+	InstanceID    string
+	LeaseUID      int32
+	HostIP        string
+	ResidentBytes *int64
+	CPUPct        *float64
 	// CPUSeconds is the cumulative CPU-seconds reading from
 	// vmmd's cpustats cache (issue #279 / PR-B). nil on the
 	// wire when the cache has no baseline for the instance

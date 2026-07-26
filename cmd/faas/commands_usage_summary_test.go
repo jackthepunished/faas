@@ -225,7 +225,7 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		// i.e. 10 s of CPU consumed across the month — a
 		// realistic order of magnitude for a Hobby app doing
 		// bursty work, picked for a clean 4-decimal render.
-		UsedCPUHours:    0.002778,
+		UsedCPUHours: 0.002778,
 	})
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	if len(lines) != 6 {

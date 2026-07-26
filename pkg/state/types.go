@@ -563,8 +563,8 @@ type Usage struct {
 	// only — billing is on plan RAM. Populated by UsageByMonth
 	// from the usage_monthly view; zero on the mb-only legacy
 	// rows.
-	CPUUsec int64
-	Requests  int64
+	CPUUsec  int64
+	Requests int64
 }
 
 // Invoice is one persisted invoice from a billing provider (issue #259,

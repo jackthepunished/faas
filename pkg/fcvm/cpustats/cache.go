@@ -44,9 +44,9 @@ import (
 // Observation is the cache's input: an instance id, a cumulative
 // CPU-µs reading, and the wall-clock moment the reading was taken.
 type Observation struct {
-	InstanceID    string
-	CPUUsageUsec  uint64
-	At            time.Time
+	InstanceID   string
+	CPUUsageUsec uint64
+	At           time.Time
 }
 
 // Reading is the cache's output: the rate (CPU percent of one
@@ -65,8 +65,8 @@ type Reading struct {
 }
 
 type lastSample struct {
-	usage  uint64
-	at     time.Time
+	usage uint64
+	at    time.Time
 	// accumSeconds is the cumulative CPUSeconds reading for this
 	// instance, preserved across the rate calculation. On
 	// regression it resets to 0 — same shape as the
@@ -84,9 +84,9 @@ type lastSample struct {
 // cgroupstats.Sample values. Construct with New (testable) or
 // NewWithDefaults (production vmmd wiring).
 type Cache struct {
-	mu     sync.Mutex
-	last   map[string]lastSample
-	now    func() time.Time
+	mu   sync.Mutex
+	last map[string]lastSample
+	now  func() time.Time
 }
 
 // New returns a Cache. now is consulted on every Observe; pass
