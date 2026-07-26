@@ -300,11 +300,20 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 		// Populate CPU fields from the cache if present. Reading
 		// under the cache's mutex is O(1) and never blocks
 		// schedd's poller on cgroup I/O — the sample loop owns
-		// the disk reads.
+		// the disk reads. The cumulative wall-clock of the
+		// per-instance Lookup loop is observed separately on
+		// `vmmd_stats_cpu_collect_seconds` (issue #279 / PR-B /
+		// ADR-039) so an operator can graph the CPU rate-and-
+		// accumulator hot path in isolation from the rest of
+		// the Stats RPC.
 		if s.cpuCache != nil {
+			cpuStart := time.Now()
 			if reading, ok := s.cpuCache.Lookup(inst); ok && reading.Valid {
 				row.CpuPct = wrapperspb.Double(reading.CPUPct)
 				row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
+			}
+			if h := s.ops.CPUStatsCollectDuration(); h != nil {
+				h.Observe(time.Since(cpuStart).Seconds())
 			}
 		}
 		resp.Instances = append(resp.Instances, row)

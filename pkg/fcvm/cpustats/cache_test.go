@@ -210,3 +210,90 @@ func TestObserve_DefaultNowIsUsed(t *testing.T) {
 		t.Errorf("first sample CPUSeconds = %f, want 0", r.CPUSeconds)
 	}
 }
+
+// TestForget_AfterRegression_DropsBaseline pins the eviction path
+// for an instance whose post-regression baseline is the only
+// remaining state. The teardown sequence on the vmmd side calls
+// Forget on instance teardown; if a cgroup recreation happened
+// first (so the cache holds only the post-regression baseline),
+// Forget must drop it cleanly and Size must return to 0. The
+// regression test catches a future "Forget only clears the
+// pre-regression baseline" refactor.
+func TestForget_AfterRegression_DropsBaseline(t *testing.T) {
+	now := time.Unix(0, 0)
+	c := New(func() time.Time { return now })
+	// Seed a baseline.
+	c.Observe(Observation{InstanceID: "a", CPUUsageUsec: 100_000, At: now})
+	now = now.Add(time.Second)
+	// Regression drops the baseline.
+	c.Observe(Observation{InstanceID: "a", CPUUsageUsec: 1_000, At: now})
+	// After the regression, "a" has a fresh baseline in the map.
+	// Snapshot returns 0 because accumSeconds resets to 0 on
+	// regression.
+	snap, ok := c.Snapshot("a")
+	if !ok || snap != 0 {
+		t.Fatalf("pre-Forget post-regression: snap=%v ok=%v, want (0, true)", snap, ok)
+	}
+	// Eviction: Forget drops the post-regression baseline. Size
+	// returns to 0. A future Observe on the same id is treated
+	// as a fresh first-sample (baseline).
+	c.Forget("a")
+	if c.Size() != 0 {
+		t.Errorf("Size after Forget post-regression = %d, want 0", c.Size())
+	}
+	now = now.Add(250 * time.Millisecond)
+	r, ok := c.Observe(Observation{InstanceID: "a", CPUUsageUsec: 5_000, At: now})
+	if ok {
+		t.Errorf("post-Forget post-regression Observe returned ok=true; want baseline reset (ok=false)")
+	}
+	if r.CPUSeconds != 0 {
+		t.Errorf("post-Forget post-regression CPUSeconds = %f, want 0", r.CPUSeconds)
+	}
+}
+
+// TestReset_ConcurrentWithObserve pins the race between Reset and
+// in-flight Observes (issue #279 / PR-B / ADR-039 §concurrency).
+// The cache is safe for one writer (the vmmd sample loop) and many
+// readers; Reset must not block or panic under concurrent writers,
+// and every Observe after Reset must observe the post-Reset state
+// (Size() == 0). This catches a future "Reset doesn't grab the
+// mutex" refactor that would race the writer.
+func TestReset_ConcurrentWithObserve(t *testing.T) {
+	c := New(nil)
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	// n goroutines each drive 100 Observes on distinct instance ids.
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			instanceID := "inst-" + string(rune('a'+id))
+			for j := 0; j < 100; j++ {
+				c.Observe(Observation{
+					InstanceID:   instanceID,
+					CPUUsageUsec: uint64(j * 1000),
+				})
+			}
+		}(i)
+	}
+	// Reset from a separate goroutine after a brief delay so the
+	// Observes are in flight. The cache's mutex serialises the
+	// two — the test passes iff the program doesn't race-detect
+	// and the cache is consistent at the end.
+	time.Sleep(time.Millisecond)
+	c.Reset()
+	wg.Wait()
+	// After Reset + the last Observes, the cache may be repopulated
+	// (the writers kept going) or empty (they all finished before
+	// any new Observation). The invariant we pin is: no negative
+	// accumulators and no panic. Size() is at most n.
+	if sz := c.Size(); sz > n {
+		t.Errorf("Size after concurrent Reset+Observe = %d, want ≤ %d", sz, n)
+	}
+	for i := 0; i < n; i++ {
+		id := "inst-" + string(rune('a'+i))
+		if snap, ok := c.Snapshot(id); ok && snap < 0 {
+			t.Errorf("instance %s snap = %f, want >= 0 (concurrent Reset+Observe race)", id, snap)
+		}
+	}
+}

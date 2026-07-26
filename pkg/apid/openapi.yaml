@@ -2001,7 +2001,7 @@ components:
         finished_at: { type: [string, "null"], format: date-time }
 
     UsageExportResponse:
-      description: "One usage record: app id, GB-hours consumed, started/finished timestamps for the export window."
+      description: "One usage record: app id, GB-hours consumed, started/finished timestamps for the export window. cpu_usec is the per-(app, month) cumulative host cgroup CPU-µs (issue #279 / PR-B). Informational only — billing is on mb_seconds."
       type: object
       required: [app_id, month, mb_seconds, requests]
       properties:
@@ -2009,6 +2009,12 @@ components:
         month: { type: string, pattern: '^\d{4}-\d{2}$' }
         mb_seconds: { type: integer, format: int64 }
         requests: { type: integer, format: int64 }
+        cpu_usec:
+          type: integer
+          format: int64
+          description: "Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue #279 / PR-B."
+          x-since: "2026-07"
+          x-issue: "279"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
@@ -2453,9 +2459,14 @@ components:
         count: { type: integer }
 
     # ─── Usage ────────────────────────────────────────────────────────────
+    # Fields tagged with `x-since: "YYYY-MM"` (issue #NNN) were added after
+    # the public launch. OpenAPI consumers (the Go SDK, the Node SDK) read
+    # the extension and surface "this field was added in YYYY-MM" so
+    # integrators don't have to grep the changelog. New fields MUST set
+    # `x-since` to the month of the PR that added them.
 
     UsageResponse:
-      description: "Per-app usage for one month: GB-hours consumed and a `next_before` cursor for paging deployments within the window."
+      description: "Per-app usage for one month: GB-hours consumed, request count, and an informational CPU-µs field (issue #279 / PR-B). The CPU dimension is observable but not yet billed."
       type: object
       required: [app_id, mb_seconds, requests, included_gb_hours]
       properties:
@@ -2463,9 +2474,15 @@ components:
         mb_seconds: { type: integer, format: int64 }
         requests: { type: integer, format: int64 }
         included_gb_hours: { type: integer, format: int64 }
+        cpu_usec:
+          type: integer
+          format: int64
+          description: "Cumulative host cgroup CPU-µs (informational; not billed). issue #279 / PR-B."
+          x-since: "2026-07"
+          x-issue: "279"
 
     UsageSummaryResponse:
-      description: "Account-level monthly roll-up: included GB-hours, used, overage math, and remaining balance."
+      description: "Account-level monthly roll-up: included GB-hours, used, overage math, remaining balance, and informational used_cpu_hours (issue #279 / PR-B). The CPU dimension is observable but not yet billed; the GB-hours fields drive the overage math."
       type: object
       required: [month, used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents]
       properties:
@@ -2474,6 +2491,11 @@ components:
         included_gb_hours: { type: integer, format: int64 }
         overage_gb_hours: { type: number }
         overage_cents: { type: integer, format: int64, description: 'Integer cents. Overages are €0.01/GB-h.' }
+        used_cpu_hours:
+          type: number
+          description: 'Per-month CPU-hours (informational; not billed). issue #279 / PR-B.'
+          x-since: "2026-07"
+          x-issue: "279"
 
     # ─── Event-driven surface (Move 2) ───────────────────────────────────
 

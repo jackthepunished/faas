@@ -154,6 +154,15 @@ type OpsMetrics struct {
 	// wait histogram is unlabelled (every observation has the same shape).
 	buildDur       *prometheus.HistogramVec
 	buildQueueWait prometheus.Histogram
+	// cpuStatsCollectDur: introduced for issue #279 / PR-B / ADR-039.
+	// Wall-clock duration of the CPU-rate-and-accumulator read path
+	// on the vmmd and schedd wires. Stored as prometheus.Histogram
+	// (unlabelled) so the bucket set is sized to the actual hot path
+	// (sub-ms per row) — the general `dur` histogram tops out at 5 s
+	// and would lose all resolution here. nil on daemons that don't
+	// expose the path (apid, imaged, builderd, gatewayd, meterd,
+	// githubd, faas CLI). Buckets: 100 µs → 100 ms.
+	cpuStatsCollectDur prometheus.Histogram
 	// residentGBPerCustomer: per-plan "resident GB-hours per paying
 	// customer" gauge emitted by meterd (ADR-031, PR #141). Labelled
 	// by plan ∈ {free, hobby, pro, scale} so the §12 dashboard's
@@ -399,6 +408,33 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help:    "Per-Tick wall-clock duration of the instancestats poller (issue #170 / PR-A). Buckets sized to the 200 ms polling interval.",
 		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0},
 	})
+	// cpuStatsCollectDur: introduced for issue #279 / PR-B / ADR-039.
+	// Wall-clock duration of the CPU-rate-and-accumulator read path
+	// on the vmmd wire (the per-instance cpustats.Cache.Lookup loop
+	// in vmmdgrpc.Stats) and on the schedd wire (the per-row
+	// SnapshotAll + proto-build loop in scheddgrpc.ListInstanceStats).
+	// Distinct from instanceStatsCollectDur (which covers the
+	// whole 200 ms schedd poller tick — much longer) because the
+	// CPU hot path is per-RPC, not per-tick, and we want bucket
+	// resolution at the cache.Lookup scale (sub-ms per row,
+	// ~µs at 100 instances). nil on daemons that don't expose the
+	// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+	// faas CLI).
+	var cpuStatsCollectDurLocal prometheus.Histogram
+	switch prefix {
+	case "vmmd":
+		cpuStatsCollectDurLocal = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "vmmd_stats_cpu_collect_seconds",
+			Help:    "Per-RPC wall-clock duration of the CPU-rate-and-accumulator read path on the vmmd side (issue #279 / PR-B / ADR-039). Buckets sized to per-row cpustats.Cache.Lookup cost.",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
+		})
+	case "schedd":
+		cpuStatsCollectDurLocal = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "schedd_list_instance_stats_collect_seconds",
+			Help:    "Per-RPC wall-clock duration of ListInstanceStats on the schedd side (issue #279 / PR-B / ADR-039). Buckets sized to per-row proto-build cost.",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
+		})
+	}
 	instanceStatsPartialErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_instance_stats_partial_errors_total",
 		Help: "Per-node dial/decode failures during an instancestats poller Tick (issue #170 / PR-A). The poller logs and continues on partial failures; a non-zero rate points at a sick node.",
@@ -478,6 +514,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceStatsCollectDur, instanceStatsPartialErrors,
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
 		egressDeny,
+	}
+	if cpuStatsCollectDurLocal != nil {
+		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
 	}
 	if prefix == "imaged" {
 		ociEgressDeny = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -605,6 +644,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceCPUSecondsTotal:    instanceCPUSecondsTotal,
 		instanceStatsCollectDur:    instanceStatsCollectDur,
 		instanceStatsPartialErrors: instanceStatsPartialErrors,
+		cpuStatsCollectDur:         cpuStatsCollectDurLocal,
 		scaleUpDecisions:           scaleUpDecisions,
 		scaleDownDecisions:         scaleDownDecisions,
 		scaleUpAdmitRPS:            scaleUpAdmitRPS,
@@ -711,6 +751,18 @@ func (m *OpsMetrics) RequestFailureFor(r *http.Request, accountID string) promet
 // breaks the time-ordering invariant the partial index is built on.
 func (m *OpsMetrics) WakeIDV4Fallback() prometheus.Counter {
 	return m.wakeIDV4Fallback
+}
+
+// CPUStatsCollectDuration returns the histogram accessor for the
+// CPU-rate-and-accumulator read-path duration histogram
+// (issue #279 / PR-B / ADR-039). The histogram is per-RPC (not
+// per-tick) and unlabelled; the underlying Histogram is a
+// singleton, not a vec. nil on daemons that don't expose the
+// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+// faas CLI) — the vmmdgrpc.Stats and scheddgrpc.ListInstanceStats
+// handlers guard the call with a nil check. Safe to cache.
+func (m *OpsMetrics) CPUStatsCollectDuration() prometheus.Histogram {
+	return m.cpuStatsCollectDur
 }
 
 // SSEClients returns the gauge apid's /v1/events handler increments

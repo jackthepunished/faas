@@ -210,6 +210,12 @@ func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstance
 	start := time.Now()
 	rows := make([]*scheddpb.InstanceStatsRow, 0)
 	if s.stats != nil {
+		// Time the SnapshotAll fan-out + per-row proto-build
+		// separately on `schedd_list_instance_stats_collect_seconds`
+		// (issue #279 / PR-B / ADR-039) so an operator can graph
+		// the CPU rate-and-accumulator hot path on the schedd
+		// side in isolation from the rest of the RPC.
+		cpuStart := time.Now()
 		for _, r := range s.stats.SnapshotAll() {
 			row := &scheddpb.InstanceStatsRow{
 				InstanceId: r.InstanceID,
@@ -219,6 +225,9 @@ func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstance
 				CpuValid:   uint32(r.CPU),
 			}
 			rows = append(rows, row)
+		}
+		if h := s.ops.CPUStatsCollectDuration(); h != nil {
+			h.Observe(time.Since(cpuStart).Seconds())
 		}
 	}
 	s.ops.Observe(op, time.Since(start), nil)

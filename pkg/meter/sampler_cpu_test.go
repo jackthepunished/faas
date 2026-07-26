@@ -3,57 +3,17 @@ package meter
 // Tests for the per-minute CPU-µs delta the Sampler reads from a
 // CPUSource and writes to usage_minutes.cpu_usec (issue #279 /
 // PR-B). The tests use a fakeClock + a stub CPUSource to pin the
-// delta math without standing up Postgres or schedd.
+// delta math without standing up Postgres or schedd. The shared
+// fakeCPUSource lives in fakes_test.go.
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
-
-// fakeCPUSource is a programmatic CPUSource for sampler tests. The
-// reader is keyed by instanceID; per instance, the source returns
-// the curr reading on every call. Tests advance curr between
-// SampleAndRoll calls to drive the delta.
-type fakeCPUSource struct {
-	mu     sync.Mutex
-	values map[string]uint64
-	// missing is the set of instanceIDs the source returns ok=false
-	// for. Used to exercise the "no row" branch.
-	missing map[string]struct{}
-}
-
-func newFakeCPUSource() *fakeCPUSource {
-	return &fakeCPUSource{values: map[string]uint64{}, missing: map[string]struct{}{}}
-}
-
-func (f *fakeCPUSource) Set(instanceID string, curr uint64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.values[instanceID] = curr
-	delete(f.missing, instanceID)
-}
-
-func (f *fakeCPUSource) SetMissing(instanceID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.values, instanceID)
-	f.missing[instanceID] = struct{}{}
-}
-
-func (f *fakeCPUSource) CPUUsageUsec(instanceID string) (uint64, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, ok := f.missing[instanceID]; ok {
-		return 0, false
-	}
-	v, ok := f.values[instanceID]
-	return v, ok
-}
 
 // seedMinuteUsageCPU is the test fixture: an account, app,
 // instance, and a rolling minute. Mirrors sampler_test.go's
