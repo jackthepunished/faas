@@ -1220,3 +1220,95 @@ func TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit(t *testing.T) {
 		t.Errorf("Free plan 402 must NOT emit cron.created, found: %+v", found)
 	}
 }
+
+// doAsAccount fires a request against the same handler `e.h` but with
+// foreignKey in the Authorization header. The store is shared with
+// `e`, so a foreign account created on e.store authenticates
+// through the same auth middleware — same as how a real foreign
+// customer would arrive at the box. Used only by the cross-account
+// 404 negative test below; happy-path tests keep using e.do.
+func doAsAccount(t *testing.T, e testEnv, foreignKey, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		r = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, r)
+	req.Header.Set("Authorization", "Bearer "+foreignKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestAuditEvents_CronForeignOwnerReturns404DoesNotEmit (issue #291
+// review) pins the cross-account seam on the cron mutation routes.
+// updateCron (handlers_ext.go:791-799) and deleteCron (:837-845)
+// resolve c, look up app, and 404 if app.AccountID != acct.ID. A
+// foreign bearer that targets a cron owned by another account must
+// get 404 (NOT 200) AND must NOT emit cron.updated / cron.deleted for
+// the legitimate owner — the audit row would otherwise become a
+// side-channel confirming another account's cron id even though the
+// call itself was rejected.
+func TestAuditEvents_CronForeignOwnerReturns404DoesNotEmit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForAudit(t, e, "audit-foreign-cron")
+
+	createRec := e.do(t, http.MethodPost, "/v1/crons",
+		api.CreateCronRequest{AppID: app.ID, Schedule: "*/5 * * * *", Path: "/tick"}, nil)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("seed cron: code=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created api.CronResponse
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode cron: %v", err)
+	}
+
+	// Foreign account + its own bearer on the SAME store / handler.
+	// Mirrors the otherAcct pattern in handlers_quota_test.go:135.
+	otherAcct, err := e.store.CreateAccount(context.Background(), "foreign-cron@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("seed foreign account: %v", err)
+	}
+	ptB, hashB, _ := api.GenerateAPIKey()
+	if _, err := e.store.CreateAPIKey(context.Background(), otherAcct.ID, hashB, "foreign", api.ScopesAdminOnly); err != nil {
+		t.Fatalf("seed foreign key: %v", err)
+	}
+
+	// 1) Foreign PATCH — must 404.
+	newSched := "*/15 * * * *"
+	patchRec := doAsAccount(t, e, ptB, http.MethodPatch, "/v1/crons/"+created.ID,
+		api.UpdateCronRequest{Schedule: &newSched})
+	if patchRec.Code != http.StatusNotFound {
+		t.Errorf("foreign PATCH /v1/crons/%s: code=%d, want 404; body=%s",
+			created.ID, patchRec.Code, patchRec.Body.String())
+	}
+
+	// 2) Foreign DELETE — must 404.
+	delRec := doAsAccount(t, e, ptB, http.MethodDelete, "/v1/crons/"+created.ID, nil)
+	if delRec.Code != http.StatusNotFound {
+		t.Errorf("foreign DELETE /v1/crons/%s: code=%d, want 404; body=%s",
+			created.ID, delRec.Code, delRec.Body.String())
+	}
+
+	// 3) Read back events for the LEGITIMATE owner. The foreign probes
+	// must not have produced cron.updated or cron.deleted rows. The
+	// cron.created row from the seed step is allowed to remain.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if found := findEventByKind(rows, "cron.updated"); found != nil {
+		t.Errorf("foreign PATCH must NOT emit cron.updated for the legitimate owner, found: %+v", found)
+	}
+	if found := findEventByKind(rows, "cron.deleted"); found != nil {
+		t.Errorf("foreign DELETE must NOT emit cron.deleted for the legitimate owner, found: %+v", found)
+	}
+	// Cron should still exist (no foreign-side state mutation).
+	if _, err := e.store.CronByID(context.Background(), created.ID); err != nil {
+		t.Errorf("foreign DELETE must not have removed the cron, CronByID err: %v", err)
+	}
+}

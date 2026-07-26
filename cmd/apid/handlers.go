@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"strings"
 	"time"
@@ -227,10 +228,7 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 	// ("1.2.3.0/24", "fe80::/10"); validateUpdateApp has already
 	// rewritten any "::ffff:" v4-mapped entry to its v4 form by
 	// the time it lands in the store, so we never see one here.
-	ea := make([]string, 0, len(a.EgressAllowlist))
-	for _, p := range a.EgressAllowlist {
-		ea = append(ea, p.String())
-	}
+	ea := egressStringList(a.EgressAllowlist)
 	return api.AppResponse{
 		ID: a.ID, Slug: a.Slug, Type: string(a.Type), Runtime: a.Runtime,
 		RAMMB: a.RAMMB, MaxConcurrency: a.MaxConcurrency, IdleTimeoutS: a.IdleTimeoutS,
@@ -340,4 +338,20 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// egressStringList renders a stored []netip.Prefix to its canonical
+// string form ("1.2.3.0/24", "fe80::/10"). The empty case returns a
+// non-nil zero-length slice so the JSON shape is `[]` (never `null`)
+// regardless of the plan / pre-PATCH state. validateUpdateApp has
+// already rewritten any "::ffff:" v4-mapped entry to its v4 form by
+// the time it lands in the store, so we never see one here. Reused by
+// the audit emit (handlers_ext.go::updateApp) so the wire shape and
+// the audit row agree on the canonical form.
+func egressStringList(prefixes []netip.Prefix) []string {
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		out = append(out, p.String())
+	}
+	return out
 }

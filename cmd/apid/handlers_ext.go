@@ -323,16 +323,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		newApp["autoscale_target_cpu_pct"] = updated.AutoscaleTargetCPUPct
 	}
 	if req.EgressAllowlist != nil {
-		oldEAL := make([]string, 0, len(app.EgressAllowlist))
-		for _, p := range app.EgressAllowlist {
-			oldEAL = append(oldEAL, p.String())
-		}
-		newEAL := make([]string, 0, len(updated.EgressAllowlist))
-		for _, p := range updated.EgressAllowlist {
-			newEAL = append(newEAL, p.String())
-		}
-		oldApp["egress_allowlist"] = oldEAL
-		newApp["egress_allowlist"] = newEAL
+		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
+		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
 	}
 	s.audit.Emit(ctx(r), "app.updated", &acct.ID, map[string]any{
 		"app_id": updated.ID,
