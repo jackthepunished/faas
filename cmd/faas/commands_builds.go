@@ -76,7 +76,7 @@ func cmdBuildProvenance(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	p, err := client.GetBuildProvenance(context.Background(), id)
+	p, err := client.GetBuildsIdProvenance(context.Background(), id)
 	if err != nil {
 		return printErr("Could not fetch build provenance", err)
 	}

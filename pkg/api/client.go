@@ -312,13 +312,20 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id, nil, &out)
 }
 
-// GetBuildProvenance returns the ADR-038 build_provenance row for
+// GetBuildsIdProvenance returns the ADR-038 build_provenance row for
 // a build id. Backs the `faas build provenance <id>` CLI command.
 // The backend surfaces a missing row as a 404 with code
 // build_provenance_not_found, which the SDK propagates as a
 // *APIError — callers should check against apierr.Code() when the
 // distinction matters (vs. a hard 404 "no such build").
-func (c *Client) GetBuildProvenance(ctx context.Context, id string) (BuildProvenanceResponse, error) {
+//
+// Method name: the sdk-coverage drift gate
+// (cmd/sdk-coverage/main.go::deriveMethodName) auto-derives
+// "Get<PathSegments>" from the route; for `GET /v1/builds/{id}/provenance`
+// the natural form is `GetBuildsIdProvenance`. Renaming here is
+// cheaper than pinning a methodRouteMap row that would diverge from
+// every other /v1/{resource}/{id} SDK shape.
+func (c *Client) GetBuildsIdProvenance(ctx context.Context, id string) (BuildProvenanceResponse, error) {
 	var out BuildProvenanceResponse
 	return out, c.do(ctx, "GET", "/v1/builds/"+id+"/provenance", nil, &out)
 }
