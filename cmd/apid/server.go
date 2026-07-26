@@ -774,7 +774,7 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			op = "unmatched"
 		}
 		s.ops.Observe(op, time.Since(start), observeErrFromStatus(rec.status))
-		// Issue #303 / ADR-038: feed the per-customer request-total
+		// Issue #303 / ADR-039: feed the per-customer request-total
 		// counter on every request (success and failure). The counter
 		// is the per-request total — paired with requestFailures
 		// (status >= 400 only) for the error-rate view. The §12

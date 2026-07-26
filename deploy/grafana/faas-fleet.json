@@ -473,7 +473,7 @@
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 72},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"expr": "topk(10, sum by (account_id) (rate(apid_request_total[5m])))", "legendFormat": "{{account_id}}", "refId": "A"}
+        {"expr": "topk(10, sum by (account_id) (rate(apid_request_total{account_id!=\"__other__\"}[5m])))", "legendFormat": "{{account_id}}", "refId": "A"}
       ],
       "fieldConfig": {
         "defaults": {

@@ -9,7 +9,7 @@ counter pair — shares the `accountLabelSet` admission primitive).
 
 The on-call path for "is anything wrong across the fleet?" stops at
 the existing alerts in
-`deploy/ansible/roles/prometheus/files/faas.rules.yml` (13 alert
+`deploy/ansible/roles/prometheus/files/faas.rules.yml` (14 alert
 rules, zero recording rules). All of them are absolute-threshold or
 rate-threshold alerts. There is no notion of "what does the normal
 traffic look like for this route, and how does right now compare" —
@@ -179,7 +179,7 @@ PromQL fixtures).
   test makes this explicit; the unconditional CI step at
   `.github/workflows/ci.yml:113-135` catches the validation gap.
 - **Negative**: the 4-alert fan-out is wider than the existing
-  alert set (13 alerts). On-call may need a few weeks to
+  alert set (14 alerts). On-call may need a few weeks to
   internalize the page-vs-warn split. The runbook branches
   explicitly on `mode` and `direction` to make the page-content
   distinct.

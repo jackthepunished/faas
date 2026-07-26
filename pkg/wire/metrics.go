@@ -101,7 +101,7 @@ type OpsMetrics struct {
 	// "__other__" in both.
 	requestFailures *prometheus.CounterVec
 	// requestTotal: HTTP requests completed, labelled by account_id,
-	// route, and code ∈ {ok, err} (issue #303, ADR-038). The
+	// route, and code ∈ {ok, err} (issue #303, ADR-039). The
 	// per-request total counterpart to requestFailures — the two
 	// metrics share the same accountLabelSet admission so a customer
 	// is represented by their real id in both, or by "__other__" in
@@ -314,7 +314,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"account_id", "route"})
 	requestTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_request_total",
-		Help: "HTTP requests completed, labelled by account_id, route, and code (issue #303, ADR-038). The counter is the per-request total — paired with requestFailures (status >= 400 only) for the per-account error-rate view. account_id flows through the same accountLabelSet as requestFailures so a customer is represented by their real id in both, or by \"__other__\" in both. code ∈ {ok, err} (ok on 2xx/3xx, err on 4xx/5xx). route is r.Pattern or \"unmatched\". Backed by the §12 traffic-anomaly recording rules (faas_apid_request_rate_5m, _3d_baseline, _ratio).",
+		Help: "HTTP requests completed, labelled by account_id, route, and code (issue #303, ADR-039). The counter is the per-request total — paired with requestFailures (status >= 400 only) for the per-account error-rate view. account_id flows through the same accountLabelSet as requestFailures so a customer is represented by their real id in both, or by \"__other__\" in both. code ∈ {ok, err} (ok on 2xx/3xx, err on 4xx/5xx). route is r.Pattern or \"unmatched\". Backed by the §12 traffic-anomaly recording rules (faas_apid_request_rate_5m, _3d_baseline, _ratio).",
 	}, []string{"account_id", "route", "code"})
 	// Reserved label values: anonymous for unauthenticated traffic,
 	// __other__ for the bounded overflow. Both are admitted at boot
@@ -690,7 +690,7 @@ func (m *OpsMetrics) RequestFailureFor(r *http.Request, accountID string) promet
 }
 
 // RequestTotal is the primitive counter accessor for
-// apid_request_total{account_id, route, code} (issue #303, ADR-038).
+// apid_request_total{account_id, route, code} (issue #303, ADR-039).
 // It is exposed for unit tests that drive the metric directly —
 // the canonical HTTP-path call site is RequestTotalFor, which owns
 // the route-template extraction so callers cannot accidentally pass
@@ -712,7 +712,7 @@ func (m *OpsMetrics) RequestTotal(accountID, route, code string) prometheus.Coun
 }
 
 // RequestTotalFor is the canonical accessor for the per-customer
-// request-total counter (issue #303, ADR-038). It extracts the route
+// request-total counter (issue #303, ADR-039). It extracts the route
 // label from r.Pattern (the Go mux pattern, e.g. "GET /v1/apps/{slug}")
 // with the reserved "unmatched" fallback for paths the mux did not
 // dispatch — so the route label's cardinality is bounded by the
