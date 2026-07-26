@@ -103,8 +103,8 @@ func TestMigrations_00047_DeploymentsSourceURL(t *testing.T) {
 	const wantURL = "https://github.com/acme/app@main"
 	const wantSHA = "0123456789abcdef0123456789abcdef01234567" // 40-char sha1
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, kind, source_bytes, status, source_url, commit_sha)
-		values ($1, $2, 'image', 1024, 'pending', $3, $4)
+		insert into deployments (id, app_id, kind, image_digest, source_bytes, status, source_url, commit_sha)
+		values ($1, $2, 'image', 'sha256:seed', 1024, 'pending', $3, $4)
 	`, depID, appID, wantURL, wantSHA); err != nil {
 		t.Fatalf("insert deployment: %v", err)
 	}
@@ -136,8 +136,8 @@ func TestMigrations_00047_DeploymentsSourceURL(t *testing.T) {
 		{"under-long", depID6, strings.Repeat("a", 6)},
 	} {
 		if _, err := pool.Exec(ctx, `
-			insert into deployments (id, app_id, kind, source_bytes, status, commit_sha)
-			values ($1, $2, 'image', 1024, 'pending', $3)
+			insert into deployments (id, app_id, kind, image_digest, source_bytes, status, commit_sha)
+			values ($1, $2, 'image', 'sha256:seed', 1024, 'pending', $3)
 		`, tc.dep, appID, tc.body); err == nil {
 			t.Fatalf("CHECK %s: expected violation for %s, got nil", tc.name, tc.body)
 		}
@@ -145,8 +145,8 @@ func TestMigrations_00047_DeploymentsSourceURL(t *testing.T) {
 
 	// (4) The CHECK accepts the boundary value (exactly 64 hex chars).
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, kind, source_bytes, status, commit_sha)
-		values ($1, $2, 'image', 1024, 'pending', $3)
+		insert into deployments (id, app_id, kind, image_digest, source_bytes, status, commit_sha)
+		values ($1, $2, 'image', 'sha256:seed', 1024, 'pending', $3)
 	`, depID64, appID, strings.Repeat("b", 64)); err != nil {
 		t.Fatalf("64-hex-char commit_sha should be accepted: %v", err)
 	}
@@ -156,8 +156,8 @@ func TestMigrations_00047_DeploymentsSourceURL(t *testing.T) {
 	// row with explicit NULLs (semantically identical to a row from
 	// before the columns existed).
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, kind, source_bytes, status, source_url, commit_sha)
-		values ($1, $2, 'image', 1024, 'pending', NULL, NULL)
+		insert into deployments (id, app_id, kind, image_digest, source_bytes, status, source_url, commit_sha)
+		values ($1, $2, 'image', 'sha256:seed', 1024, 'pending', NULL, NULL)
 	`, depIDLegacy, appID); err != nil {
 		t.Fatalf("insert legacy-shaped: %v", err)
 	}

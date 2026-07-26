@@ -70,8 +70,8 @@ func TestMigrations_00048_BuildProvenance(t *testing.T) {
 		t.Fatalf("seed app: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, kind, source_bytes, status, source_url, commit_sha)
-		values ($1, $2, 'dockerfile', 1024, 'pending', $3, $4)
+		insert into deployments (id, app_id, kind, image_digest, source_bytes, status, source_url, commit_sha)
+		values ($1, $2, 'dockerfile', 'sha256:seed', 1024, 'pending', $3, $4)
 	`, depID, appID, wantURL, wantSHA); err != nil {
 		t.Fatalf("seed deployment: %v", err)
 	}
