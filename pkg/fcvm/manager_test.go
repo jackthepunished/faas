@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/netns"
 )
 
@@ -1131,28 +1132,42 @@ func TestSetupNetworkEgressZeroDisablesTc(t *testing.T) {
 //     whose value equals (MemSizeMiB + PerVMOverheadMB) << 20.
 //  2. The cgroup write happened after vmm.Boot (bootCount was
 //     already incremented when writeMemoryMax ran).
+//
+// Sweeps the four deployed plan RAMs (128/256/512/1024 MB per
+// pkg/api/limits.go). A regression in the (plan+PerVMOverheadMB)
+// arithmetic that happens to satisfy plan=128 still passes a
+// single-value test but trips here. The cross-process e2e
+// (cmd/e2e/sec11_memory_max_e2e_test.go, //go:build metal) is the
+// authoritative gate that asserts the same fence against a real
+// jailer's /sys/fs/cgroup; this is the layer-down pin that runs
+// on every-PR CI.
 func TestWakeWritesMemoryMaxAfterBringUp(t *testing.T) {
-	run, vmm := &fakeRunner{}, &fakeVMM{}
-	m := newTestManager(run, vmm)
+	for _, planMB := range []int{128, 256, 512, 1024} {
+		t.Run(itoa(planMB)+"MB", func(t *testing.T) {
+			run, vmm := &fakeRunner{}, &fakeVMM{}
+			m := newTestManager(run, vmm)
 
-	r := req("cgroup-order")
-	r.MemSizeMiB = 128
+			instID := "cgroup-order-" + itoa(planMB)
+			r := req(instID)
+			r.MemSizeMiB = planMB
 
-	if _, err := m.ColdBoot(context.Background(), r); err != nil {
-		t.Fatalf("cold boot: %v", err)
-	}
-	if vmm.boots() != 1 {
-		t.Fatalf("expected 1 boot, got %d", vmm.boots())
-	}
-	memPath := filepath.Join(cgroupRoot, "faas-tenant.slice", PerInstanceScope("cgroup-order"), "memory.max")
-	body, err := os.ReadFile(memPath)
-	if err != nil {
-		t.Fatalf("memory.max not written at %s: %v", memPath, err)
-	}
-	const want = (128 + 8) << 20 // PerVMOverheadMB = 8 (pkg/api/limits)
-	got := strings.TrimSpace(string(body))
-	if got != itoa(want) {
-		t.Errorf("memory.max = %q, want %d", got, want)
+			if _, err := m.ColdBoot(context.Background(), r); err != nil {
+				t.Fatalf("cold boot (plan=%d): %v", planMB, err)
+			}
+			if vmm.boots() != 1 {
+				t.Fatalf("expected 1 boot, got %d", vmm.boots())
+			}
+			memPath := filepath.Join(cgroupRoot, "faas-tenant.slice", PerInstanceScope(instID), "memory.max")
+			body, err := os.ReadFile(memPath)
+			if err != nil {
+				t.Fatalf("memory.max not written at %s: %v", memPath, err)
+			}
+			want := int64(planMB+api.PerVMOverheadMB) << 20
+			got := strings.TrimSpace(string(body))
+			if got != itoa(int(want)) {
+				t.Errorf("memory.max = %q, want %d", got, want)
+			}
+		})
 	}
 }
 
