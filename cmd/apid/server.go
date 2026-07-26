@@ -774,6 +774,28 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			op = "unmatched"
 		}
 		s.ops.Observe(op, time.Since(start), observeErrFromStatus(rec.status))
+		// Issue #303 / ADR-038: feed the per-customer request-total
+		// counter on every request (success and failure). The counter
+		// is the per-request total — paired with requestFailures
+		// (status >= 400 only) for the error-rate view. The §12
+		// traffic-anomaly recording rules (faas_apid_request_rate_5m,
+		// _error_rate_5m, _3d_baseline, _ratio) read from this
+		// counter plus the code label. The code label is derived
+		// observeErrFromStatus-style: 2xx/3xx → "ok", 4xx/5xx → "err".
+		//
+		// account_id resolution reuses the same principalFrom(r)
+		// chain as RequestFailureFor below — empty resolves to
+		// "anonymous" via the bounded admission set; ids past the cap
+		// collapse to "__other__". The two counters share the same
+		// accountLabelSet so a customer is represented by their real
+		// id in both, or by "__other__" in both.
+		{
+			acct := "anonymous"
+			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+				acct = p.Acct.ID
+			}
+			s.ops.RequestTotalFor(r, rec.status, acct).Inc()
+		}
 		// Issue #278: also feed the per-customer request-failure
 		// counter when the response status indicates a client or
 		// server error. 4xx/5xx are the signal; 1xx-3xx never count.
