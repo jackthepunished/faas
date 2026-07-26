@@ -339,7 +339,8 @@ CREATE TABLE public.crons (
     schedule text NOT NULL,
     path text DEFAULT '/'::text NOT NULL,
     enabled boolean DEFAULT true NOT NULL,
-    last_fired_at timestamp with time zone
+    last_fired_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -515,7 +516,7 @@ CREATE TABLE public.instances (
     terminal_at timestamp with time zone,
     node_id uuid NOT NULL,
     wake_id uuid DEFAULT gen_random_uuid() NOT NULL,
-    CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'parked'::text, 'waking'::text, 'cold_booting'::text, 'running'::text, 'snapshotting'::text, 'stopped'::text, 'failed'::text, 'evicting_account_deleting'::text])))
+    CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'cold_booting'::text, 'waking'::text, 'running'::text, 'parked'::text, 'stopped'::text, 'evicting_account_deleting'::text])))
 );
 
 

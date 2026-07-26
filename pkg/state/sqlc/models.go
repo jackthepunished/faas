@@ -113,6 +113,7 @@ type Cron struct {
 	Path        string
 	Enabled     bool
 	LastFiredAt pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
 }
 
 type CustomDomain struct {
