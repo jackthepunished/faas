@@ -95,6 +95,14 @@ type GithubdClient interface {
 	// #2 closure). githubd mints the App JWT + GETs
 	// /app/installations/{id}; the response includes the install's
 	// default_branch (used to seed BindAppRepo on the success path).
+	//
+	// PR-B adds expected_login: when non-empty, githubd returns
+	// verified=false if the install's account.login does not match.
+	// This closes the §11 install-takeover hole where any logged-in
+	// FaaS account could adopt any installation_id the GitHub App
+	// knew about (review finding #2 only closed the
+	// install-belongs-to-the-app half; the install-belongs-to-the-user
+	// half lands here).
 	VerifyInstallation(ctx context.Context, in *VerifyInstallationRequest, opts ...grpc.CallOption) (*VerifyInstallationResponse, error)
 }
 
@@ -248,6 +256,14 @@ type GithubdServer interface {
 	// #2 closure). githubd mints the App JWT + GETs
 	// /app/installations/{id}; the response includes the install's
 	// default_branch (used to seed BindAppRepo on the success path).
+	//
+	// PR-B adds expected_login: when non-empty, githubd returns
+	// verified=false if the install's account.login does not match.
+	// This closes the §11 install-takeover hole where any logged-in
+	// FaaS account could adopt any installation_id the GitHub App
+	// knew about (review finding #2 only closed the
+	// install-belongs-to-the-app half; the install-belongs-to-the-user
+	// half lands here).
 	VerifyInstallation(context.Context, *VerifyInstallationRequest) (*VerifyInstallationResponse, error)
 	mustEmbedUnimplementedGithubdServer()
 }

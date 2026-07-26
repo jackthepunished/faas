@@ -4,10 +4,12 @@
 // side; RealService is the dashboard/OAuth side. Both share the
 // githubdgrpc.Service interface via embedding UnimplementedService.
 //
-// Bindings are kept in-memory (a sync.Map keyed by accountID). The
-// schema work to move this to Postgres is a follow-up slice — the
-// v1.0 launch uses the in-memory store and persists nothing about
-// the GitHub link (re-connect on restart is the contract).
+// PR-B: the in-memory `bindings` map becomes a read-through cache
+// for the durable BindingsStore (cmd-side adapter backed by
+// pkg/state.PgStore). Install state (`installs` map) stays in memory
+// for now — it tracks the OAuth exchange handshake and is PR-C scope
+// (it survives across binds within a process lifetime, which is
+// the contract the v1.0 dashboard needs).
 package githubd
 
 import (
@@ -16,6 +18,7 @@ import (
 	"sync"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // defaultProductionBranch is the branch fallback used when the
@@ -29,21 +32,30 @@ const defaultProductionBranch = "main"
 //   - AppAuth (RS256 JWT minting + installation-token exchange)
 //   - TokenCache (singleflight, proactive refresh)
 //   - ChecksAPI (POST /repos/{o}/{r}/check-runs)
-//   - in-memory bindings + install-state stores
+//   - BindingsStore (Postgres-backed via cmd-side adapter, PR-B)
+//   - in-memory install-state map (OAuth handshake, PR-C scope)
 type RealService struct {
 	githubdgrpc.UnimplementedService
 
 	Auth   *AppAuth
 	Tokens *TokenCache
 	Checks *ChecksAPI
+	Store  BindingsStore
 
-	// bindings is keyed by accountID → appID → binding. Direct
-	// appID lookup avoids the suffix-scan UnbindAppRepo used to
-	// do and is the canonical store.
-	bindingsMu sync.RWMutex
-	bindings   map[string]map[string]githubdgrpc.AppBinding
+	// bindingsCache is keyed by accountID → appID → state.GitHubBinding.
+	// Demoted from source-of-truth to read-through cache by PR-B.
+	// On BindAppRepo, we write to Store first; on success we
+	// populate the cache. On GetAppBinding, we hit the cache; on
+	// miss we fall back to Store.GetForApp and rebuild.
+	bindingsCacheMu sync.RWMutex
+	bindingsCache   map[string]map[string]state.GitHubBinding
 
-	// installs is keyed by accountID → install state.
+	// installs is keyed by accountID → install state. Pre-PR-B
+	// the install state was reconstructable from the same in-memory
+	// map as the bindings; PR-B leaves it in memory because the
+	// handshake still has to be tracked per-process (the install
+	// token has its own lifetime separate from the durable bind
+	// row). A future PR-C will move this too.
 	installsMu sync.RWMutex
 	installs   map[string]installState
 }
@@ -57,15 +69,19 @@ type installState struct {
 	DefBranch string
 }
 
-// NewRealService builds a RealService. auth, tokens, and checks
-// may all be nil — the service refuses calls that need them.
-func NewRealService(auth *AppAuth, tokens *TokenCache, checks *ChecksAPI) *RealService {
+// NewRealService builds a RealService. auth, tokens, checks, and
+// store may all be nil — the service refuses calls that need them.
+// The bindings cache is always allocated; an empty store means
+// every BindAppRepo call returns an error (the dashboard's bind
+// flow is fail-closed without a configured store).
+func NewRealService(auth *AppAuth, tokens *TokenCache, checks *ChecksAPI, store BindingsStore) *RealService {
 	return &RealService{
-		Auth:     auth,
-		Tokens:   tokens,
-		Checks:   checks,
-		bindings: map[string]map[string]githubdgrpc.AppBinding{},
-		installs: map[string]installState{},
+		Auth:          auth,
+		Tokens:        tokens,
+		Checks:        checks,
+		Store:         store,
+		bindingsCache: map[string]map[string]state.GitHubBinding{},
+		installs:      map[string]installState{},
 	}
 }
 
@@ -139,7 +155,14 @@ func (s *RealService) ListInstallableRepos(accountID string) ([]githubdgrpc.Repo
 }
 
 // BindAppRepo associates an app with (repo, branch) for the given
-// account. Returns the new binding_id.
+// account. PR-B: writes the bind to the durable Store FIRST; on
+// success populates the in-memory cache. On a Store failure the
+// cache is untouched so the next read pulls fresh state.
+//
+// bindingID is the deterministic "bind-<appID>-<repo>" form the
+// pre-PR-B in-memory map emitted; the (account_id, binding_id)
+// unique partial index in migration 00047 makes the upsert
+// idempotent on retry.
 func (s *RealService) BindAppRepo(appID, accountID, repoFullName, productionBranch string) (string, error) {
 	if appID == "" || accountID == "" || repoFullName == "" {
 		return "", fmt.Errorf("githubd: appID, accountID, repoFullName required")
@@ -148,44 +171,112 @@ func (s *RealService) BindAppRepo(appID, accountID, repoFullName, productionBran
 		productionBranch = defaultProductionBranch
 	}
 	bindingID := fmt.Sprintf("bind-%s-%s", appID, repoFullName)
-	s.bindingsMu.Lock()
-	if _, ok := s.bindings[accountID]; !ok {
-		s.bindings[accountID] = map[string]githubdgrpc.AppBinding{}
+
+	// Look up the install id from the in-memory install state. The
+	// pre-PR-B bind path didn't have access to it (the in-memory
+	// map was the bind); PR-B reconstructs the install id from the
+	// handshake so the durable row carries the same fields the
+	// 00007 migration expects.
+	var installID int64
+	s.installsMu.RLock()
+	if st, ok := s.installs[accountID]; ok {
+		if _, err := fmt.Sscanf(st.InstID, "%d", &installID); err != nil {
+			s.installsMu.RUnlock()
+			return "", fmt.Errorf("githubd: invalid installation id %q", st.InstID)
+		}
 	}
-	s.bindings[accountID][appID] = githubdgrpc.AppBinding{
+	s.installsMu.RUnlock()
+	if installID == 0 {
+		return "", fmt.Errorf("githubd: no installation for account %s", accountID)
+	}
+
+	if s.Store == nil {
+		return "", fmt.Errorf("githubd: bindings store not configured")
+	}
+
+	bid, err := s.Store.Upsert(context.Background(), state.GitHubBinding{
+		AppID:            appID,
+		AccountID:        accountID,
+		InstallID:        installID,
 		RepoFullName:     repoFullName,
 		ProductionBranch: productionBranch,
 		BindingID:        bindingID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("githubd: upsert binding: %w", err)
 	}
-	s.bindingsMu.Unlock()
-	return bindingID, nil
+
+	// Cache the row we just persisted.
+	s.bindingsCacheMu.Lock()
+	if _, ok := s.bindingsCache[accountID]; !ok {
+		s.bindingsCache[accountID] = map[string]state.GitHubBinding{}
+	}
+	s.bindingsCache[accountID][appID] = state.GitHubBinding{
+		AppID:            appID,
+		AccountID:        accountID,
+		InstallID:        installID,
+		RepoFullName:     repoFullName,
+		ProductionBranch: productionBranch,
+		BindingID:        bid,
+	}
+	s.bindingsCacheMu.Unlock()
+	return bid, nil
 }
 
-// UnbindAppRepo removes the binding for an app. Returns nil even if
-// no binding existed (idempotent).
+// UnbindAppRepo removes the binding for an app. Idempotent: nil
+// even if no binding existed. PR-B: deletes the durable row first,
+// then clears the cache.
 func (s *RealService) UnbindAppRepo(appID, accountID string) error {
-	s.bindingsMu.Lock()
-	defer s.bindingsMu.Unlock()
-	if byApp, ok := s.bindings[accountID]; ok {
+	if s.Store == nil {
+		return nil // no store → no persistent binding to clear
+	}
+	if err := s.Store.Delete(context.Background(), appID); err != nil {
+		// ErrAppNotFound is fine (idempotent); bubble other errors.
+		if err != ErrAppNotFound {
+			return fmt.Errorf("githubd: delete binding: %w", err)
+		}
+	}
+	s.bindingsCacheMu.Lock()
+	if byApp, ok := s.bindingsCache[accountID]; ok {
 		delete(byApp, appID)
 	}
+	s.bindingsCacheMu.Unlock()
 	return nil
 }
 
-// GetAppBinding looks up the binding for an app. Returns empty
-// AppBinding if not found (caller checks BindingID == "").
+// GetAppBinding looks up the binding for an app. Cache-first;
+// falls back to the durable Store on miss and rebuilds the cache.
+// Returns the gRPC-facing AppBinding shape (BindingID empty = no
+// binding).
 func (s *RealService) GetAppBinding(appID, accountID string) (githubdgrpc.AppBinding, error) {
-	s.bindingsMu.RLock()
-	defer s.bindingsMu.RUnlock()
-	byApp, ok := s.bindings[accountID]
-	if !ok {
+	s.bindingsCacheMu.RLock()
+	if byApp, ok := s.bindingsCache[accountID]; ok {
+		if b, ok := byApp[appID]; ok {
+			s.bindingsCacheMu.RUnlock()
+			return bindingToGRPC(b), nil
+		}
+	}
+	s.bindingsCacheMu.RUnlock()
+
+	// Miss → Store.
+	if s.Store == nil {
 		return githubdgrpc.AppBinding{}, nil
 	}
-	b, ok := byApp[appID]
-	if !ok {
-		return githubdgrpc.AppBinding{}, nil
+	b, err := s.Store.GetForApp(context.Background(), appID, accountID)
+	if err != nil {
+		if err == state.ErrNotFound {
+			return githubdgrpc.AppBinding{}, nil
+		}
+		return githubdgrpc.AppBinding{}, err
 	}
-	return b, nil
+	// Rebuild cache.
+	s.bindingsCacheMu.Lock()
+	if _, ok := s.bindingsCache[accountID]; !ok {
+		s.bindingsCache[accountID] = map[string]state.GitHubBinding{}
+	}
+	s.bindingsCache[accountID][appID] = b
+	s.bindingsCacheMu.Unlock()
+	return bindingToGRPC(b), nil
 }
 
 // CreateDeploymentFromPush is the inbound gRPC entry from apid.
@@ -206,36 +297,40 @@ func (s *RealService) WriteCheck(repoFullName, commitSHA string, phase githubdgr
 }
 
 // VerifyInstallation confirms the installation_id is real for the
-// configured GitHub App via AppAuth.VerifyInstallation (a
-// App-JWT-authenticated GET /app/installations/{id}). A 404 means
-// the callback was forged or stale — verified=false, err=nil so the
-// dashboard renders a "connection failed" banner rather than a 500.
-//
-// On success, we also persist the install → account mapping in the
-// in-memory installs store (the BindingsLookup path is separate;
-// this is for the GetInstallState gRPC and the dashboard's
-// "Connect GitHub" status pill). The accountID isn't known to the
-// GitHub App JWT caller (the callback URL doesn't carry it — it's
-// looked up from the dashboard session in apid, which then makes
-// this gRPC call), so we take it as an optional hint and rely on
-// the in-memory installs map keyed by installation_id for the
-// account-resolution lookup.
-func (s *RealService) VerifyInstallation(installationID int64) (bool, string, error) {
+// configured GitHub App AND, when expectedLogin is non-empty, that
+// the install's account.login matches (PR-B §11 ownership proof).
+// A 404 means the callback was forged or stale — verified=false,
+// err=nil so the dashboard renders a "connection failed" banner
+// rather than a 500. An account.login mismatch returns
+// verified=false too (the install is real, just not owned by this
+// user); the caller distinguishes by inspecting the AccountLogin
+// field on the Installation payload (only the apid-side §11
+// path consumes that field).
+func (s *RealService) VerifyInstallation(installationID int64, expectedLogin string) (bool, string, string, error) {
 	if s.Auth == nil {
-		return false, "", fmt.Errorf("githubd: OAuth not configured")
+		return false, "", "", fmt.Errorf("githubd: OAuth not configured")
 	}
-	_, verified, err := s.Auth.VerifyInstallation(context.Background(), installationID)
+	inst, verified, err := s.Auth.VerifyInstallation(context.Background(), installationID, expectedLogin)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
 	if !verified {
-		return false, "", nil
+		// Don't surface AccountLogin on a non-verified install —
+		// the §11 check is the whole point of the call, and a
+		// mismatched login should look identical to a 404 to the
+		// forged caller.
+		return false, "", "", nil
 	}
-	// We deliberately do NOT persist here — the /oauth/callback
-	// handler in apid owns the (accountID ↔ installation_id)
-	// binding so a forged callback can never claim ownership of
-	// someone else's install (review finding #2 closure). The
-	// installs map is keyed by accountID, which githubd does not
-	// receive in this RPC by design.
-	return true, defaultProductionBranch, nil
+	return true, inst.AccountLogin, defaultProductionBranch, nil
+}
+
+// bindingToGRPC translates the durable state row into the gRPC
+// AppBinding shape (which deliberately omits install_id and
+// linked_at — those are githubd-internal).
+func bindingToGRPC(b state.GitHubBinding) githubdgrpc.AppBinding {
+	return githubdgrpc.AppBinding{
+		RepoFullName:     b.RepoFullName,
+		ProductionBranch: b.ProductionBranch,
+		BindingID:        b.BindingID,
+	}
 }

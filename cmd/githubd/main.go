@@ -17,14 +17,12 @@ package main
 import (
 	"context"
 	"crypto/rsa"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/githubd"
@@ -101,11 +99,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// table (migration 00007), and githubd's Checks
 				// writer threads the right installation_id per
 				// repo through it instead of hardcoding install=1.
-				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), &pgBindingsLookup{pool: pool})
+				storeAdapter := newStateBindingsAdapter(pool)
+				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
 				if cerr != nil {
 					return fmt.Errorf("githubd: new checks api: %w", cerr)
 				}
-				realSvc = githubd.NewRealService(auth, tokens, checks)
+				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter)
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
@@ -200,40 +199,3 @@ var (
 // depsAdapter is reserved for the test seam in pkg/githubd tests
 // that import cmd/githubd internals.
 type depsAdapter struct{}
-
-// pgBindingsLookup bridges pgxpool.Pool to the githubd.BindingsLookup
-// interface so ChecksAPI can resolve repoFullName → installation_id
-// without importing pkg/state directly (slice 8 architectural seam:
-// githubd stays persistence-agnostic; apid owns the bindings table).
-//
-// Lives in cmd/githubd because that's where pgxpool is already
-// in scope; the actual SQL lives in pkg/state.PgStore.InstallationIDForRepo
-// (used by apid). githubd would otherwise need a parallel query or
-// a new pkg/state dependency, neither of which is justified for a
-// single read-only lookup. When apid's HTTP-side OAuth work lands
-// (commit 1), this adapter can be replaced with an HTTP call to
-// apid instead, removing the duplicate query.
-type pgBindingsLookup struct {
-	pool *pgxpool.Pool
-}
-
-func (p *pgBindingsLookup) InstallationIDForRepo(ctx context.Context, repoFullName string) (int64, error) {
-	if repoFullName == "" {
-		return 0, fmt.Errorf("githubd: repoFullName required")
-	}
-	var installID int64
-	err := p.pool.QueryRow(ctx,
-		`select github_install_id
-		 from apps
-		 where github_repo_full_name = $1
-		   and github_install_id is not null
-		 limit 1`, repoFullName,
-	).Scan(&installID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, githubd.ErrNoBinding
-		}
-		return 0, err
-	}
-	return installID, nil
-}

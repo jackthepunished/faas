@@ -359,6 +359,38 @@ type Store interface {
 	// hit wins; apid is the canonical owner of bindings so this is
 	// not a contention point in practice.
 	InstallationIDForRepo(ctx context.Context, repoFullName string) (int64, error)
+	// UpsertGithubInstallBinding persists the (account → app →
+	// installation, repo, branch) edge with a deterministic
+	// bindingID so the dashboard's bind flow is idempotent on retry
+	// (PR-B, ADR-012 closure). Returns the bindingID; writes the
+	// linked_at timestamp so the dashboard's "connected on" pill
+	// has a single source. The (account_id, binding_id) unique
+	// partial index (migration 00047) rejects duplicate binds under
+	// the same account.
+	UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error
+	// DeleteGithubInstallBinding clears the bind columns on an app.
+	// Idempotent: returns nil even if no binding was present
+	// (so the dashboard's "unbind" action is safe to retry). Returns
+	// ErrNotFound if the app itself doesn't exist.
+	DeleteGithubInstallBinding(ctx context.Context, appID string) error
+	// GetGithubInstallBindingForApp returns the bind row for an
+	// app, scoped by accountID (so a forged session cannot read
+	// another tenant's binding). Returns ErrNotFound when the app
+	// isn't bound OR the bind belongs to a different account. The
+	// pre-PR-B GitHubBindingForApp is account-agnostic; PR-B uses
+	// the new method on the apid/githubd read paths.
+	GetGithubInstallBindingForApp(ctx context.Context, appID, accountID string) (GitHubBinding, error)
+	// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+	// lookup githubd's push receiver uses to find the owning app.
+	// Returns ErrNotFound when no app is bound to (repo, branch).
+	// Uses the (repo, branch) partial index added in 00047.
+	GithubInstallBindingForRepoBranch(ctx context.Context, repoFullName, productionBranch string) (GitHubBinding, error)
+	// ListGithubInstallBindingsForAccount is the dashboard's hydrate
+	// path: given an account_id, return every bind the account
+	// currently owns. The map is keyed by appID so the dashboard's
+	// per-app lookup is O(1). Uses the
+	// apps_github_install_account_idx partial index.
+	ListGithubInstallBindingsForAccount(ctx context.Context, accountID string) (map[string]GitHubBinding, error)
 
 	// Deployments.
 	// CreateDeployment atomically inserts a new pending deployment row

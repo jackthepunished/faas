@@ -687,3 +687,42 @@ type ListAuditEventsResponse struct {
 	Events []AuditEventResponse `json:"events"`
 	Limit  int                  `json:"limit"`
 }
+
+// --- GitHub install bind picker (PR-B; §11) ---------------------------------
+//
+// InstallBindRequest is the body for both POST /v1/install/repos/list
+// and POST /v1/apps/{slug}/install/bind. ProductionBranch is
+// optional — when omitted, githubd uses the install's default_branch
+// from /installations/{id}.
+//
+// RepoFullName matches GitHub's owner/name shape (e.g. "octocat/
+// hello-world"). The pattern is enforced server-side in handlers_install_github.go
+// but kept loose here so the SDK can serialise any GitHub-shaped
+// string the dashboard holds.
+type InstallBindRequest struct {
+	InstallationID   int64  `json:"installation_id"`
+	RepoFullName     string `json:"repo_full_name"`
+	ProductionBranch string `json:"production_branch,omitempty"`
+}
+
+// InstallBindResponse is the body the dashboard parses after a
+// successful bind. BindingID is the deterministic
+// "bind-<appID>-<repo>" form RealService.BindAppRepo emits; audit
+// log entries reference it directly.
+type InstallBindResponse struct {
+	BindingID        string `json:"binding_id"`
+	RepoFullName     string `json:"repo_full_name"`
+	ProductionBranch string `json:"production_branch"`
+}
+
+// RepoResponse is one repo visible to the user's GitHub App
+// installation, as returned by githubd's
+// /user/installations/{id}/repositories. Carries only the fields the
+// dashboard bind picker renders; no nested owner object (the
+// install URL already disambiguates).
+type RepoResponse struct {
+	ID            int64  `json:"id"`
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+	Private       bool   `json:"private"`
+}

@@ -846,6 +846,103 @@ func (m *MemStore) InstallationIDForRepo(_ context.Context, repoFullName string)
 	return 0, ErrNotFound
 }
 
+// UpsertGithubInstallBinding mirrors PgStore. The in-memory map is
+// keyed by appID so a second call with the same AppID overwrites.
+// Returns ErrNotFound when the appID doesn't exist.
+func (m *MemStore) UpsertGithubInstallBinding(_ context.Context, b GitHubBinding) error {
+	if b.AppID == "" {
+		return ErrNotFound
+	}
+	if b.BindingID == "" {
+		return fmt.Errorf("state: BindingID required")
+	}
+	if b.AccountID == "" {
+		return fmt.Errorf("state: AccountID required")
+	}
+	if b.LinkedAt.IsZero() {
+		b.LinkedAt = time.Now()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[b.AppID]; !ok {
+		return ErrNotFound
+	}
+	m.githubBindings[b.AppID] = b
+	return nil
+}
+
+// DeleteGithubInstallBinding clears the binding for an app.
+// Idempotent: a no-prior-binding appID updates zero rows and
+// returns nil. Returns ErrNotFound only when the app row itself is
+// missing (matches PgStore's contract).
+func (m *MemStore) DeleteGithubInstallBinding(_ context.Context, appID string) error {
+	if appID == "" {
+		return ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[appID]; !ok {
+		return ErrNotFound
+	}
+	delete(m.githubBindings, appID)
+	return nil
+}
+
+// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+// lookup. Mirrors PgStore. Returns ErrNotFound when no app is bound.
+func (m *MemStore) GithubInstallBindingForRepoBranch(_ context.Context, repoFullName, productionBranch string) (GitHubBinding, error) {
+	if repoFullName == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	if productionBranch == "" {
+		productionBranch = "main"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.githubBindings {
+		if b.RepoFullName == repoFullName && b.ProductionBranch == productionBranch && b.InstallID != 0 {
+			return b, nil
+		}
+	}
+	return GitHubBinding{}, ErrNotFound
+}
+
+// ListGithubInstallBindingsForAccount returns the per-account bind
+// map keyed by appID. Mirrors PgStore.
+func (m *MemStore) ListGithubInstallBindingsForAccount(_ context.Context, accountID string) (map[string]GitHubBinding, error) {
+	out := make(map[string]GitHubBinding)
+	if accountID == "" {
+		return out, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for appID, b := range m.githubBindings {
+		if b.AccountID == accountID && b.InstallID != 0 {
+			out[appID] = b
+		}
+	}
+	return out, nil
+}
+
+// GetGithubInstallBindingForApp mirrors PgStore. accountID scopes
+// the lookup so a forged session can't read another tenant's binding:
+// if the row exists but is bound to a different account, returns
+// ErrNotFound (the same response an unbound app returns, so the
+// caller can't distinguish "not bound" from "wrong account").
+// Returns ErrNotFound when appID or accountID is empty.
+func (m *MemStore) GetGithubInstallBindingForApp(_ context.Context, appID, accountID string) (GitHubBinding, error) {
+	if appID == "" || accountID == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.githubBindings[appID]
+	if !ok || b.InstallID == 0 || b.AccountID != accountID {
+		return GitHubBinding{}, ErrNotFound
+	}
+	return b, nil
+}
+
 // --- Deployments ------------------------------------------------------------
 
 // CreateDeployment mirrors PgStore.CreateDeployment's active-app gate

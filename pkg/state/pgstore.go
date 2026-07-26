@@ -640,6 +640,221 @@ func (s *PgStore) InstallationIDForRepo(ctx context.Context, repoFullName string
 	return installID, nil
 }
 
+// UpsertGithubInstallBinding persists the (account → app → install,
+// repo, branch) edge on the apps row. PR-B (ADR-012 closure). The
+// (account_id, binding_id) unique partial index added in migration
+// 00047 makes the upsert idempotent on retry: a second call with the
+// same payload overwrites the prior values without a new row.
+//
+// The zero/empty BindingID is rejected so the dashboard's bind flow
+// always carries a deterministic id (it builds "bind-<appID>-<repo>"
+// client-side). A blank appID returns ErrNotFound rather than a
+// silent 0-row update so the dashboard's "app not found" path
+// stays correct.
+func (s *PgStore) UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error {
+	if b.AppID == "" {
+		return ErrNotFound
+	}
+	if b.BindingID == "" {
+		return fmt.Errorf("state: BindingID required")
+	}
+	if b.AccountID == "" {
+		return fmt.Errorf("state: AccountID required")
+	}
+	if b.LinkedAt.IsZero() {
+		b.LinkedAt = time.Now()
+	}
+	_, err := s.pool.Exec(ctx,
+		`update apps
+		 set github_install_id = $2,
+		     github_repo_full_name = $3,
+		     github_production_branch = $4,
+		     github_install_binding_id = $5,
+		     github_install_account_id = $6,
+		     github_install_linked_at = $7
+		 where id = $1`,
+		b.AppID, b.InstallID, nullString(b.RepoFullName), nullString(b.ProductionBranch),
+		b.BindingID, b.AccountID, b.LinkedAt,
+	)
+	return err
+}
+
+// DeleteGithubInstallBinding clears the (install, repo, branch,
+// binding, account, linked_at) columns on an app. Idempotent: a
+// no-prior-binding row updates zero rows and returns nil so the
+// dashboard's "unbind" action is safe to retry. Returns ErrNotFound
+// when the app row itself is missing — the caller can distinguish
+// "not bound" from "app not found".
+func (s *PgStore) DeleteGithubInstallBinding(ctx context.Context, appID string) error {
+	if appID == "" {
+		return ErrNotFound
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update apps
+		 set github_install_id = null,
+		     github_repo_full_name = null,
+		     github_production_branch = null,
+		     github_install_binding_id = null,
+		     github_install_account_id = null,
+		     github_install_linked_at = null
+		 where id = $1`,
+		appID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetGithubInstallBindingForApp returns the (appID, accountID)
+// bind row. accountID scopes the lookup so a forged session cannot
+// read another tenant's binding — when the app is bound but to a
+// different account, returns ErrNotFound. The (unbound app) case
+// also returns ErrNotFound. Uses the apps_account_idx composite
+// index (apps.account_id, apps.status) for the account check.
+func (s *PgStore) GetGithubInstallBindingForApp(ctx context.Context, appID, accountID string) (GitHubBinding, error) {
+	if appID == "" || accountID == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	var b GitHubBinding
+	var installID *int64
+	var branch *string
+	var bindingID *string
+	var linkedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select id, github_install_id, github_repo_full_name, github_production_branch,
+		        github_install_binding_id, github_install_account_id, github_install_linked_at
+		 from apps
+		 where id = $1
+		   and account_id = $2
+		   and github_install_id is not null`, appID, accountID,
+	).Scan(&b.AppID, &installID, &b.RepoFullName, &branch, &bindingID, &b.AccountID, &linkedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GitHubBinding{}, ErrNotFound
+		}
+		return GitHubBinding{}, err
+	}
+	if installID != nil {
+		b.InstallID = *installID
+	}
+	if branch != nil {
+		b.ProductionBranch = *branch
+	}
+	if bindingID != nil {
+		b.BindingID = *bindingID
+	}
+	if linkedAt != nil {
+		b.LinkedAt = *linkedAt
+	}
+	return b, nil
+}
+
+// GithubInstallBindingForRepoBranch is the inbound-webhook dispatch
+// lookup. githubd's push receiver uses it to find the owning app
+// from a (repo, branch) push. Uses the
+// apps_github_install_repo_branch_idx partial index from migration
+// 00047. Returns ErrNotFound when no app is bound to that pair.
+func (s *PgStore) GithubInstallBindingForRepoBranch(ctx context.Context, repoFullName, productionBranch string) (GitHubBinding, error) {
+	if repoFullName == "" {
+		return GitHubBinding{}, ErrNotFound
+	}
+	if productionBranch == "" {
+		productionBranch = "main"
+	}
+	var b GitHubBinding
+	var installID *int64
+	var branch *string
+	var accountID *string
+	var bindingID *string
+	var linkedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select id, github_install_account_id, github_install_binding_id, github_install_linked_at,
+		        github_install_id, github_repo_full_name, github_production_branch
+		 from apps
+		 where github_repo_full_name = $1
+		   and github_production_branch = $2
+		   and github_install_id is not null
+		 limit 1`, repoFullName, productionBranch,
+	).Scan(&b.AppID, &accountID, &bindingID, &linkedAt, &installID, &b.RepoFullName, &branch)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GitHubBinding{}, ErrNotFound
+		}
+		return GitHubBinding{}, err
+	}
+	if installID == nil {
+		return GitHubBinding{}, ErrNotFound
+	}
+	b.InstallID = *installID
+	if accountID != nil {
+		b.AccountID = *accountID
+	}
+	if bindingID != nil {
+		b.BindingID = *bindingID
+	}
+	if linkedAt != nil {
+		b.LinkedAt = *linkedAt
+	}
+	if branch != nil {
+		b.ProductionBranch = *branch
+	}
+	return b, nil
+}
+
+// ListGithubInstallBindingsForAccount returns the map[appID]GitHubBinding
+// the dashboard uses to render the per-app bind state. Uses the
+// apps_github_install_account_idx partial index. Returns an empty
+// (non-nil) map when the account has no bindings.
+func (s *PgStore) ListGithubInstallBindingsForAccount(ctx context.Context, accountID string) (map[string]GitHubBinding, error) {
+	out := make(map[string]GitHubBinding)
+	if accountID == "" {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, github_install_id, github_repo_full_name, github_production_branch,
+		        github_install_binding_id, github_install_linked_at
+		 from apps
+		 where github_install_account_id = $1
+		   and github_install_id is not null`, accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b GitHubBinding
+		b.AccountID = accountID
+		var installID *int64
+		var branch *string
+		var bindingID *string
+		var linkedAt *time.Time
+		if err := rows.Scan(&b.AppID, &installID, &b.RepoFullName, &branch, &bindingID, &linkedAt); err != nil {
+			return nil, err
+		}
+		if installID != nil {
+			b.InstallID = *installID
+		}
+		if branch != nil {
+			b.ProductionBranch = *branch
+		}
+		if bindingID != nil {
+			b.BindingID = *bindingID
+		}
+		if linkedAt != nil {
+			b.LinkedAt = *linkedAt
+		}
+		out[b.AppID] = b
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // --- deployments -------------------------------------------------------------
 
 // CreateDeployment writes a pending deployment row only if the parent app is

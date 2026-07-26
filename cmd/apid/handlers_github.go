@@ -239,7 +239,22 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Mint session cookie.
+	//
+	// PR-B §11 ownership proof: the dashboard session must carry the
+	// GitHub login we just verified, so the /oauth/callback handler
+	// can compare it to the install's account.login. We issue the
+	// session twice (once for acct.ID, then re-seal with the login
+	// attached) rather than threading the login through Issue's
+	// signature — Issue is hot-path for password/SSO handlers and
+	// widening it would couple every auth method to one provider's
+	// extra field. SealGithubLogin rebuilds the envelope in the same
+	// crypto path as Issue; cookie shape is unchanged.
 	cookie, err := s.sessions.Issue(acct.ID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
+		return
+	}
+	cookie, err = s.sessions.SealGithubLogin(acct.ID, githubUser.Login)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

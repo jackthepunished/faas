@@ -203,8 +203,15 @@ type AppManifest struct {
 // closure). githubd reads this via the BindingsLookup interface so
 // CheckRun writes go out under the right installation token instead
 // of the hardcoded install_id=1 placeholder that M7.5 shipped with.
+//
+// PR-B adds AccountID + BindingID + LinkedAt so the bind row carries
+// the (account → app → install) shape and the dashboard's "connected
+// on" pill has a single source.
 type GitHubBinding struct {
 	AppID            string
+	AccountID        string
+	BindingID        string
+	LinkedAt         time.Time
 	InstallID        int64
 	RepoFullName     string
 	ProductionBranch string

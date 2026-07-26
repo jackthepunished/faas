@@ -68,6 +68,12 @@ tags:
       Email + password (Argon2id), Google OAuth, GitHub OAuth,
       password reset, session lifecycle. Cookies carry the session
       artifact; the device-code flow is the SDK programmatic-auth path.
+  - name: github
+    description: |
+      GitHub App integration (ADR-012, PR-B). The dashboard bind
+      picker surfaces the (installation_id, repo, branch) edge;
+      /v1/auth/github + /oauth/callback handle the OAuth handshake
+      and §11 ownership proof.
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
 
@@ -790,6 +796,112 @@ paths:
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409': { $ref: '#/components/responses/ConflictRename' }
+
+  /v1/install/repos/list:
+    post:
+      tags: [github]
+      operationId: listInstallableRepos
+      summary: List repos the user's GitHub App installation can see.
+      description: |
+        Cookie-session-authenticated (NOT API-key). Hydrates the
+        dashboard bind picker's repo dropdown. Returns the repos
+        visible to the user's GitHub App installation — githubd
+        resolves the per-install token from the session's account.
+
+        §11 anti-takeover: the handler re-runs
+        githubd.VerifyInstallation with the session's github_login
+        as `expected_login` before listing. Mismatch → 403 forged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallBindRequest' }
+      responses:
+        '200':
+          description: Repos the install can see.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RepoResponse' }
+        '400':
+          description: 'code: invalid_request — missing/malformed body or installation_id.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: |
+            `forged` if the install's account.login differs from
+            the session's github_login; `github_login_required` if
+            the user hasn't completed /v1/auth/github. Returned for
+            POST /v1/install/repos/list — the bind picker refuses
+            to list repos of an install the user can't prove they own.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: 'code: github_unreachable — githubd could not reach api.github.com; retry in a minute.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: 'code: githubd_not_ready — githubd is not wired on this host (M7.5 slices 7-8).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/apps/{slug}/install/bind:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [github]
+      operationId: bindAppInstall
+      summary: Persist the (account, app, installation, repo, branch) bind row.
+      description: |
+        Cookie-session-authenticated (NOT API-key). Persists the
+        GitHub install binding via githubd.BindAppRepo (which
+        writes through to pkg/state.PgStore.UpsertGithubInstallBinding
+        per PR-B).
+
+        §11 anti-takeover: the handler re-runs
+        githubd.VerifyInstallation with the session's github_login
+        as `expected_login` before persisting. Mismatch → 403 forged.
+        Empty github_login → 403 github_login_required.
+
+        On success emits `auth.install.bound` for the audit trail.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallBindRequest' }
+      responses:
+        '200':
+          description: Bind persisted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallBindResponse' }
+        '400':
+          description: 'code: invalid_request — missing/malformed body, installation_id, or repo_full_name.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: |
+            `forged` if the install's account.login differs from
+            the session's github_login; `github_login_required` if
+            the user hasn't completed /v1/auth/github. Returned for
+            POST /v1/apps/{slug}/install/bind — the bind refuses to
+            persist a row for an install the user can't prove they own.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: 'code: github_unreachable — githubd could not reach api.github.com when persisting the bind; retry in a minute.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/apps/{slug}/instances:
     parameters:
@@ -1704,6 +1816,46 @@ components:
       required: [password]
       properties:
         password: { type: string, minLength: 12, maxLength: 256 }
+
+    # ─── GitHub install bind picker (PR-B) ──────────────────────────────
+
+    InstallBindRequest:
+      description: |
+        Body for both `POST /v1/install/repos/list` and
+        `POST /v1/apps/{slug}/install/bind`. Carries the
+        (installation_id, repo_full_name, production_branch) tuple
+        the dashboard's bind picker commits. `production_branch` is
+        optional — when omitted, githubd uses the install's
+        `default_branch` from `/installations/{id}`.
+      type: object
+      required: [installation_id, repo_full_name]
+      properties:
+        installation_id: { type: integer, format: int64, minimum: 1 }
+        repo_full_name: { type: string, pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' }
+        production_branch: { type: string, maxLength: 256 }
+
+    InstallBindResponse:
+      description: "Successful bind. `binding_id` is the deterministic `bind-<appID>-<repo>` form used in audit log entries."
+      type: object
+      required: [binding_id, repo_full_name, production_branch]
+      properties:
+        binding_id: { type: string }
+        repo_full_name: { type: string }
+        production_branch: { type: string }
+
+    RepoResponse:
+      description: |
+        Repo visible to the user's GitHub App installation, as
+        returned by githubd's `/user/installations/{id}/repositories`.
+        Carries only the fields the dashboard bind picker renders —
+        no nested owner object (the install URL already disambiguates).
+      type: object
+      required: [id, full_name, default_branch, private]
+      properties:
+        id: { type: integer, format: int64 }
+        full_name: { type: string, pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' }
+        default_branch: { type: string }
+        private: { type: boolean }
 
     # ─── Account ──────────────────────────────────────────────────────────
 

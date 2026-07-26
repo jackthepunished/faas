@@ -184,7 +184,14 @@ type Installation struct {
 // this method is the dedicated "trust on first contact" check that
 // closes the §11 least-privilege regression where the M7.5 PR shipped
 // without one.
-func (a *AppAuth) VerifyInstallation(ctx context.Context, installationID int64) (Installation, bool, error) {
+//
+// expectedLogin is the §11 ownership proof (PR-B). When non-empty,
+// the install's account.login MUST match expectedLogin for
+// verified=true; on mismatch the function returns (zero, false, nil)
+// so the caller can render a clean 403 without leaking "does this
+// install exist" to a forged caller. Empty expectedLogin preserves
+// the pre-PR-B wire shape.
+func (a *AppAuth) VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (Installation, bool, error) {
 	if a == nil || a.PrivateKey == nil {
 		return Installation{}, false, fmt.Errorf("githubd: app auth not initialized")
 	}
@@ -223,6 +230,12 @@ func (a *AppAuth) VerifyInstallation(ctx context.Context, installationID int64) 
 		return Installation{}, false, fmt.Errorf("githubd: decode install: %w", err)
 	}
 	payload.AccountLogin = payload.Account.Login
+	// §11 ownership check: the install must belong to the user the
+	// dashboard session claims. Mismatch is a forged callback trying
+	// to adopt someone else's installation.
+	if expectedLogin != "" && payload.Account.Login != expectedLogin {
+		return Installation{}, false, nil
+	}
 	return payload, true, nil
 }
 
