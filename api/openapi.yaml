@@ -1270,7 +1270,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/Id32'
     get:
-      tags: [builds]
+      tags: [deployments]
       operationId: getBuildProvenance
       summary: Get build provenance.
       description: |
