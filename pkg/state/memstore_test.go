@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -2487,5 +2488,149 @@ func TestMatchRecoveryCode_NoMatch(t *testing.T) {
 	}
 	if lastCode {
 		t.Errorf("lastCode = true on miss, want false (lastCode only valid when matched)")
+	}
+}
+
+// --- Cron quota errors (PR #340 follow-ups) ---------------------------------
+
+// TestCronQuotaError_IsRoundTrip pins the contract the store.go doc
+// comment promises: errors.Is(err, ErrCronQuotaExceeded) matches any
+// *CronQuotaError, and errors.As(err, &qe) recovers the typed value
+// with Scope / Limit / Observed intact. handlers_ext.go's createCron
+// branch relies on both — losing either is a 5xx regression in the
+// quota path.
+func TestCronQuotaError_IsRoundTrip(t *testing.T) {
+	appErr := &CronQuotaError{
+		Scope:    CronQuotaScopeApp,
+		Limit:    20,
+		Observed: 20,
+	}
+	if !errors.Is(appErr, ErrCronQuotaExceeded) {
+		t.Error("errors.Is(appErr, ErrCronQuotaExceeded) = false, want true")
+	}
+	var qe *CronQuotaError
+	if !errors.As(appErr, &qe) {
+		t.Fatal("errors.As failed to recover *CronQuotaError")
+	}
+	if qe.Scope != CronQuotaScopeApp || qe.Limit != 20 || qe.Observed != 20 {
+		t.Errorf("typed value mismatch: scope=%q limit=%d observed=%d", qe.Scope, qe.Limit, qe.Observed)
+	}
+
+	// Wrapped error (via fmt.Errorf("… %w", e)) must still match the
+	// sentinel — handlers may decorate before returning.
+	wrapped := fmt.Errorf("decorated: %w", appErr)
+	if !errors.Is(wrapped, ErrCronQuotaExceeded) {
+		t.Error("errors.Is on wrapped *CronQuotaError = false, want true")
+	}
+	if !errors.As(wrapped, &qe) || qe.Scope != CronQuotaScopeApp {
+		t.Error("errors.As on wrapped *CronQuotaError did not recover typed value")
+	}
+}
+
+// TestCreateCronIfUnderQuota_PerAppArm exercises the customer-facing
+// cap: at CronLimitPerApp, CreateCronIfUnderQuota returns
+// *CronQuotaError{Scope: CronQuotaScopeApp} with Limit/Observed pinned.
+// MemStore predicate mirrors PgStore (single critical section under
+// m.mu) so the typed error's shape is the contract both backends
+// honour.
+func TestCreateCronIfUnderQuota_PerAppArm(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "cron-app@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "a", Type: AppTypeFunction})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	limits := api.MustLimitsFor(api.PlanPro) // Pro: 20/app, 50/acct
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := m.CreateCronIfUnderQuota(ctx, app.ID, "*/5 * * * *", "/x", true, limits); err != nil {
+			t.Fatalf("seed cron %d: %v", i, err)
+		}
+	}
+	_, err = m.CreateCronIfUnderQuota(ctx, app.ID, "*/5 * * * *", "/x", true, limits)
+	if err == nil {
+		t.Fatal("expected *CronQuotaError at per-app cap, got nil")
+	}
+	var qe *CronQuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("expected *CronQuotaError, got %T: %v", err, err)
+	}
+	if qe.Scope != CronQuotaScopeApp {
+		t.Errorf("scope = %q, want %q", qe.Scope, CronQuotaScopeApp)
+	}
+	if qe.Limit != limits.CronLimitPerApp {
+		t.Errorf("limit = %d, want %d", qe.Limit, limits.CronLimitPerApp)
+	}
+	if qe.Observed != limits.CronLimitPerApp {
+		t.Errorf("observed = %d, want %d", qe.Observed, limits.CronLimitPerApp)
+	}
+}
+
+// TestCreateCronIfUnderQuota_PerAccountArm pins the per-account cap:
+// three apps with N1+N2+N3 crons reaching CronLimitPerAccount trips
+// the account arm even when the target app's per-app count is still
+// under. Scope must read "account" so the handler renders "delete
+// from a sibling app" copy, not "delete from THIS app".
+//
+// Boundary math (Pro: per-app=20, per-account=50): seed 19 on appA,
+// 19 on appB, 12 on appC → total 50 (== cap). The 51st insert on
+// appC trips per-account with appC's per-app count still at 12/20.
+func TestCreateCronIfUnderQuota_PerAccountArm(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "cron-acct@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	limits := api.MustLimitsFor(api.PlanPro) // 20/app, 50/acct
+	appA, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "a", Type: AppTypeFunction})
+	if err != nil {
+		t.Fatalf("CreateApp A: %v", err)
+	}
+	appB, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "b", Type: AppTypeFunction})
+	if err != nil {
+		t.Fatalf("CreateApp B: %v", err)
+	}
+	appC, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "c", Type: AppTypeFunction})
+	if err != nil {
+		t.Fatalf("CreateApp C: %v", err)
+	}
+	for i := 0; i < limits.CronLimitPerApp-1; i++ {
+		if _, err := m.CreateCronIfUnderQuota(ctx, appA.ID, "*/5 * * * *", "/x", true, limits); err != nil {
+			t.Fatalf("seed appA %d: %v", i, err)
+		}
+	}
+	for i := 0; i < limits.CronLimitPerApp-1; i++ {
+		if _, err := m.CreateCronIfUnderQuota(ctx, appB.ID, "*/5 * * * *", "/x", true, limits); err != nil {
+			t.Fatalf("seed appB %d: %v", i, err)
+		}
+	}
+	fillC := limits.CronLimitPerAccount - 2*(limits.CronLimitPerApp-1)
+	for i := 0; i < fillC; i++ {
+		if _, err := m.CreateCronIfUnderQuota(ctx, appC.ID, "*/5 * * * *", "/x", true, limits); err != nil {
+			t.Fatalf("seed appC %d: %v", i, err)
+		}
+	}
+	// Per-account is now 50 == cap. Per-app on appC is fillC/20, under.
+	// Next insert on appC must trip the per-account arm.
+	_, err = m.CreateCronIfUnderQuota(ctx, appC.ID, "*/5 * * * *", "/x", true, limits)
+	if err == nil {
+		t.Fatal("expected *CronQuotaError at per-account cap, got nil")
+	}
+	var qe *CronQuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("expected *CronQuotaError, got %T: %v", err, err)
+	}
+	if qe.Scope != CronQuotaScopeAccount {
+		t.Errorf("scope = %q, want %q (per-account is at cap; per-app on appC still has room)", qe.Scope, CronQuotaScopeAccount)
+	}
+	if qe.Limit != limits.CronLimitPerAccount {
+		t.Errorf("limit = %d, want %d", qe.Limit, limits.CronLimitPerAccount)
+	}
+	if qe.Observed != limits.CronLimitPerAccount {
+		t.Errorf("observed = %d, want %d", qe.Observed, limits.CronLimitPerAccount)
 	}
 }

@@ -608,6 +608,23 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)"))
 		return
 	}
+	// Plan-tier gate (spec §4.4 / paid-only event-shaped primitives).
+	// Fires BEFORE AppByID so a Free customer gets a clean 402 rather
+	// than a 404 (no app can be theirs anyway, but the wire shape
+	// matters: the 402 carries the upgrade-to-Hobby copy the dashboard
+	// renders). The store-level check still reads CronLimitPerApp==0
+	// as a fail-closed defence in depth.
+	//
+	// Use LimitsFor (not MustLimitsFor) so an unknown acct.Plan — a
+	// future tier that hasn't been added to pkg/api/limits.go yet, or
+	// a migration that wrote a stale plan value — surfaces as a clean
+	// 402 rather than a process panic → 500. Fail-closed: an unknown
+	// plan is treated as if crons weren't unlocked.
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok || limits.CronLimitPerApp == 0 {
+		api.WriteProblem(w, api.ErrPlanCronsNotAllowed(acct.Plan))
+		return
+	}
 	app, err := s.store.AppByID(ctx(r), req.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
@@ -621,9 +638,17 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	if path == "" {
 		path = "/"
 	}
-	c, err := s.store.CreateCron(ctx(r), req.AppID, req.Schedule, path, enabled)
+	c, err := s.store.CreateCronIfUnderQuota(ctx(r), req.AppID, req.Schedule, path, enabled, limits)
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("could not create cron"))
+		var qe *state.CronQuotaError
+		switch {
+		case errors.As(err, &qe):
+			api.WriteProblem(w, api.ErrPlanCronQuota(acct.Plan, string(qe.Scope), qe.Limit, qe.Observed))
+		case errors.Is(err, state.ErrNotFound):
+			s.notFound(w, "no such app")
+		default:
+			api.WriteProblem(w, api.ErrCapacity("could not create cron"))
+		}
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"created","app_id":"`+app.ID+`"}`)

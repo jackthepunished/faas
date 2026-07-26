@@ -403,6 +403,10 @@ func StatusForCode(code string) int {
 		return http.StatusRequestEntityTooLarge
 	case CodePlanFeatureGated:
 		return http.StatusPaymentRequired
+	case CodePlanCronsNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanCronQuota:
+		return http.StatusForbidden
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
 	case CodeInvalidCredentials, CodeEmailNotVerified:
@@ -515,6 +519,50 @@ func ErrCronInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeCronInvalid,
 		"Invalid cron schedule", reason).
 		WithDocs("https://docs.DOMAIN/crons")
+}
+
+// CodePlanCronsNotAllowed is the 402 the customer sees when the
+// plan doesn't unlock crons at all (Free today). Mirrors the
+// CodePlanFeatureGated shape — the dashboard renders an upsell
+// prompt, not a "delete a cron to add another" hint, because the
+// only path forward is a plan upgrade.
+const CodePlanCronsNotAllowed = "plan_crons_not_allowed"
+
+// CodePlanCronQuota is the 403 the customer sees when the plan
+// DOES unlock crons but the per-app or per-account cap was reached.
+// Distinct from CodePlanCronsNotAllowed so the CLI can branch on
+// upsell-vs-delete copy without parsing the body.
+const CodePlanCronQuota = "plan_cron_quota"
+
+// ErrPlanCronsNotAllowed is returned by apid's createCron handler
+// when the customer's plan has CronLimitPerApp == 0 (Free today).
+// Fires BEFORE the store is touched so a Free customer gets a clean
+// 402 instead of a quota-error round-trip.
+func ErrPlanCronsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanCronsNotAllowed,
+		"Crons unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include cron; upgrade to Hobby or above to schedule synthetic requests.", p)).
+		WithDocs("https://docs.DOMAIN/plans#crons")
+}
+
+// ErrPlanCronQuota is returned when CreateCronIfUnderQuota surfaces
+// a *state.CronQuotaError. Scope "app" or "account" tells the
+// handler which cap fired so the body can name it. 403 (not 402)
+// because the plan DOES unlock crons — the right copy is
+// "delete a cron to add another", not "upgrade to Hobby".
+func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
+	var scopeName string
+	if scope == "account" {
+		scopeName = "this account"
+	} else {
+		scopeName = "this app"
+	}
+	return NewProblem(http.StatusForbidden, CodePlanCronQuota,
+		"Cron limit reached",
+		fmt.Sprintf("%s plan caps crons at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.DOMAIN/plans#crons")
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't

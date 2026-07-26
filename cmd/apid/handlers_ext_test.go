@@ -1158,6 +1158,95 @@ func TestCreateCron_InvalidSchedule(t *testing.T) {
 	assertProblem(t, rec, 400, api.CodeCronInvalid)
 }
 
+// TestCreateCron_FreeReturns402 confirms the plan-tier gate (spec §4.4
+// paid-only event-shaped primitives). A Free customer hitting POST
+// /v1/crons must see 402 + CodePlanCronsNotAllowed — the body names
+// the plan and the upgrade target, not a "no such app" 404 (the
+// 402 fires BEFORE AppByID for this exact reason).
+func TestCreateCron_FreeReturns402(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	appID := mustSeedApp(t, e, "cron-free")
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 402, api.CodePlanCronsNotAllowed)
+}
+
+// TestCreateCron_AtPerAppLimitReturns403 seeds CronLimitPerApp crons
+// directly via the store (bypassing the cap so the test is independent
+// of the cap-enforcement path it's testing) and asserts the next wire
+// create returns 403 + CodePlanCronQuota. Scope="app" surfaces in the
+// body so the customer knows to delete a cron from THIS app.
+func TestCreateCron_AtPerAppLimitReturns403(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "cron-cap-app")
+	// Pro caps at 20 per-app; seed all 20 directly.
+	limits := api.MustLimitsFor(api.PlanPro)
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appID, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed cron %d: %v", i, err)
+		}
+	}
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 403, api.CodePlanCronQuota)
+}
+
+// TestCreateCron_AtPerAccountLimitReturns403 fills the per-account
+// cap across TWO apps on the same account, then attempts a create on
+// a third app — must hit 403 + CodePlanCronQuota with Scope="account"
+// (the per-app cap is still under but the per-account cap is full).
+func TestCreateCron_AtPerAccountLimitReturns403(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	limits := api.MustLimitsFor(api.PlanPro)
+	// Pro caps per-app at 20, per-account at 50. Two apps × 20 = 40
+	// (under both). Fill the third app to push past per-account.
+	appA := mustSeedApp(t, e, "cron-acct-a")
+	appB := mustSeedApp(t, e, "cron-acct-b")
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appA, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed A cron %d: %v", i, err)
+		}
+	}
+	for i := 0; i < limits.CronLimitPerApp; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appB, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed B cron %d: %v", i, err)
+		}
+	}
+	// appB is full (per-app) so the per-account cap check fires first
+	// on appB. To test the per-account path explicitly, the third
+	// app would need to be NOT full per-app — but per-account is
+	// already 40 which is < 50 cap, so this is fine. Add a third
+	// partially-full app and POST 11 more (to push per-account to 51).
+	appC := mustSeedApp(t, e, "cron-acct-c")
+	for i := 0; i < 10; i++ {
+		if _, err := e.store.CreateCron(context.Background(), appC, "*/5 * * * *", "/x", true); err != nil {
+			t.Fatalf("seed C cron %d: %v", i, err)
+		}
+	}
+	// per-account is now 40 + 10 = 50 == cap; one more on appC must 403.
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appC, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 403, api.CodePlanCronQuota)
+}
+
+// TestCreateCron_UnknownPlanReturns402 confirms the handler doesn't
+// panic when acct.Plan is not in pkg/api/limits.go::planLimits —
+// must surface the same 402 + CodePlanCronsNotAllowed a Free customer
+// sees, not a 500. Fail-closed contract: an unconfigured plan is
+// treated as if crons weren't unlocked. Mirrors the LimitsFor()
+// unknown-plan branch in pkg/api/limits_test.go::TestPlanValidity.
+func TestCreateCron_UnknownPlanReturns402(t *testing.T) {
+	// Seed with a plan that pkg/api.planLimits doesn't know about.
+	// CreateAccount doesn't validate the plan string, so the account
+	// lands with Plan="enterprise" — exactly the wire state a future
+	// tier or a stale migration would produce.
+	e := setup(t, api.Plan("enterprise"))
+	appID := mustSeedApp(t, e, "cron-unknown-plan")
+	rec := e.do(t, "POST", "/v1/crons",
+		api.CreateCronRequest{AppID: appID, Schedule: "*/5 * * * *", Path: "/x"}, nil)
+	assertProblem(t, rec, 402, api.CodePlanCronsNotAllowed)
+}
+
 // TestListCrons_HappyPath seeds a cron via the store and confirms listCrons
 // returns it. Direct store insert keeps the test self-contained — the
 // HTTP create path is already covered above.

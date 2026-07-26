@@ -1911,6 +1911,104 @@ func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, 
 	return c, nil
 }
 
+// CreateCronIfUnderQuota is the customer-facing variant of
+// CreateCron that enforces the per-app and per-account caps under
+// an apps FOR UPDATE row lock (mirrors CreateAppIfUnderQuota). The
+// per-app cap is checked first because the lock is on the apps row,
+// not the account row; two concurrent POSTs for different apps on the
+// same account serialise through the per-account count read inside
+// the same tx.
+//
+// Failure modes:
+//   - *CronQuotaError when either cap trips (Scope names which).
+//   - ErrNotFound when the app row is gone or already deleted.
+//   - mapErr-wrapped unique-violation on a future uuid collision
+//     (today crons.id is gen_random_uuid() default; left as future-
+//     proof so the surface doesn't change when a uuid scheme lands).
+//
+// The lock uses apps_pkey (id) — no extra index needed.
+func (s *PgStore) CreateCronIfUnderQuota(ctx context.Context, appID, schedule, path string, enabled bool, limits api.Limits) (Cron, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Cron{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent apps row. SELECT 1 + FOR UPDATE keeps the lock
+	//    acquisition in one round-trip; the FOR UPDATE blocks any
+	//    concurrent createCron for the same app until COMMIT/ROLLBACK.
+	//    apps_pkey serves the lock search.
+	var locked int
+	err = tx.QueryRow(ctx,
+		`select 1 from apps where id = $1 and status <> 'deleted' for update`, appID,
+	).Scan(&locked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Cron{}, ErrNotFound
+		}
+		return Cron{}, fmt.Errorf("state: lock app %s: %w", appID, err)
+	}
+
+	// 2. Per-app count, authoritative under the lock. crons_app_idx
+	//    (app_id) WHERE enabled (migration 00002) covers this for the
+	//    common case; disabled crons still count toward the cap.
+	var appCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from crons where app_id = $1`, appID,
+	).Scan(&appCount); err != nil {
+		return Cron{}, fmt.Errorf("state: count crons for app %s: %w", appID, err)
+	}
+	if appCount >= limits.CronLimitPerApp {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeApp,
+			Limit:    limits.CronLimitPerApp,
+			Observed: appCount,
+		}
+	}
+
+	// 3. Per-account count under the same tx. account_id is read off
+	//    the apps row we just locked (no second round-trip to
+	//    accounts). The join through apps excludes deleted apps so
+	//    their cron rows don't poison the cap.
+	var accountID string
+	if err := tx.QueryRow(ctx,
+		`select account_id from apps where id = $1`, appID,
+	).Scan(&accountID); err != nil {
+		return Cron{}, fmt.Errorf("state: read account_id for app %s: %w", appID, err)
+	}
+	var accountCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from crons c
+		 join apps a on a.id = c.app_id
+		 where a.account_id = $1 and a.status <> 'deleted'`,
+		accountID,
+	).Scan(&accountCount); err != nil {
+		return Cron{}, fmt.Errorf("state: count crons for account %s: %w", accountID, err)
+	}
+	if accountCount >= limits.CronLimitPerAccount {
+		return Cron{}, &CronQuotaError{
+			Scope:    CronQuotaScopeAccount,
+			Limit:    limits.CronLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	// 4. Insert under the same lock. mapErr wraps unique-violation
+	//    in ErrConflict for future-proofing.
+	row := tx.QueryRow(ctx,
+		`insert into crons (app_id, schedule, path, enabled) values ($1, $2, $3, $4)
+		 returning id, app_id, schedule, path, enabled, created_at`,
+		appID, schedule, path, enabled)
+	c := Cron{}
+	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
+		return Cron{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Cron{}, fmt.Errorf("state: commit create cron: %w", err)
+	}
+	return c, nil
+}
+
 func (s *PgStore) CronByID(ctx context.Context, id string) (Cron, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, schedule, path, enabled, created_at from crons where id = $1`, id)

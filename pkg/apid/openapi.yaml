@@ -1410,6 +1410,8 @@ paths:
                 example: {"id":"0123456789abcdef0123456789abcdef","schedule":"*/5 * * * *","target_url":"https://hello-world.example.com/cron","enabled":true,"last_run_at":"2026-07-23T11:20:00Z","next_run_at":"2026-07-23T11:25:00Z"}
         '400': { $ref: '#/components/responses/CronInvalid' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CronInvalid' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/crons/{id}:
@@ -3092,7 +3094,7 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
     PlanLimit:
-      description: 'code: plan_limit_apps | plan_limit_ram | plan_limit_concurrency | plan_min_instances_not_allowed | plan_limit_secrets | app_layer_too_large | image_egress_denied'
+      description: 'code: plan_limit_apps | plan_limit_ram | plan_limit_concurrency | plan_min_instances_not_allowed | plan_limit_secrets | plan_cron_quota | app_layer_too_large | image_egress_denied'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -3134,7 +3136,7 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
     CronInvalid:
-      description: 'code: cron_invalid'
+      description: 'code: cron_invalid | plan_crons_not_allowed | plan_cron_quota'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
