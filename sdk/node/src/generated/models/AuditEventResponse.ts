@@ -19,7 +19,7 @@ export type AuditEventResponse = {
    */
   actor: string;
   /**
-   * Namespaced event kind. Common values: `auth.login`, `auth.logout`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`.
+   * Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`, `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`.
    */
   kind: string;
   /**

@@ -7,6 +7,8 @@ import type { PasswordLoginResponse } from '../models/PasswordLoginResponse.js';
 import type { PasswordResetConfirm } from '../models/PasswordResetConfirm.js';
 import type { PasswordResetRequest } from '../models/PasswordResetRequest.js';
 import type { PasswordSignupRequest } from '../models/PasswordSignupRequest.js';
+import type { SessionListResponse } from '../models/SessionListResponse.js';
+import type { SessionsRevokeAllResponse } from '../models/SessionsRevokeAllResponse.js';
 import type { SetPasswordRequest } from '../models/SetPasswordRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -334,6 +336,222 @@ export class AuthService {
         502: `\`github.com/login/oauth/access_token\`,
         \`api.github.com/user\`, or \`api.github.com/user/emails\`
         unreachable. Surfaces as \`github_unreachable\`.
+        `,
+      },
+    });
+  }
+  /**
+   * Log the current dashboard session out.
+   * Revokes the calling session row in the `sessions` table
+   * (one row per dashboard login; ADR-039 / IAM-3) and
+   * clears the `faas_sid` cookie. Always 204 on success,
+   * even if the row was already revoked (idempotent — the
+   * cookie is cleared either way). Other sessions on the
+   * same account are NOT touched; use
+   * `POST /v1/auth/sessions/revoke_all` for that.
+   *
+   * CSRF: action `logout` (verify via the
+   * `faas_csrf` cookie + body `csrf_token` field or
+   * `X-CSRF-Token` header).
+   *
+   * Emits `auth.session.revoke` with
+   * `reason: "logout"`.
+   *
+   * @returns void
+   * @throws ApiError
+   */
+  public static postAccountLogout({
+    faasSid,
+  }: {
+    /**
+     * Dashboard session cookie. Sealed; opaque to the client
+     * (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+     * The browser sets it automatically on `/login` / `/signup`;
+     * the SDK uses the device-code flow instead and never sets
+     * this cookie.
+     *
+     */
+    faasSid?: string,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/logout',
+      cookies: {
+        'faas_sid': faasSid,
+      },
+      errors: {
+        400: `CSRF check failed.`,
+        401: `Cookie missing, expired, tampered, or its \`sid\` is
+        not backed by an active sessions row. The cookie
+        is cleared on the wire. Surfaces as
+        \`session_expired\` (pre-IAM-3 cookie / missing /
+        revoked) or \`session_invalid\` (account-mismatch
+        defensive path; AEAD-bound envelopes should not
+        produce this).
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List active sessions for the calling account.
+   * Returns one `SessionInfo` row per active login (one row
+   * per dashboard login; ADR-039 / IAM-3). Newest first. The
+   * row whose `id` matches the calling cookie's `sid` is
+   * flagged `current_session: true`. Revoked rows are NOT
+   * returned; the `audit-events` endpoint is the timeline
+   * for those.
+   *
+   * @returns SessionListResponse Active sessions for the calling account.
+   * @throws ApiError
+   */
+  public static getAccountSessions({
+    faasSid,
+  }: {
+    /**
+     * Dashboard session cookie. Sealed; opaque to the client
+     * (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+     * The browser sets it automatically on `/login` / `/signup`;
+     * the SDK uses the device-code flow instead and never sets
+     * this cookie.
+     *
+     */
+    faasSid?: string,
+  }): CancelablePromise<SessionListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/auth/sessions',
+      cookies: {
+        'faas_sid': faasSid,
+      },
+      errors: {
+        401: `See \`/v1/auth/logout\` — same 401 surface.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Revoke a single session by id.
+   * Revokes the `sessions` row whose `id` is `{id}` and
+   * whose `account_id` matches the calling envelope. Cross-
+   * account DELETE returns 404 (not 403) — the handler
+   * never confirms a row exists in another account. Revoking
+   * the current session is allowed: the calling cookie is
+   * cleared on the wire (same as `/v1/auth/logout`).
+   *
+   * CSRF: action `session_revoke`.
+   *
+   * Emits `auth.session.revoke` with
+   * `reason: "explicit"`.
+   *
+   * @returns void
+   * @throws ApiError
+   */
+  public static deleteAccountSession({
+    id,
+    requestBody,
+    faasSid,
+  }: {
+    /**
+     * Session id (UUID v4) from `SessionInfo.id`.
+     */
+    id: string,
+    requestBody: {
+      csrf_token: string;
+    },
+    /**
+     * Dashboard session cookie. Sealed; opaque to the client
+     * (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+     * The browser sets it automatically on `/login` / `/signup`;
+     * the SDK uses the device-code flow instead and never sets
+     * this cookie.
+     *
+     */
+    faasSid?: string,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'DELETE',
+      url: '/v1/auth/sessions/{id}',
+      path: {
+        'id': id,
+      },
+      cookies: {
+        'faas_sid': faasSid,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `CSRF check failed (\`csrf_mismatch\`) or the path id
+        is not a valid UUID (\`validation_failed\`).
+        `,
+        401: `See \`/v1/auth/logout\`.`,
+        404: `No active session matches the id on this account
+        (does not exist, already revoked, or belongs to
+        another account). The 404 is the same shape
+        regardless — we never leak existence across
+        accounts.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Revoke every session except the calling one.
+   * Revokes all `sessions` rows for the calling account
+   * whose `id` is NOT the calling cookie's `sid`. The
+   * caller's session stays active. Returns the count of
+   * rows revoked so the dashboard can render "Signed out
+   * N other devices".
+   *
+   * CSRF: action `sessions_revoke_all`.
+   *
+   * Emits `auth.sessions.revoke_all` with
+   * `{revoked_count, retained_sid}`.
+   *
+   * @returns SessionsRevokeAllResponse Bulk revocation succeeded.
+   * @throws ApiError
+   */
+  public static postAccountSessionsRevokeAll({
+    requestBody,
+    faasSid,
+  }: {
+    requestBody: {
+      csrf_token: string;
+    },
+    /**
+     * Dashboard session cookie. Sealed; opaque to the client
+     * (`HttpOnly; Secure; SameSite=Lax`). 7-day fixed lifetime.
+     * The browser sets it automatically on `/login` / `/signup`;
+     * the SDK uses the device-code flow instead and never sets
+     * this cookie.
+     *
+     */
+    faasSid?: string,
+  }): CancelablePromise<SessionsRevokeAllResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/sessions/revoke_all',
+      cookies: {
+        'faas_sid': faasSid,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `CSRF check failed on the bulk-revoke request.`,
+        401: `Cookie missing, expired, tampered, or its \`sid\` is not backed by an active sessions row. Same 401 surface as \`/v1/auth/logout\`.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
       },
     });
