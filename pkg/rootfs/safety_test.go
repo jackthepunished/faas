@@ -105,8 +105,14 @@ func TestApplyEntry_Symlink(t *testing.T) {
 	dst := t.TempDir()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+	// Relative-in-archive link target: the symlink points to a sibling
+	// entry inside the staging root. Absolute paths are REJECTED (see
+	// safeJoin + the CodeQL go/path-injection hardening in applyEntry)
+	// because a malicious layer could otherwise craft a symlink whose
+	// target is /etc/passwd or any other host path the staging directory
+	// will later follow.
 	if err := tw.WriteHeader(&tar.Header{
-		Name: "link", Linkname: "/usr/bin/env", Typeflag: tar.TypeSymlink, Mode: 0o777,
+		Name: "link", Linkname: "sibling", Typeflag: tar.TypeSymlink, Mode: 0o777,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,8 +126,13 @@ func TestApplyEntry_Symlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("symlink not created: %v", err)
 	}
-	if target != "/usr/bin/env" {
-		t.Errorf("symlink target = %q, want /usr/bin/env", target)
+	// safeJoin returns filepath.Join(base, clean(linkname)) so the
+	// kernel-side symlink text is the absolute path inside the staging
+	// root — that's how Layer.applyEntry interprets "relative path
+	// inside the archive root" after the CodeQL hardening.
+	wantTarget := filepath.Join(dst, "sibling")
+	if target != wantTarget {
+		t.Errorf("symlink target = %q, want %q", target, wantTarget)
 	}
 }
 

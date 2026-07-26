@@ -95,7 +95,13 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		}
 		return f.Close()
 	case tar.TypeSymlink:
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime; for a 2-step chain to escape, the first symlink would also have to point outside base, which safeJoin rejects.
+		// codeql[go/path-injection] false-positive: hdr.Linkname is the
+		// attacker-controlled tar header bytes, but safeJoin above rejects
+		// ".." and absolute paths at runtime. For a 2-step chain attack
+		// (the BAD example in CodeQL's go/unsafe-unzip-symlink rule) to
+		// escape, the first symlink would also have to point outside base,
+		// which safeJoin rejects. TestApplyEntry_Symlink_RejectsTwoStepChainAttack
+		// pins the runtime invariant.
 		linkTarget, err := safeJoin(base, hdr.Linkname)
 		if err != nil {
 			return err
