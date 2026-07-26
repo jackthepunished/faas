@@ -132,6 +132,18 @@ type runDeps struct {
 	// TLS listener. Production builds this in run() when TLS is enabled;
 	// tests leave it nil.
 	acmeMux http.Handler
+	// metrics is the process-local *gateway.Metrics bundle (Prometheus
+	// collectors owned by gatewayd — separate from pkg/wire/metrics.go
+	// OpsMetrics, which gatewayd does not instantiate). Constructed in run()
+	// before the TLS bundle so NewCertMagicConfig and the cert-expiry
+	// refresher share the same registry with the handler. Tests leave it
+	// nil; the bundle + refresher + handler all accept nil safely.
+	metrics *gateway.Metrics
+	// tlsCertExpiryCancel stops the cert-expiry refresher goroutine
+	// (spec §12 + ADR-024 H3). Set in run() when TLS is enabled; called
+	// in the shutdown path after tlsBundle.Close. nil when TLS is
+	// disabled or when the daemon is started in test mode.
+	tlsCertExpiryCancel func()
 	// extraListen is an optional secondary listener (the :80 ACME mux when
 	// TLS is enabled). nil in the legacy path. Tests use it to exercise
 	// the production-style dual-listener setup without binding :80.
@@ -252,6 +264,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return inv, nil
 		},
 	}, log)
+	// Process-local Prometheus registry (spec §12). Constructed here so
+	// every downstream consumer — TLS bundle, cert-expiry refresher,
+	// handler — shares the same registry. The registry is exposed via
+	// :9090/metrics by gateway.RunControlServer; the gate/handler pick
+	// it up via deps.metrics in runWithDeps.
+	deps.metrics = gateway.NewMetrics()
 
 	// TLS path: only when the operator opted in via the TOML [tls] table.
 	// The Disabled=true path stays on plain :8080 so the e2e harness keeps
@@ -277,7 +295,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("gatewayd: Hetzner DNS token: %w", err)
 		}
-		bundle, err := gateway.NewCertMagicConfig(ctx, resolved, tok, log, nil)
+		bundle, err := gateway.NewCertMagicConfig(ctx, resolved, tok, log, nil, deps.metrics)
 		if err != nil {
 			return fmt.Errorf("gatewayd: certmagic: %w", err)
 		}
@@ -286,6 +304,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		deps.extraListen = net.Listen
 		// Public listener now binds :443, not :8080.
 		listenAddr = ":443"
+		// ADR-024 H3 — cert-expiry refresher: walks cfg.StorageDir/<...>/...
+		// on a 5-minute ticker and updates gateway_tls_cert_expiry_seconds
+		// with the smallest remaining NotAfter across cached leaf certs.
+		// The cancel closure lands on deps so the shutdown path can stop
+		// the goroutine after tlsBundle.Close (spec §12 panel surfaces
+		// immediately on /metrics; the alert rules live in faas.rules.yml).
+		deps.tlsCertExpiryCancel = gateway.StartCertExpiryRefresher(
+			ctx, resolved.StorageDir, deps.metrics, 5*time.Minute, log,
+		)
 	}
 	// Forward the operator-configured apid loopback URL through the
 	// test seam so runWithDeps can stay TOML-free (issue #85).
@@ -322,7 +349,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// otherwise we fall back to the legacy plain :8080 path the e2e harness
 	// uses.
 
-	handler := gateway.NewHandlerWith(deps.backend, gateway.NewMetrics(), log)
+	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
 	handler.SetWakeGateHook()
 
 	// Issue #98 / ADR-028: install the per-node HTTP→gRPC forwarder.
@@ -577,6 +604,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		if deps.tlsBundle != nil {
 			_ = deps.tlsBundle.Close()
+		}
+		// ADR-024 H3 — stop the cert-expiry refresher goroutine. stop() is
+		// idempotent: the first call closes the inner `done` channel; later
+		// calls are a no-op via the select-default guard. nil-guarded because
+		// tests + TLS-disabled prod paths never start the refresher.
+		if deps.tlsCertExpiryCancel != nil {
+			deps.tlsCertExpiryCancel()
 		}
 		if deps.synth != nil {
 			//nolint:contextcheck // same shutdown-ctx contract as public.Shutdown above.

@@ -35,6 +35,7 @@ Paste the raw command output under "Result".)
 | 6 | Cert-mint abuse vector (attacker SNI) | `handshake failure` (allowlist denies) | |
 | 7 | apid status unaffected (loopback) | `200`, SLO JSON unchanged | |
 | 8 | Cert expiry | `notAfter=` ≥ 60 days out | |
+| 9 | TLS metric scrape (`gateway_tls_*` surfaces on :9090/metrics) | `gateway_tls_cert_expiry_seconds` ≥ 1d, `gateway_tls_on_demand_denied_total{reason=...}` present (any value, including 0) | |
 
 ## journalctl excerpt (first 60 s after `systemctl restart faas-gatewayd`)
 
@@ -76,5 +77,6 @@ unexpected errors. Empty if the runbook was followed verbatim.>
 ## Follow-ups committed
 
 <PR numbers or follow-up task IDs for anything the cut-over uncovered.
-ADR-024 lists H3 (Prometheus cert-expiry metric) and H4 (file-watch
-secret reload) as known follow-ups.>
+ADR-024's H3 (Prometheus cert-expiry + on-demand-denied metrics) is
+closed at cut-over time — row 9 above is the live evidence. H4
+(file-watch secret reload) remains the only open ADR-024 follow-up.>

@@ -539,3 +539,70 @@ groups:
           summary: "Error rate < 0.5x 3-day baseline (route {{ $labels.route }})"
           description: "Route {{ $labels.route }} has had its error rate below 50% of its 3d trailing average for 15m while still handling > 0.001 err/s (so it's not idle). Common causes: customer rolled back a misconfigured deploy, scanner traffic stopped, or upstream patch fixed an outage. The `> 0.001 err/s` guard prevents the rule from firing on routes that simply had no recent failures (the baseline would be ~0 and the ratio undefined)."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # TLS cert expiry (gatewayd / gateway_tls_cert_expiry_seconds).
+      # ADR-024 H3 closure: page at ≤14 days, warn between 14 and 30.
+      # The gauge carries min(notAfter − now) across cached certs on
+      # cfg.StorageDir/certificates/...; first-mint pre-boot state is
+      # +Inf (the gauge default), which legitimately fails the < 14d
+      # comparator. Operators expect a missing cert at startup, not a
+      # page.
+      #
+      # The gauge is ticked every 5 minutes by
+      # pkg/gateway.StartCertExpiryRefresher; a stale gauge would mean
+      # the refresher goroutine died (visible as gateway_tls_cert_expiry_seconds
+      # not changing for > 6m — separate drift signal, not in this rule).
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasTLSCertExpiryPage
+        expr: gateway_tls_cert_expiry_seconds < (14 * 86400)
+        for: 5m
+        labels:
+          severity: page
+          component: gatewayd
+          family: tls_cert_expiry
+        annotations:
+          summary: "TLS cert expires in ≤14 days"
+          description: "The smallest remaining lifetime across cached certs is below 14 days. A renewal has failed (or never ran) — HTTPS serving across the box will start failing within hours. Re-run `make bootstrap` on the EX44 to refresh certmagic + the Hetzner DNS-01 token, then force-renew via `faas cert refresh`."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSCertExpiryPage.md"
+
+      - alert: FaasTLSCertExpiryWarn
+        expr: gateway_tls_cert_expiry_seconds < (30 * 86400) and gateway_tls_cert_expiry_seconds >= (14 * 86400)
+        for: 5m
+        labels:
+          severity: warn
+          component: gatewayd
+          family: tls_cert_expiry
+        annotations:
+          summary: "TLS cert expiry < 30 days"
+          description: "Smallest remaining lifetime is between 14 and 30 days. Renewals normally fire at 30d; verify certmagic's renew-loop is alive (a log line every few minutes post-first-mint) and that the Hetzner DNS-01 token still has zone-write permission on the apps domain."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSCertExpiryWarn.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # On-demand cert mint denial rate
+      # (gatewayd / gateway_tls_on_demand_denied_total{reason}).
+      # ADR-024 H3 closure: spec §11 abuse-vector observability — a
+      # non-zero rate of denials (sum across the reason label set) is the
+      # signal that someone is probing :443 for unowned SNIs. The
+      # closed `reason` set is {allowlist, dns01, token}; today only
+      # `allowlist` is wire-incremented (the DecisionFunc hook in
+      # tls_wire.go). The series for `dns01` and `token` are
+      # pre-instantiated at 0 so a frozen-zero is visible as the
+      # ADR-024 H3.b follow-up signal.
+      #
+      # Threshold: > 1/min (i.e. > 1/60 per-second on a 5m rate) for 5m.
+      # Sustained probes (scanners, hijackers) fire many requests/sec;
+      # the threshold is intentionally a hair above zero so a single
+      # misconfigured cron-job probe pages rather than hides.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasTLSOnDemandDeniedHigh
+        expr: sum(rate(gateway_tls_on_demand_denied_total[5m])) > (1 / 60)
+        for: 5m
+        labels:
+          severity: warn
+          component: gatewayd
+          family: tls_on_demand_denied
+        annotations:
+          summary: "On-demand TLS denials > 1/min"
+          description: "The denials counter is climbing above 1/min over the rolling 5-minute window. Cross-check reason breakdown via `sum by (reason) (rate(gateway_tls_on_demand_denied_total[5m]))` — an allowlist spike means external scanners hitting :443; a frozen-zero on dns01 or token means the H3.b wire-incrementation follow-up is still pending."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSOnDemandDeniedHigh.md"

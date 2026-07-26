@@ -115,13 +115,13 @@ func TestACMEMux_RejectsMissingHost(t *testing.T) {
 // certmagic. Verify it both denies (false → non-nil error) and allows (true → nil).
 func TestAllowlistToDecisionFunc(t *testing.T) {
 	deny := func(string) bool { return false }
-	df := allowlistToDecisionFunc(deny, nil)
+	df := allowlistToDecisionFunc(deny, nil, nil)
 	if err := df(nil, "attacker.example.com"); err == nil {
 		t.Error("deny allowlist should produce non-nil error")
 	}
 
 	allow := func(string) bool { return true }
-	df = allowlistToDecisionFunc(allow, nil)
+	df = allowlistToDecisionFunc(allow, nil, nil)
 	if err := df(nil, "shop.example.com"); err != nil {
 		t.Errorf("allow allowlist should produce nil error, got %v", err)
 	}
@@ -131,8 +131,63 @@ func TestAllowlistToDecisionFunc(t *testing.T) {
 // config (allowlist not wired) must refuse to mint anything. This is the
 // defense-in-depth for Validate()'s OnDemandHTTP01Allowlist == nil check.
 func TestAllowlistToDecisionFunc_NilAllowlist(t *testing.T) {
-	df := allowlistToDecisionFunc(nil, nil)
+	df := allowlistToDecisionFunc(nil, nil, nil)
 	if err := df(nil, "anything.example.com"); err == nil {
 		t.Error("nil allowlist must produce non-nil error")
 	}
+}
+
+// TestAllowlistToDecisionFunc_IncrementsCounter — ADR-024 H3: a denied
+// on-demand DecisionFunc must increment the gateway_tls_on_demand_denied_total
+// counter labelled reason="allowlist". This is the wire-incrementation
+// that closes the spec §11 abuse-vector observability gap (operators can
+// alert on a non-zero rate of denials without grepping slog). Verify by
+// reading the counter back via the Metrics registry.
+func TestAllowlistToDecisionFunc_IncrementsCounter(t *testing.T) {
+	deny := func(string) bool { return false }
+	m := NewMetrics()
+	df := allowlistToDecisionFunc(deny, nil, m)
+	if err := df(nil, "attacker.example.com"); err == nil {
+		t.Fatal("deny branch should produce an error")
+	}
+	if err := df(nil, "another.example.com"); err == nil {
+		t.Fatal("deny branch should produce an error (second call)")
+	}
+	got := readTLSOnDemandDenied(t, m, "allowlist")
+	if got != 2 {
+		t.Fatalf("counter{reason=allowlist} = %v, want 2", got)
+	}
+	// dns01 and token are pre-instantiated at 0; verify they surface
+	// without having been touched (the closed-reason-set visibility
+	// signal that drives the H3.b follow-up awareness).
+	for _, reason := range []string{"dns01", "token"} {
+		if v := readTLSOnDemandDenied(t, m, reason); v != 0 {
+			t.Errorf("counter{reason=%s} = %v, want 0 (frozen-zero sentinel)", reason, v)
+		}
+	}
+}
+
+// readTLSOnDemandDenied extracts gateway_tls_on_demand_denied_total{reason}
+// from m.Registry().Gather(). Pulled out so the IncrementCounter test
+// can co-locate with the rest of the adapter tests without exporting
+// state into the production file.
+func readTLSOnDemandDenied(t *testing.T, m *Metrics, reason string) float64 {
+	t.Helper()
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_tls_on_demand_denied_total" {
+			continue
+		}
+		for _, metric := range fam.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() == "reason" && lbl.GetValue() == reason {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }

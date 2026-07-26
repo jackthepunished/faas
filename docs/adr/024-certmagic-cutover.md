@@ -113,3 +113,40 @@
     the §4.1 single-public-listener invariant assumes TLS is on the
     box, not deferred indefinitely. The EX44's networking posture
     without TLS is a customer-trust regression.
+
+## H3 closed — 2026-07-26
+
+ADR-024 declared H3 (TLS observability) as a known follow-up:
+`gateway_tls_cert_expiry_seconds` + `gateway_tls_on_demand_denied_total`
+on the §12 dashboard, with alert rules to prevent a missed renewal from
+turning into a customer-facing outage.
+
+H3 closes in this PR (the cert-expiry + on-demand-denial PR):
+
+- **`gateway_tls_cert_expiry_seconds`** (gauge, `pkg/gateway/metrics.go`):
+  smallest remaining lifetime across cached leaf certs in
+  `cfg.StorageDir`. Ticked every 5 minutes by
+  `pkg/gateway.StartCertExpiryRefresher` (new file `cert_expiry.go`).
+  Pre-mint state is "no series" — Prometheus drops NaN series and
+  the page rule's `<` expression handles a missing series correctly,
+  so no false page fires during the boot window before the first mint.
+- **`gateway_tls_on_demand_denied_total{reason}`** (counter):
+  wire-incremented from `pkg/gateway/tls_wire.go`'s on-demand
+  DecisionFunc on the `allowlist` reason. The `dns01` and `token`
+  series are pre-instantiated at 0 so the dashboard panel surfaces from
+  boot; their eventual wire-incrementation is the ADR-024 H3.b
+  follow-up (certmagic's silentZap indirection makes a clean bridge
+  non-trivial and out of scope for the cut-over PR).
+- **Three alert rules** in `deploy/ansible/roles/prometheus/files/faas.rules.yml`:
+  `FaasTLSCertExpiryPage` (<14d, page), `FaasTLSCertExpiryWarn`
+  (14-30d, warn), `FaasTLSOnDemandDeniedHigh` (>1/min, warn). Validated
+  with `promtool check rules` (17 rules total in the `faas_slo` group
+  after this PR).
+- **Cut-over drill evidence**: `docs/drills/2026-07-21-tls-cutover.md`
+  row 9 — operators curl `127.0.0.1:9090/metrics` and grep
+  `gateway_tls_` to confirm both metrics surface.
+- **Operator runbook pointer**: `docs/ops/gatewayd-tls-cutover.md` has
+  been updated to remove the "follow-up" entry for these metrics and
+  add a "Cut-over evidence — metric scrape (ADR-024 H3)" section.
+
+H4 (file-watch secret reload for `loadSecretFile`) remains open.

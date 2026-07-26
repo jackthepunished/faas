@@ -97,7 +97,12 @@ type DNSProviderFactory func(token, zone string) certmagic.DNSProvider
 //
 // dnsFactory is nil in production (NewHetznerDNSProvider is used); tests
 // pass a closure that returns a provider pointed at an httptest stub.
-func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, hetznerToken string, log *slog.Logger, dnsFactory DNSProviderFactory) (*TLSBundle, error) {
+//
+// m may be nil (production passes the per-daemon *Metrics; tests pass nil
+// and the counter hook becomes a no-op through the Metrics nil-safe
+// helpers — same pattern as ObserveBuildCount / SetResidentGBPerCustomer
+// in pkg/wire/metrics.go).
+func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, hetznerToken string, log *slog.Logger, dnsFactory DNSProviderFactory, m *Metrics) (*TLSBundle, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -177,7 +182,7 @@ func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, hetznerToken string,
 		Storage: &certmagic.FileStorage{Path: cfg.StorageDir},
 		Issuers: nil, // populated below; see comment
 		OnDemand: &certmagic.OnDemandConfig{
-			DecisionFunc: allowlistToDecisionFunc(cfg.OnDemandHTTP01Allowlist, log),
+			DecisionFunc: allowlistToDecisionFunc(cfg.OnDemandHTTP01Allowlist, log, m),
 		},
 	})
 	// NewACMEIssuer wires `am.config = magic` AND defaults CA / TestCA /
@@ -270,15 +275,30 @@ func ensureStorageDir(dir string) error {
 // certmagic's DecisionFunc (func(ctx, name) error). Returning a non-nil
 // error tells certmagic to deny the request — that's how we close the
 // cert-mint abuse vector from spec §11.
-func allowlistToDecisionFunc(allow OnDemandAllowlist, log *slog.Logger) func(context.Context, string) error {
+//
+// ADR-024 H3 (closed in PR #345): on the denied branch we also call
+// m.ObserveTLSOnDemandDenied to bump the
+// gateway_tls_on_demand_denied_total{reason="allowlist"} counter;
+// today only the allowlist reason is wire-incrementable from this
+// seam (dns01 and token failures live deeper in the certmagic +
+// Hetzner DNS provider stack and are routed through the H3.b follow-up
+// via a slog→prometheus bridge). The counter is pre-instantiated at 0
+// for dns01 and token so the panel surfaces from boot even before that
+// follow-up lands. Production refuses a nil allowlist earlier in
+// Validate() (ErrTLSAllowlistMissing); the increment here is a
+// defense-in-depth for the test-only path that builds a DecisionFunc
+// directly.
+func allowlistToDecisionFunc(allow OnDemandAllowlist, log *slog.Logger, m *Metrics) func(context.Context, string) error {
 	return func(_ context.Context, name string) error {
 		if allow == nil {
+			m.ObserveTLSOnDemandDenied("allowlist")
 			return errors.New("gateway: on-demand denied (allowlist not configured)")
 		}
 		if !allow(name) {
 			if log != nil {
 				log.Info("gateway: on-demand cert denied by allowlist", "host", name)
 			}
+			m.ObserveTLSOnDemandDenied("allowlist")
 			return fmt.Errorf("gateway: on-demand denied for %q", name)
 		}
 		return nil
