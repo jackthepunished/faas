@@ -446,9 +446,10 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
 			}
 			written += hdr.Size
 		}
-		// codeql[go/path-injection] false-positive: safeJoin is not in CodeQL's
-		// sanitizer model, but it does reject ".." and absolute paths at runtime
-		// (see safeJoin's body + the TestApplyLayer_RejectsPathEscape pin).
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and
+		// absolute paths at runtime (see safeJoin body + the
+		// TestApplyLayer_RejectsPathEscape pin). safeJoin is not in CodeQL's
+		// go/path-injection sanitizer model.
 		target, err := safeJoin(dst, hdr.Name)
 		if err != nil {
 			return err
