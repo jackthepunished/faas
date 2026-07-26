@@ -774,6 +774,33 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			op = "unmatched"
 		}
 		s.ops.Observe(op, time.Since(start), observeErrFromStatus(rec.status))
+		// Issue #278: also feed the per-customer request-failure
+		// counter when the response status indicates a client or
+		// server error. 4xx/5xx are the signal; 1xx-3xx never count.
+		// The route label is r.Pattern (or "unmatched") so the
+		// cardinality stays bounded by the route table, not by the
+		// URL path — same precedent as apid_ops_total.
+		//
+		// account_id resolution: principalFrom(r) succeeds when the
+		// inner chain (s.auth) mutated *r to carry the principal in
+		// r.Context() — see s.auth at server.go:962/998. For the
+		// unauthenticated 401 branch, principalFrom returns ok=false
+		// and the account resolves to "anonymous" via the bounded
+		// admission set inside OpsMetrics.RequestFailureFor. Id past
+		// the cap → "__other__".
+		//
+		// RequestFailureFor is preferred over the string-form
+		// RequestFailure so the route label's extraction from r.Pattern
+		// lives next to the cardinality contract — a future caller
+		// cannot accidentally pass a raw URL path and explode the
+		// label set (review finding #1 on PR #332).
+		if rec.status >= http.StatusBadRequest {
+			acct := "anonymous"
+			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+				acct = p.Acct.ID
+			}
+			s.ops.RequestFailureFor(r, acct).Inc()
+		}
 	})
 }
 
@@ -897,6 +924,13 @@ func (s *server) cliAuthSubmitChain(h http.Handler) http.Handler {
 // themselves only need the Account and continue to receive it as the
 // third argument, so this change is invisible to the 38 existing
 // accountHandler bodies. See ADR-034.
+//
+// Pointer mutation (issue #278): s.auth mutates *r in place via
+// `*r = *r.WithContext(...)` so the request seen by the outer
+// observeWrap carries the principal. Without this, principalFrom
+// would always return ok=false from inside observeWrap and the
+// per-customer request-failure counter would be useless (every
+// authenticated call would land in the "anonymous" bucket).
 type accountHandler func(w http.ResponseWriter, r *http.Request, acct state.Account)
 
 // principal is the authenticated caller. Key is nil when the caller
@@ -990,7 +1024,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 						return
 					}
 				}
-				r = r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
+				*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
 				// TouchKeyLastUsed is observability, not auth — a slow or
 				// failing PG must not block the user's request. Detached
 				// context so a request that cancels client-side (tab close,
@@ -1026,7 +1060,13 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 						}
 					}
 					// Key stays nil; session cookie = implicit admin.
-					r = r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil}))
+					// Pointer-mutation (`*r = ...`) is load-bearing —
+					// observeWrap is the outermost middleware in the
+					// chain and reads the principal via principalFrom(r);
+					// a non-mutating rebind would be invisible to
+					// observeWrap and the request-failure counter would
+					// lose the account_id label (PR #332 / issue #278).
+					*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil}))
 					// Stamp the mfa-pending flag for requireMFA. The
 					// bearer branch above deliberately does NOT
 					// stamp this — API keys bypass MFA per the
@@ -1035,7 +1075,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 					// login handlers set via
 					// IssueWithMFAFlag(mfaEnrollRequired(acct)).
 					//nolint:contextcheck // withMFAPending is the documented seam; same shape as withPrincipal above.
-					r = r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
+					*r = *r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
 					next(w, r, acct)
 					return
 				}

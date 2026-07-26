@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,11 +24,23 @@ import (
 // convention is <daemon-name>.
 const auditActor = "apid"
 
-// auditOps is the narrow counter surface auditor needs. wire.OpsMetrics
-// satisfies it (it has both EventsWriteFailures and AuditWriteFailures).
-// Defined as an interface so the helper can be unit-tested with a stub.
+// auditOps is the narrow counter+histogram surface auditor needs.
+// wire.OpsMetrics satisfies it (it has AuditWriteFailures and
+// AuditWriteFailureDuration). Defined as an interface so the
+// helper can be unit-tested with a stub (cmd/apid/audit_test.go).
+//
+// Issue #278 widened the audit-write surface:
+//   - AuditWriteFailures takes accountID so the counter can be
+//     labelled per-customer. The label value flows through the
+//     bounded admission set; empty input becomes "anonymous" and
+//     overflow collapses to "__other__".
+//   - AuditWriteFailureDuration records the AppendEvent latency
+//     histogram labelled by result ∈ {ok, failed} so an operator
+//     can distinguish a Postgres outage (slow failed) from a
+//     transient insert race (fast failed).
 type auditOps interface {
-	AuditWriteFailures() prometheus.Counter
+	AuditWriteFailures(accountID string) prometheus.Counter
+	AuditWriteFailureDuration(result string) prometheus.Observer
 }
 
 // auditor is the IAM-4 audit seam. Constructed once per server in
@@ -49,12 +62,20 @@ func newAuditor(store state.Store, log *slog.Logger, ops auditOps) *auditor {
 // system-level events, e.g. cron-fired). data may be nil; marshal into
 // {} on the way down so the column is always valid JSON.
 //
-// Failure semantics: a json.Marshal failure on our own map[string]any
-// is a programmer bug, not a runtime concern — log Error and return.
-// An AppendEvent failure logs Warn and increments the
-// audit_write_failures counter; the auth action has already returned
-// 200 by the time this fires, so the audit row is observation, not
-// source of truth. Never roll back the action.
+// Failure semantics (issue #278 widened this surface — see ADR-035
+// for the policy rationale):
+//   - json.Marshal failure on our own map[string]any is a programmer
+//     bug, not a runtime concern — log Error and return. We don't
+//     reach AppendEvent, so no duration observation is recorded.
+//   - AppendEvent failure logs Warn, observes the latency under
+//     result="failed", and increments audit_write_failures labelled
+//     by the resolved subject id (or "anonymous" if subject is nil/
+//     empty). The auth action has already returned 200 by the time
+//     this fires, so the audit row is observation, not source of
+//     truth. Never roll back the action.
+//   - AppendEvent success observes the latency under result="ok"
+//     so the failure-path latency distribution is comparable to
+//     the healthy-path latency distribution (issue #278 acceptance).
 func (a *auditor) Emit(ctx context.Context, kind string, accountID *string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
@@ -64,15 +85,34 @@ func (a *auditor) Emit(ctx context.Context, kind string, accountID *string, data
 		a.log.Error("audit: marshal", "kind", kind, "err", err)
 		return
 	}
+	// Normalize the subject into a string we can label the metric
+	// with. nil and empty collapse to the empty string; accountLabel
+	// upstream in the metric helper maps that to "anonymous". This
+	// keeps the labelled-counter helper on a single non-nil string
+	// argument so auditOps stays a clean two-method interface.
+	subjectStr := ""
+	if accountID != nil {
+		subjectStr = *accountID
+	}
 	var subject *string
-	if accountID != nil && *accountID != "" {
+	if subjectStr != "" {
 		subject = accountID
 	}
-	if err := a.store.AppendEvent(ctx, auditActor, kind, subject, payload); err != nil {
+	start := time.Now()
+	err = a.store.AppendEvent(ctx, auditActor, kind, subject, payload)
+	dur := time.Since(start)
+	if a.ops != nil {
+		if err != nil {
+			a.ops.AuditWriteFailureDuration("failed").Observe(dur.Seconds())
+		} else {
+			a.ops.AuditWriteFailureDuration("ok").Observe(dur.Seconds())
+		}
+	}
+	if err != nil {
 		a.log.Warn("audit: append event",
 			"kind", kind, "subject", subject, "err", err)
 		if a.ops != nil {
-			a.ops.AuditWriteFailures().Inc()
+			a.ops.AuditWriteFailures(subjectStr).Inc()
 		}
 	}
 }
