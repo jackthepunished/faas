@@ -16,6 +16,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -501,8 +502,13 @@ func (s *server) handler() http.Handler {
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write
 	// CI key doesn't need them. usage:read is the right knob here.
-	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage))))
+mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage))))
 	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.usageSummary))))
+	// Billing history (issue #259). Listing one's own invoices is the
+	// same access tier as usage/summary — usage:read is enough.
+	// Wrapped in requireMFA for consistency with the other
+	// session-cookie routes (IAM-2 / issue #186).
+	mux.HandleFunc("GET /v1/invoices", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.listInvoices))))
 
 	// Account-scoped deployments list (M7.5 dashboard).
 	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDeployments))))
@@ -721,7 +727,18 @@ func (s *server) handler() http.Handler {
 	// Nil s.ops (no metrics wired) = no-op passthrough. Includes
 	// the spec routes above so SDK codegen hits show up on the
 	// §12 dashboard's per-route latency panel.
-	return s.observeWrap(mux)
+	//
+	// Issue #249 / spec §11: security response headers sit OUTERMOST
+	// (above observeWrap) so every status code carries them — even
+	// the ones observeWrap synthesizes on panic. httpsec.Static sets
+	// the five static headers; httpsec.Nonce mints a per-request CSP
+	// nonce and stamps it on the context that dashboard.Render reads
+	// to mark up <script>/<style> tags. apid serves only dashboard
+	// + JSON so the gate is unconditionally true.
+	return httpsec.Static(httpsec.Nonce(
+		func(*http.Request) bool { return true },
+		s.observeWrap(mux),
+	))
 }
 
 // observeWrap returns the mux wrapped in an observe middleware that

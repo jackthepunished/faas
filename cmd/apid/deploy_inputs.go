@@ -325,10 +325,21 @@ func escapesArchiveRoot(p string) bool {
 	return false
 }
 
+// truthyFlagLiterals are the string values the multipart dockerfile
+// checkbox accepts as "yes". Centralised so goconst doesn't flag
+// repeated literals across the file (and so a future "off"/"no"
+// value addition is one line, not four).
+var truthyFlagLiterals = []string{"1", "true", "on", "yes"}
+
 // isFlagSet reads a small multipart field and reports whether it carries a
 // truthy value (used by the dockerfile checkbox).
 func isFlagSet(part *multipart.Part) bool {
 	b, _ := io.ReadAll(io.LimitReader(part, 16))
 	s := strings.ToLower(strings.TrimSpace(string(b)))
-	return s == "1" || s == "true" || s == "on" || s == "yes"
+	for _, lit := range truthyFlagLiterals {
+		if s == lit {
+			return true
+		}
+	}
+	return false
 }

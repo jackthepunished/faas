@@ -1,22 +1,12 @@
-// Package state — Postgres-backed Store (spec §5, ADR-006, CLAUDE.md
-// "SQL via sqlc only").
+// pgstore.go is the ADR-017 hand-written M5 adapter. It implements the
+// Store interface against the Postgres schema in migrations/*.sql; the SQL
+// itself lives in queries.sql so sqlc.yaml is the canonical source. This
+// file is the thin adapter that maps sqlc-style params/rows to the domain
+// types and surfaces ErrNotFound / ErrConflict at the right boundaries.
 //
-// pgstore.go implements the Store interface against the Postgres schema in
-// migrations/*.sql. The SQL itself lives in queries.sql so the codegen
-// tooling (sqlc.yaml) is the canonical source — this file is the thin
-// adapter that maps sqlc-style params/rows to the domain types and surfaces
-// ErrNotFound / ErrConflict at the right boundaries.
-//
-// Why not the sqlc-generated *.sql.go files? sqlc couldn't be built in this
-// environment (the pganalyze/pg_query_go dependency fails to compile on the
-// macOS SDK's _string.h). The hand-written adapter here is structured so it
-// can be swapped for the generated package one-for-one once sqlc is
-// available; the public Store surface is unchanged.
-//
-// TODO(M5.1): regenerate via `sqlc generate` against pkg/state/queries.sql
-// once the CI sqlc pin is clean on the macOS SDK. See ADR-017
-// (docs/adr/017-hand-written-pgstore.md) for the migration plan and
-// reviewer checklist.
+// `make sqlc-check` regenerates pkg/state/sqlc/ in CI and fails when it
+// drifts from queries.sql + schema.sql. TODO(M5.1): replace this adapter's
+// query bodies with calls into the generated package. See ADR-017.
 package state
 
 import (
@@ -1581,10 +1571,10 @@ func (s *PgStore) DeleteCustomDomain(ctx context.Context, domain string) error {
 func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error) {
 	row := s.pool.QueryRow(ctx,
 		`insert into crons (app_id, schedule, path, enabled) values ($1, $2, $3, $4)
-		 returning id, app_id, schedule, path, enabled`,
+		 returning id, app_id, schedule, path, enabled, created_at`,
 		appID, schedule, path, enabled)
 	c := Cron{}
-	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled); err != nil {
+	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 		return Cron{}, mapErr(err)
 	}
 	return c, nil
@@ -1592,9 +1582,9 @@ func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, 
 
 func (s *PgStore) CronByID(ctx context.Context, id string) (Cron, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, schedule, path, enabled from crons where id = $1`, id)
+		`select id, app_id, schedule, path, enabled, created_at from crons where id = $1`, id)
 	c := Cron{}
-	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled); err != nil {
+	if err := row.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 		return Cron{}, mapErr(err)
 	}
 	return c, nil
@@ -3035,6 +3025,108 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	return out, rows.Err()
 }
 
+// ListInvoicesForAccount returns the account's invoices, newest first,
+// ordered by (period_end DESC, id DESC) for deterministic pagination.
+// The handler clamps limit (default 25, max 100); the SQL uses the same
+// $1..$N split as ListDeploymentsForAccount.
+//
+// Month filtering (when month != nil) applies a half-open UTC range
+// [month, month+1mo) to period_end — same convention as UsageByMonth's
+// date_trunc('month', ...) guard, sidestepping the session-TZ compare
+// trap (memory: pkg-state-usage-monthly-tz-compare).
+//
+// Cursor (before) is strict-less on period_end only. The id tie-break
+// is implicit in the unique index ordering; rows sharing the same
+// period_end may appear at the page boundary if a customer has multiple
+// invoices for the same provider-period. Acceptable for the v1
+// surface — added this comment so the next reader does not silently
+// "fix" the cursor without introducing a compound id cursor.
+func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	switch {
+	case month != nil && before.IsZero():
+		monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+		monthEnd := monthStart.AddDate(0, 1, 0)
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end <  $3
+			  order by period_end desc, id desc
+			  limit $4`,
+			accountID, monthStart, monthEnd, limit)
+	case month != nil && !before.IsZero():
+		monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+		monthEnd := monthStart.AddDate(0, 1, 0)
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end <  $3
+			    and period_end < $4
+			  order by period_end desc, id desc
+			  limit $5`,
+			accountID, monthStart, monthEnd, before, limit)
+	case month == nil && !before.IsZero():
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			    and period_end < $2
+			  order by period_end desc, id desc
+			  limit $3`,
+			accountID, before, limit)
+	default: // month == nil && before.IsZero()
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, provider, provider_invoice_id, number, status,
+			        period_start, period_end,
+			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+			        currency, pdf_available, created_at, updated_at
+			   from invoices
+			  where account_id = $1
+			  order by period_end desc, id desc
+			  limit $2`,
+			accountID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Invoice
+	for rows.Next() {
+		var inv Invoice
+		if err := rows.Scan(
+			&inv.ID, &inv.AccountID, &inv.Provider, &inv.ProviderInvoiceID,
+			&inv.Number, &inv.Status,
+			&inv.PeriodStart, &inv.PeriodEnd,
+			&inv.SubtotalCents, &inv.TaxCents, &inv.TotalCents, &inv.AmountPaidCents,
+			&inv.Currency, &inv.PDFAvailable,
+			&inv.CreatedAt, &inv.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
 // UsageByHour returns per-app usage rolled up from the per-minute rows
 // in the [start, end) window. The Stripe pusher calls this hourly;
 // (start, end) is the [now-1h, now) hour window so the SQL is an
@@ -4233,18 +4325,15 @@ func (s *PgStore) ListBuildsForAccount(ctx context.Context, accountID string) ([
 }
 
 // ListCronsForAccount walks every cron tied to the account's apps.
-// Used by the GDPR export bundle.
-//
-// NOTE: crons has no created_at column on origin/main (only
-// enabled + schedule + path are tracked); the export bundle
-// doesn't need a stable order, so we sort by id instead.
+// Used by the GDPR export bundle. Ordered by created_at desc so the
+// newest crons surface first.
 func (s *PgStore) ListCronsForAccount(ctx context.Context, accountID string) ([]Cron, error) {
 	rows, err := s.pool.Query(ctx,
-		`select c.id, c.app_id, c.schedule, c.path, c.enabled
+		`select c.id, c.app_id, c.schedule, c.path, c.enabled, c.created_at
 		 from crons c
 		 join apps a on a.id = c.app_id
 		 where a.account_id = $1
-		 order by c.id`, accountID)
+		 order by c.created_at desc`, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -4252,11 +4341,7 @@ func (s *PgStore) ListCronsForAccount(ctx context.Context, accountID string) ([]
 	var out []Cron
 	for rows.Next() {
 		c := Cron{}
-		// crons table has no created_at column (see NOTE above); scan
-		// only the 5 selected columns. Cron.CreatedAt stays at the zero
-		// value for rows read by this query — the export bundle omits
-		// it because the GDPR surface doesn't need it.
-		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled); err != nil {
+		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)

@@ -128,6 +128,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
   `resident_ram_mb + request_mb + 8 ≤ 0.85 × 56_000` **and** plan concurrent count not exceeded **and** vCPU slots (160) not exhausted. Builds request from the same guard but are also capped by the build semaphore (§9). Denial → gateway serves `503 capacity` (alert fires long before customers see this; see §12).
 - **`AdmitInstance` RPC (issue #168):** the gateway can ask schedd to admit ONE additional instance for an app, bypassing the Phase-1 fast-path shortcut. The cap is enforced atomically by the same ledger as `Wake`; the response carries an `at_capacity` typed result so the gateway can distinguish "we refused because you're already at cap" (no FAILED row written) from a real failure (RAM headroom, chooser, store). The gRPC surface is additive — see ADR-018 update.
 - **Idle reaper:** every 10 s, park instances with `now − last_request_at > idle_timeout(plan)`. Defaults: Free 30 s, Hobby 60 s, Pro 300 s, Scale 600 s (app-configurable down to 10 s, not above plan default × 2).
+- **Aggressive reaper (ADR-038, issue #171):** every 10 s, *alongside* the idle reaper, a fast-cooldown path parks the surplus above `max(min_instances, desired + 1)` where `desired = ceil(windowed_rps / autoscale_target_rps)` from a per-app 5 × 1 s rolling RPS mirror (`pkg/sched/recentload/`). The `+1` is a hysteresis buffer so a brief RPS wobble doesn't wake-then-park. Scope: apps with `max_concurrency > 1` and `autoscale_target_rps > 0`; single-instance apps and apps without an autoscale target stay on the idle reaper only. Per-tick cap of 8 parks per app to prevent a single tick from blocking the reaper for `8 × ~150 ms ≈ 1.2 s` during a sudden scale-down storm. Default ON; `FAAS_REAPER_AGGRESSIVE=false` (schedd.toml `reaper_aggressive = false`) disables in-place — the mirror, metric, and audit row stay live so diagnosis continues. G7 (OpenConns > 0) and `MinInstanceAge` (30 s) protections still apply. Acceptance: 5-instance burst → 0 rps parks back to ≤ `min_instances + 1` within 30 s (three 10 s ticks). Audit row `events.kind='reaper_scale_down'` is emitted once per app per tick that parks ≥ 1 instance with `{app, desired, parked[], reason: "traffic_dropped", now}` in `data jsonb`.
 - **Eviction (RAM pressure > 80 % of the 85 % target):** park instances LRU by last request; never evict an instance younger than 30 s; Scale plan evicted last.
 - **Free-tier disk reaper:** free apps with zero requests for 14 days → snapshot + rootfs moved to object storage, state `EVICTED_COLD` (redeploy = one click, re-flatten from stored image). This is the founding doc's ceiling-protection policy (§9.7 there).
 - **Cron:** `crons` table; fire = synthetic `POST` through gatewayd (so metering/limits apply identically).
@@ -406,6 +407,21 @@ Concurrency and RAM interaction (the R1 discipline, mechanized): builder VMs are
 **Patch policy:** Firecracker/kernel CVE affecting guest isolation = same-day; everything else = weekly window. Subscribe to firecracker-microvm security advisories; drill the FC-upgrade-invalidates-snapshots path (it's routine, not an incident — ADR-005).
 **Abuse:** signup requires email verification + one of (card, GitHub account ≥ 30 days); crypto-mining heuristic = sustained cpu.stat throttled + 100 % for > 15 min on Free/Hobby → auto-park + review queue; AUP bans mining, scanning, spam relaying.
 
+**Response headers (issue #249):** every response leaving the public listener (gatewayd :443) and the apid loopback listener carries the six hardening headers below. Mounted by `pkg/httpsec` at the outermost wrapper of both daemons. The static set (HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy) runs on every response; Content-Security-Policy is gated so it only fires on apid-handled URLs (customer-app responses keep the customer's own CSP).
+
+| Header | Value | Notes |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | UAs ignore HSTS on plain HTTP per RFC 6797 §7.2 — cosmetic on dev plaintext listener. Disable via `FAAS_HSTS_ENABLED=false`. No `preload` until §11 policy review finalises. |
+| `X-Frame-Options` | `DENY` | The dashboard is the only HTML surface; clicks are never meant to be framed. |
+| `X-Content-Type-Options` | `nosniff` | Stops the browser guessing MIME on `/v1/*` responses. |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Sends only the origin on cross-origin navigations; full URL on same-origin. |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), usb=(), payment=()` | No browser feature is currently used by the dashboard; explicit close. |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'nonce-{rand}' https://unpkg.com; style-src 'self' 'nonce-{rand}'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://*.stripe.com https://billing.faas.example` | Per-request 128-bit nonce (base64-URL, 22 chars). Minted by `pkg/httpsec.Nonce`; consumed by `pkg/dashboard.Render` which stamps `nonce="…"` on every `<script>` and `<style>` tag. `https://unpkg.com` is on the `script-src` list because every dashboard template loads `htmx.org@2.0.4` (and SSE pages additionally load `htmx-ext-sse@2.2.2`) from there. SRI hashes pending as a separate ADR. |
+
+The CSP gate is `cmd/gatewayd/proxy.go::isApidPath` for gatewayd and an unconditional `func(*http.Request) bool { return true }` for apid (apid serves only dashboard + JSON). The platform never emits CSP on a customer-app response — those apps govern their own CSP.
+
+The inline `onclick="return confirm(…)"` in `pkg/dashboard/templates/account.html` was refactored to a per-page `<script nonce="…">` block using `addEventListener`. Browsers do not propagate `nonce` onto event-handler attributes, so leaving the inline handler in place would silently disable the delete-account confirm prompt the moment CSP ships.
+
 ---
 
 ## 12. Observability and SLOs
@@ -439,7 +455,38 @@ unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
 
-### 12.1 Egress deny telemetry (PR-E)
+### 12.1 Autoscale decision telemetry (ADR-037, ADR-038)
+
+Two paired counters surface the schedd scale decisions so an operator can
+see "did the box scale, and why" without correlating instances:
+
+| Metric name | Labels | Producer | Outcome semantics |
+|---|---|---|---|
+| `schedd_scale_up_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleUp` (per tick, per app that ran the trigger) | `admit` (signal above target, admitted an instance), `reject_at_cap` (signal above target but at `max_concurrency`), `no_signal` (trigger had no RPS/CPU data for this app yet) |
+| `schedd_scale_down_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleDown` (per tick, per app that ran the aggressive reaper) | `park` (≥ 1 instance parked above `max(min_instances, desired + 1)`), `keep` (signal said the running set is fine OR said "park to floor" and the floor matches the running count exactly) |
+
+Both counters are per-daemon (the `schedd_` prefix is supplied by
+`wire.NewOpsMetrics("schedd")`); the metric name is the operator-facing
+identifier. Empty-app labels are pre-instantiated for both `park`/`keep`
+and `admit`/`reject_at_cap`/`no_signal` so the panel exists at day 1 on
+an idle box (precedent: OCI-pull histogram in `pkg/wire/metrics.go`).
+
+The `scale_up` row is owned by ADR-037 (reactive scale-up trigger, issue
+#169 / #172). The `scale_down` row is owned by ADR-038 (issue #171, this
+PR). They are symmetric by design — the same Prometheus registry, the
+same outcome-pre-instantiation pattern, the same card-label cardinality
+bound. An operator can read both rows side-by-side at
+`/metrics` after a single box has seen traffic.
+
+Why paired: `scale_up` shows "traffic is asking for more", `scale_down`
+shows "the cooldown path is keeping the box tight". A box with frequent
+`scale_up` + `scale_down` flips is a customer with bursty traffic and a
+misconfigured `autoscale_target_rps`; a box with only `scale_down` is a
+healthy autoscale tail; a box with only `scale_up` is an app at the cap
+(needs `max_concurrency` bumped). The `app` label cardinality is bounded
+by `apps` (one row per customer app), not by `instances`.
+
+### 12.2 Egress deny telemetry (PR-E)
 
 Every catalog CIDR (spec §11) carries a stable nftables named counter (`drop_v4_<sanitized>` / `drop_v6_<sanitized>`) attached to its per-CIDR deny rule. Three surfaces expose the drops as Prometheus series:
 

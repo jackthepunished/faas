@@ -516,6 +516,39 @@ type Usage struct {
 	Requests  int64
 }
 
+// Invoice is one persisted invoice from a billing provider (issue #259,
+// BILLING: plan comparison + invoice history). Rows arrive via the
+// webhook ingestion path (PR B); the read API and dashboard read this
+// table. Per-account filter is enforced by the Store method that
+// returns this type — never expose the cross-account scan.
+//
+// Money is integer cents in the provider's currency; the financial
+// model distills to EUR at the API edge. Currency is preserved per
+// row so future multi-currency support can land without a backfill.
+//
+// HostedURL is intentionally NOT exposed on the read surface — the
+// column lives in invoices.hosted_url for PR-B audit only. Provider
+// invoice URLs and PDF URLs are session-scoped; we never hand them to
+// the customer via this API.
+type Invoice struct {
+	ID                string
+	AccountID         string
+	Provider          string // "stripe" | "paddle"
+	ProviderInvoiceID string
+	Number            string
+	Status            string // "draft" | "open" | "paid" | "uncollectible" | "void"
+	PeriodStart       time.Time
+	PeriodEnd         time.Time
+	SubtotalCents     int64
+	TaxCents          int64
+	TotalCents        int64
+	AmountPaidCents   int64
+	Currency          string
+	PDFAvailable      bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
 // UpdateAppParams is the partial-update payload for PATCH /v1/apps/{slug}.
 // Nil pointers mean "leave unchanged" (only the slug/ram/idle/concurrency/
 // min_instances/status fields are user-mutable; type and runtime are

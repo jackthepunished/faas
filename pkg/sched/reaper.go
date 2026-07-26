@@ -160,6 +160,92 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 	return park
 }
 
+// ReapAggressive returns instances to park because measured traffic
+// fell below target — the "fast cooldown" path in issue #171 /
+// spec §4.3. It runs ALONGSIDE ReapIdle: the aggressive path
+// parks the surplus above the autoscale-derived target, and
+// ReapIdle's timeout handles the rest.
+//
+// Per-app policy:
+//   - desired = ceil(windowed_rps / autoscale_target_rps); computed
+//     by the caller and passed in via desiredByApp. Apps absent from
+//     the map (no autoscale configured, no target, or no signal yet)
+//     are SKIPPED — ReapIdle handles their cooldown via the timeout.
+//   - limit = max(min_instances, desired + 1). The +1 is the
+//     hysteresis buffer: it keeps one "warm" instance above the
+//     target so a brief RPS wobble does not wake-then-park on the
+//     next request. Honor the existing direction (freshest kept) by
+//     trimming oldest-LastRequest-first.
+//   - G7 still wins: OpenConns > 0 protects.
+//   - MinInstanceAge still applies: candidates younger than 30 s are
+//     never reaped even if the buffer says to — spec §4.3.
+//
+// Returns instance IDs in deterministic order (oldest-LastRequest
+// first; ties broken by instance ID, matching ReapIdle).
+func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int) []string {
+	type appGroup struct {
+		running    int
+		floor      int
+		desired    int
+		candidates []InstanceInfo // RUNNING, !young, !busy
+	}
+	byApp := map[string]*appGroup{}
+	for _, in := range snapshot {
+		if in.State != state.StateRunning {
+			continue
+		}
+		desired, ok := desiredByApp[in.AppID]
+		if !ok {
+			continue // no autoscale target — defer to ReapIdle
+		}
+		g, ok := byApp[in.AppID]
+		if !ok {
+			g = &appGroup{floor: in.MinInstances, desired: desired}
+			byApp[in.AppID] = g
+		}
+		g.running++
+		// G7: open TCP flows count as activity regardless of
+		// LastRequest staleness. We still count this instance
+		// toward running (it's live) but it never enters the
+		// candidate set — the floor of the burst that holds the
+		// flow is sacred.
+		if in.OpenConns > 0 {
+			continue
+		}
+		if now.Sub(in.Started) < MinInstanceAge {
+			continue
+		}
+		g.candidates = append(g.candidates, in)
+	}
+	var park []string
+	for _, g := range byApp {
+		limit := g.floor
+		if g.desired+1 > limit {
+			limit = g.desired + 1
+		}
+		extra := g.running - limit
+		if extra <= 0 {
+			continue
+		}
+		// Trim oldest-LastRequest-first so the freshest (most
+		// recently served) stay alive — matches ReapIdle's
+		// "freshness floor" direction.
+		sort.Slice(g.candidates, func(a, b int) bool {
+			if !g.candidates[a].LastRequest.Equal(g.candidates[b].LastRequest) {
+				return g.candidates[a].LastRequest.Before(g.candidates[b].LastRequest)
+			}
+			return g.candidates[a].Instance < g.candidates[b].Instance
+		})
+		if extra > len(g.candidates) {
+			extra = len(g.candidates)
+		}
+		for i := 0; i < extra; i++ {
+			park = append(park, g.candidates[i].Instance)
+		}
+	}
+	return park
+}
+
 // SelectEvictions returns instances to park to bring residentMB down to the
 // eviction threshold, in eviction order (spec §4.3): LRU by last request, never
 // an instance younger than MinInstanceAge, Scale plan evicted last. It returns

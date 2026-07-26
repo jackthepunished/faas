@@ -40,6 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -285,7 +286,7 @@ func (s *server) renderResetForm(w http.ResponseWriter, r *http.Request) {
 		Title: "Reset password",
 		Body:  "password_reset_form",
 	}
-	if err := dashboard.Render(w, s.log, page); err != nil {
+	if err := dashboard.Render(w, s.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		s.log.Error("dashboard render reset form", "err", err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 	}

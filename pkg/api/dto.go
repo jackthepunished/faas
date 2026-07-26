@@ -291,6 +291,42 @@ type DeploymentListResponse struct {
 	NextBefore string               `json:"next_before,omitempty"`
 }
 
+// --- Invoice history (issue #259) -----------------------------------------
+
+// Invoice is one persisted invoice from a billing provider, surfaced
+// via GET /v1/invoices. Money is integer cents in the provider's
+// currency (the financial model distills to EUR at the API edge).
+// PDFAvailable is the only PDF surface we expose — the hosted PDF URL
+// is provider-scoped and customer-fetched via the Stripe/Paddle
+// portal, not via this API. HostedURL is intentionally not on the
+// wire; see state.Invoice for the rationale.
+type Invoice struct {
+	ID                string    `json:"id"`
+	Provider          string    `json:"provider"`
+	ProviderInvoiceID string    `json:"provider_invoice_id"`
+	Number            string    `json:"number"`
+	Status            string    `json:"status"`
+	PeriodStart       time.Time `json:"period_start"`
+	PeriodEnd         time.Time `json:"period_end"`
+	SubtotalCents     int64     `json:"subtotal_cents"`
+	TaxCents          int64     `json:"tax_cents"`
+	TotalCents        int64     `json:"total_cents"`
+	AmountPaidCents   int64     `json:"amount_paid_cents"`
+	Currency          string    `json:"currency"`
+	PDFAvailable      bool      `json:"pdf_available"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// InvoiceListResponse is the page shape for GET /v1/invoices.
+// Items is the page (in period_end DESC, id DESC order). NextBefore
+// is the cursor the caller passes on the next request to fetch the
+// older page. Empty NextBefore means the page is the end. Empty
+// Items with 200 OK is the empty-history shape — never 404.
+type InvoiceListResponse struct {
+	Items      []Invoice `json:"items"`
+	NextBefore string    `json:"next_before,omitempty"`
+}
+
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
 
 // OAuthProvider is the issuer name used by the dashboard OAuth flows

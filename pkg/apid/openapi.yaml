@@ -635,6 +635,11 @@ paths:
         `/user/emails`, filters the primary && verified email,
         and signs the user in. Sub-first lookup against
         `oauth_links` enforces the §11 anti-takeover invariant.
+
+        On success, `auth.login` is appended to the events table
+        (ADR-035) with `method=github`, `email=<verified email>`,
+        and `login=<GitHub username>` so the audit dashboard and
+        the corroborating slog line reference one identifier.
       parameters:
         - name: code
           in: query
@@ -651,14 +656,43 @@ paths:
           description: |
             CSRF state token. Must match the `faas_github_state`
             cookie set on the consent redirect. Mismatch returns
-            401 `csrf_mismatch`.
+            400 `csrf_mismatch`.
       responses:
         '302':
           description: |
             Redirect to `WEBSITE_URL` or `/` after a successful
             GitHub OAuth handshake. `Set-Cookie: faas_sid=…` is set.
+        '400':
+          description: |
+            Malformed callback. The `code` field maps to
+            `invalid_state` (no CSRF cookie), `csrf_mismatch`
+            (query `state` does not match the cookie), or
+            `missing_code` (no `code` query param). The
+            `oauth_exchange_failed` code signals the upstream
+            GitHub token exchange returned a non-JSON body
+            (rarely seen post-2024; the handler sends
+            `Accept: application/json`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           description: GitHub account has no primary && verified email.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: |
+            OAuth misconfigured server-side (`GITHUB_CLIENT_ID`
+            or `GITHUB_CLIENT_SECRET` unset). Surfaces as
+            `github_oauth_misconfigured`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: |
+            `github.com/login/oauth/access_token`,
+            `api.github.com/user`, or `api.github.com/user/emails`
+            unreachable. Surfaces as `github_unreachable`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -1688,6 +1722,55 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Billing history (issue #259) ──────────────────────────────────────
+  # Account-scoped read of the billing-provider invoices persisted from
+  # the Stripe / Paddle webhooks. Empty history returns 200 with items=[].
+  /v1/invoices:
+    get:
+      tags: [usage]
+      operationId: listInvoices
+      summary: List the authenticated account's billing invoices.
+      parameters:
+        - name: month
+          in: query
+          schema: { type: string, pattern: '^\d{4}-\d{2}$' }
+          description: Optional `YYYY-MM` filter (UTC half-open range on period_end).
+        - name: before
+          in: query
+          schema: { type: string, format: date-time }
+          description: Cursor (RFC3339Nano) for the next older page. Omit for the first page.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+          description: Page size; server clamps to 1..100.
+      responses:
+        '200':
+          description: One page of invoices, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceListResponse'
+              example:
+                items:
+                  - id: "9f1d8e7c-6b5a-4d3c-2b1a-0fedcba98765"
+                    provider: stripe
+                    provider_invoice_id: in_1NxAbC2eZvKYlo2C0D4E5F6G
+                    number: FaaS-2026-007
+                    status: paid
+                    period_start: "2026-07-01T00:00:00Z"
+                    period_end:   "2026-07-31T23:59:59Z"
+                    subtotal_cents: 900
+                    tax_cents: 0
+                    total_cents: 900
+                    amount_paid_cents: 900
+                    currency: eur
+                    pdf_available: true
+                    created_at: "2026-08-01T01:23:45Z"
+                next_before: null
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
   # `apid` embeds api/openapi.yaml at build time and serves the same bytes
   # customers see in the repo. The /json variant re-emits the spec in JSON
@@ -2125,6 +2208,53 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/DeploymentResponse' }
+        next_before: { type: [string, "null"], format: date-time }
+
+    # ─── Billing history (issue #259) ──────────────────────────────────────
+
+    Invoice:
+      description: |
+        One persisted billing-provider invoice (issue #259). Money is
+        integer cents in the provider's currency; EUR is the platform
+        currency today, the field is preserved per-row so multi-currency
+        support can land without a backfill. The PDF availability flag
+        is the only PDF surface we expose — the hosted PDF URL is
+        provider-scoped and the customer fetches it from the
+        Stripe/Paddle portal, not via this API. The hosted URL itself
+        is not on the wire; the column exists in invoices.hosted_url
+        for PR-B audit only.
+      type: object
+      required: [id, provider, provider_invoice_id, status, period_start, period_end,
+                 subtotal_cents, tax_cents, total_cents, amount_paid_cents,
+                 currency, pdf_available, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        provider: { type: string, enum: [stripe, paddle] }
+        provider_invoice_id: { type: string, example: "in_1NxAbC2eZvKYlo2C0D4E5F6G" }
+        number: { type: string, example: "FaaS-2026-007" }
+        status: { type: string, enum: [draft, open, paid, uncollectible, void] }
+        period_start: { type: string, format: date-time }
+        period_end:   { type: string, format: date-time }
+        subtotal_cents:    { type: integer, format: int64 }
+        tax_cents:         { type: integer, format: int64 }
+        total_cents:       { type: integer, format: int64 }
+        amount_paid_cents: { type: integer, format: int64 }
+        currency: { type: string, enum: [eur], example: "eur" }
+        pdf_available: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    InvoiceListResponse:
+      description: |
+        Paginated invoice list. Items is one page (period_end DESC, id
+        DESC order). next_before is the cursor the caller passes on the
+        next request to fetch the older page. Empty Items with 200 OK
+        is the empty-history shape — never 404.
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Invoice' }
         next_before: { type: [string, "null"], format: date-time }
 
     CreateDeploymentRequest:

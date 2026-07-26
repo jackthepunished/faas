@@ -3,6 +3,10 @@ package sched
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,7 +14,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
+	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // TestLoopReaperParksIdleInstance drives one reaper tick against a store holding
@@ -282,4 +288,333 @@ type countingRunner struct {
 func (c *countingRunner) Output(_ context.Context, _ []string) ([]byte, error) {
 	c.calls.Add(1)
 	return c.out, nil
+}
+
+// ---------------------------------------------------------------------
+// Aggressive reaper scale-down (issue #171). The integration
+// shape: a real engine + MemStore + fakeVMM + recentload driven by
+// a closure scraper. runReaper walks the full body, building the
+// snapshot, calling ReapAggressive, and parking the surplus via
+// engine.Park. The four tests below pin the four observable
+// surfaces:
+//
+//   - TestLoopReaperAggressiveScalesDownOnDrop: 5 instances drop
+//     to 0 rps, reaper parks the surplus above the +1 buffer.
+//   - TestLoopReaperAggressiveHonorsFloor: same scenario with
+//     min_instances=2 — at least 2 stay resident.
+//   - TestLoopReaperAggressiveEmitsAuditRow: one events row per
+//     app per tick that parked ≥ 1, kind=reaper_scale_down.
+//   - TestLoopReaperAggressiveMetricIncrements: the
+//     schedd_scale_down_decisions_total counter increments.
+//
+// fakeScaleUpScraper is a stub that returns a synthetic cumulative
+// map per app on each Scrape call. Production wires a real
+// HTTP-backed scraper; here we don't need HTTP — the rps signal
+// is what we're exercising, not the scraping wiring.
+// ---------------------------------------------------------------------
+
+type fakeScaleUpScraper struct {
+	mu     sync.Mutex
+	counts map[string]int64
+}
+
+func (f *fakeScaleUpScraper) Scrape(ctx context.Context) (map[string]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int64, len(f.counts))
+	for k, v := range f.counts {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// setScraper is a thread-safe setter the test uses between phases.
+func (f *fakeScaleUpScraper) set(counts map[string]int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.counts = counts
+}
+
+// wakeN calls AdmitInstance N times back-to-back so the loop
+// exercises the fan-out path (Wake would short-circuit on the
+// Phase-1 fast-path after the first call). Also stamps each
+// instance's LastRequestAt to the wake time so ReapIdle's
+// idle-timeout filter doesn't trip on zero-value timestamps
+// (which would park every just-admitted instance regardless
+// of floor / desired).
+func wakeN(t *testing.T, engine *Engine, appID string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		ins, err := engine.AdmitInstance(ctx, appID)
+		if err != nil {
+			t.Fatalf("AdmitInstance[%d]: %v", i, err)
+		}
+		now := time.Now()
+		_, _ = engine.Store().TouchInstancesLastSeen(ctx, []state.InstanceTouch{
+			{InstanceID: ins.InstanceID, LastRequest: now},
+		})
+	}
+}
+
+func TestLoopReaperAggressiveScalesDownOnDrop(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// autoscale_target_rps=10 so a 0 rps window maps to desired=0.
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	// Drive the mirror: cumulative must DECREASE to simulate "traffic
+	// dropped to zero since the last scrape". recentload treats
+	// cumulative < lastSeen as a fresh boot and clears the ring;
+	// the very next delta tick captures the new reality with
+	// delta=0 → sum stays 0.
+	scraper := &fakeScaleUpScraper{}
+	// Anchor the frozen clock PAST MinInstanceAge (30 s) so
+	// ReapAggressive's age guard doesn't reject the just-woken
+	// instances. The fakeVMM / MemStore stamp `Started` /
+	// `LastRequestAt` at real `time.Now()`, so the test has to
+	// jump the simulated clock forward to clear the 30 s
+	// "freshly woken" window. 5-minute bucket keeps Touch and
+	// runReaper's `time.Now()` in the same window without
+	// sub-second drift.
+	frozen := time.Now().Add(35 * time.Second)
+	clock := func() time.Time { return frozen }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+	scraper.set(map[string]int64{app.ID: 100})
+	mirror.Touch(context.Background(), frozen)
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), frozen.Add(time.Minute))
+	// Now RecentRPS = 0 → desired = 0.
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true)
+	loop.runReaper(context.Background())
+
+	running := liveCount(t, store, app.ID)
+	// ReapAggressive: floor=0, desired=0, limit=max(0, 0+1)=1,
+	// running=5, candidates ≤5, extra=4 → 4 parked, 1 remains.
+	if running != 1 {
+		t.Errorf("running = %d, want 1 (one warm above the +1 buffer)", running)
+	}
+	if vmm.snapshots < 4 {
+		t.Errorf("snapshots = %d, want ≥ 4 (4 aggressive parks)", vmm.snapshots)
+	}
+}
+
+func TestLoopReaperAggressiveHonorsFloor(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// min_instances=2 + autoscale_target_rps=10. After the burst
+	// drops to 0 rps, the floor must keep 2 resident.
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetMinInstances:       true,
+		MinInstances:          intPtr(2),
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	scraper := &fakeScaleUpScraper{}
+	frozen := time.Now().Add(35 * time.Second)
+	clock := func() time.Time { return frozen }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+	// Seed the ring with a fresh "0 rps" snapshot so desired=0.
+	scraper.set(map[string]int64{app.ID: 1})
+	mirror.Touch(context.Background(), frozen)
+	// Force the running sum to 0 by setting cumulative below
+	// lastSeen — this is the "traffic vanished" scenario.
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), frozen.Add(time.Minute))
+
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true)
+	loop.runReaper(context.Background())
+
+	running := liveCount(t, store, app.ID)
+	// floor=2, desired=0, limit=max(2, 0+1)=2, extra=5-2=3 → park 3.
+	if running != 2 {
+		t.Errorf("running = %d, want 2 (floor honored)", running)
+	}
+}
+
+func TestLoopReaperAggressiveEmitsAuditRow(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	scraper := &fakeScaleUpScraper{}
+	frozen := time.Now().Add(35 * time.Second)
+	clock := func() time.Time { return frozen }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+	scraper.set(map[string]int64{app.ID: 1})
+	mirror.Touch(context.Background(), frozen)
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), frozen.Add(time.Minute))
+
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true)
+	loop.runReaper(context.Background())
+
+	// Inspect the events table for the reaper_scale_down row.
+	// MemStore exposes ListEvents / similar via the store surface;
+	// for now assert via the store's AppendEvent call shape: we
+	// rely on the loop's emitScaleDownAudit having been driven.
+	// The simplest assertion is: at least one events row exists
+	// with kind='reaper_scale_down'. The MemStore's events
+	// accessor is ListEventsForActor (verified below by the
+	// engine_test.go events table tests).
+	events := storeEvents(t, store, app.ID, "reaper_scale_down")
+	if len(events) == 0 {
+		t.Fatalf("expected at least one reaper_scale_down audit row")
+	}
+	// Spot-check the JSON payload shape.
+	var payload map[string]any
+	if err := json.Unmarshal(events[0].Data, &payload); err != nil {
+		t.Fatalf("audit data unmarshal: %v", err)
+	}
+	if payload["app"] != app.ID {
+		t.Errorf("payload.app = %v, want %s", payload["app"], app.ID)
+	}
+	if payload["reason"] != "traffic_dropped" {
+		t.Errorf("payload.reason = %v, want traffic_dropped", payload["reason"])
+	}
+	if parked, ok := payload["parked"].([]any); !ok || len(parked) == 0 {
+		t.Errorf("payload.parked = %v, want non-empty array", payload["parked"])
+	}
+}
+
+func TestLoopReaperAggressiveMetricIncrements(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	scraper := &fakeScaleUpScraper{}
+	frozen := time.Now().Add(35 * time.Second)
+	clock := func() time.Time { return frozen }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+	scraper.set(map[string]int64{app.ID: 1})
+	mirror.Touch(context.Background(), frozen)
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), frozen.Add(time.Minute))
+
+	ops := wire.NewOpsMetrics("schedd")
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true).
+		WithOpsMetrics(ops)
+	loop.runReaper(context.Background())
+
+	// Scrape /metrics via httptest; assert the per-(app, outcome)
+	// counter row incremented.
+	body := wireRenderMetrics(t, ops)
+	wantLines := []string{
+		`schedd_scale_down_decisions_total{app="` + app.ID + `",outcome="park"} 1`,
+	}
+	for _, want := range wantLines {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// intPtr is a tiny helper for *int literals in UpdateAppParams
+// calls. MemStore.UpdateApp takes pointer fields; the literal
+// helper keeps the test bodies readable.
+func intPtr(i int) *int { return &i }
+
+// liveCount returns the number of RUNNING instances of an app.
+// Pulled out as a helper so the test bodies above stay focused.
+func liveCount(t *testing.T, store state.Store, appID string) int {
+	t.Helper()
+	rows, err := store.ListInstancesForApp(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	n := 0
+	for _, r := range rows {
+		if r.State == string(state.StateRunning) {
+			n++
+		}
+	}
+	return n
+}
+
+// storeEvents is the test seam for the events table accessor. The
+// MemStore exposes ListEvents (verified via pkg/state/events_test.go);
+// we abstract the call here so a future MemStore rename doesn't
+// ripple through the test bodies.
+type storedEvent struct {
+	Kind string
+	Data []byte
+}
+
+func storeEvents(t *testing.T, store state.Store, subject, kind string) []storedEvent {
+	t.Helper()
+	// MemStore.ListEvents(ctx, subject, limit) — subject is the
+	// entity the event is about (typically app_id for our audit
+	// rows). Filter the result by (actor, kind) post-fetch since
+	// the MemStore surface is intentionally narrow. Production
+	// pgstore.AppendEvent uses jsonb Data identically.
+	rows, err := store.ListEvents(context.Background(), subject, 64)
+	if err != nil {
+		t.Fatalf("ListEvents(%s): %v", subject, err)
+	}
+	out := make([]storedEvent, 0, len(rows))
+	for _, r := range rows {
+		if r.Kind == kind {
+			out = append(out, storedEvent{Kind: r.Kind, Data: r.Data})
+		}
+	}
+	return out
+}
+
+// wireRenderMetrics renders the OpsMetrics registry via an
+// httptest server and returns the body. Mirrors the helper in
+// pkg/wire/metrics_test.go (render) but is exported via a test
+// package-private name so the sched tests don't import the wire
+// package's test surface.
+func wireRenderMetrics(t *testing.T, ops *wire.OpsMetrics) []byte {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	ops.Handler().ServeHTTP(rec, req)
+	return rec.Body.Bytes()
 }

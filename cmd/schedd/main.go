@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
 	"github.com/onebox-faas/faas/pkg/sched/instancestats"
+	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -341,8 +342,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// when zero). Ticker fires at api.DefaultRetentionInterval (1h).
 		WithRetention(sched.NewRetention(store, log).WithRetention(time.Duration(cfg.RetentionDuration))).
 		WithHeartbeat(hb).
-		WithInstanceStats(statsPoller)
+		WithInstanceStats(statsPoller).
+		// Issue #171: shared Prometheus registry (same instance the
+		// engine got) — needed by the aggressive-reaper scale-down
+		// counter (ObserveScaleDown) and the audit-row emission.
+		WithOpsMetrics(ops).
+		// Issue #171: aggressive reaper toggle + per-tick park cap.
+		// cfg.ReaperAggressive defaults ON; FAAS_REAPER_AGGRESSIVE=false
+		// disables in-place. cfg.ReaperAggressiveParkCap=0 → default
+		// (sched.MaxParksPerTickPerApp = 8).
+		WithReaperAggressive(cfg.ReaperAggressive).
+		WithReaperParkCap(cfg.ReaperAggressiveParkCap)
 	if cfg.GatewayMetricsURL != "" {
+		// Issue #171: share a single HTTPPromScraper between the
+		// scale-up trigger and the aggressive-reaper signal mirror.
+		// The scraper surface is stateless (one Scrape call → one
+		// HTTP GET + parse); two callers are safe and a shared
+		// connection keeps gatewayd's listener traffic to ~1
+		// req/sec instead of ~2.
 		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
 		trigger := scaleup.New(
 			store, nil, scraper,
@@ -355,7 +372,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			},
 		)
 		loop.WithScaleUp(trigger)
-		log.Info("scaleup trigger enabled", "metrics_url", cfg.GatewayMetricsURL, "interval", trigger.Interval())
+		// Issue #171: wire the recent-load mirror off the same
+		// scraper so the reaper sees per-app RPS without duplicating
+		// the scraping wiring. nil scraper ⇒ mirror is a no-op
+		// (recentload.New handles nil); the loop's WithRecentLoad
+		// nil-check keeps the ticker + runReaper block disabled.
+		mirror := recentload.New(scraper, api.ScaleUpWindowSeconds, time.Second)
+		loop.WithRecentLoad(mirror)
+		log.Info("autoscale signal mirror enabled",
+			"metrics_url", cfg.GatewayMetricsURL,
+			"window_s", api.ScaleUpWindowSeconds,
+			"aggressive", cfg.ReaperAggressive)
 	}
 	// Cron dispatch path: route synthetic requests through gatewayd's
 	// internal unix socket so metering + rate limits apply identically

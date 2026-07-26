@@ -30,6 +30,7 @@ import (
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -125,6 +126,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		return fmt.Errorf("apid: migrate: %w", err)
 	}
+
+	// Issue #249 / spec §11: gate Strict-Transport-Security on
+	// FAAS_HSTS_ENABLED. Default true; dev mode can flip to false.
+	// RFC 6797 §7.2 says UAs ignore HSTS on plain HTTP, so the knob
+	// is purely cosmetic — but emitting it on a dev plaintext loop
+	// back listener confuses operators reading the headers.
+	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(os.Getenv))
 
 	deps := defaultDeps()
 	deps.store = func() state.Store { return state.NewPgStore(pool) }

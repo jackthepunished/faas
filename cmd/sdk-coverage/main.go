@@ -125,6 +125,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/crons":                        "ListCrons",
 	"GET /v1/usage/summary":                "UsageSummary",
 	"GET /v1/usage":                        "GetUsage",
+	"GET /v1/invoices":                     "ListInvoices",
 	"GET /v1/apps/{slug}/secrets":          "ListSecrets",
 	"GET /v1/domains":                      "ListDomains",
 	"POST /v1/domains":                     "CreateDomain",

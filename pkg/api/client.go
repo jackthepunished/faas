@@ -725,3 +725,27 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
+
+// ListInvoices returns a single page of the authenticated account's
+// invoices (issue #259). month is "YYYY-MM" or "" for all months;
+// before is the RFC3339Nano cursor for the next page ("" for first
+// page). limit is clamped server-side at 100. Empty history returns
+// a response with Items=nil (or empty) and no error.
+func (c *Client) ListInvoices(ctx context.Context, month, before string, limit int) (InvoiceListResponse, error) {
+	var out InvoiceListResponse
+	v := url.Values{}
+	if month != "" {
+		v.Set("month", month)
+	}
+	if before != "" {
+		v.Set("before", before)
+	}
+	if limit > 0 {
+		v.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	path := "/v1/invoices"
+	if encoded := v.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}

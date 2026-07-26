@@ -38,6 +38,14 @@ type Page struct {
 	// /login + /auth/*; dashboardAuth rejects unauthed requests for the
 	// rest of /dashboard/*.
 	Account *AccountView
+	// Nonce is the per-request CSP nonce minted by the
+	// httpsec.Nonce middleware (cmd/apid/server.go). Render stamps it
+	// onto every <script> and <style> tag inside the rendered HTML so
+	// the browser accepts the inline code under the page's
+	// Content-Security-Policy header. Empty string is tolerated (the
+	// template renders the tags without a nonce attribute) so unit
+	// tests don't need to mint a nonce; production always sets it.
+	Nonce string
 	// Body is the per-page template name (without the .html suffix).
 	// Render looks up templates/<Body>.html inside the layout.
 	Body string
@@ -161,6 +169,70 @@ type BillingData struct {
 	IdleSec  int
 }
 
+// PricingData is the /dashboard/pricing page payload (issue #259).
+// Plans is the four-plan table authoritative from pkg/api/limits.go;
+// Highlighted marks the row that matches the current account's plan
+// so the dashboard can render a "Your plan" badge. PriceFormatted is
+// the on-the-wire "€X.YY" / "Free" string — money stays integer
+// millicents upstream and is divided into euros at template time only.
+type PricingData struct {
+	Plans []PricingPlanView
+}
+
+// PricingPlanView is one row on /dashboard/pricing. Every field is
+// derived from api.Limits — never inline a quota here, the limit
+// table is the single source of truth (CLAUDE.md Hard limits).
+type PricingPlanView struct {
+	Plan                    string
+	PriceFormatted          string
+	Highlighted             bool
+	DeployedApps            int
+	MaxConcurrency          int
+	RAMMB                   int
+	AppLayerMaxMB           int
+	SourceTarballMaxMB      int
+	IdleTimeoutS            int
+	IncludedGBHours         int64
+	RateLimitRPS            int
+	RateLimitBurst          int
+	EgressMbit              int
+	SecretCountMax          int
+	AsyncInvokeAllowed      bool
+	MinInstancesAllowed     bool
+	ScaleUpTargetRPSAllowed bool
+	ScaleUpTargetCPUAllowed bool
+	EgressAllowlistAllowed  bool
+	EgressAllowlistMaxSize  int
+}
+
+// InvoicesData is the /dashboard/invoices page payload (issue #259).
+// Items is one row per invoice; NextBefore is the RFC3339Nano cursor
+// for the older page (empty when this is the end). Month is the
+// currently-applied filter, echoed back so the template can
+// pre-fill the form input.
+type InvoicesData struct {
+	Month      string
+	Items      []InvoiceRow
+	NextBefore string
+}
+
+// InvoiceRow is one dashboard row. TotalFormatted is pre-formatted at
+// the handler edge (integer cents → "€X.YY" / "€0.00"; never float).
+// PDFAvailable shows the marker (Y / -) but never exposes the provider
+// PDF URL. HostedURL is intentionally absent: the column lives in
+// invoices.hosted_url for PR-B audit only; PR A never puts it on the
+// wire (see state.Invoice docstring).
+type InvoiceRow struct {
+	ID             string
+	Number         string
+	Provider       string
+	Status         string
+	Period         string // "2026-07"
+	TotalFormatted string // "€X.YY" — pre-formatted at the handler edge
+	Currency       string
+	PDFAvailable   bool
+}
+
 // APIKeyItem is one row on the /dashboard/account page's keys tab.
 //
 // Scopes is the fine-grained permission set the apid IAM-1 (ADR-034
@@ -207,9 +279,18 @@ type AccountData struct {
 // and caches the parsed tree in a sync.Once — the hot path is a
 // single Execute call.
 //
+// nonce is the per-request CSP nonce minted by httpsec.Nonce
+// (cmd/apid/server.go). Render stamps it onto page.Nonce so every
+// <script> and <style> tag inside the layout and body template can
+// emit `nonce="…"` via {{.Nonce}}. Empty nonce is allowed (unit
+// tests pass "") and the templates render the tags without a nonce
+// attribute — production always supplies a value via
+// httpsec.NonceFromContext.
+//
 // Body is the per-page template name ("index", "apps_list", …). It
 // MUST be present under templates/ or Render writes a 500 problem.
-func Render(w http.ResponseWriter, log *slog.Logger, page Page) error {
+func Render(w http.ResponseWriter, log *slog.Logger, nonce string, page Page) error {
+	page.Nonce = nonce
 	if page.Body == "" {
 		page.Body = "index"
 	}

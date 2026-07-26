@@ -21,25 +21,31 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Loop subscribes to the pg_notify channels schedd cares about and reacts. It
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool       *pgxpool.Pool
-	engine     *Engine
-	log        *slog.Logger
-	gateway    GatewaySynth
-	now        func() time.Time
-	flowCounts FlowCounter
-	watchdog   *Watchdog           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention  *Retention          // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat  *Heartbeat          // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	instStats  InstanceStatsPoller // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup    *scaleup.Trigger    // issue #169 / #172 reactive scale-up trigger; nil opts out
+	pool             *pgxpool.Pool
+	engine           *Engine
+	log              *slog.Logger
+	gateway          GatewaySynth
+	now              func() time.Time
+	flowCounts       FlowCounter
+	ops              *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -148,6 +154,15 @@ func (l *Loop) WithFlowCounter(fc FlowCounter) *Loop {
 	return l
 }
 
+// WithOpsMetrics attaches the per-daemon Prometheus bundle to the
+// loop. Mirrors Engine.WithOpsMetrics so schedd wires a single
+// *wire.OpsMetrics to both. Nil is safe — observers no-op on a
+// nil receiver (the loop reads the field defensively too).
+func (l *Loop) WithOpsMetrics(ops *wire.OpsMetrics) *Loop {
+	l.ops = ops
+	return l
+}
+
 // WithScaleUp attaches the per-app reactive scale-up trigger
 // (issue #169 / #172, pkg/sched/scaleup). Nil opts out (the
 // scaleupTick arm of Run's select never fires). Production wires
@@ -157,6 +172,41 @@ func (l *Loop) WithFlowCounter(fc FlowCounter) *Loop {
 // cadence — same opt-out shape as WithHeartbeat / WithWatchdog.
 func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
 	l.scaleup = t
+	return l
+}
+
+// WithRecentLoad attaches the per-app rolling-window RPS mirror
+// (issue #171, pkg/sched/recentload). Nil opts out — the
+// recentLoadTick arm of Run's select never fires AND the
+// runReaper aggressive block is skipped. Production wires the
+// mirror from cmd/schedd after the wire.PromScraper is available;
+// tests inject a stub or skip via nil. The mirror's own cadence
+// (1 s) governs the tick — same opt-out shape as WithScaleUp /
+// WithHeartbeat / WithWatchdog.
+func (l *Loop) WithRecentLoad(r *recentload.RecentLoad) *Loop {
+	l.recentLoad = r
+	return l
+}
+
+// WithReaperAggressive toggles the issue #171 aggressive-reaper
+// scale-down path. Production defaults to ON; the cfg flag lets
+// operators disable in-place if a regression surfaces. Mirrors the
+// WithWatchdog / WithScaleUp nil-toggle shape. Reads as
+// `WithReaperAggressive(true)` to enable, `WithReaperAggressive(false)`
+// to keep the mirror wired (for telemetry) but skip the
+// runReaper aggressive block.
+func (l *Loop) WithReaperAggressive(enabled bool) *Loop {
+	l.reaperAggressive = enabled
+	return l
+}
+
+// WithReaperParkCap sets the per-app per-tick park cap used by the
+// aggressive path (issue #171). Zero falls back to
+// MaxParksPerTickPerApp (= 8) at evaluation time. The cap prevents
+// one tick from blocking the reaper for `cap × ~150 ms` during a
+// sudden-scale-down storm.
+func (l *Loop) WithReaperParkCap(cap int) *Loop {
+	l.reaperParkCap = cap
 	return l
 }
 
@@ -283,6 +333,15 @@ func (l *Loop) Run(ctx context.Context) error {
 		scaleupT = time.NewTicker(interval)
 		defer scaleupT.Stop()
 	}
+	// Recent-load mirror ticker (issue #171). 1 s cadence keeps the
+	// per-app RPS window current between reaper ticks (the reaper
+	// itself runs at 10 s). nil mirror opts out — no ticker, no
+	// runRecentLoad case, no aggressive block in runReaper.
+	var recentLoadT *time.Ticker
+	if l.recentLoad != nil {
+		recentLoadT = time.NewTicker(time.Second)
+		defer recentLoadT.Stop()
+	}
 
 	for {
 		select {
@@ -306,6 +365,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runInstanceStats(ctx)
 		case <-scaleupTick(scaleupT):
 			l.runScaleUp(ctx)
+		case <-recentLoadTick(recentLoadT):
+			l.runRecentLoad(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -363,6 +424,26 @@ func instStatsTick(t *time.Ticker) <-chan time.Time {
 // scaleupTick is the reactive scale-up trigger ticker (issue #169 /
 // #172). Same nil-safe shape as the heartbeat/retention tickers.
 func scaleupTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// MaxParksPerTickPerApp bounds the aggressive-reaper (issue #171)
+// per-app per-tick park count. Without a cap, a single tick could
+// block the reaper for `N × ~150 ms` ≈ 7.5 s on a 50-instance
+// burst that just dropped to zero RPS. 8 keeps the per-tick impact
+// at ~1.2 s — within schedd's 1 Hz watchdog tick budget and well
+// under the reaper's 10 s tick.
+const MaxParksPerTickPerApp = 8
+
+// recentLoadTick is the aggressive-reaper signal-mirror ticker
+// (issue #171). Same nil-safe shape as scaleupTick — nil ticker ⇒
+// nil channel, so the select case never fires. Production wires
+// this at 1 s so the rolling window stays current between reaper
+// ticks (the reaper itself runs at 10 s).
+func recentLoadTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -434,6 +515,26 @@ func (l *Loop) runScaleUp(ctx context.Context) {
 	}
 }
 
+// runRecentLoad dispatches one tick of the aggressive-reaper signal
+// mirror (issue #171). Same shape as runScaleUp — Touch errors are
+// swallowed (the mirror keeps its previous ring; the reaper sees
+// stale-but-non-zero, the safer direction). Exported as a method
+// so tests drive a single tick without spinning up Run.
+//
+// Note: we use `time.Now()` here (not `l.now()`) because the
+// 1 s mirror cadence is wall-clock driven — the reaper's decision
+// tick is the only place that hooks the fake clock for test
+// determinism (runReaper → l.now() at loop.go:593). The mirror's
+// own behaviour under a frozen clock is exercised by the
+// per-tick integration tests (TestLoopReaperAggressive*) which
+// drive Touch directly with the frozen value.
+func (l *Loop) runRecentLoad(ctx context.Context) {
+	if l.recentLoad == nil {
+		return
+	}
+	l.recentLoad.Touch(ctx, time.Now())
+}
+
 // handleNotification decodes the JSON payload and applies the policy.
 //
 //   - app_changed / deployment_changed: informational. Wake materialises an
@@ -466,8 +567,11 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 }
 
 // runReaper builds a read-only snapshot of every instance and applies the idle /
-// RAM-pressure selectors, delegating each action to the Engine:
+// aggressive / RAM-pressure selectors, delegating each action to the Engine:
 //   - ReapIdle → Engine.Park (snapshot + park; snapshot reused on next wake).
+//   - ReapAggressive (issue #171) → Engine.Park (snapshot + park) for the
+//     surplus above max(min_instances, desired + 1), where desired is
+//     derived from the per-app rolling-window RPS signal.
 //   - SelectEvictions → Engine.Evict (destroy; next wake cold-boots, ADR-005).
 func (l *Loop) runReaper(ctx context.Context) {
 	store := l.engine.Store()
@@ -494,7 +598,18 @@ func (l *Loop) runReaper(ctx context.Context) {
 			l.log.Warn("reaper: warm flow reader", "err", warmErr)
 		}
 	}
-	now := time.Now()
+	now := l.now()
+	// snapshot is a point-in-time view of every instance on the
+	// box. The three selectors below (ReapIdle, ReapAggressive,
+	// SelectEvictions) all read from this same slice. IMPORTANT:
+	// the snapshot does NOT reflect state changes made by the
+	// Engine.Park / Engine.Evict calls below — those selectors
+	// are stateless over a []InstanceInfo. For scale-down flows
+	// this is benign (each successful Park reduces the resident
+	// set and the next selector sees a smaller pool via the store,
+	// not the snapshot). For test determinism this is also why
+	// `now := l.now()` (vs `time.Now()`) was lifted here: the
+	// integration tests pin all selectors to the same instant.
 	var snapshot []InstanceInfo
 	for _, a := range apps {
 		plan := api.Plan("")
@@ -542,10 +657,145 @@ func (l *Loop) runReaper(ctx context.Context) {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 		}
 	}
+
+	// Aggressive scale-down (issue #171). Park the surplus above
+	// max(min_instances, desired + 1) where desired comes from the
+	// per-app rolling-window RPS signal. Apps with no autoscale
+	// target are absent from desiredByApp and ReapAggressive
+	// skips them — ReapIdle owns their cooldown.
+	//
+	// Per-tick park cap (MaxParksPerTickPerApp = 8) prevents one
+	// tick from blocking the reaper for `cap × ~150 ms` during a
+	// sudden-scale-down storm.
+	if l.recentLoad != nil && l.reaperAggressive {
+		l.runReaperAggressive(ctx, apps, snapshot, now)
+	}
+
 	for _, id := range SelectEvictions(resident, now, snapshot) {
 		if err := l.engine.Evict(ctx, id); err != nil {
 			l.log.Warn("reaper: eviction", "instance", id, "err", err)
 		}
+	}
+}
+
+// runReaperAggressive (issue #171) is the per-tick body of the
+// aggressive scale-down path. Builds desiredByApp from the
+// rolling-window RPS signal, calls ReapAggressive, and parks the
+// returned candidates with a per-app per-tick cap. Emits one
+// audit row per app that parked ≥ 1 instance, and one metric
+// observation per app per tick. Carved out of runReaper so the
+// behaviour is unit-testable without a clock / DB round-trip on
+// the full reaper body.
+func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, now time.Time) {
+	// Build an instance → app_id map once so the per-app park
+	// grouping below is O(N+M) instead of O(N×M) (issue #171 review
+	// finding: the re-scan was N walks of the snapshot for every
+	// parked ID). Cheap, deterministic, and replaces a linear scan
+	// inside what could become a 100-app reaper tick.
+	instanceToApp := make(map[string]string, len(snapshot))
+	for _, s := range snapshot {
+		instanceToApp[s.Instance] = s.AppID
+	}
+	// consideredAppIDs: every autoscale-enabled multi-instance app
+	// gets exactly one metric observation per tick (either `park`
+	// or `keep`). Apps absent from this set fall outside the
+	// aggressive path's scope — no metric, no audit.
+	// desiredByApp: subset of considered apps where the rolling
+	// signal says we need > 0 instances. ReapAggressive is only
+	// asked about these apps. An app in consideredAppIDs but
+	// absent from desiredByApp means desired=0 — the signal says
+	// "park everything down to floor+1".
+	consideredAppIDs := map[string]struct{}{}
+	desiredByApp := map[string]int{}
+	for _, a := range apps {
+		// Skip apps that don't participate in the aggressive path:
+		// single-instance apps can't exceed max(min_instances,
+		// desired+1) > 1 anyway, and apps with no autoscale target
+		// fall through to ReapIdle for the timeout-based cooldown.
+		if a.MaxConcurrency <= 1 {
+			continue
+		}
+		if a.AutoscaleTargetRPS <= 0 {
+			continue
+		}
+		consideredAppIDs[a.ID] = struct{}{}
+		// Always record desired (even when 0) so ReapAggressive
+		// can compute the surplus above max(floor, desired + 1).
+		// Apps absent from desiredByApp would be SKIPPED by
+		// ReapAggressive (the function's contract: apps not in the
+		// map defer to ReapIdle), which would silently keep all 5
+		// instances of a 100→0 rps burst alive.
+		desired := l.recentLoad.RecentDesiredReplicas(a.ID, now, a.AutoscaleTargetRPS)
+		desiredByApp[a.ID] = desired
+	}
+	if len(consideredAppIDs) == 0 {
+		return
+	}
+	// ReapAggressive returns instance IDs in oldest-LastRequest
+	// first order (per the freshness-floor direction). Group by
+	// app_id so the per-tick cap applies per-app, not globally.
+	parkByApp := map[string][]string{}
+	if len(desiredByApp) > 0 {
+		for _, id := range ReapAggressive(now, snapshot, desiredByApp) {
+			appID := instanceToApp[id]
+			if appID == "" {
+				continue
+			}
+			parkByApp[appID] = append(parkByApp[appID], id)
+		}
+	}
+	// For each considered app, emit either `park` (≥ 1 instance
+	// parked) or `keep` (signal said the running set is fine OR
+	// said "park to floor" and the floor matches the running
+	// count exactly). The metric counts one decision per app per
+	// tick.
+	cap := l.reaperParkCap
+	if cap <= 0 {
+		cap = MaxParksPerTickPerApp
+	}
+	for appID := range consideredAppIDs {
+		ids := parkByApp[appID]
+		if len(ids) == 0 {
+			l.ops.ObserveScaleDown(appID, "keep")
+			continue
+		}
+		if len(ids) > cap {
+			l.log.Info("reaper: aggressive cap hit",
+				"app", appID, "wanted", len(ids), "cap", cap)
+			ids = ids[:cap]
+		}
+		l.ops.ObserveScaleDown(appID, "park")
+		l.emitScaleDownAudit(ctx, appID, desiredByApp[appID], ids, now)
+		for _, id := range ids {
+			if err := l.engine.Park(ctx, id); err != nil {
+				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
+			}
+		}
+	}
+}
+
+// emitScaleDownAudit writes one events row per aggressive scale-
+// down decision (issue #171). The row carries the desired
+// replica count, observed RPS, target RPS, and the parked IDs so
+// operators can reconstruct "why did this scale down?" without
+// correlating instances. Best-effort: a failure is logged but
+// does not roll back the Park calls (matches the engine's
+// transitionWithKind posture on events table errors).
+func (l *Loop) emitScaleDownAudit(ctx context.Context, appID string, desired int, parked []string, now time.Time) {
+	data, err := json.Marshal(map[string]any{
+		"app":     appID,
+		"desired": desired,
+		"parked":  parked,
+		"reason":  "traffic_dropped",
+		"now":     now.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		l.log.Warn("reaper: marshal scale-down audit", "err", err)
+		return
+	}
+	subject := appID
+	if err := l.engine.Store().AppendEvent(ctx, "schedd", "reaper_scale_down", &subject, data); err != nil {
+		l.log.Warn("reaper: scale-down audit write failed", "app", appID, "err", err)
 	}
 }
 
