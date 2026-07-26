@@ -489,6 +489,11 @@ type Usage struct {
 // Money is integer cents in the provider's currency; the financial
 // model distills to EUR at the API edge. Currency is preserved per
 // row so future multi-currency support can land without a backfill.
+//
+// HostedURL is intentionally NOT exposed on the read surface — the
+// column lives in invoices.hosted_url for PR-B audit only. Provider
+// invoice URLs and PDF URLs are session-scoped; we never hand them to
+// the customer via this API.
 type Invoice struct {
 	ID                string
 	AccountID         string
@@ -504,7 +509,6 @@ type Invoice struct {
 	AmountPaidCents   int64
 	Currency          string
 	PDFAvailable      bool
-	HostedURL         string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }

@@ -858,8 +858,8 @@ type Store interface {
 	// first, ordered by (period_end DESC, id DESC) for deterministic
 	// pagination. month is optional: when non-nil, the result is
 	// filtered to the half-open UTC month [month, month+1mo). before
-	// is the cursor — rows with (period_end, id) strictly less than
-	// the cursor are returned. limit is 1..100; clamp is the caller's
+	// is the cursor — rows with period_end strictly less than
+	// before are returned. limit is 1..100; clamp is the caller's
 	// responsibility (handler clamps at 25 default). The returned
 	// slice is empty (not nil) when the account has no rows.
 	ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error)

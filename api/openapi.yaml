@@ -1597,9 +1597,8 @@ paths:
                     amount_paid_cents: 900
                     currency: eur
                     pdf_available: true
-                    hosted_url: "https://invoice.stripe.com/i/acct_1N/test_abcdef0123"
                     created_at: "2026-08-01T01:23:45Z"
-                next_before: ""
+                next_before: null
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -2053,7 +2052,9 @@ components:
         support can land without a backfill. The PDF availability flag
         is the only PDF surface we expose — the hosted PDF URL is
         provider-scoped and the customer fetches it from the
-        Stripe/Paddle portal, not via this API.
+        Stripe/Paddle portal, not via this API. The hosted URL itself
+        is not on the wire; the column exists in invoices.hosted_url
+        for PR-B audit only.
       type: object
       required: [id, provider, provider_invoice_id, status, period_start, period_end,
                  subtotal_cents, tax_cents, total_cents, amount_paid_cents,
@@ -2070,9 +2071,8 @@ components:
         tax_cents:         { type: integer, format: int64 }
         total_cents:       { type: integer, format: int64 }
         amount_paid_cents: { type: integer, format: int64 }
-        currency: { type: string, example: "eur" }
+        currency: { type: string, enum: [eur], example: "eur" }
         pdf_available: { type: boolean }
-        hosted_url: { type: [string, "null"], format: uri }
         created_at: { type: string, format: date-time }
 
     InvoiceListResponse:

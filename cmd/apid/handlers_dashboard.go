@@ -328,7 +328,8 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 // renderPricing renders /dashboard/pricing — a four-column plan
 // comparison driven entirely by pkg/api/limits.go. Money is integer
 // millicents upstream; we divide by 1000 at render time only and
-// format with %.2f (CLAUDE.md Money: integer cents/millicents).
+// format with %d.%02d (CLAUDE.md Money: integer cents/millicents —
+// no float math on money).
 func (s *server) renderPricing(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
 	view, _ := AccountFrom(r.Context())
 	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
@@ -370,7 +371,10 @@ func (s *server) renderPricing(w http.ResponseWriter, r *http.Request, log *slog
 
 // renderInvoices renders /dashboard/invoices — the account's billing
 // history (issue #259). Optional ?month=YYYY-MM filter and ?before
-// cursor pagination, mirroring the API handler's parsing.
+// cursor pagination, mirroring the API handler's parsing. Bad input
+// is silently dropped (the dashboard is forgiving; the API enforces
+// RFC 7807). The handlers are intentionally kept small enough to fit
+// the 50-line guideline via parseInvoiceMonth / parseInvoiceBefore.
 func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
 	view, _ := AccountFrom(r.Context())
 	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
@@ -378,24 +382,8 @@ func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slo
 		log.Warn("dashboard renderInvoices: count deployed apps", "account_id", acct.ID, "err", err)
 		appCount = 0
 	}
-	monthStr := r.URL.Query().Get("month")
-	var monthPtr *time.Time
-	if monthStr != "" {
-		m, perr := time.Parse("2006-01", monthStr)
-		if perr == nil {
-			monthPtr = &m
-		} else {
-			monthStr = ""
-		}
-	}
-	before := time.Time{}
-	if v := r.URL.Query().Get("before"); v != "" {
-		if t, perr := time.Parse(time.RFC3339Nano, v); perr == nil {
-			before = t
-		} else if t, perr := time.Parse(time.RFC3339, v); perr == nil {
-			before = t
-		}
-	}
+	monthStr, monthPtr := parseInvoiceMonth(r.URL.Query().Get("month"))
+	before := parseInvoiceBefore(r.URL.Query().Get("before"))
 	rows, err := s.store.ListInvoicesForAccount(r.Context(), acct.ID, monthPtr, before, 25)
 	if err != nil {
 		log.Warn("dashboard renderInvoices: list invoices", "account_id", acct.ID, "err", err)
@@ -413,7 +401,6 @@ func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slo
 			TotalFormatted: formatCentsEuros(inv.TotalCents),
 			Currency:       inv.Currency,
 			PDFAvailable:   inv.PDFAvailable,
-			HostedURL:      inv.HostedURL,
 		})
 	}
 	nextBefore := ""
@@ -426,6 +413,38 @@ func (s *server) renderInvoices(w http.ResponseWriter, r *http.Request, log *slo
 	if err := dashboard.Render(w, log, page); err != nil {
 		renderProblem(w, log, err)
 	}
+}
+
+// parseInvoiceMonth parses the dashboard's optional month query.
+// Returns (echoed-string, parsed-pointer). Bad input echoes empty so
+// the form re-renders cleanly without surfacing the validation error
+// (the API surfaces the RFC 7807 problem; the dashboard is forgiving).
+func parseInvoiceMonth(raw string) (string, *time.Time) {
+	if raw == "" {
+		return "", nil
+	}
+	m, err := time.Parse("2006-01", raw)
+	if err != nil {
+		return "", nil
+	}
+	return raw, &m
+}
+
+// parseInvoiceBefore parses the dashboard's optional before cursor.
+// Empty → zero time. Bad input → zero time (forgiving; matches the
+// dashboard's behaviour for month). The API is strict; the dashboard
+// is a thin read surface, not a validator.
+func parseInvoiceBefore(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 // formatPriceEuros converts integer millicents (1 cent = 1000
@@ -447,12 +466,11 @@ func formatPriceEuros(millicents int64) string {
 
 // formatCentsEuros converts integer cents (the invoice total unit)
 // into the dashboard's "€X.YY" string. Distinct from
-// formatPriceEuros (which takes millicents) to avoid the implicit
-// factor in the call site.
+// formatPriceEuros (which takes millicents and collapses €0 to
+// "Free" for the pricing page). formatCentsEuros is for invoice
+// rows where €0 means "a real €0 invoice" (refund / void / draft)
+// and must display as "€0.00", not as "Free".
 func formatCentsEuros(cents int64) string {
-	if cents == 0 {
-		return "Free"
-	}
 	euros := cents / 100
 	rem := cents % 100
 	if rem < 0 {

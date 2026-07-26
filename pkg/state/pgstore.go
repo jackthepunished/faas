@@ -2775,7 +2775,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			`select id, account_id, provider, provider_invoice_id, number, status,
 			        period_start, period_end,
 			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
-			        currency, pdf_available, hosted_url, created_at, updated_at
+			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
 			    and period_end >= date_trunc('month', $2::timestamptz)
@@ -2790,7 +2790,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			`select id, account_id, provider, provider_invoice_id, number, status,
 			        period_start, period_end,
 			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
-			        currency, pdf_available, hosted_url, created_at, updated_at
+			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
 			    and period_end >= date_trunc('month', $2::timestamptz)
@@ -2804,7 +2804,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			`select id, account_id, provider, provider_invoice_id, number, status,
 			        period_start, period_end,
 			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
-			        currency, pdf_available, hosted_url, created_at, updated_at
+			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
 			    and period_end < $2
@@ -2816,7 +2816,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			`select id, account_id, provider, provider_invoice_id, number, status,
 			        period_start, period_end,
 			        subtotal_cents, tax_cents, total_cents, amount_paid_cents,
-			        currency, pdf_available, hosted_url, created_at, updated_at
+			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
 			  order by period_end desc, id desc
@@ -2835,7 +2835,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			&inv.Number, &inv.Status,
 			&inv.PeriodStart, &inv.PeriodEnd,
 			&inv.SubtotalCents, &inv.TaxCents, &inv.TotalCents, &inv.AmountPaidCents,
-			&inv.Currency, &inv.PDFAvailable, &inv.HostedURL,
+			&inv.Currency, &inv.PDFAvailable,
 			&inv.CreatedAt, &inv.UpdatedAt,
 		); err != nil {
 			return nil, err

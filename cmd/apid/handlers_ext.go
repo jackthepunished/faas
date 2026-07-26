@@ -1383,14 +1383,23 @@ func (s *server) listInvoices(w http.ResponseWriter, r *http.Request, acct state
 // Returns the structured (problem, nil) pair on validation failure so
 // the handler can write through without duplicating the WriteProblem
 // boilerplate. month filter is optional; limit is clamped 1..100
-// (default 25).
+// (default 25). On bad limit we thread the limit + observed values
+// into the Problem so RFC 7807 consumers can surface actionable
+// guidance (CLAUDE.md "limit errors include limit + observed + docs").
 func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time, limit int, err *api.Problem) {
+	const limitMax = 100
 	limit = 25
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, perr := strconv.Atoi(v)
-		if perr != nil || n < 1 || n > 100 {
+		if perr != nil || n < 1 || n > limitMax {
+			observed := int64(0)
+			if perr == nil {
+				observed = int64(n)
+			}
 			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-				"Bad limit", "1..100")
+				"Bad limit", "expected 1..100").
+				WithLimit(int64(limitMax), observed).
+				WithDocs("https://docs.DOMAIN/billing#invoices")
 		}
 		limit = n
 	}
@@ -1416,7 +1425,8 @@ func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time
 }
 
 // invoiceResponse maps state.Invoice to the API DTO. Direct field
-// pass-through — the state row is already in the on-the-wire shape.
+// pass-through — the state row is already in the on-the-wire shape,
+// except HostedURL which is intentionally dropped (PR-B audit only).
 func invoiceResponse(inv state.Invoice) api.Invoice {
 	return api.Invoice{
 		ID:                inv.ID,
@@ -1432,7 +1442,6 @@ func invoiceResponse(inv state.Invoice) api.Invoice {
 		AmountPaidCents:   inv.AmountPaidCents,
 		Currency:          inv.Currency,
 		PDFAvailable:      inv.PDFAvailable,
-		HostedURL:         inv.HostedURL,
 		CreatedAt:         inv.CreatedAt,
 	}
 }

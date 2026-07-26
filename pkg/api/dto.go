@@ -298,7 +298,8 @@ type DeploymentListResponse struct {
 // currency (the financial model distills to EUR at the API edge).
 // PDFAvailable is the only PDF surface we expose — the hosted PDF URL
 // is provider-scoped and customer-fetched via the Stripe/Paddle
-// portal, not via this API.
+// portal, not via this API. HostedURL is intentionally not on the
+// wire; see state.Invoice for the rationale.
 type Invoice struct {
 	ID                string    `json:"id"`
 	Provider          string    `json:"provider"`
@@ -313,7 +314,6 @@ type Invoice struct {
 	AmountPaidCents   int64     `json:"amount_paid_cents"`
 	Currency          string    `json:"currency"`
 	PDFAvailable      bool      `json:"pdf_available"`
-	HostedURL         string    `json:"hosted_url,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 }
 

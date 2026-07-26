@@ -839,9 +839,11 @@ func cmdUsageSummary(args []string) int {
 
 // cmdInvoices: GET /v1/invoices?month=YYYY-MM&before=RFC3339Nano&limit=N
 // (issue #259). Surfaces the account's billing history in the same
-// text/JSON dual-mode as cmdUsageSummary. --month is validated locally
-// before the HTTP call so an invalid value exits non-zero without a
-// server round-trip (matches the "auth/usage" exit-code convention).
+// text/JSON dual-mode as cmdUsageSummary. --month and --limit are
+// validated server-side (the handler returns 400 CodeValidation); the
+// CLI just prints the server's RFC 7807 problem and exits 1 (user
+// error per UX §3.2). Matches cmdUsageSummary's precedent — the CLI
+// does not duplicate the validation that the server already does.
 func cmdInvoices(args []string) int {
 	fs := flag.NewFlagSet("invoices", flag.ContinueOnError)
 	month := fs.String("month", "", "billing month (YYYY-MM); default: all months")
@@ -849,16 +851,6 @@ func cmdInvoices(args []string) int {
 	limit := fs.Int("limit", 25, "page size (1..100)")
 	if err := fs.Parse(args); err != nil {
 		return 1
-	}
-	if *month != "" {
-		if _, err := time.Parse("2006-01", *month); err != nil {
-			fmt.Fprintln(os.Stderr, "faas: invalid --month, expected YYYY-MM")
-			return 2
-		}
-	}
-	if *limit < 1 || *limit > 100 {
-		fmt.Fprintln(os.Stderr, "faas: invalid --limit, expected 1..100")
-		return 2
 	}
 	client, err := authedClient()
 	if err != nil {

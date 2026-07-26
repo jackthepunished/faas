@@ -208,19 +208,21 @@ type InvoicesData struct {
 	NextBefore string
 }
 
-// InvoiceRow is one dashboard row. TotalCents is rendered via the
-// standard millicent → euros format. PDFAvailable shows the marker
-// (✓ / —) but never exposes the provider PDF URL.
+// InvoiceRow is one dashboard row. TotalFormatted is pre-formatted at
+// the handler edge (integer cents → "€X.YY" / "€0.00"; never float).
+// PDFAvailable shows the marker (Y / -) but never exposes the provider
+// PDF URL. HostedURL is intentionally absent: the column lives in
+// invoices.hosted_url for PR-B audit only; PR A never puts it on the
+// wire (see state.Invoice docstring).
 type InvoiceRow struct {
 	ID             string
 	Number         string
 	Provider       string
 	Status         string
-	Period         string // "2026-07" or human range
+	Period         string // "2026-07"
 	TotalFormatted string // "€X.YY" — pre-formatted at the handler edge
 	Currency       string
 	PDFAvailable   bool
-	HostedURL      string
 }
 
 // APIKeyItem is one row on the /dashboard/account page's keys tab.
