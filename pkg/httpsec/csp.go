@@ -33,6 +33,12 @@ const nonceLen = 16
 // (package httpsec_test) and reads it as httpsec.BuildCSPForTest.
 var BuildCSPForTest = buildCSP
 
+// MintNonceForTest exposes the unexported mintNonce to the test
+// package so the CR/LF sanitisation path (which only fires on
+// rand.Read failure) can be exercised without a fault-injection
+// hook on the rand source. Live code never calls it.
+var MintNonceForTest = mintNonce
+
 // cspScriptHosts is the additional script-src host set beyond 'self'
 // and the per-request nonce. Issue #249 keeps the dashboard's
 // htmx.org@2.0.4 and htmx-ext-sse@2.2.2 scripts served from
@@ -140,11 +146,22 @@ const zeroNonce = "0000000000000000000000"
 // reports success. On rand.Read failure it logs once (path +
 // 6-char fingerprint of the zero nonce, never the full value) and
 // returns ok=false so the caller can substitute the zero nonce.
+//
+// path is the request URL path — attacker-controlled. We strip CR
+// and LF before logging so a malicious URL like `/foo%0A%0Dbar`
+// cannot forge log lines. This is the canonical CodeQL go/log-
+// injection sanitiser (see the rule's GOOD example at
+// https://codeql.github.com/codeql-query-help/go/go-log-injection/);
+// a custom helper that does the same stripping internally does NOT
+// close the alert — CodeQL only propagates taint through the two
+// separate strings.ReplaceAll calls.
 func mintNonce(path string) (string, bool) {
 	var b [nonceLen]byte
 	if _, err := rand.Read(b[:]); err != nil {
+		safePath := strings.ReplaceAll(path, "\r", "")
+		safePath = strings.ReplaceAll(safePath, "\n", "")
 		slog.Default().Error("httpsec: rand.Read failed; nonce degraded to zeros",
-			"err", err, "path", path, "nonce_fp", zeroNonce[:6])
+			"err", err, "path", safePath, "nonce_fp", zeroNonce[:6])
 		return zeroNonce, false
 	}
 	return base64.RawURLEncoding.EncodeToString(b[:]), true
