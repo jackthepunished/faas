@@ -1,6 +1,9 @@
 package api
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // APIError carries a server problem so callers can type-switch on it
 // and render the RFC 7807 envelope verbatim. Every Client.do on the
@@ -25,3 +28,40 @@ func (e *APIError) Error() string {
 	}
 	return p.Code
 }
+
+// Unwrap returns the SDK's sentinel error for the canonical Problem
+// codes (not_found, unauthorized, rate_limited, capacity_unavailable).
+// Callers can use errors.Is to test for these without importing
+// internal/api:
+//
+//	if errors.Is(err, faas.ErrNotFound) { ... }
+//
+// Unknown codes (the majority) return nil so the chain stops at
+// APIError — callers fall through to errors.As(&api.APIError{}) for
+// the typed wire shape.
+func (e *APIError) Unwrap() error {
+	switch e.Problem.Code {
+	case CodeNotFound:
+		return ErrSentinelNotFound
+	case CodeUnauthorized:
+		return ErrSentinelUnauthorized
+	case "rate_limited":
+		return ErrSentinelRateLimited
+	case CodeCapacity:
+		return ErrSentinelCapacity
+	}
+	return nil
+}
+
+// Sentinel errors. Each maps to one or more server-side Problem.Code
+// values. The unwrap path (above) is the only consumer; callers
+// compare via errors.Is via the public re-exports in the faas
+// package. The names are prefixed with "Sentinel" to avoid colliding
+// with the existing Err* constructor functions in this package
+// (ErrCapacity, ErrPlanLimitApps, etc., which return *Problem).
+var (
+	ErrSentinelNotFound     = errors.New("faas: resource not found")
+	ErrSentinelUnauthorized = errors.New("faas: invalid credentials")
+	ErrSentinelRateLimited  = errors.New("faas: rate limited")
+	ErrSentinelCapacity     = errors.New("faas: capacity unavailable")
+)

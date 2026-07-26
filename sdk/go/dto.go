@@ -1,0 +1,104 @@
+package faas
+
+import "github.com/poyrazK/faas-go/internal/api"
+
+// Type aliases for every request/response DTO the Client methods
+// accept and return. The aliases preserve identity (a faas.App
+// IS an api.App), so methods on either type are interchangeable.
+//
+// Why aliases instead of wrappers:
+//   - 44 DTOs would be ~440 lines of empty wrapper structs.
+//   - Identity lets us add fields in internal/api without breaking
+//     customers (the alias picks them up automatically).
+//   - Identity is the only thing godoc needs to render the
+//     relationship correctly.
+//
+// Every alias here is a peer of an exported type in internal/api
+// (dto.go, build.go, appmanifest.go, cliauth.go, secrets.go). New
+// DTOs in internal/api should be added here on the next PR.
+type (
+	// App lifecycle.
+	CreateAppRequest = api.CreateAppRequest
+	UpdateAppRequest = api.UpdateAppRequest
+	RenameAppRequest = api.RenameAppRequest
+	AppResponse      = api.AppResponse
+
+	// Deployments.
+	CreateDeploymentRequest = api.CreateDeploymentRequest
+	DeploymentResponse      = api.DeploymentResponse
+	DeploymentListResponse  = api.DeploymentListResponse
+
+	// Account.
+	AccountResponse         = api.AccountResponse
+	AccountLimits           = api.AccountLimits
+	AccountDeletionResponse = api.AccountDeletionResponse
+	AccountExportResponse   = api.AccountExportResponse
+	BuildExportResponse     = api.BuildExportResponse
+	UsageExportResponse     = api.UsageExportResponse
+	APIKeyExportResponse    = api.APIKeyExportResponse
+	GdprAuditExportResponse = api.GdprAuditExportResponse
+	AppSecretExportResponse = api.AppSecretExportResponse
+	StatusPage              = api.StatusPage
+
+	// API keys.
+	APIKeyResponse   = api.APIKeyResponse
+	CreateKeyRequest = api.CreateKeyRequest
+
+	// Custom domains.
+	CustomDomainResponse      = api.CustomDomainResponse
+	CreateCustomDomainRequest = api.CreateCustomDomainRequest
+
+	// Crons.
+	CronResponse      = api.CronResponse
+	CreateCronRequest = api.CreateCronRequest
+	UpdateCronRequest = api.UpdateCronRequest
+
+	// Instances.
+	InstanceResponse = api.InstanceResponse
+
+	// Usage.
+	UsageResponse        = api.UsageResponse
+	UsageSummaryResponse = api.UsageSummaryResponse
+
+	// Auth (password).
+	PasswordLoginRequest  = api.PasswordLoginRequest
+	PasswordLoginResponse = api.PasswordLoginResponse
+	PasswordSignupRequest = api.PasswordSignupRequest
+	PasswordResetRequest  = api.PasswordResetRequest
+	PasswordResetConfirm  = api.PasswordResetConfirm
+	SetPasswordRequest    = api.SetPasswordRequest
+
+	// Auth (OAuth + device code).
+	OAuthProvider           = api.OAuthProvider
+	CliAuthStatus           = api.CliAuthStatus
+	CliAuthCodeResponse     = api.CliAuthCodeResponse
+	CliAuthExchangeRequest  = api.CliAuthExchangeRequest
+	CliAuthExchangeResponse = api.CliAuthExchangeResponse
+
+	// Async + queues + delayed tasks.
+	AsyncInvokeResponse  = api.AsyncInvokeResponse
+	InvokeResponse       = api.InvokeResponse
+	InvokeRequest        = api.InvokeRequest
+	QueueSendRequest     = api.QueueSendRequest
+	QueueSendResponse    = api.QueueSendResponse
+	QueueReceiveResponse = api.QueueReceiveResponse
+	DelayedTaskRequest   = api.DelayedTaskRequest
+	DelayedTaskResponse  = api.DelayedTaskResponse
+
+	// Audit + invocations.
+	Invocation              = api.Invocation
+	ListInvocationsResponse = api.ListInvocationsResponse
+	AuditEventResponse      = api.AuditEventResponse
+	ListAuditEventsResponse = api.ListAuditEventsResponse
+
+	// Secrets.
+	AppSecretListResponse = api.AppSecretListResponse
+	PutAppSecretRequest   = api.PutAppSecretRequest
+	AppSecretResponse     = api.AppSecretResponse
+
+	// Build + manifest.
+	BuildManifest  = api.BuildManifest
+	BuildDone      = api.BuildDone
+	BuildFramework = api.BuildFramework
+	AppManifest    = api.AppManifest
+)

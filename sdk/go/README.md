@@ -1,44 +1,139 @@
 # faas-go — onebox FaaS Go SDK
 
-> **PR 2 of issue #266** — placeholder. Real README lands in PR 13 alongside the first
-> tagged release. Until then, the SDK module is internal to the monorepo and is consumed
-> only by the daemon's own tests. **Publishing is gated on PR 13.**
+> **PR 3 of issue #266** — the public Go SDK surface. The module is
+> still internal to the monorepo and consumed only by the daemon's
+> own tests; **publishing to the Go module proxy is gated on PR 13**.
 
-This module mirrors the `pkg/api/*` wire surface for the onebox FaaS platform:
+This is the public import path for the onebox FaaS platform:
 
-- typed `Client` and request/response DTOs,
-- RFC 7807 problem envelope + structured errors,
-- bearer-auth + auto-minted idempotency-key on mutating calls,
+```go
+import faas "github.com/poyrazK/faas-go"
+```
+
+The package exposes:
+
+- a typed `Client` with **57 methods** covering every apid route,
+- bearer-auth + caller-supplied `Idempotency-Key` for replay safety,
+- RFC 7807 error envelope + `errors.Is(err, faas.ErrNotFound)` sentinels,
 - cursor pagination helpers (`ListDeploymentsAll`),
-- SSE streaming (`StreamAppLogs`, `StreamDeploymentLogs`, `StreamEvents`),
-- multipart deploy helper (`DeployMultipart`).
+- SSE streaming via `Decoder` for app logs, deployment logs, and events,
+- functional `Option` for HTTP transport, retry, and logger.
 
-The public package name will be `faas` (re-exported in PR 3) and the canonical
-module path is `github.com/poyrazK/faas-go`.
+## Install
 
-## Go version
+```sh
+go get github.com/poyrazK/faas-go
+```
 
-The SDK targets `go 1.23` (the floor of the daemon's own toolchain at the
-moment of extraction). The daemon's `go.mod` is `go 1.25.7`, but the SDK
-stays on 1.23 so a customer pinned to an older Go toolchain can still
-consume it. The SDK uses only Go 1.23-or-earlier features — no `iter`,
-no `structs`, no `cmp.Ordered` 1.24 additions. A future toolchain bump
-in the daemon does not force a bump here.
+The SDK targets `go 1.23` (the floor of the daemon's own toolchain
+at the moment of extraction). The daemon's `go.mod` is `go 1.25.7`,
+but the SDK stays on 1.23 so a customer pinned to an older Go
+toolchain can still consume it.
+
+## Quick start
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+
+    faas "github.com/poyrazK/faas-go"
+)
+
+func main() {
+    c, err := faas.NewClient("https://api.example.com", os.Getenv("FAAS_TOKEN"))
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    app, err := c.GetApp(context.Background(), "hello-world")
+    if errors.Is(err, faas.ErrNotFound) {
+        log.Fatal("app not found")
+    }
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(app.Slug, app.Status)
+}
+```
+
+## Idempotency
+
+Every mutating call (POST/PATCH/DELETE) carries an `Idempotency-Key`
+header. The SDK **auto-mints a UUIDv4** if you don't supply one, so
+naive `c.CreateApp(...)` calls are replay-safe out of the box.
+
+For retries that need a stable key, pin one explicitly:
+
+```go
+ctx = faas.WithIdempotencyKey(ctx, "deploy-attempt-3")
+dep, err := c.Deploy(ctx, slug, req)
+```
+
+A retried call with the same key returns the cached response from
+the server's replay middleware (24h window).
+
+## Errors
+
+Every 4xx/5xx with a Problem-shaped body returns `*faas.APIError`:
+
+```go
+app, err := c.GetApp(ctx, "missing")
+if err != nil {
+    var apiErr *faas.APIError
+    if errors.As(err, &apiErr) {
+        log.Printf("api: %s (%s)", apiErr.Problem.Code, apiErr.Problem.Detail)
+    }
+    // Or, for common cases:
+    if errors.Is(err, faas.ErrNotFound) { ... }
+    if errors.Is(err, faas.ErrRateLimited) { ... }
+    if errors.Is(err, faas.ErrCapacity) { ... }
+    if errors.Is(err, faas.ErrUnauthorized) { ... }
+}
+```
+
+## Options
+
+```go
+c, err := faas.NewClient(baseURL, token,
+    faas.WithHTTPClient(myHTTPClient),           // custom transport
+    faas.WithRetry(3, 200*time.Millisecond),     // bounded retry on 5xx/429
+    faas.WithLogger(slog.Default()),              // request/response logging
+)
+```
+
+`WithBaseURL`, `WithToken`, and `WithDeployTimeout` are reserved
+slots that will land in PR 12 (when the internal SDK's unexported
+fields are promoted). Today they return an `errOptionUnsupported`
+error so the limitation is explicit.
 
 ## Local development
 
-```
+```sh
 cd sdk/go
 go build ./...
-go test ./...
 go vet ./...
+go test ./...
 ```
 
-The CI gate is `.github/workflows/ci.yml::sdk-go` — a separate job that
-runs `go build`, `go vet`, and `go test` inside `sdk/go/`. The daemon's
-own `make test` walks only the daemon's package tree, so the SDK needs
-its own gate until the PR 12 split reverses the import direction.
+The CI gate is `.github/workflows/ci.yml::sdk-go` — a separate job
+that runs `go build`, `go vet`, and `go test` inside `sdk/go/`. The
+daemon's own `make test` walks only the daemon's package tree, so
+the SDK needs its own gate (memory: `nested-go-module-needs-own-ci-gate`).
 
-The module is a leaf: it imports only Go stdlib. The split in PR 12 trims
-`pkg/api/*` (in the daemon's main module) to its server-only files; this
-module then becomes the canonical home for the wire DTOs.
+The module is a leaf: it imports only Go stdlib + the internal
+`api` package. PR 12 trims `pkg/api/*` (in the daemon's main module)
+to its server-only files; this module then becomes the canonical
+home for the wire DTOs.
+
+## Reference
+
+- godoc: run `go doc -all ./...` from this directory.
+- OpenAPI spec: `../../api/openapi.yaml` (canonical), `../../pkg/apid/openapi.yaml` (embedded).
+- ADR-038 (issue #266): documents the split contract between the SDK and the daemon.
+- PR plan: `/.claude/plans/lets-create-imp-plan-bubbly-engelbart.md` (the 14-PR sequence).
