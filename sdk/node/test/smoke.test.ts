@@ -1,6 +1,6 @@
 // test/smoke.test.ts — Node SDK smoke test against the Go fixture
 // (sdk/fakeapid). Runs the full SDK surface — generated services
-// + wrapper stack — through five canonical routes and the 404
+// + wrapper stack — through six canonical routes plus the 404
 // sentinel. Mirrors `sdk/fakeapid/main_test.go` (raw HTTP) and
 // `sdk/go/transport_e2e_test.go` (SDK round-trip).
 //
@@ -94,14 +94,13 @@ test('unknown slug surfaces ErrNotFound (RFC 7807 unwrap)', async () => {
   );
 });
 
-test('Idempotency-Key header is set on mutating calls', async () => {
-  // Fire a POST and inspect the outbound headers. The wrapper's
-  // idempotencyLayer stamps a fresh UUIDv4 on every mutating call;
-  // we observe the side effect by checking the request landed on
-  // the server. The fixture is permissive — it doesn't echo the
-  // header back — so we assert only that the call succeeded (the
+test('mutating calls layer does not break happy path', async () => {
+  // The wrapper's idempotencyLayer stamps a fresh UUIDv4 on every
+  // mutating call. The fakeapid fixture doesn't echo the header
+  // back, so we can only assert that the call succeeds (the
   // header assertion requires a server-side inspection tool the
-  // fixture doesn't expose; PR 9 adds a header-echoing variant).
+  // fixture doesn't expose; PR 9 adds a `__echo` route to the
+  // fixture and this test grows an outbound-header assertion).
   const result = await AppsService.createApp({
     requestBody: { slug: 'idem-test' },
   });

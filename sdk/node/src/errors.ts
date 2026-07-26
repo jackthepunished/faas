@@ -69,11 +69,30 @@ class FaasErrorImpl extends Error implements FaasError {
   readonly status: number;
   readonly txId?: string;
   constructor(problem: Problem, status: number) {
+    // The `message` is preserved for legacy `err.message` readers;
+    // `toString()` overrides the default `Error: <msg>` shape so
+    // log lines carry the canonical code (mirrors Go's
+    // `APIError.Error()` which returns `problem.detail`).
     super(`[${status}] ${problem.code ?? 'unknown'}: ${problem.detail ?? problem.title ?? ''}`.trim());
     this.name = new.target.name;
     this.problem = problem;
     this.status = status;
     this.txId = problem.tx_id;
+  }
+  /**
+   * Structured string form used by `slog`-style loggers. Format:
+   *   `ErrNotFound [404 not_found]: app missing-app-404 not found`
+   * The optional trailing `tx=` block helps support-ticket workflows
+   * match the daemon's audit log line. Falls back to the parent's
+   * toString when the problem is empty.
+   */
+  override toString(): string {
+    const code = this.problem.code ?? 'unknown';
+    const detail = this.problem.detail ?? this.problem.title ?? '';
+    const tx = this.txId ? ` tx=${this.txId}` : '';
+    return detail
+      ? `${this.name} [${this.status} ${code}]: ${detail}${tx}`
+      : `${this.name} [${this.status} ${code}]${tx}`;
   }
 }
 

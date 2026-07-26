@@ -126,11 +126,10 @@ export class FaaSClient {
     OpenAPI.HEADERS = opts.token
       ? { Authorization: `Bearer ${opts.token}` }
       : {};
-    // Default Idempotency-Key for mutating calls. The wrapper
-    // overrides this per-attempt with a fresh UUIDv4 — this is
-    // just a fallback in case the generator reads HEADERS before
-    // our wrapper sees the request.
-    OpenAPI.HEADERS['Idempotency-Key'] = mintIdempotencyKey();
+    // No default Idempotency-Key here. The wrapper's idempotencyLayer
+    // mints a fresh UUIDv4 per attempt at request time, so a value
+    // stashed at construction time would be wasted — the very first
+    // mutating attempt would overwrite it anyway.
 
     this.logger = opts.logger ?? noopLogger;
     this.retry = opts.retry ?? { maxAttempts: 1, backoffMs: 0 };
@@ -227,11 +226,21 @@ export class FaaSClient {
         return resp;
       } catch (err) {
         const elapsed = Date.now() - start;
+        // Use the structured toString() so log lines carry the
+        // canonical Problem.code (e.g. `not_found`) instead of the
+        // generic `Error: <message>` shape. Falls back to String(err)
+        // for non-FaasError throws (network errors, AbortError).
+        let errorText: string;
+        if (isFaasError(err)) {
+          errorText = `${err.problem.code ?? 'unknown'}: ${err.toString()}`;
+        } else {
+          errorText = String(err);
+        }
         logger.debug('faas http response (error)', {
           method: init?.method ?? 'GET',
           url,
           elapsed_ms: elapsed,
-          error: String(err),
+          error: errorText,
         });
         throw err;
       }
@@ -241,15 +250,16 @@ export class FaaSClient {
     const rfc7807Layer: typeof globalThis.fetch = async (input, init) => {
       const resp = await loggerLayer(input, init);
       if (resp.status >= 400) {
-        // Read the body once; cloning first so the original response
-        // stays usable (the generator wraps `getResponseBody` which
-        // also reads it — but we surface typed errors before
-        // returning to the caller).
+        // Decode Problem bodies and raise typed sentinels. We
+        // throw here, so the generator's `request.ts` never reads
+        // the body — no defensive clone needed. (Earlier revisions
+        // cloned the body to guard against a code path that doesn't
+        // exist; the throw short-circuits the generator's parsing.)
         const ct = resp.headers.get('content-type') ?? '';
         if (ct.includes('application/problem+json') || ct.includes('application/json')) {
           let body: unknown = null;
           try {
-            body = await resp.clone().json();
+            body = await resp.json();
           } catch {
             // Malformed body — fall through to status-based error.
           }
@@ -277,35 +287,58 @@ export class FaaSClient {
       const baseBackoff = retry.backoffMs;
       let lastErr: unknown;
       let lastResp: Response | undefined;
-      for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
-        if (attempt > 0) {
-          const delay = baseBackoff * Math.pow(2, attempt - 1);
-          await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(resolve, delay);
-            // Honour caller cancellation by checking init.signal
-            // after the sleep — the generator wires
-            // AbortController.signal through request.ts:206.
-            if (init?.signal?.aborted) {
-              clearTimeout(timer);
-              reject(new Error('aborted'));
+      // Subscribe to caller cancellation ONCE. The signal is a
+      // one-shot event source; we listen at retry start so the
+      // very first sleep can abort immediately. The listener
+      // outlives the loop — `ac.signal` would otherwise fail to
+      // fire on the first attempt if the caller aborts before
+      // we entered the generator.
+      const signal = init?.signal;
+      let cancelReason: unknown = undefined;
+      const onAbort = () => { cancelReason = signal?.reason ?? new Error('aborted'); };
+      if (signal) {
+        if (signal.aborted) {
+          throw signal.reason ?? new Error('aborted');
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      try {
+        for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
+          if (attempt > 0) {
+            const delay = baseBackoff * Math.pow(2, attempt - 1);
+            // Sleep with mid-sleep cancellation. We rasterize the
+            // sleep into 50ms ticks so a caller abort at T+0.05
+            // terminates within 50ms, not at the full `delay`.
+            // 50ms is the same resolution the Go SDK uses
+            // (pkg/api/sse.go::Decoder) so behaviour is consistent
+            // across SDKs.
+            const tickMs = 50;
+            let slept = 0;
+            while (slept < delay) {
+              if (cancelReason !== undefined) break;
+              const step = Math.min(tickMs, delay - slept);
+              await new Promise<void>((resolve) => setTimeout(resolve, step));
+              slept += step;
             }
-          }).catch((err) => { lastErr = err; });
-          if (lastErr) throw lastErr;
-        }
-        try {
-          const resp = await rfc7807Layer(input, init);
-          if (resp.status < 500 && resp.status !== 429) {
-            return resp;
+            if (cancelReason !== undefined) throw cancelReason;
           }
-          // Drain the body so the connection can be reused.
-          try { await resp.arrayBuffer(); } catch { /* ignore */ }
-          lastResp = resp;
-        } catch (err) {
-          // rfc7807Layer threw a typed FaasError — surface immediately.
-          // Network errors bubble up the same way (the SDK caller
-          // owns cancellation via context.AbortSignal).
-          throw err;
+          try {
+            const resp = await rfc7807Layer(input, init);
+            if (resp.status < 500 && resp.status !== 429) {
+              return resp;
+            }
+            // Drain the body so the connection can be reused.
+            try { await resp.arrayBuffer(); } catch { /* ignore */ }
+            lastResp = resp;
+          } catch (err) {
+            // rfc7807Layer threw a typed FaasError — surface immediately.
+            // Network errors bubble up the same way (the SDK caller
+            // owns cancellation via context.AbortSignal).
+            throw err;
+          }
         }
+      } finally {
+        if (signal) signal.removeEventListener('abort', onAbort);
       }
       // Budget exhausted — return the last response so the generator
       // surfaces it via its own error path, OR rethrow the last error.

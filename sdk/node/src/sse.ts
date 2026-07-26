@@ -40,14 +40,26 @@ export interface SseEvent {
  */
 export function parseFrame(buffer: string): { event: SseEvent; consumed: number } | null {
   if (buffer.length === 0) return null;
-  // Find the first "\n\n" — a frame terminator.
-  const term = buffer.indexOf('\n\n');
+  // Find the first frame terminator. Per HTML5 §9.2.4, the
+  // terminator is one blank line; the SDK accepts LF, CRLF, or
+  // CR as the line separator. We search for the canonical 2-byte
+  // markers and pick the leftmost.
+  const terminators = ['\n\n', '\r\n\r\n', '\r\r'];
+  let term = -1;
+  let termLen = 0;
+  for (const t of terminators) {
+    const idx = buffer.indexOf(t);
+    if (idx !== -1 && (term === -1 || idx < term)) {
+      term = idx;
+      termLen = t.length;
+    }
+  }
   if (term === -1) {
     // No terminator yet; we need more bytes.
     return null;
   }
   const raw = buffer.slice(0, term);
-  const consumed = term + 2;
+  const consumed = term + termLen;
 
   // Skip pure whitespace frames (browser tolerates this; we do too).
   if (raw.trim() === '') {
