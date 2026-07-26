@@ -2133,7 +2133,7 @@ func ptrInt(v int) *int { return &v }
 // `make migrations-check` and isn't part of the unit loop, so the
 // docs for these tests live in pkg/state/pgstore.go and the actual
 // pgx-level proof is the migration-level idempotence test in
-// migrations/00047_account_mfa_test.go.
+// migrations/00048_account_mfa_test.go.
 
 // TestConsumeRecoveryCode_HappyPath drives the canonical success
 // path: a freshly-enrolled account with 10 hashes; the consumer
