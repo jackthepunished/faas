@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00048 (github_install_account_id +
+// Migration-apply test for 00049 (github_install_account_id +
 // github_install_binding_id + github_install_linked_at). Pins the
 // load-bearing PR-B schema contract:
 //
-//   1. The migration applies cleanly through 00048.
+//   1. The migration applies cleanly through 00049.
 //   2. The three new columns are present on `apps`.
 //   3. The account-FK accepts NULL (apps without GitHub bindings stay
 //      valid), accepts a real account_id, and rejects an unknown
@@ -31,9 +31,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00048_GithubBindingsAccount pins the schema contract
+// TestMigrations_00049_GithubBindingsAccount pins the schema contract
 // for the per-account GitHub install binding columns added by PR-B.
-func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
+func TestMigrations_00049_GithubBindingsAccount(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -80,19 +80,19 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	// valid); the new FK does not impose a non-null requirement.
 	if _, err := pool.Exec(ctx, `
 		insert into apps (slug, account_id, ram_mb)
-		values ('m048-no-bind-1', '00000000-0000-0000-0000-000000000048'::uuid, 128)
+		values ('m049-no-bind-1', '00000000-0000-0000-0000-000000000049'::uuid, 128)
 	`); err != nil {
 		// Most likely the account row is missing; seed and retry.
 		if _, serr := pool.Exec(ctx, `
 			insert into accounts (id, email, plan)
-			values ('00000000-0000-0000-0000-000000000048'::uuid, 'm048@example.com', 'free')
+			values ('00000000-0000-0000-0000-000000000049'::uuid, 'm049@example.com', 'free')
 			on conflict do nothing
 		`); serr != nil {
 			t.Fatalf("seed account: %v", serr)
 		}
 		if _, err := pool.Exec(ctx, `
 			insert into apps (slug, account_id, ram_mb)
-			values ('m048-no-bind-1', '00000000-0000-0000-0000-000000000048'::uuid, 128)
+			values ('m049-no-bind-1', '00000000-0000-0000-0000-000000000049'::uuid, 128)
 		`); err != nil {
 			t.Fatalf("insert app with no binding: %v", err)
 		}
@@ -100,10 +100,10 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 
 	// (4) FK rejects an unknown account_id. We need an existing app
 	// to UPDATE into a bad value; create one without a binding first.
-	const seedAcct = "00000000-0000-0000-0000-000000000481"
+	const seedAcct = "00000000-0000-0000-0000-000000000491"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan) values
-		  ($1::uuid, 'm048-fk@example.com', 'hobby')
+		  ($1::uuid, 'm049-fk@example.com', 'hobby')
 		on conflict (id) do nothing
 	`, seedAcct); err != nil {
 		t.Fatalf("seed fk account: %v", err)
@@ -111,7 +111,7 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	var seedAppID string
 	if err := pool.QueryRow(ctx, `
 		insert into apps (slug, account_id, ram_mb)
-		values ('m048-fk-target', $1::uuid, 128)
+		values ('m049-fk-target', $1::uuid, 128)
 		returning id
 	`, seedAcct).Scan(&seedAppID); err != nil {
 		t.Fatalf("seed fk app: %v", err)
@@ -131,27 +131,27 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	// (5) Account-scoped unique partial index rejects duplicate
 	// (account_id, binding_id) but allows the same binding_id under a
 	// different account.
-	const acctA = "00000000-0000-0000-0000-000000000a48"
-	const acctB = "00000000-0000-0000-0000-000000000b48"
+	const acctA = "00000000-0000-0000-0000-000000000a49"
+	const acctB = "00000000-0000-0000-0000-000000000b49"
 	for _, a := range []string{acctA, acctB} {
 		if _, err := pool.Exec(ctx, `
 			insert into accounts (id, email, plan) values ($1::uuid, $2, 'hobby')
 			on conflict (id) do nothing
-		`, a, "m048-unq-"+a[len(a)-3:]+"@example.com"); err != nil {
+		`, a, "m049-unq-"+a[len(a)-3:]+"@example.com"); err != nil {
 			t.Fatalf("seed unq account %s: %v", a, err)
 		}
 	}
 	var unqApp1 string
 	if err := pool.QueryRow(ctx, `
 		insert into apps (slug, account_id, ram_mb, github_install_account_id, github_install_binding_id)
-		values ('m048-unq-1', $1::uuid, 128, $1::uuid, 'bind-shared')
+		values ('m049-unq-1', $1::uuid, 128, $1::uuid, 'bind-shared')
 		returning id
 	`, acctA).Scan(&unqApp1); err != nil {
 		t.Fatalf("insert first binding: %v", err)
 	}
 	_, err = pool.Exec(ctx, `
 		insert into apps (slug, account_id, ram_mb, github_install_account_id, github_install_binding_id)
-		values ('m048-unq-2', $1::uuid, 128, $1::uuid, 'bind-shared')
+		values ('m049-unq-2', $1::uuid, 128, $1::uuid, 'bind-shared')
 	`, acctA)
 	if err == nil {
 		t.Errorf("expected unique violation on duplicate (account_id, binding_id); got nil")
@@ -164,7 +164,7 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	var unqApp3 string
 	if err := pool.QueryRow(ctx, `
 		insert into apps (slug, account_id, ram_mb, github_install_account_id, github_install_binding_id)
-		values ('m048-unq-3', $1::uuid, 128, $1::uuid, 'bind-shared')
+		values ('m049-unq-3', $1::uuid, 128, $1::uuid, 'bind-shared')
 		returning id
 	`, acctB).Scan(&unqApp3); err != nil {
 		t.Errorf("expected (bind-shared, acctB) to be allowed; got %v", err)
@@ -182,20 +182,20 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	// Real-world shape: account A owns the app; account B (the
 	// deleted GitHub user) is the install owner; B's deletion
 	// nulls the install reference, not the app row.
-	const ownerAcct = "00000000-0000-0000-0000-000000000e48"
-	const delAcct = "00000000-0000-0000-0000-000000000d48"
+	const ownerAcct = "00000000-0000-0000-0000-000000000e49"
+	const delAcct = "00000000-0000-0000-0000-000000000d49"
 	for _, a := range []string{ownerAcct, delAcct} {
 		if _, err := pool.Exec(ctx, `
 			insert into accounts (id, email, plan) values ($1::uuid, $2, 'hobby')
 			on conflict (id) do nothing
-		`, a, "m048-del-"+a[len(a)-3:]+"@example.com"); err != nil {
+		`, a, "m049-del-"+a[len(a)-3:]+"@example.com"); err != nil {
 			t.Fatalf("seed del account %s: %v", a, err)
 		}
 	}
 	var delAppID string
 	if err := pool.QueryRow(ctx, `
 		insert into apps (slug, account_id, ram_mb, github_install_account_id, github_install_binding_id)
-		values ('m048-del-1', $1::uuid, 128, $2::uuid, 'bind-del')
+		values ('m049-del-1', $1::uuid, 128, $2::uuid, 'bind-del')
 		returning id
 	`, ownerAcct, delAcct).Scan(&delAppID); err != nil {
 		t.Fatalf("seed del app: %v", err)

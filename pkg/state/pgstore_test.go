@@ -198,7 +198,7 @@ func TestPg_LiveDeploymentAndListAllApps(t *testing.T) {
 }
 
 // TestPg_UpsertGithubInstallBinding_PersistsAllColumns locks the PR-B
-// write path: every column added in migration 00048 is stamped
+// write path: every column added in migration 00049 is stamped
 // atomically, and a second call with the same payload is idempotent
 // (the (account_id, binding_id) unique partial index makes the
 // upsert a no-op for duplicate work).

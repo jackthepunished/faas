@@ -37,6 +37,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -400,6 +401,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	githubdSecret := loadGithubWebhookSecret(osGetenv)
 	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log)
+
+	// Issue #249 / spec §11: mount security response headers at the
+	// outermost wrapper of the public listener.
+	//
+	// httpsec.Static emits the five static headers (HSTS, X-Frame-
+	// Options, X-Content-Type-Options, Referrer-Policy, Permissions-
+	// Policy) on every response — customer apps, dashboard, API, even
+	// githubd webhooks. Static headers are universally safe; the
+	// customer's own CSP just sits on top.
+	//
+	// httpsec.Nonce gates Content-Security-Policy on isApidPath so it
+	// only fires on URLs that hit apid. Customer-app responses are
+	// proxied through our wake/proxy path — those apps govern their
+	// own CSP, and injecting a nonce-locked policy here would break
+	// every customer HTML page (issue #249 risk callout).
+	// isApidPath lives in cmd/gatewayd/proxy.go (path-string
+	// predicate); the httpsec.Nonce gate takes a *http.Request, so
+	// the adapter below extracts r.URL.Path and forwards.
+	//
+	// The order is httpsec.Nonce outer / httpsec.Static inner so the
+	// CSP can be set before Static runs (it doesn't matter for the
+	// static headers, but keeps the middleware chain readable).
+	publicHandler = httpsec.Static(httpsec.Nonce(
+		func(r *http.Request) bool { return isApidPath(r.URL.Path) },
+		publicHandler,
+	))
+
+	// Issue #249: HSTS gate. RFC 6797 §7.2 says UAs ignore HSTS on
+	// plain HTTP, so on a dev plaintext listener this is cosmetic.
+	// Production TLS listener always emits it (the default).
+	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(osGetenv))
 
 	// Private listener: control plane only — never authenticated (it's on a
 	// private bind), never reachable from the public-internet path.

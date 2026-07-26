@@ -365,7 +365,7 @@ type Store interface {
 	// (PR-B, ADR-012 closure). Returns the bindingID; writes the
 	// linked_at timestamp so the dashboard's "connected on" pill
 	// has a single source. The (account_id, binding_id) unique
-	// partial index (migration 00048) rejects duplicate binds under
+	// partial index (migration 00049) rejects duplicate binds under
 	// the same account.
 	UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error
 	// DeleteGithubInstallBinding clears the bind columns on an app.
@@ -886,6 +886,15 @@ type Store interface {
 	// double-billing under any meterd restart (M7 hardening).
 	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests int64) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
+	// ListInvoicesForAccount returns the account's invoices, newest
+	// first, ordered by (period_end DESC, id DESC) for deterministic
+	// pagination. month is optional: when non-nil, the result is
+	// filtered to the half-open UTC month [month, month+1mo). before
+	// is the cursor — rows with period_end strictly less than
+	// before are returned. limit is 1..100; clamp is the caller's
+	// responsibility (handler clamps at 25 default). The returned
+	// slice is empty (not nil) when the account has no rows.
+	ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error)
 	// UsageByHour returns the per-app usage rows whose minute ∈ [start,
 	// end). The Stripe pusher calls this hourly to compute the billable
 	// GB-RAM-hours for the past hour (spec §4.7, ADR-010). MemStore scans
