@@ -35,7 +35,7 @@ func TestRoundTrip_StableCodes(t *testing.T) {
 		{api.CodePlanLimitRAM, codes.ResourceExhausted, "Plan RAM cap"},
 		{api.CodePlanLimitApps, codes.ResourceExhausted, "Plan apps cap"},
 		{api.CodeValidation, codes.InvalidArgument, "Validation"},
-		{api.CodeNotFound, codes.InvalidArgument, "Not found"},
+		{api.CodeNotFound, codes.NotFound, "Not found"},
 		{api.CodeUnauthorized, codes.PermissionDenied, "Unauthorized"},
 		{api.CodeCapacity, codes.ResourceExhausted, "No capacity"},
 	}

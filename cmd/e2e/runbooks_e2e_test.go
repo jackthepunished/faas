@@ -271,7 +271,12 @@ func TestRunbooks_FaasRulesYml_AllUrlsResolve(t *testing.T) {
 		}
 	}
 	if totalRules == 0 {
-		t.Skipf("faas.rules.yml parsed with zero rules — file shape changed? (%s)", rulesPath)
+		// A empty faas.rules.yml is a §11 + M8 row 4 regression —
+		// every page-severity alert was silently deleted, so the
+		// test must fail loud, not skip silent. A previous revision
+		// used t.Skipf here, which let a corrupted (zero-byte)
+		// rules file greenlight the gate.
+		t.Fatalf("faas.rules.yml parsed with zero rules — file shape changed? (%s)", rulesPath)
 	}
 	if totalURLs == 0 {
 		t.Errorf("faas.rules.yml has %d rules but none references a runbook_url — every page-severity alert should have one", totalRules)

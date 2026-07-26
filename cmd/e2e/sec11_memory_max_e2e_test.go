@@ -40,14 +40,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/e2etest"
+	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
 )
-
-// faasTenantCgroup is the parent slice every per-VM scope lives under.
-// Mirrors pkg/fcvm/config.go:ParentCgroup verbatim — if either drifts the
-// test will assert against the wrong root and fail with a clear "scope
-// dir missing" diagnostic instead of a silent zero.
-const faasTenantCgroup = "faas-tenant.slice"
 
 // expectedMemoryMaxBytes returns the kernel-state value the jailer +
 // writeMemoryMax() pair must produce for a plan-sized instance.
@@ -161,17 +156,19 @@ func TestSec11_MemoryMaxFenceEnforced_CrossProcess(t *testing.T) {
 		}
 		t.Fatalf("deployment did not reach live: %v", err)
 	}
-	if _, err := e2etest.WaitForInstanceState(ctx, t, pool, appID, state.StateParked, 60*time.Second); err != nil {
-		t.Fatalf("no parked instance: %v", err)
+	// PROBE while the instance is still RUNNING — the jailer removes
+	// the per-VM cgroup scope during the Park→Kill sequence
+	// (pkg/fcvm/vmm.go:766-770: `os.RemoveAll(scopePath)` inside
+	// JailerVMM.Kill), so probing after the park wait would find an
+	// empty directory and t.Fatalf without ever reading the kernel
+	// state. Wait for StateRunning first, probe, then let the natural
+	// idle reaper park the instance (the post-park wait is no longer
+	// load-bearing for the assertion, but kept so a regression that
+	// keeps the instance RUNNING indefinitely still surfaces).
+	if _, err := e2etest.WaitForInstanceState(ctx, t, pool, appID, state.StateRunning, 60*time.Second); err != nil {
+		t.Fatalf("no running instance: %v", err)
 	}
-
-	// PROBE. List /sys/fs/cgroup/faas-tenant.slice/ from outside the
-	// vmmd process. The test owns the box, so the only directory the
-	// jailer just created is the scope we want — pick it directly. If
-	// a parallel test (or a leaked scope from a previous run) is on
-	// the box, we'd have an ambiguous selection, but t.TempDir cleanup
-	// guarantees the test process is the only actor here.
-	scopeBase := filepath.Join("/sys/fs/cgroup", faasTenantCgroup)
+	scopeBase := filepath.Join("/sys/fs/cgroup", fcvm.ParentCgroup)
 	entries, err := os.ReadDir(scopeBase)
 	if err != nil {
 		t.Fatalf("read %s: %v (parent cgroup constant drift? pkg/fcvm/config.go:ParentCgroup)", scopeBase, err)
@@ -193,11 +190,14 @@ func TestSec11_MemoryMaxFenceEnforced_CrossProcess(t *testing.T) {
 		t.Fatalf("no jailer-created scopes under %s; jailer dropped --cgroup cpu.weight=256?", scopeBase)
 	}
 	if len(scopes) > 1 {
-		// Don't fail here — surface the names so a regression report
-		// can attribute the leakage. The probe still asserts against
-		// the first scope, which is this test's instance by construction
-		// (only one VM is alive under the harness).
-		t.Logf("unexpected extra scopes (likely leaked from a prior run): %v", scopes)
+		// Multiple jailer scopes is a leakcheck failure — every other
+		// scope is either a leaked instance from a previous test run
+		// or a parallel test sharing the box. Either way, picking
+		// scopes[0] is unsafe: the leaked scope's memory.max also
+		// happens to be (plan+8)<<20 (every plan has the same overhead),
+		// so a "log and continue" branch would silently mask the leak.
+		// Fail fast with the list so the next operator run attributes it.
+		t.Fatalf("unexpected extra scopes %v under %s — leakcheck failed (see pkg/fcvm/leakcheck)", scopes, scopeBase)
 	}
 	scope := scopes[0]
 	scopeDir := filepath.Join(scopeBase, scope)

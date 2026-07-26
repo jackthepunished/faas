@@ -570,20 +570,23 @@ func TestSeccompStatus_EmptyInstance_ReturnsInvalidArgument(t *testing.T) {
 // TestSeccompStatus_UnknownInstance_ReturnsNotFound pins the
 // gRPC contract for the "instance not alive" case. The fake
 // answers (0, false) for everything, which the handler maps to
-// the api.CodeNotFound problem. The grpcerr layer currently
-// collapses CodeNotFound → InvalidArgument (see
-// pkg/grpcerr/grpcerr.go:codeToGRPC); the distinction the e2e
-// cares about lives in the api.Problem Title/Detail, not the
-// gRPC code. This test pins BOTH: the error is non-empty AND
-// the message names the instance, so a future fix to
-// codeToGRPC that flips the mapping to true NotFound also
-// passes (the message assertion is the load-bearing one).
+// the api.CodeNotFound problem; grpcerr.codeToGRPC carries that
+// to codes.NotFound on the wire (matching the REST 404). The
+// distinction "wrong instance" vs "operator missing required
+// field" (InvalidArgument, see TestSeccompStatus_EmptyInstance_
+// ReturnsInvalidArgument) is load-bearing for operator runbooks;
+// collapsing them would break the runbook's first step. We
+// pin BOTH the gRPC code and the message so a future
+// codeToGRPC drift that silently re-merges them trips here.
 func TestSeccompStatus_UnknownInstance_ReturnsNotFound(t *testing.T) {
 	f := &fakeVMM{}
 	cli, _ := newServer(t, f)
 	_, err := cli.SeccompStatus(context.Background(), &vmmdpb.SeccompStatusRequest{Instance: "never-woke"})
 	if err == nil {
 		t.Fatal("expected error for unknown instance, got nil")
+	}
+	if code := status.Code(err); code != codes.NotFound {
+		t.Errorf("code = %v, want NotFound (a regression that drops the gRPC code would mask operator runbook step 1)", code)
 	}
 	// The message carries the instance id so the operator can
 	// diagnose which one was wrong. If grpcerr.ToStatus ever

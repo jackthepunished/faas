@@ -92,11 +92,17 @@ func LoadHostKey(path string) (*age.X25519Identity, error) {
 		}
 		return nil, fmt.Errorf("secretbox: stat host key %q: %w", path, err)
 	}
-	// The private key must be owner-read ONLY. Any other bit
-	// (group/other read, any write/exec/suid) is rejected. The
-	// bitwise AND `info.Mode().Perm() & ^0o400` is non-zero
-	// whenever the file has any bit outside 0o400.
-	if info.Mode().Perm() & ^os.FileMode(0o400) != 0 {
+	// The private key must be owner-read ONLY — exact mode 0o400.
+	// Any other bit (group/other read, any write/exec/suid) is
+	// rejected. The previous check used `Perm() & ^0o400 != 0`,
+	// which is equivalent to `Perm() != 0o400` but was easy to
+	// misread as "reject anything except owner-read" — and a
+	// regression could quietly start accepting 0o440 / 0o444
+	// (group/world-readable), which would let any unprivileged
+	// user on the box extract the X25519 secret key and unseal
+	// every customer's env vars. The exact-equality form is the
+	// safest expression of the contract.
+	if info.Mode().Perm() != 0o400 {
 		return nil, fmt.Errorf("secretbox: host key %q mode %#o: %w",
 			path, info.Mode().Perm(), ErrHostKeyInsecurePerms)
 	}

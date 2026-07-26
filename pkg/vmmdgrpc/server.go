@@ -368,24 +368,34 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 // An error means the file couldn't be read or the kernel didn't write the
 // expected lines — the handler maps that to Error="…" in the response.
 func readSeccompStatus(pid int) (string, int, error) {
+	// /proc/<pid>/status is a kernel-managed procfs path — not a
+	// customer-supplied path — so the openCustomerFile symlink/
+	// non-regular guard doesn't apply. The lint forbidigo rule
+	// catches every bare os.Open as a tripwire for the customer-
+	// path case; this is the documented exception.
+	//
+	//nolint:forbidigo // vetted kernel-ABI path, see comment above
 	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		return "", 0, fmt.Errorf("open /proc/%d/status: %w", pid, err)
 	}
-	defer f.Close()
-	mode, filterLen, err := parseSeccompLines(f)
+	defer func() { _ = f.Close() }()
+	mode, filterLen, err := ParseSeccompLines(f)
 	if err != nil {
 		return "", 0, fmt.Errorf("parse /proc/%d/status: %w", pid, err)
 	}
 	return mode, filterLen, nil
 }
 
-// parseSeccompLines is the Read-from-text twin of readSeccompStatus.
-// Exposed so the in-process test (seccomp_test.go) can pin the
-// kernel-ABI parser without spinning up a real /proc/<pid>/status.
-// The two functions MUST stay in sync — if they diverge, the
-// cross-process e2e catches the drift.
-func parseSeccompLines(r io.Reader) (string, int, error) {
+// ParseSeccompLines is the Read-from-text twin of readSeccompStatus.
+// Exported so the in-process test (seccomp_test.go) AND the
+// cross-process e2e (cmd/e2e/sec11_seccomp_e2e_test.go) both
+// pin the kernel-ABI parser without spinning up a real
+// /proc/<pid>/status. The two callers MUST stay in sync with
+// production — a duplicated parser silently drifts when the
+// kernel format changes, and the cross-process test would then
+// disagree with vmmd's view. Single source of truth lives here.
+func ParseSeccompLines(r io.Reader) (string, int, error) {
 	var mode string
 	var filterLen int
 	haveMode, haveFilter := false, false

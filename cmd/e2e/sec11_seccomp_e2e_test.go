@@ -57,6 +57,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/e2etest"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -260,42 +261,24 @@ func readProcStatus(t *testing.T, pid int) string {
 	return string(b)
 }
 
-// parseSeccomp extracts the Seccomp + Seccomp_filters integers from
-// a /proc/<pid>/status body. Returns ("disabled", 0) when the
-// status file is missing the Seccomp_filters line (the kernel only
-// writes it when Seccomp=2). Missing Seccomp line entirely is
-// reported as ("unknown", 0) — the caller treats that as a kernel
-// regression.
+// parseSeccomp is the cross-process readback helper. It delegates to
+// pkg/vmmdgrpc.ParseSeccompLines — the SAME parser the gRPC handler
+// uses — so the test cannot drift from the production kernel-ABI
+// reader. (An earlier revision inlined a duplicate parser here; the
+// duplication was a tripwire: a kernel format change fixed in one
+// place but not the other would silently disagree with vmmd's
+// view, and the cross-process assertion would mask the regression.)
+//
+// The helper keeps the (mode, filterLen) two-return signature so
+// the call site at line 237 (the cross-process check) stays a
+// one-liner. Errors from the underlying parser are treated as
+// ("unknown", 0) — the same behaviour the previous inline parser
+// had for malformed input, so a missing Seccomp line in /proc
+// surfaces as a kernel regression rather than a test panic.
 func parseSeccomp(body string) (mode string, filterLen int) {
-	mode = "unknown"
-	for _, line := range strings.Split(body, "\n") {
-		switch {
-		case strings.HasPrefix(line, "Seccomp:"):
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			n, err := strconv.Atoi(fields[1])
-			if err != nil {
-				continue
-			}
-			switch n {
-			case 0:
-				mode = "disabled"
-			case 1:
-				mode = "strict"
-			case 2:
-				mode = "filter"
-			}
-		case strings.HasPrefix(line, "Seccomp_filters:"):
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			if n, err := strconv.Atoi(fields[1]); err == nil {
-				filterLen = n
-			}
-		}
+	mode, filterLen, err := vmmdgrpc.ParseSeccompLines(strings.NewReader(body))
+	if err != nil {
+		return "unknown", 0
 	}
 	return mode, filterLen
 }

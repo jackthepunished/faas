@@ -164,8 +164,8 @@ func TestDocsSite_M8AcceptanceCriteriaStillInSpec(t *testing.T) {
 		"timed restore drill",     // PR #233 plumbing + M8 row 1
 		"SLO dashboard live",      // PR C.1 status page
 		"first-time user reaches", // Move 2 / Move 3 onboarding
-		"CLI",                     // explicit "via CLI"
-		"GitHub connect",          // explicit "and GitHub connect"
+		"via CLI",                 // exact wording (not a bare "CLI" substring)
+		"GitHub connect",          // exact wording (not "connect" alone)
 	}
 	missing := []string{}
 	for _, p := range phrases {

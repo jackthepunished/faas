@@ -14,8 +14,13 @@
 // and invokes make lint-drill. Any of the three failing fails the
 // PR gate.
 //
-// No `//go:build linux` / `//go:build metal` — runs in CI on any
-// host with bash + make + go already present.
+// No `//go:build linux` / `//go:build metal` — gRPC + filesystem
+// walks + `make lint-drill` all work on macOS dev (bash + make
+// + go are on PATH on both dev and CI). Build tag is
+// `//go:build !no_pg` because two of the three tests parse Go
+// output and the bash path shells out to `go test ./pkg/drills/...`,
+// both of which need a Postgres-available schema (set via the
+// `FAAS_SKIP_PG_TESTS=1` flag to opt out).
 
 //go:build !no_pg
 
@@ -42,10 +47,11 @@ const evidenceMarkdownGlob = "*-restore-drill.md"
 
 // repoRoot resolves the module root by walking up from cwd. The
 // drill-evidence tests below need it to walk docs/drills/ and to
-// shell out to make lint-drill. Mirrors the helper that lived in
-// sec11_host_linux_test.go; duplicated here so this file compiles
-// without the linux build tag. Returns "" when the walk doesn't
-// find go.mod (e.g. cwd is /tmp).
+// shell out to make lint-drill. This file is the canonical home
+// for the helper — sec11_sweep_test.go + sec11_host_linux_test.go
+// were both rewritten to call this one (not the other way around)
+// so the build-tag matrix stays simple. Returns "" when the walk
+// doesn't find go.mod (e.g. cwd is /tmp).
 func repoRoot() string {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -192,7 +198,8 @@ func TestRestoreDrill_LintDrill_ExitsZero(t *testing.T) {
 		// Surface the actual output so a CI failure shows what
 		// the bash test trip-wired on. The test fails loudly
 		// instead of swallowing the regression.
-		if ee := (*exec.ExitError)(nil); errors.As(err, &ee) {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
 			t.Fatalf("make lint-drill exited %d\nstderr:\n%s\nstdout:\n%s",
 				ee.ExitCode(), stderr.String(), stdout.String())
 		}

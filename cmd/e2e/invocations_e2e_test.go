@@ -47,8 +47,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
@@ -391,21 +389,6 @@ func pollUntilCompleted(t *testing.T, h *e2etest.Harness, key, id string, deadli
 		time.Sleep(100 * time.Millisecond)
 	}
 }
-
-// keyEmail returns the SeedAccount-deterministic email for a
-// (plan, label). The seeded account is identified by email because
-// each subtest seeds exactly one account on its own pgtest schema,
-// so the JOIN is unambiguous.
-func keyEmail(ctx context.Context, pool *pgxpool.Pool, plan api.Plan, label string) string {
-	email := "e2e+" + string(plan)
-	if label != "" {
-		email += "+" + label
-	}
-	return email + "@test.example"
-}
-
-// silence the unused-import warning on builds that strip pgxpool.
-var _ pgxpool.Pool
 
 // --- M8 §14 row 6 (cold-wake transparency UX, ux_spec §6.5) --------------
 //

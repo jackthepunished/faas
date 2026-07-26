@@ -77,7 +77,7 @@ func TestParseSeccompLines_AllKnownModes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mode, filter, err := parseSeccompLines(strings.NewReader(tc.body))
+			mode, filter, err := ParseSeccompLines(strings.NewReader(tc.body))
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got mode=%q filter=%d", mode, filter)

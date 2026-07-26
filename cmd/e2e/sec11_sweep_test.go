@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -83,13 +84,40 @@ func startProc(t *testing.T, bin string, env []string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(bin)
 	cmd.Env = env
-	var buf bytes.Buffer
+	// syncBuffer wraps bytes.Buffer with a mutex so concurrent
+	// writes from vmmd's PeriodicUpdates / UpdateEgressAllowlist
+	// goroutines don't trip `-race` when a later assertion reads
+	// the same buffer. procBuffer drains both streams into the
+	// same buffer at reap time.
+	var buf syncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("startProc(%s): %v", bin, err)
 	}
 	return cmd
+}
+
+// syncBuffer is a mutex-guarded io.Writer used for capturing
+// subprocess stdout/stderr in startProc. Mirrors pkg/e2etest's
+// SafeBuffer; kept local so this file doesn't need a new import
+// path. The export shape (just io.Writer + String()) is enough
+// for procBuffer's drain semantics.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 // waitTCP polls 127.0.0.1:addr until accept succeeds or deadline.
@@ -641,68 +669,96 @@ func TestSec11_HostKey0400_Required(t *testing.T) {
 	// wraps it with %w, and vmmd's run() exits non-zero at
 	// cmd/vmmd/main.go:175-177 BEFORE any KVM/listener/netns touch
 	// (so the test runs on CI without /dev/kvm + root).
+	//
+	// The LoadHostKey contract is "exact 0o400 ONLY" — anything else
+	// (group/other read, any write/exec/suid) is rejected. The
+	// subtests below table-drive every non-0o400 mode that has
+	// historically been the source of a perm-drift regression
+	// (0o440 / 0o444 are the silent ones — group/world readable
+	// without ever tripping a write-bit complaint from the file
+	// audit). Earlier revisions only exercised 0o644, which left
+	// the silent-drift modes uncovered.
 	t.Run("rejects_insecure_private_perms", func(t *testing.T) {
-		dir := t.TempDir()
-		key := filepath.Join(dir, "host.age")
-		id, err := age.GenerateX25519Identity()
-		if err != nil {
-			t.Fatalf("GenerateX25519Identity: %v", err)
+		// Every mode below MUST trip ErrHostKeyInsecurePerms.
+		// 0o400 (the production mode) is asserted separately
+		// (vmmd should NOT fail-fast on it).
+		insecureModes := []os.FileMode{
+			0o440, // group-readable (silent-drift case #1)
+			0o444, // world-readable (silent-drift case #2)
+			0o460, // group-readable + group-list (operator ls accident)
+			0o604, // owner-writable, other-readable
+			0o640, // group-writable (operator multi-admin chmod)
+			0o644, // canonical 0o644 (owner + group + other readable)
+			0o660, // group-collaborative admin mistake
+			0o666, // world-writable (the "I just want it to work" mistake)
+			0o700, // owner-traversable — directory-style mistake
+			0o755, // owner + group + other traversable
 		}
-		// writeWithPerm applies the exact requested mode bits
-		// (umask-stripping is the GH/macOS foot-gun — see writeWithPerm).
-		if err := writeWithPerm(t, key, []byte(id.String()), 0o644); err != nil {
-			t.Fatalf("write host.age: %v", err)
-		}
-		fi, lerr := os.Stat(key)
-		if lerr != nil {
-			t.Fatalf("stat host.age: %v", lerr)
-		}
-		// Sanity: group-read bit MUST be set; otherwise the test
-		// fixture didn't actually become insecure and we'd
-		// pass-vacuous.
-		if fi.Mode().Perm()&0o040 == 0 {
-			t.Fatalf("test setup failed: host.age mode=%04o, group-read bit not set — writeWithPerm did not preserve it", fi.Mode().Perm())
-		}
-		// vmmd also needs the public recipient path even for the
-		// fail-fast path so it can stop at the host.age check; it
-		// IS allowed to write (LoadHostKey exits first), but we
-		// write it pre-emptively to keep the seed symmetric with
-		// production.
-		pub := filepath.Join(dir, "host.age.pub")
-		if err := writeWithPerm(t, pub, []byte(id.Recipient().String()), 0o444); err != nil {
-			t.Fatalf("write host.age.pub: %v", err)
-		}
-		// vmmd.toml must exist (env default points at
-		// /etc/faas/vmmd.toml which won't be writeable in CI).
-		cfgDir := t.TempDir()
-		cfgPath := filepath.Join(cfgDir, "vmmd.toml")
-		if err := os.WriteFile(cfgPath, []byte(`socket_path = "`+filepath.Join(cfgDir, "vmmd.sock")+`"
+		for _, mode := range insecureModes {
+			mode := mode
+			t.Run(fmt.Sprintf("mode_%04o", mode), func(t *testing.T) {
+				dir := t.TempDir()
+				key := filepath.Join(dir, "host.age")
+				id, err := age.GenerateX25519Identity()
+				if err != nil {
+					t.Fatalf("GenerateX25519Identity: %v", err)
+				}
+				// writeWithPerm applies the exact requested mode bits
+				// (umask-stripping is the GH/macOS foot-gun — see writeWithPerm).
+				if err := writeWithPerm(t, key, []byte(id.String()), mode); err != nil {
+					t.Fatalf("write host.age: %v", err)
+				}
+				fi, lerr := os.Stat(key)
+				if lerr != nil {
+					t.Fatalf("stat host.age: %v", lerr)
+				}
+				// Sanity: the mode on disk MUST match what we asked for.
+				// If writeWithPerm silently stripped bits, the test
+				// fixture became the wrong mode and would pass-vacuous.
+				if fi.Mode().Perm() != mode {
+					t.Fatalf("test setup failed: host.age mode=%04o, want %04o — writeWithPerm did not preserve the bits",
+						fi.Mode().Perm(), mode)
+				}
+				// vmmd also needs the public recipient path even for the
+				// fail-fast path so it can stop at the host.age check; it
+				// IS allowed to write (LoadHostKey exits first), but we
+				// write it pre-emptively to keep the seed symmetric with
+				// production.
+				pub := filepath.Join(dir, "host.age.pub")
+				if err := writeWithPerm(t, pub, []byte(id.Recipient().String()), 0o444); err != nil {
+					t.Fatalf("write host.age.pub: %v", err)
+				}
+				// vmmd.toml must exist (env default points at
+				// /etc/faas/vmmd.toml which won't be writeable in CI).
+				cfgDir := t.TempDir()
+				cfgPath := filepath.Join(cfgDir, "vmmd.toml")
+				if err := os.WriteFile(cfgPath, []byte(`socket_path = "`+filepath.Join(cfgDir, "vmmd.sock")+`"
 owner_user = "root"
 kernel_path = "/dev/null"
 `), 0o600); err != nil {
-			t.Fatalf("write vmmd.toml: %v", err)
-		}
-		out, werr := startVMMDAndExpectFail(t, []string{
-			"PATH=" + os.Getenv("PATH"),
-			"HOME=" + os.Getenv("HOME"),
-			"FAAS_VMMD_CONFIG=" + cfgPath,
-			"FAAS_HOST_KEY_PATH=" + key,
-			"FAAS_HOST_AGE_RECIPIENT_PATH=" + pub,
-			"FAAS_STORAGE_BACKEND=local",
-		}, 10*time.Second)
-		if werr == nil {
-			t.Fatalf("vmmd should have exited non-zero with 0644 host.age perms but exited cleanly:\n%s", out)
-		}
-		// Acceptable substrings:
-		//   - the sentinel substring "%!s(MISSING)" — fmt.Errorf with %w
-		//     prints the wrapped error's .Error() output, so
-		//     ErrHostKeyInsecurePerms appears verbatim
-		//   - the secretbox.LoadHostKey formatting ("host key ... mode ...")
-		//   - cmd/vmmd/main.go:346 wrap prefix ("vmmd: host key")
-		if !strings.Contains(out, secretbox.ErrHostKeyInsecurePerms.Error()) &&
-			!strings.Contains(out, "host key") &&
-			!strings.Contains(out, "ErrHostKeyInsecurePerms") {
-			t.Errorf("vmmd output did not mention insecure host.age perms; output:\n%s", out)
+					t.Fatalf("write vmmd.toml: %v", err)
+				}
+				out, werr := startVMMDAndExpectFail(t, []string{
+					"PATH=" + os.Getenv("PATH"),
+					"HOME=" + os.Getenv("HOME"),
+					"FAAS_VMMD_CONFIG=" + cfgPath,
+					"FAAS_HOST_KEY_PATH=" + key,
+					"FAAS_HOST_AGE_RECIPIENT_PATH=" + pub,
+					"FAAS_STORAGE_BACKEND=local",
+				}, 10*time.Second)
+				if werr == nil {
+					t.Fatalf("vmmd should have exited non-zero with %04o host.age perms but exited cleanly:\n%s", mode, out)
+				}
+				// Acceptable substrings:
+				//   - the sentinel ErrHostKeyInsecurePerms.Error()
+				//   - the secretbox.LoadHostKey formatting ("host key ... mode ...")
+				//   - cmd/vmmd/main.go:346 wrap prefix ("vmmd: host key")
+				if !strings.Contains(out, secretbox.ErrHostKeyInsecurePerms.Error()) &&
+					!strings.Contains(out, "host key") &&
+					!strings.Contains(out, "ErrHostKeyInsecurePerms") {
+					t.Errorf("vmmd output did not mention insecure host.age perms; output:\n%s", out)
+				}
+			})
 		}
 	})
 }

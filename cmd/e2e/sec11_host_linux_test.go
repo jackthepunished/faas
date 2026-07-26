@@ -261,7 +261,8 @@ func TestSec11_RebootWindowSunday0400UTC(t *testing.T) {
 	//    whether the operator has manually deleted cron.daily
 	//    apt-compat, but the presence of one of the two acceptable
 	//    Sunday anchors above IS the assertion.)
-	sundayOK := false
+	cronWeekly := false
+	systemdTimer := false
 
 	// Pattern (a): /etc/cron.weekly/apt-sunday (or any cron.weekly
 	// file invoking unattended-upgrade). The file doesn't have to
@@ -274,7 +275,7 @@ func TestSec11_RebootWindowSunday0400UTC(t *testing.T) {
 				continue
 			}
 			if strings.Contains(string(b), "unattended-upgrade") {
-				sundayOK = true
+				cronWeekly = true
 				break
 			}
 		}
@@ -285,37 +286,45 @@ func TestSec11_RebootWindowSunday0400UTC(t *testing.T) {
 	// any *.timer file in /etc/systemd/system and
 	// /lib/systemd/system for the same reason (operators pick
 	// the path).
-	if !sundayOK {
-		if matches, err := filepath.Glob("/etc/systemd/system/*.timer"); err == nil {
-		timerLoop:
+	if matches, err := filepath.Glob("/etc/systemd/system/*.timer"); err == nil {
+	timerLoop:
+		for _, f := range matches {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			if strings.Contains(string(b), "OnCalendar=Sun") ||
+				strings.Contains(string(b), "OnCalendar=") && strings.Contains(string(b), "Sun") {
+				systemdTimer = true
+				break timerLoop
+			}
+		}
+	}
+	// Some operators put the timer in /lib/systemd/system
+	// instead. Already covered by the package-provided file.
+	if !systemdTimer {
+		if matches, err := filepath.Glob("/lib/systemd/system/*.timer"); err == nil {
 			for _, f := range matches {
 				b, err := os.ReadFile(f)
 				if err != nil {
 					continue
 				}
-				if strings.Contains(string(b), "OnCalendar=Sun") ||
-					strings.Contains(string(b), "OnCalendar=") && strings.Contains(string(b), "Sun") {
-					sundayOK = true
-					break timerLoop
+				if strings.Contains(string(b), "OnCalendar=Sun") {
+					systemdTimer = true
+					break
 				}
 			}
 		}
-		// Some operators put the timer in /lib/systemd/system
-		// instead. Already covered by the package-provided file.
-		if !sundayOK {
-			if matches, err := filepath.Glob("/lib/systemd/system/*.timer"); err == nil {
-				for _, f := range matches {
-					b, err := os.ReadFile(f)
-					if err != nil {
-						continue
-					}
-					if strings.Contains(string(b), "OnCalendar=Sun") {
-						sundayOK = true
-						break
-					}
-				}
-			}
-		}
+	}
+
+	sundayOK := cronWeekly || systemdTimer
+	if cronWeekly && systemdTimer {
+		// Mutual-exclusion: a cron.weekly wrapper AND a systemd
+		// Sun timer both fire Sunday-morning — the box reboots
+		// twice a week (once from each trigger). Pick one OR the
+		// other. The §11 plan leans cron.weekly as the current
+		// shape (operator choice documented in docs/STATUS.md R3).
+		t.Errorf("both /etc/cron.weekly/* invoking unattended-upgrade AND a systemd *.timer with OnCalendar=Sun are configured — spec §11 requires one OR the other, not both (reboots twice a week)")
 	}
 
 	if !sundayOK {
