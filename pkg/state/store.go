@@ -536,6 +536,15 @@ type Store interface {
 	// wire and vmmd resolves it via Storage.Get before staging the chroot.
 	SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error
 
+	// SetDeploymentSourceURL records the canonical upstream URL +
+	// commit SHA the build was triggered from (Tier 3 / issue #197
+	// B3.10 schema half, migrations/00047). Populated by githubd's
+	// CreateDeployment callback. Empty values are accepted (an
+	// image: deploy with no upstream URL is a normal case). The
+	// reader is build_provenance (Phase 2) which surfaces the
+	// values at GET /v1/builds/{id}/provenance.
+	SetDeploymentSourceURL(ctx context.Context, id, sourceURL, commitSHA string) error
+
 	// Builds (apid creates the queued row; builderd writes status, spec §9).
 	CreateBuild(ctx context.Context, deploymentID string, kind DeploymentKind, sourceBytes int64, logPath string) (Build, error)
 	BuildByID(ctx context.Context, id string) (Build, error)
@@ -581,6 +590,28 @@ type Store interface {
 	// RequeueBuild itself is unconditional.
 	RequeueBuild(ctx context.Context, id string) error
 	UpdateBuildStatus(ctx context.Context, id string, status BuildStatus, fc FailureClass, started, finished bool) error
+
+	// CreateBuildProvenance persists the post-mortem "what ran?"
+	// record for a successful Build (ADR-038, Tier 3 / issue #197
+	// B3.1). Called by builderd's recordProvenance helper at the two
+	// markSucceeded sites; ON CONFLICT (build_id) DO UPDATE makes
+	// redelivery safe — a LISTEN race between apid and imaged's
+	// reaper must not double-row.
+	//
+	// Builderd's failure path is best-effort: a failed INSERT is
+	// logged at WARN and the build still succeeds (the builds row is
+	// authoritative for customer-visible success/fail). The reader
+	// (apid GET /v1/builds/{id}/provenance) renders 404 when the
+	// row is missing — the customer-visible surface is "missing
+	// provenance for build X" rather than "build X failed".
+	CreateBuildProvenance(ctx context.Context, prov BuildProvenance) error
+	// BuildProvenanceByBuildID resolves the row by build_id. Returns
+	// ErrNotFound when the build has no provenance row — either a
+	// pre-PR build, or a successful build whose populator INSERT
+	// failed and was logged at WARN. Backs apid's GET
+	// /v1/builds/{id}/provenance route + the `faas build provenance`
+	// CLI command.
+	BuildProvenanceByBuildID(ctx context.Context, buildID string) (BuildProvenance, error)
 
 	// SweepStuckRunningBuilds flips every build row whose status is
 	// 'running' AND whose started_at is older than threshold to

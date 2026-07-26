@@ -32,6 +32,7 @@ func ApplyLayer(dst string, tr *tar.Reader) error {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
 
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
 		target, err := safeJoin(dst, hdr.Name)
 		if err != nil {
 			return err
@@ -95,11 +96,16 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		}
 		return f.Close()
 	case tar.TypeSymlink:
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime; for a 2-step chain to escape, the first symlink would also have to point outside base, which safeJoin rejects.
+		linkTarget, err := safeJoin(base, hdr.Linkname)
+		if err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Symlink(hdr.Linkname, target)
+		return os.Symlink(linkTarget, target)
 	case tar.TypeLink:
 		// A hardlink's Linkname is a path relative to the archive root.
 		source, err := safeJoin(base, hdr.Linkname)

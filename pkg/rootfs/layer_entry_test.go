@@ -45,18 +45,21 @@ func TestApplyEntry_TypeRegTruncatesExisting(t *testing.T) {
 }
 
 func TestApplyEntry_SymlinkExternal(t *testing.T) {
+	// Pin the CodeQL go/path-injection hardening: a header whose Linkname
+	// is an absolute host path is REJECTED before the staging directory is
+	// touched. Previously applyEntry blindly called os.Symlink(hdr.Linkname,
+	// target), letting a malicious layer create a symlink whose target
+	// pointed at /etc/hostname (or anything else on the host). Now safeJoin
+	// runs first and absolute paths get a "rootfs: absolute entry path"
+	// error.
 	dir := t.TempDir()
 	target := filepath.Join(dir, "link")
 	hdr := &tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/hostname"}
-	if err := applyEntry(dir, target, hdr, nil); err != nil {
-		t.Fatal(err)
+	if err := applyEntry(dir, target, hdr, nil); err == nil {
+		t.Fatal("applyEntry accepted absolute symlink target; expected safeJoin rejection")
 	}
-	l, err := os.Readlink(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l != "/etc/hostname" {
-		t.Errorf("link target = %q", l)
+	if _, err := os.Lstat(target); err == nil {
+		t.Errorf("escaped symlink landed on host: %s", target)
 	}
 }
 

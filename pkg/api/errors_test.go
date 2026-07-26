@@ -416,3 +416,51 @@ func TestProblem_PaddleExtensionMarshalled(t *testing.T) {
 		}
 	})
 }
+
+// TestProblem_WithHeaderFlushedOnWire pins the review finding #1a
+// fix on PR #322: the build-attestation transient-I/O branch on
+// pkg/sched.Engine.Wake/Prime wraps the storage error in a
+// *api.Problem with a Retry-After: 5 header via WithHeader, and
+// gatewayd's writeWakeError surfaces it via api.WriteProblem.
+// The chain — WithHeader → extraHeaders → WriteProblem → wire
+// header — must be complete; gaps here would silently drop the
+// Retry-After and the 503 would look indistinguishable from a
+// permanent failure.
+func TestProblem_WithHeaderFlushedOnWire(t *testing.T) {
+	p := NewProblem(503, CodeCapacity, "transient", "retry shortly").
+		WithHeader("Retry-After", "5").
+		WithHeader("X-Faas-Wake-Reason", "verifier_io")
+
+	rr := httptest.NewRecorder()
+	WriteProblem(rr, p)
+
+	if got := rr.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want \"5\"", got)
+	}
+	if got := rr.Header().Get("X-Faas-Wake-Reason"); got != "verifier_io" {
+		t.Errorf("X-Faas-Wake-Reason = %q, want \"verifier_io\"", got)
+	}
+	// extraHeaders must not leak into the JSON body (it's an
+	// HTTP-layer concept, not an RFC 7807 field).
+	body := rr.Body.String()
+	if strings.Contains(body, "extraHeaders") {
+		t.Errorf("extraHeaders must not appear on the wire: %s", body)
+	}
+	if strings.Contains(body, "Retry-After") {
+		t.Errorf("Retry-After must not appear in the JSON body: %s", body)
+	}
+}
+
+// TestProblem_WithHeaderAccumulates pins that multiple WithHeader
+// calls on the same key add rather than overwrite — gatewayd's
+// downstream chain (header set, then header Add) would silently
+// drop the second value if this were a plain map assign.
+func TestProblem_WithHeaderAccumulates(t *testing.T) {
+	p := NewProblem(503, "x", "x", "x").
+		WithHeader("X-Demo", "a").
+		WithHeader("X-Demo", "b")
+
+	if got := p.HasHeader("X-Demo"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("HasHeader(X-Demo) = %v, want [a b]", got)
+	}
+}

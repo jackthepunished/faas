@@ -274,6 +274,18 @@ type Deployment struct {
 	SourceBytes int64
 	Handler     string // function handler (kind=tarball when type=function)
 	LogPath     string // build log spool path
+	// SourceURL is the canonical upstream URL the build was triggered
+	// from (Tier 3 / issue #197 B3.10). For githubd-triggered deploys
+	// this is the repo + branch; for registry pulls it is the OCI
+	// reference; for tarball / dockerfile deploys it is empty.
+	// Populated by githubd's CreateDeployment callback. Phase 2 reads
+	// it for build_provenance.source_url.
+	SourceURL string
+	// CommitSHA is the upstream commit SHA (when known). Length-bounded
+	// at 64 hex chars in the DB (deployments_commit_sha_len_chk,
+	// migrations/00047). Empty for image/tarball deploys that don't
+	// have an upstream commit.
+	CommitSHA string
 	// RootfsPath / RootfsBytes are stamped by imaged after the per-app ext4 layer
 	// is built (spec §4.6, drive1). schedd's prime handshake reads this row so
 	// it can attach drive1 from the right path on the cold boot (ADR-018).
@@ -317,6 +329,32 @@ type Build struct {
 	StartedAt    time.Time
 	FinishedAt   time.Time
 	EnqueuedAt   time.Time // set at CreateBuild; builderd measures queue wait against it (ADR-030)
+}
+
+// BuildProvenance is the post-mortem "what ran?" record for a Build
+// (ADR-038, Tier 3 / issue #197 B3.1). Populated by builderd at the
+// two markSucceeded sites; read by apid at GET /v1/builds/{id}/provenance
+// and by the CLI at `faas build provenance <id>`.
+//
+// One row per build_id (UNIQUE constraint enforces it). Fields mirror
+// the table shape with no translation; empty strings round-trip the
+// nullable columns. sbom_storage_key is empty in this PR — Phase 3's
+// syft populator fills it.
+type BuildProvenance struct {
+	ID             string
+	BuildID        string
+	BuildkitVer    string
+	RailpackVer    string
+	BaseDigest     string
+	SourceSHA256   string
+	SourceURL      string
+	CommitSHA      string
+	Plan           string
+	RunnerDigest   string
+	BuilderNodeID  string
+	StartedAt      time.Time
+	FinishedAt     time.Time
+	SBOMStorageKey string
 }
 
 // CustomDomain is a customer's CNAME'd domain. apid owns this table;

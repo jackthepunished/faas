@@ -312,6 +312,24 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id, nil, &out)
 }
 
+// GetBuildsIdProvenance returns the ADR-038 build_provenance row for
+// a build id. Backs the `faas build provenance <id>` CLI command.
+// The backend surfaces a missing row as a 404 with code
+// build_provenance_not_found, which the SDK propagates as a
+// *APIError — callers should check against apierr.Code() when the
+// distinction matters (vs. a hard 404 "no such build").
+//
+// Method name: the sdk-coverage drift gate
+// (cmd/sdk-coverage/main.go::deriveMethodName) auto-derives
+// "Get<PathSegments>" from the route; for `GET /v1/builds/{id}/provenance`
+// the natural form is `GetBuildsIdProvenance`. Renaming here is
+// cheaper than pinning a methodRouteMap row that would diverge from
+// every other /v1/{resource}/{id} SDK shape.
+func (c *Client) GetBuildsIdProvenance(ctx context.Context, id string) (BuildProvenanceResponse, error) {
+	var out BuildProvenanceResponse
+	return out, c.do(ctx, "GET", "/v1/builds/"+id+"/provenance", nil, &out)
+}
+
 // DeployMultipart ships a source tarball (with optional runtime +
 // handler) to the multipart deploy endpoint. sourceName is the form
 // filename apid sees in the multipart "source" part; pass the

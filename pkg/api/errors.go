@@ -61,6 +61,11 @@ type Problem struct {
 	// Stripe: empty). The dashboard renders this as a confirmation id
 	// after the customer completes checkout. Empty on the Stripe path.
 	TxID string `json:"tx_id,omitempty"`
+	// extraHeaders are non-JSON response headers attached via WithHeader.
+	// Kept unexported so the wire body (RFC 7807 problem+json) is
+	// exactly the spec; WriteProblem flushes these onto the wire
+	// before WriteHeader. nil = no extras.
+	extraHeaders map[string][]string `json:"-"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -75,6 +80,11 @@ func (p *Problem) Error() string {
 // code. Every HTTP surface (gatewayd, apid) uses this so error shape is uniform.
 func WriteProblem(w http.ResponseWriter, p *Problem) {
 	w.Header().Set("Content-Type", "application/problem+json")
+	for k, vs := range p.extraHeaders {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
 	w.WriteHeader(p.Status)
 	_ = json.NewEncoder(w).Encode(p)
 }
@@ -96,6 +106,30 @@ func (p *Problem) WithLimit(limit, observed int64) *Problem {
 func (p *Problem) WithDocs(url string) *Problem {
 	p.DocsURL = url
 	return p
+}
+
+// WithHeader attaches a single response header to the Problem so
+// gatewayd's writeWakeError can write it onto the wire without
+// branches on each error code. Used today by the build-attestation
+// transient-I/O path (Retry-After: 5 — review finding #1a on
+// PR #322). Multiple WithHeader calls compose: each call appends a
+// new key. Returns the same pointer for chaining.
+func (p *Problem) WithHeader(key, value string) *Problem {
+	if p.extraHeaders == nil {
+		p.extraHeaders = map[string][]string{}
+	}
+	p.extraHeaders[key] = append(p.extraHeaders[key], value)
+	return p
+}
+
+// HasHeader returns the slice of values attached to key (nil if
+// none). Exposed so tests + callers can verify the header was
+// recorded without reaching into the unexported field.
+func (p *Problem) HasHeader(key string) []string {
+	if p.extraHeaders == nil {
+		return nil
+	}
+	return p.extraHeaders[key]
 }
 
 // Stable error codes (spec Appendix A, UX spec §7). Keep in sync with docs and
@@ -137,7 +171,13 @@ const (
 	CodeHandlerMissing    = "handler_missing"
 	CodeImageRequired     = "image_required"
 	CodeDeployFailed      = "deploy_failed"
-	CodeNoRollbackTarget  = "no_rollback_target"
+	// CodeSigInvalid is returned by schedd when the layer's
+	// signature fails verification (or is missing) on cold-boot.
+	// The deployment transitions to DeployFailed with this code;
+	// the wake that triggered the verify returns 503 to gatewayd
+	// with the same code. ADR-038 §Consequences Compatibility.
+	CodeSigInvalid       = "sig_invalid"
+	CodeNoRollbackTarget = "no_rollback_target"
 
 	// CodePayment is the 402 response when an API-only plan change requires
 	// a Stripe subscription the customer does not have (issue #142 / PR).
@@ -176,6 +216,12 @@ const (
 	CodePlanFeatureGated   = "plan_feature_gated"
 	CodePlanDelayedCap     = "plan_delayed_tasks_cap"
 	CodeInvocationNotFound = "invocation_not_found"
+	// CodeBuildProvenanceNotFound is the ADR-038 / Tier 3 #197
+	// B3.10-read sentinel. Distinct from a generic "no such build"
+	// so the customer can branch: a build that exists with no
+	// provenance row is the "populator INSERT failed + WARN logged"
+	// outcome, not a 404 of the build itself.
+	CodeBuildProvenanceNotFound = "build_provenance_not_found"
 
 	// ADR-031 (tier-2 of the network roadmap) — per-app egress
 	// allowlist. Same gate shape as MinInstances: the feature is
@@ -666,6 +712,20 @@ func ErrInvocationNotFound(id string) *Problem {
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
 		WithDocs("https://docs.DOMAIN/event-driven#invocations")
+}
+
+// ErrBuildProvenanceNotFound is the ADR-038 surface for a build
+// whose populator INSERT never landed (best-effort WARN inside
+// builderd.recordProvenance) OR for a pre-PR build that pre-dates
+// build_provenance entirely. Distinct from "no such build" so the
+// customer (and the dashboard) can branch on it. The build row is
+// authoritative for the success/fail transition; the missing
+// provenance is observational metadata.
+func ErrBuildProvenanceNotFound() *Problem {
+	return NewProblem(http.StatusNotFound, CodeBuildProvenanceNotFound,
+		"Build provenance not found",
+		"the build succeeded but no provenance row exists; builderd logged a warning when the populator failed").
+		WithDocs("https://docs.DOMAIN/builds#provenance")
 }
 
 // ErrLongPollTimeout is returned by the long-poll handlers (sync

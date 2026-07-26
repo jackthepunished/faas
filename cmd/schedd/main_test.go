@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/sched"
@@ -104,12 +105,13 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 	pool := migratedPool(t)
 	wantErr := errors.New("listen broken")
 	deps := runDeps{
-		configPath: filepath.Join(t.TempDir(), "absent.toml"),
-		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
-		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
-		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    stubDialVMM,
-		listen:     func(context.Context, string, *tls.Config, string) (net.Listener, error) { return nil, wantErr },
+		configPath:  filepath.Join(t.TempDir(), "absent.toml"),
+		openDB:      func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
+		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
+		detectFC:    func(context.Context) (string, error) { return "1.10.0", nil },
+		dialVMM:     stubDialVMM,
+		listen:      func(context.Context, string, *tls.Config, string) (net.Listener, error) { return nil, wantErr },
+		signPubPath: writeTestSignPub(t),
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, want wraps %v", err, wantErr)
@@ -184,11 +186,12 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	deps := runDeps{
-		configPath: cfgPath,
-		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
-		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
-		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
-		dialVMM:    stubDialVMM,
+		configPath:  cfgPath,
+		openDB:      func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
+		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
+		detectFC:    func(context.Context) (string, error) { return "1.10.0", nil },
+		dialVMM:     stubDialVMM,
+		signPubPath: writeTestSignPub(t),
 		listen: func(_ context.Context, target string, _ *tls.Config, _ string) (net.Listener, error) {
 			t2, err := wire.ParseTarget(target)
 			if err != nil {
@@ -212,6 +215,30 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("run did not return within 3s of cancel")
 	}
+}
+
+// writeTestSignPub generates a fresh ECDSA P-256 cosign keypair and
+// writes the public half to a temp file in mode 0444. ADR-038 / Tier 3
+// phase 3: schedd's run() load step (cmd/schedd/main.go:232-242) reads
+// FAAS_SIGN_PUB / cosign.DefaultSignPubPath and fails loud on missing.
+// Tests that drive run() through runWithDeps inject the path via the
+// runDeps.signPubPath seam; the underlying file must exist and pass
+// the PEM + perm checks cosign.NewLocalVerifier runs.
+//
+// Mirrors the e2etest harness helper (pkg/e2etest/harness.go::
+// writeScheddSignPub) — same shape because both surfaces face the same
+// fail-loud contract.
+func writeTestSignPub(t *testing.T) string {
+	t.Helper()
+	_, pubPEM, err := cosign.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("generate cosign keypair: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "sign-pub.pem")
+	if err := os.WriteFile(path, pubPEM, 0o444); err != nil {
+		t.Fatalf("write sign-pub.pem: %v", err)
+	}
+	return path
 }
 
 // stubDialVMM is the canonical no-op dialer for the wiring tests
