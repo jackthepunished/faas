@@ -268,3 +268,53 @@ func TestAdmitInstance_RealFailureSurfacesProblem(t *testing.T) {
 		t.Errorf("problem = %v; want CodeCapacity", p)
 	}
 }
+
+// TestServerParkInstance_NotFoundReturnsNotFoundStatus covers the
+// `errors.Is(err, state.ErrNotFound)` branch of Server.ParkInstance
+// (server.go:152-156). When the engine says "row was already
+// gone", the server must surface that as a gRPC NotFound status
+// so the meterd quota loop can match it via codes.NotFound and
+// decide to log-and-continue rather than treat it as a hard
+// failure.
+func TestServerParkInstance_NotFoundReturnsNotFoundStatus(t *testing.T) {
+	cli := newServer(t, &fakeEngine{
+		parkFn: func(context.Context, string, string) error {
+			return state.ErrNotFound
+		},
+	})
+	_, err := cli.ParkInstance(context.Background(), &scheddpb.ParkInstanceRequest{
+		InstanceId: "i-gone",
+		Reason:     "idle",
+	})
+	if err == nil {
+		t.Fatal("expected NotFound status, got nil")
+	}
+	if code := status.Code(err); code != codes.NotFound {
+		t.Errorf("code = %v, want NotFound", code)
+	}
+}
+
+// TestServerParkInstance_InternalError covers the catch-all
+// branch of Server.ParkInstance (server.go:157) for any non-
+// NotFound error. The wire shape is the same Internal status the
+// other RPCs produce; the difference is that the message text
+// is the engine's error string (not the api.Problem shape Wake
+// and AdmitInstance use). This documents the boundary for
+// meterd's error handling.
+func TestServerParkInstance_InternalError(t *testing.T) {
+	cli := newServer(t, &fakeEngine{
+		parkFn: func(context.Context, string, string) error {
+			return errors.New("store exploded")
+		},
+	})
+	_, err := cli.ParkInstance(context.Background(), &scheddpb.ParkInstanceRequest{
+		InstanceId: "i-1",
+		Reason:     "idle",
+	})
+	if err == nil {
+		t.Fatal("expected Internal status, got nil")
+	}
+	if code := status.Code(err); code != codes.Internal {
+		t.Errorf("code = %v, want Internal", code)
+	}
+}
