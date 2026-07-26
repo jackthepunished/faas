@@ -365,7 +365,7 @@ type Store interface {
 	// (PR-B, ADR-012 closure). Returns the bindingID; writes the
 	// linked_at timestamp so the dashboard's "connected on" pill
 	// has a single source. The (account_id, binding_id) unique
-	// partial index (migration 00047) rejects duplicate binds under
+	// partial index (migration 00048) rejects duplicate binds under
 	// the same account.
 	UpsertGithubInstallBinding(ctx context.Context, b GitHubBinding) error
 	// DeleteGithubInstallBinding clears the bind columns on an app.

@@ -161,7 +161,7 @@ func (s *RealService) ListInstallableRepos(accountID string) ([]githubdgrpc.Repo
 //
 // bindingID is the deterministic "bind-<appID>-<repo>" form the
 // pre-PR-B in-memory map emitted; the (account_id, binding_id)
-// unique partial index in migration 00047 makes the upsert
+// unique partial index in migration 00048 makes the upsert
 // idempotent on retry.
 func (s *RealService) BindAppRepo(appID, accountID, repoFullName, productionBranch string) (string, error) {
 	if appID == "" || accountID == "" || repoFullName == "" {

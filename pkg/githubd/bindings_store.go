@@ -2,7 +2,7 @@
 // surface RealService reads and writes. Pre-PR-B the in-memory map
 // was the source of truth; PR-B demotes that map to a read-through
 // cache and pushes the durable state into Postgres (apps table,
-// columns added in migration 00047).
+// columns added in migration 00048).
 //
 // The interface lives in pkg/githubd so the daemon stays
 // persistence-agnostic; the concrete adapter that bridges
@@ -33,7 +33,7 @@ type BindingsStore interface {
 	// Upsert persists the bind edge and returns the binding_id
 	// (the store mints the deterministic "bind-<appID>-<repo>" form
 	// RealService has always emitted). The (account_id, binding_id)
-	// unique partial index added in migration 00047 makes the
+	// unique partial index added in migration 00048 makes the
 	// upsert idempotent on retry.
 	Upsert(ctx context.Context, b state.GitHubBinding) (bindingID string, err error)
 	// Delete clears the bind columns for an app. Idempotent: returns
