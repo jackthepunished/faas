@@ -30,8 +30,9 @@
     "gen:check": "node scripts/gen.mjs && git diff --exit-code -- src/generated",
     "build": "tsc -p tsconfig.json",
     "test:build": "tsc -p tsconfig.test.json",
-    "test": "npm run test:build && node --test --test-concurrency=1 dist-test/test/smoke.test.js",
-    "test:smoke": "npm run test",
+    "test": "npm run test:build && node --test --test-concurrency=1 'dist-test/test/**/*.test.js' && node --test --test-concurrency=1 test/post-process.test.mjs",
+    "test:smoke": "npm run test:build && node --test --test-concurrency=1 dist-test/test/smoke.test.js",
+    "test:unit": "npm run test:build && node --test --test-concurrency=1 dist-test/test/sse.test.js && node --test --test-concurrency=1 test/post-process.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {},

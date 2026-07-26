@@ -362,8 +362,13 @@ sdk-check: ## CI gate: every OpenAPI route has a typed SDK method on pkg/api.Cli
 sdk-gen-node: ## Regenerate sdk/node/src/generated from api/openapi.yaml
 	@cd sdk/node && npm run gen
 
+.PHONY: sdk-gen-node-check
+sdk-gen-node-check: ## Regenerate + assert clean diff (CI's `sdk-gen-node` job)
+	@cd sdk/node && npm run gen:check
+
 .PHONY: sdk-gen-node-twice
-sdk-gen-node-twice: sdk-gen-node ## Determinism check: regen twice, must produce zero diff
+sdk-gen-node-twice: ## Determinism check: regen twice, must produce zero diff
+	@cd sdk/node && npm run gen:check
 	@cd sdk/node && npm run gen:check
 	@echo "sdk-gen-node-twice: OK"
 
@@ -371,4 +376,8 @@ sdk-gen-node-twice: sdk-gen-node ## Determinism check: regen twice, must produce
 sdk-smoke-node: ## Build fakeapid fixture + run Node SDK smoke test
 	@cd sdk/fakeapid && go build -o bin/fakeapid .
 	@cd sdk/node && npm ci && npm run test:smoke
+
+.PHONY: sdk-unit-node
+sdk-unit-node: ## Run Node SDK unit tests (no fixture required)
+	@cd sdk/node && npm ci && npm run test:unit
 
