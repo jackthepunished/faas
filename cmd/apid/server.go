@@ -746,23 +746,29 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 		// Issue #278: also feed the per-customer request-failure
 		// counter when the response status indicates a client or
 		// server error. 4xx/5xx are the signal; 1xx-3xx never count.
-		// The route label reuses op (= r.Pattern or "unmatched") so
-		// the cardinality stays bounded by the route table, not by
-		// the URL path — same precedent as apid_ops_total.
+		// The route label is r.Pattern (or "unmatched") so the
+		// cardinality stays bounded by the route table, not by the
+		// URL path — same precedent as apid_ops_total.
 		//
 		// account_id resolution: principalFrom(r) succeeds when the
 		// inner chain (s.auth) mutated *r to carry the principal in
 		// r.Context() — see s.auth at server.go:962/998. For the
 		// unauthenticated 401 branch, principalFrom returns ok=false
 		// and the account resolves to "anonymous" via the bounded
-		// admission set inside OpsMetrics.RequestFailure. Id past
+		// admission set inside OpsMetrics.RequestFailureFor. Id past
 		// the cap → "__other__".
+		//
+		// RequestFailureFor is preferred over the string-form
+		// RequestFailure so the route label's extraction from r.Pattern
+		// lives next to the cardinality contract — a future caller
+		// cannot accidentally pass a raw URL path and explode the
+		// label set (review finding #1 on PR #332).
 		if rec.status >= http.StatusBadRequest {
 			acct := "anonymous"
 			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
 				acct = p.Acct.ID
 			}
-			s.ops.RequestFailure(acct, op).Inc()
+			s.ops.RequestFailureFor(r, acct).Inc()
 		}
 	})
 }

@@ -18,6 +18,8 @@ package wire_test
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -65,11 +67,32 @@ func TestAccountLabel_OverflowsToOther(t *testing.T) {
 		t.Errorf("expected __other__ series at overflow; body was:\n%s", body)
 	}
 	// A second overflow id should also land in __other__ and
-	// increment the same series (not mint a new one).
+	// increment the same series (not mint a new one). Review finding
+	// #2 on PR #332: this also pins the property that the overflow
+	// path does NOT consume capacity — the reserved "__other__" label
+	// was pre-admitted at boot, so the map size stays at cap+2
+	// (cap real ids + 2 reserved) regardless of how many overflow ids
+	// observe in.
 	m.AuditWriteFailures("real-overflow-2").Inc()
 	body = render(t, m)
 	if !strings.Contains(body, `apid_audit_write_failures_total{account_id="__other__"} 2`) {
-		t.Errorf("expected __other__ series to accumulate; body was:\n%s", body)
+		t.Errorf("expected __other__ series to accumulate on the audit counter; body was:\n%s", body)
+	}
+	// Drive a third overflow id through the request-failure accessor
+	// to prove the cap is shared across metrics. The same __other__
+	// label must surface in the request-failure counter too — without
+	// that, the two metrics would diverge and an operator looking at
+	// one wouldn't see the other.
+	m.RequestFailure("real-overflow-3", "GET /v1/test").Inc()
+	body = render(t, m)
+	if !strings.Contains(body, `apid_request_failures_total{account_id="__other__",route="GET /v1/test"} 1`) {
+		t.Errorf("expected __other__ series on request-failure metric; body was:\n%s", body)
+	}
+	// The audit counter must NOT have advanced from the cross-metric
+	// overflow (different metric) — pinning that the two accessors
+	// share admission but not series identity.
+	if !strings.Contains(body, `apid_audit_write_failures_total{account_id="__other__"} 2`) {
+		t.Errorf("audit counter must stay at 2 after a request-failure overflow; body was:\n%s", body)
 	}
 }
 
@@ -156,16 +179,16 @@ func TestAccountLabel_IdempotentLabel(t *testing.T) {
 	c1 := m.AuditWriteFailures("dup-id")
 	c2 := m.AuditWriteFailures("dup-id")
 	c1.Inc()
-	c1.Inc()
-	// If c1 and c2 are different Counter instances pointing at
-	// different series, the second assertion would see 0. The
-	// prometheus client lib returns the same child on repeated
-	// WithLabelValues calls; this test pins that contract for our
-	// accessor wrapper.
+	c2.Inc()
+	// The prometheus client lib returns the same underlying Counter
+	// on repeated WithLabelValues calls — if c1 and c2 pointed at
+	// different series, each Inc would land on a separate series and
+	// the readSingle below would see 1 (not 2). This test pins the
+	// contract for our accessor wrapper so the hot-path cache is
+	// guaranteed to share the same Prometheus child.
 	if got := readSingle(t, m, `apid_audit_write_failures_total{account_id="dup-id"}`); got != 2 {
 		t.Errorf("dup-id counter = %v, want 2 (callers must share series)", got)
 	}
-	_ = c2
 }
 
 // TestAuditWriteDuration_PreInstantiated asserts the ok/failed
@@ -181,6 +204,37 @@ func TestAuditWriteDuration_PreInstantiated(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing pre-instantiated histogram series %q in:\n%s", want, body)
 		}
+	}
+}
+
+// TestRequestFailureFor_ExtractsRouteFromPattern pins the canonical
+// HTTP-path accessor (issue #278, review finding #1 on PR #332).
+// The route label is read from r.Pattern (the Go mux pattern) with
+// the reserved "unmatched" fallback for paths the mux did not
+// dispatch. By owning the extraction inside the accessor, callers
+// cannot accidentally pass a raw URL path and explode the
+// cardinality — the route label is bounded by the route table.
+func TestRequestFailureFor_ExtractsRouteFromPattern(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	const id = "acct-route-pattern"
+	// Matched route: r.Pattern is the mux pattern.
+	matched := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	matched.Pattern = "GET /v1/test"
+	m.RequestFailureFor(matched, id).Inc()
+	body := render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="GET /v1/test"} 1`, id)) {
+		t.Errorf("matched route: missing expected series in:\n%s", body)
+	}
+	// Unmatched route: r.Pattern is "" (the 404 path a URL scanner
+	// hits). The accessor must collapse to "unmatched" rather than
+	// propagating the empty string (which would minter a new series
+	// per call).
+	unmatched := httptest.NewRequest(http.MethodGet, "/wp-login.php", nil)
+	unmatched.Pattern = ""
+	m.RequestFailureFor(unmatched, id).Inc()
+	body = render(t, m)
+	if !strings.Contains(body, fmt.Sprintf(`apid_request_failures_total{account_id=%q,route="unmatched"} 1`, id)) {
+		t.Errorf("unmatched route: missing expected series in:\n%s", body)
 	}
 }
 

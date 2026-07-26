@@ -429,15 +429,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// vmmd) from "dialer refused it" (this metric on imaged) — they
 	// have different remediation paths.
 	var ociEgressDeny *prometheus.CounterVec
+	// commonCollectors is the per-daemon collector set that every
+	// prefix registers. PR-E adds ociEgressDeny to the set when
+	// prefix == "imaged" — keeping the common slice as a single source
+	// of truth (review finding #5 on PR #332) means a future collector
+	// only needs to be added here, not in two parallel MustRegister
+	// calls that would silently drift apart.
+	commonCollectors := []prometheus.Collector{
+		ops, dur, watchdogKills, eventsWriteFail, auditWriteFail,
+		auditWriteDur, requestFailures, stripePushDur, paddlePushDur,
+		buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback,
+		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
+		instanceStatsCollectDur, instanceStatsPartialErrors,
+		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
+		egressDeny,
+	}
 	if prefix == "imaged" {
 		ociEgressDeny = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, auditWriteDur, requestFailures, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
-	} else {
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, auditWriteDur, requestFailures, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
+		commonCollectors = append(commonCollectors, ociEgressDeny)
 	}
+	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
 	// /metrics from the moment the daemon boots — same precedent as
@@ -605,17 +619,46 @@ func (m *OpsMetrics) AuditWriteFailureDuration(result string) prometheus.Observe
 	return m.auditWriteDur.WithLabelValues(result)
 }
 
-// RequestFailure returns the per-(account, route) counter for HTTP
-// requests completed with status >= 400 (issue #278). route is the
-// Go mux pattern (e.g. "GET /v1/apps/{slug}") or "unmatched" for
-// paths the mux did not dispatch. accountID is resolved through the
-// bounded admission set (accountLabel) — empty resolves to
-// "anonymous"; ids past the capacity collapse to "__other__".
+// RequestFailure is the primitive counter accessor for
+// apid_request_failures_total{account_id, route} (issue #278). It
+// is exposed for unit tests that drive the metric directly — the
+// canonical HTTP-path call site is RequestFailureFor, which owns
+// the route-template extraction so callers cannot accidentally pass
+// a raw URL path (that would explode the cardinality unbounded).
+//
+// route MUST be a Go mux pattern (e.g. "GET /v1/apps/{slug}") or
+// the reserved sentinel "unmatched" for paths the mux did not
+// dispatch. accountID flows through the bounded admission set
+// (accountLabel) — empty resolves to "anonymous"; ids past the
+// capacity collapse to "__other__".
 func (m *OpsMetrics) RequestFailure(accountID, route string) prometheus.Counter {
 	if m == nil {
 		return nil
 	}
 	return m.requestFailures.WithLabelValues(m.accountLabel(accountID), route)
+}
+
+// RequestFailureFor is the canonical accessor for the per-customer
+// request-failure counter (issue #278). It extracts the route label
+// from r.Pattern (the Go mux pattern, e.g. "GET /v1/apps/{slug}")
+// with the reserved "unmatched" fallback for paths the mux did not
+// dispatch — so the route label's cardinality is bounded by the
+// route table and never by a URL path the scanner fed in.
+//
+// accountID is resolved through the bounded admission set: empty
+// resolves to "anonymous" ; ids past the capacity collapse to
+// "__other__". Safe on a nil receiver so callers can call it
+// without a nil-check at the top of the helper, mirroring the
+// Observe* family pattern.
+func (m *OpsMetrics) RequestFailureFor(r *http.Request, accountID string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	route := r.Pattern
+	if route == "" {
+		route = "unmatched"
+	}
+	return m.RequestFailure(accountID, route)
 }
 
 // WakeIDV4Fallback returns the unlabelled counter the wake_id mint
