@@ -67,6 +67,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -170,8 +171,10 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
 		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
+		signPubPath := writeScheddSignPub(t, h)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
+			"FAAS_SIGN_PUB="+signPubPath,
 		)
 		h.procs = append(h.procs, startProc(t, bin, "schedd", env))
 		h.ScheddSock = sockPath
@@ -408,8 +411,10 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 		sockPath := filepath.Join(h.SockDir, "schedd.sock")
 		vmmdSock := filepath.Join(h.SockDir, "vmmd.sock")
 		cfgPath := writeScheddConfig(t, h, tmp, which&Gatewayd != 0)
+		signPubPath := writeScheddSignPub(t, h)
 		env := append(testEnvCommon(dbURL),
 			"FAAS_SCHEDD_CONFIG="+cfgPath,
+			"FAAS_SIGN_PUB="+signPubPath,
 		)
 		env = append(env, extraEnv...)
 		h.procs = append(h.procs, startProc(t, bin, "schedd", env))
@@ -547,6 +552,34 @@ func testEnvCommon(dbURL string) []string {
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}
+}
+
+// writeScheddSignPub generates a fresh ECDSA P-256 keypair (the
+// canonical cosign signer/verifier surface — see ADR-038 + the
+// `faas keys init` subcommand) and writes the public half into
+// h.SockDir at the canonical path + 0444 mode so schedd's fail-loud
+// load at cmd/schedd/main.go:232-239 doesn't reject the boot.
+//
+// Production deploys read /etc/faas/secrets/sign-pub.pem (the
+// FAAS_SIGN_PUB env override defaults to that); the harness sets
+// FAAS_SIGN_PUB to the temp-dir path so the test subprocess sees the
+// test-generated pub key. Without this helper, schedd would exit
+// immediately and every test that boots schedd would race the 30s
+// startProc deadline (or — once started — silently skip the
+// verification path the rest of the PR adds).
+//
+// Cleanup is automatic via h.TmpDir (t.TempDir).
+func writeScheddSignPub(t *testing.T, h *Harness) string {
+	t.Helper()
+	_, pubPEM, err := cosign.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("e2etest: generate cosign keypair: %v", err)
+	}
+	pubPath := filepath.Join(h.SockDir, "sign-pub.pem")
+	if err := os.WriteFile(pubPath, pubPEM, 0o444); err != nil {
+		t.Fatalf("e2etest: write sign-pub.pem: %v", err)
+	}
+	return pubPath
 }
 
 // startMeterd boots meterd against the test's schedd unix socket. The

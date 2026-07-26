@@ -1239,14 +1239,22 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	//    the app cannot transition to AppDeleted between Steps 1 and 4
 	//    (COMMIT). If INSERT fails, the prior UPDATE at Step 2 is rolled
 	//    back by the defer.
+	// Tier 3 (issue #197 B3.10) — include source_url / commit_sha in the
+	// new-row insert so the Deployment DTO Scan in scanDeployment has the
+	// 15 destinations it expects (the failing test
+	// TestPgStore_InstancesStateCheck_RejectsInjection got "got 13 and 15"
+	// before this fix). Both columns are nullable; empty string on the
+	// write side mirrors the rest of the read-side coalesce shape.
 	row := tx.QueryRow(ctx,
-		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, status)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'pending')
+		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha, status)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
 		 returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		           coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		           status, coalesce(error,''), coalesce(error_code,''), created_at`,
+		           status, coalesce(error,''), coalesce(error_code,''), created_at,
+		           coalesce(source_url,''), coalesce(commit_sha,'')`,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
-		nullString(d.Handler), nullString(d.LogPath))
+		nullString(d.Handler), nullString(d.LogPath),
+		nullString(d.SourceURL), nullString(d.CommitSHA))
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -1480,7 +1488,8 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 		  returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
 		            coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
 		            coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		            status, coalesce(error,''), coalesce(error_code,''), created_at`,
+		            status, coalesce(error,''), coalesce(error_code,''), created_at,
+		            coalesce(source_url,''), coalesce(commit_sha,'')`,
 		id, nullString(message), nullString(code))
 	return scanDeploymentWithRootfs(row)
 }
