@@ -73,6 +73,67 @@ type Store interface {
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error
 	UpdateAccountStatus(ctx context.Context, id string, status AccountStatus) error
+
+	// MFA (issue #186 / IAM-2).
+	// ConsumeRecoveryCode atomically matches `presented` against the
+	// stored SHA-256 recovery-code hashes and removes the matching
+	// hash from the array. Returns:
+	//   - (false, false, ErrNotFound) when the row is missing
+	//   - (false, false, nil)         when the presented code didn't
+	//     match any stored hash
+	//   - (true, lastCode, nil)       when the code matched and was
+	//     removed; lastCode is true iff exactly one hash remained, so
+	//     the handler can refuse to burn the last code and prompt for
+	//     a password instead.
+	// The sealed TOTP secret is preserved across consumes; the
+	// customer can still /verify after burning every recovery code.
+	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+	// MatchRecoveryCode tests a presented SHA-256 hash against the
+	// stored set without mutating. Returns (matched=true, lastCode=true)
+	// when the presented hash matches and the stored array has exactly
+	// one element. Used by /recover to refuse-the-burn BEFORE calling
+	// ConsumeRecoveryCode; the consume is only attempted when the
+	// customer has at least one backup code. Returns ErrNotFound when
+	// the row is missing or mfa_enrolled_at IS NULL.
+	MatchRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+	// ReadMFASecret returns the sealed TOTP secret (the at-rest age-
+	// sealed blob the verify handler unseals with the host age
+	// identity). Returns ErrNotFound when the row is missing OR the
+	// secret column is NULL (the customer has never enrolled).
+	ReadMFASecret(ctx context.Context, id string) (encrypted []byte, err error)
+	// SetMFASecret writes the sealed secret + recovery-code hashes
+	// WITHOUT stamping mfa_enrolled_at. Called by /v1/account/mfa/enroll:
+	// the secret lives in the row while the user types the first
+	// code, and the next /confirm is the "enrolled" point. Overwrites
+	// any prior enrollment state (idempotent re-enroll).
+	SetMFASecret(ctx context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error
+	// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+	// mfa_required = false. Idempotent on retry. Returns ErrNotFound
+	// when the row is missing — the handler must surface 404 then.
+	MarkMFAEnrolled(ctx context.Context, id string) error
+	// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash,
+	// and mfa_enrolled_at. Does NOT touch mfa_required — the
+	// chokepoints (plan upgrade / card attached / 2nd deploy) re-set
+	// it on the next trigger. The audit Emit is the caller's job
+	// (the events table is the audit trail; this method does not
+	// persist a reason string).
+	ClearMFA(ctx context.Context, id string) error
+	// SetMFARequired writes the mfa_required flag and reports whether
+	// the row actually changed. Returns (changed=true, nil) on a real
+	// write, (changed=false, nil) when the value was already what was
+	// requested (the chokepoint suppresses a duplicate audit Emit in
+	// that case), and (changed=false, ErrNotFound) when the row is
+	// missing — distinguishable from a no-op so the handler can 404
+	// the missing case.
+	SetMFARequired(ctx context.Context, id string, required bool) (changed bool, err error)
+	// CountDeployments returns the total number of live deployment
+	// rows for the account across all apps. Used by the 2nd-deploy
+	// auto-flip chokepoint (issue #186): when the count after the
+	// about-to-be-created deployment is ≥ 2, the chokepoint sets
+	// mfa_required=true. Soft-deleted apps and `failed`/`superseded`
+	// deployments are excluded. Empty on a fresh account.
+	CountDeployments(ctx context.Context, id string) (int, error)
+
 	// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
 	// account row so the webhook + push paths can join. Idempotent — a
 	// repeat call with the same value is a no-op (ADR-010, Slice 2).

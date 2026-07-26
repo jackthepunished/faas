@@ -118,10 +118,20 @@ const (
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
 	// "my key does not have permission for this endpoint".
-	CodeForbidden         = "insufficient_scope"
-	CodeNotFound          = "not_found"
-	CodeValidation        = "validation_failed"
-	CodeConflict          = "conflict"
+	CodeForbidden  = "insufficient_scope"
+	CodeNotFound   = "not_found"
+	CodeValidation = "validation_failed"
+	CodeConflict   = "conflict"
+	// CodeMFARequired is returned by requireMFA when a session-cookie
+	// principal is mfa_pending and the route is not on the MFA
+	// allowlist (IAM-2 / issue #186). Distinct from CodeForbidden so
+	// the dashboard can pivot the message from "your key is wrong"
+	// to "complete enrollment or step-up to continue".
+	CodeMFARequired = "mfa_required"
+	// CodeMFAInvalidCode is returned when /confirm, /verify, or
+	// /recover validate a presented TOTP code / recovery code and
+	// the comparison fails. The audit Emit fires regardless.
+	CodeMFAInvalidCode    = "mfa_invalid_code"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
 	CodeHandlerMissing    = "handler_missing"

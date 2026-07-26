@@ -917,6 +917,18 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
+	// IAM-2 (issue #186): plan-upgrade chokepoint. Crossing the
+	// free|hobby → pro|scale boundary arms mfa_required so the
+	// customer's next login flips to mfa_pending. Re-fetched
+	// `updated` carries the post-change plan in case a future
+	// change moves the live row state; mfaFlipOnUpgrade only
+	// needs the old/new pair, which we still have here.
+	if mfaFlipOnUpgrade(acct.Plan, plan) {
+		s.flipMFARequiredIfUnenrolled(ctx(r), updated, "plan_upgrade", map[string]any{
+			"from": string(acct.Plan),
+			"to":   string(plan),
+		})
+	}
 	writeJSON(w, http.StatusOK, api.AccountResponse{
 		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
 	})
@@ -1057,6 +1069,26 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 // VerifyWebhook returns the normalized enum directly.
 func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) {
 	switch ev.Type {
+	case billing.EventSubscriptionCreated:
+		// IAM-2 (issue #186) card-attached chokepoint. The
+		// customer's first successful subscription event is the
+		// "real customer with payment" boundary — flipping the
+		// flag here means a customer who lands on the platform
+		// via a Stripe Checkout flow is gated to MFA enrollment
+		// on next login. SubscriptionUpdated (the periodic
+		// plan-change ping) does NOT re-fire — Stripe and Paddle
+		// both redeliver it on every plan change, and the audit
+		// log would double up. Re-fetch `acct` carries the
+		// post-event status for the chokepoint's enrolled check.
+		fresh, err := s.store.AccountByID(ctx, acct.ID)
+		if err != nil {
+			s.log.Warn("card_attached chokepoint account fetch failed",
+				"account", acct.ID, "err", err.Error())
+		} else {
+			s.flipMFARequiredIfUnenrolled(ctx, fresh, "card_attached", map[string]any{
+				"provider": "stripe_or_paddle",
+			})
+		}
 	case billing.EventSubscriptionCanceled:
 		_ = s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountSuspended)
 	case billing.EventPaymentFailed:

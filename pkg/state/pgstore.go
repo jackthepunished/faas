@@ -11,6 +11,7 @@ package state
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,7 +50,7 @@ var _ Store = (*PgStore)(nil)
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at`,
+		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required`,
 		email, string(plan))
 	acct, err := scanAccount(row)
 	if err != nil {
@@ -66,19 +67,19 @@ func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan
 
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where id = $1`, id)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = $1`, id)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at from accounts where email = $1`, email)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where email = $1`, email)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at
+		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at, a.mfa_enrolled_at, a.mfa_secret_encrypted, a.mfa_recovery_codes_hash, a.mfa_required
 		 from accounts a join api_keys k on k.account_id = a.id where k.key_sha256 = $1`, hash)
 	return scanAccount(row)
 }
@@ -185,12 +186,295 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 	return nil
 }
 
+// --- MFA (IAM-2, issue #186) -------------------------------------------------
+//
+// The four mfa_* columns are projected by every account SELECT via
+// scanAccountCols; the consume path runs inside a SELECT … FOR UPDATE
+// + UPDATE pair so two concurrent /recover calls on the same account
+// cannot both observe and burn the same hash.
+
+// ConsumeRecoveryCode atomically matches `presented` against the
+// stored recovery-code hashes and removes the matching hash from the
+// array. Returns:
+//
+//   - (false, false, ErrNotFound) when the row is missing
+//   - (false, false, nil)         when the presented code doesn't
+//     match any stored hash
+//   - (true, lastCode, nil)       when the code matches and was
+//     removed; lastCode is true iff exactly one hash remained (the
+//     handler refuses to burn the last code and prompts for a
+//     password reset instead)
+//
+// The sealed TOTP secret is preserved across consumes: the customer
+// can still /verify after burning every recovery code. The transaction
+// guarantees that two concurrent /recover calls on the same account
+// cannot both observe and burn the same hash.
+func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, false, fmt.Errorf("state: mfa consume tx: %w", err)
+	}
+	// Best-effort rollback: a successful Commit absorbs the deferred
+	// rollback into a no-op, so we don't branch on err.
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	var hashes [][]byte
+	row := tx.QueryRow(ctx,
+		`select mfa_recovery_codes_hash
+		   from accounts
+		  where id = $1
+		  for update`, id)
+	if scanErr := row.Scan(&hashes); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return false, false, ErrNotFound
+		}
+		return false, false, mapErr(scanErr)
+	}
+	matchedIdx := -1
+	for i, h := range hashes {
+		if Sha256Equal(h, presented) {
+			matchedIdx = i
+			break
+		}
+	}
+	if matchedIdx < 0 {
+		// No match: no UPDATE needed, just commit the empty tx so the
+		// row lock releases promptly.
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return false, false, fmt.Errorf("state: mfa consume commit (no-match): %w", commitErr)
+		}
+		return false, false, nil
+	}
+	lastCode = len(hashes) == 1
+	// Defensive copy: rebuild without the matched element. len(hashes)
+	// is bounded at 10 (api.RecoveryCodeCount), so this is a 10-element
+	// allocation at most.
+	next := make([][]byte, 0, len(hashes)-1)
+	next = append(next, hashes[:matchedIdx]...)
+	next = append(next, hashes[matchedIdx+1:]...)
+	if _, execErr := tx.Exec(ctx,
+		`update accounts
+		    set mfa_recovery_codes_hash = $2
+		  where id = $1`, id, next); execErr != nil {
+		return false, false, mapErr(execErr)
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return false, false, fmt.Errorf("state: mfa consume commit: %w", commitErr)
+	}
+	return true, lastCode, nil
+}
+
+// MatchRecoveryCode tests a presented SHA-256 hash against the
+// stored set WITHOUT mutating. Used by /recover to refuse-the-burn
+// on the customer's last code (issue #186 review Finding #5).
+// The handler sequence is:
+//
+//  1. MatchRecoveryCode(presented) → (matched, lastCode, nil).
+//  2. If matched && lastCode → return 409 "use password instead"
+//     without touching the store.
+//  3. Otherwise ConsumeRecoveryCode(presented) to do the burn.
+//
+// Without step 1 we can't refuse the burn atomically: the prior
+// shape was consume-then-check, which would commit the delete
+// before the lastCode branch fired — the customer would land
+// with zero codes even though the wire said 409.
+//
+// The SELECT runs FOR SHARE so a concurrent /disable's
+// ConsumeRecoveryCode (which takes FOR UPDATE) blocks until we
+// commit, serialising the refuse vs the disable race correctly.
+// A short read tx is enough — we never write.
+func (s *PgStore) MatchRecoveryCode(ctx context.Context, id string, presented []byte) (bool, bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return false, false, fmt.Errorf("state: mfa match tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	var hashes [][]byte
+	row := tx.QueryRow(ctx,
+		`select mfa_recovery_codes_hash from accounts where id = $1 for share`, id)
+	if scanErr := row.Scan(&hashes); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return false, false, ErrNotFound
+		}
+		return false, false, mapErr(scanErr)
+	}
+	matchedIdx := -1
+	for i, h := range hashes {
+		if Sha256Equal(h, presented) {
+			matchedIdx = i
+			break
+		}
+	}
+	if matchedIdx < 0 {
+		return false, false, nil
+	}
+	return true, len(hashes) == 1, nil
+}
+
+// SetMFASecret writes the sealed secret + recovery-code hashes
+// WITHOUT stamping mfa_enrolled_at. Idempotent re-enrollment:
+// overwrites any prior state. The bytea[] round-trip goes through
+// pgx's native [][]byte codec (the same one used by 00016 for
+// app_secrets.acl_groups), so no pq.Array wrapper is needed.
+func (s *PgStore) ReadMFASecret(ctx context.Context, id string) ([]byte, error) {
+	var secret []byte
+	row := s.pool.QueryRow(ctx,
+		`select mfa_secret_encrypted
+		   from accounts where id = $1`, id)
+	if err := row.Scan(&secret); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapErr(err)
+	}
+	if secret == nil {
+		return nil, ErrNotFound
+	}
+	return secret, nil
+}
+
+func (s *PgStore) SetMFASecret(ctx context.Context, id string, encrypted []byte, recoveryHashes [][]byte) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_secret_encrypted = $2,
+		        mfa_recovery_codes_hash = $3
+		  where id = $1`,
+		id, encrypted, recoveryHashes)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkMFAEnrolled stamps mfa_enrolled_at = now() and clears
+// mfa_required = false. The two columns flip together so the
+// requireMFA middleware sees (MFARequired=false && MFAEnrolled=true)
+// the moment the row is visible — the audit Emit fires only after
+// this returns nil.
+func (s *PgStore) MarkMFAEnrolled(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_enrolled_at = now(),
+		        mfa_required = false
+		  where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearMFA nulls mfa_secret_encrypted, mfa_recovery_codes_hash, and
+// mfa_enrolled_at. mfa_required is intentionally untouched: the
+// chokepoints re-set it on the next trigger. The audit trail lives
+// in the events table (handlers_mfa.go emits the `account.mfa_disabled`
+// row before/after this call).
+func (s *PgStore) ClearMFA(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts
+		    set mfa_secret_encrypted = null,
+		        mfa_recovery_codes_hash = null,
+		        mfa_enrolled_at = null
+		  where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetMFARequired writes the mfa_required flag and reports whether
+// the row was actually changed. The chokepoint callers use `changed`
+// to suppress a duplicate audit Emit when a redelivered webhook (or
+// a second chokepoint firing in the same request) requests the same
+// value the row already carries. Returns ErrNotFound when the
+// account row is missing (UNKNOWN differs from a no-op — a missing
+// row is a 404, a no-op write is a 200 with no audit event).
+func (s *PgStore) SetMFARequired(ctx context.Context, id string, required bool) (changed bool, err error) {
+	tag, err := s.pool.Exec(ctx,
+		`update accounts set mfa_required = $2 where id = $1 and mfa_required <> $2`, id, required)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the row is missing OR the value was already what was
+		// requested. Distinguish with a follow-up existence check so
+		// the handler can 404 the missing case.
+		var exists bool
+		if err := s.pool.QueryRow(ctx,
+			`select exists(select 1 from accounts where id = $1)`, id).Scan(&exists); err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, ErrNotFound
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// CountDeployments returns the total deployment count for the
+// account across all apps. The 2nd-deploy chokepoint fires when
+// this returns >= 2 (the about-to-be-created deployment, AFTER
+// CreateDeployment lands, brings the account-wide total to 2 or
+// more — i.e. this is the customer's 2nd or later deploy). The
+// per-app invariant ("scale to one deploy per app at a time") is
+// enforced by CreateDeployment's same-row supersede; this counter
+// captures the cross-app volume the chokepoint cares about.
+//
+// Status 'failed' + 'superseded' are excluded: a failed build
+// counts as nothing, and a superseded deployment is one that was
+// already replaced. Soft-deleted apps are excluded (a.status <>
+// 'deleted') so the counter doesn't double-count rows whose owner
+// has triggered a GDPR hard-delete or app.Delete. The remaining
+// statuses ('pending','building','imaging','live') are the live
+// workload the chokepoint cares about. Index-backed via
+// apps_account_idx (account_id, status).
+func (s *PgStore) CountDeployments(ctx context.Context, id string) (int, error) {
+	var n int
+	row := s.pool.QueryRow(ctx,
+		`select count(*)::int
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where a.account_id = $1
+		    and a.status <> 'deleted'
+		    and d.status not in ('failed','superseded')`, id)
+	if err := row.Scan(&n); err != nil {
+		return 0, mapErr(err)
+	}
+	return n, nil
+}
+
+// Sha256Equal compares two byte slices in constant time (one shot
+// per compare, length check + crypto/subtle.ConstantTimeCompare).
+// The recovery-code store/compare path uses it to avoid leaking the
+// matched-index timing. Lives in pgstore.go so the tx-wrapped
+// ConsumeRecoveryCode has direct access without an import cycle;
+// memstore.go carries its own mirror (the function is also used by
+// the in-memory parity tests in pkg/state/memstore_test.go).
+func Sha256Equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// --- end MFA -----------------------------------------------------------------
+
 // AccountByProviderCustomerID resolves the account behind a Stripe webhook
 // payload. The unique index makes this O(log n); MemStore does it with a
 // map.
 func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
 		 from accounts where provider_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
@@ -226,7 +510,7 @@ func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerI
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
 		 from accounts order by created_at`)
 	if err != nil {
 		return nil, err
@@ -252,13 +536,18 @@ func scanAccounts(rows pgx.Rows) ([]Account, error) {
 
 // scanAccountCols is the shared column reader for the Account shape
 // used by every read path. deletion_requested_at, last_quota_warning_at,
-// and past_due_at are nullable; we scan into *time.Time and lift them
-// onto the Account when non-NULL.
+// past_due_at, mfa_enrolled_at, and mfa_secret_encrypted are nullable;
+// we scan into *time.Time / *[]byte and lift them onto the Account
+// when non-NULL. The four mfa_* fields are projected by every SELECT
+// (CreateAccount, AccountByID/Email/KeyHash/ProviderCustomerID, and
+// ListAllAccounts) so the chokepoints + requireMFA middleware always
+// see the post-enrollment state — Review Finding #1 fix.
 func scanAccountCols(scan func(...any) error) (Account, error) {
 	a := Account{}
 	var planStr, statusStr string
 	var deletionAt, lastWarnAt, pastDueAt *time.Time
-	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt); err != nil {
+	var mfaEnrolledAt *time.Time
+	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt, &mfaEnrolledAt, &a.MFASecretEncrypted, &a.MFARecoveryCodesHash, &a.MFARequired); err != nil {
 		return Account{}, err
 	}
 	a.Plan = api.Plan(planStr)
@@ -271,6 +560,9 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 	}
 	if pastDueAt != nil {
 		a.PastDueAt = pastDueAt
+	}
+	if mfaEnrolledAt != nil {
+		a.MFAEnrolledAt = mfaEnrolledAt
 	}
 	return a, nil
 }

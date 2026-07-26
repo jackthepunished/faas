@@ -238,8 +238,10 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Mint session cookie.
-	cookie, err := s.sessions.Issue(acct.ID)
+	// Mint session cookie. IAM-2: stamp mfa_pending=true if the
+	// account has the policy flag set but has not yet enrolled.
+	// Same flip as handlers_google.go; see the comment there.
+	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

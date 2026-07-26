@@ -118,10 +118,46 @@ type Account struct {
 	// suspended → deleted_pending transitions. NULL on accounts that
 	// have never been past_due.
 	PastDueAt *time.Time
+	// MFAEnrolledAt is stamped by /v1/account/mfa/confirm on the first
+	// successful TOTP verification. NULL = never enrolled. The gate
+	// the login handlers check is (MFARequired && MFAEnrolledAt == nil)
+	// — issued as an mfa_pending session cookie. See ADR-035 and the
+	// IAM-2 plan in issue #186.
+	MFAEnrolledAt *time.Time
+	// MFASecretEncrypted is the age-sealed base32 TOTP secret produced
+	// by pkg/auth/totp.GenerateSecret and sealed in pkg/secretbox
+	// (same host age key as app_secrets). The plaintext never enters
+	// logs or audit; the envelope is decrypted only inside the verify
+	// handler. NULL when MFAEnrolledAt is NULL. CHECK constraint
+	// accounts_mfa_enrolled_shape_chk enforces the (enrolled ⇒
+	// secret+recovery present) shape at the DB layer.
+	MFASecretEncrypted []byte
+	// MFARecoveryCodesHash is the array of SHA-256 hashes of the
+	// customer's 10 single-use recovery codes. Consumed (and removed)
+	// by /v1/account/mfa/recover via SELECT FOR UPDATE + UPDATE,
+	// because Postgres bytea[] has no array-diffing write. Stored as
+	// bytea[] so the consume path is a single-row serialised update.
+	MFARecoveryCodesHash [][]byte
+	// MFARequired is the policy flag set by the three chokepoints:
+	// plan upgrade, card attached, 2nd deploy. The customer clears it
+	// only by completing /enroll + /confirm (MarkMFAEnrolled flips it
+	// to false on the first successful confirm) or by /disable. API
+	// keys ignore this column per the IAM-2 design decision (keys are
+	// already cryptographically scoped).
+	MFARequired bool
 }
 
 // Active reports whether the account may deploy (not suspended/deleted).
 func (a Account) Active() bool { return a.Status == AccountActive || a.Status == AccountPastDue }
+
+// MFAEnrolled reports whether the customer has at least one
+// successful TOTP confirmation. Distinct from MFARequired: a
+// customer who has enrolled is no longer blocked even if a future
+// plan change again sets MFARequired=true. The LATCH is on
+// MFAEnrolled, not MFARequired — the chokepoints set required=true,
+// the customer clears it once via /confirm, and the chokepoints
+// re-arm on the next trigger.
+func (a Account) MFAEnrolled() bool { return a.MFAEnrolledAt != nil }
 
 // APIKey is a hashed, account-scoped credential. Scopes is the set of
 // authorization scopes attached to the key (e.g. "admin", "read", "write");

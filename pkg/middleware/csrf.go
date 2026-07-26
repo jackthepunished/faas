@@ -29,14 +29,28 @@
 // constant time. The token is a base64url-encoded nonce||ciphertext
 // blob; cookie and form are deliberately the same value so the form
 // field itself is useless without the cookie.
+//
+// Transport shape: legacy form-encoded requests carry the token in
+// the `csrf_token` form field; JSON-body requests (the apid API used
+// by the dashboard's JS client and the IAM-2 / issue #186 MFA
+// handlers /verify + /confirm + /recover + /disable) carry the same
+// field as a sibling JSON property. VerifyAuthenticated tries the
+// form first, then the JSON body — both branches resolve to the
+// same opaque token value, so the cookie-constant-time compare and
+// the action/subject/expired envelope checks are identical across
+// the two transports. The handler that decodes the request body
+// (the MFA handlers, `decodeJSON` below) still gets a usable
+// io.Reader because we restore the body after peeking.
 package middleware
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -129,16 +143,24 @@ func issue(manager *session.Manager, action, subject string, ttl time.Duration) 
 }
 
 // VerifyAuthenticated is the dashboard-side verifier. It reads the
-// faas_csrf cookie, the csrf_token form field, and the expected
-// accountID. Returns nil iff all of:
+// faas_csrf cookie, the csrf_token form field OR the
+// `csrf_token` JSON-body field, and the expected accountID.
+// Returns nil iff all of:
 //
 //   - the cookie is present, well-formed, unexpired;
 //   - the envelope's Action == action;
 //   - the envelope's Subject == accountID;
-//   - the form field's value is byte-equal to the cookie value.
+//   - the token field value (form or JSON) is byte-equal to the
+//     cookie value.
 //
 // Any other shape returns ErrCSRFInvalid (wrapped). Callers should
 // respond 400.
+//
+// Transport: form-encoded requests are read via r.ParseForm() +
+// r.PostForm.Get(). JSON requests are peeked byte-by-byte (and
+// the body is restored with io.NopCloser(bytes.NewReader(...)) so
+// the handler's downstream JSON decoder sees the original payload
+// intact).
 func VerifyAuthenticated(manager *session.Manager, r *http.Request, action, accountID string) error {
 	if manager == nil {
 		return fmt.Errorf("%w: nil session manager", ErrCSRFInvalid)
@@ -147,7 +169,7 @@ func VerifyAuthenticated(manager *session.Manager, r *http.Request, action, acco
 	if err != nil || c.Value == "" {
 		return fmt.Errorf("%w: missing %s cookie", ErrCSRFInvalid, CookieNameAuthenticated)
 	}
-	return verifyAgainstForm(manager, r, action, accountID, c.Value)
+	return verifyAgainstRequest(manager, r, action, accountID, c.Value)
 }
 
 // VerifyAnonymous is the /cli-auth equivalent: expected subject is the
@@ -160,23 +182,25 @@ func VerifyAnonymous(manager *session.Manager, r *http.Request, action, deviceCo
 	if err != nil || c.Value == "" {
 		return fmt.Errorf("%w: missing %s cookie", ErrCSRFInvalid, CookieNameAnonymous)
 	}
-	return verifyAgainstForm(manager, r, action, deviceCode, c.Value)
+	return verifyAgainstRequest(manager, r, action, deviceCode, c.Value)
 }
 
-func verifyAgainstForm(manager *session.Manager, r *http.Request, action, subject, cookieValue string) error {
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("%w: bad form", ErrCSRFInvalid)
+// verifyAgainstRequest is the shared body of VerifyAuthenticated +
+// VerifyAnonymous. The "form vs JSON" half of the transport splits
+// into extractRequestToken; the constant-time compare and envelope
+// checks are identical across both transports because the cookie +
+// the token value carry the same opaque seal.
+func verifyAgainstRequest(manager *session.Manager, r *http.Request, action, subject, cookieValue string) error {
+	tokenValue, err := extractRequestToken(r)
+	if err != nil {
+		return err
 	}
-	formValue := r.PostForm.Get(FormFieldName)
-	if formValue == "" {
-		return fmt.Errorf("%w: missing form field %s", ErrCSRFInvalid, FormFieldName)
-	}
-	// Cookie value must match the form value (constant time). Both
+	// Cookie value must match the token value (constant time). Both
 	// come from the same render call, so they should be byte-equal —
-	// but an attacker can flip individual bytes on the form side, and
-	// we want any divergence to fail closed.
-	if subtle.ConstantTimeCompare([]byte(cookieValue), []byte(formValue)) != 1 {
-		return fmt.Errorf("%w: cookie/form mismatch", ErrCSRFInvalid)
+	// but an attacker can flip individual bytes on the wire, and we
+	// want any divergence to fail closed.
+	if subtle.ConstantTimeCompare([]byte(cookieValue), []byte(tokenValue)) != 1 {
+		return fmt.Errorf("%w: cookie/request mismatch", ErrCSRFInvalid)
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(cookieValue)
 	if err != nil {
@@ -202,4 +226,74 @@ func verifyAgainstForm(manager *session.Manager, r *http.Request, action, subjec
 		return fmt.Errorf("%w: subject mismatch", ErrCSRFInvalid)
 	}
 	return nil
+}
+
+// extractRequestToken pulls the csrf_token value from the request
+// body — either the form field (legacy dashboard form encoding) or
+// the JSON-body `csrf_token` sibling (the JSON API used by the
+// dashboard's JS client + the IAM-2 / issue #186 MFA handlers).
+// Returns ErrCSRFInvalid-wrapped when neither path yields a token.
+//
+// Side effect on the JSON path: r.Body is replaced with a fresh
+// io.NopCloser wrapping the peeked bytes so the handler's
+// downstream JSON decoder still sees the original payload. The
+// peeked-bytes shape is mandatory: without it the MFA handlers'
+// decodeJSON calls would observe an empty body.
+func extractRequestToken(r *http.Request) (string, error) {
+	// Form path — only when the request advertises a form
+	// Content-Type. r.ParseForm is cheap and idempotent; failure
+	// here means a malformed form, which we treat as "no token
+	// found" so the JSON path can still try.
+	if isFormContentType(r.Header.Get("Content-Type")) {
+		if err := r.ParseForm(); err == nil {
+			if v := r.PostForm.Get(FormFieldName); v != "" {
+				return v, nil
+			}
+		}
+	}
+	// JSON path — only when Content-Type starts with
+	// application/json. We peek the body, decode a small
+	// `{csrf_token: ...}` shape (ignoring every other sibling field
+	// via a "known JSON object" decode), and restore the body via
+	// io.NopCloser(bytes.NewReader(...)) so the handler re-reads
+	// the original bytes intact.
+	if isJSONContentType(r.Header.Get("Content-Type")) {
+		if r.Body == nil {
+			return "", fmt.Errorf("%w: empty JSON body", ErrCSRFInvalid)
+		}
+		raw, readErr := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("%w: read JSON body: %w", ErrCSRFInvalid, readErr)
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		// Decoding into a permissive shape keeps the door open for
+		// future MFA-related fields without a constant-time scan.
+		var peek struct {
+			CsrfToken string `json:"csrf_token"`
+		}
+		if err := json.Unmarshal(raw, &peek); err == nil && peek.CsrfToken != "" {
+			return peek.CsrfToken, nil
+		}
+		// JSON decode failed or the field is absent — fall through
+		// to the ErrCSRFInvalid sentinel so the caller writes a
+		// 400, not a panic.
+	}
+	return "", fmt.Errorf("%w: missing %s field", ErrCSRFInvalid, FormFieldName)
+}
+
+func isFormContentType(ct string) bool {
+	// application/x-www-form-urlencoded OR multipart/form-data.
+	// We deliberately do NOT sniff charset: a missing charset is
+	// the common case for form posts and matches the dashboard
+	// <form> submissions.
+	return ct == "application/x-www-form-urlencoded" ||
+		(len(ct) >= 19 && ct[:19] == "multipart/form-data")
+}
+
+func isJSONContentType(ct string) bool {
+	// application/json with optional charset; matches what the JS
+	// dashboard client sets for /v1/account/mfa/*.
+	return ct == "application/json" ||
+		(len(ct) >= 16 && ct[:16] == "application/json;")
 }
