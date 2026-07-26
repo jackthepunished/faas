@@ -40,9 +40,9 @@ import (
 // because the dashboard renders the picker as a small JS island
 // and the wire shape is also what the OpenAPI doc exposes.
 type installBindRequest struct {
-	InstallationID    int64  `json:"installation_id"`
-	RepoFullName      string `json:"repo_full_name"`
-	ProductionBranch  string `json:"production_branch"`
+	InstallationID   int64  `json:"installation_id"`
+	RepoFullName     string `json:"repo_full_name"`
+	ProductionBranch string `json:"production_branch"`
 }
 
 // installBindResponse is the body the dashboard parses after a

@@ -69,6 +69,17 @@ var routeExclude = map[string]bool{
 	"GET /v1/auth/github/callback": true, // 302 to dashboard (browser-only)
 	"GET /auth/reset":              true, // HTML form render (browser-only)
 	"POST /logout":                 true, // dashboard form post (browser-only); SDK's Logout wraps the same handler as a convenience
+
+	// GitHub install bind picker (PR-B). Browser-only: the dashboard's
+	// bind flow drives these via the JS island in the app-detail page
+	// using the session cookie established by /v1/auth/github. The
+	// Bearer-auth SDK does not model session-cookie POSTs, and the
+	// body shape (installation_id + repo_full_name + production_branch)
+	// is GitHub-side state — programmatic consumers shouldn't bind
+	// apps via API. Mirrors the "browser-only dashboard routes"
+	// exclusion above.
+	"POST /v1/install/repos/list":       true, // bind picker hydrates from this; browser-only
+	"POST /v1/apps/{slug}/install/bind": true, // bind picker writes through this; browser-only
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire

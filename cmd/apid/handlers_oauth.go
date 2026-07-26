@@ -75,7 +75,7 @@ const oauthCallbackPath = "/oauth/callback"
 // Failure surfaces:
 //   - missing/invalid installation_id     → 400 problem
 //   - session envelope lacks github_login  → 302 to
-//                                            /dashboard/account?github=unauthenticated
+//     /dashboard/account?github=unauthenticated
 //   - install account.login != github_login → 403 forged
 //   - account suspended                   → 302 to /login (handled
 //     by sessionAuth; should
@@ -196,9 +196,9 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 				"actual_account_login", accountLogin)
 			acctID := acct.ID
 			s.audit.Emit(r.Context(), "auth.install.takeover_rejected", &acctID, map[string]any{
-				"install_id":            installationID,
-				"expected_login":        expectedLogin,
-				"actual_account_login":  accountLogin,
+				"install_id":           installationID,
+				"expected_login":       expectedLogin,
+				"actual_account_login": accountLogin,
 			})
 			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "forged",
 				"This installation belongs to a different GitHub user",

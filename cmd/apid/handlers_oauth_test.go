@@ -28,7 +28,7 @@ type fakeGithubdClient struct {
 	defaultBranch string
 	verifyErr     error
 
-	gotInstallID    int64
+	gotInstallID     int64
 	gotExpectedLogin string
 }
 
