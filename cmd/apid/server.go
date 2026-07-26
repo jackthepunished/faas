@@ -644,6 +644,16 @@ func (s *server) handler() http.Handler {
 	mux.Handle("GET /dashboard/", s.dashboardChain(s.sessionAuth(s.dashboardHandler(s.log))))
 	mux.Handle("GET /dashboard", s.dashboardChain(s.sessionAuth(s.dashboardHandler(s.log))))
 
+	// PR-B bind picker UX (handlers_install_github.go). Both routes
+	// are cookie-session-authenticated (NOT API-key auth — the
+	// dashboard renders them, no Bearer token is in scope) and
+	// share the §11 middleware stack via dashboardChain. They live
+	// under /v1/* so cmd/gatewayd/proxy.go:isApidPath already
+	// forwards them; the §11 anti-takeover proof (session.github_login
+	// == install.account.login) is enforced in the handlers.
+	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
+	mux.Handle("POST /v1/apps/{slug}/install/bind", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.bindAppToRepo))))
+
 	// G6 dashboard delete/restore (spec §17 G6, ADR-021). Both POSTs
 	// require the confirm_token form field (validated inside the
 	// handler) and sit behind sessionAuth so the call is anchored to

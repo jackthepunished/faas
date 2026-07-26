@@ -151,8 +151,12 @@ func (CheckPhase) EnumDescriptor() ([]byte, []int) {
 type VerifyInstallationRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	InstallationId int64                  `protobuf:"varint,1,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// expected_login is the GitHub login the caller asserts owns the
+	// install. Empty = no §11 ownership check (the pre-PR-B wire shape,
+	// preserved for back-compat with in-flight callers).
+	ExpectedLogin string `protobuf:"bytes,2,opt,name=expected_login,json=expectedLogin,proto3" json:"expected_login,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VerifyInstallationRequest) Reset() {
@@ -190,6 +194,13 @@ func (x *VerifyInstallationRequest) GetInstallationId() int64 {
 		return x.InstallationId
 	}
 	return 0
+}
+
+func (x *VerifyInstallationRequest) GetExpectedLogin() string {
+	if x != nil {
+		return x.ExpectedLogin
+	}
+	return ""
 }
 
 type VerifyInstallationResponse struct {
@@ -1169,9 +1180,10 @@ var File_onebox_faas_githubd_v1_githubd_proto protoreflect.FileDescriptor
 
 const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\n" +
-	"$onebox/faas/githubd/v1/githubd.proto\x12\x16onebox.faas.githubd.v1\"D\n" +
+	"$onebox/faas/githubd/v1/githubd.proto\x12\x16onebox.faas.githubd.v1\"k\n" +
 	"\x19VerifyInstallationRequest\x12'\n" +
-	"\x0finstallation_id\x18\x01 \x01(\x03R\x0einstallationId\"\x84\x01\n" +
+	"\x0finstallation_id\x18\x01 \x01(\x03R\x0einstallationId\x12%\n" +
+	"\x0eexpected_login\x18\x02 \x01(\tR\rexpectedLogin\"\x84\x01\n" +
 	"\x1aVerifyInstallationResponse\x12\x1a\n" +
 	"\bverified\x18\x01 \x01(\bR\bverified\x12%\n" +
 	"\x0edefault_branch\x18\x02 \x01(\tR\rdefaultBranch\x12#\n" +

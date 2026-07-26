@@ -139,7 +139,7 @@ func TestStubGithubdClient_EveryMethodReturnsNotReady(t *testing.T) {
 	assertGithubdNotReadyError(t, "CreateDeploymentFromPush", err)
 	err = s.WriteCheck(ctx, "r", "sha", CheckPhaseBuilding, "url", "summary")
 	assertGithubdNotReadyError(t, "WriteCheck", err)
-	_, _, err = s.VerifyInstallation(ctx, 123)
+	_, _, _, err = s.VerifyInstallation(ctx, 123, "")
 	assertGithubdNotReadyError(t, "VerifyInstallation", err)
 	if err := s.Close(); err != nil {
 		t.Errorf("Close: err = %v, want nil (stub is no-op)", err)

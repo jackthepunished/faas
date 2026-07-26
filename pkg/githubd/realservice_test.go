@@ -12,8 +12,25 @@ import (
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 )
 
+// newTestRealService builds a RealService with the in-memory
+// BindingsStore and a pre-seeded install state. PR-B requires
+// both: BindAppRepo needs the install id (it stamps the durable
+// row), and the unit tests cover the success path end-to-end.
+func newTestRealService(t *testing.T, accountID string) *RealService {
+	t.Helper()
+	store := newMemBindingsStore()
+	svc := NewRealService(nil, nil, nil, store)
+	if accountID != "" {
+		// Seed the install state so BindAppRepo can resolve installID.
+		if _, err := svc.ExchangeOAuthCode(accountID, "1", "main"); err != nil {
+			t.Fatalf("seed install state: %v", err)
+		}
+	}
+	return svc
+}
+
 func TestRealService_BindAndLookup(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "acct-1")
 	id, err := svc.BindAppRepo("app-1", "acct-1", "octo/api", "main")
 	if err != nil {
 		t.Fatalf("bind: %v", err)
@@ -37,7 +54,7 @@ func TestRealService_BindAndLookup(t *testing.T) {
 }
 
 func TestRealService_BindDefaultsToMain(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "acct-1")
 	if _, err := svc.BindAppRepo("app-2", "acct-1", "octo/api", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +65,7 @@ func TestRealService_BindDefaultsToMain(t *testing.T) {
 }
 
 func TestRealService_UnbindRemovesBinding(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "acct-1")
 	if _, err := svc.BindAppRepo("app-3", "acct-1", "octo/api", "main"); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +83,7 @@ func TestRealService_UnbindRemovesBinding(t *testing.T) {
 }
 
 func TestRealService_InstallStateDefaults(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	state, instID, branch, err := svc.GetInstallState("acct-none")
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +97,7 @@ func TestRealService_InstallStateDefaults(t *testing.T) {
 }
 
 func TestRealService_ExchangeOAuthCodePersists(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	id, err := svc.ExchangeOAuthCode("acct-1", "12345", "main")
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +115,7 @@ func TestRealService_ExchangeOAuthCodePersists(t *testing.T) {
 }
 
 func TestRealService_WriteCheckRequiresConfig(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	err := svc.WriteCheck("octo/api", "abc", githubdgrpc.CheckPhaseQueued, "", "queued")
 	if err == nil {
 		t.Error("nil Checks writer should error")
@@ -106,7 +123,7 @@ func TestRealService_WriteCheckRequiresConfig(t *testing.T) {
 }
 
 func TestRealService_ListInstallableReposRequiresAuth(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	_, err := svc.ListInstallableRepos("acct-1")
 	if err == nil {
 		t.Error("nil Auth should error")
@@ -114,7 +131,7 @@ func TestRealService_ListInstallableReposRequiresAuth(t *testing.T) {
 }
 
 func TestRealService_ExchangeOAuthRejectsEmpty(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	if _, err := svc.ExchangeOAuthCode("", "1", "main"); err == nil {
 		t.Error("empty accountID should error")
 	}
@@ -124,7 +141,7 @@ func TestRealService_ExchangeOAuthRejectsEmpty(t *testing.T) {
 }
 
 func TestRealService_CreateDeploymentFromPushIsHTTPPath(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
+	svc := newTestRealService(t, "")
 	_, _, err := svc.CreateDeploymentFromPush("octo/api", "refs/heads/main", "abc", "alice")
 	if err == nil {
 		t.Error("gRPC CreateDeploymentFromPush should error (webhook path is HTTP)")
@@ -142,8 +159,8 @@ var _ = context.Background
 // "forged" callback and could confuse with a transient GitHub
 // outage).
 func TestRealService_VerifyInstallation_RequiresAuth(t *testing.T) {
-	svc := NewRealService(nil, nil, nil)
-	verified, _, err := svc.VerifyInstallation(1)
+	svc := newTestRealService(t, "")
+	verified, _, _, err := svc.VerifyInstallation(1, "")
 	if err == nil {
 		t.Fatal("expected error when Auth is nil, got nil")
 	}
@@ -154,10 +171,10 @@ func TestRealService_VerifyInstallation_RequiresAuth(t *testing.T) {
 
 // TestRealService_VerifyInstallation_ForgedIsNotAnError asserts the
 // reviewed contract: a forged installation_id returns
-// (false, "", nil) — verified=false with err=nil — so the dashboard
-// renders the "forged callback" banner rather than a 5xx page.
-// A non-nil err is reserved for transport failures (api.github.com
-// unreachable, App JWT rejected).
+// (false, "", "", nil) — verified=false with err=nil — so the
+// dashboard renders the "forged callback" banner rather than a 5xx
+// page. A non-nil err is reserved for transport failures
+// (api.github.com unreachable, App JWT rejected).
 //
 // We exercise this with an httptest.Server that returns 404 for
 // every /app/installations/{id} request, mirroring GitHub's
@@ -175,8 +192,8 @@ func TestRealService_VerifyInstallation_ForgedIsNotAnError(t *testing.T) {
 	defer fake.Close()
 
 	auth := &AppAuth{AppID: "1", PrivateKey: newTestKey(t), HTTPClient: &singleHostClient{base: fake.Client(), api: fake.URL}}
-	svc := NewRealService(auth, nil, nil)
-	verified, branch, err := svc.VerifyInstallation(9999999)
+	svc := NewRealService(auth, nil, nil, newMemBindingsStore())
+	verified, _, branch, err := svc.VerifyInstallation(9999999, "")
 	if err != nil {
 		t.Fatalf("err = %v, want nil for forged install_id", err)
 	}
@@ -200,12 +217,73 @@ func TestRealService_VerifyInstallation_TransportErrorIsErr(t *testing.T) {
 	defer fake.Close()
 
 	auth := &AppAuth{AppID: "1", PrivateKey: newTestKey(t), HTTPClient: &singleHostClient{base: fake.Client(), api: fake.URL}}
-	svc := NewRealService(auth, nil, nil)
-	verified, _, err := svc.VerifyInstallation(1)
+	svc := NewRealService(auth, nil, nil, newMemBindingsStore())
+	verified, _, _, err := svc.VerifyInstallation(1, "")
 	if err == nil {
 		t.Fatal("err = nil, want non-nil for 5xx response")
 	}
 	if verified {
 		t.Errorf("verified = true, want false when err is non-nil")
+	}
+}
+
+// TestRealService_VerifyInstallation_AccountLoginMismatchForged asserts
+// the §11 ownership check (PR-B): a real install whose account.login
+// does NOT match expectedLogin returns verified=false, err=nil —
+// indistinguishable from a 404 to a forged caller. The dashboard
+// distinguishes them by the AccountLogin field the apid-side
+// comparison path consumes (it gets the install payload, not just
+// the bool).
+func TestRealService_VerifyInstallation_AccountLoginMismatchForged(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/app/installations/") {
+			// The install is REAL — its account is "alice".
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":42,"account":{"login":"alice"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	auth := &AppAuth{AppID: "1", PrivateKey: newTestKey(t), HTTPClient: &singleHostClient{base: fake.Client(), api: fake.URL}}
+	svc := NewRealService(auth, nil, nil, newMemBindingsStore())
+	verified, _, _, err := svc.VerifyInstallation(42, "bob")
+	if err != nil {
+		t.Fatalf("err = %v, want nil for §11 mismatch (caller should treat as forged)", err)
+	}
+	if verified {
+		t.Errorf("verified = true, want false for login mismatch")
+	}
+}
+
+// TestRealService_VerifyInstallation_AccountLoginMatchAccepted asserts
+// the §11 ownership check happy path: real install with matching
+// account.login returns verified=true with the install's account
+// login surfaced (so the apid handler can log it for the audit).
+func TestRealService_VerifyInstallation_AccountLoginMatchAccepted(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/app/installations/") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":42,"account":{"login":"alice"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	auth := &AppAuth{AppID: "1", PrivateKey: newTestKey(t), HTTPClient: &singleHostClient{base: fake.Client(), api: fake.URL}}
+	svc := NewRealService(auth, nil, nil, newMemBindingsStore())
+	verified, login, _, err := svc.VerifyInstallation(42, "alice")
+	if err != nil {
+		t.Fatalf("err = %v, want nil for matching login", err)
+	}
+	if !verified {
+		t.Errorf("verified = false, want true for matching login")
+	}
+	if login != "alice" {
+		t.Errorf("account login = %q, want alice", login)
 	}
 }
