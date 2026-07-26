@@ -443,8 +443,9 @@ func ParseSeccompLines(r io.Reader) (string, int32, error) {
 			// doesn't fit in int32 is either a kernel bug or a forged
 			// /proc — fail loud rather than silently truncate.
 			if n > math.MaxInt32 {
-				return "", 0, fmt.Errorf("Seccomp_filters value %d overflows int32", n)
+				return "", 0, fmt.Errorf("seccomp_filters value %d overflows int32", n)
 			}
+			//nolint:gosec // G109 — bounds-checked above against math.MaxInt32
 			filterLen = int32(n)
 			haveFilter = true
 		}
