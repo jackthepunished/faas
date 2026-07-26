@@ -22,11 +22,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
+	mailpkg "github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -49,14 +51,20 @@ func SetMFARecipient(f func() *age.X25519Recipient) { mfaRecipient = f }
 // consumeRecoveryCodeSelector abstracts the atomic consume
 // primitive Store.ConsumeRecoveryCode. PgStore does this with
 // SELECT FOR UPDATE + UPDATE inside a pgx transaction; MemStore
-// serialises via the existing mutex. The returned `lastCode` is
-// true iff the consumed code was the last remaining one — the
-// handler refuses to burn it and prompts for the password
-// instead, so the customer still has a way in. Tests inject a
-// stub to drive the success / miss / lastCode paths without
-// touching a real DB.
+// serialises via the existing mutex.
+//
+//   - `lastCode` is true iff the consumed code was the last
+//     remaining one — the handler refuses to burn it and prompts
+//     for the password instead, so the customer still has a way in.
+//   - `remaining` is the count of hashes still on the row AFTER the
+//     consume committed. The handler uses this to render the
+//     post-burn customer email with the right tone (one-of-many
+//     vs warning vs last-code) — see issue #329.
+//
+// Tests inject a stub to drive the success / miss / lastCode paths
+// without touching a real DB.
 type consumeRecoveryCodeSelector interface {
-	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, remaining int, err error)
 }
 
 // matchRecoveryCodeSelector abstracts the Store.MatchRecoveryCode
@@ -291,7 +299,13 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 	// safe (matched AND not lastCode). The ConsumeRecoveryCode
 	// race contract still holds — two concurrent /recover calls
 	// on the same account serialise via SELECT FOR UPDATE.
-	if _, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented); err != nil {
+	//
+	// `remaining` is the count of hashes still on the row AFTER
+	// the consume committed; we hand it to the mailer so the
+	// post-burn customer email lands in the right tone bucket
+	// (one-of-many vs warning vs last-code) — see issue #329.
+	_, _, remaining, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
+	if err != nil {
 		s.log.Error("mfa.recover.consume", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not consume recovery code"))
 		return
@@ -302,6 +316,18 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	s.audit.Emit(r.Context(), "account.mfa_recovered", &acct.ID, nil)
+	// Email the customer that a recovery code was used. Same shape
+	// as handlers_auth_login.go:256 — Mailer failure logs at
+	// ERROR but does not fail the burn (the customer just signed
+	// in; failing here would force them to re-auth).
+	subject, body := mailpkg.RecoveryCodeBurnedBody(acct.Email, remaining, time.Now().UTC())
+	if err := s.mailer.Send(r.Context(), Message{
+		To:       []string{acct.Email},
+		Subject:  subject,
+		TextBody: body,
+	}); err != nil {
+		s.log.Error("mfa.recover.mailer", "err", err.Error())
+	}
 	writeJSON(w, http.StatusOK, api.MFARecoverResponse{})
 }
 
@@ -401,7 +427,12 @@ func (s *server) disableByPassword(w http.ResponseWriter, r *http.Request, acct 
 // terminal state from /recover doesn't apply here.
 func (s *server) disableByRecoveryCode(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
 	presentedHash := auth.HashRecoveryCode(presented)
-	matched, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presentedHash)
+	// `remaining` is discarded on this path: the customer is about
+	// to ClearMFA anyway, so the count of codes left on the row is
+	// irrelevant. The /recover handler is the one that hands the
+	// remaining count to the mailer (see mfaRecover above) — issue
+	// #329's burn-email path doesn't apply to /disable.
+	matched, _, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presentedHash)
 	if err != nil || !matched {
 		s.audit.Emit(r.Context(), "account.mfa_disable_failed", &acct.ID, map[string]any{"reason": "code_mismatch"})
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
@@ -515,7 +546,7 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 // with SELECT … FOR UPDATE on accounts. Two concurrent /recover
 // requests on the same account cannot both observe and burn the same
 // hash.
-func consumeRecoveryCode(ctx context.Context, st consumeRecoveryCodeSelector, accountID string, presented []byte) (matched bool, lastCode bool, err error) {
+func consumeRecoveryCode(ctx context.Context, st consumeRecoveryCodeSelector, accountID string, presented []byte) (matched bool, lastCode bool, remaining int, err error) {
 	return st.ConsumeRecoveryCode(ctx, accountID, presented)
 }
 
