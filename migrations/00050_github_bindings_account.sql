@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00049_github_bindings_account.sql — PR-B (ADR-012 closure).
+-- 00050_github_bindings_account.sql — PR-B (ADR-012 closure).
 --
 -- Until now the (account ↔ app ↔ installation ↔ repo, branch) binding
 -- lived only in githubd's in-memory sync.Map (pkg/githubd/realservice.go).

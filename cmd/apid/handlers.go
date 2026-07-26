@@ -159,6 +159,12 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
+	// IAM-2 (issue #186): 2nd-deploy chokepoint. The deployment
+	// row is now visible; CountDeployments reflects this one
+	// (the SQL filter excludes failed/superseded). If the new
+	// count is >= 2, the customer crossed the threshold on
+	// this deploy — arm mfa_required for the next login.
+	s.maybeFlipMFAOnDeploy(ctx(r), acct)
 	// F-03: deployment_changed emits now carry status + deployment_id.
 	// status="pending" tells listeners this row is still in-flight (builderd
 	// will eventually stamp rootfs_path → imaged converts to ext4); later

@@ -39,12 +39,23 @@ type Manager struct {
 }
 
 // Envelope is the JSON payload sealed inside the cookie. Adding a
-// field here is a non-breaking change (older cookies decode fine);
-// removing or renaming is breaking (older cookies fail Verify).
+// field here is a non-breaking change (older cookies decode fine;
+// a missing field unmarshals to the zero value); removing or
+// renaming is breaking (older cookies fail Verify).
+//
+// MfaPending is the IAM-2 / issue #186 flag: when true, every
+// session-cookie route 403s CodeMFARequired except the dashboard
+// whoami + the /v1/account/mfa/* allowlist. The flag is false on
+// every cookie issued by /login paths that the customer has
+// already cleared MFA on; the /v1/account/mfa/verify handler
+// re-issues the cookie with MfaPending=false after a successful
+// TOTP check, so subsequent reads of the same cookie no longer
+// trip the gate.
 type Envelope struct {
-	AccountID string    `json:"account_id"`
-	IssuedAt  time.Time `json:"issued_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	AccountID  string    `json:"account_id"`
+	IssuedAt   time.Time `json:"issued_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	MfaPending bool      `json:"mfa_pending,omitempty"`
 	// GithubLogin is the GitHub login the session was last stamped
 	// with (PR-B §11 ownership proof). Empty when the session was
 	// issued before PR-B or the user never went through
@@ -126,13 +137,27 @@ func (m *Manager) SetClock(now func() time.Time) {
 
 // Issue seals a cookie envelope for accountID. The opaque cookie
 // value is base64(nonce || ciphertext); apid stores the same value
-// in Set-Cookie verbatim.
+// in Set-Cookie verbatim. Equivalent to IssueWithMFAFlag(accountID,
+// false) — use the explicit variant when the caller knows the
+// account is mfa_required && !MfaEnrolled.
 func (m *Manager) Issue(accountID string) (string, error) {
+	return m.IssueWithMFAFlag(accountID, false)
+}
+
+// IssueWithMFAFlag is the explicit-mfa-pending seam. Callers that
+// already know whether to set the flag use this; the legacy
+// Issue(accountID) is a thin wrapper that calls
+// IssueWithMFAFlag(accountID, false). The mfa_pending JSON tag is
+// `omitempty`, so a false value produces a cookie byte-for-byte
+// indistinguishable from a pre-IAM-2 cookie for every existing
+// browser. A true value is the only new bit on the wire.
+func (m *Manager) IssueWithMFAFlag(accountID string, mfaPending bool) (string, error) {
 	now := m.now()
 	env := Envelope{
-		AccountID: accountID,
-		IssuedAt:  now,
-		ExpiresAt: now.Add(m.maxAge),
+		AccountID:  accountID,
+		IssuedAt:   now,
+		ExpiresAt:  now.Add(m.maxAge),
+		MfaPending: mfaPending,
 	}
 	plaintext, err := json.Marshal(env)
 	if err != nil {
@@ -146,11 +171,23 @@ func (m *Manager) Issue(accountID string) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
+// IsMFAPending is the predicate requireMFA calls. It's a free
+// function (not a method) so the requireMFA middleware can read
+// the verified Envelope without reaching into the Manager.
+func IsMFAPending(env Envelope) bool { return env.MfaPending }
+
 // SealGithubLogin mints a new cookie carrying the same (accountID,
 // issued_at, expires_at) triple as a fresh Issue, but with the
 // GithubLogin field populated. Used by /v1/auth/github after a
 // successful login so the §11 ownership check on /oauth/callback
 // succeeds for the same user that just authenticated.
+//
+// mfaPending is the IAM-2 flag — IssueWithMFAFlag's argument, kept
+// here so the GitHub handler can seal a cookie that carries both
+// the §11 login AND the mfa_pending bit in a single crypto round
+// (no double-seal). The mfa_pending JSON tag is `omitempty`, so
+// false produces a cookie byte-for-byte indistinguishable from a
+// pre-IAM-2 envelope for every existing browser.
 //
 // We mint a NEW cookie rather than mutating the existing one
 // because the AEAD's nonce must be unique per seal; reuse would
@@ -158,7 +195,7 @@ func (m *Manager) Issue(accountID string) (string, error) {
 // means the dashboard has to clear the old one. apid's handler
 // does the Set-Cookie dance, so this method is the seal-only
 // primitive the handler calls.
-func (m *Manager) SealGithubLogin(accountID, githubLogin string) (string, error) {
+func (m *Manager) SealGithubLogin(accountID, githubLogin string, mfaPending bool) (string, error) {
 	if accountID == "" {
 		return "", fmt.Errorf("session: accountID required")
 	}
@@ -167,6 +204,7 @@ func (m *Manager) SealGithubLogin(accountID, githubLogin string) (string, error)
 		AccountID:   accountID,
 		IssuedAt:    now,
 		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
 		GithubLogin: githubLogin,
 	}
 	plaintext, err := json.Marshal(env)

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -189,5 +190,134 @@ func TestAnonymous_WrongDeviceCodeFails(t *testing.T) {
 	req := buildPost(t, CookieNameAnonymous, tok, FormFieldName+"="+tok)
 	if err := VerifyAnonymous(m, req, "cli-auth", "OTHERCODE"); err == nil {
 		t.Fatal("expected device-code mismatch to fail, got nil")
+	}
+}
+
+// buildJSONPost builds a POST carrying a JSON body with the same
+// csrf_token sibling the dashboard JS client + IAM-2 MFA handlers
+// (/verify + /confirm + /recover + /disable) use. Mirrors
+// buildPost above but with Content-Type: application/json. The
+// caller passes the raw JSON body — the test owns the wire shape
+// explicitly.
+func buildJSONPost(cookieName, cookieValue string, body string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/mfa/confirm",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if cookieValue != "" {
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: cookieValue})
+	}
+	return req
+}
+
+// TestVerify_JSONBody_Roundtrip pins the IAM-2 / issue #186 Finding
+// #7 contract: the CSRF token reaches the server inside a JSON
+// body's `csrf_token` sibling field (the form-legacy path stays
+// supported for dashboard POSTs). Verify must still reject mismatched
+// cookie vs JSON, expired tokens, and bad envelopes — same
+// checks, two transports.
+func TestVerify_JSONBody_Roundtrip(t *testing.T) {
+	m := newTestManager(t)
+	tok, err := IssueForAuthenticated(m, "mfa_confirm", "acct-123")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	body := `{"totp":"123456","csrf_token":"` + tok + `"}`
+	req := buildJSONPost(CookieNameAuthenticated, tok, body)
+	if err := VerifyAuthenticated(m, req, "mfa_confirm", "acct-123"); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	// Side effect: the body must remain readable for the
+	// handler's downstream JSON decoder. VerifyUnknownToken
+	// pins this contract.
+	req.Body.Close()
+}
+
+// TestVerify_JSONBody_BodyStillReadable pins the side effect of
+// peek-then-restore on r.Body. The MFA handlers call
+// decodeJSON after VerifyAuthenticated — without the NopCloser
+// restoration, decodeJSON would observe an empty body and 400 with
+// "EOF" instead of routing the message through the verify gate.
+func TestVerify_JSONBody_BodyStillReadable(t *testing.T) {
+	m := newTestManager(t)
+	tok, _ := IssueForAuthenticated(m, "mfa_confirm", "acct-123")
+	body := `{"totp":"123456","csrf_token":"` + tok + `"}`
+	req := buildJSONPost(CookieNameAuthenticated, tok, body)
+	if err := VerifyAuthenticated(m, req, "mfa_confirm", "acct-123"); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	// Decode after Verify: handlers do `json.NewDecoder(r.Body)
+	// .Decode(&req)` — same shape, here with `io.ReadAll` for
+	// brevity.
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Fatalf("body drifted: got %q, want %q", restored, body)
+	}
+}
+
+// TestVerify_JSONBody_MissingField fails closed when the JSON body
+// doesn't carry `csrf_token`. The dashboard always sets it; a
+// foreign-origin request that omits it should 400, not bypass.
+func TestVerify_JSONBody_MissingField(t *testing.T) {
+	m := newTestManager(t)
+	tok, _ := IssueForAuthenticated(m, "mfa_confirm", "acct-1")
+	body := `{"totp":"123456"}` // no csrf_token field
+	req := buildJSONPost(CookieNameAuthenticated, tok, body)
+	if err := VerifyAuthenticated(m, req, "mfa_confirm", "acct-1"); err == nil {
+		t.Fatal("expected missing csrf_token field to fail, got nil")
+	}
+}
+
+// TestVerify_JSONBody_CookieMismatch fails closed when the JSON-body
+// csrf_token disagrees with the cookie. Same constant-time compare
+// as the form path; only the extraction branch changes.
+func TestVerify_JSONBody_CookieMismatch(t *testing.T) {
+	m := newTestManager(t)
+	tok, _ := IssueForAuthenticated(m, "mfa_confirm", "acct-1")
+	cookieVal := tok
+	jsonVal := tok + "X"
+	body := `{"csrf_token":"` + jsonVal + `"}`
+	req := buildJSONPost(CookieNameAuthenticated, cookieVal, body)
+	if err := VerifyAuthenticated(m, req, "mfa_confirm", "acct-1"); err == nil {
+		t.Fatal("expected cookie/body mismatch to fail, got nil")
+	}
+}
+
+// TestExtractRequestToken_FormPreferred pins the order: when both
+// form AND JSON paths could yield a token (rare but possible if a
+// client sets both), the form value wins because legacy dashboard
+// posts put the field there. Helps keep the regression risk
+// low for the existing form-encoding users.
+func TestExtractRequestToken_FormPreferred(t *testing.T) {
+	m := newTestManager(t)
+	tok, _ := IssueForAuthenticated(m, "x", "acct-1")
+	body := FormFieldName + "=" + tok
+	req := buildPost(t, CookieNameAuthenticated, tok, body)
+	got, err := extractRequestToken(req)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got != tok {
+		t.Fatalf("got %q, want %q", got, tok)
+	}
+}
+
+// TestExtractRequestToken_BodyRestoreAfterRead pins the body-restoration
+// invariant at the helper boundary (not just VerifyAuthenticated):
+// any caller of extractRequestToken must see the body intact on return.
+// Regression here would surface as empty-body decodeJSON in callers.
+func TestExtractRequestToken_BodyRestoreAfterRead(t *testing.T) {
+	m := newTestManager(t)
+	tok, _ := IssueForAuthenticated(m, "x", "acct-1")
+	body := `{"csrf_token":"` + tok + `","x":1}`
+	req := buildJSONPost(CookieNameAuthenticated, tok, body)
+	if _, err := extractRequestToken(req); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	got, _ := io.ReadAll(req.Body)
+	if string(got) != body {
+		t.Fatalf("body drifted post-extract: got %q, want %q", got, body)
 	}
 }

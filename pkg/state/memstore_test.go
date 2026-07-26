@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 )
 
 // --- Account / Account.Active ------------------------------------------------
@@ -2123,3 +2124,368 @@ func TestMemStore_UpdateApp_AutoscaleSetBits(t *testing.T) {
 // ptrInt is a tiny helper to take the address of an int literal
 // (the UpdateAppParams fields are *int).
 func ptrInt(v int) *int { return &v }
+
+// --- MFA (IAM-2, issue #186) -------------------------------------------------
+//
+// The MemStore is the in-memory parity for PgStore; the same
+// behaviour tests here are the MemStore's claim that PgStore would
+// pass the equivalent pgtest run. The pgtest run is gated behind
+// `make migrations-check` and isn't part of the unit loop, so the
+// docs for these tests live in pkg/state/pgstore.go and the actual
+// pgx-level proof is the migration-level idempotence test in
+// migrations/00049_account_mfa_test.go.
+
+// TestConsumeRecoveryCode_HappyPath drives the canonical success
+// path: a freshly-enrolled account with 10 hashes; the consumer
+// presents a hash that matches one of them; that hash is removed,
+// the other nine remain, and the sealed TOTP secret is preserved
+// (so the customer can still /verify after the burn).
+func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-happy@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	plaintexts, hashes, err := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	if err != nil {
+		t.Fatalf("NewRecoveryCodes: %v", err)
+	}
+	sealed := []byte("sealed-blob-test")
+	if err := m.SetMFASecret(ctx, acct.ID, sealed, hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+
+	presented := auth.HashRecoveryCode(plaintexts[3])
+	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("ConsumeRecoveryCode: %v", err)
+	}
+	if !matched {
+		t.Fatalf("matched = false, want true")
+	}
+	if lastCode {
+		t.Errorf("lastCode = true, want false (10 codes started, 1 burned, 9 remain)")
+	}
+
+	after, err := m.AccountByID(ctx, acct.ID)
+	if err != nil {
+		t.Fatalf("AccountByID: %v", err)
+	}
+	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount-1 {
+		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1)
+	}
+	// Sealed secret must survive the burn (UpdateMFARecoveryCodes
+	// would have been the wrong call — it's preserved by the new
+	// primitive).
+	if string(after.MFASecretEncrypted) != string(sealed) {
+		t.Errorf("MFASecretEncrypted changed across consume: got %q, want %q", after.MFASecretEncrypted, sealed)
+	}
+	// Burned hash must not still appear in the slice.
+	for i, h := range after.MFARecoveryCodesHash {
+		if Sha256Equal(h, presented) {
+			t.Errorf("burned hash still present at index %d", i)
+		}
+	}
+}
+
+// TestConsumeRecoveryCode_NoMatch returns matched=false and leaves
+// the slice unchanged. A wrong code is the most common operational
+// case (typo in the customer's typing) and must not mutate state.
+func TestConsumeRecoveryCode_NoMatch(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-nomatch@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	_, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+
+	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, []byte("not-a-real-hash"))
+	if err != nil {
+		t.Fatalf("ConsumeRecoveryCode: %v", err)
+	}
+	if matched {
+		t.Errorf("matched = true, want false")
+	}
+	if lastCode {
+		t.Errorf("lastCode = true, want false on a no-match")
+	}
+	after, _ := m.AccountByID(ctx, acct.ID)
+	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount {
+		t.Errorf("hash slice size = %d, want %d (no-match must not mutate)", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount)
+	}
+}
+
+// TestConsumeRecoveryCode_LastCodeDetected burns codes until 1
+// remains, then asserts the next consume reports lastCode=true. The
+// /recover handler uses this signal to refuse the burn and prompt
+// the customer for the password fallback instead — burning the
+// last code would lock the customer out.
+func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-lastcode@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+
+	// Burn 9 of the 10 codes. Each consume reports
+	// lastCode=false (because more than one remains).
+	for i := 0; i < auth.RecoveryCodeCount-1; i++ {
+		presented := auth.HashRecoveryCode(plaintexts[i])
+		matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+		if err != nil {
+			t.Fatalf("burn %d: %v", i, err)
+		}
+		if !matched || lastCode {
+			t.Errorf("burn %d: matched=%v lastCode=%v, want true/false", i, matched, lastCode)
+		}
+	}
+
+	// The 10th burn is the last code. lastCode must be true.
+	presented := auth.HashRecoveryCode(plaintexts[auth.RecoveryCodeCount-1])
+	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("last burn: %v", err)
+	}
+	if !matched || !lastCode {
+		t.Errorf("last burn: matched=%v lastCode=%v, want true/true", matched, lastCode)
+	}
+
+	after, _ := m.AccountByID(ctx, acct.ID)
+	if len(after.MFARecoveryCodesHash) != 0 {
+		t.Errorf("remaining hashes = %d, want 0", len(after.MFARecoveryCodesHash))
+	}
+}
+
+// TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn fires two
+// concurrent goroutines presenting the SAME recovery code. The
+// atomic store contract is: exactly one matches and burns, the
+// other observes matched=false. MemStore holds m.mu over the whole
+// read+compare+write so this is automatic; PgStore relies on
+// SELECT … FOR UPDATE on accounts to enforce the same invariant.
+func TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-race@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+	presented := auth.HashRecoveryCode(plaintexts[5])
+
+	type result struct{ matched, lastCode bool }
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+			if err != nil {
+				t.Errorf("ConsumeRecoveryCode: %v", err)
+			}
+			results <- result{matched, lastCode}
+		}()
+	}
+
+	var matchCount int
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.matched {
+			matchCount++
+		}
+	}
+	if matchCount != 1 {
+		t.Errorf("matchCount = %d, want 1 (exactly one of two racing consumes must burn)", matchCount)
+	}
+	after, _ := m.AccountByID(ctx, acct.ID)
+	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount-1 {
+		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1)
+	}
+}
+
+// TestSha256Equal pins the constant-time compare used by the
+// recovery-code consume path. The short-circuit on len-mismatch is
+// NOT a timing leak (the stored hash length is a public 32 bytes),
+// so the early return is safe.
+func TestSha256Equal(t *testing.T) {
+	a := []byte("01234567890123456789012345678901")
+	if !Sha256Equal(a, a) {
+		t.Errorf("Sha256Equal(a, a) = false, want true")
+	}
+	if Sha256Equal(a, []byte("01234567890123456789012345678900")) {
+		t.Errorf("Sha256Equal accepted a 1-bit difference")
+	}
+	if Sha256Equal(a, a[:31]) {
+		t.Errorf("Sha256Equal accepted a length mismatch")
+	}
+	if !Sha256Equal(nil, nil) {
+		t.Errorf("Sha256Equal(nil, nil) = false, want true (both zero-length)")
+	}
+	if !Sha256Equal([]byte{}, []byte{}) {
+		t.Errorf("Sha256Equal(empty, empty) = false, want true")
+	}
+}
+
+// TestSetMFARequired_ChangedReportsRealWrites confirms the new
+// (changed bool, err error) return shape differentiates a real
+// write from a same-value no-op. The chokepoint callers
+// (flipMFARequiredIfUnenrolled) suppress the audit Emit on a no-op
+// so a redelivered webhook doesn't double-record.
+func TestSetMFARequired_ChangedReportsRealWrites(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-req@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	// First write: false → true. Must report changed=true.
+	changed, err := m.SetMFARequired(ctx, acct.ID, true)
+	if err != nil {
+		t.Fatalf("SetMFARequired(true): %v", err)
+	}
+	if !changed {
+		t.Errorf("first write changed = false, want true")
+	}
+
+	// Second write: true → true. Must report changed=false so the
+	// chokepoint suppresses the duplicate audit Emit.
+	changed, err = m.SetMFARequired(ctx, acct.ID, true)
+	if err != nil {
+		t.Fatalf("SetMFARequired(true) repeat: %v", err)
+	}
+	if changed {
+		t.Errorf("repeat write changed = true, want false")
+	}
+
+	// Third write: true → false. Must report changed=true.
+	changed, err = m.SetMFARequired(ctx, acct.ID, false)
+	if err != nil {
+		t.Fatalf("SetMFARequired(false): %v", err)
+	}
+	if !changed {
+		t.Errorf("flip-back write changed = false, want true")
+	}
+}
+
+// TestMatchRecoveryCode_NoMutation pins the read-only contract.
+// /recover's refuse-the-burn step relies on MatchRecoveryCode to
+// tell us whether the presented code matches AND whether it's
+// the last remaining one — both signals must be derivable
+// WITHOUT modifying the stored slice. Without this contract,
+// the refuse path would still see the burn committed by the
+// prior ConsumeRecoveryCode call shape (issue #186 review
+// Finding #5 — the consume-then-notice-lastCode shape that
+// left the customer with zero codes despite the 409 wire
+// response).
+func TestMatchRecoveryCode_NoMutation(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-match@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+	// Match the first code.
+	presented := auth.HashRecoveryCode(plaintexts[0])
+	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if !matched {
+		t.Errorf("matched = false, want true")
+	}
+	if lastCode {
+		t.Errorf("lastCode = true on N=10 store, want false")
+	}
+
+	// Crucially: the stored hashes are unchanged.
+	after, _ := m.AccountByID(ctx, acct.ID)
+	if got := len(after.MFARecoveryCodesHash); got != auth.RecoveryCodeCount {
+		t.Errorf("codes after Match = %d, want %d (Match must not mutate)", got, auth.RecoveryCodeCount)
+	}
+	// And a follow-up Consume on the SAME code still burns
+	// normally — confirms Match didn't pre-empt it.
+	matched2, _, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if !matched2 {
+		t.Errorf("Consume after Match: matched = false, want true")
+	}
+}
+
+// TestMatchRecoveryCode_LastCodeFlag pins the (matched=true,
+// lastCode=true) shape when the store has exactly one hash.
+// /recover's lastCode refusal branch depends on this — a
+// regression to lastCode=false would let the consume proceed
+// and orphan the customer.
+func TestMatchRecoveryCode_LastCodeFlag(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-matchlast@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	plaintexts, hashes, _ := auth.NewRecoveryCodes(1)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+
+	presented := auth.HashRecoveryCode(plaintexts[0])
+	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if !matched {
+		t.Errorf("matched = false, want true")
+	}
+	if !lastCode {
+		t.Errorf("lastCode = false on N=1 store, want true")
+	}
+
+	// Confirm the array remains untouched after the refuse path.
+	after, _ := m.AccountByID(ctx, acct.ID)
+	if got := len(after.MFARecoveryCodesHash); got != 1 {
+		t.Errorf("codes after Match = %d, want 1 (refuse must not burn)", got)
+	}
+}
+
+// TestMatchRecoveryCode_NoMatch returns matched=false without
+// ever reaching the lastCode branch.
+func TestMatchRecoveryCode_NoMatch(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "mfa-matchmiss@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	_, hashes, _ := auth.NewRecoveryCodes(3)
+	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
+		t.Fatalf("SetMFASecret: %v", err)
+	}
+	presented := auth.HashRecoveryCode("DEFINITELY-NOT-A-STORED-CODE")
+	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if matched {
+		t.Errorf("matched = true on bogus code, want false")
+	}
+	if lastCode {
+		t.Errorf("lastCode = true on miss, want false (lastCode only valid when matched)")
+	}
+}

@@ -100,7 +100,7 @@ func wrapWithGithubLogin(t *testing.T, h http.Handler, c *http.Cookie, login str
 	if err != nil {
 		t.Fatalf("verify existing cookie: %v", err)
 	}
-	cookie, err := mgr.SealGithubLogin(env.AccountID, login)
+	cookie, err := mgr.SealGithubLogin(env.AccountID, login, false)
 	if err != nil {
 		t.Fatalf("seal github login: %v", err)
 	}

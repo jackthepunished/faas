@@ -288,8 +288,50 @@ step "Running database migrations"
 su - faas -s /bin/bash -c "DATABASE_URL='postgres:///faas?host=/run/postgresql&user=faas' ${FAAS_BIN}/migrate"
 ok "Migrations applied"
 
+# ─── 11b. Host age key (IAM-2 / issue #186) ─────────────────────────────────
+# vmmd normally writes host.age on first boot with mode 0440 root:faas,
+# but vmmd is NOT deployed on DigitalOcean (no /dev/kvm) — bootstrap.sh
+# has to generate the key here so MFA handlers (/verify, /confirm,
+# /recover, /disable) have an identity to unseal TOTP secrets with.
+# `hostage-gen` is built by `make build` next to apid (cmd/hostage-gen)
+# and calls secretbox.GenerateAndSaveHostKey + WriteRecipientFile
+# internally so the on-disk shape is byte-identical to vmmd's first-
+# boot path. Per the IAM-2 review, the file is 0440 root:faas — owner
+# (root) + group (faas, apid's primary group) read; everyone else
+# locked out.
+#
+# Without this step the MFA handlers 503 CodeCapacity on every step-
+# up, locking mfa_pending customers out of every account-scoped route.
+HOST_AGE_PATH="${SECRETS_DIR}/host.age"
+HOST_AGE_PUB="${SECRETS_DIR}/host.age.pub"
+if [[ -x "${FAAS_BIN}/hostage-gen" ]]; then
+  if [[ ! -f "${HOST_AGE_PATH}" ]]; then
+    "${FAAS_BIN}/hostage-gen" "${HOST_AGE_PATH}" "${HOST_AGE_PUB}"
+    chown root:faas "${HOST_AGE_PATH}" "${HOST_AGE_PUB}"
+    chmod 0440 "${HOST_AGE_PATH}"
+    chmod 0444 "${HOST_AGE_PUB}"
+    ok "host.age written to ${HOST_AGE_PATH} (0440 root:faas)"
+    ok "host.age.pub written to ${HOST_AGE_PUB} (0444 root:faas)"
+  else
+    # Drift check: re-bootstrap must not silently rotate the key
+    # (a rotation invalidates every customer's MFA enrollment).
+    # We refuse; the operator runs `sudo rm /etc/faas/secrets/host.age`
+    # explicitly if they mean to.
+    HA_MODE=$(stat -c '%a' "${HOST_AGE_PATH}")
+    HA_OWNER=$(stat -c '%U:%G' "${HOST_AGE_PATH}")
+    if [[ "${HA_MODE}" != "440" || "${HA_OWNER}" != "root:faas" ]]; then
+      chown root:faas "${HOST_AGE_PATH}"
+      chmod 0440 "${HOST_AGE_PATH}"
+      ok "host.age perms repaired (was ${HA_MODE} ${HA_OWNER}, now 0440 root:faas)"
+    else
+      ok "host.age already present with correct perms (refusing to rotate)"
+    fi
+  fi
+else
+  warn "hostage-gen not found at ${FAAS_BIN}/hostage-gen — MFA won't function until you build it (`make build`)"
+fi
+
 # ─── 12. Generate deploy SSH key ─────────────────────────────────────────────
-step "Generating deploy SSH key"
 mkdir -p "$(dirname "${DEPLOY_KEY_PATH}")"
 # Defensive ownership on the directory regardless of which branch runs
 # (issue #85, PR 2 — review nit #6).

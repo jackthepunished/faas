@@ -330,7 +330,11 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 		`{"hash":"`+hex.EncodeToString(hash)+`"}`)
 
 	// Issue a session cookie so the browser is logged in too.
-	cookie, err := h.srv.sessions.Issue(acct.ID)
+	// IAM-2: stamp mfa_pending=true if the account is
+	// mfa_required && !mfa_enrolled. The /cli-auth page is on the
+	// dashboardAuthChain (not gated by s.auth), so the customer
+	// can re-render the post-claim page even while pending.
+	cookie, err := h.srv.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
 	if err != nil {
 		h.log.Error("cli_auth.issue_session", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)

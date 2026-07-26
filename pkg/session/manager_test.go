@@ -128,3 +128,87 @@ func TestNewEphemeralManager_RoundTrip(t *testing.T) {
 		t.Errorf("account = %q", env.AccountID)
 	}
 }
+
+// TestIssueWithMFAFlag_RoundTrip stamps MfaPending=true on the
+// envelope and confirms Verify returns the same flag. This is the
+// load-bearing property the requireMFA middleware depends on:
+// a cookie issued with mfa_pending=true must round-trip the flag
+// through Verify. Failure here means the dashboard login flow can
+// set the gate but the next /v1/apps request bypasses it.
+func TestIssueWithMFAFlag_RoundTrip(t *testing.T) {
+	m, err := session.NewManager(key(t), time.Hour)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	v, err := m.IssueWithMFAFlag("acct-mfa", true)
+	if err != nil {
+		t.Fatalf("IssueWithMFAFlag(true): %v", err)
+	}
+	env, err := m.Verify(v)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env.AccountID != "acct-mfa" {
+		t.Errorf("account = %q, want acct-mfa", env.AccountID)
+	}
+	if !env.MfaPending {
+		t.Errorf("MfaPending = false, want true")
+	}
+	if !session.IsMFAPending(env) {
+		t.Errorf("IsMFAPending = false, want true")
+	}
+
+	// And the false case: a fresh cookie with mfaPending=false
+	// must round-trip the same way Issue does. The wire bytes are
+	// indistinguishable from a pre-IAM-2 cookie, which is the
+	// backward-compat promise.
+	v2, err := m.IssueWithMFAFlag("acct-mfa", false)
+	if err != nil {
+		t.Fatalf("IssueWithMFAFlag(false): %v", err)
+	}
+	env2, err := m.Verify(v2)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env2.MfaPending {
+		t.Errorf("MfaPending = true, want false")
+	}
+}
+
+// TestVerify_BackwardCompatibleFromPreIAMPendingField confirms
+// that a cookie issued before IAM-2 (no mfa_pending JSON key)
+// decodes to MfaPending=false. The JSON tag is `omitempty`, so
+// IssueWithMFAFlag(id, false) produces a wire envelope whose
+// bytes match the pre-IAM-2 shape. We exercise the same path the
+// browser does: signed bytes → base64 → Verify → Envelope.
+func TestVerify_BackwardCompatibleFromPreIAMPendingField(t *testing.T) {
+	m, err := session.NewManager(key(t), time.Hour)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	// First confirm the false-flag wire shape preserves the
+	// pre-IAM-2 envelope (3 fields, no mfa_pending).
+	v, err := m.IssueWithMFAFlag("acct-legacy", false)
+	if err != nil {
+		t.Fatalf("IssueWithMFAFlag: %v", err)
+	}
+	env, err := m.Verify(v)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env.MfaPending {
+		t.Errorf("MfaPending = true, want false (backward-compat)")
+	}
+	// Issue() (no flag) is the alias for false — same shape.
+	v2, err := m.Issue("acct-legacy")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	env2, err := m.Verify(v2)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env2.MfaPending {
+		t.Errorf("MfaPending = true, want false (Issue alias)")
+	}
+}

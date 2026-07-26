@@ -131,7 +131,7 @@ func stampCookie(t *testing.T, mgr *session.Manager, raw, login string) string {
 	if err != nil {
 		t.Fatalf("verify existing cookie: %v", err)
 	}
-	out, err := mgr.SealGithubLogin(env.AccountID, login)
+	out, err := mgr.SealGithubLogin(env.AccountID, login, false)
 	if err != nil {
 		t.Fatalf("seal github login: %v", err)
 	}

@@ -32,6 +32,7 @@ const (
 	secretsFile   = "secrets.go"
 	manifestFile  = "appmanifest.go"
 	cliauthFile   = "cliauth.go"
+	mfaFile       = "mfa.go"
 	errorsFile    = "errors.go"
 )
 
@@ -461,6 +462,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", secretsFile),
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),
+		filepath.Join(root, "pkg", "api", mfaFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
 	}
 	dtos, err := scanDTOs(files)
