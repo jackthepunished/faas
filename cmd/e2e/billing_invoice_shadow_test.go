@@ -139,7 +139,22 @@ func seedShadowAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, t0
 	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	ins, err := store.CreateInstance(ctx, app.ID, dep.ID, string(state.StateRunning), 256, defaultLocalNodeID, "")
+	// The test instance is intentionally Parked, NOT Running. The
+	// meterd sampler (pkg/meter/sampler.go:84) iterates every
+	// instance and appends (ram_mb+8)*60 mb_seconds per live minute
+	// via state.CountsForRAM(); the per-hour pusher window therefore
+	// picks up sampler drift on top of the seed rows. When the test
+	// boots near the top of an hour, the very first sampler tick
+	// lands in the SAME window the seed already populated, pushing
+	// mb_seconds from 950_400 → 966_240 (264 * 60 = 15_840 drift
+	// per sampler minute) and breaking the integer-equality oracle.
+	// The pusher path is unaffected — it iterates accounts by Plan,
+	// not by instance state — so parking the instance leaves the
+	// "meter: push usage" line emitting exactly shadowPerHour every
+	// tick. This shape also matches spec invariant §6.2-4: "a
+	// parked app consumes zero resident RAM" — the test instance
+	// should never appear live to the sampler in the first place.
+	ins, err := store.CreateInstance(ctx, app.ID, dep.ID, string(state.StateParked), 256, defaultLocalNodeID, "")
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}

@@ -1,0 +1,33 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00047_crons_created_at.sql — retroactive fix for the silent
+-- dropped-column in 00002_app_manifest_and_domains.sql:36-43.
+--
+-- 00002 declared `create table if not exists crons (..., created_at
+-- timestamptz not null default now())`, but 00001_init.sql:112-118
+-- had already created `crons` without created_at, so the `if not
+-- exists` short-circuited Postgres and the column was never added.
+-- The live schema has been missing created_at on crons ever since;
+-- pgstore.go:3946-3964 worked around it by selecting only the 5
+-- present columns and leaving Cron.CreatedAt at the zero value.
+--
+-- This migration adds the column back. NOT NULL DEFAULT now() means
+-- every existing row is backfilled to the migration wall-clock time,
+-- which is inaccurate for cron rows inserted before this migration
+-- ran. No caller currently reads Cron.CreatedAt (the dispatch loop
+-- reads boundary off the next-fire timestamp, not created_at), so
+-- the wall-clock backfill is acceptable here. If a future caller
+-- needs an accurate created_at for legacy rows, a separate migration
+-- can backfill from a proxy (e.g. earliest events row for the cron,
+-- or first deployment timestamp for the app).
+--
+-- The ALTER is idempotent (`if not exists`) so re-running the
+-- migration on a partially-applied database is safe.
+ALTER TABLE crons ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+ALTER TABLE crons DROP COLUMN IF EXISTS created_at;
+-- +goose StatementEnd

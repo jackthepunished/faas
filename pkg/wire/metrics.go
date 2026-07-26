@@ -163,6 +163,13 @@ type OpsMetrics struct {
 	// series surface in /metrics from boot (same precedent as
 	// stripePushDur / buildDur).
 	scaleUpDecisions *prometheus.CounterVec
+	// scaleDownDecisions: per-app aggressive-reaper decisions
+	// (issue #171). Counter labelled by app_id and outcome ∈ {park,
+	// keep}; one observation per app per 10 s reaper tick that ran
+	// the aggressive path. Symmetric with scaleUpDecisions — same
+	// outcome-pre-instantiation, same app cardinality bound (apps
+	// with autoscale configured OR apps with min_instances set).
+	scaleDownDecisions *prometheus.CounterVec
 	// scaleUpAdmitRPS: per-instance RPS at the moment the trigger
 	// admitted a new instance. Sized to the per-instance RPS target
 	// range (1–1000); p95/p99 over this histogram is the spec §12
@@ -336,6 +343,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		// ceiling catches pathological cases.
 		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000},
 	})
+	// issue #171: aggressive-reaper scale-down decision counter.
+	// Symmetric with scaleUpDecisions — same (app, outcome) label
+	// shape, same outcome pre-instantiation. "park" fires once per
+	// app per 10s reaper tick when at least one instance is parked;
+	// "keep" fires when the aggressive path decided to hold the line.
+	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_scale_down_decisions_total",
+		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep}; app label is the apps.id.",
+	}, []string{"app", "outcome"})
 	sseClients := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_sse_clients",
 		Help: "Number of currently open /v1/events SSE connections (Move 3, M7.5 prep). The dashboard's per-page EventSource is one connection; the CLI's faas tail is another. Zero is the idle value.",
@@ -358,9 +374,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			Name: prefix + "_oci_egress_deny_total",
 			Help: "Per-CIDR user-space dialer denial counter (PR-E, spec §11 + §12). Same (cidr, family) label set as egress_deny_total, but counts dialer refusals (oci.EgressDialContext returned ErrImageEgressDenied) rather than kernel-layer nftables drops. The two metrics together let an operator see whether a tenant's blocked pull hit the firewall first (egress_deny_total) or the user-space check (oci_egress_deny_total) — different levers.",
 		}, []string{"cidr", "family"})
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny, ociEgressDeny)
 	} else {
-		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
+		reg.MustRegister(ops, dur, watchdogKills, eventsWriteFail, auditWriteFail, stripePushDur, paddlePushDur, buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback, imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs, instanceStatsCollectDur, instanceStatsPartialErrors, scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients, egressDeny)
 	}
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -444,6 +460,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal"} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
+	// issue #171: pre-instantiate the {park, keep} outcome rows for
+	// the empty-app label so the help/TYPE surfaces in /metrics from
+	// boot, mirroring the scale-up pattern above.
+	for _, outcome := range []string{"park", "keep"} {
+		scaleDownDecisions.WithLabelValues("", outcome)
+	}
 	return &OpsMetrics{
 		registry:                   reg,
 		ops:                        ops,
@@ -464,6 +486,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceStatsCollectDur:    instanceStatsCollectDur,
 		instanceStatsPartialErrors: instanceStatsPartialErrors,
 		scaleUpDecisions:           scaleUpDecisions,
+		scaleDownDecisions:         scaleDownDecisions,
 		scaleUpAdmitRPS:            scaleUpAdmitRPS,
 		sseClients:                 sseClients,
 		egressDeny:                 egressDeny,
@@ -830,6 +853,18 @@ func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
 		return
 	}
 	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
+}
+
+// ObserveScaleDown records one aggressive-reaper scale-down decision
+// (issue #171). One observation per app per 10 s reaper tick that ran
+// the new code path. outcome ∈ {park, keep}; "park" is emitted once
+// per app per tick even when multiple instances are parked. Safe on
+// a nil receiver so schedd unit tests without metrics keep working.
+func (m *OpsMetrics) ObserveScaleDown(app, outcome string) {
+	if m == nil {
+		return
+	}
+	m.scaleDownDecisions.WithLabelValues(app, outcome).Inc()
 }
 
 // ObserveScaleUpAdmitRPS records the per-instance RPS at the moment

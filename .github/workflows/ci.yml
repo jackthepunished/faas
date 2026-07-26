@@ -44,6 +44,16 @@ env:
   # (~3 min on a cold runner cache).
   VACUUM_VERSION: "0.29.10"
   VACUUM_SHA256_LINUX_AMD64: "84a596d5f88dd42f6f020376e5d2c2a29e6e51cc4b5614828f03dda122457a03"
+  # sqlc is the Postgres→Go query layer used by `make sqlc-check` (issue
+  # #125). Both the version and SHA-256 pin are mirrored from the v1.27.0
+  # GitHub release — never bump one without the other. The Makefile also
+  # has a `make sqlc` guard for local devs; CI uses the binary download
+  # because the `go install` path cross-compiles sqlc (with its cgo
+  # pganalyze/pg_query_go tree) from source on every cold runner (~30 s).
+  # Same supply-chain pin pattern as vacuum above and every binary in the
+  # EX44 ansible roles.
+  SQLC_VERSION: "1.27.0"
+  SQLC_SHA256_LINUX_AMD64: "f56954667ca54dce79a9246aa8b01b734f5deb6d2064f630f98cebe4fb4b8933"
 
 jobs:
   # Three parallel jobs (PR #167) so the long poles — unit tests (~4:20)
@@ -285,6 +295,38 @@ jobs:
         # correct install location for the local-dev `go install` path.
         run: make spec-check
 
+  # Go SDK build + test gate (issue #266, PR 2). The SDK is a nested
+  # Go module at sdk/go/ (module github.com/poyrazK/faas-go). The
+  # daemon's `make test` walks the daemon's package tree only; the
+  # SDK module needs its own gate so a regression in sdk/go/internal/api/*
+  # fails the PR. Decoupled from `test` for the same reasons as
+  # spec-check: short, parallel, no shared cache needed.
+  #
+  # Steps mirror the daemon's local recipe:
+  #   cd sdk/go && go build ./... && go test ./... && go vet ./...
+  # No postgres, no KVM, no test database — the SDK is hermetic.
+  sdk-go:
+    name: sdk-go build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No Go cache: the SDK module has zero external deps (no
+          # go.sum), so cache hit rate is zero anyway. Self-contained
+          # job, no shared downloads with `test` / `unit-tests`.
+      - name: go build
+        working-directory: sdk/go
+        run: go build ./...
+      - name: go vet
+        working-directory: sdk/go
+        run: go vet ./...
+      - name: go test
+        working-directory: sdk/go
+        run: go test -count=1 ./...
+
   coverage:
     services:
       postgres:
@@ -446,6 +488,53 @@ jobs:
       # here because their package has no build tag.
       - name: migrations apply-and-walk
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
+
+  sqlc-check:
+    # Drift gate between queries.sql + schema.sql and the committed
+    # pkg/state/sqlc/* baseline (issue #125). ADR-017 keeps PgStore
+    # hand-written until M5.1; this checks generated drift only, not
+    # semantic parity between pgstore.go and queries.sql.
+    name: sqlc-check (generated drift)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: install sqlc
+        # Belt + suspenders: refuse to run on a non-x86_64 runner instead
+        # of silently picking the wrong tarball. Matches the spec-check
+        # job's vacuum install step.
+        run: |
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::sqlc install assumes x86_64; runner is $(uname -m)"
+            exit 1
+          fi
+          SQLC_TARBALL="sqlc_${SQLC_VERSION}_linux_amd64.tar.gz"
+          SQLC_URL="https://github.com/sqlc-dev/sqlc/releases/download/v${SQLC_VERSION}/${SQLC_TARBALL}"
+          mkdir -p "$HOME/.local/sqlc/bin"
+          TAR="$RUNNER_TEMP/${SQLC_TARBALL}"
+          echo "→ downloading $SQLC_URL"
+          curl --fail --silent --show-error --location --output "$TAR" "$SQLC_URL"
+          echo "→ verifying SHA-256"
+          echo "${SQLC_SHA256_LINUX_AMD64}  $TAR" | sha256sum --check --strict
+          echo "→ extracting"
+          # The tarball is flat (just `sqlc`) — no version directory —
+          # so we extract into a temp scratch and copy the binary to the
+          # stable install path.
+          tar --extract --gzip --file "$TAR" --directory "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/sqlc" "$HOME/.local/sqlc/bin/sqlc"
+          chmod +x "$HOME/.local/sqlc/bin/sqlc"
+          echo "→ installed: $("$HOME/.local/sqlc/bin/sqlc" version)"
+          echo "$HOME/.local/sqlc/bin" >> "$GITHUB_PATH"
+      - name: sqlc-check
+        # The install sqlc step above appends $HOME/.local/sqlc/bin to
+        # $GITHUB_PATH, so `make sqlc` finds the binary via PATH lookup
+        # and short-circuits before the `go install` fallback.
+        run: make sqlc-check
 
   e2e:
     # cmd/e2e harness — boots real daemons (apid + schedd + meterd) as

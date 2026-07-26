@@ -198,21 +198,26 @@ SQLC     ?= $(GOBIN)/sqlc
 SQLC_VER ?= v1.27.0
 
 .PHONY: sqlc
-sqlc: ## Install sqlc at the pinned version
-	@command -v $(SQLC) >/dev/null 2>&1 && $(SQLC) version | grep -q $(SQLC_VER) && echo "sqlc $(SQLC_VER) already installed" && exit 0
-	GOFLAGS='' go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER)
+sqlc: ## Install sqlc at the pinned version (idempotent)
+	@if command -v $(SQLC) >/dev/null 2>&1; then \
+	  $(SQLC) version 2>&1 | grep -q $(SQLC_VER) && { echo "sqlc $(SQLC_VER) installed"; exit 0; }; \
+	fi; \
+	GOFLAGS='' GOBIN=$(or $(GOBIN),$(shell go env GOPATH)/bin) go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER)
 
 .PHONY: sqlc-generate
-sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.sql.go from queries.sql
+sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.go from queries.sql + schema.sql
 	$(SQLC) generate
 
 .PHONY: sqlc-check
-sqlc-check: ## Verify checked-in sqlc output matches what would be regenerated
-	@$(MAKE) sqlc > /tmp/faas-sqlc-check.out 2>&1 || (cat /tmp/faas-sqlc-check.out; exit 1)
-	@tmp=$$(mktemp -d) && cp -R pkg/state/queries.sql sqlc.yaml $$tmp/ && cd $$tmp && $(SQLC) generate >/dev/null 2>&1; \
-	  diff -r pkg/state/sqlc $$tmp/pkg/state/sqlc >/dev/null || \
-	    (echo "sqlc-check: generated sqlc/*.sql.go is out of sync with queries.sql; run 'make sqlc-generate' and commit the diff"; exit 1); \
-	  rm -rf $$tmp
+sqlc-check: sqlc ## CI gate: verify checked-in sqlc output matches what would be regenerated
+	@set -e; tmp=$$(mktemp -d); \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  mkdir -p "$$tmp/pkg/state"; \
+	  cp sqlc.yaml schema.sql "$$tmp/"; \
+	  cp pkg/state/queries.sql "$$tmp/pkg/state/"; \
+	  (cd "$$tmp" && $(SQLC) generate); \
+	  diff -r pkg/state/sqlc "$$tmp/pkg/state/sqlc" || \
+	    { echo "sqlc-check: generated pkg/state/sqlc/*.go is out of sync with queries.sql or schema.sql; run 'make sqlc-generate' and commit the diff"; exit 1; }
 	@echo "sqlc-check: OK"
 
 .PHONY: migrate-up
@@ -220,6 +225,25 @@ migrate-up: ## Apply all pending migrations against $DATABASE_URL (idempotent)
 	@command -v psql >/dev/null 2>&1 || (echo "psql not on PATH"; exit 1)
 	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set"; exit 1)
 	@go run ./cmd/migrate
+
+# schema.sql is the merged source-of-truth schema sqlc consumes. sqlc
+# v1.27.0 does not merge `create table if not exists` statements across
+# migration files, so pointing sqlc at migrations/ diverges from the live
+# schema wherever a migration adds columns to an existing table. Idempotent:
+# re-running produces byte-identical output (verified by the deterministic
+# `pg_dump -s` output against an unchanged schema).
+#
+# The Go binary at cmd/schema-dump owns the flow: open pool, apply
+# migrations via db.MigrateUp, shell to pg_dump -s, strip pg_dump version
+# noise with compiled regexes (cmd/schema-dump/main_test.go::TestStripNoise).
+# Putting it behind os/exec means failure modes (pg_dump missing, DSN
+# invalid, regex mismatch) surface with explicit Go errors instead of
+# opaque sed exit codes. DATABASE_URL must be set; pg_dump must be on
+# PATH.
+.PHONY: schema-dump
+schema-dump: ## Regenerate schema.sql from a live Postgres (source of truth for sqlc)
+	@command -v pg_dump >/dev/null 2>&1 || (echo "pg_dump not on PATH; install postgresql-client"; exit 1)
+	@$(GO) run ./cmd/schema-dump -o schema.sql
 
 # OpenAPI spec gate. The spec is the source of truth for documentation;
 # the code is the source of truth for behavior. The gate is the bridge —

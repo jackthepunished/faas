@@ -261,3 +261,237 @@ func TestSelectEvictionsIgnoresMinInstances(t *testing.T) {
 		t.Fatalf("RAM-pressure eviction must override the floor; got %v, want [warm]", got)
 	}
 }
+
+// ---------------------------------------------------------------------
+// ReapAggressive (issue #171): aggressive reaper scale-down based on
+// the recent-load signal. The pure function takes a precomputed
+// `desiredByApp` map and returns instance IDs to park.
+//
+// These tests are pure: a caller-supplied `now` and a hand-built
+// []InstanceInfo drive every branch — no clock, no DB.
+// ---------------------------------------------------------------------
+
+// mkAggressive is a test helper: build an InstanceInfo with the
+// fields ReapAggressive reads. Started is set to now-1h so the
+// MinInstanceAge filter does not incidentally protect a row that
+// the test means to be a reap candidate.
+func mkAggressive(app, id string, lastSeen time.Duration, open int64, minInst int) InstanceInfo {
+	now := time.Now()
+	return InstanceInfo{
+		Instance: id, AppID: app, Plan: api.PlanPro,
+		State:        state.StateRunning,
+		LastRequest:  now.Add(-lastSeen),
+		Started:      now.Add(-time.Hour),
+		OpenConns:    open,
+		MinInstances: minInst,
+	}
+}
+
+// TestReapAggressive_ParkToBuffer pins the headline acceptance
+// scenario: 4 instances, desired=0, floor=1. The +1 hysteresis
+// buffer keeps one warm, so 3 are parked; the freshest survives.
+// (The 5-instance headline is covered end-to-end by
+// TestLoopReaperAggressiveScalesDownOnDrop + the property test
+// TestProperty_EngineReaper_BurstToIdle30s; the pure unit test
+// sticks to 4 to keep the assertion small and explicit.)
+func TestReapAggressive_ParkToBuffer(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "oldest", time.Hour, 0, 1),
+		mkAggressive("app1", "older", 45*time.Minute, 0, 1),
+		mkAggressive("app1", "newer", 30*time.Minute, 0, 1),
+		mkAggressive("app1", "newest", 15*time.Minute, 0, 1),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	// limit = max(1, 0+1) = 1; extra = 4-1 = 3. Wait — 4 candidates, 3
+	// extra → park 3, keep the freshest.
+	if !equalSet(got, []string{"oldest", "older", "newer"}) {
+		t.Fatalf("5-inst / desired=0 / floor=1: got %v, want [oldest older newer]", got)
+	}
+}
+
+// TestReapAggressive_WithinBuffer: desired=2 means we want 2 warm.
+// With +1 buffer, limit=3. running=3, extra=0 → no park.
+func TestReapAggressive_WithinBuffer(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "a", time.Hour, 0, 0),
+		mkAggressive("app1", "b", 45*time.Minute, 0, 0),
+		mkAggressive("app1", "c", 30*time.Minute, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 2})
+	if len(got) != 0 {
+		t.Fatalf("3-inst / desired=2 / within buffer: got %v, want empty", got)
+	}
+}
+
+// TestReapAggressive_JustAboveBuffer: desired=1, running=3,
+// limit=max(0,1+1)=2, extra=1 → park 1 oldest.
+func TestReapAggressive_JustAboveBuffer(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "oldest", time.Hour, 0, 0),
+		mkAggressive("app1", "mid", 45*time.Minute, 0, 0),
+		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 1})
+	if len(got) != 1 || got[0] != "oldest" {
+		t.Fatalf("got %v, want [oldest]", got)
+	}
+}
+
+// TestReapAggressive_OpenConnsProtect: G7 still wins. An instance
+// with OpenConns > 0 counts toward running (it's live) but never
+// enters the candidate set. Layout: 3 running, of which 1 has
+// open flows. running=3, candidates=2, limit=max(0, 0+1)=1,
+// extra=3-1=2 → park 2 oldest (BOTH flow-less instances). The
+// open-conns one survives alone. The test pins that
+// "open-conns protects" — the survivor set MUST include the
+// flow-holding instance and the park set MUST NOT.
+func TestReapAggressive_OpenConnsProtect(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "oldest", time.Hour, 0, 0),
+		mkAggressive("app1", "open", 45*time.Minute, 3, 0),
+		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if !equalSet(got, []string{"oldest", "newest"}) {
+		t.Fatalf("got %v, want [oldest newest] (open-conns instance is the only survivor)", got)
+	}
+}
+
+// TestReapAggressive_MinInstanceAgeProtects: a freshly-woken
+// instance (Started = now-10s) must never be reaped by the
+// aggressive path, even if the buffer says to. This is the same
+// rule SelectEvictions enforces.
+func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
+	now := time.Now()
+	fresh := InstanceInfo{
+		Instance: "fresh", AppID: "app1", Plan: api.PlanPro,
+		State:        state.StateRunning,
+		LastRequest:  now.Add(-time.Hour),
+		Started:      now.Add(-10 * time.Second), // younger than MinInstanceAge (30s)
+		MinInstances: 0,
+	}
+	instances := []InstanceInfo{
+		fresh,
+		mkAggressive("app1", "old", time.Hour, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	// fresh: not in candidates (too young). old: in candidates.
+	// limit=max(0, 0+1)=1; extra=2-1=1; park 1 = "old".
+	if !equalSet(got, []string{"old"}) {
+		t.Fatalf("got %v, want [old] (young instance protected)", got)
+	}
+}
+
+// TestReapAggressive_SingleInstanceApp: running=1 cannot exceed
+// floor=0 + (desired+1) ≥ 1, so extra is always ≤ 0 → no park.
+func TestReapAggressive_SingleInstanceApp(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{mkAggressive("app1", "only", time.Hour, 0, 0)}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Fatalf("single instance must not be reaped, got %v", got)
+	}
+}
+
+// TestReapAggressive_NilDesired_DefersToReapIdle: apps absent
+// from desiredByApp are skipped entirely. Hobby/Free apps without
+// autoscale configured must not be touched by the aggressive path.
+func TestReapAggressive_NilDesired_DefersToReapIdle(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("hobby-app", "a", time.Hour, 0, 0),
+		mkAggressive("hobby-app", "b", 45*time.Minute, 0, 0),
+	}
+	// desiredByApp has no entry for hobby-app.
+	got := ReapAggressive(now, instances, nil)
+	if len(got) != 0 {
+		t.Fatalf("apps absent from desiredByApp must not be reaped, got %v", got)
+	}
+}
+
+// TestReapAggressive_ZeroTarget_ClampsToFloor: desired=0,
+// floor=2, running=5. limit=max(2, 0+1)=2, extra=3 → park 3
+// oldest.
+func TestReapAggressive_ZeroTarget_ClampsToFloor(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "oldest", time.Hour, 0, 2),
+		mkAggressive("app1", "older", 45*time.Minute, 0, 2),
+		mkAggressive("app1", "mid", 30*time.Minute, 0, 2),
+		mkAggressive("app1", "newer", 15*time.Minute, 0, 2),
+		mkAggressive("app1", "newest", 5*time.Minute, 0, 2),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if !equalSet(got, []string{"oldest", "older", "mid"}) {
+		t.Fatalf("got %v, want [oldest older mid] (floor 2 + 3 extra)", got)
+	}
+}
+
+// TestReapAggressive_TwoApps: pins the per-app grouping loop and
+// the per-app sort comparator. Two apps in the same snapshot, each
+// with surplus. The function must park from each independently —
+// no cross-app pollution from the candidate sort, and the output
+// must be a union of both apps' parks (no double-counting, no
+// missing row).
+func TestReapAggressive_TwoApps(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		// appA: 3 instances, desired=0, floor=1 → limit=1, extra=2.
+		mkAggressive("appA", "appA_oldest", 2*time.Hour, 0, 1),
+		mkAggressive("appA", "appA_older", 90*time.Minute, 0, 1),
+		mkAggressive("appA", "appA_newest", 60*time.Minute, 0, 1),
+		// appB: 4 instances, desired=1, floor=0 → limit=2, extra=2.
+		mkAggressive("appB", "appB_oldest", 3*time.Hour, 0, 0),
+		mkAggressive("appB", "appB_older", 2*time.Hour, 0, 0),
+		mkAggressive("appB", "appB_newer", 90*time.Minute, 0, 0),
+		mkAggressive("appB", "appB_newest", 60*time.Minute, 0, 0),
+	}
+	got := ReapAggressive(now, instances, map[string]int{
+		"appA": 0,
+		"appB": 1,
+	})
+	want := []string{"appA_oldest", "appA_older", "appB_oldest", "appB_older"}
+	if !equalSet(got, want) {
+		t.Fatalf("two apps: got %v, want %v", got, want)
+	}
+}
+
+// TestReapAggressive_FloorExceedsRunning: pins the "extra <= 0"
+// branch. desired=0, floor=10, running=3. limit=max(10, 0+1)=10,
+// extra=3-10=-7 → no park. The candidate sort is never invoked,
+// but the function must not panic on the negative extra.
+func TestReapAggressive_FloorExceedsRunning(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "a", time.Hour, 0, 10),
+		mkAggressive("app1", "b", 45*time.Minute, 0, 10),
+		mkAggressive("app1", "c", 30*time.Minute, 0, 10),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Fatalf("floor (10) > running (3): got %v, want empty", got)
+	}
+}
+
+// TestReapAggressive_EmptyCandidates: pins the "extra > len(candidates)"
+// clamp. All instances are protected (OpenConns > 0 OR fresh).
+// desired=0, floor=0, running=3, candidates=0. limit=max(0, 0+1)=1,
+// extra=3-1=2, but len(candidates)=0 → no park. The function must
+// NOT panic on the empty sort slice and must NOT return phantom IDs.
+func TestReapAggressive_EmptyCandidates(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "open", 45*time.Minute, 3, 0),
+		mkAggressive("app1", "fresh", time.Hour, 0, 0), // fresh is set by override below
+	}
+	// Override Started so the second instance is MinInstanceAge-young.
+	instances[1].Started = now.Add(-10 * time.Second)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Fatalf("all candidates protected: got %v, want empty", got)
+	}
+}
