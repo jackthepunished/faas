@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -83,13 +84,40 @@ func startProc(t *testing.T, bin string, env []string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(bin)
 	cmd.Env = env
-	var buf bytes.Buffer
+	// syncBuffer wraps bytes.Buffer with a mutex so concurrent
+	// writes from vmmd's PeriodicUpdates / UpdateEgressAllowlist
+	// goroutines don't trip `-race` when a later assertion reads
+	// the same buffer. procBuffer drains both streams into the
+	// same buffer at reap time.
+	var buf syncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("startProc(%s): %v", bin, err)
 	}
 	return cmd
+}
+
+// syncBuffer is a mutex-guarded io.Writer used for capturing
+// subprocess stdout/stderr in startProc. Mirrors pkg/e2etest's
+// SafeBuffer; kept local so this file doesn't need a new import
+// path. The export shape (just io.Writer + String()) is enough
+// for procBuffer's drain semantics.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 // waitTCP polls 127.0.0.1:addr until accept succeeds or deadline.
@@ -107,21 +135,27 @@ func waitTCP(t *testing.T, addr string, d time.Duration) {
 	t.Fatalf("waitTCP: %s not listening within %s", addr, d)
 }
 
-// TestMain builds a single apid binary into a package-level tmpdir
+// TestMain builds the apid + vmmd binaries into a package-level tmpdir
 // before any test runs, so the per-test helpers don't pay the `go
-// build` cost 5x. Each test still gets its own apid subprocess (each
-// needs its own /etc/faas/secrets/host.age.pub fixture and its own
-// FAAS_APID_LISTEN) — only the BINARY is shared, not the process.
+// build` cost per test. Each test still gets its own daemon subprocess
+// (each needs its own /etc/faas/secrets/* fixture and its own listen
+// addr) — only the BINARY is shared, not the process.
+//
+// vmmd is built alongside apid because the M8 §11 host-key subtest
+// (TestSec11_HostKey0400_Required::rejects_insecure_private_perms) needs
+// to boot vmmd with a deliberately chmod'd-loose host.age and assert
+// fail-fast on ErrHostKeyInsecurePerms — that fail-fast happens
+// *before* any KVM/listener binding, so the test is CI-safe (no
+// /dev/kvm needed, no root needed).
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "faas-sec11-bin-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sec11_test: mkdir tmp: %v\n", err)
 		os.Exit(2)
 	}
-	bin := filepath.Join(dir, "apid")
 
 	// The test binary's cwd is the package directory; resolve to the
-	// module root so `go build ./cmd/apid` finds the package.
+	// module root so `go build ./cmd/{apid,vmmd}` finds the packages.
 	wd, _ := os.Getwd()
 	root := wd
 	for i := 0; i < 8; i++ {
@@ -136,16 +170,24 @@ func TestMain(m *testing.M) {
 		root = parent
 	}
 
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/apid")
-	cmd.Dir = root
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "sec11_test: go build apid: %v\n%s", err, buf.String())
-		os.Exit(2)
+	build := func(pkg, out string) {
+		var buf bytes.Buffer
+		c := exec.Command("go", "build", "-o", out, "./"+pkg)
+		c.Dir = root
+		c.Stdout = &buf
+		c.Stderr = &buf
+		if err := c.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "sec11_test: go build %s: %v\n%s", pkg, err, buf.String())
+			os.Exit(2)
+		}
 	}
-	apidBinary = bin
+
+	apidBinary = filepath.Join(dir, "apid")
+	build("cmd/apid", apidBinary)
+
+	vmmdBinary = filepath.Join(dir, "vmmd")
+	build("cmd/vmmd", vmmdBinary)
+
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -153,6 +195,12 @@ func TestMain(m *testing.M) {
 
 // apidBinary is set once in TestMain; every test uses this path.
 var apidBinary string
+
+// vmmdBinary is set once in TestMain; the host-key private-perm
+// subtest uses this path. vmmd's fail-fast on insecure host.age
+// perm is reached before any KVM/listener/root need, so a CI runner
+// without /dev/kvm can still exercise the assertion.
+var vmmdBinary string
 
 // envForAPID returns the base env slice every apid subprocess needs,
 // WITHOUT FAAS_APID_LISTEN (startAPIDWithEnv / startAPIDAndExpectFail
@@ -238,10 +286,50 @@ func startAPIDAndExpectFail(t *testing.T, env []string, expectFailWithin time.Du
 // attached one, else empty string. Centralizing this avoids a
 // 5-line null-ok dance every call site had.
 func procBuffer(proc *exec.Cmd) string {
+	// startProc now uses *syncBuffer (mutex-guarded io.Writer; see
+	// the comment there about -race safety). The earlier *bytes.Buffer
+	// type assertion silently returned "" after the wrap — every
+	// "vmmd output did not mention ..." failure looked like an empty
+	// output, hiding the actual error message in the buffer. Mirror
+	// the shape: if it's a *syncBuffer, call its String() method;
+	// fall back to *bytes.Buffer for older test harnesses that
+	// haven't migrated yet (none today, but the assertion keeps
+	// the seam future-safe).
+	if buf, ok := proc.Stdout.(*syncBuffer); ok {
+		return buf.String()
+	}
 	if buf, ok := proc.Stdout.(*bytes.Buffer); ok {
 		return buf.String()
 	}
 	return ""
+}
+
+// startVMMDAndExpectFail boots vmmd (no listener wait — vmmd's
+// fail-fast on insecure host.age perm exits BEFORE the unix-socket
+// bind at line 244 of cmd/vmmd/main.go) and returns the captured
+// stdout/stderr + the exit error.
+//
+// The semantics mirror startAPIDAndExpectFail:
+//   - err != nil ⇒ vmmd exited non-zero (the success case for
+//     a "must fail-fast" test);
+//   - err == nil ⇒ vmmd did NOT exit within the deadline
+//     and had to be SIGKILLed — fail-fast is broken.
+//
+// Used by TestSec11_HostKey0400_Required::rejects_insecure_private_perms.
+func startVMMDAndExpectFail(t *testing.T, env []string, expectFailWithin time.Duration) (string, error) {
+	t.Helper()
+	proc := startProc(t, vmmdBinary, env)
+	doneCh := make(chan error, 1)
+	go func() { doneCh <- proc.Wait() }()
+	select {
+	case err := <-doneCh:
+		_ = proc.Wait()
+		return procBuffer(proc), err
+	case <-time.After(expectFailWithin):
+		_ = proc.Process.Kill()
+		<-doneCh
+		return procBuffer(proc), errors.New("vmmd did not exit within deadline — fail-fast missing")
+	}
 }
 
 // --- TestSec11_AuthLimitPerIP_CrossProcess ------------------------------
@@ -500,6 +588,14 @@ func TestSec11_UnixSocketOnlyDSN(t *testing.T) {
 func TestSec11_HostKey0400_Required(t *testing.T) {
 	pool := openSchemaPG(t)
 
+	// Note: t.Run("rejects_insecure_private_perms", ...) below boots
+	// vmmd (not apid) because vmmd is the *only* component on the box
+	// that reads the private host.age — apid has only the public half
+	// (host.age.pub, covered by accepts_allowed_perms /
+	// rejects_insecure_perms below). The private-side check is the
+	// §11 ship-blocker that closes the "an unprivileged user copied
+	// host.age and can now unseal every customer's env vars" gap.
+
 	t.Run("accepts_allowed_perms", func(t *testing.T) {
 		dir := t.TempDir()
 		pub := filepath.Join(dir, "host.age.pub")
@@ -569,6 +665,112 @@ func TestSec11_HostKey0400_Required(t *testing.T) {
 			!strings.Contains(out, "host.age.pub permissions") &&
 			!strings.Contains(out, secretbox.ErrRecipientInsecurePerms.Error()) {
 			t.Errorf("apid output did not mention insecure perms; output:\n%s", out)
+		}
+	})
+
+	// §11 private half (host.age, NOT .pub). The earlier subtests
+	// above cover apid's load of host.age.pub; this one covers
+	// vmmd's load of host.age itself. apid never sees the private
+	// half — that's the whole point of the split — so the
+	// fail-fast path is exclusively on the vmmd side.
+	//
+	// Operator-drift tripwire: a chmod'd-loose host.age (group- or
+	// world-readable) is the canonical "secret material has been
+	// exposed" signal; secretbox.LoadHostKey returns
+	// ErrHostKeyInsecurePerms, cmd/vmmd's loadOrGenerateHostIdentity
+	// wraps it with %w, and vmmd's run() exits non-zero at
+	// cmd/vmmd/main.go:175-177 BEFORE any KVM/listener/netns touch
+	// (so the test runs on CI without /dev/kvm + root).
+	//
+	// The LoadHostKey contract is "exact 0o400 ONLY" — anything else
+	// (group/other read, any write/exec/suid) is rejected. The
+	// subtests below table-drive every non-0o400 mode that has
+	// historically been the source of a perm-drift regression
+	// (0o440 / 0o444 are the silent ones — group/world readable
+	// without ever tripping a write-bit complaint from the file
+	// audit). Earlier revisions only exercised 0o644, which left
+	// the silent-drift modes uncovered.
+	t.Run("rejects_insecure_private_perms", func(t *testing.T) {
+		// Every mode below MUST trip ErrHostKeyInsecurePerms.
+		// 0o400 (the production mode) is asserted separately
+		// (vmmd should NOT fail-fast on it).
+		insecureModes := []os.FileMode{
+			0o440, // group-readable (silent-drift case #1)
+			0o444, // world-readable (silent-drift case #2)
+			0o460, // group-readable + group-list (operator ls accident)
+			0o604, // owner-writable, other-readable
+			0o640, // group-writable (operator multi-admin chmod)
+			0o644, // canonical 0o644 (owner + group + other readable)
+			0o660, // group-collaborative admin mistake
+			0o666, // world-writable (the "I just want it to work" mistake)
+			0o700, // owner-traversable — directory-style mistake
+			0o755, // owner + group + other traversable
+		}
+		for _, mode := range insecureModes {
+			mode := mode
+			t.Run(fmt.Sprintf("mode_%04o", mode), func(t *testing.T) {
+				dir := t.TempDir()
+				key := filepath.Join(dir, "host.age")
+				id, err := age.GenerateX25519Identity()
+				if err != nil {
+					t.Fatalf("GenerateX25519Identity: %v", err)
+				}
+				// writeWithPerm applies the exact requested mode bits
+				// (umask-stripping is the GH/macOS foot-gun — see writeWithPerm).
+				if err := writeWithPerm(t, key, []byte(id.String()), mode); err != nil {
+					t.Fatalf("write host.age: %v", err)
+				}
+				fi, lerr := os.Stat(key)
+				if lerr != nil {
+					t.Fatalf("stat host.age: %v", lerr)
+				}
+				// Sanity: the mode on disk MUST match what we asked for.
+				// If writeWithPerm silently stripped bits, the test
+				// fixture became the wrong mode and would pass-vacuous.
+				if fi.Mode().Perm() != mode {
+					t.Fatalf("test setup failed: host.age mode=%04o, want %04o — writeWithPerm did not preserve the bits",
+						fi.Mode().Perm(), mode)
+				}
+				// vmmd also needs the public recipient path even for the
+				// fail-fast path so it can stop at the host.age check; it
+				// IS allowed to write (LoadHostKey exits first), but we
+				// write it pre-emptively to keep the seed symmetric with
+				// production.
+				pub := filepath.Join(dir, "host.age.pub")
+				if err := writeWithPerm(t, pub, []byte(id.Recipient().String()), 0o444); err != nil {
+					t.Fatalf("write host.age.pub: %v", err)
+				}
+				// vmmd.toml must exist (env default points at
+				// /etc/faas/vmmd.toml which won't be writeable in CI).
+				cfgDir := t.TempDir()
+				cfgPath := filepath.Join(cfgDir, "vmmd.toml")
+				if err := os.WriteFile(cfgPath, []byte(`socket_path = "`+filepath.Join(cfgDir, "vmmd.sock")+`"
+owner_user = "root"
+kernel_path = "/dev/null"
+`), 0o600); err != nil {
+					t.Fatalf("write vmmd.toml: %v", err)
+				}
+				out, werr := startVMMDAndExpectFail(t, []string{
+					"PATH=" + os.Getenv("PATH"),
+					"HOME=" + os.Getenv("HOME"),
+					"FAAS_VMMD_CONFIG=" + cfgPath,
+					"FAAS_HOST_KEY_PATH=" + key,
+					"FAAS_HOST_AGE_RECIPIENT_PATH=" + pub,
+					"FAAS_STORAGE_BACKEND=local",
+				}, 10*time.Second)
+				if werr == nil {
+					t.Fatalf("vmmd should have exited non-zero with %04o host.age perms but exited cleanly:\n%s", mode, out)
+				}
+				// Acceptable substrings:
+				//   - the sentinel ErrHostKeyInsecurePerms.Error()
+				//   - the secretbox.LoadHostKey formatting ("host key ... mode ...")
+				//   - cmd/vmmd/main.go:346 wrap prefix ("vmmd: host key")
+				if !strings.Contains(out, secretbox.ErrHostKeyInsecurePerms.Error()) &&
+					!strings.Contains(out, "host key") &&
+					!strings.Contains(out, "ErrHostKeyInsecurePerms") {
+					t.Errorf("vmmd output did not mention insecure host.age perms; output:\n%s", out)
+				}
+			})
 		}
 	})
 }

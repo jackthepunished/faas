@@ -376,7 +376,11 @@ jobs:
           go test -race -count=1 -coverprofile=coverage/cover.out -covermode=atomic ./...
 
       - name: upload to Codecov
-        uses: codecov/codecov-action@v7
+        # Pinned to a commit SHA (action's v7 annotated tag is a99c28d3…)
+        # to close CodeQL alert #76 (actions/unpinned-tag). v7 = v7.0.0;
+        # bump via `gh api repos/codecov/codecov-action/git/refs/tags/vN`
+        # and updating the SHA — never `@v7` (mutable ref).
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
           files: coverage/cover.out
           flags: unittests

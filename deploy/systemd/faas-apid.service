@@ -39,9 +39,12 @@ LoadCredential=faas_session_key:/etc/faas/secrets/session.key
 Environment=FAAS_SESSION_KEY=%d/faas_session_key
 # Host age identity (IAM-2 / issue #186). apid reads the private
 # half of the host X25519 key to unseal TOTP secrets during
-# /verify + /confirm + /recover + /disable. The file is
-# /etc/faas/secrets/host.age, mode 0440 root:faas (per
-# pkg/secretbox/hostkey.go:97). Without this env var the MFA
+# /verify + /confirm + /recover + /disable. The on-disk file is
+# /etc/faas/secrets/host.age, mode 0400 root:root (spec §11, per
+# pkg/secretbox/hostkey.go:138 GenerateAndSaveHostKey); apid does
+# NOT open the on-disk file directly — systemd copies it into the
+# unit's credential dir (owned by faas-apid:faas) under the
+# %d/faas_host_age_identity path. Without this env var the MFA
 # handlers 503 CodeCapacity and every mfa_pending session locks
 # the customer out indefinitely.
 LoadCredential=faas_host_age_identity:/etc/faas/secrets/host.age

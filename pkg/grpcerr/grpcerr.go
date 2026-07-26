@@ -42,9 +42,18 @@ func codeToGRPC(code string) codes.Code {
 		api.CodeCapacity:
 		return codes.ResourceExhausted
 	case api.CodeBuildUndetected,
-		api.CodeValidation,
-		api.CodeNotFound:
+		api.CodeValidation:
 		return codes.InvalidArgument
+	case api.CodeNotFound:
+		// CodeNotFound → HTTP 404 on the REST surface (StatusForCode in
+		// pkg/api/errors.go); gRPC's equivalent is codes.NotFound, not
+		// InvalidArgument. The previous mapping collapsed the two and
+		// broke any client that tried to distinguish "wrong instance"
+		// from "operator missing required field" via the gRPC code
+		// (e.g. the SeccompStatus RPC's load-bearing test). Fix at the
+		// grpcerr seam so every gRPC handler that emits api.CodeNotFound
+		// picks up the correct wire code.
+		return codes.NotFound
 	case api.CodeBuildOOM,
 		api.CodeBuildTimeout:
 		return codes.ResourceExhausted

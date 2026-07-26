@@ -87,6 +87,15 @@ func (s *stubVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEg
 	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
 }
 
+// SeccompStatus (M8 §11) — the gateway hot path doesn't poll
+// seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go drives the
+// dial directly. Returns a "not implemented" envelope so the
+// gRPC VmmdClient interface stays satisfied; this path is never
+// expected to fire in handler tests.
+func (s *stubVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusRequest, ...grpc.CallOption) (*vmmdpb.SeccompStatusResponse, error) {
+	return &vmmdpb.SeccompStatusResponse{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

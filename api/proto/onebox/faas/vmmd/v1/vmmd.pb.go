@@ -1619,6 +1619,152 @@ func (*UpdateEgressAllowlistAck) Descriptor() ([]byte, []int) {
 	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{22}
 }
 
+// SeccompStatusRequest is the input to SeccompStatus. Instance is
+// the compute_node-relative instance id (instances.id). vmmd
+// resolves the running jailer child PID from its live map; an
+// unknown instance returns NotFound (not InvalidArgument — the
+// handler distinguishes "missing from the wire" from "missing on
+// the host" so the e2e can diagnose the wrong row vs the wrong
+// box).
+type SeccompStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Instance      string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SeccompStatusRequest) Reset() {
+	*x = SeccompStatusRequest{}
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SeccompStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SeccompStatusRequest) ProtoMessage() {}
+
+func (x *SeccompStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SeccompStatusRequest.ProtoReflect.Descriptor instead.
+func (*SeccompStatusRequest) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *SeccompStatusRequest) GetInstance() string {
+	if x != nil {
+		return x.Instance
+	}
+	return ""
+}
+
+// SeccompStatusResponse mirrors /proc/<pid>/status. Mode is the
+// human-readable equivalent of the kernel's Seccomp integer
+// ("disabled" for 0, "strict" for 1, "filter" for 2). FilterLen is
+// the Seccomp_filters count from the same procfs line — the
+// kernel-reported number of distinct BPF filter programs
+// attached to the process. For a freshly-installed jailer default
+// filter this is 1; 0 means "filter mode but no program" and is
+// the failure mode the e2e asserts against. Pid is the host PID
+// of the jailer child (the only firecracker parent), surfaced so
+// operators can `cat /proc/<pid>/status` themselves from the
+// dashboard. Error is non-empty only when the handler could not
+// read /proc — the wire is well-defined and the gRPC status is
+// also set, but the e2e prefers the message to a non-OK code
+// because the absence of a filter is the assertion target, not
+// the gRPC envelope.
+type SeccompStatusResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Instance string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
+	Pid      int32                  `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
+	// disabled | strict | filter
+	Mode      string `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`
+	FilterLen int32  `protobuf:"varint,4,opt,name=filter_len,json=filterLen,proto3" json:"filter_len,omitempty"`
+	// Empty on success. Non-empty on read failure (e.g. process
+	// already reaped) — distinguishes "no seccomp filter installed"
+	// (Mode="filter", FilterLen=0) from "can't tell" (Error set).
+	Error         string `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SeccompStatusResponse) Reset() {
+	*x = SeccompStatusResponse{}
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SeccompStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SeccompStatusResponse) ProtoMessage() {}
+
+func (x *SeccompStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SeccompStatusResponse.ProtoReflect.Descriptor instead.
+func (*SeccompStatusResponse) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *SeccompStatusResponse) GetInstance() string {
+	if x != nil {
+		return x.Instance
+	}
+	return ""
+}
+
+func (x *SeccompStatusResponse) GetPid() int32 {
+	if x != nil {
+		return x.Pid
+	}
+	return 0
+}
+
+func (x *SeccompStatusResponse) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
+func (x *SeccompStatusResponse) GetFilterLen() int32 {
+	if x != nil {
+		return x.FilterLen
+	}
+	return 0
+}
+
+func (x *SeccompStatusResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_onebox_faas_vmmd_v1_vmmd_proto protoreflect.FileDescriptor
 
 const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
@@ -1725,11 +1871,20 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x1cUpdateEgressAllowlistRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12)\n" +
 	"\x10egress_allowlist\x18\x02 \x03(\tR\x0fegressAllowlist\"\x1a\n" +
-	"\x18UpdateEgressAllowlistAck*2\n" +
+	"\x18UpdateEgressAllowlistAck\"2\n" +
+	"\x14SeccompStatusRequest\x12\x1a\n" +
+	"\binstance\x18\x01 \x01(\tR\binstance\"\x8e\x01\n" +
+	"\x15SeccompStatusResponse\x12\x1a\n" +
+	"\binstance\x18\x01 \x01(\tR\binstance\x12\x10\n" +
+	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x12\n" +
+	"\x04mode\x18\x03 \x01(\tR\x04mode\x12\x1d\n" +
+	"\n" +
+	"filter_len\x18\x04 \x01(\x05R\tfilterLen\x12\x14\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error*2\n" +
 	"\n" +
 	"WakeMethod\x12\x12\n" +
 	"\x0eWAKE_COLD_BOOT\x10\x00\x12\x10\n" +
-	"\fWAKE_RESTORE\x10\x012\xe5\x06\n" +
+	"\fWAKE_RESTORE\x10\x012\xcd\a\n" +
 	"\x04Vmmd\x12g\n" +
 	"\x12CreateFromSnapshot\x12..onebox.faas.vmmd.v1.CreateFromSnapshotRequest\x1a!.onebox.faas.vmmd.v1.WakeResponse\x12_\n" +
 	"\x0eCreateColdBoot\x12*.onebox.faas.vmmd.v1.CreateColdBootRequest\x1a!.onebox.faas.vmmd.v1.WakeResponse\x12g\n" +
@@ -1739,7 +1894,8 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x04Ping\x12 .onebox.faas.vmmd.v1.PingRequest\x1a!.onebox.faas.vmmd.v1.PingResponse\x12`\n" +
 	"\vForwardHTTP\x12'.onebox.faas.vmmd.v1.ForwardHTTPRequest\x1a(.onebox.faas.vmmd.v1.ForwardHTTPResponse\x12Z\n" +
 	"\tHeartbeat\x12%.onebox.faas.vmmd.v1.HeartbeatRequest\x1a&.onebox.faas.vmmd.v1.HeartbeatResponse\x12y\n" +
-	"\x15UpdateEgressAllowlist\x121.onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest\x1a-.onebox.faas.vmmd.v1.UpdateEgressAllowlistAckBBZ@github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1;vmmdpbb\x06proto3"
+	"\x15UpdateEgressAllowlist\x121.onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest\x1a-.onebox.faas.vmmd.v1.UpdateEgressAllowlistAck\x12f\n" +
+	"\rSeccompStatus\x12).onebox.faas.vmmd.v1.SeccompStatusRequest\x1a*.onebox.faas.vmmd.v1.SeccompStatusResponseBBZ@github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1;vmmdpbb\x06proto3"
 
 var (
 	file_onebox_faas_vmmd_v1_vmmd_proto_rawDescOnce sync.Once
@@ -1754,7 +1910,7 @@ func file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP() []byte {
 }
 
 var file_onebox_faas_vmmd_v1_vmmd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_onebox_faas_vmmd_v1_vmmd_proto_goTypes = []any{
 	(WakeMethod)(0),                      // 0: onebox.faas.vmmd.v1.WakeMethod
 	(*AppSpec)(nil),                      // 1: onebox.faas.vmmd.v1.AppSpec
@@ -1780,26 +1936,28 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_goTypes = []any{
 	(*HeartbeatResponse)(nil),            // 21: onebox.faas.vmmd.v1.HeartbeatResponse
 	(*UpdateEgressAllowlistRequest)(nil), // 22: onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
 	(*UpdateEgressAllowlistAck)(nil),     // 23: onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	(*structpb.Struct)(nil),              // 24: google.protobuf.Struct
-	(*wrapperspb.Int64Value)(nil),        // 25: google.protobuf.Int64Value
-	(*wrapperspb.DoubleValue)(nil),       // 26: google.protobuf.DoubleValue
-	(*timestamppb.Timestamp)(nil),        // 27: google.protobuf.Timestamp
+	(*SeccompStatusRequest)(nil),         // 24: onebox.faas.vmmd.v1.SeccompStatusRequest
+	(*SeccompStatusResponse)(nil),        // 25: onebox.faas.vmmd.v1.SeccompStatusResponse
+	(*structpb.Struct)(nil),              // 26: google.protobuf.Struct
+	(*wrapperspb.Int64Value)(nil),        // 27: google.protobuf.Int64Value
+	(*wrapperspb.DoubleValue)(nil),       // 28: google.protobuf.DoubleValue
+	(*timestamppb.Timestamp)(nil),        // 29: google.protobuf.Timestamp
 }
 var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	2,  // 0: onebox.faas.vmmd.v1.AppSpec.sealed_env:type_name -> onebox.faas.vmmd.v1.SealedSecret
 	0,  // 1: onebox.faas.vmmd.v1.WakeResponse.method:type_name -> onebox.faas.vmmd.v1.WakeMethod
 	0,  // 2: onebox.faas.vmmd.v1.WakeResponse.requested_method:type_name -> onebox.faas.vmmd.v1.WakeMethod
-	24, // 3: onebox.faas.vmmd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
+	26, // 3: onebox.faas.vmmd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
 	1,  // 4: onebox.faas.vmmd.v1.CreateFromSnapshotRequest.app:type_name -> onebox.faas.vmmd.v1.AppSpec
 	3,  // 5: onebox.faas.vmmd.v1.CreateFromSnapshotRequest.snapshot:type_name -> onebox.faas.vmmd.v1.SnapshotRef
 	1,  // 6: onebox.faas.vmmd.v1.CreateColdBootRequest.app:type_name -> onebox.faas.vmmd.v1.AppSpec
 	7,  // 7: onebox.faas.vmmd.v1.CreateColdBootRequest.build:type_name -> onebox.faas.vmmd.v1.BuildSpec
-	25, // 8: onebox.faas.vmmd.v1.StatsResponse.total_resident_bytes:type_name -> google.protobuf.Int64Value
+	27, // 8: onebox.faas.vmmd.v1.StatsResponse.total_resident_bytes:type_name -> google.protobuf.Int64Value
 	14, // 9: onebox.faas.vmmd.v1.StatsResponse.instances:type_name -> onebox.faas.vmmd.v1.InstanceStats
-	25, // 10: onebox.faas.vmmd.v1.InstanceStats.resident_bytes:type_name -> google.protobuf.Int64Value
-	26, // 11: onebox.faas.vmmd.v1.InstanceStats.cpu_pct:type_name -> google.protobuf.DoubleValue
-	27, // 12: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
-	27, // 13: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
+	27, // 10: onebox.faas.vmmd.v1.InstanceStats.resident_bytes:type_name -> google.protobuf.Int64Value
+	28, // 11: onebox.faas.vmmd.v1.InstanceStats.cpu_pct:type_name -> google.protobuf.DoubleValue
+	29, // 12: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
+	29, // 13: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
 	18, // 14: onebox.faas.vmmd.v1.ForwardHTTPRequest.headers:type_name -> onebox.faas.vmmd.v1.Header
 	18, // 15: onebox.faas.vmmd.v1.ForwardHTTPResponse.headers:type_name -> onebox.faas.vmmd.v1.Header
 	5,  // 16: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
@@ -1811,17 +1969,19 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	17, // 22: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:input_type -> onebox.faas.vmmd.v1.ForwardHTTPRequest
 	20, // 23: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
 	22, // 24: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
-	4,  // 25: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	4,  // 26: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	9,  // 27: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
-	11, // 28: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
-	13, // 29: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
-	16, // 30: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
-	19, // 31: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:output_type -> onebox.faas.vmmd.v1.ForwardHTTPResponse
-	21, // 32: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
-	23, // 33: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	25, // [25:34] is the sub-list for method output_type
-	16, // [16:25] is the sub-list for method input_type
+	24, // 25: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:input_type -> onebox.faas.vmmd.v1.SeccompStatusRequest
+	4,  // 26: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	4,  // 27: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	9,  // 28: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
+	11, // 29: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
+	13, // 30: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
+	16, // 31: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
+	19, // 32: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:output_type -> onebox.faas.vmmd.v1.ForwardHTTPResponse
+	21, // 33: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
+	23, // 34: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
+	25, // 35: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:output_type -> onebox.faas.vmmd.v1.SeccompStatusResponse
+	26, // [26:36] is the sub-list for method output_type
+	16, // [16:26] is the sub-list for method input_type
 	16, // [16:16] is the sub-list for extension type_name
 	16, // [16:16] is the sub-list for extension extendee
 	0,  // [0:16] is the sub-list for field type_name
@@ -1838,7 +1998,7 @@ func file_onebox_faas_vmmd_v1_vmmd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc), len(file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   23,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

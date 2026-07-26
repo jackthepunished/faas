@@ -178,6 +178,162 @@ func TestSec11_UnattendedUpgradesSecurityOnly(t *testing.T) {
 	}
 }
 
+// --- TestSec11_RebootWindowSunday0400UTC --------------------------------
+//
+// §11 "unattended-upgrades security-only with reboot window Sun 04:00
+// UTC". This pins the *reboot-window half* of the previous test.
+//
+// The package unattended-upgrades has no built-in day-of-week for
+// automatic reboots — only a time-of-day via
+// Unattended-Upgrade::Automatic-Reboot-Time. The Sunday-only
+// constraint is enforced in one of two ways:
+//
+//  1. A /etc/cron.weekly/apt-sunday wrapper (cron.weekly fires
+//     Sunday morning on Ubuntu) — the work-around documented by
+//     Major Hayden and used widely in production.
+//  2. A systemd timer with OnCalendar=Sun *-*-* 04:00:00 that
+//     replaces the apt-compat.cron.daily trigger.
+//
+// Both patterns are documented at ubuntu-maintain/various and either
+// is acceptable as long as the time and day pins land on disk.
+// The test accepts either.
+//
+// If unattended-upgrades is not installed on the host (Mac dev,
+// minimal containers, dev sandboxes) the test skips — we only pin
+// what the operator-installed config actually says.
+func TestSec11_RebootWindowSunday0400UTC(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux host check")
+	}
+	if ciRunnerSkip() {
+		t.Skip("host-baseline check (EX44-only; CI runner is generic ubuntu)")
+	}
+
+	// unattended-upgrades might not be installed on every box
+	// (container, CI runner). Skip rather than fail in that case —
+	// the §11 row is "reboot window Sun 04:00 UTC *given* the
+	// unattended-upgrades config", not "unattended-upgrades must
+	// be installed". The operator chose AUP because they wanted
+	// security-only patches; whether they want a reboot window at
+	// all is the same decision.
+	if _, err := os.Stat("/etc/apt/apt.conf.d/50unattended-upgrades"); err != nil {
+		t.Skipf("unattended-upgrades not installed: %v", err)
+	}
+
+	cfgBytes, err := os.ReadFile("/etc/apt/apt.conf.d/50unattended-upgrades")
+	if err != nil {
+		t.Fatalf("read 50unattended-upgrades: %v", err)
+	}
+	cfg := string(cfgBytes)
+
+	// 1. Automatic-Reboot must be enabled. The directive is
+	//    `Unattended-Upgrade::Automatic-Reboot "true";` — accepted
+	//    with optional whitespace. We match on the substring "true"
+	//    to permit double-quoted or unquoted (both are valid apt
+	//    config syntax).
+	if !strings.Contains(cfg, "Unattended-Upgrade::Automatic-Reboot") ||
+		!strings.Contains(cfg, "true") {
+		t.Errorf("50unattended-upgrades missing `Automatic-Reboot \"true\"` — reboot window contract not pinned:\n%s", cfg)
+	}
+
+	// 2. Time must be 04:00. Pin the bare quoted "04:00" substring;
+	//    the alternative `"04:00:00"` form is rejected so a test
+	//    passes vacuously only against the canonical directive.
+	if !strings.Contains(cfg, `"04:00"`) {
+		t.Errorf("50unattended-upgrades missing `Automatic-Reboot-Time \"04:00\"` — spec §11 requires 04:00 UTC:\n%s", cfg)
+	}
+
+	// 3. Day must be Sunday. unattended-upgrades has no built-in
+	//    day-of-week control — only the time. The Sunday half is
+	//    implemented by a wrapper around the apt-compat cron
+	//    entry. Acceptable shapes:
+	//
+	//      a. /etc/cron.weekly/apt-sunday — cron.weekly fires
+	//         Sunday morning on Ubuntu. This is the canonical
+	//         Major Hayden pattern.
+	//      b. A systemd timer at
+	//         /etc/systemd/system/apt-sunday.timer with
+	//         OnCalendar=Sun *-*-* 04:00:00.
+	//
+	//    Reject the default /etc/cron.daily/apt-compat silently
+	//    running because that gives you "any day at 04:00", which
+	//    is NOT what the spec says. (We can't tell on a CI box
+	//    whether the operator has manually deleted cron.daily
+	//    apt-compat, but the presence of one of the two acceptable
+	//    Sunday anchors above IS the assertion.)
+	cronWeekly := false
+	systemdTimer := false
+
+	// Pattern (a): /etc/cron.weekly/apt-sunday (or any cron.weekly
+	// file invoking unattended-upgrade). The file doesn't have to
+	// be called exactly apt-sunday — we match any cron.weekly file
+	// that references unattended-upgrade.
+	if matches, err := filepath.Glob("/etc/cron.weekly/*"); err == nil {
+		for _, f := range matches {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			if strings.Contains(string(b), "unattended-upgrade") {
+				cronWeekly = true
+				break
+			}
+		}
+	}
+
+	// Pattern (b): systemd timer with OnCalendar=Sun. The unit
+	// must exist AND reference "Sun" in its timer spec. We match
+	// any *.timer file in /etc/systemd/system and
+	// /lib/systemd/system for the same reason (operators pick
+	// the path).
+	if matches, err := filepath.Glob("/etc/systemd/system/*.timer"); err == nil {
+	timerLoop:
+		for _, f := range matches {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			if strings.Contains(string(b), "OnCalendar=Sun") ||
+				strings.Contains(string(b), "OnCalendar=") && strings.Contains(string(b), "Sun") {
+				systemdTimer = true
+				break timerLoop
+			}
+		}
+	}
+	// Some operators put the timer in /lib/systemd/system
+	// instead. Already covered by the package-provided file.
+	if !systemdTimer {
+		if matches, err := filepath.Glob("/lib/systemd/system/*.timer"); err == nil {
+			for _, f := range matches {
+				b, err := os.ReadFile(f)
+				if err != nil {
+					continue
+				}
+				if strings.Contains(string(b), "OnCalendar=Sun") {
+					systemdTimer = true
+					break
+				}
+			}
+		}
+	}
+
+	sundayOK := cronWeekly || systemdTimer
+	if cronWeekly && systemdTimer {
+		// Mutual-exclusion: a cron.weekly wrapper AND a systemd
+		// Sun timer both fire Sunday-morning — the box reboots
+		// twice a week (once from each trigger). Pick one OR the
+		// other. The §11 plan leans cron.weekly as the current
+		// shape (operator choice documented in docs/STATUS.md R3).
+		t.Errorf("both /etc/cron.weekly/* invoking unattended-upgrade AND a systemd *.timer with OnCalendar=Sun are configured — spec §11 requires one OR the other, not both (reboots twice a week)")
+	}
+
+	if !sundayOK {
+		t.Errorf("spec §11 requires the reboot window to be Sunday-only — the 50unattended-upgrades time-of-day directive doesn't pin a day. " +
+			"Need either /etc/cron.weekly/* invoking unattended-upgrade, or a systemd *.timer with OnCalendar=Sun. " +
+			"Neither was found on this host.")
+	}
+}
+
 // --- TestSec11_NftablesPolicyIsArtifactInSync ----------------------------
 //
 // §11 "nftables default-drop inbound" — pinned at the artifact layer.
@@ -197,7 +353,7 @@ func TestSec11_NftablesPolicyIsArtifactInSync(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux host check")
 	}
-	root := repoRootHost()
+	root := repoRoot()
 	if root == "" {
 		t.Skip("module root not reachable")
 	}
@@ -229,28 +385,6 @@ func TestSec11_NftablesPolicyIsArtifactInSync(t *testing.T) {
 }
 
 // --- helpers ------------------------------------------------------------
-
-// repoRootHost resolves the module root by walking up from cwd. Mirrors
-// the walk in pkg/e2etest/harness.go but lives here to avoid an
-// import cycle (e2etest's harness is heavyweight).
-func repoRootHost() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	dir := wd
-	for i := 0; i < 8; i++ {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
-	}
-	return ""
-}
 
 // commandLineHas reports whether /proc/cmdline contains needle.
 func commandLineHas(t *testing.T, needle string) bool {

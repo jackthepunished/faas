@@ -843,6 +843,27 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 	return exitCode, nil
 }
 
+// InstancePID returns the host PID of the running jailer child for
+// instance, or (0, false) if the instance is not currently alive on
+// this vmmd. M8 §11: the SeccompStatus gRPC handler reads
+// /proc/<pid>/status to verify the jailer default seccomp filter is
+// in place. The bool is the load-bearing distinction — Kill runs
+// delete on v.proc, so a torn-down instance returns (0, false) and
+// the handler maps that to NotFound. The 0-case for a "live but
+// somehow PId-less" cmd is treated as (0, false) too: even though
+// JailerVMM.Boot only registers a cmd after exec.Start succeeds, a
+// future refactor that elides the exec for any reason would surface
+// here as a missing filter — the defensive choice.
+func (v *JailerVMM) InstancePID(instance string) (int, bool) {
+	v.mu.Lock()
+	cmd, ok := v.proc[instance]
+	v.mu.Unlock()
+	if !ok || cmd == nil || cmd.Process == nil {
+		return 0, false
+	}
+	return cmd.Process.Pid, true
+}
+
 // exportBuildArtifacts loopback-mounts the chroot-local drive1 image and
 // copies /etc/faas/build-done.json and /build/out/* into exportDir. Files
 // larger than exportMaxBytes are skipped + counted as failures (best-effort
