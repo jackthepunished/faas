@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -26,6 +27,15 @@ func TestLoadHostKeyMissing(t *testing.T) {
 // Recipient() matches the original. Mode 0400 root:root (spec §11
 // literal). apid reads the identity through systemd LoadCredential,
 // not the on-disk file — see the package docstring in hostkey.go.
+//
+// The owner pin (uid == 0) is guarded by os.Geteuid() because vmmd
+// always runs as uid 0 at key-generation time, but `go test` on a
+// dev Mac runs as the developer's uid (never 0). Without the guard
+// the mode pin would be every-PR-provable but the owner pin would
+// be dev-only — the in-process tripwire that a regression can
+// regress without anyone noticing. Skipping cleanly on dev keeps
+// the on-host observability precise; the CI ubuntu-latest runner
+// is uid 0 and exercises the owner pin every PR.
 func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "host.age")
@@ -40,6 +50,18 @@ func TestGenerateAndSaveRoundTrip(t *testing.T) {
 	}
 	if perm := st.Mode().Perm(); perm != 0o400 {
 		t.Errorf("mode=%o want 0o400", perm)
+	}
+	// Owner pin: only assert when the test is running as root — the
+	// production path (vmmd) always writes as uid 0, but a dev
+	// Mac `go test` doesn't. Skipping is the right shape: it keeps
+	// the contract observable on CI (uid 0) without making the
+	// assertion vacuous on dev.
+	if os.Geteuid() == 0 {
+		if sys := st.Sys(); sys != nil {
+			if stat, ok := sys.(*syscall.Stat_t); ok && stat.Uid != 0 {
+				t.Errorf("owner uid=%d want 0 (root)", stat.Uid)
+			}
+		}
 	}
 	// Reload and compare recipient.
 	id2, err := LoadHostKey(path)
