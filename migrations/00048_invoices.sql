@@ -1,7 +1,13 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00047_invoices.sql — issue #259 (BILLING: plan comparison + invoice history).
+-- 00048_invoices.sql — issue #259 (BILLING: plan comparison + invoice history).
+--
+-- Slot note: slot 00047 was claimed on main by
+-- 00047_crons_created_at.sql (retroactive crons.created_at fix) before
+-- this PR was rebased. Renumbered to 00048 to keep the append-only
+-- migration sequence contiguous. See memory
+-- migration-slot-collisions-across-prs.md.
 --
 -- Persists billing-provider invoices so the new GET /v1/invoices surface
 -- and /dashboard/invoices page can list a customer's billing history

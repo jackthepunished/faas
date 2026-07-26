@@ -125,7 +125,7 @@ type MemStore struct {
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
 	// invoices is the in-memory mirror of the `invoices` table
-	// (migration 00047, issue #259). PR A reads via
+	// (migration 00048, issue #259). PR A reads via
 	// ListInvoicesForAccount; PR B adds the writer
 	// (UpsertInvoice via webhook ingestion). Seeded by tests for
 	// parity-with-pgstore checks.
