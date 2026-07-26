@@ -68,40 +68,88 @@ func main() {
 	outPath := flag.String("o", defaultOutput, "output path (default ./schema.sql)")
 	flag.Parse()
 
-	if err := run(*outPath); err != nil {
+	if err := run(*outPath, liveRunner{}); err != nil {
 		fmt.Fprintf(os.Stderr, "schema-dump: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(outPath string) error {
+// runner abstracts the I/O live `run` does against a real Postgres +
+// pg_dump. Tests inject a fakeRunner to assert error paths
+// (DATABASE_URL missing, pg_dump failure, db.Open failure) without
+// requiring live infra. Exposed at package scope for testability
+// (cmd/schema-dump/main_test.go).
+type runner interface {
+	// envLookup is os.Getenv in production; tests return a fixed
+	// value to assert the DATABASE_URL guard.
+	envLookup(key string) string
+	// pgDump shells out to pg_dump -s in production; tests return
+	// canned bytes (or an error) to assert the pg_dump error path
+	// and the stripNoise pass without a live Postgres.
+	pgDump(ctx context.Context, dsn string) ([]byte, error)
+	// openPool wraps db.Open + db.MigrateUp so tests can return a
+	// pre-built pool or a synthetic error. The returned closer's
+	// Close() is called by run on success AND on the pg_dump path
+	// (deferred); on error, openPool returns nil and Close() is not
+	// called.
+	openPool(ctx context.Context) (poolCloser, error)
+}
+
+// poolCloser is the subset of *pgxpool.Pool.Close() run needs. The
+// pgxpool.Pool type's Close() has no error return so an interface is
+// the cleanest way to wrap it for tests without exposing the full
+// pool surface.
+type poolCloser interface {
+	Close()
+}
+
+// liveRunner is the production wiring for `run`. Calls os.Getenv,
+// exec.CommandContext("pg_dump", ...), and db.Open/db.MigrateUp.
+type liveRunner struct{}
+
+func (liveRunner) envLookup(key string) string { return os.Getenv(key) }
+
+func (liveRunner) pgDump(ctx context.Context, dsn string) ([]byte, error) {
+	return exec.CommandContext(ctx, "pg_dump",
+		"-s", "--no-owner", "--no-privileges",
+		"--no-sync", "--no-tablespaces", dsn,
+	).Output()
+}
+
+func (liveRunner) openPool(ctx context.Context) (poolCloser, error) {
+	pool, err := db.Open(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
+}
+
+func run(outPath string, r runner) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// 1. Apply migrations so the live schema matches HEAD.
-	pool, err := db.Open(ctx, "")
+	pool, err := r.openPool(ctx)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer pool.Close()
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		return fmt.Errorf("migrate: %w", err)
-	}
 	log.Info("migrations applied")
 
 	// 2. Shell to pg_dump -s. We don't reimplement the schema-dump
 	// renderer in Go because the canonical format is pg_dump's, and
 	// every Postgres minor version can change it. Failure modes
 	// (pg_dump missing, DSN invalid) are owned by os/exec.
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := r.envLookup("DATABASE_URL")
 	if dsn == "" {
 		return fmt.Errorf("DATABASE_URL not set")
 	}
-	dump, err := exec.CommandContext(ctx, "pg_dump",
-		"-s", "--no-owner", "--no-privileges",
-		"--no-sync", "--no-tablespaces", dsn,
-	).Output()
+	dump, err := r.pgDump(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("pg_dump: %w", err)
 	}
