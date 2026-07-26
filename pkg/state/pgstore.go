@@ -3572,12 +3572,17 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 // UsageByHour returns per-app usage rolled up from the per-minute rows
 // in the [start, end) window. The Stripe pusher calls this hourly;
 // (start, end) is the [now-1h, now) hour window so the SQL is an
-// indexed range scan on usage_minutes.minute.
+// indexed range scan on usage_minutes.minute. cpu_usec is selected too
+// (issue #279 / PR-B) so the per-hour rollup exposes the additive CPU
+// accumulation; the Stripe pusher still pushes only mb_seconds-based
+// usage (billing stays on plan RAM) but the column is available for
+// future per-hour dashboards without re-rolling per-minute rows.
 func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error) {
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id,
 		        date_trunc('hour', minute) as hour,
 		        sum(mb_seconds)::bigint as mb_seconds,
+		        sum(cpu_usec)::bigint   as cpu_usec,
 		        sum(requests)::bigint as requests
 		 from usage_minutes
 		 where account_id = $1 and minute >= $2 and minute < $3
@@ -3592,7 +3597,7 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 	for rows.Next() {
 		u := Usage{}
 		var hour time.Time
-		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
 			return nil, err
 		}
 		u.Month = hour

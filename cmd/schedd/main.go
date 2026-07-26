@@ -293,11 +293,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("metrics listening", "addr", cfg.MetricsAddr)
 	}
 
-	serveErr := make(chan error, 1)
-	go func() {
-		log.Info("grpc listening", "addr", listenTarget, "service", scheddpb.Schedd_ServiceDesc.ServiceName)
-		serveErr <- gsrv.Serve(lis)
-	}()
+	// The gRPC server is registered further down (after the
+	// instancestats.Reader is constructed — issue #279 / PR-B). The
+	// actual Serve(lis) call must run AFTER Register has been
+	// invoked, otherwise grpc.NewServer fatals with
+	// "Server.RegisterService after Server.Serve". We therefore
+	// defer the Serve goroutine to just after the Register call
+	// further below. Tests that look for "grpc listening" still
+	// find the message — it's emitted from that goroutine.
 
 	log.Info("schedd ready",
 		"ram_ceiling_mb", api.RAMAdmissionCeilingMB,
@@ -374,6 +377,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// populated by the poller above (200 ms cadence); a meterd
 	// call before the first tick returns an empty list.
 	scheddgrpc.NewWithStats(engine, reader, ops, log).Register(gsrv)
+
+	// Serve goroutine — must run AFTER Register or grpc fatals.
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Info("grpc listening", "addr", listenTarget, "service", scheddpb.Schedd_ServiceDesc.ServiceName)
+		serveErr <- gsrv.Serve(lis)
+	}()
+
 	// Issue #169 / #172: per-app reactive scale-up trigger.
 	// Reads apps.autoscale_target_* + Ledger.Concurrency every
 	// cfg.ScaleUpInterval (default 1s); admits another instance
