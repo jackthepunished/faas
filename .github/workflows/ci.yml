@@ -381,7 +381,12 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: gen:check (regenerate + assert clean diff)
         working-directory: sdk/node
-        run: npm run gen:check
+        run: |
+          npm run gen:check || {
+            echo "::error::sdk/node/src/generated is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
+            exit 1
+          }
 
   sdk-smoke-node:
     name: sdk-smoke-node (Node SDK against fakeapid fixture)
@@ -406,6 +411,24 @@ jobs:
       - name: smoke test
         working-directory: sdk/node
         run: npm run test:smoke
+
+  sdk-unit-node:
+    name: sdk-unit-node (Node SDK unit tests, no fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: unit tests
+        working-directory: sdk/node
+        run: npm run test:unit
 
   coverage:
     services:

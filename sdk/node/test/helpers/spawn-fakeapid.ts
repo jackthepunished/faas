@@ -15,22 +15,18 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { freePort } from './free-port.js';
 
-const here = fileURLToPath(import.meta.url);
-// `import.meta.url` resolves to the .ts file at edit time and to
-// the .js file under dist-test/ at test-run time. Walk back enough
-// levels to land at the package root (sdk/node/), then to the
-// sibling fakeapid/ directory.
-//
-// source: <pkg>/test/helpers/spawn-fakeapid.ts   → ../.. = <pkg>/
-// build:  <pkg>/dist-test/test/helpers/spawn-fakeapid.js
-//                                              → ../../.. = <pkg>/
-const pathSegments = here.split('/');
-const pkgRootIdx = pathSegments.lastIndexOf('sdk') + 1;
-const pkgRoot = '/' + pathSegments.slice(0, pkgRootIdx + 1).join('/');
+// `import.meta.dirname` is stable on Node 22.10+ (the SDK's
+// minimum version). It resolves to the directory of the file
+// currently being executed, which is always the compiled `.js`
+// output at `<pkg>/dist-test/test/helpers/`. We walk up three
+// levels to reach the package root: `helpers/` → `test/` →
+// `dist-test/` → `<pkg>/`. Then walk up one more to the repo's
+// `sdk/` parent where the fakeapid fixture lives.
+const here = import.meta.dirname;
+const pkgRoot = resolve(here, '..', '..', '..');
 const defaultBin = resolve(pkgRoot, '..', 'fakeapid', 'bin', 'fakeapid');
 
 const isWindows = process.platform === 'win32';
