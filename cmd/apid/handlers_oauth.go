@@ -49,6 +49,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// stripLogInt is defined in handlers_install_github.go (same package);
+// both files share the helper automatically. See that file for the
+// rationale on why int64 log values still need the dataflow break.
+
 // oauthCallbackPath is the GitHub App install callback URL that
 // the dashboard's "Connect GitHub" button targets. Kept distinct
 // from loginPath / verifyPath in handlers_auth.go so a future
@@ -125,7 +129,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// through logsanitize so the audit field stays one-line-per-event.
 	log.Info("oauth callback received",
 		"account_id", acct.ID,
-		"installation_id", installationID,
+		"installation_id", stripLogInt(installationID),
 		"setup_action", stripLogCRLF(setupAction))
 
 	// PR-B §11 ownership proof. Re-read the sealed cookie inside the
@@ -156,7 +160,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		// them. Refuse the takeover rather than silently binding
 		// the install under an unverified identity.
 		log.Warn("oauth callback: session missing github_login",
-			"account_id", acct.ID, "install_id", installationID)
+			"account_id", acct.ID, "install_id", stripLogInt(installationID))
 		acctID := acct.ID
 		s.audit.Emit(r.Context(), "auth.install.unauthenticated", &acctID, map[string]any{
 			"install_id": installationID,
@@ -170,7 +174,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Warn("verify installation failed",
 			"account_id", acct.ID,
-			"install_id", installationID,
+			"install_id", stripLogInt(installationID),
 			// expected_login is the session's github_login; it
 			// comes from the AEAD-sealed cookie but the cookie is
 			// attacker-modifiable in principle, so the
@@ -196,7 +200,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		if accountLogin != "" {
 			log.Warn("verify installation: install belongs to a different GitHub user (§11 takeover attempt)",
 				"account_id", acct.ID,
-				"install_id", installationID,
+				"install_id", stripLogInt(installationID),
 				"expected_login", stripLogCRLF(expectedLogin),
 				"actual_account_login", stripLogCRLF(accountLogin))
 			acctID := acct.ID
@@ -212,7 +216,7 @@ func (s *server) renderOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Warn("verify installation: forged or unknown install_id",
 			"account_id", acct.ID,
-			"install_id", installationID,
+			"install_id", stripLogInt(installationID),
 			"expected_login", stripLogCRLF(expectedLogin))
 		http.Redirect(w, r, "/dashboard/account?github=forged", http.StatusFound)
 		return

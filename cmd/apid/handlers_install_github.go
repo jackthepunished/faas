@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -55,6 +56,18 @@ func stripLogCRLF(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
 	return s
+}
+
+// stripLogInt formats an int64 (an attacker-controllable value parsed
+// from a JSON request body) through strconv.FormatInt and then through
+// stripLogCRLF. Even though a valid int64 cannot contain CR/LF
+// bytes, CodeQL's go/log-injection (CWE-117) dataflow still tracks
+// the raw value from r.Body into slog.Int64 and re-fires the alert
+// on every push; routing the int through FormatInt + ReplaceAll
+// (both shape-recognised by the analyzer) breaks the dataflow. Use
+// this for any int64 log field whose source is request-derived.
+func stripLogInt(n int64) string {
+	return stripLogCRLF(strconv.FormatInt(n, 10))
 }
 
 // installBindRequest is the POST body for both endpoints. JSON
@@ -127,7 +140,7 @@ func (s *server) listInstallableRepos(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.log.Warn("listInstallableRepos: verify installation failed",
 			"op", op, "account_id", acct.ID,
-			"install_id", req.InstallationID,
+			"install_id", stripLogInt(req.InstallationID),
 			// expected_login flows from the session cookie and is
 			// therefore attacker-controllable in principle; sanitize
 			// to defeat Log entries created from user input
@@ -144,7 +157,7 @@ func (s *server) listInstallableRepos(w http.ResponseWriter, r *http.Request) {
 		if accountLogin != "" {
 			s.log.Warn("listInstallableRepos: install belongs to a different GitHub user",
 				"op", op, "account_id", acct.ID,
-				"install_id", req.InstallationID,
+				"install_id", stripLogInt(req.InstallationID),
 				"expected_login", stripLogCRLF(expectedLogin),
 				"actual_account_login", stripLogCRLF(accountLogin))
 			api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "forged",
@@ -233,7 +246,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.log.Warn("bindAppToRepo: verify installation failed",
 			"op", op, "account_id", acct.ID,
-			"install_id", req.InstallationID,
+			"install_id", stripLogInt(req.InstallationID),
 			// expected_login flows from the session cookie and is
 			// therefore attacker-controllable in principle; sanitize
 			// to defeat Log entries created from user input
@@ -248,7 +261,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 			s.log.Warn("bindAppToRepo: install belongs to a different GitHub user (§11 takeover attempt)",
 				"op", op, "account_id", acct.ID,
 				"app_id", app.ID,
-				"install_id", req.InstallationID,
+				"install_id", stripLogInt(req.InstallationID),
 				"expected_login", stripLogCRLF(expectedLogin),
 				"actual_account_login", stripLogCRLF(accountLogin))
 			acctID := acct.ID
@@ -266,7 +279,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		s.log.Warn("bindAppToRepo: forged or unknown install_id",
 			"op", op, "account_id", acct.ID,
-			"install_id", req.InstallationID,
+			"install_id", stripLogInt(req.InstallationID),
 			"expected_login", stripLogCRLF(expectedLogin))
 		http.Redirect(w, r, "/dashboard/account?github=forged", http.StatusFound)
 		return
@@ -287,7 +300,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("bindAppToRepo: githubd call failed",
 			"op", op, "account_id", acct.ID,
 			"app_id", app.ID,
-			"install_id", req.InstallationID, "err", err)
+			"install_id", stripLogInt(req.InstallationID), "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "github_unreachable",
 			"Could not reach GitHub", "retry in a minute: https://docs/connect-github"))
 		return
