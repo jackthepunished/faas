@@ -176,6 +176,7 @@ func (s *server) bindAppToRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := r.PathValue("slug")
+	//nolint:contextcheck // loadApp takes the request directly; existing pattern across 8+ handlers.
 	app, ok := s.loadApp(w, r, acct, slug)
 	if !ok {
 		return // loadApp already wrote the 404.

@@ -249,12 +249,11 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	// widening it would couple every auth method to one provider's
 	// extra field. SealGithubLogin rebuilds the envelope in the same
 	// crypto path as Issue; cookie shape is unchanged.
-	cookie, err := s.sessions.Issue(acct.ID)
+	cookie, err := s.sessions.SealGithubLogin(acct.ID, githubUser.Login)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return
 	}
-	cookie, err = s.sessions.SealGithubLogin(acct.ID, githubUser.Login)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "Session Error", err.Error()))
 		return

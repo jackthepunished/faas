@@ -174,20 +174,30 @@ func TestMigrations_00048_GithubBindingsAccount(t *testing.T) {
 	}
 
 	// (6) ON DELETE SET NULL — deleting the account clears
-	// github_install_account_id but leaves the app row.
+	// github_install_account_id but leaves the app row. The app's
+	// owner (apps.account_id) MUST be a different account from the
+	// one referenced via github_install_account_id — otherwise the
+	// apps_account_id_fkey RESTRICT blocks the delete before the
+	// SET NULL trigger on github_install_account_id can fire.
+	// Real-world shape: account A owns the app; account B (the
+	// deleted GitHub user) is the install owner; B's deletion
+	// nulls the install reference, not the app row.
+	const ownerAcct = "00000000-0000-0000-0000-000000000e48"
 	const delAcct = "00000000-0000-0000-0000-000000000d48"
-	if _, err := pool.Exec(ctx, `
-		insert into accounts (id, email, plan) values ($1::uuid, 'm048-del@example.com', 'hobby')
-		on conflict (id) do nothing
-	`, delAcct); err != nil {
-		t.Fatalf("seed del account: %v", err)
+	for _, a := range []string{ownerAcct, delAcct} {
+		if _, err := pool.Exec(ctx, `
+			insert into accounts (id, email, plan) values ($1::uuid, $2, 'hobby')
+			on conflict (id) do nothing
+		`, a, "m048-del-"+a[len(a)-3:]+"@example.com"); err != nil {
+			t.Fatalf("seed del account %s: %v", a, err)
+		}
 	}
 	var delAppID string
 	if err := pool.QueryRow(ctx, `
 		insert into apps (slug, account_id, ram_mb, github_install_account_id, github_install_binding_id)
-		values ('m048-del-1', $1::uuid, 128, $1::uuid, 'bind-del')
+		values ('m048-del-1', $1::uuid, 128, $2::uuid, 'bind-del')
 		returning id
-	`, delAcct).Scan(&delAppID); err != nil {
+	`, ownerAcct, delAcct).Scan(&delAppID); err != nil {
 		t.Fatalf("seed del app: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `delete from accounts where id = $1`, delAcct); err != nil {

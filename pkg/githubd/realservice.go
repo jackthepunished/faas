@@ -14,6 +14,7 @@ package githubd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -232,7 +233,7 @@ func (s *RealService) UnbindAppRepo(appID, accountID string) error {
 	}
 	if err := s.Store.Delete(context.Background(), appID); err != nil {
 		// ErrAppNotFound is fine (idempotent); bubble other errors.
-		if err != ErrAppNotFound {
+		if !errors.Is(err, ErrAppNotFound) {
 			return fmt.Errorf("githubd: delete binding: %w", err)
 		}
 	}
@@ -264,7 +265,7 @@ func (s *RealService) GetAppBinding(appID, accountID string) (githubdgrpc.AppBin
 	}
 	b, err := s.Store.GetForApp(context.Background(), appID, accountID)
 	if err != nil {
-		if err == state.ErrNotFound {
+		if errors.Is(err, state.ErrNotFound) {
 			return githubdgrpc.AppBinding{}, nil
 		}
 		return githubdgrpc.AppBinding{}, err

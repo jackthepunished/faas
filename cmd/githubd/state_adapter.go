@@ -50,9 +50,10 @@ func (a *stateBindingsAdapter) Upsert(ctx context.Context, b state.GitHubBinding
 		// bindingID mint surfaces in tests.
 		return "", fmt.Errorf("state adapter: BindingID required")
 	}
-	if b.LinkedAt.IsZero() {
-		// Let PgStore fill it (it has time.Now via its own clock).
-	}
+	// LinkedAt is left at zero value when the caller omits it;
+	// PgStore fills it with time.Now via its own clock (clock skew
+	// between cmd/githubd and the DB host is absorbed by the store
+	// layer, not by this adapter).
 	if err := a.store.UpsertGithubInstallBinding(ctx, b); err != nil {
 		return "", err
 	}

@@ -305,7 +305,21 @@ func TestPg_DeleteGithubInstallBinding_ClearsColumns(t *testing.T) {
 func TestPg_ListGithubInstallBindingsForAccount_ScopesByAccount(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctA, appA, _ := seedLiveDeploy(t, s, ctx)
-	acctB, appB, _ := seedLiveDeploy(t, s, ctx)
+	// seedLiveDeploy uses a hardcoded email "u@example.com"; create
+	// acctB with a unique email so the unique-key doesn't reject the
+	// second insert.
+	acctBRec, err := s.CreateAccount(ctx, "list-b-"+strconv.FormatInt(time.Now().UnixNano(), 10)+"@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+	appBRec, err := s.CreateApp(ctx, state.App{
+		AccountID: acctBRec.ID, Slug: "pg-app-b-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		Type: state.AppTypeApp, RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp B: %v", err)
+	}
+	acctB, appB := acctBRec.ID, appBRec.ID
 
 	// Bind appA under acctA and appB under acctB.
 	if err := s.UpsertGithubInstallBinding(ctx, state.GitHubBinding{

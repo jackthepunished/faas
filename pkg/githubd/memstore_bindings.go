@@ -88,7 +88,7 @@ func (m *memBindingsStore) FindForRepoBranch(_ context.Context, repoFullName, br
 		return state.GitHubBinding{}, state.ErrNotFound
 	}
 	if branch == "" {
-		branch = "main"
+		branch = defaultProductionBranch
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
