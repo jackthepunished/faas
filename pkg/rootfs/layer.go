@@ -32,10 +32,7 @@ func ApplyLayer(dst string, tr *tar.Reader) error {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
 
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and
-		// absolute paths at runtime (see safeJoin body + the
-		// TestApplyLayer_RejectsPathEscape pin). safeJoin is not in CodeQL's
-		// go/path-injection sanitizer model.
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
 		target, err := safeJoin(dst, hdr.Name)
 		if err != nil {
 			return err
@@ -99,14 +96,7 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		}
 		return f.Close()
 	case tar.TypeSymlink:
-		// hdr.Linkname is attacker-controlled bytes from the tar header;
-		// the next line binds it through safeJoin (which rejects ".." and
-		// absolute paths at runtime). safeJoin is not in CodeQL's
-		// go/path-injection sanitizer model.
-		//
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and
-		// absolute paths at runtime (see safeJoin body + the
-		// TestApplyEntry_Symlink_RejectsAbsoluteLinkname pin).
+		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
 		linkTarget, err := safeJoin(base, hdr.Linkname)
 		if err != nil {
 			return err
