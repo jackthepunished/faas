@@ -31,6 +31,7 @@ import (
 // have to special-case the zero value (mirrors scheddgrpc/server.go:54-56).
 type Loop struct {
 	store  state.Store
+	cpu    CPUSource
 	parker ScheddParker
 	pusher billing.Provider
 	notif  Notifier
@@ -68,7 +69,7 @@ type Loop struct {
 // and must not be skipped in production); the ops.SetResidentGBPerCustomer
 // method is nil-safe so the loop tolerates a nil ops receiver. ops
 // and log likewise may be nil — see the Loop doc comment.
-func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
+func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
 	if now == nil {
 		now = time.Now
 	}
@@ -85,7 +86,7 @@ func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, no
 		residency = NewResidency(store, now, log, ops)
 	}
 	return &Loop{
-		store: store, parker: parker, pusher: pusher, notif: notif,
+		store: store, cpu: cpu, parker: parker, pusher: pusher, notif: notif,
 		mailer: mailer, dunning: dunning, residency: residency, now: now, log: log, cfg: cfg, ops: ops,
 		lastTick: make(map[string]time.Time),
 	}
@@ -97,7 +98,7 @@ func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, no
 // Postgres blip doesn't kill the daemon; only a context cancel returns
 // cleanly.
 func (l *Loop) Run(ctx context.Context) error {
-	sampler := NewSampler(l.store, l.now)
+	sampler := NewSampler(l.store, l.cpu, l.now)
 	pusher := NewPusher(l.store, l.pusher, l.log, l.now, l.ops)
 	errc := make(chan error, 5)
 	go func() {

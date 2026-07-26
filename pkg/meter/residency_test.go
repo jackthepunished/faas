@@ -38,7 +38,7 @@ func newResidencyTestHarness(t *testing.T, now time.Time) (*meter.Residency, *st
 // to keep the math readable.
 func appendUsage(t *testing.T, store *state.MemStore, accountID string, mbSec int64, when time.Time) {
 	t.Helper()
-	if err := store.AppendUsage(context.Background(), accountID, "app-"+accountID, "inst-"+accountID, when, mbSec, 1); err != nil {
+	if err := store.AppendUsage(context.Background(), accountID, "app-"+accountID, "inst-"+accountID, when, mbSec, 1, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 }
@@ -301,7 +301,7 @@ func TestResidency_LoopRunTicks(t *testing.T) {
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	residency := meter.NewResidency(store, func() time.Time { return now }, log, ops)
-	loop := meter.NewLoop(store, &fakeParker{}, nil, &fakeNotifier{}, nil /* mailer */, nil /* dunning */, residency,
+	loop := meter.NewLoop(store, nil, &fakeParker{}, nil, &fakeNotifier{}, nil /* mailer */, nil /* dunning */, residency,
 		func() time.Time { return now }, log, cfg, ops)
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -73,7 +73,7 @@ func TestSampleAndRoll_RequestsEqualsInvocationCount(t *testing.T) {
 		}
 	}
 
-	s := NewSampler(store, func() time.Time { return minute })
+	s := NewSampler(store, nil, func() time.Time { return minute })
 	rows, err := s.SampleAndRoll(ctx)
 	if err != nil {
 		t.Fatalf("SampleAndRoll: %v", err)
@@ -123,7 +123,7 @@ func TestSampleAndRoll_AppendUsageIdempotent(t *testing.T) {
 		t.Fatalf("StampInstanceInvocation: %v", err)
 	}
 
-	s := NewSampler(store, func() time.Time { return minute })
+	s := NewSampler(store, nil, func() time.Time { return minute })
 	acct := rowAccountID(t, store, appID)
 	month := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 
@@ -163,7 +163,7 @@ func TestSampleAndRoll_ZeroInvocationsZeroRequests(t *testing.T) {
 	store, appID, _, minute := seedMinuteUsage(t)
 	ctx := context.Background()
 
-	s := NewSampler(store, func() time.Time { return minute })
+	s := NewSampler(store, nil, func() time.Time { return minute })
 	if _, err := s.SampleAndRoll(ctx); err != nil {
 		t.Fatalf("SampleAndRoll: %v", err)
 	}

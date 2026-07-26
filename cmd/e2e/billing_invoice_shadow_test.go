@@ -172,7 +172,7 @@ func seedShadowAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, t0
 
 	for h := int64(0); h < shadowHours; h++ {
 		minute := t0.Add(time.Duration(h) * time.Hour)
-		if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID, minute, shadowPerHour, 1); err != nil {
+		if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID, minute, shadowPerHour, 1, 0); err != nil {
 			t.Fatalf("AppendUsage hour %d: %v", h, err)
 		}
 	}

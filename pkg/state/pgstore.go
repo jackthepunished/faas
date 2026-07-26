@@ -2980,17 +2980,30 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests int64) error {
-	// Idempotent on (instance_id, minute). Mirrors the sqlc source in
-	// queries.sql::AppendUsage — make sqlc-check verifies these stay in
-	// lockstep. The first write wins; a redelivered minute is a no-op so a
-	// meterd restart / network blip / two meterd instances cannot inflate
-	// billing. M7 hardening, PR feat/m7-beta-hardening.
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error {
+	// Idempotent on (instance_id, minute) for mb_seconds / requests
+	// (mirrors the sqlc source in queries.sql::AppendUsage — make
+	// sqlc-check verifies these stay in lockstep). The first write
+	// of those columns wins; a redelivered minute is a no-op for
+	// them so a meterd restart / network blip / two meterd
+	// instances cannot inflate billing. M7 hardening, PR
+	// feat/m7-beta-hardening.
+	//
+	// cpu_usec is ADDITIVE on the same conflict key: the schedd
+	// accumulator (pkg/sched/instancestats/poller.go) can call
+	// AppendUsage many times within the same minute — the
+	// accumulator fires every 250 ms, and a 1-minute slice can
+	// see 240 observations per instance. We add EXCLUDED.cpu_usec
+	// to the existing row so the column is the sum of all
+	// per-tick deltas. The pusher (meter → billing) deduplicates
+	// on a coarser window before pushing, so the additive merge
+	// is safe end-to-end. issue #279 / PR-B.
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests)
-		 values ($1, $2, $3, $4, $5, $6)
-		 on conflict (instance_id, minute) do nothing`,
-		accountID, appID, instanceID, minute, mbSeconds, requests)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec)
+		 values ($1, $2, $3, $4, $5, $6, $7)
+		 on conflict (instance_id, minute) do update
+		   set cpu_usec = usage_minutes.cpu_usec + EXCLUDED.cpu_usec`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec)
 	return err
 }
 
@@ -3007,7 +3020,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	// explicit cast). date_trunc normalizes both sides to the month's start
 	// in UTC, sidestepping session-TZ semantics entirely.
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, requests from usage_monthly
+		`select account_id, app_id, month, mb_seconds, cpu_usec, requests from usage_monthly
 		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
 		accountID, monthStart)
 	if err != nil {
@@ -3017,7 +3030,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	var out []Usage
 	for rows.Next() {
 		u := Usage{}
-		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
 			return nil, err
 		}
 		out = append(out, u)

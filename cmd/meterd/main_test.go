@@ -22,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -123,6 +124,12 @@ func testPool(t *testing.T) *pgxpool.Pool {
 type nopParker struct{}
 
 func (nopParker) ParkInstance(context.Context, string, string) error { return nil }
+func (nopParker) ListInstanceStats(context.Context) ([]scheddgrpc.InstanceStatsRow, error) {
+	// Issue #279 / PR-B: the test harness returns an empty
+	// snapshot so the meterd sampler writes 0 CPU-µs per minute
+	// without retrying the schedd gRPC.
+	return nil, nil
+}
 
 type nopProvider struct{}
 

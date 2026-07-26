@@ -111,6 +111,13 @@ type VMInstanceStat struct {
 	HostIP           string
 	ResidentBytes    *int64
 	CPUPct           *float64
+	// CPUSeconds is the cumulative CPU-seconds reading from
+	// vmmd's cpustats cache (issue #279 / PR-B). nil on the
+	// wire when the cache has no baseline for the instance
+	// (first sample, regression, or non-Linux host). schedd
+	// maps nil → Unknown / NaN on the wire row and
+	// instancestats.InstanceStat.
+	CPUSeconds       *float64
 	InflightRequests int64
 	LastRequestAt    time.Time
 }
@@ -401,6 +408,10 @@ func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
 	if v := in.GetCpuPct(); v != nil {
 		c := v.GetValue()
 		row.CPUPct = &c
+	}
+	if v := in.GetCpuSeconds(); v != nil {
+		s := v.GetValue()
+		row.CPUSeconds = &s
 	}
 	if t := in.GetLastRequestAt(); t != nil {
 		row.LastRequestAt = t.AsTime()

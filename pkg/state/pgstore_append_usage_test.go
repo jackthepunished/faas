@@ -25,12 +25,12 @@ func TestPg_AppendUsage_IdempotentSameMinute(t *testing.T) {
 	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 	// First write — wins.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Redelivered minute — a no-op. Different mb_seconds / requests must
 	// NOT overwrite the first write.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0); err != nil {
 		t.Fatalf("redelivered append: %v", err)
 	}
 
@@ -70,10 +70,10 @@ func TestPg_AppendUsage_AccumulatesAcrossMinutes(t *testing.T) {
 	m0 := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	m1 := m0.Add(time.Minute)
 
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1, 0); err != nil {
 		t.Fatalf("append m0: %v", err)
 	}
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2, 0); err != nil {
 		t.Fatalf("append m1: %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestPg_AppendUsage_NoUniqueViolationReturned(t *testing.T) {
 
 	// 50 same-minute writes — every one must succeed and not surface ErrConflict.
 	for i := 0; i < 50; i++ {
-		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1); err != nil {
+		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1, 0); err != nil {
 			if errors.Is(err, state.ErrConflict) {
 				t.Fatalf("call %d returned ErrConflict: %v", i, err)
 			}

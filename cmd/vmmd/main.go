@@ -26,6 +26,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -243,8 +244,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
 	}
+	// CPU cache: a per-instance rate + accumulator over cgroup
+	// usage_usec, fed by runCPUSampleLoop below and consumed by
+	// vmmdgrpc.Server.Stats. issue #279 / PR-B. nil-safe so
+	// tests that don't care about CPU can pass a fresh
+	// cpustats.NewWithDefaults() and skip the sample loop
+	// entirely via runCPUSampleInterval=0.
+	cpuCache := cpustats.NewWithDefaults()
 	gsrv := grpc.NewServer()
-	impl := vmmdgrpc.New(mgr, ops, fcVersion, log)
+	impl := vmmdgrpc.NewWithCPU(mgr, ops, fcVersion, log, cpuCache)
 	impl.Register(gsrv)
 
 	// Optional /metrics endpoint.
@@ -295,6 +303,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	} else {
 		go runEgressPoll(ctx, ops, pop, interval, log)
 	}
+
+	// CPU sample loop (issue #279 / PR-B): drives the cpustats
+	// cache at 250 ms cadence — half the schedd poller's
+	// 200 ms so a fresh rate is always ready when schedd dials
+	// Stats. 250 ms matches the spike-capture window the
+	// cgroupstats metal test was written against
+	// (pkg/sched/instancestats/poller_metal_test.go:153). On
+	// non-Linux hosts cgroupstats.Sample returns ok=false; the
+	// loop is a no-op there, leaving cpuCache cold.
+	go runCPUSampleLoop(ctx, cpuCache, log)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

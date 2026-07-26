@@ -230,7 +230,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("schedd: listen %s: %w", listenTarget, err)
 	}
 	gsrv := grpc.NewServer()
-	scheddgrpc.New(engine, ops, log).Register(gsrv)
+	// scheddgrpc.New(gsrv) is called after the instancestats.Reader
+	// is constructed below, so the server can serve
+	// ListInstanceStats (issue #279 / PR-B). A no-stats server
+	// (the legacy path) would return an empty list — the meterd
+	// sampler degrades to "no CPU data" without restarting.
+	// See scheddgrpc.NewWithStats.
 
 	var httpSrv *http.Server
 	if cfg.MetricsAddr != "" {
@@ -324,6 +329,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		ops,
 		log,
 	)
+	// Register the gRPC server with the Reader wired so the
+	// ListInstanceStats RPC (issue #279 / PR-B) can serve the
+	// per-instance CPU-µs snapshot to meterd. The reader is
+	// populated by the poller above (200 ms cadence); a meterd
+	// call before the first tick returns an empty list.
+	scheddgrpc.NewWithStats(engine, reader, ops, log).Register(gsrv)
 	// Issue #169 / #172: per-app reactive scale-up trigger.
 	// Reads apps.autoscale_target_* + Ledger.Concurrency every
 	// cfg.ScaleUpInterval (default 1s); admits another instance

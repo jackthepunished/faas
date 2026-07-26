@@ -99,6 +99,26 @@ type InstanceStat struct {
 	// RSS is the validity of RSSMB. Unknown on a transient
 	// cgroup miss; Valid otherwise.
 	RSS Validity
+	// CPUUsageUsec is the cumulative host cgroup CPU usage
+	// observed for this instance on the most recent Tick,
+	// surfaced via the vmmd `cpu_seconds` wire field
+	// (issue #279, PR-B). The value is monotonically
+	// increasing across the lifetime of one cgroup; on a
+	// cgroup recreation (jailer restart, manual rmdir) it
+	// resets to a smaller number. The poller absorbs the
+	// reset by stamping CPU=Unknown on the first post-regression
+	// row and resuming CPU=Valid on the next sample. Callers
+	// that need a per-instance baseline (meterd's CPU sampler)
+	// SHOULD read CPUUsageUsec and remember the previous value
+	// themselves; the poller does not retain a baseline.
+	CPUUsageUsec uint64
+	// CPUHour is CPUUsageUsec / 3.6e9 — the per-instance
+	// CPU-hour reading the meterd sampler writes to
+	// usage_minutes.cpu_usec. Computed on read for the
+	// single tick (cheap, no copy); callers that need it
+	// across ticks (e.g. cumulative hour rollup) should
+	// store their own baseline.
+	CPUHour float64
 }
 
 // Reader is the stable, concurrency-safe read API the future

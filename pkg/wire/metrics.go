@@ -42,6 +42,11 @@ import (
 //   - RSSMB: cgroup memory.current, in MiB. math.NaN() means "absent".
 //   - InflightRequests: outstanding ForwardHTTP count. Always 0 or
 //     positive; zero is a real value and is emitted.
+//   - CPUSeconds: cumulative CPU-seconds since the cpustats
+//     cache's last regression reset (issue #279 / PR-B). 0 means
+//     "no baseline yet" — the wire does not emit a counter delta
+//     for that row. Otherwise the rollup Adds this to the
+//     per-(app,node) CounterVec. NaN is treated as 0.
 //
 // The NaN-for-absent convention lets the wire side collapse rows
 // the poller marked Unknown without a separate Validity field.
@@ -51,6 +56,7 @@ type InstanceStatRow struct {
 	CPUPct           float64
 	RSSMB            float64
 	InflightRequests int64
+	CPUSeconds       float64
 }
 
 // OpsMetrics is the (per-daemon) bundle emitted at /metrics. Construct via
@@ -179,6 +185,20 @@ type OpsMetrics struct {
 	instanceCPUPct       *prometheus.GaugeVec
 	instanceRSSMB        *prometheus.GaugeVec
 	instanceInflightReqs *prometheus.GaugeVec
+	// instanceCPUSecondsTotal (issue #279 / PR-B): cumulative
+	// CPU-seconds per (app, node). Counter (not Gauge) because
+	// the value is monotonic between cgroup regressions — the
+	// rollup Adds the per-row delta. Pre-instantiated with the
+	// empty (app, node) tuple so the help/TYPE surfaces in
+	// /metrics from boot.
+	instanceCPUSecondsTotal *prometheus.CounterVec
+	// cpuSecondsLast (issue #279 / PR-B): per-(app, node) last
+	// observed cumulative CPUSeconds. The rollup Adds
+	// (curr - last) to the CounterVec; on regression
+	// (curr < last) we reset the baseline and add 0, keeping
+	// the counter monotonic. Mirrors the accountLabelSet
+	// pointer-receiver pattern at the bottom of this file.
+	cpuSecondsLast *cpuSecondsLastSeen
 	// instanceStatsCollectDur: per-Tick wall-clock duration of the
 	// instancestats poller. Sized to the 200 ms poller interval.
 	instanceStatsCollectDur prometheus.Histogram
@@ -383,6 +403,20 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_instance_stats_partial_errors_total",
 		Help: "Per-node dial/decode failures during an instancestats poller Tick (issue #170 / PR-A). The poller logs and continues on partial failures; a non-zero rate points at a sick node.",
 	}, []string{"node"})
+	// Issue #279 (PR-B, CPU-hour visibility): cumulative
+	// CPU-seconds per (app, node), sourced from the vmmd
+	// cpu_seconds wire field. Sum rollup (cumulative work,
+	// not peak). Counter (not Gauge) because the value is
+	// monotonic between cgroup regressions. On a regression
+	// the wire reports a smaller value; the rollup Adds the
+	// delta only (curr - prev) and the counter stays
+	// monotonic — the same shape as the spec §12 "log
+	// scale" guidance for cumulative CPU work. Bounded
+	// structurally by #apps × #nodes, ADR-036.
+	instanceCPUSecondsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_instance_cpu_seconds_total",
+		Help: "Cumulative CPU-seconds consumed by live instances, per (app, node) — sum over live siblings, source is vmmd's cpu_seconds wire field (issue #279 / PR-B).",
+	}, []string{"app", "node"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
 	// label set is closed ({admit, reject_at_cap, no_signal});
 	// pre-instantiated below so the rows surface in /metrics from
@@ -440,6 +474,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur, requestFailures, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, wakeIDV4Fallback,
 		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
+		instanceCPUSecondsTotal,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
 		egressDeny,
@@ -540,6 +575,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"park", "keep"} {
 		scaleDownDecisions.WithLabelValues("", outcome)
 	}
+	// issue #279 (PR-B, CPU-hour visibility): pre-instantiate the
+	// empty (app, node) row so the help/TYPE surfaces in /metrics
+	// from boot. Same precedent as the scale-up / scale-down
+	// outcome rows above. Real per-(app, node) rows are added by
+	// the rollup in ReplaceInstanceStats.
+	instanceCPUSecondsTotal.WithLabelValues("", "")
 	return &OpsMetrics{
 		registry:                   reg,
 		ops:                        ops,
@@ -550,6 +591,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur:              auditWriteDur,
 		requestFailures:            requestFailures,
 		accountLabels:              newAccountLabelSet(maxAccountLabelValues),
+		cpuSecondsLast:             newCPUSecondsLastSeen(),
 		stripePushDur:              stripePushDur,
 		paddlePushDur:              paddlePushDur,
 		buildDur:                   buildDur,
@@ -560,6 +602,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceCPUPct:             instanceCPUPct,
 		instanceRSSMB:              instanceRSSMB,
 		instanceInflightReqs:       instanceInflightReqs,
+		instanceCPUSecondsTotal:    instanceCPUSecondsTotal,
 		instanceStatsCollectDur:    instanceStatsCollectDur,
 		instanceStatsPartialErrors: instanceStatsPartialErrors,
 		scaleUpDecisions:           scaleUpDecisions,
@@ -880,6 +923,11 @@ func (m *OpsMetrics) SetResidentGBPerCustomer(plan string, gb float64) {
 //   - RSSMB: sum — capacity rollup. NaN values are excluded.
 //   - InflightRequests: sum — load rollup. Always 0 or positive;
 //     zero is a real value.
+//   - CPUSeconds: sum — cumulative work, added to the
+//     CounterVec per tick via the per-(app, node) baseline
+//     in cpuSecondsLastSeen. On regression (curr < last) the
+//     baseline is reset to curr and the delta is 0, so the
+//     counter stays monotonic. NaN is treated as 0.
 //
 // After each call the three gauge label sets are exactly the
 // (app, node) pairs present in rows. The GaugeVec.Reset() call
@@ -950,6 +998,28 @@ func (m *OpsMetrics) ReplaceInstanceStats(rows []InstanceStatRow, dur time.Durat
 		}
 		m.instanceRSSMB.WithLabelValues(app, node).Set(a.sumRSS)
 		m.instanceInflightReqs.WithLabelValues(app, node).Set(float64(a.sumInfl))
+	}
+	// Second pass for the cumulative counter: sum CPUSeconds
+	// per (app, node) and Add the per-row delta through
+	// cpuSecondsLastSeen. Done after the gauge pass so the
+	// reader (Prometheus scrape) sees a consistent set of
+	// rows in one Tick. NaN values are skipped (the
+	// "absent this tick" sentinel never contributes to a
+	// monotonic counter).
+	cpuTotals := make(map[string]float64, len(rows))
+	for _, r := range rows {
+		if math.IsNaN(r.CPUSeconds) {
+			continue
+		}
+		key := r.AppID + "\x00" + r.NodeID
+		cpuTotals[key] += r.CPUSeconds
+	}
+	for key, curr := range cpuTotals {
+		app, node := splitKey(key)
+		delta := m.cpuSecondsLast.add(key, curr)
+		if delta > 0 {
+			m.instanceCPUSecondsTotal.WithLabelValues(app, node).Add(delta)
+		}
 	}
 }
 
@@ -1154,4 +1224,46 @@ func RenderSeconds(d time.Duration) string {
 	// that round-trips back to the same float64 — Prometheus expects
 	// fixed-point but tolerates either.
 	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64)
+}
+
+// cpuSecondsLastSeen is the per-(app, node) memory of the last
+// CPUSeconds value the rollup saw (issue #279 / PR-B). It is the
+// regression guard for the cumulative-counter rollup. Wire shape
+// is the same NUL-joined (app, node) key as the existing
+// splitKey; the in-memory store is a plain map + mutex. The set
+// is bounded structurally by #apps × #nodes (ADR-036) so no
+// eviction is needed — when an (app, node) tuple disappears (the
+// app is parked, the node is removed) the entry is just left in
+// place; on a reappearance with a smaller value the regression
+// branch handles the reset.
+type cpuSecondsLastSeen struct {
+	mu sync.Mutex
+	m  map[string]float64
+}
+
+func newCPUSecondsLastSeen() *cpuSecondsLastSeen {
+	return &cpuSecondsLastSeen{m: make(map[string]float64)}
+}
+
+// add computes the per-tick delta: returns the (curr - last)
+// delta to Add to the CounterVec. On a regression (curr < last)
+// the baseline is reset to curr and the returned delta is 0
+// (counter stays monotonic). On the first observation (last
+// missing) the full curr is returned — the vmmd cpustats cache
+// resets its own baseline on regression so the first post-restart
+// reading is a fresh cumulative value, not a delta.
+func (s *cpuSecondsLastSeen) add(key string, curr float64) float64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.m[key]
+	if !ok || curr < prev {
+		s.m[key] = curr
+		return 0
+	}
+	delta := curr - prev
+	s.m[key] = curr
+	return delta
 }

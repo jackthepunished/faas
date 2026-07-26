@@ -24,6 +24,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/leakcheck"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -76,11 +77,25 @@ type Server struct {
 	ops   *wire.OpsMetrics
 	fcVer string
 	log   *slog.Logger
+	// cpuCache holds the per-instance rate + accumulator used by
+	// Stats() to populate cpu_pct and cpu_seconds on the wire
+	// (issue #279, PR-B). The cache is fed by a small sample loop
+	// in cmd/vmmd; nil-safe so unit tests that don't care about
+	// CPU can pass nil to NewWithCPU.
+	cpuCache *cpustats.Cache
 }
 
 // New wires the server. ops may be nil (noop metrics), log may be nil
 // (slog default).
 func New(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger) *Server {
+	return NewWithCPU(vmm, ops, fcVer, log, nil)
+}
+
+// NewWithCPU is New plus an explicit CPU cache handle. Pass nil for
+// the cache to keep the legacy behaviour (cpu_pct / cpu_seconds
+// always absent on the wire); production cmd/vmmd passes
+// cpustats.NewWithDefaults().
+func NewWithCPU(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger, cpu *cpustats.Cache) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -89,7 +104,17 @@ func New(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger) *Ser
 		// never exported. Tests that don't assert metrics use this path.
 		ops = wire.NewOpsMetrics("vmmd_test")
 	}
-	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log}
+	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu}
+}
+
+// ForgetCPU drops the cache baseline for an instance. Called from
+// the Destroy path so the cache does not grow unbounded across the
+// vmmd process lifetime. Safe on a nil receiver / nil cache.
+func (s *Server) ForgetCPU(instance string) {
+	if s == nil || s.cpuCache == nil {
+		return
+	}
+	s.cpuCache.Forget(instance)
 }
 
 // Register binds s to a gRPC server.
@@ -187,6 +212,10 @@ func (s *Server) PauseAndSnapshot(ctx context.Context, req *vmmdpb.PauseAndSnaps
 // exit, captures the exit code, and copies /build/out/* + build-done.json
 // into ExportDir before releasing the chroot. The response carries the exit
 // code on the wire so builderd can classify (FailureUserError / OOM / Timeout).
+//
+// The CPU cache baseline is dropped on every successful destroy (and on
+// not-found, which is idempotent) so the cache does not grow
+// unbounded across the vmmd process lifetime. issue #279.
 func (s *Server) Destroy(ctx context.Context, req *vmmdpb.DestroyRequest) (*vmmdpb.DestroyResponse, error) {
 	const op = "Destroy"
 	start := time.Now()
@@ -196,6 +225,7 @@ func (s *Server) Destroy(ctx context.Context, req *vmmdpb.DestroyRequest) (*vmmd
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
+	s.ForgetCPU(req.GetInstance())
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.DestroyResponse{Instance: req.GetInstance(), ExitCode: int32(code)}, nil
 }
@@ -228,6 +258,19 @@ func (s *Server) Heartbeat(ctx context.Context, _ *vmmdpb.HeartbeatRequest) (*vm
 
 // Stats returns Manager's view: live/leased counts and per-instance
 // resident bytes sourced from cgroup memory.current.
+//
+// # CPU fields
+//
+// cpu_pct and cpu_seconds are populated from the cpustats cache
+// (issue #279 / PR-B). The cache is fed by a 250 ms sample loop in
+// cmd/vmmd that reads cgroupstats.Reader.Sample per instance; the
+// Stats handler just looks up the cached rate. A nil cache (tests
+// that don't wire the cache) returns the legacy behaviour:
+// both fields absent on the wire.
+//
+// A baseline not yet established for an instance also leaves the
+// fields absent — schedd stamps Unknown and the {app,node} rollup
+// excludes the row, exactly as the cgroupstats docs require.
 func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.StatsResponse, error) {
 	const op = "Stats"
 	start := time.Now()
@@ -250,10 +293,21 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 	resp.Instances = make([]*vmmdpb.InstanceStats, 0, len(resident))
 	for inst, b := range resident {
 		total += b
-		resp.Instances = append(resp.Instances, &vmmdpb.InstanceStats{
+		row := &vmmdpb.InstanceStats{
 			Instance:      inst,
 			ResidentBytes: wrapperspb.Int64(b),
-		})
+		}
+		// Populate CPU fields from the cache if present. Reading
+		// under the cache's mutex is O(1) and never blocks
+		// schedd's poller on cgroup I/O — the sample loop owns
+		// the disk reads.
+		if s.cpuCache != nil {
+			if reading, ok := s.cpuCache.Lookup(inst); ok && reading.Valid {
+				row.CpuPct = wrapperspb.Double(reading.CPUPct)
+				row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
+			}
+		}
+		resp.Instances = append(resp.Instances, row)
 	}
 	resp.TotalResidentBytes = wrapperspb.Int64(total)
 	return resp, nil

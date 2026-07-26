@@ -199,6 +199,7 @@ func newHealthFixture(t *testing.T, withDunning bool) (*meter.Loop, *meter.Confi
 	ops := wire.NewOpsMetrics("meter_test_health")
 	loop := meter.NewLoop(
 		state.NewMemStore(),
+		nil,
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},

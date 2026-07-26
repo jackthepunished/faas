@@ -28,10 +28,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Schedd_Wake_FullMethodName           = "/onebox.faas.schedd.v1.Schedd/Wake"
-	Schedd_AdmitInstance_FullMethodName  = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
-	Schedd_ReportActivity_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
-	Schedd_ParkInstance_FullMethodName   = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
+	Schedd_Wake_FullMethodName              = "/onebox.faas.schedd.v1.Schedd/Wake"
+	Schedd_AdmitInstance_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
+	Schedd_ReportActivity_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
+	Schedd_ParkInstance_FullMethodName      = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
+	Schedd_ListInstanceStats_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -83,6 +84,29 @@ type ScheddClient interface {
 	// exceeded_free" etc). Returns Ok on success; ResourceExhausted / NotFound
 	// for the obvious error paths.
 	ParkInstance(ctx context.Context, in *ParkInstanceRequest, opts ...grpc.CallOption) (*ParkInstanceResponse, error)
+	// ListInstanceStats returns the per-instance CPU-µs snapshot the
+	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
+	// meterdsamp the per-minute CPU delta from this snapshot and
+	// writes it to usage_minutes.cpu_usec. Returned rows are the
+	// same shape the wire rollup observes (pkg/wire.InstanceStatRow
+	// is the typed mirror; the proto is wire-stable so adding a
+	// field is additive).
+	//
+	// CPUUsageUsec is the cumulative host cgroup CPU-µs consumed
+	// since the cgroup was created. On a cgroup recreation (jailer
+	// restart, manual rmdir) the counter resets to a smaller
+	// number — callers must treat the reset as a fresh baseline.
+	// CPUValid mirrors instancestats.Validity: 0 = Valid, 1 =
+	// Unknown (the vmmd cpustats.Cache has no baseline yet, or a
+	// post-regression row). Callers MUST skip rows where CPUValid
+	// != 0; otherwise the baseline becomes "stuck" on the pre-
+	// regression counter and the per-minute delta is meaningless.
+	//
+	// Additive: the RPC is the only piece of new wire metadata
+	// needed for PR-B. The vmmd Stats RPC already carries the per-
+	// instance CPU numbers; this RPC is the schedd-side cache of
+	// those numbers, refreshed by the poller every 200 ms.
+	ListInstanceStats(ctx context.Context, in *ListInstanceStatsRequest, opts ...grpc.CallOption) (*ListInstanceStatsResponse, error)
 }
 
 type scheddClient struct {
@@ -127,6 +151,16 @@ func (c *scheddClient) ParkInstance(ctx context.Context, in *ParkInstanceRequest
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ParkInstanceResponse)
 	err := c.cc.Invoke(ctx, Schedd_ParkInstance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *scheddClient) ListInstanceStats(ctx context.Context, in *ListInstanceStatsRequest, opts ...grpc.CallOption) (*ListInstanceStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListInstanceStatsResponse)
+	err := c.cc.Invoke(ctx, Schedd_ListInstanceStats_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +216,29 @@ type ScheddServer interface {
 	// exceeded_free" etc). Returns Ok on success; ResourceExhausted / NotFound
 	// for the obvious error paths.
 	ParkInstance(context.Context, *ParkInstanceRequest) (*ParkInstanceResponse, error)
+	// ListInstanceStats returns the per-instance CPU-µs snapshot the
+	// schedd's instancestats.Poller maintains (issue #279 / PR-B).
+	// meterdsamp the per-minute CPU delta from this snapshot and
+	// writes it to usage_minutes.cpu_usec. Returned rows are the
+	// same shape the wire rollup observes (pkg/wire.InstanceStatRow
+	// is the typed mirror; the proto is wire-stable so adding a
+	// field is additive).
+	//
+	// CPUUsageUsec is the cumulative host cgroup CPU-µs consumed
+	// since the cgroup was created. On a cgroup recreation (jailer
+	// restart, manual rmdir) the counter resets to a smaller
+	// number — callers must treat the reset as a fresh baseline.
+	// CPUValid mirrors instancestats.Validity: 0 = Valid, 1 =
+	// Unknown (the vmmd cpustats.Cache has no baseline yet, or a
+	// post-regression row). Callers MUST skip rows where CPUValid
+	// != 0; otherwise the baseline becomes "stuck" on the pre-
+	// regression counter and the per-minute delta is meaningless.
+	//
+	// Additive: the RPC is the only piece of new wire metadata
+	// needed for PR-B. The vmmd Stats RPC already carries the per-
+	// instance CPU numbers; this RPC is the schedd-side cache of
+	// those numbers, refreshed by the poller every 200 ms.
+	ListInstanceStats(context.Context, *ListInstanceStatsRequest) (*ListInstanceStatsResponse, error)
 	mustEmbedUnimplementedScheddServer()
 }
 
@@ -203,6 +260,9 @@ func (UnimplementedScheddServer) ReportActivity(context.Context, *ReportActivity
 }
 func (UnimplementedScheddServer) ParkInstance(context.Context, *ParkInstanceRequest) (*ParkInstanceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ParkInstance not implemented")
+}
+func (UnimplementedScheddServer) ListInstanceStats(context.Context, *ListInstanceStatsRequest) (*ListInstanceStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListInstanceStats not implemented")
 }
 func (UnimplementedScheddServer) mustEmbedUnimplementedScheddServer() {}
 func (UnimplementedScheddServer) testEmbeddedByValue()                {}
@@ -297,6 +357,24 @@ func _Schedd_ParkInstance_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Schedd_ListInstanceStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListInstanceStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ListInstanceStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ListInstanceStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ListInstanceStats(ctx, req.(*ListInstanceStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Schedd_ServiceDesc is the grpc.ServiceDesc for Schedd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -319,6 +397,10 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ParkInstance",
 			Handler:    _Schedd_ParkInstance_Handler,
+		},
+		{
+			MethodName: "ListInstanceStats",
+			Handler:    _Schedd_ListInstanceStats_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,12 +45,88 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// scheddCPUAdapter exposes the schedd gRPC client as a
+// meter.CPUSource. The adapter is local to cmd/meterd so pkg/meter
+// stays decoupled from pkg/scheddgrpc (one-way dependency the other
+// way), and so a test fake can swap the client without touching
+// pkg/meter's source. Issue #279 / PR-B.
+//
+// The adapter refreshes the per-instance snapshot on every call.
+// meterd's sampler walks ~max_concurrency instances per minute, so
+// the per-call cost is one gRPC ListInstanceStats round trip
+// returning a slice of ~max_concurrency rows. The gRPC socket is
+// on the box's local unix socket (ADR-015), so the cost is
+// negligible vs. the 1-minute sampler cadence.
+type scheddCPUAdapter struct {
+	parker  parkInstanceParker
+	now     func() time.Time
+	mu      sync.Mutex
+	rows    map[string]scheddgrpc.InstanceStatsRow
+	fetched time.Time
+}
+
+const scheddCPUAdapterTTL = 30 * time.Second
+
+func (a *scheddCPUAdapter) CPUUsageUsec(instanceID string) (uint64, bool) {
+	a.refresh()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	row, ok := a.rows[instanceID]
+	if !ok {
+		return 0, false
+	}
+	// CpuValid mirrors instancestats.Validity (0 = Valid, 1 =
+	// Unknown). The meterd sampler must NOT treat the raw counter
+	// as a baseline on the Unknown row — the vmmd cpustats.Cache
+	// already absorbed the regression (it dropped the baseline),
+	// so the next sample will come back Valid and the sampler will
+	// pick up from the new counter.
+	if row.CPUValid != 0 {
+		return 0, false
+	}
+	return row.CPUUsageUsec, true
+}
+
+// refresh refreshes the in-memory snapshot if the last fetch is
+// older than scheddCPUAdapterTTL. The cost is one gRPC round trip
+// per minute per sampler iteration; the TTL bounds the staleness
+// without forcing a fetch per instance.
+func (a *scheddCPUAdapter) refresh() {
+	a.mu.Lock()
+	last := a.fetched
+	a.mu.Unlock()
+	if !last.IsZero() && a.now().Sub(last) < scheddCPUAdapterTTL {
+		return
+	}
+	rows, err := a.parker.ListInstanceStats(context.Background())
+	if err != nil {
+		// Preserve the previous snapshot on error so a transient
+		// gRPC failure doesn't drop the CPU data for the rest of
+		// the minute. The next sample retries.
+		return
+	}
+	m := make(map[string]scheddgrpc.InstanceStatsRow, len(rows))
+	for _, r := range rows {
+		m[r.InstanceID] = r
+	}
+	a.mu.Lock()
+	a.rows = m
+	a.fetched = a.now()
+	a.mu.Unlock()
+}
+
 // parkInstanceParker is the slice of scheddgrpc.Client meterd actually
 // uses. Slice 4 adds ParkInstance to scheddgrpc; in tests we inject a
 // recording stub. Defining the interface here keeps meterd independent
 // of pkg/scheddgrpc until the surface exists (ADR-019).
 type parkInstanceParker interface {
 	ParkInstance(ctx context.Context, instanceID, reason string) error
+	// ListInstanceStats is the per-instance CPU-µs snapshot the
+	// meterd sampler reads once per minute. Issue #279 / PR-B.
+	// Returns an empty slice when schedd has no rows for this
+	// tick (boot, between ticks); the sampler treats that as
+	// "no CPU data this minute" and writes 0.
+	ListInstanceStats(ctx context.Context) ([]scheddgrpc.InstanceStatsRow, error)
 }
 
 func main() {
@@ -266,7 +343,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// The five timers run in goroutines; the cancel-watcher below picks
 	// up the first error and returns. meterd has no inbound gRPC — the
 	// public listener is gatewayd's (spec §Component ownership).
-	loop := meter.NewLoop(store, parker, pusher, pn, mailer, dunning, residency, deps.now, log, mc, ops)
+	//
+	// Issue #279 / PR-B: the cpu adapter lets the sampler read the
+	// per-instance CPU-µs snapshot the schedd's instancestats.Poller
+	// maintains. The adapter dials the schedd gRPC socket on the same
+	// box (ADR-015) and refreshes the snapshot at most once per 30 s
+	// — bounded staleness without forcing a gRPC round trip per
+	// instance.
+	cpu := &scheddCPUAdapter{parker: parker, now: deps.now}
+	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, deps.now, log, mc, ops)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 

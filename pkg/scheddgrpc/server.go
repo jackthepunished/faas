@@ -17,6 +17,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/sched/instancestats"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -42,11 +43,21 @@ type SchedAPI interface {
 	ParkWithReason(ctx context.Context, instanceID, reason string) error
 }
 
+// StatsReader is the per-instance snapshot the schedd's
+// instancestats.Poller publishes. The scheddgrpc server exposes
+// this to meterd via ListInstanceStats (issue #279 / PR-B). A thin
+// interface keeps pkg/scheddgrpc decoupled from pkg/sched — tests
+// pass a fake without standing up the poller.
+type StatsReader interface {
+	SnapshotAll() []instancestats.InstanceStat
+}
+
 // Server implements scheddpb.ScheddServer.
 type Server struct {
 	scheddpb.UnimplementedScheddServer
 
 	engine SchedAPI
+	stats  StatsReader
 	ops    *wire.OpsMetrics
 	log    *slog.Logger
 }
@@ -63,6 +74,20 @@ func New(engine SchedAPI, ops *wire.OpsMetrics, log *slog.Logger) *Server {
 		ops = wire.NewOpsMetrics("schedd")
 	}
 	return &Server{engine: engine, ops: ops, log: log}
+}
+
+// NewWithStats wires the server with an instancestats.Reader for
+// the ListInstanceStats RPC. Production calls this from cmd/schedd;
+// tests that don't exercise CPU stats use plain New. Issue #279 /
+// PR-B.
+func NewWithStats(engine SchedAPI, stats StatsReader, ops *wire.OpsMetrics, log *slog.Logger) *Server {
+	if log == nil {
+		log = slog.Default()
+	}
+	if ops == nil {
+		ops = wire.NewOpsMetrics("schedd")
+	}
+	return &Server{engine: engine, stats: stats, ops: ops, log: log}
 }
 
 // Register binds s to a gRPC server.
@@ -157,6 +182,47 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &scheddpb.ParkInstanceResponse{Ok: true}, nil
+}
+
+// ListInstanceStats returns the per-instance CPU-µs snapshot the
+// schedd's instancestats.Poller maintains. The meterd sampler
+// calls this once per minute and computes the per-min CPU delta
+// per instance, writing it to usage_minutes.cpu_usec. Issue #279 /
+// PR-B.
+//
+// The response carries every live instance's current row
+// (deterministic (app_id, instance_id) order — the Reader's
+// contract). The cpu_valid field mirrors instancestats.Validity:
+// 0 = Valid, 1 = Unknown. Callers MUST skip rows where
+// cpu_valid != 0; otherwise the post-regression baseline becomes
+// "stuck" on the pre-regression counter and the per-minute delta
+// is meaningless. The vmmd cpustats.Cache already drops the
+// baseline on regression, so the next sample the poller sees comes
+// back as Valid and the meterd sampler picks up from the new
+// counter.
+//
+// stats may be nil (e.g. a test harness that doesn't wire the
+// Reader); the handler returns an empty response rather than a
+// gRPC error so the meterd sampler can degrade to "no CPU data"
+// without restarting the loop.
+func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstanceStatsRequest) (*scheddpb.ListInstanceStatsResponse, error) {
+	const op = "ListInstanceStats"
+	start := time.Now()
+	rows := make([]*scheddpb.InstanceStatsRow, 0)
+	if s.stats != nil {
+		for _, r := range s.stats.SnapshotAll() {
+			row := &scheddpb.InstanceStatsRow{
+				InstanceId: r.InstanceID,
+				AppId:      r.AppID,
+				NodeId:     r.NodeID,
+				CpuUsec:    r.CPUUsageUsec,
+				CpuValid:   uint32(r.CPU),
+			}
+			rows = append(rows, row)
+		}
+	}
+	s.ops.Observe(op, time.Since(start), nil)
+	return &scheddpb.ListInstanceStatsResponse{Rows: rows}, nil
 }
 
 // mapMethod translates the engine's vmmd-side WakeMethod to the schedd wire

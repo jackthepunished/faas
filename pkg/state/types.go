@@ -513,6 +513,12 @@ type Usage struct {
 	AppID     string
 	Month     time.Time // truncated to month
 	MBSeconds int64
+	// CPUUsec is the cumulative host cgroup CPU-µs consumed by
+	// this app in this month (issue #279 / PR-B). Measurement
+	// only — billing is on plan RAM. Populated by UsageByMonth
+	// from the usage_monthly view; zero on the mb-only legacy
+	// rows.
+	CPUUsec int64
 	Requests  int64
 }
 
