@@ -188,3 +188,176 @@ func TestSampler_NoRowForInstance_SkipsCPU(t *testing.T) {
 		t.Fatalf("SampleAndRoll: %v", err)
 	}
 }
+
+// TestSampler_cpuDeltaForMinute_SameMinuteRedeliveryAdds pins
+// the meterd-redelivered-minute branch of cpuDeltaForMinute
+// (T-1, issue #279 / ADR-039 §3.1): a second SampleAndRoll
+// within the same minute must return curr - prev (additive),
+// not 0. This is the path used when two sample ticks fire
+// within the same minute (250 ms cadence × 4 = 4 ticks per
+// second, ~240 ticks per minute). The AppendUsage on the same
+// (instance_id, minute) is additive for cpu_usec, so the
+// per-minute row accumulates correctly.
+func TestSampler_cpuDeltaForMinute_SameMinuteRedeliveryAdds(t *testing.T) {
+	store, _, instID, minute := seedMinuteUsageCPU(t)
+	cpu := newFakeCPUSource()
+	cpu.Set(instID, 1_000_000)
+	sampler := NewSampler(store, cpu, func() time.Time { return minute })
+
+	// First sample: baseline. CPUUsec = 0.
+	rows, err := sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("first SampleAndRoll: %v", err)
+	}
+	if len(rows) != 1 || rows[0].CPUUsec != 0 {
+		t.Fatalf("first sample: rows=%+v, want one row with CPUUsec=0 (baseline)", rows)
+	}
+
+	// Bump the CPU reading by 100_000 µs.
+	cpu.Set(instID, 1_100_000)
+	// Same minute — same SampleAndRoll call returns the full
+	// curr - prev delta. The sampler's per-minute baseline is
+	// preserved across ticks within the same minute.
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("second SampleAndRoll: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("second sample: rows=%d, want 1", len(rows))
+	}
+	if rows[0].CPUUsec != 100_000 {
+		t.Errorf("same-minute redelivered delta = %d, want 100_000 (curr - prev, additive)", rows[0].CPUUsec)
+	}
+
+	// Third sample within the same minute: bump again by 50_000.
+	cpu.Set(instID, 1_150_000)
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("third SampleAndRoll: %v", err)
+	}
+	if rows[0].CPUUsec != 50_000 {
+		t.Errorf("third same-minute redelivered delta = %d, want 50_000", rows[0].CPUUsec)
+	}
+}
+
+// TestSampler_cpuDeltaForMinute_RegressionMidMinuteResets pins
+// the regression branch (T-2, ADR-039 §3.1): when the CPU
+// reading steps down within a minute, the sampler must treat
+// the new reading as a fresh baseline for that minute (delta =
+// 0) AND the next sample within the same minute (after the
+// counter advances past the new baseline) returns a positive
+// delta. This is the path when the jailer restarts mid-minute
+// and the vmmd cpustats.Cache has already dropped its baseline.
+func TestSampler_cpuDeltaForMinute_RegressionMidMinuteResets(t *testing.T) {
+	store, _, instID, minute := seedMinuteUsageCPU(t)
+	cpu := newFakeCPUSource()
+	cpu.Set(instID, 1_000_000)
+	sampler := NewSampler(store, cpu, func() time.Time { return minute })
+
+	// First sample: baseline.
+	if _, err := sampler.SampleAndRoll(context.Background()); err != nil {
+		t.Fatalf("first SampleAndRoll: %v", err)
+	}
+
+	// Bump to 1_100_000 (100_000 µs of work) — full delta.
+	cpu.Set(instID, 1_100_000)
+	rows, err := sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("pre-regression SampleAndRoll: %v", err)
+	}
+	if rows[0].CPUUsec != 100_000 {
+		t.Fatalf("pre-regression delta = %d, want 100_000", rows[0].CPUUsec)
+	}
+
+	// Regression: drop to 50_000 µs (cgroup recreated).
+	// Delta = 0; baseline is overwritten to 50_000.
+	cpu.Set(instID, 50_000)
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("regression SampleAndRoll: %v", err)
+	}
+	if rows[0].CPUUsec != 0 {
+		t.Errorf("regression delta = %d, want 0 (fresh baseline)", rows[0].CPUUsec)
+	}
+
+	// Same minute, post-regression: advance to 75_000.
+	// The new baseline (50_000) → curr (75_000) = 25_000.
+	cpu.Set(instID, 75_000)
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("post-regression SampleAndRoll: %v", err)
+	}
+	if rows[0].CPUUsec != 25_000 {
+		t.Errorf("post-regression same-minute delta = %d, want 25_000 (75_000 - 50_000 across the regression boundary)", rows[0].CPUUsec)
+	}
+}
+
+// TestSampler_cpuDeltaForMinute_NewMinuteCarriesOver pins
+// the minute-rollover branch (T-3, ADR-039 §3.1): when the
+// minute boundary crosses, the sampler uses `curr - prev`
+// (carryover from the previous minute's last reading) for
+// the FIRST sample of the new minute. The (instance, minute)
+// PRIMARY KEY in `usage_minutes` is what partitions the
+// per-minute aggregate; the baseline is NOT reset at the
+// rollover because the cpu_usec counter on the schedd side is
+// continuous across the boundary.
+//
+// The per-minute accounting is correct because the new
+// minute's row in `usage_minutes` is a fresh row whose
+// `minute` column differs from the previous minute's row;
+// the carryover delta lands on the new (instance, minute)
+// pair. Only a regression (curr < prev) drops the baseline.
+func TestSampler_cpuDeltaForMinute_NewMinuteCarriesOver(t *testing.T) {
+	store, _, instID, minute0 := seedMinuteUsageCPU(t)
+	cpu := newFakeCPUSource()
+	cpu.Set(instID, 1_000_000)
+
+	// Drive the sampler with a clock we can advance per call.
+	current := minute0
+	sampler := NewSampler(store, cpu, func() time.Time { return current })
+
+	// minute 0: baseline. delta = 0.
+	current = minute0
+	if _, err := sampler.SampleAndRoll(context.Background()); err != nil {
+		t.Fatalf("minute0 baseline: %v", err)
+	}
+
+	// minute 0 + 30s: still minute 0. Bump to 1_100_000.
+	// Full delta of 100_000 within the minute.
+	cpu.Set(instID, 1_100_000)
+	current = minute0.Add(30 * time.Second)
+	rows, err := sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("minute0 mid: %v", err)
+	}
+	if rows[0].CPUUsec != 100_000 {
+		t.Errorf("minute0 mid delta = %d, want 100_000", rows[0].CPUUsec)
+	}
+
+	// minute 1 (rollover): curr advanced to 1_300_000.
+	// The delta is curr (1_300_000) - prev (1_100_000) = 200_000
+	// — the carryover from minute 0's last reading. This lands
+	// on the new (instance, minute1) row in usage_minutes via
+	// AppendUsage's additive merge on a fresh primary key.
+	cpu.Set(instID, 1_300_000)
+	current = minute0.Add(1 * time.Minute)
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("minute1 first: %v", err)
+	}
+	if rows[0].CPUUsec != 200_000 {
+		t.Errorf("minute1 first-sample delta = %d, want 200_000 (1_300_000 - 1_100_000 carryover)", rows[0].CPUUsec)
+	}
+
+	// minute 1 mid: bump to 1_400_000. Delta of 100_000 from
+	// the carryover baseline.
+	cpu.Set(instID, 1_400_000)
+	current = minute0.Add(75 * time.Second)
+	rows, err = sampler.SampleAndRoll(context.Background())
+	if err != nil {
+		t.Fatalf("minute1 mid: %v", err)
+	}
+	if rows[0].CPUUsec != 100_000 {
+		t.Errorf("minute1 mid delta = %d, want 100_000 (carryover baseline works across the rollover)", rows[0].CPUUsec)
+	}
+}

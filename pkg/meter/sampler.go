@@ -212,9 +212,13 @@ func (s *Sampler) cpuDeltaForMinute(instanceID string, minute time.Time) int64 {
 		// contract.
 		delta = 0
 	case curr < prev.lastCPUUsec:
-		// Regression: cgroup recreated. Treat as a fresh
-		// baseline; the next-minute delta picks up from the
-		// new counter.
+		// Regression: cgroup recreated (jailer restart).
+		// Mirrors pkg/fcvm/cpustats.Cache.Observe's
+		// drop-baseline contract (ADR-039 §3.1) — the
+		// customer's CPU clock for the instance starts fresh
+		// on the new cgroup. The previous counter's work is
+		// not patched across the break; the next-minute
+		// delta picks up from the new counter.
 		delta = 0
 	case minute.Equal(prev.lastMinute):
 		// Same minute boundary as the previous tick (redelivered

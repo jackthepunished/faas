@@ -220,9 +220,11 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		IncludedGBHours: 5,
 		OverageGBHours:  7.345,
 		OverageCents:    735,
-		// Issue #279 / PR-B: the informational CPU panel —
-		// 0.002778h = 10 µs / 3.6e9 ≈ 0.00000278h, but the
-		// sample below is 12.34 µs for a clean number.
+		// Issue #279 / PR-B: the informational CPU panel.
+		// 0.002778 CPU-hours × 3.6e9 µs/hour = ~10_000_080 µs,
+		// i.e. 10 s of CPU consumed across the month — a
+		// realistic order of magnitude for a Hobby app doing
+		// bursty work, picked for a clean 4-decimal render.
 		UsedCPUHours:    0.002778,
 	})
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")

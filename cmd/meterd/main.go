@@ -75,12 +75,16 @@ func (a *scheddCPUAdapter) CPUUsageUsec(instanceID string) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	// CpuValid mirrors instancestats.Validity (0 = Valid, 1 =
-	// Unknown). The meterd sampler must NOT treat the raw counter
-	// as a baseline on the Unknown row — the vmmd cpustats.Cache
-	// already absorbed the regression (it dropped the baseline),
-	// so the next sample will come back Valid and the sampler will
-	// pick up from the new counter.
+	// CpuValid mirrors instancestats.Validity: 0 = Valid,
+	// 1 = Unknown, 2 = Stale. The meterd sampler must NOT
+	// treat the raw counter as a baseline on a non-Valid row
+	// — the vmmd cpustats.Cache already absorbed the
+	// regression (Unknown: it dropped the baseline) or
+	// freshness budget exceeded (Stale: the reading is
+	// older than the snapshot's freshness SLA). In either
+	// case the next valid sample picks up from the new
+	// counter; the meterd side just returns ok=false so
+	// AppendUsage writes 0 cpu_usec for that minute.
 	if row.CPUValid != 0 {
 		return 0, false
 	}
@@ -103,6 +107,18 @@ func (a *scheddCPUAdapter) refresh() {
 		// Preserve the previous snapshot on error so a transient
 		// gRPC failure doesn't drop the CPU data for the rest of
 		// the minute. The next sample retries.
+		//
+		// If schedd is down for longer than ~one minute, the
+		// snapshot is stale by a wider margin: the per-instance
+		// CPU counters on the schedd side are advancing (or
+		// wrapping on regression) but the adapter keeps
+		// returning the last-known values. The per-minute
+		// AppendUsage write will silently under-count until the
+		// next successful refresh. This is a known
+		// silent-under-count; the operator can see it via the
+		// schedd /metrics and the alert pipeline (M8 row 2
+		// will add a `schedd_instance_stats_collect_failures_total`
+		// tripwire).
 		return
 	}
 	m := make(map[string]scheddgrpc.InstanceStatsRow, len(rows))

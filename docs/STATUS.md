@@ -247,6 +247,18 @@ spinner) and PR #51 (the closeout batch):
   file `docs/drills/2026-07-20-restore-drill.md` is the template.
 - **`leakcheck.sh` glob fix** matches the v1.7 jailer `--id`
   constraint.
+- **CPU-hour visibility shipped (issue #279 / PR #346 / ADR-039)** —
+  per-instance CPU consumption is now exposed end-to-end:
+  `schedd_instance_cpu_seconds_total{app,node}` (sum rollup,
+  monotonic, regression-guarded), `usage_minutes.cpu_usec` (new
+  column, additive `ON CONFLICT` merge; `mb_seconds` retains
+  first-write-wins), `GET /v1/usage`, `/v1/usage/summary`, and
+  `/v1/account/export` all expose `cpu_usec` / `used_cpu_hours`,
+  and `faas usage` shows a CPU panel. **Informational only — no
+  billing change.** `pkg/billing/provider.go`, `pkg/api/limits.go`,
+  and the financial model are explicitly untouched. The data
+  path is the seam for the future billing PR (extends
+  `Provider.PushUsageRecord` with `cpu_usec`).
 
 **Networking & egress (PRs #128, #151, #159):**
 
