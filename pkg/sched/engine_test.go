@@ -1479,3 +1479,61 @@ func TestEngineWake_NilVerifierSkipsVerify(t *testing.T) {
 		t.Errorf("coldBoots = %d, want 1", vmm.coldBoots)
 	}
 }
+
+// TestEngineWake_RejectsTransientVerifierIO pins the third
+// branch on the wake-verifier path (review finding #3 on PR
+// #322): the verifier returns a non-Problem error (the storage
+// backend refused to read the sig blob, etc.). The engine must
+// (1) NOT surface sig_invalid, (2) wrap the error as a
+// *api.Problem with Retry-After so gatewayd's writeWakeError
+// flushes the header, and (3) release the ledger slot rather
+// than holding it forever on a transient storage blip.
+func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	transient := errors.New("cosign: read sig \"sigs/x.sig\": storage backend unreachable")
+	verifier := &staleVerifier{reject: transient}
+	e.WithVerifier(verifier)
+
+	_, err := e.Wake(context.Background(), app.ID)
+	if err == nil {
+		t.Fatal("Wake accepted transient verifier I/O; want error")
+	}
+	// Must NOT carry sig_invalid — that's the tamper branch, this
+	// is the transient-I/O branch and the customer (and the
+	// alerting) need to distinguish them.
+	if strings.Contains(err.Error(), api.CodeSigInvalid) {
+		t.Errorf("err = %v, must NOT carry code %q (this is the transient-I/O branch, not tamper)",
+			err, api.CodeSigInvalid)
+	}
+	// Must carry Retry-After so gatewayd flushes a 503 with the
+	// header (writeWakeError falls back to ErrCapacity otherwise).
+	var p *api.Problem
+	if !errors.As(err, &p) {
+		t.Fatalf("err = %v, want *api.Problem so gatewayd can write Retry-After", err)
+	}
+	// Verify the engine tagged the underlying storage error in
+	// the Detail so log greps still find it (the customer-facing
+	// 503 carries "verifier I/O error for layer ...",
+	// operator-facing logs/Sentry carry the verbatim
+	// "storage backend unreachable" via the Detail).
+	if !strings.Contains(err.Error(), "storage backend unreachable") {
+		t.Errorf("err = %v, want Detail to preserve underlying storage error", err)
+	}
+	if vmm.coldBoots != 0 {
+		t.Errorf("vmm invoked on transient verifier I/O: coldBoots=%d, want 0", vmm.coldBoots)
+	}
+	if got := e.Ledger().ResidentRAM(); got != 0 {
+		t.Errorf("ResidentRAM = %d MB after reject, want 0 (transient must release the slot, not hold it)",
+			got)
+	}
+	// Verify the Retry-After header is on the Problem (the
+	// engine-side pin; gatewayd's writeWakeError surfaces it on
+	// the wire via api.WriteProblem).
+	if got := p.HasHeader("Retry-After"); len(got) != 1 || got[0] != "5" {
+		t.Errorf("HasHeader(Retry-After) = %v, want [\"5\"]", got)
+	}
+}

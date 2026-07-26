@@ -61,10 +61,8 @@ func (m *memStorage) Delete(_ context.Context, key string) error {
 
 // keyPairTempDir writes a fresh ECDSA P-256 keypair to disk under
 // t.TempDir() with the canonical 0400/0444 modes and returns the
-// paths. Cleanup is automatic via t.TempDir(). The pub return is
-// unused by the current tests but kept for negative-check
-// extensions (forged sig with a specific wrong key, etc.).
-func keyPairTempDir(t *testing.T) (privPath, pubPath string, pub *ecdsa.PublicKey) {
+// paths. Cleanup is automatic via t.TempDir().
+func keyPairTempDir(t *testing.T) (privPath, pubPath string) {
 	t.Helper()
 	privPEM, pubPEM, err := GenerateKeyPair()
 	if err != nil {
@@ -79,16 +77,12 @@ func keyPairTempDir(t *testing.T) (privPath, pubPath string, pub *ecdsa.PublicKe
 	if err := os.WriteFile(pubPath, pubPEM, 0o444); err != nil {
 		t.Fatalf("write pub: %v", err)
 	}
-	pub, err = LoadPublicKeyFile(pubPath)
-	if err != nil {
-		t.Fatalf("LoadPublicKeyFile: %v", err)
-	}
-	return privPath, pubPath, pub
+	return privPath, pubPath
 }
 
 func TestLocalSigner_RoundTrip(t *testing.T) {
 	ctx := context.Background()
-	privPath, _, _ := keyPairTempDir(t)
+	privPath, _ := keyPairTempDir(t)
 	stor := newMemStorage()
 
 	// Pin the artifact shape: 256 random bytes — small enough to
@@ -105,7 +99,7 @@ func TestLocalSigner_RoundTrip(t *testing.T) {
 		t.Fatalf("seed layer: %v", err)
 	}
 
-	signer, err := NewLocalSigner(privPath, stor)
+	signer, err := NewLocalSigner(privPath, stor, nil)
 	if err != nil {
 		t.Fatalf("NewLocalSigner: %v", err)
 	}
@@ -140,7 +134,7 @@ func TestLocalSigner_RoundTrip(t *testing.T) {
 
 func TestLocalVerifier_DetectsTamper(t *testing.T) {
 	ctx := context.Background()
-	privPath, _, _ := keyPairTempDir(t)
+	privPath, _ := keyPairTempDir(t)
 	stor := newMemStorage()
 
 	artifact := []byte("hello world")
@@ -150,7 +144,7 @@ func TestLocalVerifier_DetectsTamper(t *testing.T) {
 		t.Fatalf("seed layer: %v", err)
 	}
 
-	signer, err := NewLocalSigner(privPath, stor)
+	signer, err := NewLocalSigner(privPath, stor, nil)
 	if err != nil {
 		t.Fatalf("NewLocalSigner: %v", err)
 	}
@@ -192,8 +186,8 @@ func TestLocalVerifier_DetectsWrongKey(t *testing.T) {
 	// legitimate P-256 key, because the bytes were signed under a
 	// different one.
 	ctx := context.Background()
-	privPathA, _, _ := keyPairTempDir(t)
-	_, pubPathB, _ := keyPairTempDir(t)
+	privPathA, _ := keyPairTempDir(t)
+	_, pubPathB := keyPairTempDir(t)
 	stor := newMemStorage()
 
 	artifact := []byte("payload")
@@ -203,7 +197,7 @@ func TestLocalVerifier_DetectsWrongKey(t *testing.T) {
 		t.Fatalf("seed layer: %v", err)
 	}
 
-	signer, err := NewLocalSigner(privPathA, stor)
+	signer, err := NewLocalSigner(privPathA, stor, nil)
 	if err != nil {
 		t.Fatalf("NewLocalSigner: %v", err)
 	}
@@ -223,7 +217,7 @@ func TestLocalVerifier_DetectsWrongKey(t *testing.T) {
 
 func TestLocalVerifier_MissingSig(t *testing.T) {
 	ctx := context.Background()
-	_, pubPath, _ := keyPairTempDir(t)
+	_, pubPath := keyPairTempDir(t)
 	stor := newMemStorage()
 
 	artifact := []byte("payload")
@@ -254,21 +248,42 @@ func TestLocalVerifier_MissingSig(t *testing.T) {
 }
 
 func TestLoadPrivateKeyFile_RejectsInsecurePerms(t *testing.T) {
-	dir := t.TempDir()
-	privPath := filepath.Join(dir, "sign.key")
-	privPEM, _, err := GenerateKeyPair()
-	if err != nil {
-		t.Fatalf("GenerateKeyPair: %v", err)
+	// Pin both ends of the allowed set: the new whitelist accepts
+	// exactly 0o400 and 0o440; everything else (write bits,
+	// exec bits, other-r bits) must be rejected with the
+	// ErrInsecurePrivKeyPerms sentinel.
+	cases := []struct {
+		name string
+		mode os.FileMode
+		want error // nil = accept, ErrInsecurePrivKeyPerms = reject
+	}{
+		{"accept_0400_owner_only", 0o400, nil},
+		{"accept_0440_owner_and_group_read", 0o440, nil},
+		{"reject_0644_group_read", 0o644, ErrInsecurePrivKeyPerms},
+		{"reject_0600_owner_read_write", 0o600, ErrInsecurePrivKeyPerms},
+		{"reject_0700_owner_full", 0o700, ErrInsecurePrivKeyPerms},
+		{"reject_0404_other_read", 0o404, ErrInsecurePrivKeyPerms},
+		{"reject_0444_world_read", 0o444, ErrInsecurePrivKeyPerms},
 	}
-	// Write with mode 0644 — group-readable is the canonical
-	// "insecure perms" signal that LoadPrivateKeyFile must
-	// reject. The /etc/faas/secrets/ install uses 0400.
-	if err := os.WriteFile(privPath, privPEM, 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	_, err = LoadPrivateKeyFile(privPath)
-	if !errors.Is(err, ErrInsecurePrivKeyPerms) {
-		t.Errorf("err = %v, want ErrInsecurePrivKeyPerms", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			privPath := filepath.Join(dir, "sign.key")
+			privPEM, _, err := GenerateKeyPair()
+			if err != nil {
+				t.Fatalf("GenerateKeyPair: %v", err)
+			}
+			if err := os.WriteFile(privPath, privPEM, c.mode); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_, err = LoadPrivateKeyFile(privPath)
+			switch {
+			case c.want == nil && err != nil:
+				t.Fatalf("mode %#o accepted in pin; err = %v", c.mode, err)
+			case c.want != nil && !errors.Is(err, c.want):
+				t.Errorf("mode %#o: err = %v, want %v", c.mode, err, c.want)
+			}
+		})
 	}
 }
 

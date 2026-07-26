@@ -61,6 +61,11 @@ type Problem struct {
 	// Stripe: empty). The dashboard renders this as a confirmation id
 	// after the customer completes checkout. Empty on the Stripe path.
 	TxID string `json:"tx_id,omitempty"`
+	// extraHeaders are non-JSON response headers attached via WithHeader.
+	// Kept unexported so the wire body (RFC 7807 problem+json) is
+	// exactly the spec; WriteProblem flushes these onto the wire
+	// before WriteHeader. nil = no extras.
+	extraHeaders map[string][]string `json:"-"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -75,6 +80,11 @@ func (p *Problem) Error() string {
 // code. Every HTTP surface (gatewayd, apid) uses this so error shape is uniform.
 func WriteProblem(w http.ResponseWriter, p *Problem) {
 	w.Header().Set("Content-Type", "application/problem+json")
+	for k, vs := range p.extraHeaders {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
 	w.WriteHeader(p.Status)
 	_ = json.NewEncoder(w).Encode(p)
 }
@@ -96,6 +106,30 @@ func (p *Problem) WithLimit(limit, observed int64) *Problem {
 func (p *Problem) WithDocs(url string) *Problem {
 	p.DocsURL = url
 	return p
+}
+
+// WithHeader attaches a single response header to the Problem so
+// gatewayd's writeWakeError can write it onto the wire without
+// branches on each error code. Used today by the build-attestation
+// transient-I/O path (Retry-After: 5 — review finding #1a on
+// PR #322). Multiple WithHeader calls compose: each call appends a
+// new key. Returns the same pointer for chaining.
+func (p *Problem) WithHeader(key, value string) *Problem {
+	if p.extraHeaders == nil {
+		p.extraHeaders = map[string][]string{}
+	}
+	p.extraHeaders[key] = append(p.extraHeaders[key], value)
+	return p
+}
+
+// HasHeader returns the slice of values attached to key (nil if
+// none). Exposed so tests + callers can verify the header was
+// recorded without reaching into the unexported field.
+func (p *Problem) HasHeader(key string) []string {
+	if p.extraHeaders == nil {
+		return nil
+	}
+	return p.extraHeaders[key]
 }
 
 // Stable error codes (spec Appendix A, UX spec §7). Keep in sync with docs and
@@ -142,8 +176,8 @@ const (
 	// The deployment transitions to DeployFailed with this code;
 	// the wake that triggered the verify returns 503 to gatewayd
 	// with the same code. ADR-038 §Consequences Compatibility.
-	CodeSigInvalid = "sig_invalid"
-	CodeNoRollbackTarget  = "no_rollback_target"
+	CodeSigInvalid       = "sig_invalid"
+	CodeNoRollbackTarget = "no_rollback_target"
 
 	// CodePayment is the 402 response when an API-only plan change requires
 	// a Stripe subscription the customer does not have (issue #142 / PR).

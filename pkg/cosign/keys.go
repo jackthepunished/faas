@@ -40,18 +40,22 @@ const DefaultSignKeyPath = "/etc/faas/secrets/sign.key"
 const DefaultSignPubPath = "/etc/faas/secrets/sign-pub.pem"
 
 // LoadPrivateKeyFile reads + parses + mode-checks the signing
-// key. Allowed modes are 0o400 (read-only owner) — no group or
-// other access, no exec, no setuid. Returns *ecdsa.PrivateKey on
-// success, ErrInsecurePrivKeyPerms on a bad mode, or a parse
-// error.
+// key. Allowed modes: 0o400 (owner-only) and 0o440 (owner+group
+// read) — no write/exec/setuid bits for anyone. The 0o440 form
+// supports co-admin installs where the key is shared between the
+// primary operator and a break-glass role; the canonical
+// /etc/faas/secrets/sign.key install uses 0o400 (root:root).
+// Anything looser (group write, other read, any exec, any setuid)
+// returns ErrInsecurePrivKeyPerms.
 func LoadPrivateKeyFile(path string) (*ecdsa.PrivateKey, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("cosign: stat %q: %w", path, err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	perm := info.Mode().Perm()
+	if perm != 0o400 && perm != 0o440 {
 		return nil, fmt.Errorf("cosign: %q mode %#o: %w",
-			path, info.Mode().Perm(), ErrInsecurePrivKeyPerms)
+			path, perm, ErrInsecurePrivKeyPerms)
 	}
 	return loadPrivateKey(path)
 }

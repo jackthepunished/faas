@@ -576,11 +576,21 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			// Transient I/O — fail the boot but don't mark the
 			// layer compromised. Same shape as the vmmd
 			// round-trip failure path below: transition + release.
+			// Wrap in a *api.Problem so gatewayd's writeWakeError
+			// sees a Problem (and therefore writes through to the
+			// client with Retry-After) instead of falling through
+			// to its ErrCapacity fallback that lacks the header
+			// (review finding #1a on PR #322). The detail
+			// preserves the underlying storage error verbatim so
+			// log greps still find it.
 			e.log.Warn("wake: verifier i/o error",
 				"app", appID, "layer", spec.LayerKey, "err", err)
 			e.transitionWithKind(ctx, bootInput.insID, appID, state.StateFailed, "wake_boot_error", "sig_verify_io")
 			e.ledger.Release(bootInput.insID)
-			return WakeResult{}, err
+			return WakeResult{}, api.NewProblem(503, api.CodeCapacity,
+				"signature verification storage error",
+				fmt.Sprintf("verifier I/O error for layer %q: %v (retry shortly)", spec.LayerKey, err)).
+				WithHeader("Retry-After", "5")
 		}
 	}
 
@@ -909,11 +919,18 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 				e.ledger.Release(ins.ID)
 				return err
 			}
+			// Transient I/O — same Retry-After shape as the Wake
+			// branch. Wrap as a Problem so gatewayd's writeWakeError
+			// flushes both status + header in one path (review
+			// finding #1a on PR #322).
 			e.log.Warn("prime: verifier i/o error",
 				"app", appID, "layer", spec.LayerKey, "err", err)
 			e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_sig_verify_io")
 			e.ledger.Release(ins.ID)
-			return err
+			return api.NewProblem(503, api.CodeCapacity,
+				"signature verification storage error",
+				fmt.Sprintf("verifier I/O error for layer %q: %v (retry shortly)", spec.LayerKey, err)).
+				WithHeader("Retry-After", "5")
 		}
 	}
 

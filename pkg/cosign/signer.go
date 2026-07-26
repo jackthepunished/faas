@@ -32,6 +32,7 @@
 package cosign
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -40,7 +41,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/onebox-faas/faas/pkg/storage"
 )
@@ -126,10 +126,19 @@ func verifyDigest(pub *ecdsa.PublicKey, digest, sig []byte) bool {
 // signature back to Storage at the sig key.
 //
 // Constructed once at daemon startup; the underlying *ecdsa.PrivateKey
-// is held in memory for the lifetime of the process.
+// is held in memory for the lifetime of the process. log is optional;
+// pass nil in unit tests, the daemon's slog.Logger at startup.
 type LocalSigner struct {
 	priv *ecdsa.PrivateKey
 	stor storage.StorageBackend
+	log  Logger
+}
+
+// Logger is a minimal interface for the signer to log non-fatal
+// close errors. Implemented by *slog.Logger so we don't drag the
+// whole slog import set into pkg/cosign just for one Warn call.
+type Logger interface {
+	Warn(msg string, args ...any)
 }
 
 // NewLocalSigner parses the PKCS#8 PEM at path (mode 0400 enforced
@@ -137,7 +146,7 @@ type LocalSigner struct {
 // is what cmd/imaged calls at startup) and wires a LocalSigner that
 // signs artifacts read from / written to stor. Returns an error if
 // the PEM is missing, malformed, or not ECDSA P-256.
-func NewLocalSigner(path string, stor storage.StorageBackend) (*LocalSigner, error) {
+func NewLocalSigner(path string, stor storage.StorageBackend, log Logger) (*LocalSigner, error) {
 	priv, err := LoadPrivateKeyFile(path)
 	if err != nil {
 		return nil, err
@@ -145,7 +154,7 @@ func NewLocalSigner(path string, stor storage.StorageBackend) (*LocalSigner, err
 	if stor == nil {
 		return nil, errors.New("cosign: NewLocalSigner: nil storage backend")
 	}
-	return &LocalSigner{priv: priv, stor: stor}, nil
+	return &LocalSigner{priv: priv, stor: stor, log: log}, nil
 }
 
 // Sign reads layerKey, computes ECDSA-P-256 over SHA-256(bytes),
@@ -154,18 +163,41 @@ func (s *LocalSigner) Sign(ctx context.Context, layerKey, sigKey string) error {
 	if layerKey == "" || sigKey == "" {
 		return errors.New("cosign: Sign: empty layerKey or sigKey")
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("cosign: pre-sign ctx: %w", err)
+	}
 	rc, err := s.stor.Get(ctx, layerKey)
 	if err != nil {
 		return fmt.Errorf("cosign: read layer %q: %w", layerKey, err)
 	}
-	defer func() { _ = rc.Close() }()
 	// Hash the artifact without slurping it into memory: ext4s can
 	// be 1-2 GB (Pro/Scale apps with large layers); the SHA-256 +
 	// ECDSA sign both operate on the digest. We stream the hash
 	// and then sign the digest.
 	h := sha256.New()
-	if _, err := io.Copy(h, rc); err != nil {
+	// Wrap the Reader in a ctx-aware copy loop: io.Copy
+	// doesn't natively check ctx, but the storage backend's
+	// Read typically honors the context passed to Get — and a
+	// 1-2 GB hash on a piped stream would happily finish
+	// after the caller cancelled.
+	cc := newCtxCopy(h, rc, ctx)
+	n, err := cc.Do()
+	if err != nil {
+		_ = rc.Close()
 		return fmt.Errorf("cosign: hash layer %q: %w", layerKey, err)
+	}
+	_ = n // suppress unused warning; cc reports bytes copied
+	// Observe the close error: a mid-read truncation silently
+	// corrupts the digest (possible on remote / OBS backends).
+	// Log via the daemon's slog; LocalSigner is constructed once
+	// at startup so the optional logger is non-nil in production
+	// and nil in unit tests (test signer passes nil; the call
+	// is no-op).
+	if closeErr := rc.Close(); closeErr != nil {
+		if s.log != nil {
+			s.log.Warn("cosign: close layer reader after hash",
+				"layer", layerKey, "err", closeErr)
+		}
 	}
 	digest := h.Sum(nil)
 	r, sBig, err := ecdsa.Sign(rand.Reader, s.priv, digest)
@@ -181,35 +213,16 @@ func (s *LocalSigner) Sign(ctx context.Context, layerKey, sigKey string) error {
 	copy(out[32-len(rb):32], rb)
 	copy(out[64-len(sb):64], sb)
 
-	// Write the raw sig blob. Cast to *byteReader so the
-	// pointer-receiver Read (see byteReader's doc) advances
-	// the underlying slice header between calls — otherwise
-	// io.ReadAll inside the storage backend's Put loops
-	// forever (would-be value-receiver bug).
-	sigReader := (*byteReader)(&out)
-	if err := s.stor.Put(ctx, sigKey, sigReader); err != nil {
+	// Write the raw sig blob via bytes.NewReader. One heap alloc
+	// per Sign — well under the build-pipeline cost budget (one
+	// Sign per build, not per wake). Avoids the byteReader
+	// pointer-receiver footgun a value-receiver use would
+	// reintroduce (Storage.Put's io.ReadAll loops forever if the
+	// slice header doesn't advance between Read calls).
+	if err := s.stor.Put(ctx, sigKey, bytes.NewReader(out)); err != nil {
 		return fmt.Errorf("cosign: write sig %q: %w", sigKey, err)
 	}
 	return nil
-}
-
-// byteReader is a tiny io.Reader adapter over a byte slice so we can
-// pass the raw sig to Storage.Put without a bytes.Buffer allocation.
-//
-// Pointer receiver: the value receiver loses the slice-header
-// mutation between Read calls (a value receiver gets a copy of
-// the header each call, so `b = b[n:]` doesn't persist). Using
-// `*byteReader` advances the underlying slice once and io.ReadAll
-// sees EOF on the next call.
-type byteReader []byte
-
-func (b *byteReader) Read(p []byte) (int, error) {
-	if len(*b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, *b)
-	*b = (*b)[n:]
-	return n, nil
 }
 
 // loadPrivateKey parses a PEM-encoded PKCS#8 ECDSA private key. The
