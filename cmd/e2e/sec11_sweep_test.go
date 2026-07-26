@@ -286,6 +286,18 @@ func startAPIDAndExpectFail(t *testing.T, env []string, expectFailWithin time.Du
 // attached one, else empty string. Centralizing this avoids a
 // 5-line null-ok dance every call site had.
 func procBuffer(proc *exec.Cmd) string {
+	// startProc now uses *syncBuffer (mutex-guarded io.Writer; see
+	// the comment there about -race safety). The earlier *bytes.Buffer
+	// type assertion silently returned "" after the wrap — every
+	// "vmmd output did not mention ..." failure looked like an empty
+	// output, hiding the actual error message in the buffer. Mirror
+	// the shape: if it's a *syncBuffer, call its String() method;
+	// fall back to *bytes.Buffer for older test harnesses that
+	// haven't migrated yet (none today, but the assertion keeps
+	// the seam future-safe).
+	if buf, ok := proc.Stdout.(*syncBuffer); ok {
+		return buf.String()
+	}
 	if buf, ok := proc.Stdout.(*bytes.Buffer); ok {
 		return buf.String()
 	}
