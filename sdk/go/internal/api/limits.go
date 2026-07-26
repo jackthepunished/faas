@@ -1,11 +1,20 @@
-// Wire-relevant types from pkg/api/limits.go. The Plan enum and Limits
-// struct are part of the platform's external surface (AccountResponse.Limits
-// returns a Limits value to the customer) so they ship in the SDK. The
-// authoritative planLimits table, ConntrackCapProbe, and platform
-// constants stay in the daemon-only pkg/api/limits.go (the spec
-// documents limits.go as the single source of truth for admission —
-// spec §15 conventions; "never inline a limit at its point of use").
+// Package api is the onebox FaaS platform's wire surface. It is the
+// public Go SDK shape: typed DTOs, the RFC 7807 problem envelope, the
+// streaming SSE decoder, and the bearer/idempotency-key/pagination
+// conventions every Client method honours. The daemon's pkg/api/*
+// package is the server-side counterpart; see ADR-038 (issue #266) for
+// the split contract this module enforces.
 package api
+
+// File-level note: this file is the SDK copy of pkg/api/limits.go,
+// trimmed to the wire types only (Plan enum, Plans slice, Limits
+// struct). The authoritative planLimits table, ConntrackCapProbe, and
+// platform constants stay in the daemon-only pkg/api/limits.go (the
+// spec documents limits.go as the single source of truth for admission
+// — spec §15 conventions; "never inline a limit at its point of use").
+// See pkg/api/limits.go in the daemon for the test surface; this copy
+// has no LimitsFor / MustLimitsFor / BillableRAMMB helpers because the
+// values are server-side constants, not wire data.
 
 // Plan is a customer subscription tier. The zero value is intentionally invalid
 // so an unset plan never silently reads as Free.

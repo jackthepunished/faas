@@ -1,6 +1,20 @@
+// Package api is the onebox FaaS platform's public Go SDK. See
+// ADR-038 (issue #266) for the split contract between this module and
+// the daemon's pkg/api/* package — this file in particular ships only
+// the customer-facing scope vocabulary, not the server-side helpers.
 package api
 
 import "fmt"
+
+// File-level note: this file is the SDK copy of pkg/api/apikey.go,
+// trimmed to the public scope vocabulary (ScopeAdmin, IsValidScope,
+// NormalizeCreateKeyScopes). The server-side helpers — APIKeyPrefix,
+// GenerateAPIKey, HashAPIKey, HashToken, ValidAPIKeyFormat,
+// ConstantTimeEqualHash, and the ScopesAdminOnly / ScopesReadSurface /
+// ScopesUsageReadSurface / ScopesSecretsWriteSurface /
+// ScopesDeployWriteSurface pre-baked route gates — stay in the
+// daemon-only pkg/api/apikey.go. None of those belong in a public SDK
+// (they touch crypto/rand and server-side route gating).
 
 // API-key scopes (IAM-1, ADR-034 rev2). The first merge of the closed
 // vocab (admin | read | write) was too coarse: granting `read` to a key
