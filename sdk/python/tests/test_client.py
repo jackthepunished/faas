@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 import pytest
+from _constants import STABLE_IDEMPOTENCY_KEY
 
 from faas_sdk import (
     ErrCapacity,
@@ -37,12 +38,15 @@ from faas_sdk import (
 from faas_sdk._rfc7807 import parse_problem
 from faas_sdk._transport import (
     MUTATING_METHODS,
+    AsyncIdempotencyTransport,
+    AsyncRfc7807Layer,
     IdempotencyTransport,
     LoggingTransport,
     RetryOptions,
     RetryTransport,
     Rfc7807Layer,
     WrapperOptions,
+    build_async_chain,
     build_chain,
 )
 from faas_sdk.idempotency import (
@@ -180,10 +184,10 @@ def test_idempotency_preserves_explicit_header() -> None:
     request = httpx.Request(
         "POST",
         "https://api.example.com/v1/apps",
-        headers={HEADER_NAME: "ci-deploy-2026-07-27-abc"},
+        headers={HEADER_NAME: STABLE_IDEMPOTENCY_KEY},
     )
     transport.handle_request(request)
-    assert captured["key"] == "ci-deploy-2026-07-27-abc"
+    assert captured["key"] == STABLE_IDEMPOTENCY_KEY
 
 
 def test_with_idempotency_key_overrides_auto_mint() -> None:
@@ -203,11 +207,11 @@ def test_with_idempotency_key_overrides_auto_mint() -> None:
     assert _UUID4.match(captured["key"])
 
     # Inside the `with`: explicit.
-    with with_idempotency_key("ci-deploy-2026-07-27-abc"):
+    with with_idempotency_key(STABLE_IDEMPOTENCY_KEY):
         transport.handle_request(httpx.Request("POST", "https://api.example.com/v1/x"))
-        assert captured["key"] == "ci-deploy-2026-07-27-abc"
+        assert captured["key"] == STABLE_IDEMPOTENCY_KEY
         # Current key is the explicit one.
-        assert current_idempotency_key() == "ci-deploy-2026-07-27-abc"
+        assert current_idempotency_key() == STABLE_IDEMPOTENCY_KEY
 
     # Outside again: back to auto-mint.
     transport.handle_request(httpx.Request("POST", "https://api.example.com/v1/x"))
@@ -444,5 +448,88 @@ def test_chain_decodes_problem_after_retry_exhaustion() -> None:
         chain.handle_request(httpx.Request("GET", "https://api.example.com/v1/x"))
     # 500 + Problem body with unknown code → FaasProblemError, not a
     # canonical sentinel.
+    assert excinfo.value.problem.status == 500
+    assert excinfo.value.problem.code == "unknown_thing"
+
+
+# ---------------------------------------------------------------------------
+# Async chain — parity with sync
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_idempotency_auto_mints_uuid_v4_on_post() -> None:
+    """Async sibling of `IdempotencyTransport` mirrors the sync
+    auto-mint contract."""
+    captured: dict[str, str | None] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["key"] = request.headers.get(HEADER_NAME)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = AsyncIdempotencyTransport(httpx.MockTransport(handler))
+    await transport.handle_async_request(
+        httpx.Request("POST", "https://api.example.com/v1/apps"),
+    )
+    key = captured["key"]
+    assert key is not None
+    assert _UUID4.match(key)
+    assert uuid.UUID(key).version == 4
+
+
+@pytest.mark.asyncio
+async def test_async_idempotency_skips_get() -> None:
+    """Async transport skips non-mutating methods identically to
+    the sync `IdempotencyTransport`."""
+    captured: dict[str, str | None] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["key"] = request.headers.get(HEADER_NAME)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = AsyncIdempotencyTransport(httpx.MockTransport(handler))
+    await transport.handle_async_request(
+        httpx.Request("GET", "https://api.example.com/v1/apps"),
+    )
+    assert captured["key"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_rfc7807_layer_raises_canonical_sentinel() -> None:
+    """The async RFC 7807 layer must raise `ErrNotFound` exactly as
+    the sync layer does — without parity, async callers bypass
+    Problem decoding (review finding 5)."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            headers={"Content-Type": "application/problem+json"},
+            content=b'{"type":"about:blank","title":"app not found","status":404,"code":"not_found"}',
+        )
+
+    transport = AsyncRfc7807Layer(httpx.MockTransport(handler))
+    with pytest.raises(ErrNotFound):
+        await transport.handle_async_request(httpx.Request("GET", "https://api.example.com/v1/apps/missing"))
+
+
+@pytest.mark.asyncio
+async def test_async_chain_decodes_problem_after_retry_exhaustion() -> None:
+    """End-to-end: AsyncRetryTransport → AsyncLoggingTransport →
+    AsyncRfc7807Layer → AsyncIdempotencyTransport → user transport.
+    A 5xx with a Problem body and an unknown code still raises
+    `FaasProblemError` once retries are exhausted.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            headers={"Content-Type": "application/problem+json"},
+            content=b'{"status":500,"title":"boom","code":"unknown_thing"}',
+        )
+
+    options = WrapperOptions(retry=RetryOptions(max_attempts=1, backoff=0.0))
+    chain = build_async_chain(httpx.MockTransport(handler), options=options)
+    with pytest.raises(FaasProblemError) as excinfo:
+        await chain.handle_async_request(httpx.Request("GET", "https://api.example.com/v1/x"))
     assert excinfo.value.problem.status == 500
     assert excinfo.value.problem.code == "unknown_thing"

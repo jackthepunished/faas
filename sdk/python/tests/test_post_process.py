@@ -4,62 +4,69 @@ PR 6 does NOT introduce a post-processor (the generator's emit is
 clean). PR 7 (the `make sdk-gen` aggregator) is the natural place
 to add one if the generator ever needs deterministic output.
 
-The tests here are tripwires: any regen that produces non-canonical
-output should fail at the `make sdk-gen-twice` step (see Makefile).
-We document the tripwire and assert the on-disk tree is currently
-clean.
+The tripwire for non-determinism is `make sdk-gen-python-twice`,
+which runs in the smoke CI job; `pytest -m 'not regen' tests/` is
+the default invocation and excludes the deterministic-regen test
+below (it forks the generator twice and is redundant with the
+Makefile tripwire). To run it locally:
+
+    cd sdk/python && .venv/bin/python -m pytest -m regen tests/test_post_process.py
 """
 
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
+from collections.abc import Iterator
 
 import pytest
 
+#: Pytest marker for the deterministic-regen tripwire. Run with
+#: `pytest -m regen` to opt in; the default `pytest -m 'not regen'`
+#: excludes it (see pyproject.toml::markers).
+REGEN_MARK = pytest.mark.regen
 
-def test_regen_is_deterministic(tmp_path: Path) -> None:
-    """Regenerating twice produces no diff. Run from the SDK root
-    (`sdk/python/`) — the script path is `scripts/gen.py`.
 
-    This is the analogue of `make sdk-gen-{node,python}-twice` and
-    catches any non-determinism in the generator's emit.
+@pytest.fixture(scope="module")
+def _regen_skip_reason() -> Iterator[None]:
+    """Skip when the generator or ruamel.yaml is not on PATH."""
+    from shutil import which
+
+    if which("openapi-python-client") is None:
+        pytest.skip("openapi-python-client not installed; regen tripwire skipped")
+    yield
+
+
+@REGEN_MARK
+def test_regen_is_deterministic(_regen_skip_reason: None) -> None:
+    """Regenerating twice produces no diff. The Makefile tripwire
+    (`make sdk-gen-python-twice`) is the canonical assertion in CI;
+    this pytest is the local dev path for operators who run
+    `pytest -m regen`.
     """
+    import subprocess
+    import sys
+    from pathlib import Path
+
     repo_root = Path(__file__).resolve().parent.parent.parent.parent
     sdk_root = repo_root / "sdk" / "python"
     script = sdk_root / "scripts" / "gen.py"
     if not script.exists():
-        pytest.skip("gen.py not present (regen tooling not shipped in this checkout)")
+        pytest.skip("gen.py not present")
 
-    # First regen: capture the diff hash of the on-disk tree.
-    # Use `sys.executable` so the subprocess inherits the current
-    # venv (the test runs in the dev venv which has openapi-python-client
-    # + ruamel.yaml installed).
-    import sys as _sys
-
-    subprocess.run(
-        [_sys.executable, str(script)],
-        cwd=str(sdk_root),
-        check=True,
-    )
+    env_args = {"cwd": str(sdk_root)}
+    subprocess.run([sys.executable, str(script)], check=True, **env_args)
     first = subprocess.run(
         ["git", "ls-files", "-s", "faas_sdk/"],
-        cwd=str(sdk_root),
         check=True,
         capture_output=True,
         text=True,
+        **env_args,
     )
-    # Second regen: capture again, must match.
-    subprocess.run(
-        [_sys.executable, str(script)],
-        cwd=str(sdk_root),
-        check=True,
-    )
+    subprocess.run([sys.executable, str(script)], check=True, **env_args)
     second = subprocess.run(
         ["git", "ls-files", "-s", "faas_sdk/"],
-        cwd=str(sdk_root),
         check=True,
         capture_output=True,
         text=True,
+        **env_args,
     )
     assert first.stdout == second.stdout, "regen is non-deterministic: the second regen changed tracked files"

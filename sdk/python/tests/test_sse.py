@@ -87,7 +87,7 @@ def test_parse_frame_returns_none_on_pure_comment_frame() -> None:
 
 def test_parse_data_json_decodes_payload() -> None:
     body = b'data: {"foo":"bar","n":1}\n\n'
-    resp = _se_response = _sse_response(body)
+    resp = _sse_response(body)
     events = list(iter_sse(resp))
     payload = parse_data_json(events[0])
     assert payload == {"foo": "bar", "n": 1}

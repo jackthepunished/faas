@@ -23,6 +23,7 @@ import uuid
 
 import httpx
 import pytest
+from _constants import STABLE_IDEMPOTENCY_KEY
 
 from faas_sdk import (
     ErrNotFound,
@@ -218,7 +219,7 @@ def test_with_idempotency_key_scopes_explicit_key(fakeapid) -> None:
 
         innermost.handle_request = capturing_handle  # type: ignore[method-assign]
         try:
-            with with_idempotency_key("deploy-2026-07-27-abc"):
+            with with_idempotency_key(STABLE_IDEMPOTENCY_KEY):
                 create_app.sync(
                     client=client.inner,
                     body=CreateAppRequest(slug="explicit-key"),
@@ -226,6 +227,6 @@ def test_with_idempotency_key_scopes_explicit_key(fakeapid) -> None:
         finally:
             innermost.handle_request = original_handle  # type: ignore[method-assign]
 
-        assert captured["idempotency"] == "deploy-2026-07-27-abc"
+        assert captured["idempotency"] == STABLE_IDEMPOTENCY_KEY
     finally:
         client.close()
