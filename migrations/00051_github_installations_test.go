@@ -13,6 +13,12 @@
 //   5. The login_idx exists and is discoverable.
 //   6. Re-applying the migration is a no-op (IF NOT EXISTS).
 //
+// Slot history (PR-C's): 00051 (creation) → 00054 (renumbered to
+// dodge main's 00051_crons_app_full_idx + 00052_build_provenance
+// + 00053_deployments_source_url) → 00055 (renumbered after main's
+// 00054_usage_minutes_cpu landed via PR #346). Per
+// MEMORY.md/pr-migration-slot-race-with-shipping-main.
+//
 // Build tag mirrors apply_walk_test.go:4.
 
 package migrations_test
