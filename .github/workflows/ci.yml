@@ -499,6 +499,15 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install ruamel.yaml openapi-python-client
+          # `openapi-python-client` 0.29.0 imports the SDK package
+          # to inspect `types.Unset` at generate-time; without the
+          # editable install, the generator emits files with
+          # `from ...types import UNSET, Response` (no `Unset`),
+          # which diverges from HEAD. The standalone `sdk-gen-python`
+          # job does `pip install -e .` for the same reason — we
+          # mirror it here so the aggregator's regen is byte-
+          # identical to the standalone's.
+          .venv/bin/pip install --quiet -e .
       - name: install Node SDK deps
         working-directory: sdk/node
         run: npm ci --no-audit --no-fund
