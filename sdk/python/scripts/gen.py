@@ -280,7 +280,7 @@ def regen(overwrite: bool = True) -> None:
 def _patch_generator_bugs(sdk_root: Path) -> None:
     """Fix known bugs in the openapi-python-client 0.29.0 generator output.
 
-    Three cleanups:
+    Four cleanups:
 
     1. `from ...types import UNSET, Response` is missing `Unset` even
        though generated service files reference `Unset` in type
@@ -303,8 +303,20 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
        padding. This normaliser strips the padding on both sides
        of the inner text so the dirty-diff gate (PR 7) passes
        without the operator re-touching the tree by hand.
-       Multi-line docstrings are left alone — their inner
-       whitespace is semantically meaningful and stable.
+
+    4. Strip the leading space on multi-line docstring OPENER lines
+       and the trailing space on closer lines. The
+       `safe_docstring` Jinja2 macro in helpers.jinja emits a
+       raw-form template with a leading space-after-opening-DQ
+       and a trailing space-before-closing-DQ (per the macro:
+       three DQ, space, content, space, three DQ). When the
+       content contains newlines, those spaces survive as either
+       ` DQ_space first-line` (opener: leading space) or
+       `last-line space-DQ ` (closer: trailing space). Fix 3 only
+       catches the single-line case (both DQ on the same line);
+       Fix 4 extends the rule to opener/closer lines of multi-
+       line blocks, which leaves the body lines untouched (their
+       inner whitespace is semantically meaningful).
     """
     import re
 
@@ -316,6 +328,100 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
         r'^(\s*)"""(\s*)(.*?)(\s*)"""$',
         re.MULTILINE,
     )
+    # Fix 4: multi-line docstrings. openapi-python-client 0.29.0's
+    # `safe_docstring` Jinja2 macro (helpers.jinja:1-12) emits three
+    # DQ, then a single space, then the content, then a single
+    # space, then three DQ. When the content spans multiple lines,
+    # the opener line carries the leading space padding
+    # (` DQ-space first-line of body`) and the closer line carries
+    # the trailing space padding (`last-line of body space-DQ` or
+    # on a new line: ` DQ-space-DQ-DQ-DQ` after Jinja's
+    # `indent(4)`). We walk the file text line-by-line, locate
+    # each `"""` (opener) and the matching closer, and apply
+    # per-line padding strip.
+    #
+    # We deliberately avoid a single regex spanning the whole block
+    # because Python's `re` engine backtracks greedy `\s+` in
+    # ways that drop the macro's padding space from the captured
+    # group. Per-line processing is simpler and matches the macro's
+    # output shape exactly.
+    DQ = '"""'
+
+    def _fix_docstrings(text: str) -> str:
+        # Walk the text, tracking the most-recent `"""` opener and
+        # whether we're inside a multi-line docstring. Single-line
+        # docstrings (`DQ ... DQ` on one line) are handled by Fix 3
+        # below; here we only touch opener/closer lines of multi-
+        # line blocks.
+        out: list[str] = []
+        lines = text.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Detect a docstring OPENER on this line: DQ followed by
+            # exactly one space and at least one more character
+            # (so a closing DQ on the same line isn't an opener).
+            # Look at the first DQ occurrence on the line.
+            stripped = line.lstrip()
+            if (
+                not stripped.startswith(DQ)
+                # not a multi-line opener; let regexes below handle
+                # or leave alone
+                or line.rstrip().endswith(DQ)
+                and line.count(DQ) == 2
+            ):
+                out.append(line)
+                i += 1
+                continue
+            # Now we know line starts with some indent + DQ. Check
+            # if there's exactly one space after the opening DQ AND
+            # the line continues (no closing DQ on this line means
+            # we're in multi-line mode).
+            after_dq = line.lstrip()[3:]  # the part after DQ
+            if after_dq.startswith(" ") and DQ not in after_dq[1:]:
+                # OPENER of a multi-line docstring.
+                indent = line[: len(line) - len(line.lstrip())]
+                new_line = indent + DQ + after_dq[1:]
+                out.append(new_line)
+                # Body lines pass through unchanged.
+                i += 1
+                while i < len(lines):
+                    body = lines[i]
+                    out.append(body)
+                    # Body continues until we hit a line whose
+                    # stripped content is exactly DQ (closer on its
+                    # own line) or a line whose stripped tail ends
+                    # with ` DQ` after some content (closer after
+                    # body content).
+                    stripped_body = body.rstrip()
+                    if stripped_body.endswith(DQ):
+                        # This is a closer line (with or without
+                        # body content trailing on the line).
+                        # Detect two cases:
+                        # Case A: `last-line DQ` — closer after
+                        # body content. The DQ sits at end-of-line
+                        # with one optional space before.
+                        # Detect a trailing ` DQ` (single space +
+                        # DQ) before EOL.
+                        if stripped_body.endswith(" " + DQ):
+                            # Drop the trailing padding space.
+                            new_body = body[: -len(" " + DQ)] + DQ
+                            out[-1] = new_body
+                        else:
+                            # Closer on its own line: ` INDENT DQ`
+                            # where INDENT is the class-body indent.
+                            # Macro emits 4 indent + 1 padding = 5
+                            # spaces. Canonical is 4. Strip one.
+                            indent_count = len(body) - len(body.lstrip(" "))
+                            if indent_count > 4:
+                                out[-1] = body[: indent_count - 1] + body[indent_count:]
+                        i += 1
+                        break
+                    i += 1
+                continue
+            out.append(line)
+            i += 1
+        return "\n".join(out)
 
     for path in sdk_root.rglob("*.py"):
         text = path.read_text()
@@ -357,6 +463,15 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
             lambda m: f'{m.group(1)}"""{m.group(3)}"""',
             text,
         )
+        # Fix 4: multi-line docstrings (opener + closer padding).
+        # Per-line processing avoids the regex-engine backtracking
+        # that drops macro-padding spaces from `\s+` capture
+        # groups. The walker above recognises docstring openers
+        # (` DQ-space first-line-of-body`), follows body lines
+        # until it finds a ` DQ-DQ-DQ` closer (with optional
+        # preceding body content), and strips one space from
+        # each side of the DQ.
+        text = _fix_docstrings(text)
         if text != original:
             path.write_text(text)
 

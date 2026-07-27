@@ -33,22 +33,22 @@ class AppResponse:
     status: str
     url: str
     manifest: AppManifest
-    """ App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-
-    as-source flag (§ux 6.3). """
+    """App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-
+    as-source flag (§ux 6.3)."""
     autoscale_target_rps: int
-    """ Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured
-    per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037. """
+    """Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured
+    per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."""
     autoscale_target_cpu_pct: int
-    """ Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When
+    """Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When
     measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See
-    ADR-037. """
+    ADR-037."""
     runtime: AppResponseRuntime | Unset = UNSET
     """Runtime for `type: function` apps. Omit for `type: app` (the default)."""
     idle_timeout_s: int | None | Unset = UNSET
     egress_allowlist: list[str] | Unset = UNSET
-    """ Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6
+    """Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6
     (`2001:db8::/32`). v4-mapped v6 form (`::ffff:1.2.3.0/120`) is silently canonicalised to its v4 form at write
-    time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies. """
+    time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

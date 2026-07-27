@@ -26,8 +26,8 @@ class AccountResponse:
     plan: AccountResponsePlan
     status: AccountResponseStatus
     limits: AccountLimits
-    """ Plan-driven quota and resource caps: max RAM per app, concurrent wakes, total deployed apps, included GB-
-    hours, and max app-layer bytes per build. """
+    """Plan-driven quota and resource caps: max RAM per app, concurrent wakes, total deployed apps, included GB-
+    hours, and max app-layer bytes per build."""
     usage_gb_hours: float
     app_count: int
     github_install_id: None | str | Unset = UNSET

@@ -22,11 +22,11 @@ class UpdateAppRequest:
     egress_allowlist: list[str] | Unset = UNSET
     """v4 or v6 CIDR allowlist; empty array clears to chain-default-accept."""
     autoscale_target_rps: int | None | Unset = UNSET
-    """ Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are
-    422 invalid_autoscale_target_rps. """
+    """Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are
+    422 invalid_autoscale_target_rps."""
     autoscale_target_cpu_pct: int | None | Unset = UNSET
-    """ Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values
-    outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct. """
+    """Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values
+    outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
