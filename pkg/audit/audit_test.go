@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -144,7 +145,7 @@ func TestAuditor_Emit_WritesRowWithActor(t *testing.T) {
 	// (memstore.go:2834) which accepts canonical UUIDs (with hyphens)
 	// or 32-char hex. CreateAccount returns a real UUID, so the
 	// ListEvents filter below will match.
-	acctRec, err := store.CreateAccount(context.Background(), "schedd-audit@example.com", "schedd")
+	acctRec, err := store.CreateAccount(context.Background(), "schedd-audit@example.com", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
@@ -204,7 +205,7 @@ func TestAuditor_Emit_NilAccountIDAllowed(t *testing.T) {
 func TestAuditor_Emit_NilDataMarshalsAsEmptyObject(t *testing.T) {
 	store := state.NewMemStore()
 	a := audit.New(store, silentLog(), newStubAuditOps(), "apid")
-	acctRec, err := store.CreateAccount(context.Background(), "apid-audit@example.com", "apid")
+	acctRec, err := store.CreateAccount(context.Background(), "apid-audit@example.com", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
@@ -222,7 +223,7 @@ func TestAuditor_Emit_NilDataMarshalsAsEmptyObject(t *testing.T) {
 
 func TestAuditor_Emit_AppendEventFailureDoesNotPanic(t *testing.T) {
 	base := state.NewMemStore()
-	acctRec, err := base.CreateAccount(context.Background(), "schedd-fail@example.com", "schedd")
+	acctRec, err := base.CreateAccount(context.Background(), "schedd-fail@example.com", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
@@ -250,7 +251,7 @@ func TestAuditor_Emit_NilOpsAllowed(t *testing.T) {
 	// harness when ops wiring is skipped) must still work. The
 	// counter increment + duration observation are guarded.
 	store := state.NewMemStore()
-	acctRec, err := store.CreateAccount(context.Background(), "apid-nilops@example.com", "apid")
+	acctRec, err := store.CreateAccount(context.Background(), "apid-nilops@example.com", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}

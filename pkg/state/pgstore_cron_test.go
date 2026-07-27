@@ -271,4 +271,23 @@ func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
 	if reread["invocation_id"] != "inv-uuid-1" {
 		t.Errorf("invocation_id = %v, want inv-uuid-1", reread["invocation_id"])
 	}
+
+	// jsonb round-trip check: cast `data->>'path'` from the row
+	// directly to prove the jsonb column's text-extraction matches
+	// the unmarshal-the-Data-byte-slice path. Without this, a
+	// regression that changes the jsonb cast (e.g. switching to
+	// json instead of jsonb, or a future Postgres version with a
+	// different default whitespace normalisation) could pass the
+	// Go-side unmarshal but break a dashboard query like
+	// `select data->>'path' from events where kind='cron.fired'`.
+	pool := pgtest.Open(t)
+	var dbPath string
+	if err := pool.QueryRow(ctx,
+		`select data->>'path' from events where kind = 'cron.fired' and subject = $1`,
+		acct.ID).Scan(&dbPath); err != nil {
+		t.Fatalf("raw jsonb path query: %v", err)
+	}
+	if dbPath != "/ping" {
+		t.Errorf("data->>'path' = %q, want /ping (jsonb round-trip)", dbPath)
+	}
 }

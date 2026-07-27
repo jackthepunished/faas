@@ -495,3 +495,100 @@ func TestCronDispatch_CronFiredAuditFailureDoesNotRollback(t *testing.T) {
 		t.Errorf("synth calls = %d, want 1 (audit-log failure must not roll back dispatch)", got)
 	}
 }
+
+// failingSynth is a recordingSynth whose Invoke and SynthesizeRequest
+// both error. Drives the status="err" branch in dispatchOneCron: the
+// cron reached the Wake step (so the boundary guard already
+// approved the fire), the synthetic Invoke failed, AND the legacy
+// SynthesizeRequest fallback also failed. The defer-block emit
+// MUST still record status="err" with empty invocation_id and
+// instance_id so SOC 2 CC7.2 catches the "scheduled but failed to
+// fire" case. Test pins that audit row exists + status field.
+type failingSynth struct {
+	calls atomic.Int64
+}
+
+func (f *failingSynth) SynthesizeRequest(_ context.Context, _, _, _ string) error {
+	f.calls.Add(1)
+	return errors.New("simulated synth failure")
+}
+
+func (f *failingSynth) Invoke(_ context.Context, _ string, _ state.Invocation) (state.Invocation, error) {
+	f.calls.Add(1)
+	return state.Invocation{}, errors.New("simulated invoke failure")
+}
+
+// TestCronDispatch_EmitsCronFiredAudit_WhenInvokeFails pins the
+// err-path coverage promised by the PR description ("emitted
+// regardless of synthetic Invoke outcome"). A cron that reaches
+// the Wake step but whose synthetic Invoke + SynthesizeRequest
+// both fail MUST still produce a cron.fired audit row with
+// status="err" and empty invocation_id / instance_id (the JSON
+// shape stays stable for dashboards per pkg/audit ADR-035
+// err-path invariant).
+func TestCronDispatch_EmitsCronFiredAudit_WhenInvokeFails(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	acct, _ := store.CreateAccount(ctx, "c@example.com", api.PlanHobby)
+	app, cron := newAppAndCron(t, store, acct.ID, true)
+
+	vmm := &fakeWakeVMM{}
+	eng, _ := makeEngine(t, store, vmm)
+	synth := &failingSynth{}
+	now := time.Date(2026, 7, 17, 12, 2, 0, 0, time.UTC)
+	loop := NewLoop(nil, eng, slog.Default()).
+		WithGatewaySynth(synth).
+		WithAudit(audit.New(store, slog.Default(), nil, "schedd")).
+		WithClock(func() time.Time { return now })
+
+	loop.runCronTick(ctx)
+
+	// Even though Invoke + SynthesizeRequest both failed, the
+	// defer-block emit MUST have fired — the cron reached the Wake
+	// step so the boundary guard approved the fire, and SOC 2 CC7.2
+	// expects an audit signal for "scheduled but failed to fire".
+	rows, err := store.ListEvents(ctx, acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListEvents(acct) returned %d rows, want 1 (cron.fired on err path); rows=%+v", len(rows), rows)
+	}
+	e := rows[0]
+	if e.Kind != "cron.fired" {
+		t.Errorf("event kind = %q, want cron.fired", e.Kind)
+	}
+	if e.Actor != "schedd" {
+		t.Errorf("event actor = %q, want schedd", e.Actor)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Data, &payload); err != nil {
+		t.Fatalf("event Data not valid JSON: %v (data=%q)", err, e.Data)
+	}
+	if payload["status"] != "err" {
+		t.Errorf("payload.status = %v, want err (synth failed)", payload["status"])
+	}
+	// JSON shape invariant: invocation_id + instance_id MUST be
+	// present (empty string), NOT omitted — see pkg/audit ADR-035.
+	for _, k := range []string{"invocation_id", "instance_id"} {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("payload missing key %q on err path (full=%+v)", k, payload)
+		}
+		if v, _ := payload[k].(string); v != "" {
+			t.Errorf("payload[%q] = %q, want empty string on err path", k, v)
+		}
+	}
+	// The pre-fire state is still useful for ops reconciliation.
+	if payload["cron_id"] != cron.ID {
+		t.Errorf("payload.cron_id = %v, want %s", payload["cron_id"], cron.ID)
+	}
+	if payload["app_id"] != app.ID {
+		t.Errorf("payload.app_id = %v, want %s", payload["app_id"], app.ID)
+	}
+	// Synth call counter: both Invoke and SynthesizeRequest must
+	// have been attempted (proves the err path was actually taken).
+	if got := synth.calls.Load(); got != 2 {
+		t.Errorf("synth.calls = %d, want 2 (Invoke + SynthesizeRequest fallback)", got)
+	}
+}

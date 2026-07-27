@@ -3365,6 +3365,25 @@ func (s *PgStore) DeleteComputeNode(ctx context.Context, id string) error {
 
 // --- events ------------------------------------------------------------------
 
+// AppendEvent writes one row to the events table. The subject, when
+// non-nil, MUST be a canonical UUID (with hyphens). The hex-only
+// fallback that MemStore accepts (engine.go walks MemStore.newID
+// which returns 32-char hex; parseSubjectID converts the hex back
+// to UUID bytes) is intentionally NOT mirrored here — PgStore is
+// the production path and only canonical UUIDs reach it from
+// sqlc / migrations. A non-canonical subject is silently dropped
+// to NULL rather than failing the INSERT; the audit row's subject
+// column is filtered server-side by listAuditEvents (handlers_audit.go)
+// so a NULL subject means "won't show up under any acct-scoped
+// query" — which matches the "unparseable subject" path on the
+// MemStore side (memstore.go:3135-3139).
+//
+// Adding a hex fallback here would let a future contributor stamp
+// events with engine-hex IDs without realising the events_subject_idx
+// expects canonical UUIDs, leading to "the row landed but
+// ListEvents(subject=<hex>) returns nothing" — a silent-drop bug
+// that the audit-log PR's MemStore fix specifically ruled out for
+// MemStore. Don't widen the contract.
 func (s *PgStore) AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error {
 	var subj *uuid.UUID
 	if subject != nil {
