@@ -182,6 +182,17 @@ def regen(overwrite: bool = True) -> None:
     # which a bare `pip install` doesn't always drop into PATH in CI
     # images. The module form is the canonical, always-available
     # invocation.
+    #
+    # Stash pyproject.toml BEFORE the generator runs — the generator
+    # emits a Poetry-default pyproject.toml at OUT that would clobber
+    # our hand-curated pytest config + per-file ruff ignores.
+    project_stash = Path(tempfile.mkdtemp(prefix="faas-sdk-project-"))
+    pyproject_src = OUT / "pyproject.toml"
+    pyproject_stashed = False
+    if pyproject_src.exists():
+        shutil.copy2(pyproject_src, project_stash / "pyproject.toml")
+        pyproject_stashed = True
+
     spec_for_generator = pre_normalize_spec(SPEC)
     try:
         result = subprocess.run(
@@ -229,6 +240,14 @@ def regen(overwrite: bool = True) -> None:
     # helpers + SSE helpers. The generated service functions still
     # ship under `faas_sdk.api.<tag>.` and are reached through the
     # wrapper's `client.inner`.
+    #
+    # The generator's pyproject.toml clobbers our hand-curated one
+    # (which carries the pytest config + per-file ruff ignores the
+    # generator does not know about). The stash happens BEFORE the
+    # generator runs (see comment block above); here we strip the
+    # generated `client.py` / `client.pyi` / `errors.py` siblings
+    # (the generator's types-only Client / AuthenticatedClient /
+    # UnexpectedStatus are replaced by our hand-written wrapper).
     for sibling in ("client.py", "client.pyi", "errors.py"):
         path = OUT / sibling
         if path.exists():
@@ -245,6 +264,13 @@ def regen(overwrite: bool = True) -> None:
     _rewrite_init_py(OUT / "faas_sdk" / "__init__.py")
     _patch_generator_bugs(OUT / "faas_sdk")
 
+    # Restore the hand-curated pyproject.toml that we stashed
+    # before the generator ran (see comment block above).
+    if pyproject_stashed and pyproject_src.exists():
+        shutil.copy2(project_stash / "pyproject.toml", pyproject_src)
+    if project_stash.exists():
+        shutil.rmtree(project_stash)
+
     # Run `ruff check --fix` over the generated tree + the
     # hand-written test files so import ordering stays canonical.
     # `gen.py` is run by CI as a dirty-diff gate; if a future
@@ -252,9 +278,22 @@ def regen(overwrite: bool = True) -> None:
     # this brings the tree back to green without making the
     # operator re-run an out-of-band command.
     try:
-        for target in (OUT / "faas_sdk", OUT / "tests"):
-            if not target.exists():
-                continue
+        sdk_root = OUT / "faas_sdk"
+        if sdk_root.exists():
+            # `--fix` only patches import ordering; it does not reformat.
+            # `ruff format` is the canonicalisation step that closes
+            # the dirty-diff gate regardless of which openapi-python-client
+            # template revision produced the bytes — without it the
+            # `make sdk-gen` aggregator (which boots a fresh `.venv`)
+            # differs from the standalone `sdk-gen-python` job (which
+            # `pip install -e .`s first), and the dirty-diff gate
+            # reports 180 false-positive files. We run format on the
+            # generated tree only (everything EXCEPT the hand-written
+            # wrapper modules) — the wrappers are canonically
+            # formatted in `sdk/python/faas_sdk/_wrapper.py` and
+            # friends, and `ruff format`'s 120-char preference would
+            # otherwise collapse hand-laid line breaks that the
+            # wrappers rely on for readability.
             subprocess.run(
                 [
                     sys.executable,
@@ -263,7 +302,48 @@ def regen(overwrite: bool = True) -> None:
                     "check",
                     "--fix",
                     "--quiet",
-                    str(target),
+                    str(sdk_root),
+                ],
+                check=False,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "format",
+                    "--quiet",
+                    str(sdk_root),
+                    "--exclude",
+                    "_wrapper.py,_rfc7807.py,_sse.py,_transport.py,idempotency.py,__init__.py",
+                ],
+                check=False,
+                capture_output=True,
+            )
+        tests_root = OUT / "tests"
+        if tests_root.exists():
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "check",
+                    "--fix",
+                    "--quiet",
+                    str(tests_root),
+                ],
+                check=False,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "format",
+                    "--quiet",
+                    str(tests_root),
                 ],
                 check=False,
                 capture_output=True,
