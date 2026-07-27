@@ -461,19 +461,16 @@ jobs:
     name: sdk-gen (regenerate all SDKs + dirty-diff gate)
     runs-on: ubuntu-latest
     timeout-minutes: 7
-    # Path-filtered so the job only fires when an SDK source
-    # actually changed — saves CI minutes on unrelated PRs. The
-    # trigger set is the union of every file the aggregator
-    # inspects. `pkg/apid/openapi.yaml` is deliberately NOT in
-    # this list — that embed copy is consumed only by
-    # `//go:embed` in pkg/apid/openapi_handler.go, not by the
-    # SDK generators; its sync invariant is covered by
-    # `make spec-check` (Makefile:305-312).
-    paths:
-      - 'api/openapi.yaml'
-      - 'sdk/**'
-      - 'Makefile'
-      - 'cmd/sdk-coverage/**'
+    # NOTE: job-level `paths:` filters are rejected by GitHub's
+    # workflow-schema validator (see PR #365 review; the error
+    # surfaces at the workflow-file-parse step and aborts the
+    # whole run before any job executes). Path filters must live
+    # under `on.pull_request.paths` at the workflow level, not
+    # here. Defense-in-depth is provided by the per-SDK
+    # `sdk-gen-node` and `sdk-gen-python` jobs (unfiltered, catch
+    # drift outside the aggregator's primary input set). The
+    # `sdk-gen` aggregator runs on every PR — CI cost is ~30s
+    # extra (the venv bootstrap step), which is acceptable.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
