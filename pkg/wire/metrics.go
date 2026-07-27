@@ -97,14 +97,20 @@ type OpsMetrics struct {
 	// buckets are wrong for a Postgres call.
 	auditWriteDur *prometheus.HistogramVec
 	// requestFailures: HTTP requests completed with status >= 400,
-	// labelled by account_id and the route template (issue #278).
-	// The route label reuses r.Pattern (the Go mux pattern, e.g.
-	// "GET /v1/apps/{slug}") so cardinality is bounded by the route
-	// table, not by URL paths — same precedent as apid_ops_total{op}
-	// (PR #132). account_id flows through accountLabel as for the
-	// audit counter; the two metrics share the same admission set so
-	// an account is either represented by its real id in both, or by
-	// "__other__" in both.
+	// labelled by account_id, the route template, and code ∈ {ok, err}
+	// (issue #278; PR #336 added the `code` label, issue #303 follow-up
+	// closes the asymmetry with requestTotal — see ADR-039). The route
+	// label reuses r.Pattern (the Go mux pattern, e.g. "GET
+	// /v1/apps/{slug}") so cardinality is bounded by the route table,
+	// not by URL paths — same precedent as apid_ops_total{op} (PR
+	// #132). account_id flows through accountLabel as for the audit
+	// counter; the three metrics (requestTotal, requestFailures,
+	// auditWriteFail) share the same admission set so an account is
+	// either represented by its real id in all three, or by
+	// "__other__" in all three. `code` is always "err" today (the
+	// counter only fires on status >= 400) but the label is added so
+	// future derivations (e.g. partial-failure accounting) can flip
+	// without a schema break.
 	requestFailures *prometheus.CounterVec
 	// requestTotal: HTTP requests completed, labelled by account_id,
 	// route, and code ∈ {ok, err} (issue #303, ADR-039). The
@@ -349,8 +355,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}
 	requestFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_request_failures_total",
-		Help: "HTTP requests completed with status >= 400, labelled by account_id and the route template (issue #278). account_id=\"anonymous\" is the unauthenticated path; account_id=\"__other__\" is the bounded admission overflow bucket. route is r.Pattern (e.g. \"GET /v1/apps/{slug}\") or \"unmatched\" for paths the mux did not dispatch.",
-	}, []string{"account_id", "route"})
+		Help: "HTTP requests completed with status >= 400, labelled by account_id, the route template, and code ∈ {ok, err} (issue #278, PR #336, ADR-039). code is \"err\" for every increment today (the counter only fires on status >= 400); the label is added so the failure counter mirrors requestTotal and the per-account error-rate view derives from a single source. account_id=\"anonymous\" is the unauthenticated path; account_id=\"__other__\" is the bounded admission overflow bucket. route is r.Pattern (e.g. \"GET /v1/apps/{slug}\") or \"unmatched\" for paths the mux did not dispatch.",
+	}, []string{"account_id", "route", "code"})
 	requestTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_request_total",
 		Help: "HTTP requests completed, labelled by account_id, route, and code (issue #303, ADR-039). The counter is the per-request total — paired with requestFailures (status >= 400 only) for the per-account error-rate view. account_id flows through the same accountLabelSet as requestFailures so a customer is represented by their real id in both, or by \"__other__\" in both. code ∈ {ok, err} (ok on 2xx/3xx, err on 4xx/5xx). route is r.Pattern or \"unmatched\". Backed by the §12 traffic-anomaly recording rules (faas_apid_request_rate_5m, _3d_baseline, _ratio).",
@@ -361,7 +367,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// collision-free lookups (accountLabelSet reservedAllow).
 	auditWriteFail.WithLabelValues(anonymousAccountLabel)
 	auditWriteFail.WithLabelValues(otherAccountLabel)
-	requestFailures.WithLabelValues(anonymousAccountLabel, "unmatched")
+	requestFailures.WithLabelValues(anonymousAccountLabel, "unmatched", "err")
+	requestFailures.WithLabelValues(otherAccountLabel, "unmatched", "err")
 	// Pre-instantiate the closed (account_id, route, code) tuples for
 	// requestTotal so the §12 traffic-anomaly panels and alert rules
 	// never see "no data" on an idle daemon. The same reserved
@@ -777,11 +784,15 @@ func (m *OpsMetrics) RequestFailure(accountID, route string) prometheus.Counter 
 	if m == nil {
 		return nil
 	}
-	return m.requestFailures.WithLabelValues(m.accountLabel(accountID), route)
+	// Failures are by definition code="err"; the label is closed-set
+	// and never varies. Callers that need code="ok" must use
+	// RequestTotal, not RequestFailure.
+	return m.requestFailures.WithLabelValues(m.accountLabel(accountID), route, "err")
 }
 
 // RequestFailureFor is the canonical accessor for the per-customer
-// request-failure counter (issue #278). It extracts the route label
+// request-failure counter (issue #278; PR #336 added the `code` label
+// to mirror requestTotal — see ADR-039). It extracts the route label
 // from r.Pattern (the Go mux pattern, e.g. "GET /v1/apps/{slug}")
 // with the reserved "unmatched" fallback for paths the mux did not
 // dispatch — so the route label's cardinality is bounded by the
@@ -791,7 +802,10 @@ func (m *OpsMetrics) RequestFailure(accountID, route string) prometheus.Counter 
 // resolves to "anonymous" ; ids past the capacity collapse to
 // "__other__". Safe on a nil receiver so callers can call it
 // without a nil-check at the top of the helper, mirroring the
-// Observe* family pattern.
+// Observe* family pattern. The failure counter's `code` label is
+// closed-set at "err" — failures by definition have code="err";
+// the canonical counter for any other status is RequestTotalFor,
+// not RequestFailureFor.
 func (m *OpsMetrics) RequestFailureFor(r *http.Request, accountID string) prometheus.Counter {
 	if m == nil {
 		return nil

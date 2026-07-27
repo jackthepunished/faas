@@ -163,26 +163,24 @@ PromQL fixtures).
   eliminates false positives driven by time-of-day / weekday
   seasonality.
 - **Positive**: the new metric (`apid_request_total`) and
-  recording-rule set (6 rules) are the canonical inputs to a future
+  recording-rule set (7 rules) are the canonical inputs to a future
   capacity-planning feature (per-app, per-region). The §12
   dashboard surface is reusable without rework.
 - **Positive**: the `family: traffic_anomaly` label composes with
   the existing alertmanager inhibition / silencing rules. A
   future tier-2 change to silence on maintenance windows can
   target the family without changes to this PR.
-- **Negative**: the new `apid_request_total` has a `code` label
-  while `apid_request_failures_total` does not — a deliberate
-  asymmetry. The follow-up PR that harmonizes the two must
-  reconcile the recording-rule dependency on the `code` label.
 - **Negative**: `promtool` is required to validate the rule
   changes locally. The `pkg/promqlrules/rules_test.go` integration
   test makes this explicit; the unconditional CI step at
   `.github/workflows/ci.yml:113-135` catches the validation gap.
-- **Negative**: the 4-alert fan-out is wider than the existing
-  alert set (14 alerts). On-call may need a few weeks to
-  internalize the page-vs-warn split. The runbook branches
-  explicitly on `mode` and `direction` to make the page-content
-  distinct.
+- **Negative**: the 8-alert fan-out (4 page alerts from PR #336 +
+  `FaasTrafficAnomaly`, `FaasErrorRateSpike`, `FaasErrorRateDrop`
+  from the follow-up + `FaasTrafficSpikeAccount`/`Drop` warn pair)
+  is wider than the existing alert set. On-call may need a few
+  weeks to internalize the page-vs-warn split. The runbook
+  branches explicitly on `mode` and `direction` to make the
+  page-content distinct.
 
 ## Path corrigendum (issue #303 body)
 
@@ -202,16 +200,6 @@ explicitly records the deviation.
 
 ## Open follow-ups (not blocking)
 
-- **Error-rate spike / drop alerts**: the recording rules
-  (`faas_apid_error_rate_ratio:by_route`) exist; the alert blocks
-  for them are deferred. A 12-line follow-up PR adds
-  `FaasErrorRateSpike` and `FaasErrorRateDrop` symmetric on
-  (mode × direction) at higher thresholds (2x / 0.5x fleet, 5x /
-  0.2x account).
-- **`code` label backward-compat for `apid_request_failures_total`**:
-  add `code` to the existing failure counter (issue #278), and
-  reconcile the issue-#278 dashboard / runbook references. Closes
-  the asymmetry from §Consequences.
 - **Per-app / per-region labels**: not in scope. Per-app would
   multiply series by the app count; per-region is a one-box
   platform so it doesn't apply.
