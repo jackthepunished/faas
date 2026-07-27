@@ -310,7 +310,7 @@ func (c *Client) CreateUpgradeTransaction(_ context.Context, _ state.Account, _ 
 func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64) (*billing.RefundResult, error) {
 	params := &stripe.RefundParams{
 		Charge: stripe.String(chargeID),
-		Amount: stripe.Int64(amountCents * 10), // cents → millicents
+		Amount: stripe.Int64(centsToMillicents(amountCents)),
 	}
 	if k, ok := idempotencyKeyFromContext(ctx); ok {
 		params.IdempotencyKey = stripe.String(k)
@@ -325,6 +325,20 @@ func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64)
 		AmountCents:      amountCents,
 		Currency:         string(r.Currency),
 	}, nil
+}
+
+// centsToMillicents converts integer EUR cents to Stripe's native
+// millicents (×10). CLAUDE.md invariant: integer cents/millicents
+// only; never float on money. The factor is fixed (Stripe's wire
+// format uses 10 millicents per cent across every supported currency);
+// any drift here would silently bill customers the wrong amount.
+//
+// Extracted as a pure helper so the conversion is unit-testable
+// without standing up the stripe-go SDK / a live sandbox. The
+// caller (Client.Refund) hands the result straight to
+// stripe.Int64, which accepts int64.
+func centsToMillicents(cents int64) int64 {
+	return cents * 10
 }
 
 // idempotencyKeyContextKey is the unexported context-key the apid

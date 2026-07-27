@@ -16,7 +16,7 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -50,9 +50,18 @@ func cmdAdmin(args []string) int {
 }
 
 // cmdAdminCredit issues an account credit via POST /v1/admin/
-// accounts/{id}/credits. The Idempotency-Key is a stable
-// `cli-admin-credit-<hex>` so a flaky-network retry returns the same
-// credit_id (mirrors cmdAccountDelete's `cli-delete-…` pattern).
+// accounts/{id}/credits. The Idempotency-Key is derived from a stable
+// hash of (account_uuid, cents, reason) so a flaky-network retry —
+// or a `make` re-run that re-issues the same operator intent — returns
+// the same credit_id rather than minting a duplicate account_credits
+// row.
+//
+// Note: cmdAccountDelete's `cli-delete-<random>` key is one-shot by
+// design (each `faas account delete` invocation is its own operator
+// intent and deduping across invocations would mask double-deletes).
+// Credit issuance is different: the same (account, cents, reason)
+// tuple is the *same* operator intent, and a network blip should not
+// land a duplicate goodwill credit. Hashing the tuple captures that.
 //
 // Account argument is the target's UUID, not the email. The server
 // is the source of truth for account lookup; if the UUID is unknown
@@ -88,9 +97,14 @@ func cmdAdminCredit(args []string) int {
 	}
 	// Stable Idempotency-Key so a retry returns the same credit_id.
 	// The server stores the response for 24 h keyed on (caller, key).
-	nonce := make([]byte, 16)
-	_, _ = rand.Read(nonce)
-	key := "cli-admin-credit-" + hex.EncodeToString(nonce)
+	// Hashing the (account, cents, reason) tuple captures operator
+	// intent: re-running the exact same command is a retry, not a new
+	// credit. SHA-256 is overkill for a dedupe key but keeps the
+	// prefix-length consistent and avoids accidental collisions
+	// across (uuid, cents, reason) tuples that differ only in
+	// boundary chars.
+	h := sha256.Sum256([]byte(accountUUID.String() + "\x00" + strconv.FormatInt(cents, 10) + "\x00" + *reason))
+	key := "cli-admin-credit-" + hex.EncodeToString(h[:16])
 	resp, err := client.IssueAccountCredit(context.Background(), accountUUID.String(), key, cents, *reason)
 	if err != nil {
 		return printErr("Issue failed", err)
@@ -98,7 +112,8 @@ func cmdAdminCredit(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(resp))
 	}
-	PrintOK(osStdout, "Issued credit %s for %d cents to %s", resp.ID, resp.CentsRemaining, resp.AccountID)
+	PrintOK(osStdout, "Issued credit %s for %d cents (remaining=%d) to %s",
+		resp.ID, cents, resp.CentsRemaining, resp.AccountID)
 	_, _ = fmt.Fprintf(osStdout, "  reason:    %s\n", resp.Reason)
 	_, _ = fmt.Fprintf(osStdout, "  created:   %s\n", resp.CreatedAt.Format("2006-01-02T15:04:05Z07:00"))
 	return 0

@@ -171,6 +171,25 @@ func TestErrCapacity(t *testing.T) {
 	}
 }
 
+// TestErrBillingNotImplemented pins the 501 mapping for issue #279
+// (Paddle's Refund stub returns billing.ErrNotImplemented; an apid
+// handler that calls Provider.Refund dispatches on errors.Is(err,
+// billing.ErrNotImplemented) and routes here). The 501 status is
+// load-bearing — it's the signal that lets an operator pick a
+// billing backend that supports the surface they need.
+func TestErrBillingNotImplemented(t *testing.T) {
+	p := ErrBillingNotImplemented("Provider does not implement Refund")
+	if p.Status != http.StatusNotImplemented {
+		t.Errorf("Status = %d, want 501", p.Status)
+	}
+	if p.Code != CodeBillingNotImplemented {
+		t.Errorf("Code = %q, want %q", p.Code, CodeBillingNotImplemented)
+	}
+	if !strings.Contains(p.DocsURL, "billing/providers") {
+		t.Errorf("DocsURL = %q, want /billing/providers", p.DocsURL)
+	}
+}
+
 func TestErrSourceTooLarge(t *testing.T) {
 	l := MustLimitsFor(PlanFree) // 100 MB cap
 	p := ErrSourceTooLarge(l, 150*1024*1024)

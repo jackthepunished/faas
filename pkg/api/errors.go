@@ -146,8 +146,15 @@ const (
 	CodeBuildTimeout    = "build_timeout"
 	CodeQuotaExhausted  = "quota_exhausted"
 	CodeBillingPastDue  = "billing_past_due"
-	CodeCapacity        = "capacity_unavailable"
-	CodeUnauthorized    = "unauthorized"
+	// CodeBillingNotImplemented is returned when the selected
+	// billing provider (FAAS_BILLING_PROVIDER) does not implement the
+	// requested method (issue #279: Paddle's Refund). Distinct from
+	// CodeForbidden / CodeValidation so the dashboard / CLI can
+	// surface "switch providers to use this surface" instead of a
+	// generic error. Maps to HTTP 501.
+	CodeBillingNotImplemented = "billing_not_implemented"
+	CodeCapacity              = "capacity_unavailable"
+	CodeUnauthorized          = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
@@ -485,6 +492,21 @@ func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
 		WithDocs("https://status.DOMAIN")
+}
+
+// ErrBillingNotImplemented is returned by an apid handler that
+// invoked a billing.Provider method the selected provider (per
+// FAAS_BILLING_PROVIDER) does not support (issue #279: Paddle's
+// Refund). The 501 surfaces the seam so an operator picking the
+// billing backend knows up front which surface areas it disables;
+// today no apid handler invokes Provider.Refund — refunds are
+// Stripe-webhook-observational only — so this helper exists for
+// the future operator-initiated refund path. callers branch on
+// errors.Is(err, billing.ErrNotImplemented) and route here.
+func ErrBillingNotImplemented(detail string) *Problem {
+	return NewProblem(http.StatusNotImplemented, CodeBillingNotImplemented,
+		"Billing provider does not support this surface", detail).
+		WithDocs("https://docs.DOMAIN/billing/providers")
 }
 
 // ErrSourceTooLarge is returned when an uploaded tarball exceeds the plan cap.

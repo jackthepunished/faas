@@ -213,6 +213,16 @@ func (l *Loop) RunQuotaOnce(ctx context.Context) {
 // counter is incremented with the plan label. The cap is advisory
 // for overage only — in-budget usage continues to accumulate and
 // the Free hard-stop / paid warning ladder is unchanged.
+//
+// Concurrency note: this loop is the only writer to usage_minutes
+// (spec §6.1) and runs as a single meterd process today, so the
+// (capCache read → CurrentMonthOverageCents → EnforceQuota) sequence
+// is race-free against itself. A future meterd-replica deploy would
+// race here — at worst one minute's overage-row insert slips past
+// the cap per replica. The follow-up is to wrap the per-account
+// section in `SELECT … FOR UPDATE` on the `accounts` row (precedent
+// pgstore.go:380-381, :668); today's behaviour is acceptable per
+// the cap's documented "advisory for the overage row only" contract.
 func (l *Loop) runQuotaOnce(ctx context.Context) {
 	accounts, err := l.store.ListAllAccounts(ctx)
 	if err != nil {

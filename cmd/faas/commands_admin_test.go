@@ -148,3 +148,93 @@ func TestAdminCredit_HappyPathHitsAPID(t *testing.T) {
 		t.Errorf("body reason = %q, want %q", hits[2], wantReason)
 	}
 }
+
+// TestAdminCredit_IdempotentOnRetry pins the regression fix for the
+// bug called out in PR #337's review: the Idempotency-Key MUST be
+// stable across invocations of the same operator intent so a
+// flaky-network retry returns the same credit_id (the server's
+// idempotency middleware dedupes on (caller, key) for 24h). Before
+// the fix the key carried a fresh crypto/rand nonce per invocation,
+// defeating the dedupe and landing duplicate account_credits rows.
+//
+// Hash inputs are (account_uuid, cents, reason); the test varies
+// each axis to prove the hash mixes all three.
+func TestAdminCredit_IdempotentOnRetry(t *testing.T) {
+	setupAdmin := func() {
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("FAAS_TOKEN", "test")
+	}
+
+	target := uuid.NewString()
+	const reason = "goodwill for outage"
+
+	// Capture every Idempotency-Key the CLI sends during one test run.
+	var keys []string
+	recordSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/credits") {
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(api.AccountCreditResponse{
+			ID:             uuid.NewString(),
+			AccountID:      target,
+			CentsRemaining: 500,
+			Reason:         reason,
+		})
+	}))
+
+	setupAdmin()
+	t.Setenv("FAAS_API", recordSrv.URL)
+
+	// Two invocations of the *same* operator intent → same key.
+	for i := 0; i < 2; i++ {
+		if code := cmdAdmin([]string{"credit", "--reason", reason, target, "500"}); code != 0 {
+			t.Fatalf("invocation %d: exit %d, want 0", i, code)
+		}
+	}
+	if len(keys) != 2 {
+		t.Fatalf("captured %d requests, want 2", len(keys))
+	}
+	if keys[0] != keys[1] {
+		t.Errorf("Idempotency-Key unstable across retries: %q != %q", keys[0], keys[1])
+	}
+	if !strings.HasPrefix(keys[0], "cli-admin-credit-") {
+		t.Errorf("Idempotency-Key = %q, want cli-admin-credit-*", keys[0])
+	}
+
+	// Different cents → different key (the hash mixes all three inputs).
+	otherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/credits") {
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer otherSrv.Close()
+	setupAdmin()
+	t.Setenv("FAAS_API", otherSrv.URL)
+	if code := cmdAdmin([]string{"credit", "--reason", reason, target, "501"}); code != 0 {
+		t.Fatalf("different-cents invocation: exit %d, want 0", code)
+	}
+	if keys[2] == keys[0] {
+		t.Errorf("different cents produced the same key %q; hash is not input-sensitive", keys[2])
+	}
+
+	// Different reason → different key.
+	r3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/credits") {
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer r3Srv.Close()
+	setupAdmin()
+	t.Setenv("FAAS_API", r3Srv.URL)
+	if code := cmdAdmin([]string{"credit", "--reason", "different reason here", target, "500"}); code != 0 {
+		t.Fatalf("different-reason invocation: exit %d, want 0", code)
+	}
+	if keys[3] == keys[0] {
+		t.Errorf("different reason produced the same key %q; hash is not input-sensitive", keys[3])
+	}
+}

@@ -60,3 +60,33 @@ func TestVerifyWebhook_ChargeRefunded(t *testing.T) {
 		t.Errorf("Currency = %q, want eur", ev.Currency)
 	}
 }
+
+// TestCentsToMillicents pins the outbound conversion at the
+// stripe.Refund call site (client.go::centsToMillicents). The
+// wire-quantity contract is fixed across every Stripe currency:
+// 1 cent = 10 millicents. A drift here would silently bill customers
+// the wrong amount and is unrecoverable at this layer — Stripe's
+// Amount field is millicents and the SDK accepts the int64 raw.
+// Pinned as a pure helper so the test runs without standing up the
+// stripe-go SDK or a live sandbox.
+func TestCentsToMillicents(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		cents      int64
+		milliCents int64 // wire-format value Stripe's Amount expects
+	}{
+		{"zero", 0, 0},
+		{"one cent", 1, 10},
+		{"common goodwill credit", 500, 5000},
+		{"euro", 5000, 50000}, // 5000 cents = €50.00
+		{"largest plausible single-call refund", 100_000_00, 1_000_000_00}, // €100,000.00
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripe.CentsToMillicentsForTest(tc.cents); got != tc.milliCents {
+				t.Errorf("centsToMillicents(%d) = %d, want %d", tc.cents, got, tc.milliCents)
+			}
+		})
+	}
+}
