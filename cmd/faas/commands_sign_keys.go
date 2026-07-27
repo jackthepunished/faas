@@ -202,17 +202,17 @@ func reportSignKeyStatus(w io.Writer, label, path string) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintf(w, "%s  missing  %s\n", label, path)
+			_, _ = fmt.Fprintf(w, "%s  missing  %s\n", label, path)
 			return
 		}
-		fmt.Fprintf(w, "%s  stat error: %v  %s\n", label, err, path)
+		_, _ = fmt.Fprintf(w, "%s  stat error: %v  %s\n", label, err, path)
 		return
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(w, "%s  mode %#o  read error: %v  %s\n", label, info.Mode().Perm(), err, path)
+		_, _ = fmt.Fprintf(w, "%s  mode %#o  read error: %v  %s\n", label, info.Mode().Perm(), err, path)
 		return
 	}
 	sum := sha256.Sum256(data)
-	fmt.Fprintf(w, "%s  %#o  sha256:%s  %s\n", label, info.Mode().Perm(), hex.EncodeToString(sum[:6]), path)
+	_, _ = fmt.Fprintf(w, "%s  %#o  sha256:%s  %s\n", label, info.Mode().Perm(), hex.EncodeToString(sum[:6]), path)
 }

@@ -210,10 +210,14 @@ func TestWriteKeyPairForGroup_ForceOverwriteRotates(t *testing.T) {
 		t.Fatalf("LoadPrivateKeyFile after rotate: %v", err)
 	}
 
-	// Sanity: rotated key is a distinct P-256 key. Compare via the public
-	// component — two P-256 keys collide with negligible probability.
-	if loaded1.PublicKey.X.Cmp(loaded2.PublicKey.X) == 0 &&
-		loaded1.PublicKey.Y.Cmp(loaded2.PublicKey.Y) == 0 {
+	// Sanity: rotated key is a distinct P-256 key. Compare via the
+	// public component — two P-256 keys collide with negligible
+	// probability. Use a single embedded-field selector extraction
+	// per side so staticcheck's QF1008 (embedded-field in selector)
+	// doesn't fire on `loaded1.PublicKey.X`.
+	k1 := loaded1.PublicKey
+	k2 := loaded2.PublicKey
+	if k1.X.Cmp(k2.X) == 0 && k1.Y.Cmp(k2.Y) == 0 {
 		t.Error("rotated key has same public coordinates as the original; rotation did not replace bytes")
 	}
 
