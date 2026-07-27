@@ -1261,7 +1261,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 						}
 					}
 					// Key stays nil; session cookie = implicit admin.
-// Pointer-mutation (`*r = ...`) is load-bearing —
+					// Pointer-mutation (`*r = ...`) is load-bearing —
 					// observeWrap is the outermost middleware in the
 					// chain and reads the principal via principalFrom(r);
 					// a non-mutating rebind would be invisible to

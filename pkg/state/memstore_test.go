@@ -2842,8 +2842,8 @@ func TestMemStore_Session_RevokeAll_ExcludesCurrent(t *testing.T) {
 	alice, _ := m.CreateAccount(ctx, "alice@example.com", "free")
 	const (
 		current = "11111111-1111-1111-1111-111111111111"
-		other1 = "22222222-2222-2222-2222-222222222222"
-		other2 = "33333333-3333-3333-3333-333333333333"
+		other1  = "22222222-2222-2222-2222-222222222222"
+		other2  = "33333333-3333-3333-3333-333333333333"
 	)
 	for _, sid := range []string{current, other1, other2} {
 		if _, err := m.CreateSession(ctx, sid, alice.ID, "192.0.2.10", "u"); err != nil {
