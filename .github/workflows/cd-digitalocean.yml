@@ -81,6 +81,46 @@ jobs:
           su - faas -s /bin/bash -c \
             "DATABASE_URL='postgres:///faas?host=/run/postgresql&user=faas' /opt/faas/bin/migrate"
 
+          # Provision the cosign sign keypair if it's missing.
+          # PR #371 ships `faas sign-keys init` (operator CLI) and
+          # PR #322 made imaged + schedd fail-loud at startup if
+          # /etc/faas/secrets/sign.key or sign-pub.pem is absent.
+          # The cd-digitalocean workflow runs on every merge to
+          # main but never had to provision the keypair (PR #367
+          # + #370 cleared the migration panics, then #371 surfaced
+          # this as a new failure mode). This block auto-provisions
+          # when the files are missing and drift-repairs the perms
+          # when they're wrong — the same shape as bootstrap.sh
+          # step 11c. We deliberately do NOT call bootstrap.sh
+          # itself: it's operator-side and would clobber the
+          # operator's deploy SSH key on every merge. The init
+          # branch is "if missing" only; rotating on every deploy
+          # would invalidate every customer's build-verification
+          # chain.
+          SIGN_KEY_PATH=/etc/faas/secrets/sign.key
+          SIGN_PUB_PATH=/etc/faas/secrets/sign-pub.pem
+          if [[ ! -f "${SIGN_KEY_PATH}" || ! -f "${SIGN_PUB_PATH}" ]]; then
+            echo "→ Provisioning cosign sign keypair..."
+            /opt/faas/bin/faas sign-keys init \
+              --sign-key "${SIGN_KEY_PATH}" --verify-key "${SIGN_PUB_PATH}"
+            chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
+            chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
+            echo "✓ sign.key written (0440 root:faas)"
+            echo "✓ sign-pub.pem written (0444 root:root)"
+          else
+            # Drift-repair branch: keypair exists; check perms.
+            SK_MODE=$(stat -c '%a' "${SIGN_KEY_PATH}")
+            SK_OWNER=$(stat -c '%U:%G' "${SIGN_KEY_PATH}")
+            SP_MODE=$(stat -c '%a' "${SIGN_PUB_PATH}")
+            SP_OWNER=$(stat -c '%U:%G' "${SIGN_PUB_PATH}")
+            if [[ "${SK_MODE}" != "440" || "${SK_OWNER}" != "root:faas" \
+               || "${SP_MODE}" != "444" || "${SP_OWNER}" != "root:root" ]]; then
+              chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
+              chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
+              echo "→ sign-keypair perms repaired (was ${SK_MODE} ${SK_OWNER} / ${SP_MODE} ${SP_OWNER})"
+            fi
+          fi
+
           # Restart all FaaS services.
           for svc in apid schedd gatewayd imaged meterd githubd; do
             systemctl restart "faas-${svc}.service" || true
