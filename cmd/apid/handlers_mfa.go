@@ -288,12 +288,35 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	// Step 2: consume the code now that we know the burn is
-	// safe (matched AND not lastCode). The ConsumeRecoveryCode
-	// race contract still holds — two concurrent /recover calls
-	// on the same account serialise via SELECT FOR UPDATE.
-	if _, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented); err != nil {
+	// safe (matched AND not lastCode). ConsumeRecoveryCode is
+	// the atomic match-and-remove primitive — two concurrent
+	// /recover calls on the same account serialise under the
+	// store's row lock (MemStore: sync.Mutex; PgStore: SELECT
+	// FOR UPDATE). The first caller wins the match (matched=true,
+	// code removed). The second caller's MatchRecoveryCode above
+	// also returned matched=true (it ran before the first
+	// caller's consume committed), so without checking the
+	// consume return here, the second caller would also emit
+	// 200 — that is the (200=2, 401=0) flake the concurrent
+	// test trips on a fast machine. Checking the consume's
+	// matched return surfaces the lost race as a 401 ("code
+	// already consumed"); the customer's last-code UX (the 409
+	// branch above) is preserved because that path never reaches
+	// consume — MatchRecoveryCode is non-mutating per the issue
+	// #186 Finding #5 fix.
+	matchedConsume, _, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
+	if err != nil {
 		s.log.Error("mfa.recover.consume", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not consume recovery code"))
+		return
+	}
+	if !matchedConsume {
+		// Another /recover call (or a /disable path) burned the
+		// code between our MatchRecoveryCode and our consume.
+		// The code is no longer valid for this account.
+		s.audit.Emit(r.Context(), "account.mfa_recover_failed", &acct.ID, map[string]any{"reason": "code_raced"})
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
+			"Invalid code", "recovery code was already consumed"))
 		return
 	}
 	if err := s.reissueSessionCookie(w, r, acct, false); err != nil {
