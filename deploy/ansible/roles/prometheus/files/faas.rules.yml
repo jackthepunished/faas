@@ -336,6 +336,40 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasApidAuditWriteFailures.md"
 
       # ─────────────────────────────────────────────────────────────────
+      # Per-tenant noisy-customer detection (issue #300).
+      # The apid_top_tenant_rps{account_id} gauge is a presentation view
+      # over the per-account requestTotal counter, bounded at the top-1000
+      # by 24h request count with the rest under account_id="other"
+      # (ADR-040). This rule fires when any single customer exceeds
+      # 500 rps for 10m — the abuse threshold from the issue's literal
+      # acceptance list. The aggregation uses `topk(20, ...)` so the
+      # account_id label survives Alertmanager routing; the page
+      # receiver groups by [alertname, component] so 20 simultaneous
+      # offenders collapse into one page with per-account drill-down.
+      #
+      # The `account_id="other"` row is excluded via the `!=` matcher —
+      # the overflow bucket represents demoted customers (not abusive
+      # ones), and a non-zero "other" reading means the top-1000 cap is
+      # being saturated, which is a separate signal (covered by the
+      # snapshot_fleet_avg_mb-style fleet dashboards, not by this rule).
+      #
+      # Response: rate-limit + notify (docs/runbooks/tenant-abuse.md
+      # §Recover step 1+2). Escalation: suspend deployment (step 3).
+      # Severity: warn — abuse, not outage.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasTenantAbuse
+        expr: topk(20, max(apid_top_tenant_rps{account_id!="other"}) by (account_id)) > 500
+        for: 10m
+        labels:
+          severity: warn
+          component: apid
+          family: tenant_abuse
+        annotations:
+          summary: "Tenant {{ $labels.account_id }} exceeding 500 rps for 10m"
+          description: "Customer {{ $labels.account_id }} sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
+
+      # ─────────────────────────────────────────────────────────────────
       # Daemon liveness — every scrape target should be up.
       # 2m is tight: a single scrape miss (15s) does not trip it; a
       # crashed daemon trips it within one evaluation cycle after restart.

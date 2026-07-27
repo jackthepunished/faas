@@ -1,0 +1,177 @@
+# Synthetic time-series fixture for the FaasTenantAbuse alert
+# (issue #300, ADR-040).
+#
+# What this exercises:
+#   1. FaasTenantAbuse — the per-tenant noisy-customer alert. It must
+#      fire when a single customer's apid_top_tenant_rps exceeds 500
+#      for 10m, and must NOT fire on a customer at 50 rps (negative
+#      case) or on a customer collapsed to account_id="other" (the
+#      `!=` matcher excludes the overflow bucket).
+#   2. The gauge's cardinalty contract is pinned indirectly — the
+#      fixture feeds only the top-N + the "other" overflow, and the
+#      alert's `account_id!="other"` matcher pins that the overflow
+#      bucket is excluded from the trigger. A regression that lets
+#      the overflow bucket trip the alert would surface here.
+#
+# Why this is the canonical synthetic-fixture test (acceptance #5 of
+# issue #300): TestFaasRulesSyntax validates the rule file's syntax
+# via `promtool check rules` (parse-only); this test feeds real
+# samples through the alert evaluator and asserts the alert opens at
+# the configured threshold. No daemon-side state, no live apid
+# instance required — pure rule-engine evaluation.
+#
+# Fixture shape note: the rule uses `topk(20, max(apid_top_tenant_rps)
+# by (account_id)) > 500` — i.e. it reads the gauge directly (not the
+# underlying requestTotal counter). The sampler produces a 5s-sampled
+# gauge; the alert's `for: 10m` window must see the gauge above 500
+# for that whole interval before firing. Synthetic fixture: feed a
+# gauge series above 500 for 25m (well past the 10m `for:` window)
+# and assert the alert opens.
+
+rule_files:
+  - ../../../deploy/ansible/roles/prometheus/files/faas.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ──────────────────────────────────────────────────────────────
+  # Test 1 — abusive customer at 1500 rps for 25m →
+  # FaasTenantAbuse fires.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "single customer 1500 rps for 25m → FaasTenantAbuse fires"
+    input_series:
+      # The abusive customer. Gauge value 1500 rps for 25m = 50
+      # samples. The `for: 10m` window (20 samples at 30s) must
+      # have fully elapsed before the alert opens.
+      - series: 'apid_top_tenant_rps{account_id="acct-abuser"}'
+        values: '1500x50'
+      # A quiet customer at 50 rps — well below the 500 threshold;
+      # must NOT contribute an alert.
+      - series: 'apid_top_tenant_rps{account_id="acct-quiet"}'
+        values: '50x50'
+      # The "other" overflow bucket — saturated (the gauge is
+      # pre-instantiated with a non-zero value to confirm the
+      # `!=` matcher excludes it).
+      - series: 'apid_top_tenant_rps{account_id="other"}'
+        values: '200x50'
+    alert_rule_test:
+      # eval_time = 25m puts us well past the 10m `for:` window
+      # since the abusive series began. The alert must be active
+      # with the offending account_id label.
+      - eval_time: 25m
+        alertname: FaasTenantAbuse
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: apid
+              family: tenant_abuse
+              account_id: acct-abuser
+            exp_annotations:
+              summary: "Tenant acct-abuser exceeding 500 rps for 10m"
+              description: "Customer acct-abuser sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 2 — quiet customer at 50 rps → alert does NOT fire
+  # (negative case: sub-threshold traffic).
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "customer 50 rps → FaasTenantAbuse does NOT fire"
+    input_series:
+      - series: 'apid_top_tenant_rps{account_id="acct-quiet"}'
+        values: '50x50'
+      - series: 'apid_top_tenant_rps{account_id="other"}'
+        values: '200x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasTenantAbuse
+        # No exp_alerts → assert the alert is NOT active.
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 3 — only the "other" overflow bucket is non-zero → alert
+  # does NOT fire (the `!=` matcher excludes overflow).
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "only account_id=\"other\" non-zero → alert does NOT fire (overflow excluded)"
+    input_series:
+      - series: 'apid_top_tenant_rps{account_id="other"}'
+        values: '1500x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasTenantAbuse
+        # No exp_alerts → assert the alert is NOT active. The
+        # overflow bucket's 1500 rps is intentionally above 500
+        # to pin that the `account_id!="other"` matcher is what
+        # excludes it — a regression that removed the matcher
+        # would trip the alert here.
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 4 — multiple abusive customers: topk(20, ...) collapses
+  # to ≤20 alerts but preserves per-account labels.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "3 abusive customers → 3 distinct FaasTenantAbuse alerts"
+    input_series:
+      - series: 'apid_top_tenant_rps{account_id="acct-a"}'
+        values: '800x50'
+      - series: 'apid_top_tenant_rps{account_id="acct-b"}'
+        values: '900x50'
+      - series: 'apid_top_tenant_rps{account_id="acct-c"}'
+        values: '1200x50'
+      - series: 'apid_top_tenant_rps{account_id="acct-quiet"}'
+        values: '50x50'
+      - series: 'apid_top_tenant_rps{account_id="other"}'
+        values: '200x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasTenantAbuse
+        # Three distinct alerts, one per abusive customer. Each
+        # carries its own account_id label so Alertmanager routes
+        # per-customer and the page receiver groups by
+        # [alertname, component].
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: apid
+              family: tenant_abuse
+              account_id: acct-a
+            exp_annotations:
+              summary: "Tenant acct-a exceeding 500 rps for 10m"
+              description: "Customer acct-a sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
+          - exp_labels:
+              severity: warn
+              component: apid
+              family: tenant_abuse
+              account_id: acct-b
+            exp_annotations:
+              summary: "Tenant acct-b exceeding 500 rps for 10m"
+              description: "Customer acct-b sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
+          - exp_labels:
+              severity: warn
+              component: apid
+              family: tenant_abuse
+              account_id: acct-c
+            exp_annotations:
+              summary: "Tenant acct-c exceeding 500 rps for 10m"
+              description: "Customer acct-c sustained > 500 rps on apid for 10m. Cross-check gateway_top_tenant_rps for the L7 view, then follow docs/runbooks/tenant-abuse.md §Recover (rate-limit → notify → suspend deployment)."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/tenant-abuse.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 5 — bursty customer at 1500 rps that drops before the
+  # 10m `for:` window elapses → alert does NOT fire (debounce).
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "bursty customer drops to 50 rps within 5m → alert does NOT fire"
+    input_series:
+      # 5m at 1500 rps, then drops to 50 rps for 20m. The alert's
+      # `for: 10m` window never reaches 10m of continuous
+      # above-threshold, so the alert must not fire.
+      - series: 'apid_top_tenant_rps{account_id="acct-bursty"}'
+        values: '1500x10 50x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasTenantAbuse
+        # No exp_alerts → assert the alert is NOT active.

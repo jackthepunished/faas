@@ -524,6 +524,22 @@ The `account_id="__other__"` series is the bounded overflow bucket — drill-dow
 
 Logs: journald → Loki free tier; tenant app stdout/stderr ring-buffered per instance (10 MB), surfaced via `GET /v1/apps/{app}/logs` (tail + follow).
 
+### 12.4 Per-tenant noisy-customer gauge (issue #300, ADR-040)
+
+Two presentation gauges — `apid_top_tenant_rps{account_id}` (apiserver-side, the authoritative source for tenant attribution) and `gateway_top_tenant_rps{account_id}` (edge-proxy side, where the label VALUE is the resolved app_id because gatewayd is pre-auth and only sees hostname→app routing) — are sampled at 5s from the rolling per-account request total.
+
+**Two-tier cardinality bound.** The gauge series set is bounded at top-1000 + 1 ("other" overflow). The underlying per-account counter (`apid_request_total{account_id, ...}`) keeps the deeper 10 000 + `__other__` bound from §12.3 / issue #278; the top-N is a presentation view layered above. The two labels are deliberately distinct (`account_id="other"` for the gauge, `account_id="__other__"` for the counter) so a panel can filter one without filtering the other.
+
+**Sampling.** A sampler goroutine in `cmd/apid/topn.go` (mirrored by `cmd/gatewayd/topn.go` on the gateway side) drives the gauge emission once per 5s from a single goroutine. The per-request path bumps the rolling-window count via `OpsMetrics.ObserveTopTenantRPS(id)`; the sampler computes the diff and calls `EmitTopTenantRPS` to drive the gauge. Pushing the gauge write to a single goroutine keeps the series set bounded at cap+1 deterministically — a per-request gauge Set would accumulate series for every id that ever transiently held a top-N slot.
+
+**Rolling reset.** A 24h window; the sampler calls `ResetWindow()` when the window has elapsed. Sized so a one-shot noisy customer doesn't persist in the top-N forever (lifetime view would) and a quiet customer can't jump into the top-N at midnight UTC regardless of activity (daily-snapshot view would).
+
+**Alert.** `FaasTenantAbuse` fires on `topk(20, max(apid_top_tenant_rps{account_id!="other"}) by (account_id)) > 500` for 10m. Severity: `warn`. Family: `tenant_abuse`. The `topk(20, ...)` aggregator preserves per-account labels so Alertmanager routes per-customer; the `account_id!="other"` matcher excludes the overflow bucket (which represents saturated admission, not abusive behavior). Response: rate-limit → notify → suspend deployment (the cascade is in `docs/runbooks/tenant-abuse.md` §Recover).
+
+**Dashboard.** `deploy/grafana/top-tenants.json` (uid `faas-top-tenants`, byte-identical to the Ansible copy at `deploy/ansible/roles/grafana/files/top-tenants.json`). Four panels: top-10 by `apid_top_tenant_rps`, top-10 by `gateway_top_tenant_rps`, top-10 customer share of fleet traffic, and a single-stat for overflow bucket growth.
+
+**Cardinality contract.** `apid_top_tenant_rps` cardinality is bounded at 1001 (top-1000 + 1 overflow) across the daemon's lifetime. The contract is pinned by `pkg/wire/topn_test.go::TestTopTenantRPS_BoundedCardinality` (fuzzed 50 000 ids → ≤ 1001 series) and the synthetic-fixture test `pkg/promqlrules/tenant_abuse_test.go` (5 promtool-driven scenarios: positive, sub-threshold, overflow-only, multi-customer, debounce).
+
 ---
 
 ## 13. RAM budget ledger (enforced as systemd slices)

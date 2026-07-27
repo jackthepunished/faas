@@ -11,6 +11,9 @@
 //     WakeGate.SetGaugeSink)
 //   - gateway_rate_limited_total{app, plan}          counter
 //   - gateway_cold_wake_total{app}                   counter
+//   - gateway_top_tenant_rps{account_id}             gauge (issue #300;
+//     label value is the resolved app_id — gatewayd's only
+//     tenant-attributable key — see ObserveTopTenantRPS)
 package gateway
 
 import (
@@ -35,6 +38,23 @@ type Metrics struct {
 	queueDepth    *prometheus.GaugeVec
 	rateLimited   *prometheus.CounterVec
 	coldWake      *prometheus.CounterVec
+	// topTenantRPS is the gateway-side mirror of apid's
+	// apid_top_tenant_rps gauge (issue #300). It shares the
+	// label name `account_id` with apid so a single Grafana
+	// panel can join both surfaces — but the label VALUE at
+	// the gateway is the resolved app_id, not an authenticated
+	// principal. Gatewayd is pre-auth (TLS + hostname routing
+	// only); the only tenant-attributable key on the request
+	// path is the app_id (the apps table's owner is in apid's
+	// domain). Operators reading the panel should treat
+	// gateway_top_tenant_rps as "noisy apps seen at the edge"
+	// and apid_top_tenant_rps as "noisy customers on the API".
+	//
+	// The 5s sample cadence + 24h rolling reset are owned by
+	// the same sampler pattern as apid's (cmd/gatewayd/main.go
+	// runs a parallel topNSampler); see pkg/wire/topn.go for
+	// the cardinality contract.
+	topTenantRPS *prometheus.GaugeVec
 }
 
 func NewMetrics() *Metrics {
@@ -82,8 +102,18 @@ func NewMetrics() *Metrics {
 			Name: "gateway_cold_wake_total",
 			Help: "Requests that triggered a cold wake for an app.",
 		}, []string{"app"}),
+		topTenantRPS: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_top_tenant_rps",
+			Help: "Top-N 5s request rate per tenant observed at the edge (issue #300). Label key is account_id for parity with apid_top_tenant_rps; the label VALUE at the gateway is the resolved app_id (gatewayd is pre-auth and only sees hostname→app routing). Cardinality bounded at topAccountSetCap (1000) + 1 \"other\" overflow by pkg/wire/topn.go via the cmd/gatewayd/topn.go sampler. The overflow bucket literally named \"other\" matches apid's gauge.",
+		}, []string{"account_id"}),
 	}
-	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.coldWake)
+	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.coldWake, m.topTenantRPS)
+	// Pre-instantiate the ("other",) row so the gauge surfaces from
+	// boot, mirroring the apid precedent (pkg/wire/metrics.go:632).
+	// Without this, a quiet daemon would emit zero series for the
+	// first 5s and a dashboard reader would see "no data" until
+	// the first observation + first sampler tick.
+	m.topTenantRPS.WithLabelValues("other")
 	return m
 }
 
@@ -122,6 +152,40 @@ func (m *Metrics) ObserveWakeQueueWait(d time.Duration) {
 		return
 	}
 	m.wakeQueueWait.Observe(d.Seconds())
+}
+
+// TopTenantRPSEmit drives the gateway_top_tenant_rps gauge from
+// the sampler goroutine. topN is the sorted (id, rps) slice
+// produced by the sampler; "other" is the overflow bucket rps.
+// Called once per 5s tick; nil-safe.
+//
+// The sampler in cmd/gatewayd/topn.go runs a local topAccountSet
+// (mirroring pkg/wire/topn.go) and computes the top-N from its
+// own snapshot. It passes the resulting (id, rps) list here
+// rather than a closure because the gateway side has no
+// topAccountSet of its own to query. Same cardinality bound
+// (cap + 1) applies — the sampler caps the slice length before
+// calling this method.
+//
+// Returns the number of series emitted.
+func (m *Metrics) TopTenantRPSEmit(topN []TopNEntry, otherRPS float64) int {
+	if m == nil || m.topTenantRPS == nil {
+		return 0
+	}
+	for _, e := range topN {
+		m.topTenantRPS.WithLabelValues(e.ID).Set(e.RPS)
+	}
+	m.topTenantRPS.WithLabelValues("other").Set(otherRPS)
+	return len(topN) + 1
+}
+
+// TopNEntry is the (id, rps) tuple the gateway sampler passes to
+// Metrics.TopTenantRPSEmit. Defined here (not in the sampler)
+// because the gateway Metrics surface owns the gauge and the
+// sampler just feeds it.
+type TopNEntry struct {
+	ID  string
+	RPS float64
 }
 
 // SetQueueDepth records the current wake-queue depth for an app.

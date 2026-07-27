@@ -98,6 +98,14 @@ type Handler struct {
 	// (default for tests and the e2e harness; production wires
 	// ForwardingReverseProxy in cmd/gatewayd/main.go).
 	proxyByNode func(nodeID string) http.Handler
+	// topNSample is the per-request bump for the gateway-side
+	// top-N sampler (cmd/gatewayd/topn.go, issue #300). Set via
+	// SetTopNSample from cmd/gatewayd/main.go. nil in unit
+	// tests; observe() nil-checks before invoking. The function
+	// takes the resolved app_id and increments the sampler's
+	// rolling-window count — the gauge write itself happens in
+	// the sampler's once-per-5s tick.
+	topNSample func(appID string)
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
 }
@@ -176,6 +184,20 @@ func (h *Handler) SetWakeGateHook() {
 		}
 	}
 	h.gate.SetMetrics(h.metrics)
+}
+
+// SetTopNSample installs the per-request bump callback for the
+// gateway-side top-N sampler (issue #300). Called by main once
+// the sampler is constructed. The Handler stores the callback
+// and invokes it from observe() on every non-sentinel app id;
+// nil = no-op (unit-test seam).
+//
+// The callback signature is func(appID string) so pkg/gateway
+// stays free of any dependency on pkg/wire or the local
+// cmd/gatewayd topAccountSet — same decoupling pattern as
+// SetWakeGateHook above.
+func (h *Handler) SetTopNSample(sample func(appID string)) {
+	h.topNSample = sample
 }
 
 // Metrics exposes the Prometheus bundle (used by the control listener to mount
@@ -346,6 +368,19 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 			plan = "-"
 		}
 		h.metrics.ObserveRequest(appID, plan, code)
+	}
+	// Issue #300: feed the per-tenant rolling count for the
+	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd/topn.go).
+	// The sentinel "-" id keeps unknown-host traffic off the
+	// top-N gauge (it would otherwise flood the gauge with one
+	// series per scanner host). Cheap path — the sampler is
+	// the only writer to the gauge; this call only bumps the
+	// rolling count. Separated from the h.metrics != nil check
+	// because the sampler is wired via SetTopNSample and has
+	// its own nil-handling (topNSample is nil in unit tests
+	// that construct Handler without metrics).
+	if appID != "" && appID != "-" && h.topNSample != nil {
+		h.topNSample(appID)
 	}
 	(&requestLogger{log: h.log}).Log(appID, code, time.Since(startTime(r)), cold, requestID)
 

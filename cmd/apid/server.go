@@ -837,6 +837,19 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 			}
 			s.ops.RequestFailureFor(r, acct).Inc()
 		}
+		// Issue #300: feed the per-account rolling count that the
+		// 5s topNSampler reads to drive apid_top_tenant_rps. The
+		// sampler is the ONLY writer to the gauge; this per-request
+		// bump is the cheap path (mutex + map incr). Account_id
+		// resolution mirrors the requestTotal branch above so the
+		// two views agree on whose request they're attributing.
+		{
+			acct := "anonymous"
+			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+				acct = p.Acct.ID
+			}
+			s.ops.ObserveTopTenantRPS(acct)
+		}
 	})
 }
 

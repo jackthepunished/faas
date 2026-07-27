@@ -324,6 +324,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	handler := gateway.NewHandlerWith(deps.backend, gateway.NewMetrics(), log)
 	handler.SetWakeGateHook()
+	// Issue #300: topNSampler drives the gateway_top_tenant_rps
+	// gauge from the rolling per-app count fed by Handler.observe
+	// (pkg/gateway/handler.go:observe). 5s tick; runs for the
+	// daemon's lifetime; stops cleanly on ctx cancel. Local
+	// topAccountSet mirrors pkg/wire/topn.go so pkg/gateway stays
+	// free of any dependency on pkg/wire (avoids an import cycle
+	// through cmd/gatewayd → pkg/gateway → pkg/wire → cmd/gatewayd).
+	gatewayTopNSampler := newTopNSampler(handler.Metrics(), log)
+	go gatewayTopNSampler.run(ctx)
 
 	// Issue #98 / ADR-028: install the per-node HTTP→gRPC forwarder.
 	// Backend.Target returns a compute_node.id (string-typed for
