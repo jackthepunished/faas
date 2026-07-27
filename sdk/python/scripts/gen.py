@@ -280,7 +280,7 @@ def regen(overwrite: bool = True) -> None:
 def _patch_generator_bugs(sdk_root: Path) -> None:
     """Fix known bugs in the openapi-python-client 0.29.0 generator output.
 
-    Two cleanups:
+    Three cleanups:
 
     1. `from ...types import UNSET, Response` is missing `Unset` even
        though generated service files reference `Unset` in type
@@ -294,8 +294,28 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
     2. A handful of routes where the same request body type appears
        twice in a `Union` (e.g. `Foo | Foo | Unset`); collapse to
        a single occurrence. Cosmetic, no runtime effect.
+
+    3. Strip padding inside single-line docstrings. The Jinja2
+       templates in openapi-python-client 0.29.0 wrap each
+       attribute description in triple-double-quote placeholders,
+       and the rendered output inserts a single space on each side
+       of the substitution. Our committed form (HEAD) uses no
+       padding. This normaliser strips the padding on both sides
+       of the inner text so the dirty-diff gate (PR 7) passes
+       without the operator re-touching the tree by hand.
+       Multi-line docstrings are left alone — their inner
+       whitespace is semantically meaningful and stable.
     """
     import re
+
+    # Fix 3: regex for internal padding inside SINGLE-LINE triple-quoted
+    # docstrings emitted by openapi-python-client 0.29.0. Captures the
+    # leading indent + inner content so we can re-emit the line with
+    # the padding stripped.
+    _single_line_docstring = re.compile(
+        r'^(\s*)"""(\s*)(.*?)(\s*)"""$',
+        re.MULTILINE,
+    )
 
     for path in sdk_root.rglob("*.py"):
         text = path.read_text()
@@ -326,6 +346,15 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
         text = re.sub(
             r"\b([A-Z][A-Za-z0-9_]+)\s*\|\s*\1\b",
             r"\1",
+            text,
+        )
+        # Fix 3: strip padding inside single-line docstrings. See
+        # the regex comment above for the rationale (PR 7 dirty-
+        # diff gate). The captured groups are (indent, leading-
+        # space, inner-text, trailing-space); we drop the spaces
+        # and keep the original indent + inner text.
+        text = _single_line_docstring.sub(
+            lambda m: f'{m.group(1)}"""{m.group(3)}"""',
             text,
         )
         if text != original:

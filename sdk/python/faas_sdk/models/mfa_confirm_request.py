@@ -16,7 +16,7 @@ class MFAConfirmRequest:
     """Body for /confirm — a single 6-digit TOTP code."""
 
     totp: str
-    """ 6-digit rotating code from the authenticator app. """
+    """6-digit rotating code from the authenticator app."""
     csrf_token: str | Unset = UNSET
     """ Dashboard CSRF token. The dashboard sets a
     `faas_csrf` cookie on every authenticated response; the

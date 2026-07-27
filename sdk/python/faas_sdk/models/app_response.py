@@ -43,7 +43,7 @@ class AppResponse:
     measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See
     ADR-037. """
     runtime: AppResponseRuntime | Unset = UNSET
-    """ Runtime for `type: function` apps. Omit for `type: app` (the default). """
+    """Runtime for `type: function` apps. Omit for `type: app` (the default)."""
     idle_timeout_s: int | None | Unset = UNSET
     egress_allowlist: list[str] | Unset = UNSET
     """ Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6

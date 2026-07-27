@@ -20,7 +20,7 @@ class UpdateAppRequest:
     max_concurrency: int | None | Unset = UNSET
     min_instances: int | None | Unset = UNSET
     egress_allowlist: list[str] | Unset = UNSET
-    """ v4 or v6 CIDR allowlist; empty array clears to chain-default-accept. """
+    """v4 or v6 CIDR allowlist; empty array clears to chain-default-accept."""
     autoscale_target_rps: int | None | Unset = UNSET
     """ Per-instance RPS target for the reactive scale-up trigger. 0 = disable. Hobby/Pro/Scale only. Values < 0 are
     422 invalid_autoscale_target_rps. """

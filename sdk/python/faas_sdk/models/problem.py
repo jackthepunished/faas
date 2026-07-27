@@ -37,7 +37,7 @@ class Problem:
     title: str
     status: int
     code: str
-    """ Stable machine-readable error code. See StatusForCode in pkg/api/errors.go. """
+    """Stable machine-readable error code. See StatusForCode in pkg/api/errors.go."""
     type_: str | Unset = UNSET
     detail: str | Unset = UNSET
     limit: int | None | Unset = UNSET

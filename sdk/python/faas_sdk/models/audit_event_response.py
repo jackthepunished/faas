@@ -24,9 +24,9 @@ class AuditEventResponse:
     """
 
     id: str
-    """ Audit event row id (bigint as string). """
+    """Audit event row id (bigint as string)."""
     at: datetime.datetime
-    """ When the event was recorded (RFC 3339, UTC). """
+    """When the event was recorded (RFC 3339, UTC)."""
     actor: str
     """ Which daemon wrote the row. `apid` for IAM-4 surface; `schedd` for state-transition events (instance wakes /
     parks / watchdog timeouts). """
