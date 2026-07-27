@@ -2127,8 +2127,20 @@ func TestPg_UpsertGitHubInstall_OnConflictUpdates(t *testing.T) {
 // (Mirrors the PR-B apps_github_install_account_id path which is
 // ON DELETE SET NULL — the install row IS the user's, so CASCADE
 // is correct.)
+//
+// We can't use the shared pgStore(t) helper here because CASCADE is
+// verified with a raw `delete from accounts` against the same schema
+// that owns the row, and pgStore's pool is unexported
+// (MEMORY.md/pkg-state-pgstore-pool-unexported). Follow the
+// pgtest.Open + MigrateUp + NewPgStore pattern used by the snapshot
+// retention tests (see line 1428) so we hold both halves.
 func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
-	s, ctx := pgStore(t)
+	pool := pgtest.Open(t)
+	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := state.NewPgStore(pool)
 	acctID, _, _ := seedLiveDeploy(t, s, ctx)
 
 	inst := state.GitHubInstall{
@@ -2143,10 +2155,7 @@ func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
 		t.Fatalf("UpsertGitHubInstall: %v", err)
 	}
 	// Delete the account — installs must go with it (CASCADE).
-	// pgtest.Open gives us a direct pool handle so we don't need
-	// the unexported s.pool (MEMORY.md/pkg-state-pgstore-pool-unexported).
-	direct := pgtest.Open(t)
-	if _, err := direct.Exec(ctx, `delete from accounts where id = $1::uuid`, acctID); err != nil {
+	if _, err := pool.Exec(ctx, `delete from accounts where id = $1::uuid`, acctID); err != nil {
 		t.Fatalf("delete account: %v", err)
 	}
 	_, err := s.GitHubInstallForAccount(ctx, acctID)

@@ -35,7 +35,11 @@ func TestMigrations_00051_GitHubInstallations(t *testing.T) {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}
 
-	// (1) All 7 columns present with expected types.
+	// (1) All 7 columns present with expected types. Postgres reports
+	// timestamptz as "timestamp with time zone" in information_schema
+	// (the SQL-standard name); the "timestamptz" alias is a parser
+	// shortcut, not the storage type. Same caveat as pg_get_constraintdef
+	// (MEMORY.md/pg-get-constraintdef-shapes).
 	type colSpec struct {
 		name    string
 		typ     string
@@ -46,8 +50,8 @@ func TestMigrations_00051_GitHubInstallations(t *testing.T) {
 		{"installation_id", "bigint", true},
 		{"default_branch", "text", true},
 		{"sealed_install_token", "bytea", true},
-		{"token_expires_at", "timestamptz", true},
-		{"sealed_at", "timestamptz", true},
+		{"token_expires_at", "timestamp with time zone", true},
+		{"sealed_at", "timestamp with time zone", true},
 		{"audit_github_login", "text", true},
 	}
 	for _, c := range wantCols {
