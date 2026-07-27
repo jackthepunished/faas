@@ -44,6 +44,15 @@ transitions to a gauge value of 0, not to the overflow bucket.
 The dashboard `faas-top-tenants` (deploy/grafana/top-tenants.json,
 uid `faas-top-tenants`) has four panels:
 
+> **First-scrape-after-restart is approximate.** The sampler
+> goroutine emits the gauge once per 5s tick and computes rps as
+> (currentCount - prevCount) / interval. On the very first tick
+> after a daemon restart, `prevCount` is empty so the gauge
+> surfaces the cumulative request count divided by the 5s sample
+> interval. The value converges to a true 5s delta on the second
+> tick (5s later). If you're investigating "why is this customer's
+> rps so high right after a deploy?", wait 10s and re-check.
+
 - Panel 1: "Top-10 noisy customers (5m, apid)" — `topk(10, apid_top_tenant_rps{account_id!="other"})`.
 - Panel 2: "Top-10 noisy apps (5m, gateway)" — mirror for `gateway_top_tenant_rps`.
 - Panel 3: "Customer share of fleet traffic (5m, apid)" — top-10 by traffic share.

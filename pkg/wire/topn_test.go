@@ -14,10 +14,12 @@
 //   - the rolling-window reset wipes the counts without panicking,
 //   - the gauge exposition never exceeds cap + 1 series (acceptance #5).
 //
-// Same test pattern as metrics_cardinality_test.go (issue #278):
-// black-box `package wire_test` reaching into the OpsMetrics
+// Blackbox `package wire_test` reaching into the OpsMetrics
 // surface; the unexported `topAccountSet` is exercised via the
 // ObserveTopTenantRPS / EmitTopTenantRPS accessors added by this PR.
+// The 24h reset test reaches the primitive's clock seam via a
+// small test-only helper exposed for that purpose
+// (TestAdvanceClock).
 //
 // Test setup convention: each test calls ObserveTopTenantRPS(id)
 // once per id to bump the rolling-window count, then calls
@@ -208,18 +210,49 @@ func TestTopTenantRPS_HotIDInTopN(t *testing.T) {
 	}
 }
 
-// TestTopTenantRPS_ResetAfter24h pins the contract that resetWindow
-// wipes the rolling-window counts. This is the seam the sampler
-// goroutine drives; it is exercised in cmd/apid/topn_test.go when
-// that file lands. We assert here that the seam exists on the
-// primitive (the constructor's `now func() time.Time` field) so a
-// future refactor doesn't accidentally remove it.
+// TestTopTenantRPS_ResetAfter24h exercises the 24h rolling reset
+// path with a fake clock via the TestAdvanceClock test seam on
+// OpsMetrics (the blackbox test can't reach the primitive's
+// unexported fields directly). The seam overrides the primitive's
+// `now` clock AND rewinds `lastReset` so the shouldReset math is
+// deterministic. Without this test, a regression that breaks the
+// reset would surface as a stale id persisting past the 24h
+// window — visible only via the dashboard's "Other bucket growth"
+// panel, which is a fleet-level signal not caught by the alert
+// synthetic-fixture test.
 //
-// Implementation note: the sampler goroutine is wired in cmd/apid
-// and is not exercised here. This test is the placeholder: it pins
-// the assertion shape and is skipped until the cmd/apid/topn.go
-// sampler goroutine is wired in.
+// Implementation note: this is the blackbox analog of the same
+// test in cmd/gatewayd/topn_test.go (which is whitebox on the
+// private primitive). The two primitives are independent (no
+// shared test surface) so each gets its own coverage.
 func TestTopTenantRPS_ResetAfter24h(t *testing.T) {
-	t.Skip("sampler-side reset path; exercised by cmd/apid/topn_test.go")
-	_ = time.Now
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	m := wire.NewOpsMetrics("apid")
+	m.ObserveTopTenantRPS("acct-stale")
+	// Freeze the clock at base AND rewind lastReset so the
+	// baseline starts at base.
+	m.TestAdvanceClock(base, true)
+	// Advance the clock past the window without rewinding — now
+	// lastReset is still at base, now() is base+25h, shouldReset
+	// returns true.
+	m.TestAdvanceClock(base.Add(25*time.Hour), false)
+	set := m.TopAccountSet()
+	if !set.ShouldReset() {
+		t.Fatal("ShouldReset() = false after 25h; want true")
+	}
+	set.ResetWindow()
+	// Stale id must be gone after reset. EmitTopTenantRPS
+	// returns len(snap) + 1 (the +1 is the "other" overflow row).
+	// After reset, snap is empty so the return value is exactly
+	// 1 (the overflow row only). A value > 1 would mean some
+	// real id survived the reset.
+	emitted := m.EmitTopTenantRPS(func(string) float64 { return 1.0 })
+	if emitted != 1 {
+		t.Errorf("after reset, EmitTopTenantRPS emitted %d series; want 1 (only the other overflow row — acct-stale must be gone)", emitted)
+	}
+	// ShouldReset must be false again immediately after reset
+	// (lastReset was just bumped to now() = base+25h).
+	if set.ShouldReset() {
+		t.Error("ShouldReset() = true immediately after reset; want false")
+	}
 }

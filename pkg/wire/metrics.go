@@ -486,7 +486,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// dashboard panel can filter one without filtering the other.
 	topTenantRPS := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "_top_tenant_rps",
-		Help: "Per-tenant 5s RPS sampled by the daemon's topNSampler goroutine (issue #300). Labelled by account_id; bounded at the top 1000 customers by 24h request count with the remainder collapsed to account_id=\"other\" (the panel selector is {account_id!=\"other\"} for the top-N view). The \"other\" label here is distinct from the counter-level \"__other__\" overflow — see topAccountSet docs (pkg/wire/topn.go) for the two-tier cardinality contract. FaasTenantAbuse alert (spec §12) fires when the gauge exceeds 500 rps sustained for 10m.",
+		Help: "Per-tenant 5s RPS sampled by the daemon's topNSampler goroutine (issue #300). Labelled by account_id; bounded at the top 1000 customers by 24h request count with the remainder collapsed to account_id=\"other\" (the panel selector is {account_id!=\"other\"} for the top-N view). The \"other\" label here is distinct from the counter-level \"__other__\" overflow — see topAccountSet docs (pkg/wire/topn.go) for the two-tier cardinality contract. FaasTenantAbuse alert (spec §12) fires when the gauge exceeds 500 rps sustained for 10m. NOTE: the very first /metrics scrape after a daemon restart surfaces the cumulative request count divided by the 5s sample interval (because the sampler has no prior tick to diff against); the value converges to a true 5s delta on the second tick. This is a presentation-view approximation, not a counter drift.",
 	}, []string{"account_id"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the

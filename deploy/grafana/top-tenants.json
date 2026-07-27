@@ -43,6 +43,7 @@
       "title": "Top-10 noisy apps (5m, gateway)",
       "id": 2,
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "description": "Label key is `account_id` for parity with apid's panel, but the label VALUE is the resolved app_id (gatewayd is pre-auth and only sees hostname→app routing). Paste the displayed value into `apid_request_total{account_id=...}` to drill into the customer account.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {

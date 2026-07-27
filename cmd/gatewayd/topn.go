@@ -171,13 +171,14 @@ func sortEntries(entries []topNEntry) {
 }
 
 // topNEntry is the (id, count) tuple the primitive holds in its
-// top-N view. The sampler adds an RPS field when handing the
-// entry to Metrics.TopTenantRPSEmit; the primitive itself only
-// stores Count and lets the sampler compute RPS from the per-tick
-// diff.
+// top-N view. The sampler sets RPS on each entry before handing
+// it to Metrics.TopTenantRPSEmit; the primitive itself only
+// stores Count (the rps is a per-tick derived value, computed
+// from the prev/current diff outside the primitive's hot path).
 type topNEntry struct {
 	ID    string
 	Count uint64
+	RPS   float64
 }
 
 // topNSampler drives the per-daemon top-tenant gauge from the
@@ -241,18 +242,16 @@ func (s *topNSampler) tick() {
 	s.prev = current
 	s.mu.Unlock()
 	topN := s.set.topNSnapshot()
-	// Translate (id, count) → (id, rps) for the gauge. Skip ids
-	// whose prev snapshot didn't include them (first-tick
-	// sample) — the gauge surface can't reflect an instantaneous
-	// rate because there's no prior tick to diff against.
-	type rpsEntry struct {
-		id  string
-		rps float64
-	}
-	rpsList := make([]struct {
-		id  string
-		rps float64
-	}, 0, len(topN))
+	// Translate (id, count) → (id, rps) on the topNEntry in
+	// place. On the very first tick after boot prev is empty
+	// so the diff defaults to `now` (full count / interval) —
+	// acceptable, the gauge surfaces a non-zero value as soon
+	// as the daemon sees its first request, then converges to
+	// a true 5s delta on subsequent ticks. The "other" overflow
+	// row (pre-instantiated at boot, never reaches this loop
+	// because topNSnapshot only returns real ids with non-zero
+	// counts) is intentionally absent here.
+	emit := make([]gateway.TopNEntry, 0, len(topN))
 	var otherRPS float64
 	for _, e := range topN {
 		now := current[e.ID]
@@ -264,17 +263,10 @@ func (s *topNSampler) tick() {
 			otherRPS = float64(delta) / topNSamplerInterval.Seconds()
 			continue
 		}
-		rpsList = append(rpsList, struct {
-			id  string
-			rps float64
-		}{id: e.ID, rps: float64(delta) / topNSamplerInterval.Seconds()})
-	}
-	// Translate the anonymous struct into the gateway's topNEntry.
-	// The indirection exists so the gateway's Metrics surface
-	// stays decoupled from the sampler's internal sort order.
-	emit := make([]gateway.TopNEntry, 0, len(rpsList))
-	for _, e := range rpsList {
-		emit = append(emit, gateway.TopNEntry{ID: e.id, RPS: e.rps})
+		emit = append(emit, gateway.TopNEntry{
+			ID:  e.ID,
+			RPS: float64(delta) / topNSamplerInterval.Seconds(),
+		})
 	}
 	emitted := s.ops.TopTenantRPSEmit(emit, otherRPS)
 	s.log.Debug("gateway topNSampler tick", slog.Int("emitted_series", emitted))

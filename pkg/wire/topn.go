@@ -204,3 +204,38 @@ func (s *topAccountSet) shouldReset() bool {
 	defer s.mu.Unlock()
 	return s.now().Sub(s.lastReset) >= topAccountWindow
 }
+
+// TestAdvanceClock exposes a test-only seam on the OpsMetrics
+// side so pkg/wire/topn_test.go (package wire_test) can drive the
+// 24h reset path deterministically. The helper lives on
+// OpsMetrics because the blackbox test can't reach the unexported
+// topAccountSet fields directly; the helper delegates to the
+// primitive. Namespaced with the `Test` prefix so it doesn't
+// pollute the public surface — only the test file uses it.
+//
+// Both `now` and `lastReset` are written under the primitive's
+// mutex so a concurrent sampler tick can't observe a torn state
+// (e.g. the new clock but the old lastReset). Used by
+// TestTopTenantRPS_ResetAfter24h (issue #300 review finding #2).
+//
+// rewindLastReset controls whether lastReset is also set to base:
+// true = fully restart the window (used to set the initial
+// baseline); false = advance the clock without resetting the
+// baseline (used to walk past the 24h threshold). The two
+// behaviours are separate helpers because the production sampler
+// never rewinds lastReset — that operation is test-only.
+func (m *OpsMetrics) TestAdvanceClock(base time.Time, rewindLastReset bool) {
+	if m == nil {
+		return
+	}
+	set := m.TopAccountSet()
+	if set == nil {
+		return
+	}
+	set.mu.Lock()
+	set.now = func() time.Time { return base }
+	if rewindLastReset {
+		set.lastReset = base
+	}
+	set.mu.Unlock()
+}
