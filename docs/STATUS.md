@@ -323,9 +323,11 @@ The §14 M8 gates still on the board are listed in [What's next](#whats-next).
 The §12 dashboard pipeline is wired end-to-end:
 
 - **Alert rules** at `deploy/ansible/roles/prometheus/files/faas.rules.yml`
-  encode the §12 thresholds verbatim — twelve rules under a single
-  `faas_slo` group, three severity tiers (`info` / `warn` / `page`),
-  every annotation carries a `runbook_url:` pointing at the
+  encode the §12 thresholds verbatim — fifteen rules under a single
+  `faas_slo` group (twelve §12-mandated + three TLS observability rules
+  from ADR-024 H3: `FaasTLSCertExpiryPage`, `FaasTLSCertExpiryWarn`,
+  `FaasTLSOnDemandDeniedHigh`), three severity tiers (`info` / `warn`
+  / `page`), every annotation carries a `runbook_url:` pointing at the
   `docs/runbooks/<AlertName>.md` stub index below.
 - **Alertmanager role** at `deploy/ansible/roles/alertmanager/` mirrors
   the prometheus role's shape (defaults / tasks / templates / handlers /
@@ -417,9 +419,14 @@ explicitly open issues that the doc otherwise implies are closed.
   landed across `pkg/gateway/tls*.go`, `dns01_hetzner.go`,
   `allowlist.go`, `acme.go`, `cmd/gatewayd/{main,config,secrets}.go`,
   the systemd unit, and the ansible role; `caddyserver/certmagic`
-  v0.25.4 is pinned in `go.mod:14`. PR #87 closes the EX44 cut-over
-  + test gaps (see ADR-024); operator runbook at
-  `docs/ops/gatewayd-tls-cutover.md`.
+  v0.25.4 is pinned in `go.mod:14`. PR #87 closed the EX44 cut-over
+  + the structured acceptance tests; ADR-024 declared H3 (TLS
+  observability — cert-expiry gauge + on-demand-denial counter) and
+  H4 (file-watch secret reload) as known follow-ups. H3 closes in
+  this PR via `pkg/gateway/metrics.go::tlsCertExpiry` + `tlsOnDemandDenied`
+  + `pkg/gateway/cert_expiry.go` refresher, wired into
+  `cmd/gatewayd/main.go`; three alert rules land in `faas.rules.yml`;
+  operator runbook at `docs/ops/gatewayd-tls-cutover.md`.
 - **§14 V2 latency driver** — 100 park→wake cycles per app class,
   p50 ≤ 350 ms / p95 ≤ 800 ms. The Hobby-class gate is wired via
   `TestDeployWakeMetal/wake-latency-p50p95-100cycles` (extends the
