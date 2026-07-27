@@ -333,16 +333,42 @@ func (s *server) refuseLastRecoveryCodeOrMatch(w http.ResponseWriter, r *http.Re
 // (issue #329), and writes the 200 OK. Any failure on the way
 // writes an error response; callers don't need to.
 //
+// Concurrency note (race fix): the consume is the atomic
+// match-and-remove primitive; two concurrent /recover calls
+// serialise under the store's row lock (MemStore: sync.Mutex;
+// PgStore: SELECT FOR UPDATE). Both calls' Step-1
+// MatchRecoveryCode can return matched=true before either
+// reaches this Step-2 consume. The first caller wins the
+// match-and-remove; the second caller's consume returns
+// matched=false. Without checking matched here, the second
+// caller would also emit 200 — that is the (200=2, 401=0)
+// flake TestMFARecover_ConcurrentBurnOneCode trips on a fast
+// machine. Checking matched surfaces the lost race as a 401
+// ("code already consumed") with a code_raced audit row. The
+// customer's last-code UX (the 409 path inside
+// refuseLastRecoveryCodeOrMatch) is preserved because that
+// path never reaches consume — MatchRecoveryCode is
+// non-mutating per the issue #186 Finding #5 fix.
+//
 // Email send failure is intentionally NOT a hard failure: the
 // burn has already committed and the customer's session is
 // already reissued, so failing the response would force the
 // customer to re-authenticate. Same shape as the password-reset
 // mailer at handlers_auth_login.go:256-263.
 func (s *server) completeRecoveryCodeBurn(w http.ResponseWriter, r *http.Request, acct state.Account, presented []byte) {
-	_, _, remaining, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
+	matchedConsume, _, remaining, err := consumeRecoveryCode(r.Context(), s.store, acct.ID, presented)
 	if err != nil {
 		s.log.Error("mfa.recover.consume", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not consume recovery code"))
+		return
+	}
+	if !matchedConsume {
+		// Another /recover call (or a /disable path) burned the
+		// code between our MatchRecoveryCode and our consume.
+		// The code is no longer valid for this account.
+		s.audit.Emit(r.Context(), "account.mfa_recover_failed", &acct.ID, map[string]any{"reason": "code_raced"})
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeMFAInvalidCode,
+			"Invalid code", "recovery code was already consumed"))
 		return
 	}
 	if err := s.reissueSessionCookie(w, r, acct, false); err != nil {

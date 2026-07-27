@@ -220,10 +220,16 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		IncludedGBHours: 5,
 		OverageGBHours:  7.345,
 		OverageCents:    735,
+		// Issue #279 / PR-B: the informational CPU panel.
+		// 0.002778 CPU-hours × 3.6e9 µs/hour = ~10_000_080 µs,
+		// i.e. 10 s of CPU consumed across the month — a
+		// realistic order of magnitude for a Hobby app doing
+		// bursty work, picked for a clean 4-decimal render.
+		UsedCPUHours: 0.002778,
 	})
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
-	if len(lines) != 5 {
-		t.Fatalf("line count = %d, want 5\nraw: %s", len(lines), buf.String())
+	if len(lines) != 6 {
+		t.Fatalf("line count = %d, want 6 (issue #279 added CPU panel)\nraw: %s", len(lines), buf.String())
 	}
 	for _, want := range []string{
 		"Month:", "2026-07",
@@ -231,6 +237,7 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		"Included:", "5 GB-hours",
 		"Overage:", "7.345 GB-hours",
 		"Overage cost:", "735 cents",
+		"CPU usage:", "0.002778 CPU-hours",
 	} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("rendered output missing %q\nfull: %s", want, buf.String())

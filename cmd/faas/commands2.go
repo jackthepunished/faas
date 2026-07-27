@@ -954,6 +954,11 @@ func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
 	_, _ = fmt.Fprintf(w, "  %-*s %d GB-hours\n", labelWidth, "Included:", s.IncludedGBHours)
 	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB-hours\n", labelWidth, "Overage:", s.OverageGBHours)
 	_, _ = fmt.Fprintf(w, "  %-*s %d cents\n", labelWidth, "Overage cost:", s.OverageCents)
+	// Issue #279 / PR-B: per-month CPU-hours is informational —
+	// not billed. Surfaced as a separate line so the customer
+	// sees the measurement next to the billing total without
+	// confusing the two.
+	_, _ = fmt.Fprintf(w, "  %-*s %.6f CPU-hours\n", labelWidth, "CPU usage:", s.UsedCPUHours)
 }
 
 func boolPtr(b bool) *bool { return &b }

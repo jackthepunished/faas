@@ -1024,10 +1024,15 @@ type Store interface {
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
-	// AppendUsage is idempotent on (instance_id, minute): the first write
-	// wins, a redelivered minute is a no-op. This prevents silent
-	// double-billing under any meterd restart (M7 hardening).
-	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests int64) error
+	// AppendUsage is idempotent on (instance_id, minute): the first
+	// write of mb_seconds / requests wins, a redelivered minute is
+	// a no-op for those columns. cpu_usec is ADDITIVE on
+	// (instance_id, minute): the schedd accumulator can call
+	// AppendUsage many times within the same minute; the column is
+	// the sum of all per-tick deltas (issue #279 / PR-B). The
+	// contrast is documented at
+	// migrations/00054_usage_minutes_cpu.sql.
+	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
 	// first, ordered by (period_end DESC, id DESC) for deterministic

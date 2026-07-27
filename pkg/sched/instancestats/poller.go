@@ -250,6 +250,20 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			row.CPUPct = *in.CPUPct
 			row.CPU = Valid
 		}
+		// CPUSeconds (issue #279 / PR-B): cumulative
+		// CPU-seconds from vmmd's cpustats cache. nil
+		// means no baseline yet; we leave the wire field
+		// as NaN so the rollup's regression-handling
+		// branch does not see a bogus reading. Otherwise
+		// we propagate the value verbatim: vmmd owns the
+		// regression detection and resets the cache
+		// baseline on cgroup recreation, so the wire is
+		// always a valid cumulative value.
+		if in.CPUSeconds != nil {
+			wireRow.CPUSeconds = *in.CPUSeconds
+			row.CPUUsageUsec = uint64(*in.CPUSeconds * 1e6)
+			row.CPUHour = *in.CPUSeconds / 3600.0
+		}
 		// RSS: wire sends *int64. nil → Unknown; non-nil →
 		// convert bytes → MiB.
 		if in.ResidentBytes != nil {

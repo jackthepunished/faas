@@ -197,7 +197,7 @@ func TestSampler_RollsOneMinutePerInstance(t *testing.T) {
 	ins := makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 	_ = ins
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	rows, err := sampler.SampleAndRoll(ctx)
 	if err != nil {
 		t.Fatalf("sample: %v", err)
@@ -240,7 +240,7 @@ func TestSampler_SkipsParkedInstances(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	_, _ = s.CreateInstance(ctx, app.ID, "dep1", string(state.StateParked), 256, state.DefaultLocalNodeName, "")
 
-	rows, err := meter.NewSampler(s, func() time.Time { return now }).SampleAndRoll(ctx)
+	rows, err := meter.NewSampler(s, nil, func() time.Time { return now }).SampleAndRoll(ctx)
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestInvoiceShadow24h(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	_, _ = s.CreateInstance(ctx, app.ID, "dep1", string(state.StateRunning), 256, state.DefaultLocalNodeName, "")
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	const minutesIn24h = 24 * 60
 	for i := 0; i < minutesIn24h; i++ {
 		now = now.Add(time.Minute)
@@ -327,7 +327,7 @@ func TestFreeHardStop(t *testing.T) {
 			break
 		}
 		now = now.Add(time.Minute)
-		if err := s.AppendUsage(ctx, acct.ID, app.ID, ins.ID, now, 136*60, 0); err != nil {
+		if err := s.AppendUsage(ctx, acct.ID, app.ID, ins.ID, now, 136*60, 0, 0); err != nil {
 			t.Fatalf("append usage: %v", err)
 		}
 	}
@@ -390,7 +390,7 @@ func TestPaidOverageNoStop(t *testing.T) {
 
 	// Plant usage equal to one Hobby quota so CheckQuota at Pro's 250 GB-h
 	// threshold still trips. (5 GB-h * 1024 * 3600 = 18_432_000.)
-	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst1", now, 18_432_000*100, 0); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst1", now, 18_432_000*100, 0, 0); err != nil {
 		t.Fatalf("seed usage: %v", err)
 	}
 	usages, err := s.UsageByMonth(ctx, acct.ID, meter.AccountMonthKey(now))
@@ -439,7 +439,7 @@ func TestPaidOverageDedupesPerDay(t *testing.T) {
 	_, _ = s.CreateInstance(ctx, app.ID, "dep1", string(state.StateRunning), 512, state.DefaultLocalNodeName, "")
 	// Plant usage equal to one Hobby quota so CheckQuota at Pro's
 	// 250 GB-h threshold trips.
-	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst1", day1Hour1, 18_432_000*100, 0); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst1", day1Hour1, 18_432_000*100, 0, 0); err != nil {
 		t.Fatalf("seed usage: %v", err)
 	}
 	usages, err := s.UsageByMonth(ctx, acct.ID, meter.AccountMonthKey(day1Hour1))
@@ -517,15 +517,15 @@ func TestAppendUsagePerInstanceMinute(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 
 	// First write for (inst-A, m) — wins, mb_seconds=100, requests=1.
-	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m, 100, 1); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m, 100, 1, 0); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
 	// Redelivered minute: a no-op. mb_seconds stays 100, requests stays 1.
-	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m, 50, 2); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m, 50, 2, 0); err != nil {
 		t.Fatalf("append 2 (redelivered): %v", err)
 	}
 	// Different minute: separate row.
-	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m.Add(time.Minute), 75, 1); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, app.ID, "inst-A", m.Add(time.Minute), 75, 1, 0); err != nil {
 		t.Fatalf("append 3: %v", err)
 	}
 	usages, err := s.UsageByMonth(ctx, acct.ID, meter.AccountMonthKey(m))

@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -959,6 +960,12 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 			MBSeconds:       u.MBSeconds,
 			Requests:        u.Requests,
 			IncludedGBHours: int64(limits.IncludedGBHours),
+			// CPUUsageUsec is the informational per-app monthly
+			// CPU-µs the meterd sampler accumulated in
+			// usage_minutes.cpu_usec (issue #279 / PR-B). 0
+			// when no CPU has been recorded yet (boot, or the
+			// app has not been woken). Not billed.
+			CPUUsageUsec: u.CPUUsec,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -1533,11 +1540,19 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, api.ErrCapacity("could not load usage"))
 		return
 	}
-	var mbSec int64
+	var mbSec, cpuUsec int64
 	for _, u := range rows {
 		mbSec += u.MBSeconds
+		cpuUsec += u.CPUUsec
 	}
 	usedGB := float64(mbSec) / 3_600_000.0
+	// usedCPUHours is the per-month CPU-hours — informational only
+	// (issue #279 / PR-B). Billing math is on usedGB (plan RAM +
+	// 8 MB per running second). The conversion is the same shape
+	// the SDK exposes via UsageResponse.CPUHours() / UsageExportResponse
+	// .CPUHours() — keep them in lockstep by going through
+	// meter.CPUHours.
+	usedCPUHours := meter.CPUHours(cpuUsec)
 	limits := api.MustLimitsFor(acct.Plan)
 	included := int64(limits.IncludedGBHours)
 	overage := usedGB - float64(included)
@@ -1555,6 +1570,7 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 		IncludedGBHours: included,
 		OverageGBHours:  overage,
 		OverageCents:    overageCents,
+		UsedCPUHours:    usedCPUHours,
 	})
 }
 

@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -715,14 +716,24 @@ func TestMFARecover_RefusesToBurnLastCode(t *testing.T) {
 }
 
 // TestMFARecover_ConcurrentBurnOneCode covers the SELECT FOR
-// UPDATE contract on MemStore. Two concurrent /recover calls
-// using the SAME code must land exactly one matched=true and
-// exactly one matched=false — the second race-arrives AFTER
-// the first transaction commits and observes the SHA-256 hash
-// is gone. Without the atomic ConsumeRecoveryCode primitive,
-// both calls would think they burned the code (and the store
-// would write the same array diff twice — not data loss, but
-// a duplicate audit row + confusing UX).
+// UPDATE contract on ConsumeRecoveryCode. Two concurrent
+// /recover calls using the SAME code must land exactly one
+// 200 (burn) and exactly one 401 (code already consumed) —
+// the second race-arrives AFTER the first transaction commits
+// and observes the SHA-256 hash is gone. Without the atomic
+// primitive, both calls would think they burned the code (not
+// data loss, but a duplicate audit row + confusing UX).
+//
+// Race shape: both goroutines' MatchRecoveryCode runs before
+// either ConsumeRecoveryCode. The handler checks the consume's
+// matched return (handlers_mfa.go mfaRecover step 2) — when
+// false, it emits 401 ("code already consumed"). That check is
+// the load-bearing change that turns this test from a flake
+// (200=2, 401=0) into a deterministic pin of the user-facing
+// contract. The store-level atomicity is pinned independently
+// in TestMFARecover_StoreAtomicityOnConcurrentConsume below —
+// a regression in ConsumeRecoveryCode serialization would fail
+// that subtest even on a fast machine.
 func TestMFARecover_ConcurrentBurnOneCode(t *testing.T) {
 	e := setupWithMFA(t, api.PlanPro, false, false)
 	recovCodes, _, _ := e.generateEnrolledAccount(t)
@@ -770,6 +781,86 @@ func TestMFARecover_ConcurrentBurnOneCode(t *testing.T) {
 	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
 		t.Errorf("codes after concurrent burn = %d, want %d (double-burn would have left %d)",
 			got, want, auth.RecoveryCodeCount-2)
+	}
+}
+
+// TestMFARecover_StoreAtomicityOnConcurrentConsume pins the
+// atomicity contract on ConsumeRecoveryCode directly, without
+// relying on handler timing. N=8 goroutines fire ConsumeRecoveryCode
+// at the same account with the same presented hash; the store
+// must accept exactly one (matched=true) and reject the other
+// 7 (matched=false). The sync.WaitGroup "arrive" gate forces
+// all 8 to be parked on the same source line at the moment of
+// release so the scheduler MUST interleave them — a regression
+// in ConsumeRecoveryCode serialization (e.g. a MemStore method
+// that drops the mutex around the read-compare-mutate-write
+// chain) would surface as 2+ matched=true responses and
+// RecoveryCodeCount-2 codes remaining. N=8 is well above the
+// 2-of-2 flake window and far enough from RecoveryCodeCount=10
+// that a regression in the consume path is statistically
+// impossible to hide.
+func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
+	const concurrency = 8
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	recovCodes, _, _ := e.generateEnrolledAccount(t)
+	if len(recovCodes) < 2 {
+		t.Fatalf("setup: recovery code count = %d, want >= 2", len(recovCodes))
+	}
+	code := recovCodes[0]
+	presented := auth.HashRecoveryCode(code)
+
+	type result struct {
+		matched  bool
+		lastCode bool
+		err      error
+	}
+	results := make(chan result, concurrency)
+	var arrived sync.WaitGroup
+	arrived.Add(concurrency)
+	goSignal := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			arrived.Done()
+			<-goSignal
+			matched, lastCode, _, err := e.store.ConsumeRecoveryCode(context.Background(), e.acct.ID, presented)
+			results <- result{matched, lastCode, err}
+		}()
+	}
+	arrived.Wait()
+	close(goSignal)
+
+	var matched, lastSeen int
+	var errCount int
+	for i := 0; i < concurrency; i++ {
+		r := <-results
+		if r.err != nil {
+			errCount++
+			continue
+		}
+		if r.matched {
+			matched++
+		}
+		if r.lastCode {
+			lastSeen++
+		}
+	}
+	if errCount != 0 {
+		t.Errorf("ConsumeRecoveryCode returned %d errors, want 0", errCount)
+	}
+	if matched != 1 {
+		t.Errorf("ConsumeRecoveryCode matched=%d across %d concurrent calls on the same code, want 1 (double-burn regression)",
+			matched, concurrency)
+	}
+	if lastSeen != 0 {
+		// RecoveryCodeCount=10 codes minted; only one burn
+		// happens here so lastSeen must stay 0.
+		t.Errorf("ConsumeRecoveryCode lastSeen=%d, want 0 (initial array should not be at length 1)", lastSeen)
+	}
+
+	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
+	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
+		t.Errorf("codes after %d-way concurrent burn = %d, want %d (double-burn would have left %d)",
+			concurrency, got, want, auth.RecoveryCodeCount-2)
 	}
 }
 

@@ -411,6 +411,11 @@ func listUsageForAccountExport(ctx context.Context, st state.Store, accountID st
 		out = append(out, api.UsageExportResponse{
 			AppID: u.AppID, Month: u.Month.UTC().Format("2006-01"),
 			MBSeconds: u.MBSeconds, Requests: u.Requests,
+			// CPUUsageUsec is the per-(app, month) CPU-µs
+			// informational field (issue #279 / PR-B). 0
+			// when the meterd sampler has not accumulated
+			// any CPU for this row yet.
+			CPUUsageUsec: u.CPUUsec,
 		})
 	}
 	return out, nil

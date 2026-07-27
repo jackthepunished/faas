@@ -208,6 +208,13 @@ type usageMinute struct {
 	Minute     time.Time
 	MBSeconds  int64
 	Requests   int64
+	// CPUUsec is the cumulative host cgroup CPU-µs consumed by the
+	// instance during this minute. Source: vmmd cpustats.Cache
+	// (cpu.stat usage_usec delta) → schedd instancestats.Poller →
+	// meterd Sampler. Measurement only — billing is on plan RAM
+	// (pkg/api/limits.go). Additive on conflict (instance_id,
+	// minute) — see AppendUsage doc for the rationale.
+	CPUUsec int64
 }
 
 // NewMemStore returns an empty in-memory store with the synthetic
@@ -3159,24 +3166,41 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 // AppendUsage writes one (instance, minute) usage row and updates the
 // per-(account, app, month) aggregate so UsageByMonth keeps returning the
 // spec §10 shape without re-scanning the per-minute rows. Idempotent on
-// (instance_id, minute): a redelivered minute is a no-op (first write
-// wins). Mirrors the production INSERT … ON CONFLICT (instance_id, minute)
-// DO NOTHING semantics in pgstore.go — see M7 hardening PR
-// feat/m7-beta-hardening for the audit that surfaced this contract change.
-func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests int64) error {
+// (instance_id, minute) for mb_seconds / requests: a redelivered minute
+// is a no-op (first write wins). Mirrors the production INSERT … ON
+// CONFLICT (instance_id, minute) DO NOTHING semantics for mb_seconds
+// in pgstore.go — see M7 hardening PR feat/m7-beta-hardening for the
+// audit that surfaced this contract change.
+//
+// cpu_usec is ADDITIVE on the same conflict key (issue #279 / PR-B):
+// the schedd accumulator can call AppendUsage many times within the
+// same minute (250 ms cadence × ~240 ticks/minute), and the per-tick
+// deltas need to be summed into the row. The pusher (meter → billing)
+// deduplicates on a coarser window — the additive merge is safe
+// end-to-end. See pkg/state/pgstore.go::AppendUsage and
+// migrations/00054_usage_minutes_cpu.sql for the production rationale.
+func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := minute.UTC().Truncate(time.Minute)
 	for i := range m.usage {
 		if m.usage[i].InstanceID == instanceID && m.usage[i].Minute.Equal(key) {
-			// Idempotent: redelivered minute is a no-op. The first tick
-			// wins; restart-driven redelivery does not inflate billing.
+			// Idempotent for mb_seconds / requests (first write wins,
+			// so a restart-driven redelivery cannot inflate billing).
+			// cpu_usec is additive: the schedd accumulator can call
+			// AppendUsage many times per minute, and we sum the deltas.
+			if m.usage[i].MBSeconds == 0 && m.usage[i].Requests == 0 {
+				m.usage[i].MBSeconds = mbSeconds
+				m.usage[i].Requests = requests
+			}
+			m.usage[i].CPUUsec += cpuUsec
+			m.recomputeMonthLocked(accountID, appID, key)
 			return nil
 		}
 	}
 	m.usage = append(m.usage, usageMinute{
 		AccountID: accountID, AppID: appID, InstanceID: instanceID,
-		Minute: key, MBSeconds: mbSeconds, Requests: requests,
+		Minute: key, MBSeconds: mbSeconds, Requests: requests, CPUUsec: cpuUsec,
 	})
 	m.recomputeMonthLocked(accountID, appID, key)
 	return nil
@@ -3269,6 +3293,7 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 		AppID     string
 		MBSeconds int64
 		Requests  int64
+		CPUUsec   int64
 	}
 	bucket := map[appHourKey]hourAgg{}
 	for _, u := range m.usage {
@@ -3284,6 +3309,7 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 		a.AppID = u.AppID
 		a.MBSeconds += u.MBSeconds
 		a.Requests += u.Requests
+		a.CPUUsec += u.CPUUsec
 		bucket[k] = a
 	}
 	out := make([]Usage, 0, len(bucket))
@@ -3291,6 +3317,7 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 		out = append(out, Usage{
 			AccountID: a.AccountID, AppID: a.AppID,
 			Month: start, MBSeconds: a.MBSeconds, Requests: a.Requests,
+			CPUUsec: a.CPUUsec,
 		})
 	}
 	return out, nil
@@ -3458,7 +3485,7 @@ type appHourKey struct {
 // stays bounded (one minute × max_concurrency(plan) × apps).
 func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Time) {
 	month := time.Date(minute.Year(), minute.Month(), 1, 0, 0, 0, 0, time.UTC)
-	var mbSec, req int64
+	var mbSec, req, cpuUsec int64
 	for _, u := range m.usage {
 		if u.AccountID != accountID || u.AppID != appID {
 			continue
@@ -3468,6 +3495,7 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 		}
 		mbSec += u.MBSeconds
 		req += u.Requests
+		cpuUsec += u.CPUUsec
 	}
 	// Drop the existing row for this (account, app, month) if any, then append.
 	for i := range m.usageByMonth {
@@ -3480,7 +3508,7 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 	}
 	m.usageByMonth = append(m.usageByMonth, Usage{
 		AccountID: accountID, AppID: appID, Month: month,
-		MBSeconds: mbSec, Requests: req,
+		MBSeconds: mbSec, Requests: req, CPUUsec: cpuUsec,
 	})
 }
 
@@ -4118,11 +4146,11 @@ func (m *MemStore) ListCronsForAccount(_ context.Context, accountID string) ([]C
 }
 
 // UsageByAccount returns the per-month roll-up. Mirrors the PgStore
-// shape (per-app, per-month aggregated mb_seconds + requests).
+// shape (per-app, per-month aggregated mb_seconds + requests + cpu_usec).
 func (m *MemStore) UsageByAccount(_ context.Context, accountID string, since time.Time) ([]Usage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	type bucket struct{ mb, req int64 }
+	type bucket struct{ mb, req, cpu int64 }
 	agg := map[string]*bucket{}
 	for _, u := range m.usage {
 		if u.AccountID != accountID {
@@ -4137,6 +4165,7 @@ func (m *MemStore) UsageByAccount(_ context.Context, accountID string, since tim
 		}
 		agg[key].mb += u.MBSeconds
 		agg[key].req += u.Requests
+		agg[key].cpu += u.CPUUsec
 	}
 	out := make([]Usage, 0, len(agg))
 	for key, b := range agg {
@@ -4144,7 +4173,7 @@ func (m *MemStore) UsageByAccount(_ context.Context, accountID string, since tim
 		month, _ := time.Parse("2006-01", parts[1])
 		out = append(out, Usage{
 			AccountID: accountID, AppID: parts[0], Month: month,
-			MBSeconds: b.mb, Requests: b.req,
+			MBSeconds: b.mb, Requests: b.req, CPUUsec: b.cpu,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

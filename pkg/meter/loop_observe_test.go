@@ -33,6 +33,7 @@ func runLoopBrief(t *testing.T, store state.Store, dunning *meter.Dunning) (*met
 
 	loop := meter.NewLoop(
 		store,
+		nil,
 		&fakeParker{},
 		nil, // StripePusher — nil; the pusher returns nil, error "pusher not configured"
 		&fakeNotifier{},
