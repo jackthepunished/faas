@@ -2,6 +2,7 @@ package sched
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/netip"
@@ -10,7 +11,9 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // fakeWakeVMM satisfies VMM without touching firecracker. Returns a stub
@@ -346,5 +349,149 @@ func TestCronDispatch_BadScheduleSkippedNotPanics(t *testing.T) {
 
 	if got := vmm.calls.Load(); got != 0 {
 		t.Fatalf("wake calls = %d, want 0 for bad schedule", got)
+	}
+}
+
+// TestCronDispatch_EmitsCronFiredAudit pins issue #291 follow-up: the
+// schedd FIRE path must emit a `cron.fired` audit row keyed to the
+// owning account. Mirrors TestCronDispatch_FiresOncePerBoundary for
+// the seed/dispatch shape; asserts ListEvents(subject=acctID)
+// returns one row with kind="cron.fired", actor="schedd", and the
+// 9-key payload documented in pkg/sched/loop.go (status="ok" +
+// invocation_id + instance_id populated on the success path).
+//
+// Subject is the account id (not the instance id) because the
+// appendEvents surface is per-account for billing/quota audit
+// introspection — accounts can have multiple crons firing across
+// multiple instances; an operator queries "what crons fired for
+// acct X in the last hour?" via Subject=<acctID>. ListEvents
+// expects canonical UUID; we normalise the hex form via uuidStringOf
+// (same helper events_test uses) so the test is robust to the
+// MemStore hex-vs-canonical id shape.
+func TestCronDispatch_EmitsCronFiredAudit(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	acct, _ := store.CreateAccount(ctx, "c@example.com", api.PlanHobby)
+	app, cron := newAppAndCron(t, store, acct.ID, true)
+
+	vmm := &fakeWakeVMM{}
+	eng, _ := makeEngine(t, store, vmm)
+	synth := &recordingSynth{}
+	now := time.Date(2026, 7, 17, 12, 2, 0, 0, time.UTC)
+	ops := wire.NewOpsMetrics("schedd")
+	loop := NewLoop(nil, eng, slog.Default()).
+		WithGatewaySynth(synth).
+		WithAudit(audit.New(store, slog.Default(), ops, "schedd")).
+		WithClock(func() time.Time { return now })
+
+	loop.runCronTick(ctx)
+
+	rows, err := store.ListEvents(ctx, acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListEvents(acct) returned %d rows, want 1 (cron.fired); rows=%+v", len(rows), rows)
+	}
+	e := rows[0]
+	if e.Kind != "cron.fired" {
+		t.Errorf("event kind = %q, want cron.fired", e.Kind)
+	}
+	if e.Actor != "schedd" {
+		t.Errorf("event actor = %q, want schedd", e.Actor)
+	}
+	if e.Subject == nil {
+		t.Fatalf("event Subject = nil; cron.fired must carry the acct id")
+	}
+	if got := e.Subject.String(); got != uuidStringOf(acct.ID) {
+		t.Errorf("event Subject = %s, want %s", got, uuidStringOf(acct.ID))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Data, &payload); err != nil {
+		t.Fatalf("event Data not valid JSON: %v (data=%q)", err, e.Data)
+	}
+	// Every payload key is present — JSON shape stays stable even
+	// on the err path so dashboards can filter without nil checks.
+	for _, k := range []string{
+		"cron_id", "app_id", "schedule", "path",
+		"fired_at", "last_fired_at_before", "status",
+		"invocation_id", "instance_id",
+	} {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("payload missing key %q (full payload=%+v)", k, payload)
+		}
+	}
+	// Value-level checks on the success path.
+	if payload["status"] != "ok" {
+		t.Errorf("payload.status = %v, want ok (synth call succeeded)", payload["status"])
+	}
+	if payload["app_id"] != app.ID {
+		t.Errorf("payload.app_id = %v, want %s", payload["app_id"], app.ID)
+	}
+	if payload["cron_id"] != cron.ID {
+		t.Errorf("payload.cron_id = %v, want %s", payload["cron_id"], cron.ID)
+	}
+	if payload["schedule"] != "* * * * *" {
+		t.Errorf("payload.schedule = %v, want \"* * * * *\"", payload["schedule"])
+	}
+	if payload["path"] != "/ping" {
+		t.Errorf("payload.path = %v, want /ping", payload["path"])
+	}
+	// invocation_id is the invocations row id; instance_id is the
+	// live VM. recordingSynth stamps inst-fake-<inv.ID> (see
+	// cron_loop_test.go:88), so instance_id is non-empty iff the
+	// synth path landed. Pin both ends so future refactors can't
+	// silently regress the join.
+	if payload["invocation_id"] == "" {
+		t.Errorf("payload.invocation_id empty on success path (full payload=%+v)", payload)
+	}
+	if payload["instance_id"] == "" {
+		t.Errorf("payload.instance_id empty on success path (full payload=%+v)", payload)
+	}
+}
+
+// TestCronDispatch_CronFiredAuditFailureDoesNotRollback pins the
+// best-effort contract from ADR-035: a failing audit write never
+// rolls back the fire. We wrap the store in failingEventStore (which
+// makes only AppendEvent error — same pattern events_test.go:99
+// uses for the engine-transition regression). After runCronTick:
+//   - the cron row's LastFiredAt must be set (fire committed), and
+//   - the dispatch path must not have panicked.
+//
+// We do NOT pin the AuditWriteFailures counter here — pkg/audit's
+// own tests cover that path; the schedd concern is just "did the
+// fire survive an audit failure?".
+func TestCronDispatch_CronFiredAuditFailureDoesNotRollback(t *testing.T) {
+	t.Parallel()
+	inner := state.NewMemStore()
+	ctx := context.Background()
+	acct, _ := inner.CreateAccount(ctx, "c@example.com", api.PlanHobby)
+	app, cron := newAppAndCron(t, inner, acct.ID, true)
+
+	wrapped := &failingEventStore{Store: inner}
+	vmm := &fakeWakeVMM{}
+	eng, _ := makeEngine(t, wrapped, vmm)
+	synth := &recordingSynth{}
+	now := time.Date(2026, 7, 17, 12, 2, 0, 0, time.UTC)
+	loop := NewLoop(nil, eng, slog.Default()).
+		WithGatewaySynth(synth).
+		WithAudit(audit.New(wrapped, slog.Default(), nil, "schedd")).
+		WithClock(func() time.Time { return now })
+
+	loop.runCronTick(ctx)
+
+	// Fire must still have committed (audit failure is best-effort).
+	got, err := inner.CronByID(ctx, cron.ID)
+	if err != nil {
+		t.Fatalf("read cron: %v", err)
+	}
+	if got.LastFiredAt.IsZero() {
+		t.Fatalf("LastFiredAt still zero after tick (audit write failed but fire must survive; app=%s)", app.ID)
+	}
+	// Synth call also must still have gone through (reaper/audit
+	// failures don't bubble into the dispatch path).
+	if got := synth.calls.Load(); got != 1 {
+		t.Errorf("synth calls = %d, want 1 (audit-log failure must not roll back dispatch)", got)
 	}
 }

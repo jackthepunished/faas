@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
@@ -38,6 +39,7 @@ type Loop struct {
 	now              func() time.Time
 	flowCounts       FlowCounter
 	ops              *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit            *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
 	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
 	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
 	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
@@ -54,6 +56,14 @@ func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
 		now:        time.Now,
 		flowCounts: noopFlowCounter{},
 	}
+}
+
+// WithAudit attaches the IAM-4 audit seam so the cron-fire path can
+// emit a `cron.fired` events row after MarkCronFired. nil opts out
+// (legacy / tests that don't care about the audit row).
+func (l *Loop) WithAudit(a *audit.Auditor) *Loop {
+	l.audit = a
+	return l
 }
 
 // WithWatchdog attaches the §6.1 watchdog (commit 3). Tests can skip
@@ -939,6 +949,17 @@ func (l *Loop) runCronTick(ctx context.Context) {
 
 // dispatchOneCron is the per-cron decision tree. Factored out so the
 // test surface can drive one cron with a fake clock.
+// statusStr renders the ok bool as the literal `cron.fired.status`
+// audit payload value. Kept as a tiny helper so the dispatch can use
+// a single `if ok { ... }` set without a second branch on the emit
+// site.
+func statusStr(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "err"
+}
+
 func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time) {
 	sched, err := ParseSchedule(c.Schedule)
 	if err != nil {
@@ -961,6 +982,16 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		// Already fired in the current window.
 		return
 	}
+	// Capture the pre-fire state for the audit row (issue #291
+	// follow-up — schedd emits `cron.fired` after MarkCronFired).
+	// lastFiredAtBefore is what an operator reads to reconstruct the
+	// boundary that just crossed; the ok/invocationID/instanceID
+	// triple is updated below as the dispatch progresses so the
+	// post-MarkCronFired audit emit can decide status="ok"|"err"
+	// without re-checking the dispatch internals.
+	lastFiredAtBefore := c.LastFiredAt
+	ok := false
+	var invocationID, instanceID string
 	app, err := l.engine.Store().AppByID(ctx, c.AppID)
 	if err != nil {
 		l.log.Warn("cron: app", "cron_id", c.ID, "err", err)
@@ -1040,10 +1071,45 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			if err := l.engine.Store().CompleteInvocation(ctx, enq.ID, nil); err != nil {
 				l.log.Warn("cron: complete", "cron_id", c.ID, "err", err)
 			}
+			// Success path: the synth invoke produced a live
+			// instance handle. Capture the audit-trail triples so
+			// the post-MarkCronFired emit can record status="ok"
+			// with the wake that served the fire. invocation_id is
+			// the drain row id; instance_id is the live VM that
+			// gatewayd picked. Mirrors the invocations_history
+			// join so an operator can pivot from the audit row to
+			// the wake record with one query.
+			ok = true
+			invocationID = enq.ID
+			instanceID = invokeOut.InstanceID
 		}
 	}
 	if err := l.engine.Store().MarkCronFired(ctx, c.ID, now); err != nil {
 		l.log.Warn("cron: mark fired", "cron_id", c.ID, "err", err)
+	}
+	// Audit row for the cron fire (issue #291 follow-up — schedd
+	// now mirrors the apid audit surface). Sits AFTER MarkCronFired
+	// so the 4xx-invariant from spec §5.1 holds: a cron we didn't
+	// fire never emits. Best-effort: pkg/audit.Auditor never
+	// rolls back the fire. lastFiredAtBefore is the pre-fire value
+	// so an operator can reconstruct the boundary that just
+	// crossed (e.g. "this fire was 31 minutes after the prior
+	// fire, matching the */30 schedule"). invocation_id /
+	// instance_id are empty strings when status="err" — the JSON
+	// shape stays stable so a dashboard can filter on the keys
+	// without nil checks.
+	if l.audit != nil {
+		l.audit.Emit(ctx, "cron.fired", &acct.ID, map[string]any{
+			"cron_id":              c.ID,
+			"app_id":               c.AppID,
+			"schedule":             c.Schedule,
+			"path":                 c.Path,
+			"fired_at":             now.UTC().Format(time.RFC3339Nano),
+			"last_fired_at_before": lastFiredAtBefore.UTC().Format(time.RFC3339Nano),
+			"status":               statusStr(ok),
+			"invocation_id":        invocationID,
+			"instance_id":          instanceID,
+		})
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"cron_id": c.ID, "app_id": c.AppID, "at": now.UTC().Format(time.RFC3339Nano),

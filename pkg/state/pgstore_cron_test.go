@@ -17,6 +17,7 @@ package state_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -169,5 +170,105 @@ func TestPg_UpdateCron_PreservesCreatedAt(t *testing.T) {
 	}
 	if after.Schedule != "*/15 * * * *" {
 		t.Errorf("UpdateCron schedule = %q, want %q", after.Schedule, schedule)
+	}
+}
+
+// TestPg_CronFiredAuditRoundTrip is the PgStore half of issue #291's
+// cron-fire audit gap (companion to
+// pkg/sched/cron_loop_test.go::TestCronDispatch_EmitsCronFiredAudit,
+// which exercises the MemStore half). Pinning the contract here
+// means:
+//   - a future SQL change that drops the events.kind column or
+//     changes its type surfaces as a Scan error,
+//   - a future change to ListEvents (parameter order, subject
+//     parsing, sort order) is caught by the read-back assertions,
+//   - the JSON payload shape matches the spec §5.1 row by row so a
+//     dashboard query against `data->>'status'` or
+//     `data->>'invocation_id'` always returns a value when the
+//     field is non-empty.
+//
+// Subject is the account id (per-account filter grain, same as the
+// MemStore test). PgStore.AppendEvent only accepts canonical UUID
+// subjects (uuid.Parse, no hex fallback — that's a MemStore-only
+// concession); CreateAccount's uuid v7 is canonical so we can pass
+// it straight through. cronPgStore matches the file's existing
+// pattern (skips when Postgres is unreachable).
+func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
+	s, ctx := cronPgStore(t)
+	acct, err := s.CreateAccount(ctx, fmt.Sprintf("cron-audit-%d@example.com", time.Now().UnixNano()), api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: fmt.Sprintf("cron-audit-%d", time.Now().UnixNano()), Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// Build a payload that mirrors the schedd loop.go emit shape
+	// (the 9 keys documented in pkg/sched/loop.go). Constant
+	// fired_at so the read-back assertions are deterministic.
+	now := time.Date(2026, 7, 27, 14, 32, 1, 0, time.UTC).UTC()
+	prevFired := time.Date(2026, 7, 27, 14, 31, 1, 0, time.UTC).UTC()
+	payload := map[string]any{
+		"cron_id":              "cron-uuid-1",
+		"app_id":               app.ID,
+		"schedule":             "* * * * *",
+		"path":                 "/ping",
+		"fired_at":             now.Format(time.RFC3339Nano),
+		"last_fired_at_before": prevFired.Format(time.RFC3339Nano),
+		"status":               "ok",
+		"invocation_id":        "inv-uuid-1",
+		"instance_id":          "ins-uuid-1",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	if err := s.AppendEvent(ctx, "schedd", "cron.fired", &acct.ID, body); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	rows, err := s.ListEvents(ctx, acct.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListEvents(acct) returned %d rows, want 1; rows=%+v", len(rows), rows)
+	}
+	got := rows[0]
+	if got.Kind != "cron.fired" {
+		t.Errorf("event kind = %q, want cron.fired", got.Kind)
+	}
+	if got.Actor != "schedd" {
+		t.Errorf("event actor = %q, want schedd", got.Actor)
+	}
+	if got.Subject == nil {
+		t.Fatal("event Subject = nil; account id must round-trip through AppendEvent → ListEvents")
+	}
+	if got.Subject.String() != acct.ID {
+		t.Errorf("event Subject = %s, want %s", got.Subject.String(), acct.ID)
+	}
+	var reread map[string]any
+	if err := json.Unmarshal(got.Data, &reread); err != nil {
+		t.Fatalf("event Data not valid JSON: %v (data=%q)", err, got.Data)
+	}
+	for _, k := range []string{
+		"cron_id", "app_id", "schedule", "path",
+		"fired_at", "last_fired_at_before", "status",
+		"invocation_id", "instance_id",
+	} {
+		if _, ok := reread[k]; !ok {
+			t.Errorf("reread payload missing key %q (full=%+v)", k, reread)
+		}
+	}
+	if reread["status"] != "ok" {
+		t.Errorf("status = %v, want ok", reread["status"])
+	}
+	if reread["invocation_id"] != "inv-uuid-1" {
+		t.Errorf("invocation_id = %v, want inv-uuid-1", reread["invocation_id"])
 	}
 }
