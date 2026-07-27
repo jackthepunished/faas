@@ -113,16 +113,20 @@ type Store interface {
 	// ConsumeRecoveryCode atomically matches `presented` against the
 	// stored SHA-256 recovery-code hashes and removes the matching
 	// hash from the array. Returns:
-	//   - (false, false, ErrNotFound) when the row is missing
-	//   - (false, false, nil)         when the presented code didn't
-	//     match any stored hash
-	//   - (true, lastCode, nil)       when the code matched and was
-	//     removed; lastCode is true iff exactly one hash remained, so
-	//     the handler can refuse to burn the last code and prompt for
-	//     a password instead.
+	//   - (false, 0, false, ErrNotFound) when the row is missing
+	//   - (false, 0, false, nil)         when the presented code
+	//     didn't match any stored hash
+	//   - (true, lastCode, remaining, nil) when the code matched and
+	//     was removed; lastCode is true iff exactly one hash
+	//     remained (the handler refuses to burn the last code and
+	//     prompts for a password instead); remaining is the count
+	//     of hashes still on the row after the consume committed,
+	//     which the handler uses to render the post-burn customer
+	//     email with the right tone (one-of-many vs warning vs
+	//     last-code) — see issue #329.
 	// The sealed TOTP secret is preserved across consumes; the
 	// customer can still /verify after burning every recovery code.
-	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error)
+	ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, remaining int, err error)
 	// MatchRecoveryCode tests a presented SHA-256 hash against the
 	// stored set without mutating. Returns (matched=true, lastCode=true)
 	// when the presented hash matches and the stored array has exactly

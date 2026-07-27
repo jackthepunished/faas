@@ -416,16 +416,19 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 // precedent; the contract is identical.
 //
 // Returns:
-//   - (false, false, ErrNotFound) when the row is missing
-//   - (false, false, nil)         when no hash matched
-//   - (true, lastCode, nil)       on success; lastCode is true iff
-//     exactly one hash remained
-func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
+//   - (false, 0, false, ErrNotFound) when the row is missing
+//   - (false, 0, false, nil)         when no hash matched
+//   - (true, lastCode, remaining, nil) on success; lastCode is true
+//     iff exactly one hash remained; remaining is the count of hashes
+//     on the row AFTER the consume committed, used by the handler to
+//     render the post-burn customer email with the right tone
+//     (one-of-many vs warning vs last-code) — see issue #329.
+func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented []byte) (matched bool, lastCode bool, remaining int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
-		return false, false, ErrNotFound
+		return false, false, 0, ErrNotFound
 	}
 	matchedIdx := -1
 	for i, h := range a.MFARecoveryCodesHash {
@@ -435,7 +438,7 @@ func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented [
 		}
 	}
 	if matchedIdx < 0 {
-		return false, false, nil
+		return false, false, 0, nil
 	}
 	lastCode = len(a.MFARecoveryCodesHash) == 1
 	next := make([][]byte, 0, len(a.MFARecoveryCodesHash)-1)
@@ -443,7 +446,7 @@ func (m *MemStore) ConsumeRecoveryCode(_ context.Context, id string, presented [
 	next = append(next, a.MFARecoveryCodesHash[matchedIdx+1:]...)
 	a.MFARecoveryCodesHash = next
 	m.accounts[id] = a
-	return true, lastCode, nil
+	return true, lastCode, len(next), nil
 }
 
 // MatchRecoveryCode tests a presented SHA-256 hash against the

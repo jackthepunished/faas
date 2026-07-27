@@ -197,22 +197,25 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 // stored recovery-code hashes and removes the matching hash from the
 // array. Returns:
 //
-//   - (false, false, ErrNotFound) when the row is missing
-//   - (false, false, nil)         when the presented code doesn't
+//   - (false, 0, false, ErrNotFound) when the row is missing
+//   - (false, 0, false, nil)         when the presented code doesn't
 //     match any stored hash
-//   - (true, lastCode, nil)       when the code matches and was
+//   - (true, lastCode, remaining, nil) when the code matches and was
 //     removed; lastCode is true iff exactly one hash remained (the
 //     handler refuses to burn the last code and prompts for a
-//     password reset instead)
+//     password reset instead); remaining is the count of hashes on
+//     the row AFTER the consume committed, used by the handler to
+//     render the post-burn customer email with the right tone
+//     (one-of-many vs warning vs last-code) — see issue #329.
 //
 // The sealed TOTP secret is preserved across consumes: the customer
 // can still /verify after burning every recovery code. The transaction
 // guarantees that two concurrent /recover calls on the same account
 // cannot both observe and burn the same hash.
-func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
+func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, remaining int, err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, false, fmt.Errorf("state: mfa consume tx: %w", err)
+		return false, false, 0, fmt.Errorf("state: mfa consume tx: %w", err)
 	}
 	// Best-effort rollback: a successful Commit absorbs the deferred
 	// rollback into a no-op, so we don't branch on err.
@@ -226,9 +229,9 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		  for update`, id)
 	if scanErr := row.Scan(&hashes); scanErr != nil {
 		if errors.Is(scanErr, pgx.ErrNoRows) {
-			return false, false, ErrNotFound
+			return false, false, 0, ErrNotFound
 		}
-		return false, false, mapErr(scanErr)
+		return false, false, 0, mapErr(scanErr)
 	}
 	matchedIdx := -1
 	for i, h := range hashes {
@@ -241,9 +244,9 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		// No match: no UPDATE needed, just commit the empty tx so the
 		// row lock releases promptly.
 		if commitErr := tx.Commit(ctx); commitErr != nil {
-			return false, false, fmt.Errorf("state: mfa consume commit (no-match): %w", commitErr)
+			return false, false, 0, fmt.Errorf("state: mfa consume commit (no-match): %w", commitErr)
 		}
-		return false, false, nil
+		return false, false, 0, nil
 	}
 	lastCode = len(hashes) == 1
 	// Defensive copy: rebuild without the matched element. len(hashes)
@@ -256,12 +259,12 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		`update accounts
 		    set mfa_recovery_codes_hash = $2
 		  where id = $1`, id, next); execErr != nil {
-		return false, false, mapErr(execErr)
+		return false, false, 0, mapErr(execErr)
 	}
 	if commitErr := tx.Commit(ctx); commitErr != nil {
-		return false, false, fmt.Errorf("state: mfa consume commit: %w", commitErr)
+		return false, false, 0, fmt.Errorf("state: mfa consume commit: %w", commitErr)
 	}
-	return true, lastCode, nil
+	return true, lastCode, len(next), nil
 }
 
 // MatchRecoveryCode tests a presented SHA-256 hash against the

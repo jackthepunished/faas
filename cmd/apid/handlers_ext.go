@@ -291,6 +291,48 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"updated","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app updated", "app", updated.ID, "slug", updated.Slug, "account", acct.ID)
+	// IAM-4 (issue #291): record what the customer actually altered.
+	// Mirrors cron.updated: only fields the caller touched (req.X != nil)
+	// appear in old/new, so the audit row answers "what AND to what"
+	// without re-derivation. EgressAllowlist is rendered in canonical
+	// string form (the same form the API surfaces) rather than the
+	// raw netip.Prefix so the JSON is stable across Go minor bumps.
+	oldApp := map[string]any{}
+	newApp := map[string]any{}
+	if req.RAMMB != nil {
+		oldApp["ram_mb"] = app.RAMMB
+		newApp["ram_mb"] = updated.RAMMB
+	}
+	if req.MaxConcurrency != nil {
+		oldApp["max_concurrency"] = app.MaxConcurrency
+		newApp["max_concurrency"] = updated.MaxConcurrency
+	}
+	if req.IdleTimeoutS != nil {
+		oldApp["idle_timeout_s"] = app.IdleTimeoutS
+		newApp["idle_timeout_s"] = updated.IdleTimeoutS
+	}
+	if req.MinInstances != nil {
+		oldApp["min_instances"] = app.MinInstances
+		newApp["min_instances"] = updated.MinInstances
+	}
+	if req.AutoscaleTargetRPS != nil {
+		oldApp["autoscale_target_rps"] = app.AutoscaleTargetRPS
+		newApp["autoscale_target_rps"] = updated.AutoscaleTargetRPS
+	}
+	if req.AutoscaleTargetCPUPct != nil {
+		oldApp["autoscale_target_cpu_pct"] = app.AutoscaleTargetCPUPct
+		newApp["autoscale_target_cpu_pct"] = updated.AutoscaleTargetCPUPct
+	}
+	if req.EgressAllowlist != nil {
+		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
+		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
+	}
+	s.audit.Emit(ctx(r), "app.updated", &acct.ID, map[string]any{
+		"app_id": updated.ID,
+		"slug":   updated.Slug,
+		"old":    oldApp,
+		"new":    newApp,
+	})
 	writeJSON(w, http.StatusOK, s.appResponse(updated))
 }
 
@@ -330,6 +372,16 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"deleted","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app deleted", "app", app.ID, "slug", app.Slug, "account", acct.ID)
+	// IAM-4 (issue #291): record the soft delete. ADR-035 lists
+	// `account.deletion_scheduled` / `account.deletion_restored`
+	// for account-level churn; this is the per-app counterpart
+	// (spec §9: row goes to AppDeleted, snapshot GC follows on
+	// the next successful deploy). data carries the slug so the
+	// audit row is searchable even after the row soft-deletes.
+	s.audit.Emit(ctx(r), "app.deleted", &acct.ID, map[string]any{
+		"app_id": app.ID,
+		"slug":   app.Slug,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -403,6 +455,18 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 		fmt.Sprintf(`{"kind":"superseded","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`,
 			app.ID, current.ID, current.ID))
 	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID)
+	// IAM-4 (issue #291): record the rollback so an operator can
+	// answer "when did this app get rolled back, and to which
+	// deployment?" without joining the gdpr ledger. data.from
+	// is the deployment_id just superseded; data.to is the
+	// deployment_id promoted to live. The pg_notify emit above
+	// (lines 460+) carries the same ids for the live-system
+	// listener; the audit row is the read-only counterpart.
+	s.audit.Emit(ctx(r), "app.rolled_back", &acct.ID, map[string]any{
+		"app_id": app.ID,
+		"from":   current.ID,
+		"to":     target.ID,
+	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(target))
 }
 
@@ -560,6 +624,14 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 	// can't be tricked into parsing an attacker-supplied structure, but
 	// the structured log line is the unencoded sink.
 	s.log.Info("domain created", "domain", logsanitize.Field(d.Domain), "app", app.ID, "account", acct.ID)
+	// IAM-4 (issue #291): record the domain attachment. data.domain
+	// is the lowercased canonical form already stored on the row, so
+	// the audit row and the row stay in sync — a dashboard that
+	// joins events.domain with domains.domain gets no surprises.
+	s.audit.Emit(ctx(r), "domain.added", &acct.ID, map[string]any{
+		"app_id": d.AppID,
+		"domain": d.Domain,
+	})
 	writeJSON(w, http.StatusAccepted, domainResponse(d))
 }
 
@@ -594,6 +666,15 @@ func (s *server) deleteDomain(w http.ResponseWriter, r *http.Request, acct state
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyDomainChanged, `{"kind":"deleted","domain":"`+domain+`"}`)
 	s.log.Info("domain deleted", "domain", domain, "account", acct.ID)
+	// IAM-4 (issue #291): record the domain detachment. Symmetric
+	// to domain.added; like the cron family, the pair is what an
+	// operator queries ("when did this domain get attached and
+	// later detached?"). data carries the low-cased canonical
+	// form for the same dashboard-join reason.
+	s.audit.Emit(ctx(r), "domain.removed", &acct.ID, map[string]any{
+		"app_id": d.AppID,
+		"domain": domain,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -654,6 +735,18 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"created","app_id":"`+app.ID+`"}`)
 	s.log.Info("cron created", "cron", c.ID, "app", app.ID, "account", acct.ID)
+	// IAM-4 (issue #291): record the cron schedule so a stolen CI
+	// token that adds a backend beacon is observable. Sits AFTER
+	// the PR #340 plan-tier gate (lines above); a Free customer
+	// gets a 402 and never reaches this line, so no audit row is
+	// emitted for the rejected attempt.
+	s.audit.Emit(ctx(r), "cron.created", &acct.ID, map[string]any{
+		"cron_id":  c.ID,
+		"app_id":   c.AppID,
+		"schedule": c.Schedule,
+		"path":     c.Path,
+		"enabled":  c.Enabled,
+	})
 	writeJSON(w, http.StatusCreated, cronResponse(c))
 }
 
@@ -704,6 +797,31 @@ func (s *server) updateCron(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"updated","cron":"`+id+`"}`)
+	// IAM-4 (issue #291): record what changed and to what. We
+	// capture only the fields the caller actually sent (req.X != nil)
+	// so a schedule-only patch does NOT carry a `path` key on either
+	// side — the row answers "what did the customer alter on this
+	// cron, with what value" without re-derivation from logs.
+	oldCron := map[string]any{}
+	newCron := map[string]any{}
+	if req.Schedule != nil {
+		oldCron["schedule"] = c.Schedule
+		newCron["schedule"] = updated.Schedule
+	}
+	if req.Path != nil {
+		oldCron["path"] = c.Path
+		newCron["path"] = updated.Path
+	}
+	if req.Enabled != nil {
+		oldCron["enabled"] = c.Enabled
+		newCron["enabled"] = updated.Enabled
+	}
+	s.audit.Emit(ctx(r), "cron.updated", &acct.ID, map[string]any{
+		"cron_id": updated.ID,
+		"app_id":  updated.AppID,
+		"old":     oldCron,
+		"new":     newCron,
+	})
 	writeJSON(w, http.StatusOK, cronResponse(updated))
 }
 
@@ -724,6 +842,15 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"deleted","cron":"`+id+`"}`)
+	// IAM-4 (issue #291): record the cron removal so a teammate
+	// removing a customer's alarm is observable in the audit feed.
+	// Symmetric to cron.created; ADR-035's `key.*` / `secret.*`
+	// already pair .created with .deleted, so this closes the
+	// surface for the cron family.
+	s.audit.Emit(ctx(r), "cron.deleted", &acct.ID, map[string]any{
+		"cron_id": c.ID,
+		"app_id":  c.AppID,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

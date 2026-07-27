@@ -135,7 +135,7 @@ func TestMetalCertMagic_StagingE2E(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, token, quietMetalLogger(), nil)
+	bundle, err := NewCertMagicConfig(ctx, cfg, token, quietMetalLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestMetalCertMagic_OnDemandStaging(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, token, quietMetalLogger(), nil)
+	bundle, err := NewCertMagicConfig(ctx, cfg, token, quietMetalLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
