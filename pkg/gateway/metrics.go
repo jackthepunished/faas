@@ -44,7 +44,12 @@ type Metrics struct {
 	wakeQueueWait prometheus.Histogram
 	queueDepth    *prometheus.GaugeVec
 	rateLimited   *prometheus.CounterVec
-	coldWake      *prometheus.CounterVec
+	// accountRateLimited backs the per-account throttling introduced by
+	// ADR-040 (issue #292). Labels: account_id, plan. Pre-instantiates
+	// the four plan rows under the `__other__` placeholder so the §12
+	// dashboard panel never shows "no data" before the first 429.
+	accountRateLimited *prometheus.CounterVec
+	coldWake           *prometheus.CounterVec
 	// ADR-024 H3 (closed in PR #345): TLS observability closures. The
 	// counter is incremented from pkg/gateway/tls_wire.go's
 	// allowlistToDecisionFunc on a denied mint (today only the
@@ -102,6 +107,17 @@ func NewMetrics() *Metrics {
 			Name: "gateway_rate_limited_total",
 			Help: "Requests rejected by the per-app rate limiter.",
 		}, []string{"app", "plan"}),
+		// ADR-040 / issue #292. account_id label has cardinality O(active
+		// accounts × 4 plans). The bounded admission lives in the
+		// alert + runbook audit path (max ~10k customers on the one-box
+		// box today); raw labels are surfaced only on first 429 to avoid
+		// pre-instantiating 40k zero-valued series. Pre-instantiation
+		// only touches the closed (plan) set under the "__other__"
+		// placeholder so the §12 panel surfaces from boot.
+		accountRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_per_account_rate_limited_total",
+			Help: "Requests rejected by the per-account rate limiter (ADR-040 / issue #292). Labelled by account_id, plan. account_id=\"__other__\" is the bounded admission overflow placeholder for the closed (plan) set.",
+		}, []string{"account_id", "plan"}),
 		coldWake: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_cold_wake_total",
 			Help: "Requests that triggered a cold wake for an app.",
@@ -144,7 +160,15 @@ func NewMetrics() *Metrics {
 	for _, reason := range []string{"allowlist", "dns01", "token"} {
 		m.tlsOnDemandDenied.WithLabelValues(reason)
 	}
-	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.coldWake, m.tlsCertExpiry, m.tlsOnDemandDenied)
+	// ADR-040 / issue #292. Pre-instantiate the closed (plan) row set
+	// under the "__other__" placeholder so the §12 dashboard panel
+	// surfaces a zero-valued series from boot. Real account_id rows
+	// appear on first 429 — bounded admission is the alert + runbook
+	// concern, not the limiter's.
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		m.accountRateLimited.WithLabelValues("__other__", plan)
+	}
+	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldWake, m.tlsCertExpiry, m.tlsOnDemandDenied)
 	return m
 }
 
@@ -166,6 +190,19 @@ func (m *Metrics) ObserveRequest(appID, plan, code string) {
 // ObserveRateLimit records a 429 outcome.
 func (m *Metrics) ObserveRateLimit(appID, plan string) {
 	m.rateLimited.WithLabelValues(appID, plan).Inc()
+}
+
+// ObserveAccountRateLimit records a 429 outcome from the per-account
+// limiter (ADR-040 / issue #292). Nil-receiver-safe — mirrors the
+// ObserveWakeQueueWait / ObserveTLSOnDemandDenied pattern, unlike
+// ObserveRateLimit (which the call site guards with `if h.metrics != nil`).
+// Per-account 429s are the dashboard's primary abuse signal so the
+// call site shouldn't have to remember the nil guard.
+func (m *Metrics) ObserveAccountRateLimit(accountID, plan string) {
+	if m == nil {
+		return
+	}
+	m.accountRateLimited.WithLabelValues(accountID, plan).Inc()
 }
 
 // ObserveColdWake records that this request caused a cold wake and observes

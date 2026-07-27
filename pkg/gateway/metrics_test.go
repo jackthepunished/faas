@@ -320,3 +320,38 @@ func TestMetricsTLSOnDemandDeniedNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveTLSOnDemandDenied("allowlist") // must not panic
 }
+
+// TestMetricsAccountRateLimitedRegistersAndPreInstantiates — ADR-040
+// / issue #292: the counter must surface the four (plan) rows under the
+// "__other__" placeholder at 0 from the moment the daemon binds, so the
+// §12 dashboard panel never shows "no data". Real account_id rows
+// appear on first 429.
+func TestMetricsAccountRateLimitedRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveAccountRateLimit("acct-x", "pro")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`gateway_per_account_rate_limited_total{account_id="__other__",plan="free"} 0`,
+		`gateway_per_account_rate_limited_total{account_id="__other__",plan="hobby"} 0`,
+		`gateway_per_account_rate_limited_total{account_id="__other__",plan="pro"} 0`,
+		`gateway_per_account_rate_limited_total{account_id="__other__",plan="scale"} 0`,
+		`gateway_per_account_rate_limited_total{account_id="acct-x",plan="pro"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsAccountRateLimitedNilSafe — the helper must not panic on a
+// nil receiver (the call site in pkg/gateway/handler.go already
+// nil-guards, but the helper itself is nil-safe by design — mirror of
+// ObserveWakeQueueWait / ObserveTLSOnDemandDenied).
+func TestMetricsAccountRateLimitedNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveAccountRateLimit("x", "free") // must not panic
+}
