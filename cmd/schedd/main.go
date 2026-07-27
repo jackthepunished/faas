@@ -247,7 +247,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	verifier, err := cosign.NewLocalVerifier(signPubPath, storageBackend)
 	if err != nil {
-		return fmt.Errorf("schedd: load sign pub %q: %w (run `faas keys init` on imaged's host if missing)", signPubPath, err)
+		return fmt.Errorf("schedd: load sign pub %q: %w (run `faas sign-keys init` on imaged's host if missing)", signPubPath, err)
 	}
 	log.Info("schedd: build attestation verifier ready", "pub", signPubPath)
 	engine.WithVerifier(verifier)

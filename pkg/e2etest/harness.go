@@ -565,7 +565,7 @@ func testEnvCommon(dbURL string) []string {
 
 // writeScheddSignPub generates a fresh ECDSA P-256 keypair (the
 // canonical cosign signer/verifier surface — see ADR-038 + the
-// `faas keys init` subcommand) and writes the public half into
+// `faas sign-keys init` subcommand) and writes the public half into
 // h.SockDir at the canonical path + 0444 mode so schedd's fail-loud
 // load at cmd/schedd/main.go:232-239 doesn't reject the boot.
 //

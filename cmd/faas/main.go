@@ -40,6 +40,7 @@ Commands:
   domains      Manage custom domains
   crons        Manage scheduled requests
   keys         Manage API keys
+  sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   secrets      Manage env secrets on an app (--app <slug>)
   account      Self-service: export your data, delete account, restore
   usage        Show this month's usage (faas usage [--month YYYY-MM])
@@ -158,6 +159,8 @@ func run(args []string) int {
 		return cmdCrons(args[1:])
 	case "keys":
 		return cmdKeys(args[1:])
+	case dispatchSignKeys:
+		return cmdSignKeys(args[1:])
 	case "secrets":
 		return cmdSecrets(args[1:])
 	case "account":

@@ -102,10 +102,10 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	signKeyPath := envOr("FAAS_SIGN_KEY", cosign.DefaultSignKeyPath)
 	// Eager mode check: fail-loud BEFORE we touch storage or
 	// the DB pool so a missing sign.key gets the operator-facing
-	// "run `faas keys init`" message without a confusing
+	// "run `faas sign-keys init`" message without a confusing
 	// storage-dial error stacked on top.
 	if _, err := os.Stat(signKeyPath); err != nil {
-		return fmt.Errorf("imaged: sign key %q: %w (run `faas keys init` to provision)", signKeyPath, err)
+		return fmt.Errorf("imaged: sign key %q: %w (run `faas sign-keys init` to provision)", signKeyPath, err)
 	}
 	log.Info("imaged: build attestation sign key present", "key", signKeyPath)
 
@@ -160,7 +160,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// LocalSigner. NewLocalSigner owns the canonical LoadPrivateKeyFile
 	// call (mode check + PKCS8 parse); the earlier os.Stat guard above
 	// is the eager fail-loud so a missing sign.key gets the
-	// operator-facing "run `faas keys init`" message BEFORE the
+	// operator-facing "run `faas sign-keys init`" message BEFORE the
 	// storage-backend dial errors confuse the failure surface.
 	signer, err := cosign.NewLocalSigner(signKeyPath, storageBackend, log)
 	if err != nil {
