@@ -239,43 +239,6 @@ func (m *Manager) Seal(env Envelope) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-// IssueWithSessionAndGithubLogin seals an envelope carrying sid (IAM-3
-// / ADR-039), accountID, mfaPending (IAM-2), and githubLogin
-// (PR-B §11 ownership proof) in a single AEAD round. The single-seal
-// shape is the contract /v1/auth/github relies on — the dashboard
-// chrome reads the github_login to render "signed in as <login>",
-// and the /oauth/callback handler reads the same field to satisfy
-// the §11 ownership invariant.
-//
-// MfaPending + Sid + GithubLogin all carry `omitempty`, so a missing
-// flag/field produces a cookie byte-for-byte indistinguishable from
-// the pre-merge wire form. Cookie-shape compatibility is unchanged.
-//
-// Empty githubLogin is permitted (the user landed here from a non-
-// GitHub path) — the JSON tag is `omitempty` so the field is absent
-// on the wire, identical to the pre-PR-B cookie.
-func (m *Manager) IssueWithSessionAndGithubLogin(sid, accountID, githubLogin string, mfaPending bool) (string, error) {
-	now := m.now()
-	env := Envelope{
-		AccountID:   accountID,
-		IssuedAt:    now,
-		ExpiresAt:   now.Add(m.maxAge),
-		MfaPending:  mfaPending,
-		Sid:         sid,
-		GithubLogin: githubLogin,
-	}
-	plaintext, err := json.Marshal(env)
-	if err != nil {
-		return "", fmt.Errorf("session: marshal envelope: %w", err)
-	}
-	nonce := make([]byte, m.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("session: random nonce: %w", err)
-	}
-	sealed := m.gcm.Seal(nonce, nonce, plaintext, nil)
-	return base64.RawURLEncoding.EncodeToString(sealed), nil
-}
-
 // IsMFAPending is the predicate requireMFA calls. It's a free
 // function (not a method) so the requireMFA middleware can read
 // the verified Envelope without reaching into the Manager.
