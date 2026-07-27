@@ -430,6 +430,81 @@ jobs:
         working-directory: sdk/node
         run: npm run test:unit
 
+  sdk-gen-python:
+    name: sdk-gen-python (regenerate + dirty-diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: pip install generator + sdk
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruamel.yaml openapi-python-client pytest pytest-asyncio httpx
+          python -m pip install -e .
+      - name: gen + assert clean diff
+        working-directory: sdk/python
+        run: |
+          python scripts/gen.py
+          git diff --exit-code -- sdk/python/faas_sdk/ || {
+            echo "::error::sdk/python/faas_sdk is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-python-check' locally and commit the result."
+            exit 1
+          }
+
+  sdk-smoke-python:
+    name: sdk-smoke-python (Python SDK against fakeapid fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: build fakeapid fixture
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: install SDK + test deps
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio httpx
+      - name: smoke + unit + regen determinism
+        working-directory: sdk/python
+        run: python -m pytest tests/ --ignore=tests/debug_chain.py -v
+
+  sdk-unit-python:
+    name: sdk-unit-python (Python SDK unit tests, no fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: install SDK + test deps
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio httpx
+      - name: unit tests
+        working-directory: sdk/python
+        run: python -m pytest tests/test_client.py tests/test_sse.py
+
   coverage:
     services:
       postgres:

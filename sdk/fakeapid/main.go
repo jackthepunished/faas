@@ -210,7 +210,15 @@ func (f *fixture) handler() http.Handler {
 			}
 			f.recordCreate(slug)
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
+			// 201 Created matches the canonical OpenAPI spec
+			// (api/openapi.yaml::paths./v1/apps.post.responses.201).
+			// The Python generator's `_parse_response` is strict
+			// (only 201 decodes to AppResponse; 200 falls through
+			// to `return None` because `raise_on_unexpected_status`
+			// defaults to False). The Node generator is permissive
+			// (any 2xx decodes). Returning 201 here keeps all three
+			// SDKs green.
+			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write(appResponse(slug))
 		default:
 			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or POST is supported on /v1/apps", "fixture")

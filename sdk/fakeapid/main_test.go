@@ -124,6 +124,8 @@ func TestListApps_OK(t *testing.T) {
 }
 
 // TestCreateApp_OK: POST /v1/apps echoes the slug in the response.
+// 201 Created matches api/openapi.yaml::paths./v1/apps.post.responses.201
+// (the strict status code the Python generator decodes to AppResponse).
 func TestCreateApp_OK(t *testing.T) {
 	srv := newServer(t)
 	body := strings.NewReader(`{"slug":"hello"}`)
@@ -132,8 +134,8 @@ func TestCreateApp_OK(t *testing.T) {
 		t.Fatalf("POST /v1/apps: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("status: got %d, want 201", resp.StatusCode)
 	}
 	var got map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {

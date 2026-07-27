@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "faas_sdk"
+version = "0.1.0"
+description = "A client library for accessing one-box FaaS REST API"
+authors = []
+readme = "README.md"
+packages = [
+    { include = "faas_sdk" },
+]
+include = ["faas_sdk/py.typed"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = ">=0.23.1,<0.29.0"
+attrs = ">=22.2.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "I", "UP"]
+
+[tool.pytest.ini_options]
+markers = [
+    "regen: deterministic-regen tripwire (heavy; opt in with -m regen).",
+]
+# Default selection excludes the heavy regen tripwire; run it via
+# `pytest -m regen tests/test_post_process.py` to opt in.
+addopts = ["-m", "not regen"]
+asyncio_mode = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"faas_sdk/api/**" = ["UP"]
+"faas_sdk/models/**" = ["UP"]
