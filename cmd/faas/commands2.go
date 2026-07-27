@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -329,9 +330,36 @@ func cmdDeployTarball(args []string) int {
 		}
 	}
 
+	// Zero-config (issue #313): no source flag → pack the current directory
+	// and deploy it, mirroring the --template branch above (temp tarball →
+	// set *tarball → fall through to the shared upload path). This is an
+	// App-type deploy (runtime/handler stay unset) so the server's builder
+	// detects the framework; we only detect locally for the UX line and to
+	// set --dockerfile when a Dockerfile is at the root. --repo returned
+	// earlier and --template already set *tarball, so reaching here with both
+	// *image and *tarball empty means the customer gave no source at all.
 	if *image == "" && *tarball == "" {
-		PrintFail(os.Stderr, "one of --image, --tarball, --repo, or --template is required.")
-		return 1
+		cwd, err := os.Getwd()
+		if err != nil {
+			return printErr("Could not read current directory", err)
+		}
+		path, fw, n, err := autoPackCwd(cwd)
+		if err != nil {
+			return printErr("Could not pack current directory", err)
+		}
+		defer func() { _ = os.Remove(path) }()
+		if fw == fwUnknown {
+			return printErr("No deployable source found in "+filepath.Base(cwd),
+				errors.New("expected package.json, requirements.txt / pyproject.toml / "+
+					"Pipfile / setup.py, go.mod, or Dockerfile at the project root — "+
+					"or pass --image, --tarball, --template, or --repo"))
+		}
+		if fw == fwDocker {
+			*dockerfile = true
+		}
+		PrintProgress(os.Stderr, "detected %s project in %s, packing %d file(s)",
+			fw, filepath.Base(cwd), n)
+		*tarball = path
 	}
 
 	client, err := authedClientWithDeployTimeout(5 * time.Minute)
