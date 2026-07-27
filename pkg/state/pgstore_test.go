@@ -2134,6 +2134,10 @@ func TestPg_UpsertGitHubInstall_OnConflictUpdates(t *testing.T) {
 // (MEMORY.md/pkg-state-pgstore-pool-unexported). Follow the
 // pgtest.Open + MigrateUp + NewPgStore pattern used by the snapshot
 // retention tests (see line 1428) so we hold both halves.
+//
+// Seed just an account (no app/deploy/instances) so the raw
+// `delete from accounts` only triggers the CASCADE on
+// github_installations — apps FK would otherwise trip 23503.
 func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
@@ -2141,7 +2145,11 @@ func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	s := state.NewPgStore(pool)
-	acctID, _, _ := seedLiveDeploy(t, s, ctx)
+	acct, err := s.CreateAccount(ctx, "cascade@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	acctID := acct.ID
 
 	inst := state.GitHubInstall{
 		AccountID:        acctID,
@@ -2158,7 +2166,7 @@ func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
 	if _, err := pool.Exec(ctx, `delete from accounts where id = $1::uuid`, acctID); err != nil {
 		t.Fatalf("delete account: %v", err)
 	}
-	_, err := s.GitHubInstallForAccount(ctx, acctID)
+	_, err = s.GitHubInstallForAccount(ctx, acctID)
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("expected ErrNotFound after account delete (CASCADE), got %v", err)
 	}
