@@ -53,7 +53,7 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 		mbSeconds -= u.MBSeconds
 	}
 	if mbSeconds > 0 {
-		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0); err != nil {
+		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
 			t.Fatalf("append usage: %v", err)
 		}
 	}
@@ -61,12 +61,13 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 	ops := wire.NewOpsMetrics("meter_test_cap")
 	loop := meter.NewLoop(
 		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},
 		nil,
 		nil,
-		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -110,19 +111,20 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 
 	// 500 cents of overage (5 GB-h). Below the 10_000 cap.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 
 	ops := wire.NewOpsMetrics("meter_test_cap_below")
 	loop := meter.NewLoop(
 		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},
 		nil,
 		nil,
-		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -166,12 +168,13 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 	ops := wire.NewOpsMetrics("meter_test_cap_unset")
 	loop := meter.NewLoop(
 		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},
 		nil,
 		nil,
-		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -214,12 +217,13 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 	ops := wire.NewOpsMetrics("meter_test_cap_fail")
 	loop := meter.NewLoop(
 		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},
 		nil,
 		nil,
-		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -255,19 +259,20 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 
 	// Exactly 500 cents of derived overage.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 
 	ops := wire.NewOpsMetrics("meter_test_cap_boundary")
 	loop := meter.NewLoop(
 		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
 		nil,
 		&fakeNotifier{},
 		nil,
 		nil,
-		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {

@@ -1031,7 +1031,7 @@ type Store interface {
 	// AppendUsage many times within the same minute; the column is
 	// the sum of all per-tick deltas (issue #279 / PR-B). The
 	// contrast is documented at
-	// migrations/00054_usage_minutes_cpu.sql.
+	// migrations/00055_usage_minutes_cpu.sql.
 	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
