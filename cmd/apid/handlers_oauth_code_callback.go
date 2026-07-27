@@ -3,26 +3,26 @@
 //
 // Why a second /oauth/code-callback route (sibling of /oauth/callback):
 //
-//   /oauth/callback (handlers_oauth.go) handles the GitHub App INSTALL
-//   callback, where GitHub redirects to
-//     /oauth/callback?installation_id=N&setup_action=install
-//   after the customer clicks "Install" on github.com. That branch is
-//   "trust on first contact" — apid verifies the install exists and
-//   belongs to the dashboard user's GitHub identity, then redirects to
-//   the bind picker (/dashboard/apps/new).
+//	/oauth/callback (handlers_oauth.go) handles the GitHub App INSTALL
+//	callback, where GitHub redirects to
+//	  /oauth/callback?installation_id=N&setup_action=install
+//	after the customer clicks "Install" on github.com. That branch is
+//	"trust on first contact" — apid verifies the install exists and
+//	belongs to the dashboard user's GitHub identity, then redirects to
+//	the bind picker (/dashboard/apps/new).
 //
-//   /oauth/code-callback (this file) handles the GitHub App USER OAuth
-//   callback, where the dashboard's "Connect GitHub" button sends the
-//   user to
-//     https://github.com/login/oauth/authorize?client_id=…&state=…
-//   and GitHub redirects back with
-//     /oauth/code-callback?code=…&state=…
-//   That branch is the user-to-server OAuth handshake: githubd
-//   exchanges the code for an install token, seals it under the host
-//   age key, persists to the durable github_installations table, and
-//   emits the auth.install.token_sealed audit event. After that, the
-//   /v1/install/* and /v1/apps/{slug}/install/bind routes succeed
-//   across githubd restarts.
+//	/oauth/code-callback (this file) handles the GitHub App USER OAuth
+//	callback, where the dashboard's "Connect GitHub" button sends the
+//	user to
+//	  https://github.com/login/oauth/authorize?client_id=…&state=…
+//	and GitHub redirects back with
+//	  /oauth/code-callback?code=…&state=…
+//	That branch is the user-to-server OAuth handshake: githubd
+//	exchanges the code for an install token, seals it under the host
+//	age key, persists to the durable github_installations table, and
+//	emits the auth.install.token_sealed audit event. After that, the
+//	/v1/install/* and /v1/apps/{slug}/install/bind routes succeed
+//	across githubd restarts.
 //
 // Two callbacks, two URLs, two CSRF tokens — both scoped narrowly
 // so a stale tab can't replay one against the other.

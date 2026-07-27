@@ -37,8 +37,8 @@ func TestMigrations_00051_GitHubInstallations(t *testing.T) {
 
 	// (1) All 7 columns present with expected types.
 	type colSpec struct {
-		name string
-		typ  string
+		name    string
+		typ     string
 		notnull bool
 	}
 	wantCols := []colSpec{

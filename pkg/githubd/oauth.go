@@ -59,11 +59,11 @@ type HTTPClient interface {
 // ListInstallationsForUser) return an error so a half-configured
 // box can't accidentally bypass the §11 ownership proof.
 type AppAuth struct {
-	AppID         string // GitHub App ID (numeric, as a string)
-	ClientID      string // GitHub App OAuth Client ID (PR-C)
-	ClientSecret  string // GitHub App OAuth Client Secret (PR-C)
-	PrivateKey    *rsa.PrivateKey
-	HTTPClient    HTTPClient
+	AppID        string // GitHub App ID (numeric, as a string)
+	ClientID     string // GitHub App OAuth Client ID (PR-C)
+	ClientSecret string // GitHub App OAuth Client Secret (PR-C)
+	PrivateKey   *rsa.PrivateKey
+	HTTPClient   HTTPClient
 }
 
 // NewAppAuth loads and validates the GitHub App credentials.
@@ -230,7 +230,7 @@ func (a *AppAuth) ExchangeUserOAuthCode(ctx context.Context, code string) (strin
 // ExchangeInstallationToken) and the account.login (to seal against
 // §11 mismatches on the durable row).
 type UserInstallation struct {
-	ID     int64 `json:"id"`
+	ID      int64 `json:"id"`
 	Account struct {
 		Login string `json:"login"`
 	} `json:"account"`

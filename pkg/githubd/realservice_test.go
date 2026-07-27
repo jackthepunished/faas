@@ -471,9 +471,9 @@ func TestRealService_EnsureInstallToken_RotatesExpired(t *testing.T) {
 	}
 
 	fake := newFakeGithubServer(t, fakeGithubOpts{
-		appID:        "100",
-		installToken: "ghs_rotated_token",
-		expiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		appID:                  "100",
+		installToken:           "ghs_rotated_token",
+		expiresAt:              time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 		trackInstallTokenCalls: true,
 	})
 	defer fake.Close()
@@ -872,8 +872,8 @@ func newTestAppAuth(t *testing.T, appID, apiURL string) *AppAuth {
 
 // recordingAuditFn is a tiny in-memory audit collector for tests.
 type recordingAuditFn struct {
-	mu      sync.Mutex
-	events  []recordedEvent
+	mu     sync.Mutex
+	events []recordedEvent
 }
 
 type recordedEvent struct {

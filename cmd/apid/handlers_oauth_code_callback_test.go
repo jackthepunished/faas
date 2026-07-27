@@ -41,9 +41,9 @@ import (
 // handlers_oauth_test.go because its ExchangeOAuthCode returns
 // errGithubdNotReady.
 type oauthCodeCallbackFake struct {
-	installID    string
+	installID     string
 	defaultBranch string
-	exchangeErr  error
+	exchangeErr   error
 
 	gotAccountID string
 	gotCode      string

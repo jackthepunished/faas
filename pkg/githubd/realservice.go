@@ -71,7 +71,7 @@ type AuditEvent func(event string, accountID string, payload map[string]any)
 // RealService is the slice-8 production implementation of
 // githubdgrpc.Service. It composes:
 //   - AppAuth (RS256 JWT minting + installation-token exchange
-//     + user-to-server OAuth exchange, PR-C)
+//   - user-to-server OAuth exchange, PR-C)
 //   - TokenCache (singleflight, proactive refresh; Seed added PR-C)
 //   - ChecksAPI (POST /repos/{o}/{r}/check-runs)
 //   - BindingsStore (Postgres-backed via cmd-side adapter, PR-B)
@@ -82,14 +82,14 @@ type AuditEvent func(event string, accountID string, payload map[string]any)
 type RealService struct {
 	githubdgrpc.UnimplementedService
 
-	Auth       *AppAuth
-	Tokens     *TokenCache
-	Checks     *ChecksAPI
-	Store      BindingsStore
-	Installs   StoreInstalls
-	Recipient  *age.X25519Recipient
-	Identity   *age.X25519Identity
-	Audit      AuditEvent
+	Auth      *AppAuth
+	Tokens    *TokenCache
+	Checks    *ChecksAPI
+	Store     BindingsStore
+	Installs  StoreInstalls
+	Recipient *age.X25519Recipient
+	Identity  *age.X25519Identity
+	Audit     AuditEvent
 
 	// bindingsCache is keyed by accountID → appID → state.GitHubBinding.
 	// Demoted from source-of-truth to read-through cache by PR-B.
@@ -343,10 +343,10 @@ func (s *RealService) ExchangeOAuthCode(accountID, code, stateStr string) (strin
 	// reflects the install, not the user-claimed login.
 	if s.Audit != nil {
 		s.Audit("auth.install.token_sealed", accountID, map[string]any{
-			"install_id":      pick.ID,
-			"github_login":    auditLogin,
-			"token_expires":   expiresAt.Format(time.RFC3339),
-			"sealed_bytes":    len(sealed),
+			"install_id":    pick.ID,
+			"github_login":  auditLogin,
+			"token_expires": expiresAt.Format(time.RFC3339),
+			"sealed_bytes":  len(sealed),
 		})
 	}
 
@@ -485,13 +485,13 @@ func (s *RealService) lookupInstall(ctx context.Context, accountID string) (int6
 // ensureInstallToken is the unified warm + cold path that returns
 // (installationID, installToken, err) for an account. Order:
 //
-//	1. lookupInstall resolves the install id (cache → durable).
-//	2. Durable rehydrate FIRST: if the cached token is within
-//	   refreshSkew of its expires_at (or missing), read the sealed
-//	   row, unseal it, seed TokenCache, and return. This is what
-//	   a freshly-restarted process does (TokenCache is empty).
-//	3. TokenCache.Token() otherwise — warm path: in-process hit
-//	   with singleflight refresh.
+//  1. lookupInstall resolves the install id (cache → durable).
+//  2. Durable rehydrate FIRST: if the cached token is within
+//     refreshSkew of its expires_at (or missing), read the sealed
+//     row, unseal it, seed TokenCache, and return. This is what
+//     a freshly-restarted process does (TokenCache is empty).
+//  3. TokenCache.Token() otherwise — warm path: in-process hit
+//     with singleflight refresh.
 //
 // This ordering matters: with the cache-first order (pre-PR-C),
 // TokenCache.Token() minted a fresh install token on every cold
