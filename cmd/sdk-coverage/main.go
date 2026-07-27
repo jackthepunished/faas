@@ -161,6 +161,11 @@ var methodRouteMap = map[string]string{
 	// artifact; the SDK verb is "issue" (the operator's mental
 	// model) so the explicit map takes precedence.
 	"POST /v1/admin/accounts/{id}/credits": "IssueAccountCredit",
+	// Issue #279 PR-C — credit consumption reducer. Auto-derivation
+	// produces "PostInvoicesIdConsume-credits" (literal hyphen); the
+	// SDK verb is "ConsumeInvoiceCredits" so the explicit map drops
+	// the hyphen.
+	"POST /v1/invoices/{id}/consume-credits": "ConsumeInvoiceCredits",
 
 	// IAM-4 (ADR-035) audit log surface. The auto-derivation would
 	// otherwise produce names with literal hyphens ("GetAudit-events",

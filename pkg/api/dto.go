@@ -390,6 +390,33 @@ type AccountCreditResponse struct {
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 }
 
+// ConsumeInvoiceResponse is the wire shape returned by the credit
+// consumption reducer on POST /v1/invoices/{id}/consume-credits
+// (issue #279 PR-C). ConsumedCents is the integer cents of overage
+// that were drained against this invoice (floored to whole cents).
+// RemainingCreditsCents is the sum of cents_remaining across the
+// account's active credits after the call. AlreadyConsumedForInvoice
+// is true on idempotent replays (e.g. webhook redelivery) — the
+// reducer returns the same ConsumedCents without double-decrementing.
+// PerCredit mirrors the per-credit delta rows so the operator can
+// see FIFO drain order. Money is integer cents (CLAUDE.md).
+type ConsumeInvoiceResponse struct {
+	InvoiceID                 string              `json:"invoice_id"`
+	ConsumedCents             int64               `json:"consumed_cents"`
+	RemainingCreditsCents     int64               `json:"remaining_credits_cents"`
+	AlreadyConsumedForInvoice bool                `json:"already_consumed_for_invoice"`
+	PerCredit                 []ConsumedCreditRow `json:"per_credit"`
+}
+
+// ConsumedCreditRow is one entry in ConsumeInvoiceResponse.PerCredit.
+// NewBalance is cents_remaining after the decrement — 0 means the
+// credit was fully drained, > 0 means a partial drain.
+type ConsumedCreditRow struct {
+	CreditID   string `json:"credit_id"`
+	DeltaCents int64  `json:"delta_cents"`
+	NewBalance int64  `json:"new_balance"`
+}
+
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
 
 // OAuthProvider is the issuer name used by the dashboard OAuth flows

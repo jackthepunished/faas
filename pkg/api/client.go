@@ -918,3 +918,39 @@ func (c *Client) IssueAccountCredit(ctx context.Context, accountID, idemKey stri
 	var out AccountCreditResponse
 	return out, c.doReq(c.http, req, &out)
 }
+
+// ConsumeInvoiceCredits drains the account's active credits FIFO
+// against an invoice's overage (issue #279 PR-C). Triggered by the
+// operator at month-rollover today; the same reducer will be called
+// from the PR-B UpsertInvoice webhook Tx and a future meterd cron —
+// the HTTP endpoint is the contract the SDK exposes.
+//
+// invoiceID is the row ID (UUID) from GET /v1/invoices; the reducer
+// re-resolves account + period + provider_invoice_id internally.
+// idemKey is the Idempotency-Key header value — auto-UUIDv4 by
+// default; pass a stable string for retryable ops.
+//
+// Auth: admin-scoped API key (admin-only endpoint, two-layer auth:
+// requireScope(ScopesAdminOnly) + adminAllows email allowlist +
+// requireMFA).
+func (c *Client) ConsumeInvoiceCredits(ctx context.Context, invoiceID, idemKey string) (ConsumeInvoiceResponse, error) {
+	if idemKey == "" {
+		idemKey = newUUIDv4()
+	}
+	body, err := json.Marshal(map[string]any{})
+	if err != nil {
+		return ConsumeInvoiceResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.baseURL+"/v1/invoices/"+invoiceID+"/consume-credits", bytes.NewReader(body))
+	if err != nil {
+		return ConsumeInvoiceResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Idempotency-Key", idemKey)
+	req.Header.Set("Content-Type", "application/json")
+	var out ConsumeInvoiceResponse
+	return out, c.doReq(c.http, req, &out)
+}

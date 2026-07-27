@@ -671,6 +671,16 @@ func (s *server) handler() http.Handler {
 	// session-cookie routes (IAM-2 / issue #186).
 	mux.HandleFunc("GET /v1/invoices", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.listInvoices))))
 
+	// Credit consumption reducer (issue #279 PR-C). Admin-only +
+	// MFA-gated — operator action that mutates money (spec §11). The
+	// `idempotent` middleware replays a prior 200 on duplicate
+	// Idempotency-Key; the reducer itself is also idempotent at the DB
+	// level via the partial unique index on credit_ledger
+	// (provider_invoice_id, credit_id) — migration
+	// 00056_credit_consumption.sql.
+	mux.HandleFunc("POST /v1/invoices/{id}/consume-credits",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.consumeInvoiceCredits)))))
+
 	// Account-scoped deployments list (M7.5 dashboard).
 	mux.HandleFunc("GET /v1/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDeployments))))
 
