@@ -63,10 +63,10 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 		store,
 		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
-		nil,
+		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-		nil,
-		nil,
+nil, /* mailer */
+		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
@@ -120,10 +120,10 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 		store,
 		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
-		nil,
+		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-		nil,
-		nil,
+nil, /* mailer */
+		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
@@ -170,10 +170,10 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 		store,
 		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
-		nil,
+		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-		nil,
-		nil,
+nil, /* mailer */
+		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
@@ -219,10 +219,10 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 		store,
 		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
-		nil,
+		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-		nil,
-		nil,
+nil, /* mailer */
+		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),
@@ -268,10 +268,10 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 		store,
 		nil, /* cpu — cpu-hour metering not exercised here */
 		&fakeParker{},
-		nil,
+		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-		nil,
-		nil,
+nil, /* mailer */
+		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
 		discardLog(),

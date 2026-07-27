@@ -629,14 +629,21 @@ type AccountCredit struct {
 // @migration 00049 creates this table. ON DELETE CASCADE on account_id
 // and credit_id so GDPR DeleteAccount scrubs both tables in the same
 // transaction that scrubs the rest of the customer's data.
+//
+// ProviderInvoiceID is NULL on issuance rows (today's only writer);
+// the consumption reducer (issue #279 PR-C, @migration 00056) sets it
+// to the provider's invoice identifier and pairs it with CreditID in
+// a unique partial index so a webhook re-fire or admin endpoint
+// replay cannot double-decrement cents_remaining.
 type CreditLedgerEntry struct {
-	ID         string
-	AccountID  string
-	CreditID   string
-	DeltaCents int64
-	Reason     string
-	Actor      string
-	CreatedAt  time.Time
+	ID                string
+	AccountID         string
+	CreditID          string
+	DeltaCents        int64
+	Reason            string
+	Actor             string
+	CreatedAt         time.Time
+	ProviderInvoiceID *string
 }
 
 // UpdateAppParams is the partial-update payload for PATCH /v1/apps/{slug}.

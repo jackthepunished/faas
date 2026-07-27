@@ -3334,6 +3334,22 @@ func (m *MemStore) ListInvoicesForAccount(_ context.Context, accountID string, m
 	return all, nil
 }
 
+// GetInvoiceByID resolves a single invoice by primary key. Mirrors
+// pgstore.GetInvoiceByID: returns ErrNotFound when no row matches
+// (the consumption reducer surfaces this to the apid handler as 404
+// CodeNotFound). MemStore walks the in-memory map; an `invoices`
+// index lookup is unnecessary at one-box scale.
+func (m *MemStore) GetInvoiceByID(_ context.Context, id string) (Invoice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inv := range m.invoices {
+		if inv.ID == id {
+			return inv, nil
+		}
+	}
+	return Invoice{}, ErrNotFound
+}
+
 // SeedInvoiceForTest is the test-only seam PR A's listInvoices
 // handler tests use to plant invoice rows directly. PR B wires
 // UpsertInvoice via the webhook path; until then, no production
@@ -3423,6 +3439,233 @@ func (m *MemStore) CreateCreditLedgerEntry(_ context.Context, e CreditLedgerEntr
 	return nil
 }
 
+// ListActiveCreditsForConsumption returns the account's active credit
+// rows ordered FIFO (created_at ASC) for the consumption reducer
+// (issue #279 PR-C). Mirrors the (cents_remaining > 0) ∧ (expires_at
+// IS NULL OR expires_at > now()) active-set predicate of
+// ListAccountCredits(onlyActive=true) but sorts ASC because the
+// reducer drains oldest credit first. The slice is empty (not nil)
+// when no rows match — the handler's `make([]api.AccountCredit, 0,
+// len(rows))` guard depends on this.
+func (m *MemStore) ListActiveCreditsForConsumption(_ context.Context, accountID string) ([]AccountCredit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	out := []AccountCredit{}
+	for _, c := range m.accountCredits {
+		if c.AccountID != accountID {
+			continue
+		}
+		if c.CentsRemaining <= 0 {
+			continue
+		}
+		if c.ExpiresAt != nil && !c.ExpiresAt.After(now) {
+			continue
+		}
+		out = append(out, c)
+	}
+	// FIFO — oldest credit first. The reducer's whole correctness
+	// story hangs on this sort, so it's documented here rather than
+	// in the interface comment: a future "newest first" optimisation
+	// must keep the reducer on ASC.
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ConsumeAccountCredit performs an atomic FIFO decrement across the
+// account's active credits, capped at TargetCents. The MemStore
+// implementation holds m.mu across the loop so a concurrent
+// operator issuance (which also takes m.mu) cannot interleave
+// between the read and the decrement; a concurrent reducer call
+// serialises behind us on the same mutex and observes the post-
+// state.
+//
+// Idempotency mirrors the pgstore partial unique index
+// (provider_invoice_id, credit_id) WHERE provider_invoice_id IS NOT
+// NULL: a second call with the same ProviderInvoiceID and the same
+// credit set sees every INSERT skipped (the seen map already has
+// the (invoice, credit) pair) and returns AlreadyConsumedForInvoice
+// = true with the original ConsumedCents re-derived from the existing
+// ledger rows.
+//
+// "Atomic" here means: the per-credit check
+// (cents_remaining >= amount) cannot return a row that would have
+// driven cents_remaining negative — MemStore enforces this
+// defensively (the migration's CHECK is the production floor).
+
+// sumActive returns the sum of cents_remaining across all active
+// (non-zero, non-expired) credits for the account. Caller must hold
+// m.mu. Used to populate RemainingCreditsCents in the response and
+// to seed the idempotency guard's idempotent ConsumedCents re-derive.
+func (m *MemStore) sumActive(accountID string, now time.Time) int64 {
+	var sum int64
+	for _, c := range m.accountCredits {
+		if c.AccountID != accountID {
+			continue
+		}
+		if c.CentsRemaining <= 0 {
+			continue
+		}
+		if c.ExpiresAt != nil && !c.ExpiresAt.After(now) {
+			continue
+		}
+		sum += c.CentsRemaining
+	}
+	return sum
+}
+
+func (m *MemStore) ConsumeAccountCredit(_ context.Context, p ConsumeAccountCreditParams) (ConsumeAccountCreditResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p.TargetCents == 0 {
+		return ConsumeAccountCreditResult{}, nil
+	}
+	if p.ProviderInvoiceID == "" {
+		return ConsumeAccountCreditResult{}, fmt.Errorf("ConsumeAccountCredit: ProviderInvoiceID required (the partial unique index needs a non-null dedupe key)")
+	}
+
+	// Idempotency guard: if any consumption ledger row already exists
+	// for this invoice, the invoice was already drained in a prior
+	// call. Return the same ConsumedCents and mark
+	// AlreadyConsumedForInvoice=true so a webhook re-fire / admin
+	// replay is a no-op. This is stronger than the per-(invoice,
+	// credit) pair protection — it's a "one consumption event per
+	// invoice" contract. Without this guard, a third credit issued
+	// AFTER the first call would be drained on replay, double-
+	// decrementing the active credit balance.
+	priorCents := int64(0)
+	priorCreditIDs := make(map[string]struct{})
+	for _, le := range m.creditLedger {
+		if le.ProviderInvoiceID != nil && *le.ProviderInvoiceID == p.ProviderInvoiceID {
+			if le.DeltaCents < 0 {
+				priorCents += -le.DeltaCents
+			}
+			priorCreditIDs[le.CreditID] = struct{}{}
+		}
+	}
+	if priorCents > 0 {
+		// Re-derive ConsumedCents from the prior rows so the operator
+		// sees the same total across calls (PgStore mirrors this).
+		remaining := m.sumActive(p.AccountID, time.Now().UTC())
+		return ConsumeAccountCreditResult{
+			ConsumedCents:             priorCents,
+			RemainingCreditsCents:     remaining,
+			AlreadyConsumedForInvoice: true,
+		}, nil
+	}
+
+	now := time.Now().UTC()
+	// Build FIFO list of active credits (mirror
+	// ListActiveCreditsForConsumption — keep these two in lockstep so
+	// the parity tests don't drift).
+	active := []AccountCredit{}
+	for _, c := range m.accountCredits {
+		if c.AccountID != p.AccountID {
+			continue
+		}
+		if c.CentsRemaining <= 0 {
+			continue
+		}
+		if c.ExpiresAt != nil && !c.ExpiresAt.After(now) {
+			continue
+		}
+		active = append(active, c)
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Before(active[j].CreatedAt) })
+
+	// Idempotency map: (provider_invoice_id, credit_id) → first-seen
+	// delta. Built up-front from existing ledger rows so a second
+	// call for the same invoice recognises the prior consumption and
+	// skips the decrement.
+	seen := make(map[string]int64)
+	for _, le := range m.creditLedger {
+		if le.ProviderInvoiceID == nil || *le.ProviderInvoiceID != p.ProviderInvoiceID {
+			continue
+		}
+		key := *le.ProviderInvoiceID + "\x00" + le.CreditID
+		if _, ok := seen[key]; !ok {
+			seen[key] = le.DeltaCents
+		}
+	}
+
+	res := ConsumeAccountCreditResult{}
+	remaining := p.TargetCents
+	anyInserted := false
+	for _, c := range active {
+		if remaining == 0 {
+			break
+		}
+		amount := c.CentsRemaining
+		if amount > remaining {
+			amount = remaining
+		}
+
+		key := p.ProviderInvoiceID + "\x00" + c.ID
+		if _, alreadyConsumed := seen[key]; alreadyConsumed {
+			// This (invoice, credit) pair was already drained in a
+			// prior call — skip the decrement and the ledger insert.
+			continue
+		}
+
+		newBalance := c.CentsRemaining - amount
+		// Defensive parity check — the migration's
+		// `cents_remaining >= 0` CHECK is the production floor, but
+		// MemStore is reachable in tests that don't go through the
+		// migration. Fail loud so the unit test surfaces the bug.
+		if newBalance < 0 {
+			return ConsumeAccountCreditResult{}, fmt.Errorf("ConsumeAccountCredit: race drove cents_remaining negative (credit=%s, amount=%d, prior=%d)", c.ID, amount, c.CentsRemaining)
+		}
+
+		// Apply the decrement. The conditional `if amount > 0` is
+		// belt-and-suspenders: amount is always >= 1 here (the loop
+		// break on `remaining == 0` happens first, and the newBalance
+		// check rejects amount > CentsRemaining).
+		if amount > 0 {
+			c.CentsRemaining = newBalance
+			m.accountCredits[c.ID] = c
+			invID := p.ProviderInvoiceID
+			m.creditLedger = append(m.creditLedger, CreditLedgerEntry{
+				ID:                uuid.NewString(),
+				AccountID:         p.AccountID,
+				CreditID:          c.ID,
+				DeltaCents:        -amount,
+				Reason:            p.Reason,
+				Actor:             p.Actor,
+				CreatedAt:         now,
+				ProviderInvoiceID: &invID,
+			})
+			seen[key] = -amount
+			res.PerCredit = append(res.PerCredit, ConsumedCreditRow{
+				CreditID:   c.ID,
+				DeltaCents: -amount,
+				NewBalance: newBalance,
+			})
+			res.ConsumedCents += amount
+			remaining -= amount
+			anyInserted = true
+		}
+	}
+
+	if !anyInserted && p.TargetCents > 0 {
+		// Every (invoice, credit) pair was already drained. The
+		// original ConsumedCents for this invoice is the sum of the
+		// seen entries — re-derive it so the operator sees the same
+		// total regardless of which call they inspect.
+		for _, delta := range seen {
+			if delta < 0 {
+				res.ConsumedCents += -delta
+			}
+		}
+		res.AlreadyConsumedForInvoice = true
+	}
+
+	// Sum of remaining active credits after the call.
+	res.RemainingCreditsCents = m.sumActive(p.AccountID, now)
+
+	return res, nil
+}
+
 // GetAccountOverageCapCents returns (cents, ok, nil). ok=false means
 // the column is NULL (no cap configured). 0 with ok=true means "no
 // overage allowed"; >0 is the explicit monthly ceiling in cents.
@@ -3500,6 +3743,25 @@ func (m *MemStore) AppendCreditForTest(c AccountCredit) {
 		c.CreatedAt = time.Now().UTC()
 	}
 	m.accountCredits[c.ID] = c
+}
+
+// ListCreditLedgerForTest returns a snapshot of the in-memory
+// credit_ledger rows for an account. Test-only seam — mirrors the
+// SeedInvoiceForTest / AppendCreditForTest pattern. The Store
+// interface deliberately does NOT expose a ledger read (the dashboard
+// doesn't need it; the reducer writes but doesn't read its own rows).
+// MemStore tests use this to assert post-consumption ledger state
+// without standing up Postgres.
+func (m *MemStore) ListCreditLedgerForTest(accountID string) []CreditLedgerEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]CreditLedgerEntry, 0)
+	for _, le := range m.creditLedger {
+		if le.AccountID == accountID {
+			out = append(out, le)
+		}
+	}
+	return out
 }
 
 // UsageByHour returns the per-app usage rows whose minute ∈ [start, end).
