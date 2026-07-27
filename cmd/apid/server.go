@@ -162,7 +162,7 @@ type server struct {
 	// LoadOrStore so the first writer wins. A periodic janitor
 	// (pkg/grace) evicts old entries to bound memory.
 	touchDebounce sync.Map // map[string]time.Time
-	// sessionTouch is the IAM-3 (ADR-036) per-sid debounce map for
+	// sessionTouch is the IAM-3 (ADR-039) per-sid debounce map for
 	// last_seen_at UPDATEs. Distinct from touchDebounce (which
 	// gates per-key api_keys.last_used_at). Same sync.Map idiom;
 	// memory bounded by fresh sids in the 5-min window. Read by
@@ -495,7 +495,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(api.ScopesDeployWriteSurface...)(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
 
-	// IAM-3 server-side session revocation (ADR-036, issue #187
+	// IAM-3 server-side session revocation (ADR-039, issue #187
 	// + #244 merged). All four routes sit behind s.auth but
 	// WITHOUT authLimited — session management is rare and
 	// counting 401s would only alarm on a customer who typed
@@ -1211,7 +1211,7 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 		// Session cookie authentication (faas_sid) for Web Dashboard
 		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 			if env, err := s.sessions.Verify(c.Value); err == nil {
-				// IAM-3 (ADR-036) cross-validate the AEAD-bound
+				// IAM-3 (ADR-039) cross-validate the AEAD-bound
 				// sid against the live sessions row. Empty sid ==
 				// pre-rollout cookie (revoked). Missing/revoked row
 				// == the migration's kill switch. Account-mismatch

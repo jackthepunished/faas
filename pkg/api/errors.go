@@ -172,8 +172,8 @@ const (
 	// CodeMFAInvalidCode is returned when /confirm, /verify, or
 	// /recover validate a presented TOTP code / recovery code and
 	// the comparison fails. The audit Emit fires regardless.
-	CodeMFAInvalidCode    = "mfa_invalid_code"
-	// CodeSessionExpired is returned by the IAM-3 (ADR-036) cookie-
+	CodeMFAInvalidCode = "mfa_invalid_code"
+	// CodeSessionExpired is returned by the IAM-3 (ADR-039) cookie-
 	// branch cross-check when the cookie's sid is empty (pre-
 	// rollout), the row is gone, or the row is revoked. Distinct
 	// from CodeUnauthorized so the dashboard can pivot to
@@ -184,7 +184,7 @@ const (
 	// AEAD-bound AccountID disagrees with the sessions row. AEAD
 	// forgery on the same key ought to be unreachable; if it ever
 	// fires the operator should investigate the key-sealing path.
-	CodeSessionInvalid = "session_invalid"
+	CodeSessionInvalid    = "session_invalid"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
 	CodeHandlerMissing    = "handler_missing"

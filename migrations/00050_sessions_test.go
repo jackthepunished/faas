@@ -1,7 +1,7 @@
 //go:build !no_pg
 
 // Shape test for migration 00050 (IAM-3, issue #187 + #244 merged,
-// ADR-036). Server-side session revocation.
+// ADR-039). Server-side session revocation.
 //
 // Asserts:
 //

@@ -1,4 +1,4 @@
-// IAM-3 (ADR-036, issue #187 + #244 merged) cookie-issue helper.
+// IAM-3 (ADR-039, issue #187 + #244 merged) cookie-issue helper.
 //
 // issueDashboardSession is the single seam every dashboard login
 // path goes through: it mints the sessions row, stamps the

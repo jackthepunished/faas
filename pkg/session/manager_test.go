@@ -314,20 +314,20 @@ func TestSetClock_NilResetsToTimeNow(t *testing.T) {
 }
 
 // TestIssueWithSession_RoundTripAndBackwardCompat covers the IAM-3
-// (ADR-036) sid claim on the envelope. Three assertions:
+// (ADR-039) sid claim on the envelope. Three assertions:
 //
-//   1. IssueWithSession with a non-empty sid + mfaPending=true
-//      round-trips: Verify returns the matching Sid +
-//      MfaPending=true.
-//   2. IssueWithSession with an empty sid round-trips: Verify
-//      returns Sid="" — this is the pre-IAM-3 path
-//      (IssueWithMFAFlag / Issue which delegate internally).
-//      The apid middleware treats Sid == "" as revoked
-//      (see requireSessionCookie in cmd/apid/session_middleware.go).
-//   3. A hand-crafted envelope JSON missing the `sid` field
-//      unmarshals to Envelope.Sid == "" via the AEAD-bound JSON
-//      decode path that Verify uses, proving the omitempty tag
-//      keeps pre-IAM-3 cookies wire-compatible.
+//  1. IssueWithSession with a non-empty sid + mfaPending=true
+//     round-trips: Verify returns the matching Sid +
+//     MfaPending=true.
+//  2. IssueWithSession with an empty sid round-trips: Verify
+//     returns Sid="" — this is the pre-IAM-3 path
+//     (IssueWithMFAFlag / Issue which delegate internally).
+//     The apid middleware treats Sid == "" as revoked
+//     (see requireSessionCookie in cmd/apid/session_middleware.go).
+//  3. A hand-crafted envelope JSON missing the `sid` field
+//     unmarshals to Envelope.Sid == "" via the AEAD-bound JSON
+//     decode path that Verify uses, proving the omitempty tag
+//     keeps pre-IAM-3 cookies wire-compatible.
 func TestIssueWithSession_RoundTripAndBackwardCompat(t *testing.T) {
 	m, err := session.NewManager(key(t), time.Hour)
 	if err != nil {

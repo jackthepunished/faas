@@ -94,7 +94,7 @@ var mfaAllowlist = []string{
 	"/v1/account/mfa/verify",
 	"/v1/account/mfa/recover",
 	"/v1/account/mfa/disable",
-	// IAM-3 (ADR-036) — a customer whose session is mfa_pending
+	// IAM-3 (ADR-039) — a customer whose session is mfa_pending
 	// must still be able to list / revoke their active sessions.
 	// The /v1/auth/sessions/{id} route (any uuid) is matched by
 	// the prefix check in isMFAAllowlisted below, not by a literal

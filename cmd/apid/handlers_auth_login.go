@@ -523,7 +523,7 @@ func (s *server) verifyPasswordOrPad(ctx context.Context, email, password string
 // predicate is the same one used by the OAuth callbacks so all
 // five cookie-issue paths agree on the policy.
 //
-// IAM-3 (ADR-036, issue #187 + #244 merged): the cookie is now
+// IAM-3 (ADR-039, issue #187 + #244 merged): the cookie is now
 // issued via issueDashboardSession (cmd/apid/issue_session.go),
 // which mints a sid, persists the sessions row, seals the
 // envelope with the same sid, and emits auth.session.created.

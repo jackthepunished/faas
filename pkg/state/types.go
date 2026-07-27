@@ -835,10 +835,10 @@ type LogEntry struct {
 // log a parse-failure string verbatim). Dashboard-only — bearer API
 // keys never create or query rows on this table.
 type Session struct {
-	ID         string     // uuid, primary key, also the cookie `sid`
-	AccountID  string     // uuid, FK to accounts.id
-	IssuedIP   string     // empty when RemoteAddr unparseable
-	IssuedUA   string     // user-agent at login, may be empty
+	ID         string // uuid, primary key, also the cookie `sid`
+	AccountID  string // uuid, FK to accounts.id
+	IssuedIP   string // empty when RemoteAddr unparseable
+	IssuedUA   string // user-agent at login, may be empty
 	IssuedAt   time.Time
 	LastSeenAt *time.Time // nil until first authenticated request post-mint
 	RevokedAt  *time.Time // nil == active; non-nil == revoked

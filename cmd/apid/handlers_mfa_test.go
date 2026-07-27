@@ -110,7 +110,7 @@ func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mf
 	if err != nil {
 		t.Fatal(err)
 	}
-	// IAM-3 (ADR-036): mint a sessions row + seal the cookie with
+	// IAM-3 (ADR-039): mint a sessions row + seal the cookie with
 	// sid + accountID + mfaPending so requireSessionCookie
 	// accepts the cookie and the four session handlers can read
 	// the current sid off the context. The login path is the
@@ -267,7 +267,7 @@ func injectCSRFToken(body []byte, tok string) []byte {
 // mfa_required. Returns a fresh cookie the test can pin on the
 // next request.
 //
-// IAM-3 (ADR-036): the cookie must carry a sid backed by a
+// IAM-3 (ADR-039): the cookie must carry a sid backed by a
 // live sessions row, otherwise requireSessionCookie rejects it
 // with CodeSessionExpired. We look up the row created by
 // setupWithMFA and re-issue the envelope stamped with the same

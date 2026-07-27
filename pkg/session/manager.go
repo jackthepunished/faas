@@ -52,7 +52,7 @@ type Manager struct {
 // TOTP check, so subsequent reads of the same cookie no longer
 // trip the gate.
 //
-// IAM-3 (ADR-036): Sid carries the uuid of the corresponding
+// IAM-3 (ADR-039): Sid carries the uuid of the corresponding
 // sessions row. Every authenticated dashboard request re-validates
 // the row via state.Store.GetSession(sid); the apid middleware
 // treats an empty Sid as "rollout pre-IAM-3" and clears the
@@ -166,7 +166,7 @@ func (m *Manager) Issue(accountID string) (string, error) {
 // indistinguishable from a pre-IAM-2 cookie for every existing
 // browser. A true value is the only new bit on the wire.
 //
-// IAM-3 (ADR-036): this delegates to IssueWithSession with an empty
+// IAM-3 (ADR-039): this delegates to IssueWithSession with an empty
 // sid. Pre-IAM-3 callers continue to work — the AEAD-bound cookie
 // just lacks a sid, which the apid middleware treats as revoked.
 func (m *Manager) IssueWithMFAFlag(accountID string, mfaPending bool) (string, error) {
@@ -184,13 +184,49 @@ func (m *Manager) IssueWithMFAFlag(accountID string, mfaPending bool) (string, e
 // the mfaPending bit on the same row, no second CreateSession call.
 func (m *Manager) IssueWithSession(sid, accountID string, mfaPending bool) (string, error) {
 	now := m.now()
-	env := Envelope{
+	return m.Seal(Envelope{
 		AccountID:  accountID,
 		IssuedAt:   now,
 		ExpiresAt:  now.Add(m.maxAge),
 		MfaPending: mfaPending,
 		Sid:        sid,
-	}
+	})
+}
+
+// IssueWithSessionAndGithubLogin seals an envelope carrying sid (IAM-3
+// / ADR-039), accountID, mfaPending (IAM-2), and githubLogin
+// (PR-B §11 ownership proof) in a single AEAD round. The single-seal
+// shape is the contract /v1/auth/github relies on — the dashboard
+// chrome reads the github_login to render "signed in as <login>",
+// and the /oauth/callback handler reads the same field to satisfy
+// the §11 ownership invariant.
+//
+// MfaPending + Sid + GithubLogin all carry `omitempty`, so a missing
+// flag/field produces a cookie byte-for-byte indistinguishable from
+// the pre-merge wire form. Cookie-shape compatibility is unchanged.
+//
+// Empty githubLogin is permitted (the user landed here from a non-
+// GitHub path) — the JSON tag is `omitempty` so the field is absent
+// on the wire, identical to the pre-PR-B cookie.
+func (m *Manager) IssueWithSessionAndGithubLogin(sid, accountID, githubLogin string, mfaPending bool) (string, error) {
+	now := m.now()
+	return m.Seal(Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		Sid:         sid,
+		GithubLogin: githubLogin,
+	})
+}
+
+// Seal is the primitive the issue helpers thin-wrap: marshal +
+// AEAD-seal an envelope. Exported so tests (and any future
+// operations tooling) can mint a cookie with a hand-crafted
+// envelope — specifically, a test of the IAM-3
+// (ADR-039) defensive branch where the AEAD-bound AccountID
+// disagrees with the sessions row.
+func (m *Manager) Seal(env Envelope) (string, error) {
 	plaintext, err := json.Marshal(env)
 	if err != nil {
 		return "", fmt.Errorf("session: marshal envelope: %w", err)

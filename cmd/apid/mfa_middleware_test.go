@@ -31,7 +31,7 @@ import (
 // reissueWithMFAFlag issues a fresh cookie with mfa_pending set
 // to the desired value. The cookie must carry a sid backed by a
 // live sessions row, otherwise requireSessionCookie rejects it
-// with CodeSessionExpired (IAM-3 / ADR-036). The login handlers
+// with CodeSessionExpired (IAM-3 / ADR-039). The login handlers
 // use the same IssueWithSession path after a plan-upgrade
 // chokepoint flips mfa_required.
 func reissueWithMFAFlag(t *testing.T, mgr *session.Manager, sid, accountID string, pending bool) *http.Cookie {
@@ -106,7 +106,7 @@ func cookieDoCSRF(t *testing.T, h http.Handler, cookie *http.Cookie, csrfMgr *se
 // handler plus the account + manager + sid so the test can
 // mint cookies with custom mfa_pending values.
 //
-// IAM-3 (ADR-036): the sid is stamped into a fresh sessions
+// IAM-3 (ADR-039): the sid is stamped into a fresh sessions
 // row so requireSessionCookie accepts the resulting cookie. The
 // login helpers do the same — there is no path where the cookie
 // branch accepts a sid-less envelope.

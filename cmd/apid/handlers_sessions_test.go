@@ -1,4 +1,4 @@
-// IAM-3 (ADR-036, issue #187 + #244 merged) handler tests.
+// IAM-3 (ADR-039, issue #187 + #244 merged) handler tests.
 // Table-driven over the four routes + the cookie-branch failure
 // modes. Mirrors the handlers_mfa_test.go harness; uses MemStore
 // everywhere (the in-memory backend still has to comply with the
@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -104,6 +105,7 @@ func mintSiblingSeal(t *testing.T, env sessionTestEnv) (*http.Cookie, string) {
 //   - POST   /v1/auth/logout
 //   - DELETE /v1/auth/sessions/{id}
 //   - POST   /v1/auth/sessions/revoke_all
+//
 // The csrfActionName helper below maps the path to the action
 // the handler verifies against; the cookie + body
 // `csrf_token` field are populated using IssueForAuthenticated
@@ -452,5 +454,88 @@ func TestHandlers_Sessions_RevokedSidCookie_401(t *testing.T) {
 	}
 	if !problemHasCode(t, rec.Body.Bytes(), api.CodeSessionExpired) {
 		t.Errorf("want session_expired; got: %s", rec.Body.String())
+	}
+}
+
+// TestRequireSessionCookie_DefendsAccountMismatch covers the
+// defensive branch at session_middleware.go (sess.AccountID !=
+// env.AccountID → CodeSessionInvalid + cookie cleared). The
+// branch is unreachable on honest mints because the AEAD
+// envelope binds AccountID + Sid in the same ciphertext, but if
+// a future key rotation or impl bug ever decoupled them we'd
+// want the cross-check. Without this test a regression would
+// silently clear the cookie and 401 with CodeSessionExpired
+// instead.
+//
+// The forge: two accounts in a MemStore, a real sessions row
+// stamped with sid → accountA, then an envelope sealed with
+// the same sid BUT accountID=accountB. We use mgr.Seal to
+// construct the forged envelope — Manager.Issue/IssueWithSession
+// take a single accountID parameter and can't produce a
+// cross-account envelope, but Manager.Seal accepts a hand-built
+// Envelope. (Manager.Seal is the public primitive that
+// pkg/session exposes precisely for this kind of test seam.)
+func TestRequireSessionCookie_DefendsAccountMismatch(t *testing.T) {
+	store := state.NewMemStore()
+	acctA, err := store.CreateAccount(context.Background(), "a-forge@example.com", "free")
+	if err != nil {
+		t.Fatalf("CreateAccount A: %v", err)
+	}
+	acctB, err := store.CreateAccount(context.Background(), "b-forge@example.com", "free")
+	if err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("NewEphemeralManager: %v", err)
+	}
+	// Real sessions row stamped sid → acctA.
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acctA.ID,
+		"192.0.2.30", "forge-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// Forged envelope: same sid, but AEAD-bound AccountID = acctB.
+	// This is the precise shape that would arise from a key-rotation
+	// or impl bug: cookie says "I belong to B", row says "row belongs
+	// to A". requireSessionCookie MUST reject.
+	forged, err := mgr.Seal(session.Envelope{
+		AccountID:  acctB.ID,
+		IssuedAt:   time.Now(),
+		ExpiresAt:  time.Now().Add(sessionCookieLifetime),
+		MfaPending: false,
+		Sid:        sid,
+	})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	// Now drive the middleware directly. We can't go through
+	// doSession because the cookie needs to *fail* in
+	// requireSessionCookie — doSession only knows how to build
+	// valid CSRF cookies. Calling requireSessionCookie with a
+	// forged env proves the defensive branch trips without
+	// depending on the route table.
+	env, err := mgr.Verify(forged)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/v1/auth/sessions", nil)
+	_, handled, err := requireSessionCookie(rec, req, env, store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), &sessionTouchDebounce{})
+	if err != nil {
+		t.Fatalf("requireSessionCookie returned err (should be silent handled=true): %v", err)
+	}
+	if !handled {
+		t.Fatalf("handled = false, want true (request was rejected)")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if !problemHasCode(t, rec.Body.Bytes(), api.CodeSessionInvalid) {
+		t.Errorf("body code = %s, want %s", rec.Body.String(), api.CodeSessionInvalid)
+	}
+	// Cookie must be cleared (Set-Cookie with MaxAge<0).
+	if !cookieCleared(t, rec.Result().Cookies()) {
+		t.Errorf("faas_sid cookie was not cleared after account-mismatch defensive trip")
 	}
 }

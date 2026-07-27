@@ -1,41 +1,41 @@
-// Server-side session wire shapes (IAM-3, ADR-036, issue #187 +
+// Server-side session wire shapes (IAM-3, ADR-039, issue #187 +
 // #244 merged). The four endpoints under /v1/auth/* drive the
 // dashboard's "Active sessions" panel:
 //
 //   - POST   /v1/auth/logout                  revoke the current
-//                                              sid (this device).
+//     sid (this device).
 //   - GET    /v1/auth/sessions                list every active
-//                                              row for the calling
-//                                              account; the row
-//                                              whose id matches
-//                                              the cookie's sid
-//                                              is flagged
-//                                              current_session:
-//                                              true so the
-//                                              dashboard can
-//                                              render the
-//                                              "this device" pill.
+//     row for the calling
+//     account; the row
+//     whose id matches
+//     the cookie's sid
+//     is flagged
+//     current_session:
+//     true so the
+//     dashboard can
+//     render the
+//     "this device" pill.
 //   - DELETE /v1/auth/sessions/{id}            revoke a sibling
-//                                              by id. Cross-
-//                                              account deletes
-//                                              return 404 (we
-//                                              never confirm a
-//                                              row exists in
-//                                              another account).
-//                                              Revoking the
-//                                              current sid is
-//                                              allowed and clears
-//                                              the calling
-//                                              cookie too (the
-//                                              "log out this
-//                                              device" path via
-//                                              the list).
+//     by id. Cross-
+//     account deletes
+//     return 404 (we
+//     never confirm a
+//     row exists in
+//     another account).
+//     Revoking the
+//     current sid is
+//     allowed and clears
+//     the calling
+//     cookie too (the
+//     "log out this
+//     device" path via
+//     the list).
 //   - POST   /v1/auth/sessions/revoke_all     revoke every
-//                                              active row
-//                                              except the
-//                                              calling sid.
-//                                              Returns
-//                                              {revoked: N}.
+//     active row
+//     except the
+//     calling sid.
+//     Returns
+//     {revoked: N}.
 //
 // All four are CSRF-gated (CSRFToken absorbed in bodies; logout
 // and revoke* actions use VerifyAuthenticated). Failure modes
@@ -57,8 +57,8 @@ type SessionInfo struct {
 	ID             string `json:"id"`
 	IssuedIP       string `json:"issued_ip"`
 	IssuedUA       string `json:"issued_ua"`
-	IssuedAt       string `json:"issued_at"`         // RFC3339
-	LastSeenAt     string `json:"last_seen_at"`      // RFC3339, "" if never
+	IssuedAt       string `json:"issued_at"`    // RFC3339
+	LastSeenAt     string `json:"last_seen_at"` // RFC3339, "" if never
 	CurrentSession bool   `json:"current_session"`
 }
 

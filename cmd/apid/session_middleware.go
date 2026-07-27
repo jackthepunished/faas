@@ -1,4 +1,4 @@
-// IAM-3 server-side session revocation (ADR-036, issue #187 + #244
+// IAM-3 server-side session revocation (ADR-039, issue #187 + #244
 // merged). Companion to mfa_middleware.go for the cookie branch of
 // s.auth.
 //
@@ -51,24 +51,84 @@ import (
 // per-daemon. Memory bounded by the number of fresh sids in the
 // TTL window — a long-running daemon with N sessions / 5 minutes
 // carries N entries.
+//
+// Cleanup: every accepted touch is keyed by a fresh *touchTicket
+// pointer returned by sync.Map.LoadOrStore. After the touch
+// goroutine fires its update it calls ticket.AfterFire(window)
+// which atomically deletes the entry IFF no concurrent firer has
+// stamped a newer ticket in the meantime. Working set stays at
+// "active sids in the last 5 minutes" rather than "all sids
+// ever seen".
 type sessionTouchDebounce struct {
-	m sync.Map // map[string]time.Time
+	m sync.Map // map[string]*touchTicket
+}
+
+// touchTicket is the per-fire record. Pointer identity is what
+// the eviction path checks: a stale firer's AfterFire only
+// deletes when its ticket is still the one in the map.
+type touchTicket struct {
+	m    *sync.Map
+	sid  string
+	fire time.Time
 }
 
 // shouldTouch returns true if (a) this is the first time we've
 // seen this sid, or (b) the last touch is older than
-// sessionTouchWindow. CAS via sync.Map keeps the read path
-// lock-free.
-func (d *sessionTouchDebounce) shouldTouch(sid string, now time.Time) bool {
-	last, loaded := d.m.LoadOrStore(sid, now)
-	if !loaded {
+// sessionTouchWindow. CAS via sync.Map.LoadOrStore keeps the
+// read path lock-free AND elects exactly one firer per window.
+// Callers that receive true here fire the touch goroutine and
+// call ticket.AfterFire at the end of it.
+func (d *sessionTouchDebounce) shouldTouch(sid string, now time.Time) (*touchTicket, bool) {
+	ticket := &touchTicket{m: &d.m, sid: sid, fire: now}
+	existing, loaded := d.m.LoadOrStore(sid, ticket)
+	if loaded {
+		prev := existing.(*touchTicket)
+		if now.Sub(prev.fire) < sessionTouchWindow {
+			return nil, false
+		}
+		// Window elapsed but a prior ticket still lingers.
+		// CAS-store ours — if a concurrent caller stored a
+		// ticket in between, ours loses.
+		if cur, ok := d.m.Load(sid); ok && cur == prev {
+			if d.m.CompareAndSwap(sid, prev, ticket) {
+				return ticket, true
+			}
+			// Lost the race: re-check whether the new
+			// ticket is still inside the window.
+			if cur, ok := d.m.Load(sid); ok {
+				latest := cur.(*touchTicket)
+				if now.Sub(latest.fire) < sessionTouchWindow {
+					return nil, false
+				}
+			}
+		}
+	}
+	return ticket, true
+}
+
+// AfterFire is called by the firing goroutine after the
+// last_seen_at UPDATE returns (success or failure — the eviction
+// is independent of the touch result). It atomically removes
+// this ticket from the map IFF the stored entry is still this
+// pointer; if a fresher firer has stamped its own ticket, ours
+// is stale and we exit silently.
+func (t *touchTicket) AfterFire(window time.Duration) {
+	if t == nil {
+		return
+	}
+	time.Sleep(window)
+	t.m.CompareAndDelete(t.sid, t)
+}
+
+// active reports the size of the underlying sync.Map for
+// diagnostics. Tests use it; production code does not.
+func (d *sessionTouchDebounce) active() int {
+	count := 0
+	d.m.Range(func(_, _ any) bool {
+		count++
 		return true
-	}
-	if now.Sub(last.(time.Time)) < sessionTouchWindow {
-		return false
-	}
-	d.m.Store(sid, now)
-	return true
+	})
+	return count
 }
 
 // sessionTouchWindow is the minimum interval between per-session
@@ -194,16 +254,27 @@ func requireSessionCookie(
 	//     context from the request (contextcheck lint) and attach
 	//     a fresh timeout so a stuck PG doesn't accumulate
 	//     goroutines.
-	if debounce != nil && debounce.shouldTouch(env.Sid, time.Now()) {
-		go func(parentCtx context.Context, sid string) {
-			ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
-			defer cancel()
-			if err := store.TouchSessionLastSeen(ctx, sid); err != nil {
-				if log != nil {
-					log.Warn("session last_seen_at touch failed", "sid", sid, "error", err.Error())
+	//
+	// shouldTouch elects exactly one firer per window and
+	// returns a *touchTicket; the firing goroutine calls
+	// ticket.AfterFire(window) at the end (success or failure)
+	// so the per-sid map entry is removed `sessionTouchWindow`
+	// later — the eviction is versioned via ticket pointer so
+	// a fresher firer doesn't get its entry deleted by a
+	// stale goroutine.
+	if debounce != nil {
+		if ticket, fire := debounce.shouldTouch(env.Sid, time.Now()); fire {
+			go func(parentCtx context.Context, sid string, t *touchTicket) {
+				defer t.AfterFire(sessionTouchWindow)
+				ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+				defer cancel()
+				if err := store.TouchSessionLastSeen(ctx, sid); err != nil {
+					if log != nil {
+						log.Warn("session last_seen_at touch failed", "sid", sid, "error", err.Error())
+					}
 				}
-			}
-		}(r.Context(), env.Sid)
+			}(r.Context(), env.Sid, ticket)
+		}
 	}
 	return sess, false, nil
 }

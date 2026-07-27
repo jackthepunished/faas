@@ -1,4 +1,4 @@
-// IAM-3 server-side session handlers (ADR-036, issue #187 + #244 merged).
+// IAM-3 server-side session handlers (ADR-039, issue #187 + #244 merged).
 //
 // Four endpoints mounted under /v1/auth/* (registered in server.go):
 //

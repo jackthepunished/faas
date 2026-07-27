@@ -345,7 +345,7 @@ func (c *Client) PostAccountMfaDisable(ctx context.Context, req MFADisableReques
 	return out, c.do(ctx, "POST", "/v1/account/mfa/disable", req, &out)
 }
 
-// IAM-3 server-side session revocation (ADR-036, issue #187 + #244
+// IAM-3 server-side session revocation (ADR-039, issue #187 + #244
 // merged). The dashboard's "Active sessions" panel is driven by
 // these four endpoints. All four require the session cookie —
 // API keys bypass session tracking per the IAM-3 design decision

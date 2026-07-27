@@ -1,4 +1,4 @@
-// iam3_sessions_test.go — IAM-3 (ADR-036, issue #187 + #244 merged)
+// iam3_sessions_test.go — IAM-3 (ADR-039, issue #187 + #244 merged)
 // end-to-end sweep. Boots a real apid against a real PgStore, then
 // drives the four /v1/auth/sessions* + /v1/auth/logout routes
 // against an AEAD-bound session cookie whose sid stamps a real

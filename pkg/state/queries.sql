@@ -281,7 +281,7 @@ update builds set
 where id = $1;
 
 -- name: CreateSession :one
--- IAM-3 (ADR-036, issue #187 + #244 merged). One row per dashboard login.
+-- IAM-3 (ADR-039, issue #187 + #244 merged). One row per dashboard login.
 -- Caller has already generated the uuid (the envelope seal needs the same
 -- value). issued_ip is an inet ('' cast to NULL means "RemoteAddr
 -- unparseable" — surfaced as "" on read by coalesce(host(...))).

@@ -5386,7 +5386,7 @@ func (s *PgStore) MarkDunningStep(ctx context.Context, id string, from, to Accou
 	return nil
 }
 
-// --- IAM-3 sessions (ADR-036, issue #187 + #244 merged) ---------------------
+// --- IAM-3 sessions (ADR-039, issue #187 + #244 merged) ---------------------
 //
 // One row per dashboard login. The cookie envelope carries the row's
 // uuid as `sid`; every authenticated dashboard request re-validates
@@ -5454,7 +5454,7 @@ func (s *PgStore) ListSessions(ctx context.Context, accountID string) ([]Session
 	defer rows.Close()
 	var out []Session
 	for rows.Next() {
-		sess, err := scanSessionFromRows(rows)
+		sess, err := scanSession(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -5490,24 +5490,21 @@ func (s *PgStore) TouchSessionLastSeen(ctx context.Context, id string) error {
 	return err
 }
 
-func scanSession(row pgx.Row) (Session, error) {
-	var s Session
-	var lastSeen, revoked *time.Time
-	if err := row.Scan(&s.ID, &s.AccountID, &s.IssuedAt, &lastSeen, &revoked, &s.IssuedIP, &s.IssuedUA); err != nil {
-		return Session{}, err
-	}
-	s.LastSeenAt = lastSeen
-	s.RevokedAt = revoked
-	return s, nil
+// rowScanner is the minimal Scan(dest ...any) error interface both
+// pgx.Row (single-row scan) and pgx.Rows (multi-row scan) satisfy.
+// Centralising the field list here means a future Session-struct
+// column addition only edits one site.
+type rowScanner interface {
+	Scan(dest ...any) error
 }
 
-func scanSessionFromRows(rows pgx.Rows) (Session, error) {
-	var s Session
+func scanSession(s rowScanner) (Session, error) {
+	var sess Session
 	var lastSeen, revoked *time.Time
-	if err := rows.Scan(&s.ID, &s.AccountID, &s.IssuedAt, &lastSeen, &revoked, &s.IssuedIP, &s.IssuedUA); err != nil {
+	if err := s.Scan(&sess.ID, &sess.AccountID, &sess.IssuedAt, &lastSeen, &revoked, &sess.IssuedIP, &sess.IssuedUA); err != nil {
 		return Session{}, err
 	}
-	s.LastSeenAt = lastSeen
-	s.RevokedAt = revoked
-	return s, nil
+	sess.LastSeenAt = lastSeen
+	sess.RevokedAt = revoked
+	return sess, nil
 }

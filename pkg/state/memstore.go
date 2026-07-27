@@ -212,7 +212,7 @@ type MemStore struct {
 	// CreateComputeNode to exercise the single-box path. Production
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
-	// sessions is the IAM-3 (ADR-036) in-memory mirror of the
+	// sessions is the IAM-3 (ADR-039) in-memory mirror of the
 	// `sessions` table — one row per dashboard login, keyed by
 	// uuid. Revocation authority is RevokedAt != nil; LastSeenAt
 	// may update post-revocation (operational signal only, not
@@ -4662,7 +4662,7 @@ func (m *MemStore) SetDeletionRequestedAtForTest(id string, at time.Time) error 
 	return nil
 }
 
-// --- IAM-3 sessions (ADR-036, issue #187 + #244 merged) ---------------------
+// --- IAM-3 sessions (ADR-039, issue #187 + #244 merged) ---------------------
 //
 // One row per dashboard login, keyed by uuid. Revocation is
 // RevokedAt != nil; LastSeenAt may update post-revocation. IDOR

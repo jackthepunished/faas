@@ -43,6 +43,14 @@ import (
 // a host key.
 var mfaRecipient func() *age.X25519Recipient
 
+// errSessionMissingFromContext is returned by reissueSessionCookie
+// (IAM-3 / ADR-039) when sessionFrom(r) yields no session — i.e.
+// the handler reached a route that didn't run
+// requireSessionCookie. Callers map this to 500 + log so the
+// wiring bug surfaces instead of minting a sid-less envelope
+// that the next request would 401 out of (a UX cliff).
+var errSessionMissingFromContext = errors.New("reissueSessionCookie: no session in request context — wiring broken")
+
 // SetMFARecipient is the boot-time wire-up called by the apid
 // main() once the host age key has loaded. Tests call this
 // directly to inject an in-memory recipient.
@@ -198,7 +206,15 @@ func (s *server) mfaConfirm(w http.ResponseWriter, r *http.Request, acct state.A
 		// requireMFA until they log in again. We log it but
 		// still return 200 because the wire contract for
 		// /confirm is "enrollment landed".
-		s.log.Warn("mfa.confirm.reissue_cookie", "err", err.Error())
+		//
+		// Exception: the wiring-bug sentinel (no session in
+		// context) is a 5xx-level bug, not a sealing failure —
+		// log at Error so it can't quietly hide.
+		if errors.Is(err, errSessionMissingFromContext) {
+			s.log.Error("mfa.confirm.reissue_cookie.wiring", "err", err.Error())
+		} else {
+			s.log.Warn("mfa.confirm.reissue_cookie", "err", err.Error())
+		}
 	}
 	s.audit.Emit(r.Context(), "account.mfa_enrolled", &acct.ID, nil)
 	s.audit.Emit(r.Context(), "account.mfa_confirmed", &acct.ID, map[string]any{"method": "totp"})
@@ -576,39 +592,31 @@ func SetMFAIdentity(f func() *age.X25519Identity) { mfaIdentity = f }
 // (the customer is enrolled; the policy flag can stay armed
 // for the future).
 //
-// IAM-3 (ADR-036, issue #187 + #244 merged): this path REUSES
+// IAM-3 (ADR-039, issue #187 + #244 merged): this path REUSES
 // the existing sid — it reads the current state.Session out of
 // the request context (stamped by requireSessionCookie in the
 // cookie branch of s.auth) and seals a new envelope with the
 // SAME sid and the flipped mfaPending. No second sessions row
 // is created; the row's last_seen_at is bumped by the debounce
 // touch in requireSessionCookie just before this call lands.
+//
+// If sessionFrom(r) returns false the wiring is broken — the
+// handler reached this code via a route that didn't run
+// requireSessionCookie. We fail closed with a sentinel error
+// rather than mint a sid-less envelope; the silent-fallback
+// path was a UX cliff (next request would 401
+// CodeSessionExpired and log the customer out of an action
+// they just completed). Callers already map this error to
+// 500 + a log line, so the wiring bug surfaces instead of
+// hiding.
 func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool) error {
 	current, ok := sessionFrom(r)
 	if !ok {
-		// requireSessionCookie didn't stamp a session — wiring
-		// is broken (the handler reached this code via a route
-		// that didn't run s.auth's cookie branch). Fall back to
-		// a sid-less envelope; the next request will 401
-		// CodeSessionExpired and force a fresh login.
 		if s.log != nil {
-			s.log.Warn("reissueSessionCookie: no session in context — issuing sid-less envelope",
+			s.log.Error("reissueSessionCookie: no session in context — refusing to mint sid-less envelope",
 				"path", r.URL.Path, "account", acct.ID)
 		}
-		cookie, err := s.sessions.IssueWithSession("", acct.ID, mfaPending)
-		if err != nil {
-			return err
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookie,
-			Value:    cookie,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS,
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   int(s.sessions.MaxAge().Seconds()),
-		})
-		return nil
+		return errSessionMissingFromContext
 	}
 	cookie, err := s.sessions.IssueWithSession(current.ID, acct.ID, mfaPending)
 	if err != nil {
