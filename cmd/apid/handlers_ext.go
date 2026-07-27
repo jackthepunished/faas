@@ -1324,6 +1324,28 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 		if ev.PlanID != "" {
 			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
 		}
+	case billing.EventRefundProcessed:
+		// Issue #279: a refund was issued against one of the account's
+		// charges (Stripe: charge.refunded). The provider-initiated
+		// refund path runs through Provider.Refund (POST /v1/admin/
+		// accounts/{id}/credits), not this webhook — the webhook is
+		// the asynchronous confirmation that Stripe accepted the
+		// refund. We emit an audit row so an operator can correlate
+		// the audit log with the Stripe dashboard.
+		//
+		// Idempotent: a redelivered charge.refunded hits the same
+		// case and emits another audit row; auditors expect this
+		// (it's a real "event happened" — the second delivery is a
+		// different event in time). The dedupe happens upstream
+		// (Stripe's webhook delivery has its own retry semantics).
+		s.audit.Emit(ctx, "refund.processed", &acct.ID, map[string]any{
+			"actor":              acct.ID,
+			"actor_email":        acct.Email,
+			"provider_refund_id": ev.ProviderRefundID,
+			"charge_id":          ev.ChargeID,
+			"amount_cents":       ev.AmountCents,
+			"currency":           ev.Currency,
+		})
 	}
 }
 

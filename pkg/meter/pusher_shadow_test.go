@@ -100,6 +100,13 @@ func (r *recordingStripe) CreateUpgradeTransaction(_ context.Context, _ state.Ac
 	return "", "", nil
 }
 
+// Refund is the issue #279 billing.Provider seam. meterd's pusher
+// never calls it; returning ErrNotImplemented matches the Paddle
+// contract documented in pkg/billing/provider.go.
+func (r *recordingStripe) Refund(_ context.Context, _ string, _ int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
+}
+
 func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

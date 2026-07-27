@@ -173,6 +173,14 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 - Stripe objects: Product per plan; monthly Price; one metered Price (`gb_ram_hour`); customer + subscription per account; webhooks consumed: `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated/deleted`.
 - Dunning: `payment_failed` → account `past_due` (apps run, deploys blocked) → 7 days → `suspended` (apps parked, wake returns `402` page) → 21 days → `deleted_pending` (30-day snapshot retention, then GC). All transitions emailed.
 
+#### 4.7.1 Operator credits + per-account overage cap (issue #279)
+
+Two operator-side addenda on top of the §4.7 quota ladder:
+
+- **`POST /v1/admin/accounts/{id}/credits`** (admin scope + `FAAS_ADMIN_EMAILS` allowlist, idempotent via the `Idempotency-Key` header) inserts one row in `account_credits` and one immutable row in `credit_ledger`, then emits a `credit.issued` audit event. Reason is `3..500` chars (CHECK at the column + handler 400). Migration `00054_account_credits.sql` adds both tables with `ON DELETE CASCADE` on `account_id` so GDPR delete is a single transaction (slot walked past 00050 → 00051 → 00053 → 00054 to dodge collisions with PR #325 / #322 / #341 / #340; memory: `migration-slot-collisions-across-prs.md`). Credits are surfaced in `usageSummary` as `credits_remaining_cents` but are **not** applied at the per-minute derivation; consumption lands at invoice finalization in the PR #323 series (low-frequency reducer keeps the per-minute SUM cheap).
+- **`accounts.overage_cap_cents`** (nullable `bigint`, optional per-account ceiling; zero is a valid cap) is read by `meterd`'s quota tick once per account per cycle. The tick computes the current-month derived overage (`SUM(usage_minutes.mb_seconds) since date_trunc('month', now()) at UTC`) and skips the overage-row insert when `month_cents >= cap_cents`. The Free hard-stop / paid warning ladder is unchanged — the cap is layered on top of in-budget usage. Per-hit increments of `meterd_billing_cap_exceeded_total{plan=…}` (cardinality 4) provide the alert signal. **Race scope**: meterd is the sole writer to `usage_minutes` today (spec §6.1), so the cap check + overage-row insert is serialised by the single-writer invariant. A future meterd-replica deploy would need a per-account `SELECT … FOR UPDATE` on `accounts` around the cap check + insert decision — that locking is the obvious follow-up; until then, the worst-case is one minute's overage-row insertion past the cap.
+- **Stripe refund seam**: `billing.Provider.Refund(ctx, chargeID, amountCents)` is on the interface; Stripe's `Refund` calls forward the request's `Idempotency-Key` via a context key so a 24-h retry returns the same `re_…` id. Paddle's stub returns `ErrNotImplemented`. Webhook mapping: `charge.refunded` → `billing.EventRefundProcessed`, with `amount_refunded/10` populated on `Event.AmountCents` (Stripe millicents → integer cents) and emits a `refund.processed` audit row (target = customer account id; operator identity rides in `data["actor"]`).
+
 ### 4.8 `guest-init` — PID 1 inside every microVM
 
 Tiny static Go binary (< 5 MB), injected by imaged.
@@ -318,6 +326,15 @@ The list below covers **all** customer-facing kinds as of PR #291. Prior kinds (
 **Failure semantics (ADR-035).** Audit emission is best-effort. An `AppendEvent` failure logs Warn, increments `apid_audit_write_failures_total`, and returns. The mutation that produced the audit emit is **never** rolled back (read the audit row as observation, not source of truth). The customer-facing list endpoint `GET /v1/audit-events?kind_prefix=<family>.` filters server-side by `events.kind` prefix; `kind_prefix=app.` returns only `app.*` rows, `kind_prefix=cron.` only `cron.*`, etc., unchanged by the new families.
 
 **4xx invariant.** Failed (4xx) mutations do NOT emit — the audit row is a success signal. PR #340 introduced a 402 plan-tier gate on `POST /v1/crons`; that gate fires before `s.store.CreateCronIfUnderQuota`, so a Free customer hitting POST /v1/crons gets a 402 and the `cron.created` row is never written. `cmd/apid/handlers_audit_test.go::TestAuditEvents_CronCreatedFreeReturns402DoesNotEmit` pins this invariant end-to-end.
+
+#### 5.7 Audit events — refunds + credits (issue #279)
+
+Two new event kinds land in the existing append-only `events` table:
+
+- **`credit.issued`** — emitted by `apid` on `POST /v1/admin/accounts/{id}/credits`. `subject` = the beneficiary account id (the account receiving the credit). `actor` = fixed `"apid"` (cmd/apid/audit.go:24); the operator's account id rides in `data["actor"]`. `data` payload: `{credit_id, cents, actor, reason}` where `reason` is passed through `logsanitize.Field` before emission (codeql-go/log-injection sanitiser precedent, PR #119 / 969ba0a).
+- **`refund.processed`** — emitted by `apid` on a verified `charge.refunded` webhook (HMAC-verified via `billing.Provider.VerifyWebhook`). `subject` = the customer account the refund applies to (Stripe `customer` → `accounts.ProviderCustomerID`). `data` payload: `{actor, actor_email, provider_refund_id, charge_id, amount_cents, currency}`. Idempotent under webhook redelivery: duplicate `charge.refunded` events produce additional `refund.processed` audit rows but never double-refund (Stripe is the source of truth on the payment-method side).
+
+Both rows are observational — the actual state changes (Stripe `Refund`, `account_credits` insert, `credit_ledger` insert) are the source of truth.
 
 ---
 

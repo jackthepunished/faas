@@ -327,3 +327,19 @@ func (p *Provider) VerifyWebhook(payload []byte, headers map[string]string, tole
 	}
 	return parsePaddleEvent(payload)
 }
+
+// Refund is the Paddle stub for the billing.Provider interface
+// (issue #279). Paddle's refund ceremony is intentionally out of
+// scope for this PR — the issue lists Paddle as future work and
+// ships this stub so the compile-time
+// `var _ billing.Provider = (*Provider)(nil)` assertion (line 224)
+// still passes. Returns billing.ErrNotImplemented so the apid
+// handler maps to a 501 Problem with a clear "Paddle refund is not
+// supported" message and a docs_url pointing at the spec.
+//
+// Operators who need refunds on a Paddle deployment use the
+// Paddle Dashboard directly; the operator-initiated CLI/API path
+// only works against the Stripe provider today.
+func (p *Provider) Refund(_ context.Context, _ string, _ int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
+}

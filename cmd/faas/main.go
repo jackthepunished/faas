@@ -169,6 +169,8 @@ func run(args []string) int {
 		return cmdUsage(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
+	case "admin":
+		return cmdAdmin(args[1:])
 	case "logs":
 		return cmdLogs(args[1:])
 	case "tail":

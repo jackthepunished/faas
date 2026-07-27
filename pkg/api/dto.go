@@ -373,6 +373,23 @@ type InvoiceListResponse struct {
 	NextBefore string    `json:"next_before,omitempty"`
 }
 
+// --- Account credits (issue #279) -----------------------------------------
+
+// AccountCreditResponse is the wire shape for one row in
+// account_credits. Cents is integer (CLAUDE.md: never float on money).
+// ExpiresAt is RFC 3339 when set; empty when the credit has no
+// expiry. CreatedAt is the issuance timestamp. The handler echoes the
+// row back to the operator on POST /v1/admin/accounts/{id}/credits and
+// on GET /v1/admin/accounts/{id}/credits (list, when it lands).
+type AccountCreditResponse struct {
+	ID             string     `json:"id"`
+	AccountID      string     `json:"account_id"`
+	CentsRemaining int64      `json:"cents_remaining"`
+	Reason         string     `json:"reason"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+}
+
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
 
 // OAuthProvider is the issuer name used by the dashboard OAuth flows

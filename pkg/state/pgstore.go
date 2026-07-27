@@ -3572,6 +3572,177 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 	return out, rows.Err()
 }
 
+// --- account credits (issue #279) -------------------------------------------
+
+// CreateAccountCredit inserts a new operator-issued credit. The DB
+// generates id (UUIDv4) and created_at (default now()) via the table
+// defaults; RETURNING surfaces them so the handler can echo the row
+// back without a second round-trip. The migration 00049 CHECK
+// constraint on cents_remaining >= 0 and reason length is enforced
+// at the DB; the handler validates client-side for a friendlier 400.
+//
+// NOT transactional with the matching credit_ledger row — the ledger
+// insert is a separate statement in the handler. If the ledger write
+// fails after the credit row lands, the credit is the source of truth
+// and the ledger insert is retryable on the next operator action. The
+// handler logs a WARN when the ledger write fails. Mirrors the
+// documented behaviour of DeleteAPIKeyReturning (audit-loss trade-off,
+// store.go DeleteAPIKeyReturning doc).
+func (s *PgStore) CreateAccountCredit(ctx context.Context, c AccountCredit) (AccountCredit, error) {
+	row := s.pool.QueryRow(ctx,
+		`insert into account_credits (account_id, cents_remaining, reason, expires_at)
+		 values ($1, $2, $3, $4)
+		 returning id, account_id, cents_remaining, reason, created_at, expires_at`,
+		c.AccountID, c.CentsRemaining, c.Reason, c.ExpiresAt)
+	var out AccountCredit
+	if err := row.Scan(
+		&out.ID, &out.AccountID, &out.CentsRemaining, &out.Reason,
+		&out.CreatedAt, &out.ExpiresAt,
+	); err != nil {
+		return AccountCredit{}, err
+	}
+	return out, nil
+}
+
+// ListAccountCredits returns the account's credit rows. onlyActive
+// filters to (cents_remaining > 0) ∧ (expires_at IS NULL OR expires_at
+// > now()), the active set the consumption reducer will use once it
+// lands. Order is created_at DESC for deterministic test assertions.
+// limit is the caller's responsibility; the SQL uses a single LIMIT
+// when the caller has set one (the handler clamps at 100).
+func (s *PgStore) ListAccountCredits(ctx context.Context, accountID string, onlyActive bool) ([]AccountCredit, error) {
+	now := time.Now().UTC()
+	var rows pgx.Rows
+	var err error
+	if onlyActive {
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, cents_remaining, reason, created_at, expires_at
+			   from account_credits
+			  where account_id = $1
+			    and cents_remaining > 0
+			    and (expires_at is null or expires_at > $2)
+			  order by created_at desc`,
+			accountID, now)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, cents_remaining, reason, created_at, expires_at
+			   from account_credits
+			  where account_id = $1
+			  order by created_at desc`,
+			accountID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AccountCredit{}
+	for rows.Next() {
+		var c AccountCredit
+		if err := rows.Scan(
+			&c.ID, &c.AccountID, &c.CentsRemaining, &c.Reason,
+			&c.CreatedAt, &c.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CreateCreditLedgerEntry appends one audit row. The DB generates id
+// (UUIDv4) and created_at (default now()) via the table defaults; the
+// actor and reason are operator-supplied (the handler pulls actor from
+// the authenticated caller account ID). Migration 00049's CHECK
+// constraint on delta_cents <> 0 ensures issuance (+N) and consumption
+// (-N) are both accepted but a zero-delta row is rejected.
+func (s *PgStore) CreateCreditLedgerEntry(ctx context.Context, e CreditLedgerEntry) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into credit_ledger (account_id, credit_id, delta_cents, reason, actor)
+		 values ($1, $2, $3, $4, $5)`,
+		e.AccountID, e.CreditID, e.DeltaCents, e.Reason, e.Actor)
+	return err
+}
+
+// GetAccountOverageCapCents returns (cents, ok, nil). ok=false means
+// the column is NULL (no cap configured). 0 with ok=true means "no
+// overage allowed"; >0 is the explicit monthly ceiling. meterd calls
+// this once per account per quota tick.
+//
+// Hand-written against the column added by migration 00049 — NOT
+// sqlc-generated, mirroring the ListInvoicesForAccount pattern.
+// Single-row read with no parameters other than the account id; sqlc
+// would not add observability here.
+func (s *PgStore) GetAccountOverageCapCents(ctx context.Context, accountID string) (int64, bool, error) {
+	var cents *int64
+	if err := s.pool.QueryRow(ctx,
+		`select overage_cap_cents from accounts where id = $1`,
+		accountID).Scan(&cents); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Account row gone — treat as no cap so meterd does not
+			// block on a half-deleted account. Different from
+			// ErrNotFound semantics: the caller is meterd, not a
+			// user-facing handler.
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if cents == nil {
+		return 0, false, nil
+	}
+	return *cents, true, nil
+}
+
+// LoadAllOverageCapCents returns every (account_id, cap) tuple in one
+// round-trip. meterd's quota tick walks all accounts every minute and
+// would otherwise issue N single-row reads; the bulk read keeps the
+// per-tick cost at one round-trip. Drops accounts whose overage_cap_cents
+// is NULL — the caller treats them as "no cap".
+//
+// Hand-written for the same reason as GetAccountOverageCapCents; the
+// shape is meterd-internal and not on the sqlc public surface.
+func (s *PgStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, overage_cap_cents from accounts where overage_cap_cents is not null`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var cents int64
+		if err := rows.Scan(&id, &cents); err != nil {
+			return nil, err
+		}
+		out[id] = cents
+	}
+	return out, rows.Err()
+}
+
+// CurrentMonthOverageCents returns the account's derived overage in
+// integer cents for the current UTC month. 1 GB-h = 3600 GB-seconds;
+// at €0.01/GB-h → 1 GB-h = 100 cents. The overage-row SUM is
+// mb_seconds; we multiply by 100/3600_000 to get cents. Integer math
+// only — never float on money (CLAUDE.md).
+//
+// Hand-written: the formula is meterd-internal and not on the read
+// surface. The migration on usage_minutes is unchanged; we SELECT
+// against the existing table.
+func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string) (int64, error) {
+	var mbSeconds int64
+	if err := s.pool.QueryRow(ctx,
+		`select COALESCE(SUM(mb_seconds), 0)::bigint
+		   from usage_minutes
+		  where account_id = $1
+		    and minute >= date_trunc('month', now())`,
+		accountID).Scan(&mbSeconds); err != nil {
+		return 0, err
+	}
+	// mb_seconds / 3600 = GB-h; GB-h * 100 = cents. Integer math.
+	cents := mbSeconds * 100 / 3600
+	return cents, nil
+}
+
 // UsageByHour returns per-app usage rolled up from the per-minute rows
 // in the [start, end) window. The Stripe pusher calls this hourly;
 // (start, end) is the [now-1h, now) hour window so the SQL is an

@@ -94,6 +94,28 @@ type Provider interface {
 	// Idempotency-Key (Paddle: recorded in CustomData) so a redelivered
 	// upgrade click doesn't create a duplicate Transaction.
 	CreateUpgradeTransaction(ctx context.Context, acct state.Account, targetPlan api.Plan) (txID, checkoutURL string, err error)
+
+	// Refund issues an operator-initiated refund against a charge
+	// (issue #279). amountCents is integer cents (the financial
+	// model's unit; never float on money). The implementation is
+	// responsible for:
+	//
+	//   1. Translating cents → the provider's native unit (Stripe:
+	//      millicents; Paddle: not implemented → returns
+	//      ErrNotImplemented).
+	//   2. Forwarding a ctx-derived Idempotency-Key so a network-blip
+	//      retry does not create a duplicate refund. Stripe: read
+	//      via idempotencyKeyFromCtx; Paddle: not implemented.
+	//   3. Mapping provider errors (Stripe: amount_too_large,
+	//      charge_already_refunded, etc.) onto errors the apid
+	//      handler can dispatch on. Today the handler returns
+	//      502 for any non-nil error; the refinement is a follow-up.
+	//
+	// apid's handler is the only caller (cmd/apid/handlers_admin_credits.go).
+	// The webhook (charge.refunded) is observational and routes
+	// through VerifyWebhook → EventRefundProcessed, NOT through this
+	// method.
+	Refund(ctx context.Context, chargeID string, amountCents int64) (*RefundResult, error)
 }
 
 // EventType is the provider-neutral "what happened" classifier apid
@@ -134,6 +156,14 @@ const (
 	// EventPaymentFailed is fired when a charge bounces. apid flips
 	// the account active → past_due and sends the entry-point email.
 	EventPaymentFailed
+
+	// EventRefundProcessed is fired when a refund is issued against a
+	// charge (Stripe: charge.refunded). apid emits a `refund.processed`
+	// audit event with the operator's account ID and the refund
+	// amount. The webhook is observational — the operator-initiated
+	// refund path goes through Provider.Refund (below), not through
+	// this event.
+	EventRefundProcessed
 )
 
 // Name returns the canonical English label apid's log lines + audit
@@ -154,6 +184,8 @@ func (t EventType) Name() string {
 		return "payment_succeeded"
 	case EventPaymentFailed:
 		return "payment_failed"
+	case EventRefundProcessed:
+		return "refund_processed"
 	default:
 		return "unknown"
 	}
@@ -186,6 +218,40 @@ type Event struct {
 	// Raw is the original webhook body, preserved for the audit log
 	// and for downstream debugging. Provider-shaped JSON.
 	Raw []byte
+
+	// AmountCents is the integer-cents amount carried by the event
+	// (refund events: the refund amount; payment events: the
+	// amount_paid; subscription events: 0). Providers populate
+	// during VerifyWebhook so the apid handler can stamp the
+	// audit-log payload without re-parsing Raw.
+	AmountCents int64
+
+	// Currency is the provider's three-letter currency code (Stripe:
+	// string(r.Currency)). Empty when the event carries no monetary
+	// value or the provider did not populate it.
+	Currency string
+
+	// ProviderRefundID is the provider's refund handle (Stripe: re_…).
+	// Only populated for refund events. apid logs it on the
+	// `refund.processed` audit row.
+	ProviderRefundID string
+
+	// ChargeID is the provider's charge handle (Stripe: ch_…; Paddle:
+	// tx_…). Only populated for refund events. apid logs it so an
+	// operator can correlate the audit row with the provider
+	// dashboard.
+	ChargeID string
+}
+
+// RefundResult is what Provider.Refund returns on a successful refund.
+// The handler stamps the fields onto the audit row and echoes the
+// ProviderRefundID to the CLI so an operator can pull up the refund
+// in the provider dashboard by ID.
+type RefundResult struct {
+	ProviderRefundID string
+	ChargeID         string
+	AmountCents      int64
+	Currency         string
 }
 
 // ErrBadSignature is the unified error returned by VerifyWebhook when
@@ -193,6 +259,13 @@ type Event struct {
 // tolerance, or the HMAC does not match. Provider implementations
 // must wrap with %w so callers can use errors.Is.
 var ErrBadSignature = errors.New("billing: bad webhook signature")
+
+// ErrNotImplemented is the unified error a Provider returns when the
+// selected billing backend does not support a method (issue #279:
+// Paddle's Refund). Callers should map this to a 501 Problem with
+// docs_url pointing at the spec — the operator picks a backend that
+// supports the surface they need.
+var ErrNotImplemented = errors.New("billing: provider does not implement this method")
 
 // Classifier is the optional seam a Provider can implement to declare
 // its push-error classification. meterd's pusher loop dispatches via

@@ -147,6 +147,12 @@ func (nopProvider) CreateUpgradeTransaction(context.Context, state.Account, api.
 	return "", "", nil
 }
 
+// Refund is the issue #279 billing.Provider seam. meterd never calls
+// it; returning ErrNotImplemented matches the Paddle contract.
+func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
+}
+
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
 // pins the production default (deploy/etc/meterd.toml.example leaves
@@ -497,6 +503,12 @@ func (r *meterRec) VerifyWebhook([]byte, map[string]string, time.Duration) (bill
 }
 func (r *meterRec) CreateUpgradeTransaction(context.Context, state.Account, api.Plan) (string, string, error) {
 	return "", "", nil
+}
+
+// Refund is the issue #279 billing.Provider seam. meterd never calls
+// it; returning ErrNotImplemented matches the Paddle contract.
+func (r *meterRec) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
 }
 
 func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, int64) error {

@@ -137,6 +137,20 @@ type MemStore struct {
 	// (UpsertInvoice via webhook ingestion). Seeded by tests for
 	// parity-with-pgstore checks.
 	invoices map[string]Invoice
+	// accountCredits is the in-memory mirror of the `account_credits`
+	// table (migration 00049, issue #279). Keyed by credit id. The
+	// handler is the only writer in production; meterd never reads
+	// this map (it reads the overage cap, which lives on accounts).
+	accountCredits map[string]AccountCredit
+	// creditLedger is the in-memory mirror of the `credit_ledger`
+	// append-only audit log (migration 00049, issue #279). One row
+	// per issuance (and per consumption, when the consumption reducer
+	// lands). Slice so iteration order is deterministic.
+	creditLedger []CreditLedgerEntry
+	// overageCapCents is the in-memory mirror of
+	// accounts.overage_cap_cents (migration 00049, issue #279). Keyed
+	// by account id; the second value is `ok` (false = NULL).
+	overageCapCents map[string]int64
 	// gdprRequests is the in-memory mirror of the gdpr_requests ledger
 	// row. MemStore does not auto-cascade on DeleteAccount (the
 	// production pgstore does), but AppendGdprRequest rows here are
@@ -257,6 +271,14 @@ func NewMemStore() *MemStore {
 		// invoices starts empty; PR A reads it via ListInvoicesForAccount,
 		// PR B writes via UpsertInvoice (webhook ingestion).
 		invoices: map[string]Invoice{},
+		// accountCredits starts empty; the operator-only
+		// POST /v1/admin/accounts/{id}/credits path is the sole writer.
+		accountCredits: map[string]AccountCredit{},
+		// creditLedger starts empty; AppendCreditLedgerEntry records
+		// every issuance/consumption as an immutable audit row.
+		creditLedger: []CreditLedgerEntry{},
+		// overageCapCents starts empty (no caps configured).
+		overageCapCents: map[string]int64{},
 		// gdprRequests starts empty; AppendGdprRequest appends.
 		gdprRequests: nil,
 		// recentClaims is the B2.2 fairness mirror; starts empty so
@@ -3279,6 +3301,156 @@ func (m *MemStore) SeedInvoiceForTest(inv Invoice) {
 		inv.Currency = "eur"
 	}
 	m.invoices[inv.ID] = inv
+}
+
+// --- credits (issue #279) ----------------------------------------------------
+
+// CreateAccountCredit inserts a new operator-issued credit. Mirrors the
+// pgstore body: DB assigns id (UUIDv4) and created_at; we stamp them
+// in-memory so the handler can return the same shape over mock or real.
+//
+// MemStore does NOT validate the cents_remaining/reason CHECK constraints
+// the migration enforces — that's a database concern. The handler
+// validates client-side and a unit test on the pgstore body owns the
+// round-trip.
+func (m *MemStore) CreateAccountCredit(_ context.Context, c AccountCredit) (AccountCredit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c.ID == "" {
+		c.ID = uuid.NewString()
+	}
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now().UTC()
+	}
+	m.accountCredits[c.ID] = c
+	return c, nil
+}
+
+// ListAccountCredits returns the account's credit rows. onlyActive
+// filters to (cents_remaining > 0) ∧ (expires_at IS NULL OR expires_at >
+// now()), the active set the consumption reducer will use once it
+// lands. The slice is empty (not nil) when no rows match — the
+// handler's `make([]api.AccountCredit, 0, len(rows))` guard depends on
+// this.
+func (m *MemStore) ListAccountCredits(_ context.Context, accountID string, onlyActive bool) ([]AccountCredit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	out := []AccountCredit{}
+	for _, c := range m.accountCredits {
+		if c.AccountID != accountID {
+			continue
+		}
+		if onlyActive {
+			if c.CentsRemaining <= 0 {
+				continue
+			}
+			if c.ExpiresAt != nil && !c.ExpiresAt.After(now) {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	// Stable order for deterministic tests: newest first.
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// CreateCreditLedgerEntry appends one audit row. Mirrors the pgstore
+// body: DB assigns id (UUIDv4) and created_at; we stamp them in-memory
+// so the returned… actually we don't return — the pgstore signature
+// returns only error (the audit row is observational, not load-bearing
+// for the issuance flow). MemStore matches the pgstore signature.
+func (m *MemStore) CreateCreditLedgerEntry(_ context.Context, e CreditLedgerEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e.ID == "" {
+		e.ID = uuid.NewString()
+	}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	m.creditLedger = append(m.creditLedger, e)
+	return nil
+}
+
+// GetAccountOverageCapCents returns (cents, ok, nil). ok=false means
+// the column is NULL (no cap configured). 0 with ok=true means "no
+// overage allowed"; >0 is the explicit monthly ceiling in cents.
+// MemStore mirrors the pgstore signature: a hand-written read against
+// the `accounts.overage_cap_cents` column populated by the migration.
+func (m *MemStore) GetAccountOverageCapCents(_ context.Context, accountID string) (int64, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cents, ok := m.overageCapCents[accountID]
+	return cents, ok, nil
+}
+
+// LoadAllOverageCapCents returns the bulk read used by meterd's
+// quota tick. Mirrors PgStore.LoadAllOverageCapCents: cap-bearing
+// accounts only, missing-cap accounts are dropped (the caller treats
+// them as "no cap"). The returned map is a copy so the meterd loop
+// can iterate without holding m.mu.
+func (m *MemStore) LoadAllOverageCapCents(_ context.Context) (map[string]int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int64, len(m.overageCapCents))
+	for id, c := range m.overageCapCents {
+		out[id] = c
+	}
+	return out, nil
+}
+
+// CurrentMonthOverageCents sums the account's usage_minutes.mb_seconds
+// from the UTC month start and converts to integer cents. Formula:
+// 1 GB-h = 3600 GB-seconds; at €0.01/GB-h → 1 GB-h = 100 cents.
+// Integer math only — never float on money (CLAUDE.md).
+//
+// Mirrors pgstore.CurrentMonthOverageCents: the scan is O(rows-in-month)
+// which on a one-box is bounded. The `now` argument is the caller's
+// current time so a test can pin "month start" to a fixture.
+func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var mbSeconds int64
+	for _, u := range m.usage {
+		if u.AccountID != accountID {
+			continue
+		}
+		if u.Minute.Before(monthStart) {
+			continue
+		}
+		mbSeconds += u.MBSeconds
+	}
+	return mbSeconds * 100 / 3600, nil
+}
+
+// SetOverageCapCentsForTest is the test-only seam that plants a cap
+// value before the meterd tick runs. Not on the Store interface —
+// production code never needs to write the cap; the column is set by
+// a future operator surface (out of scope for issue #279 PR A).
+func (m *MemStore) SetOverageCapCentsForTest(accountID string, cents int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.overageCapCents[accountID] = cents
+}
+
+// AppendCreditForTest is the test-only seam that plants a credit row
+// directly, mirroring SeedInvoiceForTest. Used by the meterd cap
+// tests so the test fixture doesn't have to round-trip through
+// CreateAccountCredit.
+func (m *MemStore) AppendCreditForTest(c AccountCredit) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c.ID == "" {
+		c.ID = uuid.NewString()
+	}
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now().UTC()
+	}
+	m.accountCredits[c.ID] = c
 }
 
 // UsageByHour returns the per-app usage rows whose minute ∈ [start, end).
