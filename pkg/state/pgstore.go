@@ -2532,8 +2532,8 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 // and silently breaks the entire dedupe gate. The two-return form
 // (old + won) is the load-bearing detail.
 func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error) {
-	var existing *time.Time
 	_ = idempotencyKey // accepted on the interface; bucket dedupe lives on MemStore + alert_deliveries UNIQUE
+	var exists bool
 	err = s.pool.QueryRow(ctx, `
 		with existing as (
 		    select last_fired_at as old
@@ -2546,16 +2546,16 @@ func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey str
 		       and (last_fired_at is null or last_fired_at < $2)
 		    returning 1
 		 )
-		 select (select old from existing),
+		 select exists(select 1 from existing),
 		        exists(select 1 from upd)`,
-		ruleID, at.UTC()).Scan(&existing, &won)
+		ruleID, at.UTC()).Scan(&exists, &won)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, ErrNotFound
 		}
 		return false, fmt.Errorf("state: claim alert fire %s: %w", ruleID, err)
 	}
-	if existing == nil {
+	if !exists {
 		return false, ErrNotFound
 	}
 	return won, nil
@@ -2591,9 +2591,15 @@ func (s *PgStore) SetAlertRuleState(ctx context.Context, ruleID string, to Alert
 }
 
 func (s *PgStore) SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, at time.Time) error {
-	_, err := s.pool.Exec(ctx,
+	tag, err := s.pool.Exec(ctx,
 		`update alert_rules set last_evaluated_at = $2 where id = $1`, ruleID, at.UTC())
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- alert_deliveries ------------------------------------------------------
@@ -2756,15 +2762,28 @@ func (s *PgStore) ListAlertDeliveriesForRule(ctx context.Context, ruleID string,
 // is responsible for expanding source == 'any' to the four concrete
 // InvocationSource values before the call.
 func (s *PgStore) CountFailedInvocationsSince(ctx context.Context, accountID, appID string, source InvocationSource, since time.Time) (int, error) {
+	// appID "" means "all apps on this account" (Store contract). We
+	// pass nil to the SQL and use IS NOT DISTINCT FROM so the NULL
+	// app_id of an account-wide invocation is included in the count.
+	// source "" means "any source" — the enum is a closed vocabulary
+	// so an empty string is the wildcard sentinel (mirrors MemStore).
+	var appArg any
+	if appID != "" {
+		appArg = appID
+	}
+	var sourceArg any
+	if source != "" {
+		sourceArg = string(source)
+	}
 	var n int
 	row := s.pool.QueryRow(ctx, `
 		select count(*) from invocations
 		 where account_id = $1
 		   and state = 'failed'
 		   and created_at >= $2
-		   and ($3 = '' or app_id = $3)
-		   and ($4 = '' or source = $4)`,
-		accountID, since.UTC(), appID, string(source))
+		   and ($3::uuid is null or app_id is not distinct from $3::uuid)
+		   and ($4::text is null or source = $4::text)`,
+		accountID, since.UTC(), appArg, sourceArg)
 	if err := row.Scan(&n); err != nil {
 		return 0, err
 	}

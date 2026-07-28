@@ -358,6 +358,7 @@ func TestPgStore_AlertDelivery_RecordAndUpdate(t *testing.T) {
 		AccountID:      acct,
 		AppID:          app,
 		IdempotencyKey: rule.ID + ":bucket-1",
+		Payload:        []byte(`{"event":"test"}`),
 		ObservedValue:  0.7,
 	}
 	if _, err := s.RecordAlertDelivery(ctx, d); err != nil {
