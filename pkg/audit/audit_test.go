@@ -122,16 +122,16 @@ func (o stubObserver) Observe(secs float64) {
 	o.s.durations = append(o.s.durations, stubDuration{result: o.result, secs: secs})
 }
 
-// failingStore wraps a state.Store and returns boomErr from
-// AppendEvent only. Mirrors cmd/apid/audit_test.go::failingStore.
+// failingStore wraps a state.Store and returns errAppendEventBoom
+// from AppendEvent only. Mirrors cmd/apid/audit_test.go::failingStore.
 type failingStore struct {
 	state.Store
 }
 
-var boomErr = errors.New("simulated AppendEvent failure")
+var errAppendEventBoom = errors.New("simulated AppendEvent failure")
 
 func (failingStore) AppendEvent(_ context.Context, _, _ string, _ *string, _ []byte) error {
-	return boomErr
+	return errAppendEventBoom
 }
 
 // silentLog discards slog output so test runs stay clean.
