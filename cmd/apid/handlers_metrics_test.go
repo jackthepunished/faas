@@ -147,7 +147,7 @@ func TestAppMetrics_NoRangeFallsBackToDefault(t *testing.T) {
 	}
 }
 
-// TestAppMetrics_NaNGuards pins the safeFloat / safePercent guards
+// TestAppMetrics_NaNGuards pins the appmetrics.SafeFloat / SafePercent guards
 // on the seven arithmetic paths. Histogram_quantile over an empty
 // window returns NaN; rate() over a missing counter returns 0; the
 // handlers must coerce those into zero-valued wire fields rather
@@ -159,9 +159,9 @@ func TestAppMetrics_NaNGuards(t *testing.T) {
 	installPromFixture(t, &e, func(q string) string {
 		// Histogram_quantile queries return NaN; the rate/division
 		// queries return 0 (no data). The handler must coerce NaN
-		// to 0 via safeFloat / safePercent. The denominator-guarded
+		// to 0 via appmetrics.SafeFloat / SafePercent. The denominator-guarded
 		// queries (error_rate, cold_start) hit zero-division →
-		// NaN; safePercent must clamp to 0.
+		// NaN; SafePercent must clamp to 0.
 		if strings.Contains(q, "histogram_quantile") {
 			return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"NaN"]}]}}`
 		}
@@ -177,8 +177,8 @@ func TestAppMetrics_NaNGuards(t *testing.T) {
 		t.Fatalf("decode: %v (body may contain NaN/Inf literals — should be 0)", err)
 	}
 	// Every numeric field must be a finite, non-negative number.
-	// NaN/Inf from promql must be coerced to 0 by safeFloat /
-	// safePercent; percentages must clamp to [0,100] even if the
+	// NaN/Inf from promql must be coerced to 0 by appmetrics.SafeFloat /
+	// SafePercent; percentages must clamp to [0,100] even if the
 	// upstream had a wrapped-around math value.
 	check := func(name string, v float64) {
 		t.Helper()

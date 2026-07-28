@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/promql"
 )
 
@@ -76,7 +77,7 @@ func (s *server) statusJSONHandler(w http.ResponseWriter, r *http.Request) {
 		// tell the snapshot is degraded.
 		fallback := StatusPage{
 			AsOf:   time.Now().UTC(),
-			Source: "degraded: " + err.Error(),
+			Source: appmetrics.SourceDegradedPrefix + err.Error(),
 		}
 		writeJSON(w, http.StatusOK, fallback)
 		return
@@ -132,7 +133,7 @@ func (c *statusCache) Get(ctx context.Context) (StatusPage, error) {
 		c.mu.Lock()
 		if c.hasCached {
 			stale := c.cached
-			stale.Source = "degraded: " + err.Error()
+			stale.Source = appmetrics.SourceDegradedPrefix + err.Error()
 			c.mu.Unlock()
 			return stale, nil
 		}
@@ -165,7 +166,7 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 		return StatusPage{}, fmt.Errorf("no prometheus URL configured")
 	}
 
-	snap := StatusPage{AsOf: time.Now().UTC(), Source: sourcePrometheus}
+	snap := StatusPage{AsOf: time.Now().UTC(), Source: appmetrics.SourcePrometheus}
 	var firstErr error
 	okCount := 0
 

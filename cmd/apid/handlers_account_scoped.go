@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -42,13 +43,6 @@ import (
 // Returns 200 with an empty `instances` array for an account with
 // zero live instances — never 404. next_before is the last row's id
 // when len(out) == limit; omitted (empty) otherwise.
-// sourceDegradedNoProm is the canonical "Source" value emitted when
-// the metrics handler has no Prometheus client configured. Mirrors
-// handlers_metrics.go::sourcePrometheus / "degraded: ..." convention
-// so the dashboard's empty-state branch handles both per-app and
-// account-scoped metrics with one code path.
-const sourceDegradedNoProm = "degraded: prometheus not configured"
-
 func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "instances")
 	if prob != nil {
@@ -147,12 +141,12 @@ func (s *server) listSecretsForAccount(w http.ResponseWriter, r *http.Request, a
 func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	rng := r.URL.Query().Get("range")
 	if rng == "" {
-		rng = defaultMetricsRange
+		rng = appmetrics.DefaultRange
 	}
-	if !isValidMetricsRange(rng) {
+	if !appmetrics.IsValidRange(rng) {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"invalid range",
-			fmt.Sprintf("range must be one of: %s", strings.Join(metricsRanges, ", "))))
+			fmt.Sprintf("range must be one of: %s", strings.Join(appmetrics.Ranges(), ", "))))
 		return
 	}
 	apps, err := s.store.ListApps(r.Context(), acct.ID)
@@ -167,7 +161,7 @@ func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct sta
 		Apps:  make(map[string]api.AppMetricsResponse, len(apps)),
 	}
 	if s.promqlClient == nil {
-		resp.Source = sourceDegradedNoProm
+		resp.Source = appmetrics.SourceDegradedPrefix + "prometheus not configured"
 		resp.Apps = nil
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -221,19 +215,19 @@ func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct sta
 		single := api.AppMetricsResponse{
 			AppID:        app.ID,
 			Range:        rng,
-			Source:       sourcePrometheus,
+			Source:       appmetrics.SourcePrometheus,
 			AsOf:         now,
-			RequestCount: int64(safeRoundNonNeg(countByApp[app.ID])),
-			ErrorRatePct: safePercent(errRateByApp[app.ID]),
-			ColdStartPct: safePercent(coldByApp[app.ID]),
-			LatencyP50MS: safeFloat(histogramQuantile(0.50, appBuckets)),
-			LatencyP95MS: safeFloat(histogramQuantile(0.95, appBuckets)),
-			LatencyP99MS: safeFloat(histogramQuantile(0.99, appBuckets)),
-			WakeP95MS:    safeFloat(wakeV),
+			RequestCount: int64(appmetrics.SafeRoundNonNeg(countByApp[app.ID])),
+			ErrorRatePct: appmetrics.SafePercent(errRateByApp[app.ID]),
+			ColdStartPct: appmetrics.SafePercent(coldByApp[app.ID]),
+			LatencyP50MS: appmetrics.SafeFloat(histogramQuantile(0.50, appBuckets)),
+			LatencyP95MS: appmetrics.SafeFloat(histogramQuantile(0.95, appBuckets)),
+			LatencyP99MS: appmetrics.SafeFloat(histogramQuantile(0.99, appBuckets)),
+			WakeP95MS:    appmetrics.SafeFloat(wakeV),
 		}
 		resp.Apps[app.Slug] = single
 	}
-	resp.Source = sourcePrometheus
+	resp.Source = appmetrics.SourcePrometheus
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -243,14 +237,14 @@ func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct sta
 // partial rollup and emits a zeroed AppsMetricsResponse with the
 // degraded source string, matching the per-app endpoint's contract.
 //
-// Mirrors degradedFromErr in handlers_metrics.go but takes a writer
+// Mirrors pkg/appmetrics.degradedFromErr but takes a writer
 // instead of returning the response — the per-app variant runs inline
 // (single-pass, all 7 queries sequential) while the account-scoped
 // variant spreads across named locals; centralising the write keeps
 // both consistent.
 func writeMetricsDegraded(w http.ResponseWriter, s *server, resp api.AppsMetricsResponse, err error, label string) {
 	if s.log != nil {
-		// Same CodeQL log-injection guard as degradedFromErr — strip
+		// Same CodeQL log-injection guard as pkg/appmetrics — strip
 		// CR/LF inline at the call site so the dataflow path is
 		// unambiguous. The PromQL range= query param flows into the
 		// query body that produced the error.
@@ -266,7 +260,7 @@ func writeMetricsDegraded(w http.ResponseWriter, s *server, resp api.AppsMetrics
 // histogramQuantile computes PromQL histogram_quantile() for a single
 // q against an (app, le) → float64 bucket map produced by
 // promql.Client.QueryBuckets. Empty / nil maps return 0 (matches the
-// per-app handler's safeFloat coercion of NaN from PromQL).
+// per-app handler's appmetrics.SafeFloat coercion of NaN from PromQL).
 //
 // Why a local helper instead of importing pkg/gateway/testhist:
 // testhist is a t.Fatalf-bound package; the server-side rollup can't
@@ -280,7 +274,7 @@ func writeMetricsDegraded(w http.ResponseWriter, s *server, resp api.AppsMetrics
 //
 // NaN / +Inf from the upstream vector query surface as 0 here too
 // (PromQL emits the literal string "NaN" / "+Inf" in the value field,
-// which strconv.ParseFloat parses; we trust safeFloat on the outer
+// which strconv.ParseFloat parses; we trust appmetrics.SafeFloat on the outer
 // side to clamp).
 func histogramQuantile(q float64, buckets map[string]float64) float64 {
 	if len(buckets) == 0 {
