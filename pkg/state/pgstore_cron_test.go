@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
@@ -63,17 +65,22 @@ func seedCronApp(t *testing.T, ctx context.Context, s *state.PgStore, label stri
 }
 
 // cronPgStore stands up a fresh schema, migrates it, and returns a
-// PgStore. Mirrors pgStore(t) from pgstore_test.go (package-internal,
-// not visible from package state_test). Skips when Postgres is
-// unreachable.
-func cronPgStore(t *testing.T) (*state.PgStore, context.Context) {
+// PgStore plus the underlying pool. The pool is returned alongside
+// the store so tests that need to run raw SQL (e.g. the jsonb
+// round-trip in TestPg_CronFiredAuditRoundTrip) can reuse the SAME
+// schema — calling pgtest.Open a second time yields a fresh
+// random schema where the events table doesn't exist yet, so the
+// raw query 42P01s. Mirrors pgStore(t) from pgstore_test.go
+// (package-internal, not visible from package state_test). Skips
+// when Postgres is unreachable.
+func cronPgStore(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
 	pool := pgtest.Open(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return state.NewPgStore(pool), ctx
+	return state.NewPgStore(pool), pool, ctx
 }
 
 // TestPg_CreateCron_ReturnsCreatedAt is the round-trip regression for
@@ -82,7 +89,7 @@ func cronPgStore(t *testing.T) (*state.PgStore, context.Context) {
 // "sql: expected N destination arguments, got M") — exactly what the
 // sqlc-check drift gate is meant to catch at codegen time.
 func TestPg_CreateCron_ReturnsCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "create-cron-created-at")
 
 	before := time.Now().UTC().Add(-time.Second) // clock skew buffer
@@ -113,7 +120,7 @@ func TestPg_CreateCron_ReturnsCreatedAt(t *testing.T) {
 // changes), then verifies CronByID returns the same id + a non-zero
 // CreatedAt.
 func TestPg_CronByID_RoundTripsCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "cronbyid-roundtrip")
 
 	created, err := s.CreateCron(ctx, appID, "*/5 * * * *", "/healthz", true)
@@ -147,7 +154,7 @@ func TestPg_CronByID_RoundTripsCreatedAt(t *testing.T) {
 // column, but the RETURNING still projects it. This test catches the
 // "column drift but projection intact" half of the bug.
 func TestPg_UpdateCron_PreservesCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "updatecron-preserve")
 
 	original, err := s.CreateCron(ctx, appID, "*/5 * * * *", "/healthz", true)
@@ -194,7 +201,7 @@ func TestPg_UpdateCron_PreservesCreatedAt(t *testing.T) {
 // it straight through. cronPgStore matches the file's existing
 // pattern (skips when Postgres is unreachable).
 func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, pool, ctx := cronPgStore(t)
 	acct, err := s.CreateAccount(ctx, fmt.Sprintf("cron-audit-%d@example.com", time.Now().UnixNano()), api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
@@ -280,7 +287,9 @@ func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
 	// different default whitespace normalisation) could pass the
 	// Go-side unmarshal but break a dashboard query like
 	// `select data->>'path' from events where kind='cron.fired'`.
-	pool := pgtest.Open(t)
+	// Uses the SAME pool cronPgStore opened — a second pgtest.Open
+	// call would create a fresh random schema without the events
+	// table and 42P01 the query.
 	var dbPath string
 	if err := pool.QueryRow(ctx,
 		`select data->>'path' from events where kind = 'cron.fired' and subject = $1`,
