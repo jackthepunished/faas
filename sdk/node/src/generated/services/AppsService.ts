@@ -276,6 +276,9 @@ export class AppsService {
   public static streamAppLogs({
     slug,
     follow = 0,
+    grep,
+    since,
+    level,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -285,6 +288,19 @@ export class AppsService {
      * If 1, hold the connection open and stream new entries.
      */
     follow?: 0 | 1,
+    /**
+     * Substring filter applied to each log line.
+     */
+    grep?: string,
+    /**
+     * RFC3339 lower-bound on the line timestamp.
+     */
+    since?: string,
+    /**
+     * Exact match on the structured `level` field (info, warn, or error). Empty = no level filter. The CLI and the apid handler both validate against the same enum (api.IsValidLogLevel in pkg/api/logs.go); an unknown value short-circuits with an SSE error frame carrying code invalid_level.
+     *
+     */
+    level?: 'info' | 'warn' | 'error',
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -294,6 +310,9 @@ export class AppsService {
       },
       query: {
         'follow': follow,
+        'grep': grep,
+        'since': since,
+        'level': level,
       },
       errors: {
         401: `code: unauthorized`,

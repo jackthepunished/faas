@@ -448,7 +448,7 @@ func TestStreamAppLogs_HappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	body, err := c.StreamAppLogs(context.Background(), "x", "", false)
+	body, err := c.StreamAppLogs(context.Background(), "x", "", false, LogFilter{})
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestStreamAppLogs_ProblemError(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	body, err := c.StreamAppLogs(context.Background(), "missing", "", false)
+	body, err := c.StreamAppLogs(context.Background(), "missing", "", false, LogFilter{})
 	if err == nil {
 		_ = body.Close()
 		t.Fatal("expected error on 404")
@@ -719,7 +719,7 @@ func TestStreamAppLogs_CancelOnContextDone(t *testing.T) {
 
 	c := NewClient(srv.URL, "fp_test")
 	ctx, cancel := context.WithCancel(context.Background())
-	body, err := c.StreamAppLogs(ctx, "x", "", true)
+	body, err := c.StreamAppLogs(ctx, "x", "", true, LogFilter{})
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -742,5 +742,57 @@ func TestStreamAppLogs_CancelOnContextDone(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("body did not close after context cancellation")
+	}
+}
+
+// TestStreamAppLogs_URLEscape pins the wire shape the SDK emits when
+// all three LogFilter fields are non-empty: the slug is path-escaped
+// and the three query params appear with URL-encoded values so a
+// server-side parser can rely on the encoding. Tripwire for issue
+// #309's "switch from string-concat to url.Values" change.
+func TestStreamAppLogs_URLEscape(t *testing.T) {
+	var seenPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "fp_test")
+	body, err := c.StreamAppLogs(context.Background(), "my app", "dep-1", true, LogFilter{
+		Grep:  "GET /admin 404",
+		Since: "2026-07-28T00:00:00Z",
+		Level: "warn",
+	})
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	defer func() { _ = body.Close() }()
+	_, _ = io.Copy(io.Discard, body)
+
+	want := "/v1/apps/my%20app/logs?deployment=dep-1&follow=1&grep=GET+%2Fadmin+404&level=warn&since=2026-07-28T00%3A00%3A00Z"
+	if seenPath != want {
+		t.Fatalf("URL path mismatch:\n got: %s\nwant: %s", seenPath, want)
+	}
+	// Zero-value filter must omit every query param the customer did
+	// not set; Move 4 relies on this for "unfiltered" streams.
+	var seenZero string
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenZero = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+	}))
+	defer srv2.Close()
+	body2, err := NewClient(srv2.URL, "fp_test").StreamAppLogs(context.Background(), "myapp", "", false, LogFilter{})
+	if err != nil {
+		t.Fatalf("StreamAppLogs zero-value: %v", err)
+	}
+	defer func() { _ = body2.Close() }()
+	_, _ = io.Copy(io.Discard, body2)
+	if want := "/v1/apps/myapp/logs?follow=0"; seenZero != want {
+		t.Fatalf("zero-value path mismatch:\n got: %s\nwant: %s", seenZero, want)
 	}
 }

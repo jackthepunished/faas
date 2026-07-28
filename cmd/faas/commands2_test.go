@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -791,4 +792,152 @@ func TestCmdDeployTarball_NoFlags_DockerfileAndPackageJson(t *testing.T) {
 	if gotRuntime != "" {
 		t.Errorf("runtime = %q, want empty (App-type deploy)", gotRuntime)
 	}
+}
+
+// TestCmdLogs_GrepSinceLevel pins issue #309's CLI acceptance:
+//
+//   - The new --grep / --since / --level flags reach the server as
+//     query params on /v1/apps/{slug}/logs.
+//   - Invalid --level (anything outside info|warn|error) exits 2 with
+//     a usage message — no round-trip to the server.
+//   - Invalid --since (not RFC3339) exits 2 with a usage message —
+//     no round-trip to the server.
+//   - Zero-value LogFilter (no flags) leaves the URL untouched,
+//     preserving the pre-issue-309 wire contract for existing
+//     callers. Move 4 will start to act on these params; the SDK
+//     signature is stable across both stubs.
+//
+// The fake apid emits the same `event: not_implemented` + `event:
+// end` frames as the real Move 3 stub (handlers_ext.go::streamAppLogs)
+// so the test exercises the actual cmdLogs SSE decoder loop, not a
+// parallel one.
+func TestCmdLogs_GrepSinceLevel(t *testing.T) {
+	// capture stdout via the osStdout package seam (commands3.go:35)
+	// so the test stays -race-clean (captureStdout races; memory:
+	// `capturestdout-race-under--race.md`).
+	var stdout bytes.Buffer
+	prevOut := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = prevOut }()
+
+	t.Run("zero_value_filter_omits_query_params", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: not_implemented\ndata: {\"reason\":\"stub\"}\n\n"))
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		if code := cmdLogs([]string{"myapp"}); code != 0 {
+			t.Fatalf("cmdLogs = %d, want 0", code)
+		}
+		// No filter flags → no grep/since/level keys in the query,
+		// but follow=0 must still be present.
+		if gotQuery.Get("grep") != "" {
+			t.Errorf("grep = %q, want empty (no --grep flag)", gotQuery.Get("grep"))
+		}
+		if gotQuery.Get("since") != "" {
+			t.Errorf("since = %q, want empty (no --since flag)", gotQuery.Get("since"))
+		}
+		if gotQuery.Get("level") != "" {
+			t.Errorf("level = %q, want empty (no --level flag)", gotQuery.Get("level"))
+		}
+		if gotQuery.Get("follow") != "0" {
+			t.Errorf("follow = %q, want 0", gotQuery.Get("follow"))
+		}
+	})
+
+	t.Run("all_three_flags_forward", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: not_implemented\ndata: {\"reason\":\"stub\"}\n\n"))
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		// Flags must precede positional args — Go's flag package
+		// stops parsing at the first non-flag argument.
+		args := []string{
+			"--grep", "ERROR",
+			"--since", "2026-07-28T00:00:00Z",
+			"--level", "error",
+			"myapp",
+		}
+		if code := cmdLogs(args); code != 0 {
+			t.Fatalf("cmdLogs = %d, want 0; stdout=%q", code, stdout.String())
+		}
+		if got := gotQuery.Get("grep"); got != "ERROR" {
+			t.Errorf("grep = %q, want ERROR", got)
+		}
+		if got := gotQuery.Get("since"); got != "2026-07-28T00:00:00Z" {
+			t.Errorf("since = %q, want 2026-07-28T00:00:00Z", got)
+		}
+		if got := gotQuery.Get("level"); got != "error" {
+			t.Errorf("level = %q, want error", got)
+		}
+	})
+
+	t.Run("invalid_level_exits_2_no_round_trip", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"--level", "trace", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(--level trace) = %d, want 2", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; validation must short-circuit before HTTP", hits)
+		}
+	})
+
+	t.Run("invalid_since_exits_2_no_round_trip", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"--since", "yesterday", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(--since yesterday) = %d, want 2", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; validation must short-circuit before HTTP", hits)
+		}
+	})
 }
