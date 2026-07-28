@@ -10,6 +10,6 @@ export type CreateKeyRequest = {
   /**
    * Requested permission set. Server validates each entry against the closed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; the other five cover narrower surfaces (see APIKeyResponse.scopes). See IAM-1, ADR-034 rev2.
    */
-  scopes?: Array<'admin' | 'deploy:write' | 'secrets:read' | 'secrets:write' | 'usage:read' | 'apps:read'>;
+  scopes?: Array<'admin' | 'deploy:write' | 'secrets:read' | 'secrets:write' | 'usage:read' | 'apps:read' | 'env:read' | 'env:write'>;
 };
 

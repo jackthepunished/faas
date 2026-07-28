@@ -1001,6 +1001,172 @@ func TestAppSecretOwnershipOnUpsert(t *testing.T) {
 	}
 }
 
+// --- Customer env vars (spec §11, issue #395 / ADR-045) ----------------------
+//
+// Mirror of the customer-secrets surface minus the ciphertext column.
+// Plaintext TEXT values: the MemStore's role is to model the
+// (account_id, app_id, key) row shape + the ownership checks so unit
+// tests can verify quota / list / delete logic without touching
+// Postgres. Encryption does not apply to env vars by design.
+
+// TestAppEnvUpsertListDelete exercises the four-method CRUD through
+// MemStore. Mirrors TestAppSecretUpsertListDelete so the table-driven
+// shapes of the two surfaces agree.
+func TestAppEnvUpsertListDelete(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	const acctA, acctB = "acct-A", "acct-B"
+	const appA, appB = "app-A", "app-B"
+
+	// Initial state: nothing.
+	got, err := m.ListAppEnv(ctx, acctA, appA)
+	if err != nil {
+		t.Fatalf("list empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty list: got %d, want 0", len(got))
+	}
+
+	// Upsert two keys under (acctA, appA).
+	if err := m.UpsertAppEnv(ctx, acctA, appA, "LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("upsert LOG_LEVEL: %v", err)
+	}
+	if err := m.UpsertAppEnv(ctx, acctA, appA, "FEATURE_X", "on"); err != nil {
+		t.Fatalf("upsert FEATURE_X: %v", err)
+	}
+
+	// Count is 2.
+	n, err := m.CountAppEnv(ctx, acctA, appA)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count: got %d, want 2", n)
+	}
+
+	// List returns both, sorted by key (FEATURE_X before LOG_LEVEL).
+	got, err = m.ListAppEnv(ctx, acctA, appA)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("list: got %d, want 2", len(got))
+	}
+	if got[0].Key != "FEATURE_X" || got[1].Key != "LOG_LEVEL" {
+		t.Errorf("order: got %q/%q, want FEATURE_X/LOG_LEVEL", got[0].Key, got[1].Key)
+	}
+
+	// Upsert replaces value on conflict (same key).
+	if err := m.UpsertAppEnv(ctx, acctA, appA, "LOG_LEVEL", "info"); err != nil {
+		t.Fatalf("upsert rotate: %v", err)
+	}
+	got, _ = m.ListAppEnv(ctx, acctA, appA)
+	if got[1].Value != "info" {
+		t.Errorf("rotate: got %q, want info", got[1].Value)
+	}
+
+	// Cross-account isolation: acctB sees nothing on appA.
+	if n, _ := m.CountAppEnv(ctx, acctB, appA); n != 0 {
+		t.Errorf("cross-acct count: got %d, want 0", n)
+	}
+	if got, _ := m.ListAppEnv(ctx, acctB, appA); len(got) != 0 {
+		t.Errorf("cross-acct list: got %d, want 0", len(got))
+	}
+
+	// Cross-app isolation: same account, different app.
+	if err := m.UpsertAppEnv(ctx, acctA, appB, "PORT", "8080"); err != nil {
+		t.Fatalf("upsert appB: %v", err)
+	}
+	if n, _ := m.CountAppEnv(ctx, acctA, appB); n != 1 {
+		t.Errorf("appB count: got %d, want 1", n)
+	}
+	if n, _ := m.CountAppEnv(ctx, acctA, appA); n != 2 {
+		t.Errorf("appA count after appB upsert: got %d, want 2", n)
+	}
+
+	// Delete scoped to (acctA, appA, LOG_LEVEL).
+	if err := m.DeleteAppEnv(ctx, acctA, appA, "LOG_LEVEL"); err != nil {
+		t.Fatalf("delete LOG_LEVEL: %v", err)
+	}
+	if n, _ := m.CountAppEnv(ctx, acctA, appA); n != 1 {
+		t.Errorf("post-delete count: got %d, want 1", n)
+	}
+
+	// Delete on cross-account returns ErrNotFound (renders 400 CodeEnvVarNotFound).
+	if err := m.DeleteAppEnv(ctx, acctB, appA, "FEATURE_X"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-acct delete: got %v, want ErrNotFound", err)
+	}
+
+	// Delete on unknown key returns ErrNotFound.
+	if err := m.DeleteAppEnv(ctx, acctA, appA, "MISSING"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing delete: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestAppEnvOwnershipOnUpsert asserts the same ownership semantics as the
+// secrets surface — a different account's upsert against the same
+// (app_id, key) returns ErrNotFound and leaves the original row
+// untouched. Code path is structured so a future refactor that drops the
+// ownership check from one surface but not the other is caught here.
+func TestAppEnvOwnershipOnUpsert(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	if err := m.UpsertAppEnv(ctx, "acct-A", "app-1", "LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("upsert A: %v", err)
+	}
+	if err := m.UpsertAppEnv(ctx, "acct-B", "app-1", "LOG_LEVEL", "info"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("acctB upsert: got %v, want ErrNotFound", err)
+	}
+	got, _ := m.ListAppEnv(ctx, "acct-A", "app-1")
+	if len(got) != 1 || got[0].Value != "debug" {
+		t.Errorf("row integrity: got %+v, want debug", got)
+	}
+}
+
+// TestMem_DeleteAccount_CascadesAppEnv asserts the G6 GDPR cascade covers
+// the app_envs surface. Mirrors TestMem_DeleteAccount_CascadesEvents —
+// the right-to-erasure contract requires that no env row survives an
+// account deletion, since env rows hold plaintext values that are
+// indistinguishable from customer-readable config.
+func TestMem_DeleteAccount_CascadesAppEnv(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acct, err := m.CreateAccount(ctx, "envcasc@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "env-casc-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	if err := m.UpsertAppEnv(ctx, acct.ID, app.ID, "FEATURE_A", "on"); err != nil {
+		t.Fatalf("upsert env: %v", err)
+	}
+	if err := m.UpsertAppEnv(ctx, acct.ID, app.ID, "LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("upsert env: %v", err)
+	}
+	if n, _ := m.CountAppEnv(ctx, acct.ID, app.ID); n != 2 {
+		t.Fatalf("pre-cascade count: got %d, want 2", n)
+	}
+	// Pending is the prerequisite for the cascade path.
+	if err := m.MarkAccountDeletionPending(ctx, acct.ID); err != nil {
+		t.Fatalf("MarkAccountDeletionPending: %v", err)
+	}
+	if err := m.DeleteAccount(ctx, acct.ID); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+	// Re-seed a fresh account + app under the same ids to probe the map
+	// (MemStore's id-keyed map means stale rows would surface as
+	// false-positive counts in a fresh account lookup).
+	fresh, err := m.CreateAccount(ctx, "envcasc-fresh@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount fresh: %v", err)
+	}
+	if n, _ := m.CountAppEnv(ctx, fresh.ID, app.ID); n != 0 {
+		t.Errorf("post-cascade cross-acct count: got %d, want 0", n)
+	}
+}
+
 // --- G6 GDPR self-service regressions ----------------------------------------
 
 // TestMem_DeleteAccount_CascadesEvents is the MemStore half of the G6

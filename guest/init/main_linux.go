@@ -90,7 +90,7 @@ func boot() error {
 
 	// G2: read /etc/faas/secrets.env (unsealed JSON, written by vmmd at
 	// wake time) and stash the entry count on the supervisor via a small
-	// closure so runAppWithSecrets can pull them. A missing or malformed file is
+	// closure so runAppWithEnv can pull them. A missing or malformed file is
 	// not fatal — the app runs without env secrets (consistent with
 	// the quota=0 path).
 	secrets, secErr := loadSecrets(slog.Default())
@@ -99,9 +99,21 @@ func boot() error {
 		slog.Default().Warn("secrets.env could not be loaded; proceeding without secrets", "err_kind", errorKind(secErr))
 	}
 
+	// Issue #395 / ADR-045: read /etc/faas/env.json (plaintext JSON
+	// map, written by vmmd at wake time) and thread it into the
+	// 4-layer precedence BuildEnvWithSecrets enforces. A missing or
+	// malformed file is not fatal — the app runs without API env
+	// (consistent with the secrets layer above). The path is
+	// siblings-of secrets, deliberately separate so a JSON-decode
+	// failure on one doesn't propagate to the other.
+	apiEnv, apiErr := loadAPIEnv(slog.Default())
+	if apiErr != nil {
+		slog.Default().Warn("env.json could not be loaded; proceeding without api env", "err_kind", errorKind(apiErr))
+	}
+
 	sup := Supervisor{
 		Max:   MaxRestarts,
-		Start: func() error { return runAppWithSecrets(manifest, secrets) },
+		Start: func() error { return runAppWithEnv(manifest, secrets, apiEnv) },
 		OnCrash: func(attempt int, err error) {
 			fmt.Fprintf(os.Stderr, "guest-init: app crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
 		},
@@ -109,14 +121,16 @@ func boot() error {
 	return sup.Run()
 }
 
-// runAppWithSecrets is the secrets-aware entrypoint — same execve path as
-// runApp but with the envelope layered over the manifest's env. Empty/nil
-// secrets short-circuits to the un-secrets path (i.e. BuildEnv).
-func runAppWithSecrets(m api.AppManifest, secrets map[string]string) error {
+// runAppWithEnv is the secrets+apiEnv-aware entrypoint — same execve
+// path as runApp but with both layers merged over the manifest env.
+// Empty/nil secrets AND empty/nil apiEnv short-circuits to the bare
+// BuildEnv path; nil in one of them short-circuits to the other layer's
+// 3-arg shape via BuildEnvWithSecrets's nil-tolerant map reads.
+func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string) error {
 	argv := m.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = m.EffectiveWorkingDir()
-	cmd.Env = BuildEnvWithSecrets(os.Environ(), m, secrets)
+	cmd.Env = BuildEnvWithSecrets(os.Environ(), m, secrets, apiEnv)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if uid := lookupUID(m.EffectiveUser()); uid > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{

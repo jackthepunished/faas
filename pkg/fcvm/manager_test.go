@@ -89,6 +89,18 @@ type fakeVMM struct {
 	// G2 secrets staging.
 	stagedSecrets   []stagedSecret
 	stageSecretsErr error
+	// Issue #395 / ADR-045: plaintext api_env staging mirror.
+	stagedAPIEnv   []stagedAPIEnvEntry
+	stageAPIEnvErr error
+	// stageCallSeq is a monotonic counter incremented once per call to
+	// StageSecretsEnv or StageAPIEnv, captured on each entry's seq
+	// field. Used by TestWake_SealedAndAPIEnv_BothStage to assert the
+	// call ordering (secrets before api-env) without relying on a
+	// shared slice — the secrets and api-env staging live in distinct
+	// arrays because their blob shapes differ (sealed JSON envelope
+	// vs plaintext JSON map), so a refactor that reorders them inside
+	// Manager.Wake wouldn't otherwise trip a count-only test.
+	stageCallSeq int
 	// pids is the InstancePID source-of-truth for the M8 §11
 	// SeccompStatus path. Tests that want the gRPC handler to
 	// return a real (pid, true) register one here; the default
@@ -97,7 +109,18 @@ type fakeVMM struct {
 }
 
 type stagedSecret struct {
+	seq  int // capture of stageCallSeq at the moment of call
 	blob []byte
+}
+
+// stagedAPIEnvEntry is the plaintext sibling of stagedSecret
+// (issue #395 / ADR-045). Same shape (instance, blob) but a distinct
+// type so a test that asserts "StageSecretsEnv called N times" doesn't
+// confuse an api-env write with a secrets write.
+type stagedAPIEnvEntry struct {
+	instance string
+	seq      int // capture of stageCallSeq at the moment of call
+	blob     []byte
 }
 
 func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig) error {
@@ -372,9 +395,27 @@ func (v *fakeVMM) DestroyWithExport(_ context.Context, l Lease, _ string) (int, 
 
 func (v *fakeVMM) StageSecretsEnv(_ string, jsonBlob []byte) error {
 	v.mu.Lock()
-	v.stagedSecrets = append(v.stagedSecrets, stagedSecret{blob: append([]byte(nil), jsonBlob...)})
+	v.stageCallSeq++
+	seq := v.stageCallSeq
+	v.stagedSecrets = append(v.stagedSecrets, stagedSecret{seq: seq, blob: append([]byte(nil), jsonBlob...)})
 	v.mu.Unlock()
 	return v.stageSecretsErr
+}
+
+// StageAPIEnv is the plaintext sibling of StageSecretsEnv
+// (issue #395 / ADR-045). The fake records the call so tests can
+// assert the merged map shape without a real loopback mount.
+func (v *fakeVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
+	v.mu.Lock()
+	v.stageCallSeq++
+	seq := v.stageCallSeq
+	v.stagedAPIEnv = append(v.stagedAPIEnv, stagedAPIEnvEntry{
+		instance: instance,
+		seq:      seq,
+		blob:     append([]byte(nil), jsonBlob...),
+	})
+	v.mu.Unlock()
+	return v.stageAPIEnvErr
 }
 
 // InstancePID is the in-process fake for the M8 §11 SeccompStatus

@@ -79,6 +79,15 @@ type VMM interface {
 	// be empty — implementations MUST treat that as a no-op so apps without
 	// secrets skip the mount/umount cycle entirely.
 	StageSecretsEnv(instance string, jsonBlob []byte) error
+	// StageAPIEnv is the plaintext env channel (issue #395 / ADR-045).
+	// Loopback-mounts drive1 in the chroot, writes /etc/faas/env.json
+	// (plaintext map of key→value), and umounts. jsonBlob may be
+	// empty — implementations MUST treat that as a no-op so apps
+	// without API env rows skip the mount/umount cycle entirely.
+	// Distinct from StageSecretsEnv because the file lives at a
+	// different path and the payload is plaintext-by-contract (no
+	// unseal step).
+	StageAPIEnv(instance string, jsonBlob []byte) error
 	// LogRing returns the per-instance ring buffer of the running VM's
 	// stdout/stderr stream (issue #254, Move 4), or nil if instance is
 	// not alive on this vmmd. The vmmd gRPC Logs(req) handler dials this
@@ -288,6 +297,15 @@ func (m *Manager) stageSecretsEnv(instance string, jsonBlob []byte) error {
 	return m.vmm.StageSecretsEnv(instance, jsonBlob)
 }
 
+// stageAPIEnv delegates to the VMM's loopback-mount write for the plaintext
+// api_env channel (issue #395 / ADR-045). Same shape as stageSecretsEnv but
+// writes /etc/faas/env.json instead of /etc/faas/secrets.env; guest-init
+// reads both files and merges with precedence "secrets > api_env > manifest
+// > os.environ". See VMM.StageAPIEnv for the file-write implementation.
+func (m *Manager) stageAPIEnv(instance string, jsonBlob []byte) error {
+	return m.vmm.StageAPIEnv(instance, jsonBlob)
+}
+
 // WakeRequest brings an app up for a request or cron (spec §6.1). If Snapshot is
 // usable on the running Firecracker version it is restored (fast path); otherwise,
 // or if restore fails, the instance cold boots from rootfs (ADR-005: cold boot
@@ -343,6 +361,17 @@ type WakeRequest struct {
 	// Manager is the unseal-and-forget boundary. It is never logged, never
 	// persisted, never returned to any caller.
 	SealedEnvEntries []SealedEnvEntry
+	// APIEnvEntries are the per-key plaintext rows from `app_envs` the
+	// caller wants loaded into the guest's env (issue #395 / ADR-045).
+	// Unlike SealedEnvEntries, the values are NOT sealed — env vars are
+	// non-sensitive runtime config by contract (the issue's plaintext
+	// rationale + ADR-045 §Decision). vmmd merges the entries into a
+	// single JSON map and writes /etc/faas/env.json on drive1; guest-init
+	// reads it and merges into the process env with precedence
+	// "secrets > api_env > manifest_env > os.environ". Empty slice = no
+	// env.json file written (manifest env still flows in via
+	// /etc/faas/app.json, the legacy path).
+	APIEnvEntries []APIEnvEntry
 	// EgressAllowlist (ADR-031, tier-2 of the network roadmap): per-app
 	// outbound IPv4 allowlist. Each entry is a CIDR string (e.g.
 	// "1.2.3.0/24"); empty slice = current behaviour (no allowlist rule
@@ -362,6 +391,20 @@ type WakeRequest struct {
 type SealedEnvEntry struct {
 	Key        string
 	Ciphertext []byte
+}
+
+// APIEnvEntry is one (key, value) plaintext pair as stored in app_envs
+// (issue #395 / ADR-045). The value is sent over the wire as a UTF-8
+// string — every layer of the pipeline (apid JSON decode, Postgres
+// TEXT column, env.json encoding/json marshal) is UTF-8-bound, so a
+// `bytes` field would have hidden silent Unicode replacement during
+// the on-disk JSON marshal. vmmd merges all entries into a single
+// JSON map written to /etc/faas/env.json on drive1; guest-init
+// reads it and merges into the process env with precedence below
+// sealed secrets.
+type APIEnvEntry struct {
+	Key   string
+	Value string
 }
 
 // ColdBootRequest is the deploy-pipeline prime path: a first boot with no
@@ -389,6 +432,9 @@ type ColdBootRequest struct {
 	// SealedEnvEntries is forwarded to WakeRequest for staging onto drive1
 	// (spec §11/G2). Empty slice = no secrets file written.
 	SealedEnvEntries []SealedEnvEntry
+	// APIEnvEntries is forwarded to WakeRequest for staging onto drive1
+	// (issue #395 / ADR-045). Empty slice = no env.json file written.
+	APIEnvEntries []APIEnvEntry
 	// EgressAllowlist (ADR-031) — same shape as WakeRequest.
 	EgressAllowlist []string
 }
@@ -402,6 +448,7 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		VcpuCount: req.VcpuCount, MemSizeMiB: req.MemSizeMiB,
 		EgressMbit: req.EgressMbit, Snapshot: nil,
 		ExportDir: req.ExportDir, SealedEnvEntries: req.SealedEnvEntries,
+		APIEnvEntries:   req.APIEnvEntries,
 		EgressAllowlist: req.EgressAllowlist,
 		Plan:            req.Plan,
 	})
@@ -533,6 +580,29 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		}
 		if err := m.stageSecretsEnv(req.Instance, blob); err != nil {
 			return nil, fmt.Errorf("wake %s: stage secrets.env: %w", req.Instance, err)
+		}
+	}
+
+	// Issue #395 / ADR-045: stage plaintext api_env → JSON-encode the
+	// merged map → loopback-mounted write → umount. Mirrors the
+	// sealed-secrets block above but skips the unseal step entirely.
+	// Sorted-by-key write so the wire is deterministic (handy for
+	// future redaction / diff tooling). No host key needed — values
+	// are plaintext by contract.
+	if len(req.APIEnvEntries) > 0 {
+		merged := map[string]string{}
+		for _, e := range req.APIEnvEntries {
+			merged[e.Key] = e.Value
+		}
+		// Marshal deterministically (encoding/json already sorts map
+		// keys alphabetically) so re-reads on the guest side produce
+		// the same bytes regardless of input ordering.
+		blob, err := json.Marshal(merged)
+		if err != nil {
+			return nil, fmt.Errorf("wake %s: marshal api env: %w", req.Instance, err)
+		}
+		if err := m.stageAPIEnv(req.Instance, blob); err != nil {
+			return nil, fmt.Errorf("wake %s: stage api env: %w", req.Instance, err)
 		}
 	}
 

@@ -2192,6 +2192,668 @@ func (s *PgStore) ListEnabledCrons(ctx context.Context) ([]Cron, error) {
 	return scanCrons(rows)
 }
 
+// --- alert rules (issue #396, ADR-045) ---------------------------------------
+//
+// Schema: migrations/00062_alert_rules.sql. Account-scoped webhook
+// delivery for the {error rate, latency p50/p95/p99, cold-start %,
+// request count, failed invocations} condition model, evaluated by
+// meterd (PR 4). ClaimAlertFire mirrors LoadAndStampLastQuotaWarning:
+// CTE captures the OLD stamp before the UPDATE so a "stamps equal"
+// predicate can't trivially succeed post-write (PR #69 regression
+// caught by CI; see pkg-state-usage-monthly-tz-compare.md).
+//
+// All write paths emit db.NotifyAlertRuleChanged so meterd can drop
+// its enabled-rules cache before the next sweep; meterd's evaluator
+// still re-reads on every signal because the cache stays advisory.
+//
+// Implementation notes that bit PR-A:
+//   - app_id is a uuid; the scan helpers use *string so a NULL row
+//     surfaces as "" while a real id is preserved. We deliberately
+//     do NOT use *time.Time for uuid columns — the converter is
+//     silent on bad type and a uuid through time.Time throws the
+//     value away.
+//   - failure_source is *string so the same select works whether the
+//     row uses the failure-source dimension (failed_invocations) or
+//     leaves it NULL (every other metric).
+//   - webhook_secret_sealed is []byte (NOT NULL); the handler seals
+//     via pkg/secretbox.SealOne before calling.
+
+const alertRuleSelectCols = `id, account_id, app_id, name, enabled, metric, comparison,
+       threshold, window_spec, failure_source, webhook_url,
+       webhook_secret_sealed, cooldown_minutes, state,
+       last_fired_at, last_evaluated_at, created_at, updated_at`
+
+func scanAlertRule(row pgx.Row) (AlertRule, error) {
+	r, err := scanAlertRuleCols(row.Scan)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AlertRule{}, ErrNotFound
+		}
+		return AlertRule{}, err
+	}
+	return r, nil
+}
+
+func scanAlertRules(rows pgx.Rows) ([]AlertRule, error) {
+	var out []AlertRule
+	for rows.Next() {
+		r, err := scanAlertRuleCols(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// scanAlertRuleCols is the single source of column order for
+// alert_rules. The select clause above is the contract — every
+// SELECT against alert_rules lists these columns in this order, and
+// the SELECT statement binds Scan's positional arguments against
+// this list. A future column add lands here first, in the same
+// commit, so a SELECT-write drift cannot silently swallow a column.
+func scanAlertRuleCols(scan func(...any) error) (AlertRule, error) {
+	r := AlertRule{}
+	var metric, comparison, windowSpec, state string
+	var appID, failureSource *string
+	var secret []byte
+	var lastFired, lastEvaluated *time.Time
+	if err := scan(
+		&r.ID, &r.AccountID, &appID, &r.Name, &r.Enabled,
+		&metric, &comparison, &r.Threshold, &windowSpec, &failureSource,
+		&r.WebhookURL, &secret, &r.CooldownMinutes, &state,
+		&lastFired, &lastEvaluated, &r.CreatedAt, &r.UpdatedAt,
+	); err != nil {
+		return AlertRule{}, err
+	}
+	r.Metric = AlertMetric(metric)
+	r.Comparison = AlertComparison(comparison)
+	r.WindowSpec = AlertWindowSpec(windowSpec)
+	r.State = AlertState(state)
+	if failureSource != nil && *failureSource != "" {
+		r.FailureSource = AlertFailureSource(*failureSource)
+	}
+	if appID != nil {
+		r.AppID = *appID
+	}
+	if len(secret) > 0 {
+		r.WebhookSecretSealed = secret
+	}
+	if lastFired != nil {
+		r.LastFiredAt = *lastFired
+	}
+	if lastEvaluated != nil {
+		r.LastEvaluatedAt = *lastEvaluated
+	}
+	return r, nil
+}
+
+func (s *PgStore) CreateAlertRule(ctx context.Context, in AlertRule) (AlertRule, error) {
+	var appIDArg any
+	if in.AppID != "" {
+		appIDArg = in.AppID
+	}
+	var sourceArg any
+	if in.FailureSource != "" {
+		sourceArg = string(in.FailureSource)
+	}
+	stateArg := string(in.State)
+	if stateArg == "" {
+		stateArg = string(AlertStateOk)
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into alert_rules (
+			account_id, app_id, name, enabled, metric, comparison,
+			threshold, window_spec, failure_source, webhook_url,
+			webhook_secret_sealed, cooldown_minutes, state
+		) values (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10,
+			$11, $12, $13
+		)
+		returning `+alertRuleSelectCols,
+		in.AccountID, appIDArg, in.Name, in.Enabled,
+		string(in.Metric), string(in.Comparison), in.Threshold,
+		string(in.WindowSpec), sourceArg, in.WebhookURL,
+		in.WebhookSecretSealed, in.CooldownMinutes, stateArg,
+	)
+	r, err := scanAlertRule(row)
+	if err != nil {
+		return AlertRule{}, mapErr(err)
+	}
+	return r, nil
+}
+
+// CreateAlertRuleIfUnderQuota — see Store interface. Account-wide
+// rules (AppID == "") bypass the per-app row lock + per-app count;
+// both flavours still hit the per-account count and the per-account
+// cap. Returns:
+//   - (AlertRule{}, ErrNotFound) when the app row is gone (only the
+//     app-scoped branch can return this — account-wide rules with
+//     a missing account row fall through to the FK violation on insert
+//     and surface as ErrConflict)
+//   - (AlertRule{}, *AlertRuleQuotaError) when either cap trips
+func (s *PgStore) CreateAlertRuleIfUnderQuota(ctx context.Context, in AlertRule, limits api.Limits) (AlertRule, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return AlertRule{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	if in.AppID != "" {
+		var locked int
+		err = tx.QueryRow(ctx,
+			`select 1 from apps where id = $1 and status <> 'deleted' for update`, in.AppID,
+		).Scan(&locked)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return AlertRule{}, ErrNotFound
+			}
+			return AlertRule{}, fmt.Errorf("state: lock app %s: %w", in.AppID, err)
+		}
+
+		var appCount int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from alert_rules where app_id = $1`, in.AppID,
+		).Scan(&appCount); err != nil {
+			return AlertRule{}, fmt.Errorf("state: count alert_rules for app %s: %w", in.AppID, err)
+		}
+		if appCount >= limits.AlertRuleLimitPerApp {
+			return AlertRule{}, &AlertRuleQuotaError{
+				Scope:    AlertRuleQuotaScopeApp,
+				Limit:    limits.AlertRuleLimitPerApp,
+				Observed: appCount,
+			}
+		}
+	}
+
+	// Per-account count excludes soft-deleted apps' alert rows.
+	var accountCount int
+	if err := tx.QueryRow(ctx, `
+		select count(*) from alert_rules r
+		 where r.account_id = $1
+		   and (r.app_id is null
+		        or exists(select 1 from apps a
+		                   where a.id = r.app_id and a.status <> 'deleted'))`,
+		in.AccountID,
+	).Scan(&accountCount); err != nil {
+		return AlertRule{}, fmt.Errorf("state: count alert_rules for account %s: %w", in.AccountID, err)
+	}
+	if accountCount >= limits.AlertRuleLimitPerAccount {
+		return AlertRule{}, &AlertRuleQuotaError{
+			Scope:    AlertRuleQuotaScopeAccount,
+			Limit:    limits.AlertRuleLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	var appIDArg any
+	if in.AppID != "" {
+		appIDArg = in.AppID
+	}
+	var sourceArg any
+	if in.FailureSource != "" {
+		sourceArg = string(in.FailureSource)
+	}
+	row := tx.QueryRow(ctx, `
+		insert into alert_rules (
+			account_id, app_id, name, enabled, metric, comparison,
+			threshold, window_spec, failure_source, webhook_url,
+			webhook_secret_sealed, cooldown_minutes, state
+		) values (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10,
+			$11, $12, 'ok'
+		)
+		returning `+alertRuleSelectCols,
+		in.AccountID, appIDArg, in.Name, in.Enabled,
+		string(in.Metric), string(in.Comparison), in.Threshold,
+		string(in.WindowSpec), sourceArg, in.WebhookURL,
+		in.WebhookSecretSealed, in.CooldownMinutes,
+	)
+	r, err := scanAlertRule(row)
+	if err != nil {
+		return AlertRule{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AlertRule{}, fmt.Errorf("state: commit create alert rule: %w", err)
+	}
+	return r, nil
+}
+
+func (s *PgStore) AlertRuleByID(ctx context.Context, id string) (AlertRule, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+alertRuleSelectCols+` from alert_rules where id = $1`, id)
+	return scanAlertRule(row)
+}
+
+// UpdateAlertRule coalesces the optional fields onto alert_rules.
+// All fields share the nil-skip pattern; WebhookSecretSealed is *[]byte
+// because a nil means "leave the seal alone" (a non-rotation update
+// path) and a non-nil replaces the column. FailureSource is not on
+// UpdateAlertRuleParams — see the struct godoc for why metric and
+// source rotate together or not at all.
+func (s *PgStore) UpdateAlertRule(ctx context.Context, id string, p UpdateAlertRuleParams) (AlertRule, error) {
+	var nameArg, urlArg any
+	if p.Name != nil {
+		nameArg = *p.Name
+	}
+	if p.WebhookURL != nil {
+		urlArg = *p.WebhookURL
+	}
+	var secretArg any
+	if p.WebhookSecretSealed != nil {
+		secretArg = *p.WebhookSecretSealed
+	}
+	var metricArg, comparisonArg, windowArg any
+	if p.Metric != nil {
+		metricArg = string(*p.Metric)
+	}
+	if p.Comparison != nil {
+		comparisonArg = string(*p.Comparison)
+	}
+	if p.WindowSpec != nil {
+		windowArg = string(*p.WindowSpec)
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		update alert_rules set
+			name    = coalesce($2, name),
+			enabled = coalesce($3, enabled),
+			metric  = coalesce($4, metric),
+			comparison = coalesce($5, comparison),
+			threshold  = coalesce($6, threshold),
+			window_spec = coalesce($7, window_spec),
+			webhook_url = coalesce($8, webhook_url),
+			webhook_secret_sealed = coalesce($9, webhook_secret_sealed),
+			cooldown_minutes = coalesce($10, cooldown_minutes),
+			updated_at = now()
+		where id = $1
+		returning `+alertRuleSelectCols,
+		id, nameArg, p.Enabled, metricArg, comparisonArg, p.Threshold,
+		windowArg, urlArg, secretArg, p.CooldownMinutes,
+	)
+	r, err := scanAlertRule(row)
+	if err != nil {
+		return AlertRule{}, mapErr(err)
+	}
+	return r, nil
+}
+
+func (s *PgStore) DeleteAlertRule(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `delete from alert_rules where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PgStore) ListAlertRulesForAccount(ctx context.Context, accountID string) ([]AlertRule, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+alertRuleSelectCols+` from alert_rules
+		 where account_id = $1 order by created_at desc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAlertRules(rows)
+}
+
+func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+alertRuleSelectCols+` from alert_rules where enabled = true order by account_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAlertRules(rows)
+}
+
+// ClaimAlertFire: rides the alert_rules row itself rather than a
+// separate dedupe table. idempotencyKey is the bucket
+// (rule_id + ':' + floor(epoch/cooldown_seconds)); last_fired_at is
+// the stamp. A NULL or stale stamp = the claim wins; a fresh stamp
+// inside the bucket = the claim loses.
+//
+// The Postgres impl is a stamped-only gate (PR 4's evaluator builds
+// the idempotency_key per rule when it wants two-tier dedupe — the
+// rule-id is the wider gate, the bucket is the inner). The bucket
+// parameter is accepted here so the Store interface stays a single
+// signature for both stores; MemStore enforces the bucket-level dedupe
+// via alertClaimKeys (see memstore.go:1149) and PgStore enforces the
+// rule-id-level gate via this CTE.
+//
+// CTE shape captures the OLD stamp explicitly so the "stamp already
+// set" branch is distinguishable from "stamp was NULL". The PR #69
+// regression used returning col = $2; that's always true post-update
+// and silently breaks the entire dedupe gate. The two-return form
+// (old + won) is the load-bearing detail.
+func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error) {
+	// The dedupe primitive is `alert_deliveries.idempotency_key`
+	// UNIQUE: the FIRST claim inside a cool-down bucket inserts the
+	// delivery row with status='pending' (the dispatch layer later
+	// promotes it to delivered/failed via UpdateAlertDeliveryStatus),
+	// every subsequent claim within the bucket fails at INSERT time
+	// with a UNIQUE violation we map to (false, nil). The meterd
+	// evaluator loop also reads ClaimAlertFire's won bit so it can
+	// short-circuit before doing the webhook dial — a defensive
+	// parallel to the UNIQUE.
+	//
+	// Wrapped in a single tx so the dedupe-INSERT and the
+	// last_fired_at stamp are atomic. The CTE captures the OLD stamp
+	// BEFORE the UPDATE so the predicate "$3 = old" doesn't trivially
+	// succeed post-write (the exact bug CI caught in PR #69 — see
+	// pkg-state-usage-monthly-tz-compare.md).
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`select true from alert_rules where id = $1`, ruleID,
+	).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, fmt.Errorf("state: claim alert fire lookup %s: %w", ruleID, err)
+	}
+
+	// Insert pending delivery as the dedupe gate. UNIQUE on
+	// idempotency_key makes this atomic — a duplicate within the
+	// bucket is a SQLSTATE 23505, mapped to (false, nil).
+	_, err = tx.Exec(ctx, `
+		insert into alert_deliveries
+			(rule_id, account_id, app_id, idempotency_key, payload, status, observed_value, fired_at)
+		select $1, account_id, app_id, $2, '{}'::jsonb, 'pending', 0, $3
+		  from alert_rules where id = $1`,
+		ruleID, idempotencyKey, at.UTC())
+	if err != nil {
+		// 23505 = unique_violation; the per-bucket dedupe hit.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return false, nil
+		}
+		return false, fmt.Errorf("state: claim alert fire insert %s: %w", ruleID, err)
+	}
+
+	// Stamp last_fired_at. Old → existing row, so we read first
+	// then UPDATE under the same tx. The stamp is the *rule-row*
+	// gate (cross-bucket re-firing only after cooldown); the dedupe
+	// above is the *bucket* gate.
+	var old *time.Time
+	if err := tx.QueryRow(ctx,
+		`select last_fired_at from alert_rules where id = $1`, ruleID,
+	).Scan(&old); err != nil {
+		return false, fmt.Errorf("state: claim alert fire stamp read %s: %w", ruleID, err)
+	}
+	if old == nil || old.Before(at) {
+		if _, err := tx.Exec(ctx,
+			`update alert_rules set last_fired_at = $2 where id = $1`,
+			ruleID, at.UTC(),
+		); err != nil {
+			return false, fmt.Errorf("state: claim alert fire stamp write %s: %w", ruleID, err)
+		}
+		won = true
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("state: claim alert fire commit: %w", err)
+	}
+	return won, nil
+}
+
+func (s *PgStore) SetAlertRuleState(ctx context.Context, ruleID string, to AlertState, at time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		update alert_rules
+		   set state      = $2,
+		       updated_at = $3
+		 where id = $1 and state <> $2`,
+		ruleID, string(to), at.UTC())
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the row is missing OR already in `to`. Distinguish
+		// via a follow-up SELECT — if the row is gone we MUST
+		// return ErrNotFound; if it's there with the desired
+		// state we return (false, nil) so the caller treats it as
+		// a no-op and skips duplicate work (audit emission etc).
+		var current string
+		err := s.pool.QueryRow(ctx, `select state from alert_rules where id = $1`, ruleID).Scan(&current)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, ErrNotFound
+			}
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *PgStore) SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, at time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update alert_rules set last_evaluated_at = $2 where id = $1`, ruleID, at.UTC())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- alert_deliveries ------------------------------------------------------
+
+const alertDeliverySelectCols = `id, rule_id, account_id, app_id, idempotency_key, payload,
+       status, attempt_count, last_status_code, last_error,
+       observed_value, fired_at, delivered_at`
+
+func scanAlertDelivery(row pgx.Row) (AlertDelivery, error) {
+	d := AlertDelivery{}
+	var status string
+	var appID *string
+	var lastError *string
+	var deliveredAt *time.Time
+	var payload []byte
+	var attemptCount, lastStatusCode int
+	if err := row.Scan(
+		&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
+		&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
+		&d.FiredAt, &deliveredAt,
+	); err != nil {
+		return AlertDelivery{}, err
+	}
+	d.Status = AlertDeliveryStatus(status)
+	d.AttemptCount = attemptCount
+	d.LastStatusCode = lastStatusCode
+	if lastError != nil {
+		d.LastError = *lastError
+	}
+	if deliveredAt != nil {
+		d.DeliveredAt = *deliveredAt
+	}
+	if appID != nil {
+		d.AppID = *appID
+	}
+	if len(payload) > 0 {
+		d.Payload = payload
+	}
+	return d, nil
+}
+
+func scanAlertDeliveries(rows pgx.Rows) ([]AlertDelivery, error) {
+	var out []AlertDelivery
+	for rows.Next() {
+		d := AlertDelivery{}
+		var status string
+		var appID *string
+		var lastError *string
+		var deliveredAt *time.Time
+		var payload []byte
+		var attemptCount, lastStatusCode int
+		if err := rows.Scan(
+			&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
+			&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
+			&d.FiredAt, &deliveredAt,
+		); err != nil {
+			return nil, err
+		}
+		d.Status = AlertDeliveryStatus(status)
+		d.AttemptCount = attemptCount
+		d.LastStatusCode = lastStatusCode
+		if lastError != nil {
+			d.LastError = *lastError
+		}
+		if deliveredAt != nil {
+			d.DeliveredAt = *deliveredAt
+		}
+		if appID != nil {
+			d.AppID = *appID
+		}
+		if len(payload) > 0 {
+			d.Payload = payload
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *PgStore) RecordAlertDelivery(ctx context.Context, in AlertDelivery) (AlertDelivery, error) {
+	var appIDArg any
+	if in.AppID != "" {
+		appIDArg = in.AppID
+	}
+	var deliveredAtArg any
+	if !in.DeliveredAt.IsZero() {
+		deliveredAtArg = in.DeliveredAt.UTC()
+	}
+	var lastErrorArg any
+	if in.LastError != "" {
+		lastErrorArg = in.LastError
+	}
+	// Default status to 'pending' when the caller leaves it empty
+	// (coalesce treats '' as not-null, so we map empty → NULL →
+	// 'pending' explicitly rather than relying on coalesce alone).
+	var statusArg any
+	if in.Status != "" {
+		statusArg = string(in.Status)
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into alert_deliveries (
+			rule_id, account_id, app_id, idempotency_key, payload,
+			status, attempt_count, last_status_code, last_error,
+			observed_value, fired_at, delivered_at
+		) values (
+			$1, $2, $3, $4, $5,
+			coalesce($6, 'pending'), $7, $8, $9,
+			$10, coalesce($11, now()), $12
+		)
+		returning `+alertDeliverySelectCols,
+		in.RuleID, in.AccountID, appIDArg, in.IdempotencyKey, []byte(in.Payload),
+		statusArg, in.AttemptCount, in.LastStatusCode, lastErrorArg,
+		in.ObservedValue, in.FiredAt, deliveredAtArg,
+	)
+	d, err := scanAlertDelivery(row)
+	if err != nil {
+		// The UNIQUE on idempotency_key is the cool-down dedupe
+		// primitive; surface it as ErrConflict so callers can map
+		// it to a no-op without parsing SQLSTATE themselves.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return AlertDelivery{}, ErrConflict
+		}
+		return AlertDelivery{}, err
+	}
+	return d, nil
+}
+
+func (s *PgStore) UpdateAlertDeliveryStatus(ctx context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error {
+	var lastErrArg any
+	if lastErr != "" {
+		lastErrArg = lastErr
+	}
+	var deliveredAtArg any
+	if deliveredAt != nil {
+		deliveredAtArg = deliveredAt.UTC()
+	}
+	tag, err := s.pool.Exec(ctx, `
+		update alert_deliveries set
+			status           = $2,
+			attempt_count    = $3,
+			last_status_code = $4,
+			last_error       = $5,
+			delivered_at     = coalesce($6, delivered_at)
+		where id = $1`,
+		id, string(status), attempt, statusCode, lastErrArg, deliveredAtArg)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PgStore) ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int) ([]AlertDelivery, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.pool.Query(ctx,
+		`select `+alertDeliverySelectCols+` from alert_deliveries
+		 where rule_id = $1 order by fired_at desc limit $2`, ruleID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAlertDeliveries(rows)
+}
+
+// CountFailedInvocationsSince counts terminal-failed invocations on
+// (accountID, appID, source) since `since`. The invocations table
+// carries created_at (NOT NULL); for "how many failures in the last
+// window" that's the right grain — terminal rows have a created_at
+// that anchors when they entered the queue, not when they failed.
+// Mirrors the time-window predicate in
+// CountInstanceInvocationsInMinute (pgstore.go:2435).
+//
+// appID == "" → no app filter (cross-app aggregate). The caller
+// is responsible for expanding source == 'any' to the four concrete
+// InvocationSource values before the call.
+func (s *PgStore) CountFailedInvocationsSince(ctx context.Context, accountID, appID string, source InvocationSource, since time.Time) (int, error) {
+	// appID "" means "all apps on this account" (Store contract). We
+	// pass nil to the SQL and use IS NOT DISTINCT FROM so the NULL
+	// app_id of an account-wide invocation is included in the count.
+	// source "" means "any source" — the enum is a closed vocabulary
+	// so an empty string is the wildcard sentinel (mirrors MemStore).
+	var appArg any
+	if appID != "" {
+		appArg = appID
+	}
+	var sourceArg any
+	if source != "" {
+		sourceArg = string(source)
+	}
+	var n int
+	row := s.pool.QueryRow(ctx, `
+		select count(*) from invocations
+		 where account_id = $1
+		   and state = 'failed'
+		   and created_at >= $2
+		   and ($3::uuid is null or app_id is not distinct from $3::uuid)
+		   and ($4::text is null or source = $4::text)`,
+		accountID, since.UTC(), appArg, sourceArg)
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // --- invocations (Move 1 event-shaped queue) ---------------------------------
 //
 // Schema: migrations/00030_invocations.sql. The drain's hot path is
@@ -2948,6 +3610,48 @@ func (s *PgStore) ListInstancesForAccount(ctx context.Context, accountID string)
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
 		 order by i.started_at desc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
+// ListInstancesForAccountPaged is the cursor-paginated variant of
+// ListInstancesForAccount (issue #393). Cursor is the instances.id;
+// the SQL filter `id < $before` partitions rows by id and the
+// handler emits `out[len-1].ID` as the next cursor, so the walk
+// visits every row exactly once regardless of how `id` is generated
+// (the column default is gen_random_uuid() — UUIDv4 — so the cursor
+// order is not insertion-time-ordered, but each row's id is unique
+// and `id::text < cursor` strictly partitions).
+//
+// Note: PR #338 added UUIDv7 for `wake_id`, not `id`. An earlier
+// comment claimed `id` was UUIDv7; that was wrong. We deliberately
+// ORDER BY id DESC (not started_at DESC) so the cursor walk matches
+// the cursor predicate: with ORDER BY (started_at DESC, id DESC) the
+// cursor (last id of the page) can be lexicographically larger than
+// earlier rows' ids — same started_at, smaller id — and the walk
+// stalls (test CursorPagination). `id DESC` is the only order whose
+// cursor walk is well-defined for both UUIDv4 and UUIDv7.
+//
+// Cross-account safety is the JOIN on apps.account_id = $1 — there
+// is no per-account guard at the handler layer because the SQL is
+// the only path. The handler validates `limit` (1..100) before this
+// call so the SQL stays narrow.
+func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID string, limit int, before string) ([]Instance, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx,
+		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		 from instances i
+		 join apps a on a.id = i.app_id
+		 where a.account_id = $1
+		   and ($2 = '' or i.id::text < $2)
+		 order by i.id::text desc
+		 limit $3`, accountID, before, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -4842,6 +5546,43 @@ func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) (
 	return out, rows.Err()
 }
 
+// ListAppSecretsForAccount joins apps + app_secrets on account_id
+// (issue #393). The cursor is the (app_slug, key) pair — the
+// handler emits "<slug>|<key>" and the SQL splits it back via
+// split_part. Order is (app_slug ASC, key ASC) so the cursor walk
+// is monotonic. Each row carries the app_slug the per-app path
+// doesn't (the URL slug is the path parameter there).
+//
+// Cross-account isolation is the JOIN on apps.account_id = $1 — the
+// SQL is the only IDOR guard. Returns nil slice (not error) when
+// the account has no secrets.
+func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx,
+		`select s.account_id, s.app_id, a.slug, s.key, s.ciphertext, s.created_at, s.updated_at
+		 from app_secrets s
+		 join apps a on a.id = s.app_id
+		 where s.account_id = $1
+		   and ($2 = '' or (a.slug, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2)))
+		 order by a.slug asc, s.key asc
+		 limit $3`, accountID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountAppSecret
+	for rows.Next() {
+		var r AccountAppSecret
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // CountAppSecrets is the quota helper. Used by apid's PUT handler to
 // enforce Limits.SecretCountMax BEFORE UpsertAppSecret so a quota-exceeded
 // request never overwrites an existing (app_id, key) row.
@@ -4849,6 +5590,80 @@ func (s *PgStore) CountAppSecrets(ctx context.Context, accountID, appID string) 
 	var n int
 	err := s.pool.QueryRow(ctx,
 		`select count(*) from app_secrets where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// --- app env vars (issue #395 / ADR-045) -------------------------------------
+//
+// Mirror of the sealed-secrets shape (lines 4608-4676) minus the
+// ciphertext column. Plaintext TEXT values; apid is the sole writer;
+// schedd reads via ListAppEnv at wake time and ships the rows on the
+// AppSpec wire.
+
+// UpsertAppEnv inserts or replaces the (app_id, key) env row. updated_at
+// is bumped on conflict so schedd's "freshest per app" staging path
+// observes a fresh mtime on every write — same posture as the secrets
+// table (rotation flows re-PUT without changing the value are still
+// treated as a write).
+func (s *PgStore) UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_envs (account_id, app_id, key, value)
+		 values ($1, $2, $3, $4)
+		 on conflict (app_id, key) do update
+		   set value = excluded.value,
+		       updated_at = now()`,
+		accountID, appID, key, value)
+	return err
+}
+
+// DeleteAppEnv removes the (app_id, key) row scoped to accountID.
+// Returns ErrNotFound when no row matches — handler renders 400
+// CodeEnvVarNotFound.
+func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from app_envs where account_id = $1 and app_id = $2 and key = $3`,
+		accountID, appID, key)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListAppEnv returns every (key, value) row on the app, scoped to
+// accountID. Order: by key ASC for deterministic staging (mirrors
+// ListAppSecrets). Returns nil slice when the app has no env rows.
+func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, key, value, created_at, updated_at
+		 from app_envs
+		 where account_id = $1 and app_id = $2
+		 order by key asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppEnv
+	for rows.Next() {
+		var e AppEnv
+		if err := rows.Scan(&e.AccountID, &e.AppID, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CountAppEnv is the quota helper used by apid's PUT handler to enforce
+// Limits.EnvVarsMax BEFORE UpsertAppEnv. Mirrors CountAppSecrets.
+func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_envs where account_id = $1 and app_id = $2`,
 		accountID, appID).Scan(&n)
 	return n, err
 }
@@ -5667,6 +6482,10 @@ func (s *PgStore) DeleteAccount(ctx context.Context, id string) error {
 		{"api_keys", `delete from api_keys where account_id = $1`},
 		{"idempotency_keys", `delete from idempotency_keys where account_id = $1`},
 		{"usage_minutes", `delete from usage_minutes where account_id = $1`},
+		// app_envs: matches app_secrets posture above — env rows hold
+		// account_id directly, so the FK + GDPR cascade handles them.
+		// Plaintext text values are erased with the account.
+		{"app_envs", `delete from app_envs where account_id = $1`},
 		// `events` is included (per spec §17 G6 right-to-erasure):
 		// audit rows whose subject or payload references the account
 		// must not outlive the customer's data. The data->>'account_id'

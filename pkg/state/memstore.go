@@ -102,6 +102,24 @@ type MemStore struct {
 	buildProvenance map[string]BuildProvenance
 	domains         map[string]CustomDomain
 	crons           map[string]Cron
+	// alertRules mirrors alert_rules for handler tests. Keyed by
+	// ruleID. AlertDelivery rows are kept separately so the
+	// delivery list query can walk just the matching subset on
+	// every tick. MemStore holds the same UNIQUE(account_id, name)
+	// invariant the Postgres index enforces — CreateAlertRule
+	// rejects a duplicate before insert. AlertDeliveryRows are
+	// keyed by idempotency_key (the UNIQUE column); ClaimAlertFire
+	// translates a "win" into an INSERT-after-claim so two parallel
+	// claims inside the same bucket produce exactly one delivery
+	// row (mirrors the UNIQUE-index floor in Postgres).
+	alertRules      map[string]AlertRule
+	alertDeliveries map[string]AlertDelivery
+	// alertClaimKeys tracks the (ruleID, idempotency_key) → claimTime
+	// pair so MemStore mirrors the Postgres UNIQUE(idempotency_key)
+	// + last_fired_at dedupe behaviour. Two claims with the SAME
+	// idempotency key — even at a strictly later at — lose the
+	// second attempt; a fresh key with a later bucket time wins.
+	alertClaimKeys map[string]time.Time
 	// invocations is the Move 1 event-shaped queue (async_invoke,
 	// queue, delayed_task, cron). MemStore mirrors PgStore's `select
 	// ... for update skip locked` semantics by serialising every access
@@ -210,6 +228,9 @@ type MemStore struct {
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
+	// envs is the plaintext app_envs mirror (issue #395 / ADR-045).
+	// Same composite-key shape as secrets; same ownership semantics.
+	envs map[envKey]AppEnv
 	// computeNodes mirrors the compute_nodes table; keyed by id (issue
 	// #97 / ADR-025 axis 3). The synthetic 'default-local' row is
 	// seeded by NewMemStore so tests don't have to call
@@ -229,6 +250,13 @@ type MemStore struct {
 // MemStore uses the same composite-key shape so tests don't drift from
 // production behavior.
 type secretKey struct {
+	AppID string
+	Key   string
+}
+
+// envKey mirrors the app_envs PRIMARY KEY (app_id, key). Mirrors
+// secretKey by intent — same ownership shape, different value type.
+type envKey struct {
 	AppID string
 	Key   string
 }
@@ -282,6 +310,9 @@ func NewMemStore() *MemStore {
 		buildProvenance:  map[string]BuildProvenance{},
 		domains:          map[string]CustomDomain{},
 		crons:            map[string]Cron{},
+		alertRules:       map[string]AlertRule{},
+		alertDeliveries:  map[string]AlertDelivery{},
+		alertClaimKeys:   map[string]time.Time{},
 		invocations:      map[string]Invocation{},
 		instances:        map[string]Instance{},
 		loginTokens:      map[string]LoginToken{},
@@ -336,6 +367,7 @@ func NewMemStore() *MemStore {
 		// keeps the MemStore parity tests in lockstep.
 		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
 		secrets:              map[secretKey]AppSecret{},
+		envs:                 map[envKey]AppEnv{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -2736,6 +2768,46 @@ func (m *MemStore) ListInstancesForAccount(_ context.Context, accountID string) 
 	return out, nil
 }
 
+// ListInstancesForAccountPaged is the cursor-paginated mirror of
+// PgStore.ListInstancesForAccountPaged (issue #393). Mirrors the
+// SQL semantics: cursor is instance.id, sort is started_at DESC then
+// id DESC, limit is server-side clamped to 1..100.
+func (m *MemStore) ListInstancesForAccountPaged(_ context.Context, accountID string, limit int, before string) ([]Instance, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owned := make(map[string]struct{}, len(m.apps))
+	for _, a := range m.apps {
+		if a.AccountID == accountID {
+			owned[a.ID] = struct{}{}
+		}
+	}
+	var out []Instance
+	for _, ins := range m.instances {
+		if _, ok := owned[ins.AppID]; !ok {
+			continue
+		}
+		if before != "" && ins.ID >= before {
+			// Mirror the SQL: `id < $before` — strictly less than, so
+			// the cursor itself is excluded from the next page.
+			continue
+		}
+		out = append(out, ins)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.Equal(out[j].StartedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // ListLatestInstancePerApp returns the most-recently-started instance
 // for each app owned by the account (PR #48 follow-up). Used by the
 // dashboard cold-wake badge so one query replaces N per-app
@@ -4716,6 +4788,62 @@ func (m *MemStore) ListAppSecrets(_ context.Context, accountID, appID string) ([
 	return out, nil
 }
 
+// ListAppSecretsForAccount is the account-scoped mirror of
+// ListAppSecrets (issue #393). The cursor is the (app_slug, key)
+// pair — encoded as "<slug>|<key>" by the handler. Order is
+// (app_slug ASC, key ASC) to match the SQL ORDER BY. Slugs are
+// charset-validated upstream so the "|" separator is unambiguous.
+func (m *MemStore) ListAppSecretsForAccount(_ context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slugOf := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		slugOf[a.ID] = a.Slug
+	}
+	var beforeSlug, beforeKey string
+	if before != "" {
+		parts := strings.SplitN(before, "|", 2)
+		beforeSlug, beforeKey = parts[0], parts[1]
+	}
+	var out []AccountAppSecret
+	for _, s := range m.secrets {
+		if s.AccountID != accountID {
+			continue
+		}
+		slug, ok := slugOf[s.AppID]
+		if !ok {
+			continue
+		}
+		if before != "" {
+			if slug < beforeSlug || (slug == beforeSlug && s.Key <= beforeKey) {
+				continue
+			}
+		}
+		out = append(out, AccountAppSecret{
+			AccountID:  s.AccountID,
+			AppID:      s.AppID,
+			AppSlug:    slug,
+			Key:        s.Key,
+			Ciphertext: s.Ciphertext,
+			CreatedAt:  s.CreatedAt,
+			UpdatedAt:  s.UpdatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AppSlug != out[j].AppSlug {
+			return out[i].AppSlug < out[j].AppSlug
+		}
+		return out[i].Key < out[j].Key
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // CountAppSecrets is the quota helper. Mirrors PgStore.CountAppSecrets.
 func (m *MemStore) CountAppSecrets(_ context.Context, accountID, appID string) (int, error) {
 	m.mu.Lock()
@@ -4723,6 +4851,78 @@ func (m *MemStore) CountAppSecrets(_ context.Context, accountID, appID string) (
 	n := 0
 	for _, s := range m.secrets {
 		if s.AppID == appID && s.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// --- app env vars (issue #395 / ADR-045) -------------------------------------
+//
+// Mirror of the customer-secrets surface (lines 4479-4544) minus the
+// ciphertext column. Plaintext values live only in this map; never
+// logged by MemStore.
+
+// UpsertAppEnv inserts or replaces the (account_id, app_id, key) row.
+// updated_at is bumped on every call so schedd's wake staging observes
+// a fresh mtime on every write.
+func (m *MemStore) UpsertAppEnv(_ context.Context, accountID, appID, key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Key: key}
+	existing, ok := m.envs[k]
+	now := time.Now()
+	if !ok {
+		m.envs[k] = AppEnv{AccountID: accountID, AppID: appID, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}
+	if existing.AccountID != accountID {
+		return ErrNotFound
+	}
+	existing.Value = value
+	existing.UpdatedAt = now
+	m.envs[k] = existing
+	return nil
+}
+
+// DeleteAppEnv removes the (account_id, app_id, key) row. Returns
+// ErrNotFound when no row matches — same semantics as PgStore so the
+// handler renders 400 CodeEnvVarNotFound.
+func (m *MemStore) DeleteAppEnv(_ context.Context, accountID, appID, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Key: key}
+	row, ok := m.envs[k]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.envs, k)
+	return nil
+}
+
+// ListAppEnv returns every env row on the app, scoped to accountID.
+// Order: by key ASC (matches PgStore ORDER BY).
+func (m *MemStore) ListAppEnv(_ context.Context, accountID, appID string) ([]AppEnv, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppEnv
+	for _, e := range m.envs {
+		if e.AppID != appID || e.AccountID != accountID {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// CountAppEnv is the quota helper. Mirrors PgStore.CountAppEnv.
+func (m *MemStore) CountAppEnv(_ context.Context, accountID, appID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, e := range m.envs {
+		if e.AppID == appID && e.AccountID == accountID {
 			n++
 		}
 	}
@@ -4764,6 +4964,11 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for k := range m.secrets {
 		if m.secrets[k].AccountID == id {
 			delete(m.secrets, k)
+		}
+	}
+	for k := range m.envs {
+		if m.envs[k].AccountID == id {
+			delete(m.envs, k)
 		}
 	}
 	for domain, d := range m.domains {
@@ -4908,6 +5113,350 @@ func (m *MemStore) ListCronsForAccount(_ context.Context, accountID string) ([]C
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// --- alert rules (issue #396, ADR-045) --------------------------------------
+//
+// MemStore mirrors the Postgres shape. The ClaimAlertFire semantics
+// ride a single timestamp per rule (last_fired_at) so two ticks in
+// the same bucket cannot both produce a delivery. UNIQUE(account_id,
+// name) and the idempotency_key UNIQUE are enforced in Go because
+// there are no SQL indexes backing them in the in-memory mirror.
+
+// CreateAlertRule rejects on duplicate (account_id, name) before
+// insert — same invariant the Postgres unique index holds. The
+// returned row carries the DB-assigned id and created_at via the
+// same field values the PgStore does (default gen_random_uuid +
+// default now() are faked by MemStore with newID/time.Now).
+func (m *MemStore) CreateAlertRule(_ context.Context, in AlertRule) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.alertRules {
+		if existing.AccountID == in.AccountID && existing.Name == in.Name {
+			return AlertRule{}, ErrConflict
+		}
+	}
+	if in.State == "" {
+		in.State = AlertStateOk
+	}
+	if in.ID == "" {
+		in.ID = newID()
+	}
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = time.Now()
+	}
+	in.UpdatedAt = in.CreatedAt
+	m.alertRules[in.ID] = in
+	return in, nil
+}
+
+// CreateAlertRuleIfUnderQuota enforces the per-app + per-account caps
+// with the same TOCTOU-defence shape as CreateCronIfUnderQuota:
+// MemStore is single-process so a single critical section (m.mu)
+// gates the count + insert. Account-wide rules (AppID == "") skip
+// the per-app branch but still hit the per-account branch.
+func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, limits api.Limits) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.alertRules {
+		if existing.AccountID == in.AccountID && existing.Name == in.Name {
+			return AlertRule{}, ErrConflict
+		}
+	}
+
+	if in.AppID != "" {
+		app, ok := m.apps[in.AppID]
+		if !ok || app.Status == "deleted" {
+			return AlertRule{}, ErrNotFound
+		}
+		// Per-app count: count every rule that pins this app,
+		// regardless of account (a rule pinning an app belongs to
+		// one account by definition; this loop is a fast double-
+		// check).
+		appCount := 0
+		for _, r := range m.alertRules {
+			if r.AppID == in.AppID {
+				appCount++
+			}
+		}
+		if appCount >= limits.AlertRuleLimitPerApp {
+			return AlertRule{}, &AlertRuleQuotaError{
+				Scope:    AlertRuleQuotaScopeApp,
+				Limit:    limits.AlertRuleLimitPerApp,
+				Observed: appCount,
+			}
+		}
+	}
+
+	// Per-account count excludes rules whose pinned app is soft-
+	// deleted (matches the PgStore's EXISTS predicate).
+	accountCount := 0
+	for _, r := range m.alertRules {
+		if r.AccountID != in.AccountID {
+			continue
+		}
+		if r.AppID != "" {
+			app, ok := m.apps[r.AppID]
+			if !ok || app.Status == "deleted" {
+				continue
+			}
+		}
+		accountCount++
+	}
+	if accountCount >= limits.AlertRuleLimitPerAccount {
+		return AlertRule{}, &AlertRuleQuotaError{
+			Scope:    AlertRuleQuotaScopeAccount,
+			Limit:    limits.AlertRuleLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	if in.ID == "" {
+		in.ID = newID()
+	}
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = time.Now()
+	}
+	if in.State == "" {
+		in.State = AlertStateOk
+	}
+	in.UpdatedAt = in.CreatedAt
+	m.alertRules[in.ID] = in
+	return in, nil
+}
+
+func (m *MemStore) AlertRuleByID(_ context.Context, id string) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.alertRules[id]
+	if !ok {
+		return AlertRule{}, ErrNotFound
+	}
+	return r, nil
+}
+
+// UpdateAlertRule mirrors the PgStore's nil-skip semantics. The
+// MemStore holds a deep-copy of the row so the caller's mutation
+// after return doesn't bleed into the next read.
+func (m *MemStore) UpdateAlertRule(_ context.Context, id string, p UpdateAlertRuleParams) (AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.alertRules[id]
+	if !ok {
+		return AlertRule{}, ErrNotFound
+	}
+	if p.Name != nil {
+		r.Name = *p.Name
+	}
+	if p.Enabled != nil {
+		r.Enabled = *p.Enabled
+	}
+	if p.Metric != nil {
+		r.Metric = *p.Metric
+	}
+	if p.Comparison != nil {
+		r.Comparison = *p.Comparison
+	}
+	if p.Threshold != nil {
+		r.Threshold = *p.Threshold
+	}
+	if p.WindowSpec != nil {
+		r.WindowSpec = *p.WindowSpec
+	}
+	if p.WebhookURL != nil {
+		r.WebhookURL = *p.WebhookURL
+	}
+	if p.WebhookSecretSealed != nil {
+		// copy on store so the caller's slice can't mutate the
+		// sealed bytes through aliasing.
+		cp := make([]byte, len(*p.WebhookSecretSealed))
+		copy(cp, *p.WebhookSecretSealed)
+		r.WebhookSecretSealed = cp
+	}
+	if p.CooldownMinutes != nil {
+		r.CooldownMinutes = *p.CooldownMinutes
+	}
+	r.UpdatedAt = time.Now()
+	m.alertRules[id] = r
+	return r, nil
+}
+
+func (m *MemStore) DeleteAlertRule(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.alertRules[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.alertRules, id)
+	return nil
+}
+
+func (m *MemStore) ListAlertRulesForAccount(_ context.Context, accountID string) ([]AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AlertRule
+	for _, r := range m.alertRules {
+		if r.AccountID == accountID {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemStore) ListEnabledAlertRules(_ context.Context) ([]AlertRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AlertRule
+	for _, r := range m.alertRules {
+		if r.Enabled {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
+	return out, nil
+}
+
+// ClaimAlertFire mirrors the Postgres CTE shape: a duplicate
+// idempotency_key always loses regardless of `at` ordering, and a
+// fresh key whose at advances past the rule's last_fired_at wins.
+// Two-state lookup keyed by the same (ruleID, idempotency_key) tuple
+// MemStore keeps in alertClaimKeys so a duplicate in the same bucket
+// can't slip through.
+func (m *MemStore) ClaimAlertFire(_ context.Context, ruleID, idempotencyKey string, at time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.alertRules[ruleID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	cacheKey := ruleID + "\x00" + idempotencyKey
+	if _, dup := m.alertClaimKeys[cacheKey]; dup {
+		return false, nil
+	}
+	if r.LastFiredAt.IsZero() || r.LastFiredAt.Before(at) {
+		r.LastFiredAt = at.UTC()
+		m.alertRules[ruleID] = r
+		m.alertClaimKeys[cacheKey] = at.UTC()
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *MemStore) SetAlertRuleState(_ context.Context, ruleID string, to AlertState, at time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.alertRules[ruleID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if r.State == to {
+		return false, nil
+	}
+	r.State = to
+	r.UpdatedAt = at.UTC()
+	m.alertRules[ruleID] = r
+	return true, nil
+}
+
+func (m *MemStore) SetAlertRuleLastEvaluated(_ context.Context, ruleID string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.alertRules[ruleID]
+	if !ok {
+		return ErrNotFound
+	}
+	r.LastEvaluatedAt = at.UTC()
+	m.alertRules[ruleID] = r
+	return nil
+}
+
+func (m *MemStore) RecordAlertDelivery(_ context.Context, in AlertDelivery) (AlertDelivery, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Mirror the UNIQUE(idempotency_key) constraint in Postgres.
+	if _, dup := m.alertDeliveries[in.IdempotencyKey]; dup {
+		return AlertDelivery{}, ErrConflict
+	}
+	if in.ID == "" {
+		in.ID = newID()
+	}
+	if in.FiredAt.IsZero() {
+		in.FiredAt = time.Now()
+	}
+	if in.Status == "" {
+		in.Status = AlertDeliveryPending
+	}
+	m.alertDeliveries[in.IdempotencyKey] = in
+	return in, nil
+}
+
+func (m *MemStore) UpdateAlertDeliveryStatus(_ context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, d := range m.alertDeliveries {
+		if d.ID != id {
+			continue
+		}
+		d.Status = status
+		d.AttemptCount = attempt
+		d.LastStatusCode = statusCode
+		d.LastError = lastErr
+		if deliveredAt != nil {
+			d.DeliveredAt = deliveredAt.UTC()
+		}
+		m.alertDeliveries[k] = d
+		return nil
+	}
+	return ErrNotFound
+}
+
+func (m *MemStore) ListAlertDeliveriesForRule(_ context.Context, ruleID string, limit int) ([]AlertDelivery, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	var out []AlertDelivery
+	for _, d := range m.alertDeliveries {
+		if d.RuleID == ruleID {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FiredAt.After(out[j].FiredAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// CountFailedInvocationsSince walks the in-memory invocations map.
+// Mirrors the time-window predicate in PgStore — created_at is the
+// grain (terminal rows have a created_at that anchors when they
+// entered the queue).
+func (m *MemStore) CountFailedInvocationsSince(_ context.Context, accountID, appID string, source InvocationSource, since time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, inv := range m.invocations {
+		if inv.AccountID != accountID {
+			continue
+		}
+		if inv.State != InvocationFailed {
+			continue
+		}
+		if inv.CreatedAt.Before(since) {
+			continue
+		}
+		if appID != "" && inv.AppID != appID {
+			continue
+		}
+		if source != "" && inv.Source != source {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // UsageByAccount returns the per-month roll-up. Mirrors the PgStore

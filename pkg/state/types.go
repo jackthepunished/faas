@@ -2,6 +2,8 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/netip"
 	"time"
 
@@ -413,6 +415,206 @@ type Cron struct {
 	CreatedAt   time.Time
 	LastFiredAt time.Time // zero until first fire; updated by MarkCronFired
 }
+
+// AlertMetric is a closed vocabulary for the metric side of an AlertRule
+// condition (issue #396, ADR-045). Names mirror the AppMetricsResponse
+// payload verbatim so the evaluator and the customer-facing metrics
+// endpoint cannot drift. failed_invocations is the only non-Prometheus
+// metric; its source dimension comes through AlertRule.FailureSource.
+type AlertMetric string
+
+const (
+	AlertMetricErrorRate    AlertMetric = "error_rate_pct"
+	AlertMetricLatencyP50   AlertMetric = "latency_p50_ms"
+	AlertMetricLatencyP95   AlertMetric = "latency_p95_ms"
+	AlertMetricLatencyP99   AlertMetric = "latency_p99_ms"
+	AlertMetricColdStartPct AlertMetric = "cold_start_pct"
+	AlertMetricRequestCount AlertMetric = "request_count"
+	AlertMetricFailedInvocs AlertMetric = "failed_invocations"
+)
+
+// AlertComparison is the textual form of the comparison operator stored
+// on alert_rules. Symbolic operators (`>`, `>=`) force escaping in JSON
+// and the OpenAPI schema; the textual enum is the floor a typo cannot
+// cross. The CHECK constraint on alert_rules mirrors this set.
+type AlertComparison string
+
+const (
+	AlertGt  AlertComparison = "gt"
+	AlertGte AlertComparison = "gte"
+	AlertLt  AlertComparison = "lt"
+	AlertLte AlertComparison = "lte"
+)
+
+// AlertWindowSpec is the closed window vocabulary; sharing it with the
+// metrics endpoint (migrations/00023_metrics_range_vocabulary.sql)
+// means the evaluator can never ask Prometheus for data outside
+// prom_retention_days:15.
+type AlertWindowSpec string
+
+const (
+	AlertWindow5m  AlertWindowSpec = "5m"
+	AlertWindow15m AlertWindowSpec = "15m"
+	AlertWindow1h  AlertWindowSpec = "1h"
+	AlertWindow6h  AlertWindowSpec = "6h"
+	AlertWindow24h AlertWindowSpec = "24h"
+	AlertWindow7d  AlertWindowSpec = "7d"
+	AlertWindow15d AlertWindowSpec = "15d"
+)
+
+// AlertFailureSource is the dimension selector for the failed_invocations
+// metric. Values mirror the existing InvocationSource enum with the
+// addition of "any" so a rule can collapse across sources. The CHECK
+// constraint on alert_rules rejects any value outside this set.
+type AlertFailureSource string
+
+const (
+	AlertFailureAny         AlertFailureSource = "any"
+	AlertFailureCron        AlertFailureSource = "cron"
+	AlertFailureQueue       AlertFailureSource = "queue"
+	AlertFailureDelayedTask AlertFailureSource = "delayed_task"
+	AlertFailureAsyncInvoke AlertFailureSource = "async_invoke"
+)
+
+// AlertState is the cool-down state machine (issue #396 criterion 4).
+// ok   — no current breach; a fresh evaluate can transition to firing.
+// firing — the rule is mid-cooldown. The ClaimAlertFire store method
+//
+//	refuses to enqueue a second delivery until the rule returns
+//	to 'ok' AND the cool-down bucket has elapsed.
+type AlertState string
+
+const (
+	AlertStateOk     AlertState = "ok"
+	AlertStateFiring AlertState = "firing"
+)
+
+// AlertDeliveryStatus is the terminal state of one alert_deliveries row.
+// The dispatcher (issue #396 PR 2 + PR 4) walks the retry ladder; a
+// delivery lands in 'delivered' on a 2xx, 'failed' on a terminal 4xx
+// or after the retry exhaustion.
+type AlertDeliveryStatus string
+
+const (
+	AlertDeliveryPending   AlertDeliveryStatus = "pending"
+	AlertDeliveryDelivered AlertDeliveryStatus = "delivered"
+	AlertDeliveryFailed    AlertDeliveryStatus = "failed"
+)
+
+// UpdateAlertRuleParams carries the optional fields of UpdateAlertRule.
+// All fields are pointers; nil means "don't touch". Enabled and
+// Threshold intentionally use their own types (bool / float64) since
+// the caller must distinguish "leave alone" from "set to false / 0".
+// The pointer-to-pointer pattern keeps the Store API narrow without
+// falling back on sentinel values.
+//
+// FailureSource is intentionally absent: the column is derived from
+// `metric` via the alert_rules_failure_source_xor_chk constraint, so
+// rotating one half in isolation is rejected by the DB. PR 3's
+// handler must rotate Metric + FailureSource together by issuing a
+// fresh CreateAlertRule if the metric family actually changes, or by
+// an explicit dedicated wrapper. Today's UpdateAlertRule will silently
+// ignore a FailureSource change, which is a footgun — the field
+// exists nowhere on this struct on purpose.
+type UpdateAlertRuleParams struct {
+	Name                *string
+	Enabled             *bool
+	Metric              *AlertMetric
+	Comparison          *AlertComparison
+	Threshold           *float64
+	WindowSpec          *AlertWindowSpec
+	WebhookURL          *string
+	WebhookSecretSealed *[]byte // nil = don't reseal; non-nil replaces
+	CooldownMinutes     *int
+}
+
+// AlertRule is one customer-configurable rule (issue #396, ADR-045).
+// Account-scoped on the FK root; AppID is empty (zero string) for an
+// account-wide rule, set otherwise. The webhook secret is at-rest
+// sealed (webhookSecretSealed, age/X25519 via pkg/secretbox) and is
+// never surfaced on a read — the apid response carries a masked
+// constant.
+type AlertRule struct {
+	ID                  string
+	AccountID           string
+	AppID               string // empty = account-wide
+	Name                string
+	Enabled             bool
+	Metric              AlertMetric
+	Comparison          AlertComparison
+	Threshold           float64
+	WindowSpec          AlertWindowSpec
+	FailureSource       AlertFailureSource // empty unless Metric == failed_invocations
+	WebhookURL          string
+	WebhookSecretSealed []byte // age/X25519 ciphertext; never logged
+	CooldownMinutes     int
+	State               AlertState
+	LastFiredAt         time.Time // zero until first fire
+	LastEvaluatedAt     time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// AlertDelivery is one delivery attempt record. IdempotencyKey is
+// '<ruleID>:<cooldown_bucket>' and is UNIQUE in Postgres — this is the
+// dispatcher dedupe primitive (issue #396 criterion 4).
+type AlertDelivery struct {
+	ID             string
+	RuleID         string
+	AccountID      string
+	AppID          string // empty when the rule was account-wide
+	IdempotencyKey string
+	Payload        json.RawMessage
+	Status         AlertDeliveryStatus
+	AttemptCount   int
+	LastStatusCode int    // 0 when the attempt never reached the wire
+	LastError      string // empty when no error
+	ObservedValue  float64
+	FiredAt        time.Time
+	DeliveredAt    time.Time // zero until status=delivered
+}
+
+// AlertDeliveryRow embeds AlertDelivery with a pinned list return —
+// used by ListAlertDeliveriesForRule (the dashboard's recent-deliveries
+// pane). Kept distinct from AlertDelivery so the Store interface can
+// return one or the other without a sentinel split.
+type AlertDeliveryRow = AlertDelivery
+
+// AlertRuleQuotaError is returned by CreateAlertRuleIfUnderQuota when
+// either cap (per-app or per-account) is reached. Mirrors the cron
+// shape (CronQuotaError at store.go:52): distinguishes the two scopes
+// so the handler can render different copy ("delete from this app" vs
+// "delete from any app on your account").
+type AlertRuleQuotaError struct {
+	Scope    AlertRuleQuotaScope
+	Limit    int
+	Observed int
+}
+
+// AlertRuleQuotaScope names the cap that CreateAlertRuleIfUnderQuota
+// tripped on. A rule with app_id NULL counts toward the per-account
+// cap but not the per-app cap.
+type AlertRuleQuotaScope string
+
+const (
+	AlertRuleQuotaScopeApp     AlertRuleQuotaScope = "app"
+	AlertRuleQuotaScopeAccount AlertRuleQuotaScope = "account"
+)
+
+func (e *AlertRuleQuotaError) Error() string {
+	return fmt.Sprintf("state: alert rule quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is allows errors.Is(err, ErrAlertRuleQuotaExceeded) to match any
+// *AlertRuleQuotaError. Mirrors CronQuotaError's Is() contract.
+func (e *AlertRuleQuotaError) Is(target error) bool {
+	return target == ErrAlertRuleQuotaExceeded
+}
+
+// ErrAlertRuleQuotaExceeded is the sentinel callers compare against
+// via errors.Is. Distinct from ErrCronQuotaExceeded so a handler
+// that distinguishes the two by errors.Is gets a clean match.
+var ErrAlertRuleQuotaExceeded = errors.New("state: alert rule quota exceeded")
 
 // InvocationSource tags the API surface that originated a row on the
 // invocations table (Move 1 — async_invoke / queue / delayed_task / cron).
@@ -935,4 +1137,42 @@ type AppSecret struct {
 	Ciphertext []byte
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+// AccountAppSecret is the per-row shape returned by
+// ListAppSecretsForAccount (issue #393). Distinct from AppSecret
+// because the account-scoped variant needs the app_slug (the per-app
+// variant doesn't expose it — the URL slug is the path parameter, so
+// the row doesn't need to carry it).
+//
+// Ciphertext is the same age-sealed Envelope that AppSecret carries;
+// the handler emits it base64-encoded on the wire (paginated walk
+// orders by (app_slug ASC, key ASC), so the cursor is the pair).
+type AccountAppSecret struct {
+	AccountID  string
+	AppID      string
+	AppSlug    string
+	Key        string
+	Ciphertext []byte
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// AppEnv is one row of customer runtime env vars (issue #395 / ADR-045).
+// apid is the only writer. Value is plaintext TEXT (NOT sealed): env vars
+// are explicitly non-credential config, and putting non-sensitive config
+// behind the age seal would (a) double-count against SecretCountMax for no
+// reason and (b) blur the secret.set audit trail. Anything sensitive
+// belongs in app_secrets, not here — endpoints cross-reference the
+// distinct audit kinds env.set vs secret.set.
+//
+// AccountID is the row's owning account. Both PgStore and MemStore filter
+// on (AccountID, AppID, Key) so cross-account access returns ErrNotFound.
+type AppEnv struct {
+	AccountID string
+	AppID     string
+	Key       string
+	Value     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

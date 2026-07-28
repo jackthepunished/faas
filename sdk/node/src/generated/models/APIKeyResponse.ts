@@ -15,7 +15,7 @@ export type APIKeyResponse = {
   /**
    * Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access scope; apps:read covers GETs across the apps/deployments/audit/secrets-list surface; deploy:write covers POST/PUT/PATCH/DELETE on apps+queues; secrets:write covers PUT/DELETE on /apps/{slug}/secrets/{key}; usage:read covers GET /v1/usage*.
    */
-  scopes: Array<'admin' | 'deploy:write' | 'secrets:read' | 'secrets:write' | 'usage:read' | 'apps:read'>;
+  scopes: Array<'admin' | 'deploy:write' | 'secrets:read' | 'secrets:write' | 'usage:read' | 'apps:read' | 'env:read' | 'env:write'>;
   last_used_at?: string | null;
   created_at: string;
   /**

@@ -201,6 +201,13 @@ type VMInstanceStat struct {
 // intent, schedd reads to drive wakes). Empty slice = no secrets file
 // written; vmmd treats nil and empty as equivalent.
 //
+// APIEnv (issue #395 / ADR-045) carries the per-key plaintext rows from
+// `app_envs`. Distinct from SealedEnv because the values are not sealed
+// (env vars are non-sensitive runtime config by contract). Empty slice =
+// no env.json file written; vmmd treats nil and empty as equivalent.
+// Precedence at the guest layer is "secrets > api_env > manifest_env >
+// os.environ".
+//
 // EgressAllowlist (ADR-031) carries the per-app outbound IP allowlist —
 // CIDR strings (e.g. "1.2.3.0/24"), parsed upstream by apid on PUT/PATCH
 // and re-validated by the apps.egress_allowlist cidr[] CHECK (v4-only).
@@ -213,7 +220,8 @@ type AppSpec struct {
 	MemSizeMiB      int32  // plan RAM; the slice fences at +8 MiB (pkg/api/limits.go)
 	EgressMbit      int32  // per-plan tc cap (pkg/api/limits.EgressMbit); 0 = no cap
 	SealedEnv       []fcvm.SealedEnvEntry
-	EgressAllowlist []string // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
+	APIEnv          []fcvm.APIEnvEntry // issue #395 / ADR-045: plaintext per-app env
+	EgressAllowlist []string           // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
 }
 
 // SnapshotRef points at the snapshot to restore from and the Firecracker
@@ -548,6 +556,14 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 			Ciphertext: e.Ciphertext,
 		})
 	}
+	// Issue #395 / ADR-045: plaintext api_env mirror.
+	apiEnv := make([]*vmmdpb.APIEnvEntry, 0, len(a.APIEnv))
+	for _, e := range a.APIEnv {
+		apiEnv = append(apiEnv, &vmmdpb.APIEnvEntry{
+			Key:   e.Key,
+			Value: e.Value,
+		})
+	}
 	return &vmmdpb.AppSpec{
 		BaseKey:         a.BaseKey,
 		LayerKey:        a.LayerKey,
@@ -555,6 +571,7 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 		MemSizeMib:      a.MemSizeMiB,
 		EgressMbit:      a.EgressMbit,
 		SealedEnv:       sealed,
+		ApiEnv:          apiEnv,
 		EgressAllowlist: a.EgressAllowlist,
 	}
 }

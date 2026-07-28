@@ -184,6 +184,15 @@ var methodRouteMap = map[string]string{
 	// (GetApp, ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
 
+	// Issue #393 — account-scoped list endpoints. Distinct from the
+	// per-app counterparts (ListInstances / ListSecrets / GetAppMetrics)
+	// which take a slug; the aggregate route has no slug, so the SDK
+	// uses Get<Resource> to flag the account-scoped contract (one call
+	// replaces N per-app calls — see ADR-045).
+	"GET /v1/instances":    "GetInstances",
+	"GET /v1/secrets":      "GetSecrets",
+	"GET /v1/apps/metrics": "GetAppsMetrics",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action

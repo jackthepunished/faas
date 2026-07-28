@@ -12,14 +12,14 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- PR #401 (issue #394, queue introspection + dead_letter state)
--- originally had 00060_invocations_dead_letter.sql here. PRs #399
--- and #403 both claimed slot 60 in the same window — PR #399 with
--- a `_reserve_slot.sql` placeholder, PR #403 with a real schema.
--- To clear the cross-PR collision without consuming another real
--- slot, PR #401 renumbered its real schema to 62 and planted this
--- reservation at 60 (matching the existing carve-out shape) plus
--- a parallel reservation at 61 (also see 00061_reserve_slot.sql).
+-- Slot history (PR #401, issue #394): PR #401 originally had its real
+-- schema at 60 but PRs #399 and #403 both also claimed 60 in the same
+-- window — PR #399 with a `_reserve_slot.sql` placeholder, PR #403
+-- with a real schema. To clear the cross-PR collision without consuming
+-- another real slot, PR #401 renumbered its real schema to 62 then to
+-- 64 (PR #399 also claimed 62), with reservation placeholders at 60,
+-- 61, and 63 to keep the embedded set contiguous. The Up/Down bodies
+-- remain `select 1;` per the carve-out convention.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change. Future-proof against upstream

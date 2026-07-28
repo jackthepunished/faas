@@ -94,6 +94,34 @@ First successful keychain save one-shot-deletes the legacy
 plaintext file so customers do not keep a redundant copy on disk
 after upgrading.
 
+**Mutable per-app env vars (issue #395, ADR-045)** — three new
+plaintext routes mirror `/v1/apps/{slug}/secrets` minus the seal step:
+
+```
+GET    /v1/apps/{slug}/env
+PUT    /v1/apps/{slug}/env/{KEY}
+DELETE /v1/apps/{slug}/env/{KEY}
+```
+
+A new `app_envs` table (migration 00061) stores plaintext `value TEXT`
+under the same `^[A-Z][A-Z0-9_]*$` SQL CHECK that gates sealed
+secrets. Migration 00063 widens `api_keys_scopes_vocab_chk` to admit
+`env:read` / `env:write` (both ship in the same PR so the DB CHECK
+never rejects a freshly-minted API key during the rollout window).
+Per-plan quotas (`EnvVarsMax` 8/32/64/256 Free–Scale,
+`EnvValueMaxBytes` 4K/8K/16K/32K) live in `pkg/api/limits.go`
+alongside the secrets quota. Semantics: applies on next wake — no
+snapshot invalidation, no new vmmd RPC. The wake path stages
+`/etc/faas/env.json` next to the existing `/etc/faas/secrets.env`
+sibling, and `guest/init::BuildEnvWithSecrets` gains a fourth
+precedence layer with the order `OS environ < manifest env <
+api env < secrets` (pinned by
+`guest/init/app_test.go::TestBuildEnv_FourLayerPrecedence`). Audit
+kinds `env.set` / `env.deleted` are distinct from `secret.set` /
+`secret.deleted` so a sealed-secret audit row still means only
+"credential change". The console Env Vars page becomes writable in a
+separate `faas-frontend` PR — this PR ships the API surface only.
+
 ## M6 — builderd + real image pulls. ✅
 
 Build-in-microVM is wired through (`cmd/builderd`, `pkg/builderd`

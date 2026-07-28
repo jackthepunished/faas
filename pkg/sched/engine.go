@@ -514,6 +514,11 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
 		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
+		// sealed secrets surface but stores non-sensitive runtime
+		// config. Precedence at the guest layer is "secrets >
+		// api_env > manifest_env > os.environ".
+		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID),
 		// ADR-031: surface the per-app egress allowlist on the
 		// wake wire. vmmd translates the CIDRs into the per-netns
 		// forward chain. Empty slice = no allowlist rule (current
@@ -895,6 +900,11 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
 		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
+		// sealed secrets surface but stores non-sensitive runtime
+		// config. Precedence at the guest layer is "secrets >
+		// api_env > manifest_env > os.environ".
+		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID),
 		// ADR-031: see the Wake builder above. Prime is the
 		// deploy-pipeline first boot — same wire shape, same
 		// per-netns ruleset; a freshly-deployed app starts under
@@ -1259,6 +1269,33 @@ func (e *Engine) loadSealedEnv(ctx context.Context, accountID, appID string) []f
 	out := make([]fcvm.SealedEnvEntry, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
+	}
+	return out
+}
+
+// loadAPIEnv is the plaintext sibling of loadSealedEnv (issue #395 /
+// ADR-045). Reads the per-app app_envs rows and flattens them into
+// the fcvm shape Manager.Wake consumes. Same non-fatal read-failure
+// posture as loadSealedEnv — a transient PG hiccup drops the env
+// layer (the next wake retries) rather than failing the wake itself.
+// Plaintext by contract so there's nothing to leak; the worst case
+// is a missing env var, which customer support can spot from the
+// "API env X missing" log line.
+//
+// Carries AccountID explicitly so a cross-account (accountID, appID)
+// pair returns ErrNotFound (consistent with apid's 404 contract).
+func (e *Engine) loadAPIEnv(ctx context.Context, accountID, appID string) []fcvm.APIEnvEntry {
+	rows, err := e.store.ListAppEnv(ctx, accountID, appID)
+	if err != nil {
+		e.log.Warn("load api env", "app", appID, "err", err)
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]fcvm.APIEnvEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, fcvm.APIEnvEntry{Key: r.Key, Value: r.Value})
 	}
 	return out
 }

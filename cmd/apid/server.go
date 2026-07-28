@@ -566,6 +566,13 @@ func (s *server) handler() http.Handler {
 	// cross-account slug is a 404, not a 200 with another tenant's
 	// data.
 	mux.HandleFunc("GET /v1/apps/{slug}/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppMetrics)))
+	// Account-scoped metrics rollup (issue #393). One call replaces
+	// N per-app /v1/apps/{slug}/metrics calls. Same auth chain as
+	// the per-app endpoint (read-only, no MFA). Cross-account
+	// isolation is the SQL JOIN on apps.account_id = $1 in the
+	// pgstore helper — there's no (accountID, slug) pair to load
+	// because there's no slug path.
+	mux.HandleFunc("GET /v1/apps/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppsMetrics)))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
 
@@ -592,6 +599,13 @@ func (s *server) handler() http.Handler {
 
 	// Instances (read-only here; schedd is the writer).
 	mux.HandleFunc("GET /v1/apps/{slug}/instances", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInstances))))
+	// Account-scoped instances (issue #393). Cursor: ?before=
+	// (instances.id UUIDv7). Default limit 25, max 100 (strict 400
+	// on bad input via api.ParseLimit). Additive to the per-app
+	// endpoint — dashboards opt in. Per-account rate limit
+	// (ADR-040) fires at the gatewayd edge; this route charges 1
+	// token via authLimited just like every other /v1/* call.
+	mux.HandleFunc("GET /v1/instances", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInstancesForAccount))))
 	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamAppLogs))))
 
 	// Custom domains.
@@ -662,8 +676,25 @@ func (s *server) handler() http.Handler {
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.
 	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listSecrets))))
+	// Account-scoped sealed-secret list (issue #393). Each row
+	// carries the owning app's id and slug so the dashboard can
+	// render "foo-app / DATABASE_URL" without a parallel /v1/apps
+	// round-trip. Cursor: ?before= is the (app_slug, key) pair
+	// encoded as "<slug>|<key>" (the SQL splits it back via
+	// split_part). Plaintext NEVER appears in this handler's
+	// output (same invariant the per-app handler upholds).
+	mux.HandleFunc("GET /v1/secrets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listSecretsForAccount))))
 	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret))))
+
+	// Customer env vars (issue #395 / ADR-045). Plaintext VALUE flows
+	// through PUT over TLS; persisted as-is (no seal step) by
+	// handlers_env.go. env:write is NOT MFA-gated because env vars are
+	// explicitly non-sensitive runtime config — the secret surface is
+	// the credential store and stays MFA-locked.
+	mux.HandleFunc("GET /v1/apps/{slug}/env", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listEnv)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.setEnv)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.deleteEnv)))
 
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write

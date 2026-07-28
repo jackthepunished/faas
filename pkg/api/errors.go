@@ -246,6 +246,15 @@ const (
 	CodeSecretValueTooLarge = "secret_value_too_large"
 	CodeSecretNotFound      = "secret_not_found"
 
+	// Customer env vars (issue #395 / ADR-045). Distinct codes from
+	// CodeSecret* so the quota + audit shape is unambiguous to
+	// dashboards and SDK callers — a `plan_limit_env_vars` is a config
+	// quota, not a credential one.
+	CodePlanLimitEnvVars    = "plan_limit_env_vars"
+	CodeEnvVarInvalidKey    = "env_var_invalid_key"
+	CodeEnvVarValueTooLarge = "env_value_too_large"
+	CodeEnvVarNotFound      = "env_var_not_found"
+
 	// Plan-tier feature gates (M8 §6.5). Distinct from CodePlanLimit*
 	// because the failure mode is "your plan doesn't unlock this knob
 	// at all" rather than "you used more than the plan allows".
@@ -457,6 +466,15 @@ func StatusForCode(code string) int {
 	case CodeSecretInvalidKey, CodeSecretNotFound:
 		return http.StatusBadRequest
 	case CodeSecretValueTooLarge:
+		return http.StatusRequestEntityTooLarge
+	// Env vars (issue #395 / ADR-045): mirror the secrets status shape
+	// so SDK callers can reuse the same error-decoding pattern. Plan
+	// quota is 403, value size is 413, key regex + not-found are 400.
+	case CodePlanLimitEnvVars:
+		return http.StatusForbidden
+	case CodeEnvVarInvalidKey, CodeEnvVarNotFound:
+		return http.StatusBadRequest
+	case CodeEnvVarValueTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeAccountDeletionConfirm, CodeAccountDeletionPending, CodeAccountNotRestorable:
 		return http.StatusConflict
@@ -726,6 +744,54 @@ func ErrSecretNotFound(key string) *Problem {
 		"Secret not set",
 		fmt.Sprintf("no secret named %q on this app.", key)).
 		WithDocs("https://docs.DOMAIN/secrets")
+}
+
+// ErrPlanLimitEnvVars is returned when an env PUT would exceed the plan's
+// per-app env-var count (issue #395 / ADR-045). Observed is the post-write
+// count. The 403 mirrors ErrPlanLimitSecrets so the SDK's error decoder can
+// share the quota-reached branch.
+func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLimitEnvVars,
+		"Env var count limit reached",
+		fmt.Sprintf("%s plan allows %d env var(s) per app; you have %d.", l.Plan, l.EnvVarsMax, observed)).
+		WithLimit(int64(l.EnvVarsMax), int64(observed)).
+		WithDocs("https://docs.DOMAIN/env#limits")
+}
+
+// ErrEnvVarInvalidKey is returned when an env key fails the
+// ^[A-Z][A-Z0-9_]*$ pattern. Detail names the specific failure so the CLI
+// can render an actionable message. The regex intentionally reuses the
+// SecretKeyPattern constant because POSIX env-var naming and the secrets
+// naming surface share the same ASCII identifier grammar — keeping one
+// pattern avoids the drift where two regexes diverge over time.
+func ErrEnvVarInvalidKey(detail string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeEnvVarInvalidKey,
+		"Invalid env var key",
+		fmt.Sprintf("env var keys must match %s; %s", SecretKeyPattern, detail)).
+		WithDocs("https://docs.DOMAIN/env#keys")
+}
+
+// ErrEnvVarValueTooLarge is returned when a PUT value exceeds
+// Limits.EnvValueMaxBytes. The byte length is checked against the request
+// body BEFORE the row hits PG so the cap is enforced on the wire (no
+// over-quota value ever lands in app_envs).
+func ErrEnvVarValueTooLarge(l Limits, observedBytes int) *Problem {
+	return NewProblem(http.StatusRequestEntityTooLarge, CodeEnvVarValueTooLarge,
+		"Env var value too large",
+		fmt.Sprintf("%s plan caps env values at %d bytes; got %d.", l.Plan, l.EnvValueMaxBytes, observedBytes)).
+		WithLimit(int64(l.EnvValueMaxBytes), int64(observedBytes)).
+		WithDocs("https://docs.DOMAIN/env#limits")
+}
+
+// ErrEnvVarNotFound is returned by DELETE /v1/apps/{slug}/env/{key} when
+// the key isn't set on the app. Distinct from CodeNotFound for the same
+// reason as ErrSecretNotFound: the URL shape makes the resource the env
+// var, not the app.
+func ErrEnvVarNotFound(key string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeEnvVarNotFound,
+		"Env var not set",
+		fmt.Sprintf("no env var named %q on this app.", key)).
+		WithDocs("https://docs.DOMAIN/env")
 }
 
 // ErrPlanMinInstancesNotAllowed is returned when a Free or Hobby account

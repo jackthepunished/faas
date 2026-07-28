@@ -109,7 +109,7 @@ func isValidMetricsRange(rng string) bool {
 func (s *server) fetchAppMetrics(ctx context.Context, appID, rng string) (api.AppMetricsResponse, string) {
 	resp := api.AppMetricsResponse{}
 	if s.promqlClient == nil {
-		return resp, "degraded: prometheus not configured"
+		return resp, sourceDegradedNoProm
 	}
 
 	// 1. Request count.
