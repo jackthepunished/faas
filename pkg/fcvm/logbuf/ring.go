@@ -103,8 +103,14 @@ func (r *Ring) Write(stream string, p []byte) (int, error) {
 	// Most Writes carry at most a handful of lines, so a fresh copy with one
 	// IndexByte pass per '\n' beats a bufio.Scanner heap allocation under the
 	// per-instance hot path.
+	//
+	// Preallocation cap is len(p) only — NOT len(p)+64 — because the +64
+	// could overflow on a near-max-byte slice (CodeQL go/integer-conversion-
+	// bounds-check flagged this as a high-severity alloc-overflow risk). The
+	// next Write's append will grow the slice if a single chunk exceeds the
+	// current cap, so dropping the +64 has no observable cost.
 	if r.tail == nil {
-		r.tail = make([]byte, 0, len(p)+64)
+		r.tail = make([]byte, 0, len(p))
 	}
 	r.tail = append(r.tail, p...)
 	// Pull every complete line off the tail into committed Lines.
