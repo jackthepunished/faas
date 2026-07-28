@@ -988,6 +988,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// outcome rows above. Real per-(app, node) rows are added by
 	// the rollup in ReplaceInstanceStats.
 	instanceCPUSecondsTotal.WithLabelValues("", "")
+	// issue #301 (ADR-042, per-plan CPU fairness observability):
+	// pre-instantiate the ("other", "other") overflow row so the
+	// dashboard panel selector {app_id!="other"} never sees "no
+	// data" — same precedent as instanceCPUSecondsTotal above and
+	// the vmmd_top_tenant_rps gauge (issue #300). The (other,
+	// other) overflow is also re-emitted by EmitTopAppThrottle
+	// every 5s; this pre-instantiation covers the boot window
+	// before the first sampler tick.
+	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
 		registry:                      reg,
 		ops:                           ops,
@@ -1303,6 +1312,18 @@ func (m *OpsMetrics) TopAppSet() *topAppSet {
 	return m.topApps
 }
 
+// AppKeyForTest builds the composite (account_id, app_id) key
+// matching what the rollup uses internally. Test-only seam
+// (issue #301 / ADR-042) so pkg/sched/instancestats/poller_test.go
+// can index SnapshotAppCounts() without exporting the unexported
+// appKey struct to the public surface. Mirrors the
+// TestAdvanceAppClock / ThrottleSecondsLastSeenForTest pattern:
+// same package-private access via thin helpers rather than
+// exporting the type.
+func (m *OpsMetrics) AppKeyForTest(accountID, appID string) appKey {
+	return appKey{accountID: accountID, appID: appID}
+}
+
 // ShouldReset returns true if the rolling 24h window has elapsed
 // since the last resetWindow. Cheap read; called from the 5s
 // sampler tick. Forwarded from *topAppSet so the sampler stays
@@ -1392,6 +1413,32 @@ func (m *OpsMetrics) EmitTopAppThrottle(perAppThrottleSeconds func(accountID, ap
 		m.throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel).Add(overflow)
 	}
 	return len(snap) + 1
+}
+
+// ThrottleSecondsLastSeenForTest exposes the per-(account_id,
+// app_id) baseline microseconds the rollup last observed via
+// ReplaceInstanceStats. Test-only seam (issue #301 / ADR-042)
+// used by pkg/sched/instancestats/poller_test.go to assert the
+// schedd-side poller correctly fed the baseline after decoding
+// the wire field CpuThrottledSeconds. The empty-account case
+// resolves through the "anonymous" admission label so the test
+// sees the same key the rollup uses internally.
+//
+// Returns 0 if the pair has never been observed (no prior
+// baseline — the wire's first sample is the canonical
+// "no-baseline-yet" state).
+//
+// Nil-safe.
+func (m *OpsMetrics) ThrottleSecondsLastSeenForTest(accountID, appID string) float64 {
+	if m == nil || m.throttleSecondsLastSeen == nil {
+		return 0
+	}
+	if accountID == "" {
+		accountID = "anonymous"
+	}
+	m.throttleSecondsLastSeen.mu.Lock()
+	defer m.throttleSecondsLastSeen.mu.Unlock()
+	return m.throttleSecondsLastSeen.m[accountID+"\x00"+appID]
 }
 
 // SetThrottleRatio sets the per-slice throttle ratio gauge

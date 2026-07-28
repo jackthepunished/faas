@@ -423,12 +423,14 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// Plan is allocator-side state and must follow the lease's
 	// lifetime.
 	lease.Plan = req.Plan
-	// Any failure from this point — wire-side allowlist validation
-	// included — must fully clean up. Registering the cleanup BEFORE
-	// the validation loop is load-bearing: the lease is acquired, so
-	// fail-closed early-return paths otherwise leak the slot. The
-	// validator (cidr parse + v4/non-/0 checks) sits AFTER the defer
-	// on purpose; see ADR-031 + PR #159 review F3.
+	// Any failure from this point — Plan validation, wire-side
+	// allowlist checks, bringUp, cgroup write — must fully clean up.
+	// Registering the cleanup BEFORE the validation loop is
+	// load-bearing: the lease is acquired, so fail-closed early-return
+	// paths otherwise leak the slot. The Plan validator sits BEFORE
+	// bringUp so a wire call with an empty/unknown plan never boots
+	// the VM under the legacy 2-level cgroup path (issue #301 /
+	// ADR-043, PR #390 review finding #1).
 	defer func() {
 		if err != nil {
 			m.cleanup(context.WithoutCancel(ctx), lease, netns.NewConfig(
@@ -438,6 +440,17 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	}()
 	nc := netns.NewConfig(lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP)
 	nc.EgressMbit = req.EgressMbit
+	// Plan validation (issue #301 / ADR-043). An empty / unknown plan
+	// would land the VM under the wrong cgroup sub-slice (or under
+	// none at all) and silently disable per-plan cpu.weight + cpu.max
+	// enforcement. Validate AFTER the cleanup defer is registered so
+	// the lease is released on reject — but BEFORE setupNetwork /
+	// bringUp so the VM never reaches the wrong slice. PR #390
+	// review finding #1 (correctness / ship-blocker).
+	if !req.Plan.Valid() {
+		err = fmt.Errorf("wake %s: invalid plan %q (issue #301 / ADR-043)", req.Instance, req.Plan)
+		return nil, err
+	}
 	// Spec §7 conntrack cap (ADR-018 deferral). Platform-wide constant;
 	// not propagated through vmmd gRPC because every instance sees the
 	// same value (the failure mode is host-table exhaustion, shared).
@@ -481,15 +494,6 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	method, err = m.bringUp(ctx, lease, nc, req)
 	if err != nil {
 		return nil, err
-	}
-
-	// Plan validation (issue #301 / ADR-044). An unknown / empty
-	// plan would land the VM under the wrong cgroup sub-slice (or
-	// under no sub-slice at all) and silently disable the per-plan
-	// cpu.weight + cpu.max enforcement. Validate up-front so the
-	// error surfaces before the VM is up.
-	if !req.Plan.Valid() {
-		return nil, fmt.Errorf("wake %s: invalid plan %q (issue #301 / ADR-044)", req.Instance, req.Plan)
 	}
 
 	// G2: stage sealed env → unseal each entry → merge into envelope →

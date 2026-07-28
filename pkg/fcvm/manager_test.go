@@ -200,6 +200,81 @@ func TestWakeColdBoot_DoesNotInvokeResumeHook(t *testing.T) {
 	}
 }
 
+// TestWakeRejectsEmptyPlan pins the up-front Plan validation
+// (issue #301 / ADR-042). A wire call with req.Plan = "" must fail
+// BEFORE bringUp runs — otherwise the VM would boot under the
+// legacy 2-level path (ParentCgroupFor("") = defaultParentCgroup),
+// silently disabling cpu.weight + cpu.max enforcement for that
+// lease, and the cleanup defer would only fire after the VM was
+// up. PR #390 review finding #1 (ship-blocker).
+func TestWakeRejectsEmptyPlan(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	req := WakeRequest{
+		Instance:   "ghost",
+		BaseKey:    "/b.ext4",
+		LayerKey:   "/l.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 128,
+		Plan:       "", // empty — fail-closed contract
+	}
+	if _, err := m.Wake(context.Background(), req); err == nil {
+		t.Fatal("Wake with empty plan: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid plan") {
+		t.Errorf("Wake with empty plan: error %q does not mention invalid plan", err)
+	}
+	// The VM MUST NOT have booted.
+	if vmm.boots() != 0 {
+		t.Errorf("VM booted %d times despite invalid plan; want 0 (validation must run before bringUp)", vmm.boots())
+	}
+	// And the lease MUST have been released — a fail-closed plan
+	// rejection must not leak the alloc slot.
+	if m.LeasedCount() != 0 {
+		t.Errorf("LeasedCount = %d after empty-plan rejection, want 0 (lease leak)", m.LeasedCount())
+	}
+	// Network must not have been set up either — same rationale
+	// (rejection is up-front, no I/O side effects).
+	if run.ran("netns add fc-ghost") || run.ran("ip netns add fc-ghost") {
+		t.Error("netns was created despite invalid plan; want no I/O before validation")
+	}
+}
+
+// TestWakeRejectsUnknownPlan pins the same fail-closed contract for
+// a plan string that's not in api.Plans (e.g. a future plan that
+// hasn't been wired into limits.go yet, or a typo'd wire call). Same
+// shape as TestWakeRejectsEmptyPlan — must reject, must not boot,
+// must not leak.
+func TestWakeRejectsUnknownPlan(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	req := WakeRequest{
+		Instance:   "typo",
+		BaseKey:    "/b.ext4",
+		LayerKey:   "/l.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 128,
+		Plan:       api.Plan("enterprise"), // not in api.Plans
+	}
+	if _, err := m.Wake(context.Background(), req); err == nil {
+		t.Fatal("Wake with unknown plan: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid plan") {
+		t.Errorf("Wake with unknown plan: error %q does not mention invalid plan", err)
+	}
+	if vmm.boots() != 0 {
+		t.Errorf("VM booted %d times despite unknown plan; want 0", vmm.boots())
+	}
+	if m.LeasedCount() != 0 {
+		t.Errorf("LeasedCount = %d after unknown-plan rejection, want 0 (lease leak)", m.LeasedCount())
+	}
+	if run.ran("netns add fc-typo") || run.ran("ip netns add fc-typo") {
+		t.Error("netns was created despite unknown plan; want no I/O before validation")
+	}
+}
+
 // TestWakeRestore_InvokesResumeHook verifies the restore path DOES call
 // TriggerResumeHook exactly once per Wake, with the lease slot wired into
 // the VsockDevice passed via RestoreSpec.
