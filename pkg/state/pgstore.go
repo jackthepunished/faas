@@ -2555,7 +2555,7 @@ func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey str
 
 	var exists bool
 	if err := tx.QueryRow(ctx,
-		`select 1 from alert_rules where id = $1`, ruleID,
+		`select true from alert_rules where id = $1`, ruleID,
 	).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, ErrNotFound
@@ -2759,7 +2759,18 @@ func (s *PgStore) RecordAlertDelivery(ctx context.Context, in AlertDelivery) (Al
 		statusArg, in.AttemptCount, in.LastStatusCode, lastErrorArg,
 		in.ObservedValue, in.FiredAt, deliveredAtArg,
 	)
-	return scanAlertDelivery(row)
+	d, err := scanAlertDelivery(row)
+	if err != nil {
+		// The UNIQUE on idempotency_key is the cool-down dedupe
+		// primitive; surface it as ErrConflict so callers can map
+		// it to a no-op without parsing SQLSTATE themselves.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return AlertDelivery{}, ErrConflict
+		}
+		return AlertDelivery{}, err
+	}
+	return d, nil
 }
 
 func (s *PgStore) UpdateAlertDeliveryStatus(ctx context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error {
