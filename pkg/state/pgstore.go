@@ -2194,7 +2194,7 @@ func (s *PgStore) ListEnabledCrons(ctx context.Context) ([]Cron, error) {
 
 // --- alert rules (issue #396, ADR-045) ---------------------------------------
 //
-// Schema: migrations/00060_alert_rules.sql. Account-scoped webhook
+// Schema: migrations/00061_alert_rules.sql. Account-scoped webhook
 // delivery for the {error rate, latency p50/p95/p99, cold-start %,
 // request count, failed invocations} condition model, evaluated by
 // meterd (PR 4). ClaimAlertFire mirrors LoadAndStampLastQuotaWarning:
@@ -2254,8 +2254,8 @@ func scanAlertRules(rows pgx.Rows) ([]AlertRule, error) {
 // commit, so a SELECT-write drift cannot silently swallow a column.
 func scanAlertRuleCols(scan func(...any) error) (AlertRule, error) {
 	r := AlertRule{}
-	var metric, comparison, windowSpec, failureSource, state string
-	var appID *string
+	var metric, comparison, windowSpec, state string
+	var appID, failureSource *string
 	var secret []byte
 	var lastFired, lastEvaluated *time.Time
 	if err := scan(
@@ -2270,8 +2270,8 @@ func scanAlertRuleCols(scan func(...any) error) (AlertRule, error) {
 	r.Comparison = AlertComparison(comparison)
 	r.WindowSpec = AlertWindowSpec(windowSpec)
 	r.State = AlertState(state)
-	if failureSource != "" {
-		r.FailureSource = AlertFailureSource(failureSource)
+	if failureSource != nil && *failureSource != "" {
+		r.FailureSource = AlertFailureSource(*failureSource)
 	}
 	if appID != nil {
 		r.AppID = *appID
