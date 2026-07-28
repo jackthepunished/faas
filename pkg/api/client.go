@@ -601,6 +601,60 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// --- Alert rules (issue #396 / ADR-045 PR 3) -------------------------------
+
+// ListAlertRules returns every alert rule visible at the given app
+// (both app-scoped and account-wide rules — design decision recorded
+// in the PR 3 plan). Free plans get 402 plan_alert_rules_not_allowed;
+// per-account / per-app cap trips return 403 plan_alert_rule_quota.
+func (c *Client) ListAlertRules(ctx context.Context, slug string) ([]AlertRuleResponse, error) {
+	var out []AlertRuleResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/alerts", nil, &out)
+}
+
+// CreateAlertRule pins a metric to a threshold + comparison + window
+// and seals the plaintext webhook_secret. The response carries the
+// masked constant ("***") in webhook_secret_sealed_masked; the
+// plaintext is never echoed. SSRF block (loopback / metadata) returns
+// 403 image_egress_denied.
+func (c *Client) CreateAlertRule(ctx context.Context, slug string, req CreateAlertRuleRequest) (AlertRuleResponse, error) {
+	var out AlertRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alerts", req, &out)
+}
+
+// GetAlertRule fetches one rule by id. IDOR-safe: a foreign account's
+// rule id returns 404, not 403.
+func (c *Client) GetAlertRule(ctx context.Context, slug, id string) (AlertRuleResponse, error) {
+	var out AlertRuleResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/alerts/"+id, nil, &out)
+}
+
+// UpdateAlertRule applies a partial update. Pointer-everything
+// optionals let the caller distinguish "omitted" from "explicit zero".
+// Metric-family swaps (e.g. error_rate_pct → failed_invocations) are
+// rejected with 400 alert_rule_invalid; the caller must delete +
+// recreate.
+func (c *Client) UpdateAlertRule(ctx context.Context, slug, id string, req UpdateAlertRuleRequest) (AlertRuleResponse, error) {
+	var out AlertRuleResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/alerts/"+id, req, &out)
+}
+
+// DeleteAlertRule removes the rule and returns nil on 204.
+func (c *Client) DeleteAlertRule(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/alerts/"+id, nil, nil)
+}
+
+// RotateAlertRuleSecret server-mints a fresh 32-byte HMAC secret and
+// overwrites the row's sealed ciphertext in place. The plaintext is
+// NEVER returned in the response — only the masked constant + a
+// rotated_at timestamp. The customer must capture the new secret via
+// out-of-band mechanism if they need it on the receiving end; PR 4's
+// dashboard adds a one-time-display UX.
+func (c *Client) RotateAlertRuleSecret(ctx context.Context, slug, id string) (RotateAlertRuleSecretResponse, error) {
+	var out RotateAlertRuleSecretResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alerts/"+id+"/rotate-secret", nil, &out)
+}
+
 // --- Event-driven surface (Move 2) -----------------------------------------
 //
 // The 10 routes exposed under /v1/apps/{slug}/invoke[/async],

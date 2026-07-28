@@ -483,3 +483,88 @@ func TestProblem_WithHeaderAccumulates(t *testing.T) {
 		t.Errorf("HasHeader(X-Demo) = %v, want [a b]", got)
 	}
 }
+
+// TestErrPlanAlertRulesNotAllowed pins the 402 returned when the
+// customer's plan doesn't unlock alert rules at all (Free today).
+// Issue #396 / ADR-045 PR 3.
+func TestErrPlanAlertRulesNotAllowed(t *testing.T) {
+	p := ErrPlanAlertRulesNotAllowed(PlanFree)
+	if p.Status != http.StatusPaymentRequired {
+		t.Errorf("Status = %d, want 402", p.Status)
+	}
+	if p.Code != CodePlanAlertRulesNotAllowed {
+		t.Errorf("Code = %q, want %q", p.Code, CodePlanAlertRulesNotAllowed)
+	}
+	if !strings.Contains(p.Detail, "free") {
+		t.Errorf("Detail = %q, want to name the plan", p.Detail)
+	}
+}
+
+// TestErrPlanAlertRuleQuota pins the 403 returned when the plan
+// unlocks alert rules but the per-app or per-account cap was reached.
+// Mirrors TestErrPlanCronQuota in spirit (issue #396 / ADR-045 PR 3).
+func TestErrPlanAlertRuleQuota(t *testing.T) {
+	cases := []struct {
+		scope   string
+		wantSub string
+	}{
+		{"app", "this app"},
+		{"account", "this account"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.scope, func(t *testing.T) {
+			p := ErrPlanAlertRuleQuota(PlanPro, tc.scope, 10, 10)
+			if p.Status != http.StatusForbidden {
+				t.Errorf("Status = %d, want 403", p.Status)
+			}
+			if p.Code != CodePlanAlertRuleQuota {
+				t.Errorf("Code = %q, want %q", p.Code, CodePlanAlertRuleQuota)
+			}
+			if p.Limit == nil || *p.Limit != 10 {
+				t.Errorf("Limit = %v, want 10", p.Limit)
+			}
+			if p.Observed == nil || *p.Observed != 10 {
+				t.Errorf("Observed = %v, want 10", p.Observed)
+			}
+			if !strings.Contains(p.Detail, tc.wantSub) {
+				t.Errorf("Detail = %q, want to contain %q", p.Detail, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestErrAlertRuleInvalid pins the 400 for shape violations (closed-
+// set drift, NaN threshold, cooldown out of band, SSRF rejected,
+// metric-family swap rejected). Issue #396 / ADR-045 PR 3.
+func TestErrAlertRuleInvalid(t *testing.T) {
+	p := ErrAlertRuleInvalid("metric family cannot change; delete and recreate")
+	if p.Status != http.StatusBadRequest {
+		t.Errorf("Status = %d, want 400", p.Status)
+	}
+	if p.Code != CodeAlertRuleInvalid {
+		t.Errorf("Code = %q, want %q", p.Code, CodeAlertRuleInvalid)
+	}
+	if !strings.Contains(p.Detail, "delete and recreate") {
+		t.Errorf("Detail = %q, want to carry the reason", p.Detail)
+	}
+}
+
+// TestStatusForCode_AlertRules pins the inverse-status table for the
+// three new alert-rule codes so pkg/grpcerr.FromStatus can lift a gRPC
+// code back into a Problem with the right HTTP status (defense in
+// depth against future code additions that forget the switch case).
+func TestStatusForCode_AlertRules(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{CodePlanAlertRulesNotAllowed, http.StatusPaymentRequired},
+		{CodePlanAlertRuleQuota, http.StatusForbidden},
+		{CodeAlertRuleInvalid, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		if got := StatusForCode(tc.code); got != tc.want {
+			t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
+		}
+	}
+}

@@ -126,6 +126,97 @@ func TestSealBinaryOutput(t *testing.T) {
 	}
 }
 
+// TestSealBytesOpenBytesRoundTrip exercises the byte-oriented seal
+// path (issue #396 / ADR-045 PR 3). The bytes are opaque to apid —
+// only the dispatcher (PR 4) reads them back. The namespace tag
+// is preserved across the round-trip so a future multi-secret-per-
+// blob case can disambiguate.
+//
+// Plaintext contents test:
+//   - lowercase + mixed case + digits + special chars (no
+//     restriction; the env-var-key regex from SealOne does NOT apply)
+//   - empty plaintext (boundary)
+//   - binary-ish bytes (no NUL inside; the tag terminator is at
+//     index 0 and the plaintext starts at index 1)
+func TestSealBytesOpenBytesRoundTrip(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	cases := []struct {
+		name      string
+		namespace string
+		plaintext []byte
+	}{
+		{"lowercase_namespace", "alert_rule_secret", []byte("plaintext-shh")},
+		{"empty_namespace", "", []byte("plaintext-shh")},
+		{"empty_plaintext", "alert_rule_secret", []byte{}},
+		{"binary_payload", "alert_rule_secret", []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd}},
+		{"base64_secret", "alert_rule_secret", []byte("aGVsbG8td29ybGQ=")},
+	}
+	for _, tc := range cases {
+		blob, err := SealBytes(id.Recipient(), tc.namespace, tc.plaintext, 256)
+		if err != nil {
+			t.Fatalf("SealBytes(%q): %v", tc.namespace, err)
+		}
+		gotNS, gotPlain, err := OpenBytes(id, blob)
+		if err != nil {
+			t.Fatalf("OpenBytes after SealBytes(%q): %v", tc.namespace, err)
+		}
+		if gotNS != tc.namespace {
+			t.Errorf("namespace round-trip: got %q, want %q", gotNS, tc.namespace)
+		}
+		if !bytes.Equal(gotPlain, tc.plaintext) {
+			t.Errorf("plaintext round-trip: got %v, want %v", gotPlain, tc.plaintext)
+		}
+	}
+}
+
+// TestSealBytesEnforcesByteCap asserts the byte cap is enforced
+// at the seal boundary (defense in depth — the handler also
+// enforces). A 64-byte plaintext with a 32-byte cap must fail.
+func TestSealBytesEnforcesByteCap(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	_, err := SealBytes(id.Recipient(), "alert_rule_secret", bytes.Repeat([]byte("a"), 64), 32)
+	if err == nil {
+		t.Fatal("SealBytes accepted over-cap plaintext")
+	}
+}
+
+// TestSealBytes_NilRecipient_ReturnsError pins the nil-recipient
+// 503 path. PR review finding F8: the handler tests use
+// `withTestRecipient(t)` to avoid this path, leaving it untested.
+// A future refactor that breaks recipient wiring could silently
+// regress callers — the handler falls through to ErrCapacity on
+// this error, so we want to be sure the error is non-nil.
+func TestSealBytes_NilRecipient_ReturnsError(t *testing.T) {
+	_, err := SealBytes(nil, "alert_rule_secret", []byte("plaintext"), 256)
+	if err == nil {
+		t.Fatal("SealBytes with nil recipient returned nil error")
+	}
+}
+
+// TestOpenBytes_NilIdentity_ReturnsError pins the nil-identity
+// mirror of the above for the OpenBytes path.
+func TestOpenBytes_NilIdentity_ReturnsError(t *testing.T) {
+	_, _, err := OpenBytes(nil, []byte("anything"))
+	if err == nil {
+		t.Fatal("OpenBytes with nil identity returned nil error")
+	}
+}
+
+// TestOpenBytes_EmptyBlob_ReturnsError pins the empty-blob guard.
+// Decrypting an empty age stream is undefined behaviour; the
+// handler must reject it before age even tries.
+func TestOpenBytes_EmptyBlob_ReturnsError(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	_, _, err := OpenBytes(id, nil)
+	if err == nil {
+		t.Fatal("OpenBytes with empty blob returned nil error")
+	}
+	_, _, err = OpenBytes(id, []byte{})
+	if err == nil {
+		t.Fatal("OpenBytes with empty blob returned nil error")
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 // envelopesEqual compares two Envelopes without relying on map ordering.

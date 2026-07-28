@@ -194,6 +194,7 @@ const (
 	CodeSessionInvalid    = "session_invalid"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
+	CodeAlertRuleInvalid  = "alert_rule_invalid"
 	CodeHandlerMissing    = "handler_missing"
 	CodeImageRequired     = "image_required"
 	CodeDeployFailed      = "deploy_failed"
@@ -425,7 +426,7 @@ func StatusForCode(code string) int {
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
-		CodeHandlerMissing, CodeImageRequired:
+		CodeAlertRuleInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout:
 		return http.StatusServiceUnavailable
@@ -493,6 +494,10 @@ func StatusForCode(code string) int {
 	case CodePlanCronsNotAllowed:
 		return http.StatusPaymentRequired
 	case CodePlanCronQuota:
+		return http.StatusForbidden
+	case CodePlanAlertRulesNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
@@ -647,6 +652,21 @@ const CodePlanCronsNotAllowed = "plan_crons_not_allowed"
 // upsell-vs-delete copy without parsing the body.
 const CodePlanCronQuota = "plan_cron_quota"
 
+// CodePlanAlertRulesNotAllowed is the 402 the customer sees when
+// the plan doesn't unlock alert rules at all (Free today; the
+// plan-tier gate fires before loadApp so the slug's existence is
+// never leaked). Mirrors the CodePlanFeatureGated shape — the
+// dashboard renders an upsell prompt, not a quota hint, because
+// the only path forward is a plan upgrade.
+const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
+
+// CodePlanAlertRuleQuota is the 403 the customer sees when the
+// plan DOES unlock alert rules but the per-app or per-account
+// cap was reached. Distinct from CodePlanAlertRulesNotAllowed so
+// the CLI can branch on upsell-vs-delete copy without parsing
+// the body.
+const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
+
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
 // when the customer's plan has CronLimitPerApp == 0 (Free today).
 // Fires BEFORE the store is touched so a Free customer gets a clean
@@ -676,6 +696,52 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs("https://docs.DOMAIN/plans#crons")
+}
+
+// ErrAlertRuleInvalid is returned for malformed alert-rule bodies:
+// closed-set metric/comparison/window_spec/failure_source drift,
+// non-finite threshold, cooldown band breach, oversized webhook
+// secret, or a metric-family swap that the xor_chk constraint
+// would reject at the DB. Mirrors ErrCronInvalid's shape so the
+// CLI can use one problem-code table for both surfaces.
+func ErrAlertRuleInvalid(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAlertRuleInvalid,
+		"Invalid alert rule", reason).
+		WithDocs("https://docs.DOMAIN/alerts")
+}
+
+// ErrPlanAlertRulesNotAllowed is returned by apid's createAlertRule
+// / listAlertRules handlers when the customer's plan has
+// AlertRuleLimitPerApp == 0 (Free today). Fires BEFORE loadApp so a
+// Free customer posting to a non-existent slug gets a clean 402
+// instead of a 404 that would leak the slug's existence (PR review
+// finding F4). Mirrors ErrPlanCronsNotAllowed.
+func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanAlertRulesNotAllowed,
+		"Alert rules unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include alert rules; upgrade to Hobby or above to fire alerts.", p)).
+		WithDocs("https://docs.DOMAIN/plans#alerts")
+}
+
+// ErrPlanAlertRuleQuota is returned when
+// CreateAlertRuleIfUnderQuota surfaces a *state.AlertRuleQuotaError.
+// Scope "app" or "account" tells the handler which cap fired so
+// the body can name it. 403 (not 402) because the plan DOES unlock
+// alert rules — the right copy is "delete a rule to add another",
+// not "upgrade to Hobby". Mirrors ErrPlanCronQuota.
+func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Problem {
+	var scopeName string
+	if scope == "account" {
+		scopeName = "this account"
+	} else {
+		scopeName = "this app"
+	}
+	return NewProblem(http.StatusForbidden, CodePlanAlertRuleQuota,
+		"Alert rule limit reached",
+		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.DOMAIN/plans#alerts")
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't

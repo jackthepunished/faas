@@ -117,3 +117,76 @@ func SealOne(recipient *age.X25519Recipient, key, value string, maxValueBytes in
 	}
 	return Seal(recipient, Envelope{key: value})
 }
+
+// SealBytes seals an arbitrary plaintext blob (issue #396 / ADR-045
+// PR 3 webhook_secret + PR 4 meterd-side dispatcher reads). The
+// blob is NOT wrapped in an Envelope map and is NOT validated
+// against the env-var key regex — the bytes are opaque to apid and
+// only the dispatcher needs to be able to recover them. The
+// maxValueBytes byte cap is enforced here so a megabyte secret
+// payload can't blow up the age writer.
+//
+// namespace is recorded in the seal metadata so a future OpenBytes
+// can disambiguate (currently unused but the prefix is future-
+// proofing for multi-secret-per-blob cases). Pass "" for no
+// namespace; the namespace MUST be lowercase + no whitespace.
+func SealBytes(recipient *age.X25519Recipient, namespace string, plaintext []byte, maxValueBytes int) ([]byte, error) {
+	if recipient == nil {
+		return nil, errors.New("secretbox: nil recipient")
+	}
+	if maxValueBytes > 0 && len(plaintext) > maxValueBytes {
+		return nil, api.ErrSecretValueTooLarge(api.Limits{SecretValueMaxBytes: maxValueBytes}, len(plaintext))
+	}
+	// Prepend the namespace as an ASCII tag so OpenBytes can later
+	// distinguish alert-rule-secret blobs from app-secret blobs in
+	// the unlikely event both land in the same column. The tag is
+	// authenticated by ChaCha20-Poly1305 inside the age stanza; a
+	// tampered tag fails Open.
+	tag := ""
+	if namespace != "" {
+		tag = namespace + "\x00"
+	}
+	var out bytes.Buffer
+	w, err := age.Encrypt(&out, recipient)
+	if err != nil {
+		return nil, fmt.Errorf("secretbox: open age writer: %w", err)
+	}
+	if _, err := w.Write([]byte(tag)); err != nil {
+		return nil, fmt.Errorf("secretbox: write namespace tag: %w", err)
+	}
+	if _, err := w.Write(plaintext); err != nil {
+		return nil, fmt.Errorf("secretbox: write plaintext: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("secretbox: close age writer: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+// OpenBytes is the inverse of SealBytes. Returns the namespace +
+// the original plaintext. The age decryption authenticates the
+// ciphertext + the namespace tag together; a tampered tag fails
+// the open.
+func OpenBytes(identity *age.X25519Identity, blob []byte) (namespace string, plaintext []byte, err error) {
+	if identity == nil {
+		return "", nil, errors.New("secretbox: nil identity")
+	}
+	if len(blob) == 0 {
+		return "", nil, errors.New("secretbox: empty blob")
+	}
+	r, err := age.Decrypt(bytes.NewReader(blob), identity)
+	if err != nil {
+		return "", nil, fmt.Errorf("secretbox: open age reader: %w", err)
+	}
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return "", nil, fmt.Errorf("secretbox: read plaintext: %w", err)
+	}
+	// Split on the first NUL. If no NUL, namespace is empty.
+	for i, b := range raw {
+		if b == 0 {
+			return string(raw[:i]), raw[i+1:], nil
+		}
+	}
+	return "", raw, nil
+}

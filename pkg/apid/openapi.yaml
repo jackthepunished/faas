@@ -48,6 +48,15 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: alert_rules
+    description: |
+      Customer-configurable alert rules (issue #396 / ADR-045 PR 3).
+      A rule pins a metric (latency_p99_ms, error_rate_pct, …) to a
+      threshold + comparison + window; when the threshold is breached
+      the meterd dispatcher POSTs a signed payload to webhook_url.
+      Account-wide rules (app_id == "") are visible in every per-app
+      listing but the create/update/delete endpoints pin to a specific
+      app.
   - name: invocations
     description: Sync / async function invocations (event-driven surface, Move 2).
   - name: queues
@@ -1850,6 +1859,159 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Alert rules (issue #396 / ADR-045 PR 3) ─────────────────────────
+  # Per-app CRUD surface. Account-wide rules (app_id == "") appear in
+  # the per-app list endpoint but the create/update/delete endpoints
+  # pin to a specific app. The /rotate-secret action mints a fresh
+  # server-side plaintext; the response carries the masked constant +
+  # rotated_at only.
+
+  /v1/apps/{slug}/alerts:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [alert_rules]
+      operationId: listAlertRules
+      summary: List alert rules visible at this app.
+      description: |
+        Returns both app-scoped rules (app_id == <slug>) and
+        account-wide rules (app_id == ""). Account-wide rules
+        apply to every app on the account.
+      responses:
+        '200':
+          description: Alert rules on the account, filtered to those visible at this app.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AlertRuleResponse' }
+              example:
+                - {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","name":"p99 > 500ms","enabled":true,"metric":"latency_p99_ms","comparison":"gt","threshold":500,"window_spec":"5m","webhook_url":"https://example.com/hook","webhook_secret_sealed_masked":"***","cooldown_minutes":15,"state":"ok","created_at":"2026-07-28T10:00:00Z","updated_at":"2026-07-28T10:00:00Z"}
+                - {"id":"fedcba9876543210fedcba9876543210","app_id":"","name":"error_rate > 1%","enabled":true,"metric":"error_rate_pct","comparison":"gt","threshold":1,"window_spec":"15m","webhook_url":"https://example.com/acct","webhook_secret_sealed_masked":"***","cooldown_minutes":30,"state":"ok","created_at":"2026-07-28T09:00:00Z","updated_at":"2026-07-28T09:00:00Z"}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [alert_rules]
+      operationId: createAlertRule
+      summary: Create an alert rule.
+      description: |
+        Plaintext webhook_secret arrives in the body, is sealed
+        via the host age recipient, and never appears in a
+        response. webhook_url is SSRF-guarded at write time
+        (loopback + metadata ranges denied).
+      requestBody:
+        required: true
+        description: 'Alert rule payload. See CreateAlertRuleRequest.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAlertRuleRequest' }
+            example:
+              name: "p99 > 500ms"
+              metric: "latency_p99_ms"
+              comparison: "gt"
+              threshold: 500
+              window_spec: "5m"
+              webhook_url: "https://example.com/hook"
+              webhook_secret: "shh"
+              cooldown_minutes: 15
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The new alert rule (carries the masked secret).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/alerts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [alert_rules]
+      operationId: getAlertRule
+      summary: Fetch one alert rule by id.
+      responses:
+        '200':
+          description: The alert rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [alert_rules]
+      operationId: updateAlertRule
+      summary: Partial-update an alert rule.
+      description: |
+        Every field is optional. metric cannot cross families
+        (e.g. error_rate_pct → failed_invocations) — returns
+        400 alert_rule_invalid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAlertRuleRequest' }
+            example: {"name":"p99 > 750ms","cooldown_minutes":30}
+      responses:
+        '200':
+          description: The updated alert rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertRuleResponse' }
+        '400': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [alert_rules]
+      operationId: deleteAlertRule
+      summary: Delete an alert rule.
+      responses:
+        '204': { description: No body. The rule was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/alerts/{id}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+    post:
+      tags: [alert_rules]
+      operationId: rotateAlertRuleSecret
+      summary: Mint a new webhook HMAC secret.
+      description: |
+        Server-mints a 32-byte secret, base64-encodes it, and
+        overwrites the row's sealed ciphertext in place. The
+        plaintext is NEVER returned in the response — the body
+        carries the masked constant + rotated_at only.
+      responses:
+        '200':
+          description: Rotation succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RotateAlertRuleSecretResponse' }
+              example:
+                rotated_at: "2026-07-28T12:00:00Z"
+                webhook_secret_sealed_masked: "***"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Event-driven surface (Move 2) ─────────────────────────────────────────
   # Customer-facing surface for the Move 1 invocations backend. The five
   # shapes — async_invoke, queue_send, queue_receive, queue_ack, delayed_task
@@ -3370,6 +3532,138 @@ components:
         path: { type: [string, "null"] }
         enabled: { type: [boolean, "null"] }
 
+    # ─── Alert rules (issue #396 / ADR-045 PR 3) ──────────────────────────
+    # Wire shape mirrors pkg/api/alerts.go. Plaintext webhook_secret is
+    # only present on the create/update request bodies; every response
+    # carries the masked constant in webhook_secret_sealed_masked. The
+    # sealed ciphertext never leaves the server.
+
+    AlertRuleResponse:
+      description: |
+        A customer-configurable alert rule. Carries the masked webhook
+        secret; the sealed ciphertext is server-side only.
+      type: object
+      required:
+        - id
+        - app_id
+        - name
+        - enabled
+        - metric
+        - comparison
+        - threshold
+        - window_spec
+        - webhook_url
+        - webhook_secret_sealed_masked
+        - cooldown_minutes
+        - state
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id:
+          type: string
+          pattern: '^[a-f0-9]{32}$'
+          description: 'Pinned app id. Empty string = account-wide rule.'
+          example: "0123456789abcdef0123456789abcdef"
+        name: { type: string, example: "p99 > 500ms" }
+        enabled: { type: boolean, example: true }
+        metric:
+          type: string
+          enum:
+            - error_rate_pct
+            - latency_p50_ms
+            - latency_p95_ms
+            - latency_p99_ms
+            - cold_start_pct
+            - request_count
+            - failed_invocations
+        comparison:
+          type: string
+          enum: [gt, gte, lt, lte]
+        threshold: { type: number, format: double, example: 500 }
+        window_spec:
+          type: string
+          enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d']
+        failure_source:
+          type: string
+          description: 'Source dimension for failed_invocations; omit when metric is not failed_invocations (xor_chk).'
+          enum: [any, cron, queue, delayed_task, async_invoke]
+        webhook_url: { type: string, format: uri, example: "https://example.com/hook" }
+        webhook_secret_sealed_masked:
+          type: string
+          description: 'Literal "***" — the plaintext is never returned.'
+          example: "***"
+        cooldown_minutes:
+          type: integer
+          minimum: 5
+          maximum: 1440
+          example: 15
+        state:
+          type: string
+          enum: [ok, firing]
+          description: 'Cool-down state machine.'
+        last_fired_at: { type: string, format: date-time }
+        last_evaluated_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateAlertRuleRequest:
+      description: 'Create an alert rule on an app.'
+      type: object
+      required: [name, metric, comparison, threshold, window_spec, webhook_url, webhook_secret]
+      properties:
+        name: { type: string, example: "p99 > 500ms" }
+        enabled: { type: boolean, example: true }
+        metric:
+          type: string
+          enum: [error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations]
+        comparison: { type: string, enum: [gt, gte, lt, lte] }
+        threshold: { type: number, format: double, example: 500 }
+        window_spec: { type: string, enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d'] }
+        failure_source:
+          type: string
+          description: 'Required when metric == failed_invocations; omit otherwise (xor_chk).'
+          enum: [any, cron, queue, delayed_task, async_invoke]
+        webhook_url: { type: string, format: uri, example: "https://example.com/hook" }
+        webhook_secret:
+          type: string
+          description: 'Plaintext HMAC secret (max 256 bytes). Sealed at rest; never echoed.'
+          maxLength: 256
+          example: "shh"
+        cooldown_minutes:
+          type: integer
+          minimum: 5
+          maximum: 1440
+          example: 15
+
+    UpdateAlertRuleRequest:
+      description: 'Partial update — every field is optional. Omitted means leave alone.'
+      type: object
+      properties:
+        name: { type: string }
+        enabled: { type: boolean }
+        metric:
+          type: string
+          description: 'Cannot cross metric families (e.g. error_rate_pct → failed_invocations) — returns 400.'
+          enum: [error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations]
+        comparison: { type: string, enum: [gt, gte, lt, lte] }
+        threshold: { type: number, format: double }
+        window_spec: { type: string, enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d'] }
+        webhook_url: { type: string, format: uri }
+        webhook_secret:
+          type: string
+          description: 'New plaintext HMAC secret. Omit to keep the existing secret.'
+          maxLength: 256
+        cooldown_minutes: { type: integer, minimum: 5, maximum: 1440 }
+
+    RotateAlertRuleSecretResponse:
+      description: 'rotate-secret response — returns the rotated_at timestamp + the masked constant.'
+      type: object
+      required: [rotated_at, webhook_secret_sealed_masked]
+      properties:
+        rotated_at: { type: string, format: date-time, example: "2026-07-28T12:00:00Z" }
+        webhook_secret_sealed_masked: { type: string, example: "***" }
+
     # ─── API keys ─────────────────────────────────────────────────────────
 
     APIKeyResponse:
@@ -4330,6 +4624,12 @@ components:
 
     CronInvalid:
       description: 'code: cron_invalid | plan_crons_not_allowed | plan_cron_quota'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    AlertRuleInvalid:
+      description: 'code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

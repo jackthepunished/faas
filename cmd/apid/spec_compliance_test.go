@@ -30,7 +30,8 @@ const (
 	serverSrcPath = "server.go"
 	dtoFile       = "dto.go"
 	secretsFile   = "secrets.go"
-	envFile       = "env.go" // issue #395 / ADR-045
+	envFile       = "env.go"    // issue #395 / ADR-045
+	alertsFile    = "alerts.go" // issue #396 PR 3 / ADR-045
 	manifestFile  = "appmanifest.go"
 	cliauthFile   = "cliauth.go"
 	mfaFile       = "mfa.go"
@@ -80,12 +81,14 @@ var routeExclude = map[string]bool{
 // they cross the apid/CLI boundary — but they belong to non-public surfaces
 // (CLI device-code, public status page).
 var dtoExclude = map[string]bool{
-	"CliAuthCodeResponse":     true, // POST /v1/cli-auth/code (anonymous)
-	"CliAuthExchangeRequest":  true, // POST /v1/cli-auth/exchange
-	"CliAuthExchangeResponse": true, // POST /v1/cli-auth/exchange
-	"CliAuthStatus":           true, // enum used by CLI auth
-	"StatusPage":              true, // GET /status/slo.json (public status)
-	"SessionsRevokeRequest":   true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
+	"CliAuthCodeResponse":          true, // POST /v1/cli-auth/code (anonymous)
+	"CliAuthExchangeRequest":       true, // POST /v1/cli-auth/exchange
+	"CliAuthExchangeResponse":      true, // POST /v1/cli-auth/exchange
+	"CliAuthStatus":                true, // enum used by CLI auth
+	"StatusPage":                   true, // GET /status/slo.json (public status)
+	"SessionsRevokeRequest":        true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
+	"AlertRuleRow":                 true, // internal conversion struct (state row → wire DTO); never sent over the wire on its own
+	"RotateAlertRuleSecretRequest": true, // PR 3 / ADR-045: server-mints the secret; request body is empty, not in spec
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -466,6 +469,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", dtoFile),
 		filepath.Join(root, "pkg", "api", secretsFile),
 		filepath.Join(root, "pkg", "api", envFile),
+		filepath.Join(root, "pkg", "api", alertsFile),
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),
 		filepath.Join(root, "pkg", "api", mfaFile),

@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..models.create_alert_rule_request_comparison import (
+    CreateAlertRuleRequestComparison,
+    check_create_alert_rule_request_comparison,
+)
+from ..models.create_alert_rule_request_failure_source import (
+    CreateAlertRuleRequestFailureSource,
+    check_create_alert_rule_request_failure_source,
+)
+from ..models.create_alert_rule_request_metric import (
+    CreateAlertRuleRequestMetric,
+    check_create_alert_rule_request_metric,
+)
+from ..models.create_alert_rule_request_window_spec import (
+    CreateAlertRuleRequestWindowSpec,
+    check_create_alert_rule_request_window_spec,
+)
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="CreateAlertRuleRequest")
+
+
+@_attrs_define
+class CreateAlertRuleRequest:
+    """Create an alert rule on an app."""
+
+    name: str
+    metric: CreateAlertRuleRequestMetric
+    comparison: CreateAlertRuleRequestComparison
+    threshold: float
+    window_spec: CreateAlertRuleRequestWindowSpec
+    webhook_url: str
+    webhook_secret: str
+    """Plaintext HMAC secret (max 256 bytes). Sealed at rest; never echoed."""
+    enabled: bool | Unset = UNSET
+    failure_source: CreateAlertRuleRequestFailureSource | Unset = UNSET
+    """Required when metric == failed_invocations; omit otherwise (xor_chk)."""
+    cooldown_minutes: int | Unset = UNSET
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        name = self.name
+
+        metric: str = self.metric
+
+        comparison: str = self.comparison
+
+        threshold = self.threshold
+
+        window_spec: str = self.window_spec
+
+        webhook_url = self.webhook_url
+
+        webhook_secret = self.webhook_secret
+
+        enabled = self.enabled
+
+        failure_source: str | Unset = UNSET
+        if not isinstance(self.failure_source, Unset):
+            failure_source = self.failure_source
+
+        cooldown_minutes = self.cooldown_minutes
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "name": name,
+                "metric": metric,
+                "comparison": comparison,
+                "threshold": threshold,
+                "window_spec": window_spec,
+                "webhook_url": webhook_url,
+                "webhook_secret": webhook_secret,
+            }
+        )
+        if enabled is not UNSET:
+            field_dict["enabled"] = enabled
+        if failure_source is not UNSET:
+            field_dict["failure_source"] = failure_source
+        if cooldown_minutes is not UNSET:
+            field_dict["cooldown_minutes"] = cooldown_minutes
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        name = d.pop("name")
+
+        metric = check_create_alert_rule_request_metric(d.pop("metric"))
+
+        comparison = check_create_alert_rule_request_comparison(d.pop("comparison"))
+
+        threshold = d.pop("threshold")
+
+        window_spec = check_create_alert_rule_request_window_spec(d.pop("window_spec"))
+
+        webhook_url = d.pop("webhook_url")
+
+        webhook_secret = d.pop("webhook_secret")
+
+        enabled = d.pop("enabled", UNSET)
+
+        _failure_source = d.pop("failure_source", UNSET)
+        failure_source: CreateAlertRuleRequestFailureSource | Unset
+        if isinstance(_failure_source, Unset):
+            failure_source = UNSET
+        else:
+            failure_source = check_create_alert_rule_request_failure_source(_failure_source)
+
+        cooldown_minutes = d.pop("cooldown_minutes", UNSET)
+
+        create_alert_rule_request = cls(
+            name=name,
+            metric=metric,
+            comparison=comparison,
+            threshold=threshold,
+            window_spec=window_spec,
+            webhook_url=webhook_url,
+            webhook_secret=webhook_secret,
+            enabled=enabled,
+            failure_source=failure_source,
+            cooldown_minutes=cooldown_minutes,
+        )
+
+        create_alert_rule_request.additional_properties = d
+        return create_alert_rule_request
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties
