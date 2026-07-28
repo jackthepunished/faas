@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00051 (github_installations). Pins the
+// Migration-apply test for 00056 (github_installations). Pins the
 // load-bearing PR-C schema contract:
 //
-//   1. The migration applies cleanly through 00051.
+//   1. The migration applies cleanly through 00056.
 //   2. All 7 columns are present on github_installations with the
 //      right types and NOT NULL / PK constraints.
 //   3. The FK to accounts(id) accepts a real account and rejects
@@ -13,11 +13,15 @@
 //   5. The login_idx exists and is discoverable.
 //   6. Re-applying the migration is a no-op (IF NOT EXISTS).
 //
-// Slot history (PR-C's): 00051 (creation) → 00054 (renumbered to
-// dodge main's 00051_crons_app_full_idx + 00052_build_provenance
-// + 00053_deployments_source_url) → 00055 (renumbered after main's
-// 00054_usage_minutes_cpu landed via PR #346). Per
-// MEMORY.md/pr-migration-slot-race-with-shipping-main.
+// Slot history (PR-C's): 00051 (creation, after PR-C feature commit
+// initially placed it at the next free slot post-main) → 00054 → 00055
+// (mid-rebase renumbers to dodge main's own migrations landing while
+// PR-C was in flight) → 00056 (final slot after rebase onto origin/main
+// @ f5b583aa; PR-C rebase resolved the slot-51 collision with main's
+// 00051_crons_app_full_idx + put the migration at 00056 where the
+// cross-PR gate's reservation carve-out from PR #391 hides the
+// 00056_reserve_slot.{sql,test.go} no-ops in PR #335 and PR #369).
+// Per MEMORY.md/pr-migration-slot-race-with-shipping-main.
 //
 // Build tag mirrors apply_walk_test.go:4.
 
@@ -32,9 +36,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00051_GitHubInstallations pins the schema contract
+// TestMigrations_00056_GitHubInstallations pins the schema contract
 // for the durable install-state table added by PR-C.
-func TestMigrations_00051_GitHubInstallations(t *testing.T) {
+func TestMigrations_00056_GitHubInstallations(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

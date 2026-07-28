@@ -11,7 +11,7 @@
 // PR-C (audit-gap closure) does the same for the install state:
 // the `installs` map is now a read-through cache for the durable
 // StoreInstalls (Postgres-backed via the cmd-side adapter, table
-// github_installations from migration 00051). Pre-PR-C, githubd's
+// github_installations from migration 00056). Pre-PR-C, githubd's
 // restart vaporized this map and the dashboard's
 // /v1/install/repos/list + /v1/apps/{slug}/install/bind started
 // 502'ing; PR-C keeps the cache hot in-process for the warm path

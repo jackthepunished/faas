@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00051_github_installations.sql — PR-C (audit-gap closure).
+-- 00056_github_installations.sql — PR-C (audit-gap closure).
 --
 -- Until PR-C, githubd's install state lived in an in-memory map
 -- (pkg/githubd/realservice.go's `s.installs`). That map evaporated
