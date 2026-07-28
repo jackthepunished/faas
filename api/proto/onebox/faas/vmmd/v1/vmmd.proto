@@ -170,6 +170,16 @@ message AppSpec {
   // empty field here is a contract violation surfaced as
   // InvalidArgument).
   string app_id = 8;
+  // api_env (issue #395 / ADR-045) carries the per-key plaintext
+  // rows from `app_envs`. Unlike SealedEnv above, the values are
+  // NOT sealed — env vars are non-sensitive runtime config by
+  // contract. vmmd merges all entries into a single map and writes
+  // /etc/faas/env.json on drive1; guest-init reads it and merges
+  // into the process env via BuildEnvWithSecrets with precedence
+  // "secrets > api_env > manifest_env > os.environ". Empty list
+  // = no env.json file written (manifest env still flows in via
+  // /etc/faas/app.json, the legacy path).
+  repeated APIEnvEntry api_env = 9;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -179,6 +189,20 @@ message AppSpec {
 message SealedSecret {
   string key        = 1;
   bytes  ciphertext = 2;
+}
+
+// APIEnvEntry is one (key, value) plaintext pair from app_envs
+// (issue #395 / ADR-045). The value is sent over the wire as a
+// UTF-8 string — every layer of the pipeline (apid JSON decode,
+// Postgres TEXT column, env.json encoding/json marshal) is
+// UTF-8-bound, so a `bytes` field would only have hidden silent
+// Unicode replacement during the on-disk JSON marshal. vmmd
+// merges all entries into a single map and writes /etc/faas/env.json
+// on drive1; guest-init reads it and merges into the process env
+// with precedence below sealed secrets.
+message APIEnvEntry {
+  string key   = 1;
+  string value = 2;
 }
 
 // SnapshotRef points at the snapshot a caller wants to restore from. The

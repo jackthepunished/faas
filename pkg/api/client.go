@@ -864,6 +864,27 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
 }
 
+// Env vars (issue #395 / ADR-045). Plaintext by contract — values are
+// non-sensitive runtime config. Value never appears in the GET
+// response; only the key set + timestamps do (AppEnvResponse shape).
+// PutAppsSlugEnvKey's body is the value path; DeleteAppsSlugEnvKey is
+// identity-only. Method names match the sdk-coverage gate's
+// MethodResource convention so every spec route ships with a Go SDK
+// method (the older secrets surface used helper-style names like
+// ListSecrets/SetSecret/UnsetSecret which the gate tolerates as
+// pre-existing helpers — new surfaces follow MethodResource).
+func (c *Client) GetAppsSlugEnv(ctx context.Context, slug string) (AppEnvListResponse, error) {
+	var out AppEnvListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/env", nil, &out)
+}
+func (c *Client) PutAppsSlugEnvKey(ctx context.Context, slug, key, value string) error {
+	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/env/"+key,
+		PutAppEnvRequest{Value: value}, nil)
+}
+func (c *Client) DeleteAppsSlugEnvKey(ctx context.Context, slug, key string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/env/"+key, nil, nil)
+}
+
 // Usage.
 func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, error) {
 	var out UsageResponse

@@ -1,11 +1,15 @@
 from typing import Literal
 
-APIKeyResponseScopesItem = Literal["admin", "apps:read", "deploy:write", "secrets:read", "secrets:write", "usage:read"]
+APIKeyResponseScopesItem = Literal[
+    "admin", "apps:read", "deploy:write", "env:read", "env:write", "secrets:read", "secrets:write", "usage:read"
+]
 
 API_KEY_RESPONSE_SCOPES_ITEM_VALUES: set[APIKeyResponseScopesItem] = {
     "admin",
     "apps:read",
     "deploy:write",
+    "env:read",
+    "env:write",
     "secrets:read",
     "secrets:write",
     "usage:read",

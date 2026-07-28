@@ -147,15 +147,18 @@ func TestNormalizeCreateKeyScopes(t *testing.T) {
 }
 
 // TestIsValidScope pins the closed vocabulary at the package surface —
-// mirror of the DB CHECK constraint added in migration 00044. If a
-// route file references a scope that isn't in this set, it would
-// fail closed everywhere: the migration prevents the INSERT,
+// mirror of the DB CHECK constraint added in migration 00046
+// (widened by 00061 to admit env:read/env:write). If a route file
+// references a scope that isn't in this set, it would fail closed
+// everywhere: the migration prevents the INSERT,
 // NormalizeCreateKeyScopes blocks the mint, and principalHasScope
 // never sees it from a valid key.
 func TestIsValidScope(t *testing.T) {
 	valid := []string{
 		ScopeAdmin, ScopeAppsRead, ScopeDeployWrite,
 		ScopeSecretsRead, ScopeSecretsWrite, ScopeUsageRead,
+		// Issue #395 / ADR-045: env surfaces.
+		ScopeEnvRead, ScopeEnvWrite,
 	}
 	for _, s := range valid {
 		if !IsValidScope(s) {
@@ -192,4 +195,6 @@ func TestScopeSurfaceConstants(t *testing.T) {
 	mustContain("ScopesUsageReadSurface", ScopesUsageReadSurface, ScopeAdmin, ScopeUsageRead)
 	mustContain("ScopesSecretsWriteSurface", ScopesSecretsWriteSurface, ScopeAdmin, ScopeSecretsWrite)
 	mustContain("ScopesDeployWriteSurface", ScopesDeployWriteSurface, ScopeAdmin, ScopeDeployWrite)
+	// Issue #395 / ADR-045: env:write mirrors secrets:write in shape.
+	mustContain("ScopesEnvWriteSurface", ScopesEnvWriteSurface, ScopeAdmin, ScopeEnvWrite)
 }

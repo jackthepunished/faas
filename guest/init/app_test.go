@@ -118,3 +118,49 @@ func TestBuildEnv_HandlesEdgeEntries(t *testing.T) {
 		t.Errorf("BuildEnv edge entries = %v, want %v", got, want)
 	}
 }
+
+// TestBuildEnv_FourLayerPrecedence (issue #395 / ADR-045 acceptance #4):
+// pins the 4-layer merge order "OS environ < manifest env < api_env <
+// secrets" in a single fixture. Each layer contributes a different value
+// for the same key, and the test asserts the winner. A future refactor
+// that reorders the layers (e.g. applies secrets before api_env, or
+// drops the apiEnv merge) trips here.
+//
+// Key shape:
+//   - FOO appears in all four layers → secrets wins ("s")
+//   - BAR appears in os + manifest + api_env → api_env wins ("a")
+//   - BAZ appears in manifest only → manifest wins ("m")
+//   - QUX appears in api_env only → api_env wins ("a")
+//   - ONLYOS appears in os only → os wins ("o")
+//
+// The fixture keeps each layer's contribution distinct so a reordering
+// bug shows up as a wrong value, not as a missing-key failure.
+func TestBuildEnv_FourLayerPrecedence(t *testing.T) {
+	base := []string{"FOO=o", "BAR=o", "ONLYOS=o"}
+	m := api.AppManifest{
+		Env: map[string]string{
+			"FOO": "m",
+			"BAR": "m",
+			"BAZ": "m",
+		},
+	}
+	apiEnv := map[string]string{
+		"FOO": "a",
+		"BAR": "a",
+		"QUX": "a",
+	}
+	secrets := map[string]string{
+		"FOO": "s",
+	}
+	got := BuildEnvWithSecrets(base, m, secrets, apiEnv)
+	want := []string{
+		"BAR=a",    // api_env beats manifest+os
+		"BAZ=m",    // manifest only
+		"FOO=s",    // secrets beats all
+		"ONLYOS=o", // os only
+		"QUX=a",    // api_env only
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("BuildEnv 4-layer precedence = %v, want %v", got, want)
+	}
+}

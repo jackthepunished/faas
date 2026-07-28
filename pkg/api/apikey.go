@@ -101,8 +101,10 @@ func ConstantTimeEqualHash(a, b []byte) bool {
 // access.
 //
 // The closed vocabulary is mirrored at the DB layer by migration
-// 00044's api_keys_scopes_vocab_chk CHECK constraint. NormalizeCreateKeyScopes
-// is the first line; the constraint is the floor a typo cannot cross.
+// 00046's api_keys_scopes_vocab_chk CHECK constraint (and widened by
+// migration 00063 to admit env:read/env:write for issue #395). The Go
+// side is the first line; the constraint is the floor a typo cannot
+// cross.
 const (
 	ScopeAdmin        = "admin"
 	ScopeAppsRead     = "apps:read"
@@ -110,6 +112,12 @@ const (
 	ScopeSecretsRead  = "secrets:read"
 	ScopeSecretsWrite = "secrets:write"
 	ScopeUsageRead    = "usage:read"
+	// Issue #395 / ADR-045: env:read scopes the GET endpoint;
+	// env:write scopes PUT/DELETE. Distinct codes from secrets:* so
+	// the secret-quota bypass argument is closed — a customer can't
+	// grant "secrets:write" through an env-var surface.
+	ScopeEnvRead  = "env:read"
+	ScopeEnvWrite = "env:write"
 )
 
 // validScopes is the closed set of scope strings the API accepts. The
@@ -121,6 +129,8 @@ var validScopes = map[string]struct{}{
 	ScopeSecretsRead:  {},
 	ScopeSecretsWrite: {},
 	ScopeUsageRead:    {},
+	ScopeEnvRead:      {},
+	ScopeEnvWrite:     {},
 }
 
 // IsValidScope reports whether s is in the allowed scope vocabulary.
@@ -187,6 +197,13 @@ var (
 	// /v1/apps/{slug}/secrets/{key}. Granted by admin or
 	// secrets:write.
 	ScopesSecretsWriteSurface = []string{ScopeAdmin, ScopeSecretsWrite}
+
+	// ScopesEnvWriteSurface: PUT/DELETE on /v1/apps/{slug}/env/{key}
+	// (issue #395 / ADR-045). Granted by admin or env:write.
+	// NOT MFA-gated because env vars are explicitly non-sensitive
+	// runtime config (see handlers_env.go file header for the
+	// trust-model rationale + ADR-045 §Decision).
+	ScopesEnvWriteSurface = []string{ScopeAdmin, ScopeEnvWrite}
 
 	// ScopesDeployWriteSurface: every deploy/mutate action except
 	// secrets and key/admin operations. Granted by admin or

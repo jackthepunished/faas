@@ -1450,4 +1450,26 @@ type Store interface {
 	// CountAppSecrets is the quota check helper. apid calls it before
 	// UpsertAppSecret to enforce Limits.SecretCountMax.
 	CountAppSecrets(ctx context.Context, accountID, appID string) (int, error)
+
+	// AppEnv is plaintext runtime config (issue #395 / ADR-045). The
+	// four methods mirror the secrets surface 1:1 minus the ciphertext
+	// argument — values are stored as TEXT, not sealed bytea.
+	//
+	// UpsertAppEnv writes-or-replaces the (app_id, key) row. accountID
+	// is passed for ownership verification; the row also stores
+	// account_id for the account-scoped delete path and the G6 GDPR
+	// cascade.
+	UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error
+	// DeleteAppEnv removes the (app_id, key) row. Returns ErrNotFound
+	// if the row doesn't exist — handlers render 400 CodeEnvVarNotFound
+	// (intentional: URL resource IS the env-var name).
+	DeleteAppEnv(ctx context.Context, accountID, appID, key string) error
+	// ListAppEnv returns every env row on the app, scoped to
+	// accountID. Order: by key ASC for deterministic wake staging.
+	// Returns nil slice (not error) when the app has no env rows —
+	// schedd treats that as "no env.json to write".
+	ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error)
+	// CountAppEnv is the quota check helper. apid calls it before
+	// UpsertAppEnv to enforce Limits.EnvVarsMax.
+	CountAppEnv(ctx context.Context, accountID, appID string) (int, error)
 }

@@ -33,7 +33,7 @@ class AuditEventResponse:
     kind: str
     """Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`,
     `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`,
-    `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`,
+    `secret.set`, `secret.deleted`, `env.set`, `env.deleted`, `account.plan_changed`, `account.deletion_scheduled`,
     `account.deletion_restored`."""
     data: AuditEventResponseData
     """Kind-specific payload. Always a JSON object; the inner shape depends on `kind`. Plaintext values (e.g.

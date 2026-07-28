@@ -1123,3 +1123,22 @@ type AccountAppSecret struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
+
+// AppEnv is one row of customer runtime env vars (issue #395 / ADR-045).
+// apid is the only writer. Value is plaintext TEXT (NOT sealed): env vars
+// are explicitly non-credential config, and putting non-sensitive config
+// behind the age seal would (a) double-count against SecretCountMax for no
+// reason and (b) blur the secret.set audit trail. Anything sensitive
+// belongs in app_secrets, not here — endpoints cross-reference the
+// distinct audit kinds env.set vs secret.set.
+//
+// AccountID is the row's owning account. Both PgStore and MemStore filter
+// on (AccountID, AppID, Key) so cross-account access returns ErrNotFound.
+type AppEnv struct {
+	AccountID string
+	AppID     string
+	Key       string
+	Value     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}

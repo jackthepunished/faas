@@ -11,7 +11,7 @@ export type GdprAuditExportResponse = {
   requested_at: string;
   completed_at?: string | null;
   /**
-   * Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `account.deletion_scheduled`.
+   * Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `env.set`, `account.deletion_scheduled`.
    */
   kind?: string;
   /**

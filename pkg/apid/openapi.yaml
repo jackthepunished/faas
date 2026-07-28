@@ -60,6 +60,11 @@ tags:
     description: Customer-facing security event timeline (IAM-4, ADR-035). Append-only; read-only.
   - name: secrets
     description: Per-app sealed secrets (sealed at rest).
+  - name: env
+    description: |
+      Per-app plaintext env vars (issue #395, ADR-045). Non-sensitive
+      runtime config — credentials stay on /secrets. Values are
+      stored as-is and applied on next wake.
   - name: usage
     description: Usage roll-up and metering.
   - name: admin
@@ -1432,6 +1437,81 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Customer env vars (issue #395 / ADR-045) ────────────────────────────
+  # Plaintext per-app env store mirroring the secrets surface minus
+  # the seal step. Audit kind env.set/env.deleted is distinct from
+  # secret.set so dashboards can render a separate quota / change
+  # signal. env:write is NOT MFA-gated because env vars are explicitly
+  # non-sensitive runtime config — credentials stay on /secrets.
+
+  /v1/apps/{slug}/env:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [env]
+      operationId: listEnv
+      summary: List env vars on an app.
+      description: |
+        Returns every env var key + timestamps on the app. The plaintext
+        value NEVER appears in the response — guest-init reads the value
+        at process start from `/etc/faas/env.json` inside the guest.
+      responses:
+        '200':
+          description: Env var envelopes on the app (plaintext never returned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppEnvListResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/env/{key}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/SecretKey'
+    put:
+      tags: [env]
+      operationId: setEnv
+      summary: Set an env var.
+      description: |
+        Persists the plaintext value verbatim in the app_envs table (no
+        seal step). Env vars are non-sensitive runtime config by contract
+        — credentials stay on `/v1/apps/{slug}/secrets/{key}`. Applies on
+        next wake (cold-boot OR snapshot-restore); the running instance
+        is unaffected.
+      requestBody:
+        required: true
+        description: "Env var payload — key name + plaintext."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutAppEnvRequest'
+              example: {"value":"debug"}
+      responses:
+        '200':
+          description: The stored env var envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppEnvResponse'
+                example: {"key":"LOG_LEVEL","created_at":"2026-07-28T11:25:00Z","updated_at":"2026-07-28T11:25:00Z"}
+        '400': { $ref: '#/components/responses/EnvVarInvalidKey' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PlanLimitEnvVars' }
+        '413': { $ref: '#/components/responses/EnvValueTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [env]
+      operationId: deleteEnv
+      summary: Delete an env var.
+      responses:
+        '204': { description: No body. The env var was removed. }
+        '400': { $ref: '#/components/responses/EnvVarNotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Deployments ──────────────────────────────────────────────────────────
 
   /v1/deployments:
@@ -2782,7 +2862,7 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read, env:read, env:write] }
           description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): `admin` is the legacy full-access scope; `apps:read` covers GETs across the apps/deployments/audit/secrets-list surface; `deploy:write` covers POST/PUT/PATCH/DELETE on apps+queues; `secrets:write` covers PUT/DELETE on /apps/{slug}/secrets/{key}; `usage:read` covers GET /v1/usage*."
           example: [admin]
         created_at: { type: string, format: date-time }
@@ -2798,7 +2878,7 @@ components:
         action: { type: string, enum: [export, delete, restore] }
         requested_at: { type: string, format: date-time }
         completed_at: { type: [string, "null"], format: date-time }
-        kind: { type: string, description: "Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `account.deletion_scheduled`." }
+        kind: { type: string, description: "Security event kind. Populated only when `source` = `event`. Examples: `auth.login`, `key.created`, `secret.set`, `env.set`, `account.deletion_scheduled`." }
         data: { type: object, additionalProperties: true, description: "Kind-specific JSON payload from the events row. Populated only when `source` = `event`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`." }
 
     AppSecretExportResponse:
@@ -3204,7 +3284,7 @@ components:
         label: { type: [string, "null"] , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read, env:read, env:write] }
           description: "Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access scope; apps:read covers GETs across the apps/deployments/audit/secrets-list surface; deploy:write covers POST/PUT/PATCH/DELETE on apps+queues; secrets:write covers PUT/DELETE on /apps/{slug}/secrets/{key}; usage:read covers GET /v1/usage*."
           example: [admin]
         last_used_at: { type: [string, "null"], format: date-time }
@@ -3221,7 +3301,7 @@ components:
         label: { type: string, maxLength: 100 , example: "ci-deploy"}
         scopes:
           type: array
-          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read] }
+          items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read, env:read, env:write] }
           description: "Requested permission set. Server validates each entry against the closed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; the other five cover narrower surfaces (see APIKeyResponse.scopes). See IAM-1, ADR-034 rev2."
           example: [apps:read, deploy:write]
 
@@ -3247,7 +3327,7 @@ components:
           example: apid
         kind:
           type: string
-          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`, `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
+          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`, `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `env.set`, `env.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
           example: auth.login
         subject:
           type: string
@@ -3298,6 +3378,35 @@ components:
         secrets:
           type: array
           items: { $ref: '#/components/schemas/AppSecretResponse' }
+        quota_max: { type: integer }
+        count: { type: integer }
+
+    # ─── Env vars (issue #395 / ADR-045) ──────────────────────────────────
+
+    PutAppEnvRequest:
+      description: "Set an env var: plaintext value (persisted verbatim in app_envs, non-sensitive by contract)."
+      type: object
+      required: [value]
+      properties:
+        value: { type: string, description: 'Plaintext env-var value. Stored as-is; do NOT use this surface for credentials.', example: "debug" }
+
+    AppEnvResponse:
+      description: "An env var envelope: key name + timestamps. The plaintext value never appears here."
+      type: object
+      required: [key, created_at, updated_at]
+      properties:
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "LOG_LEVEL" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AppEnvListResponse:
+      description: "List of env var envelopes (no plaintext values)."
+      type: object
+      required: [env, quota_max, count]
+      properties:
+        env:
+          type: array
+          items: { $ref: '#/components/schemas/AppEnvResponse' }
         quota_max: { type: integer }
         count: { type: integer }
 
@@ -4032,6 +4141,32 @@ components:
 
     SecretNotFound:
       description: 'code: secret_not_found'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    # Env vars (issue #395 / ADR-045): mirror the secret response
+    # shape so SDK callers reuse the same error-decoding branch.
+    PlanLimitEnvVars:
+      description: 'code: plan_limit_env_vars'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    EnvValueTooLarge:
+      description: 'code: env_value_too_large'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    EnvVarInvalidKey:
+      description: 'code: env_var_invalid_key'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    EnvVarNotFound:
+      description: 'code: env_var_not_found'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

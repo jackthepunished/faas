@@ -95,6 +95,16 @@ type Limits struct {
 	SecretCountMax      int // max secrets per app (Free 3, Hobby 25, Pro 50, Scale 100)
 	SecretValueMaxBytes int // per-secret value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
+	// Customer env vars (issue #395 / ADR-045). Plaintext per-app store
+	// for non-sensitive runtime config (LOG_LEVEL, FEATURE_X, etc.). The
+	// quota shape mirrors secrets minus the per-secret seal cost — values
+	// are stored as-is, no ciphertext. EnvVarsMax bounds the (app_id,
+	// key) row count. EnvValueMaxBytes bounds the per-value byte cap.
+	// Per-plan values are tuned to cover typical 12-factor config
+	// surface without letting one app monopolise the table.
+	EnvVarsMax       int // max env vars per app (Free 8, Hobby 32, Pro 64, Scale 256)
+	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
+
 	// MinInstancesAllowed toggles the per-app cold-wake floor (ux_spec
 	// §6.5). Free + Hobby keep the default scale-to-zero behaviour
 	// because `min_instances = N` keeps N × RAMMB resident at all times,
@@ -230,6 +240,8 @@ var planLimits = map[Plan]Limits{
 		EgressMbit:          10,
 		SecretCountMax:      3,
 		SecretValueMaxBytes: 4 * 1024,
+		EnvVarsMax:          8,
+		EnvValueMaxBytes:    4 * 1024,
 		// Move 1: async invoke and queues are paid-only (§4.4); Free
 		// keeps HTTP-only. The tiny 1 KB payload cap is the binding
 		// constraint should a Free customer spoof the gate.
@@ -281,6 +293,8 @@ var planLimits = map[Plan]Limits{
 		EgressMbit:          25,
 		SecretCountMax:      25,
 		SecretValueMaxBytes: 8 * 1024,
+		EnvVarsMax:          32,
+		EnvValueMaxBytes:    8 * 1024,
 		// 64 KB envelope = 0.25 % of Hobby's 25 MB tarball budget — small
 		// enough to keep the drain tick bounded, large enough for typical
 		// JSON event payloads.
@@ -336,6 +350,8 @@ var planLimits = map[Plan]Limits{
 		EgressMbit:          100,
 		SecretCountMax:      50,
 		SecretValueMaxBytes: 16 * 1024,
+		EnvVarsMax:          64,
+		EnvValueMaxBytes:    16 * 1024,
 		MinInstancesAllowed: true,
 		// 256 KB = 0.1 % of Pro's 250 MB tarball.
 		MaxQueueDepth:               25,
@@ -389,6 +405,8 @@ var planLimits = map[Plan]Limits{
 		EgressMbit:          250,
 		SecretCountMax:      100,
 		SecretValueMaxBytes: 32 * 1024,
+		EnvVarsMax:          256,
+		EnvValueMaxBytes:    32 * 1024,
 		MinInstancesAllowed: true,
 		// Soft ceiling: the binding constraint on Scale is the per-payload
 		// byte cap (1 MiB), not the row count.
