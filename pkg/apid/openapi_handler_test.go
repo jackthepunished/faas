@@ -48,8 +48,12 @@ func TestServeOpenAPISpec_ContentType(t *testing.T) {
 		t.Errorf("body must begin with `openapi: 3.1`; got prefix %q", first40(body))
 	}
 	// Spot-check: paths section is present.
-	if !bytes.Contains(body[:min(4096, len(body))], []byte("\npaths:")) {
-		t.Errorf("body missing `paths:` section in first 4 KB; first lines: %q", first40(body))
+	// The spec has grown past 16 KiB since PR 3 (alert-rules surface
+	// added ~300 lines), so the `paths:` block now sits at ~5.3 KiB.
+	// The original 4 KiB constant broke on PR 3; we keep the assertion
+	// as a "structure is sane" smoke test rather than an exact offset.
+	if !bytes.Contains(body[:min(16384, len(body))], []byte("\npaths:")) {
+		t.Errorf("body missing `paths:` section in first 16 KB; first lines: %q", first40(body))
 	}
 }
 
