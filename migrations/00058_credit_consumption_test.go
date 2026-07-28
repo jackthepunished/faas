@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00057 (issue #279 PR-C, credit consumption).
+// Migration-apply test for 00058 (issue #279 PR-C, credit consumption).
 //
 // Asserts the unique partial index credit_ledger_invoice_credit_idx
 // (provider_invoice_id, credit_id) WHERE provider_invoice_id IS NOT NULL
@@ -26,7 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00057_CreditConsumption_LandsUniquePartialIndex(t *testing.T) {
+func TestMigrations_00058_CreditConsumption_LandsUniquePartialIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

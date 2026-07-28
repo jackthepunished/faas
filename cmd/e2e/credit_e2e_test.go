@@ -231,7 +231,7 @@ func TestE2E_CreditConsume_HappyPathAndIdempotent(t *testing.T) {
 	// (provider_invoice_id, credit_id). WaitForMigration gates
 	// against the cmd/e2e schedd migration race — daemons must
 	// boot AFTER the migration is in goose_db_version.
-	pgtest.WaitForMigration(t, pool, 57, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, 58, 10*time.Second)
 
 	const adminEmail = "e2e+hobby+admin@test.example"
 	const targetEmail = "e2e+hobby+consume-target@test.example"

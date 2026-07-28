@@ -1,14 +1,15 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00057_credit_consumption.sql — issue #279 PR-C.
+-- 00058_credit_consumption.sql — issue #279 PR-C.
 --
--- Slot note: 00057 is next-free on main after slot 56 was claimed
--- by open PRs #335 and #352 (the slot-collision gate from
--- scripts/ci/check_migration_slots.sh failed both). Walking past
--- collisions at rebase time is documented in memory
--- `migration-slot-collisions-across-prs.md` and
--- `git-mv-migration-internals-untouched.md`.
+-- Slot note: this PR walked the slot list at rebase time. It was
+-- 56 → 57 → 58 as open PRs #335 and #352 (and the cross-PR slot
+-- detector `scripts/ci/check_migration_slots.sh`) ate each in
+-- turn. Walking past collisions at rebase time is documented in
+-- memory `migration-slot-collisions-across-prs.md` and
+-- `git-mv-migration-internals-untouched.md`. Slot 58 is the first
+-- free slot on main after the slot-54 → 55 → 56 → 57 → 58 walk.
 --
 -- The PR #337 / #279 PR-A surface only ISSUED credits. This
 -- migration closes the loop: credit consumption is recorded as

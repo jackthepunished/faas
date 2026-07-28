@@ -631,7 +631,7 @@ type AccountCredit struct {
 // transaction that scrubs the rest of the customer's data.
 //
 // ProviderInvoiceID is NULL on issuance rows (today's only writer);
-// the consumption reducer (issue #279 PR-C, @migration 00057) sets it
+// the consumption reducer (issue #279 PR-C, @migration 00058) sets it
 // to the provider's invoice identifier and pairs it with CreditID in
 // a unique partial index so a webhook re-fire or admin endpoint
 // replay cannot double-decrement cents_remaining.

@@ -3734,7 +3734,7 @@ func (s *PgStore) ListAccountCredits(ctx context.Context, accountID string, only
 // constraint on delta_cents <> 0 ensures issuance (+N) and consumption
 // (-N) are both accepted but a zero-delta row is rejected.
 //
-// provider_invoice_id (migration 00057) is NULL on issuance rows
+// provider_invoice_id (migration 00058) is NULL on issuance rows
 // (today's only caller, cmd/apid/handlers_admin_credits.go::issueCredit);
 // the consumption reducer (issue #279 PR-C) sets it on consumption
 // rows and the partial unique index
@@ -3827,7 +3827,7 @@ func (s *PgStore) ListActiveCreditsForConsumption(ctx context.Context, accountID
 //
 // Idempotency is the partial unique index credit_ledger_invoice_credit_idx
 // (provider_invoice_id, credit_id) WHERE provider_invoice_id IS NOT NULL
-// (migration 00057). The INSERT uses ON CONFLICT DO NOTHING so a second
+// (migration 00058). The INSERT uses ON CONFLICT DO NOTHING so a second
 // call for the same invoice sees zero rows returned for every (invoice,
 // credit) pair and reports AlreadyConsumedForInvoice=true.
 //
@@ -4072,7 +4072,7 @@ func drainActive(ctx context.Context, tx pgx.Tx, active []AccountCredit, p Consu
 		// index whose column list AND WHERE clause match the
 		// conflict target. The partial unique index
 		// credit_ledger_invoice_credit_idx carries `WHERE
-		// provider_invoice_id IS NOT NULL` (migration 00057), so
+		// provider_invoice_id IS NOT NULL` (migration 00058), so
 		// the inference clause must repeat it — without the WHERE,
 		// Postgres errors with SQLSTATE 42P10 "there is no unique
 		// or exclusion constraint matching the ON CONFLICT
