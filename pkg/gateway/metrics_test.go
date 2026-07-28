@@ -497,3 +497,80 @@ func TestObserveWakeLocalityNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveWakeLocality("local_snapshot") // must not panic
 }
+
+// TestComputeNodeChangedSubscriberAliveRegisters — PR scale-out
+// readiness. The gauge must surface in the exposition handler
+// (catches a rename that would silently break the dashboard panel).
+//
+// Uses the same Gather() path as TestMetricsTLSCertExpiryRegisters
+// rather than a string-Contains on the literal numeric value: the
+// gauge's value is monotonic and the operator cares about
+// "frozen-or-zero", not the exact number.
+func TestComputeNodeChangedSubscriberAliveRegisters(t *testing.T) {
+	m := NewMetrics()
+	m.TouchComputeNodeChangedSubscriber()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "gateway_compute_node_changed_subscriber_alive") {
+		t.Errorf("gauge not in registry output:\n%s", rec.Body.String())
+	}
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	var found bool
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_compute_node_changed_subscriber_alive" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			got = mt.GetGauge().GetValue()
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("gateway_compute_node_changed_subscriber_alive not in registry gather")
+	}
+	if got != 1 {
+		t.Errorf("gauge value = %v, want 1 after one Touch", got)
+	}
+}
+
+// TestComputeNodeChangedSubscriberAliveObserves — the wrapper
+// increments by exactly one per call. Pins the monotonic contract
+// the alert rule depends on (freeze = stale).
+func TestComputeNodeChangedSubscriberAliveObserves(t *testing.T) {
+	m := NewMetrics()
+	for i := 0; i < 3; i++ {
+		m.TouchComputeNodeChangedSubscriber()
+	}
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_compute_node_changed_subscriber_alive" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			got = mt.GetGauge().GetValue()
+		}
+	}
+	if got != 3 {
+		t.Errorf("gauge value = %v, want 3 after 3 Touches", got)
+	}
+}
+
+// TestTouchComputeNodeChangedSubscriberNilSafe — the wrapper must not
+// panic when called on a nil receiver (mirrors ObserveWakeLocalityNilSafe
+// above and SetTLSCertExpiryNilSafe earlier in this file). cmd/gatewayd
+// tests pass a nil *Metrics; production wires deps.metrics which is
+// always non-nil after NewMetrics.
+func TestTouchComputeNodeChangedSubscriberNilSafe(t *testing.T) {
+	var m *Metrics
+	m.TouchComputeNodeChangedSubscriber() // must not panic
+}
