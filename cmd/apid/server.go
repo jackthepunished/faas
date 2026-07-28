@@ -619,6 +619,19 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
 
+	// Alert rules (issue #396 / ADR-045 PR 3). Per-app surface —
+	// account-wide rules are visible at every per-app listing but
+	// the create / update / delete endpoints pin to a specific app.
+	// POST is wrapped in idempotent so retries are safe; a race
+	// against the (account_id, name) unique index lands on
+	// state.ErrConflict for the duplicate-name path.
+	mux.HandleFunc("GET /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertRules))))
+	mux.HandleFunc("POST /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createAlertRule)))))
+	mux.HandleFunc("GET /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAlertRule))))
+	mux.HandleFunc("PATCH /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateAlertRule))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
+	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))
+
 	// Move 2: event-driven surface (handlers_invocations.go).
 	// Charged routes take idempotent so retries are safe; the long-poll
 	// ones take authLimited (no idempotent — a network jitter on a

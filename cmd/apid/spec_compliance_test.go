@@ -35,6 +35,7 @@ const (
 	cliauthFile   = "cliauth.go"
 	mfaFile       = "mfa.go"
 	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
+	alertsFile    = "alerts.go"   // issue #396 / ADR-045 PR 3
 	errorsFile    = "errors.go"
 )
 
@@ -80,12 +81,14 @@ var routeExclude = map[string]bool{
 // they cross the apid/CLI boundary — but they belong to non-public surfaces
 // (CLI device-code, public status page).
 var dtoExclude = map[string]bool{
-	"CliAuthCodeResponse":     true, // POST /v1/cli-auth/code (anonymous)
-	"CliAuthExchangeRequest":  true, // POST /v1/cli-auth/exchange
-	"CliAuthExchangeResponse": true, // POST /v1/cli-auth/exchange
-	"CliAuthStatus":           true, // enum used by CLI auth
-	"StatusPage":              true, // GET /status/slo.json (public status)
-	"SessionsRevokeRequest":   true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
+	"CliAuthCodeResponse":          true, // POST /v1/cli-auth/code (anonymous)
+	"CliAuthExchangeRequest":       true, // POST /v1/cli-auth/exchange
+	"CliAuthExchangeResponse":      true, // POST /v1/cli-auth/exchange
+	"CliAuthStatus":                true, // enum used by CLI auth
+	"StatusPage":                   true, // GET /status/slo.json (public status)
+	"SessionsRevokeRequest":        true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
+	"AlertRuleRow":                 true, // issue #396 / ADR-045 PR 3: handler-side mapping type, not on the wire
+	"RotateAlertRuleSecretRequest": true, // PR 3: body-less POST; reserved for a future plaintext-passing variant
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -470,6 +473,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", cliauthFile),
 		filepath.Join(root, "pkg", "api", mfaFile),
 		filepath.Join(root, "pkg", "api", sessionsFile),
+		filepath.Join(root, "pkg", "api", alertsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
 	}
 	dtos, err := scanDTOs(files)

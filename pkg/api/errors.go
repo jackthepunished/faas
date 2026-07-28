@@ -204,6 +204,14 @@ const (
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
+	// Alert-rule codes (issue #396 / ADR-045 PR 3). Mirror the cron
+	// block: 402 for plan-feature-gated, 403 for quota-trip,
+	// 400 for shape violations. Naming follows
+	// <resource>_<verb>_<past_tense> so the SDK and dashboard can
+	// branch without parsing the body.
+	CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
+	CodePlanAlertRuleQuota       = "plan_alert_rule_quota"
+	CodeAlertRuleInvalid         = "alert_rule_invalid"
 
 	// CodeScanCritical is returned by vmmd when the staged base
 	// ext4's Grype scan sidecar reports a CRITICAL finding (or
@@ -418,14 +426,15 @@ const MaxSecretKeyLen = 128
 // 500 — a reconstructed Problem is never served without a real status.
 func StatusForCode(code string) int {
 	switch code {
-	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
+	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue,
+		CodePlanAlertRuleQuota:
 		return http.StatusForbidden
 	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
-		CodeHandlerMissing, CodeImageRequired:
+		CodeHandlerMissing, CodeImageRequired, CodeAlertRuleInvalid:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout:
 		return http.StatusServiceUnavailable
@@ -460,6 +469,8 @@ func StatusForCode(code string) int {
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
 	case CodePayment:
+		return http.StatusPaymentRequired
+	case CodePlanAlertRulesNotAllowed:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
 		return http.StatusForbidden
@@ -676,6 +687,49 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs("https://docs.DOMAIN/plans#crons")
+}
+
+// ErrPlanAlertRulesNotAllowed is returned by apid's createAlertRule
+// handler when the customer's plan has AlertRuleLimitPerApp == 0
+// (Free today). Fires BEFORE the store is touched so a Free customer
+// gets a clean 402 instead of a quota-error round-trip. Mirrors
+// ErrPlanCronsNotAllowed (issue #396 / ADR-045 PR 3).
+func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanAlertRulesNotAllowed,
+		"Alert rules unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include alert rules; upgrade to Hobby or above to configure customer-side alerts.", p)).
+		WithDocs("https://docs.DOMAIN/plans#alert-rules")
+}
+
+// ErrPlanAlertRuleQuota is returned when CreateAlertRuleIfUnderQuota
+// surfaces a *state.AlertRuleQuotaError. Scope "app" or "account"
+// tells the handler which cap fired so the body can name it. 403
+// (not 402) because the plan DOES unlock alert rules — the right
+// copy is "delete a rule to add another", not "upgrade to Hobby".
+// Mirrors ErrPlanCronQuota (issue #396 / ADR-045 PR 3).
+func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Problem {
+	var scopeName string
+	if scope == "account" {
+		scopeName = "this account"
+	} else {
+		scopeName = "this app"
+	}
+	return NewProblem(http.StatusForbidden, CodePlanAlertRuleQuota,
+		"Alert rule limit reached",
+		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.DOMAIN/plans#alert-rules")
+}
+
+// ErrAlertRuleInvalid is returned for malformed alert-rule payloads
+// (closed-set drift, NaN threshold, cooldown out of band, SSRF
+// rejected, metric-family swap rejected). Mirrors ErrCronInvalid
+// (issue #396 / ADR-045 PR 3).
+func ErrAlertRuleInvalid(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAlertRuleInvalid,
+		"Invalid alert rule", reason).
+		WithDocs("https://docs.DOMAIN/alert-rules")
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't

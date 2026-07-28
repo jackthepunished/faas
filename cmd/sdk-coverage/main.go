@@ -140,8 +140,22 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/secrets":          "ListSecrets",
 	"GET /v1/domains":                      "ListDomains",
 	"POST /v1/domains":                     "CreateDomain",
-	"GET /v1/keys":                         "ListKeys",
-	"POST /v1/keys":                        "CreateKey",
+
+	// Issue #396 / ADR-045 PR 3 — alert rules. The auto-derivation
+	// would produce names with literal hyphens for the rotate-secret
+	// action ("PostAppsSlugAlertsIdRotate-secret"); the SDK verb is
+	// "RotateAlertRuleSecret" so the explicit map drops the hyphen.
+	// The other 5 entries exist because the SDK names them after the
+	// resource noun (AlertRule) rather than the path placeholder
+	// concatenation (AppsSlugAlerts) — same convention as crons.
+	"GET /v1/apps/{slug}/alerts":                     "ListAlertRules",
+	"POST /v1/apps/{slug}/alerts":                    "CreateAlertRule",
+	"GET /v1/apps/{slug}/alerts/{id}":                "GetAlertRule",
+	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
+	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
+	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
+	"GET /v1/keys":                                   "ListKeys",
+	"POST /v1/keys":                                  "CreateKey",
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and

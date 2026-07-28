@@ -47,9 +47,13 @@ func TestServeOpenAPISpec_ContentType(t *testing.T) {
 	if !bytes.HasPrefix(body, []byte("openapi: 3.1")) {
 		t.Errorf("body must begin with `openapi: 3.1`; got prefix %q", first40(body))
 	}
-	// Spot-check: paths section is present.
-	if !bytes.Contains(body[:min(4096, len(body))], []byte("\npaths:")) {
-		t.Errorf("body missing `paths:` section in first 4 KB; first lines: %q", first40(body))
+	// Spot-check: paths section is present. The 4 KB cap was set
+	// when the spec was smaller; issue #396 PR 3 added the alert-
+	// rules tag (issue #396 / ADR-045) which pushed paths past the
+	// 4 KB boundary. Look anywhere in the body — the section's
+	// presence is what matters, not its byte offset.
+	if !bytes.Contains(body, []byte("\npaths:")) {
+		t.Errorf("body missing `paths:` section; first lines: %q", first40(body))
 	}
 }
 
