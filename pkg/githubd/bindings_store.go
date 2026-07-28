@@ -63,7 +63,7 @@ type BindingsStore interface {
 // (PR-C, audit-gap closure). Pre-PR-C the install state lived in
 // RealService's in-memory `s.installs` map; PR-C demotes that map
 // to a read-through cache and pushes the durable state into the
-// github_installations Postgres table (migration 00056). The
+// github_installations Postgres table (migration 00059). The
 // githubd daemon stays persistence-agnostic — the concrete adapter
 // that bridges pkg/state.PgStore lives in cmd/githubd/main.go.
 //

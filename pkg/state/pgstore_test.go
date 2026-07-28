@@ -2036,7 +2036,7 @@ func createApp(t *testing.T, s *state.PgStore, ctx context.Context, acctID, slug
 }
 
 // TestPg_UpsertGitHubInstall_InsertsRow pins the insert path on the
-// new github_installations table (PR-C, migration 00056). The
+// new github_installations table (PR-C, migration 00059). The
 // SealedToken bytea is the load-bearing bit — the test asserts a
 // sealed blob survives the round-trip, so a regression that writes
 // plaintext would be caught.

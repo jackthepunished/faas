@@ -120,27 +120,27 @@ func LoadMigrations(t *testing.T) []MigrationFile {
 // contiguity is required for the check to pass.
 //
 // Reservation files (NNNNN_reserve_slot.sql, NNNNN_no_op_slot_reservation.sql
-// — see ADR-041) are excluded from the slot counter: their job is to
-// hold a slot for a real schema to land in, so they do NOT occupy a
-// position in the {1..N} sequence. A real schema at the same slot as a
-// reservation file is permitted; the reservation is shadowed by the
-// real schema and is dropped on merge. This mirrors the cross-PR gate
-// (scripts/ci/check_migration_slots.sh::slots_from_paths).
+// — see ADR-041) DO occupy a slot in the {1..N} sequence: they are
+// real (non-DDL) goose statements that goose applies and writes to
+// goose_db_version. The carve-out for reservations is only in the
+// unique-prefix check (TestMigrationsUniquePrefixes) and the cross-PR
+// gate (scripts/ci/check_migration_slots.sh::slots_from_paths), where
+// reservations exist to hold a slot for a real schema to land in. A
+// reservation at slot N between two real schemas at N-1 and N+1 is
+// fine — it's just another file in the embedded set, and goose treats
+// it like any other no-op migration. The contiguity invariant on the
+// file set therefore treats reservations as first-class entries.
 func TestMigrationsContiguous(t *testing.T) {
 	files := LoadMigrations(t)
 	if len(files) == 0 {
 		t.Fatal("no embedded migrations; embed.go is empty?")
 	}
-	want := int64(1)
-	for _, f := range files {
-		if isReservationFilename(f.Name) {
-			continue // reservations don't occupy a slot
-		}
+	for i, f := range files {
+		want := int64(i + 1)
 		if f.Version != want {
-			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, want)
+			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, i+1)
 			return // report first gap, not all
 		}
-		want++
 	}
 }
 
@@ -227,6 +227,11 @@ func TestMigrationsReservationsAreNoOp(t *testing.T) {
 			t.Errorf("%s: no '-- +goose Up' body; goose will skip it and the slot won't be held", f.Name)
 			continue
 		}
+		// Strip SQL line comments so the explanatory header (which
+		// uses words like "drop", "rollback", "DDL" liberally) does
+		// not trip the keyword scanner. The carve-out is about
+		// *statements*, not comments about statements.
+		body = stripSQLLineComments(body)
 		for _, kw := range []string{"create", "alter", "drop", "insert", "update", "delete", "truncate", "grant", "revoke"} {
 			if containsSQLKeyword(body, kw) {
 				t.Errorf("%s: reservation file contains %q statement; ADR-041 reservations must be no-ops so a real schema can shadow the slot", f.Name, kw)
@@ -264,6 +269,25 @@ func extractGooseUpBody(content string) string {
 		}
 	}
 	return ""
+}
+
+// stripSQLLineComments removes SQL line comments (`--` to end-of-line)
+// from body. Used by TestMigrationsReservationsAreNoOp so that an
+// explanatory header comment inside the Up block ("the reservation is
+// dropped on merge", "would re-expose the slot to the cross-PR gate")
+// does not trip the DDL-keyword scanner. Block comments (`/* */`) are
+// rare in migration files and are not stripped here — adds value
+// without added risk; reservation bodies should be empty of both.
+func stripSQLLineComments(body string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		sb.WriteString(strings.TrimSpace(line))
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // containsSQLKeyword reports whether body contains `kw` as a SQL token

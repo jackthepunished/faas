@@ -259,7 +259,7 @@ type GitHubBinding struct {
 // and evaporated on kill -TERM, breaking the dashboard's
 // /v1/install/repos/list + /v1/apps/{slug}/install/bind paths with
 // 502s the moment githubd restarted. PR-C moves the source of truth
-// to the github_installations table (migration 00056).
+// to the github_installations table (migration 00059).
 //
 // AccountID is the PK (a uuid, references accounts(id) ON DELETE
 // CASCADE — GDPR §17 G2 path deletes the row when the owning account
