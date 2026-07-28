@@ -81,11 +81,19 @@ func pipeStdin(t *testing.T, data string) {
 // directly. The (reader, restore) shape means callers must call
 // restore() before reading.
 
-// readSavedToken reads the token file written by saveToken and
-// returns its contents (minus trailing newline). Used by every test
-// that exercises the happy path.
+// readSavedToken reads the token written by saveToken and returns
+// its contents (minus trailing newline). It consults both stores in
+// priority order — the OS keychain (when a stub is installed) then
+// the plaintext-file fallback — matching production loadToken
+// semantics after issue #293. Used by every test that exercises the
+// happy path.
 func readSavedToken(t *testing.T) string {
 	t.Helper()
+	if kr := effectiveKeyring(); kr != nil {
+		if v, err := kr.Get(keyringService, keyringAccount); err == nil {
+			return strings.TrimRight(v, "\r\n")
+		}
+	}
 	p, err := tokenPath()
 	if err != nil {
 		t.Fatalf("tokenPath: %v", err)
@@ -133,6 +141,7 @@ func TestCmdLogin_InteractiveHappyPath_BrowserOpens(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
 	stubBrowser(t, nil)
+	setFakeKeyring(t)
 	out, _ := captureStdout(t)
 	// Empty stdin line → polling path kicks in after the 3s timeout.
 	pipeStdin(t, "\n")
@@ -189,6 +198,7 @@ func TestCmdLogin_InteractiveHappyPath_PasteCode(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
 	stubBrowser(t, nil) // browser "succeeds" but the user still pastes
+	setFakeKeyring(t)
 	out, _ := captureStdout(t)
 	pipeStdin(t, "ABCD-1234\n")
 
@@ -461,6 +471,7 @@ func TestCmdLogin_AutoCreatesAccount(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
 	stubBrowser(t, nil)
+	setFakeKeyring(t)
 	out, _ := captureStdout(t)
 	pipeStdin(t, "WXYZ-1234\n")
 
@@ -490,6 +501,7 @@ func TestCmdLogin_TokenFlagRegression(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
 
 	if code := cmdLogin([]string{"--token", "fp_live_x"}); code != 0 {
 		t.Fatalf("cmdLogin --token regression = %d, want 0", code)
