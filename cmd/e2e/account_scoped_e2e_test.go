@@ -106,14 +106,12 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	store := state.NewPgStore(h.Pool)
 	ctx := context.Background()
 
-	apps := make([]state.App, 0, 3)
 	var key string
 	for _, slug := range []string{"alpha", "beta", "gamma"} {
-		acctID, k, app := seedAccountAndApp(t, h, ctx, "across-"+slug, api.PlanHobby, slug)
+		_, k, app := seedAccountAndApp(t, h, ctx, "across-"+slug, api.PlanHobby, slug)
 		if key == "" {
 			key = k // all share the same plan; first key is fine for the GET
 		}
-		_ = acctID
 		dep := seedDeployment(t, h, ctx, app.ID)
 		for i := 0; i < 2; i++ {
 			if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
@@ -121,7 +119,6 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 				t.Fatalf("CreateInstance: %v", err)
 			}
 		}
-		apps = append(apps, app)
 	}
 
 	// Re-seed a single account that owns ALL three apps so the

@@ -42,6 +42,13 @@ import (
 // Returns 200 with an empty `instances` array for an account with
 // zero live instances — never 404. next_before is the last row's id
 // when len(out) == limit; omitted (empty) otherwise.
+// sourceDegradedNoProm is the canonical "Source" value emitted when
+// the metrics handler has no Prometheus client configured. Mirrors
+// handlers_metrics.go::sourcePrometheus / "degraded: ..." convention
+// so the dashboard's empty-state branch handles both per-app and
+// account-scoped metrics with one code path.
+const sourceDegradedNoProm = "degraded: prometheus not configured"
+
 func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "instances")
 	if prob != nil {
@@ -148,7 +155,7 @@ func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct sta
 			fmt.Sprintf("range must be one of: %s", strings.Join(metricsRanges, ", "))))
 		return
 	}
-	apps, err := s.store.ListApps(ctx(r), acct.ID)
+	apps, err := s.store.ListApps(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list apps"))
 		return
@@ -160,7 +167,7 @@ func (s *server) getAppsMetrics(w http.ResponseWriter, r *http.Request, acct sta
 		Apps:  make(map[string]api.AppMetricsResponse, len(apps)),
 	}
 	if s.promqlClient == nil {
-		resp.Source = "degraded: prometheus not configured"
+		resp.Source = sourceDegradedNoProm
 		resp.Apps = nil
 		writeJSON(w, http.StatusOK, resp)
 		return
