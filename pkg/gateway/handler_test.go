@@ -44,6 +44,21 @@ type fakeBackend struct {
 	// admitErrOverrides forces the next N Admit calls to return the
 	// given error (used by the at-capacity test).
 	atCapForCalls int32
+	// wakeMethodOut lets a test pin the WakeMethod the fake Admit
+	// returns. Default (zero value) is WakeMethodColdBoot, which is
+	// what every existing test expects. Set to WakeMethodSnapshotRestore
+	// to drive the wake-locality classifier down the local_snapshot
+	// branch (PR scale-out readiness).
+	wakeMethodOut WakeMethod
+	// failNextPick forces the next Pick call to return !ok so the
+	// handler hits the "every cached instance was evicted between
+	// admit and pick" branch. The handler surfaces that as a 503
+	// without ever calling ObserveWakeLocality, which is exactly
+	// the contract the wake-locality tests pin (PR scale-out
+	// readiness). Single-shot: the flag is consumed (cleared) on
+	// the failing call so a second Pick in the same test (e.g. a
+	// retry path) gets the normal round-robin.
+	failNextPick bool
 }
 
 // AddTarget seeds a Target into the per-app cache without going through
@@ -65,6 +80,15 @@ func (b *fakeBackend) Lookup(_ context.Context, host string) (App, bool) {
 func (b *fakeBackend) Pick(_ string) (Target, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.failNextPick {
+		// Test seam (PR scale-out readiness): force Pick to fail so the
+		// handler hits the "every cached instance was evicted between
+		// admit and pick" branch and writes the 503 path. The flag is
+		// consumed (single-shot) so a second Pick in the same test
+		// (e.g. a retry path) gets the normal round-robin.
+		b.failNextPick = false
+		return Target{}, false
+	}
 	if len(b.targets) > 0 {
 		idx := b.nextIdx.Add(1) - 1
 		return b.targets[int(idx%uint64(len(b.targets)))], true
@@ -90,7 +114,7 @@ func (b *fakeBackend) HealthyCount(_ string) int {
 	return 0
 }
 
-func (b *fakeBackend) Admit(_ context.Context, _ string, maxConcurrency int) (string, bool, error) {
+func (b *fakeBackend) Admit(_ context.Context, _ string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Issue #168 fan-out invariant: the HealthyCount + addTarget pair
 	// must be serialized. The fakeBackend takes b.mu for the whole
 	// call so concurrent Admit callers cannot collectively exceed
@@ -101,25 +125,31 @@ func (b *fakeBackend) Admit(_ context.Context, _ string, maxConcurrency int) (st
 	if len(b.targets) >= maxConcurrency {
 		// Already at the cap — the production semantics here are
 		// "schedule atomically refused", surfaced as atCapacity.
-		return "", true, nil
+		return "", WakeMethodUnspecified, true, nil
 	}
 	seq := atomic.AddInt32(&b.admits, 1)
 	if atomic.LoadInt32(&b.atCapForCalls) > 0 {
 		atomic.AddInt32(&b.atCapForCalls, -1)
-		return "", true, nil
+		return "", WakeMethodUnspecified, true, nil
 	}
 	if b.wakeErr != nil {
-		return "", false, b.wakeErr
+		return "", WakeMethodUnspecified, false, b.wakeErr
 	}
 	b.running = true // legacy-mode flag — also seeded via setLegacyHot in tests
 	// Mint a fresh per-admit Target so the round-robin fans out
 	// across admits (issue #168).
 	t := Target{NodeID: b.upstream, InstanceID: "i-" + itoa(uint64(seq)), WakeID: "fake-wake-id"}
 	b.targets = append(b.targets, t)
-	if b.wakeIDOut != "" {
-		return b.wakeIDOut, false, nil
+	// Pick the WakeMethod the test pinned (zero value = ColdBoot, so
+	// every existing test continues to drive the cold-boot chokepoint).
+	method := b.wakeMethodOut
+	if method == WakeMethodUnspecified {
+		method = WakeMethodColdBoot
 	}
-	return "fake-wake-id", false, nil
+	if b.wakeIDOut != "" {
+		return b.wakeIDOut, method, false, nil
+	}
+	return "fake-wake-id", method, false, nil
 }
 
 // Admits returns the AdmitInstance() call count (test assertion hook).
@@ -830,4 +860,179 @@ func bodyForHistogram(t *testing.T, m *Metrics) string {
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	m.Handler().ServeHTTP(rec, req)
 	return rec.Body.String()
+}
+
+// counterValueFromBody scrapes the metrics endpoint and parses the
+// counter value whose label tuple matches labelNeedle. Returns 0
+// when no matching line is found. Counter exposition is
+// `<name>{<labels>} <value>`, no `_count` / `_sum` suffix, so this
+// helper differs from histogramCountFromBody in two ways: (1) no
+// suffix is appended to the prefix and (2) we accept a fully-formed
+// label substring so callers can pin both the metric name and the
+// label tuple in one needle.
+//
+// SAFE the needle must be a complete metric-name + label prefix
+// (e.g. `gateway_wake_locality_total{outcome="local_coldboot"}`),
+// not an ambiguous substring. Today the wake-locality needles are
+// uniquely identifying — future contributors adding a sibling metric
+// whose name is a substring (e.g. `gateway_wake_locality_bytes_*`)
+// would silently match the wrong line. If that happens, prefer
+// `strings.HasPrefix` plus a name-and-label-tuple check, or split
+// the needle into a name and a label substring and match both.
+func counterValueFromBody(t *testing.T, m *Metrics, labelNeedle string) int {
+	t.Helper()
+	body := bodyForHistogram(t, m)
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.Contains(line, labelNeedle) {
+			continue
+		}
+		// Trailing "<int>" is the counter value.
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			continue
+		}
+		var n int
+		_, _ = fmt.Sscanf(parts[1], "%d", &n)
+		return n
+	}
+	return 0
+}
+
+// TestHandlerObserveWakeLocality is the PR 1 table-driven assertion
+// that exercises the wake-locality classifier at the after-proxy
+// chokepoint (pkg/gateway/handler.go:454). Five cases pin the
+// behaviour:
+//
+//  1. newly admitted restore → local_snapshot increments by 1
+//  2. newly admitted cold boot → local_coldboot increments by 1
+//  3. warm request (no admit) → neither counter moves
+//  4. admission error → neither counter moves (handler returns before
+//     the chokepoint)
+//  5. pick-race failure → neither counter moves (handler returns
+//     after ensureCapacity but before the chokepoint)
+//
+// The test is the load-bearing seam that locks down "the metric
+// answers what fraction of admissions were local, not what fraction
+// of requests were local" — the comment on ObserveWakeLocality that
+// justifies the closed set is enforced here.
+func TestHandlerObserveWakeLocality(t *testing.T) {
+	cases := []struct {
+		name          string
+		setup         func(b *fakeBackend)
+		wantLocalSnap int
+		wantLocalCB   int
+	}{
+		{
+			name: "newly admitted restore increments local_snapshot",
+			setup: func(b *fakeBackend) {
+				b.wakeMethodOut = WakeMethodSnapshotRestore
+			},
+			wantLocalSnap: 1,
+			wantLocalCB:   0,
+		},
+		{
+			name: "newly admitted cold boot increments local_coldboot",
+			setup: func(b *fakeBackend) {
+				// Default fakeBackend.wakeMethodOut is WakeMethodUnspecified
+				// which Admit maps to ColdBoot — explicit here for clarity.
+				b.wakeMethodOut = WakeMethodColdBoot
+			},
+			wantLocalSnap: 0,
+			wantLocalCB:   1,
+		},
+		{
+			name: "warm request increments neither counter",
+			setup: func(b *fakeBackend) {
+				// PlanFree cap=1; setLegacyHot pre-seeds one Target so
+				// HealthyCount==1==MaxConcurrency → ensureCapacity's
+				// saturation path returns cold=false without firing
+				// Admit. The handler then exits at Pick without ever
+				// reaching the after-proxy chokepoint. Same canonical
+				// pattern as TestHotPathDoesNotWakeOrTagCold.
+				b.app.Plan = api.PlanFree
+				b.setLegacyHot()
+			},
+			wantLocalSnap: 0,
+			wantLocalCB:   0,
+		},
+		{
+			name: "admission error increments neither counter",
+			setup: func(b *fakeBackend) {
+				b.wakeErr = errors.New("schedd unreachable")
+			},
+			wantLocalSnap: 0,
+			wantLocalCB:   0,
+		},
+		{
+			name: "pick-fail failure increments neither counter",
+			setup: func(b *fakeBackend) {
+				// Drive an admit so cold==true is in play, then force
+				// Pick to fail mid-request. The handler returns 503
+				// before the after-proxy chokepoint.
+				b.failNextPick = true
+			},
+			wantLocalSnap: 0,
+			wantLocalCB:   0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, b, _ := newTestHandler(t)
+			if tc.setup != nil {
+				tc.setup(b)
+			}
+
+			req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			// Sanity: each request must reach the handler regardless of
+			// the path (the metric is observed at a chokepoint that
+			// only fires for one of the five cases).
+			if rec.Code == 0 {
+				t.Fatalf("status = 0; handler did not write a response")
+			}
+
+			gotSnap := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_snapshot"}`)
+			if gotSnap != tc.wantLocalSnap {
+				t.Errorf("local_snapshot count = %d, want %d", gotSnap, tc.wantLocalSnap)
+			}
+			gotCB := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_coldboot"}`)
+			if gotCB != tc.wantLocalCB {
+				t.Errorf("local_coldboot count = %d, want %d", gotCB, tc.wantLocalCB)
+			}
+		})
+	}
+}
+
+// TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit pins the
+// dual-increment contract: when the after-proxy chokepoint fires
+// twice (two distinct cold admits on the same app), the counter
+// increments exactly twice. Catches a future contributor who wraps
+// the increment in a loop, double-increments on a particular path,
+// or otherwise drifts from the "one increment per admission" rule.
+// Same canonical pattern as TestHandlerObserveWakeLocality: the
+// app is PlanPro (cap=5) so a second request still hits the cold
+// fan-out path (HealthyCount=1 < 5), admitting a second instance.
+// Both admits must enumerate.
+func TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request #%d: status = %d, want 200", i, rec.Code)
+		}
+	}
+
+	gotCB := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_coldboot"}`)
+	if gotCB != 2 {
+		t.Errorf("local_coldboot count after 2 cold admits = %d, want 2 (exactly once per admit)", gotCB)
+	}
+	gotSnap := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_snapshot"}`)
+	if gotSnap != 0 {
+		t.Errorf("local_snapshot count = %d, want 0 (PlanPro default is cold boot)", gotSnap)
+	}
 }

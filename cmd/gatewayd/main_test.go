@@ -42,15 +42,15 @@ func (f *fixedBackend) Pick(_ string) (gateway.Target, bool) {
 func (f *fixedBackend) HealthyCount(_ string) int {
 	return len(f.picks)
 }
-func (f *fixedBackend) Admit(_ context.Context, _ string, _ int) (string, bool, error) {
+func (f *fixedBackend) Admit(_ context.Context, _ string, _ int) (string, gateway.WakeMethod, bool, error) {
 	f.admitCalls++
 	if f.admitErr != nil {
-		return "", false, f.admitErr
+		return "", gateway.WakeMethodUnspecified, false, f.admitErr
 	}
 	if f.atCap {
-		return "", true, nil
+		return "", gateway.WakeMethodUnspecified, true, nil
 	}
-	return "wake-fixed", false, nil
+	return "wake-fixed", gateway.WakeMethodColdBoot, false, nil
 }
 
 func discardLogger() *slog.Logger {
@@ -68,7 +68,7 @@ func TestUnwiredBackendReturnsNotFound(t *testing.T) {
 	if got := b.HealthyCount("any"); got != 0 {
 		t.Errorf("HealthyCount = %d, want 0", got)
 	}
-	if _, _, err := b.Admit(context.Background(), "any", 1); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "any", 1); err != nil {
 		t.Errorf("Admit should be no-op: %v", err)
 	}
 }
@@ -217,7 +217,7 @@ func TestFixedBackend_Delegates(t *testing.T) {
 	if got := b.HealthyCount("a"); got != 1 {
 		t.Errorf("HealthyCount = %d, want 1", got)
 	}
-	if _, _, err := b.Admit(context.Background(), "x", 1); err == nil || err.Error() != "upstream" {
+	if _, _, _, err := b.Admit(context.Background(), "x", 1); err == nil || err.Error() != "upstream" {
 		t.Errorf("Admit err = %v", err)
 	}
 	if b.admitCalls != 1 {

@@ -30,6 +30,11 @@
 //     boot and a missing wire-incrementation is visible as a frozen zero.
 //     ADR-024 H3.b is the still-open follow-up to bridge the certmagic zap
 //     logger into this counter)
+//   - gateway_wake_locality_total{outcome}          counter (PR scale-out
+//     readiness; outcome ∈ {local_snapshot, local_coldboot} today;
+//     remote_* outcomes slot in transparently when the second compute
+//     node joins — pins the wake-locality ratio so the sticky-vs-shared
+//     snapshot-store decision is a measurement, not a guess)
 package gateway
 
 import (
@@ -107,6 +112,14 @@ type Metrics struct {
 	// its NotAfter; the page rule fires regardless.
 	tlsCertExpiry     prometheus.Gauge
 	tlsOnDemandDenied *prometheus.CounterVec
+	// wakeLocality is the increment-only wake-outcome classifier that
+	// backs the multiplex scale-out decision (PR scale-out readiness,
+	// ADRs 025/028). Outcome ∈ {local_snapshot, local_coldboot} today;
+	// when a second compute node joins, remote_* outcomes slot in
+	// transparently without a metric rename. Nil-safe via the
+	// ObserveWakeLocality wrapper so the Handler hot path doesn't need
+	// to gate on every call.
+	wakeLocality *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -212,6 +225,14 @@ func NewMetrics() *Metrics {
 			Name: "gateway_tls_on_demand_denied_total",
 			Help: "On-demand cert mint denials, labelled by reason. ADR-024 H3 (closed in PR #345); H3.b is the still-open follow-up. reason=allowlist is incremented from pkg/gateway/tls_wire.go's allowlistToDecisionFunc today. reason=dns01 and reason=token are reserved for the H3.b follow-up that bridges the certmagic ACME-issuer logger through this counter; the series are pre-instantiated at 0 so the dashboard panel surfaces from boot and a missing wire-incrementation is visible as a frozen zero.",
 		}, []string{"reason"}),
+		// PR scale-out readiness — wake-locality counter. The closed
+		// (outcome) set is pre-instantiated below so the panel surfaces
+		// from boot. New outcomes (remote_*) join by widening the
+		// pre-instantiation loop; the metric name stays stable.
+		wakeLocality: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_wake_locality_total",
+			Help: "Wake-outcome classifier used to drive the sticky-vs-shared snapshot-store decision. outcome ∈ {local_snapshot, local_coldboot} today; remote_* outcomes slot in when a second compute node joins. Counting is restricted to admissions that actually brought up an instance — warm requests and at-capacity benign outcomes are not enumerated.",
+		}, []string{"outcome"}),
 	}
 	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
 	// the gauge surfaces from boot, mirroring the apid precedent
@@ -244,7 +265,15 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.accountRateLimited.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied)
+	// PR scale-out readiness. Pre-instantiate the closed (outcome)
+	// set so the panel surfaces from boot. Mirrors the
+	// tlsOnDemandDenied / accountRateLimited pre-instantiation
+	// pattern above. To add a new outcome (e.g. remote_*):
+	// extend this slice; the metric name stays stable.
+	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
+		m.wakeLocality.WithLabelValues(outcome)
+	}
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied, m.wakeLocality)
 	return m
 }
 
@@ -331,6 +360,24 @@ func (m *Metrics) ObserveWakeQueueWait(d time.Duration) {
 		return
 	}
 	m.wakeQueueWait.Observe(d.Seconds())
+}
+
+// ObserveWakeLocality increments the wake-locality counter for the
+// given outcome (PR scale-out readiness). outcome ∈ {local_snapshot,
+// local_coldboot} today; unknown values fall through to Prometheus's
+// default behaviour (a new label tuple surfaces in /metrics but the
+// dashboard panel never queries for them). Nil-safe so the Handler
+// hot path doesn't need a nil guard — mirrors ObserveWakeQueueWait
+// and ObserveTLSOnDemandDenied. Only call from paths that actually
+// admitted an instance; warm requests and at-capacity benign
+// outcomes should NOT invoke this so the metric answers "what
+// fraction of admissions were local?" not "what fraction of
+// requests were local?".
+func (m *Metrics) ObserveWakeLocality(outcome string) {
+	if m == nil {
+		return
+	}
+	m.wakeLocality.WithLabelValues(outcome).Inc()
 }
 
 // TopTenantRPSEmit drives the gateway_top_tenant_rps gauge from

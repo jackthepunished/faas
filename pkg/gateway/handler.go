@@ -68,10 +68,12 @@ type Backend interface {
 	// commits. Implementations MUST serialize the HealthyCount check and
 	// the cache update so a burst of concurrent Admit calls can never
 	// collectively exceed maxConcurrency (issue #168 fan-out invariant).
-	// On the admitted path wakeID is non-empty and the new Target is
-	// cached. On the at-capacity path wakeID is empty and err is nil.
-	// On real failure err is a non-nil *api.Problem.
-	Admit(ctx context.Context, appID string, maxConcurrency int) (wakeID string, atCapacity bool, err error)
+	// On the admitted path wakeID is non-empty, the new Target is cached,
+	// and method reflects what schedd actually did (restore or cold boot).
+	// On the at-capacity path wakeID is empty, method is
+	// WakeMethodUnspecified, and err is nil. On real failure err is a
+	// non-nil *api.Problem and method is WakeMethodUnspecified.
+	Admit(ctx context.Context, appID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -363,7 +365,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// N instances before short-circuiting.
 	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
-	cold, wakeID, err := h.ensureCapacity(r.Context(), app.ID, limits.MaxConcurrency)
+	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, limits.MaxConcurrency)
 	if err != nil {
 		writeWakeError(w, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
@@ -442,6 +444,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			firstByteAt = time.Now()
 		}
 		h.metrics.ObserveColdBoot(app.ID, firstByteAt.Sub(wakeStart))
+		// Wake-locality classifier (PR scale-out readiness). Increment
+		// AFTER the existing first-byte observation so the 350 ms
+		// measurement path is unchanged. Only fires on a real admit
+		// (cold==true), so warm requests, at-capacity benign outcomes,
+		// and admission errors do not enumerate. Today's outcomes are
+		// local_snapshot / local_coldboot; remote_* outcomes slot in
+		// when a second compute node joins.
+		h.metrics.ObserveWakeLocality(wakeMethod.String())
 	}
 }
 
@@ -608,15 +618,18 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 //  3. Saturated (HealthyCount >= max_concurrency): no-op. Pick returns
 //     one of the cached targets.
 //
-// Returns (cold, wakeID, err):
+// Returns (cold, wakeID, method, err):
 //   - cold=true on a fresh admit (one or more new instances reached RUNNING);
 //     cold=false when the request hit an existing cached target with no
 //     fresh admit fired.
 //   - wakeID is non-empty on a fresh admit, empty when no admit fired.
+//   - method reports what schedd actually did (snapshot restore or cold
+//     boot) on the admitted path. WakeMethodUnspecified on
+//     cold=false/at-capacity paths and on real failures.
 //   - err is non-nil only on real admission failures (RAM headroom, chooser,
 //     store). The benign app_concurrency_reached outcome is never lifted to
 //     an error by Backend.Admit.
-func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurrency int) (cold bool, wakeID string, err error) {
+func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
 	// Loop bound: a single request can drive at most max_concurrency
 	// iterations (cold-start with follow-up fan-out). The cap is
 	// enforced atomically by Backend.Admit (HealthyCount + add as one
@@ -625,12 +638,12 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 	for attempt := 0; attempt < maxConcurrency; attempt++ {
 		healthy := h.backend.HealthyCount(appID)
 		if healthy == 0 {
-			c, w, e := h.coldStart(ctx, appID, maxConcurrency)
+			c, w, m, e := h.coldStart(ctx, appID, maxConcurrency)
 			if e != nil {
-				return false, "", e
+				return false, "", WakeMethodUnspecified, e
 			}
 			if c {
-				return true, w, nil
+				return true, w, m, nil
 			}
 			// Cold-start saw no need to admit (a peer's wake
 			// already populated the cache). Re-check HealthyCount
@@ -639,37 +652,40 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 			continue
 		}
 		if healthy >= maxConcurrency {
-			return false, "", nil
+			return false, "", WakeMethodUnspecified, nil
 		}
 		// Fan-out path: admit directly, no gate. Backend.Admit
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
 		if e != nil {
-			return false, "", e
+			return false, "", WakeMethodUnspecified, e
 		}
 		if atCapacity {
-			return false, "", nil
+			return false, "", WakeMethodUnspecified, nil
 		}
-		return true, wakeID, nil
+		return true, wakeID, method, nil
 	}
-	return false, "", nil
+	return false, "", WakeMethodUnspecified, nil
 }
 
 // coldStart is path 1 of ensureCapacity: HealthyCount == 0, so we go
 // through the WakeGate's single-flight coalescing. shouldWake is held
 // under the gate lock and re-runs HealthyCount; if a peer's admit has
 // just landed, we skip the redundant cold boot.
-func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency int) (bool, string, error) {
-	var admittedWakeID string
-	var cold bool
+func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency int) (bool, string, WakeMethod, error) {
+	var (
+		admittedWakeID string
+		cold           bool
+		method         WakeMethod
+	)
 	werr := h.gate.Wait(ctx, appID,
 		func() bool {
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
 			if e != nil {
 				return e
 			}
@@ -677,14 +693,15 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 				return nil
 			}
 			admittedWakeID = id
+			method = m
 			cold = true
 			return nil
 		},
 	)
 	if werr != nil {
-		return false, "", werr
+		return false, "", WakeMethodUnspecified, werr
 	}
-	return cold, admittedWakeID, nil
+	return cold, admittedWakeID, method, nil
 }
 
 func writeWakeError(w http.ResponseWriter, err error) {

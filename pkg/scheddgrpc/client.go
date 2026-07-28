@@ -98,18 +98,27 @@ func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wa
 // Return shape:
 //   - instanceID, nodeID, wakeID: non-empty on the admitted path,
 //     empty on the at-capacity path.
+//   - method: the wake-outcome schedd actually performed (PR
+//     scale-out readiness). The wire value is scheddpb.WakeMethod;
+//     this method returns it as int32 so pkg/gateway can translate
+//     it via gateway.scheddWakeMethodToGateway without importing the
+//     protobuf package directly. WAKE_RESTORE (proto value 1) and
+//     WAKE_COLD_BOOT (proto value 0) pass through; any other value
+//     is left as-is and the gateway default-branch maps it to
+//     WakeMethodColdBoot (the safer "slow but always works" outcome,
+//     matching scheddgrpc.mapMethod's defense).
 //   - atCapacity: true when the app is already at effective
 //     max_concurrency. The gateway treats this as a benign no-op
 //     when it already has ≥1 cached target.
 //   - err: non-nil only on real admission failures (RAM headroom,
 //     chooser, store). The benign app_concurrency_reached outcome is
 //     never lifted to an error.
-func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, atCapacity bool, err error) {
+func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, err error) {
 	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID})
 	if err != nil {
-		return "", "", "", false, liftErr(err)
+		return "", "", "", 0, false, liftErr(err)
 	}
-	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), resp.GetAtCapacity(), nil
+	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int32(resp.GetMethod()), resp.GetAtCapacity(), nil
 }
 
 // ReportActivity flushes a batch of last_request_at touches to schedd. Returns
