@@ -323,7 +323,7 @@ func TestMemStoreAlertRule_CountFailedInvocationsSince(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := m.FailInvocation(ctx, inv.ID, "boom", 0); err != nil {
+		if err := m.FailInvocation(ctx, inv.ID, "boom", 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -337,7 +337,7 @@ func TestMemStoreAlertRule_CountFailedInvocationsSince(t *testing.T) {
 		State: InvocationPending, Method: "POST", Path: "/",
 		CreatedAt: t0,
 	})
-	_ = m.FailInvocation(ctx, inv.ID, "boom", 0)
+	_ = m.FailInvocation(ctx, inv.ID, "boom", 0, 0)
 
 	// App-scoped.
 	n, err := m.CountFailedInvocationsSince(ctx, acct.ID, app.ID, InvocationCron, t0.Add(-time.Second))

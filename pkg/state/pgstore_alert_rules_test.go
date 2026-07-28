@@ -411,7 +411,7 @@ func TestPgStore_AlertRule_CountFailedInvocationsSince(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.FailInvocation(ctx, inv.ID, "boom", 0); err != nil {
+		if err := s.FailInvocation(ctx, inv.ID, "boom", 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -433,7 +433,7 @@ func TestPgStore_AlertRule_CountFailedInvocationsSince(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FailInvocation(ctx, qInv.ID, "boom", 0); err != nil {
+	if err := s.FailInvocation(ctx, qInv.ID, "boom", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -462,7 +462,7 @@ func TestPgStore_AlertRule_CountFailedInvocationsSince(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FailInvocation(ctx, xInv.ID, "boom", 0); err != nil {
+	if err := s.FailInvocation(ctx, xInv.ID, "boom", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 
