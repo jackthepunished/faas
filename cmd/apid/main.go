@@ -478,6 +478,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			//nolint:contextcheck // shutdown context must outlive request ctx; detached from caller per net/http contract.
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}
+		// Issue #286: drain the async failed-login audit channel
+		// so in-flight rows land in the events table before the
+		// daemon exits. Close is idempotent — safe to call from
+		// the shutdown path even if WithOpsMetrics wasn't wired
+		// (the auditor's failedCh is nil and Close is a no-op).
+		if srv.audit != nil {
+			srv.audit.Close()
+		}
 		return nil
 	}
 }

@@ -139,10 +139,23 @@
 
 - **Out of scope (deferred):**
 
-  - **Failed-login emission** at volume. High-frequency DoS amplifier
-    via sync DB write; v1 emits `auth.*` only on success paths.
-    Failed attempts continue to land as `slog` lines until a follow-up
-    PR lands an async-batched audit channel.
+  - **Failed-login emission** at volume. Status (issue #286, 2026-07-28):
+    **delivered**. The first deferred item now lands via an async-batched
+    `auditor.EmitFailedLogin(ip, emailHash, userAgent)` channel drained by
+    a single background goroutine that batches INSERTs every 250 ms or
+    1000 rows (whichever first). The handler-side `select { case ch <- row:
+    default: dropCounter.Inc() }` is non-blocking by ADR-035 §"Rejected
+    alternatives" reason #4 — the sync-write DoS amplifier is the exact
+    shape this PR is avoiding. Per-IP metric `apid_failed_login_total{ip}`
+    with bounded admission (`maxIPLabelValues = 10_000` → `__other__`
+    overflow bucket) plus companion `apid_failed_login_audit_dropped_total`
+    counter + `FaasFailedLoginSpike` Prometheus alert at 20/min/IP/5m.
+    Code: `cmd/apid/audit.go`, `cmd/apid/handlers_auth_login.go`,
+    `cmd/apid/handlers_google.go`, `cmd/apid/handlers_github.go`,
+    `pkg/wire/metrics.go`, `pkg/middleware/authlimit.go` (exports
+    `ClientIP`), `pkg/auth/hash.go` (new — `HashEmail` is plain SHA-256 of
+    lower-cased email; the doc comment notes "breach-resistant, not strongly
+    anonymous"). Runbook: `docs/runbooks/FaasFailedLoginSpike.md`.
   - **App/Deployment/Cron/Domain audit emissions.** Developer actions,
     not security-relevant; cover in a separate PR if the customer
     audit page ever asks.

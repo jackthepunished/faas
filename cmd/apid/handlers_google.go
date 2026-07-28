@@ -14,6 +14,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -92,18 +93,37 @@ func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request
 func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	stateCookie, err := r.Cookie(googleAuthStateCookie)
 	if err != nil || stateCookie.Value == "" {
+		// Issue #286: the OAuth callback can fail before any
+		// identity is known — there is no customer-supplied email
+		// to hash, so the audit row carries email_hash="". The IP
+		// + user_agent discriminator still lets SOC 2 evidence
+		// correlate a credential-stuffing pattern of GETs against
+		// the callback URL.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "invalid_state", "Invalid State", "missing CSRF state cookie"))
 		return
 	}
 
 	queryState := r.URL.Query().Get("state")
 	if queryState == "" || queryState != stateCookie.Value {
+		// Issue #286: see note above.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "csrf_mismatch", "CSRF Error", "state token mismatch"))
 		return
 	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
+		// Issue #286: see note above. The OAuth consent screen
+		// denial path lands here — `code` is empty because the
+		// user backed out before granting the scopes.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "missing_code", "Authorization Error", "missing code parameter from Google"))
 		return
 	}
