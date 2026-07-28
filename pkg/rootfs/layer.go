@@ -32,8 +32,9 @@ func ApplyLayer(dst string, tr *tar.Reader) error {
 			return fmt.Errorf("rootfs: read tar: %w", err)
 		}
 
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
-		target, err := safeJoin(dst, hdr.Name)
+		// codeql[go/path-injection] false-positive: resolveEntryPath rejects ".."
+		// and absolute names, then clamps every ancestor symlink inside dst.
+		target, err := resolveEntryPath(dst, hdr.Name)
 		if err != nil {
 			return err
 		}
@@ -96,19 +97,33 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 		}
 		return f.Close()
 	case tar.TypeSymlink:
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime; for a 2-step chain to escape, the first symlink would also have to point outside base, which safeJoin rejects.
-		linkTarget, err := safeJoin(base, hdr.Linkname)
-		if err != nil {
-			return err
-		}
+		// A symlink's Linkname is GUEST-side data, not a host path: the
+		// string is stored verbatim in the ext4 inode and is resolved by
+		// the guest kernel at use time, where the staging root IS "/".
+		// So it must be written exactly as the layer declares it —
+		// absolute targets stay absolute ("/bin/busybox"), relative
+		// targets stay relative ("../lib/foo").
+		//
+		// Absolute targets are not an edge case: the alpine base layer
+		// alone ships 306 of them (every bin/* applet -> /bin/busybox),
+		// and so does every Debian/Ubuntu image. Rewriting them into
+		// host staging paths — or rejecting them — makes it impossible
+		// to build a base rootfs from any real OCI image.
+		//
+		// This is safe because the host never *follows* these links:
+		// resolveEntryPath clamps ancestor symlinks inside dst on every
+		// subsequent entry, so a hostile "bin -> /etc" link cannot be
+		// used to write through to the host's /etc. See resolveWithin.
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
 		_ = os.Remove(target)
-		return os.Symlink(linkTarget, target)
+		return os.Symlink(hdr.Linkname, target)
 	case tar.TypeLink:
-		// A hardlink's Linkname is a path relative to the archive root.
-		source, err := safeJoin(base, hdr.Linkname)
+		// A hardlink's Linkname IS resolved host-side (os.Link needs a
+		// real path), and per tar semantics it is relative to the
+		// archive root even when written with a leading "/".
+		source, err := resolveLinkSource(base, hdr.Linkname)
 		if err != nil {
 			return err
 		}
@@ -125,6 +140,11 @@ func applyEntry(base, target string, hdr *tar.Header, tr io.Reader) error {
 // REJECTING (not silently clamping) absolute paths and ".." traversal — a
 // malicious or broken layer must fail the build, not be quietly neutralised
 // (spec §9.1).
+//
+// safeJoin is purely SYNTACTIC: it says nothing about symlinks already on
+// disk. It is the first of two gates; resolveWithin is the second. It applies
+// to tar entry NAMES (and hardlink sources), never to symlink Linknames —
+// those are guest-side strings, see applyEntry's TypeSymlink branch.
 func safeJoin(base, name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("rootfs: empty entry name")
@@ -143,6 +163,136 @@ func safeJoin(base, name string) (string, error) {
 		return "", fmt.Errorf("rootfs: entry %q escapes staging root", name)
 	}
 	return joined, nil
+}
+
+// maxSymlinkHops bounds symlink chasing in resolveWithin, mirroring the
+// kernel's SYMLOOP_MAX. A layer containing a symlink cycle ("a -> b",
+// "b -> a") must fail the build, not spin forever.
+const maxSymlinkHops = 40
+
+// resolveEntryPath computes the host path an entry named `name` is written
+// to, given staging root `root`.
+//
+// The final component is deliberately NOT symlink-resolved: an OCI layer
+// entry for path X REPLACES whatever sits at X (overlayfs semantics), so a
+// regular-file entry landing on an existing symlink must clobber the link,
+// not write through it. Every ANCESTOR component is resolved and clamped
+// inside root by resolveWithin.
+func resolveEntryPath(root, name string) (string, error) {
+	// Gate 1 (syntactic): reject absolute names and ".." traversal.
+	if _, err := safeJoin(root, name); err != nil {
+		return "", err
+	}
+	clean := filepath.Clean(name)
+	if clean == "." {
+		return root, nil
+	}
+	// Gate 2 (on-disk): resolve the parent, clamping ancestor symlinks.
+	parent, err := resolveWithin(root, filepath.Dir(clean))
+	if err != nil {
+		return "", fmt.Errorf("rootfs: entry %q: %w", name, err)
+	}
+	return filepath.Join(parent, filepath.Base(clean)), nil
+}
+
+// resolveLinkSource resolves a hardlink's Linkname to a host path. Unlike a
+// symlink target, a hardlink source must exist on the host right now for
+// os.Link to succeed. Per tar semantics the name is relative to the archive
+// root even when a producer writes it with a leading "/", so strip that
+// first rather than rejecting it.
+func resolveLinkSource(root, linkname string) (string, error) {
+	rel := strings.TrimPrefix(linkname, "/")
+	if _, err := safeJoin(root, rel); err != nil {
+		return "", err
+	}
+	// Hardlink sources resolve fully — including the last component, which
+	// must name a real existing file.
+	resolved, err := resolveWithin(root, rel)
+	if err != nil {
+		return "", fmt.Errorf("rootfs: hardlink %q: %w", linkname, err)
+	}
+	return resolved, nil
+}
+
+// resolveWithin walks `rel` component-by-component beneath `root`, following
+// symlinks encountered along the way but CLAMPING them inside root — the
+// same contract as a chroot, and what containerd/moby do when unpacking
+// layers.
+//
+// Clamping (rather than rejecting) is what makes it safe to store symlink
+// Linknames verbatim. A hostile layer that ships "bin -> /etc" followed by
+// "bin/passwd" gets the link written literally, but this walk resolves the
+// later write to <root>/etc/passwd — inside staging. The host's /etc is
+// unreachable. Rejecting instead would break legitimate images: Debian's
+// merged-usr layout ("bin -> usr/bin") relies on exactly this traversal.
+//
+// TOCTOU note: this is a non-atomic lstat walk, which is sound HERE because
+// the staging tree is a fresh os.MkdirTemp written by a single goroutine of
+// this daemon. The attacker controls tar bytes, not concurrent filesystem
+// access. If staging ever becomes shared or concurrently written, this must
+// move to openat2(RESOLVE_IN_ROOT).
+func resolveWithin(root, rel string) (string, error) {
+	cur := root
+	// Remaining components to consume, innermost-first.
+	todo := splitPath(rel)
+	for hops := 0; len(todo) > 0; {
+		comp := todo[0]
+		todo = todo[1:]
+
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			// Clamp at root: ".." from the top stays at the top.
+			if cur != root {
+				cur = filepath.Dir(cur)
+			}
+			continue
+		}
+
+		next := filepath.Join(cur, comp)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Nothing on disk yet — the caller will MkdirAll it.
+				cur = next
+				continue
+			}
+			return "", err
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+
+		hops++
+		if hops > maxSymlinkHops {
+			return "", fmt.Errorf("too many symlink hops resolving %q", rel)
+		}
+		dest, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(dest) {
+			// Absolute link target: re-anchor at root, NOT at host "/".
+			// This is the clamp that makes verbatim Linknames safe.
+			cur = root
+		}
+		todo = append(splitPath(dest), todo...)
+	}
+	return cur, nil
+}
+
+// splitPath splits a slash path into components, dropping empties.
+func splitPath(p string) []string {
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	out := parts[:0]
+	for _, s := range parts {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // clearDir removes every child of dir but keeps dir itself.
