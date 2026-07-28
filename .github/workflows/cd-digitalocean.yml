@@ -91,12 +91,33 @@ jobs:
             fi
           done
 
+          # restart_counts prints "<svc>=<NRestarts>" for every service, so a
+          # crash-loop is detectable as a CHANGING value rather than a state.
+          restart_counts() {
+            local svc
+            for svc in ${FAAS_SERVICES}; do
+              printf '%s=%s ' "${svc}" \
+                "$(systemctl show "faas-${svc}" -p NRestarts --value 2>/dev/null || echo '?')"
+            done
+          }
+
           # wait_healthy polls until every service is active AND the gateway
-          # answers /healthz, or the budget runs out. Replaces the old fixed
-          # `sleep 3`, which raced a slow restart and reported success while
-          # a daemon was still in its restart backoff.
+          # answers /healthz, then holds to confirm it STAYS that way.
+          #
+          # The hold is load-bearing. `systemctl is-active` is a point sample,
+          # and a Type=simple daemon that crash-loops is genuinely "active"
+          # for the few hundred ms it takes to reach its fatal error. Sampled
+          # on the real box while imaged was looping:
+          #
+          #   activating activating activating active activating activating
+          #
+          # — "active" ~1 poll in 6. The first version of this gate hit that
+          # window and printed "✓ all services active, gateway healthy" one
+          # second before the verify step failed on the same box. Requiring
+          # NRestarts to be UNCHANGED across the hold is what distinguishes a
+          # started daemon from a looping one.
           wait_healthy() {
-            local deadline=$((SECONDS + 60)) svc bad
+            local deadline=$((SECONDS + 60)) svc bad before after
             while (( SECONDS < deadline )); do
               bad=""
               for svc in ${FAAS_SERVICES}; do
@@ -104,8 +125,19 @@ jobs:
               done
               if [[ -z "${bad}" ]] && curl -sf --max-time 5 \
                    http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-                echo "✓ all services active, gateway healthy"
-                return 0
+                before="$(restart_counts)"
+                sleep 12
+                after="$(restart_counts)"
+                bad=""
+                for svc in ${FAAS_SERVICES}; do
+                  systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
+                done
+                if [[ -z "${bad}" && "${before}" == "${after}" ]]; then
+                  echo "✓ all services active and stable over 12s (${after})"
+                  return 0
+                fi
+                echo "…not stable yet (restarts ${before}-> ${after}); still polling"
+                continue
               fi
               sleep 3
             done
@@ -193,6 +225,25 @@ jobs:
               chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
               echo "→ sign-keypair perms repaired (was ${SK_MODE} ${SK_OWNER} / ${SP_MODE} ${SP_OWNER})"
             fi
+          fi
+
+          # --- Config drift guard: builder base registry --------------------
+          # imaged pulls the builder base on every startup. Pointed at
+          # docker.io it pulls ANONYMOUSLY, and the box's IP shares Docker
+          # Hub's unauthenticated rate limit — so a restart loop turns a
+          # transient failure into a permanent one:
+          #
+          #   registry returned 429: TOOMANYREQUESTS
+          #   You have reached your unauthenticated pull rate limit
+          #
+          # deploy/digitalocean/sealed.env.example pins mirror.gcr.io for
+          # exactly this reason, but the box had drifted back to docker.io
+          # and nothing noticed until imaged had burned 20,000 restarts.
+          # Fail the deploy on the drift instead of shipping onto it.
+          if grep -qE '^FAAS_BUILDER_BASE_REF=(https?://)?(registry-1\.)?docker\.io/' \
+               /etc/faas/sealed.env 2>/dev/null; then
+            echo "::error::FAAS_BUILDER_BASE_REF points at docker.io — anonymous pulls are rate-limited and will crash-loop imaged. Use mirror.gcr.io (see deploy/digitalocean/sealed.env.example)."
+            exit 1
           fi
 
           # Restart all FaaS services.
