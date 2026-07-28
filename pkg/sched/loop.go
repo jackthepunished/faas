@@ -1029,17 +1029,26 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		if l.audit == nil {
 			return
 		}
-		l.audit.Emit(ctx, "cron.fired", &acct.ID, map[string]any{
-			"cron_id":              c.ID,
-			"app_id":               c.AppID,
-			"schedule":             c.Schedule,
-			"path":                 c.Path,
-			"fired_at":             now.UTC().Format(time.RFC3339Nano),
-			"last_fired_at_before": lastFiredAtBefore.UTC().Format(time.RFC3339Nano),
-			"status":               statusStr(fireSucceeded),
-			"invocation_id":        invocationID,
-			"instance_id":          instanceID,
-		})
+		// last_fired_at_before is omitted on the first fire (no prior
+		// fire exists — LastFiredAt was zero). The unconditional
+		// format below would have rendered that as the literal
+		// "0001-01-01T00:00:00Z", which an operator can't distinguish
+		// from data corruption. Missing key → JSON renders the field
+		// as absent; payload[k] on the read side returns nil.
+		payload := map[string]any{
+			"cron_id":       c.ID,
+			"app_id":        c.AppID,
+			"schedule":      c.Schedule,
+			"path":          c.Path,
+			"fired_at":      now.UTC().Format(time.RFC3339Nano),
+			"status":        statusStr(fireSucceeded),
+			"invocation_id": invocationID,
+			"instance_id":   instanceID,
+		}
+		if !lastFiredAtBefore.IsZero() {
+			payload["last_fired_at_before"] = lastFiredAtBefore.UTC().Format(time.RFC3339Nano)
+		}
+		l.audit.Emit(ctx, "cron.fired", &acct.ID, payload)
 	}()
 	if _, err := l.engine.Wake(ctx, c.AppID); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
