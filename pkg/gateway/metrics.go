@@ -6,7 +6,7 @@
 // Emitted series:
 //   - gateway_requests_total{app, plan, code}        counter
 //   - gateway_request_duration_seconds{app, class}   histogram (issue #273 /
-//     ADR-041; full request-received → handler-return duration, not TTFB;
+//     ADR-042; full request-received → handler-return duration, not TTFB;
 //     class ∈ {2xx,3xx,4xx,5xx}; per-app series pre-instantiated by
 //     PreInstantiateApp so the §12 panel surfaces from first request)
 //   - gateway_wake_latency_seconds                    histogram
@@ -15,7 +15,7 @@
 //     WakeGate.SetGaugeSink)
 //   - gateway_rate_limited_total{app, plan}          counter
 //   - gateway_cold_boot_total{app}                   counter (renamed from
-//     gateway_cold_wake_total in #273 / ADR-041; zero external consumers so
+//     gateway_cold_wake_total in #273 / ADR-042; zero external consumers so
 //     it is a straight rename, not a dual-emit migration)
 //   - gateway_top_tenant_rps{account_id}             gauge (issue #300;
 //     label value is the resolved app_id — gatewayd's only
@@ -58,10 +58,10 @@ type Metrics struct {
 	// the four plan rows under the `__other__` placeholder so the §12
 	// dashboard panel never shows "no data" before the first 429.
 	accountRateLimited *prometheus.CounterVec
-	// requestDuration backs issue #273 / ADR-041: per-app full
+	// requestDuration backs issue #273 / ADR-042: per-app full
 	// request-received → handler-return duration. Labels: app, class
 	// (2xx/3xx/4xx/5xx — derived by statusClassBucket, NOT the full
-	// status code, to keep cardinality bounded; see ADR-041 for the
+	// status code, to keep cardinality bounded; see ADR-042 for the
 	// math). The per-app rows are pre-instantiated by PreInstantiateApp
 	// at the first Backend.Lookup hit so dashboards surface from the
 	// first request rather than after the first observation. The
@@ -70,7 +70,7 @@ type Metrics struct {
 	// sub-100ms warm responses AND multi-second slow ones.
 	requestDuration *prometheus.HistogramVec
 	// coldBoot backs the renamed gateway_cold_boot_total counter
-	// (issue #273 / ADR-041). Renamed outright from coldWake —
+	// (issue #273 / ADR-042). Renamed outright from coldWake —
 	// gateway_cold_wake_total had zero external consumers (no
 	// dashboard panel, alert rule, runbook, ADR, or spec mention),
 	// so a dual-emit migration would have doubled the cold-boot
@@ -169,21 +169,21 @@ func NewMetrics() *Metrics {
 			Name: "gateway_per_account_rate_limited_total",
 			Help: "Requests rejected by the per-account rate limiter (ADR-040 / issue #292). Labelled by account_id, plan. account_id=\"__other__\" is the bounded admission overflow placeholder for the closed (plan) set.",
 		}, []string{"account_id", "plan"}),
-		// Issue #273 / ADR-041. Per-app full request duration.
+		// Issue #273 / ADR-042. Per-app full request duration.
 		// Buckets resolve both warm (≤100ms) and slow (≥1s) traffic; the
 		// ~50ms mark separates the two regimes for an at-a-glance
 		// p50/p95 reading.
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "gateway_request_duration_seconds",
-			Help: "Per-app full request duration (request received to handler return), labelled by HTTP status class (2xx/3xx/4xx/5xx). Issue #273 / ADR-041.",
+			Help: "Per-app full request duration (request received to handler return), labelled by HTTP status class (2xx/3xx/4xx/5xx). Issue #273 / ADR-042.",
 			Buckets: []float64{
 				0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
 			},
 		}, []string{"app", "class"}),
-		// Issue #273 / ADR-041. Renamed outright from gateway_cold_wake_total.
+		// Issue #273 / ADR-042. Renamed outright from gateway_cold_wake_total.
 		coldBoot: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_cold_boot_total",
-			Help: "Requests that triggered a cold boot for an app. Issue #273 / ADR-041 (renamed from gateway_cold_wake_total).",
+			Help: "Requests that triggered a cold boot for an app. Issue #273 / ADR-042 (renamed from gateway_cold_wake_total).",
 		}, []string{"app"}),
 		topTenantRPS: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gateway_top_tenant_rps",
@@ -267,7 +267,7 @@ func (m *Metrics) ObserveRequest(appID, plan, code string) {
 // handler return) for the {app, class} label tuple. class ∈ {"2xx",
 // "3xx", "4xx", "5xx"}; anything outside that closed set falls through
 // to prometheus's default behaviour (a new label tuple surfaces in
-// /metrics). Issue #273 / ADR-041.
+// /metrics). Issue #273 / ADR-042.
 //
 // Nil-receiver safe (follows the ObserveWakeQueueWait precedent) so
 // the Handler hot path doesn't need to nil-guard on every request.
@@ -280,7 +280,7 @@ func (m *Metrics) ObserveRequestDuration(appID, class string, d time.Duration) {
 
 // PreInstantiateApp writes zero-valued series for the closed (class)
 // label set under appID so dashboards surface from the first request
-// rather than after the first observation (issue #273 / ADR-041). App
+// rather than after the first observation (issue #273 / ADR-042). App
 // IDs are runtime values that cannot be pre-instantiated at boot, but
 // the inner class set is closed and bounded. Idempotent — calling
 // twice for the same appID is cheap (prometheus's WithLabelValues
@@ -316,7 +316,7 @@ func (m *Metrics) ObserveAccountRateLimit(accountID, plan string) {
 
 // ObserveColdBoot records that this request caused a cold boot and observes
 // the wake latency (request-received to first upstream byte). Issue #273 /
-// ADR-041 renamed from ObserveColdWake; the gateway_cold_wake_total →
+// ADR-042 renamed from ObserveColdWake; the gateway_cold_wake_total →
 // gateway_cold_boot_total rename is intentional and not dual-emitted.
 func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration) {
 	m.coldBoot.WithLabelValues(appID).Inc()

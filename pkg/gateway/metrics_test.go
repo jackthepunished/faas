@@ -37,7 +37,7 @@ func TestMetricsWakeQueueWaitNilSafe(t *testing.T) {
 }
 
 // TestMetricsIssue273Exposition pins the new histogram + the cold
-// rename (issue #273 / ADR-041). Catches a rename that the existing
+// rename (issue #273 / ADR-042). Catches a rename that the existing
 // cold-wake test would have missed because it reads the Go field
 // rather than the exposition string. Also asserts the request
 // duration histogram is registered with the expected label set.
@@ -90,7 +90,7 @@ func TestMetricsIssue273Exposition(t *testing.T) {
 
 // TestMetricsPreInstantiateAppBounded asserts the per-app series
 // surface stays at exactly the closed (class) set — protects the
-// ADR-041 cardinality math from a future change that drops the
+// ADR-042 cardinality math from a future change that drops the
 // loop or adds a label.
 func TestMetricsPreInstantiateAppBounded(t *testing.T) {
 	m := NewMetrics()

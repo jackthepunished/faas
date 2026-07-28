@@ -1,6 +1,6 @@
 // Package promql is a thin HTTP client for the Prometheus query API
 // used by apid for both the public status page (cmd/apid/status.go)
-// and the per-app metrics endpoint behind issue #273 / ADR-041.
+// and the per-app metrics endpoint behind issue #273 / ADR-042.
 //
 // Extracted from cmd/apid/status.go so two consumers (the existing
 // /status/slo.json handler and the new GET /v1/apps/{slug}/metrics

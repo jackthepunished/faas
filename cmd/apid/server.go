@@ -107,7 +107,7 @@ type server struct {
 	statusCache *statusCache
 	// promqlClient is the Prometheus HTTP client shared by the
 	// statusCache and the per-app metrics endpoint (issue #273 /
-	// ADR-041). Owned here so the GET /v1/apps/{slug}/metrics handler
+	// ADR-042). Owned here so the GET /v1/apps/{slug}/metrics handler
 	// reuses the same tested transport; the client is nil-safe (the
 	// handler falls back to a degraded zero-valued payload when
 	// Prometheus isn't configured). See pkg/promql/client.go.
@@ -229,7 +229,7 @@ func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 // prometheus URL degrades the JSON to "no source" rather than 5xx.
 //
 // The Prometheus HTTP client is shared with the per-app metrics
-// endpoint (issue #273 / ADR-041) so both consumers use the same
+// endpoint (issue #273 / ADR-042) so both consumers use the same
 // tested transport. nil promURL keeps both consumers functional but
 // degraded — statusCache returns "no source", the metrics handler
 // returns zeroed fields with Source="degraded".
@@ -478,7 +478,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listApps))))
 	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createApp)))))
 	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getApp))))
-	// Issue #273 / ADR-041 — per-app metrics endpoint. Read-only,
+	// Issue #273 / ADR-042 — per-app metrics endpoint. Read-only,
 	// no MFA required (the primary caller is an API key with
 	// ScopesReadSurface). Mirrors getApp's IDOR-safe loadApp so a
 	// cross-account slug is a 404, not a 200 with another tenant's

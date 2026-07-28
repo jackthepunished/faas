@@ -689,7 +689,7 @@ type ListAuditEventsResponse struct {
 }
 
 // AppMetricsResponse is the per-app metrics payload returned by
-// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-041). Field-
+// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-042). Field-
 // for-field mirror of pkg/api.AppMetricsResponse — the SDK parity
 // gate (cmd/sdk-coverage) enforces byte-identical JSON output.
 type AppMetricsResponse struct {

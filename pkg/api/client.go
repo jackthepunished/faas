@@ -794,7 +794,7 @@ func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, err
 // GetAppMetrics returns the per-app metrics snapshot for slug over
 // the named range window. rng is one of "5m", "15m", "1h", "6h",
 // "24h", "7d", "15d" — empty falls back to the server's default
-// (5m). Issue #273 / ADR-041.
+// (5m). Issue #273 / ADR-042.
 func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetricsResponse, error) {
 	var out AppMetricsResponse
 	path := "/v1/apps/" + slug + "/metrics"

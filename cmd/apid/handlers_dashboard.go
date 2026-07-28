@@ -259,7 +259,7 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		Deployments:     deps,
 		Crons:           cronItems,
 		RecentInstances: recentItems,
-		// Issue #273 / ADR-041 — best-effort metrics snapshot.
+		// Issue #273 / ADR-042 — best-effort metrics snapshot.
 		// Failure is non-fatal: Prometheus being down renders the
 		// "degraded" empty state rather than blocking the whole
 		// page render. The 3s timeout matches the per-query timeout

@@ -681,7 +681,7 @@ func TestMetricsSpec12_FirstByteNotFullBody(t *testing.T) {
 
 // TestHandlerObserveRequestDuration exercises the new histogram on
 // every criterion-#8 path: warm success, cold success, 4xx, and the
-// unknown-host sentinel. Issue #273 / ADR-041.
+// unknown-host sentinel. Issue #273 / ADR-042.
 func TestHandlerObserveRequestDuration(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 	h.SetWakeGateHook()
@@ -748,7 +748,7 @@ func histogramCountFromBody(t *testing.T, m *Metrics, labelNeedle string) int {
 // TestHandlerWithStartTimeFix pins the WithStartTime wiring fix. A
 // stub upstream that sleeps 50ms before responding must surface an
 // observed duration ≥ 50ms — this fails before the fix (issue #273
-// / ADR-041: WithStartTime was dead code, so startTime() fell back
+// / ADR-042: WithStartTime was dead code, so startTime() fell back
 // to time.Now() at observe() and the histogram recorded ~0).
 func TestHandlerWithStartTimeFix(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -814,7 +814,7 @@ func TestHandlerSiblingIsolation(t *testing.T) {
 		t.Errorf("app-1 row missing: got %d, want 1", got)
 	}
 	// A SIBLING app must NOT have any series — this is the
-	// invariant ADR-041 promises.
+	// invariant ADR-042 promises.
 	for _, line := range strings.Split(bodyForHistogram(t, h.metrics), "\n") {
 		if strings.Contains(line, `app="sibling"`) {
 			t.Errorf("sibling series leaked into /metrics: %q", line)

@@ -117,7 +117,7 @@ type Handler struct {
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
 	// piApps deduplicates Metrics.PreInstantiateApp calls per appID
-	// (issue #273 / ADR-041). A value-typed sync.Map wrapper; the
+	// (issue #273 / ADR-042). A value-typed sync.Map wrapper; the
 	// zero value is valid so NewHandlerWith doesn't have to
 	// initialise it explicitly. Value semantics avoid the
 	// data-race that lazy init would create under -race.
@@ -274,7 +274,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Stamp the request-received timestamp onto the context so every exit
 	// path can measure the SAME elapsed interval (was previously always
 	// falling back to time.Now() because WithStartTime was dead code —
-	// issue #273 / ADR-041 fixed this so gateway_request_duration_seconds
+	// issue #273 / ADR-042 fixed this so gateway_request_duration_seconds
 	// has a real elapsed to record and the slog latency_ms field stops
 	// being effectively zero).
 	start := time.Now()
@@ -313,7 +313,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue #273 / ADR-041 — pre-instantiate the closed (class) set
+	// Issue #273 / ADR-042 — pre-instantiate the closed (class) set
 	// for this app so its histogram rows surface from the first
 	// request rather than after the first observation. App IDs are
 	// runtime values, but the inner class set is bounded; the sync.Map
@@ -454,7 +454,7 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 	code := statusClass(status)
 	requestID := requestIDFrom(r)
 	// Measure elapsed against the same start stamp set at the top of
-	// ServeHTTP (issue #273 / ADR-041 fixed the WithStartTime dead-code
+	// ServeHTTP (issue #273 / ADR-042 fixed the WithStartTime dead-code
 	// bug so this is now request-received → handler-return, not
 	// "now() — now()").
 	elapsed := time.Since(startTime(r))
@@ -466,7 +466,7 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 			plan = "-"
 		}
 		h.metrics.ObserveRequest(appID, plan, code)
-		// Per-app full request duration histogram (issue #273 / ADR-041).
+		// Per-app full request duration histogram (issue #273 / ADR-042).
 		// The class label is the 3-digit status bucketed to 2xx/3xx/4xx/5xx
 		// to keep cardinality bounded — full status codes would explode
 		// per-app series count past 60× the class-based set.
@@ -486,7 +486,7 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 		h.topNSample(appID)
 	}
 	// Use the locally-measured elapsed (request-received → handler-return).
-	// WithStartTime was dead code in the repo (issue #273 / ADR-041); the
+	// WithStartTime was dead code in the repo (issue #273 / ADR-042); the
 	// WithContext call at the top of ServeHTTP now stamps the real start
 	// time so the slog latency_ms field is no longer effectively ~0. Doing
 	// the time.Since(startTime(r)) call here would yield the same result
@@ -511,7 +511,7 @@ func statusClass(status int) string {
 }
 
 // statusClassBucket turns an HTTP status into a class label for the
-// gateway_request_duration_seconds histogram (issue #273 / ADR-041).
+// gateway_request_duration_seconds histogram (issue #273 / ADR-042).
 // Distinct from statusClass above: that one returns the FULL 3-digit
 // code (used for the counter label so dashboards can drill into e.g.
 // 404 vs 503); this one buckets to the closed 4-set so a histogram
@@ -532,7 +532,7 @@ func statusClassBucket(status int) string {
 }
 
 // preInstantiateApps deduplicates PreInstantiateApp calls per appID.
-// Issue #273 / ADR-041 — PreInstantiateApp is cheap (returns the
+// Issue #273 / ADR-042 — PreInstantiateApp is cheap (returns the
 // existing series on repeat calls), but the sync.Map.Load+Store
 // short-circuits the work entirely after first sight so the hot path
 // stays allocation-free. A value-typed field on Handler: the zero

@@ -847,7 +847,7 @@ type RepoResponse struct {
 }
 
 // AppMetricsResponse is the per-app metrics payload returned by
-// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-041).
+// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-042).
 //
 // Time-windowed via the `range` query param (closed vocabulary, see
 // server handler). When the underlying Prometheus client is
@@ -877,7 +877,7 @@ type AppMetricsResponse struct {
 	// ErrorRatePct is the share of [45]xx requests in the window.
 	ErrorRatePct float64 `json:"error_rate_pct"`
 	// ColdStartPct is the share of requests that triggered a cold
-	// boot (the WakeGate leader — see ADR-041 §cold semantics).
+	// boot (the WakeGate leader — see ADR-042 §cold semantics).
 	// Followers waiting on the gate show as zero cold contribution
 	// but their wait is visible via gateway_wake_queue_wait_seconds
 	// on the §12 dashboard.

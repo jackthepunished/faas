@@ -105,7 +105,7 @@ type statusCache struct {
 // (e.g. "http://10.0.0.1:9090"); empty string disables the cache and
 // the JSON handler returns a degraded payload. The HTTP transport
 // lives in pkg/promql so tests can inject an httptest.Server and
-// issue #273 / ADR-041 can reuse the client for the per-app metrics
+// issue #273 / ADR-042 can reuse the client for the per-app metrics
 // endpoint.
 func newStatusCache(promURL string, log *slog.Logger) *statusCache {
 	var c *promql.Client

@@ -1,6 +1,6 @@
 package main
 
-// Per-app metrics handlers (issue #273 / ADR-041).
+// Per-app metrics handlers (issue #273 / ADR-042).
 //
 // GET /v1/apps/{slug}/metrics?range=...
 //
@@ -226,7 +226,7 @@ func safePercent(v float64) float64 {
 // call site does the int-conversion (int64(...)) so the rounding
 // policy (currently a float-truncating cast) lives at the call
 // site; keeping this as its own helper means a future change to
-// banker's rounding has one site to touch. Issue #273 / ADR-041.
+// banker's rounding has one site to touch. Issue #273 / ADR-042.
 func safeRoundNonNeg(v float64) float64 {
 	return safeFloat(v)
 }

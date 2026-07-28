@@ -1,6 +1,6 @@
 package main
 
-// Issue #273 / ADR-041 — per-app metrics handler tests.
+// Issue #273 / ADR-042 — per-app metrics handler tests.
 //
 // Coverage matrix:
 //   - happy path (owner 200)
@@ -151,7 +151,7 @@ func TestAppMetrics_NoRangeFallsBackToDefault(t *testing.T) {
 // on the seven arithmetic paths. Histogram_quantile over an empty
 // window returns NaN; rate() over a missing counter returns 0; the
 // handlers must coerce those into zero-valued wire fields rather
-// than serialise "NaN" / "Inf" to JSON. Issue #273 / ADR-041
+// than serialise "NaN" / "Inf" to JSON. Issue #273 / ADR-042
 // criterion #7.
 func TestAppMetrics_NaNGuards(t *testing.T) {
 	e := setup(t, api.PlanPro)
@@ -235,7 +235,7 @@ func installPromFixture(t *testing.T, e *testEnv, responder func(query string) s
 
 // TestAppMetrics_NoRequireMFA pins the deliberate omission of
 // requireMFA from the per-app metrics handler chain. Issue #273 /
-// ADR-041: a session cookie without an MFA-cookie-clearance MUST
+// ADR-042: a session cookie without an MFA-cookie-clearance MUST
 // still pass — the route is read-only and the primary caller is an
 // API key that does not carry a session cookie at all. A future
 // refactor that adds requireMFA here would break API-key access.
@@ -262,7 +262,7 @@ func TestAppMetrics_NoRequireMFA(t *testing.T) {
 }
 
 // TestAppMetrics_ScopeRejected exercises the per-route requireScope
-// gate. Issue #273 / ADR-041: ScopesReadSurface (admin or apps:read)
+// gate. Issue #273 / ADR-042: ScopesReadSurface (admin or apps:read)
 // is the only allowed scope; a deploy:write-only key must be 403'd.
 // Mirrors the matrix in handlers_scopes_test.go.
 func TestAppMetrics_ScopeRejected(t *testing.T) {
