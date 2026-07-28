@@ -55,8 +55,9 @@ canonical causes are:
   wants the alert; recovery is on their side.
 - **Coordinated abuse**: scanners rotating across an account's
   apps. The PR-#292 fix is the intended mitigation; let the 429s
-  stand. If the offender violates the ToS, freeze the account via
-  the apid `POST /admin/accounts/<uuid>/freeze` endpoint.
+  stand. Per-account freeze is tier-3 follow-up (ADR-040 Open
+  follow-ups); today's only knob is SIGHUP which drops every
+  bucket (see Recover below).
 - **Config regression**: a plan row in `pkg/api/limits.go` dropped
   to zero (Free 50, Hobby 200, Pro 1000, Scale 5000 are the
   expected values — pin via
@@ -81,18 +82,10 @@ amtool silence add \
 # SIGHUP re-reads pkg/api/limits.go and ForgetAll's both the per-app
 # and per-account limiters in cmd/gatewayd/main.go.
 kill -HUP $(pidof faas-gatewayd)
-
-# Per-customer recovery (follow-up work — admin endpoint TBD):
-# today, SIGHUP is the only knob. The PR-#292 ADR-040 "Open
-# follow-ups" section reserves a per-account ForgetAccount admin
-# endpoint for tier-3; until that lands, SIGHUP is correct (it
-# drops the abuse victim's bucket too, but at 5min refill
-# they'll re-stabilize within a single tick).
 ```
 
-If the spike is sustained and the customer-side fix isn't
-arriving within the silence window, escalate via the apid
-`POST /admin/accounts/<uuid>/freeze` admin endpoint
-(investigating reasons: abuse report, payment failure) — a frozen
-account returns 423 Locked from the wake path (ADR-040 explicit,
-admin-only).
+SIGHUP drops every bucket — the abuse victim's bucket resets too,
+but at the 5-minute per-minute refill floor they re-stabilize
+within a single tick. A per-account `ForgetAccount` admin
+endpoint is reserved for tier-3 work (ADR-040 Open follow-ups);
+until that lands, SIGHUP is the only knob.

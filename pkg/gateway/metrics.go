@@ -114,6 +114,14 @@ func NewMetrics() *Metrics {
 		// pre-instantiating 40k zero-valued series. Pre-instantiation
 		// only touches the closed (plan) set under the "__other__"
 		// placeholder so the §12 panel surfaces from boot.
+		//
+		// TODO(ADR-040 follow-up): bind ObserveAccountRateLimit to the
+		// apid accountLabelSet admission primitive (issue #278,
+		// pkg/wire/metrics.go) before customer count crosses ~10k.
+		// Without the binding a flood of distinct account_id labels on a
+		// misuse case would mint unbounded series and break §12. The
+		// same primitive already gates apid_request_total{account_id}; the
+		// wiring is a one-line call into the shared helper.
 		accountRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_per_account_rate_limited_total",
 			Help: "Requests rejected by the per-account rate limiter (ADR-040 / issue #292). Labelled by account_id, plan. account_id=\"__other__\" is the bounded admission overflow placeholder for the closed (plan) set.",
