@@ -2276,3 +2276,50 @@ func TestStreamAppLogs_RejectsInvalidLevel(t *testing.T) {
 		t.Errorf("body contains not_implemented; a bad filter is an error, not 'not built yet'")
 	}
 }
+
+// TestStreamAppLogs_RejectsInvalidGrep pins the server-side defence
+// against log-injection through --grep. A grep value containing a
+// newline or carriage return is rejected with an
+// `event: error` frame (`code: "invalid_grep"`) followed by the
+// terminal `event: end`, mirroring the invalid-level path. Move 4's
+// substring matcher MUST NOT see a multi-line grep — otherwise a
+// grep of `INFO\n` would match every line. The CLI doesn't pre-parse
+// grep, so the server is the only defence; without this test, a
+// future Move 4 regression that drops the newline check would slip
+// through silently (same log-injection precedent as
+// `CodeQL go/log-injection sanitisers`).
+func TestStreamAppLogs_RejectsInvalidGrep(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"newline", "grep=foo%0Abar"},
+		{"carriage_return", "grep=foo%0Dbar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setup(t, api.PlanPro)
+			dep := mustSeedDeployment(t, e, "stub-logs-bad-grep-"+tc.name)
+			appID := mustSeedApp(t, e, "stub-logs-bad-grep-app-"+tc.name)
+			if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+				t.Fatalf("CreateInstance: %v", err)
+			}
+
+			path := "/v1/apps/stub-logs-bad-grep-app-" + tc.name + "/logs?follow=0&" + tc.query
+			rec := e.do(t, "GET", path, nil, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (SSE stream is already open); body=%s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "event: error\ndata: {\"code\":\"invalid_grep\"") {
+				t.Errorf("body missing invalid_grep error frame:\n%s", body)
+			}
+			if !strings.Contains(body, "event: end\ndata: {}") {
+				t.Errorf("body missing terminal end frame:\n%s", body)
+			}
+			if strings.Contains(body, "event: not_implemented") {
+				t.Errorf("body contains not_implemented; a bad filter is an error, not 'not built yet'")
+			}
+		})
+	}
+}

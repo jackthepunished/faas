@@ -25,9 +25,30 @@ type LogFilter struct {
 	Grep string
 	// Since is an RFC3339 timestamp lower-bound on the line timestamp.
 	Since string
-	// Level is the minimum severity on the structured `level` field
-	// (info, warn, error). Empty = no level filter.
+	// Level is an exact match on the structured `level` field
+	// (info, warn, error). Empty = no level filter. The CLI and the
+	// apid handler both call IsValidLogLevel before forwarding so an
+	// invalid value never reaches the wire.
 	Level string
+}
+
+// validLogLevels is the canonical set the CLI (cmd/faas/commands2.go)
+// and the apid handler (cmd/apid/handlers_ext.go::streamAppLogs) share
+// — keep this single source of truth or the two sides will drift.
+var validLogLevels = [...]string{"info", "warn", "error"}
+
+// IsValidLogLevel reports whether s is one of the recognised log
+// severity values (info, warn, error). Issue #309: used by both the
+// CLI to short-circuit before opening the HTTP call and by the apid
+// handler to emit an `event: error` SSE frame on a bad value — having
+// both call sites agree on the enum is the whole point.
+func IsValidLogLevel(s string) bool {
+	for _, v := range validLogLevels {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // StreamAppLogs opens the GET /v1/apps/{slug}/logs stream and returns

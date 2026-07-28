@@ -1171,16 +1171,14 @@ func cmdLogs(args []string) int {
 	}
 	// Validate --level early so a typo costs the customer a network
 	// round-trip; --since is validated next so the SDK never sees a
-	// malformed timestamp. The server re-validates --level (mirror
-	// contract — see cmd/apid/handlers_ext.go::streamAppLogs) and
-	// rejects bad values with an `event: error` SSE frame.
-	if *level != "" {
-		switch *level {
-		case "info", "warn", "error":
-		default:
-			PrintUsage(os.Stderr, "--level must be one of: info, warn, error", "logs")
-			return 2
-		}
+	// malformed timestamp. Both call api.IsValidLogLevel / time.Parse
+	// to share the wire contract with the apid handler (see
+	// cmd/apid/handlers_ext.go::streamAppLogs), which re-validates
+	// --level on the wire and rejects bad values with an
+	// `event: error` SSE frame.
+	if *level != "" && !api.IsValidLogLevel(*level) {
+		PrintUsage(os.Stderr, "--level must be one of: info, warn, error", "logs")
+		return 2
 	}
 	if *since != "" {
 		if _, err := time.Parse(time.RFC3339, *since); err != nil {

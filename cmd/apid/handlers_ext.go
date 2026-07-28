@@ -1901,14 +1901,13 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // parseable frames and the dashboard's per-app log button doesn't 404.
 // Move 4 replaces the body.
 //
-// Issue #309 (tier-2 DX): --grep/--since/--level are accepted as
+// Issue #309 (tier-2 DX): --grep / --since / --level are accepted as
 // query params now so the wire contract is stable; the Move 4
 // implementation reads them and applies them against the ring buffer.
-// Today they are parsed, validated, and ignored — Move 3 is a no-op.
-// An invalid --level emits an `event: error` SSE frame and a
-// terminal `end` so programmatic SDK callers get a structured error
-// path; the CLI validates the same enum client-side (see
-// cmd/faas/commands2.go::cmdLogs) so a typo costs no round-trip.
+// Today --level is validated; --grep is sanitised against newline
+// injection; --since is forwarded verbatim (the CLI's RFC3339 parse
+// keeps malformed values from ever reaching the wire). Move 3
+// otherwise no-ops the params.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -1920,28 +1919,34 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 		return
 	}
 	q := r.URL.Query()
-	level := q.Get("level")
-	if level != "" {
-		switch level {
-		case "info", "warn", "error":
-		default:
-			startSSE(w)
-			flusher, _ := w.(http.Flusher)
-			_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_level\",\"message\":\"level must be one of: info, warn, error\"}\n\n")
-			_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
-			if flusher != nil {
-				flusher.Flush()
-			}
-			return
+	// --level: enum match against api.IsValidLogLevel so the CLI and
+	// the server share the same source of truth. A bad value emits an
+	// `event: error` SSE frame + terminal `end` so programmatic SDK
+	// callers get a structured error path; the CLI validates the same
+	// enum client-side so a typo costs no round-trip.
+	if level := q.Get("level"); level != "" && !api.IsValidLogLevel(level) {
+		startSSE(w)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_level\",\"message\":\"level must be one of: info, warn, error\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+		if flusher != nil {
+			flusher.Flush()
 		}
+		return
 	}
-	// `grep` and `since` are accepted here but currently have no
-	// effect on the stub. Move 4's vmmd Logs(req) gRPC stream will
-	// apply them against the per-instance ring buffer; the wire
-	// contract is locked now so neither the SDK URL builder nor the
-	// CLI flag set needs to change when the body is replaced.
-	_ = q.Get("grep")
-	_ = q.Get("since")
+	// --grep: reject embedded newlines so Move 4's substring matcher
+	// can never match across log line boundaries (same log-injection
+	// precedent as `CodeQL go/log-injection sanitisers`).
+	if grep := q.Get("grep"); strings.ContainsAny(grep, "\n\r") {
+		startSSE(w)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_grep\",\"message\":\"grep must not contain newline or carriage return\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
 	startSSE(w)
 	flusher, _ := w.(http.Flusher)
 	// Two frames then close: a not_implemented signal so a client can
