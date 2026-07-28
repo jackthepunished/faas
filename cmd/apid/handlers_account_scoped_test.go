@@ -389,7 +389,7 @@ func TestGetAppsMetrics_Degraded_NoPrometheus(t *testing.T) {
 
 // TestGetAppsMetrics_InvalidRange covers the closed-vocabulary check
 // on `?range=` (the same shape as the per-app handler's
-// isValidMetricsRange guard).
+// appmetrics.IsValidRange guard).
 func TestGetAppsMetrics_InvalidRange(t *testing.T) {
 	e := setup(t, api.PlanHobby)
 	rec := e.do(t, http.MethodGet, "/v1/apps/metrics?range=99y", nil, nil)
@@ -568,7 +568,7 @@ func TestListAccountSecrets_RequiresMFA(t *testing.T) {
 //   - skip the +Inf bucket (would otherwise return +Inf for q<1)
 //   - find the first bucket whose cumulative ≥ q·N
 //   - interpolate linearly in (prevNonEmptyUpper, upper) by count ratio
-//   - empty / nil maps → 0 (matches safeFloat's NaN clamp)
+//   - empty / nil maps → 0 (matches appmetrics.SafeFloat's NaN clamp)
 //   - malformed `le` strings → row dropped, rest still computes
 //   - q outside [0,1] → returns 0 / prevUpper (PromQL returns NaN; we
 //     clamp to 0 to match the dashboard's "no data" rendering)

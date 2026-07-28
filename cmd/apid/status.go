@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/promql"
 )
 
@@ -165,7 +166,7 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 		return StatusPage{}, fmt.Errorf("no prometheus URL configured")
 	}
 
-	snap := StatusPage{AsOf: time.Now().UTC(), Source: sourcePrometheus}
+	snap := StatusPage{AsOf: time.Now().UTC(), Source: appmetrics.SourcePrometheus}
 	var firstErr error
 	okCount := 0
 

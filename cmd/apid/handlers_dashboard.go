@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -284,9 +285,9 @@ func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, ap
 	}
 	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	resp, src := s.fetchAppMetrics(dctx, appID, "5m")
+	resp, src := appmetrics.Fetch(dctx, s.promqlClient, log, appID, appmetrics.DefaultRange)
 	view := &dashboard.AppMetricsView{
-		Range:        "5m",
+		Range:        appmetrics.DefaultRange,
 		Source:       src,
 		RequestCount: resp.RequestCount,
 		LatencyP50MS: resp.LatencyP50MS,
@@ -296,7 +297,7 @@ func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, ap
 		ColdStartPct: resp.ColdStartPct,
 		WakeP95MS:    resp.WakeP95MS,
 	}
-	if src != sourcePrometheus && log != nil {
+	if src != appmetrics.SourcePrometheus && log != nil {
 		log.Warn("dashboard renderAppDetail: metrics fetch degraded", "app_id", appID, "source", src)
 	}
 	return view
