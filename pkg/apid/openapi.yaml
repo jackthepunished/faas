@@ -1844,6 +1844,7 @@ paths:
       description: |
         Cap-checked against the plan's MaxQueueDepth (Hobby 5, Pro 25,
         Scale 100). The drain re-checks at dispatch tick.
+      x-faas-queue-leases: false
       parameters:
         - $ref: '#/components/parameters/Slug'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1871,6 +1872,7 @@ paths:
         Returns 200 with the dequeued row, or 204 (no body) if the
         server-side 30s budget elapses with no event. The customer
         retries on 204.
+      x-faas-queue-leases: true
       parameters:
         - $ref: '#/components/parameters/Slug'
       responses:
@@ -1889,12 +1891,91 @@ paths:
       tags: [queues]
       operationId: queueAck
       summary: Ack a queue row (idempotent).
+      x-faas-queue-leases: false
       parameters:
         - $ref: '#/components/parameters/Slug'
         - $ref: '#/components/parameters/Id32'
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '204': { description: No body. The ack (or a re-ack) was accepted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # Issue #394 — queue introspection (read-only).
+  /v1/apps/{slug}/queues/state:
+    get:
+      tags: [queues]
+      operationId: queueState
+      summary: Read queue depth, in-flight count, and oldest pending age.
+      description: |
+        Read-only depth / in-flight / oldest-pending stats. NO lease is
+        acquired and no row is mutated — the response can be polled at
+        any cadence without affecting drain behaviour. Free plans can
+        call this for diagnostics even though they cannot send.
+      x-faas-queue-leases: false
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      responses:
+        '200':
+          description: Queue stats for the app.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueStateResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/peek:
+    get:
+      tags: [queues]
+      operationId: queuePeek
+      summary: List pending queue rows without acquiring a lease.
+      description: |
+        Read-only peek at pending rows, oldest first. Repeated calls
+        return the same rows in the same order — the underlying SQL has
+        no FOR UPDATE / FOR SHARE / advisory lock, so attempts is
+        never incremented and no row state changes. Cursor pagination
+        matches the existing `?before=<id>` convention. NOT equivalent
+        to `queues/receive` — peek never leases.
+      x-faas-queue-leases: false
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/QueueCursorLimit'
+        - $ref: '#/components/parameters/QueueCursorBefore'
+      responses:
+        '200':
+          description: A page of pending rows.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueuePeekResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/queues/dead_letter:
+    get:
+      tags: [queues]
+      operationId: queueDeadLetter
+      summary: List queue rows that exhausted the plan's retry budget.
+      description: |
+        Read-only list of rows in `state='dead_letter'`, newest first.
+        The drain transitions a row here once it has failed
+        `MaxQueueAttempts` times for the app's plan (Hobby 3, Pro 10,
+        Scale 25). NO lease is acquired and no row is mutated. Replaying
+        a dead-letter row is out of scope for this endpoint — the
+        customer re-sends via `queues/send`.
+      x-faas-queue-leases: false
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/QueueCursorLimit'
+        - $ref: '#/components/parameters/QueueCursorBefore'
+      responses:
+        '200':
+          description: A page of dead-letter rows.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueDeadLetterResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -2422,6 +2503,23 @@ components:
       required: true
       schema: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 }
       description: Secret key. Must start with a letter; A-Z, 0-9, underscore.
+
+    # Issue #394 — queue introspection pagination. Shared by the two
+    # read-list endpoints (peek / dead_letter) so the `description`
+    # is not flagged by vacuum's `description-duplication` rule when
+    # both endpoints grow the same shape.
+    QueueCursorLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, default: 20, maximum: 200, minimum: 1 }
+      description: "Maximum number of rows to return; capped at 200."
+    QueueCursorBefore:
+      name: before
+      in: query
+      required: false
+      schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+      description: "Cursor — the last id from the previous page (omit for the first page)."
 
   schemas:
 
@@ -3305,6 +3403,65 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         payload: { type: object, additionalProperties: true }
         result: { type: object, additionalProperties: true }
+
+    QueueStateResponse:
+      description: "200 — queue depth / in-flight / oldest-pending stats. Read-only."
+      type: object
+      required: [app_slug, plan, plan_cap, depth, in_flight, generated_at]
+      properties:
+        app_slug: { type: string }
+        plan: { type: string, enum: [free, hobby, pro, scale] }
+        plan_cap: { type: integer, description: "MaxQueueDepth for the plan." }
+        depth: { type: integer, description: "Pending + dispatching row count." }
+        in_flight: { type: integer, description: "Rows with a live dispatch lease (state=dispatching, lease_expires_at > now or NULL)." }
+        oldest_pending_at: { type: [string, "null"], format: date-time, description: "Oldest pending row's created_at; null when the queue is empty." }
+        oldest_pending_age_seconds: { type: [integer, "null"], description: "Convenience field — seconds since oldest_pending_at; null when the queue is empty." }
+        generated_at: { type: string, format: date-time }
+
+    QueuePeekMessage:
+      description: "One pending row. No lease was acquired and `attempts` was not incremented."
+      type: object
+      required: [id, created_at, attempts, payload]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        created_at: { type: string, format: date-time }
+        attempts: { type: integer }
+        payload: { type: string, description: "Stored payload rendered as a JSON string (verbatim from the jsonb column)." }
+        last_error: { type: string, description: "Most recent failure reason, when attempts > 0." }
+
+    QueuePeekResponse:
+      description: "200 — a page of pending rows ordered by created_at ASC, id ASC. Pass `next_before` as `?before=<id>` for the next page."
+      type: object
+      required: [app_slug, messages]
+      properties:
+        app_slug: { type: string }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/QueuePeekMessage' }
+        next_before: { type: string, pattern: '^[a-f0-9]{32}$', description: "Omitted when the page is the final one." }
+
+    QueueDeadLetterMessage:
+      description: "One row that exhausted the plan's retry budget (state='dead_letter')."
+      type: object
+      required: [id, created_at, failed_at, attempts, last_error, payload]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        created_at: { type: string, format: date-time }
+        failed_at: { type: string, format: date-time, description: "When the drain transitioned the row to dead_letter." }
+        attempts: { type: integer }
+        last_error: { type: string }
+        payload: { type: string }
+
+    QueueDeadLetterResponse:
+      description: "200 — a page of dead-letter rows ordered by created_at DESC, id DESC."
+      type: object
+      required: [app_slug, messages]
+      properties:
+        app_slug: { type: string }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/QueueDeadLetterMessage' }
+        next_before: { type: string, pattern: '^[a-f0-9]{32}$', description: "Cursor for the previous page; absent on the final page." }
 
     DelayedTaskResponse:
       description: "Delayed task create/get shape. ScheduledAt is the customer-facing UTC dispatch time. State is populated on get, omitted on create (always `pending` there)."

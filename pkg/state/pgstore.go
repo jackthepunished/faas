@@ -2354,14 +2354,53 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 	return nil
 }
 
-func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration) error {
+func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int) error {
+	// Issue #394 — dead-letter path. When retryAfter > 0 and budget > 0
+	// and attempts is already at the ceiling (ClaimInvocation already
+	// bumped attempts to the current attempt count — see pgstore.go
+	// ClaimInvocation line 2327), the row is routed to
+	// state='dead_letter' (terminal) and attempts is NOT bumped past
+	// the ceiling. Three call shapes:
+	//
+	//   retryAfter > 0, budget <= 0          → legacy infinite retry
+	//                                          (state='pending', bump
+	//                                          attempts, set due_at).
+	//   retryAfter > 0, budget > 0           → transient decision via
+	//                                          the CASE in the SET
+	//                                          clause: dead_letter if
+	//                                          attempts >= budget,
+	//                                          else pending. attempts
+	//                                          and completed_at follow
+	//                                          the same case.
+	//   retryAfter == 0 (any budget)         → permanent 'failed'. The
+	//                                          drain uses this branch
+	//                                          for shape/capacity
+	//                                          errors; the budget gate
+	//                                          does not apply.
 	var query string
 	var args []any
-	if retryAfter > 0 {
-		// Same int→text concat workaround as ClaimInvocation: pass the
-		// microseconds as a pre-formatted string with the unit suffix so
-		// Postgres parses it as interval. Avoids the OID 25 encode-plan
-		// lookup failure on the GH Actions Postgres 15 image.
+	switch {
+	case retryAfter > 0 && budget > 0:
+		// Same int→text concat workaround as ClaimInvocation: pass
+		// the microseconds as a pre-formatted string with the unit
+		// suffix so Postgres parses it as interval. Avoids the OID 25
+		// encode-plan lookup failure on the GH Actions Postgres 15
+		// image.
+		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
+		query = `update invocations
+				    set state = case when attempts >= $4 then 'dead_letter' else 'pending' end,
+				        due_at = case when attempts >= $4 then due_at else now() + $2::interval end,
+				        completed_at = case when attempts >= $4 then now() else completed_at end,
+				        lease_expires_at = null,
+				        last_error = $3
+				    -- Do NOT bump attempts on transient re-queue;
+				    -- ClaimInvocation (line 2327) already incremented
+				    -- it for this dispatch attempt. Double-bumping would
+				    -- make MaxQueueAttempts=10 dead-letter after 5
+				    -- iterations instead of 10.
+				  where id = $1 and state in ('dispatching','pending')`
+		args = []any{id, retryText, lastError, budget}
+	case retryAfter > 0:
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
 		query = `update invocations
 				    set state = 'pending',
@@ -2371,7 +2410,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 				        attempts = attempts + 1
 				  where id = $1 and state in ('dispatching','pending')`
 		args = []any{id, retryText, lastError}
-	} else {
+	default:
 		query = `update invocations
 				    set state = 'failed',
 				        completed_at = now(),
@@ -2499,6 +2538,109 @@ func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, state
 		where app_id = $1
 		  and state = any($2::text[])
 		order by created_at desc, id desc`, appID, stateStrs)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// QueueState (issue #394) is the read-side counter aggregator. One
+// round-trip returns three numbers: depth (pending+dispatching),
+// in_flight (dispatching with lease_expires_at either NULL or in the
+// future), oldest_pending_at (min created_at over the pending slice).
+// Index-backed by invocations_app_pending_idx on the depth count; the
+// other two predicates add an extra FILTER (WHERE) clause that the
+// planner can satisfy from the same partial index.
+func (s *PgStore) QueueState(ctx context.Context, appID string) (QueueStats, error) {
+	var stats QueueStats
+	var oldest *time.Time
+	err := s.pool.QueryRow(ctx, `
+		select
+		  count(*) filter (where state in ('pending','dispatching'))                  as depth,
+		  count(*) filter (where state = 'dispatching'
+		                    and (lease_expires_at is null or lease_expires_at > now())) as in_flight,
+		  min(created_at) filter (where state = 'pending')                            as oldest_pending_at
+		from invocations
+		where app_id = $1 and source = 'queue'
+	`, appID).Scan(&stats.Depth, &stats.InFlight, &oldest)
+	if err != nil {
+		return QueueStats{}, err
+	}
+	if oldest != nil {
+		stats.OldestPendingAt = *oldest
+	}
+	return stats, nil
+}
+
+// QueuePeek (issue #394) lists the oldest pending queue messages for
+// an app without acquiring a lease. Read-only — no FOR UPDATE, no
+// FOR SHARE, no advisory lock. Cursor convention mirrors
+// ListInvocationsForAccount: `before` is an invocation id (uuid);
+// empty means "start from the oldest". The subquery resolves the
+// anchor row's created_at so we page by the (created_at, id) tuple,
+// matching the ORDER BY clause under the cursor predicate.
+//
+// The query goes through invocations_app_pending_idx when the planner
+// can satisfy both the app filter and the state predicate from the
+// partial index; on hot apps the index-only path also covers the
+// payload column for small payloads, keeping the read off the heap.
+func (s *PgStore) QueuePeek(ctx context.Context, appID string, limit int, before string) ([]Invocation, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	var beforeParam any
+	if before != "" {
+		beforeParam = before
+	}
+	rows, err := s.pool.Query(ctx, `
+		select `+invocationSelectCols+`
+		  from invocations
+		 where app_id = $1
+		   and source = 'queue'
+		   and state = 'pending'
+		   and ($2::uuid is null or
+		        created_at < (select created_at from invocations where id = $2))
+		   and ($2::uuid is null or
+		        id < (select id from invocations where id = $2))
+		 order by created_at asc, id asc
+		 limit $3
+	`, appID, beforeParam, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// QueueDeadLetter (issue #394) lists dead-letter rows (state =
+// 'dead_letter') for an app. Same cursor / limit / ordering
+// conventions as QueuePeek, but the index is
+// invocations_app_dead_letter_idx and the order is DESC so the
+// newest dead_letter surfaces first.
+func (s *PgStore) QueueDeadLetter(ctx context.Context, appID string, limit int, before string) ([]Invocation, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	var beforeParam any
+	if before != "" {
+		beforeParam = before
+	}
+	rows, err := s.pool.Query(ctx, `
+		select `+invocationSelectCols+`
+		  from invocations
+		 where app_id = $1
+		   and source = 'queue'
+		   and state = 'dead_letter'
+		   and ($2::uuid is null or
+		        created_at < (select created_at from invocations where id = $2))
+		 order by created_at desc, id desc
+		 limit $3
+	`, appID, beforeParam, limit)
 	if err != nil {
 		return nil, err
 	}

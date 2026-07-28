@@ -803,6 +803,72 @@ type ListInvocationsResponse struct {
 	Invocations []Invocation `json:"invocations"`
 }
 
+// --- Issue #394 — queue introspection -------------------------------
+//
+// QueueStateResponse is the read-only depth/stats contract for
+// GET /v1/apps/{slug}/queues/state. NO lease is acquired by calling
+// this endpoint. PlanCap is the static per-plan MaxQueueDepth so
+// dashboards can render "depth / cap" without a second lookup.
+// OldestPendingAt / OldestPendingAgeSeconds are omitted when the queue
+// is empty (zero value); clients should treat absence as "no backlog".
+type QueueStateResponse struct {
+	AppSlug                 string     `json:"app_slug"`
+	Plan                    string     `json:"plan"`
+	PlanCap                 int        `json:"plan_cap"`
+	Depth                   int        `json:"depth"`
+	InFlight                int        `json:"in_flight"`
+	OldestPendingAt         *time.Time `json:"oldest_pending_at,omitempty"`
+	OldestPendingAgeSeconds *int64     `json:"oldest_pending_age_seconds,omitempty"`
+	GeneratedAt             time.Time  `json:"generated_at"`
+}
+
+// QueuePeekMessage is one pending row returned by GET .../queues/peek.
+// The handler does NOT acquire a lease and does NOT increment attempts —
+// repeated peeks leave the underlying state byte-identical. Payload
+// is rendered as a JSON string (the stored column is jsonb, surfaced
+// verbatim) so callers can decode with their preferred JSON lib.
+type QueuePeekMessage struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	Attempts  int       `json:"attempts"`
+	Payload   string    `json:"payload"`
+	LastError string    `json:"last_error,omitempty"`
+}
+
+// QueuePeekResponse is the paginated contract. NextBefore is the
+// last returned id (UUID) — pass it as `?before=<id>` on the next
+// call. Empty NextBefore means "no more pages" (caller stops).
+type QueuePeekResponse struct {
+	AppSlug    string             `json:"app_slug"`
+	Messages   []QueuePeekMessage `json:"messages"`
+	NextBefore string             `json:"next_before,omitempty"`
+}
+
+// QueueDeadLetterMessage is one row that exhausted its plan's retry
+// budget (state='dead_letter'). FailedAt is the moment the drain
+// transitioned the row to terminal (== state.Invocation.CompletedAt).
+// LastError is the most recent failure; Payload is preserved verbatim
+// so an operator can replay it as a fresh send if needed.
+type QueueDeadLetterMessage struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	FailedAt  time.Time `json:"failed_at"`
+	Attempts  int       `json:"attempts"`
+	LastError string    `json:"last_error"`
+	Payload   string    `json:"payload"`
+}
+
+// QueueDeadLetterResponse is the paginated contract for
+// GET /v1/apps/{slug}/queues/dead_letter. Same cursor convention as
+// QueuePeekResponse (NextBefore = last id, `?before=<id>` for the next
+// page). Rows are ordered newest-first (created_at DESC) so operators
+// see the most recent failures at the top.
+type QueueDeadLetterResponse struct {
+	AppSlug    string                    `json:"app_slug"`
+	Messages   []QueueDeadLetterMessage `json:"messages"`
+	NextBefore string                    `json:"next_before,omitempty"`
+}
+
 // --- IAM-4 (ADR-035) — auth audit event surface -----------------------------
 //
 // AuditEventResponse is one row of the customer's own security event

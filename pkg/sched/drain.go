@@ -237,7 +237,10 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 	// been downgraded between EnqueueInvocation and now).
 	if inv.Source == state.InvocationDelayedTask {
 		if d.isOverDelayedCap(ctx, inv.AppID) {
-			_ = d.store.FailInvocation(ctx, inv.ID, "delayed-task cap exceeded on dispatch", 30*time.Second)
+			// budget=0 keeps the legacy infinite-retry semantics on
+			// the delayed-task-cap path; that path is not plan-scoped
+			// (issue #394 only arms the budget for queue source).
+			_ = d.store.FailInvocation(ctx, inv.ID, "delayed-task cap exceeded on dispatch", 30*time.Second, 0)
 			d.log.Warn("drain: delayed-task cap on dispatch", "inv", inv.ID, "app_id", inv.AppID)
 			return
 		}
@@ -250,7 +253,11 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 	// a SLO; long enough that we don't churn cycles on a suspended
 	// account.
 	if !d.isAccountActive(ctx, inv.AppID) {
-		_ = d.store.FailInvocation(ctx, inv.ID, "account suspended", 5*time.Minute)
+		// budget=0: account-suspended retry does not consume the
+		// plan's per-message budget. Free customers hitting this path
+		// (a Free app can't queue, but can be a delayed_task/cron
+		// actor) never had a budget to begin with.
+		_ = d.store.FailInvocation(ctx, inv.ID, "account suspended", 5*time.Minute, 0)
 		d.log.Info("drain: account suspended; deferred",
 			"inv", inv.ID, "app_id", inv.AppID)
 		return
@@ -276,7 +283,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		if errors.Is(err, ErrPermanentWake) {
 			retryAfter = 0
 		}
-		_ = d.store.FailInvocation(ctx, inv.ID, "wake: "+err.Error(), retryAfter)
+		_ = d.store.FailInvocation(ctx, inv.ID, "wake: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv))
 		d.log.Warn("drain: wake", "inv", inv.ID, "err", err, "permanent", retryAfter == 0)
 		return
 	}
@@ -303,7 +310,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		if errors.Is(err, ErrPermanentInvoke) {
 			retryAfter = 0
 		}
-		_ = d.store.FailInvocation(ctx, inv.ID, "invoke: "+err.Error(), retryAfter)
+		_ = d.store.FailInvocation(ctx, inv.ID, "invoke: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv))
 		d.log.Warn("drain: invoke", "inv", inv.ID, "inst", wakeRes.InstanceID, "err", err, "permanent", retryAfter == 0)
 		return
 	}
@@ -396,4 +403,32 @@ func (d *Drain) isAccountActive(ctx context.Context, appID string) bool {
 	}
 	d.accts.put(app.AccountID, acct.Active(), d.now().Add(5*time.Second))
 	return acct.Active()
+}
+
+// queueAttemptBudget (issue #394) returns the per-plan retry budget
+// for an invocation, resolved from the parent account's plan. Returns
+// 0 for non-queue sources (delayed_task, async_invoke, cron) and for
+// any lookup error — Store.FailInvocation treats budget==0 as
+// "infinite retry", which is the correct behaviour for those paths
+// and a safe degrade for lookups.
+//
+// Plan caps rarely change (no churn from a healthy customer), so we
+// don't cache the value here. The AccountByID round-trip is one extra
+// store call per dispatched row; if this becomes hot, a TTL'd
+// plan-cache keyed by account_id is the obvious follow-up. A failure
+// here also fail-opens to 0, matching the rest of the drain's
+// fail-open stance (never block the platform on a Postgres hiccup).
+func (d *Drain) queueAttemptBudget(ctx context.Context, inv state.Invocation) int {
+	if inv.Source != state.InvocationQueue {
+		return 0
+	}
+	app, err := d.engine.Store().AppByID(ctx, inv.AppID)
+	if err != nil {
+		return 0
+	}
+	acct, err := d.engine.Store().AccountByID(ctx, app.AccountID)
+	if err != nil {
+		return 0
+	}
+	return api.MustLimitsFor(acct.Plan).MaxQueueAttempts
 }

@@ -445,7 +445,7 @@ func TestDrain_ReactivatesAfterSuspension(t *testing.T) {
 	}
 	// Mark the row's due_at future-dated so the next tick picks it up
 	// after reactivation.
-	if err := store.FailInvocation(ctx, inv.ID, "manual: reset for reactivation test", 1*time.Millisecond); err != nil {
+	if err := store.FailInvocation(ctx, inv.ID, "manual: reset for reactivation test", 1*time.Millisecond, 0); err != nil {
 		// FailInvocation may set retryAfter=0 → failed; we want pending.
 		// If it set failed, force a re-issue via EnqueueInvocation.
 		_, _ = store.EnqueueInvocation(ctx, inv)

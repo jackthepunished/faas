@@ -195,7 +195,7 @@ func TestPg_FailInvocationTransientAndPermanent(t *testing.T) {
 		t.Fatalf("ClaimInvocation: %v", err)
 	}
 
-	if err := s.FailInvocation(ctx, enq.ID, "blip", 5*time.Second); err != nil {
+	if err := s.FailInvocation(ctx, enq.ID, "blip", 5*time.Second, 0); err != nil {
 		t.Fatalf("FailInvocation transient: %v", err)
 	}
 	got, _ := s.InvocationByID(ctx, enq.ID)
@@ -213,7 +213,7 @@ func TestPg_FailInvocationTransientAndPermanent(t *testing.T) {
 	if _, err := s.ClaimInvocation(ctx, enq.ID, "", 30); err != nil {
 		t.Fatalf("re-Claim: %v", err)
 	}
-	if err := s.FailInvocation(ctx, enq.ID, "permanent", 0); err != nil {
+	if err := s.FailInvocation(ctx, enq.ID, "permanent", 0, 0); err != nil {
 		t.Fatalf("FailInvocation permanent: %v", err)
 	}
 	final, _ := s.InvocationByID(ctx, enq.ID)
@@ -270,7 +270,7 @@ func TestPg_CountPendingInvocationsPartialIndex(t *testing.T) {
 	if _, err := s.ClaimInvocation(ctx, rows[4].ID, "", 30); err != nil {
 		t.Fatalf("claim 4: %v", err)
 	}
-	if err := s.FailInvocation(ctx, rows[4].ID, "x", 0); err != nil {
+	if err := s.FailInvocation(ctx, rows[4].ID, "x", 0, 0); err != nil {
 		t.Fatalf("fail 4: %v", err)
 	}
 

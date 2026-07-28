@@ -2226,7 +2226,7 @@ func (m *MemStore) CompleteInvocation(_ context.Context, id string, result json.
 // so the drain's redelivery is a no-op). Mirrors the PG contract
 // exactly so the drain's cap re-check on pending rows works on both
 // backends.
-func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string, retryAfter time.Duration) error {
+func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string, retryAfter time.Duration, budget int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inv, ok := m.invocations[id]
@@ -2238,10 +2238,40 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 	}
 	inv.LastError = lastError
 	if retryAfter > 0 {
-		inv.State = InvocationPending
-		inv.DueAt = time.Now().Add(retryAfter)
-		inv.LeaseExpiresAt = nil
+		// Transient. Either re-queue (budget == 0 or attempts not yet
+		// exhausted) or transition to dead_letter (issue #394 — budget
+		// exhausted). Three branches:
+		//
+		//   budget <= 0          → legacy infinite retry; invariant of the
+		//                          pre-#394 drain and the path every
+		//                          non-queue caller still takes.
+		//   budget > 0 and
+		//   attempts <  budget  → transient re-queue; attempts is NOT
+		//                          bumped here — ClaimInvocation (line
+		//                          2194) already incremented it to count
+		//                          this dispatch attempt.
+		//   budget > 0 and
+		//   attempts >= budget  → state='dead_letter', completed_at=now;
+		//                          attempts is the count at the moment
+		//                          of failure and is NOT bumped past the
+		//                          ceiling.
+		if budget > 0 && inv.Attempts >= budget {
+			inv.State = InvocationDeadLetter
+			now := time.Now()
+			inv.CompletedAt = &now
+		} else {
+			inv.State = InvocationPending
+			inv.DueAt = time.Now().Add(retryAfter)
+			inv.LeaseExpiresAt = nil
+			// Do NOT bump attempts here. ClaimInvocation already
+			// incremented it for this dispatch attempt; double-bumping
+			// would make MaxQueueAttempts=10 dead-letter after 5
+			// iterations instead of 10.
+		}
 	} else {
+		// Permanent. retryAfter == 0 short-circuits to state='failed'
+		// regardless of budget; budget applies only to the transient
+		// retry loop.
 		inv.State = InvocationFailed
 		now := time.Now()
 		inv.CompletedAt = &now
@@ -2364,6 +2394,144 @@ func (m *MemStore) ListInvocationsForApp(_ context.Context, appID string, states
 		}
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
+	return out, nil
+}
+
+// QueueState (issue #394) is the read-side counter aggregator. MemStore
+// walks the in-memory map under the lock and returns the three numbers
+// in one pass — no transactional semantics needed because the lock
+// serialises the read against writers. Equivalent to the PgStore
+// triple-aggregate query (depth, in_flight, oldest_pending_at).
+func (m *MemStore) QueueState(_ context.Context, appID string) (QueueStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var s QueueStats
+	for _, inv := range m.invocations {
+		if inv.AppID != appID || inv.Source != InvocationQueue {
+			continue
+		}
+		switch inv.State {
+		case InvocationPending:
+			s.Depth++
+			if s.OldestPendingAt.IsZero() || inv.CreatedAt.Before(s.OldestPendingAt) {
+				s.OldestPendingAt = inv.CreatedAt
+			}
+		case InvocationDispatching:
+			s.Depth++
+			// In-flight = dispatching with no expired lease. The legacy
+			// drain stamps lease_expires_at = now + wakeLeaseSeconds; if
+			// a row's lease has slipped past that deadline the worker
+			// is no longer holding it and the row should not count
+			// toward InFlight (the next drain tick will re-claim it).
+			if inv.LeaseExpiresAt == nil || inv.LeaseExpiresAt.After(time.Now()) {
+				s.InFlight++
+			}
+		}
+	}
+	return s, nil
+}
+
+// QueuePeek (issue #394) returns the oldest pending queue messages
+// for an app without acquiring a lease. Read-only; the in-memory
+// iteration copies snapshots into `out` so a concurrent writer cannot
+// perturb the slice the handler encodes.
+//
+// Cursor convention mirrors ListInvocationsForAccount: `before` is an
+// Invocation.ID (uuid); empty means "start from the oldest". MemStore
+// does the cursor subquery-resolves-created_at dance manually because
+// it has no SQL.
+func (m *MemStore) QueuePeek(_ context.Context, appID string, limit int, before string) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	beforeCreated := time.Time{}
+	if before != "" {
+		anchor, ok := m.invocations[before]
+		if !ok {
+			return nil, nil // unknown cursor; treat as "start from oldest"
+		}
+		beforeCreated = anchor.CreatedAt
+	}
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.AppID != appID || inv.Source != InvocationQueue {
+			continue
+		}
+		if inv.State != InvocationPending {
+			continue
+		}
+		if !beforeCreated.IsZero() && inv.CreatedAt.After(beforeCreated) {
+			continue
+		}
+		if !beforeCreated.IsZero() && inv.CreatedAt.Equal(beforeCreated) && inv.ID >= before {
+			continue
+		}
+		out = append(out, inv)
+	}
+	// Oldest-first, then id ASC as the stable tie-breaker (mirrors the
+	// ORDER BY clause in pkg/state/pgstore.go::QueuePeek).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// QueueDeadLetter (issue #394) returns dead-letter rows for an app,
+// newest-first (descending created_at). Same cursor semantics as
+// QueuePeek but the index in PgStore is ordered DESC; here we sort
+// accordingly. Pagination by `before` means "older than the anchor".
+func (m *MemStore) QueueDeadLetter(_ context.Context, appID string, limit int, before string) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	beforeCreated := time.Time{}
+	if before != "" {
+		anchor, ok := m.invocations[before]
+		if !ok {
+			return nil, nil
+		}
+		beforeCreated = anchor.CreatedAt
+	}
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.AppID != appID || inv.Source != InvocationQueue {
+			continue
+		}
+		if inv.State != InvocationDeadLetter {
+			continue
+		}
+		if !beforeCreated.IsZero() && inv.CreatedAt.After(beforeCreated) {
+			continue
+		}
+		out = append(out, inv)
+	}
+	// Newest-first, then id DESC as the stable tie-breaker (matches
+	// the partial index order on the PgStore side).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 

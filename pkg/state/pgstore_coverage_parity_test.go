@@ -62,7 +62,7 @@ func TestPg_CoverageInvocationLifecycle(t *testing.T) {
 	if err := s.CompleteInvocation(ctx, due.ID, json.RawMessage(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FailInvocation(ctx, due.ID, "noop", 0); !errors.Is(err, state.ErrNotFound) {
+	if err := s.FailInvocation(ctx, due.ID, "noop", 0, 0); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("fail after completion = %v", err)
 	}
 	fail, err := enqueue(time.Now().Add(-time.Minute))
@@ -72,10 +72,10 @@ func TestPg_CoverageInvocationLifecycle(t *testing.T) {
 	if _, err := s.ClaimInvocation(ctx, fail.ID, "instance", 30); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FailInvocation(ctx, fail.ID, "boom", time.Minute); err != nil {
+	if err := s.FailInvocation(ctx, fail.ID, "boom", time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FailInvocation(ctx, fail.ID, "perm", 0); err != nil {
+	if err := s.FailInvocation(ctx, fail.ID, "perm", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CancelInvocation(ctx, future.ID); err != nil {

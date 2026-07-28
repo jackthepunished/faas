@@ -149,6 +149,21 @@ type Limits struct {
 	MaxSourceBytesPerInvocation int
 	AsyncInvokeAllowed          bool
 
+	// MaxQueueAttempts (issue #394 / Move 1 dead-letter) is the
+	// per-plan retry budget for queue messages that hit a transient
+	// failure during drain (pkg/sched/drain.go). Once a row's
+	// `attempts` reaches this value, the next transient failure
+	// transitions it to state='dead_letter' (terminal) instead of
+	// 'pending' (re-queued). Free = 0 means queues aren't entitled
+	// anyway (MaxQueueDepth = 0); the drain keeps the legacy
+	// infinite-retry behaviour because Free never queues. Hobby/Pro/
+	// Scale follow the same shape as the other async-event caps:
+	// small on the cheap tier, larger as we move up. The dead-letter
+	// rows are readable via GET /v1/apps/{slug}/queues/dead_letter
+	// (migrations/00060_invocations_dead_letter.sql lands the
+	// 'dead_letter' state value + partial index).
+	MaxQueueAttempts int
+
 	// Cron limits (spec §4.4 / event-shaped surface). Two independent
 	// caps; both populated for every plan, Free is 0/0 so the
 	// per-store check returns QuotaError immediately. The handler
@@ -222,6 +237,12 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       0,
 		MaxSourceBytesPerInvocation: 0,
 		AsyncInvokeAllowed:          false,
+		// Free: queues aren't entitled (MaxQueueDepth = 0). Value is
+		// kept at 0 for symmetry with the rest of the async-event
+		// caps. The drain falls back to legacy infinite-retry when
+		// budget == 0, but Free customers never reach the queue
+		// surface so the path is unreachable.
+		MaxQueueAttempts: 0,
 		// Autoscale (issue #169 / #172): Free stays off. The per-request
 		// cost envelope already covers Free's load shape, and a "scale
 		// up" trigger on a 1-concurrency plan is meaningless.
@@ -268,6 +289,10 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       5,
 		MaxSourceBytesPerInvocation: 64 * 1024,
 		AsyncInvokeAllowed:          true,
+		// Hobby: 3 attempts. Tight on the cheap tier — a worker that
+		// keeps re-trying a bad payload would otherwise burn the
+		// per-app rps budget and starve the rest of the queue.
+		MaxQueueAttempts: 3,
 		// Autoscale: Hobby is gated on Pro+ for both RPS and CPU
 		// (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier on
 		// ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
@@ -314,6 +339,12 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       50,
 		MaxSourceBytesPerInvocation: 256 * 1024,
 		AsyncInvokeAllowed:          true,
+		// Pro: 10 attempts. Trades tolerance against "a poisoned row
+		// churns indefinitely". At 10 retries a transient downstream
+		// flap has plenty of room, while a permanently-bad payload
+		// exits the worker pool within ~50 s at the default retry
+		// backoff (5 s).
+		MaxQueueAttempts: 10,
 		// ADR-031: Pro gets 16 CIDR entries — enough for "1 SaaS +
 		// 1 webhook + 1 monitoring + ~10 partner integrations" which
 		// is the typical Pro-tier reachability graph.
@@ -363,6 +394,12 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       1_000_000,
 		MaxSourceBytesPerInvocation: 1024 * 1024,
 		AsyncInvokeAllowed:          true,
+		// Scale: 25 attempts. The highest tier gets the most
+		// tolerance so an upstream outage lasting a few minutes
+		// doesn't dump the queue into dead_letter on a single bad
+		// minute. Above 25 is irrational — that's 2 minutes at the
+		// 5 s default backoff.
+		MaxQueueAttempts: 25,
 		// ADR-031: Scale gets 64 CIDR entries — broad enough for
 		// SaaS-scale apps with many upstream integrations; doubling
 		// the Pro budget tracks the doubling in DeployedApps (25 -> 100).

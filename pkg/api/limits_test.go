@@ -18,6 +18,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// "100ms/100ms, 200ms/100ms, 500ms/100ms, 1000ms/100ms".
 			CPUWeight: 2, CPUQuotaUS: 100_000, CPUPeriodUS: 100_000,
 			MaxQueueDepth: 0, MaxDelayedTasksPerApp: 0, MaxSourceBytesPerInvocation: 0, AsyncInvokeAllowed: false,
+			// Issue #394: Free is gated out of queues entirely (spec §4.4
+			// paid-only), so MaxQueueAttempts is moot — 0 matches the
+			// "feature not offered" contract.
+			MaxQueueAttempts: 0,
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
 			CronLimitPerApp: 0, CronLimitPerAccount: 0,
@@ -29,6 +33,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// load-bearing signal in the cpu-fairness e2e (cmd/e2e/cpu_fairness_test.go).
 			CPUWeight: 4, CPUQuotaUS: 200_000, CPUPeriodUS: 200_000,
 			MaxQueueDepth: 5, MaxDelayedTasksPerApp: 5, MaxSourceBytesPerInvocation: 64 * 1024, AsyncInvokeAllowed: true,
+			// Issue #394: Hobby gets 3 retries before dead-letter — a
+			// poisoned row exits within ~15s at the default 5s backoff
+			// without thrashing the worker for long.
+			MaxQueueAttempts: 3,
 			// Issue #169 / #172: Hobby is gated on Pro+ for both RPS
 			// and CPU (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier
 			// on ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
@@ -45,6 +53,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-044: see PlanFree.
 			CPUWeight: 8, CPUQuotaUS: 500_000, CPUPeriodUS: 500_000,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
+			// Issue #394: Pro gets 10 retries — 5× Hobby's budget.
+			// Tolerates a transient downstream flap while still bounding
+			// the "permanently bad payload" worker cost.
+			MaxQueueAttempts: 10,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
@@ -60,6 +72,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// level, gated by the §1 56 GB hard fence at the slice level.
 			CPUWeight: 16, CPUQuotaUS: 1_000_000, CPUPeriodUS: 1_000_000,
 			MaxQueueDepth: 100, MaxDelayedTasksPerApp: 1_000_000, MaxSourceBytesPerInvocation: 1024 * 1024, AsyncInvokeAllowed: true,
+			// Issue #394: Scale gets 25 retries — 2.5× Pro's budget, but
+			// capped so a genuinely-bad payload still terminates within
+			// the worker's hourly budget window.
+			MaxQueueAttempts: 25,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
