@@ -2,8 +2,9 @@ package webhookdedupe
 
 import (
 	"context"
-	"log/slog"
+	"errors"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ func TestSweeper_Run_StopsOnContextCancel(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Errorf("Run returned %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):

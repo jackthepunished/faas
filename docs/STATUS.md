@@ -158,7 +158,7 @@ historical path bit-for-bit unchanged. apid also mounts
 decision; the operator runbook is
 `docs/ops/billing-provider-switch.md`.
 
-**Webhook signature replay protection (PR for issue #294, ADR-041)**
+**Webhook signature replay protection (PR for issue #294, ADR-042)**
 — the three webhook ingresses (GitHub via gatewayd, Stripe + Paddle
 via apid) verify HMAC but never checked the delivery UUID against a
 dedupe table; a replayed webhook within the signature-validity

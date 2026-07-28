@@ -30,7 +30,7 @@ type stripePushKey struct {
 // webhookDeliveryKey is the (provider, delivery_id) dedupe key the
 // three webhook ingresses on the box use; mirrors the
 // (provider, delivery_id) primary key on the webhook_deliveries
-// table (migration 00056). The value is the expires_at timestamp so
+// table (migration 00059). The value is the expires_at timestamp so
 // the MemStore can answer "is this row within its 5-minute TTL?"
 // without a separate sweep — TTL eviction is O(1) at access time.
 // Issue #294.

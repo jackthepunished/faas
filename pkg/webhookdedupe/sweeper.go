@@ -92,8 +92,8 @@ func (s *Sweeper) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			if _, err := s.RunOnce(ctx); err != nil {
-				// RunOnce already logs; loop continues.
+			if n, err := s.RunOnce(ctx); err != nil {
+				s.log.Warn("webhook dedupe sweep failed", "deleted", n, "err", err)
 			}
 		}
 	}

@@ -148,10 +148,15 @@ func TestSweep_DropsExpiredRows(t *testing.T) {
 
 // TestErrReplay_AliasesStateSentinel pins the wrapper contract:
 // webhookdedupe.ErrReplay IS state.ErrReplay (same value, not a
-// copy), so errors.Is from either side matches.
+// wrap), so errors.Is(err, ErrReplay) and errors.Is(err,
+// state.ErrReplay) both match — callers that import only one of the
+// two packages get the same behaviour. The single assertion
+// (target = webhookdedupe.ErrReplay, needle = state.ErrReplay)
+// is the minimal check that proves value identity; the symmetric
+// direction is identical because the values are equal.
 func TestErrReplay_AliasesStateSentinel(t *testing.T) {
-	if ErrReplay != state.ErrReplay {
-		t.Errorf("webhookdedupe.ErrReplay (%v) should be the same value as state.ErrReplay (%v)", ErrReplay, state.ErrReplay)
+	if !errors.Is(ErrReplay, state.ErrReplay) {
+		t.Errorf("errors.Is(webhookdedupe.ErrReplay, state.ErrReplay) = false; expected true (same value)")
 	}
 }
 

@@ -1,4 +1,4 @@
-// gatewayd audit emitter (issue #294, ADR-041).
+// gatewayd audit emitter (issue #294, ADR-042).
 //
 // Mirrors cmd/apid/audit.go (best-effort AppendEvent) so the GitHub
 // proxy can emit webhook.replay_rejected rows without dragging in

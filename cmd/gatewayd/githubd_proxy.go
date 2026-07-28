@@ -206,7 +206,7 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // within the TTL window. The 200 response is emitted at the call
 // site; audit emission is intentionally deferred to a follow-up so
 // the gatewayd audit seam (mirrors cmd/apid/audit.go) can land in
-// its own PR — see issue #294 ADR-041 follow-up notes.
+// its own PR — see issue #294 ADR-042 follow-up notes.
 //
 // A transport / connection error from the dedupe table is logged
 // at WARN and the request is forwarded anyway — the dedupe table

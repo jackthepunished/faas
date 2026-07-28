@@ -1,4 +1,4 @@
-# ADR-041 — Webhook signature replay protection
+# ADR-042 — Webhook signature replay protection
 
 Status: Accepted, 2026-07-28. Owner: @poyrazK. Closes issue #294.
 Related: spec §5.1 (audit events), §11 (security rules), ADR-035
@@ -33,7 +33,7 @@ Add a single shared `webhook_deliveries` table, one helper package
 and a 5-minute TTL window. Replays are rejected with 200 (idempotent —
 the upstream provider interprets as success and stops retrying).
 
-### The table — migration `00056_webhook_deliveries.sql`
+### The table — migration `00059_webhook_deliveries.sql`
 
 ```sql
 create table if not exists webhook_deliveries (
@@ -131,8 +131,9 @@ and the apid posture at `handlers_ext.go:1188` (Stripe) and
 ## Conventions honoured
 
 - **Migration slots renumbered at PR creation** — issue body says
-  `00052` but `origin/main` ends at `00055` with slots 56+ contested;
-  this ADR ships at slot `00056`. Memory:
+  `00052`, `origin/main` ends at `00055`, slots 56–58 contested by
+  open PRs #335/#352/#369; this ADR ships at slot `00059` (next
+  free above 58). Memory:
   `migration-slot-renumber-at-pr-creation.md` + PR #377 gate.
 - **SQL via sqlc** — the dedupe pair is added to `queries.sql` and
   regenerated; pgstore wraps the sqlc helpers (mirrors

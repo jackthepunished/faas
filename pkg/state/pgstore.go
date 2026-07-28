@@ -3860,7 +3860,7 @@ func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string
 // a dedupe row received on or after cutoff. The PgStore implementation
 // translates a found-row into ErrReplay so callers can branch on a
 // single errors.Is(err, state.ErrReplay) check at the ingress layer.
-// Backing schema: webhook_deliveries (migration 00056).
+// Backing schema: webhook_deliveries (migration 00059).
 func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
@@ -3879,7 +3879,7 @@ func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID s
 // redelivery arrives after the original expires_at but before the
 // sweep runs. The unique constraint is (provider, delivery_id);
 // the provider column is constrained by the
-// webhook_deliveries_provider_check CHECK (added in migration 00056).
+// webhook_deliveries_provider_check CHECK (added in migration 00059).
 func (s *PgStore) RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error {
 	_, err := s.pool.Exec(ctx,
 		`insert into webhook_deliveries (provider, delivery_id, expires_at)
