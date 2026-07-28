@@ -27,7 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00055_Sessions_ShapeAndFK(t *testing.T) {
+func TestMigrations_00056_Sessions_ShapeAndFK(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
