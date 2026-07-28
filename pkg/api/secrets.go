@@ -50,6 +50,37 @@ type AppSecretListResponse struct {
 	Count   int                 `json:"count"`
 }
 
+// AccountAppSecretResponse is one row in GET /v1/secrets — a sealed
+// envelope on a specific app, returned alongside the owning app's
+// identifier so the dashboard can render "foo-app / DATABASE_URL"
+// without a parallel GET /v1/apps round-trip (issue #393).
+//
+// Ciphertext here is the age-sealed Envelope (base64). Plaintext
+// NEVER appears in this struct, on the wire, or in logs — the same
+// invariant that the per-app endpoint upholds (AppSecretResponse
+// above). The handler is the only place that maps state → this DTO,
+// and the mapping deliberately drops the per-row plaintext path:
+// only the host X25519 recipient key unwraps, and that key never
+// leaves the host.
+type AccountAppSecretResponse struct {
+	AppID      string `json:"app_id"`
+	AppSlug    string `json:"app_slug"`
+	Key        string `json:"key"`
+	Ciphertext string `json:"ciphertext"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// ListSecretsForAccountResponse is the page shape for GET /v1/secrets.
+// Cursor is (app_slug, key) — pair-encoded as "<slug>|<key>" by the
+// handler (the pgstore splits it back via split_part). Same JSON
+// convention as InvoiceListResponse: empty NextBefore means the page
+// is the end.
+type ListSecretsForAccountResponse struct {
+	Secrets    []AccountAppSecretResponse `json:"secrets"`
+	NextBefore string                     `json:"next_before,omitempty"`
+}
+
 // ValidateSecretKey returns nil when key matches ^[A-Z][A-Z0-9_]*$ and is
 // within MaxSecretKeyLen bytes; otherwise it returns the api.Problem-shaped
 // CodeSecretInvalidKey. Returns *Problem directly (not error) so call sites

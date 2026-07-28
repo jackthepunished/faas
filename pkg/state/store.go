@@ -901,6 +901,14 @@ type Store interface {
 	// on a one-box that's bounded by max_concurrency(plan) × apps, fine to
 	// run on the minute boundary.
 	ListInstancesForAccount(ctx context.Context, accountID string) ([]Instance, error)
+	// ListInstancesForAccountPaged is the cursor-paginated variant of
+	// ListInstancesForAccount (issue #393). The cursor is the
+	// instances.id UUIDv7; the SQL filter `id < $before` pages
+	// backwards in started_at DESC order. Used by the account-scoped
+	// dashboard pages so one call replaces N per-app fan-outs. The
+	// limit is server-side clamped to 1..100 — the handler validates
+	// before this call so the SQL stays narrow.
+	ListInstancesForAccountPaged(ctx context.Context, accountID string, limit int, before string) ([]Instance, error)
 	UpdateInstanceState(ctx context.Context, id, state string) error
 	// UpdateInstanceStateWithTimestamp is the same write but stamps
 	// parked_at to the supplied time on the same statement. Used by
@@ -1254,6 +1262,14 @@ type Store interface {
 	// handler renders KEYS only; ciphertext flows to vmmd. Returns nil slice
 	// (not error) when the app has no secrets.
 	ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error)
+	// ListAppSecretsForAccount is the account-scoped sibling of
+	// ListAppSecrets (issue #393). The cursor is the (app_slug, key)
+	// pair — encoded as "<slug>|<key>" by the handler and split via
+	// split_part in SQL. Order is (app_slug ASC, key ASC) so a
+	// paginated walk is deterministic across calls. Used by the
+	// dashboard's account-wide secrets page so one call replaces N
+	// per-app fan-outs.
+	ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error)
 	// CountAppSecrets is the quota check helper. apid calls it before
 	// UpsertAppSecret to enforce Limits.SecretCountMax.
 	CountAppSecrets(ctx context.Context, accountID, appID string) (int, error)

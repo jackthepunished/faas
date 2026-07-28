@@ -1,6 +1,10 @@
 package api
 
-import "context"
+import (
+	"context"
+	"net/http"
+	"strconv"
+)
 
 // ListDeploymentsAll walks the next_before cursor on
 // GET /v1/deployments until the server returns an empty cursor,
@@ -30,4 +34,46 @@ func (c *Client) ListDeploymentsAll(ctx context.Context) ([]DeploymentResponse, 
 			return out, err
 		}
 	}
+}
+
+// ParseLimit parses a ?limit= query value with a strict 400 contract
+// (issue #393 — matches /v1/invoices' parseInvoiceListParams shape).
+// Returns:
+//
+//   - (nil, defaultN) when raw is "" — caller passes the default.
+//   - (nil, n) when raw parses to an integer in [1, maxN].
+//   - (*Problem, 0) when raw is malformed, < 1, or > maxN. The
+//     Problem is RFC 7807-shaped, carries the limit + observed value
+//     via WithLimit, and pins the docs URL via WithDocs so a customer
+//     hitting the cap from a script gets an actionable message.
+//   - (nil, n) when raw parses to a number inside the allowed range.
+//
+// label is the URL-friendly noun used in the WithDocs fragment
+// (e.g. "instances", "secrets"). Must be lowercase plural so the
+// docs URL stays stable across endpoints.
+//
+// Call site:
+//
+//	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "instances")
+//	if prob != nil { api.WriteProblem(w, prob); return }
+//
+// The matching free function (vs. a method) keeps the import cycle
+// out of cmd/apid: pkg/api does not import cmd/apid, but cmd/apid
+// already imports pkg/api, so the call direction is one-way.
+func ParseLimit(raw string, defaultN, maxN int, label string) (*Problem, int) {
+	if raw == "" {
+		return nil, defaultN
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > maxN {
+		observed := int64(0)
+		if err == nil {
+			observed = int64(n)
+		}
+		return NewProblem(http.StatusBadRequest, CodeValidation,
+			"Bad limit", "expected 1.."+strconv.Itoa(maxN)).
+			WithLimit(int64(maxN), observed).
+			WithDocs("https://docs.DOMAIN/api#pagination"), 0
+	}
+	return nil, n
 }

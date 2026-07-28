@@ -120,3 +120,142 @@ func (c *Client) QueryScalar(ctx context.Context, query string) (float64, error)
 	}
 	return f, nil
 }
+
+// queryResponse is the JSON envelope Prometheus returns for the
+// instant-query API. Decoded by both QueryScalar (already inlined)
+// and the new vector-query helpers — extracted here so all three
+// share the same wire shape.
+type queryResponse struct {
+	Data struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Value  [2]any            `json:"value"`
+		} `json:"result"`
+	} `json:"data"`
+}
+
+// QueryMap runs query against Prometheus and returns the result as a
+// map keyed by the `app` label on each vector sample. Used by the
+// account-scoped metrics rollup (issue #393) so N apps cost one
+// round-trip per metric (vs. N with QueryScalar). The query MUST
+// produce a vector — matrix / scalar results error out, same as
+// QueryScalar's contract.
+//
+// Sample without an `app` label is silently dropped (and so are
+// samples whose label resolves to ""): the rollup's "6 round-trips
+// regardless of N apps" promise depends on the per-app loop only
+// seeing per-app keys; an unlabeled metric would otherwise poison
+// the loop with a "" key. NaN / Inf samples parse to NaN / +Inf —
+// callers guard with safeFloat / safeRoundNonNeg.
+func (c *Client) QueryMap(ctx context.Context, query string) (map[string]float64, error) {
+	if c == nil || c.baseURL == "" {
+		return nil, fmt.Errorf("promql: client not configured")
+	}
+	rows, err := c.doVector(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]float64, len(rows))
+	for _, row := range rows {
+		app, ok := row.Metric["app"]
+		if !ok || app == "" {
+			continue
+		}
+		f, err := parseSampleValue(row.Value, query)
+		if err != nil {
+			return nil, err
+		}
+		out[app] = f
+	}
+	return out, nil
+}
+
+// Buckets groups histogram-bucket samples by app. Returned shape:
+// map[appID]map[le]float64. Used by the metrics rollup so a single
+// `sum by (app, le) (rate(...))` query replaces N per-app `rate`
+// queries; the caller runs histogram_quantile in Go per app.
+//
+// `le` is parsed as a float64 — Prometheus emits it as a string
+// ("+Inf" or numeric). "+Inf" parses to +Inf (ParseFloat accepts
+// "Inf" / "+Inf" / "-Inf"). The caller is responsible for handling
+// +Inf per the histogram_quantile spec.
+func (c *Client) QueryBuckets(ctx context.Context, query string) (map[string]map[string]float64, error) {
+	if c == nil || c.baseURL == "" {
+		return nil, fmt.Errorf("promql: client not configured")
+	}
+	rows, err := c.doVector(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]float64, len(rows))
+	for _, row := range rows {
+		app, ok := row.Metric["app"]
+		if !ok || app == "" {
+			continue
+		}
+		le, ok := row.Metric["le"]
+		if !ok {
+			continue
+		}
+		f, err := parseSampleValue(row.Value, query)
+		if err != nil {
+			return nil, err
+		}
+		bucket, exists := out[app]
+		if !exists {
+			bucket = make(map[string]float64, 4)
+			out[app] = bucket
+		}
+		bucket[le] = f
+	}
+	return out, nil
+}
+
+// doVector runs query and decodes a vector response into the shared
+// queryResponse shape. Shared by QueryMap and QueryBuckets so the
+// transport / parsing / error mapping is one tested path.
+func (c *Client) doVector(ctx context.Context, query string) ([]struct {
+	Metric map[string]string `json:"metric"`
+	Value  [2]any            `json:"value"`
+}, error) {
+	qctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	u := c.baseURL + "/api/v1/query?query=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(qctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doer.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+		return nil, fmt.Errorf("prometheus %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var pr queryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, err
+	}
+	if pr.Data.ResultType != "vector" {
+		return nil, fmt.Errorf("expected vector, got %q for query %q", pr.Data.ResultType, query)
+	}
+	return pr.Data.Result, nil
+}
+
+// parseSampleValue parses the second element of a Prometheus sample
+// value pair (timestamp + stringified float). Returns a structured
+// error so callers can wrap with the offending query.
+func parseSampleValue(v [2]any, query string) (float64, error) {
+	raw, ok := v[1].(string)
+	if !ok {
+		return 0, fmt.Errorf("unexpected value shape for query %q", query)
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %q for query %q: %w", raw, query, err)
+	}
+	return f, nil
+}
