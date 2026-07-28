@@ -179,7 +179,17 @@ func (s *server) fetchAppMetrics(ctx context.Context, appID, rng string) (api.Ap
 // server log has the detail).
 func (s *server) degradedFromErr(resp api.AppMetricsResponse, err error, label string) (api.AppMetricsResponse, string) {
 	if s.log != nil {
-		s.log.Warn("apid: app-metrics query failed", "label", label, "err", err)
+		// CodeQL go/log-injection (alert #117): the err string is
+		// user-controllable (the PromQL `range=` query param flows
+		// into the query body that produced the error). CodeQL's
+		// sanitiser model only recognises the two-call pattern
+		// below — see memory/codeql-go-log-injection-sanitisers.md
+		// for the full precedent. We strip CR/LF inline at the call
+		// site (NOT inside a helper) so the dataflow path is
+		// unambiguous to CodeQL.
+		msg := strings.ReplaceAll(err.Error(), "\r", "")
+		msg = strings.ReplaceAll(msg, "\n", "")
+		s.log.Warn("apid: app-metrics query failed", "label", label, "err", msg)
 	}
 	// Fall back to zeroed fields rather than partially-populated
 	// numbers — the dashboard's empty-state message depends on
