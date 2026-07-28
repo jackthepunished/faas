@@ -3891,11 +3891,21 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 		return false, fmt.Errorf("paddle dedupe upsert acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
 	}
 
-	// Step 2: atomic claim. Either the row is fresh (state='completed'
-	// from the upsert above, claimed_at is now()) and we flip it to
-	// pending, OR the row is a stale-pending claim from a crashed pod
-	// (claimed_at older than the lease) and we steal it. Either way,
-	// the RETURNING tells us we won the race.
+	// Step 2: atomic claim. Three branches map to claimable rows:
+	//
+	//   * Fresh row from Step 1 above — state='completed', claimed_at
+	//     is `now()` (we just set it). The state clause carries this
+	//     branch; without it the lease predicate alone would skip
+	//     fresh rows because now() < now() - lease is FALSE.
+	//   * Stale-pending row from a crashed pod — claimed_at is older
+	//     than the lease. The lease predicate carries this branch.
+	//   * Reaper-reset row from ReapStalePaddleOverageClaims — state
+	//     reset to 'completed', claimed_at=null. The IS NULL clause
+	//     carries this branch.
+	//
+	// A currently-pending row inside the lease is intentionally NOT
+	// claimable — only the pod that holds the claim (or a reaped
+	// releaser) can flip it.
 	var claimed bool
 	err := s.pool.QueryRow(ctx,
 		`update paddle_overage_dedupe
@@ -3905,6 +3915,7 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 		 where account_id = $1
 		   and window_start = $2
 		   and (claimed_at is null
+		        or state = 'completed'
 		        or claimed_at < now() - make_interval(secs => $4))
 		 returning true`,
 		accountID, windowStart, claimedBy, leaseSeconds,
