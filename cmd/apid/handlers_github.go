@@ -39,6 +39,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -129,17 +130,35 @@ func (s *server) renderGitHubAuthRedirect(w http.ResponseWriter, r *http.Request
 func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	stateCookie, err := r.Cookie(githubAuthStateCookie)
 	if err != nil || stateCookie.Value == "" {
+		// Issue #286: OAuth callback failure path that lands
+		// before any customer-supplied identity is known — the
+		// audit row carries email_hash="" (the discriminator is
+		// ip + user_agent). See the Google callback for the
+		// rationale.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "invalid_state", "Invalid State", "missing CSRF state cookie"))
 		return
 	}
 	queryState := r.URL.Query().Get("state")
 	if queryState == "" || queryState != stateCookie.Value {
+		// Issue #286: CSRF mismatch — see note above.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "csrf_mismatch", "CSRF Error", "state token mismatch"))
 		return
 	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
+		// Issue #286: GitHub consent-denial path — the user
+		// backed out before granting the scopes. Same call
+		// shape as the other OAuth denial paths.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			"", r.UserAgent())
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "missing_code", "Authorization Error", "missing code parameter from GitHub"))
 		return
 	}

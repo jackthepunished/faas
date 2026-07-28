@@ -347,7 +347,7 @@ func TestAuditEvents_GetEndpointCrossAccount404(t *testing.T) {
 	}
 	srv := newServer(store,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(wire.NewOpsMetrics("apid"))
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), wire.NewOpsMetrics("apid"))
 	h := srv.handler()
 	idStr := strconv.FormatInt(rowsA[0].ID, 10)
 	req := httptest.NewRequest(http.MethodGet, "/v1/audit-events/"+idStr, nil)
@@ -687,7 +687,7 @@ func TestAuditEvents_FailingStoreDoesNotRollback(t *testing.T) {
 	// ops lazily so we keep e.ops the same.
 	srv := newServer(wrapped,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(e.ops)
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), e.ops)
 	h := srv.handler()
 	body, _ := json.Marshal(api.CreateKeyRequest{Label: "audit-fail", Scopes: []string{api.ScopeAppsRead}})
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys", bytes.NewReader(body))

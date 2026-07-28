@@ -203,7 +203,15 @@ func (s *server) shouldTouchKey(keyID string, now time.Time) bool {
 // methods stay untouched. Mirrors pkg/builderd/builderd.go's
 // WithOpsMetrics (PR #124, ADR-030) and pkg/githubd/server.go's
 // WithOpsMetrics (this PR).
-func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
+//
+// Issue #286: also wires the failed-login counter surface on the
+// auditor (auditor.SetFailedOps) and starts the async-batched audit
+// flusher goroutine (auditor.Start). The flush context is the daemon's
+// main cancel context — passed here so the flusher can drain on
+// shutdown (and so SIGTERM/abort can short-circuit any in-flight
+// AppendEvent calls via contextcheck-friendly ctx propagation
+// through drainFlusher/flushOne).
+func (s *server) WithOpsMetrics(ctx context.Context, ops *wire.OpsMetrics) *server {
 	s.ops = ops
 	// Re-bind the audit counter so the IAM-4 seam can record
 	// failures. If ops is nil (unit tests that don't care about
@@ -211,6 +219,13 @@ func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 	// silently skips the .Inc().
 	if s.audit != nil {
 		s.audit.setOps(ops)
+		// Issue #286: bind the failed-login counter surface and
+		// start the flusher. The flush context is the daemon's
+		// main context — Close() is the canonical shutdown path,
+		// but the context cancellation is the safety net for
+		// abnormal exits (panic, OOM kill, etc.).
+		s.audit.SetFailedOps(ops)
+		s.audit.Start(ctx)
 	}
 	return s
 }
