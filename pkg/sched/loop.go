@@ -43,6 +43,7 @@ type Loop struct {
 	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
 	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
 	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift        *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
 	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
 	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
@@ -95,6 +96,21 @@ func (l *Loop) WithRetention(r *Retention) *Loop {
 // (DefaultHeartbeatInterval = 30s; overridable for tests).
 func (l *Loop) WithHeartbeat(h *Heartbeat) *Loop {
 	l.heartbeat = h
+	return l
+}
+
+// WithDiskDrift attaches the read-only /srv/fc/snap vs DB drift
+// sweep (PR scale-out readiness #3). Same nil-skip semantics as
+// WithHeartbeat: nil means the ticker block in Run is skipped, the
+// select case never fires, and the counter stays at zero. Production
+// cmd/schedd wires sched.NewDiskDrift(store, log).WithMetrics(ops);
+// tests inject a fake or skip. Cadence is api.DefaultDiskDriftInterval
+// (1h) — same hourly cadence as WithRetention so the two sweeps
+// fire on aligned boundaries. The sweep is diagnostic only (never
+// writes, never follows symlinks, never repairs); operators read
+// rate(snapshot_disk_drift_total[5m]) and alert on a non-zero rate.
+func (l *Loop) WithDiskDrift(d *DiskDrift) *Loop {
+	l.diskDrift = d
 	return l
 }
 
@@ -297,6 +313,23 @@ func (l *Loop) Run(ctx context.Context) error {
 		heartbeatT = time.NewTicker(interval)
 		defer heartbeatT.Stop()
 	}
+	// Disk-drift sweep ticker (PR scale-out readiness #3). Hourly
+	// cadence (api.DefaultDiskDriftInterval = 1h) aligns with the
+	// retention sweep's hourly tick so the two read-only sweeps
+	// fire on the same wall-clock minute and operators see a
+	// coordinated batch. The ticker fires once immediately on
+	// construction — same first-fire shape as the heartbeat path
+	// above, not the deferred-first-fire shape of the retention
+	// ticker; the drift sweep is idempotent (read-only + per-file
+	// counter) so an immediate first fire doesn't risk racy
+	// backfill semantics like retention's. nil diskDrift skips the
+	// ticker entirely (the diskDriftTick helper returns nil for a
+	// nil ticker; the select case below never fires).
+	var diskDriftT *time.Ticker
+	if l.diskDrift != nil {
+		diskDriftT = time.NewTicker(api.DefaultDiskDriftInterval)
+		defer diskDriftT.Stop()
+	}
 	// Instance-stats poller ticker (issue #170 / PR-A). Per-Tick
 	// sweep: enumerate live instances + active compute_nodes,
 	// dial each node fresh, decode Stats, replace the Reader
@@ -373,6 +406,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runWatchdog(ctx)
 		case <-heartbeatTick(heartbeatT):
 			l.runHeartbeat(ctx)
+		case <-diskDriftTick(diskDriftT):
+			l.runDiskDrift(ctx)
 		case <-instStatsTick(instStatsT):
 			l.runInstanceStats(ctx)
 		case <-scaleupTick(scaleupT):
@@ -415,6 +450,19 @@ func retentionTick(t *time.Ticker) <-chan time.Time {
 // nil-safe shape as the watchdog/retention tickers: nil ticker ⇒
 // nil channel, so the select case never fires.
 func heartbeatTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// diskDriftTick is the read-only /srv/fc/snap drift sweep ticker
+// (PR scale-out readiness #3). Same nil-safe shape as
+// heartbeatTick / retentionTick: nil ticker ⇒ nil channel, so the
+// select case in Run never fires. Kept separate from
+// heartbeatTick so each ticker type's name shows up in stack traces
+// if a future regression corrupts the channel wiring.
+func diskDriftTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -470,6 +518,23 @@ func recentLoadTick(t *time.Ticker) <-chan time.Time {
 func (l *Loop) runHeartbeat(ctx context.Context) {
 	if err := l.heartbeat.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		l.log.Warn("heartbeat tick error", "err", err)
+	}
+}
+
+// runDiskDrift dispatches one sweep of the read-only /srv/fc/snap
+// vs DB drift sweep (PR scale-out readiness #3). Exported as a
+// method so tests drive a single tick without spinning up Run's
+// goroutine. Tick errors are logged + swallowed (the sweep is
+// diagnostic — Tick never returns an error today, but if a future
+// contributor adds one we still want the loop to keep ticking).
+// Drift counts are logged inside DiskDrift.Tick; this dispatch
+// helper intentionally has no return path for them.
+func (l *Loop) runDiskDrift(ctx context.Context) {
+	if l.diskDrift == nil {
+		return
+	}
+	if _, err := l.diskDrift.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("disk-drift tick error", "err", err)
 	}
 }
 

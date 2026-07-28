@@ -591,6 +591,15 @@ const (
 	// the next hour.
 	DefaultRetentionInterval = 1 * time.Hour
 
+	// DefaultDiskDriftInterval is the cadence for the read-only
+	// /srv/fc/snap vs DB size-tracking drift sweep (PR scale-out
+	// readiness #3). Hourly matches DefaultRetentionInterval so the
+	// two hourly tickers fire on aligned boundaries and don't drift
+	// apart by minute-precision. The sweep never writes — it only
+	// increments OpsMetrics.SnapshotDiskDrift when a disk-vs-DB
+	// discrepancy is observed.
+	DefaultDiskDriftInterval = 1 * time.Hour
+
 	// DefaultConntrackCap is the spec §7 per-instance conntrack cap
 	// (docs/faas_implementation_spec.md:344). One platform-wide number;
 	// not per-plan tiered — every tenant sees the same cap because the

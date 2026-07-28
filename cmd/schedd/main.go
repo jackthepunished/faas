@@ -409,6 +409,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// engine got) — needed by the aggressive-reaper scale-down
 		// counter (ObserveScaleDown) and the audit-row emission.
 		WithOpsMetrics(ops).
+		// PR scale-out readiness #3: read-only /srv/fc/snap vs DB drift
+		// sweep. Hourly cadence (api.DefaultDiskDriftInterval = 1h).
+		// Diagnostic only — never writes, never follows symlinks,
+		// never repairs. Ops reads rate(snapshot_disk_drift_total[5m])
+		// and alerts on a non-zero rate. Shares the OpsMetrics
+		// receiver the engine + retention + watchdog already use.
+		WithDiskDrift(sched.NewDiskDrift(store, log).WithMetrics(ops)).
 		// Audit seam (lifted from cmd/apid/audit.go into pkg/audit
 		// for cross-daemon reuse). schedd uses actor="schedd" so the
 		// cron-fire path can emit a `cron.fired` events row after

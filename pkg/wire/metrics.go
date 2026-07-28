@@ -272,6 +272,17 @@ type OpsMetrics struct {
 	// non-zero rate indicates a broken crypto/rand subsystem and
 	// should alert. Unlabelled: one counter, no cardinality.
 	wakeIDV4Fallback prometheus.Counter
+	// snapshotDiskDrift: PR scale-out readiness #3 (read-only schedd
+	// disk-drift sweep). One counter, no cardinality — drift is
+	// process-level not per-snapshot. Each Tick walks /srv/fc/snap
+	// and compares each <dep>/{mem,vmstate} file's size to the
+	// corresponding snapshots.mem_bytes / disk_bytes row; each
+	// discrepancy (missing file, size mismatch, unexpected entry,
+	// non-regular entry) increments by 1. Persistent drift shows up
+	// as a non-zero rate; the sweep never writes. Registered on every
+	// daemon's OpsMetrics registry (single-registry pattern); only
+	// schedd's Tick produces samples in production.
+	snapshotDiskDrift prometheus.Counter
 	// buildDur / buildQueueWait: introduced in ADR-030 for builderd's
 	// build lifecycle. Distinct from the dur histogram (which tops out
 	// at 5 s — sub-millisecond control-plane sizing) because a build runs
@@ -621,6 +632,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_wake_id_v4_fallback_total",
 		Help: "Count of wake_id mints where uuid.NewV7 returned an error and the engine fell back to uuid.New (v4). Any non-zero rate indicates a broken crypto/rand subsystem and breaks the time-ordering invariant the instances_wake_id_app_idx partial index is built on. Should never increment in production.",
 	})
+	snapshotDiskDrift := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_snapshot_disk_drift_total",
+		Help: "Count of disk-vs-DB discrepancies observed by the read-only /srv/fc/snap drift sweep (PR scale-out readiness #3). Each Tick increments once per missing file, size mismatch, unexpected entry, or non-regular entry under <SnapDir>/<depID>/. Repeated sweeps increment the counter while the discrepancy remains; rate(snapshot_disk_drift_total[5m]) alerts on a non-zero rate. Sweep never writes — diagnostic only.",
+	})
 	imagedOCIPull := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_oci_pull_duration_seconds",
 		Help: "Latency of imaged's OCI registry pulls (manifest, config, blob, above-base), in seconds. Sized to api.OCIPullTimeoutSeconds (60 s).",
@@ -786,6 +801,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		wakeIDV4Fallback,
+		snapshotDiskDrift,
 		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
 		instanceCPUSecondsTotal,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
@@ -1026,6 +1042,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		residentGBPerCustomer:         residentGBPerCustomer,
 		billingCapExceededTotal:       billingCapExceededTotal,
 		wakeIDV4Fallback:              wakeIDV4Fallback,
+		snapshotDiskDrift:             snapshotDiskDrift,
 		imagedOCIPull:                 imagedOCIPull,
 		instanceCPUPct:                instanceCPUPct,
 		instanceRSSMB:                 instanceRSSMB,
@@ -1523,6 +1540,18 @@ func CodeFromStatus(status int) string {
 // breaks the time-ordering invariant the partial index is built on.
 func (m *OpsMetrics) WakeIDV4Fallback() prometheus.Counter {
 	return m.wakeIDV4Fallback
+}
+
+// SnapshotDiskDrift returns the counter accessor for the read-only
+// /srv/fc/snap drift sweep (PR scale-out readiness #3). Nil-safe —
+// returns nil on a nil receiver so DiskDrift.Tick can call this
+// without a nil-check at every call site. The counter is unlabelled,
+// so callers increment directly without label selection.
+func (m *OpsMetrics) SnapshotDiskDrift() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.snapshotDiskDrift
 }
 
 // CPUStatsCollectDuration returns the histogram accessor for the
