@@ -642,6 +642,15 @@ const (
 	InvocationCompleted   InvocationState = "completed"
 	InvocationFailed      InvocationState = "failed"
 	InvocationCancelled   InvocationState = "cancelled"
+	// InvocationDeadLetter (issue #394 / Move 1) is the terminal state
+	// for queue messages that exhausted their per-plan retry budget
+	// (see pkg/api.Limits.MaxQueueAttempts). Rows reach this state only
+	// via pkg/state.Store.FailInvocation with budget > 0; the drain
+	// (pkg/sched/drain.go) is the sole writer in production. The
+	// invocations_state_check CHECK constraint (migrations/00060) and
+	// the invocations_app_dead_letter_idx partial index back the
+	// reader surface (GET /v1/apps/{slug}/queues/dead_letter).
+	InvocationDeadLetter InvocationState = "dead_letter"
 )
 
 // Invocation mirrors a row on the invocations table. apid writes
@@ -673,6 +682,31 @@ type Invocation struct {
 	Attempts       int              `json:"attempts"`
 	LastError      string           `json:"last_error,omitempty"`
 	CreatedAt      time.Time        `json:"created_at"`
+}
+
+// QueueStats is the projection returned by Store.QueueState (issue
+// #394 / Move 1 dead-letter). It is the read-side mirror of the three
+// counters apid's GET /v1/apps/{slug}/queues/state surfaces to the
+// customer:
+//
+//	Depth:          pending + dispatching rows on the per-app queue.
+//	                Same numerator the apid cap check uses on POST
+//	                .../queues/send (CountPendingInvocations), so the
+//	                two numbers cannot disagree without a race.
+//	InFlight:       dispatching rows with lease_expires_at either
+//	                NULL or in the future. A row whose lease has
+//	                expired is treated as effectively pending again —
+//	                the next drain tick will re-claim it. Mapping
+//	                makes "in_flight" a tight upper bound on the
+//	                worker queue, excluding zombie leases.
+//	OldestPendingAt: zero-time when no pending rows exist. cmd/apid
+//	                  translates this to a nil pointer + omitempty
+//	                  on the JSON wire so dashboards can render
+//	                  "queue is empty" cleanly.
+type QueueStats struct {
+	Depth           int
+	InFlight        int
+	OldestPendingAt time.Time
 }
 
 // GdprAction enumerates the GDPR self-service actions recorded in

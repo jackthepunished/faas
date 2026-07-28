@@ -648,6 +648,56 @@ func (c *Client) AckQueueRow(ctx context.Context, slug, id string) error {
 	return c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/"+id+"/ack", nil, nil)
 }
 
+// QueueState returns depth / in-flight / oldest-pending stats for the
+// app's queue. Read-only: no lease is acquired, no row is mutated.
+// PlanCap is MaxQueueDepth for the app's plan so dashboards can render
+// "depth / cap" without a second plan lookup.
+func (c *Client) QueueState(ctx context.Context, slug string) (QueueStateResponse, error) {
+	var out QueueStateResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/queues/state", nil, &out)
+}
+
+// QueuePeek lists up to `limit` pending messages on the app's queue
+// without acquiring a lease or incrementing attempts. Repeated calls
+// return the same rows in the same order (the server guarantee is
+// "byte-identical" — no SQL state changes). Pass `before` (the id
+// returned as NextBefore in the previous page) to paginate; empty
+// NextBefore means "no more pages".
+func (c *Client) QueuePeek(ctx context.Context, slug string, limit int, before string) (QueuePeekResponse, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	path := "/v1/apps/" + slug + "/queues/peek"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out QueuePeekResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// QueueDeadLetter lists messages that exhausted the plan's retry
+// budget (state='dead_letter'). Read-only: no lease, no mutation.
+// Ordered newest-first; same cursor convention as QueuePeek.
+func (c *Client) QueueDeadLetter(ctx context.Context, slug string, limit int, before string) (QueueDeadLetterResponse, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	path := "/v1/apps/" + slug + "/queues/dead_letter"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out QueueDeadLetterResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // CreateDelayedTask schedules a delayed-task row to fire at the
 // given future timestamp. Cap-checked against MaxDelayedTasksPerApp.
 func (c *Client) CreateDelayedTask(ctx context.Context, slug string, req DelayedTaskRequest) (DelayedTaskResponse, error) {

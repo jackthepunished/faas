@@ -2,9 +2,12 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { QueueDeadLetterResponse } from '../models/QueueDeadLetterResponse.js';
+import type { QueuePeekResponse } from '../models/QueuePeekResponse.js';
 import type { QueueReceiveResponse } from '../models/QueueReceiveResponse.js';
 import type { QueueSendRequest } from '../models/QueueSendRequest.js';
 import type { QueueSendResponse } from '../models/QueueSendResponse.js';
+import type { QueueStateResponse } from '../models/QueueStateResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -122,6 +125,140 @@ export class QueuesService {
       },
       headers: {
         'Idempotency-Key': idempotencyKey,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Read queue depth, in-flight count, and oldest pending age.
+   * Read-only depth / in-flight / oldest-pending stats. NO lease is
+   * acquired and no row is mutated — the response can be polled at
+   * any cadence without affecting drain behaviour. Free plans can
+   * call this for diagnostics even though they cannot send.
+   *
+   * @returns QueueStateResponse Queue stats for the app.
+   * @throws ApiError
+   */
+  public static queueState({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<QueueStateResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/queues/state',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List pending queue rows without acquiring a lease.
+   * Read-only peek at pending rows, oldest first. Repeated calls
+   * return the same rows in the same order — the underlying SQL has
+   * no FOR UPDATE / FOR SHARE / advisory lock, so attempts is
+   * never incremented and no row state changes. Cursor pagination
+   * matches the existing `?before=<id>` convention. NOT equivalent
+   * to `queues/receive` — peek never leases.
+   *
+   * @returns QueuePeekResponse A page of pending rows.
+   * @throws ApiError
+   */
+  public static queuePeek({
+    slug,
+    limit = 20,
+    before,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Maximum number of rows to return; capped at 200.
+     */
+    limit?: number,
+    /**
+     * Cursor — the last id from the previous page (omit for the first page).
+     */
+    before?: string,
+  }): CancelablePromise<QueuePeekResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/queues/peek',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'limit': limit,
+        'before': before,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List queue rows that exhausted the plan's retry budget.
+   * Read-only list of rows in `state='dead_letter'`, newest first.
+   * The drain transitions a row here once it has failed
+   * `MaxQueueAttempts` times for the app's plan (Hobby 3, Pro 10,
+   * Scale 25). NO lease is acquired and no row is mutated. Replaying
+   * a dead-letter row is out of scope for this endpoint — the
+   * customer re-sends via `queues/send`.
+   *
+   * @returns QueueDeadLetterResponse A page of dead-letter rows.
+   * @throws ApiError
+   */
+  public static queueDeadLetter({
+    slug,
+    limit = 20,
+    before,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Maximum number of rows to return; capped at 200.
+     */
+    limit?: number,
+    /**
+     * Cursor — the last id from the previous page (omit for the first page).
+     */
+    before?: string,
+  }): CancelablePromise<QueueDeadLetterResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/queues/dead_letter',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'limit': limit,
+        'before': before,
       },
       errors: {
         401: `code: unauthorized`,

@@ -1,34 +1,35 @@
 -- +goose Up
 -- +goose StatementBegin
-
--- Slot 00060 reservation.
 --
--- PR #401 (queue: introspection endpoints + dead_letter state, issue #394)
--- holds slot 60 on a separate branch and lands a real schema there. PR #399
--- (alerts: customer-configurable alert rules, issue #396 PR 1/4, ADR-045)
--- wants the next free slot after 60, which is 61. To keep PR #399's
--- embedded migration set contiguous 1..N through 61 without conflicting
--- with #401, this reservation holds 60 until PR #401 merges; once #401
--- lands at 60 with its real schema, this reservation is dropped in a
--- follow-up commit (per the same playbook PR #335 used to drop the 00057
--- reservation after IAM-3 landed sessions at 57 — see commit e243fb9e).
+-- 00060_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
 --
--- The cross-PR slot gate (scripts/ci/check_migration_slots.sh) sees this
--- file as a no-op reservation and does NOT count it as a slot claim by
--- PR #399; the local embed_test.go::TestMigrationsContiguous mirrors that
--- carve-out (ADR-041, PR #391 / PR #352).
-
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with no
+-- gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot history (PR #401, issue #394): PR #401 originally had its real
+-- schema at 60 but PRs #399 and #403 both also claimed 60 in the same
+-- window — PR #399 with a `_reserve_slot.sql` placeholder, PR #403
+-- with a real schema. To clear the cross-PR collision without consuming
+-- another real slot, PR #401 renumbered its real schema to 62 then to
+-- 64 (PR #399 also claimed 62), with reservation placeholders at 60,
+-- 61, and 63 to keep the embedded set contiguous. The Up/Down bodies
+-- remain `select 1;` per the carve-out convention.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
 select 1;
 
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-
--- Slot 00060 reservation is forward-only by design; rolling it back would
--- re-expose the slot to the cross-PR gate and is not part of any
--- supported rollback path.
-
-select 1;
-
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

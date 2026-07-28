@@ -48,7 +48,7 @@ func TestMemStoreCoverageInvocations(t *testing.T) {
 	if err := m.CompleteInvocation(ctx, claimed.ID, json.RawMessage(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.FailInvocation(ctx, claimed.ID, "noop", 0); !errors.Is(err, ErrNotFound) {
+	if err := m.FailInvocation(ctx, claimed.ID, "noop", 0, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("fail completed = %v", err)
 	}
 	fail, err := enqueue(InvocationAsyncInvoke)
@@ -58,10 +58,10 @@ func TestMemStoreCoverageInvocations(t *testing.T) {
 	if _, err := m.ClaimInvocation(ctx, fail.ID, "instance", 30); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.FailInvocation(ctx, fail.ID, "boom", time.Minute); err != nil {
+	if err := m.FailInvocation(ctx, fail.ID, "boom", time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.FailInvocation(ctx, fail.ID, "perm", 0); err != nil {
+	if err := m.FailInvocation(ctx, fail.ID, "perm", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := m.InvocationByID(ctx, fail.ID); got.State != InvocationFailed {

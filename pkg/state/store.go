@@ -948,7 +948,18 @@ type Store interface {
 	// retryAfter; when retryAfter == 0 the row is terminal ('failed').
 	// The drain uses the transient path on Wake/Invoke queue-full / timeout;
 	// the permanent path on shape / capacity errors.
-	FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration) error
+	//
+	// budget (issue #394) is the per-plan retry ceiling (see
+	// pkg/api.Limits.MaxQueueAttempts). Pass 0 to disable the budget —
+	// the row will retry indefinitely regardless of `attempts`. Pass
+	// any positive integer to enable the budget; once `attempts + 1`
+	// would meet or exceed `budget`, the transient path transitions
+	// the row to state='dead_letter' instead of state='pending'.
+	// The legacy delayed-task-cap and account-suspended callers pass
+	// budget=0 because their retry semantics are not plan-scoped; the
+	// queue-source drain caller (drain.go:279/306) passes
+	// plan.LimitsForPlan(acct.Plan).MaxQueueAttempts.
+	FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int) error
 	// CountPendingInvocations is index-backed by invocations_app_pending_idx;
 	// used by the apid cap check on POST .../queues/invocations:send and
 	// POST /v1/apps/{slug}/delayed-tasks, and by the drain's cap re-check
@@ -973,6 +984,32 @@ type Store interface {
 	// combinations the planner falls back to a sequential scan, which is
 	// fine for the rare delete path.
 	ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error)
+
+	// Queue introspection (issue #394, Move 1 dead-letter + read API).
+	// The three read-only methods back GET /v1/apps/{slug}/queues/{state,peek,dead_letter}
+	// and are read-only against the invocations table — no advisory locks,
+	// no UPDATE/INSERT/DELETE in the implementation. The PgStore
+	// implementation uses invocations_app_pending_idx (state slice) and
+	// invocations_app_dead_letter_idx (dead_letter filter) for index-only
+	// scans on the hot path.
+	//
+	// QueueState returns the per-app live counters — depth
+	// (pending+dispatching), in_flight (dispatching with lease_expires_at
+	// either NULL or in the future), and the oldest pending created_at.
+	// Used by the queueStats handler. OldestPendingAt is the zero-time
+	// when the app has no pending rows; callers translate to nil.
+	QueueState(ctx context.Context, appID string) (QueueStats, error)
+	// QueuePeek lists the oldest pending queue messages for an app
+	// without acquiring a lease or incrementing attempts. Paginated by
+	// `before` (a queue row id, uuid) — same cursor convention as
+	// ListInvocationsForAccount. `limit` is clamped by the handler to
+	// [1, 200] (default 20); the store itself does no clamping. Returns
+	// rows ordered by (created_at ASC, id ASC).
+	QueuePeek(ctx context.Context, appID string, limit int, before string) ([]Invocation, error)
+	// QueueDeadLetter lists dead-letter rows (state='dead_letter') for
+	// an app. Same cursor / limit / ordering as QueuePeek. Backed by
+	// invocations_app_dead_letter_idx.
+	QueueDeadLetter(ctx context.Context, appID string, limit int, before string) ([]Invocation, error)
 	// CountInstanceInvocationsInMinute is the meter's join key: it counts
 	// dispatched rows for (instance, minute) so SampleAndRoll can set
 	// usage_minutes.requests = N on each rolling minute. Index-backed by

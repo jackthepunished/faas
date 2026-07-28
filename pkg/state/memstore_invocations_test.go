@@ -121,7 +121,7 @@ func TestInvocationFailTransientAndPermanent(t *testing.T) {
 	if _, err := m.ClaimInvocation(ctx, inv.ID, "inst", 30); err != nil {
 		t.Fatalf("ClaimInvocation: %v", err)
 	}
-	if err := m.FailInvocation(ctx, inv.ID, "blip", 5*time.Second); err != nil {
+	if err := m.FailInvocation(ctx, inv.ID, "blip", 5*time.Second, 0); err != nil {
 		t.Fatalf("FailInvocation transient: %v", err)
 	}
 	got, _ := m.InvocationByID(ctx, inv.ID)
@@ -132,7 +132,7 @@ func TestInvocationFailTransientAndPermanent(t *testing.T) {
 	if _, err := m.ClaimInvocation(ctx, inv.ID, "inst", 30); err != nil {
 		t.Fatalf("re-claim after transient fail: %v", err)
 	}
-	if err := m.FailInvocation(ctx, inv.ID, "bad payload", 0); err != nil {
+	if err := m.FailInvocation(ctx, inv.ID, "bad payload", 0, 0); err != nil {
 		t.Fatalf("FailInvocation permanent: %v", err)
 	}
 	got, _ = m.InvocationByID(ctx, inv.ID)
@@ -157,7 +157,7 @@ func TestInvocationCountPending_OnlyLiveRows(t *testing.T) {
 			_ = m.CancelInvocation(ctx, r.ID)
 		case InvocationDelayedTask:
 			if _, err := m.ClaimInvocation(ctx, r.ID, "inst", 30); err == nil {
-				_ = m.FailInvocation(ctx, r.ID, "boom", 0)
+				_ = m.FailInvocation(ctx, r.ID, "boom", 0, 0)
 			}
 		}
 	}
