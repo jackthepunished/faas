@@ -117,9 +117,11 @@ type Handler struct {
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
 	// piApps deduplicates Metrics.PreInstantiateApp calls per appID
-	// (issue #273 / ADR-041). Lazy-initialised in preInstantiateApp
-	// so handlers without metrics don't carry the field overhead.
-	piApps *preInstantiateApps
+	// (issue #273 / ADR-041). A value-typed sync.Map wrapper; the
+	// zero value is valid so NewHandlerWith doesn't have to
+	// initialise it explicitly. Value semantics avoid the
+	// data-race that lazy init would create under -race.
+	piApps preInstantiateApps
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -160,6 +162,10 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		metrics:        m,
 		log:            log,
 	}
+	// piApps is a value-typed sync.Map wrapper; its zero value is valid
+	// and no init is required (avoiding a lazy-init write that would
+	// race with parallel ServeHTTP readers — the load test under -race
+	// caught that pattern; see the field doc).
 	h.proxyFor = defaultProxy
 	return h
 }
@@ -529,13 +535,13 @@ func statusClassBucket(status int) string {
 // Issue #273 / ADR-041 — PreInstantiateApp is cheap (returns the
 // existing series on repeat calls), but the sync.Map.Load+Store
 // short-circuits the work entirely after first sight so the hot path
-// stays allocation-free.
+// stays allocation-free. A value-typed field on Handler: the zero
+// value is valid, so NewHandlerWith doesn't need to initialise it
+// (avoiding a lazy-init write that would race with parallel
+// ServeHTTP readers — the load test under -race caught that).
 type preInstantiateApps struct{ m sync.Map }
 
 func (p *preInstantiateApps) seen(appID string) bool {
-	if p == nil {
-		return false
-	}
 	_, loaded := p.m.LoadOrStore(appID, struct{}{})
 	return loaded
 }
@@ -546,11 +552,6 @@ func (p *preInstantiateApps) seen(appID string) bool {
 func (h *Handler) preInstantiateApp(appID string) {
 	if h == nil || h.metrics == nil || appID == "" {
 		return
-	}
-	if h.piApps == nil {
-		// Lazy init so a Handler constructed without metrics (some
-		// legacy tests) doesn't pay the field.
-		h.piApps = &preInstantiateApps{}
 	}
 	if h.piApps.seen(appID) {
 		return
