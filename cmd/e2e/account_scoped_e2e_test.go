@@ -105,6 +105,7 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	h := e2etest.Start(t, pool, e2etest.APID)
 	store := state.NewPgStore(h.Pool)
 	ctx := context.Background()
+	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
 	var key string
 	for _, slug := range []string{"alpha", "beta", "gamma"} {
@@ -115,7 +116,7 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 		dep := seedDeployment(t, h, ctx, app.ID)
 		for i := 0; i < 2; i++ {
 			if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
-				string(state.StateRunning), 256, "node-1", ""); err != nil {
+				string(state.StateRunning), 256, nodeID, ""); err != nil {
 				t.Fatalf("CreateInstance: %v", err)
 			}
 		}
@@ -127,6 +128,7 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	// need them consolidated to test the cross-app fan-in.
 	h2 := e2etest.Start(t, pool, e2etest.APID)
 	store2 := state.NewPgStore(h2.Pool)
+	nodeID2 := defaultLocalComputeNodeID(t, ctx, store2)
 	acct, err := store2.CreateAccount(ctx, "e2e+fanin@test.example", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount fanin: %v", err)
@@ -153,7 +155,7 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 		dep := seedDeployment(t, h2, ctx, app.ID)
 		for i := 0; i < 2; i++ {
 			if _, err := store2.CreateInstance(ctx, app.ID, dep.ID,
-				string(state.StateRunning), 256, "node-1", ""); err != nil {
+				string(state.StateRunning), 256, nodeID2, ""); err != nil {
 				t.Fatalf("CreateInstance: %v", err)
 			}
 		}
@@ -203,12 +205,13 @@ func TestE2E_ListInstancesForAccount_CursorPagination(t *testing.T) {
 	h := e2etest.Start(t, pool, e2etest.APID)
 	store := state.NewPgStore(h.Pool)
 	ctx := context.Background()
+	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
 	_, key, app := seedAccountAndApp(t, h, ctx, "pagi", api.PlanHobby, "pagi-app")
 	dep := seedDeployment(t, h, ctx, app.ID)
 	for i := 0; i < 5; i++ {
 		if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
-			string(state.StateRunning), 256, "node-1", ""); err != nil {
+			string(state.StateRunning), 256, nodeID, ""); err != nil {
 			t.Fatalf("CreateInstance[%d]: %v", i, err)
 		}
 	}
@@ -260,6 +263,7 @@ func TestE2E_ListInstancesForAccount_CrossAccountIsolation(t *testing.T) {
 	h := e2etest.Start(t, pool, e2etest.APID)
 	store := state.NewPgStore(h.Pool)
 	ctx := context.Background()
+	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
 	_, keyA, appA := seedAccountAndApp(t, h, ctx, "iso-a", api.PlanHobby, "iso-a-app")
 	_, keyB, appB := seedAccountAndApp(t, h, ctx, "iso-b", api.PlanHobby, "iso-b-app")
@@ -268,7 +272,7 @@ func TestE2E_ListInstancesForAccount_CrossAccountIsolation(t *testing.T) {
 		dep := seedDeployment(t, h, ctx, app.ID)
 		for i := 0; i < 3; i++ {
 			if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
-				string(state.StateRunning), 256, "node-1", ""); err != nil {
+				string(state.StateRunning), 256, nodeID, ""); err != nil {
 				t.Fatalf("CreateInstance: %v", err)
 			}
 		}
