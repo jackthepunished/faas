@@ -15,6 +15,7 @@ export type { AccountResponse } from './models/AccountResponse.js';
 export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';
 export type { APIKeyResponse } from './models/APIKeyResponse.js';
 export type { AppManifest } from './models/AppManifest.js';
+export type { AppMetricsResponse } from './models/AppMetricsResponse.js';
 export type { AppResponse } from './models/AppResponse.js';
 export type { AppSecretExportResponse } from './models/AppSecretExportResponse.js';
 export type { AppSecretListResponse } from './models/AppSecretListResponse.js';

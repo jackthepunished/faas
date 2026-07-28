@@ -9,6 +9,7 @@ export type { AccountExportResponse } from './AccountExportResponse.js';
 export type { AccountLimits } from './AccountLimits.js';
 export type { AccountResponse } from './AccountResponse.js';
 export type { AppManifest } from './AppManifest.js';
+export type { AppMetricsResponse } from './AppMetricsResponse.js';
 export type { AppResponse } from './AppResponse.js';
 export type { AppSecretExportResponse } from './AppSecretExportResponse.js';
 export type { AppSecretListResponse } from './AppSecretListResponse.js';
