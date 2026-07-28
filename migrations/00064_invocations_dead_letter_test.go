@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00060 (issue #394, queue introspection).
+// Migration-apply test for 00064 (issue #394, queue introspection).
 //
 // Asserts the new CHECK allows 'dead_letter' as a terminal state and
 // that the new partial index invocations_app_dead_letter_idx exists
@@ -8,6 +8,10 @@
 //
 // Build tag mirrors apply_walk_test.go:4 — set FAAS_SKIP_PG_TESTS=1
 // locally to skip.
+//
+// Slot history: original slot was 60, but PR #399, #403 both claimed
+// 60 in the same window. Renumbered to 62 (collision with #399), then
+// 64. Issue #366 captures the broader pattern.
 
 package migrations_test
 
@@ -23,7 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00060_DeadLetter_LandsStateAndIndex(t *testing.T) {
+func TestMigrations_00064_DeadLetter_LandsStateAndIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

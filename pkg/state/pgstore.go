@@ -2546,22 +2546,38 @@ func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, state
 
 // QueueState (issue #394) is the read-side counter aggregator. One
 // round-trip returns three numbers: depth (pending+dispatching),
-// in_flight (dispatching with lease_expires_at either NULL or in the
-// future), oldest_pending_at (min created_at over the pending slice).
-// Index-backed by invocations_app_pending_idx on the depth count; the
-// other two predicates add an extra FILTER (WHERE) clause that the
-// planner can satisfy from the same partial index.
+// in_flight (dispatching with a live lease), oldest_pending_at (min
+// created_at over the pending slice).
+//
+// Index-backed by invocations_app_pending_idx — the partial index is
+// declared on `(app_id, source, state) WHERE state IN
+// ('pending','dispatching')`, so the outer WHERE MUST include both
+// the partial-index predicate and the leading-column filter for the
+// planner to pick the index. Without the outer state constraint the
+// planner falls back to a sequential scan over the app's entire
+// history (including completed/failed/cancelled/dead_letter rows),
+// which would be unbounded on a healthy queue.
+//
+// In-flight predicate: only rows with a non-NULL lease_expires_at in
+// the future count as in-flight. ClaimInvocation always installs a
+// non-NULL lease, so a NULL value is malformed/manual data — not an
+// active lease — and shouldn't be counted toward in_flight. The
+// FILTER (state = 'dispatching') precondition excludes any state
+// that hasn't gone through ClaimInvocation.
 func (s *PgStore) QueueState(ctx context.Context, appID string) (QueueStats, error) {
 	var stats QueueStats
 	var oldest *time.Time
 	err := s.pool.QueryRow(ctx, `
 		select
-		  count(*) filter (where state in ('pending','dispatching'))                  as depth,
+		  count(*)                                                              as depth,
 		  count(*) filter (where state = 'dispatching'
-		                    and (lease_expires_at is null or lease_expires_at > now())) as in_flight,
-		  min(created_at) filter (where state = 'pending')                            as oldest_pending_at
+		                    and lease_expires_at is not null
+		                    and lease_expires_at > now())                        as in_flight,
+		  min(created_at) filter (where state = 'pending')                      as oldest_pending_at
 		from invocations
-		where app_id = $1 and source = 'queue'
+		where app_id = $1
+		  and source = 'queue'
+		  and state in ('pending','dispatching')
 	`, appID).Scan(&stats.Depth, &stats.InFlight, &oldest)
 	if err != nil {
 		return QueueStats{}, err
@@ -2577,8 +2593,18 @@ func (s *PgStore) QueueState(ctx context.Context, appID string) (QueueStats, err
 // FOR SHARE, no advisory lock. Cursor convention mirrors
 // ListInvocationsForAccount: `before` is an invocation id (uuid);
 // empty means "start from the oldest". The subquery resolves the
-// anchor row's created_at so we page by the (created_at, id) tuple,
-// matching the ORDER BY clause under the cursor predicate.
+// anchor row's created_at + id so we page by the (created_at, id)
+// tuple strictly *after* the anchor under the ORDER BY direction.
+//
+// Because the ORDER BY is ASC (oldest first), the cursor predicate
+// is `(created_at, id) > (anchor.created_at, anchor.id)` — "rows
+// strictly newer than the anchor in the same sort direction." Page 1
+// returns the oldest N rows; page 2 (with `before=<last id of page
+// 1>`) returns the next N rows newer than that anchor. The DESC
+// counterpart (QueueDeadLetter) flips the predicate to `<` to match
+// its DESC sort order. Both predicates use the (created_at, id) pair
+// as the tie-breaker so rows with identical created_at do not skip
+// or duplicate across pages.
 //
 // The query goes through invocations_app_pending_idx when the planner
 // can satisfy both the app filter and the state predicate from the
@@ -2596,15 +2622,16 @@ func (s *PgStore) QueuePeek(ctx context.Context, appID string, limit int, before
 		beforeParam = before
 	}
 	rows, err := s.pool.Query(ctx, `
+		with anchor as (
+		    select created_at, id from invocations where id = $2
+		)
 		select `+invocationSelectCols+`
 		  from invocations
 		 where app_id = $1
 		   and source = 'queue'
 		   and state = 'pending'
 		   and ($2::uuid is null or
-		        created_at < (select created_at from invocations where id = $2))
-		   and ($2::uuid is null or
-		        id < (select id from invocations where id = $2))
+		        (created_at, id) > (select created_at, id from anchor))
 		 order by created_at asc, id asc
 		 limit $3
 	`, appID, beforeParam, limit)
@@ -2616,9 +2643,15 @@ func (s *PgStore) QueuePeek(ctx context.Context, appID string, limit int, before
 
 // QueueDeadLetter (issue #394) lists dead-letter rows (state =
 // 'dead_letter') for an app. Same cursor / limit / ordering
-// conventions as QueuePeek, but the index is
+// conventions as QueuePeek but the index is
 // invocations_app_dead_letter_idx and the order is DESC so the
-// newest dead_letter surfaces first.
+// newest dead_letter surfaces first. Because DESC + `<` walks the
+// anchor's "older" rows forward, the predicate uses the (created_at,
+// id) tuple strictly *before* the anchor under the DESC sort order.
+// The id tie-breaker is required because the partial index orders on
+// (app_id, created_at DESC) only — two rows with identical
+// created_at would otherwise swap pages under non-deterministic
+// ordering.
 func (s *PgStore) QueueDeadLetter(ctx context.Context, appID string, limit int, before string) ([]Invocation, error) {
 	if limit <= 0 {
 		limit = 20
@@ -2631,13 +2664,16 @@ func (s *PgStore) QueueDeadLetter(ctx context.Context, appID string, limit int, 
 		beforeParam = before
 	}
 	rows, err := s.pool.Query(ctx, `
+		with anchor as (
+		    select created_at, id from invocations where id = $2
+		)
 		select `+invocationSelectCols+`
 		  from invocations
 		 where app_id = $1
 		   and source = 'queue'
 		   and state = 'dead_letter'
 		   and ($2::uuid is null or
-		        created_at < (select created_at from invocations where id = $2))
+		        (created_at, id) < (select created_at, id from anchor))
 		 order by created_at desc, id desc
 		 limit $3
 	`, appID, beforeParam, limit)

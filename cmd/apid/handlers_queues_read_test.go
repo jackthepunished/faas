@@ -8,12 +8,13 @@ package main
 // mapping layer, the SQL is what owns the "no mutation" guarantee.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,11 +86,42 @@ func TestQueueState_EmptyQueue(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if bytesContains(rec.Body.Bytes(), "oldest_pending_at") {
+	if bytes.Contains(rec.Body.Bytes(), []byte("oldest_pending_at")) {
 		t.Errorf("oldest_pending_at present on empty queue — want omitted\n%s", rec.Body.String())
 	}
-	if bytesContains(rec.Body.Bytes(), "oldest_pending_age_seconds") {
+	if bytes.Contains(rec.Body.Bytes(), []byte("oldest_pending_age_seconds")) {
 		t.Errorf("oldest_pending_age_seconds present on empty queue — want omitted\n%s", rec.Body.String())
+	}
+}
+
+// TestQueueState_FreePlanAllowed pins the diagnostic-only contract:
+// even though Free is gated out of queueSend/queueReceive
+// (queueReceive returns 402 ErrPlanQueuesNotAllowed), the introspection
+// endpoints must still be reachable for ops/debug. PlanCap=0
+// (Free's MaxQueueDepth) is the visible signal that no new messages
+// can be sent; Depth=0 because nothing is in flight. A future change
+// that moves the gate INTO queueState would break this contract and
+// would surface here.
+func TestQueueState_FreePlanAllowed(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-app")
+
+	rec := e.do(t, "GET", "/v1/apps/free-app/queues/state", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (introspection must work on Free for diagnostics); body=%s", rec.Code, rec.Body.String())
+	}
+	var out api.QueueStateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Plan != "free" {
+		t.Errorf("Plan = %q, want free", out.Plan)
+	}
+	if out.PlanCap != 0 {
+		t.Errorf("PlanCap = %d, want 0 (Free's MaxQueueDepth)", out.PlanCap)
+	}
+	if out.Depth != 0 {
+		t.Errorf("Depth = %d, want 0", out.Depth)
 	}
 }
 
@@ -248,7 +280,7 @@ func TestQueueDeadLetter_ExhaustedToDeadLetter(t *testing.T) {
 	if out.Messages[0].ID != invID {
 		t.Errorf("Messages[0].ID = %q, want %q", out.Messages[0].ID, invID)
 	}
-	if !stringsContains(out.Messages[0].LastError, "blip") {
+	if !strings.Contains(out.Messages[0].LastError, "blip") {
 		t.Errorf("LastError = %q, want contains %q", out.Messages[0].LastError, "blip")
 	}
 
@@ -256,6 +288,86 @@ func TestQueueDeadLetter_ExhaustedToDeadLetter(t *testing.T) {
 	if _, err := e.store.ClaimInvocation(context.Background(), invID, "inst", 30); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("post-dead-letter claim err = %v, want ErrNotFound", err)
 	}
+}
+
+// TestQueueDeadLetter_OrderNewestFirst pins the wire-shape contract
+// for the dead-letter endpoint: rows must surface newest-first (DESC
+// by created_at). Three rows are seeded with strictly-increasing
+// created_at; the response order must match the seeded order in
+// reverse — the migration's partial index, the store's ORDER BY, and
+// the handler's next-before emission all share this invariant, and a
+// regression at any layer would surface here.
+func TestQueueDeadLetter_OrderNewestFirst(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "myapp")
+	// idOldest is seeded first (earliest CreatedAt); idMiddle second;
+	// idNewest last (latest CreatedAt). With 2ms sleeps between, the
+	// three CreatedAt values are strictly monotonic.
+	idOldest := seedDeadLetterRow(t, e, appID, "oldest")
+	time.Sleep(2 * time.Millisecond)
+	idMiddle := seedDeadLetterRow(t, e, appID, "middle")
+	time.Sleep(2 * time.Millisecond)
+	idNewest := seedDeadLetterRow(t, e, appID, "newest")
+
+	rec := e.do(t, "GET", "/v1/apps/myapp/queues/dead_letter", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var out api.QueueDeadLetterResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Messages) != 3 {
+		t.Fatalf("len(Messages) = %d, want 3", len(out.Messages))
+	}
+	if out.Messages[0].ID != idNewest {
+		t.Errorf("Messages[0].ID = %q, want %q (newest first)", out.Messages[0].ID, idNewest)
+	}
+	if out.Messages[1].ID != idMiddle {
+		t.Errorf("Messages[1].ID = %q, want %q", out.Messages[1].ID, idMiddle)
+	}
+	if out.Messages[2].ID != idOldest {
+		t.Errorf("Messages[2].ID = %q, want %q", out.Messages[2].ID, idOldest)
+	}
+}
+
+// seedDeadLetterRow inserts a queue-source invocation directly into
+// state='dead_letter' so the handler-level ordering test doesn't have
+// to wait through MaxQueueAttempts retry cycles. Bypasses
+// FailInvocation's path so the test is deterministic and fast.
+//
+// Implementation: claim once (bumps attempts from 0→1), then
+// FailInvocation with budget=1 — the predicate `attempts >= budget`
+// fires and the row transitions to state='dead_letter' on the first
+// iteration. LastError is set to the supplied label so the test can
+// distinguish rows.
+func seedDeadLetterRow(t *testing.T, e testEnv, appID, label string) string {
+	t.Helper()
+	inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     appID,
+		AccountID: e.acct.ID,
+		Source:    state.InvocationQueue,
+		Payload:   json.RawMessage(`{"label":"` + label + `"}`),
+		DueAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("enqueue seed row: %v", err)
+	}
+	if _, err := e.store.ClaimInvocation(context.Background(), inv.ID, "inst", 30); err != nil {
+		t.Fatalf("claim seed row: %v", err)
+	}
+	if err := e.store.FailInvocation(context.Background(), inv.ID, label+": poisoned", time.Minute, 1); err != nil {
+		t.Fatalf("fail seed row: %v", err)
+	}
+	// Sanity: the row must actually be in dead_letter state.
+	got, err := e.store.InvocationByID(context.Background(), inv.ID)
+	if err != nil {
+		t.Fatalf("re-read seed row: %v", err)
+	}
+	if got.State != state.InvocationDeadLetter {
+		t.Fatalf("seed row state = %q, want dead_letter", got.State)
+	}
+	return inv.ID
 }
 
 // TestQueueRead_CrossAccount: the IDOR-safety property. Cross-account
@@ -268,8 +380,14 @@ func TestQueueRead_CrossAccount(t *testing.T) {
 	appID := mustSeedApp(t, owner, "owner-app")
 	seedQueueRow(t, owner, appID, `{"i":0}`)
 
-	// Foreign env — same store (MemStore) but a different account
-	// whose key is used in the HTTP request.
+	// Foreign env has a fresh MemStore (server_test.go: setup() creates
+	// a fresh state.NewMemStore() per call, so the foreign env has its
+	// own store with no rows). The 404 here comes from loadApp →
+	// AppBySlug → not-found in the foreign store, NOT from cross-account
+	// authorization enforcement. For genuine shared-store isolation
+	// coverage (the actual IDOR shape — a customer probing another
+	// customer's slug on the same DB), see the spec_compliance matrix
+	// in issue #394 §acceptance #4.
 	foreign := setup(t, api.PlanPro)
 
 	probes := []struct {
@@ -315,29 +433,3 @@ func TestQueueRead_UnknownAppIs404(t *testing.T) {
 }
 
 // --- small helpers (kept local so the test stays self-contained) ---
-
-func bytesContains(b []byte, s string) bool {
-	return bytesIndex(b, s) >= 0
-}
-
-func bytesIndex(b []byte, s string) int {
-	for i := 0; i+len(s) <= len(b); i++ {
-		if string(b[i:i+len(s)]) == s {
-			return i
-		}
-	}
-	return -1
-}
-
-func stringsContains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}
-
-// keep strconv referenced — the peek path cap is enforced via the
-// limit query param; the test matrix in TestQueuePeek_* uses it.
-var _ = strconv.Itoa

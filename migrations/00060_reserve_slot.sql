@@ -1,0 +1,35 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00060_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with no
+-- gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #401 (issue #394, queue introspection + dead_letter state)
+-- originally had 00060_invocations_dead_letter.sql here. PRs #399
+-- and #403 both claimed slot 60 in the same window — PR #399 with
+-- a `_reserve_slot.sql` placeholder, PR #403 with a real schema.
+-- To clear the cross-PR collision without consuming another real
+-- slot, PR #401 renumbered its real schema to 62 and planted this
+-- reservation at 60 (matching the existing carve-out shape) plus
+-- a parallel reservation at 61 (also see 00061_reserve_slot.sql).
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

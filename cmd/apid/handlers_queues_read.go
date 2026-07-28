@@ -10,8 +10,15 @@ package main
 // All three are read-only. None acquire a lease, none increment
 // attempts, none mutate SQL state — see TestQueuePeek_ByteIdentical
 // in handlers_queues_read_test.go for the property test.
+//
+// Error envelope: store-side failures route through ErrInternal, not
+// ErrCapacity. ErrCapacity is reserved for admission-refusal scenarios
+// (queue full, box at capacity); these read endpoints have no
+// admission semantics, so a DB error would mislabel as "capacity" and
+// misroute the on-call runbook.
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -37,7 +44,8 @@ func (s *server) queueState(w http.ResponseWriter, r *http.Request, acct state.A
 	limits := api.MustLimitsFor(acct.Plan)
 	stats, err := s.store.QueueState(ctx(r), app.ID)
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("queue state"))
+		slog.Default().Error("queue state read failed", "app_id", app.ID, "err", err)
+		api.WriteProblem(w, api.ErrInternal("queue state"))
 		return
 	}
 	now := time.Now().UTC()
@@ -81,7 +89,8 @@ func (s *server) queuePeek(w http.ResponseWriter, r *http.Request, acct state.Ac
 	before := r.URL.Query().Get("before")
 	rows, err := s.store.QueuePeek(ctx(r), app.ID, limit, before)
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("queue peek"))
+		slog.Default().Error("queue peek read failed", "app_id", app.ID, "err", err)
+		api.WriteProblem(w, api.ErrInternal("queue peek"))
 		return
 	}
 	out := api.QueuePeekResponse{AppSlug: app.Slug, Messages: make([]api.QueuePeekMessage, 0, len(rows))}
@@ -117,7 +126,8 @@ func (s *server) queueDeadLetter(w http.ResponseWriter, r *http.Request, acct st
 	before := r.URL.Query().Get("before")
 	rows, err := s.store.QueueDeadLetter(ctx(r), app.ID, limit, before)
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("queue dead_letter"))
+		slog.Default().Error("queue dead-letter read failed", "app_id", app.ID, "err", err)
+		api.WriteProblem(w, api.ErrInternal("queue dead_letter"))
 		return
 	}
 	out := api.QueueDeadLetterResponse{AppSlug: app.Slug, Messages: make([]api.QueueDeadLetterMessage, 0, len(rows))}

@@ -56,7 +56,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #394: Pro gets 10 retries — 5× Hobby's budget.
 			// Tolerates a transient downstream flap while still bounding
 			// the "permanently bad payload" worker cost.
-			MaxQueueAttempts: 10,
+			MaxQueueAttempts:       10,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 16,
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
@@ -75,7 +75,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #394: Scale gets 25 retries — 2.5× Pro's budget, but
 			// capped so a genuinely-bad payload still terminates within
 			// the worker's hourly budget window.
-			MaxQueueAttempts: 25,
+			MaxQueueAttempts:       25,
 			EgressAllowlistAllowed: true, EgressAllowlistMaxSize: 64,
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,

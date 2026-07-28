@@ -2440,6 +2440,13 @@ func (m *MemStore) QueueState(_ context.Context, appID string) (QueueStats, erro
 // Invocation.ID (uuid); empty means "start from the oldest". MemStore
 // does the cursor subquery-resolves-created_at dance manually because
 // it has no SQL.
+//
+// Cursor direction (mirrors the PG query): ORDER BY is ASC, so the
+// predicate is "rows strictly *after* the anchor in the same sort
+// direction" — i.e. `(created_at, id) > (anchor.created_at, anchor.id)`.
+// Page 1 returns the oldest N rows; page 2 (with `before=<last id of
+// page 1>`) returns the next N rows newer than that anchor. The DESC
+// counterpart (QueueDeadLetter) flips the comparison to `<`.
 func (m *MemStore) QueuePeek(_ context.Context, appID string, limit int, before string) ([]Invocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2449,13 +2456,13 @@ func (m *MemStore) QueuePeek(_ context.Context, appID string, limit int, before 
 	if limit > 200 {
 		limit = 200
 	}
-	beforeCreated := time.Time{}
+	var anchor *Invocation
 	if before != "" {
-		anchor, ok := m.invocations[before]
+		a, ok := m.invocations[before]
 		if !ok {
 			return nil, nil // unknown cursor; treat as "start from oldest"
 		}
-		beforeCreated = anchor.CreatedAt
+		anchor = &a
 	}
 	var out []Invocation
 	for _, inv := range m.invocations {
@@ -2465,11 +2472,13 @@ func (m *MemStore) QueuePeek(_ context.Context, appID string, limit int, before 
 		if inv.State != InvocationPending {
 			continue
 		}
-		if !beforeCreated.IsZero() && inv.CreatedAt.After(beforeCreated) {
-			continue
-		}
-		if !beforeCreated.IsZero() && inv.CreatedAt.Equal(beforeCreated) && inv.ID >= before {
-			continue
+		if anchor != nil {
+			if inv.CreatedAt.Before(anchor.CreatedAt) {
+				continue
+			}
+			if inv.CreatedAt.Equal(anchor.CreatedAt) && inv.ID <= anchor.ID {
+				continue
+			}
 		}
 		out = append(out, inv)
 	}
@@ -2490,7 +2499,11 @@ func (m *MemStore) QueuePeek(_ context.Context, appID string, limit int, before 
 // QueueDeadLetter (issue #394) returns dead-letter rows for an app,
 // newest-first (descending created_at). Same cursor semantics as
 // QueuePeek but the index in PgStore is ordered DESC; here we sort
-// accordingly. Pagination by `before` means "older than the anchor".
+// accordingly. Pagination by `before` means "rows strictly older than
+// the anchor in the DESC sort order" — i.e. `(created_at, id) <
+// (anchor.created_at, anchor.id)`. The id tie-breaker mirrors the PG
+// partial index `(app_id, created_at DESC)` so rows with identical
+// created_at do not duplicate or skip across pages.
 func (m *MemStore) QueueDeadLetter(_ context.Context, appID string, limit int, before string) ([]Invocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2500,13 +2513,13 @@ func (m *MemStore) QueueDeadLetter(_ context.Context, appID string, limit int, b
 	if limit > 200 {
 		limit = 200
 	}
-	beforeCreated := time.Time{}
+	var anchor *Invocation
 	if before != "" {
-		anchor, ok := m.invocations[before]
+		a, ok := m.invocations[before]
 		if !ok {
 			return nil, nil
 		}
-		beforeCreated = anchor.CreatedAt
+		anchor = &a
 	}
 	var out []Invocation
 	for _, inv := range m.invocations {
@@ -2516,8 +2529,13 @@ func (m *MemStore) QueueDeadLetter(_ context.Context, appID string, limit int, b
 		if inv.State != InvocationDeadLetter {
 			continue
 		}
-		if !beforeCreated.IsZero() && inv.CreatedAt.After(beforeCreated) {
-			continue
+		if anchor != nil {
+			if inv.CreatedAt.After(anchor.CreatedAt) {
+				continue
+			}
+			if inv.CreatedAt.Equal(anchor.CreatedAt) && inv.ID >= anchor.ID {
+				continue
+			}
 		}
 		out = append(out, inv)
 	}

@@ -13,8 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -35,13 +36,13 @@ func pgQueueRow(t *testing.T, ctx context.Context, s *state.PgStore, appID, acct
 }
 
 // dumpInvocationRows pulls every column of every row for the app into
-// a comparable shape. Opens a fresh pgtest pool that lands on the
-// same schema the test is using (pgtest.Open is schema-isolated per
-// test run, so a second Open on the same schema returns a connection
-// to the same schema).
-func dumpInvocationRows(t *testing.T, ctx context.Context, appID string) []map[string]any {
+// a comparable shape. The caller MUST pass the same pool that
+// pgStoreWithPool created — pgtest.Open allocates a fresh schema per
+// call, so opening a *new* pool here would land on an empty schema
+// and `before == after == []` would pass the byte-identical check
+// vacuously. See pgStoreWithPool's docstring for the rationale.
+func dumpInvocationRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, appID string) []map[string]any {
 	t.Helper()
-	pool := pgtest.Open(t)
 	rows, err := pool.Query(ctx, `
 		SELECT id, app_id, account_id, source, state, attempts, last_error, payload
 		  FROM invocations
@@ -80,7 +81,7 @@ func dumpInvocationRows(t *testing.T, ctx context.Context, appID string) []map[s
 // advisory lock) plus the driver path (the read pool returns the
 // same snapshot).
 func TestPg_QueuePeek_ByteIdentical(t *testing.T) {
-	s, ctx := pgStore(t)
+	s, pool, ctx := pgStoreWithPool(t)
 	acctID, appID, _ := seedLiveDeploy(t, s, ctx)
 
 	// Seed 12 pending rows with strictly increasing created_at so
@@ -92,7 +93,7 @@ func TestPg_QueuePeek_ByteIdentical(t *testing.T) {
 		// api.PlanPro Plan's seedCreatedAt timestamp drifts forward.
 	}
 
-	before := dumpInvocationRows(t, ctx, appID)
+	before := dumpInvocationRows(t, ctx, pool, appID)
 	if len(before) != 12 {
 		t.Fatalf("seed produced %d rows, want 12", len(before))
 	}
@@ -121,7 +122,7 @@ func TestPg_QueuePeek_ByteIdentical(t *testing.T) {
 		}
 	}
 
-	after := dumpInvocationRows(t, ctx, appID)
+	after := dumpInvocationRows(t, ctx, pool, appID)
 	if !reflect.DeepEqual(before, after) {
 		t.Errorf("invocations table mutated by repeated peeks\nbefore=%+v\nafter=%+v", before, after)
 	}

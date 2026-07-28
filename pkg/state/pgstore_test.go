@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -56,6 +57,19 @@ func resolveDefaultLocal(t *testing.T, ctx context.Context, s *state.PgStore) st
 // especially the schedd wake-path methods added for M5.
 func pgStore(t *testing.T) (*state.PgStore, context.Context) {
 	t.Helper()
+	s, _, ctx := pgStoreWithPool(t)
+	return s, ctx
+}
+
+// pgStoreWithPool mirrors pgStore but also returns the underlying
+// pgxpool.Pool so a test can query the same schema the store writes
+// through. Necessary for any test that needs to inspect raw SQL state
+// (dump-table comparisons, byte-identical property tests, etc.) —
+// pgtest.Open generates a fresh schema per call, so opening a second
+// pool from inside the test would land on an empty schema and the
+// "no mutation" assertion would pass vacuously.
+func pgStoreWithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
+	t.Helper()
 	pool := pgtest.Open(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -67,7 +81,7 @@ func pgStore(t *testing.T) (*state.PgStore, context.Context) {
 	// Cached per-store so the next pgStore(t) (different schema)
 	// doesn't reuse the previous schema's UUID.
 	_ = resolveDefaultLocal(t, ctx, s)
-	return s, ctx
+	return s, pool, ctx
 }
 
 // seedLiveDeploy creates account+app+live-deployment and returns their ids.

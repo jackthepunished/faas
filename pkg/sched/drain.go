@@ -415,19 +415,29 @@ func (d *Drain) isAccountActive(ctx context.Context, appID string) bool {
 // Plan caps rarely change (no churn from a healthy customer), so we
 // don't cache the value here. The AccountByID round-trip is one extra
 // store call per dispatched row; if this becomes hot, a TTL'd
-// plan-cache keyed by account_id is the obvious follow-up. A failure
-// here also fail-opens to 0, matching the rest of the drain's
-// fail-open stance (never block the platform on a Postgres hiccup).
+// plan-cache keyed by account_id is the obvious follow-up.
+//
+// Telemetry: a lookup-error fail-open disables the retry ceiling for
+// the affected row, which lets a poisoned payload retry indefinitely
+// until the lookup recovers. The fail-open is the right behaviour for
+// the in-flight row (don't dead-letter on a Postgres hiccup) but it
+// MUST be observable — we slog a warning so the operator sees the
+// gate fall back. Without this, a sustained Postgres blip would
+// silently mask the dead-letter safety net issue #394 introduces.
 func (d *Drain) queueAttemptBudget(ctx context.Context, inv state.Invocation) int {
 	if inv.Source != state.InvocationQueue {
 		return 0
 	}
 	app, err := d.engine.Store().AppByID(ctx, inv.AppID)
 	if err != nil {
+		d.log.WarnContext(ctx, "queueAttemptBudget: AppByID failed; falling back to legacy infinite retry",
+			"inv_id", inv.ID, "app_id", inv.AppID, "err", err)
 		return 0
 	}
 	acct, err := d.engine.Store().AccountByID(ctx, app.AccountID)
 	if err != nil {
+		d.log.WarnContext(ctx, "queueAttemptBudget: AccountByID failed; falling back to legacy infinite retry",
+			"inv_id", inv.ID, "app_id", inv.AppID, "account_id", app.AccountID, "err", err)
 		return 0
 	}
 	return api.MustLimitsFor(acct.Plan).MaxQueueAttempts
