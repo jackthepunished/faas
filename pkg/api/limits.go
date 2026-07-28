@@ -167,6 +167,21 @@ type Limits struct {
 	CronLimitPerApp     int
 	CronLimitPerAccount int
 
+	// AlertRuleLimitPerApp caps how many alert rules an account may pin
+	// to a single app. Account-wide rules (Issue #396 / ADR-045,
+	// AppID == "") count toward the per-app cap only when the rule pins
+	// an app — they do not count against any per-app cap because they
+	// have no app to bind against. The cap defends against a noisy
+	// customer deploying N rules on a hot app.
+	AlertRuleLimitPerApp int
+	// AlertRuleLimitPerAccount caps the total alert rules an account
+	// holds across every app plus account-wide. Independent of
+	// AlertRuleLimitPerApp — the per-account cap defends against the
+	// N-apps-times-cap-per-app bypass that the cron shape closed in
+	// M7. Both enforced under the same apps-row lock + per-account
+	// read in pkg/state.CreateAlertRuleIfUnderQuota.
+	AlertRuleLimitPerAccount int
+
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
 	// allowlist opt-out because the abuse-desk use case is a
@@ -233,6 +248,11 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// Alert rules (issue #396 / ADR-045): Free stays at 0/0.
+		// Gates via CodePlanAlertRulesNotAllowed at the handler level
+		// — the value is informational here for fail-closed accessors.
+		AlertRuleLimitPerApp:     0,
+		AlertRuleLimitPerAccount: 0,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -281,6 +301,14 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// Alert rules (issue #396): Hobby gets 3 per-app and 10
+		// per-account — a Hobby customer with 2 apps + 1 account-wide
+		// rule lands inside both caps. The per-account floor tracks the
+		// cron shape (10) because the typical Hobby customer configures
+		// "one alert per app" and the spare capacity is for a couple of
+		// account-wide rules.
+		AlertRuleLimitPerApp:     3,
+		AlertRuleLimitPerAccount: 10,
 		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
@@ -330,6 +358,11 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// Alert rules (issue #396): Pro gets 10 per-app and 30
+		// per-account. ~2× the Hobby per-account budget tracks the
+		// Pro app budget (25 apps vs Hobby's 5).
+		AlertRuleLimitPerApp:     10,
+		AlertRuleLimitPerAccount: 30,
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
@@ -376,6 +409,12 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// Alert rules (issue #396): Scale gets 25 per-app and 100
+		// per-account — 2.5× Pro's per-app (10→25) and ~3× the
+		// per-account (30→100). Scale's app budget is 4× Pro's, so
+		// the per-account figure absorbs the fan-out.
+		AlertRuleLimitPerApp:     25,
+		AlertRuleLimitPerAccount: 100,
 		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
 		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
@@ -730,6 +769,32 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// AlertRuleLimitPerApp returns the per-app alert-rule cap for the
+// plan (issue #396 / ADR-045). 0 for Free (handler returns 402
+// CodePlanAlertRulesNotAllowed before the store is touched);
+// positive for Hobby/Pro/Scale. Account-wide rules (AppID == "")
+// bypass this; only the per-account cap applies. Same fail-closed
+// contract as CronLimitPerApp.
+func (p Plan) AlertRuleLimitPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.AlertRuleLimitPerApp
+}
+
+// AlertRuleLimitPerAccount returns the per-account alert-rule cap.
+// Independent of AlertRuleLimitPerApp — same N-apps-times-cap-per-app
+// defence the cron shape used. Same fail-closed contract as
+// CronLimitPerAccount.
+func (p Plan) AlertRuleLimitPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.AlertRuleLimitPerAccount
 }
 
 // RateLimitPerAccountRPM returns the per-account requests/minute cap for

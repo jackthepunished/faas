@@ -21,6 +21,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
 			CronLimitPerApp: 0, CronLimitPerAccount: 0,
+			// ADR-045 (#396): alert rules — Free gated to 402, so the limits
+			// surface is 0/0 to fail-closed by default.
+			AlertRuleLimitPerApp: 0, AlertRuleLimitPerAccount: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50},
@@ -36,6 +39,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: false, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
+			// ADR-045 (#396): Hobby gets 3 per-app and 10 per-account.
+			AlertRuleLimitPerApp: 3, AlertRuleLimitPerAccount: 10,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
@@ -50,6 +55,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
+			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
+			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
@@ -65,6 +72,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
+			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
+			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.

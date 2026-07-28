@@ -836,6 +836,90 @@ type Store interface {
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
 
+	// Alert rules (issue #396, ADR-045). apid is the only writer;
+	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
+	// primitives. Account-scoped (per-app quotas enforced under the
+	// per-account scope because account-wide rules do not pin an app).
+	//
+	// CreateAlertRule is the un-capped insert path used by tests. The
+	// customer-facing handler always calls CreateAlertRuleIfUnderQuota
+	// (same TOCTOU-defence pattern as CreateCronIfUnderQuota).
+	CreateAlertRule(ctx context.Context, r AlertRule) (AlertRule, error)
+	// CreateAlertRuleIfUnderQuota inserts a rule iff the per-app and
+	// per-account caps (limits.AlertRuleLimitPerApp /
+	// AlertRuleLimitPerAccount) are not yet reached. App-scoped rules
+	// are counted under both caps; account-wide rules (AppID == "")
+	// count toward the per-account cap only. Returns:
+	//   - (AlertRule{}, *AlertRuleQuotaError) when either cap trips
+	//   - (AlertRule{}, ErrNotFound) when the app row is missing or
+	//     deleted — and ignored for account-wide rules (caller passes
+	//     an empty appID; the method skips the FOR UPDATE row lock)
+	//   - (AlertRule{}, ErrConflict) on a duplicate (account_id, name)
+	CreateAlertRuleIfUnderQuota(ctx context.Context, r AlertRule, limits api.Limits) (AlertRule, error)
+	AlertRuleByID(ctx context.Context, id string) (AlertRule, error)
+	// UpdateAlertRule mutates the optional fields of an alert row. nil
+	// pointers leave the field untouched; the WebhookSecretSealed
+	// argument is *[]byte so a nil means "don't reseal" (typical for
+	// the customer editing name/threshold without rotating the secret)
+	// and a non-nil replaces the seal. All other fields share the
+	// nil-skip update convention.
+	UpdateAlertRule(ctx context.Context, id string, params UpdateAlertRuleParams) (AlertRule, error)
+	DeleteAlertRule(ctx context.Context, id string) error
+	ListAlertRulesForAccount(ctx context.Context, accountID string) ([]AlertRule, error)
+	// ListEnabledAlertRules returns every enabled rule across every
+	// account. meterd's evaluator tick walks this in one round-trip
+	// (one-box scale, spec §4.3). The partial index
+	// alert_rules_enabled_idx keeps the sweep cheap; meterd's
+	// per-rule target resolution happens inside the evaluator.
+	ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error)
+
+	// ClaimAlertFire is the cool-down prime primitive (criterion 4).
+	// Atomically attempts to claim a fire slot keyed by idempotencyKey
+	// (rule_id + ':' + floor(unix_seconds/cooldown_seconds)); returns
+	// won=true only on the FIRST claim inside that bucket. Subsequent
+	// claims inside the same bucket return won=false. The CTE mirrors
+	// LoadAndStampLastQuotaWarning (pgstore.go) and captures the OLD
+	// stamp BEFORE the UPDATE so the predicate "$2 = old" doesn't
+	// trivially succeed post-write (the regression CI caught in PR
+	// #69 / memory/pkg-state-usage-monthly-tz-compare.md). Returns:
+	//   - (won=true, nil)  on a fresh claim — the caller proceeds to
+	//     RecordAlertDelivery
+	//   - (won=false, nil) on a duplicate inside the bucket — the
+	//     caller stays silent and lets the cool-down carry on
+	//   - (false, ErrNotFound) when the rule row is gone
+	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error)
+	// SetAlertRuleState transitions a rule's cool-down state. Called by
+	// the evaluator on healthy ticks (firing→ok) and after a successful
+	// delivery (ok→firing). returns (true, nil) on a real transition,
+	// (false, nil) when the state already matched (no-op), and
+	// (false, ErrNotFound) when the rule is missing.
+	SetAlertRuleState(ctx context.Context, ruleID string, to AlertState, at time.Time) (changed bool, err error)
+	// SetAlertRuleLastEvaluated stamps the last_evaluated_at column.
+	// Called on every tick so the dashboard can surface "evaluated N
+	// seconds ago". Fire-and-forget — failures are warn-logged at the
+	// call site and never propagate.
+	SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, at time.Time) error
+
+	// Alert deliveries (issue #396, ADR-045). RecordAlertDelivery
+	// inserts a fresh row after ClaimAlertFire returns won=true. The
+	// idempotency_key UNIQUE rejects a duplicate at the database floor
+	// (defence-in-depth on top of ClaimAlertFire's race check).
+	RecordAlertDelivery(ctx context.Context, d AlertDelivery) (AlertDelivery, error)
+	// UpdateAlertDeliveryStatus mutates the retry record in place.
+	// Called after each attempt by the dispatcher (PR 2 / PR 4).
+	UpdateAlertDeliveryStatus(ctx context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error
+	ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int) ([]AlertDelivery, error)
+
+	// CountFailedInvocationsSince counts terminal-failed invocations on
+	// (accountID, appID, source) since `since`. The meterd evaluator
+	// uses this for the failed_invocations metric branch — Issue
+	// #396 criterion 2's "scheduled-work failure" axis. appID is
+	// "": both scoped and un-scoped rules reach this; caller decides
+	// (account-wide rules expand to per-app at evaluation time, then
+	// the per-app counts return here). source 'any' is expanded to
+	// the four InvocationSource values by the caller before the call.
+	CountFailedInvocationsSince(ctx context.Context, accountID, appID string, source InvocationSource, since time.Time) (int, error)
+
 	// Invocations (Move 1 — async_invoke / queue / delayed_task / cron).
 	// apid writes customer-intent rows; schedd's drain loop owns the
 	// state transitions pending → dispatching → completed/failed.

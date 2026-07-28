@@ -169,6 +169,15 @@ const (
 	// no listener is wired. Add the listener when §11 introduces
 	// the public-listener SSE channel design.
 	NotifyCliAuthCodeActivated = "cli_auth_code_activated"
+	// NotifyAlertRuleChanged {"rule_id":uuid, "account_id":uuid,
+	//                         "op":"created|updated|deleted|fired"}
+	//   apid → meterd: any rule-change path invalidates the
+	//   ListEnabledAlertRules cache meterd keeps between ticks.
+	//   The listener short-circuits a stale-rule evaluation cycle
+	//   instead of waiting up to FAAS_ALERT_INTERVAL for the next
+	//   sweep. Payload is informational; the listener re-reads the
+	//   table on every signal anyway.
+	NotifyAlertRuleChanged = "alert_rule_changed"
 	// NotifyComputeNodeChanged {"node_id":uuid, "active":bool}
 	// schedd (SetComputeNodeActive + UpsertComputeNode) →
 	// gatewayd (NodeClientCache.Evict). gatewayd's per-node
