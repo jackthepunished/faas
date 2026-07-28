@@ -36,6 +36,13 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		MemSizeMiB:       int(app.GetMemSizeMib()),
 		EgressMbit:       int(app.GetEgressMbit()),
 		SealedEnvEntries: sealedFromProto(app.GetSealedEnv()),
+		// Issue #395 / ADR-045: plaintext api_env channel. apid
+		// enforces the per-plan EnvValueMaxBytes + EnvVarsMax
+		// quota upstream; vmmd just forwards to StageAPIEnv which
+		// writes /etc/faas/env.json on drive1. Empty slice = no
+		// env.json file written (manifest env still flows in via
+		// /etc/faas/app.json, the legacy path).
+		APIEnvEntries: apiEnvFromProto(app.GetApiEnv()),
 		// ADR-031: forward the per-app outbound IP allowlist on the
 		// wake wire. apid parses + plan-gates + size-caps upstream;
 		// vmmd translates CIDRs into netns.Config.EgressAllowlist on
@@ -108,6 +115,10 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		MemSizeMiB:       int(app.GetMemSizeMib()),
 		EgressMbit:       int(app.GetEgressMbit()),
 		SealedEnvEntries: sealedFromProto(app.GetSealedEnv()),
+		// Issue #395 / ADR-045: see toWakeRequest's APIEnvEntries
+		// comment. Cold-boot mirrors the wake path so deploy's
+		// first boot primes the same plaintext env layer.
+		APIEnvEntries: apiEnvFromProto(app.GetApiEnv()),
 		// ADR-031: see toWakeRequest for the rationale; cold-boot
 		// mirrors it so deploy primes the same egress policy.
 		EgressAllowlist: app.GetEgressAllowlist(),
@@ -141,6 +152,27 @@ func sealedFromProto(pbs []*vmmdpb.SealedSecret) []fcvm.SealedEnvEntry {
 		out = append(out, fcvm.SealedEnvEntry{
 			Key:        p.GetKey(),
 			Ciphertext: p.GetCiphertext(),
+		})
+	}
+	return out
+}
+
+// apiEnvFromProto is the plaintext sibling of sealedFromProto (issue
+// #395 / ADR-045). Mirrors the nil-in/nil-out shape — Manager.Wake
+// treats nil and empty equivalently: no StageAPIEnv call. We don't
+// re-validate key regex or byte cap here; apid's PUT handler enforces
+// both against Limits.EnvVarsMax / Limits.EnvValueMaxBytes BEFORE the
+// row reaches PG, so by the time the value arrives on the wire it's
+// already trusted.
+func apiEnvFromProto(pbs []*vmmdpb.APIEnvEntry) []fcvm.APIEnvEntry {
+	if len(pbs) == 0 {
+		return nil
+	}
+	out := make([]fcvm.APIEnvEntry, 0, len(pbs))
+	for _, p := range pbs {
+		out = append(out, fcvm.APIEnvEntry{
+			Key:   p.GetKey(),
+			Value: p.GetValue(),
 		})
 	}
 	return out

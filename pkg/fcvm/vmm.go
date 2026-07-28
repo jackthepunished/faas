@@ -1015,6 +1015,13 @@ const layerImageName = "layer.ext4"
 // so a secret rotation propagates without re-provisioning the layer.
 const secretsEnvPath = "etc/faas/secrets.env"
 
+// apiEnvPath is the plaintext api-env file written by StageAPIEnv
+// (issue #395 / ADR-045). Sibling to secretsEnvPath — same drive1
+// location, different file. Guest-init reads BOTH files at boot and
+// merges into the process env with precedence "secrets > api_env >
+// manifest_env > os.environ".
+const apiEnvPath = "etc/faas/env.json"
+
 // StageSecretsEnv loopback-mounts drive1 (the per-app layer, the only fs
 // the VM can write at runtime), writes /etc/faas/secrets.env with mode
 // 0400, and umounts. The plaintext is read off the chroot-local image
@@ -1053,6 +1060,47 @@ func (v *JailerVMM) StageSecretsEnv(instance string, jsonBlob []byte) error {
 	}
 	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
 		return fmt.Errorf("write secrets.env: %w", err)
+	}
+	return nil
+}
+
+// StageAPIEnv is the plaintext sibling of StageSecretsEnv (issue #395 /
+// ADR-045). Writes /etc/faas/env.json on drive1 (a JSON map of key→value)
+// for guest-init to merge into the process env at boot. Same loopback-
+// mount dance as StageSecretsEnv (loop mount drive1 → write file →
+// umount), but the payload is plaintext by contract — no host key
+// needed, no unseal step. Empty jsonBlob short-circuits to a no-op so
+// apps without API env rows skip the mount/umount cycle entirely.
+//
+// File mode 0o400 mirrors StageSecretsEnv's read-only posture even
+// though the contents are non-sensitive — the guest-init process is the
+// only consumer and there's no reason to give the customer code write
+// access to its own env file.
+func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
+	if len(jsonBlob) == 0 {
+		return nil
+	}
+	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
+	if _, err := os.Stat(drive1); err != nil {
+		return fmt.Errorf("stat drive1: %w", err)
+	}
+	mp, err := os.MkdirTemp("", "faas-vmm-apienv-")
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(mp) }()
+
+	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	}
+	defer func() { _ = exec.Command("umount", mp).Run() }()
+
+	target := filepath.Join(mp, apiEnvPath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir etc/faas: %w", err)
+	}
+	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
+		return fmt.Errorf("write env.json: %w", err)
 	}
 	return nil
 }

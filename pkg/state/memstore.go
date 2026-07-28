@@ -228,6 +228,9 @@ type MemStore struct {
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
+	// envs is the plaintext app_envs mirror (issue #395 / ADR-045).
+	// Same composite-key shape as secrets; same ownership semantics.
+	envs map[envKey]AppEnv
 	// computeNodes mirrors the compute_nodes table; keyed by id (issue
 	// #97 / ADR-025 axis 3). The synthetic 'default-local' row is
 	// seeded by NewMemStore so tests don't have to call
@@ -247,6 +250,13 @@ type MemStore struct {
 // MemStore uses the same composite-key shape so tests don't drift from
 // production behavior.
 type secretKey struct {
+	AppID string
+	Key   string
+}
+
+// envKey mirrors the app_envs PRIMARY KEY (app_id, key). Mirrors
+// secretKey by intent — same ownership shape, different value type.
+type envKey struct {
 	AppID string
 	Key   string
 }
@@ -357,6 +367,7 @@ func NewMemStore() *MemStore {
 		// keeps the MemStore parity tests in lockstep.
 		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
 		secrets:              map[secretKey]AppSecret{},
+		envs:                 map[envKey]AppEnv{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -4660,6 +4671,78 @@ func (m *MemStore) CountAppSecrets(_ context.Context, accountID, appID string) (
 	return n, nil
 }
 
+// --- app env vars (issue #395 / ADR-045) -------------------------------------
+//
+// Mirror of the customer-secrets surface (lines 4479-4544) minus the
+// ciphertext column. Plaintext values live only in this map; never
+// logged by MemStore.
+
+// UpsertAppEnv inserts or replaces the (account_id, app_id, key) row.
+// updated_at is bumped on every call so schedd's wake staging observes
+// a fresh mtime on every write.
+func (m *MemStore) UpsertAppEnv(_ context.Context, accountID, appID, key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Key: key}
+	existing, ok := m.envs[k]
+	now := time.Now()
+	if !ok {
+		m.envs[k] = AppEnv{AccountID: accountID, AppID: appID, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}
+	if existing.AccountID != accountID {
+		return ErrNotFound
+	}
+	existing.Value = value
+	existing.UpdatedAt = now
+	m.envs[k] = existing
+	return nil
+}
+
+// DeleteAppEnv removes the (account_id, app_id, key) row. Returns
+// ErrNotFound when no row matches — same semantics as PgStore so the
+// handler renders 400 CodeEnvVarNotFound.
+func (m *MemStore) DeleteAppEnv(_ context.Context, accountID, appID, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Key: key}
+	row, ok := m.envs[k]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.envs, k)
+	return nil
+}
+
+// ListAppEnv returns every env row on the app, scoped to accountID.
+// Order: by key ASC (matches PgStore ORDER BY).
+func (m *MemStore) ListAppEnv(_ context.Context, accountID, appID string) ([]AppEnv, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppEnv
+	for _, e := range m.envs {
+		if e.AppID != appID || e.AccountID != accountID {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// CountAppEnv is the quota helper. Mirrors PgStore.CountAppEnv.
+func (m *MemStore) CountAppEnv(_ context.Context, accountID, appID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, e := range m.envs {
+		if e.AppID == appID && e.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // --- G6 account self-service (spec §17 G6, ADR-021) -------------------------
 //
 // MemStore mirrors PgStore for the G6 endpoints so handler tests
@@ -4695,6 +4778,11 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for k := range m.secrets {
 		if m.secrets[k].AccountID == id {
 			delete(m.secrets, k)
+		}
+	}
+	for k := range m.envs {
+		if m.envs[k].AccountID == id {
+			delete(m.envs, k)
 		}
 	}
 	for domain, d := range m.domains {

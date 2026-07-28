@@ -25,20 +25,28 @@ const MaxRestarts = 3
 // (loaded from /etc/faas/secrets.env by secrets.go) is applied LAST so
 // customers' explicit credential values win over any default in the manifest.
 func BuildEnv(base []string, m api.AppManifest) []string {
-	return BuildEnvWithSecrets(base, m, nil)
+	return BuildEnvWithSecrets(base, m, nil, nil)
 }
 
-// BuildEnvWithSecrets is the secrets-aware variant. Pass nil secrets to get
-// the same behavior as BuildEnv. Precedence (lowest to highest):
+// BuildEnvWithSecrets is the secrets-aware variant. Pass nil secrets and
+// nil apiEnv to get the same behavior as BuildEnv. Precedence (lowest to
+// highest):
 //
-//	base (os.Environ) < manifest env < secrets env
+//	base (os.Environ) < manifest env < apiEnv < secrets env
 //
-// All three sources must conform to the [A-Z][A-Z0-9_]* key shape; entries
+// All four sources must conform to the [A-Z][A-Z0-9_]* key shape; entries
 // that do not are silently skipped (defense in depth — the SQL CHECK
 // already enforces shape, but an out-of-band writer shouldn't be able to
 // crash execve with a malformed env entry).
-func BuildEnvWithSecrets(base []string, m api.AppManifest, secrets map[string]string) []string {
-	merged := make(map[string]string, len(base)+len(m.Env)+len(secrets))
+//
+// The apiEnv layer is issue #395 / ADR-045 — the plaintext per-app env
+// store (LOG_LEVEL, FEATURE_X, …). Non-sensitive runtime config sits here;
+// credentials stay in the secrets layer. The ordering "secrets > apiEnv >
+// manifest" matches the issue's plaintext rationale: a runtime tweak via
+// PUT /v1/apps/{slug}/env/{key} overrides the image's default env but
+// cannot accidentally clobber a credential set via the secret surface.
+func BuildEnvWithSecrets(base []string, m api.AppManifest, secrets, apiEnv map[string]string) []string {
+	merged := make(map[string]string, len(base)+len(m.Env)+len(secrets)+len(apiEnv))
 	for _, kv := range base {
 		if k, v, ok := cut(kv); ok && validEnvKey(k) {
 			merged[k] = v
@@ -49,6 +57,17 @@ func BuildEnvWithSecrets(base []string, m api.AppManifest, secrets map[string]st
 			merged[k] = v
 		}
 	}
+	// apiEnv layer (issue #395 / ADR-045): applied AFTER manifest so a
+	// runtime PUT overrides the image's default env. Plaintext by
+	// contract — see the file header in cmd/apid/handlers_env.go for
+	// the trust-model rationale.
+	for k, v := range apiEnv {
+		if validEnvKey(k) {
+			merged[k] = v
+		}
+	}
+	// Secrets layer stays LAST: a customer credential always wins
+	// over any default, manifest env, or plaintext api_env row.
 	for k, v := range secrets {
 		if validEnvKey(k) {
 			merged[k] = v

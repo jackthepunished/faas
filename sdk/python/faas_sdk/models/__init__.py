@@ -14,6 +14,8 @@ from .api_key_export_response import APIKeyExportResponse
 from .api_key_export_response_scopes_item import APIKeyExportResponseScopesItem
 from .api_key_response import APIKeyResponse
 from .api_key_response_scopes_item import APIKeyResponseScopesItem
+from .app_env_list_response import AppEnvListResponse
+from .app_env_response import AppEnvResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
 from .app_metrics_response import AppMetricsResponse
@@ -109,6 +111,7 @@ from .password_reset_request import PasswordResetRequest
 from .password_signup_request import PasswordSignupRequest
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
 from .problem import Problem
+from .put_app_env_request import PutAppEnvRequest
 from .put_app_secret_request import PutAppSecretRequest
 from .queue_receive_response import QueueReceiveResponse
 from .queue_receive_response_payload import QueueReceiveResponsePayload
@@ -146,6 +149,8 @@ __all__ = (
     "APIKeyExportResponseScopesItem",
     "APIKeyResponse",
     "APIKeyResponseScopesItem",
+    "AppEnvListResponse",
+    "AppEnvResponse",
     "AppManifest",
     "AppManifestEnv",
     "AppMetricsResponse",
@@ -241,6 +246,7 @@ __all__ = (
     "PasswordSignupRequest",
     "PostAccountSessionsRevokeAllBody",
     "Problem",
+    "PutAppEnvRequest",
     "PutAppSecretRequest",
     "QueueReceiveResponse",
     "QueueReceiveResponsePayload",

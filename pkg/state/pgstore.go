@@ -5416,6 +5416,80 @@ func (s *PgStore) CountAppSecrets(ctx context.Context, accountID, appID string) 
 	return n, err
 }
 
+// --- app env vars (issue #395 / ADR-045) -------------------------------------
+//
+// Mirror of the sealed-secrets shape (lines 4608-4676) minus the
+// ciphertext column. Plaintext TEXT values; apid is the sole writer;
+// schedd reads via ListAppEnv at wake time and ships the rows on the
+// AppSpec wire.
+
+// UpsertAppEnv inserts or replaces the (app_id, key) env row. updated_at
+// is bumped on conflict so schedd's "freshest per app" staging path
+// observes a fresh mtime on every write — same posture as the secrets
+// table (rotation flows re-PUT without changing the value are still
+// treated as a write).
+func (s *PgStore) UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_envs (account_id, app_id, key, value)
+		 values ($1, $2, $3, $4)
+		 on conflict (app_id, key) do update
+		   set value = excluded.value,
+		       updated_at = now()`,
+		accountID, appID, key, value)
+	return err
+}
+
+// DeleteAppEnv removes the (app_id, key) row scoped to accountID.
+// Returns ErrNotFound when no row matches — handler renders 400
+// CodeEnvVarNotFound.
+func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from app_envs where account_id = $1 and app_id = $2 and key = $3`,
+		accountID, appID, key)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListAppEnv returns every (key, value) row on the app, scoped to
+// accountID. Order: by key ASC for deterministic staging (mirrors
+// ListAppSecrets). Returns nil slice when the app has no env rows.
+func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, key, value, created_at, updated_at
+		 from app_envs
+		 where account_id = $1 and app_id = $2
+		 order by key asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppEnv
+	for rows.Next() {
+		var e AppEnv
+		if err := rows.Scan(&e.AccountID, &e.AppID, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CountAppEnv is the quota helper used by apid's PUT handler to enforce
+// Limits.EnvVarsMax BEFORE UpsertAppEnv. Mirrors CountAppSecrets.
+func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_envs where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
 // --- row scanners ------------------------------------------------------------
 
 func scanAccount(row pgx.Row) (Account, error) {
@@ -6230,6 +6304,10 @@ func (s *PgStore) DeleteAccount(ctx context.Context, id string) error {
 		{"api_keys", `delete from api_keys where account_id = $1`},
 		{"idempotency_keys", `delete from idempotency_keys where account_id = $1`},
 		{"usage_minutes", `delete from usage_minutes where account_id = $1`},
+		// app_envs: matches app_secrets posture above — env rows hold
+		// account_id directly, so the FK + GDPR cascade handles them.
+		// Plaintext text values are erased with the account.
+		{"app_envs", `delete from app_envs where account_id = $1`},
 		// `events` is included (per spec §17 G6 right-to-erasure):
 		// audit rows whose subject or payload references the account
 		// must not outlive the customer's data. The data->>'account_id'

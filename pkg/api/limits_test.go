@@ -12,6 +12,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// Free/Hobby rows below omit them intentionally — mirrors the
 		// MinInstancesAllowed row shape.
 		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096,
+			// Issue #395 / ADR-045: Free gets 8 keys / 4 KB per value.
+			EnvVarsMax: 8, EnvValueMaxBytes: 4096,
 			// ADR-044: per-plan CPUWeight/CPUQuotaUS/CPUPeriodUS — issue
 			// #301 acceptance #1+#2. The 2/4/8/16 ratio is the literal
 			// value from the issue; the quota is the spec's literal
@@ -28,6 +30,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
+			// Issue #395 / ADR-045: Hobby gets 32 keys / 8 KB per value.
+			EnvVarsMax: 32, EnvValueMaxBytes: 8192,
 			// ADR-044: see PlanFree. Hobby's tight quota is the
 			// load-bearing signal in the cpu-fairness e2e (cmd/e2e/cpu_fairness_test.go).
 			CPUWeight: 4, CPUQuotaUS: 200_000, CPUPeriodUS: 200_000,
@@ -46,7 +50,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the account limit catches the cross-app botnet signature.
 			RateLimitPerAccountRPM: 200},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
-		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MinInstancesAllowed: true,
+		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
+			// Issue #395 / ADR-045: Pro gets 64 keys / 16 KB per value.
+			EnvVarsMax: 64, EnvValueMaxBytes: 16384, MinInstancesAllowed: true,
 			// ADR-044: see PlanFree.
 			CPUWeight: 8, CPUQuotaUS: 500_000, CPUPeriodUS: 500_000,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
@@ -61,7 +67,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			RateLimitPerAccountRPM: 1000},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
-		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MinInstancesAllowed: true,
+		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
+			// Issue #395 / ADR-045: Scale gets 256 keys / 32 KB per value.
+			EnvVarsMax: 256, EnvValueMaxBytes: 32768, MinInstancesAllowed: true,
 			// ADR-044: see PlanFree. Scale's 1000ms/100ms quota is the
 			// upper bound — 10 vCPU worth of compute at the per-instance
 			// level, gated by the §1 56 GB hard fence at the slice level.
@@ -130,6 +138,11 @@ func TestPlansAreMonotonic(t *testing.T) {
 			{"EgressMbit", lo.EgressMbit, hi.EgressMbit},
 			{"CronLimitPerApp", lo.CronLimitPerApp, hi.CronLimitPerApp},
 			{"CronLimitPerAccount", lo.CronLimitPerAccount, hi.CronLimitPerAccount},
+			// Issue #395 / ADR-045: env quota must be monotonic like every
+			// other gate — Free's 8 < Hobby's 32 < Pro's 64 < Scale's 256,
+			// and the per-value byte cap doubles each step.
+			{"EnvVarsMax", lo.EnvVarsMax, hi.EnvVarsMax},
+			{"EnvValueMaxBytes", lo.EnvValueMaxBytes, hi.EnvValueMaxBytes},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {

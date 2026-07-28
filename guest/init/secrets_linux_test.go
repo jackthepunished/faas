@@ -21,7 +21,7 @@ func TestBuildEnv_SecretsOverrideManifest(t *testing.T) {
 	base := []string{"FOO=base", "BAR=base"}
 	m := api.AppManifest{Env: map[string]string{"FOO": "manifest", "BAZ": "manifest"}}
 	secrets := map[string]string{"FOO": "secret", "SECRET_KEY": "x"}
-	got := BuildEnvWithSecrets(base, m, secrets)
+	got := BuildEnvWithSecrets(base, m, secrets, nil)
 
 	want := map[string]string{
 		"FOO":        "secret",   // secrets win
@@ -49,7 +49,7 @@ func TestBuildEnv_SecretsOverrideManifest(t *testing.T) {
 func TestBuildEnv_NilSecretsActsAsBuildEnv(t *testing.T) {
 	m := api.AppManifest{Env: map[string]string{"K": "m"}}
 	a := BuildEnv([]string{"K=b", "OTHER=o"}, m)
-	b := BuildEnvWithSecrets([]string{"K=b", "OTHER=o"}, m, nil)
+	b := BuildEnvWithSecrets([]string{"K=b", "OTHER=o"}, m, nil, nil)
 	if !reflect.DeepEqual(a, b) {
 		t.Errorf("nil secrets differs from BuildEnv:\n  BuildEnv  = %v\n  WithNil   = %v", a, b)
 	}
@@ -61,9 +61,9 @@ func TestBuildEnv_DeterministicOrder(t *testing.T) {
 	// (base ∪ manifest ∪ secrets), sorted.
 	m := api.AppManifest{Env: map[string]string{"FOO": "f", "ZOO": "z"}}
 	secrets := map[string]string{"MID": "m", "AAA": "a"}
-	first := BuildEnvWithSecrets(nil, m, secrets)
+	first := BuildEnvWithSecrets(nil, m, secrets, nil)
 	for i := 0; i < 32; i++ {
-		again := BuildEnvWithSecrets(nil, m, secrets)
+		again := BuildEnvWithSecrets(nil, m, secrets, nil)
 		if !reflect.DeepEqual(first, again) {
 			t.Fatalf("non-deterministic at iteration %d: %v vs %v", i, first, again)
 		}
@@ -83,7 +83,7 @@ func TestBuildEnv_InvalidKeysDropped(t *testing.T) {
 		"OK_NAME":    "good",
 	}}
 	secrets := map[string]string{"ALSO_OK": "v", "BAD KEY": "v"}
-	got := BuildEnvWithSecrets(base, m, secrets)
+	got := BuildEnvWithSecrets(base, m, secrets, nil)
 	for _, kv := range got {
 		for i := 0; i < len(kv); i++ {
 			if kv[i] == '=' {
@@ -119,7 +119,7 @@ func TestBuildEnv_InvalidKeysDropped(t *testing.T) {
 func TestBuildEnv_EmptyKeysRejectsEmptyKey(t *testing.T) {
 	// An empty key (only '=') must be dropped — never reach execve.
 	base := []string{"=bare"}
-	got := BuildEnvWithSecrets(base, api.AppManifest{}, nil)
+	got := BuildEnvWithSecrets(base, api.AppManifest{}, nil, nil)
 	for _, kv := range got {
 		if len(kv) == 0 || kv[0] == '=' {
 			t.Errorf("bare env line leaked: %q", kv)

@@ -682,6 +682,15 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret))))
 
+	// Customer env vars (issue #395 / ADR-045). Plaintext VALUE flows
+	// through PUT over TLS; persisted as-is (no seal step) by
+	// handlers_env.go. env:write is NOT MFA-gated because env vars are
+	// explicitly non-sensitive runtime config — the secret surface is
+	// the credential store and stays MFA-locked.
+	mux.HandleFunc("GET /v1/apps/{slug}/env", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listEnv)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.setEnv)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.deleteEnv)))
+
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write
 	// CI key doesn't need them. usage:read is the right knob here.
