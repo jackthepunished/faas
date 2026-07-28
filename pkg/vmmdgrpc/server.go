@@ -26,6 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/leakcheck"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -67,6 +68,11 @@ type VmmdAPI interface {
 	// pkg/fcvm.Manager) so the handler reads through the narrow
 	// seam the Manager already exposes — no new Manager method.
 	InstancePID(instance string) (int, bool)
+	// LogRing (issue #254 / Move 4) returns the per-instance ring
+	// buffer of stdout/stderr lines the ringWriter in pkg/fcvm/vmm.go
+	// is filling from firecracker's own stdout. nil when the instance
+	// is not alive on this vmmd (the Logs handler maps nil to NotFound).
+	LogRing(instance string) *logbuf.Ring
 }
 
 // Server implements vmmdpb.VmmdServer.

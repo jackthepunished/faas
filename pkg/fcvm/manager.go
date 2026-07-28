@@ -17,6 +17,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -78,6 +79,12 @@ type VMM interface {
 	// be empty — implementations MUST treat that as a no-op so apps without
 	// secrets skip the mount/umount cycle entirely.
 	StageSecretsEnv(instance string, jsonBlob []byte) error
+	// LogRing returns the per-instance ring buffer of the running VM's
+	// stdout/stderr stream (issue #254, Move 4), or nil if instance is
+	// not alive on this vmmd. The vmmd gRPC Logs(req) handler dials this
+	// to fan frames out to subscribers. nil-safe so the handler can treat
+	// "no ring" as NotFound without a separate liveness check.
+	LogRing(instance string) *logbuf.Ring
 	// InstancePID returns the host PID of the running jailer child for
 	// instance, or (0, false) if the instance is not currently alive on
 	// this vmmd. M8 §11: the SeccompStatus gRPC handler reads
@@ -770,6 +777,15 @@ func (m *Manager) ExportDirFor(instance string) string {
 // hop that keeps JailerVMM's bookkeeping internal.
 func (m *Manager) InstancePID(instance string) (int, bool) {
 	return m.vmm.InstancePID(instance)
+}
+
+// LogRing delegates to the underlying VMM (issue #254 / Move 4). The
+// Manager-to-VMM hop is one level of indirection, same as InstancePID,
+// because the ring is private to JailerVMM. Returns nil for instances
+// that are not alive on this vmmd; the vmmdgrpc handler maps nil to
+// NotFound without a separate liveness check.
+func (m *Manager) LogRing(instance string) *logbuf.Ring {
+	return m.vmm.LogRing(instance)
 }
 
 // NetnsFor returns the network namespace name (fc-<instance>) the

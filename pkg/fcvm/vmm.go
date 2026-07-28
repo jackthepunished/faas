@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/storage"
 )
 
@@ -50,6 +51,11 @@ type JailerVMM struct {
 	proc    map[string]*exec.Cmd // instance -> running jailer process
 	clients map[string]*http.Client
 	recs    map[string]*instanceRecord // instance -> per-process bookkeeping (M6 builder VMs)
+	// rings is the per-instance log ring buffer (issue #254 / Move 4).
+	// Created in Boot/Restore before startJailer so cmd.Stdout can be wired
+	// to the ring's writer; closed in Kill/DestroyWithExport so the byte
+	// budget is released when the instance is gone (invariant §6.2-4).
+	rings map[string]*logbuf.Ring
 	// materialisedTmp tracks tmp files materializeFromStorage created for
 	// each instance so Kill/DestroyWithExport can Remove them on teardown.
 	// Without this, the tmp files (in /tmp) outlive the chroot and leak
@@ -69,6 +75,69 @@ type instanceRecord struct {
 	done     chan struct{} // closed by the watchdog; readers <-done to wake
 }
 
+// ringWriter is a thin io.Writer that forwards every Write call to the
+// per-instance logbuf.Ring as a Line tagged with the configured stream
+// ("stdout" or "stderr"). The ring buffers partial lines until '\n' and
+// assigns the monotonic Seq, so this adapter is allocation-free per Write
+// beyond a 1-field closure copy in the io.Writer interface.
+type ringWriter struct {
+	ring   *logbuf.Ring
+	stream string
+}
+
+func (w *ringWriter) Write(p []byte) (int, error) {
+	return w.ring.Write(w.stream, p)
+}
+
+// ringFor returns the per-instance ring registered for instance, or nil
+// when the instance never had one (legacy Boot callers, test seams).
+// Caller may be holding v.mu; the function takes and releases it.
+func (v *JailerVMM) ringFor(instance string) *logbuf.Ring {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.rings[instance]
+}
+
+// LogRing returns the per-instance log ring, or nil if instance is not
+// alive on this vmmd. Used by vmmdgrpc.Server.Logs to fan frames out to
+// subscribers. nil-safe so the gRPC handler can treat "no ring" as a
+// NotFound without a separate liveness check.
+func (v *JailerVMM) LogRing(instance string) *logbuf.Ring {
+	return v.ringFor(instance)
+}
+
+// registerRing creates a fresh ring for the instance, replacing any prior
+// ring (which is closed and discarded). Called from Boot/Restore before
+// startJailer so cmd.Stdout can be wired to the writer.
+//
+// Returns the ring pointer for callers that want to pre-publish a line
+// (e.g. M6 builder VMs writing the build-done marker).
+func (v *JailerVMM) registerRing(instance string) *logbuf.Ring {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if old, ok := v.rings[instance]; ok {
+		_ = old.Close()
+	}
+	r := logbuf.New(0) // 0 -> logbuf.DefaultMaxBytes (10 MiB)
+	v.rings[instance] = r
+	return r
+}
+
+// unregisterRing closes the ring and removes it from the map. Idempotent
+// — Kill/DestroyWithExport always call this so a park/unpark cycle frees
+// the byte budget (invariant §6.2-4: parked app = zero RAM).
+func (v *JailerVMM) unregisterRing(instance string) {
+	v.mu.Lock()
+	r, ok := v.rings[instance]
+	if ok {
+		delete(v.rings, instance)
+	}
+	v.mu.Unlock()
+	if ok {
+		_ = r.Close()
+	}
+}
+
 // NewJailerVMM constructs a JailerVMM. readyTimeout of 0 defaults to 30s (the
 // COLD_BOOTING ceiling, spec §6.1).
 func NewJailerVMM(chrootBase string, readyTimeout time.Duration) *JailerVMM {
@@ -84,6 +153,7 @@ func NewJailerVMM(chrootBase string, readyTimeout time.Duration) *JailerVMM {
 		proc:            make(map[string]*exec.Cmd),
 		clients:         make(map[string]*http.Client),
 		recs:            make(map[string]*instanceRecord),
+		rings:           make(map[string]*logbuf.Ring),
 		materialisedTmp: make(map[string][]string),
 	}
 }
@@ -190,6 +260,9 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 // Prefer BootColdBoot for cold boots — it materializes the StorageBackend
 // keys in ColdBootSpec into host paths first, then delegates here. Boot
 // is kept for tests that already have resolved paths in hand.
+//
+// Move 4 (issue #254): registerRing is called BEFORE startJailer so
+// cmd.Stdout can be wired to the ring's writer in startJailer.
 func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig) (err error) {
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
@@ -200,6 +273,7 @@ func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig) (err error)
 			_ = v.Kill(context.WithoutCancel(ctx), l)
 		}
 	}()
+	_ = v.registerRing(l.Instance)
 
 	jailed, err := v.provision(root, cfg, l.UID, l.GID)
 	if err != nil {
@@ -365,6 +439,10 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	}
 
 	// Start firecracker with only the API socket, then load + resume.
+	// Move 4 (issue #254): register the per-instance ring BEFORE
+	// startJailer so cmd.Stdout captures every byte the resumed FC
+	// writes, including the boot echo and the resume hook's ack.
+	_ = v.registerRing(l.Instance)
 	if err = v.startJailer(ctx, l); err != nil {
 		return err
 	}
@@ -727,6 +805,11 @@ func (v *JailerVMM) Kill(_ context.Context, l Lease) error {
 		delete(v.proc, l.Instance)
 	}
 	v.mu.Unlock()
+	// Move 4 (issue #254): close the per-instance ring so subscribers
+	// see a clean EOF and the byte budget is released (invariant §6.2-4:
+	// parked app = zero RAM). Done BEFORE the chroot wipe because the
+	// ring holds host-side bytes; nothing else depends on it.
+	v.unregisterRing(l.Instance)
 
 	if hasCmd && cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
@@ -835,6 +918,10 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 	delete(v.recs, l.Instance)
 	delete(v.proc, l.Instance)
 	v.mu.Unlock()
+	// Move 4 (issue #254): close the per-instance ring so subscribers
+	// see EOF and the byte budget is released. Done before the chroot
+	// wipe for the same reason as in Kill.
+	v.unregisterRing(l.Instance)
 	v.closeClient(l.Instance)
 	if err := os.RemoveAll(filepath.Join(v.chrootBase, v.fcName, l.Instance)); err != nil {
 		return exitCode, fmt.Errorf("vmm: remove chroot: %w", err)
@@ -1032,6 +1119,14 @@ func (v *JailerVMM) mkChroot(instance string) (string, error) {
 
 // startJailer launches jailer→firecracker for the instance with any extra
 // firecracker args appended, and records the process.
+//
+// Issue #254 / Move 4: the previously-discarded cmd.Stdout (which carries
+// firecracker's own stdout, including kernel printk and any userland
+// process writing to /dev/console) is now wired into a per-instance
+// logbuf.Ring. The ring is registered in v.rings by Boot/Restore BEFORE
+// this call so the lookup here is always non-nil. Firecracker writes its
+// own stderr only on configuration errors; that stream remains discarded
+// to avoid mixing error noise into the customer's log tail.
 func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...string) error {
 	execFile, err := exec.LookPath(FirecrackerBin)
 	if err != nil {
@@ -1046,7 +1141,19 @@ func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...str
 		Instance: l.Instance, UID: l.UID, GID: l.GID, Netns: l.Netns, ExecFile: execFile,
 	}), extraFCArgs...)
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	ring := v.ringFor(l.Instance)
+	if ring != nil {
+		// Stream FC's stdout (kernel printk + guest /dev/console writers)
+		// into the per-instance ring. stderr stays discarded — FC only
+		// writes there on configuration errors and operators inspect those
+		// via systemctl logs, not the per-app tail.
+		cmd.Stdout = &ringWriter{ring: ring, stream: "stdout"}
+	} else {
+		// Pre-Move-4 paths (legacy Boot callers, tests that bypass the
+		// ring registration) keep the previous behaviour.
+		cmd.Stdout = io.Discard
+	}
+	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("vmm: start jailer: %w", err)
 	}

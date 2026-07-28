@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/netns"
 )
 
@@ -312,6 +313,14 @@ func (v *fakeVMM) InstancePID(instance string) (int, bool) {
 	p, ok := v.pids[instance]
 	return p, ok
 }
+
+// LogRing (issue #254 / Move 4) is the in-process fake for the
+// vmmdgrpc.Logs handler's VMM seam. fakeVMM never spawns a real
+// firecracker process, so the canonical "test a real log stream"
+// path is cmd/e2e/logs_e2e_test.go (//go:build metal). The fake
+// returns nil; tests that want to drive the Logs handler through
+// the fake should embed a real *logbuf.Ring and override LogRing.
+func (v *fakeVMM) LogRing(_ string) *logbuf.Ring { return nil }
 
 func (v *fakeVMM) restoredInstance(id string) bool {
 	v.mu.Lock()
