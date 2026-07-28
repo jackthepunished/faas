@@ -152,6 +152,16 @@ metal-lima-m5: ## Run the M5 §14 deploy-to-park cold-boot acceptance on Lima (s
 lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate
 	@$(GO) tool golangci-lint run
 
+.PHONY: scan
+scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (issue #299)
+	@command -v govulncheck >/dev/null 2>&1 || $(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	@command -v grype >/dev/null 2>&1 || { echo "grype required: https://github.com/anchore/grype/releases" >&2; exit 1; }
+	@command -v syft >/dev/null 2>&1 || { echo "syft required: https://github.com/anchore/syft/releases" >&2; exit 1; }
+	govulncheck -mode=source ./...
+	@mkdir -p bin
+	grype dir:images/ -o json --file bin/grype-results.json
+	syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "$$(git rev-parse --short HEAD)" --source-type directory
+
 .PHONY: bootstrap
 bootstrap: ## Idempotent host setup (ansible) — only on a dev EX44
 	@test -f deploy/ansible/site.yml || (echo "deploy/ansible/site.yml not present yet (M0)"; exit 1)

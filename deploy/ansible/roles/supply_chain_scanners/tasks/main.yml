@@ -1,0 +1,130 @@
+# supply_chain_scanners — install Grype + Syft (issue #299).
+#
+# Mirrors deploy/ansible/roles/firecracker/tasks/main.yml: pinned
+# version + sha256sum verify + chmod + smoke test. Installs the
+# binary into /usr/local/bin (install_root/bin/<tool>) so
+# cmd/imaged's WithGrypeRun + WithSyftRun subprocess dispatch
+# (cmd/imaged/main.go) resolves via PATH lookup without further
+# configuration.
+#
+# Idempotency: each tool's install is gated by an `creates:` on
+# the destination path so a second invocation is a no-op. SHA
+# verification runs unconditionally — a future re-download with
+# a different SHA would still trip the role's assert.
+
+- name: supply_chain_scanners — read role defaults for current pins
+  ansible.builtin.debug:
+    msg: >-
+      installing grype {{ grype_version }} +
+      syft {{ syft_version }} into {{ install_root }}/bin
+
+- name: supply_chain_scanners — ensure {{ install_root }}/bin
+  ansible.builtin.file:
+    path: "{{ install_root }}/bin"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: supply_chain_scanners — download grype release tarball
+  ansible.builtin.get_url:
+    url: "https://github.com/anchore/grype/releases/download/v{{ grype_version }}/grype_{{ grype_version }}_linux_{{ arch }}.tar.gz"
+    dest: "/tmp/grype-{{ grype_version }}.tar.gz"
+    checksum: "sha256:{{ grype_release[grype_version].sha256_linux_amd64 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: arch == "amd64"
+  register: grype_tarball
+
+- name: supply_chain_scanners — verify grype tarball SHA-256
+  ansible.builtin.command: sha256sum /tmp/grype-{{ grype_version }}.tar.gz
+  register: grype_tarball_sum
+  changed_when: false
+  check_mode: false
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — assert local checksum matches pin (grype)
+  ansible.builtin.assert:
+    that:
+      - "grype_release[grype_version].sha256_linux_amd64 in grype_tarball_sum.stdout"
+    fail_msg: >-
+      Downloaded grype tarball SHA-256 does not match the pin in
+      roles/supply_chain_scanners/defaults/main.yml. Refusing to
+      continue — a download mismatch is almost certainly a
+      compromised supply chain.
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — untar grype into {{ install_root }}/bin
+  ansible.builtin.unarchive:
+    src: "/tmp/grype-{{ grype_version }}.tar.gz"
+    dest: "{{ install_root }}/bin"
+    remote_src: true
+    creates: "{{ install_root }}/bin/grype"
+  args:
+    creates: "{{ install_root }}/bin/grype"
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — chmod grype binary
+  ansible.builtin.file:
+    path: "{{ install_root }}/bin/grype"
+    owner: root
+    group: root
+    mode: "0755"
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — download syft release tarball
+  ansible.builtin.get_url:
+    url: "https://github.com/anchore/syft/releases/download/v{{ syft_version }}/syft_{{ syft_version }}_linux_{{ arch }}.tar.gz"
+    dest: "/tmp/syft-{{ syft_version }}.tar.gz"
+    checksum: "sha256:{{ syft_release[syft_version].sha256_linux_amd64 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: arch == "amd64"
+  register: syft_tarball
+
+- name: supply_chain_scanners — verify syft tarball SHA-256
+  ansible.builtin.command: sha256sum /tmp/syft-{{ syft_version }}.tar.gz
+  register: syft_tarball_sum
+  changed_when: false
+  check_mode: false
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — assert local checksum matches pin (syft)
+  ansible.builtin.assert:
+    that:
+      - "syft_release[syft_version].sha256_linux_amd64 in syft_tarball_sum.stdout"
+    fail_msg: >-
+      Downloaded syft tarball SHA-256 does not match the pin in
+      roles/supply_chain_scanners/defaults/main.yml. Refusing to
+      continue — a download mismatch is almost certainly a
+      compromised supply chain.
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — untar syft into {{ install_root }}/bin
+  ansible.builtin.unarchive:
+    src: "/tmp/syft-{{ syft_version }}.tar.gz"
+    dest: "{{ install_root }}/bin"
+    remote_src: true
+    creates: "{{ install_root }}/bin/syft"
+  args:
+    creates: "{{ install_root }}/bin/syft"
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — chmod syft binary
+  ansible.builtin.file:
+    path: "{{ install_root }}/bin/syft"
+    owner: root
+    group: root
+    mode: "0755"
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — smoke test (version check)
+  ansible.builtin.command:
+    cmd: "{{ item }} version"
+  loop:
+    - "{{ install_root }}/bin/grype"
+    - "{{ install_root }}/bin/syft"
+  changed_when: false
+  check_mode: false

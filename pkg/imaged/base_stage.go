@@ -1,13 +1,17 @@
 package imaged
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Base stage — imaged startup provisions the shared read-only drive0 used by
@@ -164,6 +168,22 @@ func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, o
 	if err := be.Put(ctx, digestKey, digestRC); err != nil {
 		h.log.Warn("imaged: write base digest sidecar", "key", digestKey, "err", err)
 	}
+
+	// issue #299: scan-and-write the Grype sidecar in lock-step
+	// with the digest sidecar above. The scan key is derived from
+	// the base key so vmmd's bringUpScanCheck can find it on the
+	// wake wire. Fail-closed: a scan failure (Grype missing,
+	// JSON malformed, timeout) writes a CRITICAL=9999 placeholder
+	// so vmmd refuses to boot any staged ext4 whose scan failed —
+	// the alternative (silently admit) would let a missing
+	// scanner hide CVEs. The fail-closed sidecar is the canonical
+	// posture for this PR and is mirrored in the
+	// pkg/fcvm/manager.go bringUpScanCheck admission seam.
+	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
+		h.log.Warn("imaged: write grype scan sidecar",
+			"key", wire.ScanKeyForBaseKey(baseKey), "err", err)
+	}
+
 	h.log.Info("imaged: staged builder base",
 		"ref", ref, "key", res.ImageKey, "size_bytes", res.SizeBytes,
 		"digest", wantDigest)
@@ -196,4 +216,61 @@ func (r *stringReaderImpl) Read(p []byte) (int, error) {
 	n := copy(p, r.s[r.off:])
 	r.off += n
 	return n, nil
+}
+
+// writeScanSidecar runs a Grype scan of the staged base ext4 and
+// writes the per-severity finding counts to the scan sidecar
+// (issue #299). The sidecar is keyed by wire.ScanKeyForBaseKey so
+// vmmd's bringUpScanCheck can find it at boot. Fail-closed: a scan
+// error or nil findings writes a CRITICAL=9999 placeholder so
+// vmmd refuses to boot any un-scanned artifact.
+//
+// `ref` is the OCI ref the base ext4 was pulled from (recorded in
+// the sidecar's `image` field for dashboard traceability — a
+// customer looking at `vmmd_trivy_image_vulns_total{image=...}`
+// needs to see the registry ref, not the local staging path).
+// `outImage` is the filesystem path Grype's `dir:` source walks.
+// Passing the OCI ref to `dir:` was the original implementation;
+// Grype's `dir:` source is filesystem-only and rejected registry
+// refs, which tripped the fail-closed branch on every staged
+// base (Critical #1 of the PR #385 review). The mapped path
+// is recorded in the sidecar's `image` field for dashboard
+// traceability.
+func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage string) error {
+	be, err := h.storageFor()
+	if err != nil {
+		return fmt.Errorf("imaged: writeScanSidecar storageFor: %w", err)
+	}
+	findings, scanErr := h.runGrype(ctx, outImage)
+	if scanErr != nil || findings == nil {
+		h.log.Warn("imaged: grype scan failed; writing fail-closed sidecar",
+			"ref", ref, "err", scanErr)
+		// CRITICAL=9999 (and the other buckets set to 9999 as well)
+		// ensures vmmd's bringUpScanCheck fails closed on every
+		// severity, not just CRITICAL. A future admission policy
+		// could distinguish "CRITICAL known-bad" from "no scan
+		// at all" via the Findings field — for now, both collapse
+		// to "refuse to boot".
+		findings = map[string]int{
+			"CRITICAL": 9999, "HIGH": 9999, "MEDIUM": 9999,
+			"LOW": 9999, "UNKNOWN": 0,
+		}
+	}
+	scanBlob, err := json.Marshal(struct {
+		Image     string         `json:"image"`
+		Findings  map[string]int `json:"findings"`
+		ScannedAt time.Time      `json:"scanned_at"`
+	}{
+		Image:     ref,
+		Findings:  findings,
+		ScannedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return fmt.Errorf("imaged: marshal scan sidecar: %w", err)
+	}
+	scanKey := wire.ScanKeyForBaseKey(baseKey)
+	if err := be.Put(ctx, scanKey, bytes.NewReader(scanBlob)); err != nil {
+		return fmt.Errorf("imaged: write scan sidecar %q: %w", scanKey, err)
+	}
+	return nil
 }

@@ -362,6 +362,20 @@ type OpsMetrics struct {
 	// single-registry pattern — memory note wire/OpsMetrics —
 	// demands the field be present on the shared struct).
 	provenanceWrites *prometheus.CounterVec
+	// imageScanVulns: issue #299 / supply-chain scan observability.
+	// Counter labelled by image (the OCI ref of the staged base
+	// ext4, e.g. "ghcr.io/onebox-faas/builder-base:latest" or
+	// "ghcr.io/onebox-faas/runner-node22:v1.2.3") and severity ∈
+	// {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN}. Closed `severity`
+	// set pre-instantiated at boot below — `image` is bounded by
+	// the runtime count (~5) + a few builder-base variants.
+	// The CRITICAL count is the vmmd admission gate's read side
+	// (Manager.bringUpScanCheck at pkg/fcvm/manager.go refuses to
+	// bring up an instance whose sidecar has CRITICAL > 0). The
+	// counter is incremented once per Grype scan at imaged
+	// base-stage time (pkg/imaged/base_stage.go) and re-read on
+	// every cold-boot by vmmd.
+	imageScanVulns *prometheus.CounterVec
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -707,6 +721,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		}, []string{"cidr", "family"})
 		commonCollectors = append(commonCollectors, ociEgressDeny)
 	}
+	// issue #299: Grype scan findings, per (image, severity). The
+	// `image` label is the OCI ref of the staged base ext4; the
+	// `severity` label is the closed Grype {CRITICAL, HIGH,
+	// MEDIUM, LOW, UNKNOWN} set. Incremented once per Grype scan
+	// at imaged base-stage time. The CRITICAL count is the vmmd
+	// admission gate's read side — see Manager.bringUpScanCheck at
+	// pkg/fcvm/manager.go. Registered on every daemon because the
+	// counter is shared via the single-registry pattern (memory
+	// note wire/OpsMetrics), even though only vmmd / imaged
+	// increment it in production.
+	imageScanVulns := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_trivy_image_vulns_total",
+		Help: "Per-image Grype finding counts, labelled by image (the OCI ref of the staged base ext4) and severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #299). The CRITICAL count is the vmmd admission gate's read side — a non-zero rate means vmmd refused to bring up an instance whose staged ext4 had a CRITICAL finding. The counter is incremented once per Grype scan at imaged base-stage time.",
+	}, []string{"image", "severity"})
+	commonCollectors = append(commonCollectors, imageScanVulns)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -727,6 +756,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// the same change in ObserveProvenanceWrite below.
 	for _, code := range []string{"ok", "error"} {
 		provenanceWrites.WithLabelValues(code)
+	}
+	// issue #299: pre-instantiate the closed `severity` label set
+	// for imageScanVulns so the rows surface in /metrics from boot
+	// — same precedent as every other CounterVec on this struct.
+	// The `image` label carries a sentinel `<unknown>` here so a
+	// Grafana panel can filter on `image=~"<unknown>"` to plot the
+	// "vulns posted by a misconfigured imaged" row separately from
+	// the per-image rows that ObserveImageScanVuln adds after the
+	// first scan. Using an empty-string sentinel would emit a row
+	// with `image=""` whose label Grafana's templating collapses
+	// with the placeholders from prometheus's exporter interface,
+	// making the row indistinguishable from a scrape artifact.
+	// Closed set: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN — matches
+	// the Grype severity vocabulary exactly so an operator can
+	// alert on the raw label without remapping. Extending the
+	// Grype severity set requires extending this loop in lock-step.
+	for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
+		imageScanVulns.WithLabelValues("<unknown>", sev)
 	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in
@@ -866,6 +913,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		egressDeny:                    egressDeny,
 		ociEgressDeny:                 ociEgressDeny,
 		provenanceWrites:              provenanceWrites,
+		imageScanVulns:                imageScanVulns,
 	}
 }
 
@@ -1371,6 +1419,21 @@ func (m *OpsMetrics) ObserveProvenanceWrite(code string) {
 		return
 	}
 	m.provenanceWrites.WithLabelValues(code).Inc()
+}
+
+// ObserveImageScanVuln records one (image, severity, count) tuple from
+// a Grype scan at imaged base-stage time (issue #299). The counter
+// is <daemon>_trivy_image_vulns_total{image, severity}; severity is
+// the closed {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} Grype set. The
+// CRITICAL count is the vmmd admission gate's read side — see
+// Manager.bringUpScanCheck at pkg/fcvm/manager.go. Safe on a nil
+// receiver so the imaged and vmmd callers don't need a nil-check at
+// the top of the hot path.
+func (m *OpsMetrics) ObserveImageScanVuln(image, severity string, count int) {
+	if m == nil {
+		return
+	}
+	m.imageScanVulns.WithLabelValues(image, severity).Add(float64(count))
 }
 
 // ObserveBuildDuration records one build's wall-clock duration in the
