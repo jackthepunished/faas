@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubd"
-	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
 
@@ -34,12 +33,19 @@ func sign(body []byte, secret []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-// newTestProxyWithReplay builds a proxy with a real state.MemStore
-// backing the dedupe check, mirroring production wiring. The
-// returned *state.MemStore lets tests pre-seed rows or assert on
-// recorded deliveries after the call returns.
-func newTestProxyWithReplay(t *testing.T, secret []byte) (http.Handler, *atomic.Int32, *state.MemStore, *fakeAuditStore) {
+// newTestProxyWithReplay builds a proxy with the in-process
+// dedupe helper. Tests reset the package-level sync.Map via
+// webhookdedupe's exported tests to keep the dedupe state
+// independent per-test. The fakeAuditStore is the only
+// production-shaped dependency that survives the v1 dedupe
+// simplification.
+func newTestProxyWithReplay(t *testing.T, secret []byte) (http.Handler, *atomic.Int32, *fakeAuditStore) {
 	t.Helper()
+	// The dedupe store is package-level and process-local; tests
+	// in this package share the same state. Reset at the start
+	// of every #294-coverage test so cross-test delivery IDs
+	// don't leak a previously-recorded row.
+	webhookdedupe.ResetForTest()
 	var upstreamHits atomic.Int32
 	upstreamHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
@@ -51,10 +57,9 @@ func newTestProxyWithReplay(t *testing.T, secret []byte) (http.Handler, *atomic.
 	})
 	srv := httptest.NewServer(upstreamHandler)
 	t.Cleanup(srv.Close)
-	mem := state.NewMemStore()
 	auditor := newFakeAuditStore()
-	proxy := newGithubdProxy(srv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), mem, newGatewaydAuditor(auditor, slog.New(slog.NewTextHandler(io.Discard, nil))))
-	return proxy, &upstreamHits, mem, auditor
+	proxy := newGithubdProxy(srv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), newGatewaydAuditor(auditor, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	return proxy, &upstreamHits, auditor
 }
 
 // fakeAuditStore records every AppendEvent call so tests can
@@ -102,6 +107,10 @@ func (f *fakeAuditStore) Last() (fakeAuditRow, bool) {
 
 func newTestProxy(t *testing.T, secret []byte, upstream http.Handler) (http.Handler, *atomic.Int32) {
 	t.Helper()
+	// The dedupe store is package-level and process-local; reset
+	// here too so tests using the old helper (no replay audit
+	// seam) don't see replays from the issue-#294 cohort.
+	webhookdedupe.ResetForTest()
 	var upstreamHits atomic.Int32
 	upstreamHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
@@ -119,9 +128,9 @@ func newTestProxy(t *testing.T, secret []byte, upstream http.Handler) (http.Hand
 	srv := httptest.NewServer(upstreamHandler)
 	t.Cleanup(srv.Close)
 	// Issue #294: tests that pre-date the replay check pass nil for
-	// both replay and auditor; the proxy forwards every HMAC-verified
-	// request, matching pre-#294 behaviour.
-	proxy := newGithubdProxy(srv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	// the auditor; the proxy forwards every HMAC-verified request,
+	// matching pre-#294 behaviour.
+	proxy := newGithubdProxy(srv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	return proxy, &upstreamHits
 }
 
@@ -203,7 +212,7 @@ func TestGithubdProxy_EmptySecretRejectsEverything(t *testing.T) {
 	srv := httptest.NewServer(upstreamHandler)
 	defer srv.Close()
 	proxy := newGithubdProxy(srv.URL, nil /* secret unset */, http.NewServeMux(),
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body := []byte(`{"ref":"refs/heads/main"}`)
 	req := httptest.NewRequest(http.MethodPost, githubWebhookPath, bytes.NewReader(body))
@@ -232,7 +241,7 @@ func TestGithubdProxy_NonWebhookPathsFallThrough(t *testing.T) {
 	})
 	// Build the proxy over a fallthrough handler directly to
 	// observe "did the request reach next?".
-	proxy2 := newGithubdProxy("http://127.0.0.1:1", secret, mux, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	proxy2 := newGithubdProxy("http://127.0.0.1:1", secret, mux, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	for _, p := range []string{"/dashboard/", "/oauth/callback", "/api/v1/deployments", "/v1/apps"} {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
@@ -299,7 +308,7 @@ func TestGithubdProxy_UpstreamDownReturns502(t *testing.T) {
 	secret := []byte("test-webhook-secret")
 	// Point at a closed port so RoundTrip fails immediately.
 	proxy := newGithubdProxy("http://127.0.0.1:1", secret, http.NewServeMux(),
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body := []byte(`{"ref":"refs/heads/main","after":"abc"}`)
 	req := httptest.NewRequest(http.MethodPost, githubWebhookPath, bytes.NewReader(body))
@@ -361,7 +370,7 @@ func TestGithubdProxy_VerifierMatchesGithubdPackage(t *testing.T) {
 // to the dedupe table.
 func TestGithubdProxy_FirstDelivery_RecordsRow(t *testing.T) {
 	secret := []byte("test-webhook-secret")
-	proxy, hits, mem, _ := newTestProxyWithReplay(t, secret)
+	proxy, hits, _ := newTestProxyWithReplay(t, secret)
 
 	body := []byte(`{"ref":"refs/heads/main","after":"abc"}`)
 	req := httptest.NewRequest(http.MethodPost, githubWebhookPath, bytes.NewReader(body))
@@ -379,7 +388,7 @@ func TestGithubdProxy_FirstDelivery_RecordsRow(t *testing.T) {
 		t.Errorf("upstream hits = %d, want 1", hits.Load())
 	}
 	// Round-trip via the helper to prove the row was recorded.
-	if err := webhookdedupe.CheckReplay(t.Context(), mem, webhookdedupe.ProviderGitHub, "delivery-rec-1"); !webhookdedupe.IsReplay(err) {
+	if err := webhookdedupe.CheckReplay(t.Context(), webhookdedupe.ProviderGitHub, "delivery-rec-1"); !webhookdedupe.IsReplay(err) {
 		t.Errorf("recorded delivery should be a replay; err=%v", err)
 	}
 }
@@ -390,7 +399,7 @@ func TestGithubdProxy_FirstDelivery_RecordsRow(t *testing.T) {
 // and does NOT reach the upstream.
 func TestGithubdProxy_RejectsReplay(t *testing.T) {
 	secret := []byte("test-webhook-secret")
-	proxy, hits, _, auditor := newTestProxyWithReplay(t, secret)
+	proxy, hits, auditor := newTestProxyWithReplay(t, secret)
 	body := []byte(`{"ref":"refs/heads/main","after":"abc"}`)
 
 	for i, wantHits := range []int32{1, 1} {
@@ -447,7 +456,7 @@ func TestGithubdProxy_RejectsReplay(t *testing.T) {
 // speaking a different protocol.
 func TestGithubdProxy_MissingDeliveryHeader_Returns400(t *testing.T) {
 	secret := []byte("test-webhook-secret")
-	proxy, hits, mem, auditor := newTestProxyWithReplay(t, secret)
+	proxy, hits, auditor := newTestProxyWithReplay(t, secret)
 
 	body := []byte(`{"ref":"refs/heads/main"}`)
 	req := httptest.NewRequest(http.MethodPost, githubWebhookPath, bytes.NewReader(body))
@@ -465,7 +474,7 @@ func TestGithubdProxy_MissingDeliveryHeader_Returns400(t *testing.T) {
 		t.Errorf("upstream hits = %d, want 0 (400 short-circuits before forward)", hits.Load())
 	}
 	// No dedupe row recorded, no audit emission.
-	if err := webhookdedupe.CheckReplay(t.Context(), mem, webhookdedupe.ProviderGitHub, ""); !webhookdedupe.IsReplay(err) {
+	if err := webhookdedupe.CheckReplay(t.Context(), webhookdedupe.ProviderGitHub, ""); !webhookdedupe.IsReplay(err) {
 		// empty delivery_id is its own fresh-key branch (no row) — that's fine.
 		_ = err
 	}
@@ -480,7 +489,7 @@ func TestGithubdProxy_MissingDeliveryHeader_Returns400(t *testing.T) {
 // the state-mutation side; the audit row is observation.
 func TestGithubdProxy_AuditEmitFailure_DoesNotRollback(t *testing.T) {
 	secret := []byte("test-webhook-secret")
-	proxy, hits, _, auditor := newTestProxyWithReplay(t, secret)
+	proxy, hits, auditor := newTestProxyWithReplay(t, secret)
 	auditor.failN = 100 // force every audit emit to fail
 
 	body := []byte(`{"ref":"refs/heads/main"}`)
@@ -500,11 +509,6 @@ func TestGithubdProxy_AuditEmitFailure_DoesNotRollback(t *testing.T) {
 		t.Errorf("upstream hits = %d, want 1", hits.Load())
 	}
 }
-
-// Compile-time sanity: state.MemStore satisfies githubdReplayStore
-// (the slice of state.Store the proxy uses). Catches interface
-// drift at build time rather than at runtime via a nil-deref.
-var _ githubdReplayStore = (*state.MemStore)(nil)
 
 // Compile-time sanity: webhookdedupe.TTL is exposed for tests
 // (and the production wiring relies on it via the constant).

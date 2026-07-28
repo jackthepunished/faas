@@ -21,9 +21,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
-	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
 
 // --- apps CRUD --------------------------------------------------------------
@@ -1169,7 +1169,7 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 	// (log WARN + forward) — the dedupe is defence-in-depth, not the
 	// authenticity gate; HMAC was verified above.
 	if ev.ID != "" {
-		if err := webhookdedupe.CheckReplay(r.Context(), s.store, webhookdedupe.ProviderStripe, ev.ID); err != nil {
+		if err := webhookdedupe.CheckReplay(r.Context(), webhookdedupe.ProviderStripe, ev.ID); err != nil {
 			if webhookdedupe.IsReplay(err) {
 				acctID := acct.ID
 				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
@@ -1249,7 +1249,7 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 	// check — pre-#294 behaviour. Fail-open on dedupe transport
 	// errors (mirrors gatewayd).
 	if ev.EventID != "" {
-		if err := webhookdedupe.CheckReplay(r.Context(), s.store, webhookdedupe.ProviderPaddle, ev.EventID); err != nil {
+		if err := webhookdedupe.CheckReplay(r.Context(), webhookdedupe.ProviderPaddle, ev.EventID); err != nil {
 			if webhookdedupe.IsReplay(err) {
 				acctID := acct.ID
 				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{

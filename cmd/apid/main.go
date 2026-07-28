@@ -210,7 +210,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// expires_at column + the partial index keep the per-tick
 		// DELETE bounded by (60s tick × ~rows added in that window).
 		// 60s matches the meterd dunning sweep cadence.
-		webhookSweeper := webhookdedupe.NewSweeper(srv.store, log, webhookdedupe.DefaultSweepInterval)
+		webhookSweeper := webhookdedupe.NewSweeper(webhookdedupe.DefaultSweepInterval)
 		go func() { _ = webhookSweeper.Run(ctx) }()
 	}
 	return runWithDeps(ctx, log, deps)

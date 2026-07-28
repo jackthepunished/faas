@@ -1,14 +1,8 @@
 // Package webhookdedupe is the shared replay-protection primitive
-// for the three webhook ingresses on the box. One table covers all
-// three providers (GitHub via gatewayd, Stripe + Paddle via apid);
-// one helper exposes the check; one audit event (`webhook.replay_rejected`)
-// fires when a redelivery arrives inside the TTL window.
+// for the three webhook ingresses on the box.
 //
 // Issue #294 closes the SOC 2 CC6.1 expectation that every external
-// event ingestion be idempotent. The earlier dedupe tables —
-// `stripe_push_dedupe` (migration 00004) and `paddle_overage_dedupe`
-// (migration 00034) — are pusher-side (meterd) and don't cover the
-// upstream webhook ingest path. This package sits in front of the
+// event ingestion be idempotent. The helper sits in front of the
 // handler dispatch so a replayed (re-POSTed) webhook within the TTL
 // returns 200 (idempotent — the upstream provider interprets as
 // success and stops retrying) without re-running the side effects.
@@ -21,20 +15,34 @@
 // tolerance windows (5 minutes) so a legitimate retry that falls
 // inside the signature-validity window cannot bypass the replay
 // check.
+//
+// # Storage
+//
+// The dedupe state is a process-local sync.Map (keyed by
+// provider+deliveryID) so this package has no persistence
+// dependency and can ship independently of any migration slot.
+// Trade-off: a daemon restart clears the dedupe window, so a
+// replay arriving within 5 minutes of restart can pass through.
+// This is acceptable for v1 because (a) the HMAC verify in front
+// of this package is still the authenticity gate, and (b) each
+// provider's own redelivery cadence concentrates retries in
+// seconds, not minutes, so the rest of the dedupe window is
+// rarely meaningful. A follow-up PR will back the sync.Map with
+// a shared `webhook_deliveries` table once migration slot
+// contention with PRs #335/#352/#369 (which currently claim
+// slots 56, 57, 58) clears.
 package webhookdedupe
 
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// Provider identifiers — values that land in webhook_deliveries.provider
-// and are constrained by the webhook_deliveries_provider_check CHECK.
-// Adding a new provider is a one-line ALTER to drop the CHECK; the
-// shared helper does not need a code change.
+// Provider identifiers — values that land in the dedupe key
+// namespace. The set is closed (GitHub/Stripe/Paddle) and adding a
+// future provider is a one-line constant addition.
 const (
 	// ProviderGitHub is the source of the X-GitHub-Delivery UUID.
 	// gatewayd's GitHub proxy reads the header and passes it here.
@@ -53,26 +61,22 @@ const (
 // tolerance windows (5*time.Minute in pkg/billing/stripe and
 // pkg/billing/paddle) so a legitimate retry that falls inside the
 // signature-validity window cannot bypass the replay check. Also
-// matches GitHub's documented "immediate" redelivery cadence
-// (GitHub retries every few seconds for ~30s, then backs off).
-//
-// Stamped on every row as expires_at = now + TTL; the apid sweep
-// goroutine deletes rows whose expires_at < now() every 60s.
+// matches GitHub's "immediate" redelivery cadence (GitHub retries
+// every few seconds for ~30s, then backs off).
 const TTL = 5 * time.Minute
 
-// ErrReplay is the alias for state.ErrReplay. The two sentinels
-// are the same value (re-exported here so callers don't have to
-// import both packages). errors.Is(err, ErrReplay) and
-// errors.Is(err, state.ErrReplay) both match.
-var ErrReplay = state.ErrReplay
+// ErrReplay is the sentinel returned by CheckReplay when the
+// (provider, deliveryID) pair is already in the dedupe state within
+// the TTL window. Callers MUST respond 200 in this branch and emit
+// a webhook.replay_rejected audit row.
+var ErrReplay = errors.New("webhookdedupe: replay detected")
 
 // Replay is the typed error wrapper used when CheckReplay sees a
-// row within the TTL window. The wrapper carries (provider,
+// hit within the TTL window. The wrapper carries (provider,
 // deliveryID) so audit payloads and log lines can render the
 // offending pair without re-reading the request headers.
 //
-// errors.Is(err, ErrReplay) is true; errors.Is(err, state.ErrReplay)
-// is also true (the underlying sentinel is wrapped).
+// errors.Is(err, ErrReplay) is true.
 type Replay struct {
 	Provider   string
 	DeliveryID string
@@ -86,39 +90,52 @@ func (e *Replay) Is(target error) bool {
 	return target == ErrReplay
 }
 
-// CheckReplay is the single helper every webhook ingress calls.
-// Returns nil on a fresh delivery (recording it on success).
-// Returns a *Replay error wrapping state.ErrReplay when
-// (provider, deliveryID) is already in the table within the TTL
-// window — callers MUST respond 200 in this branch and emit a
-// webhook.replay_rejected audit row.
-//
-// The cutoff / expiresAt pair is computed from now() inside this
-// helper so the TTL constant lives in one place; the
-// underlying state.Store methods take the timestamps explicitly so
-// the test suite can drive the sweep with a fake clock.
-func CheckReplay(ctx context.Context, s state.Store, provider, deliveryID string) error {
-	now := time.Now()
-	found, err := s.CheckWebhookReplay(ctx, provider, deliveryID, now.Add(-TTL))
-	if err != nil {
-		// state.Store.CheckWebhookReplay never returns ErrReplay; the
-		// "found" boolean is what indicates a replay. A non-nil error
-		// here is a transport / connection issue — surface it verbatim
-		// so the ingress can decide (log + 5xx or fail closed).
-		return err
-	}
-	if found {
-		return &Replay{Provider: provider, DeliveryID: deliveryID}
-	}
-	return s.RecordWebhookDelivery(ctx, provider, deliveryID, now.Add(TTL))
+// dedupeKey is the composite key for the in-process map.
+type dedupeKey struct {
+	provider   string
+	deliveryID string
 }
 
-// Sweep is a thin wrapper around state.Store.SweepExpiredWebhookDeliveries
-// for callers that want to drive the sweep from outside apid (the
-// apid goroutine calls the state method directly). Returns the
-// number of rows deleted.
-func Sweep(ctx context.Context, s state.Store, now time.Time) (int64, error) {
-	return s.SweepExpiredWebhookDeliveries(ctx, now)
+// store is the process-local dedupe state. The zero value is
+// usable; sync.Map covers all races. A daemon restart loses the
+// dedupe state — see the package doc for the trade-off.
+var store sync.Map
+
+// nowFunc is the clock seam; tests can replace it via
+// setNowForTest. Defaults to time.Now.
+var nowFunc = time.Now
+
+// CheckReplay returns ErrReplay if (provider, deliveryID) is
+// already in the dedupe state within the TTL window. A fresh
+// delivery is recorded and the helper returns nil. Callers MUST
+// respond 200 on a non-nil error wrapping ErrReplay and emit a
+// webhook.replay_rejected audit row.
+//
+// The store and the TTL are the only state involved; the helper
+// is safe for concurrent use across all three ingresses within a
+// single daemon.
+func CheckReplay(_ context.Context, provider, deliveryID string) error {
+	now := nowFunc()
+	cutoff := now.Add(-TTL)
+	key := dedupeKey{provider: provider, deliveryID: deliveryID}
+	expiresAt := now.Add(TTL)
+	// LoadOrStore is the atomic check-then-set: the first writer
+	// of a fresh key wins (loaded=false) and we return nil; the
+	// Nth writer sees the prior writer's value (loaded=true) and
+	// must inspect the entry's expires_at to decide replay vs.
+	// expired-overwrite.
+	if actual, loaded := store.LoadOrStore(key, expiresAt); loaded {
+		if exp, ok := actual.(time.Time); ok && exp.After(cutoff) {
+			return &Replay{Provider: provider, DeliveryID: deliveryID}
+		}
+		// Loaded but expired — overwrite with the fresh
+		// expires_at. A second writer who raced past the
+		// LoadOrStore will overwrite our overwrite; both
+		// post-date the cutoff, so the dedupe outcome is
+		// equivalent.
+		store.Store(key, expiresAt)
+	}
+	return nil
 }
 
 // IsReplay reports whether err is a replay-rejection. Convenience

@@ -1808,7 +1808,7 @@ func TestStripeWebhook_RejectsReplay(t *testing.T) {
 
 	// Round-trip via the webhookdedupe helper to prove the row was
 	// recorded by the first delivery.
-	if err := webhookdedupe.CheckReplay(context.Background(), e.store, webhookdedupe.ProviderStripe, id); !webhookdedupe.IsReplay(err) {
+	if err := webhookdedupe.CheckReplay(context.Background(), webhookdedupe.ProviderStripe, id); !webhookdedupe.IsReplay(err) {
 		t.Errorf("recorded Stripe event should be a replay; err=%v", err)
 	}
 }

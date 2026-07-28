@@ -1,86 +1,70 @@
-// apid-side sweep goroutine for webhook_deliveries (issue #294).
-//
-// Lives in pkg/webhookdedupe (not cmd/apid) so the test suite can
-// exercise the lifecycle — RunOnce is exported for the deterministic
-// test path, Run spins a ticker that calls RunOnce every Interval.
-//
-// Mirrors the shape of pkg/grace (G6 grace timer) and
-// pkg/logintoken (login-token cleanup) so apid's main.go wiring is
-// a one-line `go sweeper.Run(ctx)` next to the existing goroutines.
-//
-// gatewayd does NOT run a sweep — apid is the only writer for the
-// Stripe + Paddle paths AND for the GitHub path (gatewayd inserts
-// the row but apid sweeps it; a single sweep goroutine is simpler
-// than per-provider sweeps and the partial index on
-// webhook_deliveries_expires_idx keeps the DELETE cheap).
+// In-process GC for the webhookdedupe dedupe state. The dedupe is
+// a process-local sync.Map; the sweeper walks it every DefaultSweepInterval
+// and removes entries whose expires_at has passed. Without this
+// goroutine the map would only grow for the lifetime of the daemon —
+// the sweep bounds the memory footprint to ~(deliveries in last TTL).
+
 package webhookdedupe
 
 import (
 	"context"
-	"log/slog"
+	"sync/atomic"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// DefaultSweepInterval is the cadence Run uses when the caller does
-// not specify one. 60s matches the meterd dunning sweep cadence
-// (pkg/meter/dunning.go:223) — the webhook_deliveries table is much
-// smaller than the dunning work, so the same cadence is fine.
+// DefaultSweepInterval is the cadence at which the sweeper walks
+// the dedupe state. 60s matches the meterd dunning sweep cadence
+// (pkg/meter/dunning.go); the dedupe map is much smaller than
+// the dunning work, so the same cadence is fine.
 const DefaultSweepInterval = 60 * time.Second
 
-// Sweeper periodically calls state.Store.SweepExpiredWebhookDeliveries
-// to keep the webhook_deliveries table bounded. Constructed once
-// per apid process and driven from main.go via `go swp.Run(ctx)`.
+// Sweeper is the apid-side GC goroutine for the dedupe state.
+// The zero value is invalid; use NewSweeper.
 type Sweeper struct {
-	store    state.Store
-	log      *slog.Logger
 	interval time.Duration
-	now      func() time.Time // clock seam for tests
+	now      func() time.Time
 }
 
-// NewSweeper builds the goroutine. log + store must be non-nil.
-// Pass interval = 0 to use DefaultSweepInterval.
-func NewSweeper(store state.Store, log *slog.Logger, interval time.Duration) *Sweeper {
+// NewSweeper returns a sweeper that ticks at the given interval.
+// interval <= 0 falls back to DefaultSweepInterval. The now
+// field is left at time.Now; tests can override it via
+// setSweeperNowForTest.
+func NewSweeper(interval time.Duration) *Sweeper {
 	if interval <= 0 {
 		interval = DefaultSweepInterval
 	}
-	return &Sweeper{
-		store:    store,
-		log:      log,
-		interval: interval,
-		now:      time.Now,
-	}
+	return &Sweeper{interval: interval, now: time.Now}
 }
 
-// RunOnce performs one sweep. Exported so tests can drive the
-// sweep deterministically without spinning up a real ticker.
-// Returns the rows deleted (informational; the caller does not
-// gate on it).
-func (s *Sweeper) RunOnce(ctx context.Context) (int64, error) {
-	if s == nil || s.store == nil {
-		return 0, nil
+// RunOnce walks the dedupe state and removes entries whose
+// expires_at is at or before the sweeper's now(). Returns the
+// number of entries removed. The walk is O(N); the map is
+// expected to be small (deliveries in the last 5 minutes per
+// provider). A nil receiver is a no-op so misconfigured boot
+// paths don't panic.
+func (s *Sweeper) RunOnce() int64 {
+	if s == nil {
+		return 0
 	}
-	n, err := s.store.SweepExpiredWebhookDeliveries(ctx, s.now())
-	if err != nil {
-		if s.log != nil {
-			s.log.Warn("webhookdedupe sweep error", "err", err)
+	var removed int64
+	now := s.now()
+	cutoff := now.Add(-TTL)
+	store.Range(func(k, v any) bool {
+		exp, ok := v.(time.Time)
+		if !ok || !exp.After(cutoff) {
+			store.Delete(k)
+			atomic.AddInt64(&removed, 1)
 		}
-		return 0, err
-	}
-	if n > 0 && s.log != nil {
-		s.log.Info("webhookdedupe sweep", "rows", n)
-	}
-	return n, nil
+		return true
+	})
+	return removed
 }
 
-// Run blocks until ctx is cancelled, calling RunOnce every
-// Interval. Errors are logged at WARN; the loop continues. The
-// function returns ctx.Err() on cancellation.
-//
-// Mirrors the lifecycle shape of grace.New(...).Run(ctx) and
-// logintoken.New(...).Run(ctx) so the apid main.go wiring is
-// consistent with its sibling goroutines.
+// Run blocks on the ticker + ctx.Done, returning ctx.Err() on
+// cancellation. Stops cleanly on context cancel; the daemon
+// shutdown path relies on the ctx cancel to tear the goroutine
+// down. A nil receiver is a no-op so misconfigured boot paths
+// don't panic.
 func (s *Sweeper) Run(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -92,9 +76,7 @@ func (s *Sweeper) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			if n, err := s.RunOnce(ctx); err != nil {
-				s.log.Warn("webhook dedupe sweep failed", "deleted", n, "err", err)
-			}
+			s.RunOnce()
 		}
 	}
 }

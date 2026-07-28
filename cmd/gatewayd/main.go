@@ -454,7 +454,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// *state.PgStore (compile-time checked in audit.go). nil
 	// `deps.pgStore` (tests) skips the replay check, matching the
 	// pre-#294 behaviour.
-	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, deps.pgStore, newGatewaydAuditor(deps.pgStore, log))
+	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, newGatewaydAuditor(deps.pgStore, log))
 
 	// Issue #249 / spec §11: mount security response headers at the
 	// outermost wrapper of the public listener.

@@ -26,7 +26,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubd"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -38,16 +37,6 @@ import (
 // routes per-binding from the repo field in the body).
 const githubWebhookPath = "/webhooks/github"
 
-// githubdReplayStore is the slice of the state.Store the githubd
-// proxy needs to consult the dedupe table. Pinning the interface
-// here keeps the proxy free of the full state.Store surface (so
-// tests can inject a tiny fake) while preserving the migration's
-// (provider, delivery_id) primary-key semantics.
-type githubdReplayStore interface {
-	CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error)
-	RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error
-}
-
 // githubdProxy wraps next so /webhooks/github requests are
 // HMAC-verified at the edge and forwarded to githubd's loopback
 // listener. Everything else falls through to next (dashboard proxy
@@ -58,7 +47,6 @@ type githubdProxy struct {
 	next      http.Handler
 	log       *slog.Logger
 	transport *http.Transport
-	replay    githubdReplayStore
 	auditor   *gatewaydAuditor
 }
 
@@ -67,15 +55,14 @@ type githubdProxy struct {
 // request returns 503 — gatewayd refuses to forward unverified
 // payloads, so missing secret = closed-by-default).
 //
-// replay may be nil (tests that pre-date issue #294); in that
-// case the dedupe check is skipped and the proxy forwards every
-// HMAC-verified request, which matches the pre-#294 behaviour.
-// Production wires a *state.PgStore (cmd/gatewayd/main.go).
-//
 // auditor may be nil; in that case replay rejections are still
 // 200-returned but no audit row is emitted. Tests for replay
 // wiring install an auditor fake.
-func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.Logger, replay githubdReplayStore, auditor *gatewaydAuditor) http.Handler {
+//
+// Issue #294 dedupe state lives in pkg/webhookdedupe (process-local
+// sync.Map), so the proxy does not need a store dependency — the
+// helper is consulted directly in handleWebhook.
+func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.Logger, auditor *gatewaydAuditor) http.Handler {
 	if target == "" || log == nil {
 		log.Warn("githubd proxy disabled (empty target)")
 		return next
@@ -96,7 +83,6 @@ func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.
 		next:      next,
 		log:       log,
 		transport: &http.Transport{},
-		replay:    replay,
 		auditor:   auditor,
 	}
 }
@@ -142,26 +128,25 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	// Issue #294: replay check. We require the delivery UUID header
 	// (GitHub always sends it; a missing one is a misconfigured
-	// client) and consult the shared dedupe table. nil `replay`
-	// (tests without the seam) skips the check — pre-#294 behaviour.
+	// client) and consult the shared dedupe helper. The helper is
+	// process-local (sync.Map in pkg/webhookdedupe); the dedupe is
+	// consulted in-line below.
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	if deliveryID == "" {
 		g.log.Warn("githubd proxy missing X-GitHub-Delivery header")
 		http.Error(w, "missing delivery id", http.StatusBadRequest)
 		return
 	}
-	if g.replay != nil {
-		if err := g.checkReplay(r.Context(), deliveryID); err != nil {
-			g.log.Info("githubd replay rejected", "delivery_id", deliveryID, "err", err)
-			if g.auditor != nil {
-				g.auditor.Emit(r.Context(), "webhook.replay_rejected", nil, map[string]any{
-					"provider":    webhookdedupe.ProviderGitHub,
-					"delivery_id": deliveryID,
-				})
-			}
-			w.WriteHeader(http.StatusOK)
-			return
+	if err := g.checkReplay(r.Context(), deliveryID); err != nil {
+		g.log.Info("githubd replay rejected", "delivery_id", deliveryID, "err", err)
+		if g.auditor != nil {
+			g.auditor.Emit(r.Context(), "webhook.replay_rejected", nil, map[string]any{
+				"provider":    webhookdedupe.ProviderGitHub,
+				"delivery_id": deliveryID,
+			})
 		}
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	// Hand the original body back to the upstream via a fresh
 	// request body reader. We rebuild the upstream URL from the
@@ -202,28 +187,17 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 // checkReplay is the githubd proxy's thin wrapper around
 // pkg/webhookdedupe.CheckReplay. Returns nil on a fresh delivery,
-// *webhookdedupe.Replay (errors.Is(state.ErrReplay)) on a redelivery
-// within the TTL window. The 200 response is emitted at the call
-// site; audit emission is intentionally deferred to a follow-up so
-// the gatewayd audit seam (mirrors cmd/apid/audit.go) can land in
-// its own PR — see issue #294 ADR-042 follow-up notes.
+// *webhookdedupe.Replay (errors.Is(webhookdedupe.ErrReplay)) on a
+// redelivery within the TTL window. The 200 response is emitted
+// at the call site; the auditor (if non-nil) emits the audit row.
 //
-// A transport / connection error from the dedupe table is logged
-// at WARN and the request is forwarded anyway — the dedupe table
-// is a defence-in-depth check, not the authenticity gate (the
-// HMAC verify above is the gate). This matches the gatewayd fail-
-// open posture on transient infrastructure failures.
+// Issue #294: the dedupe state is process-local (sync.Map), so
+// there is no transport error path here. The previous table-backed
+// shape returned a sentinel from a SQL error and the call site
+// failed open; the in-memory shape cannot fail, which is the
+// intended simplification for v1.
 func (g *githubdProxy) checkReplay(ctx context.Context, deliveryID string) error {
-	now := time.Now()
-	found, err := g.replay.CheckWebhookReplay(ctx, webhookdedupe.ProviderGitHub, deliveryID, now.Add(-webhookdedupe.TTL))
-	if err != nil {
-		g.log.Warn("githubd replay-check infra error; forwarding", "err", err)
-		return nil
-	}
-	if found {
-		return &webhookdedupe.Replay{Provider: webhookdedupe.ProviderGitHub, DeliveryID: deliveryID}
-	}
-	return g.replay.RecordWebhookDelivery(ctx, webhookdedupe.ProviderGitHub, deliveryID, now.Add(webhookdedupe.TTL))
+	return webhookdedupe.CheckReplay(ctx, webhookdedupe.ProviderGitHub, deliveryID)
 }
 
 // loadGithubWebhookSecret reads FAAS_GITHUB_WEBHOOK_SECRET from env

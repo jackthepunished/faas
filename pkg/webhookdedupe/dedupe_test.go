@@ -3,50 +3,55 @@ package webhookdedupe
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// TestCheckReplay_FirstDelivery_FreshAndRecords covers the happy
-// path: empty table → CheckReplay returns nil AND records the row.
-// The audit seam is downstream of CheckReplay; covered separately.
-func TestCheckReplay_FirstDelivery_FreshAndRecords(t *testing.T) {
-	s := state.NewMemStore()
-	ctx := context.Background()
+// resetStoreForTest wipes the package-level sync.Map between tests.
+// The store is process-local by design; tests share it and must
+// not pollute each other.
+func resetStoreForTest(t *testing.T) {
+	t.Helper()
+	store.Range(func(k, _ any) bool { store.Delete(k); return true })
+}
 
-	if err := CheckReplay(ctx, s, ProviderGitHub, "delivery-abc-123"); err != nil {
+// setNowForTest swaps the package clock seam and returns a restore
+// closure. Tests that want to drive the TTL boundary without
+// sleeping can pin the clock to a known value.
+func setNowForTest(t *testing.T, when time.Time) func() {
+	t.Helper()
+	prev := nowFunc
+	nowFunc = func() time.Time { return when }
+	return func() { nowFunc = prev }
+}
+
+// TestCheckReplay_FirstDelivery_Fresh covers the happy path: empty
+// store → CheckReplay returns nil and records the entry.
+func TestCheckReplay_FirstDelivery_Fresh(t *testing.T) {
+	resetStoreForTest(t)
+	if err := CheckReplay(context.Background(), ProviderGitHub, "delivery-abc-123"); err != nil {
 		t.Fatalf("first delivery should be fresh; err=%v", err)
-	}
-	// Round-trip: a second CheckReplay within TTL should be rejected
-	// (proves the row was recorded).
-	err := CheckReplay(ctx, s, ProviderGitHub, "delivery-abc-123")
-	if !IsReplay(err) {
-		t.Fatalf("second delivery within TTL should be a replay; err=%v", err)
 	}
 }
 
 // TestCheckReplay_SecondDeliveryWithinTTL_Rejected covers the
-// security-critical branch: the same (provider, delivery_id) pair
-// arriving twice in the TTL window returns *Replay (errors.Is
-// matches state.ErrReplay).
+// security-critical branch: the same (provider, deliveryID) pair
+// arriving twice in the TTL window returns *Replay.
 func TestCheckReplay_SecondDeliveryWithinTTL_Rejected(t *testing.T) {
-	s := state.NewMemStore()
-	ctx := context.Background()
-
-	if err := CheckReplay(ctx, s, ProviderGitHub, "delivery-abc-123"); err != nil {
+	resetStoreForTest(t)
+	if err := CheckReplay(context.Background(), ProviderGitHub, "delivery-abc-123"); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
-	err := CheckReplay(ctx, s, ProviderGitHub, "delivery-abc-123")
+	err := CheckReplay(context.Background(), ProviderGitHub, "delivery-abc-123")
 	if err == nil {
 		t.Fatalf("second delivery within TTL should be rejected")
 	}
-	if !errors.Is(err, state.ErrReplay) {
-		t.Errorf("errors.Is(err, state.ErrReplay) = false; got %v", err)
-	}
 	if !IsReplay(err) {
 		t.Errorf("IsReplay(err) = false; got %v", err)
+	}
+	if !errors.Is(err, ErrReplay) {
+		t.Errorf("errors.Is(err, ErrReplay) = false; got %v", err)
 	}
 	var replay *Replay
 	if !errors.As(err, &replay) {
@@ -59,124 +64,102 @@ func TestCheckReplay_SecondDeliveryWithinTTL_Rejected(t *testing.T) {
 
 // TestCheckReplay_DeliveryAfterTTL_Fresh covers the TTL boundary:
 // a delivery whose stored expires_at is older than the cutoff
-// (computed as now-TTL inside CheckReplay) is treated as fresh
-// and re-recorded. We pre-seed a row via RecordWebhookDelivery
-// with a stale expires_at to exercise the path without sleeping.
+// (computed as now-TTL inside CheckReplay) is treated as fresh.
+// We pin the clock to seed an entry, advance, and re-check.
 func TestCheckReplay_DeliveryAfterTTL_Fresh(t *testing.T) {
-	s := state.NewMemStore()
-	ctx := context.Background()
-
-	// Pre-seed a row that is already past the TTL window — the
-	// MemStore's CheckWebhookReplay drops it inline (per
-	// memstore.go's TTL semantics), so CheckReplay sees it as
-	// fresh and refreshes expires_at.
-	if err := s.RecordWebhookDelivery(ctx, ProviderGitHub, "stale", time.Now().Add(-2*TTL)); err != nil {
+	resetStoreForTest(t)
+	restore := setNowForTest(t, time.Now())
+	defer restore()
+	if err := CheckReplay(context.Background(), ProviderGitHub, "stale"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := CheckReplay(ctx, s, ProviderGitHub, "stale"); err != nil {
+	// Advance the clock past the TTL window so the entry is stale.
+	nowFunc = func() time.Time { return time.Now().Add(2 * TTL) }
+	if err := CheckReplay(context.Background(), ProviderGitHub, "stale"); err != nil {
 		t.Fatalf("delivery after TTL should be fresh; err=%v", err)
 	}
 }
 
-// TestCheckReplay_DifferentProviders_Independent covers the PK
-// shape: same delivery_id, different provider → both fresh
-// (the (provider, delivery_id) PK on webhook_deliveries scopes
-// rows per provider, not globally).
+// TestCheckReplay_DifferentProviders_Independent covers the
+// provider-axis: same deliveryID, different provider → both fresh
+// (the dedupe key is (provider, deliveryID), not deliveryID alone).
 func TestCheckReplay_DifferentProviders_Independent(t *testing.T) {
-	s := state.NewMemStore()
+	resetStoreForTest(t)
 	ctx := context.Background()
-
-	if err := CheckReplay(ctx, s, ProviderGitHub, "shared-id"); err != nil {
+	if err := CheckReplay(ctx, ProviderGitHub, "shared-id"); err != nil {
 		t.Fatalf("github first delivery: %v", err)
 	}
-	if err := CheckReplay(ctx, s, ProviderStripe, "shared-id"); err != nil {
+	if err := CheckReplay(ctx, ProviderStripe, "shared-id"); err != nil {
 		t.Fatalf("stripe first delivery (different provider, same id) should be fresh; err=%v", err)
 	}
-	if err := CheckReplay(ctx, s, ProviderPaddle, "shared-id"); err != nil {
+	if err := CheckReplay(ctx, ProviderPaddle, "shared-id"); err != nil {
 		t.Fatalf("paddle first delivery (different provider, same id) should be fresh; err=%v", err)
 	}
 }
 
 // TestCheckReplay_DifferentDeliveryIDs_Independent covers the
-// second axis: same provider, different delivery_id → both fresh.
-// (Issue #294 acceptance criterion 4 is a happy-path test in
-// gatewayd; this one is the unit-level pair.)
+// deliveryID-axis: same provider, different deliveryID → both
+// fresh.
 func TestCheckReplay_DifferentDeliveryIDs_Independent(t *testing.T) {
-	s := state.NewMemStore()
+	resetStoreForTest(t)
 	ctx := context.Background()
-
-	if err := CheckReplay(ctx, s, ProviderGitHub, "delivery-1"); err != nil {
+	if err := CheckReplay(ctx, ProviderGitHub, "delivery-1"); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	if err := CheckReplay(ctx, s, ProviderGitHub, "delivery-2"); err != nil {
-		t.Fatalf("different delivery_id should be fresh; err=%v", err)
+	if err := CheckReplay(ctx, ProviderGitHub, "delivery-2"); err != nil {
+		t.Fatalf("different deliveryID should be fresh; err=%v", err)
 	}
 }
 
-// TestSweep_DropsExpiredRows covers the sweep's contract: rows
-// older than the cutoff are removed; rows newer than the cutoff
-// remain.
-func TestSweep_DropsExpiredRows(t *testing.T) {
-	s := state.NewMemStore()
-	ctx := context.Background()
-	now := time.Now()
-
-	if err := s.RecordWebhookDelivery(ctx, ProviderGitHub, "expired", now.Add(-time.Hour)); err != nil {
-		t.Fatalf("seed expired: %v", err)
+// TestCheckReplay_ConcurrentSafe is a smoke test for the
+// sync.Map-backed store: 50 goroutines hammer the same
+// (provider, deliveryID) — exactly one should observe nil, the
+// other 49 should observe a replay. Catches accidental
+// reintroductions of a non-thread-safe map.
+func TestCheckReplay_ConcurrentSafe(t *testing.T) {
+	resetStoreForTest(t)
+	const N = 50
+	var wg sync.WaitGroup
+	results := make([]error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = CheckReplay(context.Background(), ProviderGitHub, "concurrent-id")
+		}(i)
 	}
-	if err := s.RecordWebhookDelivery(ctx, ProviderGitHub, "fresh", now.Add(time.Hour)); err != nil {
-		t.Fatalf("seed fresh: %v", err)
+	wg.Wait()
+	var fresh, replay int
+	for _, err := range results {
+		if err == nil {
+			fresh++
+		} else if IsReplay(err) {
+			replay++
+		} else {
+			t.Errorf("unexpected error: %v", err)
+		}
 	}
-
-	swept, err := Sweep(ctx, s, now)
-	if err != nil {
-		t.Fatalf("Sweep: %v", err)
+	if fresh != 1 {
+		t.Errorf("fresh count = %d, want 1; replay count = %d", fresh, replay)
 	}
-	if swept != 1 {
-		t.Errorf("swept = %d, want 1", swept)
-	}
-	// After the sweep, the expired row's next CheckReplay is fresh
-	// (MemStore's CheckWebhookReplay drops it inline); the fresh
-	// row's next CheckReplay is a replay.
-	if err := CheckReplay(ctx, s, ProviderGitHub, "expired"); err != nil {
-		t.Errorf("after-sweep, expired should be fresh; got err=%v", err)
-	}
-	if err := CheckReplay(ctx, s, ProviderGitHub, "fresh"); !IsReplay(err) {
-		t.Errorf("after-sweep, fresh should still be a replay; got err=%v", err)
-	}
-}
-
-// TestErrReplay_AliasesStateSentinel pins the wrapper contract:
-// webhookdedupe.ErrReplay IS state.ErrReplay (same value, not a
-// wrap), so errors.Is(err, ErrReplay) and errors.Is(err,
-// state.ErrReplay) both match — callers that import only one of the
-// two packages get the same behaviour. The single assertion
-// (target = webhookdedupe.ErrReplay, needle = state.ErrReplay)
-// is the minimal check that proves value identity; the symmetric
-// direction is identical because the values are equal.
-func TestErrReplay_AliasesStateSentinel(t *testing.T) {
-	if !errors.Is(ErrReplay, state.ErrReplay) {
-		t.Errorf("errors.Is(webhookdedupe.ErrReplay, state.ErrReplay) = false; expected true (same value)")
+	if replay != N-1 {
+		t.Errorf("replay count = %d, want %d", replay, N-1)
 	}
 }
 
-// TestReplay_TypeAssertions covers the typed error wrapper for
-// callers that want both the bool (IsReplay) and the typed payload
-// (errors.As *Replay).
-func TestReplay_TypeAssertions(t *testing.T) {
-	inner := &Replay{Provider: ProviderStripe, DeliveryID: "evt_test_123"}
-	wrapped := state.ErrReplay // bare sentinel — covers the IsReplay(err) == true branch on bare sentinels too.
-
-	if !IsReplay(inner) {
-		t.Errorf("IsReplay on *Replay should be true")
+// TestErrReplay_Sentinel pins the wrapper contract:
+// webhookdedupe.ErrReplay is a package-local sentinel, and
+// *Replay.Is(target) matches it. Callers can use either
+// errors.Is(err, ErrReplay) or IsReplay(err).
+func TestErrReplay_Sentinel(t *testing.T) {
+	if !IsReplay(ErrReplay) {
+		t.Errorf("IsReplay(ErrReplay) = false; want true (bare sentinel)")
 	}
-	if !errors.Is(inner, state.ErrReplay) {
-		t.Errorf("errors.Is(*Replay, state.ErrReplay) should be true")
-	}
-	if !errors.Is(inner, ErrReplay) {
-		t.Errorf("errors.Is(*Replay, webhookdedupe.ErrReplay) should be true")
-	}
+	wrapped := &Replay{Provider: ProviderStripe, DeliveryID: "evt_test_123"}
 	if !IsReplay(wrapped) {
-		t.Errorf("IsReplay on bare state.ErrReplay should be true too — covers the sentinel-only branch")
+		t.Errorf("IsReplay(*Replay) = false; want true (wrapped)")
+	}
+	if !errors.Is(wrapped, ErrReplay) {
+		t.Errorf("errors.Is(*Replay, ErrReplay) = false; want true")
 	}
 }
