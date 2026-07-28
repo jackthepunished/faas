@@ -42,11 +42,15 @@ import (
 )
 
 // Observation is the cache's input: an instance id, a cumulative
-// CPU-µs reading, and the wall-clock moment the reading was taken.
+// CPU-µs reading, the cumulative cgroup throttled-µs reading
+// (issue #301, ADR-044), and the wall-clock moment the reading
+// was taken. ThrottledUsec is read from the same cpu.stat file as
+// CPUUsageUsec so a single per-tick cgroup read populates both.
 type Observation struct {
-	InstanceID   string
-	CPUUsageUsec uint64
-	At           time.Time
+	InstanceID    string
+	CPUUsageUsec  uint64
+	ThrottledUsec uint64
+	At            time.Time
 }
 
 // Reading is the cache's output: the rate (CPU percent of one
@@ -54,9 +58,31 @@ type Observation struct {
 // reset for this instance. CPUSeconds is a monotonic
 // counter-style value; CPUPct is the instantaneous rate between
 // the last two observations.
+//
+// ThrottledSeconds (issue #301, ADR-044) is the cumulative
+// CPU time this scope spent throttled, in seconds, since the
+// cache was last reset for this instance. Counter-shape value
+// (Σ(throttled_usec delta) / 1e6), used to label the
+// vmmd_cpu_throttle_seconds_total{account_id, app_id} counter
+// via schedd's rollup into the topAppSet admission (cap 100).
+// Resets on regression under the same contract as CPUSeconds.
+//
+// ThrottledRatio (issue #301, ADR-044) is the per-tick
+// throttle-to-total ratio:
+//
+//	ratio = (throttle_delta) / (throttle_delta + usage_delta)
+//
+// computed across the last two observations. The wire-side
+// vmmd_cpu_throttle_ratio{slice} gauge is the FaasCpuStarvation
+// alert source; the slice label is the per-instance ratio
+// averaged across all instances of the slice by the vmmd sampler.
+// Valid follows the same contract as the other fields — false on
+// baseline / regression / clock-skew.
 type Reading struct {
-	CPUPct     float64
-	CPUSeconds float64
+	CPUPct           float64
+	CPUSeconds       float64
+	ThrottledSeconds float64
+	ThrottledRatio   float64
 	// Valid is false when the cache has only one observation
 	// (baseline not yet established) or the previous observation
 	// was dropped on regression. Callers MUST treat Valid=false
@@ -65,19 +91,32 @@ type Reading struct {
 }
 
 type lastSample struct {
-	usage uint64
-	at    time.Time
+	usage     uint64
+	throttled uint64
+	at        time.Time
 	// accumSeconds is the cumulative CPUSeconds reading for this
 	// instance, preserved across the rate calculation. On
 	// regression it resets to 0 — same shape as the
 	// schedd-side seam, which sums Σ(usage_delta) over the
 	// instance's lifetime.
 	accumSeconds float64
+	// accumThrottledSeconds (issue #301, ADR-044) is the
+	// cumulative CPU-throttled-seconds reading for this
+	// instance, preserved across the rate calculation. On
+	// regression it resets to 0 under the same contract as
+	// accumSeconds. Counter-shape value drives the
+	// vmmd_cpu_throttle_seconds_total{account_id, app_id}
+	// wire field (SchedStats's ThrottledSeconds column) and
+	// the pkg/wire/topn_app.go topAppSet rollup.
+	accumThrottledSeconds float64
 	// lastRate is the most recent CPU% reading computed by
 	// Observe. Stored on the cache so the Stats gRPC handler
 	// can serve a fresh rate without doing any cgroup I/O or
 	// advancing the baseline. Reset to 0 on regression.
 	lastRate float64
+	// lastThrottledRatio is the most recent throttle ratio
+	// computed by Observe. Same caching rationale as lastRate.
+	lastThrottledRatio float64
 }
 
 // Cache is a per-instance rate-and-accumulator over
@@ -126,13 +165,17 @@ func (c *Cache) Observe(o Observation) (Reading, bool) {
 	prev, hadPrev := c.last[o.InstanceID]
 	// First observation: just record the baseline; no rate yet.
 	if !hadPrev {
-		c.last[o.InstanceID] = lastSample{usage: o.CPUUsageUsec, at: now}
+		c.last[o.InstanceID] = lastSample{usage: o.CPUUsageUsec, throttled: o.ThrottledUsec, at: now}
 		return Reading{Valid: false}, false
 	}
 	// Regression: drop baseline, start fresh. The next Observe
 	// will return ok=true with the post-regression rate.
-	if o.CPUUsageUsec < prev.usage {
-		c.last[o.InstanceID] = lastSample{usage: o.CPUUsageUsec, at: now}
+	// Either counter regressing (usage OR throttle) trips the
+	// reset — they're written by the same kernel struct under
+	// the same cgroup, so a regression in either one means a
+	// recreation that nuked both baselines.
+	if o.CPUUsageUsec < prev.usage || o.ThrottledUsec < prev.throttled {
+		c.last[o.InstanceID] = lastSample{usage: o.CPUUsageUsec, throttled: o.ThrottledUsec, at: now}
 		return Reading{Valid: false}, false
 	}
 	// No wall-clock progression: degenerate (clock didn't move,
@@ -140,9 +183,10 @@ func (c *Cache) Observe(o Observation) (Reading, bool) {
 	// accumulator and return Valid=false so callers don't
 	// divide by zero.
 	if !now.After(prev.at) {
-		return Reading{CPUSeconds: prev.accumSeconds}, false
+		return Reading{CPUSeconds: prev.accumSeconds, ThrottledSeconds: prev.accumThrottledSeconds, ThrottledRatio: prev.lastThrottledRatio}, false
 	}
 	deltaUsec := o.CPUUsageUsec - prev.usage
+	deltaThrottledUsec := o.ThrottledUsec - prev.throttled
 	deltaDur := now.Sub(prev.at)
 	deltaSeconds := deltaDur.Seconds()
 	// cpu_pct = 100 * (delta_usec / 1e6) / delta_seconds
@@ -151,7 +195,7 @@ func (c *Cache) Observe(o Observation) (Reading, bool) {
 	// cadence) so this never underflows in practice; we still
 	// guard for the clock-skew case.
 	if deltaSeconds <= 0 {
-		return Reading{CPUSeconds: prev.accumSeconds, Valid: false}, false
+		return Reading{CPUSeconds: prev.accumSeconds, ThrottledSeconds: prev.accumThrottledSeconds, ThrottledRatio: prev.lastThrottledRatio, Valid: false}, false
 	}
 	pct := 100.0 * (float64(deltaUsec) / 1e6) / deltaSeconds
 	// Clamp to a sane upper bound. A vCPU can consume at most
@@ -167,17 +211,35 @@ func (c *Cache) Observe(o Observation) (Reading, bool) {
 	if pct < 0 {
 		pct = 0
 	}
+	// throttle_ratio = throttle_delta / (throttle_delta + usage_delta)
+	// (issue #301, ADR-044). When both deltas are zero the
+	// VM didn't run at all in this window — ratio is 0 by
+	// convention (a true "no throttle" reading, distinct from
+	// "no data"). Denominator guarded against the
+	// (vanishingly-unlikely) case where both deltas are exactly
+	// zero via an explicit check.
+	totalDeltaUsec := deltaUsec + deltaThrottledUsec
+	var throttleRatio float64
+	if totalDeltaUsec > 0 {
+		throttleRatio = float64(deltaThrottledUsec) / float64(totalDeltaUsec)
+	}
 	accum := prev.accumSeconds + float64(deltaUsec)/1e6
+	accumThrottled := prev.accumThrottledSeconds + float64(deltaThrottledUsec)/1e6
 	c.last[o.InstanceID] = lastSample{
-		usage:        o.CPUUsageUsec,
-		at:           now,
-		accumSeconds: accum,
-		lastRate:     pct,
+		usage:                 o.CPUUsageUsec,
+		throttled:             o.ThrottledUsec,
+		at:                    now,
+		accumSeconds:          accum,
+		accumThrottledSeconds: accumThrottled,
+		lastRate:              pct,
+		lastThrottledRatio:    throttleRatio,
 	}
 	return Reading{
-		CPUPct:     pct,
-		CPUSeconds: accum,
-		Valid:      true,
+		CPUPct:           pct,
+		CPUSeconds:       accum,
+		ThrottledSeconds: accumThrottled,
+		ThrottledRatio:   throttleRatio,
+		Valid:            true,
 	}, true
 }
 
@@ -236,9 +298,11 @@ func (c *Cache) Lookup(instanceID string) (Reading, bool) {
 		return Reading{Valid: false}, false
 	}
 	return Reading{
-		CPUPct:     prev.lastRate,
-		CPUSeconds: prev.accumSeconds,
-		Valid:      true,
+		CPUPct:           prev.lastRate,
+		CPUSeconds:       prev.accumSeconds,
+		ThrottledSeconds: prev.accumThrottledSeconds,
+		ThrottledRatio:   prev.lastThrottledRatio,
+		Valid:            true,
 	}, true
 }
 

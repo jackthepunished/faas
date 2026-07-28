@@ -47,6 +47,16 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// when it calls CreateFromSnapshot; passing it on the wire
 		// means vmmd doesn't have to round-trip back to apid.
 		AppID: app.GetAppId(),
+		// issue #301 / ADR-044 — Plan + AccountID thread the
+		// apps-row context onto the wire so vmmd can land the VM
+		// under the per-plan cgroup sub-slice
+		// (faas-tenant.slice/<plan-slice>/<instance>) and label
+		// the vmmd_cpu_throttle_seconds_total counter. Empty
+		// Plan falls back to the legacy 2-level path
+		// (ParentCgroupRoot/<instance>) for pre-#301 callers;
+		// new callers must always populate this.
+		Plan:      api.Plan(req.GetPlan()),
+		AccountID: req.GetAccountId(),
 	}
 	if snap != nil {
 		// #96 / ADR-025 axis 2 (slice 3) — mem_path is gone from the
@@ -107,6 +117,12 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// instance via m.live[].AppID without a separate
 		// bootstrap path.
 		AppID: app.GetAppId(),
+		// issue #301 / ADR-044 — see toWakeRequest. Cold-boot
+		// mirrors Plan + AccountID so deploy's first boot on a
+		// fresh VM lands under the per-plan cgroup sub-slice
+		// and the throttle counter labels are populated.
+		Plan:      api.Plan(req.GetPlan()),
+		AccountID: req.GetAccountId(),
 	}, nil
 }
 

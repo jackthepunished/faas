@@ -1,4 +1,4 @@
-# systemd_slices (spec §13, §1).
+# systemd_slices (spec §13, §1, ADR-044).
 #
 # Drops three `.slice` unit files that PUT HARD MEMORY CEILINGS on the
 # VM resource accounting. Numbers come from the `pkg/api/limits.go`
@@ -9,6 +9,20 @@
 #   faas-cp.slice     : MemoryMax=6144M   (postgres + daemons; spec §13 budget row)
 #   faas-build.slice  : MemoryMax=4096M, Parent=faas-cp.slice
 #                                                (1 guaranteed slot + 1 opportunistic)
+#
+# Per-plan sub-slices (issue #301, ADR-044):
+#   faas-tenant.slice/tenant-free.slice  : CPUWeight=2   Parent=faas-tenant.slice
+#   faas-tenant.slice/tenant-hobby.slice : CPUWeight=4   Parent=faas-tenant.slice
+#   faas-tenant.slice/tenant-pro.slice   : CPUWeight=8   Parent=faas-tenant.slice
+#   faas-tenant.slice/tenant-scale.slice: CPUWeight=16  Parent=faas-tenant.slice
+# The weights encode the issue's literal ratio (Free:2 / Hobby:4 / Pro:8 /
+# Scale:16) — see pkg/api/limits.go::Limits.CPUWeight and the SliceName()
+# mapping (tenant-free/hobby/pro/scale). These weights are KERNEL-ACCOUNTED
+# from boot so the cgroup is correctly weighted even before vmmd writes the
+# per-VM cpu.max. Memory charge stays pooled to faas-tenant.slice; per-VM
+# memory.max is still written by vmmd via the jailer (spec §13, Gotchas).
+# We do NOT set MemoryMax / CPUQuota here — doing so would override the
+# parent's hard fence.
 #
 # The slot definitions alone are not enough — the corresponding
 # daemon `daemon.slice` units land in M5. Until then the slices are
@@ -30,6 +44,40 @@
       MemoryMax=57344M
       CPUQuota=1600%
   register: tenant_slice
+
+# ADR-044 — per-plan CPUWeight sub-slices. The loop mirrors
+# pkg/api/limits.go::Plan.SliceName() + Limits.CPUWeight (Free=2, Hobby=4,
+# Pro=8, Scale=16). Parent=faas-tenant.slice is required because systemd
+# does NOT auto-nest; without it the unit is a sibling of faas-tenant.slice
+# and the per-VM cpu.max inherits nothing. No MemoryMax / CPUQuota on the
+# sub-slices — the parent's hard fence is the only memory ceiling, and
+# per-instance cpu.max is written by vmmd (jailer v1.7 has no --cgroup
+# cpu.max arg).
+- name: systemd_slices — write per-plan tenant sub-slices (CPUWeight only)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=onebox-faas tenant-{{ item.plan }} microVMs (CPUWeight {{ item.weight }}, ADR-044)
+      # issue #301, ADR-044 — see pkg/api/limits.go::(Plan).SliceName() and
+      # Limits.CPUWeight. Parent= must be explicit (systemd does not
+      # auto-nest). No MemoryMax — memory charge pools to faas-tenant.slice;
+      # per-VM memory.max is written by vmmd (jailer).
+
+      [Slice]
+      CPUWeight={{ item.weight }}
+      Parent=faas-tenant.slice
+  loop:
+    - { plan: free,  dest: tenant-free.slice,  weight: 2 }
+    - { plan: hobby, dest: tenant-hobby.slice, weight: 4 }
+    - { plan: pro,   dest: tenant-pro.slice,   weight: 8 }
+    - { plan: scale, dest: tenant-scale.slice, weight: 16 }
+  loop_control:
+    label: "{{ item.dest }}"
+  register: plan_slices
 
 - name: systemd_slices — write faas-cp.slice
   ansible.builtin.copy:
@@ -67,4 +115,4 @@
 - name: systemd_slices — daemon-reload
   ansible.builtin.systemd:
     daemon_reload: true
-  when: cp_slice is changed or build_slice is changed or tenant_slice is changed
+  when: cp_slice is changed or build_slice is changed or tenant_slice is changed or plan_slices is changed

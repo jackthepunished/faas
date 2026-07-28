@@ -57,6 +57,25 @@ type InstanceStatRow struct {
 	RSSMB            float64
 	InflightRequests int64
 	CPUSeconds       float64
+	// AccountID is the apps row's owning account (issue #301,
+	// ADR-044). Required by the vmmd-side throttle counter so
+	// the (account_id, app_id) label tuple is well-formed; the
+	// top-100 admission primitive (topAppSet) keys on the
+	// composite. Empty string is treated as "anonymous" by the
+	// admission setter (matching the requestTotal overflow
+	// policy) so a missing owner doesn't explode the wire
+	// surface.
+	AccountID string
+	// ThrottledUsec is the cumulative cpu.stat throttled_usec
+	// for the instance's cgroup slice (issue #301, ADR-044).
+	// 0 means "no baseline yet" — the wire does not emit a
+	// counter delta for that row. Otherwise the rollup Adds
+	// the per-row delta to vmmd_cpu_throttle_seconds_total{account_id,
+	// app_id} via the per-(account_id, app_id) baseline in
+	// cpuThrottleLastSeen. NaN is treated as 0. The cpu.max
+	// ratio gauge (vmmd_cpu_throttle_ratio{slice}) is the
+	// alert source; this counter is the dashboard top-N view.
+	ThrottledUsec float64
 }
 
 // OpsMetrics is the (per-daemon) bundle emitted at /metrics. Construct via
@@ -184,6 +203,47 @@ type OpsMetrics struct {
 	// topAccounts: the bounded top-N admission primitive that
 	// drives topTenantRPS. See pkg/wire/topn.go for the contract.
 	topAccounts *topAccountSet
+	// throttleSecondsTotal (issue #301 / ADR-044): cumulative
+	// vmmd CPU-throttled seconds per (account_id, app_id).
+	// Counter (not Gauge) because the value is monotonic between
+	// cgroup regressions — the rollup Adds the per-row delta
+	// (curr - last) via the per-(account_id, app_id) baseline in
+	// throttleSecondsLastSeen. The label tuple is bounded by
+	// topAppSetCap (100) real cached pairs plus the
+	// ("other", "other") overflow; the actual Prometheus series
+	// set is also bounded by topAppSet's snapshot emission.
+	// Layered above accountLabelSet the same way topTenantRPS
+	// is: an (account_id, app_id) pair admitted at the 10k
+	// account-id level can still be demoted past the top-100
+	// here. The counter is the dashboard top-N view; the
+	// FaasCpuStarvation alert (issue #301 acceptance #3) reads
+	// from the sibling throttleRatio gauge instead.
+	throttleSecondsTotal *prometheus.CounterVec
+	// throttleRatio (issue #301 / ADR-044): per-slice throttle
+	// ratio (throttle_delta / (throttle_delta + usage_delta))
+	// over the 5s sampler window. Gauge (not Counter) because
+	// the value is computed windowed, not cumulative. Labelled
+	// by slice ∈ {tenant-free, tenant-hobby, tenant-pro,
+	// tenant-scale}; the closed plan set is pre-instantiated at
+	// boot so the dashboard surfaces "no data" → "0" on an
+	// idle box. The FaasCpuStarvation alert reads
+	// throttleRatio{slice=~"tenant-.*"} > 0.8 for 5m.
+	throttleRatio *prometheus.GaugeVec
+	// topApps: the bounded top-N admission primitive that
+	// drives throttleSecondsTotal. Keyed on the composite
+	// (account_id, app_id); cap = topAppSetCap (100). See
+	// pkg/wire/topn_app.go for the contract. Sibling of
+	// topAccounts (issue #300's per-customer noise primitive)
+	// with a smaller cap and a composite key — see the
+	// package doc on topn_app.go for why a separate type.
+	topApps *topAppSet
+	// throttleSecondsLastSeen: per-(account_id, app_id) baseline
+	// for the cumulative throttleSecondsTotal counter. Mirrors
+	// cpuSecondsLastSeen (issue #279 / PR-B) — on regression
+	// (curr < last) the baseline is reset to curr and the
+	// delta is 0, so the counter stays monotonic. See
+	// cpuSecondsLastSeen for the full mutex + map contract.
+	throttleSecondsLastSeen *cpuThrottleLastSeen
 	// stripePushDur: introduced in feat/m7-stripe-push-observability.
 	// Per-push latency to Stripe, labelled by terminal result code.
 	// Distinct from the dur histogram (which labels by op only) because
@@ -634,6 +694,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_instance_cpu_seconds_total",
 		Help: "Cumulative CPU-seconds consumed by live instances, per (app, node) — sum over live siblings, source is vmmd's cpu_seconds wire field (issue #279 / PR-B).",
 	}, []string{"app", "node"})
+	// issue #301 / ADR-044: per-app CPU-throttle counter (the
+	// dashboard top-N view) + per-slice throttle ratio gauge (the
+	// FaasCpuStarvation alert source). See the field doc comments
+	// on throttleSecondsTotal and throttleRatio for the cardinality
+	// contract and the two-tier admission via topAppSet.
+	throttleSecondsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_cpu_throttle_seconds_total",
+		Help: "Cumulative CPU-seconds the cgroup spent throttled, per (account_id, app_id) — sum over live siblings, source is vmmd's cpu.stat throttled_usec (issue #301, ADR-044). Bounded at topAppSetCap (100) real cached pairs plus the (\"other\", \"other\") overflow; the (account_id, app_id) tuple is layered above accountLabelSet so a customer id at the 10k level can still be demoted past the top-100 here. Default overflow label is (\"other\", \"other\"); the panel selector {app_id!=\"other\"} excludes the overflow bucket. The FaasCpuStarvation alert reads the sibling throttleRatio gauge instead.",
+	}, []string{"account_id", "app_id"})
+	throttleRatio := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_cpu_throttle_ratio",
+		Help: "Per-slice throttle ratio (throttle_delta / (throttle_delta + usage_delta)) over the 5s sampler window (issue #301, ADR-044). Labelled by slice ∈ {tenant-free, tenant-hobby, tenant-pro, tenant-scale}; the closed plan set is pre-instantiated at boot so the dashboard surfaces 'no data' → '0' on an idle box. The FaasCpuStarvation alert reads slice=~\"tenant-.*\" > 0.8 for 5m. Ratio is the operationally meaningful number — a counter delta alone would conflate 'lots of CPU, low throttle' with 'no CPU, no throttle'.",
+	}, []string{"slice"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
 	// label set is closed ({admit, reject_at_cap, no_signal});
 	// pre-instantiated below so the rows surface in /metrics from
@@ -722,6 +795,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginAuditWriteFailures,
 		topTenantRPS,
 		apidLogsEmittedTotal,
+		throttleSecondsTotal, throttleRatio,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -884,6 +958,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// listener.go), which routes through topAccountSet and demotes past
 	// top-1000 into this bucket.
 	topTenantRPS.WithLabelValues(topAccountOtherLabel)
+	// issue #301 / ADR-044: pre-instantiate the closed "slice"
+	// label set for throttleRatio (the FaasCpuStarvation alert
+	// source) so the gauge surfaces "no data" → "0" on an idle
+	// box. The slice values are the api.Plan.SliceName() set
+	// (tenant-free, tenant-hobby, tenant-pro, tenant-scale);
+	// the alert's `slice=~"tenant-.*"` matcher stays stable
+	// for any future tenant-customer slice hierarchy.
+	for _, slice := range []string{"tenant-free", "tenant-hobby", "tenant-pro", "tenant-scale"} {
+		throttleRatio.WithLabelValues(slice)
+	}
+	// Pre-instantiate the ("other", "other") overflow bucket for
+	// throttleSecondsTotal so the dashboard's
+	// {app_id!="other"} selector excludes a series that exists
+	// from boot. Real (account_id, app_id) pairs are added by
+	// ObserveTopAppThrottle (the vmmd-side sampler, fed via
+	// ReplaceInstanceStats) which routes through topAppSet and
+	// demotes past top-100 into this bucket.
+	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	// issue #171: pre-instantiate the {park, keep} outcome rows for
 	// the empty-app label so the help/TYPE surfaces in /metrics from
 	// boot, mirroring the scale-up pattern above.
@@ -913,6 +1005,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ipLabels:                      newIPLabelSet(maxIPLabelValues),
 		topTenantRPS:                  topTenantRPS,
 		topAccounts:                   newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:          throttleSecondsTotal,
+		throttleRatio:                 throttleRatio,
+		topApps:                       newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:       newCPUThrottleLastSeen(),
 		cpuSecondsLast:                newCPUSecondsLastSeen(),
 		stripePushDur:                 stripePushDur,
 		paddlePushDur:                 paddlePushDur,
@@ -1193,6 +1289,124 @@ func (m *OpsMetrics) TopAccountSet() *topAccountSet {
 		return nil
 	}
 	return m.topAccounts
+}
+
+// TopAppSet exposes the bounded admission primitive for the per-app
+// throttle counter (issue #301, ADR-044). Same nil-safe contract as
+// TopAccountSet. The return type is the sibling *topAppSet; the
+// sampler calls into ShouldReset/ResetWindow/SnapshotAppCounts
+// instead of the topAccountSet methods.
+func (m *OpsMetrics) TopAppSet() *topAppSet {
+	if m == nil {
+		return nil
+	}
+	return m.topApps
+}
+
+// ShouldReset returns true if the rolling 24h window has elapsed
+// since the last resetWindow. Cheap read; called from the 5s
+// sampler tick. Forwarded from *topAppSet so the sampler stays
+// decoupled from the primitive's unexported state.
+func (s *topAppSet) ShouldReset() bool {
+	if s == nil {
+		return false
+	}
+	return s.shouldReset()
+}
+
+// ResetWindow wipes the rolling-window counts and updates
+// lastReset. Called by the sampler goroutine every 24h. Nil-safe.
+func (s *topAppSet) ResetWindow() {
+	if s == nil {
+		return
+	}
+	s.resetWindow()
+}
+
+// SnapshotAppCounts returns a copy of the current per-(account_id,
+// app_id) rolling counts. Used by the vmmd-side sampler
+// (cmd/vmmd/throttle_sampler.go, fed via ReplaceInstanceStats) to
+// compute the per-tick delta between successive ticks. The
+// returned map is a fresh allocation; callers may mutate it freely.
+func (s *topAppSet) SnapshotAppCounts() map[appKey]uint64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[appKey]uint64, len(s.counts))
+	for k, count := range s.counts {
+		out[k] = count
+	}
+	return out
+}
+
+// ObserveTopAppThrottle records a throttle observation for the
+// given (accountID, appID) into the bounded top-N admission
+// primitive (issue #301, ADR-044). Cheap path: takes the topAppSet
+// lock, increments the count, releases. Does NOT touch the counter
+// — that happens once per 5s tick via EmitTopAppThrottle, called
+// from the vmmd-side sampler.
+//
+// accountID flows through accountLabelSet so the 10k overflow
+// collapses to "__other__" upstream of the top-N primitive. Empty
+// or nil accountID resolves to "anonymous" (mirroring the
+// requestTotal overflow policy) so a missing owner doesn't explode
+// the wire surface.
+//
+// Safe on a nil receiver.
+func (m *OpsMetrics) ObserveTopAppThrottle(accountID, appID string) {
+	if m == nil || m.topApps == nil {
+		return
+	}
+	safe := m.accountLabel(accountID)
+	m.topApps.sample(safe, appID)
+}
+
+// EmitTopAppThrottle drives the counter emission from the sampler
+// goroutine's once-per-tick snapshot. Reads topNSnapshot, adds one
+// counter delta per tuple, and emits the ("other", "other")
+// overflow row for any (account_id, app_id) not in the top-N.
+// perAppThrottleSeconds is a closure that returns the current tick's
+// throttle-seconds for the given pair (e.g. from the underlying
+// throttleSecondsLastSeen baseline).
+//
+// Returns the number of series emitted (always ≤ cap + 1).
+//
+// Safe on a nil receiver — returns 0.
+func (m *OpsMetrics) EmitTopAppThrottle(perAppThrottleSeconds func(accountID, appID string) float64) int {
+	if m == nil || m.topApps == nil || m.throttleSecondsTotal == nil {
+		return 0
+	}
+	snap := m.topApps.topNSnapshot()
+	for _, c := range snap {
+		delta := perAppThrottleSeconds(c.accountID, c.appID)
+		if delta > 0 {
+			m.throttleSecondsTotal.WithLabelValues(c.accountID, c.appID).Add(delta)
+		}
+	}
+	// Always emit the ("other", "other") overflow row so the
+	// panel selector {app_id!="other"} never sees "no data".
+	overflow := perAppThrottleSeconds(topAppOtherAccountLabel, topAppOtherLabel)
+	if overflow > 0 {
+		m.throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel).Add(overflow)
+	}
+	return len(snap) + 1
+}
+
+// SetThrottleRatio sets the per-slice throttle ratio gauge
+// (issue #301, ADR-044). Called by the vmmd-side sampler after
+// computing the per-tick (throttle_delta / (throttle_delta +
+// usage_delta)) ratio. slice must be one of the api.Plan.SliceName
+// values ("tenant-free", "tenant-hobby", "tenant-pro",
+// "tenant-scale"); the closed set is pre-instantiated at boot
+// (see the loop at top of NewOpsMetrics) so /metrics always
+// surfaces a row. Safe on a nil receiver.
+func (m *OpsMetrics) SetThrottleRatio(slice string, ratio float64) {
+	if m == nil || m.throttleRatio == nil {
+		return
+	}
+	m.throttleRatio.WithLabelValues(slice).Set(ratio)
 }
 
 // ShouldReset returns true if the rolling 24h window has elapsed
@@ -1538,6 +1752,15 @@ func (m *OpsMetrics) BillingCapExceededTotal(plan string) {
 //     in cpuSecondsLastSeen. On regression (curr < last) the
 //     baseline is reset to curr and the delta is 0, so the
 //     counter stays monotonic. NaN is treated as 0.
+//   - ThrottledUsec (issue #301 / ADR-044): sum — cumulative
+//     cgroup throttled_usec, fed into the per-(account_id,
+//     app_id) baseline in cpuThrottleLastSeen. The CounterVec
+//     emission happens via EmitTopAppThrottle from the
+//     vmmd-side sampler (each vmmd polls its own per-instance
+//     baseline; the Sampler picks the top-N every 5s). Here
+//     we just record the per-tick sample into topAppSet so the
+//     100-app invariant has the data to rank. NaN is treated
+//     as 0.
 //
 // After each call the three gauge label sets are exactly the
 // (app, node) pairs present in rows. The GaugeVec.Reset() call
@@ -1630,6 +1853,51 @@ func (m *OpsMetrics) ReplaceInstanceStats(rows []InstanceStatRow, dur time.Durat
 		if delta > 0 {
 			m.instanceCPUSecondsTotal.WithLabelValues(app, node).Add(delta)
 		}
+	}
+	// Third pass (issue #301 / ADR-044): sum ThrottledUsec per
+	// (account_id, app_id), record the per-tick sample in
+	// topAppSet (the bounded top-100 admission primitive), and
+	// update the per-pair baseline in cpuThrottleLastSeen. The
+	// actual counter emission is via EmitTopAppThrottle from the
+	// vmmd-side sampler (the Sampler closes the loop with the
+	// per-tick delta); here we just (a) keep the baseline fresh
+	// and (b) bump the topAppSet count so the top-N ranking
+	// stays accurate. NaN values are skipped (the "absent this
+	// tick" sentinel never contributes to a monotonic counter).
+	throttleTotals := make(map[string]float64, len(rows))
+	throttleKeys := make(map[string]appKey, len(rows))
+	for _, r := range rows {
+		if math.IsNaN(r.ThrottledUsec) {
+			continue
+		}
+		// accountID is the apps row's owner; empty falls
+		// through to the "anonymous" admission label so the
+		// topAppSet is bounded consistently with the other
+		// account-labelled metrics.
+		accountID := r.AccountID
+		if accountID == "" {
+			accountID = "anonymous"
+		}
+		key := accountID + "\x00" + r.AppID
+		throttleTotals[key] += r.ThrottledUsec
+		throttleKeys[key] = appKey{accountID: accountID, appID: r.AppID}
+	}
+	for key, curr := range throttleTotals {
+		k := throttleKeys[key]
+		// Bump the topAppSet count so the top-N ranking
+		// reflects the current tick. The Sampler closes the
+		// loop with EmitTopAppThrottle — but the rank
+		// primitive must see the observation first.
+		if m.topApps != nil {
+			m.topApps.sample(k.accountID, k.appID)
+		}
+		// Update the per-pair baseline so the Sampler's
+		// perAppThrottleSeconds closure can compute the
+		// delta between rolls. The first observation
+		// returns 0 (no prior baseline); the Sampler must
+		// skip the first tick the same way it does for the
+		// (app, node) CPUSeconds pass.
+		m.throttleSecondsLastSeen.add(key, curr)
 	}
 }
 
@@ -2051,4 +2319,56 @@ func (s *cpuSecondsLastSeen) add(key string, curr float64) float64 {
 	delta := curr - prev
 	s.m[key] = curr
 	return delta
+}
+
+// cpuThrottleLastSeen is the per-(account_id, app_id) memory of
+// the last ThrottledUsec value the rollup saw (issue #301,
+// ADR-044). Mirrors cpuSecondsLastSeen (issue #279 / PR-B) — the
+// regression guard for throttleSecondsTotal. The key is the
+// NUL-joined composite so the rollup in ReplaceInstanceStats can
+// reuse the same key-join / splitKey approach as the existing
+// CPUSeconds pass. The set is bounded structurally by the (account_id,
+// app_id) cardinality at the topAppSet admission layer (max 100 +
+// 1 overflow), so no eviction is needed — when an (account_id,
+// app_id) pair disappears (the app is parked) the entry is just
+// left in place; on a reappearance with a smaller value the
+// regression branch handles the reset.
+type cpuThrottleLastSeen struct {
+	mu sync.Mutex
+	m  map[string]float64
+}
+
+func newCPUThrottleLastSeen() *cpuThrottleLastSeen {
+	return &cpuThrottleLastSeen{m: make(map[string]float64)}
+}
+
+// add computes the per-tick delta: returns the (curr - last)
+// delta in seconds (the wire-side ThrottledUsec is microseconds
+// and the counter is in seconds; the conversion is here so the
+// call site is one obvious primitive). On a regression (curr <
+// last) the baseline is reset to curr and the returned delta is
+// 0 (counter stays monotonic). On the first observation (last
+// missing) the curr is returned — the vmmd cpustats cache resets
+// its own baseline on regression so the first post-restart reading
+// is a fresh cumulative value, not a delta.
+//
+// curr is microseconds (matches the cpu.stat throttled_usec
+// field); the return value is seconds (matches the Prometheus
+// "_seconds_total" naming convention — `rate()` over a
+// "_seconds_total" counter is the operationally useful
+// derivative).
+func (s *cpuThrottleLastSeen) add(key string, currMicroseconds float64) float64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.m[key]
+	if !ok || currMicroseconds < prev {
+		s.m[key] = currMicroseconds
+		return 0
+	}
+	deltaMicroseconds := currMicroseconds - prev
+	s.m[key] = currMicroseconds
+	return deltaMicroseconds / 1_000_000
 }

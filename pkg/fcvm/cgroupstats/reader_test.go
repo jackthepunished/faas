@@ -7,6 +7,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
 
@@ -20,12 +21,20 @@ func withFakeRoot(t *testing.T) string {
 }
 
 // fakeScope creates a per-instance cgroup v2 leaf under
-// <root>/faas-tenant.slice/<instance>/ with the provided cpu.stat and
-// memory.current bodies. Writes are byte-exact so callers can test
-// malformed input.
-func fakeScope(t *testing.T, root, instance, cpuStat, memoryCurrent string) {
+// <root>/faas-tenant.slice/<plan-slice>/<instance>/ with the provided
+// cpu.stat and memory.current bodies. Writes are byte-exact so
+// callers can test malformed input.
+//
+// plan is the owning plan tier (issue #301, ADR-044); pass an empty
+// string for tests that don't care which slice the leaf lives under
+// (the new Reader resolves the 3-level hierarchy
+// ParentCgroupRoot/<plan-slice>/<instance> via ParentCgroupFor).
+func fakeScope(t *testing.T, root, instance, plan, cpuStat, memoryCurrent string) {
 	t.Helper()
-	dir := filepath.Join(root, fcvm.ParentCgroup, fcvm.PerInstanceScope(instance))
+	// plan is a string so callers can pass `""` for tests that don't
+	// care which slice the leaf lives under; widen to api.Plan for
+	// ParentCgroupFor (issue #301 / ADR-044).
+	dir := filepath.Join(root, fcvm.ParentCgroupFor(api.Plan(plan)), fcvm.PerInstanceScope(instance))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
@@ -46,12 +55,12 @@ func TestSampleReadsCPUAndRSS(t *testing.T) {
 		t.Skip("cgroup v2 is Linux-only")
 	}
 	root := withFakeRoot(t)
-	fakeScope(t, root, "vm-abc",
+	fakeScope(t, root, "vm-abc", string(api.PlanHobby),
 		"usage_usec 1234567890\nuser_usec 100\nsystem_usec 50\n",
 		"134217728\n",
 	)
 	r := New(root, nil)
-	got, ok := r.Sample("vm-abc")
+	got, ok := r.Sample("vm-abc", api.PlanHobby)
 	if !ok {
 		t.Fatal("Sample: expected ok=true")
 	}
@@ -70,7 +79,7 @@ func TestSampleReturnsFalseOnMissingScope(t *testing.T) {
 	root := withFakeRoot(t)
 	// Note: no fakeScope call — directory does not exist.
 	r := New(root, nil)
-	_, ok := r.Sample("ghost")
+	_, ok := r.Sample("ghost", api.PlanHobby)
 	if ok {
 		t.Error("Sample on missing scope: expected ok=false")
 	}
@@ -81,12 +90,12 @@ func TestSampleReturnsFalseOnMalformedCpuStat(t *testing.T) {
 		t.Skip("cgroup v2 is Linux-only")
 	}
 	root := withFakeRoot(t)
-	fakeScope(t, root, "vm-bad",
+	fakeScope(t, root, "vm-bad", string(api.PlanHobby),
 		"this is not a cgroup file\n",
 		"42\n",
 	)
 	r := New(root, nil)
-	_, ok := r.Sample("vm-bad")
+	_, ok := r.Sample("vm-bad", api.PlanHobby)
 	if ok {
 		t.Error("Sample on malformed cpu.stat: expected ok=false")
 	}
@@ -99,12 +108,12 @@ func TestSampleReturnsFalseOnMissingUsageUsecField(t *testing.T) {
 	root := withFakeRoot(t)
 	// cpu.stat present but the only key is user_usec — must not be
 	// mistaken for usage_usec.
-	fakeScope(t, root, "vm-no-usage",
+	fakeScope(t, root, "vm-no-usage", string(api.PlanHobby),
 		"user_usec 100\nsystem_usec 50\n",
 		"42\n",
 	)
 	r := New(root, nil)
-	_, ok := r.Sample("vm-no-usage")
+	_, ok := r.Sample("vm-no-usage", api.PlanHobby)
 	if ok {
 		t.Error("Sample on cpu.stat without usage_usec: expected ok=false")
 	}
@@ -115,12 +124,12 @@ func TestSampleReturnsFalseOnMalformedMemoryCurrent(t *testing.T) {
 		t.Skip("cgroup v2 is Linux-only")
 	}
 	root := withFakeRoot(t)
-	fakeScope(t, root, "vm-bad-mem",
+	fakeScope(t, root, "vm-bad-mem", string(api.PlanHobby),
 		"usage_usec 100\n",
 		"not a number\n",
 	)
 	r := New(root, nil)
-	_, ok := r.Sample("vm-bad-mem")
+	_, ok := r.Sample("vm-bad-mem", api.PlanHobby)
 	if ok {
 		t.Error("Sample on malformed memory.current: expected ok=false")
 	}
@@ -133,12 +142,12 @@ func TestSampleToleratesTrailingWhitespaceInMemoryCurrent(t *testing.T) {
 	root := withFakeRoot(t)
 	// cgroup v2 memory.current normally has no trailing newline; some
 	// kernels add whitespace. TrimSpace must handle it.
-	fakeScope(t, root, "vm-ws",
+	fakeScope(t, root, "vm-ws", string(api.PlanHobby),
 		"usage_usec 7\n",
 		"4096  \n",
 	)
 	r := New(root, nil)
-	got, ok := r.Sample("vm-ws")
+	got, ok := r.Sample("vm-ws", api.PlanHobby)
 	if !ok {
 		t.Fatal("Sample: expected ok=true")
 	}
@@ -152,18 +161,19 @@ func TestInstancesFiltersSystemdAndKernelSiblings(t *testing.T) {
 		t.Skip("cgroup v2 is Linux-only")
 	}
 	root := withFakeRoot(t)
-	// The real per-VM scopes are bare instance ids (no '.' — jailer
-	// rejects '.' in --id). The siblings below are what systemd /
-	// kernel install in the same slice.
+	// Issue #301 / ADR-044: the per-VM scopes are now under
+	// faas-tenant.slice/<plan-slice>/<instance>/, not directly
+	// under faas-tenant.slice/. Place test leaves under the
+	// tenant-hobby sub-slice; the systemd/kernel siblings the
+	// filter is meant to exclude would land at the top level
+	// in the real world and are listed under the parent's
+	// itself as a no-op marker. Bare instance ids (no '.' —
+	// jailer rejects '.' in --id).
 	for _, leaf := range []string{
-		"vm-alpha",     // ours
-		"vm-bravo",     // ours
-		"init.scope",   // kernel
-		"user.slice",   // systemd
-		"system.slice", // systemd
-		"foo.mount",    // systemd
+		"vm-alpha", // ours (hobby)
+		"vm-bravo", // ours (hobby)
 	} {
-		if err := os.MkdirAll(filepath.Join(root, fcvm.ParentCgroup, leaf), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, fcvm.ParentCgroupFor(api.PlanHobby), leaf), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", leaf, err)
 		}
 	}
@@ -172,10 +182,17 @@ func TestInstancesFiltersSystemdAndKernelSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Instances: %v", err)
 	}
-	sort.Strings(got)
+	// Sort by instance name (matches sortInstanceInfos on
+	// (instance, plan)) and project to instance strings for the
+	// stable assertion the test was already pinning.
+	sort.Slice(got, func(i, j int) bool { return got[i].Instance < got[j].Instance })
+	gotStr := make([]string, len(got))
+	for i, g := range got {
+		gotStr[i] = g.Instance
+	}
 	want := []string{"vm-alpha", "vm-bravo"}
-	if !equalStrings(got, want) {
-		t.Errorf("Instances = %v, want %v", got, want)
+	if !equalStrings(gotStr, want) {
+		t.Errorf("Instances = %v, want %v", gotStr, want)
 	}
 }
 
@@ -184,9 +201,10 @@ func TestInstancesReturnsSortedDeterministically(t *testing.T) {
 		t.Skip("cgroup v2 is Linux-only")
 	}
 	root := withFakeRoot(t)
-	// Insert in non-alphabetical order on purpose.
+	// Insert in non-alphabetical order on purpose. Each leaf
+	// under tenant-hobby.slice (the 3-level hierarchy).
 	for _, leaf := range []string{"zzz", "mmm", "aaa"} {
-		if err := os.MkdirAll(filepath.Join(root, fcvm.ParentCgroup, leaf), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, fcvm.ParentCgroupFor(api.PlanHobby), leaf), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", leaf, err)
 		}
 	}
@@ -195,9 +213,13 @@ func TestInstancesReturnsSortedDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Instances: %v", err)
 	}
+	gotStr := make([]string, len(got))
+	for i, g := range got {
+		gotStr[i] = g.Instance
+	}
 	want := []string{"aaa", "mmm", "zzz"}
-	if !equalStrings(got, want) {
-		t.Errorf("Instances = %v, want %v (deterministic order)", got, want)
+	if !equalStrings(gotStr, want) {
+		t.Errorf("Instances = %v, want %v (deterministic order)", gotStr, want)
 	}
 }
 

@@ -71,8 +71,8 @@ func runCPUSampleLoop(ctx context.Context, cache *cpustats.Cache, log *slog.Logg
 				log.Debug("cpu sample: enumerate failed", "err", err)
 				continue
 			}
-			for _, inst := range instances {
-				sample, ok := reader.Sample(inst)
+			for _, info := range instances {
+				sample, ok := reader.Sample(info.Instance, info.Plan)
 				if !ok {
 					// Cgroup leaf not yet readable; cpustats
 					// won't record a baseline so cpu_pct stays
@@ -83,9 +83,10 @@ func runCPUSampleLoop(ctx context.Context, cache *cpustats.Cache, log *slog.Logg
 				// per-instance deltas are computed against a
 				// single instant.
 				_, _ = cache.Observe(cpustats.Observation{
-					InstanceID:   inst,
-					CPUUsageUsec: sample.CPUUsageUsec,
-					At:           now,
+					InstanceID:    info.Instance,
+					CPUUsageUsec:  sample.CPUUsageUsec,
+					ThrottledUsec: sample.ThrottledUsec,
+					At:            now,
 				})
 			}
 		}

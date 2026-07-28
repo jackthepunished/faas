@@ -4,10 +4,18 @@ import (
 	"context"
 	"fmt"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func wakeReq(id string, snap *Snapshot) WakeRequest {
-	return WakeRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128, Snapshot: snap}
+	// Issue #301 / ADR-044 — Manager.Wake validates req.Plan
+	// against api.Plan.Valid() and rejects empty/unknown plans
+	// (the wire-side seam at pkg/vmmdgrpc/proto.go::toWakeRequest
+	// populates it from CreateFromSnapshotRequest.plan). Tests
+	// that don't care which plan tier they exercise use Hobby
+	// (the cheapest paid tier — cpu.max = 200ms/100ms).
+	return WakeRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128, Snapshot: snap, Plan: api.PlanHobby}
 }
 
 func TestWakeRestoresUsableSnapshot(t *testing.T) {

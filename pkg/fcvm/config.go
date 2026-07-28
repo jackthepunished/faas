@@ -1,6 +1,10 @@
 package fcvm
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/onebox-faas/faas/pkg/api"
+)
 
 // Firecracker machine config + jailer invocation builders (spec §4.4, Appendix
 // B). These are pure functions: given a spec they produce the exact JSON and
@@ -171,10 +175,33 @@ func (s ColdBootSpec) Validate() error {
 // Jailer paths (spec §8, Appendix B).
 const (
 	JailChrootBase = "/srv/fc/jail"
-	ParentCgroup   = "faas-tenant.slice"
-	FirecrackerBin = "firecracker"
-	APISockName    = "api.sock"
-	VMConfigName   = "vmconfig.json"
+	// ParentCgroupRoot is the top-level slice vmmd lands every VM
+	// under. systemd owns this slice (deploy/ansible/roles/systemd_slices/
+	// tasks/main.yml). The per-plan sub-slices (tenant-free, tenant-hobby,
+	// tenant-pro, tenant-scale) live underneath it — see ParentCgroupFor.
+	// Issue #301 / ADR-044: prior to this PR, every VM landed directly
+	// at faas-tenant.slice/<instance> with a single neutral cpu.weight=256;
+	// the new design nests under the per-plan sub-slice so the kernel
+	// can enforce cpu.weight + cpu.max per plan tier.
+	ParentCgroupRoot = "faas-tenant.slice"
+	// defaultParentCgroup is the legacy 2-level hierarchy (free / hobby /
+	// pro / scale unaware) — kept as a non-empty fallback for callers
+	// that don't pass a plan through (e.g. unit tests that mock the
+	// Manager without schedd). Production always passes a real plan;
+	// the fallback emits a warning and lands the instance directly
+	// under ParentCgroupRoot so the test still runs. Use
+	// ParentCgroupFor(plan) for the production path.
+	//
+	// Historical name: this constant USED to be called "ParentCgroup".
+	// The rename to ParentCgroupRoot + ParentCgroupFor(plan) split is
+	// what introduced the per-plan sub-slice hierarchy (issue #301 /
+	// ADR-044). Direct callers that previously read the const must be
+	// updated — a code-review tripwire would be nice but we don't have
+	// one; rely on the package-wide grep for "ParentCgroup(".
+	defaultParentCgroup = "faas-tenant.slice"
+	FirecrackerBin      = "firecracker"
+	APISockName         = "api.sock"
+	VMConfigName        = "vmconfig.json"
 	// VsockUDSSocketName is the chroot-relative path Firecracker creates the
 	// vsock UDS on when a vsock device is attached. Jailer owns it under
 	// the per-instance chroot; the host side dials through chrootRoot.
@@ -183,6 +210,29 @@ const (
 	// and referenced from the config-file.
 	VsockDeviceID = "vsock-0"
 )
+
+// ParentCgroupFor returns the full parent-cgroup path the jailer
+// should attach a VM to. The 3-level hierarchy (issue #301, ADR-044)
+//
+//	/sys/fs/cgroup/faas-tenant.slice/<api.Plan.SliceName>/<instance>
+//
+// puts each instance under the per-plan sub-slice systemd drops at
+// boot (deploy/ansible/roles/systemd_slices), so the kernel can
+// enforce cpu.weight (the sub-slice's CPUWeight= directive) and
+// cpu.max (the per-instance direct write in writePlanCgroup) per
+// plan tier.
+//
+// Empty plan falls back to the legacy 2-level path so unit tests
+// that don't thread a plan through (and pre-issue-301 callers) keep
+// working. Production never passes an empty plan — the Manager.Wake
+// validation rejects a missing plan (see WakeRequest.Plan doc).
+func ParentCgroupFor(plan api.Plan) string {
+	slice := plan.SliceName()
+	if slice == "" {
+		return defaultParentCgroup
+	}
+	return ParentCgroupRoot + "/" + slice
+}
 
 // Vsock CID allocation (ADR-022). The Linux kernel reserves CID 0 (wildcard),
 // 1 (host-hypervisor), and 2 (guest-hypervisor); Firecracker documents
@@ -208,6 +258,14 @@ type JailerSpec struct {
 	GID      int    // from the Lease
 	Netns    string // netns name, e.g. fc-<instance>
 	ExecFile string // path to the firecracker binary jailer copies into the chroot
+	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
+	// Drives the parent-cgroup path (ParentCgroupFor) and the
+	// --cgroup cpu.weight=N argv so the kernel enforces the per-plan
+	// share. Required by JailerCommand — an empty plan falls back to
+	// the neutral cpu.weight=256 default (legacy 2-level path) so
+	// pre-issue-301 callers don't break, but production always sets
+	// it from WakeRequest.Plan.
+	Plan api.Plan
 }
 
 // PerInstanceScope returns the cgroup scope name the jailer will create
@@ -236,19 +294,33 @@ func PerInstanceScope(instance string) string { return instance }
 // instance name, because jailer v1.7 rejects '.' and other special
 // characters in --id (panic: "Invalid char (.) at position N"). The
 // vmm wrapper writes memory.max into
-// `<cgroupRoot>/faas-tenant.slice/<instance>` after bringUp; the scope
-// must exist by then or writeMemoryMax returns IsNotExist. Note this
-// means the cgroup scope, chroot leaf, and AF_VSOCK jailer's --id are
-// all the same string — keep them in lockstep.
+// `<cgroupRoot>/faas-tenant.slice/<plan-slice>/<instance>` after
+// bringUp; the scope must exist by then or writeMemoryMax returns
+// IsNotExist. Note this means the cgroup scope, chroot leaf, and
+// AF_VSOCK jailer's --id are all the same string — keep them in
+// lockstep.
 //
-// --cgroup cpu.weight=256 is mandatory on the v2 path: without at least one
-// --cgroup-param, jailer (FC v1.7+) only attaches the jailer PID to the parent
-// slice and never creates a per-instance child scope. See above.
-// cpu.weight=256 is a neutral default (kernel normalises 100-1000, 256 ~ mid).
+// --cgroup cpu.weight=N is mandatory on the v2 path: without at
+// least one --cgroup-param, jailer (FC v1.7+) only attaches the
+// jailer PID to the parent slice and never creates a per-instance
+// child scope. The value is plan-driven (issue #301, ADR-044):
+// Free=2 / Hobby=4 / Pro=8 / Scale=16. An empty plan falls back
+// to the legacy cpu.weight=256 neutral default so pre-issue-301
+// callers keep working. The cpu.max quota is written by the vmm
+// wrapper in writePlanCgroup because jailer v1.7 has no
+// --cgroup cpu.max= arg — only cpu.weight and memory.max are
+// exposed through --cgroup.
 func JailerCommand(s JailerSpec) []string {
 	execFile := s.ExecFile
 	if execFile == "" {
 		execFile = FirecrackerBin
+	}
+	cpuWeight := s.Plan.CPUWeight()
+	if cpuWeight <= 0 {
+		// Empty plan: keep the legacy neutral default. cpu.weight
+		// must always be in [1, 10000] per the kernel; 256 is the
+		// mid of the normalised range.
+		cpuWeight = 256
 	}
 	return []string{
 		"jailer",
@@ -259,8 +331,8 @@ func JailerCommand(s JailerSpec) []string {
 		"--chroot-base-dir", JailChrootBase,
 		"--netns", "/run/netns/" + s.Netns,
 		"--cgroup-version", "2",
-		"--parent-cgroup", ParentCgroup,
-		"--cgroup", "cpu.weight=256",
+		"--parent-cgroup", ParentCgroupFor(s.Plan),
+		"--cgroup", fmt.Sprintf("cpu.weight=%d", cpuWeight),
 		"--",
 		"--api-sock", APISockName,
 	}
