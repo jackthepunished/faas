@@ -17,10 +17,13 @@ package state_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -62,17 +65,22 @@ func seedCronApp(t *testing.T, ctx context.Context, s *state.PgStore, label stri
 }
 
 // cronPgStore stands up a fresh schema, migrates it, and returns a
-// PgStore. Mirrors pgStore(t) from pgstore_test.go (package-internal,
-// not visible from package state_test). Skips when Postgres is
-// unreachable.
-func cronPgStore(t *testing.T) (*state.PgStore, context.Context) {
+// PgStore plus the underlying pool. The pool is returned alongside
+// the store so tests that need to run raw SQL (e.g. the jsonb
+// round-trip in TestPg_CronFiredAuditRoundTrip) can reuse the SAME
+// schema — calling pgtest.Open a second time yields a fresh
+// random schema where the events table doesn't exist yet, so the
+// raw query 42P01s. Mirrors pgStore(t) from pgstore_test.go
+// (package-internal, not visible from package state_test). Skips
+// when Postgres is unreachable.
+func cronPgStore(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Context) {
 	t.Helper()
 	pool := pgtest.Open(t)
 	ctx := context.Background()
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return state.NewPgStore(pool), ctx
+	return state.NewPgStore(pool), pool, ctx
 }
 
 // TestPg_CreateCron_ReturnsCreatedAt is the round-trip regression for
@@ -81,7 +89,7 @@ func cronPgStore(t *testing.T) (*state.PgStore, context.Context) {
 // "sql: expected N destination arguments, got M") — exactly what the
 // sqlc-check drift gate is meant to catch at codegen time.
 func TestPg_CreateCron_ReturnsCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "create-cron-created-at")
 
 	before := time.Now().UTC().Add(-time.Second) // clock skew buffer
@@ -112,7 +120,7 @@ func TestPg_CreateCron_ReturnsCreatedAt(t *testing.T) {
 // changes), then verifies CronByID returns the same id + a non-zero
 // CreatedAt.
 func TestPg_CronByID_RoundTripsCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "cronbyid-roundtrip")
 
 	created, err := s.CreateCron(ctx, appID, "*/5 * * * *", "/healthz", true)
@@ -146,7 +154,7 @@ func TestPg_CronByID_RoundTripsCreatedAt(t *testing.T) {
 // column, but the RETURNING still projects it. This test catches the
 // "column drift but projection intact" half of the bug.
 func TestPg_UpdateCron_PreservesCreatedAt(t *testing.T) {
-	s, ctx := cronPgStore(t)
+	s, _, ctx := cronPgStore(t)
 	appID := seedCronApp(t, ctx, s, "updatecron-preserve")
 
 	original, err := s.CreateCron(ctx, appID, "*/5 * * * *", "/healthz", true)
@@ -169,5 +177,126 @@ func TestPg_UpdateCron_PreservesCreatedAt(t *testing.T) {
 	}
 	if after.Schedule != "*/15 * * * *" {
 		t.Errorf("UpdateCron schedule = %q, want %q", after.Schedule, schedule)
+	}
+}
+
+// TestPg_CronFiredAuditRoundTrip is the PgStore half of issue #291's
+// cron-fire audit gap (companion to
+// pkg/sched/cron_loop_test.go::TestCronDispatch_EmitsCronFiredAudit,
+// which exercises the MemStore half). Pinning the contract here
+// means:
+//   - a future SQL change that drops the events.kind column or
+//     changes its type surfaces as a Scan error,
+//   - a future change to ListEvents (parameter order, subject
+//     parsing, sort order) is caught by the read-back assertions,
+//   - the JSON payload shape matches the spec §5.1 row by row so a
+//     dashboard query against `data->>'status'` or
+//     `data->>'invocation_id'` always returns a value when the
+//     field is non-empty.
+//
+// Subject is the account id (per-account filter grain, same as the
+// MemStore test). PgStore.AppendEvent only accepts canonical UUID
+// subjects (uuid.Parse, no hex fallback — that's a MemStore-only
+// concession); CreateAccount's uuid v7 is canonical so we can pass
+// it straight through. cronPgStore matches the file's existing
+// pattern (skips when Postgres is unreachable).
+func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
+	s, pool, ctx := cronPgStore(t)
+	acct, err := s.CreateAccount(ctx, fmt.Sprintf("cron-audit-%d@example.com", time.Now().UnixNano()), api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: fmt.Sprintf("cron-audit-%d", time.Now().UnixNano()), Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// Build a payload that mirrors the schedd loop.go emit shape
+	// (the 9 keys documented in pkg/sched/loop.go). Constant
+	// fired_at so the read-back assertions are deterministic.
+	now := time.Date(2026, 7, 27, 14, 32, 1, 0, time.UTC).UTC()
+	prevFired := time.Date(2026, 7, 27, 14, 31, 1, 0, time.UTC).UTC()
+	payload := map[string]any{
+		"cron_id":              "cron-uuid-1",
+		"app_id":               app.ID,
+		"schedule":             "* * * * *",
+		"path":                 "/ping",
+		"fired_at":             now.Format(time.RFC3339Nano),
+		"last_fired_at_before": prevFired.Format(time.RFC3339Nano),
+		"status":               "ok",
+		"invocation_id":        "inv-uuid-1",
+		"instance_id":          "ins-uuid-1",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	if err := s.AppendEvent(ctx, "schedd", "cron.fired", &acct.ID, body); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	rows, err := s.ListEvents(ctx, acct.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListEvents(acct) returned %d rows, want 1; rows=%+v", len(rows), rows)
+	}
+	got := rows[0]
+	if got.Kind != "cron.fired" {
+		t.Errorf("event kind = %q, want cron.fired", got.Kind)
+	}
+	if got.Actor != "schedd" {
+		t.Errorf("event actor = %q, want schedd", got.Actor)
+	}
+	if got.Subject == nil {
+		t.Fatal("event Subject = nil; account id must round-trip through AppendEvent → ListEvents")
+	}
+	if got.Subject.String() != acct.ID {
+		t.Errorf("event Subject = %s, want %s", got.Subject.String(), acct.ID)
+	}
+	var reread map[string]any
+	if err := json.Unmarshal(got.Data, &reread); err != nil {
+		t.Fatalf("event Data not valid JSON: %v (data=%q)", err, got.Data)
+	}
+	for _, k := range []string{
+		"cron_id", "app_id", "schedule", "path",
+		"fired_at", "last_fired_at_before", "status",
+		"invocation_id", "instance_id",
+	} {
+		if _, ok := reread[k]; !ok {
+			t.Errorf("reread payload missing key %q (full=%+v)", k, reread)
+		}
+	}
+	if reread["status"] != "ok" {
+		t.Errorf("status = %v, want ok", reread["status"])
+	}
+	if reread["invocation_id"] != "inv-uuid-1" {
+		t.Errorf("invocation_id = %v, want inv-uuid-1", reread["invocation_id"])
+	}
+
+	// jsonb round-trip check: cast `data->>'path'` from the row
+	// directly to prove the jsonb column's text-extraction matches
+	// the unmarshal-the-Data-byte-slice path. Without this, a
+	// regression that changes the jsonb cast (e.g. switching to
+	// json instead of jsonb, or a future Postgres version with a
+	// different default whitespace normalisation) could pass the
+	// Go-side unmarshal but break a dashboard query like
+	// `select data->>'path' from events where kind='cron.fired'`.
+	// Uses the SAME pool cronPgStore opened — a second pgtest.Open
+	// call would create a fresh random schema without the events
+	// table and 42P01 the query.
+	var dbPath string
+	if err := pool.QueryRow(ctx,
+		`select data->>'path' from events where kind = 'cron.fired' and subject = $1`,
+		acct.ID).Scan(&dbPath); err != nil {
+		t.Fatalf("raw jsonb path query: %v", err)
+	}
+	if dbPath != "/ping" {
+		t.Errorf("data->>'path' = %q, want /ping (jsonb round-trip)", dbPath)
 	}
 }
