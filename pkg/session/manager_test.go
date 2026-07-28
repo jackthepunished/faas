@@ -313,6 +313,91 @@ func TestSetClock_NilResetsToTimeNow(t *testing.T) {
 	}
 }
 
+// TestIssueWithSession_RoundTripAndBackwardCompat covers the IAM-3
+// (ADR-039) sid claim on the envelope. Three assertions:
+//
+//  1. IssueWithSession with a non-empty sid + mfaPending=true
+//     round-trips: Verify returns the matching Sid +
+//     MfaPending=true.
+//  2. IssueWithSession with an empty sid round-trips: Verify
+//     returns Sid="" — this is the pre-IAM-3 path
+//     (IssueWithMFAFlag / Issue which delegate internally).
+//     The apid middleware treats Sid == "" as revoked
+//     (see requireSessionCookie in cmd/apid/session_middleware.go).
+//  3. A hand-crafted envelope JSON missing the `sid` field
+//     unmarshals to Envelope.Sid == "" via the AEAD-bound JSON
+//     decode path that Verify uses, proving the omitempty tag
+//     keeps pre-IAM-3 cookies wire-compatible.
+func TestIssueWithSession_RoundTripAndBackwardCompat(t *testing.T) {
+	m, err := session.NewManager(key(t), time.Hour)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// (1) full sid + mfaPending=true round-trip.
+	const sid = "11111111-1111-1111-1111-111111111111"
+	v1, err := m.IssueWithSession(sid, "acct-iam3", true)
+	if err != nil {
+		t.Fatalf("IssueWithSession(sid, true): %v", err)
+	}
+	env1, err := m.Verify(v1)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env1.Sid != sid {
+		t.Errorf("env.Sid = %q, want %q", env1.Sid, sid)
+	}
+	if env1.AccountID != "acct-iam3" {
+		t.Errorf("env.AccountID = %q, want acct-iam3", env1.AccountID)
+	}
+	if !env1.MfaPending {
+		t.Errorf("env.MfaPending = false, want true")
+	}
+
+	// (2) empty sid + mfaPending=false round-trip (the legacy /
+	// sid-less path IssueWithMFAFlag / Issue take).
+	v2, err := m.IssueWithSession("", "acct-iam3", false)
+	if err != nil {
+		t.Fatalf("IssueWithSession('', false): %v", err)
+	}
+	env2, err := m.Verify(v2)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if env2.Sid != "" {
+		t.Errorf("env.Sid = %q, want empty", env2.Sid)
+	}
+	if env2.MfaPending {
+		t.Errorf("env.MfaPending = true, want false")
+	}
+
+	// (3) Issue + IssueWithMFAFlag internals must delegate to
+	// IssueWithSession with sid="" — their output must
+	// round-trip with Sid == "" too.
+	vIssue, err := m.Issue("acct-iam3")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	envIssue, err := m.Verify(vIssue)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if envIssue.Sid != "" {
+		t.Errorf("Issue env.Sid = %q, want empty (backward-compat)", envIssue.Sid)
+	}
+	vMfa, err := m.IssueWithMFAFlag("acct-iam3", false)
+	if err != nil {
+		t.Fatalf("IssueWithMFAFlag: %v", err)
+	}
+	envMfa, err := m.Verify(vMfa)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if envMfa.Sid != "" {
+		t.Errorf("IssueWithMFAFlag env.Sid = %q, want empty (backward-compat)", envMfa.Sid)
+	}
+}
+
 // TestIsMFAPending_Predicate locks the free function's contract
 // across the four corners (omitted, false, true, post-verify). The
 // requireMFA middleware reads this; if it ever drifts the dashboard

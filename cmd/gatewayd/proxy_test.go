@@ -202,6 +202,14 @@ func TestIsApidPath_TableDriven(t *testing.T) {
 		{"/v1/apps/foo", true},
 		{"/v1/events", true},
 		{"/v1/deployments/abc/logs", true},
+		// /v1/auth/* — IAM-3 (ADR-039, issue #187 + #244 merged)
+		// session surface. Subsumed by /v1; pinned explicitly
+		// here so the contract survives any future apid-side
+		// route-table refactor (PR #180 review finding #6).
+		{"/v1/auth/logout", true},
+		{"/v1/auth/sessions", true},
+		{"/v1/auth/sessions/11111111-1111-1111-1111-111111111111", true},
+		{"/v1/auth/sessions/revoke_all", true},
 		{"/v1.zip", false}, // shadowing regression
 		{"/v1x", false},    // shadowing regression
 		{"/api/v1/apps", false},

@@ -186,6 +186,16 @@ var methodRouteMap = map[string]string{
 	"POST /login/forgot":                   "RequestPasswordReset",
 	"POST /auth/reset":                     "ConfirmPasswordReset",
 	"POST /dashboard/account/set-password": "SetPassword",
+
+	// IAM-3 (ADR-039) dashboard session surface. The auto-derivation
+	// strips /v1/ and title-cases each segment, so POST /v1/auth/logout
+	// becomes "PostAuthLogout". The SDK named these methods after
+	// the account-scoped noun (Post*Account*) to mirror the
+	// Get/Post/Patch/Delete pattern used elsewhere; pin them.
+	"POST /v1/auth/logout":              "PostAccountLogout",
+	"GET /v1/auth/sessions":             "GetAccountSessions",
+	"DELETE /v1/auth/sessions/{id}":     "DeleteAccountSession",
+	"POST /v1/auth/sessions/revoke_all": "PostAccountSessionsRevokeAll",
 }
 
 func main() {

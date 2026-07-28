@@ -2652,3 +2652,273 @@ func TestCreateCronIfUnderQuota_PerAccountArm(t *testing.T) {
 		t.Errorf("observed = %d, want %d", qe.Observed, limits.CronLimitPerAccount)
 	}
 }
+
+// IAM-3 (ADR-036, issue #187 + #244 merged) MemStore parity tests
+// for the six session methods. The pgstore tests live in
+// pgstore_test.go (under the same suite). These five cover the
+// in-memory parity surface — the production store ships from
+// pgstore but the dashboard tests + the cmd/e2e harness go
+// through MemStore, so behaviour drift would surface here.
+
+// TestMemStore_Session_RoundTripAndConflict pins CreateSession's
+// (id uniqueness) + GetSession round-trip + the (issued_ip,
+// issued_ua) read-back. The empty "" IP/UA path is the RemoteAddr
+// unparseable + no-User-Agent surface.
+func TestMemStore_Session_RoundTripAndConflict(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acct, err := m.CreateAccount(ctx, "alice@example.com", "free")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid1 := "11111111-1111-1111-1111-111111111111"
+	s1, err := m.CreateSession(ctx, sid1, acct.ID, "192.0.2.10", "Mozilla/5.0 iam3-test")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if s1.ID != sid1 || s1.AccountID != acct.ID || s1.IssuedIP != "192.0.2.10" || s1.IssuedUA != "Mozilla/5.0 iam3-test" {
+		t.Errorf("returned row mismatch: %+v", s1)
+	}
+	if s1.RevokedAt != nil {
+		t.Errorf("fresh row should not be revoked: %+v", s1)
+	}
+	if s1.LastSeenAt != nil {
+		t.Errorf("fresh row should have nil last_seen_at: %+v", s1)
+	}
+
+	// GetSession round-trip.
+	got, err := m.GetSession(ctx, sid1)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ID != sid1 || got.AccountID != acct.ID || got.IssuedIP != "192.0.2.10" {
+		t.Errorf("GetSession returned: %+v", got)
+	}
+
+	// Empty IP/UA path is the RemoteAddr-unparseable surface.
+	if _, err := m.CreateSession(ctx, "22222222-2222-2222-2222-222222222222", acct.ID, "", ""); err != nil {
+		t.Errorf("CreateSession with empty IP/UA: %v", err)
+	}
+	gotEmpty, err := m.GetSession(ctx, "22222222-2222-2222-2222-222222222222")
+	if err != nil {
+		t.Fatalf("GetSession on empty-ip row: %v", err)
+	}
+	if gotEmpty.IssuedIP != "" || gotEmpty.IssuedUA != "" {
+		t.Errorf("empty ip/ua round-trip wrong: %+v", gotEmpty)
+	}
+
+	// ErrConflict on duplicate sid.
+	if _, err := m.CreateSession(ctx, sid1, acct.ID, "1.1.1.1", "u"); !errors.Is(err, ErrConflict) {
+		t.Errorf("duplicate sid err = %v, want ErrConflict", err)
+	}
+
+	// CreateSession against a missing account returns ErrNotFound.
+	if _, err := m.CreateSession(ctx, "33333333-3333-3333-3333-333333333333", "00000000-0000-0000-0000-000000000000", "", ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing-account CreateSession err = %v, want ErrNotFound", err)
+	}
+
+	// Missing sid GetSession returns ErrNotFound.
+	if _, err := m.GetSession(ctx, "99999999-9999-9999-9999-999999999999"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing sid GetSession err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_Session_RevokeScoping pins the IAM-3 IDOR guard:
+// RevokeSession's account_id predicate. A cross-account revoke
+// returns false (the handler maps to 404); a same-account revoke
+// flips the row + returns true; a second revoke returns false
+// (idempotence, per the coalesce(revoked_at, now()) SQL idiom).
+func TestMemStore_Session_RevokeScoping(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	alice, _ := m.CreateAccount(ctx, "alice@example.com", "free")
+	bob, _ := m.CreateAccount(ctx, "bob@example.com", "free")
+	const sidAlice = "11111111-1111-1111-1111-111111111111"
+
+	if _, err := m.CreateSession(ctx, sidAlice, alice.ID, "192.0.2.10", "u"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cross-account revoke returns false (handler maps to 404).
+	ok, err := m.RevokeSession(ctx, sidAlice, bob.ID)
+	if err != nil {
+		t.Fatalf("RevokeSession cross-account err = %v, want nil", err)
+	}
+	if ok {
+		t.Errorf("cross-account revoke returned true; want false (IDOR guard)")
+	}
+
+	// Same-account revoke flips + returns true.
+	ok, err = m.RevokeSession(ctx, sidAlice, alice.ID)
+	if err != nil {
+		t.Fatalf("RevokeSession same-account: %v", err)
+	}
+	if !ok {
+		t.Errorf("same-account revoke returned false; want true")
+	}
+	got, _ := m.GetSession(ctx, sidAlice)
+	if got.RevokedAt == nil {
+		t.Errorf("post-revoke RevokedAt == nil")
+	}
+
+	// Revoking a never-existing sid returns false (handler 404).
+	ok, _ = m.RevokeSession(ctx, "99999999-9999-9999-9999-999999999999", alice.ID)
+	if ok {
+		t.Errorf("missing-sid RevokeSession returned true; want false")
+	}
+}
+
+// TestMemStore_Session_ListFiltersAndOrders pins ListSessions:
+//   - revoked rows are excluded
+//   - active rows are returned newest-first
+//   - cross-account sessions are invisible
+func TestMemStore_Session_ListFiltersAndOrders(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	alice, _ := m.CreateAccount(ctx, "alice@example.com", "free")
+	bob, _ := m.CreateAccount(ctx, "bob@example.com", "free")
+
+	// Three alice rows, one revoked.
+	for i, sid := range []string{
+		"11111111-1111-1111-1111-111111111111",
+		"22222222-2222-2222-2222-222222222222",
+		"33333333-3333-3333-3333-333333333333",
+	} {
+		if _, err := m.CreateSession(ctx, sid, alice.ID, "192.0.2.10", "u"); err != nil {
+			t.Fatal(err)
+		}
+		// Force a distinct IssuedAt so the order assertion is
+		// deterministic across the fast CI clock. Stamping in
+		// reverse keeps "first inserted" = "last listed" out of
+		// the test surface.
+		m.mu.Lock()
+		row := m.sessions[sid]
+		row.IssuedAt = time.Unix(int64(1700000000+i), 0).UTC()
+		m.sessions[sid] = row
+		m.mu.Unlock()
+	}
+	// One bob row — must not leak into alice's list.
+	if _, err := m.CreateSession(ctx, "44444444-4444-4444-4444-444444444444", bob.ID, "192.0.2.20", "u"); err != nil {
+		t.Fatal(err)
+	}
+	// Revoke the second alice row (middle, would otherwise land
+	// in the middle of the order assertion).
+	if _, err := m.RevokeSession(ctx, "22222222-2222-2222-2222-222222222222", alice.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := m.ListSessions(ctx, alice.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("len(list) = %d, want 2 (revoked + cross-account excluded)", len(list))
+	}
+	// Newest first: row 33333333 (IssuedAt=1700000002) before
+	// row 11111111 (IssuedAt=1700000000).
+	if list[0].ID != "33333333-3333-3333-3333-333333333333" {
+		t.Errorf("list[0].ID = %q, want 33333333...", list[0].ID)
+	}
+	if list[1].ID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("list[1].ID = %q, want 11111111...", list[1].ID)
+	}
+	for _, row := range list {
+		if row.AccountID != alice.ID {
+			t.Errorf("cross-account row leaked: %+v", row)
+		}
+		if row.RevokedAt != nil {
+			t.Errorf("revoked row leaked: %+v", row)
+		}
+	}
+}
+
+// TestMemStore_Session_RevokeAll_ExcludesCurrent pins the "log
+// out everywhere except this device" path. The calling sid is the
+// exception; every other active row for the account is revoked.
+// Returns the count of revoked rows.
+func TestMemStore_Session_RevokeAll_ExcludesCurrent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	alice, _ := m.CreateAccount(ctx, "alice@example.com", "free")
+	const (
+		current = "11111111-1111-1111-1111-111111111111"
+		other1  = "22222222-2222-2222-2222-222222222222"
+		other2  = "33333333-3333-3333-3333-333333333333"
+	)
+	for _, sid := range []string{current, other1, other2} {
+		if _, err := m.CreateSession(ctx, sid, alice.ID, "192.0.2.10", "u"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := m.RevokeAllSessions(ctx, alice.ID, current)
+	if err != nil {
+		t.Fatalf("RevokeAllSessions: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("RevokeAllSessions count = %d, want 2 (current excluded)", n)
+	}
+	// current stays active; others revoked.
+	got, _ := m.GetSession(ctx, current)
+	if got.RevokedAt != nil {
+		t.Errorf("current session was revoked (should be retained)")
+	}
+	for _, sid := range []string{other1, other2} {
+		row, _ := m.GetSession(ctx, sid)
+		if row.RevokedAt == nil {
+			t.Errorf("other session %s not revoked", sid)
+		}
+	}
+	// Zero-revoke when only current remains.
+	n2, err := m.RevokeAllSessions(ctx, alice.ID, current)
+	if err != nil {
+		t.Fatalf("RevokeAllSessions (zero): %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("post-clean RevokeAllSessions count = %d, want 0", n2)
+	}
+}
+
+// TestMemStore_Session_TouchAllowedOnRevoked pins the
+// "LastSeenAt continues to update post-revoke" policy. The
+// TouchSessionLastSeen no-ops on missing rows; on revoked rows
+// it stamps LastSeenAt as an operational signal, not an
+// authorization signal.
+func TestMemStore_Session_TouchAllowedOnRevoked(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	alice, _ := m.CreateAccount(ctx, "alice@example.com", "free")
+	const sid = "11111111-1111-1111-1111-111111111111"
+	if _, err := m.CreateSession(ctx, sid, alice.ID, "192.0.2.10", "u"); err != nil {
+		t.Fatal(err)
+	}
+	// Missing sid → silent no-op (the requireSessionCookie
+	// caller is fire-and-forget).
+	if err := m.TouchSessionLastSeen(ctx, "99999999-9999-9999-9999-999999999999"); err != nil {
+		t.Errorf("TouchSessionLastSeen on missing sid err = %v, want nil", err)
+	}
+	// Existing sid → LastSeenAt gets stamped.
+	if err := m.TouchSessionLastSeen(ctx, sid); err != nil {
+		t.Fatalf("TouchSessionLastSeen: %v", err)
+	}
+	got, _ := m.GetSession(ctx, sid)
+	if got.LastSeenAt == nil {
+		t.Errorf("LastSeenAt not stamped by Touch")
+	}
+	// Revoke + touch → LastSeenAt updates (policy).
+	if _, err := m.RevokeSession(ctx, sid, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	touched, _ := time.Parse(time.RFC3339Nano, "2026-01-01T00:00:00Z")
+	m.mu.Lock()
+	row := m.sessions[sid]
+	row.LastSeenAt = &touched
+	m.sessions[sid] = row
+	m.mu.Unlock()
+	if err := m.TouchSessionLastSeen(ctx, sid); err != nil {
+		t.Fatalf("TouchSessionLastSeen on revoked: %v", err)
+	}
+	got2, _ := m.GetSession(ctx, sid)
+	if got2.LastSeenAt == nil || !got2.LastSeenAt.After(touched) {
+		t.Errorf("post-revoke Touch did not bump LastSeenAt: %v", got2.LastSeenAt)
+	}
+}

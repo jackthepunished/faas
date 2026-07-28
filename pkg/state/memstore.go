@@ -212,6 +212,13 @@ type MemStore struct {
 	// CreateComputeNode to exercise the single-box path. Production
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
+	// sessions is the IAM-3 (ADR-039) in-memory mirror of the
+	// `sessions` table — one row per dashboard login, keyed by
+	// uuid. Revocation authority is RevokedAt != nil; LastSeenAt
+	// may update post-revocation (operational signal only, not
+	// authorization). MemStore's m.mu mirrors the SQL `for update`
+	// semantics the PgStore uses.
+	sessions map[string]Session
 }
 
 // secretKey mirrors the app_secrets PRIMARY KEY (app_id, key). The
@@ -327,6 +334,9 @@ func NewMemStore() *MemStore {
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
+		// sessions is empty here; populated by CreateSession at each
+		// dashboard login (handlers_auth*.go + handlers_mfa reissue).
+		sessions: map[string]Session{},
 	}
 	// Auto-seed default-local. Done after the struct literal so the
 	// seeded row carries a real id and created_at timestamp. Mirrors
@@ -4649,6 +4659,125 @@ func (m *MemStore) SetDeletionRequestedAtForTest(id string, at time.Time) error 
 	stamp := at.UTC()
 	a.DeletionRequestedAt = &stamp
 	m.accounts[id] = a
+	return nil
+}
+
+// --- IAM-3 sessions (ADR-039, issue #187 + #244 merged) ---------------------
+//
+// One row per dashboard login, keyed by uuid. Revocation is
+// RevokedAt != nil; LastSeenAt may update post-revocation. IDOR
+// protection lives at the AccountID equality check (the SQL analog
+// in pgstore uses an account_id predicate in the WHERE; in-memory
+// we enforce the same predicate inline). Caller invariants:
+//
+//   - sid is a caller-generated uuid (the cookie envelope seal needs
+//     the same value).
+//   - issuedIP == "" means "RemoteAddr unparseable" — surfaces as an
+//     empty string on reads (matches coalesce(host(issued_ip),'')
+//     in pgstore).
+//   - RevokeSession / RevokeAllSessions account-scope every write.
+//
+// MemStore drift from pgstore is caught by hand-parity tests in
+// memstore_test.go (the IAM-3 block writes 5 cases: round-trip,
+// touch, account-scoped revoke, list filters revoked, revoke-all
+// excludes current).
+
+func (m *MemStore) CreateSession(_ context.Context, id, accountID, issuedIP, issuedUA string) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[id]; exists {
+		return Session{}, ErrConflict
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return Session{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	s := Session{
+		ID:        id,
+		AccountID: accountID,
+		IssuedIP:  issuedIP,
+		IssuedUA:  issuedUA,
+		IssuedAt:  now,
+	}
+	m.sessions[id] = s
+	return s, nil
+}
+
+func (m *MemStore) GetSession(_ context.Context, id string) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return Session{}, ErrNotFound
+	}
+	return s, nil
+}
+
+// RevokeSession stamps revoked_at iff (a) the row exists, (b) it
+// belongs to accountID, and (c) it is not already revoked. Returns
+// true on real write, false on no-op (handler maps to 404).
+func (m *MemStore) RevokeSession(_ context.Context, id, accountID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok || s.AccountID != accountID || s.RevokedAt != nil {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	s.RevokedAt = &now
+	m.sessions[id] = s
+	return true, nil
+}
+
+func (m *MemStore) ListSessions(_ context.Context, accountID string) ([]Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Session
+	for _, s := range m.sessions {
+		if s.AccountID != accountID || s.RevokedAt != nil {
+			continue
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].IssuedAt.After(out[j].IssuedAt)
+	})
+	return out, nil
+}
+
+// RevokeAllSessions revokes every active row for accountID except
+// the supplied sid (the calling session). Returns the count.
+func (m *MemStore) RevokeAllSessions(_ context.Context, accountID, exceptID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	now := time.Now().UTC()
+	for id, s := range m.sessions {
+		if s.AccountID != accountID || id == exceptID || s.RevokedAt != nil {
+			continue
+		}
+		s.RevokedAt = &now
+		m.sessions[id] = s
+		n++
+	}
+	return n, nil
+}
+
+// TouchSessionLastSeen stamps last_seen_at = now(). Best-effort;
+// allowed on revoked rows (operational signal — not authorization).
+// Missing rows are silent no-ops: the calling handler is fire-and-
+// forget and a GetSession that returned ErrNotFound followed by a
+// Touch that races with a revoke must not panic.
+func (m *MemStore) TouchSessionLastSeen(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil
+	}
+	now := time.Now().UTC()
+	s.LastSeenAt = &now
+	m.sessions[id] = s
 	return nil
 }
 

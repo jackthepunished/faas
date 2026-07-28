@@ -15,6 +15,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+
+	"github.com/google/uuid"
 )
 
 // setupWithScopes is the scope-aware twin of the package-level setup()
@@ -48,6 +50,10 @@ func setupWithScopes(t *testing.T, scopes []string) testEnv {
 // callers MUST build their own httptest.NewRequest and attach the
 // cookie with req.AddCookie; the bearer-only e.do helper does not
 // carry cookies.
+//
+// IAM-3 (ADR-039): the cookie must carry a sid backed by a live
+// sessions row, otherwise requireSessionCookie rejects it with
+// CodeSessionExpired. Mirrors setupMW in mfa_middleware_test.go.
 func setupWithSession(t *testing.T) (testEnv, *http.Cookie) {
 	t.Helper()
 	store := state.NewMemStore()
@@ -60,7 +66,12 @@ func setupWithSession(t *testing.T) (testEnv, *http.Cookie) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := mgr.Issue(acct.ID)
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acct.ID,
+		"192.0.2.30", "session-test-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	token, err := mgr.IssueWithSession(sid, acct.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

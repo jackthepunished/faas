@@ -710,6 +710,185 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: postAccountLogout
+      summary: Log the current dashboard session out.
+      description: |
+        Revokes the calling session row in the `sessions` table
+        (one row per dashboard login; ADR-039 / IAM-3) and
+        clears the `faas_sid` cookie. Always 204 on success,
+        even if the row was already revoked (idempotent — the
+        cookie is cleared either way). Other sessions on the
+        same account are NOT touched; use
+        `POST /v1/auth/sessions/revoke_all` for that.
+
+        CSRF: action `logout` (verify via the
+        `faas_csrf` cookie + body `csrf_token` field or
+        `X-CSRF-Token` header).
+
+        Emits `auth.session.revoke` with
+        `reason: "logout"`.
+      parameters:
+        - $ref: '#/components/parameters/CookieSession'
+      responses:
+        '204':
+          description: |
+            Logout successful. `Set-Cookie: faas_sid=…` clears
+            the session cookie.
+        '400':
+          description: CSRF check failed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: |
+            Cookie missing, expired, tampered, or its `sid` is
+            not backed by an active sessions row. The cookie
+            is cleared on the wire. Surfaces as
+            `session_expired` (pre-IAM-3 cookie / missing /
+            revoked) or `session_invalid` (account-mismatch
+            defensive path; AEAD-bound envelopes should not
+            produce this).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/sessions:
+    get:
+      tags: [auth]
+      operationId: getAccountSessions
+      summary: List active sessions for the calling account.
+      description: |
+        Returns one `SessionInfo` row per active login (one row
+        per dashboard login; ADR-039 / IAM-3). Newest first. The
+        row whose `id` matches the calling cookie's `sid` is
+        flagged `current_session: true`. Revoked rows are NOT
+        returned; the `audit-events` endpoint is the timeline
+        for those.
+      parameters:
+        - $ref: '#/components/parameters/CookieSession'
+      responses:
+        '200':
+          description: Active sessions for the calling account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionListResponse' }
+        '401':
+          description: |
+            See `/v1/auth/logout` — same 401 surface.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/sessions/{id}:
+    delete:
+      tags: [auth]
+      operationId: deleteAccountSession
+      summary: Revoke a single session by id.
+      description: |
+        Revokes the `sessions` row whose `id` is `{id}` and
+        whose `account_id` matches the calling envelope. Cross-
+        account DELETE returns 404 (not 403) — the handler
+        never confirms a row exists in another account. Revoking
+        the current session is allowed: the calling cookie is
+        cleared on the wire (same as `/v1/auth/logout`).
+
+        CSRF: action `session_revoke`.
+
+        Emits `auth.session.revoke` with
+        `reason: "explicit"`.
+      parameters:
+        - $ref: '#/components/parameters/CookieSession'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Session id (UUID v4) from `SessionInfo.id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csrf_token]
+              properties:
+                csrf_token: { type: string }
+      responses:
+        '204':
+          description: "Session revoked. `Set-Cookie: faas_sid=…` clears the cookie if the path id matched the current session."
+        '400':
+          description: |
+            CSRF check failed (`csrf_mismatch`) or the path id
+            is not a valid UUID (`validation_failed`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: See `/v1/auth/logout`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: |
+            No active session matches the id on this account
+            (does not exist, already revoked, or belongs to
+            another account). The 404 is the same shape
+            regardless — we never leak existence across
+            accounts.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/sessions/revoke_all:
+    post:
+      tags: [auth]
+      operationId: postAccountSessionsRevokeAll
+      summary: Revoke every session except the calling one.
+      description: |
+        Revokes all `sessions` rows for the calling account
+        whose `id` is NOT the calling cookie's `sid`. The
+        caller's session stays active. Returns the count of
+        rows revoked so the dashboard can render "Signed out
+        N other devices".
+
+        CSRF: action `sessions_revoke_all`.
+
+        Emits `auth.sessions.revoke_all` with
+        `{revoked_count, retained_sid}`.
+      parameters:
+        - $ref: '#/components/parameters/CookieSession'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csrf_token]
+              properties:
+                csrf_token: { type: string }
+      responses:
+        '200':
+          description: Bulk revocation succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionsRevokeAllResponse' }
+        '400':
+          description: CSRF check failed on the bulk-revoke request.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Cookie missing, expired, tampered, or its `sid` is not backed by an active sessions row. Same 401 surface as `/v1/auth/logout`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /dashboard/account/set-password:
     post:
       tags: [auth]
@@ -2838,7 +3017,7 @@ components:
           example: apid
         kind:
           type: string
-          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
+          description: "Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`, `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`, `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`, `account.deletion_restored`."
           example: auth.login
         subject:
           type: string
@@ -3122,6 +3301,64 @@ components:
       properties:
         payload: { type: object, additionalProperties: true }
         scheduled_at: { type: string, format: date-time }
+
+    # ─── IAM-3 (ADR-039) dashboard session surface ────────────────────────
+
+    SessionInfo:
+      description: |
+        One row per dashboard login (ADR-039 / IAM-3). The
+        cookie envelope carries the row's `id` as `sid`;
+        every authenticated request re-validates the row.
+        Revoked rows are filtered out of the
+        `GET /v1/auth/sessions` response.
+      type: object
+      required: [id, account_id, issued_at, current_session]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: "Session id. Also stamped as `sid` in the cookie envelope."
+        account_id:
+          type: string
+          format: uuid
+        issued_ip:
+          type: string
+          description: "Client IP captured at login (host portion only; IPv4 or IPv6). Empty when the request's RemoteAddr was unparseable."
+          example: "192.0.2.10"
+        issued_ua:
+          type: string
+          description: "User-Agent header captured at login. May be empty when the client suppressed the header."
+        issued_at:
+          type: string
+          format: date-time
+          description: "When the session was minted (RFC 3339, UTC)."
+        last_seen_at:
+          type: string
+          format: date-time
+          description: "Last time the cookie cross-validated this row. Updated with a 5-minute debounce; continues post-revoke (operational signal only, not authorization)."
+        current_session:
+          type: boolean
+          description: "True when this row's id matches the calling cookie's sid. Exactly one row per list response has this flag set."
+
+    SessionListResponse:
+      description: "Body for `GET /v1/auth/sessions`."
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          description: "Active sessions, newest first. Revoked rows are not returned."
+          items: { $ref: '#/components/schemas/SessionInfo' }
+
+    SessionsRevokeAllResponse:
+      description: "Body for `POST /v1/auth/sessions/revoke_all`."
+      type: object
+      required: [revoked]
+      properties:
+        revoked:
+          type: integer
+          minimum: 0
+          description: "Number of sibling sessions revoked. The caller's session is NOT included in this count."
 
     # ─── Errors ───────────────────────────────────────────────────────────
 

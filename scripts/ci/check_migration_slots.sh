@@ -42,6 +42,21 @@ slots_from_paths() {
 		|| true
 }
 
+# Inverse of slots_from_paths: emit ONLY the reservation slots. Used to log
+# the carved-out slots for reviewer visibility (so a maintainer reading CI
+# output knows what was skipped, not just what collided). Lives in its own
+# function rather than as an inline `$(...)` substitution because bash 3.2
+# rejects the `\<newline># comment\<newline>| pipe` continuation pattern
+# that PR #392 first used here (`syntax error near unexpected token |'`).
+reserved_from_paths() {
+	# grep -oE (not sed -nE) keeps the regex portable across BSD/GNU; the
+	# optional-group parens `(.*_)?` are rejected by BSD sed -E.
+	grep -oE '^migrations/[0-9]{5}_((.*_)?(reservation|reserve_slot))(_[^/]*)?\.sql$' \
+		| sed -E 's|migrations/([0-9]{5})_.*|\1|' \
+		| sort -u \
+		|| true
+}
+
 # --- self-test (BATS_TEST=1) ---------------------------------------------
 # Verifies slots_from_paths' reservation carve-out in isolation. No gh /
 # git dependency, no env-var requirement, <1 s. Wired into CI via the
@@ -61,10 +76,16 @@ if [[ "${BATS_TEST:-0}" == "1" ]]; then
 	got="$(printf '%s\n' "${fixtures[@]}" | slots_from_paths | sort | tr '\n' ',' | sed 's/,$//')"
 	want="00054,00056,00057"
 	if [[ "${got}" != "${want}" ]]; then
-		echo "SELF-TEST FAIL: got [${got}], want [${want}]" >&2
+		echo "SELF-TEST FAIL: slots_from_paths got [${got}], want [${want}]" >&2
 		exit 1
 	fi
-	echo "SELF-TEST PASS: slots_from_paths filters reservations correctly"
+	got_reserved="$(printf '%s\n' "${fixtures[@]}" | reserved_from_paths | sort | tr '\n' ',' | sed 's/,$//')"
+	want_reserved="00055,00056"
+	if [[ "${got_reserved}" != "${want_reserved}" ]]; then
+		echo "SELF-TEST FAIL: reserved_from_paths got [${got_reserved}], want [${want_reserved}]" >&2
+		exit 1
+	fi
+	echo "SELF-TEST PASS: slots_from_paths and reserved_from_paths filter reservations correctly"
 	exit 0
 fi
 
@@ -86,9 +107,7 @@ if [[ -z "${mine}" ]]; then
 fi
 echo "this PR claims slot(s): $(echo "${mine}" | tr '\n' ' ')"
 
-reserved="$(printf '%s\n' "${mine_raw}" \
-	| sed -nE 's|^migrations/([0-9]{5})_(.*_)?(reservation|reserve_slot)(_[^/]*)?\.sql$|\1|p' \
-	| sort -u | tr '\n' ' ')"
+reserved="$(printf '%s\n' "${mine_raw}" | reserved_from_paths | tr '\n' ' ' || true)"
 if [[ -n "${reserved}" ]]; then
 	echo "this PR holds reservation slot(s): ${reserved} (excluded from overlap check)"
 fi

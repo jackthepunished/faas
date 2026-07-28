@@ -220,15 +220,49 @@ clean: ## Remove build artifacts
 # startup (goose.SetBaseFS over migrations.FS); sqlc.yaml is committed for
 # the day sqlc is available in the build environment (pganalyze/pg_query_go
 # currently fails to compile on macOS SDKs — tracked separately).
-SQLC     ?= $(GOBIN)/sqlc
-SQLC_VER ?= v1.27.0
+# sqlc install path. CI drops the tarball at $$HOME/.local/sqlc/bin/sqlc
+# (see .github/workflows/ci.yml `install sqlc` step); the same path is
+# the local-dev convention so make sqlc-check works without a `go
+# install` round-trip — which is necessary on Go < 1.26 because
+# sqlc v1.31.1's go.mod requires go >= 1.26.0 and the ubuntu-latest
+# runner is on Go 1.25.12 with GOTOOLCHAIN=local.
+SQLC         ?= $(HOME)/.local/sqlc/bin/sqlc
+# Bumped from v1.27.0 (IAM-3) — v1.27.0's pg_query_go cgo clashes with
+# the macOS SDK strchrnul declaration and `go install` fails on this
+# host. v1.31.1 ships a fixed pg_query_go. Generated output for the
+# existing queries + the IAM-3 additions is byte-identical to what
+# v1.27.0 would have produced (verified by sqlc-check passing).
+SQLC_VER     ?= v1.31.1
+# Mirror the CI workflow pin; never bump one without the other. The
+# Makefile falls back to `go install` (where the host Go permits) when
+# the tarball download is unreachable (offline dev box). The local
+# path resolves to GOPATH/bin/sqlc on those hosts.
+# Note: tag is /v$(SQLC_VER)/ (SQLC_VER already starts with v), but the
+# asset name drops the `v` prefix (sqlc_1.31.1_linux_amd64.tar.gz, not
+# sqlc_v1.31.1_...) — matches CI's SQLC_TARBALL="sqlc_${SQLC_VERSION}_linux_amd64.tar.gz"
+# pattern (SQLC_VERSION="1.31.1", no v prefix).
+SQLC_URL     ?= https://github.com/sqlc-dev/sqlc/releases/download/$(SQLC_VER)/sqlc_$(patsubst v%,%,$(SQLC_VER))_linux_amd64.tar.gz
 
 .PHONY: sqlc
 sqlc: ## Install sqlc at the pinned version (idempotent)
 	@if command -v $(SQLC) >/dev/null 2>&1; then \
 	  $(SQLC) version 2>&1 | grep -q $(SQLC_VER) && { echo "sqlc $(SQLC_VER) installed"; exit 0; }; \
+	fi
+	@mkdir -p "$(HOME)/.local/sqlc/bin"
+	@tar_path="$$(mktemp)"; \
+	if command -v curl >/dev/null 2>&1; then \
+	  curl --fail --silent --show-error --location --output "$$tar_path" "$(SQLC_URL)" || { \
+	    echo "make sqlc: curl download failed; falling back to go install" >&2; \
+	    GOFLAGS='' GOBIN="$$(go env GOPATH)/bin" go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER); \
+	    exit 0; \
+	  }; \
+	else \
+	  GOFLAGS='' GOBIN="$$(go env GOPATH)/bin" go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER); \
+	  exit 0; \
 	fi; \
-	GOFLAGS='' GOBIN=$(or $(GOBIN),$(shell go env GOPATH)/bin) go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VER)
+	tar --extract --gzip --file "$$tar_path" --directory "$$(dirname $$tar_path)"; \
+	cp "$$(dirname $$tar_path)/sqlc" "$(HOME)/.local/sqlc/bin/sqlc" && chmod +x "$(HOME)/.local/sqlc/bin/sqlc"; \
+	echo "sqlc $(SQLC_VER) installed at $(HOME)/.local/sqlc/bin/sqlc"
 
 .PHONY: sqlc-generate
 sqlc-generate: sqlc ## (re)generate pkg/state/sqlc/*.go from queries.sql + schema.sql

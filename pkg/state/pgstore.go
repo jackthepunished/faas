@@ -5385,3 +5385,126 @@ func (s *PgStore) MarkDunningStep(ctx context.Context, id string, from, to Accou
 	}
 	return nil
 }
+
+// --- IAM-3 sessions (ADR-039, issue #187 + #244 merged) ---------------------
+//
+// One row per dashboard login. The cookie envelope carries the row's
+// uuid as `sid`; every authenticated dashboard request re-validates
+// the row before the handler runs. Revocation is `revoked_at != nil`;
+// LastSeenAt may update post-revocation (operational signal only).
+//
+// IDOR protection lives at the SQL `account_id = $2` predicate — a
+// cross-account DELETE returns 0 rows (handler maps false → 404).
+// The MemStore mirrors this with an in-memory AccountID equality
+// check (memstore.go, same section header).
+
+const sessionSelectCols = `
+	coalesce(host(issued_ip), '') as issued_ip,
+	coalesce(issued_ua, '') as issued_ua`
+
+func (s *PgStore) CreateSession(ctx context.Context, id, accountID, issuedIP, issuedUA string) (Session, error) {
+	row := s.pool.QueryRow(ctx, `
+		insert into sessions (id, account_id, issued_ip, issued_ua)
+		values ($1, $2, nullif($3, '')::inet, nullif($4, ''))
+		returning id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols,
+		id, accountID, issuedIP, issuedUA)
+	sess, err := scanSession(row)
+	if err != nil {
+		return Session{}, mapErr(err)
+	}
+	return sess, nil
+}
+
+func (s *PgStore) GetSession(ctx context.Context, id string) (Session, error) {
+	row := s.pool.QueryRow(ctx,
+		`select id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols+`
+		   from sessions where id = $1`, id)
+	sess, err := scanSession(row)
+	if err != nil {
+		return Session{}, mapErr(err)
+	}
+	return sess, nil
+}
+
+// RevokeSession atomically stamps revoked_at iff (a) the row exists,
+// (b) it belongs to accountID, and (c) it is not already revoked.
+// Returns true on real write, false on no-op. The account_id check
+// is the SQL IDOR guard; pgx.RowsAffected()==0 covers all three
+// no-op cases (gone / wrong-account / already-revoked) without
+// leaking existence.
+func (s *PgStore) RevokeSession(ctx context.Context, id, accountID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`update sessions set revoked_at = coalesce(revoked_at, now())
+		   where id = $1 and account_id = $2 and revoked_at is null`,
+		id, accountID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *PgStore) ListSessions(ctx context.Context, accountID string) ([]Session, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols+`
+		   from sessions where account_id = $1 and revoked_at is null
+		   order by issued_at desc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RevokeAllSessions revokes every active row for accountID except
+// the supplied sid (the calling session). Returns the count via
+// pgx.RowsAffected.
+func (s *PgStore) RevokeAllSessions(ctx context.Context, accountID, exceptID string) (int, error) {
+	tag, err := s.pool.Exec(ctx,
+		`update sessions set revoked_at = now()
+		   where account_id = $1 and id <> $2 and revoked_at is null`,
+		accountID, exceptID)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// TouchSessionLastSeen stamps last_seen_at = now(). Best-effort,
+// fire-and-forget. Allowed on revoked rows. Missing rows are
+// silent no-ops — a race between GetSession (missing) and Touch
+// is benign.
+func (s *PgStore) TouchSessionLastSeen(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`update sessions set last_seen_at = now() where id = $1`, id)
+	return err
+}
+
+// rowScanner is the minimal Scan(dest ...any) error interface both
+// pgx.Row (single-row scan) and pgx.Rows (multi-row scan) satisfy.
+// Centralising the field list here means a future Session-struct
+// column addition only edits one site.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSession(s rowScanner) (Session, error) {
+	var sess Session
+	var lastSeen, revoked *time.Time
+	if err := s.Scan(&sess.ID, &sess.AccountID, &sess.IssuedAt, &lastSeen, &revoked, &sess.IssuedIP, &sess.IssuedUA); err != nil {
+		return Session{}, err
+	}
+	sess.LastSeenAt = lastSeen
+	sess.RevokedAt = revoked
+	return sess, nil
+}

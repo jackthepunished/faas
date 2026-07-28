@@ -522,8 +522,16 @@ func (s *server) verifyPasswordOrPad(ctx context.Context, email, password string
 // CodeMFARequired while the cookie is pending. The mfaEnrollRequired
 // predicate is the same one used by the OAuth callbacks so all
 // five cookie-issue paths agree on the policy.
+//
+// IAM-3 (ADR-039, issue #187 + #244 merged): the cookie is now
+// issued via issueDashboardSession (cmd/apid/issue_session.go),
+// which mints a sid, persists the sessions row, seals the
+// envelope with the same sid, and emits auth.session.created.
+// method = "password" — the only call site here is postLoginEmail
+// (handlers_auth_login.go), the email+password ladder reserved
+// for issue #2 / PR #2 once IAM-3 lands.
 func (s *server) issueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	cookie, err := s.sessions.IssueWithMFAFlag(acct.ID, mfaEnrollRequired(acct))
+	cookie, _, err := s.issueDashboardSession(r.Context(), r, acct.ID, mfaEnrollRequired(acct), "password")
 	if err != nil {
 		s.log.Error("auth.session_issue", "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
