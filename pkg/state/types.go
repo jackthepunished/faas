@@ -902,3 +902,22 @@ type AppSecret struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
+
+// AccountAppSecret is the per-row shape returned by
+// ListAppSecretsForAccount (issue #393). Distinct from AppSecret
+// because the account-scoped variant needs the app_slug (the per-app
+// variant doesn't expose it — the URL slug is the path parameter, so
+// the row doesn't need to carry it).
+//
+// Ciphertext is the same age-sealed Envelope that AppSecret carries;
+// the handler emits it base64-encoded on the wire (paginated walk
+// orders by (app_slug ASC, key ASC), so the cursor is the pair).
+type AccountAppSecret struct {
+	AccountID  string
+	AppID      string
+	AppSlug    string
+	Key        string
+	Ciphertext []byte
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}

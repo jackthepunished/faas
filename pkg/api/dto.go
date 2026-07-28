@@ -296,6 +296,18 @@ type InstanceResponse struct {
 	WakeID string `json:"wake_id,omitempty"`
 }
 
+// ListInstancesResponse is the page shape for GET /v1/instances
+// (issue #393). Cursor is the instances.id UUIDv7 — the handler
+// emits the last row's id as NextBefore when len(Instances) == limit,
+// so the caller can pass it back unchanged as ?before=<id> on the
+// next request. Empty NextBefore means the page is the end. An
+// account with zero live instances returns 200 with an empty
+// `instances` array — never 404.
+type ListInstancesResponse struct {
+	Instances  []InstanceResponse `json:"instances"`
+	NextBefore string             `json:"next_before,omitempty"`
+}
+
 // UsageResponse is one app's monthly usage slice (spec §10).
 //
 // CPUUsageUsec is the cumulative host cgroup CPU-µs this app
@@ -914,4 +926,28 @@ type AppMetricsResponse struct {
 	// as such in the UI; here it's named plainly because the
 	// dashboard copy does the labelling.
 	WakeP95MS float64 `json:"wake_p95_ms"`
+}
+
+// --- Account-scoped metrics rollup (issue #393) --------------------------
+
+// AppsMetricsResponse is the rollup for GET /v1/apps/metrics?range=
+// (issue #393) — one call replacing N per-app fan-outs. The wire
+// shape mirrors AppMetricsResponse at the row level (each value is
+// an AppMetricsResponse) so the SDK can reuse the per-app type for
+// row decoding.
+//
+// Apps is keyed by app_slug so the dashboard can render the rows
+// without a parallel /v1/apps lookup. Apps is nil (not {}) when the
+// Prometheus client is unavailable — the Source field carries the
+// "degraded: <reason>" contract from the per-app handler, so the
+// dashboard has one empty-state branch across both endpoints.
+//
+// Range / Source / AsOf follow the per-app shape exactly. The
+// per-app WakeP95MS is the FLEET p95 (gateway_wake_latency_seconds
+// is unlabeled) — same here.
+type AppsMetricsResponse struct {
+	Range  string                        `json:"range"`
+	Source string                        `json:"source"`
+	AsOf   string                        `json:"as_of"`
+	Apps   map[string]AppMetricsResponse `json:"apps"`
 }

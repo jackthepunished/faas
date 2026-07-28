@@ -1954,6 +1954,165 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/instances:
+    get:
+      tags: [instances]
+      operationId: listInstancesForAccount
+      summary: List every live instance across the caller's account.
+      description: |
+        Replaces the per-app fan-out from `/v1/apps/{slug}/instances`
+        with one account-scoped read (issue #393). Each instance carries
+        its `app_id`; cross-account isolation is enforced by the SQL
+        `apps.account_id = $1` join (test: see
+        `TestListInstancesForAccount_CrossAccountIsolation`).
+
+        Cursor: `?before=<id>` (the instances.id UUIDv7). Defaults to 25
+        per page; capped at 100; invalid `limit` returns 400
+        `code_validation` with `limit=100` and the observed value
+        (RFC 7807 strict mode, matching `/v1/invoices`).
+
+        Rate-limit tiering: one call now replaces N per-app calls,
+        so per-page-load token spend drops from N to 1. The
+        per-account bucket (ADR-040) still applies at the gatewayd
+        edge; this route charges 1 token via the apid authLimited
+        middleware, same as every other `/v1/*` route.
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: "Cursor (instances.id UUIDv7). Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+          description: "Page size; server clamps to 1..100, returns 400 with `limit=100` and the observed value on bad input."
+      responses:
+        '200':
+          description: One page of instances, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListInstancesResponse' }
+              example:
+                instances:
+                  - id: "0123456789abcdef0123456789abcdef"
+                    app_id: "0123456789abcdef0123456789abcdef"
+                    deployment_id: "0123456789abcdef0123456789abcdef"
+                    state: "running"
+                    ram_mb: 256
+                    started_at: "2026-07-23T11:25:00Z"
+                next_before: null
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/secrets:
+    get:
+      tags: [secrets]
+      operationId: listSecretsForAccount
+      summary: List every sealed secret across the caller's account.
+      description: |
+        Replaces the per-app fan-out from `/v1/apps/{slug}/secrets`
+        with one account-scoped read (issue #393). Each row carries
+        the owning app's `app_id` and `app_slug` so the dashboard
+        can render "foo-app / DATABASE_URL" without a parallel
+        `/v1/apps` round-trip.
+
+        **Plaintext never appears here** — only the age-sealed
+        envelope (base64). The plaintext value lives transiently in
+        the PUT handler and never crosses the apid wire.
+
+        Cursor: `?before=<slug>|<key>` — the (app_slug, key) pair,
+        pipe-separated. The SQL splits it back via `split_part`.
+        Sort order is (app_slug ASC, key ASC). Default limit 25,
+        max 100 (strict 400 on bad input, matching `/v1/invoices`).
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor in the form `<slug>|<key>`. Omit for the first page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+          description: "Page size; server clamps to 1..100, returns 400 on bad input."
+      responses:
+        '200':
+          description: One page of sealed-secret envelopes, ordered by (app_slug ASC, key ASC).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListSecretsForAccountResponse' }
+              example:
+                secrets:
+                  - app_id: "0123456789abcdef0123456789abcdef"
+                    app_slug: "foo-app"
+                    key: "DATABASE_URL"
+                    ciphertext: "YWdlLWVuY3J5cHRpb24..."
+                    created_at: "2026-07-23T11:25:00Z"
+                    updated_at: "2026-07-23T11:25:00Z"
+                next_before: null
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/metrics:
+    get:
+      tags: [apps]
+      operationId: getAppsMetrics
+      summary: Account-wide per-app metrics rollup.
+      description: |
+        One call replaces N per-app `/v1/apps/{slug}/metrics` calls
+        (issue #393). Returns the same `AppMetricsResponse` shape
+        per app, keyed by `app_slug`, so the dashboard can render
+        all apps on a single page without a per-app fan-out.
+
+        Range is the closed vocabulary from the per-app endpoint:
+        `5m` (default) | `15m` | `1h` | `6h` | `24h` | `7d` | `15d`.
+        Prometheus failure short-circuits the entire response
+        (never partial-populated) and emits `source:
+        "degraded: <reason>"` with zeroed `apps`, matching the
+        per-app contract exactly.
+
+        PromQL cost: 6 round-trips regardless of N apps (vs. 7N
+        for the naive per-app loop) — see `pkg/promql.Client.QueryMap`
+        and `Client.QueryBuckets`.
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [5m, 15m, 1h, 6h, 24h, 7d, 15d]
+            default: 5m
+          description: "Time window applied to every per-app rollup row. Default `5m`."
+      responses:
+        '200':
+          description: The rollup.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppsMetricsResponse' }
+              example:
+                range: "5m"
+                source: "prometheus"
+                as_of: "2026-07-28T13:00:00Z"
+                apps:
+                  foo-app:
+                    app_id: "0123456789abcdef0123456789abcdef"
+                    range: "5m"
+                    source: "prometheus"
+                    as_of: "2026-07-28T13:00:00Z"
+                    request_count: 142
+                    latency_p50_ms: 12.4
+                    latency_p95_ms: 87.3
+                    latency_p99_ms: 412.5
+                    error_rate_pct: 0.7
+                    cold_start_pct: 8.5
+                    wake_p95_ms: 380.2
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/invocations/{id}:
     get:
       tags: [invocations]
@@ -3254,6 +3413,126 @@ components:
           description: "FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."
           x-since: "2026-07"
           x-issue: "273"
+
+    ListInstancesResponse:
+      description: |
+        Page shape for `GET /v1/instances` (issue #393). `instances`
+        is the page in started_at DESC, id DESC order. `next_before`
+        is the cursor the caller passes on the next request to fetch
+        the older page; empty when the page is the end.
+      type: object
+      required: [instances]
+      properties:
+        instances:
+          type: array
+          items: { $ref: '#/components/schemas/InstanceResponse' }
+        next_before:
+          type: [string, "null"]
+          format: uuid
+          description: "Cursor (instances.id UUIDv7) for the next older page. Empty / null at the end."
+
+    AccountAppSecretResponse:
+      description: |
+        One row in `GET /v1/secrets` — a sealed envelope on a specific
+        app (issue #393). Plaintext NEVER appears here: only the
+        age-sealed envelope (base64). `app_id` and `app_slug` let the
+        dashboard render "foo-app / DATABASE_URL" without a parallel
+        `/v1/apps` round-trip.
+      type: object
+      required: [app_id, app_slug, key, ciphertext, created_at, updated_at]
+      properties:
+        app_id:
+          type: string
+          pattern: '^[a-f0-9]{32}$'
+          example: "0123456789abcdef0123456789abcdef"
+          x-since: "2026-07"
+          x-issue: "393"
+        app_slug:
+          type: string
+          x-since: "2026-07"
+          x-issue: "393"
+        key:
+          type: string
+          x-since: "2026-07"
+          x-issue: "393"
+        ciphertext:
+          type: string
+          description: "base64 age-sealed envelope. Plaintext NEVER appears on this wire."
+          x-since: "2026-07"
+          x-issue: "393"
+        created_at:
+          type: string
+          format: date-time
+          x-since: "2026-07"
+          x-issue: "393"
+        updated_at:
+          type: string
+          format: date-time
+          x-since: "2026-07"
+          x-issue: "393"
+
+    ListSecretsForAccountResponse:
+      description: |
+        Page shape for `GET /v1/secrets` (issue #393). `secrets` is
+        the page in (app_slug ASC, key ASC) order. `next_before` is
+        the cursor the caller passes on the next request — encoded as
+        `<slug>|<key>`. Empty / null at the end.
+      type: object
+      required: [secrets]
+      properties:
+        secrets:
+          type: array
+          items: { $ref: '#/components/schemas/AccountAppSecretResponse' }
+        next_before:
+          type: [string, "null"]
+          description: "Cursor in the form `<slug>|<key>`. Empty / null at the end."
+
+    AppsMetricsResponse:
+      description: |
+        Account-wide per-app metrics rollup for `GET /v1/apps/metrics?range=`
+        (issue #393). One call replaces N per-app
+        `/v1/apps/{slug}/metrics` calls.
+
+        `apps` is keyed by `app_slug` so the dashboard can render the
+        rows without a parallel `/v1/apps` lookup. The per-app values
+        are `AppMetricsResponse` — the same shape as the per-app
+        endpoint emits, so the dashboard renders the rollup with one
+        code path.
+
+        `wake_p95_ms` per app is the FLEET p95 (the underlying
+        `gateway_wake_latency_seconds` histogram is unlabeled — there
+        is no per-app wake histogram).
+
+        On Prometheus failure the endpoint returns 200 with `apps:
+        null` and `source: "degraded: <reason>"`, matching the
+        per-app contract exactly so the dashboard has one empty-state
+        branch across both endpoints.
+      type: object
+      required: [range, source, as_of, apps]
+      properties:
+        range:
+          type: string
+          enum: [5m, 15m, 1h, 6h, 24h, 7d, 15d]
+          description: "Time window that was queried for every per-app rollup row."
+          x-since: "2026-07"
+          x-issue: "393"
+        source:
+          type: string
+          description: '"prometheus" on success; "degraded: <reason>" otherwise.'
+          x-since: "2026-07"
+          x-issue: "393"
+        as_of:
+          type: string
+          format: date-time
+          description: "RFC3339Nano UTC stamp at which the rollup was assembled."
+          x-since: "2026-07"
+          x-issue: "393"
+        apps:
+          type: [object, "null"]
+          description: "Per-app `AppMetricsResponse`, keyed by app_slug. Null when degraded."
+          additionalProperties: { $ref: '#/components/schemas/AppMetricsResponse' }
+          x-since: "2026-07"
+          x-issue: "393"
 
     UsageSummaryResponse:
       description: "Account-level monthly roll-up: included GB-hours, used, overage math, remaining balance, and informational used_cpu_hours (issue #279 / PR-B). The CPU dimension is observable but not yet billed; the GB-hours fields drive the overage math."

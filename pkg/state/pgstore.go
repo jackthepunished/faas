@@ -2777,6 +2777,48 @@ func (s *PgStore) ListInstancesForAccount(ctx context.Context, accountID string)
 	return scanInstances(rows)
 }
 
+// ListInstancesForAccountPaged is the cursor-paginated variant of
+// ListInstancesForAccount (issue #393). Cursor is the instances.id;
+// the SQL filter `id < $before` partitions rows by id and the
+// handler emits `out[len-1].ID` as the next cursor, so the walk
+// visits every row exactly once regardless of how `id` is generated
+// (the column default is gen_random_uuid() — UUIDv4 — so the cursor
+// order is not insertion-time-ordered, but each row's id is unique
+// and `id::text < cursor` strictly partitions).
+//
+// Note: PR #338 added UUIDv7 for `wake_id`, not `id`. An earlier
+// comment claimed `id` was UUIDv7; that was wrong. We deliberately
+// ORDER BY id DESC (not started_at DESC) so the cursor walk matches
+// the cursor predicate: with ORDER BY (started_at DESC, id DESC) the
+// cursor (last id of the page) can be lexicographically larger than
+// earlier rows' ids — same started_at, smaller id — and the walk
+// stalls (test CursorPagination). `id DESC` is the only order whose
+// cursor walk is well-defined for both UUIDv4 and UUIDv7.
+//
+// Cross-account safety is the JOIN on apps.account_id = $1 — there
+// is no per-account guard at the handler layer because the SQL is
+// the only path. The handler validates `limit` (1..100) before this
+// call so the SQL stays narrow.
+func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID string, limit int, before string) ([]Instance, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx,
+		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		 from instances i
+		 join apps a on a.id = i.app_id
+		 where a.account_id = $1
+		   and ($2 = '' or i.id::text < $2)
+		 order by i.id::text desc
+		 limit $3`, accountID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
 // ListLatestInstancePerApp returns the most-recently-started instance
 // for each app owned by the account, keyed by app ID. Used by the
 // dashboard cold-wake badge (PR #48 follow-up); collapses N per-app
@@ -4660,6 +4702,43 @@ func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) (
 			return nil, err
 		}
 		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListAppSecretsForAccount joins apps + app_secrets on account_id
+// (issue #393). The cursor is the (app_slug, key) pair — the
+// handler emits "<slug>|<key>" and the SQL splits it back via
+// split_part. Order is (app_slug ASC, key ASC) so the cursor walk
+// is monotonic. Each row carries the app_slug the per-app path
+// doesn't (the URL slug is the path parameter there).
+//
+// Cross-account isolation is the JOIN on apps.account_id = $1 — the
+// SQL is the only IDOR guard. Returns nil slice (not error) when
+// the account has no secrets.
+func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx,
+		`select s.account_id, s.app_id, a.slug, s.key, s.ciphertext, s.created_at, s.updated_at
+		 from app_secrets s
+		 join apps a on a.id = s.app_id
+		 where s.account_id = $1
+		   and ($2 = '' or (a.slug, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2)))
+		 order by a.slug asc, s.key asc
+		 limit $3`, accountID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountAppSecret
+	for rows.Next() {
+		var r AccountAppSecret
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

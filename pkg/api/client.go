@@ -533,6 +533,30 @@ func (c *Client) ListInstances(ctx context.Context, slug string) ([]InstanceResp
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/instances", nil, &out)
 }
 
+// GetInstances returns every live instance across the caller's account
+// (issue #393). One call replaces N per-app ListInstances calls. The
+// cursor / limit semantics mirror /v1/invoices: before is the last
+// instance.id from a previous page, limit clamps to 1..100 (default 25).
+// Cross-account isolation is a property of the SQL — the SDK doesn't
+// need to scope the call. See ADR-045.
+func (c *Client) GetInstances(ctx context.Context, before string, limit int) (ListInstancesResponse, error) {
+	var out ListInstancesResponse
+	path := "/v1/instances"
+	if before != "" || limit > 0 {
+		path += "?"
+		if before != "" {
+			path += "before=" + before
+		}
+		if limit > 0 {
+			if before != "" {
+				path += "&"
+			}
+			path += "limit=" + strconv.Itoa(limit)
+		}
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // Domains.
 func (c *Client) ListDomains(ctx context.Context) ([]CustomDomainResponse, error) {
 	var out []CustomDomainResponse
@@ -806,6 +830,32 @@ func (c *Client) ListSecrets(ctx context.Context, slug string) (AppSecretListRes
 	var out AppSecretListResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/secrets", nil, &out)
 }
+
+// GetSecrets returns every sealed secret across the caller's account
+// (issue #393). One call replaces N per-app ListSecrets calls. Each
+// row carries app_id and app_slug so the dashboard renders
+// "foo-app / DATABASE_URL" without a parallel /v1/apps lookup.
+// Ciphertext is the age-sealed envelope (base64); plaintext VALUE
+// is never on the wire (same invariant as ListSecrets). Cursor is
+// the (app_slug, key) pair, encoded as "<slug>|<key>" — see
+// ADR-045.
+func (c *Client) GetSecrets(ctx context.Context, before string, limit int) (ListSecretsForAccountResponse, error) {
+	var out ListSecretsForAccountResponse
+	path := "/v1/secrets"
+	if before != "" || limit > 0 {
+		path += "?"
+		if before != "" {
+			path += "before=" + url.QueryEscape(before)
+		}
+		if limit > 0 {
+			if before != "" {
+				path += "&"
+			}
+			path += "limit=" + strconv.Itoa(limit)
+		}
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
 func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
 	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/secrets/"+key,
 		PutAppSecretRequest{Value: value}, nil)
@@ -827,6 +877,22 @@ func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, err
 func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetricsResponse, error) {
 	var out AppMetricsResponse
 	path := "/v1/apps/" + slug + "/metrics"
+	if rng != "" {
+		path += "?range=" + rng
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAppsMetrics returns the account-wide per-app metrics rollup
+// (issue #393). One call replaces N per-app GetAppMetrics calls;
+// the response is keyed by app_slug so the dashboard renders rows
+// without a parallel /v1/apps lookup. rng follows the same closed
+// vocabulary as the per-app endpoint. First Prometheus failure
+// short-circuits the entire response with source="degraded: …"
+// and zeroed apps — see ADR-045.
+func (c *Client) GetAppsMetrics(ctx context.Context, rng string) (AppsMetricsResponse, error) {
+	var out AppsMetricsResponse
+	path := "/v1/apps/metrics"
 	if rng != "" {
 		path += "?range=" + rng
 	}

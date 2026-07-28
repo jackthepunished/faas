@@ -2550,6 +2550,46 @@ func (m *MemStore) ListInstancesForAccount(_ context.Context, accountID string) 
 	return out, nil
 }
 
+// ListInstancesForAccountPaged is the cursor-paginated mirror of
+// PgStore.ListInstancesForAccountPaged (issue #393). Mirrors the
+// SQL semantics: cursor is instance.id, sort is started_at DESC then
+// id DESC, limit is server-side clamped to 1..100.
+func (m *MemStore) ListInstancesForAccountPaged(_ context.Context, accountID string, limit int, before string) ([]Instance, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owned := make(map[string]struct{}, len(m.apps))
+	for _, a := range m.apps {
+		if a.AccountID == accountID {
+			owned[a.ID] = struct{}{}
+		}
+	}
+	var out []Instance
+	for _, ins := range m.instances {
+		if _, ok := owned[ins.AppID]; !ok {
+			continue
+		}
+		if before != "" && ins.ID >= before {
+			// Mirror the SQL: `id < $before` — strictly less than, so
+			// the cursor itself is excluded from the next page.
+			continue
+		}
+		out = append(out, ins)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.Equal(out[j].StartedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // ListLatestInstancePerApp returns the most-recently-started instance
 // for each app owned by the account (PR #48 follow-up). Used by the
 // dashboard cold-wake badge so one query replaces N per-app
@@ -4527,6 +4567,62 @@ func (m *MemStore) ListAppSecrets(_ context.Context, accountID, appID string) ([
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// ListAppSecretsForAccount is the account-scoped mirror of
+// ListAppSecrets (issue #393). The cursor is the (app_slug, key)
+// pair — encoded as "<slug>|<key>" by the handler. Order is
+// (app_slug ASC, key ASC) to match the SQL ORDER BY. Slugs are
+// charset-validated upstream so the "|" separator is unambiguous.
+func (m *MemStore) ListAppSecretsForAccount(_ context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slugOf := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		slugOf[a.ID] = a.Slug
+	}
+	var beforeSlug, beforeKey string
+	if before != "" {
+		parts := strings.SplitN(before, "|", 2)
+		beforeSlug, beforeKey = parts[0], parts[1]
+	}
+	var out []AccountAppSecret
+	for _, s := range m.secrets {
+		if s.AccountID != accountID {
+			continue
+		}
+		slug, ok := slugOf[s.AppID]
+		if !ok {
+			continue
+		}
+		if before != "" {
+			if slug < beforeSlug || (slug == beforeSlug && s.Key <= beforeKey) {
+				continue
+			}
+		}
+		out = append(out, AccountAppSecret{
+			AccountID:  s.AccountID,
+			AppID:      s.AppID,
+			AppSlug:    slug,
+			Key:        s.Key,
+			Ciphertext: s.Ciphertext,
+			CreatedAt:  s.CreatedAt,
+			UpdatedAt:  s.UpdatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AppSlug != out[j].AppSlug {
+			return out[i].AppSlug < out[j].AppSlug
+		}
+		return out[i].Key < out[j].Key
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 
