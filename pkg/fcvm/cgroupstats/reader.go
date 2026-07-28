@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
 
@@ -25,9 +26,19 @@ const defaultRoot = "/sys/fs/cgroup"
 // poller does the delta math against its previous cumulative, so this
 // package intentionally returns the raw counter — the rate belongs to
 // the consumer. Other cpu.stat fields (user_usec, system_usec,
-// nr_periods, nr_throttled, …) are not surfaced because schedd only
-// needs the total for instance-level CPU% rollups.
+// nr_periods, nr_throttled, …) are NOT surfaced by this field — see
+// throttledStatField below for the throttle counterpart introduced
+// in issue #301 / ADR-044.
 const cpuStatField = "usage_usec"
+
+// throttledStatField is the cgroup v2 cpu.stat key that represents
+// the cumulative CPU time THIS SCOPE spent throttled, in
+// microseconds (issue #301, ADR-044). The poller uses this as the
+// throttle counter's source — the Sample struct carries the raw
+// counter, and the wire side converts to seconds for the
+// vmmd_cpu_throttle_seconds_total Prometheus counter. Same raw-
+// counter contract as cpuStatField: the rate belongs to the consumer.
+const throttledStatField = "throttled_usec"
 
 // Sample is the cumulative CPU and current memory charge for one
 // instance, read once from cgroup v2. CPUPct and rate are computed by
@@ -41,6 +52,17 @@ type Sample struct {
 	// regression (cgroup recreated under us) the poller detects and
 	// resets its baseline.
 	CPUUsageUsec uint64
+
+	// ThrottledUsec is the cumulative CPU time this scope spent
+	// throttled, in microseconds (issue #301, ADR-044). Read from
+	// the second line of the same cpu.stat file as CPUUsageUsec.
+	// The poller computes the per-tick delta against the previous
+	// sample and the wire side converts to seconds for
+	// vmmd_cpu_throttle_seconds_total. The throttle ratio gauge
+	// (vmmd_cpu_throttle_ratio{slice}) is derived from the same
+	// delta divided by (throttle_delta + usage_delta) over the 5s
+	// sampler window — that's the FaasCpuStarvation alert source.
+	ThrottledUsec uint64
 
 	// RSSBytes is the current cgroup memory charge in bytes, read
 	// from memory.current. Includes the Firecracker process and VM
@@ -98,15 +120,22 @@ func NewWithDefaults() *Reader { return New(defaultRoot, nil) }
 // The function does not log on the not-found / malformed path: those
 // are normal during the wake/destroy lifecycle and the poller
 // explicitly prefers partial snapshots to error spam.
-func (r *Reader) Sample(instance string) (Sample, bool) {
+//
+// plan is the apps row's owning plan tier (issue #301, ADR-044); it
+// resolves the 3-level cgroup hierarchy
+// (faas-tenant.slice/<plan-slice>/<instance>) so the reader knows
+// which sub-slice to walk. An empty plan falls back to the legacy
+// 2-level path (ParentCgroupRoot/<instance>) for pre-issue-301
+// callers; new callers must always pass the real plan.
+func (r *Reader) Sample(instance string, plan api.Plan) (Sample, bool) {
 	if runtime.GOOS != "linux" {
 		return Sample{}, false
 	}
-	scope := filepath.Join(r.root, fcvm.ParentCgroup, fcvm.PerInstanceScope(instance))
+	scope := filepath.Join(r.root, fcvm.ParentCgroupFor(plan), fcvm.PerInstanceScope(instance))
 	if _, err := os.Stat(scope); err != nil {
 		return Sample{}, false
 	}
-	cpu, cpuOK := readCPUUsageUsec(filepath.Join(scope, "cpu.stat"))
+	cpu, throttled, cpuOK := readCPUStat(filepath.Join(scope, "cpu.stat"))
 	if !cpuOK {
 		// CPU is the more sensitive signal — if we can't read it,
 		// return ok=false so the poller doesn't think it has a stale
@@ -117,24 +146,31 @@ func (r *Reader) Sample(instance string) (Sample, bool) {
 	if !rssOK {
 		return Sample{}, false
 	}
-	return Sample{CPUUsageUsec: cpu, RSSBytes: rss}, true
+	return Sample{CPUUsageUsec: cpu, ThrottledUsec: throttled, RSSBytes: rss}, true
 }
 
-// Instances enumerates the per-VM cgroup leaves under faas-tenant.slice.
-// Mirrors pkg/fcvm/leakcheck.listTenantScopes' filter — no '.', no
-// '..' — so systemd-installed siblings (init.scope, user.slice,
-// *.mount) are excluded. Returns the bare instance names (matching
-// Lease.Instance verbatim).
+// Instances enumerates the per-VM cgroup leaves under the per-plan
+// sub-slices of faas-tenant.slice. Issue #301 / ADR-044 introduced
+// the 3-level hierarchy (faas-tenant.slice/<plan-slice>/<instance>);
+// this function walks each plan sub-slice and returns the
+// consolidated bare instance names. Returns InstanceInfo entries
+// carrying the owning plan so the caller can pass the right plan
+// back into Sample.
 //
-// The slice is sorted lexicographically by instance id so callers get
-// deterministic ordering across calls. This matters for the poller:
-// its CPU-baseline map is keyed by instance id, and a stable order
-// makes the per-tick dial loop easier to reason about in logs.
-func (r *Reader) Instances() ([]string, error) {
+// The filter — no '.', no '..' — mirrors pkg/fcvm/leakcheck's
+// listTenantScopes' so systemd-installed siblings (init.scope,
+// user.slice, *.mount) are excluded.
+//
+// The slice is sorted lexicographically by instance id (ties broken
+// by plan) so callers get deterministic ordering across calls.
+// This matters for the poller: its CPU-baseline map is keyed by
+// instance id, and a stable order makes the per-tick dial loop
+// easier to reason about in logs.
+func (r *Reader) Instances() ([]InstanceInfo, error) {
 	if runtime.GOOS != "linux" {
 		return nil, nil
 	}
-	base := filepath.Join(r.root, fcvm.ParentCgroup)
+	base := filepath.Join(r.root, fcvm.ParentCgroupRoot)
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		// Missing slice (cold-boot race, transient teardown) is
@@ -146,34 +182,79 @@ func (r *Reader) Instances() ([]string, error) {
 		}
 		return nil, err
 	}
-	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	out := make([]InstanceInfo, 0, len(entries))
+	plans := api.Plans
+	for _, plan := range plans {
+		// Walk each per-plan sub-slice and enumerate its leaves.
+		// A missing sub-slice (cold-boot race for that plan tier,
+		// no VMs yet on Free) is not an error — the enumeration
+		// just yields zero leaves for that plan. systemd drops the
+		// sub-slices at boot, so once any VM has woken on a plan
+		// the dir is sticky for the daemon's lifetime.
+		planDir := filepath.Join(base, plan.SliceName())
+		planEntries, perr := os.ReadDir(planDir)
+		if perr != nil {
+			if errors.Is(perr, fs.ErrNotExist) {
+				continue
+			}
+			return nil, perr
 		}
-		name := e.Name()
-		if strings.Contains(name, ".") || strings.Contains(name, "..") {
-			continue
+		for _, e := range planEntries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.Contains(name, ".") || strings.Contains(name, "..") {
+				continue
+			}
+			out = append(out, InstanceInfo{Instance: name, Plan: plan})
 		}
-		out = append(out, name)
 	}
-	// Deterministic order — sort lexicographically.
-	sortStrings(out)
+	// Deterministic order — sort lexicographically by (instance, plan).
+	sortInstanceInfos(out)
 	return out, nil
 }
 
-// readCPUUsageUsec parses one cgroup v2 cpu.stat file. The file is a
+// InstanceInfo carries one cgroup leaf's identity. Returned by
+// Instances and consumed by the poller (cmd/vmmd/cpu_poller.go) so
+// each Sample call receives the correct plan to resolve the
+// 3-level scope path.
+type InstanceInfo struct {
+	Instance string
+	Plan     api.Plan
+}
+
+// readCPUStat parses one cgroup v2 cpu.stat file. The file is a
 // newline-separated key-value list:
 //
 //	usage_usec 1234567890
-//	user_usec 987654321
-//	system_usec 246913569
+//	throttled_usec 987654
+//	user_usec ...
+//	system_usec ...
+//	nr_periods ...
+//	nr_throttled ...
 //	...
 //
-// Only usage_usec is consumed (see cpuStatField rationale above).
-// Malformed files (missing key, non-numeric value, no newline) return
-// ok=false rather than panicking — cgroup leaves can briefly hold
-// stale content during destroy.
+// Returns both usage_usec (the cumulative CPU time consumed by the
+// scope) and throttledUsec (the cumulative CPU time spent
+// throttled). Both are read from the same file in a single pass —
+// splitting into two readers would race against the kernel's
+// writes. Returns ok=false on a malformed file (missing usage_usec,
+// non-numeric value, scanner error) so the poller marks the row
+// Unknown rather than emitting a partial Sample.
+//
+// usage_usec is REQUIRED. The cgroup v2 kernel always emits it on
+// every scope that has any CPU activity; absence means the file is
+// garbled (mid-write torn page, a manually-edited test fixture, or
+// a non-cgroup file opened by mistake). Returning ok=false on
+// missing usage_usec is the load-bearing guard against emitting a
+// zero-CPU reading that would silently under-report capacity.
+//
+// Throttled_usec may be missing on kernels older than 5.14
+// (cpu.stat throttling accounting landed in 5.14). When absent
+// the parser returns 0 + ok=true; the FaasCpuStarvation alert
+// treats a zero throttle ratio as healthy so a missing
+// throttled_usec reads as "no throttling" rather than alerting.
 //
 // Path is vetted by the caller: it lives under
 // /sys/fs/cgroup/<slice>/<instance>/, where <instance> is the
@@ -184,27 +265,58 @@ func (r *Reader) Instances() ([]string, error) {
 // enforces is irrelevant on the host's cgroup v2 mount. The
 // errcheck ignore below pairs with the doc: we cannot meaningfully
 // act on a Close error from a /sys read.
-func readCPUUsageUsec(path string) (uint64, bool) {
+func readCPUStat(path string) (usageUsec, throttledUsec uint64, ok bool) {
 	f, err := os.Open(path) //nolint:forbidigo // vetted cgroup path, see comment above
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	// cpu.stat lines are short; the default 64 KiB buffer is plenty.
+	// usageSeen tracks whether the parser actually consumed a
+	// usage_usec line — distinguishing "VM just started, zero CPU
+	// time yet" (usageSeen=true, value=0, ok=true) from "the file
+	// is missing usage_usec entirely" (usageSeen=false, ok=false).
+	var usageSeen bool
 	for sc.Scan() {
 		line := sc.Text()
 		key, val, ok := strings.Cut(line, " ")
-		if !ok || key != cpuStatField {
+		if !ok {
 			continue
 		}
-		n, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
-		if err != nil {
-			return 0, false
+		switch key {
+		case cpuStatField:
+			n, perr := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+			if perr != nil {
+				return 0, 0, false
+			}
+			usageUsec = n
+			usageSeen = true
+		case throttledStatField:
+			n, perr := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+			if perr != nil {
+				return 0, 0, false
+			}
+			throttledUsec = n
 		}
-		return n, true
 	}
-	return 0, false
+	// Scanner error (file truncated / kernel panic halfway through)
+	// is fail-closed regardless of the parsed values.
+	if sc.Err() != nil {
+		return 0, 0, false
+	}
+	// usage_usec is required — a missing key means the file is
+	// garbled. The two failure cases the unit tests pin:
+	//   - TestSampleReturnsFalseOnMalformedCpuStat: a non-cgroup
+	//     file ("this is not a cgroup file") has no usage_usec line.
+	//   - TestSampleReturnsFalseOnMissingUsageUsecField: a cgroup
+	//     file with only user_usec/system_usec (no usage_usec).
+	// Both must return ok=false so the poller doesn't emit a
+	// zero-CPU row that would under-report capacity.
+	if !usageSeen {
+		return 0, 0, false
+	}
+	return usageUsec, throttledUsec, true
 }
 
 // readMemoryCurrent reads cgroup v2 memory.current — a single integer
@@ -221,13 +333,20 @@ func readMemoryCurrent(path string) (int64, bool) {
 	return n, true
 }
 
-// sortStrings is a tiny inlined sort.Strings wrapper to keep this
+// sortInstanceInfos is a tiny inlined sort wrapper to keep this
 // file's imports list narrow. Hot path: only the instance names found
-// in this tick — typically tens of entries, not millions.
-func sortStrings(s []string) {
+// in this tick — typically tens of entries, not millions. Sorts by
+// (instance, plan) lex so the iteration order is deterministic.
+func sortInstanceInfos(s []InstanceInfo) {
 	// Insertion sort: small N, no allocation, predictable.
 	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+		for j := i; j > 0; j-- {
+			if s[j-1].Instance < s[j].Instance {
+				break
+			}
+			if s[j-1].Instance == s[j].Instance && s[j-1].Plan <= s[j].Plan {
+				break
+			}
 			s[j-1], s[j] = s[j], s[j-1]
 		}
 	}

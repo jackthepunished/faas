@@ -171,9 +171,18 @@ type VMInstanceStat struct {
 	// (first sample, regression, or non-Linux host). schedd
 	// maps nil → Unknown / NaN on the wire row and
 	// instancestats.InstanceStat.
-	CPUSeconds       *float64
-	InflightRequests int64
-	LastRequestAt    time.Time
+	CPUSeconds *float64
+	// CpuThrottledSeconds (issue #301 / ADR-043) is the
+	// cumulative CPU-throttled-seconds reading from vmmd's
+	// cpustats cache. Same nil-contract as CPUSeconds — nil
+	// on the wire when the cache has no baseline for the
+	// instance; schedd decodes non-nil into wire.InstanceStatRow.
+	// ThrottledUsec and feeds the per-(account_id, app_id)
+	// vmmd_cpu_throttle_seconds_total counter via
+	// wire.OpsMetrics.ReplaceInstanceStats.
+	CpuThrottledSeconds *float64
+	InflightRequests    int64
+	LastRequestAt       time.Time
 }
 
 // AppSpec is the flat set of fields vmmd needs to boot an instance (ADR-014).
@@ -520,6 +529,10 @@ func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
 	if v := in.GetCpuSeconds(); v != nil {
 		s := v.GetValue()
 		row.CPUSeconds = &s
+	}
+	if v := in.GetCpuThrottledSeconds(); v != nil {
+		s := v.GetValue()
+		row.CpuThrottledSeconds = &s
 	}
 	if t := in.GetLastRequestAt(); t != nil {
 		row.LastRequestAt = t.AsTime()

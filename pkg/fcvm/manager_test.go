@@ -109,7 +109,7 @@ func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig) error {
 	// RAM cap. Both operations must succeed for Boot to be considered
 	// successful — a missing scope or unwritable memory.max means the
 	// VM is not properly constrained and we must fail.
-	scopePath := filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance))
+	scopePath := filepath.Join(cgroupRoot, ParentCgroupFor(l.Plan), PerInstanceScope(l.Instance))
 	if err := os.MkdirAll(scopePath, 0o755); err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func (v *fakeVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) error 
 	v.restored = append(v.restored, l.Instance)
 	v.mu.Unlock()
 	// Same scope-create as Boot — jailer creates the scope on restore too.
-	if err := os.MkdirAll(filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance)), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, ParentCgroupFor(l.Plan), PerInstanceScope(l.Instance)), 0o755); err != nil {
 		return err
 	}
 	// Mirror the production JailerVMM.Restore: after /snapshot/load, dial the
@@ -185,6 +185,7 @@ func TestWakeColdBoot_DoesNotInvokeResumeHook(t *testing.T) {
 		LayerKey:   "/layer.ext4",
 		VcpuCount:  2,
 		MemSizeMiB: 128,
+		Plan:       api.PlanHobby,
 		// Snapshot intentionally nil — forces cold boot.
 	}); err != nil {
 		t.Fatalf("Wake: %v", err)
@@ -199,6 +200,81 @@ func TestWakeColdBoot_DoesNotInvokeResumeHook(t *testing.T) {
 	}
 }
 
+// TestWakeRejectsEmptyPlan pins the up-front Plan validation
+// (issue #301 / ADR-043). A wire call with req.Plan = "" must fail
+// BEFORE bringUp runs — otherwise the VM would boot under the
+// legacy 2-level path (ParentCgroupFor("") = defaultParentCgroup),
+// silently disabling cpu.weight + cpu.max enforcement for that
+// lease, and the cleanup defer would only fire after the VM was
+// up. PR #390 review finding #1 (ship-blocker).
+func TestWakeRejectsEmptyPlan(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	req := WakeRequest{
+		Instance:   "ghost",
+		BaseKey:    "/b.ext4",
+		LayerKey:   "/l.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 128,
+		Plan:       "", // empty — fail-closed contract
+	}
+	if _, err := m.Wake(context.Background(), req); err == nil {
+		t.Fatal("Wake with empty plan: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid plan") {
+		t.Errorf("Wake with empty plan: error %q does not mention invalid plan", err)
+	}
+	// The VM MUST NOT have booted.
+	if vmm.boots() != 0 {
+		t.Errorf("VM booted %d times despite invalid plan; want 0 (validation must run before bringUp)", vmm.boots())
+	}
+	// And the lease MUST have been released — a fail-closed plan
+	// rejection must not leak the alloc slot.
+	if m.LeasedCount() != 0 {
+		t.Errorf("LeasedCount = %d after empty-plan rejection, want 0 (lease leak)", m.LeasedCount())
+	}
+	// Network must not have been set up either — same rationale
+	// (rejection is up-front, no I/O side effects).
+	if run.ran("netns add fc-ghost") || run.ran("ip netns add fc-ghost") {
+		t.Error("netns was created despite invalid plan; want no I/O before validation")
+	}
+}
+
+// TestWakeRejectsUnknownPlan pins the same fail-closed contract for
+// a plan string that's not in api.Plans (e.g. a future plan that
+// hasn't been wired into limits.go yet, or a typo'd wire call). Same
+// shape as TestWakeRejectsEmptyPlan — must reject, must not boot,
+// must not leak.
+func TestWakeRejectsUnknownPlan(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	req := WakeRequest{
+		Instance:   "typo",
+		BaseKey:    "/b.ext4",
+		LayerKey:   "/l.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 128,
+		Plan:       api.Plan("enterprise"), // not in api.Plans
+	}
+	if _, err := m.Wake(context.Background(), req); err == nil {
+		t.Fatal("Wake with unknown plan: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid plan") {
+		t.Errorf("Wake with unknown plan: error %q does not mention invalid plan", err)
+	}
+	if vmm.boots() != 0 {
+		t.Errorf("VM booted %d times despite unknown plan; want 0", vmm.boots())
+	}
+	if m.LeasedCount() != 0 {
+		t.Errorf("LeasedCount = %d after unknown-plan rejection, want 0 (lease leak)", m.LeasedCount())
+	}
+	if run.ran("netns add fc-typo") || run.ran("ip netns add fc-typo") {
+		t.Error("netns was created despite unknown plan; want no I/O before validation")
+	}
+}
+
 // TestWakeRestore_InvokesResumeHook verifies the restore path DOES call
 // TriggerResumeHook exactly once per Wake, with the lease slot wired into
 // the VsockDevice passed via RestoreSpec.
@@ -210,6 +286,7 @@ func TestWakeRestore_InvokesResumeHook(t *testing.T) {
 		LayerKey:   "/layer.ext4",
 		VcpuCount:  2,
 		MemSizeMiB: 128,
+		Plan:       api.PlanHobby,
 		Snapshot:   usableSnapshot(),
 	}); err != nil {
 		t.Fatalf("Wake: %v", err)
@@ -246,6 +323,7 @@ func TestWakeRestore_ResumeHookErrorFallsBackToColdBoot(t *testing.T) {
 		LayerKey:   "/layer.ext4",
 		VcpuCount:  2,
 		MemSizeMiB: 128,
+		Plan:       api.PlanHobby,
 		Snapshot:   usableSnapshot(),
 	}); err != nil {
 		t.Fatalf("Wake: %v (cold-boot fallback should have rescued it)", err)
@@ -357,7 +435,10 @@ func (v *fakeVMM) killedInstance(id string) bool {
 }
 
 func req(id string) ColdBootRequest {
-	return ColdBootRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128}
+	// Issue #301 / ADR-044 — Manager.Wake validates req.Plan against
+	// api.Plan.Valid(). PlanHobby is the cheapest paid tier; tests
+	// that don't care which plan they exercise use it.
+	return ColdBootRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128, Plan: api.PlanHobby}
 }
 
 func newTestManager(run Runner, vmm VMM) *Manager {
@@ -520,6 +601,7 @@ func TestRestoreFailsThenColdBootSucceeds(t *testing.T) {
 	inst, err := m.Wake(context.Background(), WakeRequest{
 		Instance: "fb", BaseKey: "/b.ext4", LayerKey: "/l.ext4",
 		VcpuCount: 2, MemSizeMiB: 128,
+		Plan:     api.PlanHobby,
 		Snapshot: usableSnapshot(),
 	})
 	if err != nil {
@@ -561,6 +643,7 @@ func TestWakeRejectsEgressAllowlist_v6Accepted(t *testing.T) {
 		LayerKey:   "/l.ext4",
 		VcpuCount:  2,
 		MemSizeMiB: 128,
+		Plan:       api.PlanHobby,
 		// v6 prefix: ADR-032 accepts this; renderer partitions
 		// into a separate ip6 faas forward rule.
 		EgressAllowlist: []string{"fe80::/10"},
@@ -593,6 +676,7 @@ func TestWakeRejectsEgressAllowlist_ZeroBitsClosed(t *testing.T) {
 		LayerKey:        "/l.ext4",
 		VcpuCount:       2,
 		MemSizeMiB:      128,
+		Plan:            api.PlanHobby,
 		EgressAllowlist: []string{"0.0.0.0/0"},
 	})
 	if err == nil {
@@ -627,6 +711,7 @@ func TestWakeRejectsEgressAllowlist_V6SlashZeroClosed(t *testing.T) {
 		LayerKey:        "/l.ext4",
 		VcpuCount:       2,
 		MemSizeMiB:      128,
+		Plan:            api.PlanHobby,
 		EgressAllowlist: []string{"::/0"},
 	})
 	if err == nil {
@@ -657,6 +742,7 @@ func TestRestoreSucceedsUsesFastPath(t *testing.T) {
 	inst, err := m.Wake(context.Background(), WakeRequest{
 		Instance: "rp", BaseKey: "/b.ext4", LayerKey: "/l.ext4",
 		VcpuCount: 2, MemSizeMiB: 128,
+		Plan:     api.PlanHobby,
 		Snapshot: usableSnapshot(),
 	})
 	if err != nil {
@@ -1166,7 +1252,12 @@ func TestWakeWritesMemoryMaxAfterBringUp(t *testing.T) {
 			if vmm.boots() != 1 {
 				t.Fatalf("expected 1 boot, got %d", vmm.boots())
 			}
-			memPath := filepath.Join(cgroupRoot, "faas-tenant.slice", PerInstanceScope(instID), "memory.max")
+			// Issue #301 / ADR-044: 3-level hierarchy
+			//   <cgroupRoot>/faas-tenant.slice/<plan-slice>/<instance>/
+			// ParentCgroupFor(plan) already includes the
+			// "faas-tenant.slice/" prefix, so the path is just
+			// cgroupRoot + ParentCgroupFor(plan) + PerInstanceScope(instID).
+			memPath := filepath.Join(cgroupRoot, ParentCgroupFor(r.Plan), PerInstanceScope(instID), "memory.max")
 			body, err := os.ReadFile(memPath)
 			if err != nil {
 				t.Fatalf("memory.max not written at %s: %v", memPath, err)

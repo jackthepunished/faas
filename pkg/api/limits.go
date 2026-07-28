@@ -50,6 +50,26 @@ type Limits struct {
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
 
+	// CPU fairness (issue #301 / ADR-044). The 3-level cgroup hierarchy
+	// (faas-tenant.slice/tenant-<plan>.slice/<instance>) enforces these
+	// per-plan via two complementary channels:
+	//
+	//   - CPUWeight is fed to the jailer --cgroup cpu.weight=N argv, so
+	//     the kernel schedules bursts under the plan's share of the
+	//     tenant slice. Ratio 2:4:8:16 (Free:Hobby:Pro:Scale) so
+	//     Scale-customer bursts can preempt Free-customer bursts but
+	//     never starve them out of their weight.
+	//   - CPUQuotaUS / CPUPeriodUS are written directly to the
+	//     instance's cpu.max file (jailer v1.7 has no --cgroup cpu.max
+	//     arg). Together they cap per-instance compute so a Plan H
+	//     hot-loop never burns the box's full multi-core share.
+	//
+	// The values are the issue #301 spec: Free 100ms/100ms, Hobby
+	// 200ms/200ms, Pro 500ms/500ms, Scale 1000ms/1000ms.
+	CPUWeight   int // kernel cpu.weight (1..10000); ratio per plan
+	CPUQuotaUS  int // cpu.max quota half (microseconds)
+	CPUPeriodUS int // cpu.max period half (microseconds)
+
 	// Metering (spec §1, §10). Money in millicents.
 	IncludedGBHours int   // included GB-RAM-hours per calendar month
 	PriceMillicents int64 // monthly subscription price
@@ -216,6 +236,14 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// CPU fairness (issue #301 / ADR-044): Free gets the smallest
+		// slice weight=2 and the tightest quota (100ms/100ms). 100 ms
+		// is enough headroom for a Free-tier app to handle a handful of
+		// requests without a throttle trip but stops a tight loop from
+		// preempting other slice members.
+		CPUWeight:   2,
+		CPUQuotaUS:  100_000,
+		CPUPeriodUS: 100_000,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -257,6 +285,12 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// CPU fairness (issue #301): Hobby weight=4, quota 200ms/200ms.
+		// Doubles Free's quota — tracks the per-app concurrency bump
+		// (1 → 2) and the per-app rps (5 → 20).
+		CPUWeight:   4,
+		CPUQuotaUS:  200_000,
+		CPUPeriodUS: 200_000,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -299,6 +333,12 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// CPU fairness (issue #301): Pro weight=8, quota 500ms/500ms.
+		// Half-bandwidth of 2 cores — tracks the per-app concurrency
+		// (5) and the per-app rps (100).
+		CPUWeight:   8,
+		CPUQuotaUS:  500_000,
+		CPUPeriodUS: 500_000,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -343,6 +383,14 @@ var planLimits = map[Plan]Limits{
 		// coordinated abuse, not baseline load.
 		RateLimitPerAccountRPM:  5000,
 		ScaleUpTargetCPUAllowed: true,
+		// CPU fairness (issue #301): Scale weight=16, quota 1000ms/1000ms
+		// — i.e. the full bandwidth of one core. Scale runs 20 concurrent
+		// VMs by plan, so the slice's aggregate quota is 20× at burst.
+		// The kernel cpu.weight ratio with the lower tiers keeps single
+		// VM bursts from monopolising the parent slice.
+		CPUWeight:   16,
+		CPUQuotaUS:  1_000_000,
+		CPUPeriodUS: 1_000_000,
 	},
 }
 
@@ -723,6 +771,78 @@ func (p Plan) ScaleUpTargetCPUAllowed() bool {
 		return false
 	}
 	return l.ScaleUpTargetCPUAllowed
+}
+
+// SliceName returns the systemd sub-slice name for this plan. The
+// 3-level cgroup hierarchy (issue #301 / ADR-044) is
+//
+//	/sys/fs/cgroup/faas-tenant.slice/<sliceName>/<instance>
+//
+// systemd drops the per-plan sub-slice at boot via
+// deploy/ansible/roles/systemd_slices (4 copies: free/hobby/pro/scale);
+// the jailer expects the parent dir to exist before it creates the
+// per-instance scope. The slice name is the canonical form
+// "tenant-<plan>" — it carries the "tenant-" prefix so the
+// faas.rules.yml `slice=~"tenant-.*"` matcher stays stable for any
+// future tenant-customer slice hierarchy. Unknown plans return the
+// empty string so call sites fail closed (jailer will reject a zero
+// parent cgroup path) rather than silently writing the wrong scope.
+func (p Plan) SliceName() string {
+	switch p {
+	case PlanFree:
+		return "tenant-free"
+	case PlanHobby:
+		return "tenant-hobby"
+	case PlanPro:
+		return "tenant-pro"
+	case PlanScale:
+		return "tenant-scale"
+	default:
+		return ""
+	}
+}
+
+// CPUWeight returns the kernel cpu.weight value for the plan, used as
+// the jailer `--cgroup cpu.weight=N` argv (issue #301 / ADR-044). The
+// ratio 2:4:8:16 (Free:Hobby:Pro:Scale) ensures a Scale-customer
+// burst can preempt a Free-customer burst but never starves them out of
+// their weight. Unknown plans fail closed (return 100 — the kernel
+// default) so a missing Limits row never silently disables the cgroup
+// weight; the cpu.max quota still bounds the impact.
+func (p Plan) CPUWeight() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 100
+	}
+	return l.CPUWeight
+}
+
+// CPUQuotaUS returns the cpu.max quota half (microseconds) for the
+// plan — written directly to the per-instance cpu.max file. Issue
+// #301 spec: Free 100ms / Hobby 200ms / Pro 500ms / Scale 1000ms.
+// Unknown plans fail closed (return 0 — disabled quota, which the
+// kernel treats as "no limit", so a misconfigured plan is detectable
+// in dashboards rather than silently denied).
+func (p Plan) CPUQuotaUS() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CPUQuotaUS
+}
+
+// CPUPeriodUS returns the cpu.max period half (microseconds) for the
+// plan. Always equal to CPUQuotaUS for the issue #301 spec — the
+// potential quota is "<period> microseconds per <period>". Unknown
+// plans fail closed (return 100_000 — the standard default period),
+// which then makes the quota half easy to reason about even when the
+// row is missing.
+func (p Plan) CPUPeriodUS() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 100_000
+	}
+	return l.CPUPeriodUS
 }
 
 // AdmissionMB is the RAM an instance charges against the admission ceiling and

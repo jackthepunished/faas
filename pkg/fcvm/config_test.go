@@ -2,8 +2,11 @@ package fcvm
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func validColdSpec() ColdBootSpec {
@@ -103,6 +106,7 @@ func TestJailerCommandMatchesSpec(t *testing.T) {
 	argv := JailerCommand(JailerSpec{
 		Instance: "abc", UID: 20007, GID: 20007, Netns: "fc-abc",
 		ExecFile: "/usr/local/bin/firecracker",
+		Plan:     api.PlanHobby, // issue #301 / ADR-044
 	})
 	line := strings.Join(argv, " ")
 	wants := []string{
@@ -112,9 +116,9 @@ func TestJailerCommandMatchesSpec(t *testing.T) {
 		"--chroot-base-dir " + JailChrootBase,
 		"--netns /run/netns/fc-abc",
 		"--cgroup-version 2",
-		"--parent-cgroup " + ParentCgroup,
-		"--cgroup cpu.weight=256", // mandatory to make jailer create the per-VM child scope
-		"-- --api-sock api.sock",  // firecracker's own argv only — no binary name
+		"--parent-cgroup " + ParentCgroupFor(api.PlanHobby), // 3-level path (issue #301)
+		"--cgroup cpu.weight=" + fmt.Sprintf("%d", api.PlanHobby.CPUWeight()),
+		"-- --api-sock api.sock", // firecracker's own argv only — no binary name
 	}
 	for _, w := range wants {
 		if !strings.Contains(line, w) {

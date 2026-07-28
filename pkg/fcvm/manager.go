@@ -131,6 +131,14 @@ type Instance struct {
 	// unit suite stubs it out.
 	AllowlistHandleV4 uint64
 	AllowlistHandleV6 uint64
+
+	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
+	// Stored on the Instance so Destroy (pkg/fcvm/vmm.go) can compute
+	// the per-plan cgroup scope path (ParentCgroupFor) without
+	// needing to thread the plan through the vmm-side Lease type.
+	// The Lease stays allocator-owned and instance-id-keyed; the Plan
+	// is schedd-owned and recorded at Wake time.
+	Plan api.Plan
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
@@ -292,14 +300,30 @@ func (m *Manager) stageSecretsEnv(instance string, jsonBlob []byte) error {
 // *Path fields used, so single-box behaviour is preserved. Field
 // names changed from *Path → *Key to match the new semantics.
 type WakeRequest struct {
-	Instance   string
-	AppID      string // apps.id UUID; PR-B UpdateEgressAllowlist walks live by AppID
+	Instance string
+	AppID    string // apps.id UUID; PR-B UpdateEgressAllowlist walks live by AppID
+	// AccountID is the apps row's owning account id (issue #301,
+	// ADR-044). Threads onto the wire so vmmd can label the
+	// vmmd_cpu_throttle_seconds_total{account_id, app_id} counter
+	// and the throttle top-N admission primitive (topAppSet, cap
+	// 100). Empty = "anonymous" admission (matches the
+	// requestTotal overflow policy where missing account_id maps
+	// to "other" via pkg/wire/metrics.go's overflow label set).
+	AccountID  string
 	BaseKey    string // StorageBackend key for drive0 shared ro base rootfs for the app's runtime
 	LayerKey   string // StorageBackend key for drive1 per-app layer
 	VcpuCount  int
 	MemSizeMiB int
 	EgressMbit int       // per-plan tc cap (pkg/api/limits.EgressMbit); 0 = no cap
 	Snapshot   *Snapshot // nil => cold boot
+	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
+	// Drives the parent-cgroup path (ParentCgroupFor) and the
+	// --cgroup cpu.weight=N jailer argv, plus the per-instance
+	// cpu.max direct file write. Required — Manager.Wake validates
+	// the row against api.Plan.Valid() and returns an error on
+	// empty/unknown plans so a missing wire field doesn't
+	// silently land a VM under the wrong slice.
+	Plan api.Plan
 	// ExportDir, if non-empty, marks this instance as a builder VM (M6).
 	// vmmd's Manager.DestroyWithExport waits for exit, captures the exit code,
 	// and copies build artifacts (build-done.json + /build/out/*) into this host
@@ -347,12 +371,19 @@ type SealedEnvEntry struct {
 // StorageBackend keys schedd sends on the wake wire (not host paths).
 // Same semantics as WakeRequest.
 type ColdBootRequest struct {
-	Instance   string
+	Instance string
+	// AccountID is the apps row's owning account id (issue #301,
+	// ADR-044). Forwarded to WakeRequest.AccountID — see
+	// WakeRequest for the contract.
+	AccountID  string
 	BaseKey    string
 	LayerKey   string
 	VcpuCount  int
 	MemSizeMiB int
 	EgressMbit int // per-plan tc cap; 0 = no cap (legacy / disabled)
+	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
+	// Forwarded to WakeRequest.Plan — see WakeRequest for the contract.
+	Plan api.Plan
 	// ExportDir is non-empty for builder VMs. See WakeRequest.
 	ExportDir string
 	// SealedEnvEntries is forwarded to WakeRequest for staging onto drive1
@@ -366,11 +397,13 @@ type ColdBootRequest struct {
 // snapshot.
 func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance, error) {
 	return m.Wake(ctx, WakeRequest{
-		Instance: req.Instance, BaseKey: req.BaseKey, LayerKey: req.LayerKey,
+		Instance: req.Instance, AccountID: req.AccountID,
+		BaseKey: req.BaseKey, LayerKey: req.LayerKey,
 		VcpuCount: req.VcpuCount, MemSizeMiB: req.MemSizeMiB,
 		EgressMbit: req.EgressMbit, Snapshot: nil,
 		ExportDir: req.ExportDir, SealedEnvEntries: req.SealedEnvEntries,
 		EgressAllowlist: req.EgressAllowlist,
+		Plan:            req.Plan,
 	})
 }
 
@@ -382,12 +415,22 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	if err != nil {
 		return nil, fmt.Errorf("wake %s: acquire lease: %w", req.Instance, err)
 	}
-	// Any failure from this point — wire-side allowlist validation
-	// included — must fully clean up. Registering the cleanup BEFORE
-	// the validation loop is load-bearing: the lease is acquired, so
-	// fail-closed early-return paths otherwise leak the slot. The
-	// validator (cidr parse + v4/non-/0 checks) sits AFTER the defer
-	// on purpose; see ADR-031 + PR #159 review F3.
+	// Stamp the Plan onto the Lease (issue #301, ADR-044) so the
+	// downstream vmm.Boot/Restore/Kill/Destroy path can compute the
+	// per-plan parent cgroup + cpu.weight without a separate map
+	// lookup. Set BEFORE the validation loop so a rejected wake
+	// cleans up via the same defer that releases the slot — the
+	// Plan is allocator-side state and must follow the lease's
+	// lifetime.
+	lease.Plan = req.Plan
+	// Any failure from this point — Plan validation, wire-side
+	// allowlist checks, bringUp, cgroup write — must fully clean up.
+	// Registering the cleanup BEFORE the validation loop is
+	// load-bearing: the lease is acquired, so fail-closed early-return
+	// paths otherwise leak the slot. The Plan validator sits BEFORE
+	// bringUp so a wire call with an empty/unknown plan never boots
+	// the VM under the legacy 2-level cgroup path (issue #301 /
+	// ADR-043, PR #390 review finding #1).
 	defer func() {
 		if err != nil {
 			m.cleanup(context.WithoutCancel(ctx), lease, netns.NewConfig(
@@ -397,6 +440,17 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	}()
 	nc := netns.NewConfig(lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP)
 	nc.EgressMbit = req.EgressMbit
+	// Plan validation (issue #301 / ADR-043). An empty / unknown plan
+	// would land the VM under the wrong cgroup sub-slice (or under
+	// none at all) and silently disable per-plan cpu.weight + cpu.max
+	// enforcement. Validate AFTER the cleanup defer is registered so
+	// the lease is released on reject — but BEFORE setupNetwork /
+	// bringUp so the VM never reaches the wrong slice. PR #390
+	// review finding #1 (correctness / ship-blocker).
+	if !req.Plan.Valid() {
+		err = fmt.Errorf("wake %s: invalid plan %q (issue #301 / ADR-043)", req.Instance, req.Plan)
+		return nil, err
+	}
 	// Spec §7 conntrack cap (ADR-018 deferral). Platform-wide constant;
 	// not propagated through vmmd gRPC because every instance sees the
 	// same value (the failure mode is host-table exhaustion, shared).
@@ -482,21 +536,25 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		}
 	}
 
-	// memory.max fence (spec §4.4) — written AFTER bringUp returns because
-	// the scope is created by jailer during Boot/Restore and does not exist
-	// before then. writeMemoryMax is naturally idempotent (cgroupv2 accepts
-	// an identical-value write as a no-op), so snapshot-restore Wake does
-	// not need a reset. Failure routes through the deferred cleanup path —
-	// the VM is already up, but teardown kills it and releases the lease.
-	if err = writeMemoryMax(req.Instance, req.MemSizeMiB); err != nil {
+	// cgroup fence (spec §4.4 / issue #301 / ADR-044) — written AFTER
+	// bringUp returns because the scope is created by jailer during
+	// Boot/Restore and does not exist before then. writePlanCgroup
+	// writes BOTH memory.max (the per-VM + 8 MB fence) and cpu.max
+	// (the per-plan quota: Free 100ms/100ms, Hobby 200ms/200ms, Pro
+	// 500ms/500ms, Scale 1000ms/1000ms). Both writes are naturally
+	// idempotent (cgroupv2 accepts an identical-value write as a no-op),
+	// so snapshot-restore Wake does not need a reset. Failure routes
+	// through the deferred cleanup path — the VM is already up, but
+	// teardown kills it and releases the lease.
+	if err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB); err != nil {
 		// Cgroup fence spec §4.4 but may fail in constrained environments
 		// (cgroup namespace isolation). VM is already up; continue without memory cap.
 		// Useful for local metal testing only.
-		m.log.Warn("cgroup fence: writeMemoryMax failed, continuing",
-			"instance", req.Instance, "err", err)
+		m.log.Warn("cgroup fence: writePlanCgroup failed, continuing",
+			"instance", req.Instance, "plan", req.Plan, "err", err)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and

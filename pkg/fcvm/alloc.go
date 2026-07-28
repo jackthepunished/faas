@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // Invariant §6.2-5: two instances (including two restored from the SAME snapshot)
@@ -42,6 +44,12 @@ type Lease struct {
 	Netns    string     // network namespace name, fc-<instance>
 	VethHost string     // host-side veth (≤15 chars, derived from slot)
 	VethPeer string     // netns-side veth (≤15 chars, derived from slot)
+	// Plan is the apps row's owning plan tier (issue #301, ADR-044).
+	// Stamped at alloc time so every downstream consumer (Boot,
+	// Restore, Destroy, Kill) reads the same plan without a separate
+	// map lookup. Empty for pre-issue-301 callers (legacy 2-level
+	// hierarchy); see ParentCgroupFor for the empty fallback.
+	Plan api.Plan
 }
 
 // Allocator hands out unique Leases and recycles slots on release. Safe for

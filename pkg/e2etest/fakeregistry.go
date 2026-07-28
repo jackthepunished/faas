@@ -77,6 +77,100 @@ func HelloImageAboveBase(repo, helloBody string) (fakeImage, string) {
 	return layeredHelloImage(repo, helloBody, true)
 }
 
+// CPUBoundImage returns a single-layer image whose entrypoint is a tight
+// shell loop (`while :; do :; done`). Used by the cpu-fairness e2e
+// (cmd/e2e/cpu_fairness_test.go, issue #301 / ADR-044) to drive a
+// sustained 100% CPU workload on a single Hobby-tier VM so the per-plan
+// cpu.max = 200ms/100ms cap engages and the test can measure the
+// starvation it imposes on neighbouring Hobby-tier VMs.
+//
+// Layer shape matches HelloImage so this image pairs with the same
+// BaseLayerImage("onebox-faas/deploy-base", ...) the rest of the e2e
+// suite uses — `oci.LayersAboveBase` sees a matching diff_id prefix and
+// the above-base layer (here: a noop regular file) lands in `above`.
+//
+// The Cmd is intentionally a POSIX shell busy-loop, not `dd` or
+// `openssl speed`: the goal is *CPU saturation*, not I/O or crypto
+// throughput. `while :; do :; done` is the smallest possible pure-CPU
+// loop the guest's `/bin/sh` supports, and the kernel scheduler's
+// throttle ratio is the only thing that can throttle it — exactly the
+// signal the issue's `vmmd_cpu_throttle_ratio{slice}` gauge measures.
+//
+// Pair with HelloImage for the quiet side of the experiment:
+//   - CPUBoundImage (hot)        on plan=Hobby → saturates tenant-hobby.slice
+//   - HelloImage      (quiet ×5) on plan=Hobby → measurement baseline
+//
+// The 200ms/100ms cpu.max is the tightest quota in the §1 model
+// (Hobby), so a hot Hobby app at its ceiling preempts the 5 quiet
+// Hobby apps via the cpu.weight ratio (4 vs 4 — equal weights, so
+// the throttle is the only signal). If the hot app were Pro/Scale,
+// the cpu.weight differential (4 vs 8 / 4 vs 16) would dominate and
+// the test would not isolate cpu.max enforcement.
+func CPUBoundImage(repo string) (fakeImage, string) {
+	return layeredHelloImageWithCmd(repo, []string{"/bin/sh", "-c", "while :; do :; done"})
+}
+
+// layeredHelloImageWithCmd is layeredHelloImage with a custom Cmd.
+// Kept as a separate helper to avoid growing the existing
+// layeredHelloImage signature (which already has two callers —
+// HelloImage + HelloImageAboveBase — that don't need a knob).
+func layeredHelloImageWithCmd(repo string, cmd []string) (fakeImage, string) {
+	// Layer shape identical to layeredHelloImage (one base layer with
+	// the hardcoded diff_id; no above-base layer — pairs with the
+	// shared deploy-base via the same prefix trick). Re-use
+	// buildHelloLayer("") so the diff_id stays helloLayerDiffID.
+	baseBlob := buildHelloLayer("")
+	baseSum := sha256.Sum256(baseBlob)
+	baseDigest := "sha256:" + hex.EncodeToString(baseSum[:])
+
+	cfg := map[string]any{
+		"architecture": "amd64",
+		"os":           "linux",
+		"config": map[string]any{
+			"Cmd":          cmd,
+			"Env":          []string{},
+			"WorkingDir":   "/",
+			"ExposedPorts": map[string]any{"8080/tcp": struct{}{}},
+		},
+		"rootfs": map[string]any{
+			"type":     "layers",
+			"diff_ids": []string{helloLayerDiffID},
+		},
+	}
+	cfgBytes, _ := json.Marshal(cfg)
+	cfgSum := sha256.Sum256(cfgBytes)
+	cfgDigest := "sha256:" + hex.EncodeToString(cfgSum[:])
+
+	manifest := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
+		"config": map[string]any{
+			"mediaType": "application/vnd.oci.image.config.v1+json",
+			"digest":    cfgDigest,
+			"size":      len(cfgBytes),
+		},
+		"layers": []map[string]any{{
+			"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+			"digest":    baseDigest,
+			"size":      len(baseBlob),
+		}},
+	}
+	manifestBytes, _ := json.Marshal(manifest)
+	mSum := sha256.Sum256(manifestBytes)
+	manifestDigest := "sha256:" + hex.EncodeToString(mSum[:])
+
+	img := fakeImage{
+		configDigest:   cfgDigest,
+		configBytes:    cfgBytes,
+		layerBlobs:     []blobEntry{{digest: baseDigest, bytes: baseBlob}},
+		manifestDigest: manifestDigest,
+		manifestBytes:  manifestBytes,
+		manifestMT:     "application/vnd.oci.image.manifest.v1+json",
+	}
+	ref := fmt.Sprintf("%s@%s", repo, manifestDigest)
+	return img, ref
+}
+
 func layeredHelloImage(repo, helloBody string, aboveBase bool) (fakeImage, string) {
 	// Build the layer blob list. The "base" layer (always present) advertises
 	// the hardcoded helloLayerDiffID — a fake that the deploy-time base image

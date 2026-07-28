@@ -870,3 +870,127 @@ func TestPoller_NaNSentinel(t *testing.T) {
 		t.Error("math.NaN is not NaN — sentinel broken")
 	}
 }
+
+// TestPoller_DecodesCpuThrottledSecondsIntoWireRow pins the
+// end-to-end contract for issue #301 acceptance #4 — schedd must
+// decode InstanceStats.CpuThrottledSeconds into
+// wire.InstanceStatRow.ThrottledUsec. Without this decode
+// (PR #390 review finding #2, ship-blocker) the wire row reaches
+// ReplaceInstanceStats with ThrottledUsec=NaN, the per-(account_id,
+// app_id) baseline is never updated, the top-N admission primitive
+// never sees the throttle dimension, and the top-throttled-apps
+// dashboard panel is permanently empty in production.
+//
+// The schedd-side poller is the bridge that takes the wire field
+// (vmmd populates it from cgroupstats.Sample) and hands it to
+// wire.OpsMetrics.ReplaceInstanceStats. This test exercises that
+// bridge by hooking the wire rollup via Metrics and asserting the
+// ReplaceInstanceStats sees a non-NaN ThrottledUsec for the row.
+//
+// Note: the actual counter emission (vmmd_cpu_throttle_seconds_total)
+// lives in vmmd's per-tick Sampler via EmitTopAppThrottle — that
+// is a vmmd-side concern, not a schedd-side one. This test
+// verifies the schedd-side contribution: the wire row's
+// ThrottledUsec is populated, the per-(account_id, app_id)
+// baseline in throttleSecondsLastSeen is updated, and the
+// topAppSet sample is bumped (so the vmmd-side top-N ranking
+// will admit the (account_id, app_id) tuple).
+func TestPoller_DecodesCpuThrottledSecondsIntoWireRow(t *testing.T) {
+	store := state.NewMemStore()
+	_, live := seedTwoNodes(t, store)
+	ins := seedInstance(t, store, "app1", live.ID)
+
+	dialer := &statsFakeDialer{
+		stats: map[string]*sched.StatsSnapshot{
+			live.TargetURL: {
+				Instances: []sched.VMInstanceStat{
+					{
+						InstanceID:          ins.ID,
+						CpuThrottledSeconds: ptrF64(4.5), // 4.5s cumulative
+					},
+				},
+			},
+		},
+	}
+	m := wire.NewOpsMetrics("schedd")
+	p := NewPoller(store, dialer, nil, NewReader(), m, nilLogger())
+	if err := p.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// The wire rollup must have updated throttleSecondsLastSeen
+	// for the (anonymous, app1) tuple — query the baseline via
+	// the (currently package-private) accessor or, more
+	// defensively, scrape the metrics and verify the
+	// pre-instantiated ("other", "other") overflow row has not
+	// been touched. The load-bearing signal is that the
+	// topAppSet sample was bumped, which we observe via the
+	// TopAppSet() test seam: the rolling count for (anonymous,
+	// app1) is > 0.
+	ts := m.TopAppSet()
+	if ts == nil {
+		t.Fatal("TopAppSet() returned nil; the primitive should be non-nil on a freshly-constructed OpsMetrics")
+	}
+	snap := ts.SnapshotAppCounts()
+	// topAppSet is keyed (accountID, appID); the poller
+	// populates accountID from the wire row's AccountID which
+	// is empty (the MemStore-seeded instance has no owner),
+	// collapsed to "anonymous" by the rollup's accountLabel
+	// path. The composite key is therefore ("anonymous",
+	// "app1"). Single-row admission under cap=100.
+	key := m.AppKeyForTest("anonymous", "app1")
+	count, ok := snap[key]
+	if !ok || count == 0 {
+		t.Errorf("topAppSet sample for (anonymous, app1) = %d (present=%v); want count > 0; full snapshot: %+v", count, ok, snap)
+	}
+	// Also verify the per-pair baseline (throttleSecondsLastSeen)
+	// was updated — query the test seam. The baseline must
+	// reflect the wire value (4.5s = 4,500,000 usec).
+	if seen := m.ThrottleSecondsLastSeenForTest("anonymous", "app1"); seen != 4_500_000 {
+		t.Errorf("throttleSecondsLastSeen for (anonymous, app1) = %g; want 4,500,000 (4.5s × 1e6)", seen)
+	}
+}
+
+// TestPoller_CpuThrottledSecondsNilLeavesThrottledUsecAtNaN pins
+// the nil-on-wire contract: vmmd has no baseline for the
+// instance's cgroup yet (first sample, regression, non-Linux
+// host) and the wire sends a nil *float64. The poller must leave
+// ThrottledUsec at NaN so the rollup's regression-handling
+// branch excludes the row (matches the CPUSeconds contract).
+func TestPoller_CpuThrottledSecondsNilLeavesThrottledUsecAtNaN(t *testing.T) {
+	store := state.NewMemStore()
+	_, live := seedTwoNodes(t, store)
+	ins := seedInstance(t, store, "app1", live.ID)
+
+	dialer := &statsFakeDialer{
+		stats: map[string]*sched.StatsSnapshot{
+			live.TargetURL: {
+				Instances: []sched.VMInstanceStat{
+					{InstanceID: ins.ID}, // CpuThrottledSeconds nil
+				},
+			},
+		},
+	}
+	m := wire.NewOpsMetrics("schedd")
+	p := NewPoller(store, dialer, nil, NewReader(), m, nilLogger())
+	if err := p.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// The (anonymous, app1) tuple must NOT have been admitted
+	// to topAppSet because the wire value is NaN (the
+	// rollup's "if math.IsNaN(r.ThrottledUsec) { continue }"
+	// guard skips the row). The other bucket pre-instantiation
+	// is unaffected.
+	ts := m.TopAppSet()
+	if ts == nil {
+		t.Fatal("TopAppSet() returned nil")
+	}
+	snap := ts.SnapshotAppCounts()
+	if _, ok := snap[m.AppKeyForTest("anonymous", "app1")]; ok {
+		t.Errorf("topAppSet admitted (anonymous, app1) for nil CpuThrottledSeconds; full snapshot: %+v", snap)
+	}
+	// The baseline must NOT have been updated — the rollup's
+	// NaN guard skipped the row.
+	if seen := m.ThrottleSecondsLastSeenForTest("anonymous", "app1"); seen != 0 {
+		t.Errorf("throttleSecondsLastSeen for (anonymous, app1) = %g; want 0 (nil contract — NaN guard must skip)", seen)
+	}
+}

@@ -317,6 +317,18 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 			if reading, ok := s.cpuCache.Lookup(inst); ok && reading.Valid {
 				row.CpuPct = wrapperspb.Double(reading.CPUPct)
 				row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
+				// PR-D (issue #301, ADR-044): the
+				// cumulative throttled-seconds reading.
+				// Source: same Reading as cpu_seconds,
+				// driven by the same regression contract
+				// (absent on baseline / cgroup
+				// recreation). The Prometheus rollup
+				// lives in pkg/wire/topn_app.go
+				// (topAppSet admission, cap=100) — the
+				// wire shape stays per-instance and
+				// the {account_id, app_id} cardinality
+				// stays bounded.
+				row.CpuThrottledSeconds = wrapperspb.Double(reading.ThrottledSeconds)
 			}
 			if h := s.ops.CPUStatsCollectDuration(); h != nil {
 				h.Observe(time.Since(cpuStart).Seconds())

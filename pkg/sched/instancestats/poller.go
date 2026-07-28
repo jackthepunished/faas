@@ -226,6 +226,8 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			InflightRequests: in.InflightRequests,
 			CPUPct:           math.NaN(),
 			RSSMB:            math.NaN(),
+			CPUSeconds:       math.NaN(),
+			ThrottledUsec:    math.NaN(),
 		}
 		// CPU: the wire is a CPUPct *float64. PR-A treats
 		// nil as the "absent this tick" sentinel — the
@@ -263,6 +265,19 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			wireRow.CPUSeconds = *in.CPUSeconds
 			row.CPUUsageUsec = uint64(*in.CPUSeconds * 1e6)
 			row.CPUHour = *in.CPUSeconds / 3600.0
+		}
+		// CpuThrottledSeconds (issue #301 / ADR-043): cumulative
+		// CPU-throttled-seconds from vmmd's cpustats cache. nil
+		// means no baseline yet — the poller leaves ThrottledUsec
+		// at NaN so the rollup's regression-handling branch
+		// excludes the row (matches the CPUSeconds contract).
+		// Wire unit is seconds; the rollup converts to seconds
+		// (× 1e6 → usec) for the cpuThrottleLastSeen baseline
+		// comparison. Without this decode, the per-(account_id,
+		// app_id) vmmd_cpu_throttle_seconds_total counter is
+		// never fed (PR #390 review finding #2, ship-blocker).
+		if in.CpuThrottledSeconds != nil {
+			wireRow.ThrottledUsec = *in.CpuThrottledSeconds * 1e6
 		}
 		// RSS: wire sends *int64. nil → Unknown; non-nil →
 		// convert bytes → MiB.

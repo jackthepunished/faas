@@ -841,12 +841,17 @@ func (v *JailerVMM) Kill(_ context.Context, l Lease) error {
 	// (= Lease.Instance); see pkg/fcvm/cgroup.go for the matching write path.
 	// Idempotent; missing dir is fine.
 	//
+	// The parent path is plan-aware (issue #301 / ADR-044): the 3-level
+	// hierarchy is faas-tenant.slice/<plan-slice>/<instance>. ParentCgroupFor
+	// reads the lease's Plan; an empty plan falls back to the legacy 2-level
+	// path so pre-issue-301 callers keep working.
+	//
 	// EBUSY (or any other non-IsNotExist error) is logged and swallowed: the
 	// jailer process is already gone at this point, so we cannot rewind the
 	// teardown. A leftover cgroup dir leaks RAM only until the next cgroup
 	// pressure event reaps it; failing the whole call would mask the real
 	// teardown success.
-	scopePath := filepath.Join(cgroupRoot, ParentCgroup, PerInstanceScope(l.Instance))
+	scopePath := filepath.Join(cgroupRoot, ParentCgroupFor(l.Plan), PerInstanceScope(l.Instance))
 	if err := os.RemoveAll(scopePath); err != nil && !os.IsNotExist(err) {
 		slog.Default().Warn("cgroup scope remove failed; continuing teardown",
 			"path", scopePath, "instance", l.Instance, "err", err)
@@ -1139,6 +1144,7 @@ func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...str
 	}
 	argv := append(JailerCommand(JailerSpec{
 		Instance: l.Instance, UID: l.UID, GID: l.GID, Netns: l.Netns, ExecFile: execFile,
+		Plan: l.Plan,
 	}), extraFCArgs...)
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	ring := v.ringFor(l.Instance)
