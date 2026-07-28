@@ -845,3 +845,46 @@ type RepoResponse struct {
 	DefaultBranch string `json:"default_branch"`
 	Private       bool   `json:"private"`
 }
+
+// AppMetricsResponse is the per-app metrics payload returned by
+// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-042).
+//
+// Time-windowed via the `range` query param (closed vocabulary, see
+// server handler). When the underlying Prometheus client is
+// unavailable, every numeric field is zero and Source is prefixed
+// with "degraded: <reason>" — same contract as the public status
+// page so the dashboard has one empty-state path.
+//
+// All percentage fields are clamped to [0, 100]; all latency
+// fields are milliseconds ≥ 0. NaN/Inf come back as zero — see
+// the server handler for the guard order.
+type AppMetricsResponse struct {
+	AppID  string `json:"app_id"`
+	Range  string `json:"range"`  // echoed window, e.g. "5m"
+	Source string `json:"source"` // "prometheus" on success, "degraded: <err>" otherwise
+	AsOf   string `json:"as_of"`  // RFC3339Nano UTC
+	// RequestCount is the count of gateway_requests_total{app} over the
+	// window. Drives the empty-state message: 0 means "no requests in
+	// the last 5m" rather than a row of zeros.
+	RequestCount int64 `json:"request_count"`
+	// LatencyP50MS / P95MS / P99MS are histogram_quantile(q) over
+	// the 2xx class only — failures surface separately as
+	// ErrorRatePct. NaN from histogram_quantile on an empty window
+	// is coerced to 0 by the handler.
+	LatencyP50MS float64 `json:"latency_p50_ms"`
+	LatencyP95MS float64 `json:"latency_p95_ms"`
+	LatencyP99MS float64 `json:"latency_p99_ms"`
+	// ErrorRatePct is the share of [45]xx requests in the window.
+	ErrorRatePct float64 `json:"error_rate_pct"`
+	// ColdStartPct is the share of requests that triggered a cold
+	// boot (the WakeGate leader — see ADR-042 §cold semantics).
+	// Followers waiting on the gate show as zero cold contribution
+	// but their wait is visible via gateway_wake_queue_wait_seconds
+	// on the §12 dashboard.
+	ColdStartPct float64 `json:"cold_start_pct"`
+	// WakeP95MS is the FLEET wake p95 (gateway_wake_latency_seconds
+	// is unlabeled — there is no per-app wake histogram). Labelled
+	// as such in the UI; here it's named plainly because the
+	// dashboard copy does the labelling.
+	WakeP95MS float64 `json:"wake_p95_ms"`
+}

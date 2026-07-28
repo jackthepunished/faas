@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -557,8 +558,8 @@ func TestMetricsSpec12(t *testing.T) {
 	if got := testutil.ToFloat64(h.metrics.requests.WithLabelValues("app-1", "pro", "200")); got != 1 {
 		t.Errorf("requests_total{200}=%v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.coldWake.WithLabelValues("app-1")); got != 1 {
-		t.Errorf("cold_wake_total=%v, want 1", got)
+	if got := testutil.ToFloat64(h.metrics.coldBoot.WithLabelValues("app-1")); got != 1 {
+		t.Errorf("cold_boot_total=%v, want 1", got)
 	}
 	if got := histogramObservationCount(t, h.metrics.wakeLatency); got != 1 {
 		t.Errorf("wake_latency _count = %v, want 1 (one observation)", got)
@@ -676,4 +677,157 @@ func TestMetricsSpec12_FirstByteNotFullBody(t *testing.T) {
 	if got < 0 {
 		t.Errorf("wake_latency observation = %v, want > 0", got)
 	}
+}
+
+// TestHandlerObserveRequestDuration exercises the new histogram on
+// every criterion-#8 path: warm success, cold success, 4xx, and the
+// unknown-host sentinel. Issue #273 / ADR-042.
+func TestHandlerObserveRequestDuration(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+	h.SetWakeGateHook()
+
+	// Warm success.
+	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := histogramCountFromBody(t, h.metrics, `app="app-1",class="2xx"`); got != 1 {
+		t.Errorf("request_duration{app-1,2xx} count = %d, want 1", got)
+	}
+
+	// Cold success (parked app, fresh admit).
+	b := h.backend.(*fakeBackend)
+	b.mu.Lock()
+	b.targets = nil
+	b.running = false
+	b.mu.Unlock()
+	req = httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	// Cold path also ends in 2xx, so the same class row gets count=2.
+	if got := histogramCountFromBody(t, h.metrics, `app="app-1",class="2xx"`); got != 2 {
+		t.Errorf("request_duration{app-1,2xx} after cold = %d, want 2", got)
+	}
+
+	// Unknown host → 404 → 4xx class.
+	req = httptest.NewRequest("GET", "http://nope.apps.dom/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := histogramCountFromBody(t, h.metrics, `app="-",class="4xx"`); got != 1 {
+		t.Errorf("request_duration{-,4xx} count = %d, want 1", got)
+	}
+}
+
+// histogramCountFromBody scrapes the metrics endpoint and parses the
+// `_count` line whose labels match labelNeedle. Returns 0 when no
+// matching line is found. Used by tests that need a per-label-tuple
+// count from a HistogramVec (which the older histogramObservationCount
+// helper does not support — it takes a single Histogram).
+func histogramCountFromBody(t *testing.T, m *Metrics, labelNeedle string) int {
+	t.Helper()
+	body := bodyForHistogram(t, m)
+	prefix := "gateway_request_duration_seconds_count{"
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		if !strings.Contains(line, labelNeedle) {
+			continue
+		}
+		// Trailing " <int>" is the count.
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			continue
+		}
+		var n int
+		_, _ = fmt.Sscanf(parts[1], "%d", &n)
+		return n
+	}
+	return 0
+}
+
+// TestHandlerWithStartTimeFix pins the WithStartTime wiring fix. A
+// stub upstream that sleeps 50ms before responding must surface an
+// observed duration ≥ 50ms — this fails before the fix (issue #273
+// / ADR-042: WithStartTime was dead code, so startTime() fell back
+// to time.Now() at observe() and the histogram recorded ~0).
+func TestHandlerWithStartTimeFix(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write([]byte("slow app"))
+	}))
+	t.Cleanup(upstream.Close)
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "jane-api.apps.dom",
+		upstream: upstream.Listener.Addr().String(),
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// Read the histogram's count + sum straight from the scrape
+	// body. _count ≥ 1 (the request happened), and _sum / _count
+	// ≥ 50ms — the latter is the assertion that fails before the
+	// WithStartTime fix.
+	body := bodyForHistogram(t, h.metrics)
+	count := histogramCountFromBody(t, h.metrics, `app="app-1",class="2xx"`)
+	if count < 1 {
+		t.Fatalf("expected ≥ 1 observation on app-1/2xx; body:\n%s", body)
+	}
+	var sumSeconds float64
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "gateway_request_duration_seconds_sum{") &&
+			strings.Contains(line, `app="app-1",class="2xx"`) {
+			parts := strings.Fields(line)
+			if len(parts) == 2 {
+				_, _ = fmt.Sscanf(parts[1], "%f", &sumSeconds)
+			}
+		}
+	}
+	mean := sumSeconds / float64(count)
+	if mean < 0.05 {
+		t.Errorf("request_duration mean = %vs, want ≥ 0.05s (50ms upstream)", mean)
+	}
+}
+
+// TestHandlerSiblingIsolation ensures traffic for one app does NOT
+// mint histogram series for another. Pre-instantiation happens at
+// Backend.Lookup hit time, so an app that's never routed never
+// surfaces rows.
+func TestHandlerSiblingIsolation(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+	h.SetWakeGateHook()
+
+	// Hit app-1.
+	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// app-1 rows exist (pre-instantiated at Lookup + observation on
+	// the request).
+	if got := histogramCountFromBody(t, h.metrics, `app="app-1",class="2xx"`); got != 1 {
+		t.Errorf("app-1 row missing: got %d, want 1", got)
+	}
+	// A SIBLING app must NOT have any series — this is the
+	// invariant ADR-042 promises.
+	for _, line := range strings.Split(bodyForHistogram(t, h.metrics), "\n") {
+		if strings.Contains(line, `app="sibling"`) {
+			t.Errorf("sibling series leaked into /metrics: %q", line)
+		}
+	}
+}
+
+// bodyForHistogram is a helper that scrapes the metrics handler and
+// returns the body as a string. Used by sibling-isolation checks.
+func bodyForHistogram(t *testing.T, m *Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	return rec.Body.String()
 }

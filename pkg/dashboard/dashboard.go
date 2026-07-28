@@ -138,6 +138,31 @@ type AppDetailData struct {
 	// if the store returns no rows (cold-install, fully parked),
 	// the section renders as empty and the template shows a hint.
 	RecentInstances []RecentInstanceItem
+	// Metrics is the per-app Prometheus snapshot (issue #273 / ADR-042).
+	// nil = skip the section entirely (Prometheus not configured, or
+	// the fetch failed non-fatally). When non-nil with RequestCount=0
+	// the template renders an "no requests in this window" empty
+	// state instead of a row of zeros. Source is the same
+	// "prometheus" / "degraded: <err>" vocabulary the public status
+	// page uses so the dashboard has one empty-state path.
+	Metrics *AppMetricsView
+}
+
+// AppMetricsView is the dashboard-facing snapshot of one app's
+// metrics (issue #273 / ADR-042). Numbers are pre-formatted; the
+// template renders them via plain {{printf "%g" .}}. P50/P95/P99 are
+// the 2xx-class only — failures surface as ErrorRatePct. WakeP95MS is
+// the FLEET p95; the dashboard template labels it as such.
+type AppMetricsView struct {
+	Range        string // echoed window, e.g. "5m"
+	Source       string // "prometheus" / "degraded: <reason>"
+	RequestCount int64
+	LatencyP50MS float64
+	LatencyP95MS float64
+	LatencyP99MS float64
+	ErrorRatePct float64
+	ColdStartPct float64
+	WakeP95MS    float64
 }
 
 // RecentInstanceItem is one row of the Recent Wakes table on the

@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -115,6 +116,12 @@ type Handler struct {
 	topNSample func(appID string)
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
+	// piApps deduplicates Metrics.PreInstantiateApp calls per appID
+	// (issue #273 / ADR-042). A value-typed sync.Map wrapper; the
+	// zero value is valid so NewHandlerWith doesn't have to
+	// initialise it explicitly. Value semantics avoid the
+	// data-race that lazy init would create under -race.
+	piApps preInstantiateApps
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -155,6 +162,10 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		metrics:        m,
 		log:            log,
 	}
+	// piApps is a value-typed sync.Map wrapper; its zero value is valid
+	// and no init is required (avoiding a lazy-init write that would
+	// race with parallel ServeHTTP readers — the load test under -race
+	// caught that pattern; see the field doc).
 	h.proxyFor = defaultProxy
 	return h
 }
@@ -260,6 +271,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	w = rec
 
+	// Stamp the request-received timestamp onto the context so every exit
+	// path can measure the SAME elapsed interval (was previously always
+	// falling back to time.Now() because WithStartTime was dead code —
+	// issue #273 / ADR-042 fixed this so gateway_request_duration_seconds
+	// has a real elapsed to record and the slog latency_ms field stops
+	// being effectively zero).
+	start := time.Now()
+	r = r.WithContext(WithStartTime(r.Context(), start)) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+
 	// Request ID is generated once per request and set on the response BEFORE
 	// any error path so even 4xx responses are correlatable. Inbound
 	// x-faas-request-id overrides (lets curl/clients supply their own trace).
@@ -268,7 +288,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rid = newRequestID()
 	}
 	w.Header().Set("x-faas-request-id", rid)
-	r = r.WithContext(WithRequestID(r.Context(), rid))
+	r = r.WithContext(WithRequestID(r.Context(), rid)) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
 
 	host := hostname(r.Host)
 
@@ -292,6 +312,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.observe(r, rec.status, "", "", false, Target{})
 		return
 	}
+
+	// Issue #273 / ADR-042 — pre-instantiate the closed (class) set
+	// for this app so its histogram rows surface from the first
+	// request rather than after the first observation. App IDs are
+	// runtime values, but the inner class set is bounded; the sync.Map
+	// dedupes so the hot path stays allocation-free after first sight.
+	h.preInstantiateApp(app.ID)
 
 	// Per-account rate limit (ADR-040 / issue #292). Runs BEFORE the
 	// per-app limit so a botnet rotating across many apps within an
@@ -414,7 +441,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"app", app.ID, "node", target.NodeID, "instance", target.InstanceID)
 			firstByteAt = time.Now()
 		}
-		h.metrics.ObserveColdWake(app.ID, firstByteAt.Sub(wakeStart))
+		h.metrics.ObserveColdBoot(app.ID, firstByteAt.Sub(wakeStart))
 	}
 }
 
@@ -426,6 +453,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold bool, target Target) {
 	code := statusClass(status)
 	requestID := requestIDFrom(r)
+	// Measure elapsed against the same start stamp set at the top of
+	// ServeHTTP (issue #273 / ADR-042 fixed the WithStartTime dead-code
+	// bug so this is now request-received → handler-return, not
+	// "now() — now()").
+	elapsed := time.Since(startTime(r))
 	if h.metrics != nil {
 		// Use placeholder labels for the unknown-host path so 404s show up on
 		// the dashboard under a sentinel app_id (e.g. "-" or "").
@@ -434,6 +466,11 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 			plan = "-"
 		}
 		h.metrics.ObserveRequest(appID, plan, code)
+		// Per-app full request duration histogram (issue #273 / ADR-042).
+		// The class label is the 3-digit status bucketed to 2xx/3xx/4xx/5xx
+		// to keep cardinality bounded — full status codes would explode
+		// per-app series count past 60× the class-based set.
+		h.metrics.ObserveRequestDuration(appID, statusClassBucket(status), elapsed)
 	}
 	// Issue #300: feed the per-tenant rolling count for the
 	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd/topn.go).
@@ -448,7 +485,13 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 	if appID != "" && appID != "-" && h.topNSample != nil {
 		h.topNSample(appID)
 	}
-	(&requestLogger{log: h.log}).Log(appID, code, time.Since(startTime(r)), cold, requestID)
+	// Use the locally-measured elapsed (request-received → handler-return).
+	// WithStartTime was dead code in the repo (issue #273 / ADR-042); the
+	// WithContext call at the top of ServeHTTP now stamps the real start
+	// time so the slog latency_ms field is no longer effectively ~0. Doing
+	// the time.Since(startTime(r)) call here would yield the same result
+	// but recomputes; `elapsed` was already measured above.
+	(&requestLogger{log: h.log}).Log(appID, code, elapsed, cold, requestID)
 
 	// Idle reaper hook (spec §4.1): 2xx → the instance is alive. 4xx/5xx are
 	// not evidence of activity (a misconfigured client can hammer a dead
@@ -465,6 +508,55 @@ func statusClass(status int) string {
 	}
 	const digits = "0123456789"
 	return string([]byte{digits[(status/100)%10], digits[(status/10)%10], digits[status%10]})
+}
+
+// statusClassBucket turns an HTTP status into a class label for the
+// gateway_request_duration_seconds histogram (issue #273 / ADR-042).
+// Distinct from statusClass above: that one returns the FULL 3-digit
+// code (used for the counter label so dashboards can drill into e.g.
+// 404 vs 503); this one buckets to the closed 4-set so a histogram
+// with ~13 series per label combo stays bounded per app.
+func statusClassBucket(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "2xx"
+	case status >= 300 && status < 400:
+		return "3xx"
+	case status >= 400 && status < 500:
+		return "4xx"
+	default:
+		// Anything outside 1xx/2xx/3xx/4xx lands in 5xx — this
+		// matches the §12 dashboard's "errors" panel definition.
+		return "5xx"
+	}
+}
+
+// preInstantiateApps deduplicates PreInstantiateApp calls per appID.
+// Issue #273 / ADR-042 — PreInstantiateApp is cheap (returns the
+// existing series on repeat calls), but the sync.Map.Load+Store
+// short-circuits the work entirely after first sight so the hot path
+// stays allocation-free. A value-typed field on Handler: the zero
+// value is valid, so NewHandlerWith doesn't need to initialise it
+// (avoiding a lazy-init write that would race with parallel
+// ServeHTTP readers — the load test under -race caught that).
+type preInstantiateApps struct{ m sync.Map }
+
+func (p *preInstantiateApps) seen(appID string) bool {
+	_, loaded := p.m.LoadOrStore(appID, struct{}{})
+	return loaded
+}
+
+// preInstantiateApp records appID once and delegates to
+// Metrics.PreInstantiateApp. Safe on a nil h (test seam) and a nil
+// Metrics (also nil-safe inside the method).
+func (h *Handler) preInstantiateApp(appID string) {
+	if h == nil || h.metrics == nil || appID == "" {
+		return
+	}
+	if h.piApps.seen(appID) {
+		return
+	}
+	h.metrics.PreInstantiateApp(appID)
 }
 
 // statusRecorder is a thin ResponseWriter wrapper that records the HTTP status

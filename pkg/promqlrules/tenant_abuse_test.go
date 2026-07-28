@@ -1,5 +1,5 @@
 // Synthetic-fixture driver for the FaasTenantAbuse alert (issue #300,
-// ADR-041). Invokes `promtool test rules` against the fixture in
+// ADR-042). Invokes `promtool test rules` against the fixture in
 // testdata/tenant_abuse.test.yml and asserts the exit code is 0.
 //
 // What this exercises:

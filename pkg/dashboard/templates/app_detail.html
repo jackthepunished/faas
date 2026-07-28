@@ -119,6 +119,40 @@
         <p>No wakes yet — this app has not run since the last cold boot.</p>
       {{end}}
 
+      <!-- Issue #273 / ADR-042. Best-effort metrics snapshot. nil =
+           Prometheus not configured (skip the section entirely);
+           non-nil with Source != "prometheus" = degraded; non-nil
+           with RequestCount==0 = the explicit empty-state message
+           so a row of zeros doesn't read as "0% errors, all good". -->
+      {{if .Data.Metrics}}
+        <section aria-label="Metrics">
+          <h2>Metrics
+            <small style="font-weight:normal;color:#888">(last {{.Data.Metrics.Range}})</small>
+            {{if eq .Data.Metrics.Source "prometheus"}}{{else}}
+              <span class="badge dim" title="{{.Data.Metrics.Source}}">degraded</span>
+            {{end}}
+          </h2>
+          {{if eq .Data.Metrics.RequestCount 0}}
+            <p>No requests in the last {{.Data.Metrics.Range}}.</p>
+          {{else}}
+            <p>
+              Wake latency is time-to-first-byte on the request that
+              starts your app. Request latency is the full round-trip,
+              for every request.
+            </p>
+            <dl>
+              <dt>Requests</dt><dd>{{.Data.Metrics.RequestCount}}</dd>
+              <dt>Request latency p50</dt><dd>{{printf "%.1f" .Data.Metrics.LatencyP50MS}} ms</dd>
+              <dt>Request latency p95</dt><dd>{{printf "%.1f" .Data.Metrics.LatencyP95MS}} ms</dd>
+              <dt>Request latency p99</dt><dd>{{printf "%.1f" .Data.Metrics.LatencyP99MS}} ms</dd>
+              <dt>Error rate</dt><dd>{{printf "%.1f" .Data.Metrics.ErrorRatePct}}%</dd>
+              <dt>Cold-start share</dt><dd>{{printf "%.1f" .Data.Metrics.ColdStartPct}}%</dd>
+              <dt>Wake latency p95 <small style="color:#888">(fleet)</small></dt><dd>{{printf "%.1f" .Data.Metrics.WakeP95MS}} ms</dd>
+            </dl>
+          {{end}}
+        </section>
+      {{end}}
+
       <h2>Crons</h2>
       {{if .Data.Crons}}
         <table>

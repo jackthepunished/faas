@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
@@ -156,6 +157,56 @@ export class AppsService {
         'slug': slug,
       },
       errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app request metrics (issue
+   * Time-windowed rollup of one app's gateway activity. The `range`
+   * parameter is a closed vocabulary bounded by Prometheus
+   * retention (`prom_retention_days: 15`):
+   *
+   * `5m` (default) | `15m` | `1h` | `6h` | `24h` | `7d` | `15d`
+   *
+   * Wake latency (`wake_p95_ms`) is the FLEET p95
+   * (`gateway_wake_latency_seconds` is unlabeled). On Prometheus
+   * failure the endpoint returns 200 with zeroed fields and
+   * `source: "degraded: <reason>"`, matching the public status
+   * page contract.
+   *
+   * @returns AppMetricsResponse The metrics snapshot.
+   * @throws ApiError
+   */
+  public static getAppMetrics({
+    slug,
+    range = '5m',
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Time window. Default `5m`.
+     */
+    range?: '5m' | '15m' | '1h' | '6h' | '24h' | '7d' | '15d',
+  }): CancelablePromise<AppMetricsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/metrics',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'range': range,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:

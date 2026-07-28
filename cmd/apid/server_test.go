@@ -21,6 +21,7 @@ import (
 
 type testEnv struct {
 	h     http.Handler
+	s     *server // exposed so tests can call WithStatusCache etc.
 	store *state.MemStore
 	key   string
 	acct  state.Account
@@ -40,7 +41,7 @@ func setup(t *testing.T, plan api.Plan) testEnv {
 	}
 	ops := wire.NewOpsMetrics("apid_test")
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
-	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
+	return testEnv{h: srv.handler(), s: srv, store: store, key: pt, acct: acct, ops: ops}
 }
 
 func (e testEnv) do(t *testing.T, method, path string, body any, hdrs map[string]string) *httptest.ResponseRecorder {

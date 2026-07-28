@@ -170,6 +170,12 @@ var methodRouteMap = map[string]string{
 	"GET /v1/audit-events":      "ListAuditEvents",
 	"GET /v1/audit-events/{id}": "GetAuditEvent",
 
+	// Issue #273 / ADR-042 — per-app metrics. The auto-derivation
+	// would produce GetAppsSlugMetrics (Swagger-style); the SDK
+	// names it GetAppMetrics to match the existing per-app methods
+	// (GetApp, ListApps) — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/metrics": "GetAppMetrics",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action

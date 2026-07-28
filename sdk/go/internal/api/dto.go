@@ -687,3 +687,21 @@ type ListAuditEventsResponse struct {
 	Events []AuditEventResponse `json:"events"`
 	Limit  int                  `json:"limit"`
 }
+
+// AppMetricsResponse is the per-app metrics payload returned by
+// GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-042). Field-
+// for-field mirror of pkg/api.AppMetricsResponse — the SDK parity
+// gate (cmd/sdk-coverage) enforces byte-identical JSON output.
+type AppMetricsResponse struct {
+	AppID        string  `json:"app_id"`
+	Range        string  `json:"range"`
+	Source       string  `json:"source"`
+	AsOf         string  `json:"as_of"`
+	RequestCount int64   `json:"request_count"`
+	LatencyP50MS float64 `json:"latency_p50_ms"`
+	LatencyP95MS float64 `json:"latency_p95_ms"`
+	LatencyP99MS float64 `json:"latency_p99_ms"`
+	ErrorRatePct float64 `json:"error_rate_pct"`
+	ColdStartPct float64 `json:"cold_start_pct"`
+	WakeP95MS    float64 `json:"wake_p95_ms"`
+}
