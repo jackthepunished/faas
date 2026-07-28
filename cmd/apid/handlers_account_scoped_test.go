@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -446,6 +447,21 @@ func TestGetAppsMetrics_HappyPath_WithProm(t *testing.T) {
 		if row.WakeP95MS <= 0 {
 			t.Errorf("app %s wake_p95_ms should be set from FLEET scalar", slug)
 		}
+		// Latency percentiles must come from the in-process
+		// histogramQuantile walk against the QueryBuckets result —
+		// not zeroed, not silently-NaN. The fixture's p95 (39.9/42
+		// for foo-app, 16.15/17 for bar-app) lands above the last
+		// finite bucket (0.5) so the walk returns prevNonEmptyUpper
+		// = 0.5 (the +Inf bucket is skipped per PromQL semantics).
+		if row.LatencyP50MS <= 0 {
+			t.Errorf("app %s latency_p50_ms=%.4f, want >0", slug, row.LatencyP50MS)
+		}
+		if math.Abs(row.LatencyP95MS-0.5) > 1e-9 {
+			t.Errorf("app %s latency_p95_ms=%.6f, want 0.5 (cap at last finite bucket)", slug, row.LatencyP95MS)
+		}
+		if math.Abs(row.LatencyP99MS-0.5) > 1e-9 {
+			t.Errorf("app %s latency_p99_ms=%.6f, want 0.5 (same fixture)", slug, row.LatencyP99MS)
+		}
 	}
 }
 
@@ -541,5 +557,119 @@ func TestListAccountSecrets_RequiresMFA(t *testing.T) {
 	}
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status %d, want 403 — the gate returns 403 (not 401) so the dashboard can render the prompt", rec.Code)
+	}
+}
+
+// TestHistogramQuantile pins the PromQL semantics the
+// account-scoped metrics rollup depends on. The walk matches
+// PromQL histogram_quantile() — see handlers_account_scoped.go
+// for the contract:
+//
+//   - skip the +Inf bucket (would otherwise return +Inf for q<1)
+//   - find the first bucket whose cumulative ≥ q·N
+//   - interpolate linearly in (prevNonEmptyUpper, upper) by count ratio
+//   - empty / nil maps → 0 (matches safeFloat's NaN clamp)
+//   - malformed `le` strings → row dropped, rest still computes
+//   - q outside [0,1] → returns 0 / prevUpper (PromQL returns NaN; we
+//     clamp to 0 to match the dashboard's "no data" rendering)
+//
+// Each row's expected value is hand-computed from the fixture so a
+// regression in the walk surfaces immediately.
+func TestHistogramQuantile(t *testing.T) {
+	cases := []struct {
+		name    string
+		q       float64
+		buckets map[string]float64
+		want    float64
+	}{
+		{
+			name:    "empty buckets returns 0",
+			q:       0.95,
+			buckets: nil,
+			want:    0,
+		},
+		{
+			name:    "only +Inf bucket returns 0 (PromQL skips +Inf)",
+			q:       0.95,
+			buckets: map[string]float64{"+Inf": 42},
+			want:    0,
+		},
+		{
+			name: "single finite bucket interpolates from 0",
+			// cum = {le=0.5: 10}, total = 10. p50 target = 5.
+			// First (and only) bucket cum=10 ≥ 5 → interp from
+			// prevUpper=0 to upper=0.5 by frac=5/10=0.5 → 0.25.
+			// Matches the canonical pkg/gateway/testhist walk
+			// (and PromQL itself: single-bucket input is
+			// underdetermined, so linear-from-zero is a reasonable
+			// convention; never reached in practice because the
+			// dashboard always sees ≥ 3 buckets).
+			q:       0.50,
+			buckets: map[string]float64{"0.5": 10},
+			want:    0.25,
+		},
+		{
+			name: "monotonic buckets: p50 between 0.1 and 0.5",
+			// cum = {le=0.1: 5, le=0.5: 20, le=+Inf: 20}, total = 20.
+			// p50 target = 10 → first bucket with cum ≥ 10 is 0.5
+			// (cum=20 ≥ 10), prevUpper=0.1, countInBucket=15,
+			// frac = (10-5)/15 = 0.333..., result = 0.1 + 0.333*(0.5-0.1)
+			// = 0.1 + 0.1333... = 0.2333...
+			q:       0.50,
+			buckets: map[string]float64{"0.1": 5, "0.5": 20, "+Inf": 20},
+			want:    0.23333333333333333,
+		},
+		{
+			name: "p95 lands inside the populated bucket",
+			// cum = {le=0.1: 20, le=0.5: 35, le=+Inf: 42}, total = 42.
+			// p95 target = 39.9 → first bucket with cum ≥ 39.9 is +Inf.
+			// +Inf is skipped → returns prevUpper (the last
+			// finite-non-empty bucket), which is 0.5.
+			q:       0.95,
+			buckets: map[string]float64{"0.1": 20, "0.5": 35, "+Inf": 42},
+			want:    0.5,
+		},
+		{
+			name: "p99 in the same fixture caps at 0.5",
+			// Same as p95 above; target = 41.58 → still above 35,
+			// still under +Inf → return prevUpper = 0.5.
+			q:       0.99,
+			buckets: map[string]float64{"0.1": 20, "0.5": 35, "+Inf": 42},
+			want:    0.5,
+		},
+		{
+			name: "p10 inside the 0.1 bucket",
+			// target = 0.10*42 = 4.2 → first bucket with cum ≥ 4.2 is
+			// le=0.1 (cum=20 ≥ 4.2), prevUpper=0 (no prior
+			// non-empty), countInBucket=20, frac = 4.2/20 = 0.21,
+			// result = 0 + 0.21*(0.1-0) = 0.021.
+			q:       0.10,
+			buckets: map[string]float64{"0.1": 20, "0.5": 35, "+Inf": 42},
+			want:    0.021,
+		},
+		{
+			name: "malformed le is dropped, rest computes",
+			// "junk" is dropped; remaining cum = {le=0.5: 10}.
+			// Same as the single-bucket case → p50 returns 0.25.
+			q:       0.50,
+			buckets: map[string]float64{"junk": 99, "0.5": 10},
+			want:    0.25,
+		},
+		{
+			name:    "all malformed le returns 0",
+			q:       0.95,
+			buckets: map[string]float64{"junk": 1, "NaN": 2},
+			want:    0,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := histogramQuantile(tc.q, tc.buckets)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("histogramQuantile(%v, %v) = %v, want %v",
+					tc.q, tc.buckets, got, tc.want)
+			}
+		})
 	}
 }
