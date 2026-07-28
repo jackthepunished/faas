@@ -1,0 +1,48 @@
+# supply_chain_scanners — defaults (issue #299).
+#
+# Pins the Grype + Syft binaries to a specific GitHub release and
+# surfaces the SHA-256s here so a future upgrade is a one-line
+# change per tool (`grype_version` / `syft_version`). Both tools
+# are pulled from https://github.com/anchore/<tool>/releases and
+# verified via sha256sum before installation, mirroring the
+# firecracker role's pattern (deploy/ansible/roles/firecracker/
+# tasks/main.yml) so a supply-chain compromise at the registry
+# surfaces as a hard ansible-failed role rather than a silent
+# binary swap.
+#
+# Why both binaries are pinned: cmd/imaged's WithGrypeRun +
+# WithSyftRun wiring (cmd/imaged/main.go) expects a real
+# subprocess runner — when grype/syft are missing the imaged
+# base-stage sidecar fails-closed with CRITICAL=9999 (see
+# pkg/imaged/base_stage.go::writeScanSidecar), causing vmmd to
+# refuse every boot. Installing them here is the only path that
+# keeps the runtime gate from refusing the entire fleet.
+
+# Grype — vulnerability scanner for OCI images and directories.
+# Anchored major.minor on the latest released line; bump on
+# quarterly review (memory note: ci-vacuum-binary-download)
+grype_version: "0.78.0"
+grype_release:
+  "0.78.0":
+    sha256_linux_amd64: "6037fd3763b6112302b98db559bb5390fbb06f0011c0585a4be03ca851daa838"
+
+# Syft — SBOM generator (CycloneDX 1.5 JSON). Same quarterly-
+# review cadence as Grype; pinned to a release vetted against
+# pkg/imaged/sbom.go's expected output schema (-o cyclonedx-json).
+syft_version: "1.0.0"
+syft_release:
+  "1.0.0":
+    sha256_linux_amd64: "27dfeaca134cd8aeff6135ba349ff922109bd89b955755459601667d69fed88e"
+
+# install_root is the prefix the role installs into; grype / syft
+# binaries are placed at <install_root>/bin/<tool>. Picked to
+# match what cmd/imaged's PATH lookup expects — keep this in
+# sync with the imaged unit's EnvironmentFile=/etc/faas/seal.env
+# if a non-default path is required. Default /usr/local keeps the
+# images/* Dockerfiles' apt-install precedent.
+install_root: /usr/local
+
+# arch is overridable for an arm64 dev box (Lima / Mac) so the
+# role is portable; production x86_64 boxes leave this at the
+# default.
+arch: amd64

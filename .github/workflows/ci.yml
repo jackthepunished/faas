@@ -559,7 +559,8 @@ jobs:
       # https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/.
       # Pin at install time — see memory note ci-vacuum-binary-download
       # for the same pattern used by vacuum/sqlc pins below.
-      GRYPE_SHA256_LINUX_AMD64: "REPLACE_ME_AT_INSTALL_TIME"
+      # Compute locally via `curl -fsSL -o grype.tar.gz <url> && shasum -a 256 grype.tar.gz`.
+      GRYPE_SHA256_LINUX_AMD64: "6037fd3763b6112302b98db559bb5390fbb06f0011c0585a4be03ca851daa838"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

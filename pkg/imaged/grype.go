@@ -62,7 +62,34 @@ type grypeOutput struct {
 // here as a `exec: "grype": executable file not found in $PATH`
 // error from the subprocess — same fail-closed path.
 func defaultGrypeRun(ctx context.Context, dir string) (map[string]int, error) {
-	cmd := exec.CommandContext(ctx, "grype", "dir:"+dir, "-o", "json")
+	return runGrypeImpl(ctx, "grype", dir)
+}
+
+// RunGrype is the production entry point for cmd/imaged when the
+// operator pins grype to PATH (FAAS_GRYPE_BIN is empty). It is the
+// same code path defaultGrypeRun uses, exported so cmd/imaged can
+// hand a single function value to WithGrypeRun without a closure
+// wrapper. Pinned by TestRunGrype_DelegatesToSubprocess in
+// grype_test.go (run with FAAS_RUN_GRYPE_TESTS=1).
+func RunGrype(ctx context.Context, dir string) (map[string]int, error) {
+	return defaultGrypeRun(ctx, dir)
+}
+
+// RunGrypeAt is the operator-pinned variant: when the ansible role
+// installs grype at a non-PATH location (e.g. /opt/grype/bin/grype),
+// cmd/imaged passes that path via FAAS_GRYPE_BIN and the closure
+// inside makeGrypeRunner binds the binary to RunGrypeAt so the
+// subprocess invocation doesn't depend on $PATH resolution.
+func RunGrypeAt(ctx context.Context, bin, dir string) (map[string]int, error) {
+	return runGrypeImpl(ctx, bin, dir)
+}
+
+// runGrypeImpl is the shared body. Parameterised on the binary
+// path so defaultGrypeRun (PATH lookup, "grype") and RunGrypeAt
+// (operator-supplied absolute path) share the same parse +
+// counting logic; the per-call dispatch is one switch.
+func runGrypeImpl(ctx context.Context, bin, dir string) (map[string]int, error) {
+	cmd := exec.CommandContext(ctx, bin, "dir:"+dir, "-o", "json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

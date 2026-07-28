@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -115,6 +116,26 @@ type BuildInput struct {
 	// /usr/local/bin/faas-runner so the guest can exec it. Wired from
 	// cmd/imaged's config; empty skips the runner injection.
 	FunctionRunnerPath string
+	// SBOMRun, when set, runs after publishExt4 against the staging
+	// directory (still alive — the cleanup defer has not fired yet)
+	// to produce a CycloneDX SBOM (issue #299 / ADR-038 Phase 3).
+	// The returned bytes are validated for JSON-shape and Put under
+	// SBOMStorageKey. Nil = no SBOM emission (legacy / unit tests).
+	// Production wires the syft subprocess via imaged's WithSyftRun
+	// seam; tests inject a stub returning canned CycloneDX bytes.
+	//
+	// Best-effort: a syft error or non-JSON output leaves SBOMKey
+	// empty and the build still succeeds. The build_provenance row
+	// builderd writes immediately after carries an empty
+	// sbom_storage_key in that case (observability metadata only;
+	// schema §4.2 lets the deployment succeed without a
+	// provenance row).
+	SBOMRun func(ctx context.Context, dir string) ([]byte, error)
+	// SBOMStorageKey is the storage key the SBOM is Put under. When
+	// SBOMRun is non-nil, SBOMKey MUST be set (validated by
+	// validateOutputTarget's sibling check). When SBOMRun is nil,
+	// SBOMStorageKey is ignored.
+	SBOMStorageKey string
 }
 
 // BuildResult reports the produced layer.
@@ -128,6 +149,11 @@ type BuildResult struct {
 	ImagePath    string
 	SizeMB       int
 	ContentBytes int64
+	// SBOMKey is the storage key the CycloneDX SBOM was published
+	// under (issue #299 / ADR-038 Phase 3). Empty when the build
+	// did not configure SBOMRun + SBOMStorageKey, or when the
+	// emission failed (best-effort: the build still succeeds).
+	SBOMKey string
 }
 
 // Build runs the pipeline. It stages into a temp dir that is always removed.
@@ -208,7 +234,27 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 		return BuildResult{}, err
 	}
 
-	res := BuildResult{SizeMB: sizeMB, ContentBytes: content}
+	// Issue #299 / ADR-038 Phase 3: SBOM emission runs on the staging
+	// dir BEFORE the cleanup defer fires (the staging dir is the only
+	// artefact that contains the customer's source tree, and the user
+	// wants the SBOM to enumerate the actual files present in the
+	// produced layer). emitSBOM is best-effort: a syft error or
+	// non-JSON output leaves SBOMKey empty and the build still
+	// succeeds. The build_provenance row builderd writes immediately
+	// after carries an empty sbom_storage_key in that case (schema
+	// §4.2 lets the deployment succeed without a provenance row).
+	sbomKey, sbomErr := b.emitSBOM(ctx, in, staging)
+	if sbomErr != nil {
+		// Mirror the storage-write Warn pattern below: best-effort,
+		// never fails the build. We do not surface the error to
+		// callers because the apid endpoint apid/handlers_ext.go's
+		// getBuildSbom will return 503 build_sbom_unavailable
+		// instead — the operator sees the missing SBOM and re-runs
+		// imaged to populate the column for future builds.
+		_ = sbomErr
+	}
+
+	res := BuildResult{SizeMB: sizeMB, ContentBytes: content, SBOMKey: sbomKey}
 	if in.OutImage != "" {
 		res.ImagePath = in.OutImage
 	} else {
@@ -286,6 +332,44 @@ func (b *Builder) publishExt4(ctx context.Context, in BuildInput, staging string
 		}
 	}
 	return nil
+}
+
+// emitSBOM runs the injected SBOM subprocess against the staging
+// directory and Persists the CycloneDX JSON to Storage under
+// SBOMStorageKey (issue #299 / ADR-038 Phase 3). The build is
+// best-effort: a syft error, empty output, or non-JSON output
+// leaves SBOMKey empty and the build still succeeds (the build
+// itself is the load-bearing artefact; the SBOM is observational).
+//
+// The staging dir is the only artefact that contains the customer's
+// source tree at this point — the cleanup defer at the top of Build
+// has not yet fired. Running syft on the produced ext4 instead
+// would require rootfs to parse ext4 in-process to enumerate the
+// files syft understands, which would duplicate syft's own
+// extraction logic. The staging-dir approach is also what the
+// issue-spec recommends: it picks up /etc/faas/app.json, the
+// function runner binary, and the customer's source tarball
+// directly without an extra mkfs round-trip.
+func (b *Builder) emitSBOM(ctx context.Context, in BuildInput, staging string) (string, error) {
+	if in.SBOMRun == nil {
+		return "", nil
+	}
+	if in.Storage == nil || in.SBOMStorageKey == "" {
+		// Caller wired SBOMRun but not the storage side. Fail soft
+		// rather than aborting the build — the SBOM is observational.
+		return "", nil
+	}
+	blob, err := in.SBOMRun(ctx, staging)
+	if err != nil || len(blob) == 0 {
+		return "", nil
+	}
+	if !json.Valid(blob) {
+		return "", nil
+	}
+	if err := in.Storage.Put(ctx, in.SBOMStorageKey, bytes.NewReader(blob)); err != nil {
+		return "", nil
+	}
+	return in.SBOMStorageKey, nil
 }
 
 // validateOutputTarget enforces the rule that exactly one of {Storage +

@@ -179,7 +179,7 @@ func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, o
 	// scanner hide CVEs. The fail-closed sidecar is the canonical
 	// posture for this PR and is mirrored in the
 	// pkg/fcvm/manager.go bringUpScanCheck admission seam.
-	if err := h.writeScanSidecar(ctx, baseKey, ref); err != nil {
+	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
 		h.log.Warn("imaged: write grype scan sidecar",
 			"key", wire.ScanKeyForBaseKey(baseKey), "err", err)
 	}
@@ -225,18 +225,23 @@ func (r *stringReaderImpl) Read(p []byte) (int, error) {
 // error or nil findings writes a CRITICAL=9999 placeholder so
 // vmmd refuses to boot any un-scanned artifact.
 //
-// The scan target is the OCI ref (the same `ref` EnsureBaseExt4
-// pulled the manifest from); Grype's `dir:` mode walks a local
-// filesystem path, but here we pass the OCI ref string verbatim
-// so the default runner can resolve it through the same registry
-// path the staged ext4 came from. The mapped path is recorded in
-// the sidecar's `image` field for dashboard traceability.
-func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref string) error {
+// `ref` is the OCI ref the base ext4 was pulled from (recorded in
+// the sidecar's `image` field for dashboard traceability — a
+// customer looking at `vmmd_trivy_image_vulns_total{image=...}`
+// needs to see the registry ref, not the local staging path).
+// `outImage` is the filesystem path Grype's `dir:` source walks.
+// Passing the OCI ref to `dir:` was the original implementation;
+// Grype's `dir:` source is filesystem-only and rejected registry
+// refs, which tripped the fail-closed branch on every staged
+// base (Critical #1 of the PR #385 review). The mapped path
+// is recorded in the sidecar's `image` field for dashboard
+// traceability.
+func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage string) error {
 	be, err := h.storageFor()
 	if err != nil {
 		return fmt.Errorf("imaged: writeScanSidecar storageFor: %w", err)
 	}
-	findings, scanErr := h.runGrype(ctx, ref)
+	findings, scanErr := h.runGrype(ctx, outImage)
 	if scanErr != nil || findings == nil {
 		h.log.Warn("imaged: grype scan failed; writing fail-closed sidecar",
 			"ref", ref, "err", scanErr)

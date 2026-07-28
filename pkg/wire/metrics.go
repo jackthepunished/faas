@@ -647,14 +647,20 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// issue #299: pre-instantiate the closed `severity` label set
 	// for imageScanVulns so the rows surface in /metrics from boot
 	// — same precedent as every other CounterVec on this struct.
-	// The `image` label is left empty here (real per-image rows are
-	// added on the first Grype scan via ObserveImageScanVuln).
+	// The `image` label carries a sentinel `<unknown>` here so a
+	// Grafana panel can filter on `image=~"<unknown>"` to plot the
+	// "vulns posted by a misconfigured imaged" row separately from
+	// the per-image rows that ObserveImageScanVuln adds after the
+	// first scan. Using an empty-string sentinel would emit a row
+	// with `image=""` whose label Grafana's templating collapses
+	// with the placeholders from prometheus's exporter interface,
+	// making the row indistinguishable from a scrape artifact.
 	// Closed set: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN — matches
 	// the Grype severity vocabulary exactly so an operator can
 	// alert on the raw label without remapping. Extending the
 	// Grype severity set requires extending this loop in lock-step.
 	for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
-		imageScanVulns.WithLabelValues("", sev)
+		imageScanVulns.WithLabelValues("<unknown>", sev)
 	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in

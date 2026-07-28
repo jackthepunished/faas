@@ -63,7 +63,32 @@ func BuildSBOMKey(buildID string) string {
 // WithSyftRun returning canned CycloneDX JSON so the storage write
 // is hermetic and doesn't require syft on PATH.
 func defaultSyftRun(ctx context.Context, dir string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "syft", "dir:"+dir, "-o", "cyclonedx-json")
+	return runSyftImpl(ctx, "syft", dir)
+}
+
+// RunSyft is the production entry point for cmd/imaged when the
+// operator pins syft to PATH (FAAS_SYFT_BIN is empty). Same shape
+// as defaultSyftRun; exported so cmd/imaged's makeSyftRunner can
+// bind a single function value to WithSyftRun without a closure
+// wrapper.
+func RunSyft(ctx context.Context, dir string) ([]byte, error) {
+	return defaultSyftRun(ctx, dir)
+}
+
+// RunSyftAt is the operator-pinned variant: when the ansible role
+// installs syft at a non-PATH location, cmd/imaged passes the
+// absolute path via FAAS_SYFT_BIN and makeSyftRunner binds it to
+// RunSyftAt. Dispatch: runSyftImpl with the explicit binary.
+func RunSyftAt(ctx context.Context, bin, dir string) ([]byte, error) {
+	return runSyftImpl(ctx, bin, dir)
+}
+
+// runSyftImpl is the shared body used by defaultSyftRun +
+// RunSyft + RunSyftAt. Parameterised on the binary path so the
+// JSON parse contract and the empty-output guard are not
+// duplicated.
+func runSyftImpl(ctx context.Context, bin, dir string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, bin, "dir:"+dir, "-o", "cyclonedx-json")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("imaged: syft: %w", err)

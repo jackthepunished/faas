@@ -545,11 +545,24 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			Plan:          acct.Plan,
 			Storage:       be,
 			StorageKey:    appsKey,
+			// Issue #299 / ADR-038 Phase 3: SBOM emission runs
+			// inside Builder.Build on the staging dir (the only
+			// artefact that contains the customer's source tree at
+			// that point). SBOMKey is stamped onto the
+			// build_provenance row after a successful build — see
+			// updateBuildProvenanceSBOM below.
+			SBOMRun:        h.syftRun,
+			SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "build app layer: "+err.Error())
 			return fmt.Errorf("imaged: build app layer: %w", err)
 		}
+		// Stamp the SBOM storage key onto build_provenance.sbom_storage_key
+		// (issue #299 / ADR-038 Phase 3). Best-effort: an error here
+		// is logged at WARN and the build still succeeds (the SBOM
+		// is observational metadata, schema §4.2).
+		h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 		if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -583,11 +596,16 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			Plan:          acct.Plan,
 			Storage:       be,
 			StorageKey:    appsKey,
+			// Issue #299 / ADR-038 Phase 3: see the two-drive
+			// branch above for the SBOM-populator contract.
+			SBOMRun:        h.syftRun,
+			SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "build app layer: "+err.Error())
 			return fmt.Errorf("imaged: build app layer: %w", err)
 		}
+		h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 		if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -718,11 +736,19 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// FunctionRunnerPath is the static guest/runners/<rt>/faas-runner
 		// binary that lives at /usr/local/bin/faas-runner in the layer.
 		FunctionRunnerPath: runnerPath,
+		// Issue #299 / ADR-038 Phase 3: SBOM emission runs inside
+		// Builder.Build on the staging dir (which holds the customer's
+		// source tarball + the runner binary + guest-init — exactly
+		// what the SBOM should enumerate). SBOMKey is stamped onto
+		// the build_provenance row immediately below.
+		SBOMRun:        h.syftRun,
+		SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 	})
 	if err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "build function layer: "+err.Error())
 		return fmt.Errorf("imaged: build function layer: %w", err)
 	}
+	h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 	if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 		return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -1272,6 +1298,85 @@ func (h *Handler) cleanupAppFiles(ctx context.Context, appID string) error {
 		}
 	}
 	return nil
+}
+
+// --- F2/Issue #299 / ADR-038 Phase 3: SBOM populator seams -------------------
+
+// sbomStorageKeyForDeployment resolves the canonical CycloneDX storage
+// key for a deployment's source tree, or "" when no build row exists
+// for the deployment (issue #299 / ADR-038 Phase 3). The image-only
+// deploy path (app.Type == AppTypeApp on the legacy
+// handleDeployment arm) has no build — the OCI image comes straight
+// from the registry, and a build_provenance row would be empty. We
+// return "" rather than synthesising an empty-key stamp; the build
+// will populate the column on its first cache-hit (builderd calls
+// recordProvenance at every markSucceeded site).
+//
+// When the deployment's source has a build row, the storage key is
+// derived from its build_id:
+//
+//	sboms/<build_id>.cdx.json
+//
+// The convention mirrors BuildSBOMKey() in pkg/imaged/sbom.go (the
+// populator helper). Re-deriving here rather than importing
+// BuildSBOMKey avoids a tiny read-side alias across packages — the
+// field is private, but the key shape is the load-bearing contract
+// the apid GET handler reads back.
+func (h *Handler) sbomStorageKeyForDeployment(ctx context.Context, deploymentID string) string {
+	if deploymentID == "" {
+		return ""
+	}
+	build, err := h.store.BuildByDeployment(ctx, deploymentID)
+	if err != nil {
+		// ErrNotFound is the steady-state for image-only deploys;
+		// log at Debug (not Warn) so we don't pollute the log
+		// stream with the legacy arm.
+		if !errors.Is(err, state.ErrNotFound) {
+			h.log.Debug("imaged: sbom key lookup failed",
+				"deployment", deploymentID, "err", err)
+		}
+		return ""
+	}
+	return BuildSBOMKey(build.ID)
+}
+
+// updateBuildProvenanceSBOM stamps the SBOM storage key onto the
+// build_provenance row for this deployment (issue #299 /
+// ADR-038 Phase 3). Best-effort: an error here is logged at WARN
+// and the build still succeeds (the SBOM is observational
+// metadata, schema §4.2).
+//
+// The deployment may not have a build row yet (the image-only
+// arm of handleDeployment) — in that case sbomKey is "" and we
+// skip the lookup entirely. sbomKey == "" also covers the
+// syft-failure case: the build still succeeds, build_provenance
+// is stamped with empty sbom_storage_key, and the apid GET
+// returns 503 build_sbom_unavailable.
+func (h *Handler) updateBuildProvenanceSBOM(ctx context.Context, deploymentID, sbomKey string) {
+	if deploymentID == "" {
+		return
+	}
+	build, err := h.store.BuildByDeployment(ctx, deploymentID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			// Image-only deploy or pre-build state — no
+			// build_provenance row to stamp yet.
+			return
+		}
+		h.log.Warn("imaged: build_provenance lookup failed",
+			"deployment", deploymentID, "err", err)
+		return
+	}
+	if err := h.store.UpdateBuildProvenanceSBOM(ctx, build.ID, sbomKey); err != nil {
+		// A ErrNotFound here means the builderd populator
+		// INSERT failed (logged at WARN inside
+		// builderd.recordProvenance). We log at WARN too so the
+		// missing pair surfaces in operator dashboards, but do
+		// not fail the deploy — the build itself is the
+		// load-bearing artefact.
+		h.log.Warn("imaged: stamp sbom_storage_key",
+			"build", build.ID, "sbom_key", sbomKey, "err", err)
+	}
 }
 
 // --- F2: FC-version startup sweep ------------------------------------------

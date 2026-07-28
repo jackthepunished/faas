@@ -40,17 +40,40 @@ func BaseScanKeyForArch(runtime, arch string) string {
 }
 
 // ScanKeyForBaseKey derives the scan sidecar storage key from a
-// base ext4 storage key (issue #299). Replaces the "base/" prefix
-// with "scans/" and appends ".scan.json" — e.g.
-// "base/runner-node22-amd64.ext4" maps to
-// "scans/runner-node22-amd64.ext4.scan.json". This is the
-// inverse-of-mapping shape vmmd uses at boot time to look up the
-// scan sidecar given a wake request's BaseKey; imaged calls the
+// base ext4 storage key (issue #299). The first path segment is
+// rewritten to "scans/" via TrimPrefix+prepend, not strings.Replace —
+// Replace with n=1 only catches the literal "base/" prefix and
+// silently passes through "bases/" / "BASE/" / mixed-case through
+// unchanged, so the scan sidecar ends up at a key vmmd never
+// reads. The TrimPrefix+prepend shape is case-sensitive against the
+// canonical "base/" prefix and handles non-root "bases/legacy/..."
+// keys (a future imaged refactor that moves the base prefix into a
+// sub-directory) by stripping the leading "base" segment and
+// rewriting the first component. Appends ".scan.json" so the
+// mapping is unambiguous.
+//
+// Inverse-of-mapping shape: vmmd uses this at boot time to look up
+// the scan sidecar given a wake request's BaseKey; imaged uses the
 // same function at stage time to write the sidecar in lock-step
-// with the digest sidecar. Uses strings.Replace with n=1 so only
-// the first "base/" prefix is rewritten (defensive — a baseKey
-// string with two "base/" prefixes is malformed input that we
-// silently pass through unchanged).
+// with the digest sidecar. Pinned by TestScanKeyForBaseKeyFormat in
+// pkg/fcvm/manager_scan_test.go.
 func ScanKeyForBaseKey(baseKey string) string {
-	return strings.Replace(baseKey, "base/", "scans/", 1) + ".scan.json"
+	const (
+		basePrefix = "base/"
+		scanPrefix = "scans/"
+		scanSuffix = ".scan.json"
+	)
+	if baseKey == "" {
+		return scanPrefix + scanSuffix
+	}
+	if strings.HasPrefix(baseKey, basePrefix) {
+		return scanPrefix + strings.TrimPrefix(baseKey, basePrefix) + scanSuffix
+	}
+	// Fallback for keys that don't carry the canonical "base/"
+	// prefix (legacy / operator-overridden paths). The gate's
+	// get-miss path surfaces this as *api.Problem{Code: scan_critical}
+	// anyway, so a malformed key is fail-closed rather than silently
+	// admitted under a different prefix. The trim-and-prepend keeps
+	// the function pure (no panic on bad input).
+	return scanPrefix + strings.TrimPrefix(baseKey, "/") + scanSuffix
 }

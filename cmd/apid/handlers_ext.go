@@ -2001,8 +2001,6 @@ func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct
 //   - 503 with sbom_storage_key set but the file missing on disk —
 //     same code (the populator exists in the schema but not on the
 //     filesystem; recoverable by re-running imaged).
-//   - 404 with sbom_storage_key empty string — covered by the first
-//     branch (unavailable).
 //
 // The SBOM is served with `application/vnd.cyclonedx+json` so external
 // tooling (cyclonedx-cli validate, jq's @cdx/manifest formatters) can
@@ -2011,69 +2009,14 @@ func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct
 // well under the handler heap budget.
 func (s *server) getBuildSbom(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	build, err := s.store.BuildByID(ctx(r), id)
-	if err != nil {
-		s.notFound(w, "no such build")
+	sbomPath, prob := s.resolveSbomPath(r, id, acct)
+	if prob != nil {
+		api.WriteProblem(w, prob)
 		return
 	}
-	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
-	if err != nil {
-		s.notFound(w, "no such build")
-		return
-	}
-	app, err := s.store.AppByID(ctx(r), dep.AppID)
-	if err != nil || app.AccountID != acct.ID {
-		s.notFound(w, "no such build")
-		return
-	}
-	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
-	if err != nil {
-		// Provenance row absent — Phase-3 populator had not landed
-		// when this build was created. We can still confirm the
-		// account owns the build via Build→Deployment→App→AccountID,
-		// so the SBOM-missing case is genuinely "missing", not
-		// "wrong account".
-		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
-		return
-	}
-	if prov.SBOMStorageKey == "" {
-		// Provenance row exists but the populator didn't write the
-		// sbom_storage_key column. Same shape as ErrBuildProvenanceNotFound's
-		// best-effort WARN — observability broke for this build, the
-		// build itself is final.
-		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
-		return
-	}
-	if s.sbomRoot == "" {
-		// Operationally the operator hasn't wired a SBOM root. The
-		// CLI's "you forgot to deploy imaged Phase 3" message lands
-		// here. Distinct code so future ops automation can branch
-		// on it (this is the only way a customer-visible route can
-		// fail for an operator-side wiring gap).
-		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
-		return
-	}
-	// Defense-in-depth against path traversal in the storage key:
-	// sbom_storage_key is a relative path under sbomRoot, NOT an
-	// absolute one and NOT one with `..` segments. storage/validateKey
-	// is the canonical validator, but the storage key arrives via
-	// imaged's syft populator path which already enforces a fixed
-	// "sboms/<buildID>.cdx.json" shape. We re-check here because
-	// the column is general-purpose and a future populator could
-	// write anything.
-	clean := filepath.Clean(prov.SBOMStorageKey)
-	if strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || clean == "." {
-		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
-		return
-	}
-	full := filepath.Join(s.sbomRoot, clean)
-	f, err := os.Open(full)
+	f, err := os.Open(sbomPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// The populator wrote a storage key the filesystem does
-			// not honour (imaged ran on a different box; the SBOM
-			// directory was gc'd). Same code as the empty-key branch
-			// — the operator's job to re-run imaged.
 			api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
 			return
 		}
@@ -2084,4 +2027,61 @@ func (s *server) getBuildSbom(w http.ResponseWriter, r *http.Request, acct state
 	w.Header().Set("Content-Type", "application/vnd.cyclonedx+json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, f)
+}
+
+// resolveSbomPath centralises the IDOR-safe lookup + storage-key
+// validation logic so getBuildSbom stays under the 50-line handler
+// budget (CLAUDE.md). Returns the local-filesystem path to the SBOM
+// blob, or a 0 path + non-zero *api.Problem indicating the failure
+// mode:
+//
+//   - 404 not_found "no such build": build / deployment / app /
+//     AccountID mismatch — IDOR-safe (every negative path collapses
+//     to the same response so probing can't infer other customers'
+//     build ids).
+//   - 503 build_sbom_unavailable: SBOM populator didn't write the column
+//     (pre-Phase-3 build, populator INSERT best-effort WARN'd) or
+//     sbomRoot is unset, or the storage key fails the path-traversal guard.
+//
+// The caller never inspects the *api.Problem's code/message — just
+// renders it via api.WriteProblem. Pinned by TestGetBuildSbom_*
+// in handlers_ext_test.go.
+func (s *server) resolveSbomPath(r *http.Request, buildID string, acct state.Account) (string, *api.Problem) {
+	notFound := func() (string, *api.Problem) {
+		return "", api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Not found", "no such build")
+	}
+	build, err := s.store.BuildByID(ctx(r), buildID)
+	if err != nil {
+		return notFound()
+	}
+	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
+	if err != nil {
+		return notFound()
+	}
+	app, err := s.store.AppByID(ctx(r), dep.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		return notFound()
+	}
+	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
+	if err != nil {
+		// Provenance row absent — pre-PR build.
+		return "", api.ErrBuildSBOMUnavailable()
+	}
+	if prov.SBOMStorageKey == "" {
+		// Populator didn't stamp sbom_storage_key.
+		return "", api.ErrBuildSBOMUnavailable()
+	}
+	if s.sbomRoot == "" {
+		// Operator hasn't wired a SBOM root.
+		return "", api.ErrBuildSBOMUnavailable()
+	}
+	// Path-traversal guard: storage key MUST be a relative path
+	// under sbomRoot — no leading "/" or ".." segments. imaged's
+	// syft populator enforces a fixed "sboms/<buildID>.cdx.json"
+	// shape but the column is general-purpose, so re-validate here.
+	clean := filepath.Clean(prov.SBOMStorageKey)
+	if strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || clean == "." {
+		return "", api.ErrBuildSBOMUnavailable()
+	}
+	return filepath.Join(s.sbomRoot, clean), nil
 }
