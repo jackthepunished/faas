@@ -2034,3 +2034,140 @@ func createApp(t *testing.T, s *state.PgStore, ctx context.Context, acctID, slug
 	}
 	return a.ID
 }
+
+// TestPg_UpsertGitHubInstall_InsertsRow pins the insert path on the
+// new github_installations table (PR-C, migration 00059). The
+// SealedToken bytea is the load-bearing bit — the test asserts a
+// sealed blob survives the round-trip, so a regression that writes
+// plaintext would be caught.
+func TestPg_UpsertGitHubInstall_InsertsRow(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctID, _, _ := seedLiveDeploy(t, s, ctx)
+
+	exp := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	inst := state.GitHubInstall{
+		AccountID:        acctID,
+		InstallationID:   12345,
+		DefaultBranch:    "main",
+		SealedToken:      []byte("age-encryption.org/v1\nX25519 ...\n...fake sealed bytes"),
+		TokenExpiresAt:   exp,
+		AuditGithubLogin: "octocat",
+	}
+	if err := s.UpsertGitHubInstall(ctx, inst); err != nil {
+		t.Fatalf("UpsertGitHubInstall: %v", err)
+	}
+
+	got, err := s.GitHubInstallForAccount(ctx, acctID)
+	if err != nil {
+		t.Fatalf("GitHubInstallForAccount: %v", err)
+	}
+	if got.AccountID != acctID {
+		t.Errorf("AccountID = %q, want %q", got.AccountID, acctID)
+	}
+	if got.InstallationID != 12345 {
+		t.Errorf("InstallationID = %d, want 12345", got.InstallationID)
+	}
+	if got.DefaultBranch != "main" {
+		t.Errorf("DefaultBranch = %q, want main", got.DefaultBranch)
+	}
+	if string(got.SealedToken) != string(inst.SealedToken) {
+		t.Errorf("SealedToken round-trip mismatch")
+	}
+	if !got.TokenExpiresAt.Equal(exp) {
+		t.Errorf("TokenExpiresAt = %v, want %v", got.TokenExpiresAt, exp)
+	}
+	if got.AuditGithubLogin != "octocat" {
+		t.Errorf("AuditGithubLogin = %q, want octocat", got.AuditGithubLogin)
+	}
+}
+
+// TestPg_UpsertGitHubInstall_OnConflictUpdates pins the ON CONFLICT
+// DO UPDATE path: a second upsert with a different installation_id
+// overwrites the first row instead of crashing on the PK.
+func TestPg_UpsertGitHubInstall_OnConflictUpdates(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctID, _, _ := seedLiveDeploy(t, s, ctx)
+
+	exp := time.Now().Add(time.Hour).UTC()
+	first := state.GitHubInstall{
+		AccountID:        acctID,
+		InstallationID:   1,
+		DefaultBranch:    "main",
+		SealedToken:      []byte("first-seal"),
+		TokenExpiresAt:   exp,
+		AuditGithubLogin: "octocat",
+	}
+	if err := s.UpsertGitHubInstall(ctx, first); err != nil {
+		t.Fatalf("first UpsertGitHubInstall: %v", err)
+	}
+	second := first
+	second.InstallationID = 2
+	second.DefaultBranch = "develop"
+	second.AuditGithubLogin = "octocat-2"
+	if err := s.UpsertGitHubInstall(ctx, second); err != nil {
+		t.Fatalf("second UpsertGitHubInstall: %v", err)
+	}
+	got, err := s.GitHubInstallForAccount(ctx, acctID)
+	if err != nil {
+		t.Fatalf("GitHubInstallForAccount: %v", err)
+	}
+	if got.InstallationID != 2 {
+		t.Errorf("InstallationID = %d, want 2 (ON CONFLICT DO UPDATE didn't fire)", got.InstallationID)
+	}
+	if got.DefaultBranch != "develop" {
+		t.Errorf("DefaultBranch = %q, want develop", got.DefaultBranch)
+	}
+	if got.AuditGithubLogin != "octocat-2" {
+		t.Errorf("AuditGithubLogin = %q, want octocat-2", got.AuditGithubLogin)
+	}
+}
+
+// TestPg_GitHubInstallForAccount_OnDeleteCascade pins the §17 G2
+// GDPR path: deleting the owning account removes the install row.
+// (Mirrors the PR-B apps_github_install_account_id path which is
+// ON DELETE SET NULL — the install row IS the user's, so CASCADE
+// is correct.)
+//
+// We can't use the shared pgStore(t) helper here because CASCADE is
+// verified with a raw `delete from accounts` against the same schema
+// that owns the row, and pgStore's pool is unexported
+// (MEMORY.md/pkg-state-pgstore-pool-unexported). Follow the
+// pgtest.Open + MigrateUp + NewPgStore pattern used by the snapshot
+// retention tests (see line 1428) so we hold both halves.
+//
+// Seed just an account (no app/deploy/instances) so the raw
+// `delete from accounts` only triggers the CASCADE on
+// github_installations — apps FK would otherwise trip 23503.
+func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
+	pool := pgtest.Open(t)
+	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := state.NewPgStore(pool)
+	acct, err := s.CreateAccount(ctx, "cascade@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	acctID := acct.ID
+
+	inst := state.GitHubInstall{
+		AccountID:        acctID,
+		InstallationID:   42,
+		DefaultBranch:    "main",
+		SealedToken:      []byte("seal"),
+		TokenExpiresAt:   time.Now().Add(time.Hour).UTC(),
+		AuditGithubLogin: "octocat",
+	}
+	if err := s.UpsertGitHubInstall(ctx, inst); err != nil {
+		t.Fatalf("UpsertGitHubInstall: %v", err)
+	}
+	// Delete the account — installs must go with it (CASCADE).
+	if _, err := pool.Exec(ctx, `delete from accounts where id = $1::uuid`, acctID); err != nil {
+		t.Fatalf("delete account: %v", err)
+	}
+	_, err = s.GitHubInstallForAccount(ctx, acctID)
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("expected ErrNotFound after account delete (CASCADE), got %v", err)
+	}
+}

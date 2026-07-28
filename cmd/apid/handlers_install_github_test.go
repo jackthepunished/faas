@@ -71,8 +71,8 @@ func (f *bindPickerFake) BindAppRepo(_ context.Context, _, _ string, _, _ string
 func (f *bindPickerFake) GetInstallState(context.Context, string) (InstallState, string, string, error) {
 	return InstallStateUnspecified, "", "", errGithubdNotReady
 }
-func (f *bindPickerFake) ExchangeOAuthCode(context.Context, string, string, string) (string, error) {
-	return "", errGithubdNotReady
+func (f *bindPickerFake) ExchangeOAuthCode(context.Context, string, string, string) (string, string, error) {
+	return "", "", errGithubdNotReady
 }
 func (f *bindPickerFake) ListInstallableRepos(context.Context, string) ([]Repo, error) {
 	return nil, errGithubdNotReady

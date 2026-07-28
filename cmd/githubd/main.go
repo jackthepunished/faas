@@ -23,10 +23,13 @@ import (
 	"os"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/githubd"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -89,7 +92,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if kerr != nil {
 			log.Warn("githubd: read app private key", "err", kerr)
 		} else {
-			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient())
+			clientID := os.Getenv("FAAS_GITHUB_APP_CLIENT_ID")
+			clientSecret := os.Getenv("FAAS_GITHUB_APP_CLIENT_SECRET")
+			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient(), clientID, clientSecret)
 			if aerr != nil {
 				log.Warn("githubd: app auth init", "err", aerr)
 			} else {
@@ -100,11 +105,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// writer threads the right installation_id per
 				// repo through it instead of hardcoding install=1.
 				storeAdapter := newStateBindingsAdapter(pool)
+				installsAdapter := newStateInstallsAdapter(pool)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
 				if cerr != nil {
 					return fmt.Errorf("githubd: new checks api: %w", cerr)
 				}
-				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter)
+				// PR-C: load the host age keypair so the install
+				// token can be sealed at rest (SealOne at mint)
+				// and unsealed at cold-start rehydrate (Open).
+				// LoadHostKey enforces 0o400 perms (strict
+				// equality, MEMORY.md/host-age-0400-loadcredential-decouple);
+				// failure here is fatal — without the identity
+				// we can't unseal existing rows.
+				identity, ierr := secretbox.LoadHostKey(hostKeyPath())
+				if ierr != nil {
+					return fmt.Errorf("githubd: load host age identity: %w", ierr)
+				}
+				recipient, rerr := loadHostPubKey()
+				if rerr != nil {
+					return fmt.Errorf("githubd: load host age recipient: %w", rerr)
+				}
+				auditFn := newGithubdAuditFn(log)
+				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter, installsAdapter, recipient, identity, auditFn)
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
@@ -188,6 +210,62 @@ func readKeyPEMDefault() ([]byte, error) {
 		return nil, fmt.Errorf("githubd: read app key %q: %w", path, err)
 	}
 	return data, nil
+}
+
+// hostKeyPath returns the path to the host age private key. Used
+// by ensureInstallToken's cold-start rehydrate path to unseal
+// stored install tokens. The default matches the rest of the
+// secrets tree; an operator can override via FAAS_HOST_AGE_KEY.
+func hostKeyPath() string {
+	if p := os.Getenv("FAAS_HOST_AGE_KEY"); p != "" {
+		return p
+	}
+	return "/etc/faas/secrets/host.age.key"
+}
+
+// hostPubKeyPath returns the path to the host age public key. Used
+// by ExchangeOAuthCode's seal-at-mint path. Mode 0444 expected.
+func hostPubKeyPath() string {
+	if p := os.Getenv("FAAS_HOST_AGE_PUB"); p != "" {
+		return p
+	}
+	return "/etc/faas/secrets/host.age.pub"
+}
+
+// loadHostPubKey reads the host age public key from disk and
+// parses it as an X25519 recipient. The public half is
+// world-readable, so no perm check beyond the file being readable.
+// (Strict 0o400 enforcement is on the PRIVATE half via LoadHostKey;
+// the public half just needs to be readable to the daemon.)
+func loadHostPubKey() (*age.X25519Recipient, error) {
+	path := hostPubKeyPath()
+	data, err := os.ReadFile(path) //nolint:gosec // path is operator-controlled
+	if err != nil {
+		return nil, fmt.Errorf("githubd: read host age pub %q: %w", path, err)
+	}
+	id, err := age.ParseX25519Recipient(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("githubd: parse host age pub %q: %w", path, err)
+	}
+	return id, nil
+}
+
+// newGithubdAuditFn returns the AuditEvent callback RealService
+// invokes to emit auth.install.* events. Today it just JSON-logs
+// at info level; a future wiring can forward to apid's audit
+// event emitter (PR-D scope — the inbound-webhook path needs the
+// same audit sink so the §11 paper trail is unified).
+//
+// The event names match the apid-side audit taxonomy
+// (auth.install.verified / .token_sealed / .takeover_rejected /
+// .unauthenticated from PR-A + PR-B + PR-C).
+func newGithubdAuditFn(log *slog.Logger) githubd.AuditEvent {
+	return func(event string, accountID string, payload map[string]any) {
+		log.Info("githubd audit",
+			"event", event,
+			"account_id", accountID,
+			"payload", payload)
+	}
 }
 
 // Compile-time guards: keep imports stable for tests / future slices.

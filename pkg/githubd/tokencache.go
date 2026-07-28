@@ -139,6 +139,31 @@ func (c *TokenCache) Token(ctx context.Context, installationID int64) (string, e
 	return tok, err
 }
 
+// Seed stamps an entry unconditionally. Used by the cold-start
+// rehydrate path in RealService.ensureInstallToken so the freshly
+// unsealed token (read from pkg/state.GitHubInstallForAccount) can
+// populate the cache without racing the singleflight that Token()
+// uses for proactive refresh. Returns an error when installationID
+// is non-positive (mirrors Token's contract).
+//
+// Unlike Token, Seed does NOT call the fetcher — the caller is
+// passing a token it just minted or unsealed. Existing entries are
+// overwritten, so Seed can also be used to force-refresh after the
+// store row was rotated.
+func (c *TokenCache) Seed(_ context.Context, installationID int64, token string, expiresAt time.Time) error {
+	if installationID <= 0 {
+		return fmt.Errorf("githubd: invalid installation id %d", installationID)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[installationID] = &tokenEntry{
+		token:       token,
+		expiresAt:   expiresAt,
+		lastRefresh: c.clock(),
+	}
+	return nil
+}
+
 // StartJanitor spawns a goroutine that wakes every minute to evict
 // expired entries and trigger proactive refreshes for entries
 // inside the refresh window. Returns a stop func; callers invoke

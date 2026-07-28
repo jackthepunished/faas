@@ -125,7 +125,7 @@ func TestStubGithubdClient_EveryMethodReturnsNotReady(t *testing.T) {
 		t.Errorf("GetInstallState: token=%q login=%q, want empty", tok, login)
 	}
 
-	_, err = s.ExchangeOAuthCode(ctx, "a", "c", "s")
+	_, _, err = s.ExchangeOAuthCode(ctx, "a", "c", "s")
 	assertGithubdNotReadyError(t, "ExchangeOAuthCode", err)
 	_, err = s.ListInstallableRepos(ctx, "a")
 	assertGithubdNotReadyError(t, "ListInstallableRepos", err)

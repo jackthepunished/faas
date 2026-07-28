@@ -19,9 +19,15 @@ import (
 // real methods here. Defining the interface up-front means apid and
 // tests can call githubd today and exercise the round-trip before any
 // business logic lands.
+//
+// PR-C widens ExchangeOAuthCode's return shape to also carry
+// default_branch — the apid handler needs it to seed BindAppRepo on
+// the success path. The proto wire already had
+// `default_branch = 2` on ExchangeOAuthCodeResponse (just unused),
+// so this is a wire-compatible, additive widening.
 type Service interface {
 	GetInstallState(accountID string) (InstallState, string, string, error)
-	ExchangeOAuthCode(accountID, code, state string) (string, error)
+	ExchangeOAuthCode(accountID, code, state string) (installationID, defaultBranch string, err error)
 	ListInstallableRepos(accountID string) ([]Repo, error)
 	BindAppRepo(appID, accountID, repoFullName, productionBranch string) (string, error)
 	UnbindAppRepo(appID, accountID string) error
@@ -94,10 +100,16 @@ func (s *Server) GetInstallState(ctx context.Context, req *githubdpb.GetInstallS
 }
 
 // ExchangeOAuthCode passes through to Service.ExchangeOAuthCode.
+// PR-C: the Service interface widens to (string, string, error)
+// (installation_id, default_branch, err). The proto wire stays at
+// (string, error) for now — the default_branch is consumed via
+// apid's internal VerifyInstallation follow-up (which already
+// returns it). The widening is purely an in-process Service
+// shape; the proto wire is unchanged, so no regeneration needed.
 func (s *Server) ExchangeOAuthCode(ctx context.Context, req *githubdpb.ExchangeOAuthCodeRequest) (*githubdpb.ExchangeOAuthCodeResponse, error) {
 	const op = "ExchangeOAuthCode"
 	start := time.Now()
-	instID, err := s.svc.ExchangeOAuthCode(req.GetAccountId(), req.GetCode(), req.GetState())
+	instID, _, err := s.svc.ExchangeOAuthCode(req.GetAccountId(), req.GetCode(), req.GetState())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, toStatusErr(err)
@@ -246,8 +258,10 @@ func (UnimplementedService) GetInstallState(string) (InstallState, string, strin
 }
 
 // ExchangeOAuthCode returns Unimplemented. Slice 8 replaces this.
-func (UnimplementedService) ExchangeOAuthCode(string, string, string) (string, error) {
-	return "", status.Error(codes.Unimplemented, "githubd: ExchangeOAuthCode not yet wired (slice 8)")
+// PR-C widens to (string, string, error) so the response can carry
+// default_branch.
+func (UnimplementedService) ExchangeOAuthCode(string, string, string) (string, string, error) {
+	return "", "", status.Error(codes.Unimplemented, "githubd: ExchangeOAuthCode not yet wired (slice 8)")
 }
 
 // ListInstallableRepos returns Unimplemented. Slice 8 replaces this.

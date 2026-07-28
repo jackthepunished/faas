@@ -105,3 +105,32 @@ func (a *stateBindingsAdapter) InstallationIDForRepo(ctx context.Context, repoFu
 	}
 	return 0, err
 }
+
+// stateInstallsAdapter bridges pkg/state.PgStore to
+// pkg/githubd.StoreInstalls (PR-C). The interface is deliberately
+// written in state types (per the binding adapter's pattern), so
+// this is a near no-op — the only translation is the ErrNotFound
+// pass-through that RealService.lookupInstall reads as "no
+// installation for account".
+type stateInstallsAdapter struct {
+	store *state.PgStore
+}
+
+func newStateInstallsAdapter(pool *pgxpool.Pool) *stateInstallsAdapter {
+	return &stateInstallsAdapter{store: state.NewPgStore(pool)}
+}
+
+// Upsert persists the OAuth handshake state. SealedToken is
+// passed through verbatim — pkg/secretbox.SealOne already armoured
+// it before RealService handed it here, so the database never sees
+// a plaintext "ghs_…" token.
+func (a *stateInstallsAdapter) Upsert(ctx context.Context, inst state.GitHubInstall) error {
+	return a.store.UpsertGitHubInstall(ctx, inst)
+}
+
+// ForAccount reads the durable install row. state.ErrNotFound
+// surfaces as-is so RealService.lookupInstall can render the
+// pre-PR-B "no installation for account" error.
+func (a *stateInstallsAdapter) ForAccount(ctx context.Context, accountID string) (state.GitHubInstall, error) {
+	return a.store.GitHubInstallForAccount(ctx, accountID)
+}

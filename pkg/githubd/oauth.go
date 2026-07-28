@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -48,16 +49,31 @@ type HTTPClient interface {
 // private key never escapes this struct — it's only used by
 // MintAppJWT (which itself feeds the OAuth flow, not the public
 // surface).
+//
+// ClientID + ClientSecret are the GitHub App's OAuth credentials
+// (added by PR-C), distinct from the App private key: the App
+// private key signs installation JWTs (server-to-server auth) and
+// the ClientID/ClientSecret pair authenticates the user-to-server
+// OAuth flow that ExchangeOAuthCode drives. Empty values mean the
+// user-to-server methods (ExchangeUserOAuthCode,
+// ListInstallationsForUser) return an error so a half-configured
+// box can't accidentally bypass the §11 ownership proof.
 type AppAuth struct {
-	AppID      string // GitHub App ID (numeric, as a string)
-	PrivateKey *rsa.PrivateKey
-	HTTPClient HTTPClient
+	AppID        string // GitHub App ID (numeric, as a string)
+	ClientID     string // GitHub App OAuth Client ID (PR-C)
+	ClientSecret string // GitHub App OAuth Client Secret (PR-C)
+	PrivateKey   *rsa.PrivateKey
+	HTTPClient   HTTPClient
 }
 
 // NewAppAuth loads and validates the GitHub App credentials.
 // Returns an error if the key can't be parsed — the daemon must
 // not start with a half-configured install.
-func NewAppAuth(appID string, keyPEM []byte, hc HTTPClient) (*AppAuth, error) {
+//
+// clientID + clientSecret are the OAuth credentials PR-C's
+// user-to-server flow needs; pass empty strings to disable that
+// flow (the install-token flow still works).
+func NewAppAuth(appID string, keyPEM []byte, hc HTTPClient, clientID, clientSecret string) (*AppAuth, error) {
 	if appID == "" {
 		return nil, fmt.Errorf("githubd: app id required")
 	}
@@ -71,7 +87,13 @@ func NewAppAuth(appID string, keyPEM []byte, hc HTTPClient) (*AppAuth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("githubd: parse app key: %w", err)
 	}
-	return &AppAuth{AppID: appID, PrivateKey: key, HTTPClient: hc}, nil
+	return &AppAuth{
+		AppID:        appID,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		PrivateKey:   key,
+		HTTPClient:   hc,
+	}, nil
 }
 
 // MintAppJWT produces a 10-minute RS256 JWT signed by the GitHub
@@ -138,6 +160,123 @@ func (a *AppAuth) ExchangeInstallationToken(ctx context.Context, installationID 
 		return "", time.Time{}, fmt.Errorf("githubd: install token response missing token field")
 	}
 	return payload.Token, payload.ExpiresAt, nil
+}
+
+// GitHubOAuthAccessTokenURL is the user-to-server OAuth token
+// exchange endpoint. Distinct from api.github.com: the user OAuth
+// flow hits login/oauth/access_token with form-encoded
+// client_id+client_secret+code, not with the App JWT.
+const GitHubOAuthAccessTokenURL = "https://github.com/login/oauth/access_token"
+
+// ExchangeUserOAuthCode trades a one-shot `code` for a user-to-server
+// access token (PR-C). The apid OAuth-code-callback handler hands us
+// the `code` that arrived in the dashboard's
+// ?code=…&state=… redirect; this method trades it for the user
+// access token that authorizes /user/installations.
+//
+// Returns the access_token string. On a non-200 response, decodes
+// the response body's `error` field and returns it wrapped so the
+// caller can distinguish bad-verification-code (400) from network
+// failure (transport error). Returns an error when AppAuth is not
+// configured with ClientID+ClientSecret (defense-in-depth: a box
+// that didn't ship the OAuth credentials can't accidentally bypass
+// the §11 ownership proof).
+func (a *AppAuth) ExchangeUserOAuthCode(ctx context.Context, code string) (string, error) {
+	if a == nil || a.ClientID == "" || a.ClientSecret == "" {
+		return "", fmt.Errorf("githubd: user-to-server oauth not configured (ClientID/ClientSecret missing)")
+	}
+	if code == "" {
+		return "", fmt.Errorf("githubd: code required")
+	}
+	form := "client_id=" + url.QueryEscape(a.ClientID) +
+		"&client_secret=" + url.QueryEscape(a.ClientSecret) +
+		"&code=" + url.QueryEscape(code)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GitHubOAuthAccessTokenURL, strings.NewReader(form))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "faas-githubd/1.0")
+
+	resp, err := a.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("githubd: exchange user oauth code: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("githubd: exchange user oauth code: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("githubd: decode user oauth code: %w", err)
+	}
+	if payload.Error != "" {
+		return "", fmt.Errorf("githubd: user oauth code rejected: %s (%s)", payload.Error, payload.ErrorDesc)
+	}
+	if payload.AccessToken == "" {
+		return "", fmt.Errorf("githubd: user oauth response missing access_token field")
+	}
+	return payload.AccessToken, nil
+}
+
+// UserInstallation is one entry from /user/installations. We only
+// need the id (to mint the install token via
+// ExchangeInstallationToken) and the account.login (to seal against
+// §11 mismatches on the durable row).
+type UserInstallation struct {
+	ID      int64 `json:"id"`
+	Account struct {
+		Login string `json:"login"`
+	} `json:"account"`
+}
+
+// ListInstallationsForUser enumerates the GitHub App installs visible
+// to a user via their user-to-server access token. PR-C's
+// ExchangeOAuthCode flow calls this with the access_token returned
+// by ExchangeUserOAuthCode. The first install is the one we'll
+// bind (PR-C's single-install-per-account assumption); the account
+// login is captured for the §11 AuditGithubLogin paper trail on
+// the durable github_installations row.
+//
+// Endpoint: GET https://api.github.com/user/installations?per_page=100
+// Auth:    Bearer <user-token>
+// Response: { "installations": [{ "id": ..., "account": { "login": ... } }, ...] }
+func (a *AppAuth) ListInstallationsForUser(ctx context.Context, userToken string) ([]UserInstallation, error) {
+	if userToken == "" {
+		return nil, fmt.Errorf("githubd: user token required")
+	}
+	endpoint := GitHubAPI + "/user/installations?per_page=100"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+userToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "faas-githubd/1.0")
+
+	resp, err := a.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubd: list user installations: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return nil, fmt.Errorf("githubd: list user installations: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Installations []UserInstallation `json:"installations"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("githubd: decode user installations: %w", err)
+	}
+	return payload.Installations, nil
 }
 
 // InstallableRepo is one entry in the list returned by

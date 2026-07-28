@@ -994,6 +994,83 @@ func (s *PgStore) DeleteGithubInstallBinding(ctx context.Context, appID string) 
 	return nil
 }
 
+// UpsertGitHubInstall persists the durable OAuth handshake state
+// for one account's GitHub App install (PR-C, audit-gap closure).
+// Idempotent on (AccountID) via ON CONFLICT (account_id) DO UPDATE
+// so the OAuth flow can retry without crashing on the PK. The FK
+// to accounts(id) ON DELETE CASCADE makes this the §17 G2 GDPR
+// path — deleting an account removes its install row in the same
+// tx. SealedToken is written verbatim (bytea); the plaintext
+// token was sealed by githubd via pkg/secretbox.SealOne before
+// it ever reached this method, so the database never sees a
+// plaintext "ghs_…" value.
+//
+// AccountID is required; a blank input returns ErrNotFound so the
+// caller can distinguish "unknown account" from a transient write
+// failure without parsing SQL error messages.
+func (s *PgStore) UpsertGitHubInstall(ctx context.Context, inst GitHubInstall) error {
+	if inst.AccountID == "" {
+		return ErrNotFound
+	}
+	if inst.AuditGithubLogin == "" {
+		return fmt.Errorf("state: AuditGithubLogin required (§11 paper trail)")
+	}
+	if inst.SealedAt.IsZero() {
+		inst.SealedAt = time.Now()
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into github_installations
+		     (account_id, installation_id, default_branch,
+		      sealed_install_token, token_expires_at, sealed_at,
+		      audit_github_login)
+		 values ($1::uuid, $2, $3, $4, $5, $6, $7)
+		 on conflict (account_id) do update set
+		     installation_id       = excluded.installation_id,
+		     default_branch        = excluded.default_branch,
+		     sealed_install_token  = excluded.sealed_install_token,
+		     token_expires_at      = excluded.token_expires_at,
+		     sealed_at             = excluded.sealed_at,
+		     audit_github_login    = excluded.audit_github_login`,
+		inst.AccountID, inst.InstallationID, inst.DefaultBranch,
+		inst.SealedToken, inst.TokenExpiresAt, inst.SealedAt,
+		inst.AuditGithubLogin,
+	)
+	return err
+}
+
+// GitHubInstallForAccount reads the durable install row for an
+// account. Used by githubd's cold-start rehydrate path; on a miss,
+// returns ErrNotFound so the caller can distinguish "the OAuth
+// handshake hasn't happened yet" from "the database is down".
+// Translates pgx.ErrNoRows to ErrNotFound at the boundary so the
+// caller can use errors.Is(err, state.ErrNotFound) directly.
+func (s *PgStore) GitHubInstallForAccount(ctx context.Context, accountID string) (GitHubInstall, error) {
+	if accountID == "" {
+		return GitHubInstall{}, ErrNotFound
+	}
+	var inst GitHubInstall
+	err := s.pool.QueryRow(ctx,
+		`select installation_id, default_branch,
+		        sealed_install_token, token_expires_at, sealed_at,
+		        audit_github_login
+		   from github_installations
+		  where account_id = $1::uuid`,
+		accountID,
+	).Scan(
+		&inst.InstallationID, &inst.DefaultBranch,
+		&inst.SealedToken, &inst.TokenExpiresAt, &inst.SealedAt,
+		&inst.AuditGithubLogin,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GitHubInstall{}, ErrNotFound
+		}
+		return GitHubInstall{}, err
+	}
+	inst.AccountID = accountID
+	return inst, nil
+}
+
 // GetGithubInstallBindingForApp returns the (appID, accountID)
 // bind row. accountID scopes the lookup so a forged session cannot
 // read another tenant's binding — when the app is bound but to a
