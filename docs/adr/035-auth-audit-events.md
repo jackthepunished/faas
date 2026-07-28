@@ -153,9 +153,17 @@
     Code: `cmd/apid/audit.go`, `cmd/apid/handlers_auth_login.go`,
     `cmd/apid/handlers_google.go`, `cmd/apid/handlers_github.go`,
     `pkg/wire/metrics.go`, `pkg/middleware/authlimit.go` (exports
-    `ClientIP`), `pkg/auth/hash.go` (new — `HashEmail` is plain SHA-256 of
-    lower-cased email; the doc comment notes "breach-resistant, not strongly
-    anonymous"). Runbook: `docs/runbooks/FaasFailedLoginSpike.md`.
+    `ClientIP`), `pkg/auth/hash.go` (new — `HashEmail` is **HMAC-SHA256**
+    keyed by a per-box audit HMAC secret; the doc comment documents the
+    rainbow-table-resistance property. **Update (PR #386, CodeQL #121):**
+    the SHA-256 form documented here was replaced by HMAC-SHA256 before
+    ship — the SHA-256 form is rainbow-table-reversible for common
+    emails, and the CodeQL `go/weak-sensitive-data-hashing` rule
+    correctly flagged it. The audit HMAC key is loaded at apid startup
+    via `auth.SetHMACSecret`, with precedence: `FAAS_AUDIT_HMAC_KEY`
+    env var (production), `/var/lib/faas/audit-hmac.key` (dev-mode
+    auto-generated, 0o600), or zero-key fallback (logs a Warn).).
+    Runbook: `docs/runbooks/FaasFailedLoginSpike.md`.
   - **App/Deployment/Cron/Domain audit emissions.** Developer actions,
     not security-relevant; cover in a separate PR if the customer
     audit page ever asks.
