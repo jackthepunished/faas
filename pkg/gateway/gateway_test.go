@@ -486,9 +486,15 @@ func TestInvariant5_NoSecondWakeAfterShouldWakeFalse(t *testing.T) {
 
 // TestLimiterForget verifies Forget returns the bucket to a clean burst state.
 // Origin: main — TestLimiterForget complements TestLimiterForgetAll above by
-// pinning the single-key Forget semantics.
+// pinning the single-key Forget semantics. Uses a frozen clock so the drain
+// loop is deterministic on shared CI runners; on a slow runner, wall-clock
+// refill across 500 Allow calls can push tokens past the burst cap and
+// produce an off-by-one (issue: PR #388 coverage flake). PlanPro rps=100
+// means ~100 tokens/sec accumulate during the drain — well over 1 token
+// per ~10 ms, the typical CI call latency.
 func TestLimiterForget(t *testing.T) {
-	l := NewLimiter()
+	clock := time.Now()
+	l := NewLimiterWithClock(func() time.Time { return clock })
 	if !l.Allow("app", api.PlanPro) {
 		t.Fatal("first allow should succeed")
 	}

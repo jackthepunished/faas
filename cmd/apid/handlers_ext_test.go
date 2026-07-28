@@ -2234,28 +2234,26 @@ func TestGetInvocation_NotFoundAcrossAccount(t *testing.T) {
 	}
 }
 
-// TestStreamAppLogs_NotImplementedFrame pins the Move 3 stub wire
+// TestStreamAppLogs_StubDegradedFrame pins the Move 4 stub wire
 // shape: GET /v1/apps/{slug}/logs MUST return text/event-stream with
-// the two frames the SDK decoder parses:
+// two frames the SDK decoder parses when the schedd stub is wired
+// (no real daemon in unit tests):
 //
-//	event: not_implemented
-//	data: {"reason":"vmmd Logs(req) gRPC pending — Move 4"}
+//	event: degraded
+//	data: {"error":"...","code":"not_found"}
 //
 //	event: end
-//	data: {}
+//	data: {"reason":"schedd_unreachable"}
 //
-// The order matters — the SDK consumes frames line-by-line via the
-// typed Event/Data split (pkg/api/sse.go:Event) and treats `end` as
-// the terminal sentinel. A future Move 4 implementation that
-// subscribes to vmmd's Logs(req) gRPC stream replaces the body of
-// streamAppLogs but MUST keep the same opening protocol so existing
-// SDK consumers parse the new frames identically.
+// The Move 3 wire shape (`event: not_implemented`) is now obsolete —
+// the producer is real; the stub returns codes.Unimplemented which
+// the handler renders as a `degraded` event. The SDK's structured-
+// frame loop exits on `event: end` so consumers degrade gracefully
+// without a hot restart.
 //
-// Locks the contract for: SDK happy path
-// (pkg/api/client_test.go::TestStreamAppLogs_HappyPath), the dashboard
-// per-app log button (no 404), and a future Move 4 implementation
-// that upgrades the body.
-func TestStreamAppLogs_NotImplementedFrame(t *testing.T) {
+// Order matters: degraded must precede end so the SDK surfaces the
+// reason before the consumer loop exits.
+func TestStreamAppLogs_StubDegradedFrame(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	dep := mustSeedDeployment(t, e, "stub-logs")
 	appID := mustSeedApp(t, e, "stub-logs-app")
@@ -2275,34 +2273,38 @@ func TestStreamAppLogs_NotImplementedFrame(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 	body := rec.Body.String()
-	// Frame 1: not_implemented signal. The reason text is part of the
-	// SDK's stable contract — a customer reading the docs sees it as
-	// the canonical "this isn't built yet" message.
-	if !strings.Contains(body, "event: not_implemented\ndata: {\"reason\":\"vmmd Logs(req) gRPC pending — Move 4\"}") {
-		t.Errorf("body missing not_implemented frame:\n%s", body)
+	// Frame 1: degraded signal carries the schedd-side error. The
+	// stub returns codes.Unimplemented → "schedd not wired"; a real
+	// schedd error lifts to its gRPC code.
+	if !strings.Contains(body, "event: degraded") {
+		t.Errorf("body missing degraded frame:\n%s", body)
 	}
 	// Frame 2: terminal sentinel. SDK consumers with a structured-
 	// frame loop exit on `event: end`.
-	if !strings.Contains(body, "event: end\ndata: {}") {
+	if !strings.Contains(body, "event: end") {
 		t.Errorf("body missing end frame:\n%s", body)
 	}
-	// Order: not_implemented must precede end so the SDK's decoder
+	// Order: degraded must precede end so the SDK's decoder
 	// surfaces the reason before the consumer's loop exits.
-	niIdx := strings.Index(body, "event: not_implemented")
+	dIdx := strings.Index(body, "event: degraded")
 	endIdx := strings.Index(body, "event: end")
-	if niIdx < 0 || endIdx < 0 || niIdx >= endIdx {
-		t.Errorf("frame order wrong: not_implemented@%d end@%d", niIdx, endIdx)
+	if dIdx < 0 || endIdx < 0 || dIdx >= endIdx {
+		t.Errorf("frame order wrong: degraded@%d end@%d", dIdx, endIdx)
 	}
 }
 
 // TestStreamAppLogs_AcceptsFilterQueryParams pins issue #309's wire
 // contract: --grep / --since / --level reach the handler as query
-// params and are accepted by the Move 3 stub. Today the params are
-// advisory (the stub does not act on them yet) but the contract
-// MUST stay stable so neither the SDK URL builder nor the CLI flag
-// set needs to change when Move 4 replaces the body. The
-// `not_implemented` + `end` frames still fire so existing SDK
-// consumers and TestStreamAppLogs_NotImplementedFrame stay green.
+// params and are accepted without error so neither the SDK URL
+// builder nor the CLI flag set needs to change. Move 4 (issue #254)
+// reads them and applies them against the per-instance ring; today
+// the params pass through validation only — the actual server-side
+// filtering is a follow-up (the ring's `Write`/`Subscribe` surface
+// carries a per-line `level` already, the substring matcher is the
+// next step). The stub returns codes.Unimplemented → `event:
+// degraded` + `event: end`, mirroring TestStreamAppLogs_StubDegradedFrame
+// — only the validation path differs (the handler must NOT short-
+// circuit on a valid filter, so the stub frame still fires).
 func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	dep := mustSeedDeployment(t, e, "stub-logs-filter")
@@ -2321,10 +2323,11 @@ func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 	body := rec.Body.String()
-	// The existing Move 3 frames must still appear — params are
-	// advisory today (Move 4 acts on them).
-	if !strings.Contains(body, "event: not_implemented") {
-		t.Errorf("body missing not_implemented frame:\n%s", body)
+	// Move 4 stub: valid filter params pass through validation, so
+	// the degraded frame is the stub's "schedd not wired" signal —
+	// NOT a `not_implemented` (Move 3 wire shape, obsolete).
+	if !strings.Contains(body, "event: degraded") {
+		t.Errorf("body missing degraded frame (stub should fire on valid filters):\n%s", body)
 	}
 	if !strings.Contains(body, "event: end") {
 		t.Errorf("body missing end frame:\n%s", body)

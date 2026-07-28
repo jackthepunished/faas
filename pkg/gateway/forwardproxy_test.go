@@ -78,6 +78,15 @@ func (f *fakeVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEg
 	panic("UpdateEgressAllowlist: not stubbed")
 }
 
+// Logs (issue #254 / Move 4) — the gateway hot path never dials
+// the per-instance log stream directly; apid dials schedd for
+// that. Panics so a future test that exercises the RPC from the
+// gateway side fails loudly (the gateway is not a logs fan-out
+// participant).
+func (f *fakeVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[vmmdpb.LogsResponse], error) {
+	panic("Logs: gateway hot path doesn't dial per-instance log streams")
+}
+
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
 // vmmd socket directly to assert the filter is in place. Panics

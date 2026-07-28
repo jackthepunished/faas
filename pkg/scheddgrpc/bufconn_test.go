@@ -30,6 +30,11 @@ type fakeEngine struct {
 	admitInstanceFn func(ctx context.Context, appID string) (sched.WakeResult, error)
 	reportFn        func(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	parkFn          func(ctx context.Context, instanceID, reason string) error
+	// streamLogFn (issue #254 / Move 4) drives the per-frame fan-out
+	// in the StreamAppLogs handler tests. Default nil = no-op
+	// (returns nil immediately), so the existing test suite stays
+	// broken-free.
+	streamLogFn func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID string) (sched.WakeResult, error) {
@@ -55,6 +60,17 @@ func (f *fakeEngine) ReportActivity(ctx context.Context, touches []state.Instanc
 func (f *fakeEngine) ParkWithReason(ctx context.Context, instanceID, reason string) error {
 	if f.parkFn != nil {
 		return f.parkFn(ctx, instanceID, reason)
+	}
+	return nil
+}
+
+// StreamAppLogs (issue #254 / Move 4) — the default fake drains
+// the sink immediately and returns nil. Tests that exercise the
+// per-frame fan-out wire (pkg/scheddgrpc/logs_test.go) inject a
+// custom streamLogFn via the fakeEngine.
+func (f *fakeEngine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+	if f.streamLogFn != nil {
+		return f.streamLogFn(ctx, appID, sinceSeq, sink)
 	}
 	return nil
 }

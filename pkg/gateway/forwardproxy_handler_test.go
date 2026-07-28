@@ -35,6 +35,8 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // stubVmmdClient is the in-package fake for the handler-side seam
@@ -85,6 +87,14 @@ func (s *stubVmmdClient) Ping(context.Context, *vmmdpb.PingRequest, ...grpc.Call
 // interface stays satisfied.
 func (s *stubVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEgressAllowlistRequest, ...grpc.CallOption) (*vmmdpb.UpdateEgressAllowlistAck, error) {
 	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
+}
+
+// Logs (issue #254 / Move 4) — the gateway hot path never dials
+// the per-instance log stream directly; apid dials schedd for
+// that. The stub returns Unimplemented so any accidental test
+// that touches the codepath fails fast with a stable gRPC code.
+func (s *stubVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[vmmdpb.LogsResponse], error) {
+	return nil, status.Error(codes.Unimplemented, "gateway stub does not stream logs")
 }
 
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll

@@ -326,6 +326,16 @@ type OpsMetrics struct {
 	// incremented in handlers_events.go at the top of the handler
 	// and decremented via defer. Zero is the expected idle value.
 	sseClients prometheus.Gauge
+	// apidLogsEmittedTotal: per-app SSE log frame counter (issue #254,
+	// Move 4). Labelled by app (apps.id, UUID). Registered on every
+	// daemon's OpsMetrics so the struct stays a single-registry
+	// (per memory wire-opsmetrics-single-registry) — only apid
+	// increments via ObserveLogEmitted; non-apid daemons leave the
+	// CounterVec at zero. The series pre-instantiation is bounded by
+	// the per-account app quota (Hobby=5, Pro=25, Scale=100), so
+	// cardinality stays well inside Prometheus' "tens of thousands
+	// of series per metric" guideline.
+	apidLogsEmittedTotal *prometheus.CounterVec
 	// egressDeny: per-CIDR drop counter for the nftables egress
 	// denylist (PR-E). Labelled by (cidr, family) — the cidr label
 	// is the DenyEntry.CounterName (e.g. "drop_v4_10_0_0_0_8") and
@@ -671,6 +681,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_top_tenant_rps",
 		Help: "Per-tenant 5s RPS sampled by the daemon's topNSampler goroutine (issue #300). Labelled by account_id; bounded at the top 1000 customers by 24h request count with the remainder collapsed to account_id=\"other\" (the panel selector is {account_id!=\"other\"} for the top-N view). The \"other\" label here is distinct from the counter-level \"__other__\" overflow — see topAccountSet docs (pkg/wire/topn.go) for the two-tier cardinality contract. FaasTenantAbuse alert (spec §12) fires when the gauge exceeds 500 rps sustained for 10m. NOTE: the very first /metrics scrape after a daemon restart surfaces the cumulative request count divided by the 5s sample interval (because the sampler has no prior tick to diff against); the value converges to a true 5s delta on the second tick. This is a presentation-view approximation, not a counter drift.",
 	}, []string{"account_id"})
+	// apid_logs_emitted_total — Move 4 (issue #254). Counter
+	// shape and naming match the §12 conventions; the `app`
+	// label is the apps.id (UUID) and is bounded by per-plan
+	// app quotas (Hobby=5 / Pro=25 / Scale=100) so cardinality
+	// stays inside Prometheus' guideline. Registered on every
+	// daemon (single-registry pattern, memory
+	// wire-opsmetrics-single-registry); only apid increments
+	// in production via ObserveLogEmitted.
+	apidLogsEmittedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_logs_emitted_total",
+		Help: "Per-app SSE log frames emitted to clients (issue #254, Move 4). One Increment per `event: log` frame written to the SSE response body in cmd/apid/handlers_ext.go::writeAppLogEvent. The series is registered on every daemon so the struct is a single-registry; only apid's production path increments. Use this rate with apid_ops_total{op=\"app_logs\"} to break out per-app log throughput — that op label is already on every streamAppLogs handler entry.",
+	}, []string{"app"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the
 	// field stays nil and the imaged-side hook in cmd/imaged/main.go
@@ -699,6 +721,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginTotal, failedLoginDropped,
 		failedLoginAuditWriteFailures,
 		topTenantRPS,
+		apidLogsEmittedTotal,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -914,6 +937,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ociEgressDeny:                 ociEgressDeny,
 		provenanceWrites:              provenanceWrites,
 		imageScanVulns:                imageScanVulns,
+		apidLogsEmittedTotal:          apidLogsEmittedTotal,
 	}
 }
 
@@ -1675,6 +1699,24 @@ func (m *OpsMetrics) ObserveScaleUpAdmitRPS(rps float64) {
 		return
 	}
 	m.scaleUpAdmitRPS.Observe(rps)
+}
+
+// ObserveLogEmitted records one SSE log frame emitted to a client
+// (issue #254, Move 4). Called from cmd/apid/handlers_ext.go::
+// writeAppLogEvent for each `event: log` frame so the §12
+// per-app log throughput panel has a per-app series. The app
+// label is the apps.id (UUID) — same identity used by
+// ObserveScaleUp / ObserveScaleDown. Safe on a nil receiver so
+// unit tests without a metrics registry keep working.
+//
+// Per memory wire-opsmetrics-single-registry: only apid calls
+// this in production; the CounterVec is registered on every
+// daemon's OpsMetrics so the struct remains single-registry.
+func (m *OpsMetrics) ObserveLogEmitted(app string) {
+	if m == nil {
+		return
+	}
+	m.apidLogsEmittedTotal.WithLabelValues(app).Inc()
 }
 
 // Handler returns an http.Handler that serves the registry's metrics.

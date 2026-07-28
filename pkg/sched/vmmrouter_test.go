@@ -85,6 +85,13 @@ func (f *fakeRouterVMM) UpdateEgressAllowlist(_ context.Context, _ string, _ []n
 	return nil
 }
 
+// Logs (issue #254 / Move 4) — router tests don't drive the
+// log stream path; the scheddgrpc handler tests do. Returns a
+// closed fakeLogStream so any accidental caller exits cleanly.
+func (f *fakeRouterVMM) Logs(_ context.Context, _ string, _ int64) (LogStream, error) {
+	return &fakeLogStream{}, nil
+}
+
 // trackingDial records every (target, tls) it sees and returns a
 // cached fakeRouterVMM on subsequent calls to the same target.
 // `dials` counts only fresh (cache-miss) dials — the load-bearing

@@ -152,6 +152,13 @@ type server struct {
 	// roll back the action). nil falls back to a no-op helper so
 	// older tests can build a server without an audit handle.
 	audit *auditor
+	// schedd is the typed handle to the schedd daemon (issue #254 /
+	// Move 4). apid uses it to drive the per-app log stream — the
+	// schedd fans out per-instance vmmd Logs RPCs and emits
+	// frames back over the gRPC stream. nil falls back to a
+	// stub that returns codes.Unimplemented so the SSE handler
+	// degrades gracefully when the daemon is unreachable.
+	schedd scheddClient
 	// touchDebounce coalesces per-key last_used_at updates (PR #232
 	// review #7). Without this, every successful bearer auth would
 	// spawn a goroutine issuing an UPDATE api_keys SET last_used_at =
@@ -333,6 +340,41 @@ type Notifier interface {
 	WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error)
 }
 
+// scheddClient is the typed seam to the schedd daemon for the
+// per-app log stream (issue #254 / Move 4). Defined here so the
+// SSE handler stays decoupled from the gRPC client — tests pass
+// a recording stub without standing up the daemon.
+//
+// The production wiring is a *scheddgrpc.Client over a unix
+// socket (cmd/apid/main.go::dialSchedd). The nil fall-back
+// triggers the SSE handler's "schedd unreachable" branch which
+// emits a 503-style Problem frame and closes the stream.
+type scheddClient interface {
+	// StreamAppLogs fans out per-instance vmmd Logs RPCs into
+	// a single server-streaming response. Each frame is a
+	// scheddpb.StreamAppLogsResponse carrying the per-instance
+	// identity. Returns an error if the dialer / stream fails;
+	// the SSE handler maps that to its `degraded` event.
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (schedLogStream, error)
+}
+
+// schedLogStream is the typed view of scheddpb.Schedd_StreamAppLogsClient.
+// Decoupled from the proto so the SSE handler doesn't import
+// the generated package.
+type schedLogStream interface {
+	// Recv blocks until the next frame or the stream ends.
+	// Returns io.EOF on a clean shutdown.
+	Recv() (schedLogFrame, error)
+}
+
+type schedLogFrame struct {
+	InstanceID string
+	Seq        int64
+	Stream     string
+	Line       string
+	WrittenAt  time.Time
+}
+
 func newServer(store state.Store, log *slog.Logger, domain string, notif Notifier) *server {
 	return newServerWithDeps(store, log, domain, notif, "", nil, nil, nil, nil, 0, "")
 }
@@ -435,6 +477,10 @@ func newServerWithDeps(
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
 		audit:                  newAuditor(store, log, nil),
+		// schedd (issue #254 / Move 4) defaults to a stub that
+		// returns Unimplemented. Production wires the real client
+		// via withScheddClient (cmd/apid/main.go).
+		schedd: stubScheddClient{},
 	}
 }
 

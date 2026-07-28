@@ -17,6 +17,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -47,8 +48,12 @@ type fakeVMM struct {
 	// maps that to NotFound, which is the right answer for the
 	// "unknown instance" gRPC unit test.
 	instancePIDFn func(instance string) (int, bool)
-	live          int
-	leased        int
+	// logRingFn (issue #254 / Move 4) lets the Logs handler test
+	// inject a *logbuf.Ring. nil = nil — the handler maps nil to
+	// NotFound, which is the right answer for the "no ring" branch.
+	logRingFn func(instance string) *logbuf.Ring
+	live      int
+	leased    int
 }
 
 func (f *fakeVMM) Wake(ctx context.Context, req fcvm.WakeRequest) (*fcvm.Instance, error) {
@@ -138,6 +143,15 @@ func (f *fakeVMM) InstancePID(instance string) (int, bool) {
 		return f.instancePIDFn(instance)
 	}
 	return 0, false
+}
+
+// LogRing (issue #254 / Move 4) returns nil by default — the Logs
+// handler unit tests wire a custom LogRingFn to inject a ring buffer.
+func (f *fakeVMM) LogRing(instance string) *logbuf.Ring {
+	if f.logRingFn != nil {
+		return f.logRingFn(instance)
+	}
+	return nil
 }
 func (f *fakeVMM) NetnsFor(instance string) (string, bool) {
 	if f.netnsFn != nil {

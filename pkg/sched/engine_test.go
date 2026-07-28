@@ -201,6 +201,13 @@ func (f *fakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []neti
 	return nil
 }
 
+// Logs (issue #254 / Move 4) — engine tests don't drive the
+// log stream path; the scheddgrpc handler tests do. Returns a
+// closed fakeLogStream so any accidental caller exits cleanly.
+func (f *fakeVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+	return &fakeLogStream{}, nil
+}
+
 // fakeNotifier records emitted pg_notify events.
 type fakeNotifier struct {
 	mu     sync.Mutex

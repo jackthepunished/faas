@@ -67,6 +67,60 @@ type VMM interface {
 	// safe. Errors surface as the gRPC status (Unavailable /
 	// Internal) — the egress_drift subscriber logs and drops.
 	UpdateEgressAllowlist(ctx context.Context, appID string, allowlist []netip.Prefix) error
+	// Logs (issue #254 / Move 4) opens a server-streaming handle
+	// on the per-instance ring buffer at vmmd. The returned
+	// LogStream is the typed view of vmmdpb.Vmmd_LogsClient; the
+	// caller drives it in a loop until EOF (clean) or error.
+	//
+	// since_seq is the per-instance replay cursor (≥0). 0 = tail
+	// from now; pass the last-seen seq+1 to resume after a
+	// reconnect. Negative values are clamped to 0 — vmmd's
+	// Snapshot filters by Seq >= sinceSeq, so a negative cursor
+	// is meaningless and the dial site normalises it.
+	//
+	// The returned LogStream is alive until the caller closes it
+	// via the gRPC closer or the context cancels. RoutedVMM routes
+	// by nodeID; the per-node VMMClient forwards over gRPC via
+	// the vmmdpb.Logs RPC. vmmd returns codes.NotFound when the
+	// instance is not live on this node — the caller (apid) maps
+	// that to its own 404 problem.
+	Logs(ctx context.Context, instance string, sinceSeq int64) (LogStream, error)
+}
+
+// LogReceiver is the per-instance callback the vmmd Logs RPC hands
+// each frame to. It returns a non-nil error to abort the stream;
+// the vmmd handler surfaces that error over the gRPC trailer.
+// A nil return tells the stream to keep delivering the next frame.
+//
+// The callback is invoked synchronously from the vmmdclient's
+// reader goroutine; long-running work inside the callback will
+// stall backpressure on the matching vmmd Logs stream. The
+// production caller (pkg/scheddgrpc.Server.StreamAppLogs) renders
+// each frame to a proto and forwards it onto the caller's gRPC
+// stream — that work is bounded by the per-frame size.
+type LogReceiver func(seq int64, stream, line string, writtenAt time.Time) error
+
+// LogStream is the typed handle on a vmmd Logs RPC. The caller
+// drives the stream by calling Recv in a loop until it returns
+// io.EOF (the ring closed / the instance died) or a non-EOF error
+// (the dial failed, the context was cancelled, etc).
+//
+// The production schedd-side caller (pkg/scheddgrpc.Server.StreamAppLogs)
+// wraps a LogStream in a goroutine per live instance and merges
+// the per-instance frames into the caller's gRPC stream.
+type LogStream interface {
+	// Recv blocks until the next frame is available or the
+	// stream ends. Returns io.EOF on a clean shutdown.
+	Recv() (LogLine, error)
+}
+
+// LogLine is the typed view of one vmmd Logs(frame). Decoupled
+// from vmmdpb so the VMM interface + tests don't import the proto.
+type LogLine struct {
+	Seq       int64
+	Stream    string
+	Line      string
+	WrittenAt time.Time
 }
 
 // PingOutcome is the sched-side view of vmmdpb.PingResponse.
@@ -340,6 +394,60 @@ func (c *VMMClient) UpdateEgressAllowlist(ctx context.Context, appID string, all
 		return liftErr(err)
 	}
 	return nil
+}
+
+// Logs implements VMM (issue #254 / Move 4). The returned LogStream
+// is a thin wrapper over vmmdpb.Vmmd_LogsClient that decouples the
+// VMM interface from the proto: every caller in pkg/sched works in
+// the typed LogLine shape (no proto import).
+//
+// sinceSeq is clamped to ≥0 here so downstream callers never have
+// to repeat the check; vmmd's Snapshot filters by Seq >= sinceSeq
+// and a negative cursor is meaningless (it would replay from
+// the oldest snapshot).
+func (c *VMMClient) Logs(ctx context.Context, instance string, sinceSeq int64) (LogStream, error) {
+	if sinceSeq < 0 {
+		sinceSeq = 0
+	}
+	cli, err := c.cli.Logs(ctx, &vmmdpb.LogsRequest{
+		Instance: instance,
+		SinceSeq: sinceSeq,
+	})
+	if err != nil {
+		return nil, liftErr(err)
+	}
+	return &grpcLogStream{cli: cli}, nil
+}
+
+// grpcLogStream adapts vmmdpb.Vmmd_LogsClient to the pkg/sched LogStream
+// interface. The wrapper exists for two reasons:
+//   - decouple the VMM interface from the proto package so engine +
+//     tests don't import vmmdpb (mirrors the rest of vmmclient.go)
+//   - bound the typed LogLine surface to the four fields the
+//     schedd-side caller actually needs
+type grpcLogStream struct {
+	cli vmmdpb.Vmmd_LogsClient
+}
+
+// Recv blocks until the next frame is available or the stream ends.
+// A clean vmmd-side shutdown (ring closed, ctx cancelled) surfaces
+// as io.EOF; any other failure is the gRPC status lifted via
+// grpcerr. The proto's timestamp field is decoded back to time.Time
+// so callers never see a *timestamppb.Timestamp.
+func (s *grpcLogStream) Recv() (LogLine, error) {
+	resp, err := s.cli.Recv()
+	if err != nil {
+		return LogLine{}, err
+	}
+	line := LogLine{
+		Seq:    resp.GetSeq(),
+		Stream: resp.GetStream(),
+		Line:   resp.GetLine(),
+	}
+	if t := resp.GetWrittenAt(); t != nil {
+		line.WrittenAt = t.AsTime()
+	}
+	return line, nil
 }
 
 // Ping implements VMM. Wire-level liveness probe (issue #97 /
