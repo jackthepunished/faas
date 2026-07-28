@@ -21,9 +21,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			RateLimitPerAccountRPM: 50},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			MaxQueueDepth: 5, MaxDelayedTasksPerApp: 5, MaxSourceBytesPerInvocation: 64 * 1024, AsyncInvokeAllowed: true,
-			// Issue #169 / #172: Hobby unlocks RPS target only (CPU is
-			// gated on Pro+ for cost reasons).
-			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: false,
+			// Issue #169 / #172: Hobby is gated on Pro+ for both RPS
+			// and CPU (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier
+			// on ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
+			// on Pro+ for cost reasons.
+			ScaleUpTargetRPSAllowed: false, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
@@ -182,6 +184,31 @@ func TestPlanMinInstancesAllowed(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.MinInstancesAllowed(); got != c.want {
 			t.Errorf("%s.MinInstancesAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanScaleUpTargetRPSAllowed pins the per-plan gate that apid's
+// updateApp handler uses for the per-app autoscale_target_rps field
+// (issue #172, ADR-037). Free/Hobby → false (Hobby lost the gate
+// via the 2026-07-28 Hobby→Pro re-tier — ADR-037 amendment); Pro/Scale
+// → true. Unknown plans must default to false (fail-closed: a missing
+// plan never silently unlocks a premium feature). Mirrors
+// TestPlanMinInstancesAllowed above.
+func TestPlanScaleUpTargetRPSAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.ScaleUpTargetRPSAllowed(); got != c.want {
+			t.Errorf("%s.ScaleUpTargetRPSAllowed() = %v, want %v", c.plan, got, c.want)
 		}
 	}
 }

@@ -24,9 +24,9 @@ class UsageSummaryResponse:
     included_gb_hours: int
     overage_gb_hours: float
     overage_cents: int
-    """ Integer cents. Overages are €0.01/GB-h. """
+    """Integer cents. Overages are €0.01/GB-h."""
     used_cpu_hours: float | Unset = UNSET
-    """ Per-month CPU-hours (informational; not billed). issue #279 / PR-B. """
+    """Per-month CPU-hours (informational; not billed). issue #279 / PR-B."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

@@ -162,6 +162,25 @@ type server struct {
 // bounded even under sustained 1k RPS on one key.
 const keyTouchWindow = 30 * time.Second
 
+// anonymousAccountLabel is the literal value of the `account_id`
+// label that the per-request accounting chain assigns to unauthenticated
+// requests (the 401 path and the rare cases where principalFrom(r)
+// succeeds but p.Acct.ID is empty). The OpsMetrics admission set
+// (`accountLabelSet`, pkg/wire/metrics.go) treats this as a real id
+// for cardinality purposes: it counts against the 10 000 cap and
+// surfaces in /metrics as a normal series — a regression where the
+// sentinel is stringified differently across call sites would split
+// the anonymous traffic across N series and silently inflate the
+// admission set. Kept here (cmd/apid, not pkg/wire) because the
+// server-side accounting paths are the only writers; pkg/wire only
+// reads the value as a normal label.
+//
+// goconst: extracted because the three request-accounting call sites
+// (requestTotal, requestFailures, observeTopTenantRPS) all open-code
+// `acct := anonymousAccountLabel` and golangci-lint's goconst rule
+// would otherwise flag the duplication.
+const anonymousAccountLabel = "anonymous"
+
 // shouldTouchKey reports whether the key's last_used_at is stale enough
 // to warrant an UPDATE. Atomic-ish via sync.Map.LoadOrStore so two
 // concurrent first-time callers don't both schedule a touch; the
@@ -191,7 +210,7 @@ func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 	// metrics), leave the auditor with a nil ops interface so Emit
 	// silently skips the .Inc().
 	if s.audit != nil {
-		s.audit.ops = ops
+		s.audit.setOps(ops)
 	}
 	return s
 }
@@ -837,7 +856,7 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 		// accountLabelSet so a customer is represented by their real
 		// id in both, or by "__other__" in both.
 		{
-			acct := "anonymous"
+			acct := anonymousAccountLabel
 			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
 				acct = p.Acct.ID
 			}
@@ -864,11 +883,24 @@ func (s *server) observeWrap(h http.Handler) http.Handler {
 		// cannot accidentally pass a raw URL path and explode the
 		// label set (review finding #1 on PR #332).
 		if rec.status >= http.StatusBadRequest {
-			acct := "anonymous"
+			acct := anonymousAccountLabel
 			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
 				acct = p.Acct.ID
 			}
 			s.ops.RequestFailureFor(r, acct).Inc()
+		}
+		// Issue #300: feed the per-account rolling count that the
+		// 5s topNSampler reads to drive apid_top_tenant_rps. The
+		// sampler is the ONLY writer to the gauge; this per-request
+		// bump is the cheap path (mutex + map incr). Account_id
+		// resolution mirrors the requestTotal branch above so the
+		// two views agree on whose request they're attributing.
+		{
+			acct := anonymousAccountLabel
+			if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+				acct = p.Acct.ID
+			}
+			s.ops.ObserveTopTenantRPS(acct)
 		}
 	})
 }

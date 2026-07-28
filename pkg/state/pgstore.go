@@ -3392,6 +3392,25 @@ func (s *PgStore) DeleteComputeNode(ctx context.Context, id string) error {
 
 // --- events ------------------------------------------------------------------
 
+// AppendEvent writes one row to the events table. The subject, when
+// non-nil, MUST be a canonical UUID (with hyphens). The hex-only
+// fallback that MemStore accepts (engine.go walks MemStore.newID
+// which returns 32-char hex; parseSubjectID converts the hex back
+// to UUID bytes) is intentionally NOT mirrored here — PgStore is
+// the production path and only canonical UUIDs reach it from
+// sqlc / migrations. A non-canonical subject is silently dropped
+// to NULL rather than failing the INSERT; the audit row's subject
+// column is filtered server-side by listAuditEvents (handlers_audit.go)
+// so a NULL subject means "won't show up under any acct-scoped
+// query" — which matches the "unparseable subject" path on the
+// MemStore side (memstore.go:3135-3139).
+//
+// Adding a hex fallback here would let a future contributor stamp
+// events with engine-hex IDs without realising the events_subject_idx
+// expects canonical UUIDs, leading to "the row landed but
+// ListEvents(subject=<hex>) returns nothing" — a silent-drop bug
+// that the audit-log PR's MemStore fix specifically ruled out for
+// MemStore. Don't widen the contract.
 func (s *PgStore) AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error {
 	var subj *uuid.UUID
 	if subject != nil {
@@ -3899,11 +3918,21 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 		return false, fmt.Errorf("paddle dedupe upsert acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
 	}
 
-	// Step 2: atomic claim. Either the row is fresh (state='completed'
-	// from the upsert above, claimed_at is now()) and we flip it to
-	// pending, OR the row is a stale-pending claim from a crashed pod
-	// (claimed_at older than the lease) and we steal it. Either way,
-	// the RETURNING tells us we won the race.
+	// Step 2: atomic claim. Three branches map to claimable rows:
+	//
+	//   * Fresh row from Step 1 above — state='completed', claimed_at
+	//     is `now()` (we just set it). The state clause carries this
+	//     branch; without it the lease predicate alone would skip
+	//     fresh rows because now() < now() - lease is FALSE.
+	//   * Stale-pending row from a crashed pod — claimed_at is older
+	//     than the lease. The lease predicate carries this branch.
+	//   * Reaper-reset row from ReapStalePaddleOverageClaims — state
+	//     reset to 'completed', claimed_at=null. The IS NULL clause
+	//     carries this branch.
+	//
+	// A currently-pending row inside the lease is intentionally NOT
+	// claimable — only the pod that holds the claim (or a reaped
+	// releaser) can flip it.
 	var claimed bool
 	err := s.pool.QueryRow(ctx,
 		`update paddle_overage_dedupe
@@ -3913,6 +3942,7 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 		 where account_id = $1
 		   and window_start = $2
 		   and (claimed_at is null
+		        or state = 'completed'
 		        or claimed_at < now() - make_interval(secs => $4))
 		 returning true`,
 		accountID, windowStart, claimedBy, leaseSeconds,

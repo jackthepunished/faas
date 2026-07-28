@@ -407,6 +407,20 @@ sdk-gen-python-twice: ## Determinism check: regen twice, must produce zero diff
 	@git diff --exit-code -- sdk/python/faas_sdk/
 	@echo "sdk-gen-python-twice: OK"
 
+.PHONY: sdk-gen
+sdk-gen: ## (re)generate every generated SDK + assert clean diff vs HEAD
+	# Aggregator for issue #266 PR 7. Composes the per-SDK `-check`
+	# recipes (sdk-gen-{node,python}-check), each of which already
+	# asserts `git diff --exit-code` against its own sub-tree. We do
+	# NOT add a top-level `git diff --exit-code -- sdk/` here — it
+	# would be redundant with the two per-SDK diffs and would mask
+	# per-SDK attribution on failure. The Go SDK at sdk/go/ is
+	# hand-written (extracted from pkg/api/ in PR 2); its spec-sync
+	# invariant is covered by `make sdk-check`, a separate concern.
+	@$(MAKE) sdk-gen-node-check
+	@$(MAKE) sdk-gen-python-check
+	@echo "sdk-gen: OK"
+
 .PHONY: sdk-smoke-python
 sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests
 	@cd sdk/fakeapid && go build -o bin/fakeapid .

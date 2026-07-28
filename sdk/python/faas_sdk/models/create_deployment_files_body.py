@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CreateDeploymentFilesBody")
 @_attrs_define
 class CreateDeploymentFilesBody:
     source: File | Unset = UNSET
-    """ Multipart file field — the source tarball or Dockerfile context. """
+    """Multipart file field — the source tarball or Dockerfile context."""
     dockerfile: bool | Unset = UNSET
     kind: CreateDeploymentFilesBodyKind | Unset = UNSET
     runtime: CreateDeploymentFilesBodyRuntime | Unset = UNSET

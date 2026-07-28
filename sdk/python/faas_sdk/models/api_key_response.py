@@ -27,17 +27,17 @@ class APIKeyResponse:
 
     id: str
     prefix: str
-    """ First 16 chars of the key (e.g. `fp_live_abc12345…`). """
+    """First 16 chars of the key (e.g. `fp_live_abc12345…`)."""
     scopes: list[APIKeyResponseScopesItem]
-    """ Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access
+    """Permission set attached to the key. Closed vocabulary (IAM-1, ADR-034 rev2): admin is the legacy full-access
     scope; apps:read covers GETs across the apps/deployments/audit/secrets-list surface; deploy:write covers
     POST/PUT/PATCH/DELETE on apps+queues; secrets:write covers PUT/DELETE on /apps/{slug}/secrets/{key}; usage:read
-    covers GET /v1/usage*. """
+    covers GET /v1/usage*."""
     created_at: datetime.datetime
     label: None | str | Unset = UNSET
     last_used_at: datetime.datetime | None | Unset = UNSET
     plaintext: None | str | Unset = UNSET
-    """ PRESENT ONLY on POST /v1/keys response. Never returned again. """
+    """PRESENT ONLY on POST /v1/keys response. Never returned again."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

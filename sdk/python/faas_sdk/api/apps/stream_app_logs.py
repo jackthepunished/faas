@@ -1,3 +1,4 @@
+import datetime
 from http import HTTPStatus
 from typing import Any, cast
 from urllib.parse import quote
@@ -8,6 +9,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.problem import Problem
 from ...models.stream_app_logs_follow import StreamAppLogsFollow
+from ...models.stream_app_logs_level import StreamAppLogsLevel
 from ...types import UNSET, Response, Unset
 
 
@@ -15,6 +17,9 @@ def _get_kwargs(
     slug: str,
     *,
     follow: StreamAppLogsFollow | Unset = 0,
+    grep: str | Unset = UNSET,
+    since: datetime.datetime | Unset = UNSET,
+    level: StreamAppLogsLevel | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -24,6 +29,19 @@ def _get_kwargs(
         json_follow = follow
 
     params["follow"] = json_follow
+
+    params["grep"] = grep
+
+    json_since: str | Unset = UNSET
+    if not isinstance(since, Unset):
+        json_since = since.isoformat()
+    params["since"] = json_since
+
+    json_level: str | Unset = UNSET
+    if not isinstance(level, Unset):
+        json_level = level
+
+    params["level"] = json_level
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -78,6 +96,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     follow: StreamAppLogsFollow | Unset = 0,
+    grep: str | Unset = UNSET,
+    since: datetime.datetime | Unset = UNSET,
+    level: StreamAppLogsLevel | Unset = UNSET,
 ) -> Response[Any | Problem]:
     """Stream app logs (SSE).
 
@@ -88,6 +109,9 @@ def sync_detailed(
     Args:
         slug (str):
         follow (StreamAppLogsFollow | Unset):  Default: 0.
+        grep (str | Unset):
+        since (datetime.datetime | Unset):
+        level (StreamAppLogsLevel | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -100,6 +124,9 @@ def sync_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         follow=follow,
+        grep=grep,
+        since=since,
+        level=level,
     )
 
     response = client.get_httpx_client().request(
@@ -114,6 +141,9 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     follow: StreamAppLogsFollow | Unset = 0,
+    grep: str | Unset = UNSET,
+    since: datetime.datetime | Unset = UNSET,
+    level: StreamAppLogsLevel | Unset = UNSET,
 ) -> Any | Problem | None:
     """Stream app logs (SSE).
 
@@ -124,6 +154,9 @@ def sync(
     Args:
         slug (str):
         follow (StreamAppLogsFollow | Unset):  Default: 0.
+        grep (str | Unset):
+        since (datetime.datetime | Unset):
+        level (StreamAppLogsLevel | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -137,6 +170,9 @@ def sync(
         slug=slug,
         client=client,
         follow=follow,
+        grep=grep,
+        since=since,
+        level=level,
     ).parsed
 
 
@@ -145,6 +181,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     follow: StreamAppLogsFollow | Unset = 0,
+    grep: str | Unset = UNSET,
+    since: datetime.datetime | Unset = UNSET,
+    level: StreamAppLogsLevel | Unset = UNSET,
 ) -> Response[Any | Problem]:
     """Stream app logs (SSE).
 
@@ -155,6 +194,9 @@ async def asyncio_detailed(
     Args:
         slug (str):
         follow (StreamAppLogsFollow | Unset):  Default: 0.
+        grep (str | Unset):
+        since (datetime.datetime | Unset):
+        level (StreamAppLogsLevel | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -167,6 +209,9 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         follow=follow,
+        grep=grep,
+        since=since,
+        level=level,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -179,6 +224,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     follow: StreamAppLogsFollow | Unset = 0,
+    grep: str | Unset = UNSET,
+    since: datetime.datetime | Unset = UNSET,
+    level: StreamAppLogsLevel | Unset = UNSET,
 ) -> Any | Problem | None:
     """Stream app logs (SSE).
 
@@ -189,6 +237,9 @@ async def asyncio(
     Args:
         slug (str):
         follow (StreamAppLogsFollow | Unset):  Default: 0.
+        grep (str | Unset):
+        since (datetime.datetime | Unset):
+        level (StreamAppLogsLevel | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -203,5 +254,8 @@ async def asyncio(
             slug=slug,
             client=client,
             follow=follow,
+            grep=grep,
+            since=since,
+            level=level,
         )
     ).parsed

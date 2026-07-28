@@ -41,13 +41,13 @@ class Invocation:
     result: InvocationResultType0 | None | Unset = UNSET
     last_error: None | str | Unset = UNSET
     ack_url: None | str | Unset = UNSET
-    """ Optional ack URL for queueReceive consumers; populated on queue-sourced rows. """
+    """Optional ack URL for queueReceive consumers; populated on queue-sourced rows."""
     attempts: int | Unset = UNSET
-    """ Number of dispatch attempts so far; 0 on the first try. """
+    """Number of dispatch attempts so far; 0 on the first try."""
     lease_expires_at: datetime.datetime | None | Unset = UNSET
-    """ When the in-flight dispatch lease expires; null when no lease is held. """
+    """When the in-flight dispatch lease expires; null when no lease is held."""
     received_at: datetime.datetime | None | Unset = UNSET
-    """ When the drain first claimed the row; null until claimed. """
+    """When the drain first claimed the row; null until claimed."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

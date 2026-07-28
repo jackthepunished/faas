@@ -1902,6 +1902,14 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // contract (pkg/api/logs.go::StreamAppLogs) keeps returning a 200 with
 // parseable frames and the dashboard's per-app log button doesn't 404.
 // Move 4 replaces the body.
+//
+// Issue #309 (tier-2 DX): --grep / --since / --level are accepted as
+// query params now so the wire contract is stable; the Move 4
+// implementation reads them and applies them against the ring buffer.
+// Today --level is validated; --grep is sanitised against newline
+// injection; --since is forwarded verbatim (the CLI's RFC3339 parse
+// keeps malformed values from ever reaching the wire). Move 3
+// otherwise no-ops the params.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -1910,6 +1918,35 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 	if _, err := s.store.ListInstancesForApp(ctx(r), app.ID); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 			"No running instance", "the app is parked; wake it first"))
+		return
+	}
+	q := r.URL.Query()
+	// --level: enum match against api.IsValidLogLevel so the CLI and
+	// the server share the same source of truth. A bad value emits an
+	// `event: error` SSE frame + terminal `end` so programmatic SDK
+	// callers get a structured error path; the CLI validates the same
+	// enum client-side so a typo costs no round-trip.
+	if level := q.Get("level"); level != "" && !api.IsValidLogLevel(level) {
+		startSSE(w)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_level\",\"message\":\"level must be one of: info, warn, error\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+	// --grep: reject embedded newlines so Move 4's substring matcher
+	// can never match across log line boundaries (same log-injection
+	// precedent as `CodeQL go/log-injection sanitisers`).
+	if grep := q.Get("grep"); strings.ContainsAny(grep, "\n\r") {
+		startSSE(w)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_grep\",\"message\":\"grep must not contain newline or carriage return\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
 		return
 	}
 	startSSE(w)

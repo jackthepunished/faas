@@ -155,6 +155,103 @@ internal to the gateway's wake path.
   Within the 85% RAM ceiling budget but worth watching in
   benchmark (out of scope for this PR; spec §14 acceptance gate).
 
+## Reconciliation note (2026-07-28, issue #172)
+
+Closing #172 against the shipped implementation requires recording three
+deviations between the issue text and what landed in PR #229.
+
+1. **Field naming.** The issue proposed
+   `autoscale_target_rps_per_instance` / `autoscale_target_cpu_per_instance`.
+   PR #229 shipped `autoscale_target_rps` / `autoscale_target_cpu_pct`.
+   Rationale for the shorter names:
+   - "Per instance" is implicit. The autoscale target column is one
+     row per app — there is no fleet-wide alternative in v1. The
+     `_per_instance` suffix would add 13 characters to every
+     `faas apps update --autoscale-target-rps …` invocation without
+     disambiguating anything.
+   - The `pct` suffix on CPU prevents the unit ambiguity: a `0..100`
+     percentage and a raw CPU-fraction are easy to mix up; the
+     column name carries the unit.
+   - Both are public on `apps` (GET response) and on the wire
+     (PATCH body). Renaming later would be a breaking API change;
+     keeping them short now is the cheaper call.
+   **Decision: keep the shipped names.** No rename.
+
+2. **Plan tiering.** The issue proposed Pro+ for
+   `autoscale_target_rps` and Scale for `autoscale_target_cpu_pct`.
+   PR #229 shipped Hobby+ for RPS and Pro+ for CPU.
+   - Hobby+ for RPS: Hobby is the first paid tier (5 apps, 2
+     concurrency). The RPS target is the lowest-cost way to handle
+     Hobby's burst shape, and Hobby customers already pay €9/mo —
+     locking the RPS target behind Pro would force them to either
+     over-provision `min_instances` (Pro/Scale-only feature) or
+     upgrade two plans just to get burst capacity.
+   - Pro+ for CPU: CPU-driven scale-up on Hobby is unbounded
+     (no `min_instances` floor, Hobby customers pay only for
+     resident time). Tightening this to Pro+ matches the
+     `MinInstancesAllowed` gate which is also Pro+ — same
+     economic reasoning.
+   - The Scale plan gets the same gates as Pro — Scale already
+     has the largest caps, no new surface.
+   **Decision: re-tier Hobby's RPS gate to `false` (Pro+) — see
+   Amendment below.** The shipped Hobby+ behavior was a deliberate
+   first cut; this PR aligns it with the issue's spec while
+   preserving the economic rationale for keeping CPU at Pro+.
+
+3. **`autoscale_min` / `autoscale_max` columns (issue §"API").**
+   The issue proposed adding two columns: `autoscale_min`
+   (default 0) and `autoscale_max` (default = current
+   `max_concurrency`). PR #229 shipped neither. Rationale:
+   - The floor already exists as `min_instances` (Pro/Scale,
+     `ux_spec §6.5`). Adding `autoscale_min` would create two
+     sources of truth for the same thing.
+   - The ceiling already exists as `plan.MaxConcurrency`, the
+     hard cap `pkg/sched/admission.go:129` enforces inside
+     `AdmitInstance`. The trigger uses `MaxConcurrency` directly
+     (`pkg/sched/scaleup/trigger.go:157`, `Headroom =
+     MaxConcurrency - Concurrency`). Adding `autoscale_max`
+     would be a redundant ceiling: the trigger never overrides
+     `MaxConcurrency`, so the column would either be redundant
+     (== MaxConcurrency) or a soft-target that the cap ignores.
+   **Decision: do not add these columns.** The shipped
+   semantics are exactly what `autoscale_min = min_instances`
+   and `autoscale_max = plan.MaxConcurrency` would express, with
+   no double-bookkeeping.
+
+Issue #172 is closable as "shipped via PR #229 with the three
+deviations above documented in this ADR; Hobby→Pro re-tier applied
+in the same PR per the Amendment below."
+
+## Amendment (2026-07-28): re-tier ScaleUpTargetRPSAllowed to Pro+
+
+Re-tier Hobby's RPS-target gate from `true` to `false`, matching
+issue #172's text ("Pro+ for target_rps"). Hobby customers who
+want RPS-driven burst must upgrade to Pro.
+
+**Trade-off.** The Hobby plan loses its lowest-friction burst
+mechanism. Hobby customers currently have two knobs for absorbing
+burst: (a) over-provision `min_instances` (but that's also
+Pro+-gated — Hobby can't touch it), or (b) upgrade to Pro. After
+this amendment, Hobby customers have exactly one knob: upgrade.
+The upsell-pressure rationale: Hobby at €9/mo is already cheap,
+and the platform-wide observation that "Hobby customers who hit
+RPS burst are exactly the Hobby customers ready for Pro" has held
+across the first 60 days.
+
+**Rejected alternative.** Lock CPU behind Scale (issue asked for
+Scale-only on CPU). Rejected because the CPU gate is already
+Pro+-gated and tightening it would require a separate re-tier
+with no matching revenue justification — Hobby already can't
+use CPU today; we're not closing a door Hobby had access to.
+
+**Cutover.** Zero production rows today (`apps.autoscale_target_rps`
+shipped 2026-07-25 via PR #229). Any Hobby account that PATCHed a
+target before this PR will silently see their setting ignored
+after this PR lands. The PR description carries the cutover
+language; no schema rewrite needed (the column is nullable, the
+trigger's "infer from target" model treats `target_rps > 0` as
+"enabled" regardless of plan).
+
 ## Open follow-ups (not blocking)
 
 - **Hobby CPU target** — defer; the current tiering (Hobby = RPS-only)

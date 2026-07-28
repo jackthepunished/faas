@@ -23,7 +23,7 @@ class UsageResponse:
     requests: int
     included_gb_hours: int
     cpu_usec: int | Unset = UNSET
-    """ Cumulative host cgroup CPU-µs (informational; not billed). issue #279 / PR-B. """
+    """Cumulative host cgroup CPU-µs (informational; not billed). issue #279 / PR-B."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

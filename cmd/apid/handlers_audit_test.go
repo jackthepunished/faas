@@ -359,6 +359,116 @@ func TestAuditEvents_GetEndpointCrossAccount404(t *testing.T) {
 	}
 }
 
+// TestAuditEvents_ListEndpointReturnsCronFired is the cmd/apid
+// half of issue #291's cron-fire audit gap (companion to
+// pkg/sched/cron_loop_test.go::TestCronDispatch_EmitsCronFiredAudit
+// for the MemStore write path and
+// pkg/state/pgstore_cron_test.go::TestPg_CronFiredAuditRoundTrip for
+// the PgStore round-trip). It pins that the existing kind_prefix
+// filter on GET /v1/audit-events includes the new "cron." family
+// unchanged — meaning the dashboard's "cron history" query keeps
+// working after this PR without handler churn.
+//
+// Strategy: mint a `cron.fired` row via store.AppendEvent directly
+// (the schedd side is covered by the MemStore test; this one
+// exercises only the apid read surface). Query with
+// kind_prefix=cron. and assert the row comes back with the
+// correct shape. We also query without a prefix to confirm the
+// row lands alongside all other audit rows — that ordering is
+// load-bearing for the unified history endpoint.
+func TestAuditEvents_ListEndpointReturnsCronFired(t *testing.T) {
+	e := setup(t, api.PlanPro)
+
+	// Mint a cron.fired row directly via AppendEvent. The shape
+	// matches pkg/sched/loop.go's emit (status=ok, invocation_id +
+	// instance_id populated, last_fired_at_before present). Subject
+	// is the test account — listAuditEvents is per-account scoped.
+	payload, err := json.Marshal(map[string]any{
+		"cron_id":              "cron-list-test",
+		"app_id":               "app-list-test",
+		"schedule":             "*/5 * * * *",
+		"path":                 "/tick",
+		"fired_at":             "2026-07-27T14:32:01Z",
+		"last_fired_at_before": "2026-07-27T14:27:01Z",
+		"status":               "ok",
+		"invocation_id":        "inv-list-test",
+		"instance_id":          "ins-list-test",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := e.store.AppendEvent(context.Background(), "schedd", "cron.fired", &e.acct.ID, payload); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// 1) kind_prefix=cron. returns the new row alongside the
+	//    (zero, post-mint) cron-emitted rows the handler keeps
+	//    around. The cron.fired row must be in the response.
+	rec := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=cron.", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?kind_prefix=cron.: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var list api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v body=%s", err, rec.Body.String())
+	}
+	if list.Limit != 50 {
+		t.Errorf("Limit = %d, want 50", list.Limit)
+	}
+	var fired *api.AuditEventResponse
+	for i := range list.Events {
+		if list.Events[i].Kind == "cron.fired" {
+			fired = &list.Events[i]
+			break
+		}
+	}
+	if fired == nil {
+		t.Fatalf("no cron.fired row in list response (kind_prefix=cron.); events=%+v", list.Events)
+	}
+	if fired.Actor != "schedd" {
+		t.Errorf("fired.Actor = %q, want schedd", fired.Actor)
+	}
+	if fired.Subject != uuidStringOf(e.acct.ID) {
+		t.Errorf("fired.Subject = %q, want %s", fired.Subject, uuidStringOf(e.acct.ID))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(fired.Data), &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v (data=%q)", err, fired.Data)
+	}
+	if data["status"] != "ok" {
+		t.Errorf("Data.status = %v, want ok", data["status"])
+	}
+	if data["invocation_id"] != "inv-list-test" {
+		t.Errorf("Data.invocation_id = %v, want inv-list-test", data["invocation_id"])
+	}
+	if data["instance_id"] != "ins-list-test" {
+		t.Errorf("Data.instance_id = %v, want ins-list-test", data["instance_id"])
+	}
+
+	// 2) Without a prefix the row is in the unified history. Pin
+	//    that the list endpoint's no-filter path still surfaces it
+	//    (no implicit filter on the kind column was added) — this
+	//    is what the dashboard's "all events for account" tab does.
+	rec = e.do(t, http.MethodGet, "/v1/audit-events", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var unified api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &unified); err != nil {
+		t.Fatalf("decode unified list: %v", err)
+	}
+	var seen bool
+	for _, ev := range unified.Events {
+		if ev.Kind == "cron.fired" {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Errorf("cron.fired not in unfiltered list response; events=%+v", unified.Events)
+	}
+}
+
 // TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated drives
 // the full device-code flow (POST /v1/cli-auth/code → claim → POST
 // /v1/cli-auth/exchange) and asserts BOTH audit rows landed:

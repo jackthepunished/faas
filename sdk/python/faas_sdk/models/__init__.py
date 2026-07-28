@@ -106,6 +106,7 @@ from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .set_password_request import SetPasswordRequest
 from .stream_app_logs_follow import StreamAppLogsFollow
+from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
 from .update_app_request import UpdateAppRequest
 from .update_cron_request import UpdateCronRequest
@@ -220,6 +221,7 @@ __all__ = (
     "RepoResponse",
     "SetPasswordRequest",
     "StreamAppLogsFollow",
+    "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
     "UpdateAppRequest",
     "UpdateCronRequest",

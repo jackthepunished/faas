@@ -23,8 +23,8 @@ class UsageExportResponse:
     mb_seconds: int
     requests: int
     cpu_usec: int | Unset = UNSET
-    """ Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue
-    #279 / PR-B. """
+    """Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue
+    #279 / PR-B."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

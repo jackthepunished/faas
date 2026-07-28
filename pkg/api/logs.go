@@ -6,7 +6,50 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 )
+
+// LogFilter narrows the per-instance log stream by substring (Grep),
+// timestamp lower-bound (Since, RFC3339), and severity floor (Level,
+// one of info|warn|error). Issue #309 closes the tier-2 DX gap that
+// `faas logs <app>` had no flag-based filtering — these fields are
+// optional; the zero value passes through every line.
+//
+// The wire contract today is advisory — apid's Move 3 stub at
+// streamAppLogs accepts but does not yet act on the params, so a
+// LogFilter at this layer only narrows the round-trip; once Move 4
+// lands vmmd's Logs(req) gRPC stream, the same fields drive the
+// server-side filter against the per-instance ring buffer.
+type LogFilter struct {
+	// Grep is a substring match applied to each log line.
+	Grep string
+	// Since is an RFC3339 timestamp lower-bound on the line timestamp.
+	Since string
+	// Level is an exact match on the structured `level` field
+	// (info, warn, error). Empty = no level filter. The CLI and the
+	// apid handler both call IsValidLogLevel before forwarding so an
+	// invalid value never reaches the wire.
+	Level string
+}
+
+// validLogLevels is the canonical set the CLI (cmd/faas/commands2.go)
+// and the apid handler (cmd/apid/handlers_ext.go::streamAppLogs) share
+// — keep this single source of truth or the two sides will drift.
+var validLogLevels = [...]string{"info", "warn", "error"}
+
+// IsValidLogLevel reports whether s is one of the recognised log
+// severity values (info, warn, error). Issue #309: used by both the
+// CLI to short-circuit before opening the HTTP call and by the apid
+// handler to emit an `event: error` SSE frame on a bad value — having
+// both call sites agree on the enum is the whole point.
+func IsValidLogLevel(s string) bool {
+	for _, v := range validLogLevels {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
 
 // StreamAppLogs opens the GET /v1/apps/{slug}/logs stream and returns
 // its raw response body. The response is text/event-stream; callers
@@ -22,20 +65,32 @@ import (
 // `?deployment=` query param the CLI's `faas logs --deployment` uses);
 // pass "" to receive all instances' frames.
 //
+// opts narrows the per-line output by Grep / Since / Level; pass the
+// zero LogFilter for an unfiltered stream. Issue #309.
+//
 // Non-2xx responses are decoded as *APIError (same convention as the
 // JSON methods) and the body is closed internally; the caller only
 // ever sees a successful body or an error.
-func (c *Client) StreamAppLogs(ctx context.Context, slug, deploymentID string, follow bool) (io.ReadCloser, error) {
-	path := fmt.Sprintf("/v1/apps/%s/logs?follow=", slug)
+func (c *Client) StreamAppLogs(ctx context.Context, slug, deploymentID string, follow bool, opts LogFilter) (io.ReadCloser, error) {
+	q := url.Values{}
 	if follow {
-		path += "1"
+		q.Set("follow", "1")
 	} else {
-		path += "0"
+		q.Set("follow", "0")
 	}
 	if deploymentID != "" {
-		path += "&deployment=" + deploymentID
+		q.Set("deployment", deploymentID)
 	}
-	return c.stream(ctx, path)
+	if opts.Grep != "" {
+		q.Set("grep", opts.Grep)
+	}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Level != "" {
+		q.Set("level", opts.Level)
+	}
+	return c.stream(ctx, "/v1/apps/"+url.PathEscape(slug)+"/logs?"+q.Encode())
 }
 
 // StreamDeploymentLogs opens GET /v1/deployments/{id}/logs. beforeSeq
