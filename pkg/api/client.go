@@ -180,6 +180,64 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 	return nil
 }
 
+// doBytes executes an HTTP request and returns the raw response body
+// verbatim (issue #299, used by GetBuildsIdSbom for the CycloneDX
+// JSON document the server streams back). Mirrors do for auth +
+// idempotency conventions but skips the JSON unmarshal — the
+// caller passes a *[]byte and receives the body untouched. Returns
+// (nil, *APIError) on a non-2xx, same shape as do.
+func (c *Client) doBytes(ctx context.Context, method, path string, body, out any) error {
+	var r io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request: %w", err)
+		}
+		r = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, r)
+	if err != nil {
+		return err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if method != http.MethodGet && method != http.MethodHead && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", newUUIDv4())
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("could not reach the API: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= 300 {
+		var p Problem
+		if json.Unmarshal(data, &p) == nil && p.Code != "" {
+			return &APIError{Problem: p}
+		}
+		return fmt.Errorf("API error: %s", resp.Status)
+	}
+	if out != nil {
+		if bp, ok := out.(*[]byte); ok {
+			*bp = data
+			return nil
+		}
+		// Fall through: caller wants JSON-decoded, do the same
+		// unmarshal as doReq. Untyped callers will get a decode
+		// error if they pass anything other than *[]byte.
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return fmt.Errorf("decode response: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 // ErrNoBody is returned by helpers that expected a body but got none.
 // Errors.Is/As users can match it directly; it's also wrapped inside
 // *APIError.Problem paths so callers don't need to import errors.
@@ -328,6 +386,23 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 func (c *Client) GetBuildsIdProvenance(ctx context.Context, id string) (BuildProvenanceResponse, error) {
 	var out BuildProvenanceResponse
 	return out, c.do(ctx, "GET", "/v1/builds/"+id+"/provenance", nil, &out)
+}
+
+// GetBuildsIdSbom returns the CycloneDX SBOM for a build id
+// (issue #299, ADR-038 Phase 3). Backs the `faas build sbom <id>`
+// CLI command. The body is the raw CycloneDX 1.5 JSON the imaged
+// populator wrote into storage at build-completion time; the SDK
+// returns it as []byte (not a typed struct) so callers can hand it
+// straight to `cyclonedx-cli validate` or to a dashboard renderer
+// without an intermediate decode.
+//
+// Returns (nil, *APIError) when no SBOM exists for the build id —
+// Phase-3 populator hasn't landed yet, the build predates the
+// schema column, or the storage backend lost the artifact. The
+// caller (CLI) surfaces this as a "no SBOM" hint.
+func (c *Client) GetBuildsIdSbom(ctx context.Context, id string) ([]byte, error) {
+	var out []byte
+	return out, c.doBytes(ctx, "GET", "/v1/builds/"+id+"/sbom", nil, &out)
 }
 
 // DeployMultipart ships a source tarball (with optional runtime +

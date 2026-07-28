@@ -54,6 +54,7 @@ from .gdpr_audit_export_response_action import GdprAuditExportResponseAction
 from .gdpr_audit_export_response_data import GdprAuditExportResponseData
 from .gdpr_audit_export_response_source import GdprAuditExportResponseSource
 from .get_app_metrics_range import GetAppMetricsRange
+from .get_build_sbom_response_200 import GetBuildSbomResponse200
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
@@ -171,6 +172,7 @@ __all__ = (
     "GdprAuditExportResponseData",
     "GdprAuditExportResponseSource",
     "GetAppMetricsRange",
+    "GetBuildSbomResponse200",
     "GetOpenAPISpecJSONResponse200",
     "InstallBindRequest",
     "InstallBindResponse",

@@ -1644,6 +1644,33 @@ func (s *PgStore) BuildProvenanceByBuildID(ctx context.Context, buildID string) 
 	return scanBuildProvenance(row)
 }
 
+// UpdateBuildProvenanceSBOM stamps the SBOM storage key onto an
+// existing build_provenance row (issue #299 / ADR-038 Phase 3).
+// The SBOM populator runs in imaged AFTER the row is created by
+// builderd's recordProvenance: by the time imaged has the source
+// tree to enumerate, the build is already marked succeeded and
+// the provenance row is in place. Empty sbomKey clears the
+// column (best-effort: a syft failure leaves the cell NULL).
+//
+// Returns ErrNotFound when no row exists for buildID. The imaged
+// call site logs at WARN and continues — the apid GET renders
+// 503 build_sbom_unavailable rather than failing the build. We
+// guard against the "build_provenance row never landed" race
+// (a future builderd refactor that doesn't call
+// CreateBuildProvenance) by explicit RowsAffected check.
+func (s *PgStore) UpdateBuildProvenanceSBOM(ctx context.Context, buildID, sbomKey string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update build_provenance set sbom_storage_key = $1 where build_id = $2`,
+		nullString(sbomKey), buildID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SweepStuckRunningBuilds is the reaper sweep (issue #195 B1.4).
 // Returns the number of rows flipped. A partial index on
 // builds(status='running') keeps this O(matches) instead of O(table).

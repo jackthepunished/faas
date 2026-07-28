@@ -651,6 +651,16 @@ type Store interface {
 	// /v1/builds/{id}/provenance route + the `faas build provenance`
 	// CLI command.
 	BuildProvenanceByBuildID(ctx context.Context, buildID string) (BuildProvenance, error)
+	// UpdateBuildProvenanceSBOM stamps the SBOM storage key onto an
+	// existing build_provenance row (issue #299 / ADR-038 Phase 3).
+	// The SBOM populator (imaged's writeBuildSBOM) runs AFTER the
+	// row is created by builderd's recordProvenance — by the time
+	// imaged has the source tree to enumerate, the build is already
+	// marked succeeded and the provenance row is in place. Empty
+	// sbomKey clears the column (best-effort: a syft failure leaves
+	// the cell NULL). Returns ErrNotFound when no row exists for
+	// buildID; the caller logs at WARN and continues.
+	UpdateBuildProvenanceSBOM(ctx context.Context, buildID, sbomKey string) error
 
 	// SweepStuckRunningBuilds flips every build row whose status is
 	// 'running' AND whose started_at is older than threshold to

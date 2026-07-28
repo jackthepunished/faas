@@ -1564,6 +1564,21 @@ func (m *MemStore) BuildProvenanceByBuildID(_ context.Context, buildID string) (
 	return p, nil
 }
 
+// UpdateBuildProvenanceSBOM mirrors PgStore.UpdateBuildProvenanceSBOM.
+// Returns ErrNotFound when no row exists for the build_id — the
+// imaged call site logs at WARN and continues (best-effort).
+func (m *MemStore) UpdateBuildProvenanceSBOM(_ context.Context, buildID, sbomKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.buildProvenance[buildID]
+	if !ok {
+		return ErrNotFound
+	}
+	p.SBOMStorageKey = sbomKey
+	m.buildProvenance[buildID] = p
+	return nil
+}
+
 // SweepStuckRunningBuilds mirrors PgStore.SweepStuckRunningBuilds
 // (issue #195 B1.4). Returns the number of rows flipped.
 func (m *MemStore) SweepStuckRunningBuilds(_ context.Context, threshold time.Time) (int, error) {

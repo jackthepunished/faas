@@ -186,6 +186,31 @@ const (
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
 
+	// CodeScanCritical is returned by vmmd when the staged base
+	// ext4's Grype scan sidecar reports a CRITICAL finding (or
+	// is missing/unreadable) at boot time (issue #299). The
+	// failure mode is policy-driven (a CRITICAL CVE is a known
+	// bad, not an operator fault), so the code is SLO-exempt —
+	// it's not a customer-actionable signal in the same way
+	// capacity / build-failure codes are, but a sustained
+	// non-zero rate signals an imaged regression (the
+	// fail-closed scan-sidecar write path in
+	// pkg/imaged/base_stage.go) or a fresh CVE drop in a base
+	// image. The 503 status mirrors CodeSigInvalid's posture —
+	// the wake request fails closed, the caller can retry after
+	// the operator rebuilds the base.
+	CodeScanCritical = "scan_critical"
+
+	// CodeBuildSBOMUnavailable is returned by the SBOM GET handler
+	// when no SBOM populator has run for this build (pre-PR build, or
+	// the imaged syft populator in pkg/imaged/loop.go has not yet
+	// landed). Distinct from build_provenance_not_found (which means
+	// the populator INSERT itself failed at WARN — the build is
+	// genuine but observability broke). 503 — the artefact may exist
+	// later if the operator re-deploys imaged; the customer can
+	// branch on the code and re-fetch.
+	CodeBuildSBOMUnavailable = "build_sbom_unavailable"
+
 	// CodePayment is the 402 response when an API-only plan change requires
 	// a Stripe subscription the customer does not have (issue #142 / PR).
 	// The Problem carries a BillingPortalURL extension so the dashboard
@@ -375,6 +400,22 @@ func StatusForCode(code string) int {
 		CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout:
+		return http.StatusServiceUnavailable
+	case CodeScanCritical:
+		// 503 — the base ext4 has a CRITICAL Grype finding
+		// (issue #299). SLO-exempt: a CRITICAL CVE is a known
+		// bad, not an operator fault, and the wake must fail
+		// closed regardless of customer SLO posture. The
+		// operator rebuilds the base to clear the sidecar.
+		return http.StatusServiceUnavailable
+	case CodeBuildSBOMUnavailable:
+		// 503 — the SBOM populator hasn't run (issue #299 /
+		// ADR-038 Phase 3). The build row itself is final; the
+		// SBOM artefact is best-effort post-mortem. SLO-exempt
+		// for the same reason as CodeScanCritical: "missing
+		// observational metadata" is not a customer-impacting
+		// fault, and the SDK distinguishes 404 build-not-found
+		// from 503 SBOM-missing so customer agents can branch.
 		return http.StatusServiceUnavailable
 	case CodeUnauthorized:
 		return http.StatusUnauthorized
@@ -796,6 +837,21 @@ func ErrBuildProvenanceNotFound() *Problem {
 		"Build provenance not found",
 		"the build succeeded but no provenance row exists; builderd logged a warning when the populator failed").
 		WithDocs("https://docs.DOMAIN/builds#provenance")
+}
+
+// ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface
+// for `faas build sbom <id>` (and the SDK GetBuildsIdSbom) when no
+// SBOM artefact has been stored for this build yet — either the imaged
+// syft populator in pkg/imaged/loop.go hasn't landed (pre-PR build) or
+// the populator INSERT was best-effort WARNed away. The 503 distinguishes
+// "may exist later, retry" from the 404 "no such build". The SDK errors
+// stays parseable so the CLI's "no SBOM for this build" path can branch
+// on the code.
+func ErrBuildSBOMUnavailable() *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeBuildSBOMUnavailable,
+		"Build SBOM unavailable",
+		"no SBOM has been generated for this build; imaged's syft populator did not run or did not persist the artefact").
+		WithDocs("https://docs.DOMAIN/builds#sbom")
 }
 
 // ErrLongPollTimeout is returned by the long-poll handlers (sync

@@ -97,6 +97,26 @@ type Handler struct {
 	// PullLayers path, plus imaged_oci_pull_duration_seconds
 	// per-pull op{manifest,config,blob,above_base}.
 	ops *wire.OpsMetrics
+	// grypeRun is the supply-chain scan runner used at base-stage
+	// time to write the Grype scan sidecar (issue #299). Wired
+	// via WithGrypeRun; nil = default to a subprocess invocation
+	// (grype dir:<outImage> -o json) — production default. Tests
+	// inject a stub returning canned findings so the sidecar write
+	// is hermetic and doesn't require Grype on PATH. Fail-closed
+	// at the sidecar-write site (CRITICAL=9999 placeholder) when
+	// the runner returns an error or nil findings.
+	grypeRun func(ctx context.Context, dir string) (map[string]int, error)
+	// syftRun is the post-build SBOM generator used to populate
+	// build_provenance.sbom_storage_key (issue #299 / ADR-038
+	// Phase 3). Wired via WithSyftRun; nil = default to a
+	// subprocess invocation (`syft dir:<outDir> -o cyclonedx-json`)
+	// — production default. Tests inject a stub returning canned
+	// CycloneDX JSON so the storage write is hermetic and doesn't
+	// require syft on PATH. Best-effort: a syft error writes no
+	// SBOM and leaves sbom_storage_key empty; the build itself
+	// still succeeds (the SBOM is observational, not a deployment
+	// precondition — schema §4.2).
+	syftRun func(ctx context.Context, dir string) ([]byte, error)
 }
 
 // New returns a Handler. The OCI puller is injected so tests can substitute
@@ -180,6 +200,42 @@ func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 func (h *Handler) WithOpsMetrics(ops *wire.OpsMetrics) *Handler {
 	h.ops = ops
 	return h
+}
+
+// WithGrypeRun replaces the default Grype subprocess invocation
+// (issue #299). Default is nil, which falls back to the production
+// runner that shells out to `grype dir:<dir> -o json` and parses
+// the per-severity finding counts. Tests inject a stub returning
+// canned findings so the sidecar write is hermetic. Mirrors the
+// `LayerBuilder` interface injection pattern — same Handler-Builder
+// seam, same With* fluent setter shape.
+func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (map[string]int, error)) *Handler {
+	h.grypeRun = fn
+	return h
+}
+
+// WithSyftRun injects the post-build SBOM generator (issue #299 /
+// ADR-038 Phase 3). Mirrors WithGrypeRun's fluent setter shape.
+// Tests wire a stub returning canned CycloneDX bytes; production
+// leaves the field nil so the default subprocess runner in
+// pkg/imaged/sbom.go fires.
+func (h *Handler) WithSyftRun(fn func(ctx context.Context, dir string) ([]byte, error)) *Handler {
+	h.syftRun = fn
+	return h
+}
+
+// runGrype dispatches to the injected grypeRun or falls back to
+// the default subprocess runner (issue #299). The default shells
+// out to `grype dir:<dir> -o json` and parses the matches[].vulnerability.severity
+// counts into map[string]int. Errors and nil maps are surfaced to
+// the caller (the sidecar-write site fail-closed with a
+// CRITICAL=9999 placeholder). Production wires the default;
+// tests wire a stub via WithGrypeRun.
+func (h *Handler) runGrype(ctx context.Context, dir string) (map[string]int, error) {
+	if h.grypeRun != nil {
+		return h.grypeRun(ctx, dir)
+	}
+	return defaultGrypeRun(ctx, dir)
 }
 
 // storageFor returns the wired StorageBackend, building a default
@@ -489,11 +545,24 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			Plan:          acct.Plan,
 			Storage:       be,
 			StorageKey:    appsKey,
+			// Issue #299 / ADR-038 Phase 3: SBOM emission runs
+			// inside Builder.Build on the staging dir (the only
+			// artefact that contains the customer's source tree at
+			// that point). SBOMKey is stamped onto the
+			// build_provenance row after a successful build — see
+			// updateBuildProvenanceSBOM below.
+			SBOMRun:        h.syftRun,
+			SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "build app layer: "+err.Error())
 			return fmt.Errorf("imaged: build app layer: %w", err)
 		}
+		// Stamp the SBOM storage key onto build_provenance.sbom_storage_key
+		// (issue #299 / ADR-038 Phase 3). Best-effort: an error here
+		// is logged at WARN and the build still succeeds (the SBOM
+		// is observational metadata, schema §4.2).
+		h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 		if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -527,11 +596,16 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			Plan:          acct.Plan,
 			Storage:       be,
 			StorageKey:    appsKey,
+			// Issue #299 / ADR-038 Phase 3: see the two-drive
+			// branch above for the SBOM-populator contract.
+			SBOMRun:        h.syftRun,
+			SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "build app layer: "+err.Error())
 			return fmt.Errorf("imaged: build app layer: %w", err)
 		}
+		h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 		if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -662,11 +736,19 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// FunctionRunnerPath is the static guest/runners/<rt>/faas-runner
 		// binary that lives at /usr/local/bin/faas-runner in the layer.
 		FunctionRunnerPath: runnerPath,
+		// Issue #299 / ADR-038 Phase 3: SBOM emission runs inside
+		// Builder.Build on the staging dir (which holds the customer's
+		// source tarball + the runner binary + guest-init — exactly
+		// what the SBOM should enumerate). SBOMKey is stamped onto
+		// the build_provenance row immediately below.
+		SBOMRun:        h.syftRun,
+		SBOMStorageKey: h.sbomStorageKeyForDeployment(ctx, dep.ID),
 	})
 	if err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "build function layer: "+err.Error())
 		return fmt.Errorf("imaged: build function layer: %w", err)
 	}
+	h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 	if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 		return fmt.Errorf("imaged: stamp rootfs: %w", err)
@@ -1216,6 +1298,85 @@ func (h *Handler) cleanupAppFiles(ctx context.Context, appID string) error {
 		}
 	}
 	return nil
+}
+
+// --- F2/Issue #299 / ADR-038 Phase 3: SBOM populator seams -------------------
+
+// sbomStorageKeyForDeployment resolves the canonical CycloneDX storage
+// key for a deployment's source tree, or "" when no build row exists
+// for the deployment (issue #299 / ADR-038 Phase 3). The image-only
+// deploy path (app.Type == AppTypeApp on the legacy
+// handleDeployment arm) has no build — the OCI image comes straight
+// from the registry, and a build_provenance row would be empty. We
+// return "" rather than synthesising an empty-key stamp; the build
+// will populate the column on its first cache-hit (builderd calls
+// recordProvenance at every markSucceeded site).
+//
+// When the deployment's source has a build row, the storage key is
+// derived from its build_id:
+//
+//	sboms/<build_id>.cdx.json
+//
+// The convention mirrors BuildSBOMKey() in pkg/imaged/sbom.go (the
+// populator helper). Re-deriving here rather than importing
+// BuildSBOMKey avoids a tiny read-side alias across packages — the
+// field is private, but the key shape is the load-bearing contract
+// the apid GET handler reads back.
+func (h *Handler) sbomStorageKeyForDeployment(ctx context.Context, deploymentID string) string {
+	if deploymentID == "" {
+		return ""
+	}
+	build, err := h.store.BuildByDeployment(ctx, deploymentID)
+	if err != nil {
+		// ErrNotFound is the steady-state for image-only deploys;
+		// log at Debug (not Warn) so we don't pollute the log
+		// stream with the legacy arm.
+		if !errors.Is(err, state.ErrNotFound) {
+			h.log.Debug("imaged: sbom key lookup failed",
+				"deployment", deploymentID, "err", err)
+		}
+		return ""
+	}
+	return BuildSBOMKey(build.ID)
+}
+
+// updateBuildProvenanceSBOM stamps the SBOM storage key onto the
+// build_provenance row for this deployment (issue #299 /
+// ADR-038 Phase 3). Best-effort: an error here is logged at WARN
+// and the build still succeeds (the SBOM is observational
+// metadata, schema §4.2).
+//
+// The deployment may not have a build row yet (the image-only
+// arm of handleDeployment) — in that case sbomKey is "" and we
+// skip the lookup entirely. sbomKey == "" also covers the
+// syft-failure case: the build still succeeds, build_provenance
+// is stamped with empty sbom_storage_key, and the apid GET
+// returns 503 build_sbom_unavailable.
+func (h *Handler) updateBuildProvenanceSBOM(ctx context.Context, deploymentID, sbomKey string) {
+	if deploymentID == "" {
+		return
+	}
+	build, err := h.store.BuildByDeployment(ctx, deploymentID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			// Image-only deploy or pre-build state — no
+			// build_provenance row to stamp yet.
+			return
+		}
+		h.log.Warn("imaged: build_provenance lookup failed",
+			"deployment", deploymentID, "err", err)
+		return
+	}
+	if err := h.store.UpdateBuildProvenanceSBOM(ctx, build.ID, sbomKey); err != nil {
+		// A ErrNotFound here means the builderd populator
+		// INSERT failed (logged at WARN inside
+		// builderd.recordProvenance). We log at WARN too so the
+		// missing pair surfaces in operator dashboards, but do
+		// not fail the deploy — the build itself is the
+		// load-bearing artefact.
+		h.log.Warn("imaged: stamp sbom_storage_key",
+			"build", build.ID, "sbom_key", sbomKey, "err", err)
+	}
 }
 
 // --- F2: FC-version startup sweep ------------------------------------------

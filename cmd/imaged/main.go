@@ -193,7 +193,20 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	}
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
-		WithOpsMetrics(ops)
+		WithOpsMetrics(ops).
+		// Issue #299 / ADR-038 Phase 3 + Tier-2 ship blocker.
+		// Wire the production runners explicitly so a misconfigured
+		// imaged (e.g. an ansible role that forgets to install
+		// grype/syft) is observable at startup rather than silently
+		// falling through to a nil-runner scan/sbom that emits a
+		// fail-closed CRITICAL=9999 placeholder on every build.
+		// Without these wires the supply-chain gate at
+		// pkg/fcvm/manager.go::bringUpScanCheck would refuse to boot
+		// every staged ext4, masquerading the misconfig as a
+		// "scan-critical" failure rather than the supply-chain
+		// installation gap it actually is.
+		WithGrypeRun(makeGrypeRunner(os.Getenv("FAAS_GRYPE_BIN"))).
+		WithSyftRun(makeSyftRunner(os.Getenv("FAAS_SYFT_BIN")))
 
 	// F3: function runner wiring. cmd/imaged refuses to come up if either
 	// env var is set but the path doesn't exist on disk — silent omission
@@ -385,4 +398,37 @@ func ociPullTimeout() time.Duration {
 		return time.Duration(api.OCIPullTimeoutSeconds) * time.Second
 	}
 	return time.Duration(secs) * time.Second
+}
+
+// makeGrypeRunner wires an explicit Grype subprocess runner bound
+// to the operator-supplied binary path (issue #299). The default
+// empty string means "use PATH lookup", matching the production
+// behaviour pkg/imaged/grype.go's defaultGrypeRun implements
+// natively; cmd/imaged calls WithGrypeRun regardless so the
+// supply-chain gate at pkg/fcvm/manager.go::bringUpScanCheck
+// reports the real install location rather than a nil-stub
+// placeholder. The closure shape mirrors defaultGrypeRun — see
+// that function for the JSON parse contract.
+func makeGrypeRunner(bin string) func(ctx context.Context, dir string) (map[string]int, error) {
+	return func(ctx context.Context, dir string) (map[string]int, error) {
+		if bin != "" {
+			return imaged.RunGrypeAt(ctx, bin, dir)
+		}
+		return imaged.RunGrype(ctx, dir)
+	}
+}
+
+// makeSyftRunner wires an explicit Syft subprocess runner bound
+// to the operator-supplied binary path (issue #299 / ADR-038
+// Phase 3). As with makeGrypeRunner, the empty-string path means
+// "use PATH lookup"; cmd/imaged calls WithSyftRun regardless so
+// the SBOM populator at pkg/imaged/sbom.go::writeBuildSBOM emits
+// real CycloneDX on every build rather than persisting nothing.
+func makeSyftRunner(bin string) func(ctx context.Context, dir string) ([]byte, error) {
+	return func(ctx context.Context, dir string) ([]byte, error) {
+		if bin != "" {
+			return imaged.RunSyftAt(ctx, bin, dir)
+		}
+		return imaged.RunSyft(ctx, dir)
+	}
 }

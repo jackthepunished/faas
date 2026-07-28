@@ -364,6 +364,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	log.Info("billing provider loaded", "provider", provName)
 
+	// Issue #299 / ADR-038 Phase 3: SBOM root directory. imagd's syft
+	// populator writes CycloneDX JSON to <root>/sboms/<buildID>.cdx.json
+	// and stores the relative path in build_provenance.sbom_storage_key.
+	// apid joins the relative path against this root at GET
+	// /v1/builds/{id}/sbom time. Default is the single-box deploy root
+	// (/srv/fc, FAAS_STORAGE_ROOT for the local storage backend); on a
+	// remote-storage deploy the operator sets FAAS_SBOM_ROOT to the
+	// mirror mount. Empty disables the route — the handler returns 503
+	// build_sbom_unavailable (issue #299: "may exist later, retry") so
+	// the CLI/SDK can distinguish from 404 "no such build".
+	srv.WithSBOMRoot(deps.getenv("FAAS_SBOM_ROOT"))
+
 	// Issue #98 / ADR-028: admin allowlist for /v1/compute-nodes.
 	// Empty in dev = all admin routes 403 with code admin_required;
 	// production sets FAAS_ADMIN_EMAILS to the operator team's
