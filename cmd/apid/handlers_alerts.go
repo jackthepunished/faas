@@ -220,7 +220,15 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		"rule", logsanitize.Field(row.ID),
 		"app", app.Slug,
 		"account", acct.ID,
-		"metric", row.Metric,
+		// CodeQL go/log-injection (alert #126): row.Metric is closed-set
+		// validated before insert (validateAlertRuleBody calls
+		// api.AllowedAlertRuleMetric), so it can never contain CR/LF,
+		// but the static analyser can't see the closed-set guard.
+		// Sanitise anyway so the log line stays one-line-per-event and
+		// the alert gets dismissed without a // codeql[go/log-injection]
+		// suppression comment (precedent: pkg/logsanitize.Field on
+		// every user-influenced attribute).
+		"metric", logsanitize.Field(string(row.Metric)),
 	)
 	// IAM-4 (ADR-035): audit the rule creation. Mirrors
 	// cron.created (handlers_ext.go:748). NEVER carry the plaintext

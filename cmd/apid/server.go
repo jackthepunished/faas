@@ -619,12 +619,15 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
 
-	// Alert rules (issue #396 / ADR-045 PR 3). Per-app surface —
-	// account-wide rules are visible at every per-app listing but
-	// the create / update / delete endpoints pin to a specific app.
-	// POST is wrapped in idempotent so retries are safe; a race
-	// against the (account_id, name) unique index lands on
-	// state.ErrConflict for the duplicate-name path.
+	// Alert rules (ADR-045 / issue #396 PR 3).
+	// CRUD surface under /v1/apps/{slug}/alerts. The rotate-secret
+	// action verb is the literal `/rotate-secret` segment (Go 1.22+
+	// mux wildcard ends at `}` so a colon-form verb would panic —
+	// same precedent as the queues/{id}/ack block at line 642).
+	// Plan-tier gate (Free→402) lives inside createAlertRule /
+	// listAlertRules so a Free customer posting to a non-existent
+	// slug gets a clean 402, not a 404 that would leak the slug
+	// (PR review finding F4).
 	mux.HandleFunc("GET /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAlertRules))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createAlertRule)))))
 	mux.HandleFunc("GET /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAlertRule))))
