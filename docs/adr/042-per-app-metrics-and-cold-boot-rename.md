@@ -1,4 +1,4 @@
-# ADR-041 — per-app request metrics + cold-boot rename (issue #273)
+# ADR-042 — per-app request metrics + cold-boot rename (issue #273)
 
 Status: Accepted, 2026-07-28. Owner: @poyrazK. Closes: #273.
 Related: ADR-036 (instance metrics cardinality rollups — the
