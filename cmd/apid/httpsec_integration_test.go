@@ -39,7 +39,7 @@ func TestHttpsec_StaticHeadersOnAllPaths(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid_httpsec_test")
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(ops)
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	h := srv.handler()
 
 	// Hoist the account + key out of the loop so the per-path
@@ -102,7 +102,7 @@ func TestHttpsec_CSPOnAllPaths(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid_httpsec_csp_test")
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(ops)
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	h := srv.handler()
 
 	rec := httptest.NewRecorder()
@@ -135,7 +135,7 @@ func TestHttpsec_NonceFreshnessAcrossRequests(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid_httpsec_nonce_test")
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(ops)
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	h := srv.handler()
 
 	parse := func(csp string) string {
@@ -178,7 +178,7 @@ func TestHttpsec_HSTSDisabledByEnv(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid_httpsec_hsts_test")
 	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{}).WithOpsMetrics(ops)
+		"example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	h := srv.handler()
 
 	rec := httptest.NewRecorder()

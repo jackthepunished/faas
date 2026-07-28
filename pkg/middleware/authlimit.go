@@ -306,6 +306,22 @@ func defaultClientIP(r *http.Request) string {
 	return host
 }
 
+// ClientIP is the exported counterpart of defaultClientIP. Handlers
+// outside pkg/middleware (e.g. cmd/apid/handlers_auth_login.go for
+// the failed-login audit row, issue #286) must call this helper —
+// NEVER reach for r.RemoteAddr directly, because the loopback+XFF
+// trust contract documented on defaultClientIP is the one that keeps
+// the per-IP bucket key, the Prometheus `ip` label, and the audit
+// row's `ip` field in sync. Disagreement between the rate-limit
+// bucket and the audit surface would silently make a credential-
+// stuffing burst look like a different (smaller) attack.
+//
+// The implementation is intentionally a one-line wrapper so the
+// trust contract has a single source of truth.
+func ClientIP(r *http.Request) string {
+	return defaultClientIP(r)
+}
+
 // isLoopbackHost reports whether s is an IPv4 127.0.0.0/8 address or
 // IPv6 ::1. Returns false on unparseable input (untrusted callers
 // default to the RemoteAddr fallback above).

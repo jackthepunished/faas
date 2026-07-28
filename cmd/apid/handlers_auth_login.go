@@ -41,6 +41,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -98,6 +99,17 @@ func (s *server) postLoginEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, ok := s.verifyPasswordOrPad(r.Context(), email, password)
 	if !ok {
+		// Issue #286: emit a failed-login audit row on the
+		// async-batched channel. The discriminator is the same
+		// at every emit site (ip + email_hash + user_agent) so
+		// the audit reader does not need to disambiguate the
+		// three failure modes collapsed into one 401 by
+		// verifyPasswordOrPad. The 401 response is unaffected
+		// by the audit row — EmitFailedLogin is non-blocking.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
 		api.WriteProblem(w, api.ErrInvalidCredentials())
 		return
 	}
@@ -146,6 +158,17 @@ func (s *server) postSignup(w http.ResponseWriter, r *http.Request) {
 					// Newcomer would have set this password; the
 					// existing account has a different one. We
 					// MUST NOT reveal the difference (anti-enumeration).
+					// Issue #286: emit failed-login on the same
+					// async-batched channel — the emit site is
+					// the same as the postLoginEmail path so the
+					// audit row shape is identical and the
+					// operator cannot distinguish a /login
+					// wrong-password from a /signup wrong-password
+					// (which is the desired posture).
+					s.audit.EmitFailedLogin(
+						middleware.ClientIP(r),
+						auth.HashEmail(email),
+						r.UserAgent())
 					api.WriteProblem(w, api.ErrInvalidCredentials())
 					return
 				}
@@ -187,11 +210,30 @@ func (s *server) postSignup(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Bound account with no password row (OAuth-only): pad.
 		_, _ = auth.Verify(auth.DummyPHC, password)
+		// Issue #286: emit failed-login (OAuth-only branch).
+		// Same payload shape as the postLoginEmail path so the
+		// audit row is indistinguishable from the /login
+		// wrong-password path — the discriminator is the email
+		// hash, not the route.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
 		api.WriteProblem(w, api.ErrInvalidCredentials())
 		return
 	}
 	ok, err = auth.Verify(hash, password)
 	if err != nil || !ok {
+		// Issue #286: emit failed-login (wrong-password branch).
+		// This is the canonical "wrong password" audit row, hit
+		// by the bulk of credential-stuffing attempts. The
+		// counter (`apid_failed_login_total{ip}`) is the
+		// operational signal — the audit row in the events table
+		// is the SOC 2 evidence.
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
 		api.WriteProblem(w, api.ErrInvalidCredentials())
 		return
 	}

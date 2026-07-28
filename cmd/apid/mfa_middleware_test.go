@@ -121,7 +121,7 @@ func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state
 	ops := wire.NewOpsMetrics("apid_mfa_middleware_test")
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
-		nil, 15*60_000_000_000, "").WithOpsMetrics(ops)
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
 	return srv.handler(), acct, mgr
 }
 
@@ -152,7 +152,7 @@ func TestRequireMFA_BearerBypasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_mfa_bypass_test")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 
 	// Bearer key + non-allowlisted route. The requireMFA
 	// middleware must NOT 403.

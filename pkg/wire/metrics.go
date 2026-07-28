@@ -132,6 +132,44 @@ type OpsMetrics struct {
 	// LRU would let evicted ids re-admit later and grow the series
 	// set unbounded over process lifetime.
 	accountLabels *accountLabelSet
+	// failedLoginTotal: SOC 2 CC7.2 evidence (issue #286). Counts
+	// every failed login attempt on the dashboard auth surface
+	// (`POST /login`, `POST /signup`, OAuth callbacks), labelled by
+	// the source IP. Bounded by ipLabelSet (maxIPLabelValues) so
+	// the Prometheus TSDB series set stays bounded over the daemon's
+	// lifetime — overflow collapses to "__other__". Backs the
+	// FaasFailedLoginSpike alert at 20/min/IP/5m.
+	failedLoginTotal *prometheus.CounterVec
+	// failedLoginDropped: tracks rows that the apid async-batched
+	// audit channel dropped because the in-process buffer was full
+	// (4030+ sustained failed-logins/sec would do this under a
+	// credential-stuffing burst). Unlabelled — the operator only
+	// needs to know IF the channel is shedding load, not which IP
+	// is causing it. A non-zero rate is the canary for "the
+	// auth_limit bucket is shedding the attack but the audit
+	// flusher is the bottleneck".
+	failedLoginDropped prometheus.Counter
+	// failedLoginAuditWriteFailures: counts apid-side failed-login
+	// audit writes (cmd/apid/audit.go::flushOne) whose events row
+	// could not be written. Distinct from auditWriteFailures
+	// (which serves the success-path AuditEmit surface and is
+	// labelled by account_id) because a failed login cannot be
+	// attributed to a known account — routing both failure paths
+	// through AuditWriteFailures("") would conflate "subject is
+	// nil because nobody is logged in" with "subject is nil
+	// because the caller didn't supply one" in the operator's
+	// `account_id="anonymous"` view. Unlabelled — the same
+	// subject-nil rationale applies, and a count over a fixed
+	// baseline is enough to drive a "the flusher can talk to
+	// Postgres?" question.
+	failedLoginAuditWriteFailures prometheus.Counter
+	// ipLabels: the bounded admission set shared by ip-labelled
+	// metrics (failedLoginTotal today). See accountLabelSet docs
+	// for the same fixed-capacity, non-evicting contract.
+	// Distinct from accountLabels because the cap-sizing rationale
+	// differs — IPs grow under attack, account_ids grow under
+	// signup — and the two sets should not share capacity.
+	ipLabels *ipLabelSet
 	// topTenantRPS: introduced in issue #300 — a per-tenant RPS
 	// gauge sampled every 5s by the daemon's topNSampler goroutine
 	// (cmd/apid/topn.go / cmd/gatewayd/listener.go). Bounded at
@@ -373,6 +411,45 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_audit_write_failures_total",
 		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written, labelled by account_id. The handler has already returned 200; this is observation-only. account_id=\"__other__\" is the bounded admission overflow bucket — operators must check daemon slog for the original id (issue #278).",
 	}, []string{"account_id"})
+	// issue #286 — failed-login audit evidence (SOC 2 CC7.2). Counts
+	// every failed login attempt on the dashboard auth surface
+	// (`POST /login`, `POST /signup`, OAuth callback denial paths).
+	// Labelled by source IP, bounded by ipLabelSet (maxIPLabelValues =
+	// 10_000); overflow collapses to "__other__". Backs the
+	// FaasFailedLoginSpike alert rule at 20/min/IP/5m. The same
+	// apid-side emit path also writes an `events.kind =
+	// "auth.login.failed"` row via the async-batched audit channel
+	// (cmd/apid/audit.go) — the counter is the high-frequency
+	// Prometheus signal, the audit row is the operator-row join.
+	failedLoginTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_failed_login_total",
+		Help: "Failed login attempts on the dashboard auth surface, labelled by source IP. Bounded by ipLabelSet (maxIPLabelValues=10_000); overflow collapses to ip=\"__other__\". Backs the FaasFailedLoginSpike alert (issue #286, SOC 2 CC7.2).",
+	}, []string{"ip"})
+	// failedLoginDropped: shed rows on the async-batched audit channel
+	// (cmd/apid/audit.go::EmitFailedLogin). Unlabelled — the operator
+	// only needs to know IF the flusher is the bottleneck. A non-zero
+	// rate means the auth-limit bucket is shedding the attack but the
+	// audit flusher is saturated; the customer-facing auth response
+	// is unaffected (the channel write is non-blocking and the 401
+	// returns regardless).
+	failedLoginDropped := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_failed_login_audit_dropped_total",
+		Help: "Failed-login audit rows dropped because the in-process buffered channel was full. Unlabelled — a non-zero rate is the canary for \"audit flusher is the bottleneck under a credential-stuffing burst\" (issue #286).",
+	})
+	// failedLoginAuditWriteFailures: failed-login audit writes
+	// (cmd/apid/audit.go::flushOne) whose AppendEvent returned an
+	// error. Distinct from audit_write_failures_total (success path
+	// labelled by account_id) because the failed-login row's subject
+	// is always nil — a "subject collapse" through that counter
+	// would conflate this path with the success path's anonymous
+	// failures and make the operator's triage harder. Unlabelled —
+	// the per-IP breakage is not observable on this path (the row
+	// is dropped before the per-IP Prometheus series is touched);
+	// the operator needs only an aggregate signal.
+	failedLoginAuditWriteFailures := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_failed_login_audit_write_failures_total",
+		Help: "Failed-login audit rows whose AppendEvent could not be written (cmd/apid/audit.go::flushOne). Unlabelled — distinct from apid_audit_write_failures_total{account_id} because the failed-login row's subject is always nil, which would collapse to account_id=\"anonymous\" in the success-path counter and conflate the two surfaces (issue #286).",
+	})
 	auditWriteDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_audit_write_failures_duration_seconds",
 		Help: "Latency of state.Store.AppendEvent on the apid audit seam, labelled by terminal result {ok, failed}. Sized for the single-row INSERT round-trip (issue #278).",
@@ -404,6 +481,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// collision-free lookups (accountLabelSet reservedAllow).
 	auditWriteFail.WithLabelValues(anonymousAccountLabel)
 	auditWriteFail.WithLabelValues(otherAccountLabel)
+	// issue #286: pre-instantiate the two reserved IP labels so the
+	// counter's HELP/TYPE and zero-valued series surface in /metrics
+	// from boot — same precedent as auditWriteFail above. The "anonymous"
+	// series is the unparseable-IP fallback (pkg/middleware.defaultClientIP
+	// returns "unknown" — that collapses to anonymous here so the
+	// operator can distinguish a missing/garbled RemoteAddr from an
+	// overflow).
+	failedLoginTotal.WithLabelValues(anonymousIPLabel)
+	failedLoginTotal.WithLabelValues(otherIPLabel)
 	requestFailures.WithLabelValues(anonymousAccountLabel, "unmatched", "err")
 	requestFailures.WithLabelValues(otherAccountLabel, "unmatched", "err")
 	// Pre-instantiate the closed (account_id, route, code) tuples for
@@ -609,7 +695,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceCPUSecondsTotal,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
-		egressDeny, topTenantRPS,
+		egressDeny,
+		failedLoginTotal, failedLoginDropped,
+		failedLoginAuditWriteFailures,
+		topTenantRPS,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -785,42 +874,46 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// the rollup in ReplaceInstanceStats.
 	instanceCPUSecondsTotal.WithLabelValues("", "")
 	return &OpsMetrics{
-		registry:                   reg,
-		ops:                        ops,
-		dur:                        dur,
-		watchdogKills:              watchdogKills,
-		eventsWriteFail:            eventsWriteFail,
-		auditWriteFail:             auditWriteFail,
-		auditWriteDur:              auditWriteDur,
-		requestFailures:            requestFailures,
-		requestTotal:               requestTotal,
-		accountLabels:              newAccountLabelSet(maxAccountLabelValues),
-		topTenantRPS:               topTenantRPS,
-		topAccounts:                newTopAccountSet(topAccountSetCap),
-		cpuSecondsLast:             newCPUSecondsLastSeen(),
-		stripePushDur:              stripePushDur,
-		paddlePushDur:              paddlePushDur,
-		buildDur:                   buildDur,
-		buildQueueWait:             buildQueueWait,
-		residentGBPerCustomer:      residentGBPerCustomer,
-		billingCapExceededTotal:    billingCapExceededTotal,
-		wakeIDV4Fallback:           wakeIDV4Fallback,
-		imagedOCIPull:              imagedOCIPull,
-		instanceCPUPct:             instanceCPUPct,
-		instanceRSSMB:              instanceRSSMB,
-		instanceInflightReqs:       instanceInflightReqs,
-		instanceCPUSecondsTotal:    instanceCPUSecondsTotal,
-		instanceStatsCollectDur:    instanceStatsCollectDur,
-		instanceStatsPartialErrors: instanceStatsPartialErrors,
-		cpuStatsCollectDur:         cpuStatsCollectDurLocal,
-		scaleUpDecisions:           scaleUpDecisions,
-		scaleDownDecisions:         scaleDownDecisions,
-		scaleUpAdmitRPS:            scaleUpAdmitRPS,
-		sseClients:                 sseClients,
-		egressDeny:                 egressDeny,
-		ociEgressDeny:              ociEgressDeny,
-		provenanceWrites:           provenanceWrites,
-		imageScanVulns:             imageScanVulns,
+		registry:                      reg,
+		ops:                           ops,
+		dur:                           dur,
+		watchdogKills:                 watchdogKills,
+		eventsWriteFail:               eventsWriteFail,
+		auditWriteFail:                auditWriteFail,
+		auditWriteDur:                 auditWriteDur,
+		requestFailures:               requestFailures,
+		requestTotal:                  requestTotal,
+		accountLabels:                 newAccountLabelSet(maxAccountLabelValues),
+		failedLoginTotal:              failedLoginTotal,
+		failedLoginDropped:            failedLoginDropped,
+		failedLoginAuditWriteFailures: failedLoginAuditWriteFailures,
+		ipLabels:                      newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                  topTenantRPS,
+		topAccounts:                   newTopAccountSet(topAccountSetCap),
+		cpuSecondsLast:                newCPUSecondsLastSeen(),
+		stripePushDur:                 stripePushDur,
+		paddlePushDur:                 paddlePushDur,
+		buildDur:                      buildDur,
+		buildQueueWait:                buildQueueWait,
+		residentGBPerCustomer:         residentGBPerCustomer,
+		billingCapExceededTotal:       billingCapExceededTotal,
+		wakeIDV4Fallback:              wakeIDV4Fallback,
+		imagedOCIPull:                 imagedOCIPull,
+		instanceCPUPct:                instanceCPUPct,
+		instanceRSSMB:                 instanceRSSMB,
+		instanceInflightReqs:          instanceInflightReqs,
+		instanceCPUSecondsTotal:       instanceCPUSecondsTotal,
+		instanceStatsCollectDur:       instanceStatsCollectDur,
+		instanceStatsPartialErrors:    instanceStatsPartialErrors,
+		cpuStatsCollectDur:            cpuStatsCollectDurLocal,
+		scaleUpDecisions:              scaleUpDecisions,
+		scaleDownDecisions:            scaleDownDecisions,
+		scaleUpAdmitRPS:               scaleUpAdmitRPS,
+		sseClients:                    sseClients,
+		egressDeny:                    egressDeny,
+		ociEgressDeny:                 ociEgressDeny,
+		provenanceWrites:              provenanceWrites,
+		imageScanVulns:                imageScanVulns,
 	}
 }
 
@@ -870,6 +963,52 @@ func (m *OpsMetrics) AuditWriteFailureDuration(result string) prometheus.Observe
 		return nil
 	}
 	return m.auditWriteDur.WithLabelValues(result)
+}
+
+// FailedLoginTotal returns the per-IP counter for failed login
+// attempts on the dashboard auth surface (issue #286, SOC 2 CC7.2).
+// The IP is resolved through the bounded admission set (ipLabel):
+// empty or "unknown" collapses to "anonymous" (unparseable IP);
+// new IPs past the capacity return the counter labelled "__other__"
+// so the Prometheus TSDB series set stays bounded under a
+// credential-stuffing burst. Backs the FaasFailedLoginSpike alert
+// at 20/min/IP/5m. Repeated calls for the same IP return the same
+// underlying Counter — safe to call from the hot path.
+func (m *OpsMetrics) FailedLoginTotal(ip string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.failedLoginTotal.WithLabelValues(m.ipLabel(ip))
+}
+
+// FailedLoginDropped returns the unlabelled counter for failed-login
+// audit rows that the async-batched channel could not enqueue
+// (issue #286). A non-zero rate is the canary for "audit flusher is
+// the bottleneck under a credential-stuffing burst". The auth
+// response is unaffected — the channel write is non-blocking and the
+// 401 returns regardless.
+func (m *OpsMetrics) FailedLoginDropped() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.failedLoginDropped
+}
+
+// FailedLoginAuditWriteFailures returns the unlabelled counter for
+// failed-login audit rows whose AppendEvent could not be written
+// (issue #286, cmd/apid/audit.go::flushOne). Distinct from the
+// success-path audit counter (which is labelled by account_id) —
+// routing this counter through AuditWriteFailures would conflate
+// "the failed-login row's subject is always nil" with "the success-
+// path caller's subject is empty" in the operator's anonymous
+// bucket. Unlabelled — the per-IP breakage is not observable on
+// this path. Backs the SOC 2 CC7.2 audit-write-failure signal
+// alongside apid_audit_write_failures_total{account_id}.
+func (m *OpsMetrics) FailedLoginAuditWriteFailures() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.failedLoginAuditWriteFailures
 }
 
 // RequestFailure is the primitive counter accessor for
@@ -1556,6 +1695,46 @@ func (m *OpsMetrics) Handler() http.Handler {
 // AuditWriteFailures and RequestFailure see the same admission set
 // so a customer is either represented by their real id in both, or
 // by "__other__" in both.
+// maxIPLabelValues caps the per-OpsMetrics IP-label admission set
+// (issue #286). Sized at the same 10_000 ceiling as
+// maxAccountLabelValues — comfortably above the realistic 95th
+// percentile of unique source IPs seen in a 5-minute window on a
+// single-host edge, while staying inside Prometheus' "tens of
+// thousands of series per metric" guideline. Above the cap, new IPs
+// collapse to otherIPLabel ("__other__") so the TSDB series set stays
+// bounded over the daemon's lifetime — the same fixed-capacity,
+// non-evicting contract as accountLabelSet, sized differently because
+// IP cardinality grows under attack (a credential-stuffing burst
+// from a botnet) where account_id cardinality grows under organic
+// signup.
+//
+// Distinct from maxAccountLabelValues so the two sets don't share
+// capacity — a sudden signup surge could affect account labels while
+// IP cardinality stays low, and vice versa.
+const maxIPLabelValues = 10_000
+
+// anonymousIPLabel is the reserved IP for traffic whose source IP
+// could not be resolved. Two cases collapse here:
+//   - the RemoteAddr is missing entirely (the Go http server's
+//     RemoteAddr is empty string in pathological cases), and
+//   - pkg/middleware.defaultClientIP returned the "unknown" sentinel
+//     for an unparseable host (the canonical fallback for untrusted
+//     callers — `defaultClientIP` parses the host, returns "unknown"
+//     on parse failure, and ipLabelSet.admit collapses that sentinel
+//     to anonymousIPLabel).
+//
+// Always admitted without consuming capacity, so an operator can
+// distinguish a missing/garbled RemoteAddr from a credential-stuffing
+// burst that crossed the admission cap (which collapses to
+// otherIPLabel).
+const anonymousIPLabel = "anonymous"
+
+// otherIPLabel is the reserved IP for traffic whose IP exceeded the
+// admission cap. Same contract as otherAccountLabel — operators must
+// check the daemon slog for the original IP when an IP lands here;
+// the metric label is intentionally lossy.
+const otherIPLabel = "__other__"
+
 const maxAccountLabelValues = 10_000
 
 // anonymousAccountLabel is the reserved account_id for traffic that
@@ -1619,8 +1798,9 @@ func newAccountLabelSet(capacity int) *accountLabelSet {
 
 // admit resolves an account id to its label value (issue #278).
 // Empty input normalizes to anonymousAccountLabel. Reserved values
-// (anonymousAccountLabel, otherAccountLabel) are always admitted.
-// Real ids are admitted up to the capacity; further ids collapse to
+// (anonymousAccountLabel, otherAccountLabel) are always admitted
+// without consuming capacity (see reservedCount below). Real ids
+// are admitted up to the capacity; further ids collapse to
 // otherAccountLabel without ever consuming capacity, and the
 // underlying map is never resized past cap.
 //
@@ -1644,7 +1824,16 @@ func (s *accountLabelSet) admit(accountID string) string {
 	if _, ok := s.admitted[accountID]; ok {
 		return accountID
 	}
-	if len(s.admitted) >= s.cap {
+	// Reserved labels are pre-admitted at construction (see
+	// newAccountLabelSet) — their entries count toward len(s.admitted)
+	// but not toward the user-facing capacity. Subtract them so the
+	// real-id budget is exactly `cap - reservedCount`, not
+	// `cap - reservedCount - 2`. Without the subtraction the
+	// reserved labels steal two slots from the real-id budget; the
+	// IP-side sibling (ipLabelSet.admit) caught this same flaw via
+	// TestFailedLoginTotal_OverflowCollapsesToOtherSlow (issue #286).
+	const reservedCount = 2
+	if len(s.admitted)-reservedCount >= s.cap {
 		return otherAccountLabel
 	}
 	s.admitted[accountID] = struct{}{}
@@ -1660,6 +1849,113 @@ func (m *OpsMetrics) accountLabel(accountID string) string {
 		return accountID
 	}
 	return m.accountLabels.admit(accountID)
+}
+
+// ipLabelSet is the bounded admission set that backs every
+// ip-labelled metric in OpsMetrics (issue #286, today only
+// failedLoginTotal). Same shape and contract as accountLabelSet
+// above — plain map + mutex, fixed capacity, non-evicting — but a
+// distinct type so the two sets do not share capacity. The cap is
+// maxIPLabelValues (10_000). Above the cap, new IPs collapse to
+// otherIPLabel ("__other__") so the Prometheus TSDB series set stays
+// bounded over the daemon's lifetime. The map is initialised once
+// per OpsMetrics in NewOpsMetrics; the mutex is the only
+// synchronisation primitive and is held only across the
+// lookup/insert path. Prometheus Counter increments happen outside
+// the critical section.
+//
+// Reserved values (anonymousIPLabel, otherIPLabel) are admitted at
+// boot without consuming capacity and are always re-admitted on
+// lookup. Real IPs consume capacity once and are never evicted in
+// process — the daemon restart is the only path that resets the set.
+type ipLabelSet struct {
+	mu       sync.Mutex
+	admitted map[string]struct{}
+	cap      int
+}
+
+// newIPLabelSet constructs an admission set with the given capacity.
+// capacity must be > 0; the call panics otherwise to fail loud at
+// boot rather than silently allow unbounded admission.
+//
+// Returns a pointer because ipLabelSet contains a sync.Mutex;
+// returning by value would copy the lock (govet copylocks).
+func newIPLabelSet(capacity int) *ipLabelSet {
+	if capacity <= 0 {
+		panic("wire: ipLabelSet capacity must be positive")
+	}
+	s := &ipLabelSet{
+		admitted: make(map[string]struct{}, capacity),
+		cap:      capacity,
+	}
+	// Reserved values don't count against the cap, but pre-admitting
+	// them at construction means ipLabel() doesn't need a special
+	// branch for them — the lookup short-circuits through the same map.
+	s.admitted[anonymousIPLabel] = struct{}{}
+	s.admitted[otherIPLabel] = struct{}{}
+	return s
+}
+
+// admit resolves an IP to its label value (issue #286). Empty input
+// and the literal "unknown" sentinel from
+// pkg/middleware.defaultClientIP both collapse to anonymousIPLabel,
+// so the counter for "unparseable RemoteAddr" is observable
+// distinctly from a real credential-stuffing burst that crossed the
+// admission cap (which lands in otherIPLabel). New IPs past the
+// capacity collapse to otherIPLabel without ever consuming capacity,
+// and the underlying map is never resized past cap.
+//
+// Concurrency: holds mu across the lookup+insert. The hot path is
+// the "already admitted" lookup, which is O(1) and never inserts.
+// The Prometheus increment happens at the call site AFTER admit
+// returns, so it is outside the critical section.
+//
+// Pointer receiver: the type contains a sync.Mutex, so copying the
+// value would duplicate the lock. ipLabelSet is constructed once per
+// OpsMetrics in NewOpsMetrics and held as a pointer field.
+func (s *ipLabelSet) admit(ip string) string {
+	switch ip {
+	case "", "unknown":
+		// ClientIP returns "unknown" for an unparseable
+		// RemoteAddr; collapse to anonymousIPLabel so the operator
+		// can distinguish "we couldn't resolve the source IP"
+		// from a credential-stuffing burst that crossed the
+		// admission cap.
+		return anonymousIPLabel
+	case anonymousIPLabel, otherIPLabel:
+		return ip
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.admitted[ip]; ok {
+		return ip
+	}
+	// Reserved labels (anonymous, __other__) are pre-admitted at
+	// construction (see newIPLabelSet) and consume map entries but
+	// NOT user-facing capacity. The user-facing cap of `s.cap`
+	// distinct REAL IPs must hold. The check is therefore
+	// "real IPs admitted = (len - reserved) >= s.cap", not
+	// "len >= s.cap" (which would steal reservedCount slots from
+	// the real budget — the original bug, surfaced by
+	// TestFailedLoginTotal_OverflowCollapsesToOtherSlow).
+	const reservedCount = 2
+	realAdmitted := len(s.admitted) - reservedCount
+	if realAdmitted >= s.cap {
+		return otherIPLabel
+	}
+	s.admitted[ip] = struct{}{}
+	return ip
+}
+
+// ipLabel exposes the IP admission set as an OpsMetrics method so
+// callers don't need to know the underlying type. Safe on a nil
+// receiver — returns the input unchanged for the daemon paths that
+// don't wire an OpsMetrics (unit tests).
+func (m *OpsMetrics) ipLabel(ip string) string {
+	if m == nil || m.ipLabels == nil {
+		return ip
+	}
+	return m.ipLabels.admit(ip)
 }
 
 // RenderSeconds is a tiny helper for callers that want to hand-format a

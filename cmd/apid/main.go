@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,12 +22,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
@@ -388,7 +391,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Built unconditionally so /metrics works even with FAAS_APID_METRICS_ADDR
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
-	srv.WithOpsMetrics(ops)
+	srv.WithOpsMetrics(ctx, ops)
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
@@ -439,6 +442,38 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	} else {
 		log.Warn("FAAS_HOST_AGE_IDENTITY_PATH unset — MFA /confirm, /verify, /disable, /recover will return 503")
 	}
+
+	// Issue #286 / CodeQL alert #121: load (or generate + persist)
+	// a per-box audit HMAC key and wire it into pkg/auth so
+	// HashEmail uses HMAC-SHA256 instead of plain SHA-256. The
+	// plain SHA-256 form is rainbow-table-reversible — a leaked
+	// `events.data` column lets an adversary precompute hashes for
+	// common emails and reverse the column. HMAC keyed by a
+	// per-box secret closes that path while preserving the audit-
+	// row join-key contract (deterministic for a given (email,
+	// secret) pair). The key is held in-process only — never
+	// written to events, never logged, never returned from any
+	// HTTP handler.
+	//
+	// Loading precedence:
+	//   1. FAAS_AUDIT_HMAC_KEY env var (hex-encoded 32 bytes) — the
+	//      operator-supplied path; production uses this so the key
+	//      survives container restarts via the env-var mount
+	//      (Kubernetes secret, systemd EnvironmentFile=).
+	//   2. /var/lib/faas/audit-hmac.key (0o600) — the auto-generated
+	//      fallback. Generated once on first boot, persisted with
+	//      0o600 perms so it survives daemon restart without
+	//      requiring operator action. The file path is gated on
+	//      FAAS_AUDIT_HMAC_KEY_FILE for tests / non-standard
+	//      deployments.
+	//   3. nil (zero-key fallback) — only if both above paths fail.
+	//      pkg/auth logs a Warn; HashEmail still produces a stable
+	//      join key, just without rainbow-table resistance.
+	auditHMACKey, err := loadOrGenerateAuditHMACKey(deps.getenv, log)
+	if err != nil {
+		return fmt.Errorf("apid: load or generate audit HMAC key: %w", err)
+	}
+	auth.SetHMACSecret(auditHMACKey, log)
 
 	// Optional pre-listen hook (DNS poller in production; nil in tests).
 	if deps.bgBefore != nil {
@@ -496,6 +531,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			//nolint:contextcheck // shutdown context must outlive request ctx; detached from caller per net/http contract.
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}
+		// Issue #286: drain the async failed-login audit channel
+		// so in-flight rows land in the events table before the
+		// daemon exits. Close is idempotent — safe to call from
+		// the shutdown path even if WithOpsMetrics wasn't wired
+		// (the auditor's failedCh is nil and Close is a no-op).
+		if srv.audit != nil {
+			srv.audit.Close()
+		}
 		return nil
 	}
 }
@@ -520,4 +563,106 @@ func (p pgNotifier) Subscribe(ctx context.Context, channels []string) (<-chan db
 // interface stays the only thing the handlers depend on.
 func (p pgNotifier) WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error) {
 	return db.WaitForNotification(ctx, p.pool, channel, predicate, timeout)
+}
+
+// auditHMACKeyFile is the on-disk fallback path for the audit HMAC
+// key when FAAS_AUDIT_HMAC_KEY is unset (CodeQL alert #121, issue
+// #286). The file is created on first boot with 0o600 perms and
+// persists across daemon restarts so the audit-row email_hash
+// values remain stable across boots (otherwise every restart would
+// rotate the key and break the join-key contract — the same email
+// would hash to a different value, fragmenting the audit table).
+//
+// 0o600 perms because the file IS a secret: anyone with read access
+// can derive the audit HMAC key and rainbow-table the audit table.
+// Mirrors the host.age identity perms (0o400 read-only; PR #237).
+const auditHMACKeyFile = "/var/lib/faas/audit-hmac.key"
+
+// auditHMACKeyEnvVar is the env var name an operator sets to
+// supply the audit HMAC key explicitly (hex-encoded 32 bytes). The
+// env-var path is the production-recommended route (Kubernetes
+// Secret + envFromSecret, systemd EnvironmentFile=). The file
+// fallback is the dev / single-node convenience.
+const auditHMACKeyEnvVar = "FAAS_AUDIT_HMAC_KEY"
+
+// auditHMACKeyFileEnvVar overrides the default auditHMACKeyFile
+// path. Exists so the e2e harness and operator with non-standard
+// state dirs can pin the path; tests use this to redirect to a
+// tmp dir.
+const auditHMACKeyFileEnvVar = "FAAS_AUDIT_HMAC_KEY_FILE"
+
+// loadOrGenerateAuditHMACKey returns the per-daemon audit HMAC key
+// per the precedence documented at the call site. Returns nil with
+// no error if neither the env var nor the fallback file path yields
+// a key — pkg/auth.SetHMACSecret accepts nil and logs a Warn, so the
+// daemon still boots (in dev mode) with the zero-key fallback.
+//
+// Errors are returned only when:
+//   - FAAS_AUDIT_HMAC_KEY is set but is not valid hex / wrong length.
+//     A malformed key is a hard error: silently using a partial key
+//     would let the operator think they have rainbow-table
+//     resistance when they don't.
+//   - The fallback file path is unreachable (perm denied, fs error).
+//     Hard error: dev-mode auto-generation needs the file to
+//     persist the key across restarts.
+//
+// The env var takes precedence over the file path even if the file
+// is older / shorter — operator intent is explicit.
+func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([]byte, error) {
+	// Precedence 1: env var (production path).
+	if hexStr := getenv(auditHMACKeyEnvVar); hexStr != "" {
+		key, err := hex.DecodeString(hexStr)
+		if err != nil {
+			return nil, fmt.Errorf("decode %s hex: %w", auditHMACKeyEnvVar, err)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("%s must decode to exactly 32 bytes (got %d); use `openssl rand -hex 32` to generate", auditHMACKeyEnvVar, len(key))
+		}
+		log.Info("audit HMAC key loaded from env", "env", auditHMACKeyEnvVar)
+		return key, nil
+	}
+
+	// Precedence 2: file path (dev-mode auto-generated).
+	path := auditHMACKeyFile
+	if override := getenv(auditHMACKeyFileEnvVar); override != "" {
+		path = override
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		key, decErr := hex.DecodeString(strings.TrimSpace(string(data)))
+		if decErr != nil {
+			return nil, fmt.Errorf("decode %s hex content: %w", path, decErr)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("%s content must decode to exactly 32 bytes (got %d); delete the file to regenerate", path, len(key))
+		}
+		log.Info("audit HMAC key loaded from file", "path", path)
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// Precedence 3: generate + persist (dev-mode first boot). Skip
+	// silently if /var/lib/faas doesn't exist (typical for tests
+	// running as non-root) — the zero-key fallback in pkg/auth
+	// will catch it.
+	dir := filepath.Dir(path)
+	if _, statErr := os.Stat(dir); statErr != nil {
+		log.Warn("audit HMAC key file dir unavailable; running on zero-key fallback (HashEmail is rainbow-table-reversible)",
+			"path", path, "err", statErr)
+		return nil, nil
+	}
+	key, err := auth.GenerateHMACSecret()
+	if err != nil {
+		return nil, fmt.Errorf("generate audit HMAC key: %w", err)
+	}
+	encoded := hex.EncodeToString(key)
+	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+		log.Warn("audit HMAC key auto-persist failed; running on in-process key (HashEmail joins break on restart)",
+			"path", path, "err", err)
+		return key, nil
+	}
+	log.Info("audit HMAC key generated and persisted", "path", path)
+	return key, nil
 }
