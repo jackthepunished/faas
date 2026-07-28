@@ -15,6 +15,8 @@ from .api_key_response import APIKeyResponse
 from .api_key_response_scopes_item import APIKeyResponseScopesItem
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
+from .app_metrics_response import AppMetricsResponse
+from .app_metrics_response_range import AppMetricsResponseRange
 from .app_response import AppResponse
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
@@ -51,6 +53,7 @@ from .gdpr_audit_export_response import GdprAuditExportResponse
 from .gdpr_audit_export_response_action import GdprAuditExportResponseAction
 from .gdpr_audit_export_response_data import GdprAuditExportResponseData
 from .gdpr_audit_export_response_source import GdprAuditExportResponseSource
+from .get_app_metrics_range import GetAppMetricsRange
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
@@ -129,6 +132,8 @@ __all__ = (
     "APIKeyResponseScopesItem",
     "AppManifest",
     "AppManifestEnv",
+    "AppMetricsResponse",
+    "AppMetricsResponseRange",
     "AppResponse",
     "AppResponseRuntime",
     "AppResponseType",
@@ -165,6 +170,7 @@ __all__ = (
     "GdprAuditExportResponseAction",
     "GdprAuditExportResponseData",
     "GdprAuditExportResponseSource",
+    "GetAppMetricsRange",
     "GetOpenAPISpecJSONResponse200",
     "InstallBindRequest",
     "InstallBindResponse",
