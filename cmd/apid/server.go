@@ -677,7 +677,7 @@ func (s *server) handler() http.Handler {
 	// Idempotency-Key; the reducer itself is also idempotent at the DB
 	// level via the partial unique index on credit_ledger
 	// (provider_invoice_id, credit_id) — migration
-	// 00056_credit_consumption.sql.
+	// 00057_credit_consumption.sql.
 	mux.HandleFunc("POST /v1/invoices/{id}/consume-credits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.consumeInvoiceCredits)))))
 

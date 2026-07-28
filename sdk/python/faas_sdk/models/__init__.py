@@ -30,6 +30,8 @@ from .build_export_response import BuildExportResponse
 from .build_provenance_response import BuildProvenanceResponse
 from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
+from .consume_invoice_response import ConsumeInvoiceResponse
+from .consumed_credit_row import ConsumedCreditRow
 from .create_app_request import CreateAppRequest
 from .create_app_request_runtime import CreateAppRequestRuntime
 from .create_app_request_type import CreateAppRequestType
@@ -153,6 +155,8 @@ __all__ = (
     "BuildProvenanceResponse",
     "ChangePlanRequest",
     "ChangePlanRequestPlan",
+    "ConsumedCreditRow",
+    "ConsumeInvoiceResponse",
     "CreateAppRequest",
     "CreateAppRequestRuntime",
     "CreateAppRequestType",

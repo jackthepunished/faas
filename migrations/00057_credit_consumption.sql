@@ -1,12 +1,12 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00056_credit_consumption.sql — issue #279 PR-C.
+-- 00057_credit_consumption.sql — issue #279 PR-C.
 --
--- Slot note: 00056 is next-free on main after the slot-00054
--- collision was resolved by renaming PR #346's
--- 00054_usage_minutes_cpu.sql → 00055. Walking past collisions
--- at rebase time is documented in memory
+-- Slot note: 00057 is next-free on main after slot 56 was claimed
+-- by open PRs #335 and #352 (the slot-collision gate from
+-- scripts/ci/check_migration_slots.sh failed both). Walking past
+-- collisions at rebase time is documented in memory
 -- `migration-slot-collisions-across-prs.md` and
 -- `git-mv-migration-internals-untouched.md`.
 --

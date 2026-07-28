@@ -49,7 +49,7 @@ func TestE2E_CreditIssue_AdminKey(t *testing.T) {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	pgtest.WaitForMigration(t, pool, 54, 10*time.Second) // issue #279 landed at slot 54
+	pgtest.WaitForMigration(t, pool, 54, 10*time.Second) // issue #279 PR-A landed at slot 54
 
 	// The admin allowlist is read from FAAS_ADMIN_EMAILS by apid at
 	// boot (cmd/apid/main.go:349). The harness seeds accounts whose
@@ -231,7 +231,7 @@ func TestE2E_CreditConsume_HappyPathAndIdempotent(t *testing.T) {
 	// (provider_invoice_id, credit_id). WaitForMigration gates
 	// against the cmd/e2e schedd migration race — daemons must
 	// boot AFTER the migration is in goose_db_version.
-	pgtest.WaitForMigration(t, pool, 56, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, 57, 10*time.Second)
 
 	const adminEmail = "e2e+hobby+admin@test.example"
 	const targetEmail = "e2e+hobby+consume-target@test.example"

@@ -1197,7 +1197,7 @@ type Store interface {
 	// ConsumeAccountCredit performs an atomic FIFO decrement across the
 	// account's active credits, capped at TargetCents. The unique
 	// (provider_invoice_id, credit_id) partial index on credit_ledger
-	// (migration 00056) makes the call idempotent: re-running with
+	// (migration 00057) makes the call idempotent: re-running with
 	// the same ProviderInvoiceID and credit set is a no-op and
 	// returns AlreadyConsumedForInvoice=true.
 	//

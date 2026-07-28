@@ -1,0 +1,35 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00056_no_op_slot_reservation.sql — placeholder migration to keep
+-- migration slots contiguous.
+--
+-- Why this file exists
+-- --------------------
+-- This PR's actual content lands at slot 00057_credit_consumption.sql
+-- (issue #279 PR-C). The slot-56 collision detector
+-- (scripts/ci/check_migration_slots.sh) rejected claiming slot 56
+-- because open PRs #335 and #352 have already filed migrations at
+-- that slot. To resolve the collision without breaking migration
+-- contiguity (enforced by migrations/embed_test.go::TestMigrationsContiguous),
+-- this PR takes slot 57 and reserves slot 56 as a no-op.
+--
+-- Whichever of PR #335 / #352 lands first will overwrite this file
+-- with their real migration (the conflict-detector at rebase time
+-- will re-trigger on the slot-56 collision, and that PR renumbers
+-- forward). When that happens this file is replaced on main and the
+-- goose_db_version row at slot 56 becomes the honest "applied here"
+-- record for the surviving migration's SQL.
+--
+-- If neither PR #335 nor #352 lands first, this no-op migrates to
+-- main as-is: a zero-effect migration that exists purely to fill a
+-- contiguity gap. Goose accepts the empty body; the only persistent
+-- change is a row in goose_db_version with version_id=56 and
+-- is_applied=true.
+--
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse.
+-- +goose StatementEnd

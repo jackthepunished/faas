@@ -24,7 +24,7 @@
 // account). The reducer itself is also idempotent at the DB level
 // via the partial unique index on credit_ledger
 // (provider_invoice_id, credit_id) — see migration
-// 00056_credit_consumption.sql. A second reducer call for the same
+// 00057_credit_consumption.sql. A second reducer call for the same
 // invoice returns AlreadyConsumedForInvoice=true and the same
 // ConsumedCents without double-decrementing.
 //

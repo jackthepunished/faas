@@ -65,7 +65,7 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 		&fakeParker{},
 		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-nil, /* mailer */
+		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
@@ -122,7 +122,7 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 		&fakeParker{},
 		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-nil, /* mailer */
+		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
@@ -172,7 +172,7 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 		&fakeParker{},
 		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-nil, /* mailer */
+		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
@@ -221,7 +221,7 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 		&fakeParker{},
 		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-nil, /* mailer */
+		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
@@ -270,7 +270,7 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 		&fakeParker{},
 		nil, /* pusher (Provider) — cap test doesn't push usage */
 		&fakeNotifier{},
-nil, /* mailer */
+		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
 		func() time.Time { return now },
