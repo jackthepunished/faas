@@ -190,9 +190,9 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // Admit asks schedd to admit ONE additional instance for appID (issue #168).
 // On the admitted path the new Target is added to the per-app targetSet
 // (dedup by InstanceID). On the at-capacity path the engine's typed result
-// is passed through (wakeID empty, err nil). On a real failure (RAM
-// headroom, chooser, store) the error is preserved — schedd lifts them to
-// *api.Problem at the wire boundary.
+// is passed through (wakeID empty, method WakeMethodUnspecified, err nil).
+// On a real failure (RAM headroom, chooser, store) the error is preserved —
+// schedd lifts them to *api.Problem at the wire boundary.
 //
 // Fan-out invariant (issue #168): HealthyCount < maxConcurrency is enforced
 // atomically inside this method. Concurrent callers serialize on tgtMu so a
@@ -200,22 +200,29 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // enforces the cap via its per-app ledger, but that round-trip is expensive
 // — the gateway-side check is the cheap fast path that keeps the RPC count
 // ≤ maxConcurrency per burst.
-func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int) (string, bool, error) {
+//
+// method is the wake-outcome schedd actually performed (PR scale-out
+// readiness, ADR-028). On the admitted path the value is
+// WakeMethodSnapshotRestore or WakeMethodColdBoot, translated by
+// scheddgrpc.Client from the wire's scheddpb.WakeMethod. On
+// at-capacity and error paths the value is WakeMethodUnspecified.
+func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
 	b.tgtMu.Lock()
 	set := b.targets[appID]
 	if set != nil && len(set.entries) >= maxConcurrency {
 		b.tgtMu.Unlock()
-		return "", true, nil
+		return "", WakeMethodUnspecified, true, nil
 	}
 	b.tgtMu.Unlock()
 
-	instanceID, nodeID, wakeID, atCapacity, err := b.sched.AdmitInstance(ctx, appID)
+	instanceID, nodeID, wakeID, rawMethod, atCapacity, err := b.sched.AdmitInstance(ctx, appID)
 	if err != nil {
-		return "", false, err
+		return "", WakeMethodUnspecified, false, err
 	}
+	method := scheddWakeMethodToGateway(rawMethod)
 	if atCapacity {
-		return "", true, nil
+		return "", WakeMethodUnspecified, true, nil
 	}
 	if nodeID == "" || instanceID == "" {
 		// schedd returned a successful admit with empty ids. This is
@@ -223,7 +230,7 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 		// says instance_id/node_id are populated on the admitted
 		// path. Lift to *api.Problem so writeWakeError surfaces a
 		// descriptive 5xx instead of the generic "wake failed" 503.
-		return "", false, api.NewProblem(http.StatusInternalServerError,
+		return "", WakeMethodUnspecified, false, api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity, "schedd admit returned empty ids",
 			fmt.Sprintf("instance=%q node=%q wake=%q", instanceID, nodeID, wakeID))
 	}
@@ -240,7 +247,7 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 		AddedAt:    time.Now(),
 	})
 	b.tgtMu.Unlock()
-	return wakeID, false, nil
+	return wakeID, method, false, nil
 }
 
 // EvictInstance drops a specific instance from its app's targetSet (issue

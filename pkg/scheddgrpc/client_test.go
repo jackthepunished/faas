@@ -148,7 +148,7 @@ func TestClientAdmitInstance_AdmitsNewInstance(t *testing.T) {
 			}, nil
 		},
 	})
-	instanceID, nodeID, wakeID, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, method, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("AdmitInstance: %v", err)
 	}
@@ -164,6 +164,11 @@ func TestClientAdmitInstance_AdmitsNewInstance(t *testing.T) {
 	if atCapacity {
 		t.Errorf("atCapacity = true on admit path; want false")
 	}
+	// PR scale-out readiness: the wire's WAKE_COLD_BOOT (proto value 0)
+	// must pass through AdmitInstance as int32 0.
+	if method != 0 {
+		t.Errorf("method = %d, want 0 (WAKE_COLD_BOOT)", method)
+	}
 }
 
 // TestClientAdmitInstance_AtCapacityIsTypedResult (issue #168) —
@@ -178,7 +183,7 @@ func TestClientAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 			return sched.WakeResult{AtCapacity: true}, nil
 		},
 	})
-	instanceID, nodeID, wakeID, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, method, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("AdmitInstance: at_capacity must NOT be lifted to an error; got %v", err)
 	}
@@ -188,6 +193,13 @@ func TestClientAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 	if instanceID != "" || nodeID != "" || wakeID != "" {
 		t.Errorf("identity fields populated on at_capacity path: i=%q n=%q w=%q",
 			instanceID, nodeID, wakeID)
+	}
+	// PR scale-out readiness: at_capacity path leaves method at 0
+	// (unset) so the gateway's scheddWakeMethodToGateway default-branch
+	// maps it to WakeMethodColdBoot — the gateway does NOT enumerate
+	// the locality classifier on this path.
+	if method != 0 {
+		t.Errorf("method = %d on at_capacity path, want 0 (unset)", method)
 	}
 }
 
@@ -202,7 +214,7 @@ func TestClientAdmitInstance_LiftsError(t *testing.T) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
-	_, _, _, _, err := c.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, err := c.AdmitInstance(context.Background(), "app-1")
 	if err == nil {
 		t.Fatal("expected capacity denial on AdmitInstance")
 	}

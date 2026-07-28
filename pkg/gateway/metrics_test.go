@@ -445,3 +445,55 @@ func TestMetricsAccountRateLimitedNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveAccountRateLimit("x", "free") // must not panic
 }
+
+// TestMetricsWakeLocalityPreinstantiated pins the closed (outcome) set
+// at zero from the moment the daemon binds, so the dashboard panel
+// surfaces from boot and a missing wire-incrementation is visible as a
+// frozen zero (PR scale-out readiness). Catches a future change that
+// drops the pre-instantiation loop or renames an outcome value.
+func TestMetricsWakeLocalityPreinstantiated(t *testing.T) {
+	m := NewMetrics()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
+		want := fmt.Sprintf(`gateway_wake_locality_total{outcome=%q} 0`, outcome)
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsWakeLocalityObserved asserts the counter increments per
+// outcome and that an unknown outcome is passed through (Prometheus
+// default behaviour — the closed set is closed by the pre-instantiation
+// loop and the call site, not by the registry).
+func TestMetricsWakeLocalityObserved(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveWakeLocality("local_snapshot")
+	m.ObserveWakeLocality("local_coldboot")
+	m.ObserveWakeLocality("local_coldboot")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`gateway_wake_locality_total{outcome="local_snapshot"} 1`,
+		`gateway_wake_locality_total{outcome="local_coldboot"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
+		}
+	}
+}
+
+// TestObserveWakeLocalityNilSafe — the wrapper must not panic on a nil
+// receiver (the call site in handler.go already nil-guards, but the
+// helper itself is nil-safe by design — mirror of
+// ObserveWakeQueueWait / ObserveTLSOnDemandDenied).
+func TestObserveWakeLocalityNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveWakeLocality("local_snapshot") // must not panic
+}

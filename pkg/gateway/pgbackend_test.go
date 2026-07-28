@@ -85,7 +85,7 @@ func TestPGBackend_AdmitSeedsThenEvictInstance(t *testing.T) {
 		t.Fatal("Pick pre-admit = ok; want empty cache")
 	}
 
-	if _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	if got := b.HealthyCount("app-1"); got != 1 {
@@ -115,7 +115,7 @@ func TestPGBackend_FanOutAcrossMaxConcurrency(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for _, want := range []string{"i-1", "i-2", "i-3"} {
-		if _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
 			t.Fatalf("Admit: %v", err)
 		}
 		if got := b.HealthyCount("app-1"); got == 0 {
@@ -168,7 +168,7 @@ func TestPGBackend_AdmitErrorDoesNotSeedTarget(t *testing.T) {
 	sched := gateway.NewFakeScheduler("node-fake-1").WithErr(api.ErrCapacity("full"))
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	if _, _, err := b.Admit(context.Background(), "app-1", 5); err == nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err == nil {
 		t.Fatal("expected admit error")
 	}
 	if got := b.HealthyCount("app-1"); got != 0 {
@@ -183,7 +183,7 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 	sched := &atCapScheduler{}
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
-	wakeID, atCap, err := b.Admit(context.Background(), "app-1", 5)
+	wakeID, _, atCap, err := b.Admit(context.Background(), "app-1", 5)
 	if err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
@@ -202,8 +202,78 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 // typed at_capacity=true outcome (issue #168).
 type atCapScheduler struct{}
 
-func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, bool, error) {
-	return "", "", "", true, nil
+func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
+	return "", "", "", 0, true, nil
+}
+
+// TestPGBackend_AdmitForwardsWakeMethod (PR scale-out readiness) — the
+// raw wire-method value the Scheduler returns must reach PGBackend.Admit's
+// caller unchanged. This is the load-bearing step that lets the
+// handler's wake-locality classifier distinguish a snapshot restore
+// from a cold boot. The translation from int32 → WakeMethod happens
+// inside PGBackend.Admit via scheddWakeMethodToGateway; this test
+// pins both the cold-boot default and the restore path, plus the
+// unknown-wire fallback to cold boot.
+func TestPGBackend_AdmitForwardsWakeMethod(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      int32
+		wantWake gateway.WakeMethod
+	}{
+		{"wireWakeColdBoot → WakeMethodColdBoot", gateway.WireWakeColdBoot, gateway.WakeMethodColdBoot},
+		{"wireWakeRestore → WakeMethodSnapshotRestore", gateway.WireWakeRestore, gateway.WakeMethodSnapshotRestore},
+		// Unknown wire value falls through the default branch to
+		// cold boot — same defense as scheddgrpc.mapMethod.
+		{"unknown wire value → WakeMethodColdBoot default", 999, gateway.WakeMethodColdBoot},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sched := &controllableScheduler{rawMethod: tc.raw}
+			b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+			_, method, atCap, err := b.Admit(context.Background(), "app-1", 5)
+			if err != nil {
+				t.Fatalf("Admit: %v", err)
+			}
+			if atCap {
+				t.Errorf("atCapacity = true; want false on admit path")
+			}
+			if method != tc.wantWake {
+				t.Errorf("method = %v, want %v", method, tc.wantWake)
+			}
+		})
+	}
+}
+
+// TestPGBackend_AdmitAtCapacityLeavesMethodUnspecified (PR scale-out
+// readiness) — at-capacity is a benign no-op from the locality
+// classifier's perspective; the method must surface as
+// WakeMethodUnspecified so the handler skips the metric increment.
+func TestPGBackend_AdmitAtCapacityLeavesMethodUnspecified(t *testing.T) {
+	sched := &atCapScheduler{}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+	_, method, atCap, err := b.Admit(context.Background(), "app-1", 5)
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if !atCap {
+		t.Errorf("atCapacity = false; want true")
+	}
+	if method != gateway.WakeMethodUnspecified {
+		t.Errorf("method = %v, want WakeMethodUnspecified", method)
+	}
+}
+
+// controllableScheduler lets a test pin the raw wire-method value
+// AdmitInstance returns (PR scale-out readiness). atCapacity and
+// err are zero-valued so each test case is "fresh admit, no error".
+type controllableScheduler struct {
+	rawMethod int32
+}
+
+func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
+	return "i-test", "n-test", "w-test", c.rawMethod, false, nil
 }
 
 func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {

@@ -246,7 +246,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// response header to a customer, so x-faas-wake-id has
 			// no consumer here. AdmitInstance is still called for
 			// the admit + boot side effects.
-			_, _, _, _, err := sched.AdmitInstance(ctx, appID)
+			//
+			// method is discarded for the same reason: the
+			// wake-locality counter is observed at the public
+			// handler's after-proxy chokepoint, not on the synth
+			// path. Synth traffic is operational (cron, per-minute
+			// sampler), not customer traffic, and would skew the
+			// "what fraction of admissions were local" reading.
+			_, _, _, _, _, err := sched.AdmitInstance(ctx, appID)
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -663,8 +670,8 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) (gateway.Target, bool) { return gateway.Target{}, false }
 func (unwiredBackend) HealthyCount(string) int            { return 0 }
-func (unwiredBackend) Admit(context.Context, string, int) (string, bool, error) {
-	return "", false, nil
+func (unwiredBackend) Admit(context.Context, string, int) (string, gateway.WakeMethod, bool, error) {
+	return "", gateway.WakeMethodUnspecified, false, nil
 }
 
 // envOrGateway returns the value of env key, or fallback when unset/empty.

@@ -23,6 +23,94 @@ import (
 	"time"
 )
 
+// WakeMethod is the narrow gateway-facing mirror of the on-the-wire
+// scheddpb.WakeMethod (PR scale-out readiness). The Scheduler
+// implementations translate the protobuf enum into this type so the
+// gateway code never reaches into the protobuf package directly. The
+// closed set is intentionally small: only the two outcomes that affect
+// the wake-locality classifier. Any unknown wire value maps to
+// WakeMethodColdBoot — the safer (slow but always-correct) fallback,
+// matching scheddgrpc.mapMethod's default branch.
+type WakeMethod int
+
+// Wire-shape int32 values for WakeMethod. Defined next to the type so
+// the wake-method switching in this file and the proto enum in
+// api/proto/onebox/faas/schedd/v1/schedd.proto:132-135 share a single
+// source of truth. The proto file is the authority — TestWireWakeMethod
+// in scheduler_test.go asserts these constants match the proto enum
+// numbers so a future proto reordering trips CI instead of silently
+// regressing the wake-locality classifier.
+//
+// Exported so tests in this package can reference the wire values by
+// name (e.g. `gateway.WireWakeRestore`) instead of magic numbers. The
+// package's runtime code does not need to cross an import boundary to
+// use them.
+const (
+	WireWakeColdBoot int32 = 0
+	WireWakeRestore  int32 = 1
+)
+
+const (
+	// WakeMethodUnspecified is the zero value; it represents the
+	// outcome schedd surfaces when a request takes the Phase-1
+	// fast-path (returning an already-RUNNING instance) and no fresh
+	// admit happened. The gateway should never observe this on the
+	// admitted path; it is here so the type is zero-value-safe.
+	WakeMethodUnspecified WakeMethod = iota
+	// WakeMethodSnapshotRestore — the admitted instance was restored
+	// from a snapshot.
+	WakeMethodSnapshotRestore
+	// WakeMethodColdBoot — the admitted instance was cold-booted
+	// (no usable snapshot, snapshot restore failed, or fall-back
+	// path).
+	WakeMethodColdBoot
+)
+
+// String renders the outcome in the metric-label form. The closed
+// set keeps the gateway_wake_locality_total{outcome} cardinality
+// bounded.
+//
+// The translation from raw wire int32 to WakeMethod happens in
+// scheddWakeMethodToGateway (below) before this switch is reached,
+// so the default branch is unreachable in normal flow. It is
+// belt-and-braces: a future WakeMethod addition that the switch
+// misses still renders as "local_coldboot" rather than minting a
+// frozen unexpected label tuple.
+func (m WakeMethod) String() string {
+	switch m {
+	case WakeMethodSnapshotRestore:
+		return "local_snapshot"
+	case WakeMethodColdBoot:
+		return "local_coldboot"
+	default:
+		// WakeMethodUnspecified, plus any future addition that
+		// drifts from this switch → local_coldboot.
+		return "local_coldboot"
+	}
+}
+
+// WakeMethodFromSchedd is the translation seam from the protobuf
+// scheddpb.WakeMethod into the gateway type. Exposed as a function
+// rather than a method so callers don't need to import the protobuf
+// package; pkg/scheddgrpc.Client.AdmitInstance uses this internally.
+//
+// Wire values:
+//   - WAKE_RESTORE      → WakeMethodSnapshotRestore
+//   - WAKE_COLD_BOOT    → WakeMethodColdBoot
+//   - everything else   → WakeMethodColdBoot (default branch)
+//
+// Mirrors scheddgrpc.mapMethod's default-to-cold-boot defense.
+func scheddWakeMethodToGateway(m int32) WakeMethod {
+	// The closed enum has exactly two values (WireWakeColdBoot = 0,
+	// WireWakeRestore = 1 in the proto). Anything outside falls
+	// through to cold boot — same logic as the server-side
+	// mapMethod in pkg/scheddgrpc/server.go.
+	if m == WireWakeRestore {
+		return WakeMethodSnapshotRestore
+	}
+	return WakeMethodColdBoot
+}
+
 // Scheduler is what the gateway needs from schedd. AdmitInstance blocks
 // until schedd has either admitted + dispatched a NEW instance or decided
 // the app is already at max_concurrency (atCapacity=true).
@@ -32,6 +120,12 @@ import (
 //     detached from the triggering request's ctx).
 //   - return an *api.Problem-shaped error so the gateway can map it to the
 //     right RFC 7807 status without re-classifying strings.
+//
+// method is the raw wire value schedd returned (PR scale-out readiness).
+// The translation to WakeMethod happens in pgbackend.go via
+// scheddWakeMethodToGateway so this package doesn't have to depend on
+// the protobuf package — the same boundary scheddgrpc.Client already
+// crosses.
 type Scheduler interface {
 	// AdmitInstance attempts to admit ONE additional instance for appID
 	// (issue #168). Unlike the legacy Wake primitive, this RPC skips
@@ -39,16 +133,18 @@ type Scheduler interface {
 	// demand a new instance even when others are already running.
 	// Three outcomes:
 	//
-	//   - admitted: instanceID/nodeID/wakeID non-empty, atCapacity=false
+	//   - admitted: instanceID/nodeID/wakeID non-empty, atCapacity=false,
+	//     method reflects what schedd actually did (1 = restore,
+	//     0/2+ = cold boot, see scheddWakeMethodToGateway).
 	//   - at_capacity: instanceID/nodeID/wakeID empty, atCapacity=true.
 	//     The gateway treats this as a benign no-op when it already
-	//     has ≥1 cached target.
+	//     has ≥1 cached target. method is 0.
 	//   - failure: non-nil err. Real admission failures (RAM headroom,
 	//     chooser, store) travel as *api.Problem. The benign
 	//     app_concurrency_reached outcome is NEVER lifted to an error —
 	//     it surfaces as atCapacity=true so the gateway can treat it
-	//     as a no-op.
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, atCapacity bool, err error)
+	//     as a no-op. method is 0.
+	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -59,8 +155,8 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, bool, error) {
-	return "", "", "", false, ErrSchedulerUnconfigured
+func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
+	return "", "", "", 0, false, ErrSchedulerUnconfigured
 }
 
 // FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd
@@ -71,12 +167,17 @@ func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, str
 // (format "i-<seq>") and a stable node id (the `nodeID` field). The wake
 // id mirrors the instance id unless WithWakeID overrides it. Tests that
 // need a fixed identity set `WithInstanceID`/`WithNodeID` once.
+//
+// WakeMethod defaults to WakeMethodColdBoot (the gateway-side
+// expectation of a fresh admission); tests that exercise the
+// snapshot-restore path use WithWakeMethod.
 type FakeScheduler struct {
 	mu         sync.Mutex
 	latencyMs  int
 	nodeID     string // stable per-FakeScheduler; reused as the synthetic compute_node.id
 	instanceID string // fixed override (default: empty → mint per call)
 	wakeID     string // fixed override (default: empty → mirror instance id)
+	method     WakeMethod
 	errOnAdmit error
 
 	// nextID is the per-call instance id counter when instanceID override is unset.
@@ -97,6 +198,7 @@ func NewFakeScheduler(nodeID string) *FakeScheduler {
 		nodeID:      nodeID,
 		instanceID:  "", // empty → mint per call
 		wakeID:      "", // empty → mirror instance id
+		method:      WakeMethodColdBoot,
 		admitsByApp: map[string]int{},
 	}
 }
@@ -125,6 +227,16 @@ func (f *FakeScheduler) WithWakeID(id string) *FakeScheduler {
 	return f
 }
 
+// WithWakeMethod sets the wake-method AdmitInstance returns (default:
+// WakeMethodColdBoot on construction). Tests that exercise the
+// restore-outcome path of the wake-locality classifier use this.
+func (f *FakeScheduler) WithWakeMethod(m WakeMethod) *FakeScheduler {
+	f.mu.Lock()
+	f.method = m
+	f.mu.Unlock()
+	return f
+}
+
 // WithLatency sets the simulated cold-wake latency in milliseconds.
 func (f *FakeScheduler) WithLatency(ms int) *FakeScheduler {
 	f.latencyMs = ms
@@ -149,7 +261,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, bool, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, int32, bool, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond
@@ -157,13 +269,14 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	nodeID := f.nodeID
 	instanceOverride := f.instanceID
 	wakeOverride := f.wakeID
+	method := f.method
 	f.mu.Unlock()
 
 	if latency > 0 {
 		select {
 		case <-time.After(latency):
 		case <-ctx.Done():
-			return "", "", "", false, ctx.Err()
+			return "", "", "", 0, false, ctx.Err()
 		}
 	}
 
@@ -178,7 +291,20 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	if wakeID == "" {
 		wakeID = instanceID
 	}
-	return instanceID, nodeID, wakeID, false, err
+	// Translate the typed WakeMethod to the wire-shape int32 the
+	// Scheduler interface returns. The mapping mirrors the protobuf
+	// wire values (WAKE_COLD_BOOT = 0, WAKE_RESTORE = 1) so a test
+	// that sets WithWakeMethod(WakeMethodSnapshotRestore) reaches
+	// pgbackend.go's scheddWakeMethodToGateway as WireWakeRestore
+	// and resolves to WakeMethodSnapshotRestore on the gateway side.
+	var rawMethod int32
+	switch method {
+	case WakeMethodSnapshotRestore:
+		rawMethod = WireWakeRestore
+	default:
+		rawMethod = WireWakeColdBoot
+	}
+	return instanceID, nodeID, wakeID, rawMethod, false, err
 }
 
 // itoa renders a uint64 as a base-10 string without importing strconv into
