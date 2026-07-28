@@ -493,6 +493,14 @@ explicitly open issues that the doc otherwise implies are closed.
 These are still open on GitHub. Earlier revisions of this file
 sometimes implied they were closed; they aren't.
 
+- ~~**#254** — App logs SSE stream is a stub (tier-1 ship-blocker).
+  Move 4: per-instance ring + schedd StreamAppLogs RPC + vmmd
+  Logs RPC end-to-end. Consumer side (Move 3, PR #291) shipped.
+  Producer side (per-instance ring + schedd fan-out + vmmd Logs
+  RPC + apid handler) shipped in this PR; ADR-043 records the
+  decision. The follow-up PR wires the production schedd
+  StreamAppLogs in cmd/apid so the apid stub is replaced by the
+  real fan-out.~~ *(closed by Move 4 — see ADR-043)*
 - **#144** — `NftResetCommands` missing ip6 reset (snapshot-restore
   Wake fails on second add).
 - ~~**#146** — host egress chain deny lines were dead-code; the
