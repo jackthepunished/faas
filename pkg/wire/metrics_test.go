@@ -303,6 +303,49 @@ func TestOpsMetrics_ObserveScaleDownNilSafe(t *testing.T) {
 	m.ObserveScaleDown("a1", "park")
 }
 
+// TestOpsMetrics_ObserveLogEmitted (issue #254, Move 4) — the per-app
+// SSE log frame counter increments on each ObserveLogEmitted call and
+// the value surfaces in /metrics under apid_logs_emitted_total{app}.
+// Pins the wire path end-to-end so an accidental rename in the metric
+// name or the label set trips the test before the dashboard panel
+// goes dark.
+//
+// The series is registered on every daemon (single-registry pattern,
+// per memory wire-opsmetrics-single-registry); the test constructs an
+// apid-flavored OpsMetrics so the absolute metric name matches the
+// production path.
+func TestOpsMetrics_ObserveLogEmitted(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.ObserveLogEmitted("app-1")
+	m.ObserveLogEmitted("app-1")
+	m.ObserveLogEmitted("app-2")
+
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_logs_emitted_total{app="app-1"} 2`,
+		`apid_logs_emitted_total{app="app-2"} 1`,
+		// The metric is registered on every daemon (including apid),
+		// so the HELP/TYPE must surface in /metrics from boot — even
+		// before any frame has been emitted. Verifies the
+		// commonCollectors append was applied.
+		`# HELP apid_logs_emitted_total`,
+		`# TYPE apid_logs_emitted_total counter`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_ObserveLogEmittedNilSafe — handlers without a
+// metrics registry (unit tests, throwaway scripts) must not panic
+// when the SSE handler renders its first frame. Same nil-receiver
+// contract as the other Observers.
+func TestOpsMetrics_ObserveLogEmittedNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	m.ObserveLogEmitted("app-1")
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration

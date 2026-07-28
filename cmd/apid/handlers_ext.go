@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // --- apps CRUD --------------------------------------------------------------
@@ -2074,7 +2075,7 @@ func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flush
 			}
 			return
 		}
-		writeAppLogEvent(w, flusher, frame)
+		writeAppLogEvent(w, flusher, frame, appID, s.ops)
 	}
 }
 
@@ -2083,7 +2084,13 @@ func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flush
 // field Move 4 pinned (acceptance #5):
 //
 //	{seq, instance, stream, line, written_at}
-func writeAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f schedLogFrame) {
+//
+// The appID argument is plumbed through so we can also
+// increment apid_logs_emitted_total{app=appID} per frame —
+// the §12 dashboard panel needs the per-app throughput rate.
+// nil-safe: a nil ops no-ops (per ObserveLogEmitted receiver
+// contract) so unit tests that don't wire metrics keep working.
+func writeAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f schedLogFrame, appID string, ops *wire.OpsMetrics) {
 	payload, _ := json.Marshal(map[string]any{
 		"seq":        f.Seq,
 		"instance":   f.InstanceID,
@@ -2095,6 +2102,7 @@ func writeAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f schedLogFra
 	if flusher != nil {
 		flusher.Flush()
 	}
+	ops.ObserveLogEmitted(appID)
 }
 
 // renderAppLogsError renders a schedd-side dial error as either
