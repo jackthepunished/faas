@@ -25,6 +25,8 @@ export type { AuditEventResponse } from './models/AuditEventResponse.js';
 export type { BuildExportResponse } from './models/BuildExportResponse.js';
 export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.js';
 export type { ChangePlanRequest } from './models/ChangePlanRequest.js';
+export type { ConsumedCreditRow } from './models/ConsumedCreditRow.js';
+export type { ConsumeInvoiceResponse } from './models/ConsumeInvoiceResponse.js';
 export type { CookieSession } from './models/CookieSession.js';
 export type { CreateAppRequest } from './models/CreateAppRequest.js';
 export type { CreateCronRequest } from './models/CreateCronRequest.js';

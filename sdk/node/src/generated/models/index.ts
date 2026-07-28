@@ -19,6 +19,8 @@ export type { AuditEventResponse } from './AuditEventResponse.js';
 export type { BuildExportResponse } from './BuildExportResponse.js';
 export type { BuildProvenanceResponse } from './BuildProvenanceResponse.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
+export type { ConsumeInvoiceResponse } from './ConsumeInvoiceResponse.js';
+export type { ConsumedCreditRow } from './ConsumedCreditRow.js';
 export type { CookieSession } from './CookieSession.js';
 export type { CreateAppRequest } from './CreateAppRequest.js';
 export type { CreateCronRequest } from './CreateCronRequest.js';
