@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,8 +26,3 @@ type stubScheddClient struct{}
 func (stubScheddClient) StreamAppLogs(_ context.Context, _ string, _ int64) (schedLogStream, error) {
 	return nil, status.Error(codes.Unimplemented, "schedd not wired (dev mode)")
 }
-
-// errScheddClosed is the sentinel returned by stubScheddStream
-// when a caller Recv's on a closed stream. Kept here so the
-// SSE handler can branch on "stream ended normally" vs "error".
-var errScheddClosed = errors.New("schedd stream closed")

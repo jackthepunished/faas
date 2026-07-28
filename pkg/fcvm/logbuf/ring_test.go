@@ -86,12 +86,13 @@ func TestRing_SnapshotSince(t *testing.T) {
 //   - 3 commits: 3×17 = 51 ≤ 64 → no eviction, 3 retained.
 //   - 4th commit: totalBytes=51, line=17 → 68 > 64, so evict 1 → retain 3 lines.
 //   - 5th commit: totalBytes=51, evict 1, retain 3 lines.
+//
 // We assert the buffer holds exactly 3 lines (the most recent three)
 // regardless of how many commits we make beyond the budget, and the
 // retained sequence numbers are consecutive from the latest committed.
 func TestRing_Wraparound(t *testing.T) {
 	const (
-		ringBytes = 64
+		ringBytes  = 64
 		payloadLen = 17 // stored line length; does not include the '\n' terminator
 	)
 	r := New(ringBytes)
@@ -164,7 +165,6 @@ func TestRing_PartialLine(t *testing.T) {
 // len(payload)+1. Determinism here is the test property: a flaky ring
 // (lost line, duplicated line) fails on the count mismatch.
 func TestRing_DeterminismMB(t *testing.T) {
-	const total = 1 << 20
 	r := New(8 << 20) // 8 MiB cap, plenty of headroom for 1 MiB payload
 	var buf [8]byte
 	for i := 0; i < 131072; i++ {
