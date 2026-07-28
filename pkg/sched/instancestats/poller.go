@@ -266,7 +266,7 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			row.CPUUsageUsec = uint64(*in.CPUSeconds * 1e6)
 			row.CPUHour = *in.CPUSeconds / 3600.0
 		}
-		// CpuThrottledSeconds (issue #301 / ADR-042): cumulative
+		// CpuThrottledSeconds (issue #301 / ADR-043): cumulative
 		// CPU-throttled-seconds from vmmd's cpustats cache. nil
 		// means no baseline yet — the poller leaves ThrottledUsec
 		// at NaN so the rollup's regression-handling branch

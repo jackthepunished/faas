@@ -172,7 +172,7 @@ type VMInstanceStat struct {
 	// maps nil → Unknown / NaN on the wire row and
 	// instancestats.InstanceStat.
 	CPUSeconds *float64
-	// CpuThrottledSeconds (issue #301 / ADR-042) is the
+	// CpuThrottledSeconds (issue #301 / ADR-043) is the
 	// cumulative CPU-throttled-seconds reading from vmmd's
 	// cpustats cache. Same nil-contract as CPUSeconds — nil
 	// on the wire when the cache has no baseline for the

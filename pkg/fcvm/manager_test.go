@@ -201,7 +201,7 @@ func TestWakeColdBoot_DoesNotInvokeResumeHook(t *testing.T) {
 }
 
 // TestWakeRejectsEmptyPlan pins the up-front Plan validation
-// (issue #301 / ADR-042). A wire call with req.Plan = "" must fail
+// (issue #301 / ADR-043). A wire call with req.Plan = "" must fail
 // BEFORE bringUp runs — otherwise the VM would boot under the
 // legacy 2-level path (ParentCgroupFor("") = defaultParentCgroup),
 // silently disabling cpu.weight + cpu.max enforcement for that

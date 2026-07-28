@@ -503,13 +503,13 @@ type CreateFromSnapshotRequest struct {
 	Instance string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
 	App      *AppSpec               `protobuf:"bytes,2,opt,name=app,proto3" json:"app,omitempty"`
 	Snapshot *SnapshotRef           `protobuf:"bytes,3,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	// Plan (issue #301, ADR-042) is the apps row's owning plan tier.
+	// Plan (issue #301, ADR-043) is the apps row's owning plan tier.
 	// Drives the per-plan cgroup hierarchy
 	// (faas-tenant.slice/<plan-slice>/<instance>) and the cpu.weight /
 	// cpu.max enforcement. Empty = legacy 2-level path (pre-#301
 	// callers); new callers must always populate this.
 	Plan string `protobuf:"bytes,4,opt,name=plan,proto3" json:"plan,omitempty"`
-	// AccountID (issue #301, ADR-042) is the apps row's owning
+	// AccountID (issue #301, ADR-043) is the apps row's owning
 	// account id. Threads onto the wire so vmmd can label the
 	// vmmd_cpu_throttle_seconds_total{account_id, app_id} counter
 	// and the throttle top-N admission primitive (topAppSet, cap
@@ -594,11 +594,11 @@ type CreateColdBootRequest struct {
 	// drive1 export during Destroy and the build manifest is left untouched on
 	// drive1 (builderd's CreateBuildDrive1 wrote it). Spec §4.5, ADR-003.
 	Build *BuildSpec `protobuf:"bytes,3,opt,name=build,proto3" json:"build,omitempty"`
-	// Plan (issue #301, ADR-042) — same semantics as
+	// Plan (issue #301, ADR-043) — same semantics as
 	// CreateFromSnapshotRequest.plan. Empty = legacy 2-level path;
 	// new callers must always populate this.
 	Plan string `protobuf:"bytes,4,opt,name=plan,proto3" json:"plan,omitempty"`
-	// AccountID (issue #301, ADR-042) — same semantics as
+	// AccountID (issue #301, ADR-043) — same semantics as
 	// CreateFromSnapshotRequest.account_id.
 	AccountId     string `protobuf:"bytes,5,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1093,7 +1093,7 @@ type InstanceStats struct {
 	// not a per-tick gauge). The field is additive and informational;
 	// no billing path consumes it yet (issue #279 follow-up).
 	CpuSeconds *wrapperspb.DoubleValue `protobuf:"bytes,8,opt,name=cpu_seconds,json=cpuSeconds,proto3" json:"cpu_seconds,omitempty"`
-	// PR-D (issue #301, ADR-042): cumulative CPU-throttled seconds
+	// PR-D (issue #301, ADR-043): cumulative CPU-throttled seconds
 	// consumed by this instance's cgroup since the cpustats cache
 	// was last reset, i.e. Σ(throttled_usec delta) / 1e6 across
 	// the cache's lifetime. Reads from the same cpu.stat file as

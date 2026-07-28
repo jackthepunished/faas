@@ -988,7 +988,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// outcome rows above. Real per-(app, node) rows are added by
 	// the rollup in ReplaceInstanceStats.
 	instanceCPUSecondsTotal.WithLabelValues("", "")
-	// issue #301 (ADR-042, per-plan CPU fairness observability):
+	// issue #301 (ADR-043, per-plan CPU fairness observability):
 	// pre-instantiate the ("other", "other") overflow row so the
 	// dashboard panel selector {app_id!="other"} never sees "no
 	// data" — same precedent as instanceCPUSecondsTotal above and
@@ -1314,7 +1314,7 @@ func (m *OpsMetrics) TopAppSet() *topAppSet {
 
 // AppKeyForTest builds the composite (account_id, app_id) key
 // matching what the rollup uses internally. Test-only seam
-// (issue #301 / ADR-042) so pkg/sched/instancestats/poller_test.go
+// (issue #301 / ADR-043) so pkg/sched/instancestats/poller_test.go
 // can index SnapshotAppCounts() without exporting the unexported
 // appKey struct to the public surface. Mirrors the
 // TestAdvanceAppClock / ThrottleSecondsLastSeenForTest pattern:
@@ -1417,7 +1417,7 @@ func (m *OpsMetrics) EmitTopAppThrottle(perAppThrottleSeconds func(accountID, ap
 
 // ThrottleSecondsLastSeenForTest exposes the per-(account_id,
 // app_id) baseline microseconds the rollup last observed via
-// ReplaceInstanceStats. Test-only seam (issue #301 / ADR-042)
+// ReplaceInstanceStats. Test-only seam (issue #301 / ADR-043)
 // used by pkg/sched/instancestats/poller_test.go to assert the
 // schedd-side poller correctly fed the baseline after decoding
 // the wire field CpuThrottledSeconds. The empty-account case
