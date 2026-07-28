@@ -2295,12 +2295,16 @@ func TestStreamAppLogs_StubDegradedFrame(t *testing.T) {
 
 // TestStreamAppLogs_AcceptsFilterQueryParams pins issue #309's wire
 // contract: --grep / --since / --level reach the handler as query
-// params and are accepted by the Move 3 stub. Today the params are
-// advisory (the stub does not act on them yet) but the contract
-// MUST stay stable so neither the SDK URL builder nor the CLI flag
-// set needs to change when Move 4 replaces the body. The
-// `not_implemented` + `end` frames still fire so existing SDK
-// consumers and TestStreamAppLogs_NotImplementedFrame stay green.
+// params and are accepted without error so neither the SDK URL
+// builder nor the CLI flag set needs to change. Move 4 (issue #254)
+// reads them and applies them against the per-instance ring; today
+// the params pass through validation only — the actual server-side
+// filtering is a follow-up (the ring's `Write`/`Subscribe` surface
+// carries a per-line `level` already, the substring matcher is the
+// next step). The stub returns codes.Unimplemented → `event:
+// degraded` + `event: end`, mirroring TestStreamAppLogs_StubDegradedFrame
+// — only the validation path differs (the handler must NOT short-
+// circuit on a valid filter, so the stub frame still fires).
 func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	dep := mustSeedDeployment(t, e, "stub-logs-filter")
@@ -2319,10 +2323,11 @@ func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 	body := rec.Body.String()
-	// The existing Move 3 frames must still appear — params are
-	// advisory today (Move 4 acts on them).
-	if !strings.Contains(body, "event: not_implemented") {
-		t.Errorf("body missing not_implemented frame:\n%s", body)
+	// Move 4 stub: valid filter params pass through validation, so
+	// the degraded frame is the stub's "schedd not wired" signal —
+	// NOT a `not_implemented` (Move 3 wire shape, obsolete).
+	if !strings.Contains(body, "event: degraded") {
+		t.Errorf("body missing degraded frame (stub should fire on valid filters):\n%s", body)
 	}
 	if !strings.Contains(body, "event: end") {
 		t.Errorf("body missing end frame:\n%s", body)
