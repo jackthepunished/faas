@@ -706,10 +706,20 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// The wrapped rErr names the failure mode (vsock dial timeout vs
 			// ack-nack vs /snapshot/load failure) so the operator doesn't have
 			// to dig through vmm.go to find out why the resume hook fired.
+			//
+			// PR scale-out readiness (4-PR #2): the desired_/snapshot_
+			// fc_version fields are the cross-node diagnostic for the day
+			// a snapshot made on node A is loaded on node B. They reach
+			// this Warn only when PlanWake returned WakeRestore (which
+			// already passed Usable() — FCVersion was equal) AND Restore
+			// failed; a pure version mismatch takes the cold-boot path
+			// through BootColdBoot below without firing here.
 			m.log.Warn("restore failed, falling back to cold boot",
 				"instance", req.Instance,
 				"err", rErr,
-				"slot", lease.Slot)
+				"slot", lease.Slot,
+				"desired_fc_version", m.fcVersion,
+				"snapshot_fc_version", req.Snapshot.FCVersion)
 			m.metrics.ObserveFallback()
 			_ = m.vmm.Kill(ctx, lease)
 		}

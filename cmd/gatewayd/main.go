@@ -160,7 +160,11 @@ type runDeps struct {
 	apidLoopback string
 	// nodeCache holds the per-node *grpc.ClientConn cache plus the
 	// compute_node_changed pg_notify subscriber (issue #98 / ADR-028).
-	// nil in tests; production wires it after pgStore opens.
+	// nil in tests; production wires it after pgStore opens. PR
+	// scale-out readiness: also the sink for the heartbeat goroutine
+	// that bumps gateway_compute_node_changed_subscriber_alive every
+	// subscriberHeartbeatInterval (30s); newNodeCache receives
+	// deps.metrics for this purpose.
 	nodeCache *nodeCache
 	// pgStore is the shared state.Store; used by the githubd proxy
 	// for the issue #294 replay dedupe and by the gatewayd audit
@@ -342,7 +346,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
-	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log)
+	// PR scale-out readiness: thread *gateway.Metrics into the node
+	// cache so the WatchEvictions heartbeat goroutine has a sink for
+	// gateway_compute_node_changed_subscriber_alive. deps.metrics is
+	// always non-nil after NewMetrics (cmd/gatewayd/main.go:284).
+	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	deps.pgStore = pgStore
 	return runWithDeps(ctx, log, deps)

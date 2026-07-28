@@ -1,9 +1,12 @@
 package fcvm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1854,5 +1857,139 @@ func TestUpdateEgressAllowlist_V6FailureLeavesV4Untouched(t *testing.T) {
 	if v4AddCount != 1 {
 		t.Errorf("v4 add ran %d times; want 1 (no revert of v4 success); commands: %v",
 			v4AddCount, run.commands)
+	}
+}
+
+// PR scale-out readiness (4-PR #2) — Warn field tests.
+//
+// newTestManagerWithLog mirrors newTestManager but threads a
+// caller-supplied *slog.Logger into NewManager so the test can
+// capture the JSON-encoded Warn lines and assert on structured
+// fields. newTestManager still passes nil log (NewManager falls back
+// to a discard handler), so existing tests are unaffected.
+func newTestManagerWithLog(run Runner, vmm VMM, log *slog.Logger) *Manager {
+	return NewManager(run, vmm, Paths{Kernel: "/srv/fc/base/vmlinux-6.1"}, testFCVersion, log, nil)
+}
+
+// captureWarningLog returns a slog JSON handler bound to the supplied
+// bytes.Buffer. Mirrors the inline slog-capture idiom used in
+// pkg/gateway/synth_integration_test.go:38-41,
+// pkg/middleware/middleware_test.go:314, pkg/mail/mail_test.go:27.
+// LevelDebug is used so a future Debug-level addition doesn't cause
+// a test to silently miscount records.
+func captureWarningLog(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// findRecord returns the FIRST slog record whose "msg" field equals
+// msg. Returns ok=false when the buffer contains no matching record.
+// Anchors are bracket-exact to avoid accidental substring matches in
+// field values (e.g. "restore failed" inside an error message).
+func findRecord(t *testing.T, buf *bytes.Buffer, msg string) (map[string]any, bool) {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(buf.Bytes()))
+	for {
+		var rec map[string]any
+		if err := dec.Decode(&rec); err != nil {
+			return nil, false
+		}
+		if got, _ := rec["msg"].(string); got == msg {
+			return rec, true
+		}
+	}
+}
+
+// TestManagerRestoreFallbackLogIncludesFCVersions (PR scale-out
+// readiness, 4-PR #2) — the post-`PlanWake==WakeRestore` + failed
+// `Restore` Warn at manager.go:709 carries the desired_fc_version
+// (= m.fcVersion) and snapshot_fc_version (= req.Snapshot.FCVersion)
+// fields. Both fields must equal testFCVersion because the
+// usableSnapshot() helper matches the Manager version.
+func TestManagerRestoreFallbackLogIncludesFCVersions(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{restoreErr: fmt.Errorf("snapshot corrupt")}
+	var buf bytes.Buffer
+	m := newTestManagerWithLog(run, vmm, captureWarningLog(&buf))
+
+	inst, err := m.Wake(context.Background(), WakeRequest{
+		Instance: "fb", BaseKey: "/b.ext4", LayerKey: "/l.ext4",
+		VcpuCount: 2, MemSizeMiB: 128,
+		Plan:     api.PlanHobby,
+		Snapshot: usableSnapshot(),
+	})
+	if err != nil {
+		t.Fatalf("Wake after restore-fail: %v", err)
+	}
+	if inst.Method != WakeColdBoot {
+		t.Errorf("method = %v, want WakeColdBoot (fallback)", inst.Method)
+	}
+
+	rec, ok := findRecord(t, &buf, "restore failed, falling back to cold boot")
+	if !ok {
+		t.Fatalf("restore-fallback Warn not in log:\n%s", buf.String())
+	}
+	for _, field := range []string{"desired_fc_version", "snapshot_fc_version"} {
+		got, _ := rec[field].(string)
+		if got != testFCVersion {
+			t.Errorf("%s = %q, want %q (Manager fcVersion / snapshot FCVersion)", field, got, testFCVersion)
+		}
+	}
+	if got, _ := rec["instance"].(string); got != "fb" {
+		t.Errorf("instance = %q, want fb", got)
+	}
+}
+
+// TestManagerVersionMismatchSkipsFallbackLog (PR scale-out readiness,
+// 4-PR #2) — when req.Snapshot has FCVersion != m.fcVersion,
+// PlanWake() returns WakeColdBoot directly via Usable's
+// snap.FCVersion != currentFCVersion check (snapshot.go:81-86 +
+// snapshot.go:58); Restore is never called and the fallback Warn
+// never fires. This pins the invariant the new fields rely on:
+// the warn only reaches operators on a "restore failed after
+// version matched", not on a version mismatch (which is silent and
+// is the intended cold-boot behavior).
+//
+// Inline snapshot construction here only — no mismatchedFCSnapshot()
+// helper exists because the helper would have to mutate the snapshot
+// to force the Warn path, which would require weakening PlanWake
+// (anti-goal in the plan).
+func TestManagerVersionMismatchSkipsFallbackLog(t *testing.T) {
+	run := &fakeRunner{}
+	vmm := &fakeVMM{restoreErr: fmt.Errorf("snapshot corrupt")}
+	var buf bytes.Buffer
+	m := newTestManagerWithLog(run, vmm, captureWarningLog(&buf))
+
+	// Inline mismatched snapshot. DeploymentID + paths are irrelevant
+	// — PlanWake bails on the FC version check before any io
+	// operation. usableSnapshot would set FCVersion = testFCVersion
+	// which doesn't exercise the gate; deliberately diverge here.
+	mismatchSnap := &Snapshot{
+		DeploymentID: "d1",
+		FCVersion:    testFCVersion + "-other",
+		StorageKey:   "snap/d1/mem",
+		VMStatePath:  "/snap/state",
+	}
+
+	inst, err := m.Wake(context.Background(), WakeRequest{
+		Instance: "fb", BaseKey: "/b.ext4", LayerKey: "/l.ext4",
+		VcpuCount: 2, MemSizeMiB: 128,
+		Plan:     api.PlanHobby,
+		Snapshot: mismatchSnap,
+	})
+	if err != nil {
+		t.Fatalf("Wake on version-mismatch: %v", err)
+	}
+	if inst.Method != WakeColdBoot {
+		t.Errorf("method = %v, want WakeColdBoot (PlanWake took the cold-boot path)", inst.Method)
+	}
+	if n := len(vmm.restored); n != 0 {
+		t.Errorf("Restore invoked on version-mismatch snapshot: count=%d (PlanWake must skip)", n)
+	}
+
+	// The Warn must NOT fire. Scan the entire buffer; any
+	// "restore failed, falling back to cold boot" record fails the
+	// test.
+	if _, found := findRecord(t, &buf, "restore failed, falling back to cold boot"); found {
+		t.Errorf("restore-fallback Warn fired on version-mismatch path (must be PlanWake-only):\n%s", buf.String())
 	}
 }

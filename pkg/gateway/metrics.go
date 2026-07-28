@@ -35,6 +35,14 @@
 //     remote_* outcomes slot in transparently when the second compute
 //     node joins — pins the wake-locality ratio so the sticky-vs-shared
 //     snapshot-store decision is a measurement, not a guess)
+//   - gateway_compute_node_changed_subscriber_alive  unlabelled gauge (PR
+//     scale-out readiness; bumped every 30s by the LISTEN
+//     compute_node_changed subscriber loop in cmd/gatewayd/nodecache.go.
+//     Stale gauge means the NodeClientCache is silently out of date and
+//     the next compute_nodes UPSERT is invisible to placement — page
+//     rule fires when the gauge freezes or drops to 0. The hook is the
+//     OBSERVABILITY point; the alert rule + dashboard panel + window
+//     choice live in ops wiring, out of scope for this PR.)
 package gateway
 
 import (
@@ -120,6 +128,18 @@ type Metrics struct {
 	// ObserveWakeLocality wrapper so the Handler hot path doesn't need
 	// to gate on every call.
 	wakeLocality *prometheus.CounterVec
+	// computeNodeChangedSubscriberAlive is the per-process liveness
+	// gauge for the LISTEN compute_node_changed subscriber loop
+	// (cmd/gatewayd/nodecache.go:102-141). PR scale-out readiness:
+	// bumped every `subscriberHeartbeatInterval` (30s) while the
+	// subscriber is alive. On ctx cancel, channel close, or the
+	// initial subscribe failure, the heartbeat goroutine stops and
+	// the gauge freezes at its last value — operators see "I'm stale"
+	// without a separate series per channel. Unlabelled: cardinality
+	// is per-process, not per node / channel / daemon. Nil-safe via
+	// TouchComputeNodeChangedSubscriber so cmd/gatewayd's wiring can
+	// pass nil *Metrics in tests without a guarded call site.
+	computeNodeChangedSubscriberAlive prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -233,6 +253,20 @@ func NewMetrics() *Metrics {
 			Name: "gateway_wake_locality_total",
 			Help: "Wake-outcome classifier used to drive the sticky-vs-shared snapshot-store decision. outcome ∈ {local_snapshot, local_coldboot} today; remote_* outcomes slot in when a second compute node joins. Counting is restricted to admissions that actually brought up an instance — warm requests and at-capacity benign outcomes are not enumerated.",
 		}, []string{"outcome"}),
+		// PR scale-out readiness — liveness gauge for the LISTEN
+		// compute_node_changed subscriber. Bumped every
+		// `subscriberHeartbeatInterval` (30s) by the goroutine in
+		// cmd/gatewayd/nodecache.go.WatchEvictions; the gauge freezes
+		// at its last value when the heartbeat goroutine ends
+		// (ctx cancel / channel close / initial subscribe failure)
+		// so a frozen gauge is the "subscriber died" signal. Series
+		// is absent before the first tick — the alert expression
+		// handles absent correctly the same way it does for
+		// gateway_tls_cert_expiry_seconds (H3, closed in PR #345).
+		computeNodeChangedSubscriberAlive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gateway_compute_node_changed_subscriber_alive",
+			Help: "Liveness gauge for the LISTEN compute_node_changed subscriber loop in cmd/gatewayd/nodecache.go. Bumped every subscriberHeartbeatInterval (30s) while the subscriber is alive. A frozen or zero gauge means the NodeClientCache is silently out of date and the next compute_nodes UPSERT is invisible to placement. The hook is the observability point; the alert rule + window choice live in ops wiring, out of scope for this PR.",
+		}),
 	}
 	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
 	// the gauge surfaces from boot, mirroring the apid precedent
@@ -273,7 +307,7 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied, m.wakeLocality)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive)
 	return m
 }
 
@@ -378,6 +412,31 @@ func (m *Metrics) ObserveWakeLocality(outcome string) {
 		return
 	}
 	m.wakeLocality.WithLabelValues(outcome).Inc()
+}
+
+// TouchComputeNodeChangedSubscriber bumps the subscriber-liveness gauge
+// by 1. Called every `subscriberHeartbeatInterval` (30s, see
+// cmd/gatewayd/nodecache.go) by the heartbeat goroutine that mirrors
+// StartCertExpiryRefresher. The gauge value is monotonically
+// increasing until the heartbeat goroutine ends (ctx cancel / channel
+// close / initial subscribe failure) — the freeze is the "I'm stale"
+// signal. The exact value is irrelevant; the alert cares about
+// "frozen or still 0", not "=N". Gauge starts unset (Prometheus drops
+// NaN) so the panel row is absent before the first tick; the
+// freeze-detection rule will handle absent correctly the same way it
+// does for gateway_tls_cert_expiry_seconds.
+//
+// The Prometheus rule itself (window, expression, severity) is ops
+// wiring and out of scope for this PR. The hook is the
+// observability point.
+//
+// Nil-safe: cmd/gatewayd tests may pass a nil *Metrics. Production
+// passes deps.metrics which is always non-nil after NewMetrics.
+func (m *Metrics) TouchComputeNodeChangedSubscriber() {
+	if m == nil || m.computeNodeChangedSubscriberAlive == nil {
+		return
+	}
+	m.computeNodeChangedSubscriberAlive.Inc()
 }
 
 // TopTenantRPSEmit drives the gateway_top_tenant_rps gauge from
