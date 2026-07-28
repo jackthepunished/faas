@@ -69,7 +69,7 @@ func newSessionEnv(t *testing.T) sessionTestEnv {
 	}
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
-		nil, 15*60_000_000_000, "").WithOpsMetrics(wire.NewOpsMetrics("apid_iam3_test"))
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), wire.NewOpsMetrics("apid_iam3_test"))
 	return sessionTestEnv{
 		h:         srv.handler(),
 		srv:       srv,

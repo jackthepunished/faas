@@ -135,7 +135,7 @@ func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state
 	ops := wire.NewOpsMetrics("apid_mfa_middleware_test")
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
-		nil, 15*60_000_000_000, "").WithOpsMetrics(ops)
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
 	return srv.handler(), acct, mgr, sid
 }
 
