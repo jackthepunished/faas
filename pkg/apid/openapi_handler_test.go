@@ -64,13 +64,6 @@ func first40(b []byte) string {
 	return string(b)
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // TestOpenAPIYAML_NotEmpty is a smoke test on the package-level getter:
 // the embed succeeded and the YAML is non-trivial.
 func TestOpenAPIYAML_NotEmpty(t *testing.T) {

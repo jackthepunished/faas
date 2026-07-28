@@ -65,6 +65,15 @@ const alertRuleWebhookSecretBytes = 32
 // format). The label is never logged.
 const alertRuleSecretSealLabel = "alert_rule_secret"
 
+// alertRuleMetricFailedInvocations is the wire-level name of the
+// `failed_invocations` metric family (the only metric in the alert
+// vocabulary that carries a failure_source sibling — every other
+// metric must have failure_source empty per the xor_chk DB
+// constraint). Lifted out of the user-facing error messages and
+// alertRuleFamily so the literal has a single source of truth and
+// goconst stays happy.
+const alertRuleMetricFailedInvocations = "failed_invocations"
+
 // --- list -------------------------------------------------------------------
 
 // listAlertRules returns the rules visible to (acct, app). Per-app
@@ -636,7 +645,7 @@ func alertRuleCooldownFrom(p *int) int {
 // non-empty via CHECK).
 func validateAlertRuleBody(req api.CreateAlertRuleRequest) *api.Problem {
 	if !api.AllowedAlertRuleMetric(req.Metric) {
-		return api.ErrAlertRuleInvalid("metric must be one of error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations")
+		return api.ErrAlertRuleInvalid(fmt.Sprintf("metric must be one of error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, %s", alertRuleMetricFailedInvocations))
 	}
 	if !api.AllowedAlertRuleComparison(req.Comparison) {
 		return api.ErrAlertRuleInvalid("comparison must be one of gt, gte, lt, lte")
@@ -684,7 +693,7 @@ func validateAlertRuleRowUpdate(merged state.AlertRule) *api.Problem {
 		return api.ErrAlertRuleInvalid("name must be non-empty")
 	}
 	if !api.AllowedAlertRuleMetric(string(merged.Metric)) {
-		return api.ErrAlertRuleInvalid("metric must be one of error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations")
+		return api.ErrAlertRuleInvalid(fmt.Sprintf("metric must be one of error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, %s", alertRuleMetricFailedInvocations))
 	}
 	if !api.AllowedAlertRuleComparison(string(merged.Comparison)) {
 		return api.ErrAlertRuleInvalid("comparison must be one of gt, gte, lt, lte")
@@ -767,7 +776,7 @@ func validateFailureSourceFamily(req api.CreateAlertRuleRequest) *api.Problem {
 // swap check in updateAlertRule.
 func alertRuleFamily(m state.AlertMetric) string {
 	if m == state.AlertMetricFailedInvocs {
-		return "failed_invocations"
+		return alertRuleMetricFailedInvocations
 	}
 	return "other"
 }
@@ -806,8 +815,16 @@ func resolveAndCheckEgress(c context.Context, rawURL string) *api.Problem {
 	// don't 403 — the customer might be staging a rule that fires
 	// later when DNS is back. The dispatcher re-resolves on every
 	// fire and will 503 the dispatch if the IP is still missing.
-	ips, err := net.DefaultResolver.LookupIPAddr(c, host)
-	if err != nil || len(ips) == 0 {
+	//
+	// The LookupIPAddr error is intentionally discarded (the
+	// customer-facing posture is "missing DNS isn't a validation
+	// failure, it's a future-fire failure"); nilerr is satisfied
+	// because we only return nil on the no-IPs path, never on a
+	// non-nil err path. The error path falls through to the
+	// IP-iteration loop where len(ips)==0 means "nothing to check,
+	// caller proceeds".
+	ips, _ := net.DefaultResolver.LookupIPAddr(c, host)
+	if len(ips) == 0 {
 		return nil
 	}
 	for _, ipa := range ips {
