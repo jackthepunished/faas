@@ -1220,8 +1220,14 @@ func cmdLogs(args []string) int {
 			if !ok {
 				return 0
 			}
-			if e.Event == "not_implemented" {
-				fmt.Fprintln(os.Stderr, "vmmd Logs(req) gRPC pending — Move 4")
+			// Move 4 (issue #254): the apid stub emits `event: degraded`
+			// when schedd's StreamAppLogs RPC isn't wired yet (the
+			// production-side path is a follow-up PR — this commit only
+			// swaps the Move 3 stub for the real SSE shape on the apid
+			// side). Move 3's `not_implemented` shape is dead code;
+			// removed.
+			if e.Event == "degraded" {
+				fmt.Fprintln(os.Stderr, "schedd StreamAppLogs gRPC pending — production wiring")
 				return 0
 			}
 			if e.Event == "end" {

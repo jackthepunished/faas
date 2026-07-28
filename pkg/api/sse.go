@@ -69,8 +69,8 @@ type LogEvent struct {
 // Move 3 / M7.5: replaces the private sseLineReader in
 // cmd/faas/commands2.go that discarded the `event:` name. The new
 // decoder preserves the name so callers can switch on Event to
-// distinguish `event: log` from `event: not_implemented` from
-// `event: invocation_done` (the three shapes Move 3 ships).
+// distinguish `event: log` from `event: degraded` (the Move 4 stub
+// shape) from `event: invocation_done` (the dashboard's Move 3 frame).
 type Event struct {
 	Event string // "" if absent on the wire
 	Data  string // joined with '\n' if multi-line
