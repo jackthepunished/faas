@@ -45,6 +45,30 @@ var nameRe = regexp.MustCompile(`^(\d+)_(.+)\.sql$`)
 // alongside this PR for new migrations).
 var filenameCommentRe = regexp.MustCompile(`^-- filename:\s*(\S+)\s*$`)
 
+// reservationFilenameRe flags the no-op slot-reservation files ADR-041
+// uses to break 4-way cross-PR slot collisions (issue #366, PRs #335 /
+// #352 / #369 / #389 all wanted slot 56 in the same week). A
+// reservation file does NOT claim a slot — it is metadata that says
+// "I'm holding this slot number; let a real schema land here first,
+// then drop me on merge." Both shapes (the canonical `NNNNN_reserve_slot`
+// and the alt `NNNNN_no_op_slot_reservation` from PR #369) match.
+//
+// Contiguity and unique-prefix checks ignore these files when
+// iterating the embedded set; reservations are tracked separately so
+// the cross-PR gate's behaviour and the local test agree. Mirrors
+// scripts/ci/check_migration_slots.sh::slots_from_paths exactly —
+// keep both regexes in lockstep (the gate has a BATS self-test that
+// asserts this regex matches the fixtures; mirror it here).
+var reservationFilenameRe = regexp.MustCompile(`^[0-9]{5}_(.*_)?(reservation|reserve_slot)(_[^/]*)?\.sql$`)
+
+// isReservationFilename reports whether name is a no-op slot-reservation
+// file per ADR-041. Exported so apply_walk_test.go (external test package)
+// can reuse the rule from a different package without re-importing the
+// regex.
+func isReservationFilename(name string) bool {
+	return reservationFilenameRe.MatchString(name)
+}
+
 // LoadMigrations reads every embedded *.sql file, parses its filename, and
 // returns the set sorted by version. Files that don't match the
 // NNNNN_name.sql pattern are reported via t.Errorf and skipped — they
@@ -94,30 +118,54 @@ func LoadMigrations(t *testing.T) []MigrationFile {
 // embeds a slot the DB is past — the failure mode that bit PR #93's
 // deploy (run 29841378918). The first missing slot is reported; full
 // contiguity is required for the check to pass.
+//
+// Reservation files (NNNNN_reserve_slot.sql, NNNNN_no_op_slot_reservation.sql
+// — see ADR-041) are excluded from the slot counter: their job is to
+// hold a slot for a real schema to land in, so they do NOT occupy a
+// position in the {1..N} sequence. A real schema at the same slot as a
+// reservation file is permitted; the reservation is shadowed by the
+// real schema and is dropped on merge. This mirrors the cross-PR gate
+// (scripts/ci/check_migration_slots.sh::slots_from_paths).
 func TestMigrationsContiguous(t *testing.T) {
 	files := LoadMigrations(t)
 	if len(files) == 0 {
 		t.Fatal("no embedded migrations; embed.go is empty?")
 	}
-	for i, f := range files {
-		want := int64(i + 1)
+	want := int64(1)
+	for _, f := range files {
+		if isReservationFilename(f.Name) {
+			continue // reservations don't occupy a slot
+		}
 		if f.Version != want {
-			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, i+1)
+			t.Errorf("migration slot %d is missing (got %s in position %d); migrations are append-only and contiguous, never skip a slot", want, f.Name, want)
 			return // report first gap, not all
 		}
+		want++
 	}
 }
 
-// TestMigrationsUniquePrefixes asserts no two files share the same NNNNN
-// prefix. A collision here would panic goose at startup with "duplicate
-// version N detected" — a failure mode the repo has hit twice already
-// (PR #73 and PR #83 renumberings). Distinct from contiguity: two files
-// both with prefix 14 would parse but produce the same version, which
-// contiguity alone misses.
+// TestMigrationsUniquePrefixes asserts no two REAL migration files share
+// the same NNNNN prefix. A collision here would panic goose at startup
+// with "duplicate version N detected" — a failure mode the repo has hit
+// twice already (PR #73 and PR #83 renumberings). Distinct from
+// contiguity: two files both with prefix 14 would parse but produce the
+// same version, which contiguity alone misses.
+//
+// Reservation files (ADR-041) are excluded from the duplicate-prefix
+// check. A real schema at the same slot as a reservation is the whole
+// point of the carve-out — the reservation is shadowed by the real
+// schema, and a follow-up commit drops the reservation. Without this
+// exclusion, a PR landing at a slot already held by a reservation
+// would fail locally even though the cross-PR gate clears it, which is
+// the mismatch PR #352 hit on rebase. Mirrors the gate's
+// slots_from_paths.
 func TestMigrationsUniquePrefixes(t *testing.T) {
 	files := LoadMigrations(t)
 	seen := make(map[int64]string, len(files))
 	for _, f := range files {
+		if isReservationFilename(f.Name) {
+			continue // reservations don't claim a slot
+		}
 		if other, dup := seen[f.Version]; dup {
 			t.Errorf("duplicate migration prefix %05d: %s and %s", f.Version, other, f.Name)
 		}
@@ -125,18 +173,106 @@ func TestMigrationsUniquePrefixes(t *testing.T) {
 	}
 }
 
-// TestMigrationsGooseUpDirective asserts every migration file contains a
-// "-- +goose Up" directive. Without it, goose silently skips the file —
-// the table the migration was meant to create simply won't exist. Hard
-// fail: every existing migration has Up today and every future migration
-// must too.
+// TestMigrationsGooseUpDirective asserts every REAL migration file
+// contains a "-- +goose Up" directive. Without it, goose silently skips
+// the file — the table the migration was meant to create simply won't
+// exist. Hard fail: every existing migration has Up today and every
+// future migration must too.
+//
+// Reservation files (ADR-041) are exempted: they are intentionally
+// no-op placeholders that hold a slot for a real schema to land in.
+// They carry "-- +goose Up" + "-- +goose StatementBegin" +
+// "-- +goose StatementEnd" so goose applies them as zero-statement
+// blocks (the SQL body is empty), but the spirit of the rule — every
+// real schema MUST have an Up directive — does not apply. A separate
+// tripwire (TestMigrationsReservationsAreNoOp) asserts that
+// reservations genuinely have no DDL.
 func TestMigrationsGooseUpDirective(t *testing.T) {
 	files := LoadMigrations(t)
 	for _, f := range files {
+		if isReservationFilename(f.Name) {
+			continue // reservations are no-ops by design
+		}
 		if !hasDirective(t, f.Name, "-- +goose Up") {
 			t.Errorf("%s: missing '-- +goose Up' directive; goose will silently skip the file", f.Name)
 		}
 	}
+}
+
+// TestMigrationsReservationsAreNoOp is the tripwire for the ADR-041
+// carve-out: every file matched by reservationFilenameRe must be a
+// genuine no-op (no CREATE / ALTER / DROP / INSERT / UPDATE / DELETE
+// statements inside its Up block). The carve-out exists to let a real
+// schema shadow a reservation at the same slot; if a reservation ever
+// smuggles in real DDL, the carved-out slot is no longer truly free and
+// a subsequent PR at that slot would race with the DDL on apply. The
+// gate's regex matches the same filenames; keep this regex, the gate's
+// regex (slots_from_paths), and the filename convention in lockstep.
+func TestMigrationsReservationsAreNoOp(t *testing.T) {
+	files := LoadMigrations(t)
+	for _, f := range files {
+		if !isReservationFilename(f.Name) {
+			continue
+		}
+		// Reservation must have an Up block (so goose applies it
+		// cleanly and the slot is part of the embedded set), and
+		// the Up body MUST NOT contain DDL keywords.
+		data, err := fs.ReadFile(FS, f.Name)
+		if err != nil {
+			t.Errorf("read %s: %v", f.Name, err)
+			continue
+		}
+		body := extractGooseUpBody(string(data))
+		if body == "" {
+			t.Errorf("%s: no '-- +goose Up' body; goose will skip it and the slot won't be held", f.Name)
+			continue
+		}
+		for _, kw := range []string{"create", "alter", "drop", "insert", "update", "delete", "truncate", "grant", "revoke"} {
+			if containsSQLKeyword(body, kw) {
+				t.Errorf("%s: reservation file contains %q statement; ADR-041 reservations must be no-ops so a real schema can shadow the slot", f.Name, kw)
+			}
+		}
+	}
+}
+
+// extractGooseUpBody returns the SQL between "-- +goose StatementBegin"
+// and "-- +goose StatementEnd" after a "-- +goose Up" line, or "" if
+// the file has no Up block. Trims surrounding whitespace. Defence
+// against a future convention change that drops StatementBegin/End.
+func extractGooseUpBody(content string) string {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	inUp := false
+	inStmt := false
+	var sb strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case strings.HasPrefix(line, "-- +goose Up"):
+			inUp = true
+			continue
+		case strings.HasPrefix(line, "-- +goose Down"):
+			return "" // Down came first; no Up body to read
+		case inUp && strings.HasPrefix(line, "-- +goose StatementBegin"):
+			inStmt = true
+			continue
+		case inUp && inStmt && strings.HasPrefix(line, "-- +goose StatementEnd"):
+			return strings.TrimSpace(sb.String())
+		}
+		if inUp && inStmt {
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+	}
+	return ""
+}
+
+// containsSQLKeyword reports whether body contains `kw` as a SQL token
+// (whole-word, case-insensitive). Avoids false positives like
+// `comment 'description has create in it'`. Reservation files should
+// have empty bodies anyway, so this is belt-and-braces.
+func containsSQLKeyword(body, kw string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, kw+" ") || strings.HasSuffix(lower, kw)
 }
 
 // TestMigrationsGooseDownDirective is a soft warning. Three legacy
