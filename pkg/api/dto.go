@@ -297,6 +297,13 @@ type InstanceResponse struct {
 }
 
 // UsageResponse is one app's monthly usage slice (spec §10).
+//
+// CPUUsageUsec is the cumulative host cgroup CPU-µs this app
+// consumed during the month (issue #279 / PR-B). Measurement
+// only — billing is on plan RAM (spec §4.7). Exposed as
+// cpu_usec (integer) so the dashboard can compute hours lazily
+// without an integer→float→integer round trip; the SDK exposes
+// both the raw integer and the derived CPUHours getter.
 type UsageResponse struct {
 	AppID     string `json:"app_id"`
 	MBSeconds int64  `json:"mb_seconds"`
@@ -304,6 +311,18 @@ type UsageResponse struct {
 	// IncludedGBHours is the included quota for the account's plan at the
 	// requested month; the CLI computes the overage from this and the rows.
 	IncludedGBHours int64 `json:"included_gb_hours"`
+	// CPUUsageUsec is the per-app monthly CPU-µs — informational
+	// only (issue #279 / PR-B). 0 when no meterd sample has
+	// accumulated yet (boot, or the schedd reader has no row for
+	// this app).
+	CPUUsageUsec int64 `json:"cpu_usec"`
+}
+
+// CPUHours returns CPUUsageUsec converted to CPU-hours. 1 hour
+// = 3.6e9 µs. Convenience getter for the SDK and the CLI; the
+// dashboard can compute the same value with `pkg/meter.CPUHours`.
+func (u UsageResponse) CPUHours() float64 {
+	return float64(u.CPUUsageUsec) / 3.6e9
 }
 
 // DeploymentListResponse is the page shape for GET /v1/deployments.
@@ -352,6 +371,23 @@ type Invoice struct {
 type InvoiceListResponse struct {
 	Items      []Invoice `json:"items"`
 	NextBefore string    `json:"next_before,omitempty"`
+}
+
+// --- Account credits (issue #279) -----------------------------------------
+
+// AccountCreditResponse is the wire shape for one row in
+// account_credits. Cents is integer (CLAUDE.md: never float on money).
+// ExpiresAt is RFC 3339 when set; empty when the credit has no
+// expiry. CreatedAt is the issuance timestamp. The handler echoes the
+// row back to the operator on POST /v1/admin/accounts/{id}/credits and
+// on GET /v1/admin/accounts/{id}/credits (list, when it lands).
+type AccountCreditResponse struct {
+	ID             string     `json:"id"`
+	AccountID      string     `json:"account_id"`
+	CentsRemaining int64      `json:"cents_remaining"`
+	Reason         string     `json:"reason"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 }
 
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
@@ -434,12 +470,21 @@ type SetPasswordRequest struct {
 //
 // Overage math: anything above IncludedGBHours is billable at the
 // overage rate in the financial model (€0.01/GB-h). Cents are integer.
+//
+// Issue #279 / PR-B: UsedCPUHours is informational and NOT billed.
+// The billing math is on UsedGBHours (plan RAM + 8 MB per running
+// second). The CPU dimension is a measurement the dashboard will
+// surface in a separate panel without affecting the billing total.
 type UsageSummaryResponse struct {
 	Month           string  `json:"month"`             // YYYY-MM
 	UsedGBHours     float64 `json:"used_gb_hours"`     // Σ mb_seconds / 3_600_000
 	IncludedGBHours int64   `json:"included_gb_hours"` // from plan limits
 	OverageGBHours  float64 `json:"overage_gb_hours"`  // max(0, used - included)
 	OverageCents    int64   `json:"overage_cents"`     // overage * 1.0 (€0.01/GB-h in cents)
+	// UsedCPUHours is the per-month CPU-hours Σ CPUUsageUsec /
+	// 3.6e9. Informational only — billing is on UsedGBHours.
+	// Issue #279 / PR-B.
+	UsedCPUHours float64 `json:"used_cpu_hours"`
 }
 
 // ValidateAppConfig checks a requested app config against its plan caps (spec
@@ -503,11 +548,22 @@ type BuildExportResponse struct {
 
 // UsageExportResponse is the per-month roll-up in the export bundle.
 // `month` is YYYY-MM (matches the dashboard's usage page render).
+// CPUUsageUsec is the per-app monthly CPU-µs — informational
+// only (issue #279 / PR-B). 0 when no meterd sample has
+// accumulated.
 type UsageExportResponse struct {
-	AppID     string `json:"app_id"`
-	Month     string `json:"month"`
-	MBSeconds int64  `json:"mb_seconds"`
-	Requests  int64  `json:"requests"`
+	AppID        string `json:"app_id"`
+	Month        string `json:"month"`
+	MBSeconds    int64  `json:"mb_seconds"`
+	Requests     int64  `json:"requests"`
+	CPUUsageUsec int64  `json:"cpu_usec"`
+}
+
+// CPUHours returns CPUUsageUsec converted to CPU-hours. Mirror
+// of UsageResponse.CPUHours so the export bundle and the API
+// shape stay in lockstep.
+func (u UsageExportResponse) CPUHours() float64 {
+	return float64(u.CPUUsageUsec) / 3.6e9
 }
 
 // APIKeyExportResponse is one row in the export's API key slice.

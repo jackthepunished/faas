@@ -71,37 +71,212 @@ jobs:
             root@${{ secrets.DO_HOST }} 'bash -s' << 'REMOTE'
           set -euo pipefail
 
+          FAAS_SERVICES="apid schedd gatewayd imaged meterd githubd"
+          BINARIES="apid schedd gatewayd imaged meterd githubd faas migrate"
+          # Deliberately NOT under /opt/faas/bin: this dir survives a failed
+          # deploy (so the previous build stays inspectable) and nothing that
+          # globs the binary directory should ever see it.
+          ROLLBACK_DIR=/opt/faas/rollback
+
+          # --- Snapshot the currently-installed binaries -------------------
+          # Without this a bad merge leaves the box crash-looping until a
+          # human notices: the imaged/rootfs regression racked up 18,991
+          # restarts across ~12 h before anyone looked. The deploy now owns
+          # its own undo.
+          rm -rf "${ROLLBACK_DIR}"
+          mkdir -p "${ROLLBACK_DIR}"
+          for bin in ${BINARIES}; do
+            if [[ -f "/opt/faas/bin/${bin}" ]]; then
+              cp -a "/opt/faas/bin/${bin}" "${ROLLBACK_DIR}/${bin}"
+            fi
+          done
+
+          # restart_counts prints "<svc>=<NRestarts>" for every service, so a
+          # crash-loop is detectable as a CHANGING value rather than a state.
+          restart_counts() {
+            local svc
+            for svc in ${FAAS_SERVICES}; do
+              printf '%s=%s ' "${svc}" \
+                "$(systemctl show "faas-${svc}" -p NRestarts --value 2>/dev/null || echo '?')"
+            done
+          }
+
+          # wait_healthy polls until every service is active AND the gateway
+          # answers /healthz, then holds to confirm it STAYS that way.
+          #
+          # The hold is load-bearing. `systemctl is-active` is a point sample,
+          # and a Type=simple daemon that crash-loops is genuinely "active"
+          # for the few hundred ms it takes to reach its fatal error. Sampled
+          # on the real box while imaged was looping:
+          #
+          #   activating activating activating active activating activating
+          #
+          # — "active" ~1 poll in 6. The first version of this gate hit that
+          # window and printed "✓ all services active, gateway healthy" one
+          # second before the verify step failed on the same box. Requiring
+          # NRestarts to be UNCHANGED across the hold is what distinguishes a
+          # started daemon from a looping one.
+          wait_healthy() {
+            local deadline=$((SECONDS + 60)) svc bad before after
+            while (( SECONDS < deadline )); do
+              bad=""
+              for svc in ${FAAS_SERVICES}; do
+                systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
+              done
+              if [[ -z "${bad}" ]] && curl -sf --max-time 5 \
+                   http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+                before="$(restart_counts)"
+                sleep 12
+                after="$(restart_counts)"
+                bad=""
+                for svc in ${FAAS_SERVICES}; do
+                  systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
+                done
+                if [[ -z "${bad}" && "${before}" == "${after}" ]]; then
+                  echo "✓ all services active and stable over 12s (${after})"
+                  return 0
+                fi
+                echo "…not stable yet (restarts ${before}-> ${after}); still polling"
+                continue
+              fi
+              sleep 3
+            done
+            echo "::error::health gate timed out after 60s; unhealthy:${bad:- (gateway /healthz)}"
+            for svc in ${FAAS_SERVICES}; do
+              systemctl is-active --quiet "faas-${svc}" || {
+                echo "--- faas-${svc} ---"
+                journalctl -u "faas-${svc}" -n 30 --no-pager || true
+              }
+            done
+            return 1
+          }
+
+          # roll_back restores the previous binaries and restarts. Migrations
+          # are deliberately NOT reverted: goose is append-only (repo rule)
+          # and every migration must stay readable by the previous binary for
+          # one release, so binaries-only is the safe direction.
+          roll_back() {
+            echo "::warning::rolling back to the previous binaries"
+            local bin
+            for bin in ${BINARIES}; do
+              # Plain `if`, not `[[ ... ]] && install`: under `set -e` a
+              # false test makes the && list return 1 and aborts the
+              # rollback halfway through on a first-ever deploy, when
+              # ROLLBACK_DIR has no previous copy of some binary.
+              if [[ -f "${ROLLBACK_DIR}/${bin}" ]]; then
+                install -m 0755 "${ROLLBACK_DIR}/${bin}" "/opt/faas/bin/${bin}"
+              fi
+            done
+            for svc in ${FAAS_SERVICES}; do
+              systemctl restart "faas-${svc}.service" || true
+            done
+            if wait_healthy; then
+              echo "::warning::rollback succeeded — box is serving the PREVIOUS build"
+            else
+              echo "::error::rollback FAILED — box needs manual attention"
+            fi
+          }
+
           # Safely overwrite running binaries using 'install' (unlinks old files)
-          for bin in apid schedd gatewayd imaged meterd githubd faas migrate; do
+          for bin in ${BINARIES}; do
             install -m 0755 /opt/faas/bin/deploy-tmp/$bin /opt/faas/bin/$bin
           done
           rm -rf /opt/faas/bin/deploy-tmp
 
-          # Run pending migrations as faas user.
+          # Migration preflight, then apply. `migrate -status` reports the
+          # box's version and the pending list WITHOUT applying anything, so
+          # the CI log always records the before-state. When a migration then
+          # fails, "was the box where we expected it to be?" is answerable
+          # from the log — previously that took an SSH session, because the
+          # only output was a raw SQLSTATE from mid-apply.
+          FAAS_DSN='postgres:///faas?host=/run/postgresql&user=faas'
           su - faas -s /bin/bash -c \
-            "DATABASE_URL='postgres:///faas?host=/run/postgresql&user=faas' /opt/faas/bin/migrate"
+            "DATABASE_URL='${FAAS_DSN}' /opt/faas/bin/migrate -status"
+          su - faas -s /bin/bash -c \
+            "DATABASE_URL='${FAAS_DSN}' /opt/faas/bin/migrate"
+
+          # Provision the cosign sign keypair if it's missing.
+          # PR #371 ships `faas sign-keys init` (operator CLI) and
+          # PR #322 made imaged + schedd fail-loud at startup if
+          # /etc/faas/secrets/sign.key or sign-pub.pem is absent.
+          # The cd-digitalocean workflow runs on every merge to
+          # main but never had to provision the keypair (PR #367
+          # + #370 cleared the migration panics, then #371 surfaced
+          # this as a new failure mode). This block auto-provisions
+          # when the files are missing and drift-repairs the perms
+          # when they're wrong — the same shape as bootstrap.sh
+          # step 11c. We deliberately do NOT call bootstrap.sh
+          # itself: it's operator-side and would clobber the
+          # operator's deploy SSH key on every merge. The init
+          # branch is "if missing" only; rotating on every deploy
+          # would invalidate every customer's build-verification
+          # chain.
+          SIGN_KEY_PATH=/etc/faas/secrets/sign.key
+          SIGN_PUB_PATH=/etc/faas/secrets/sign-pub.pem
+          if [[ ! -f "${SIGN_KEY_PATH}" || ! -f "${SIGN_PUB_PATH}" ]]; then
+            echo "→ Provisioning cosign sign keypair..."
+            /opt/faas/bin/faas sign-keys init \
+              --sign-key "${SIGN_KEY_PATH}" --verify-key "${SIGN_PUB_PATH}"
+            chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
+            chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
+            echo "✓ sign.key written (0440 root:faas)"
+            echo "✓ sign-pub.pem written (0444 root:root)"
+          else
+            # Drift-repair branch: keypair exists; check perms.
+            SK_MODE=$(stat -c '%a' "${SIGN_KEY_PATH}")
+            SK_OWNER=$(stat -c '%U:%G' "${SIGN_KEY_PATH}")
+            SP_MODE=$(stat -c '%a' "${SIGN_PUB_PATH}")
+            SP_OWNER=$(stat -c '%U:%G' "${SIGN_PUB_PATH}")
+            if [[ "${SK_MODE}" != "440" || "${SK_OWNER}" != "root:faas" \
+               || "${SP_MODE}" != "444" || "${SP_OWNER}" != "root:root" ]]; then
+              chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
+              chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
+              echo "→ sign-keypair perms repaired (was ${SK_MODE} ${SK_OWNER} / ${SP_MODE} ${SP_OWNER})"
+            fi
+          fi
+
+          # --- Config drift guard: builder base registry --------------------
+          # imaged pulls the builder base on every startup. Pointed at
+          # docker.io it pulls ANONYMOUSLY, and the box's IP shares Docker
+          # Hub's unauthenticated rate limit — so a restart loop turns a
+          # transient failure into a permanent one:
+          #
+          #   registry returned 429: TOOMANYREQUESTS
+          #   You have reached your unauthenticated pull rate limit
+          #
+          # deploy/digitalocean/sealed.env.example pins mirror.gcr.io for
+          # exactly this reason, but the box had drifted back to docker.io
+          # and nothing noticed until imaged had burned 20,000 restarts.
+          # Fail the deploy on the drift instead of shipping onto it.
+          if grep -qE '^FAAS_BUILDER_BASE_REF=(https?://)?(registry-1\.)?docker\.io/' \
+               /etc/faas/sealed.env 2>/dev/null; then
+            echo "::error::FAAS_BUILDER_BASE_REF points at docker.io — anonymous pulls are rate-limited and will crash-loop imaged. Use mirror.gcr.io (see deploy/digitalocean/sealed.env.example)."
+            exit 1
+          fi
 
           # Restart all FaaS services.
-          for svc in apid schedd gatewayd imaged meterd githubd; do
+          for svc in ${FAAS_SERVICES}; do
             systemctl restart "faas-${svc}.service" || true
           done
 
-          # Quick smoke test.
-          # Probes gatewayd (loopback :8080), not apid directly — spec §11
-          # binds apid to loopback-only, and gatewayd reverse-proxies /healthz
-          # onto apid. So this exercises the full proxy chain end-to-end
-          # (issue #85 PR 1 + PR 2).
-          sleep 3
-          curl -sf http://127.0.0.1:8080/healthz > /dev/null \
-            && echo "✓ Gateway healthy (apid reachable via loopback proxy)" \
-            || echo "⚠ Gateway not responding"
+          # Health gate. Probes gatewayd (loopback :8080), not apid directly
+          # — spec §11 binds apid to loopback-only and gatewayd
+          # reverse-proxies /healthz onto apid, so this exercises the full
+          # proxy chain end-to-end (issue #85 PR 1 + PR 2).
+          #
+          # This used to be `curl ... || echo "⚠ Gateway not responding"`,
+          # which swallowed the failure: the step exited 0 with a warning
+          # nobody read, and the job only went red one step later with no
+          # daemon logs attached. Now an unhealthy box rolls back and fails.
+          if ! wait_healthy; then
+            roll_back
+            exit 1
+          fi
+          rm -rf "${ROLLBACK_DIR}"
           REMOTE
 
       - name: Verify deployment
         run: |
-          echo "Waiting 5 seconds for services to settle..."
-          sleep 5
-
           echo "1. Verifying systemd service states via SSH..."
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no root@${{ secrets.DO_HOST }} '
             failed=0
@@ -110,7 +285,16 @@ jobs:
                 echo "✓ faas-$svc is active and running"
               else
                 echo "::error::faas-$svc is not running!"
-                systemctl status faas-$svc -n 20
+                # `systemctl status` on a unit in Restart=on-failure backoff
+                # prints "activating (auto-restart)" and NO application error
+                # — that is why the imaged/rootfs crash-loop needed a manual
+                # SSH session to diagnose. Pull the daemon logs so the CI log
+                # alone is enough, and show the restart counter so a
+                # crash-loop is distinguishable from a slow start.
+                echo "--- journalctl -u faas-$svc (last 40) ---"
+                journalctl -u faas-$svc -n 40 --no-pager || true
+                echo "--- restart counter ---"
+                systemctl show faas-$svc -p NRestarts --value || true
                 failed=1
               fi
             done

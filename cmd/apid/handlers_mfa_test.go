@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -714,14 +716,24 @@ func TestMFARecover_RefusesToBurnLastCode(t *testing.T) {
 }
 
 // TestMFARecover_ConcurrentBurnOneCode covers the SELECT FOR
-// UPDATE contract on MemStore. Two concurrent /recover calls
-// using the SAME code must land exactly one matched=true and
-// exactly one matched=false — the second race-arrives AFTER
-// the first transaction commits and observes the SHA-256 hash
-// is gone. Without the atomic ConsumeRecoveryCode primitive,
-// both calls would think they burned the code (and the store
-// would write the same array diff twice — not data loss, but
-// a duplicate audit row + confusing UX).
+// UPDATE contract on ConsumeRecoveryCode. Two concurrent
+// /recover calls using the SAME code must land exactly one
+// 200 (burn) and exactly one 401 (code already consumed) —
+// the second race-arrives AFTER the first transaction commits
+// and observes the SHA-256 hash is gone. Without the atomic
+// primitive, both calls would think they burned the code (not
+// data loss, but a duplicate audit row + confusing UX).
+//
+// Race shape: both goroutines' MatchRecoveryCode runs before
+// either ConsumeRecoveryCode. The handler checks the consume's
+// matched return (handlers_mfa.go mfaRecover step 2) — when
+// false, it emits 401 ("code already consumed"). That check is
+// the load-bearing change that turns this test from a flake
+// (200=2, 401=0) into a deterministic pin of the user-facing
+// contract. The store-level atomicity is pinned independently
+// in TestMFARecover_StoreAtomicityOnConcurrentConsume below —
+// a regression in ConsumeRecoveryCode serialization would fail
+// that subtest even on a fast machine.
 func TestMFARecover_ConcurrentBurnOneCode(t *testing.T) {
 	e := setupWithMFA(t, api.PlanPro, false, false)
 	recovCodes, _, _ := e.generateEnrolledAccount(t)
@@ -769,6 +781,86 @@ func TestMFARecover_ConcurrentBurnOneCode(t *testing.T) {
 	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
 		t.Errorf("codes after concurrent burn = %d, want %d (double-burn would have left %d)",
 			got, want, auth.RecoveryCodeCount-2)
+	}
+}
+
+// TestMFARecover_StoreAtomicityOnConcurrentConsume pins the
+// atomicity contract on ConsumeRecoveryCode directly, without
+// relying on handler timing. N=8 goroutines fire ConsumeRecoveryCode
+// at the same account with the same presented hash; the store
+// must accept exactly one (matched=true) and reject the other
+// 7 (matched=false). The sync.WaitGroup "arrive" gate forces
+// all 8 to be parked on the same source line at the moment of
+// release so the scheduler MUST interleave them — a regression
+// in ConsumeRecoveryCode serialization (e.g. a MemStore method
+// that drops the mutex around the read-compare-mutate-write
+// chain) would surface as 2+ matched=true responses and
+// RecoveryCodeCount-2 codes remaining. N=8 is well above the
+// 2-of-2 flake window and far enough from RecoveryCodeCount=10
+// that a regression in the consume path is statistically
+// impossible to hide.
+func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
+	const concurrency = 8
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	recovCodes, _, _ := e.generateEnrolledAccount(t)
+	if len(recovCodes) < 2 {
+		t.Fatalf("setup: recovery code count = %d, want >= 2", len(recovCodes))
+	}
+	code := recovCodes[0]
+	presented := auth.HashRecoveryCode(code)
+
+	type result struct {
+		matched  bool
+		lastCode bool
+		err      error
+	}
+	results := make(chan result, concurrency)
+	var arrived sync.WaitGroup
+	arrived.Add(concurrency)
+	goSignal := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			arrived.Done()
+			<-goSignal
+			matched, lastCode, _, err := e.store.ConsumeRecoveryCode(context.Background(), e.acct.ID, presented)
+			results <- result{matched, lastCode, err}
+		}()
+	}
+	arrived.Wait()
+	close(goSignal)
+
+	var matched, lastSeen int
+	var errCount int
+	for i := 0; i < concurrency; i++ {
+		r := <-results
+		if r.err != nil {
+			errCount++
+			continue
+		}
+		if r.matched {
+			matched++
+		}
+		if r.lastCode {
+			lastSeen++
+		}
+	}
+	if errCount != 0 {
+		t.Errorf("ConsumeRecoveryCode returned %d errors, want 0", errCount)
+	}
+	if matched != 1 {
+		t.Errorf("ConsumeRecoveryCode matched=%d across %d concurrent calls on the same code, want 1 (double-burn regression)",
+			matched, concurrency)
+	}
+	if lastSeen != 0 {
+		// RecoveryCodeCount=10 codes minted; only one burn
+		// happens here so lastSeen must stay 0.
+		t.Errorf("ConsumeRecoveryCode lastSeen=%d, want 0 (initial array should not be at length 1)", lastSeen)
+	}
+
+	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
+	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
+		t.Errorf("codes after %d-way concurrent burn = %d, want %d (double-burn would have left %d)",
+			concurrency, got, want, auth.RecoveryCodeCount-2)
 	}
 }
 
@@ -823,7 +915,7 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 	// Drive the store primitive directly to bypass the
 	// handler's lastCode refusal: the customer is calling
 	// /disable, which is allowed to burn the last code.
-	matched, lastCodeFlag, err := e.store.ConsumeRecoveryCode(ctx, e.acct.ID, presented)
+	matched, lastCodeFlag, remaining, err := e.store.ConsumeRecoveryCode(ctx, e.acct.ID, presented)
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
@@ -833,6 +925,9 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 	if !lastCodeFlag {
 		t.Errorf("lastCodeFlag = false, want true (single code is the last)")
 	}
+	if remaining != 0 {
+		t.Errorf("remaining = %d, want 0 (last-code consume drops remaining to 0; issue #329 contract)", remaining)
+	}
 
 	// And once consumed, the account has zero codes — proving
 	// the SELECT FOR UPDATE + UPDATE removed them.
@@ -841,3 +936,102 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 		t.Errorf("recovery code count = %d, want 0 (consume should have deleted the last code)", got)
 	}
 }
+
+// TestMFARecover_SendsBurnEmail pins issue #329 — when /recover
+// successfully burns a recovery code, the handler MUST send the
+// customer an email describing the burn. The body tone branches
+// on remaining count:
+//
+//	9 left  → "9 recovery codes remaining"
+//	2 left  → "You have 2 recovery codes left"
+//	1 left  → "second-to-last code"
+//	0 left  → unreachable via /recover (the handler refuses
+//	          the last-code burn at line 287-294); covered by
+//	          the third branch in pkg/mail/mfa_test.go for
+//	          completeness
+//
+// The mailer stub is recordingMailer (defined in
+// handlers_account_test.go) — same package, so we wire it in by
+// reassigning srv.mailer. The test asserts:
+//
+//   - exactly one mailer.Send call per /recover success
+//   - the To: address is the account email
+//   - the subject matches the locked contract
+//   - the body contains the right phrase for the remaining-count
+//     bracket the test drove (one-of-many / warning)
+//
+// Mailer.Send failure must NOT fail the burn — the customer just
+// proved a recovery code, so failing here would force them to
+// re-authenticate. The recovery path stays green even when the
+// mailer stub returns an error; a second test pins this.
+func TestMFARecover_SendsBurnEmail(t *testing.T) {
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	recovCodes, _, _ := e.generateEnrolledAccount(t)
+	e.cookie = e.mfaIssueWithPending(t, true)
+
+	mailer := &recordingMailer{}
+	e.srv.mailer = mailer
+
+	// First burn: 10 codes → 9 left. Body lands in the
+	// one-of-many branch.
+	rec := e.do(t, http.MethodPost, "/v1/account/mfa/recover",
+		api.MFARecoverRequest{Code: recovCodes[0]})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/recover status %d: %s", rec.Code, rec.Body)
+	}
+	calls := mailer.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("mailer.Send calls = %d, want 1", len(calls))
+	}
+	got := calls[0]
+	if len(got.To) != 1 || got.To[0] != e.acct.Email {
+		t.Errorf("To = %v, want [%s]", got.To, e.acct.Email)
+	}
+	if got.Subject != "Recovery code used on your faas account" {
+		t.Errorf("Subject = %q, want %q", got.Subject, "Recovery code used on your faas account")
+	}
+	if !strings.Contains(got.TextBody, "9 recovery codes remaining") {
+		t.Errorf("body missing '9 recovery codes remaining'; got:\n%s", got.TextBody)
+	}
+	if !strings.Contains(got.TextBody, "support@DOMAIN") {
+		t.Errorf("body missing support@DOMAIN; got:\n%s", got.TextBody)
+	}
+}
+
+// TestMFARecover_MailerErrorDoesNotFailBurn pins the "Mailer
+// failure is operator-visible but not customer-visible" guarantee
+// (same shape as handlers_auth_login.go:256-263). A customer who
+// just proved a recovery code must not be told the burn failed
+// because the SMTP relay flaked — they re-authenticate, hit the
+// refused-the-burn branch on the last code, and email themselves
+// into an auth loop. The /recover handler logs the mailer error
+// at ERROR and returns 200 anyway.
+func TestMFARecover_MailerErrorDoesNotFailBurn(t *testing.T) {
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	recovCodes, _, _ := e.generateEnrolledAccount(t)
+	e.cookie = e.mfaIssueWithPending(t, true)
+
+	mailer := &recordingMailer{sendErr: errSMTPFlake}
+	e.srv.mailer = mailer
+
+	rec := e.do(t, http.MethodPost, "/v1/account/mfa/recover",
+		api.MFARecoverRequest{Code: recovCodes[0]})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/recover status %d, want 200 (mailer error must not fail the burn); body=%s", rec.Code, rec.Body)
+	}
+	if len(mailer.snapshot()) != 1 {
+		t.Errorf("mailer.Send calls = %d, want 1 (the handler must still attempt the send)", len(mailer.snapshot()))
+	}
+	// And the code was actually burned — the burn precedes the
+	// mailer.Send call, so a flaky mailer can't accidentally
+	// leave the customer with a "code appears burned but isn't"
+	// half-state.
+	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
+	if got := len(after.MFARecoveryCodesHash); got != auth.RecoveryCodeCount-1 {
+		t.Errorf("recovery code count = %d, want %d (burn must commit even if mailer flakes)", got, auth.RecoveryCodeCount-1)
+	}
+}
+
+// errSMTPFlake is a stand-in SMTP relay failure. Defined here so
+// the burn-email test isn't coupled to a real mail package.
+var errSMTPFlake = errors.New("smtp: relay temporarily unavailable")

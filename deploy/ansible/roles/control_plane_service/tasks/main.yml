@@ -67,6 +67,11 @@
     - { path: "/var/log/faas",   user: "faas-apid" }
     - { path: "/var/spool/faas", user: "faas-apid" }
     - { path: "/srv/fc/snap",    user: "faas-imaged" }
+    # ADR-038 build attestations. Must exist before faas-imaged starts:
+    # a ReadWritePaths= target that does not exist makes systemd fail the
+    # mount-namespace setup, so creating the dir and listing it in the unit
+    # are a pair. /srv/fc/base is created by the firecracker role.
+    - { path: "/srv/fc/sigs",    user: "faas-imaged" }
     - { path: "/etc/faas/statuspage", user: "faas-apid" }
 
 # Status page HTML (spec §12, M8 acceptance). apid reads this file at
@@ -105,10 +110,11 @@
     path: /etc/faas/secrets/session.key
   register: faas_session_key_stat
   failed_when:
-    - not faas_session_key_stat.stat.exists
-    or faas_session_key_stat.stat.mode != "0400"
-    or faas_session_key_stat.stat.pw_name != "root"
-    or faas_session_key_stat.stat.gr_name != "root"
+    - >-
+      not faas_session_key_stat.stat.exists
+      or faas_session_key_stat.stat.mode != "0400"
+      or faas_session_key_stat.stat.pw_name != "root"
+      or faas_session_key_stat.stat.gr_name != "root"
 
 # IAM-2 / issue #186 (TOTP MFA on dashboard sessions): apid needs
 # to read /etc/faas/secrets/host.age so the MFA handlers
@@ -135,7 +141,44 @@
     path: /etc/faas/secrets/host.age
   register: faas_host_age_stat
   failed_when:
-    - not faas_host_age_stat.stat.exists
-    or faas_host_age_stat.stat.mode != "0400"
-    or faas_host_age_stat.stat.pw_name != "root"
-    or faas_host_age_stat.stat.gr_name != "root"
+    - >-
+      not faas_host_age_stat.stat.exists
+      or faas_host_age_stat.stat.mode != "0400"
+      or faas_host_age_stat.stat.pw_name != "root"
+      or faas_host_age_stat.stat.gr_name != "root"
+
+# Tier 3 / ADR-038 §Phase 3 — cosign sign-keypair (build attestation).
+# imaged reads /etc/faas/secrets/sign.key at startup
+# (cmd/imaged/main.go:103-109 fail-loud os.Stat). The file MUST be
+# 0440 root:faas because faas-imaged runs as User=faas-imaged
+# Group=faas (deploy/systemd/faas-imaged.service) and reads the
+# key via group access; 0400 root:root would be unreadable to a
+# non-root daemon. schedd reads the public side (sign-pub.pem,
+# 0444 root:root) — world-readable is intentional, the public key
+# is non-secret (ADR-038 §Consequences Compatibility). The Go-side
+# loader (pkg/cosign/keys.go:50-61) accepts both 0400 and 0440 for
+# the private side; the canonical DigitalOcean install is 0440
+# root:faas. Mirrors the host.age / session.key fail-loud shape:
+# the role fails the playbook BEFORE systemd daemon-reload so a
+# drift on a fresh box never reaches production.
+- name: control_plane_service — assert sign.key mode is 0440 root:faas (Tier 3)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/sign.key
+  register: faas_sign_key_stat
+  failed_when:
+    - >-
+      not faas_sign_key_stat.stat.exists
+      or faas_sign_key_stat.stat.mode != "0440"
+      or faas_sign_key_stat.stat.pw_name != "root"
+      or faas_sign_key_stat.stat.gr_name != "faas"
+
+- name: control_plane_service — assert sign-pub.pem mode is 0444 root:root (Tier 3)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/sign-pub.pem
+  register: faas_sign_pub_stat
+  failed_when:
+    - >-
+      not faas_sign_pub_stat.stat.exists
+      or faas_sign_pub_stat.stat.mode != "0444"
+      or faas_sign_pub_stat.stat.pw_name != "root"
+      or faas_sign_pub_stat.stat.gr_name != "root"

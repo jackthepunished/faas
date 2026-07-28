@@ -197,22 +197,25 @@ func (s *PgStore) UpdateAccountStripeSubscriptionItem(ctx context.Context, id, s
 // stored recovery-code hashes and removes the matching hash from the
 // array. Returns:
 //
-//   - (false, false, ErrNotFound) when the row is missing
-//   - (false, false, nil)         when the presented code doesn't
+//   - (false, 0, false, ErrNotFound) when the row is missing
+//   - (false, 0, false, nil)         when the presented code doesn't
 //     match any stored hash
-//   - (true, lastCode, nil)       when the code matches and was
+//   - (true, lastCode, remaining, nil) when the code matches and was
 //     removed; lastCode is true iff exactly one hash remained (the
 //     handler refuses to burn the last code and prompts for a
-//     password reset instead)
+//     password reset instead); remaining is the count of hashes on
+//     the row AFTER the consume committed, used by the handler to
+//     render the post-burn customer email with the right tone
+//     (one-of-many vs warning vs last-code) — see issue #329.
 //
 // The sealed TOTP secret is preserved across consumes: the customer
 // can still /verify after burning every recovery code. The transaction
 // guarantees that two concurrent /recover calls on the same account
 // cannot both observe and burn the same hash.
-func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, err error) {
+func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented []byte) (matched bool, lastCode bool, remaining int, err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, false, fmt.Errorf("state: mfa consume tx: %w", err)
+		return false, false, 0, fmt.Errorf("state: mfa consume tx: %w", err)
 	}
 	// Best-effort rollback: a successful Commit absorbs the deferred
 	// rollback into a no-op, so we don't branch on err.
@@ -226,9 +229,9 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		  for update`, id)
 	if scanErr := row.Scan(&hashes); scanErr != nil {
 		if errors.Is(scanErr, pgx.ErrNoRows) {
-			return false, false, ErrNotFound
+			return false, false, 0, ErrNotFound
 		}
-		return false, false, mapErr(scanErr)
+		return false, false, 0, mapErr(scanErr)
 	}
 	matchedIdx := -1
 	for i, h := range hashes {
@@ -241,9 +244,9 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		// No match: no UPDATE needed, just commit the empty tx so the
 		// row lock releases promptly.
 		if commitErr := tx.Commit(ctx); commitErr != nil {
-			return false, false, fmt.Errorf("state: mfa consume commit (no-match): %w", commitErr)
+			return false, false, 0, fmt.Errorf("state: mfa consume commit (no-match): %w", commitErr)
 		}
-		return false, false, nil
+		return false, false, 0, nil
 	}
 	lastCode = len(hashes) == 1
 	// Defensive copy: rebuild without the matched element. len(hashes)
@@ -256,12 +259,12 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 		`update accounts
 		    set mfa_recovery_codes_hash = $2
 		  where id = $1`, id, next); execErr != nil {
-		return false, false, mapErr(execErr)
+		return false, false, 0, mapErr(execErr)
 	}
 	if commitErr := tx.Commit(ctx); commitErr != nil {
-		return false, false, fmt.Errorf("state: mfa consume commit: %w", commitErr)
+		return false, false, 0, fmt.Errorf("state: mfa consume commit: %w", commitErr)
 	}
-	return true, lastCode, nil
+	return true, lastCode, len(next), nil
 }
 
 // MatchRecoveryCode tests a presented SHA-256 hash against the
@@ -3409,17 +3412,30 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests int64) error {
-	// Idempotent on (instance_id, minute). Mirrors the sqlc source in
-	// queries.sql::AppendUsage — make sqlc-check verifies these stay in
-	// lockstep. The first write wins; a redelivered minute is a no-op so a
-	// meterd restart / network blip / two meterd instances cannot inflate
-	// billing. M7 hardening, PR feat/m7-beta-hardening.
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error {
+	// Idempotent on (instance_id, minute) for mb_seconds / requests
+	// (mirrors the sqlc source in queries.sql::AppendUsage — make
+	// sqlc-check verifies these stay in lockstep). The first write
+	// of those columns wins; a redelivered minute is a no-op for
+	// them so a meterd restart / network blip / two meterd
+	// instances cannot inflate billing. M7 hardening, PR
+	// feat/m7-beta-hardening.
+	//
+	// cpu_usec is ADDITIVE on the same conflict key: the schedd
+	// accumulator (pkg/sched/instancestats/poller.go) can call
+	// AppendUsage many times within the same minute — the
+	// accumulator fires every 250 ms, and a 1-minute slice can
+	// see 240 observations per instance. We add EXCLUDED.cpu_usec
+	// to the existing row so the column is the sum of all
+	// per-tick deltas. The pusher (meter → billing) deduplicates
+	// on a coarser window before pushing, so the additive merge
+	// is safe end-to-end. issue #279 / PR-B.
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests)
-		 values ($1, $2, $3, $4, $5, $6)
-		 on conflict (instance_id, minute) do nothing`,
-		accountID, appID, instanceID, minute, mbSeconds, requests)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec)
+		 values ($1, $2, $3, $4, $5, $6, $7)
+		 on conflict (instance_id, minute) do update
+		   set cpu_usec = usage_minutes.cpu_usec + EXCLUDED.cpu_usec`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec)
 	return err
 }
 
@@ -3436,7 +3452,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	// explicit cast). date_trunc normalizes both sides to the month's start
 	// in UTC, sidestepping session-TZ semantics entirely.
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, requests from usage_monthly
+		`select account_id, app_id, month, mb_seconds, cpu_usec, requests from usage_monthly
 		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
 		accountID, monthStart)
 	if err != nil {
@@ -3446,7 +3462,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	var out []Usage
 	for rows.Next() {
 		u := Usage{}
-		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -3556,15 +3572,191 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 	return out, rows.Err()
 }
 
+// --- account credits (issue #279) -------------------------------------------
+
+// CreateAccountCredit inserts a new operator-issued credit. The DB
+// generates id (UUIDv4) and created_at (default now()) via the table
+// defaults; RETURNING surfaces them so the handler can echo the row
+// back without a second round-trip. The migration 00049 CHECK
+// constraint on cents_remaining >= 0 and reason length is enforced
+// at the DB; the handler validates client-side for a friendlier 400.
+//
+// NOT transactional with the matching credit_ledger row — the ledger
+// insert is a separate statement in the handler. If the ledger write
+// fails after the credit row lands, the credit is the source of truth
+// and the ledger insert is retryable on the next operator action. The
+// handler logs a WARN when the ledger write fails. Mirrors the
+// documented behaviour of DeleteAPIKeyReturning (audit-loss trade-off,
+// store.go DeleteAPIKeyReturning doc).
+func (s *PgStore) CreateAccountCredit(ctx context.Context, c AccountCredit) (AccountCredit, error) {
+	row := s.pool.QueryRow(ctx,
+		`insert into account_credits (account_id, cents_remaining, reason, expires_at)
+		 values ($1, $2, $3, $4)
+		 returning id, account_id, cents_remaining, reason, created_at, expires_at`,
+		c.AccountID, c.CentsRemaining, c.Reason, c.ExpiresAt)
+	var out AccountCredit
+	if err := row.Scan(
+		&out.ID, &out.AccountID, &out.CentsRemaining, &out.Reason,
+		&out.CreatedAt, &out.ExpiresAt,
+	); err != nil {
+		return AccountCredit{}, err
+	}
+	return out, nil
+}
+
+// ListAccountCredits returns the account's credit rows. onlyActive
+// filters to (cents_remaining > 0) ∧ (expires_at IS NULL OR expires_at
+// > now()), the active set the consumption reducer will use once it
+// lands. Order is created_at DESC for deterministic test assertions.
+// limit is the caller's responsibility; the SQL uses a single LIMIT
+// when the caller has set one (the handler clamps at 100).
+func (s *PgStore) ListAccountCredits(ctx context.Context, accountID string, onlyActive bool) ([]AccountCredit, error) {
+	now := time.Now().UTC()
+	var rows pgx.Rows
+	var err error
+	if onlyActive {
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, cents_remaining, reason, created_at, expires_at
+			   from account_credits
+			  where account_id = $1
+			    and cents_remaining > 0
+			    and (expires_at is null or expires_at > $2)
+			  order by created_at desc`,
+			accountID, now)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select id, account_id, cents_remaining, reason, created_at, expires_at
+			   from account_credits
+			  where account_id = $1
+			  order by created_at desc`,
+			accountID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AccountCredit{}
+	for rows.Next() {
+		var c AccountCredit
+		if err := rows.Scan(
+			&c.ID, &c.AccountID, &c.CentsRemaining, &c.Reason,
+			&c.CreatedAt, &c.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CreateCreditLedgerEntry appends one audit row. The DB generates id
+// (UUIDv4) and created_at (default now()) via the table defaults; the
+// actor and reason are operator-supplied (the handler pulls actor from
+// the authenticated caller account ID). Migration 00049's CHECK
+// constraint on delta_cents <> 0 ensures issuance (+N) and consumption
+// (-N) are both accepted but a zero-delta row is rejected.
+func (s *PgStore) CreateCreditLedgerEntry(ctx context.Context, e CreditLedgerEntry) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into credit_ledger (account_id, credit_id, delta_cents, reason, actor)
+		 values ($1, $2, $3, $4, $5)`,
+		e.AccountID, e.CreditID, e.DeltaCents, e.Reason, e.Actor)
+	return err
+}
+
+// GetAccountOverageCapCents returns (cents, ok, nil). ok=false means
+// the column is NULL (no cap configured). 0 with ok=true means "no
+// overage allowed"; >0 is the explicit monthly ceiling. meterd calls
+// this once per account per quota tick.
+//
+// Hand-written against the column added by migration 00049 — NOT
+// sqlc-generated, mirroring the ListInvoicesForAccount pattern.
+// Single-row read with no parameters other than the account id; sqlc
+// would not add observability here.
+func (s *PgStore) GetAccountOverageCapCents(ctx context.Context, accountID string) (int64, bool, error) {
+	var cents *int64
+	if err := s.pool.QueryRow(ctx,
+		`select overage_cap_cents from accounts where id = $1`,
+		accountID).Scan(&cents); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Account row gone — treat as no cap so meterd does not
+			// block on a half-deleted account. Different from
+			// ErrNotFound semantics: the caller is meterd, not a
+			// user-facing handler.
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if cents == nil {
+		return 0, false, nil
+	}
+	return *cents, true, nil
+}
+
+// LoadAllOverageCapCents returns every (account_id, cap) tuple in one
+// round-trip. meterd's quota tick walks all accounts every minute and
+// would otherwise issue N single-row reads; the bulk read keeps the
+// per-tick cost at one round-trip. Drops accounts whose overage_cap_cents
+// is NULL — the caller treats them as "no cap".
+//
+// Hand-written for the same reason as GetAccountOverageCapCents; the
+// shape is meterd-internal and not on the sqlc public surface.
+func (s *PgStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, overage_cap_cents from accounts where overage_cap_cents is not null`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var cents int64
+		if err := rows.Scan(&id, &cents); err != nil {
+			return nil, err
+		}
+		out[id] = cents
+	}
+	return out, rows.Err()
+}
+
+// CurrentMonthOverageCents returns the account's derived overage in
+// integer cents for the current UTC month. 1 GB-h = 3600 GB-seconds;
+// at €0.01/GB-h → 1 GB-h = 100 cents. The overage-row SUM is
+// mb_seconds; we multiply by 100/3600_000 to get cents. Integer math
+// only — never float on money (CLAUDE.md).
+//
+// Hand-written: the formula is meterd-internal and not on the read
+// surface. The migration on usage_minutes is unchanged; we SELECT
+// against the existing table.
+func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string) (int64, error) {
+	var mbSeconds int64
+	if err := s.pool.QueryRow(ctx,
+		`select COALESCE(SUM(mb_seconds), 0)::bigint
+		   from usage_minutes
+		  where account_id = $1
+		    and minute >= date_trunc('month', now())`,
+		accountID).Scan(&mbSeconds); err != nil {
+		return 0, err
+	}
+	// mb_seconds / 3600 = GB-h; GB-h * 100 = cents. Integer math.
+	cents := mbSeconds * 100 / 3600
+	return cents, nil
+}
+
 // UsageByHour returns per-app usage rolled up from the per-minute rows
 // in the [start, end) window. The Stripe pusher calls this hourly;
 // (start, end) is the [now-1h, now) hour window so the SQL is an
-// indexed range scan on usage_minutes.minute.
+// indexed range scan on usage_minutes.minute. cpu_usec is selected too
+// (issue #279 / PR-B) so the per-hour rollup exposes the additive CPU
+// accumulation; the Stripe pusher still pushes only mb_seconds-based
+// usage (billing stays on plan RAM) but the column is available for
+// future per-hour dashboards without re-rolling per-minute rows.
 func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error) {
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id,
 		        date_trunc('hour', minute) as hour,
 		        sum(mb_seconds)::bigint as mb_seconds,
+		        sum(cpu_usec)::bigint   as cpu_usec,
 		        sum(requests)::bigint as requests
 		 from usage_minutes
 		 where account_id = $1 and minute >= $2 and minute < $3
@@ -3579,7 +3771,7 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 	for rows.Next() {
 		u := Usage{}
 		var hour time.Time
-		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
 			return nil, err
 		}
 		u.Month = hour

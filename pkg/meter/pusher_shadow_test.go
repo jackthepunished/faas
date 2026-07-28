@@ -100,6 +100,13 @@ func (r *recordingStripe) CreateUpgradeTransaction(_ context.Context, _ state.Ac
 	return "", "", nil
 }
 
+// Refund is the issue #279 billing.Provider seam. meterd's pusher
+// never calls it; returning ErrNotImplemented matches the Paddle
+// contract documented in pkg/billing/provider.go.
+func (r *recordingStripe) Refund(_ context.Context, _ string, _ int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
+}
+
 func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -232,7 +239,7 @@ func TestPushHour_Shadow24h(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	const hoursIn24h = 24
 	const minutesIn24h = hoursIn24h * 60
 	for i := 0; i < minutesIn24h; i++ {
@@ -353,7 +360,7 @@ func TestPushHour_SkipsFreeAndSuspended(t *testing.T) {
 	}
 
 	// Sample one hour so both accounts have non-zero usage_minutes rows.
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	for i := 0; i < 60; i++ {
 		now = now.Add(time.Minute)
 		if _, err := sampler.SampleAndRoll(ctx); err != nil {
@@ -410,7 +417,7 @@ func TestPushHour_RecordsStripeError(t *testing.T) {
 	// One hour of sampling produces exactly one billable (acct, hour)
 	// pair — the simplest setup where PushHour can attempt a single
 	// SDK call.
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	for i := 0; i < 60; i++ {
 		if _, err := sampler.SampleAndRoll(ctx); err != nil {
 			t.Fatalf("sample %d: %v", i, err)
@@ -525,7 +532,7 @@ func TestPushHour_PaddleDispatchHitsPaddleHistogram(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	for i := 0; i < 60; i++ {
 		if _, err := sampler.SampleAndRoll(ctx); err != nil {
 			t.Fatalf("sample %d: %v", i, err)
@@ -621,7 +628,7 @@ func TestPushHour_Shadow24h_StripeFake(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	const hoursIn24h = 24
 	const minutesIn24h = hoursIn24h * 60
 	for i := 0; i < minutesIn24h; i++ {
@@ -696,7 +703,7 @@ func TestPushHour_Shadow24h_Paddle(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	const hoursIn24h = 24
 	const minutesIn24h = hoursIn24h * 60
 	for i := 0; i < minutesIn24h; i++ {

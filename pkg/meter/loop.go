@@ -31,6 +31,7 @@ import (
 // have to special-case the zero value (mirrors scheddgrpc/server.go:54-56).
 type Loop struct {
 	store  state.Store
+	cpu    CPUSource
 	parker ScheddParker
 	pusher billing.Provider
 	notif  Notifier
@@ -68,7 +69,7 @@ type Loop struct {
 // and must not be skipped in production); the ops.SetResidentGBPerCustomer
 // method is nil-safe so the loop tolerates a nil ops receiver. ops
 // and log likewise may be nil — see the Loop doc comment.
-func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
+func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
 	if now == nil {
 		now = time.Now
 	}
@@ -85,7 +86,7 @@ func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, no
 		residency = NewResidency(store, now, log, ops)
 	}
 	return &Loop{
-		store: store, parker: parker, pusher: pusher, notif: notif,
+		store: store, cpu: cpu, parker: parker, pusher: pusher, notif: notif,
 		mailer: mailer, dunning: dunning, residency: residency, now: now, log: log, cfg: cfg, ops: ops,
 		lastTick: make(map[string]time.Time),
 	}
@@ -97,7 +98,7 @@ func NewLoop(store state.Store, parker ScheddParker, pusher billing.Provider, no
 // Postgres blip doesn't kill the daemon; only a context cancel returns
 // cleanly.
 func (l *Loop) Run(ctx context.Context) error {
-	sampler := NewSampler(l.store, l.now)
+	sampler := NewSampler(l.store, l.cpu, l.now)
 	pusher := NewPusher(l.store, l.pusher, l.log, l.now, l.ops)
 	errc := make(chan error, 5)
 	go func() {
@@ -191,16 +192,63 @@ func (l *Loop) runQuotaTicks(ctx context.Context) error {
 	}
 }
 
-// runQuotaOnce is exported as RunQuotaOnce so tests can step it without
-// spinning the ticker. Production's only caller is runQuotaTicks.
+// RunQuotaOnce is the test seam for the per-account quota loop. It
+// runs a single tick of the quota sweep without spinning the ticker,
+// so cap tests can pin the synthetic clock and assert the
+// meterd_billing_cap_exceeded_total counter incremented. Production
+// callers must use Run, which schedules runQuotaTicks on the
+// configured QuotaInterval.
+func (l *Loop) RunQuotaOnce(ctx context.Context) {
+	l.runQuotaOnce(ctx)
+}
+
+// runQuotaOnce is exposed to tests via the RunQuotaOnce thin wrapper
+// below so the ticker doesn't have to spin. Production's only caller
+// is runQuotaTicks.
+//
+// Issue #279 PR A: a per-account overage cap (`accounts.overage_cap_cents`,
+// opt-in) sits in front of the existing free/paid ladder. The cap is
+// loaded once per tick (one round-trip) and consulted per account;
+// accounts at-or-past the cap skip the overage-row insert path
+// inside EnforceQuota and the meterd_billing_cap_exceeded_total
+// counter is incremented with the plan label. The cap is advisory
+// for overage only — in-budget usage continues to accumulate and
+// the Free hard-stop / paid warning ladder is unchanged.
+//
+// Concurrency note: this loop is the only writer to usage_minutes
+// (spec §6.1) and runs as a single meterd process today, so the
+// (capCache read → CurrentMonthOverageCents → EnforceQuota) sequence
+// is race-free against itself. A future meterd-replica deploy would
+// race here — at worst one minute's overage-row insert slips past
+// the cap per replica. The follow-up is to wrap the per-account
+// section in `SELECT … FOR UPDATE` on the `accounts` row (precedent
+// pgstore.go:380-381, :668); today's behaviour is acceptable per
+// the cap's documented "advisory for the overage row only" contract.
 func (l *Loop) runQuotaOnce(ctx context.Context) {
 	accounts, err := l.store.ListAllAccounts(ctx)
 	if err != nil {
 		l.log.Warn("meter: quota list_accounts", "err", err)
 		return
 	}
+	capCache, err := l.store.LoadAllOverageCapCents(ctx)
+	if err != nil {
+		// Fail-open: a transient read failure must not skip the
+		// quota ladder. Log once and proceed with no caps.
+		l.log.Warn("meter: overage cap load failed", "err", err)
+		capCache = map[string]int64{}
+	}
 	now := l.now()
 	for _, acct := range accounts {
+		capCents, ok := capCache[acct.ID]
+		if ok && capCents >= 0 {
+			monthCents, err := l.store.CurrentMonthOverageCents(ctx, acct.ID)
+			if err != nil {
+				l.log.Warn("meter: overage read failed", "account", acct.ID, "err", err)
+			} else if monthCents >= capCents {
+				l.ops.BillingCapExceededTotal(string(acct.Plan))
+				continue
+			}
+		}
 		usages, err := MonthUsageForAccount(ctx, l.store, acct.ID, now)
 		if err != nil {
 			l.log.Warn("meter: quota usage_by_month", "account", acct.ID, "err", err)

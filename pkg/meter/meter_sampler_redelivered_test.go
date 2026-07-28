@@ -33,7 +33,7 @@ func TestSampler_RedeliveredMinuteIsIdempotent(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	_ = makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	if _, err := sampler.SampleAndRoll(ctx); err != nil {
 		t.Fatalf("first sample: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestSampler_AdvancesAcrossMinutes(t *testing.T) {
 	app := newApp(t, ctx, s, acct.ID)
 	_ = makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
 
-	sampler := meter.NewSampler(s, clock)
+	sampler := meter.NewSampler(s, nil, clock)
 	if _, err := sampler.SampleAndRoll(ctx); err != nil {
 		t.Fatalf("first sample: %v", err)
 	}

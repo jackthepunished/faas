@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"strings"
 	"time"
@@ -70,6 +71,19 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// slug in logsanitize.Field so the audit line is one-event-per-line
 	// regardless of what a future refactor of validSlug does.
 	s.log.Info("app created", "app", created.ID, "slug", logsanitize.Field(created.Slug), "account", acct.ID)
+	// IAM-4 (issue #291): record the app creation. Runtime is
+	// omitted from the data map when empty (AppTypeApp has no
+	// runtime) so the row stays minimal. The audit row never
+	// reaches the structured-log sink, so logsanitize is not
+	// needed here — CodeQL go/log-injection only fires on slog.
+	s.audit.Emit(ctx(r), "app.created", &acct.ID, map[string]any{
+		"app_id":          created.ID,
+		"slug":            created.Slug,
+		"type":            string(created.Type),
+		"ram_mb":          created.RAMMB,
+		"max_concurrency": created.MaxConcurrency,
+		"runtime":         created.Runtime,
+	})
 	writeJSON(w, http.StatusCreated, s.appResponse(created))
 }
 
@@ -192,6 +206,18 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// here means the log statement stays safe regardless of upstream changes.
 	// d.ID and app.ID are server-generated UUIDs — no sanitize needed.
 	s.log.Info("deployment created", "deployment", d.ID, "app", app.ID, "ref", logsanitize.Field(req.Image))
+	// IAM-4 (issue #291): record the deployment. data.supersedes
+	// is the previous deployment_id (PR-B: read before the
+	// CreateDeployment tx via LatestDeployment, line 167 in the
+	// pre-PR-#340 layout). Empty when this is the first deploy
+	// on the app — dashboards can distinguish "first deploy"
+	// from "supersede" without inspecting app history.
+	s.audit.Emit(ctx(r), "app.deployed", &acct.ID, map[string]any{
+		"app_id":        app.ID,
+		"deployment_id": d.ID,
+		"ref":           req.Image,
+		"supersedes":    prev.ID,
+	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
 
@@ -202,10 +228,7 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 	// ("1.2.3.0/24", "fe80::/10"); validateUpdateApp has already
 	// rewritten any "::ffff:" v4-mapped entry to its v4 form by
 	// the time it lands in the store, so we never see one here.
-	ea := make([]string, 0, len(a.EgressAllowlist))
-	for _, p := range a.EgressAllowlist {
-		ea = append(ea, p.String())
-	}
+	ea := egressStringList(a.EgressAllowlist)
 	return api.AppResponse{
 		ID: a.ID, Slug: a.Slug, Type: string(a.Type), Runtime: a.Runtime,
 		RAMMB: a.RAMMB, MaxConcurrency: a.MaxConcurrency, IdleTimeoutS: a.IdleTimeoutS,
@@ -315,4 +338,20 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// egressStringList renders a stored []netip.Prefix to its canonical
+// string form ("1.2.3.0/24", "fe80::/10"). The empty case returns a
+// non-nil zero-length slice so the JSON shape is `[]` (never `null`)
+// regardless of the plan / pre-PATCH state. validateUpdateApp has
+// already rewritten any "::ffff:" v4-mapped entry to its v4 form by
+// the time it lands in the store, so we never see one here. Reused by
+// the audit emit (handlers_ext.go::updateApp) so the wire shape and
+// the audit row agree on the canonical form.
+func egressStringList(prefixes []netip.Prefix) []string {
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		out = append(out, p.String())
+	}
+	return out
 }

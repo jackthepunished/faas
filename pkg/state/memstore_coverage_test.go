@@ -381,10 +381,10 @@ func TestMemStoreCoverageAuthUsageAndEvents(t *testing.T) {
 		t.Fatalf("oauth takeover = %v", err)
 	}
 	minute := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
-	if err := m.AppendUsage(ctx, account.ID, app.ID, "instance", minute, 100, 2); err != nil {
+	if err := m.AppendUsage(ctx, account.ID, app.ID, "instance", minute, 100, 2, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.AppendUsage(ctx, account.ID, app.ID, "instance", minute.Add(30*time.Second), 999, 999); err != nil {
+	if err := m.AppendUsage(ctx, account.ID, app.ID, "instance", minute.Add(30*time.Second), 999, 999, 0); err != nil {
 		t.Fatal(err)
 	}
 	usage, err := m.UsageByMonth(ctx, account.ID, minute)

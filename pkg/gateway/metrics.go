@@ -14,6 +14,16 @@
 //   - gateway_top_tenant_rps{account_id}             gauge (issue #300;
 //     label value is the resolved app_id — gatewayd's only
 //     tenant-attributable key — see ObserveTopTenantRPS)
+//   - gateway_tls_cert_expiry_seconds                gauge (ADR-024 H3, closed
+//     in PR #345; refreshed every 5 min by StartCertExpiryRefresher; smallest
+//     remaining lifetime across cached certs on disk; negative when a cert
+//     is already expired — the page rule fires regardless)
+//   - gateway_tls_on_demand_denied_total{reason}     counter (ADR-024 H3, closed
+//     in PR #345; reason ∈ {allowlist, dns01, token} — only allowlist is wired
+//     today; dns01 + token pre-instantiate at 0 so the panel surfaces from
+//     boot and a missing wire-incrementation is visible as a frozen zero.
+//     ADR-024 H3.b is the still-open follow-up to bridge the certmagic zap
+//     logger into this counter)
 package gateway
 
 import (
@@ -55,6 +65,20 @@ type Metrics struct {
 	// runs a parallel topNSampler); see pkg/wire/topn.go for
 	// the cardinality contract.
 	topTenantRPS *prometheus.GaugeVec
+	// ADR-024 H3 (closed in PR #345): TLS observability closures. The
+	// counter is incremented from pkg/gateway/tls_wire.go's
+	// allowlistToDecisionFunc on a denied mint (today only the
+	// allowlist branch is wired; the dns01 + token branches
+	// pre-instantiate at 0 and gain their wire-incrementation in the
+	// ADR-024 H3.b follow-up). The gauge is refreshed every 5 min by
+	// StartCertExpiryRefresher (see pkg/gateway/cert_expiry.go) — it
+	// reports the smallest remaining lifetime across cached certs on
+	// disk so the §12 panels can surface both "expires soon" (warn at
+	// 30 d) and "about to expire" (page at 14 d) without a per-host
+	// fan-out. A negative value means a cert on disk is already past
+	// its NotAfter; the page rule fires regardless.
+	tlsCertExpiry     prometheus.Gauge
+	tlsOnDemandDenied *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -106,14 +130,54 @@ func NewMetrics() *Metrics {
 			Name: "gateway_top_tenant_rps",
 			Help: "Top-N 5s request rate per tenant observed at the edge (issue #300). Label key is account_id for parity with apid_top_tenant_rps; the label VALUE at the gateway is the resolved app_id (gatewayd is pre-auth and only sees hostname→app routing). Cardinality bounded at topAccountSetCap (1000) + 1 \"other\" overflow by pkg/wire/topn.go via the cmd/gatewayd/topn.go sampler. The overflow bucket literally named \"other\" matches apid's gauge.",
 		}, []string{"account_id"}),
+		// ADR-024 H3 (closed in PR #345). Gauge starts unset (NaN at
+		// scrape time — Prometheus drops NaN series, so an idle daemon
+		// emits no series at all); the page rule's `<` then returns
+		// false and the alert stays silent until a real cert has been
+		// minted. SetTLSCertExpiry may emit a negative value when a
+		// cert on disk is past its NotAfter — that's intentional, the
+		// page rule fires regardless.
+		tlsCertExpiry: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gateway_tls_cert_expiry_seconds",
+			Help: "Smallest remaining lifetime across cached certs on disk (cfg.StorageDir). ADR-024 H3 (closed). Page at ≤14 d; warn at ≤30 d. Gauge is unset (no series) before the first cert is minted; the `<` alert expression handles a missing series correctly. A negative value means a cert on disk is already past its NotAfter — the page rule fires regardless.",
+		}),
+		// ADR-024 H3 (closed in PR #345). The reason label set is closed
+		// and pre-instantiated below so every reason series surfaces in
+		// /metrics from boot. Only `allowlist` is wired today (from the
+		// on-demand DecisionFunc); dns01 + token gain their wire-
+		// incrementation in the still-open H3.b follow-up. The frozen-
+		// zero is the visibility for that follow-up — operators see
+		// the panel exist and a stuck-at-zero signals the follow-up
+		// is unmerged.
+		tlsOnDemandDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_tls_on_demand_denied_total",
+			Help: "On-demand cert mint denials, labelled by reason. ADR-024 H3 (closed in PR #345); H3.b is the still-open follow-up. reason=allowlist is incremented from pkg/gateway/tls_wire.go's allowlistToDecisionFunc today. reason=dns01 and reason=token are reserved for the H3.b follow-up that bridges the certmagic ACME-issuer logger through this counter; the series are pre-instantiated at 0 so the dashboard panel surfaces from boot and a missing wire-incrementation is visible as a frozen zero.",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.coldWake, m.topTenantRPS)
-	// Pre-instantiate the ("other",) row so the gauge surfaces from
-	// boot, mirroring the apid precedent (pkg/wire/metrics.go:632).
-	// Without this, a quiet daemon would emit zero series for the
-	// first 5s and a dashboard reader would see "no data" until
-	// the first observation + first sampler tick.
+	reg.MustRegister(m.requests, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.coldWake, m.topTenantRPS, m.tlsCertExpiry, m.tlsOnDemandDenied)
+	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
+	// the gauge surfaces from boot, mirroring the apid precedent
+	// (pkg/wire/metrics.go:632). Without this, a quiet daemon would
+	// emit zero series for the first 5s and a dashboard reader would
+	// see "no data" until the first observation + first sampler tick.
+	// (Issue #300.)
 	m.topTenantRPS.WithLabelValues("other")
+	// Pre-instantiate every closed (reason) label tuple on
+	// gateway_tls_on_demand_denied_total so the counter's HELP/TYPE
+	// and zero-valued series surface in /metrics from the moment the
+	// daemon binds — same precedent as auditWriteFail / requestFailures
+	// pre-instantiation above and the egress-deny / scale-decisions
+	// catalog pre-instantiation in pkg/wire/metrics.go. Without this
+	// loop, the `reason="dns01"` / `reason="token"` rows would only
+	// appear after the first denial, hiding the "frozen zero =
+	// follow-up unmerged" signal we depend on for the §12 dashboard
+	// panel. NewMetrics is called exactly once per daemon
+	// (cmd/gatewayd/main.go:269), so each daemon gets exactly one set
+	// of pre-instantiated series; if you ever construct a second
+	// *Metrics, that's by design, not a bug. (ADR-024 H3, PR #345.)
+	for _, reason := range []string{"allowlist", "dns01", "token"} {
+		m.tlsOnDemandDenied.WithLabelValues(reason)
+	}
 	return m
 }
 
@@ -191,6 +255,42 @@ type TopNEntry struct {
 // SetQueueDepth records the current wake-queue depth for an app.
 func (m *Metrics) SetQueueDepth(appID string, depth int) {
 	m.queueDepth.WithLabelValues(appID).Set(float64(depth))
+}
+
+// ObserveTLSOnDemandDenied increments the per-reason counter that backs
+// gateway_tls_on_demand_denied_total (ADR-024 H3). reason ∈ {allowlist,
+// dns01, token}; unknown reasons fall through to the
+// prometheus.NewCounterVec default behaviour (a new labelled series
+// surfaces in /metrics but the operator panel never queries for them).
+// Called from pkg/gateway/tls_wire.go's allowlistToDecisionFunc — today
+// only with reason="allowlist"; the dns01 + token branches are wired in
+// the H3.b follow-up that bridges certmagic's ACME-issuer logger. Safe
+// on a nil receiver so callers running outside the daemon (tests with a
+// stub Metrics) don't need a nil-check at every call site; matches the
+// ObserveBuildCount / SetResidentGBPerCustomer nil-safe precedent.
+func (m *Metrics) ObserveTLSOnDemandDenied(reason string) {
+	if m == nil {
+		return
+	}
+	m.tlsOnDemandDenied.WithLabelValues(reason).Inc()
+}
+
+// SetTLSCertExpiry writes the smallest remaining lifetime across cached
+// certs on disk to the gateway_tls_cert_expiry_seconds gauge (ADR-024
+// H3, closed in PR #345). d is the time delta to the soonest-expiring
+// cert — positive when at least one cert is on disk and unexpired,
+// negative when a cert is already past its NotAfter (the page rule
+// fires regardless of sign). Callers must NOT touch the gauge when
+// there are no certs; the prometheus.Gauge default is "no series",
+// and Prometheus's `<` comparator against a missing series returns
+// false (so the alert is silent pre-first-mint). Refreshed every 5 min
+// by StartCertExpiryRefresher (see pkg/gateway/cert_expiry.go). Safe
+// on a nil receiver.
+func (m *Metrics) SetTLSCertExpiry(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.tlsCertExpiry.Set(d.Seconds())
 }
 
 // requestLogger is a one-line structured slog request logger used by Handler.

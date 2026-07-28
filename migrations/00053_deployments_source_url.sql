@@ -1,5 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
+-- filename: 00053_deployments_source_url.sql
 --
 -- 00053_deployments_source_url.sql — Tier 3 (issue #197 B3.10 schema half).
 --
@@ -32,20 +33,41 @@
 -- one for image: deploys). ADR-038 (Phase 2) names the producer; the
 -- reader is /v1/builds/{id}/provenance.
 --
+-- Idempotent (ADD COLUMN IF NOT EXISTS + DO-block-guarded
+-- ADD CONSTRAINT, mirroring 00047_crons_created_at.sql's
+-- convention) so re-running this migration on a DB where the
+-- columns and constraint already exist but the goose row was
+-- lost is a no-op. The CD job on 2026-07-27 hit the
+-- non-idempotent shape on the production box: schema present,
+-- version row missing — the bare ADD COLUMN tripped SQLSTATE
+-- 42701. The shape here closes the recurrence vector; the
+-- companion second-MigrateUp assertion in
+-- 00053_deployments_source_url_test.go pins the contract at
+-- PR time.
+--
 -- Down: drops both columns. No data is lost in steady state because
 -- both fields are recomputable from the deployment trigger (re-run
 -- the githubd createDeployment callback or re-derive source_url from
 -- the app config).
 
 ALTER TABLE deployments
-    ADD COLUMN source_url text,
-    ADD COLUMN commit_sha text;
+    ADD COLUMN IF NOT EXISTS source_url text,
+    ADD COLUMN IF NOT EXISTS commit_sha text;
 
-ALTER TABLE deployments
-    ADD CONSTRAINT deployments_commit_sha_shape_chk
-        CHECK (commit_sha IS NULL
-               OR (char_length(commit_sha) BETWEEN 7 AND 64
-                   AND commit_sha ~ '^[0-9a-f]+$'));
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'deployments_commit_sha_shape_chk'
+          AND conrelid = 'deployments'::regclass
+    ) THEN
+        ALTER TABLE deployments
+            ADD CONSTRAINT deployments_commit_sha_shape_chk
+                CHECK (commit_sha IS NULL
+                       OR (char_length(commit_sha) BETWEEN 7 AND 64
+                           AND commit_sha ~ '^[0-9a-f]+$'));
+    END IF;
+END$$;
 
 -- +goose StatementEnd
 

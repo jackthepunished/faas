@@ -1,6 +1,7 @@
 package rootfs
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
@@ -115,6 +116,51 @@ func TestBuildBase_AppliesAllLayers(t *testing.T) {
 	sizeArg := run.argv[len(run.argv)-1]
 	if !strings.HasSuffix(sizeArg, "M") {
 		t.Errorf("size arg %q does not end with M", sizeArg)
+	}
+}
+
+// TestBuildBase_RealImageShapeWithAbsoluteSymlinks is the base-build-level
+// regression pin for the imaged crash-loop that held cd-digitalocean red on
+// every merge to main:
+//
+//	imaged: stage builder base docker.io/library/alpine@sha256:79ff19… →
+//	  /srv/fc/base/builder-base.ext4: imaged: build base ext4:
+//	  rootfs: apply base layer 0: rootfs: absolute entry path
+//	  "/bin/busybox" rejected
+//
+// The layer fixture below mirrors the real alpine base image: a busybox
+// binary plus applet symlinks whose targets are ABSOLUTE. The upstream
+// image ships 306 such links; commit 7805f76 made ApplyLayer reject them,
+// so imaged could not produce builder-base.ext4 and exited 1 in a restart
+// loop (18,000+ restarts before this was caught).
+//
+// This exercises the exact call path imaged runs at startup — BuildBase,
+// not just ApplyLayer — so the failure surfaces in PR CI rather than on the
+// box after merge.
+func TestBuildBase_RealImageShapeWithAbsoluteSymlinks(t *testing.T) {
+	be := newTestStorage(t)
+	run := &mkfsFakeRunner{fill: []byte("FAKE-BASE-EXT4")}
+	b := NewBuilder(run)
+	_, err := b.BuildBase(context.Background(), BaseBuildInput{
+		Layers: []io.Reader{
+			gzLayer(t, []entry{
+				{name: "bin", typeflag: tar.TypeDir},
+				{name: "bin/busybox", body: "ELF"},
+				// The alpine shape: absolute applet symlinks.
+				{name: "bin/sh", typeflag: tar.TypeSymlink, linkname: "/bin/busybox"},
+				{name: "bin/cat", typeflag: tar.TypeSymlink, linkname: "/bin/busybox"},
+				{name: "bin/ls", typeflag: tar.TypeSymlink, linkname: "/bin/busybox"},
+				// And a relative one, which alpine also ships.
+				{name: "usr/bin/awk", typeflag: tar.TypeSymlink, linkname: "../../bin/busybox"},
+			}),
+		},
+		Storage:    be,
+		StorageKey: "base/builder-base.ext4",
+	})
+	if err != nil {
+		t.Fatalf("BuildBase rejected a real-image layer shape: %v\n"+
+			"this is the imaged startup crash-loop (commit 7805f76); "+
+			"absolute symlink targets are normal in every OCI base image", err)
 	}
 }
 

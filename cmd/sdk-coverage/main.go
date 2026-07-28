@@ -156,6 +156,11 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/delayed-tasks/{id}":        "CancelDelayedTask",
 	"GET /v1/invocations":                  "ListInvocations",
 	"GET /v1/invocations/{id}":             "GetInvocation",
+	// Issue #279 — operator credits. The auto-derivation produces
+	// "PostAdminAccountsIdCredits" which reads as a Swagger-style
+	// artifact; the SDK verb is "issue" (the operator's mental
+	// model) so the explicit map takes precedence.
+	"POST /v1/admin/accounts/{id}/credits": "IssueAccountCredit",
 
 	// IAM-4 (ADR-035) audit log surface. The auto-derivation would
 	// otherwise produce names with literal hyphens ("GetAudit-events",

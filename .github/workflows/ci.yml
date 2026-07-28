@@ -134,6 +134,38 @@ jobs:
           sudo mv "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool check rules deploy/ansible/roles/prometheus/files/faas.rules.yml
 
+      # ansible syntax gate. deploy/ansible/ is the source of truth for the
+      # box's systemd units, sysctls and secret file modes, but nothing in
+      # CI ever parsed it — so it rotted. When this gate was added, SIX role
+      # files did not parse as YAML at all (unquoted `name:` values holding
+      # a `: `, a `when:` opening with a double-quoted path, `failed_when:`
+      # OR-chains whose continuation lines sat at the `-` indent), and the
+      # tree failed before ansible even reached module resolution.
+      #
+      # That is why the deploy roles drifted from the live box: three copies
+      # of faas-imaged.service existed and two were missing /srv/fc/base
+      # while all three were missing /srv/fc/sigs, which crash-looped imaged
+      # and took cd-digitalocean red (PR #374, #375). Nothing could have
+      # caught it, because the playbook was unrunnable.
+      #
+      # --syntax-check both parses every file and RESOLVES every module, so
+      # it also catches semantics YAML alone can't: a task-level `creates:`
+      # that ansible rejects as a conflicting action statement (and which
+      # silently disabled the kernel-extract idempotency guard), and a role
+      # adopting a collection that requirements.yml doesn't pin.
+      #
+      # ansible-core is version-pinned for the same reason promtool is: the
+      # gate should fail on OUR drift, not on an upstream release. Deprecation
+      # warnings are printed but not fatal — ansible-core's deprecation
+      # schedule is outside this repo's control.
+      - name: ansible syntax-check
+        run: |
+          set -euo pipefail
+          pip install --quiet 'ansible-core==2.21.2'
+          cd deploy/ansible
+          ansible-galaxy collection install -r requirements.yml
+          ansible-playbook --syntax-check site.yml
+
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
       # through pkg/wire.Daemon. `--help` must exit 0 with non-empty usage text
       # (a silent success here usually means init() truncated on a bad flag
@@ -327,6 +359,184 @@ jobs:
         working-directory: sdk/go
         run: go test -count=1 ./...
 
+  # fakeapid fixture (issue #266, PR 4). The cross-language smoke
+  # fixture for the public SDKs — a stdlib-only Go binary that
+  # mimics apid's surface so Node (PR 5) and Python (PR 6) SDKs
+  # can smoke-test against a real HTTP process. The fixture must
+  # build + test cleanly with no external deps; this gate fails
+  # the PR if a regression breaks the wire shape.
+  #
+  # Mirrors sdk-go: same GO_VERSION, no services, no path filters
+  # (the existing convention is "no filter" so we don't accidentally
+  # skip the gate when a non-sdk change touches the workflow).
+  # PR 5/6 will invoke this job's pre-built ./bin/fakeapid from
+  # their own `-tags smoke_bin` runs to assert artifact
+  # compatibility (see sdk/fakeapid/main_bin_test.go).
+  sdk-fakeapid:
+    name: sdk-fakeapid (Go stdlib fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No Go cache: the fixture module has zero external deps
+          # (no go.sum), so cache hit rate is zero anyway.
+      - name: go build
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: go test
+        working-directory: sdk/fakeapid
+        run: go test -count=1 -race ./...
+
+  # PR 5 (issue #266, Node SDK). Two jobs: gen asserts the
+  # committed generated tree matches a fresh regen (dirty-diff gate
+  # per ADR-013); smoke runs the smoke suite against the fakeapid
+  # fixture built inline (no shared artifact upload).
+  #
+  # No path filters — matches sdk-go / sdk-fakeapid precedent so the
+  # gate fires whenever the workflow runs.
+  sdk-gen-node:
+    name: sdk-gen-node (regenerate + dirty-diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: gen:check (regenerate + assert clean diff)
+        working-directory: sdk/node
+        run: |
+          npm run gen:check || {
+            echo "::error::sdk/node/src/generated is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
+            exit 1
+          }
+
+  sdk-smoke-node:
+    name: sdk-smoke-node (Node SDK against fakeapid fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: build fakeapid fixture
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: smoke test
+        working-directory: sdk/node
+        run: npm run test:smoke
+
+  sdk-unit-node:
+    name: sdk-unit-node (Node SDK unit tests, no fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - name: npm ci
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: unit tests
+        working-directory: sdk/node
+        run: npm run test:unit
+
+  sdk-gen-python:
+    name: sdk-gen-python (regenerate + dirty-diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: pip install generator + sdk
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruamel.yaml openapi-python-client pytest pytest-asyncio httpx
+          python -m pip install -e .
+      - name: gen + assert clean diff
+        working-directory: sdk/python
+        run: |
+          python scripts/gen.py
+          git diff --exit-code -- sdk/python/faas_sdk/ || {
+            echo "::error::sdk/python/faas_sdk is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-python-check' locally and commit the result."
+            exit 1
+          }
+
+  sdk-smoke-python:
+    name: sdk-smoke-python (Python SDK against fakeapid fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: build fakeapid fixture
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: install SDK + test deps
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio httpx
+      - name: smoke + unit + regen determinism
+        working-directory: sdk/python
+        run: python -m pytest tests/ --ignore=tests/debug_chain.py -v
+
+  sdk-unit-python:
+    name: sdk-unit-python (Python SDK unit tests, no fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: install SDK + test deps
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio httpx
+      - name: unit tests
+        working-directory: sdk/python
+        run: python -m pytest tests/test_client.py tests/test_sse.py
+
   coverage:
     services:
       postgres:
@@ -484,7 +694,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # fetch-depth: 0 — the slot-collision and replay-safety steps both diff
+      # against origin/<base>, which a shallow clone cannot resolve.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -492,6 +706,23 @@ jobs:
           cache-dependency-path: go.sum
       - name: migrations check (static)
         run: make migrations-check
+
+      # Cross-PR slot collision. TestMigrationsUniquePrefixes (in the static
+      # step above) only sees one branch at a time: a PR builds against
+      # refs/pull/N/merge, which cannot contain a sibling PR's files. So two
+      # open PRs can each add 00054_*.sql, both go green, and the collision
+      # only exists after the second merges — at which point main panics with
+      # "goose: duplicate version 54", every other open PR goes red, and the
+      # deploy fails. That happened on slots 51, 52 and 54 (issue #366).
+      # Post-merge detection is too late; this moves it to the only point
+      # where renumbering is cheap.
+      - name: migration slot collision (vs other open PRs)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: ./scripts/ci/check_migration_slots.sh
       # No `-tags no_pg` here on purpose: apply_walk_test.go carries
       # `//go:build !no_pg`, so the static-only `make migrations-check`
       # step skips it and this step picks it up. The `-run` filter
@@ -500,6 +731,36 @@ jobs:
       # here because their package has no build tag.
       - name: migrations apply-and-walk
         run: go test -race -count=1 -v -run TestMigrationsApplyAndWalk ./migrations/...
+
+      # Replay safety for migrations this diff ADDS. apply-and-walk above
+      # migrates a FRESH database, which is the one state the DO box is never
+      # in: twice its schema has been AHEAD of its goose ledger and the deploy
+      # died mid-apply on a migration CI had passed —
+      #   00030_invocations:            relation "invocations" already exists
+      #   00053_deployments_source_url: column "source_url" already exists
+      # Only NEW migrations are replayed: 00001_init is legitimately not
+      # re-runnable, and replaying from zero against a populated database is
+      # not a scenario worth surviving. See migrations/replay_safety_test.go.
+      - name: compute added migration versions
+        id: newmig
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch -q origin "${{ github.base_ref }}"
+            base="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+          else
+            # push to main: compare against the commit before this one, so a
+            # direct merge still exercises whatever it introduced.
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          versions="$(git diff --name-only --diff-filter=A "${base}" HEAD -- 'migrations/*.sql' \
+            | sed -nE 's|.*/([0-9]{5})_.*\.sql$|\1|p' | sort -u | paste -sd, -)"
+          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          echo "added migration versions: ${versions:-<none>}"
+      - name: migrations replay-safety (new migrations only)
+        env:
+          FAAS_REPLAY_CHECK_VERSIONS: ${{ steps.newmig.outputs.versions }}
+        run: go test -race -count=1 -v -run TestNewMigrationsAreReplaySafe ./migrations/...
 
   sqlc-check:
     # Drift gate between queries.sql + schema.sql and the committed

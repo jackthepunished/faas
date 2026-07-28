@@ -328,6 +328,13 @@ func (f *fakeBillingProvider) CreateUpgradeTransaction(_ context.Context, acct s
 	return f.txnID, f.checkoutURL, nil
 }
 
+// Refund is the issue #279 billing.Provider seam. The changePlan
+// tests never call it; returning ErrNotImplemented matches the
+// Paddle-out-of-scope contract documented in pkg/billing/provider.go.
+func (f *fakeBillingProvider) Refund(_ context.Context, _ string, _ int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
+}
+
 // TestChangePlan_PaddleCheckout_RendersPaddleExtension pins the
 // Paddle dispatch on the changePlan 402 path (PR #3 / ADR-025). The
 // fakeBillingProvider returns ("txn_abc", "https://paddle.example/checkout/xyz", nil);

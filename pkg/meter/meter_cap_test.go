@@ -1,0 +1,314 @@
+// Issue #279 PR A — overage cap gate inside the meterd quota tick.
+//
+// The cap is layered on top of the existing free/paid ladder:
+// accounts.overage_cap_cents is consulted once per quota tick; an
+// account at-or-past the cap skips the overage-row insert path
+// inside EnforceQuota and the meterd_billing_cap_exceeded_total
+// counter is incremented with the plan label. In-budget usage is
+// unchanged; the cap is advisory for overage only.
+package meter_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
+)
+
+// TestRunQuotaOnce_OverageCapHonored — a paid account at 120% of its
+// monthly overage ceiling skips the quota ladder and the counter
+// increments. The same account pre-cap is treated as a normal paid
+// customer (counter stays zero).
+func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	// Cap-bearing Hobby account.
+	acct := makeAccount(t, ctx, store, api.PlanHobby)
+	store.SetOverageCapCentsForTest(acct.ID, 1000)
+
+	// 1200 cents of derived overage this month. 100 cents = 1 GB-h, so
+	// 1200 cents = 12 GB-h = 12 * 1024 * 3600 = 44_236_800 mb_seconds.
+	// Round to 44_280_000 to land at 1200 cents exactly (44_280_000 / 3600 * 100 = 1_230_000; wait — formula is
+	// mb_seconds * 100 / 3600 = cents. 43_200_000 * 100 / 3600 = 1_200_000 cents = 1200 cents.
+	const targetCents = int64(1200)
+	mbSeconds := targetCents * 3600 / 100 // 43_200_000
+	month := meter.AccountMonthKey(now)
+	// UsageByMonth is keyed by month; planting a single row in the
+	// current month is enough — the cap gate sums usage_minutes, not
+	// the per-app rollup.
+	row, err := store.UsageByMonth(ctx, acct.ID, month)
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	for _, u := range row {
+		mbSeconds -= u.MBSeconds
+	}
+	if mbSeconds > 0 {
+		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
+			t.Fatalf("append usage: %v", err)
+		}
+	}
+
+	ops := wire.NewOpsMetrics("meter_test_cap")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	// The metric prefix is the test registry name from NewOpsMetrics.
+	// The cap-hit increments the counter past zero; the {plan="hobby"}
+	// line must show ≥ 1.
+	hitLine := `meter_test_cap_billing_cap_exceeded_total{plan="hobby"} 1`
+	if !strings.Contains(body, hitLine) {
+		t.Fatalf("counter did not increment past 0; expected line %q:\n%s", hitLine, body)
+	}
+	// Sibling pre-init lines for other plans must still be at zero.
+	for _, p := range []string{"free", "pro", "scale"} {
+		zeroLine := fmt.Sprintf(`meter_test_cap_billing_cap_exceeded_total{plan=%q} 0`, p)
+		if !strings.Contains(body, zeroLine) {
+			t.Fatalf("sibling pre-init line %q missing:\n%s", zeroLine, body)
+		}
+	}
+}
+
+// TestRunQuotaOnce_OverageCapBelowThreshold — cap is set but the
+// account hasn't hit it yet. The quota ladder runs normally; the
+// counter is NOT incremented.
+func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	acct := makeAccount(t, ctx, store, api.PlanPro)
+	store.SetOverageCapCentsForTest(acct.ID, 10_000)
+
+	// 500 cents of overage (5 GB-h). Below the 10_000 cap.
+	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
+		t.Fatalf("append usage: %v", err)
+	}
+
+	ops := wire.NewOpsMetrics("meter_test_cap_below")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	// The counter is pre-instantiated for the closed api.Plans set so
+	// the line shows up even before the first cap hit. The metric
+	// name is prefixed with the test registry so it carries the
+	// "meter_test_cap_below_" prefix (Pattern: pkg/wire.NewOpsMetrics).
+	zeroLine := `meter_test_cap_below_billing_cap_exceeded_total{plan="pro"} 0`
+	if !strings.Contains(body, zeroLine) {
+		t.Fatalf("body missing %q (counter pre-init for the closed plan set):\n%s", zeroLine, body)
+	}
+	// Counter must NOT be incremented for a below-cap account.
+	incLine := `meter_test_cap_below_billing_cap_exceeded_total{plan="pro"} 1`
+	if strings.Contains(body, incLine) {
+		t.Fatalf("counter incremented for a below-cap account:\n%s", body)
+	}
+}
+
+// TestRunQuotaOnce_OverageCapUnset — accounts without a cap behave
+// exactly as before the PR: the quota ladder runs, the counter is
+// not emitted for this plan at all (no cap = nothing to skip).
+func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	makeAccount(t, ctx, store, api.PlanScale)
+	// No SetOverageCapCentsForTest call — NULL column analog.
+
+	ops := wire.NewOpsMetrics("meter_test_cap_unset")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	// No cap means no skip, no counter increment — the cap counter
+	// line should be absent for the scale plan.
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	if strings.Contains(body, `meter_test_cap_unset_billing_cap_exceeded_total{plan="scale"} 1`) {
+		t.Fatalf("counter incremented for a no-cap account:\n%s", body)
+	}
+	// No-cap account must NOT have bypassed the pre-init: the counter
+	// line should still be present at zero (the registry pre-instantiates
+	// every closed plan set).
+	zeroLine := `meter_test_cap_unset_billing_cap_exceeded_total{plan="scale"} 0`
+	if !strings.Contains(body, zeroLine) {
+		t.Fatalf("counter pre-init line %q missing:\n%s", zeroLine, body)
+	}
+}
+
+// TestRunQuotaOnce_OverageCapLoadFailure — fail-open: a transient
+// error from LoadAllOverageCapCents must not stall the quota loop.
+// The ladder runs as if no caps were configured. We use a hand-rolled
+// Store that errors on the cap load to simulate the transient.
+func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
+	t.Parallel()
+	store := &errCapStore{MemStore: state.NewMemStore()}
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	makeAccount(t, ctx, store.MemStore, api.PlanHobby)
+
+	ops := wire.NewOpsMetrics("meter_test_cap_fail")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	// Must not panic / return error — the loop's caller is the
+	// ticker, and the cap-load failure is logged + swallowed.
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	if strings.Contains(body, `meter_test_cap_fail_billing_cap_exceeded_total{plan="hobby"} 1`) {
+		t.Fatalf("counter incremented on a cap-load failure; expected no increment:\n%s", body)
+	}
+}
+
+// TestRunQuotaOnce_OverageCapAtCap — pins the boundary semantics:
+// monthCents == capCents IS treated as a hit (the implementation
+// uses `>=`). An off-by-one fix would silently flip the behaviour
+// here, so the test pins the equality.
+func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+
+	acct := makeAccount(t, ctx, store, api.PlanScale)
+	store.SetOverageCapCentsForTest(acct.ID, 500) // cents
+
+	// Exactly 500 cents of derived overage.
+	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0); err != nil {
+		t.Fatalf("append usage: %v", err)
+	}
+
+	ops := wire.NewOpsMetrics("meter_test_cap_boundary")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil,
+		&fakeNotifier{},
+		nil,
+		nil,
+		nil, /* residency — cpu-hour metering not exercised here */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	loop.RunQuotaOnce(ctx)
+
+	body := scrapeBody(t, ops)
+	// Equality IS a cap hit: counter goes 0 → 1.
+	hitLine := `meter_test_cap_boundary_billing_cap_exceeded_total{plan="scale"} 1`
+	if !strings.Contains(body, hitLine) {
+		t.Fatalf("boundary (monthCents == capCents) should count as a cap hit; expected line %q:\n%s", hitLine, body)
+	}
+}
+
+// errCapStore wraps MemStore so LoadAllOverageCapCents returns an
+// error. Used by TestRunQuotaOnce_OverageCapLoadFailure. Other
+// methods fall through to the embedded MemStore so the quota ladder
+// has accounts to walk.
+type errCapStore struct {
+	*state.MemStore
+}
+
+func (errCapStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64, error) {
+	return nil, errTransient
+}
+
+// errTransient is the synthetic error used by the cap-load failure
+// test. Implements error.
+var errTransient = errTransientError("synthetic: cap load failed")
+
+type errTransientError string
+
+func (e errTransientError) Error() string { return string(e) }

@@ -337,6 +337,53 @@ else
   warn "hostage-gen not found at ${FAAS_BIN}/hostage-gen — MFA won't function until you build it (`make build`)"
 fi
 
+# ─── 11c. Cosign sign-keypair (Tier 3 / ADR-038 §Phase 3) ────────────────────
+# imaged and schedd fail-loud at startup if /etc/faas/secrets/sign.key
+# or sign-pub.pem is missing or has wrong perms (cmd/imaged/main.go:103-109
+# and cmd/schedd/main.go:248-251). The cosign signer/verifier is the
+# build-attestation pipeline (ADR-038); without these files the daemons
+# crash-loop indefinitely. The Go side enforces the file MODE only
+# (0440 root:faas for the priv side via pkg/cosign.WriteKeyPairForGroup;
+# 0444 root:root for the pub side). The installer (bootstrap.sh here,
+# the ansible role in deploy/ansible/) is responsible for the OWNERSHIP
+# because the install context varies — root in bootstrap, the faas
+# user in ansible, and only the install caller knows the target user.
+# Drift-repair branch mirrors 11b's host.age flow: refuse silent
+# rotation; only repair perms.
+SIGN_KEY_PATH="${SECRETS_DIR}/sign.key"
+SIGN_PUB_PATH="${SECRETS_DIR}/sign-pub.pem"
+if [[ ! -f "${SIGN_KEY_PATH}" || ! -f "${SIGN_PUB_PATH}" ]]; then
+  if [[ -x "${FAAS_BIN}/faas" ]]; then
+    "${FAAS_BIN}/faas" sign-keys init \
+      --sign-key "${SIGN_KEY_PATH}" --verify-key "${SIGN_PUB_PATH}"
+    chown root:faas "${SIGN_KEY_PATH}"
+    chmod 0440 "${SIGN_KEY_PATH}"
+    chown root:root "${SIGN_PUB_PATH}"
+    chmod 0444 "${SIGN_PUB_PATH}"
+    ok "sign.key written to ${SIGN_KEY_PATH} (0440 root:faas)"
+    ok "sign-pub.pem written to ${SIGN_PUB_PATH} (0444 root:root)"
+  else
+    warn "faas CLI not found at ${FAAS_BIN}/faas — imaged and schedd will fail-loud until you build it (`make build`) and run \`faas sign-keys init\`"
+  fi
+else
+  # Drift check: re-bootstrap must not silently rotate the key (a
+  # rotation invalidates every customer's build-verification chain
+  # until schedd reloads the new pub). We refuse rotation; we DO
+  # repair perms — same shape as step 11b's host.age drift branch.
+  SK_MODE=$(stat -c '%a' "${SIGN_KEY_PATH}")
+  SK_OWNER=$(stat -c '%U:%G' "${SIGN_KEY_PATH}")
+  SP_MODE=$(stat -c '%a' "${SIGN_PUB_PATH}")
+  SP_OWNER=$(stat -c '%U:%G' "${SIGN_PUB_PATH}")
+  if [[ "${SK_MODE}" != "440" || "${SK_OWNER}" != "root:faas" \
+     || "${SP_MODE}" != "444" || "${SP_OWNER}" != "root:root" ]]; then
+    chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
+    chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
+    ok "sign-keypair perms repaired (was ${SK_MODE} ${SK_OWNER} / ${SP_MODE} ${SP_OWNER}, now 0440 root:faas / 0444 root:root)"
+  else
+    ok "sign-keypair already present with correct perms (refusing to rotate)"
+  fi
+fi
+
 # ─── 12. Generate deploy SSH key ─────────────────────────────────────────────
 mkdir -p "$(dirname "${DEPLOY_KEY_PATH}")"
 # Defensive ownership on the directory regardless of which branch runs

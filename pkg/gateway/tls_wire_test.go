@@ -60,7 +60,7 @@ func TestNewCertMagicConfig_BuildsBundle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h))
+	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h), nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestNewCertMagicConfig_ManageSyncReturnsCleanly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), factory)
+	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), factory, nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig must tolerate ManageSync failure: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestNewCertMagicConfig_StagingCAWhenConfigured(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h))
+	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h), nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestNewCertMagicConfig_ProdCAWhenStagingDisabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h))
+	bundle, err := NewCertMagicConfig(ctx, cfg, "test-token", quietLogger(), newTestHetznerFactory(t, h), nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -185,7 +185,7 @@ func firstIssuerCA(cfg *certmagic.Config) string {
 func TestNewCertMagicConfig_DisabledConfigRejected(t *testing.T) {
 	cfg := validTLSConfig()
 	cfg.Disabled = true
-	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil)
+	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil, nil)
 	if err == nil {
 		t.Fatal("Disabled=true must be rejected by NewCertMagicConfig")
 	}
@@ -199,7 +199,7 @@ func TestNewCertMagicConfig_DisabledConfigRejected(t *testing.T) {
 func TestNewCertMagicConfig_HalfConfiguredRejected(t *testing.T) {
 	cfg := validTLSConfig()
 	cfg.WildcardCertDomain = ""
-	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil)
+	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil, nil)
 	if !errors.Is(err, ErrTLSMisconfigured) {
 		t.Errorf("expected ErrTLSMisconfigured, got %v", err)
 	}
@@ -211,7 +211,7 @@ func TestNewCertMagicConfig_HalfConfiguredRejected(t *testing.T) {
 func TestNewCertMagicConfig_NoAllowlistRejected(t *testing.T) {
 	cfg := validTLSConfig()
 	cfg.OnDemandHTTP01Allowlist = nil
-	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil)
+	_, err := NewCertMagicConfig(context.Background(), cfg, "tok", quietLogger(), nil, nil)
 	if !errors.Is(err, ErrTLSAllowlistMissing) {
 		t.Errorf("expected ErrTLSAllowlistMissing, got %v", err)
 	}
@@ -226,7 +226,7 @@ func TestNewCertMagicConfig_StorageDirCreated(t *testing.T) {
 	cfg.StorageDir = dir
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h)); err != nil {
+	if _, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h), nil); err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
 	info, err := os.Stat(dir)
@@ -256,7 +256,12 @@ func TestCertMagicOnDemand_AbuseVectorDenied(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h))
+	// ADR-024 H3: wire a *Metrics into the bundle so the counter hook
+	// fires alongside the existing CountingAllowlist test. The Metrics
+	// is process-local; same shape as production (the daemon passes its
+	// own *Metrics to NewCertMagicConfig at startup).
+	m := NewMetrics()
+	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h), m)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -269,6 +274,17 @@ func TestCertMagicOnDemand_AbuseVectorDenied(t *testing.T) {
 	}
 	if got := counter.Allow.Load(); got != 0 {
 		t.Errorf("counter.Allow = %d, want 0 (no allowlist hit expected for the attacker SNI)", got)
+	}
+	// H3 assertion: the gateway_tls_on_demand_denied_total{reason="allowlist"}
+	// counter incremented for this denial. dns01 + token stay at 0
+	// (pre-instantiated; not touched by this path).
+	if got := readTLSOnDemandDenied(t, m, "allowlist"); got != 1 {
+		t.Fatalf("counter{reason=allowlist} = %v, want 1 (one denial observed)", got)
+	}
+	for _, reason := range []string{"dns01", "token"} {
+		if v := readTLSOnDemandDenied(t, m, reason); v != 0 {
+			t.Errorf("counter{reason=%s} = %v, want 0 (frozen-zero sentinel)", reason, v)
+		}
 	}
 }
 
@@ -285,7 +301,7 @@ func TestCertMagicOnDemand_KnownHostAllowed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h))
+	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h), nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}
@@ -307,7 +323,7 @@ func TestNewACMEMux_HTTPChallengeHandlerRoundTrip(t *testing.T) {
 	cfg.StorageDir = testStorageDir(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h))
+	bundle, err := NewCertMagicConfig(ctx, cfg, "tok", quietLogger(), newTestHetznerFactory(t, h), nil)
 	if err != nil {
 		t.Fatalf("NewCertMagicConfig: %v", err)
 	}

@@ -28,9 +28,14 @@ var ErrInsecurePrivKeyPerms = errors.New("cosign: sign.key mode permits group/ot
 var ErrInsecurePubKeyPerms = errors.New("cosign: sign-pub.pem mode permits group/other write/exec/setuid")
 
 // DefaultSignKeyPath is the canonical location for the platform's
-// ECDSA P-256 signing key (mode 0400, root:root). The ansible role
-// asserts the file exists before systemctl start; cmd/imaged loads
-// it at startup with LoadPrivateKeyFile (fail-loud).
+// ECDSA P-256 signing key. The canonical DigitalOcean install is
+// mode 0440 root:faas so the faas-imaged systemd unit (running as
+// User=faas-imaged Group=faas) can read the file via group access;
+// an owner-only install (mode 0400 root:root) is also accepted by
+// LoadPrivateKeyFile and used in single-operator topologies. The
+// ansible role asserts the file exists before systemctl start;
+// cmd/imaged loads it at startup with LoadPrivateKeyFile
+// (fail-loud).
 const DefaultSignKeyPath = "/etc/faas/secrets/sign.key"
 
 // DefaultSignPubPath is the canonical location for the platform's
@@ -42,9 +47,10 @@ const DefaultSignPubPath = "/etc/faas/secrets/sign-pub.pem"
 // LoadPrivateKeyFile reads + parses + mode-checks the signing
 // key. Allowed modes: 0o400 (owner-only) and 0o440 (owner+group
 // read) — no write/exec/setuid bits for anyone. The 0o440 form
-// supports co-admin installs where the key is shared between the
-// primary operator and a break-glass role; the canonical
-// /etc/faas/secrets/sign.key install uses 0o400 (root:root).
+// is the canonical install for the DigitalOcean topology where
+// faas-imaged runs as User=faas-imaged Group=faas and reads the
+// key via group access; the 0o400 form is the owner-only
+// alternative (root:root) for single-operator installs.
 // Anything looser (group write, other read, any exec, any setuid)
 // returns ErrInsecurePrivKeyPerms.
 func LoadPrivateKeyFile(path string) (*ecdsa.PrivateKey, error) {

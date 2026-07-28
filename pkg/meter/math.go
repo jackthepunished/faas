@@ -12,6 +12,16 @@ func GBHours(mbSeconds int64) float64 {
 	return float64(mbSeconds) / 1024.0 / 3600.0
 }
 
+// CPUHours converts microseconds of CPU usage to CPU-hours. 1 hour = 3.6e9 µs.
+//
+// CPUHours is the public arithmetic shape the API DTO exposes
+// (UsageResponse.CPUHours). Issue #279 / PR-B wires the data path;
+// the unit is observability, not billing — see pkg/api/limits.go for
+// the active billing unit (plan RAM).
+func CPUHours(cpuUsec int64) float64 {
+	return float64(cpuUsec) / 3.6e9
+}
+
 // MBSecondsPerMinute is the billable mb_seconds one instance accumulates in
 // one minute when its admission-time RAM stays resident for the whole
 // interval. Used by the sampler.

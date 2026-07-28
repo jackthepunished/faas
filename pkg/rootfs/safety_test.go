@@ -105,12 +105,9 @@ func TestApplyEntry_Symlink(t *testing.T) {
 	dst := t.TempDir()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	// Relative-in-archive link target: the symlink points to a sibling
-	// entry inside the staging root. Absolute paths are REJECTED (see
-	// safeJoin + the CodeQL go/path-injection hardening in applyEntry)
-	// because a malicious layer could otherwise craft a symlink whose
-	// target is /etc/passwd or any other host path the staging directory
-	// will later follow.
+	// A symlink's Linkname is stored VERBATIM: it is guest-side data that
+	// the guest kernel resolves once the ext4 is mounted at "/". A
+	// relative target must stay relative.
 	if err := tw.WriteHeader(&tar.Header{
 		Name: "link", Linkname: "sibling", Typeflag: tar.TypeSymlink, Mode: 0o777,
 	}); err != nil {
@@ -126,84 +123,40 @@ func TestApplyEntry_Symlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("symlink not created: %v", err)
 	}
-	// safeJoin returns filepath.Join(base, clean(linkname)) so the
-	// kernel-side symlink text is the absolute path inside the staging
-	// root — that's how Layer.applyEntry interprets "relative path
-	// inside the archive root" after the CodeQL hardening.
-	wantTarget := filepath.Join(dst, "sibling")
-	if target != wantTarget {
-		t.Errorf("symlink target = %q, want %q", target, wantTarget)
+	// Verbatim — NOT filepath.Join(dst, "sibling"). Rewriting the target
+	// to a host staging path bakes /tmp/faas-base-XXXX into the image and
+	// produces a rootfs whose symlinks all dangle inside the guest.
+	if target != "sibling" {
+		t.Errorf("symlink target = %q, want %q (verbatim)", target, "sibling")
 	}
 }
 
-func TestApplyEntry_Symlink_RejectsAbsoluteLinkname(t *testing.T) {
-	// Defense-in-depth: a malicious layer can ship a symlink whose
-	// Linkname is an absolute host path. safeJoin rejects it before the
-	// staging directory is ever touched. Pin the failure mode here so
-	// the symlink path doesn't silently regress to "create the symlink
-	// with the absolute target" on a future refactor.
+// TestApplyEntry_Symlink_AbsoluteTargetStoredVerbatim is the regression pin
+// for the imaged crash-loop that took cd-digitalocean red on every merge to
+// main (imaged: "rootfs: absolute entry path \"/bin/busybox\" rejected").
+//
+// Commit 7805f76 routed symlink Linknames through safeJoin to silence a
+// CodeQL go/path-injection alert. safeJoin rejects absolute paths — but
+// absolute symlink targets are the NORM in OCI images, not an attack: the
+// alpine base layer alone ships 306 of them (bin/arch, bin/ash, bin/cat …
+// all -> /bin/busybox), and every Debian/Ubuntu image does the same. The
+// result was that imaged could not build a base rootfs from any real image
+// and crash-looped at startup.
+//
+// The target must be stored exactly as declared. Safety comes from the
+// host never FOLLOWING it — see TestApplyLayer_WriteThroughSymlinkIsClamped.
+func TestApplyEntry_Symlink_AbsoluteTargetStoredVerbatim(t *testing.T) {
 	dst := t.TempDir()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+	// Exactly the alpine shape.
 	if err := tw.WriteHeader(&tar.Header{
-		Name: "esc", Linkname: "/etc/passwd", Typeflag: tar.TypeSymlink, Mode: 0o777,
+		Name: "bin/busybox", Typeflag: tar.TypeReg, Mode: 0o755, Size: 0,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := ApplyLayer(dst, tar.NewReader(&buf)); err == nil {
-		t.Fatal("ApplyLayer accepted absolute symlink target; this is the CodeQL go/path-injection surface")
-	}
-	if _, err := os.Lstat(filepath.Join(dst, "esc")); err == nil {
-		t.Errorf("escaped symlink landed on host: %s/esc", dst)
-	}
-}
-
-// TestApplyEntry_Symlink_RejectsTwoStepChainAttack pins the attack
-// shape CodeQL's go/unsafe-unzip-symlink query specifically warns
-// about in its BAD/GOOD example: a malicious tar with two symlinks
-// chained so that a purely-syntactic check (e.g. filepath.Rel on
-// the un-resolved paths) would let the second link escape the
-// staging root.
-//
-// Attack shape (mirrors the rule's BAD example):
-//
-//	subdir/parent -> subdir            (link A, looks harmless)
-//	escape         -> subdir/parent/.. (link B, reads as "." under
-//	                                      naive Rel(subdir, "subdir/parent/..")
-//	                                      but actually points at the
-//	                                      parent of `subdir`)
-//
-// safeJoin's filepath.Clean collapses B's Linkname to "subdir"
-// (inside base), so B's on-disk target is dst/subdir — same as A.
-// Neither symlink's resolved target escapes dst. The kernel walk
-// at read time can't escape because A's target string itself was
-// validated at write time.
-//
-// This test pins the runtime invariant: BOTH symlinks land on disk
-// (safeJoin accepts them), but neither target resolves to a path
-// outside dst. A naive refactor that swaps safeJoin's
-// Clean+Rel(joined,base) for a plain Rel(subdir, "subdir/parent/..")
-// would let B point at dst's parent, which the test catches via
-// filepath.EvalSymlinks.
-func TestApplyEntry_Symlink_RejectsTwoStepChainAttack(t *testing.T) {
-	dst := t.TempDir()
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	// Step 1: innocent-looking symlink inside base. Linkname
-	// "subdir" passes safeJoin verbatim → target = dst/subdir.
 	if err := tw.WriteHeader(&tar.Header{
-		Name: "subdir/parent", Linkname: "subdir", Typeflag: tar.TypeSymlink, Mode: 0o777,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// Step 2: the CodeQL-flagged shape. safeJoin's Clean collapses
-	// "subdir/parent/.." → "subdir", so B's on-disk target is also
-	// dst/subdir (NOT dst's parent).
-	if err := tw.WriteHeader(&tar.Header{
-		Name: "escape", Linkname: "subdir/parent/..", Typeflag: tar.TypeSymlink, Mode: 0o777,
+		Name: "bin/sh", Linkname: "/bin/busybox", Typeflag: tar.TypeSymlink, Mode: 0o777,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -211,33 +164,171 @@ func TestApplyEntry_Symlink_RejectsTwoStepChainAttack(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := ApplyLayer(dst, tar.NewReader(&buf)); err != nil {
-		t.Fatalf("ApplyLayer on benign-shape 2-link tar: %v (test fixture bug, not safeJoin regression)", err)
+		t.Fatalf("ApplyLayer rejected an absolute symlink target: %v\n"+
+			"this is the imaged crash-loop regression (commit 7805f76)", err)
 	}
-	// Walk the escape symlink; the kernel-resolved target MUST
-	// remain inside dst. A regression in safeJoin that lets B's
-	// Linkname pass as-is (rather than via Clean collapse) would
-	// resolve to dst/.. — the test catches it here.
-	//
-	// EvalSymlinks dst too: on macOS, t.TempDir() returns a path
-	// under /var/folders/... which itself is a symlink to
-	// /private/var/folders/...; comparing resolved-vs-dst without
-	// normalising dst gives a false-positive escape reading on
-	// every run. The dst path is a real directory owned by us, so
-	// normalising it is safe.
-	dstReal, err := filepath.EvalSymlinks(dst)
+	got, err := os.Readlink(filepath.Join(dst, "bin/sh"))
 	if err != nil {
-		t.Fatalf("EvalSymlinks(dst): %v", err)
+		t.Fatalf("bin/sh symlink not created: %v", err)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(dst, "escape"))
+	if got != "/bin/busybox" {
+		t.Errorf("bin/sh -> %q, want %q (verbatim, guest-side path)", got, "/bin/busybox")
+	}
+}
+
+// TestApplyLayer_WriteThroughSymlinkIsClamped pins the security property
+// that makes verbatim Linknames safe, and is the real answer to the CodeQL
+// go/path-injection alert that 7805f76 mis-fixed.
+//
+// A hostile layer ships "escape -> /etc" and then writes "escape/passwd".
+// The link text is stored as-is, but the host resolves the later write
+// with resolveWithin, which re-anchors absolute link targets at the
+// staging root. The write must land inside dst and the host's real
+// /etc/passwd must be untouched.
+func TestApplyLayer_WriteThroughSymlinkIsClamped(t *testing.T) {
+	dst := t.TempDir()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape", Linkname: "/etc", Typeflag: tar.TypeSymlink, Mode: 0o777,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("PWNED")
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyLayer(dst, tar.NewReader(&buf)); err != nil {
+		t.Fatalf("ApplyLayer: %v", err)
+	}
+	// The write landed inside staging, at <dst>/etc/passwd.
+	clamped := filepath.Join(dst, "etc", "passwd")
+	got, err := os.ReadFile(clamped)
 	if err != nil {
-		t.Fatalf("EvalSymlinks on escape: %v", err)
+		t.Fatalf("clamped write not found at %s: %v", clamped, err)
 	}
-	rel, err := filepath.Rel(dstReal, resolved)
+	if string(got) != string(body) {
+		t.Errorf("clamped content = %q, want %q", got, body)
+	}
+	// And the link text itself is still the verbatim guest-side value.
+	link, err := os.Readlink(filepath.Join(dst, "escape"))
 	if err != nil {
-		t.Fatalf("Rel(%q, %q): %v", dstReal, resolved, err)
+		t.Fatal(err)
 	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		t.Errorf("2-step symlink chain escaped dst: %q -> %q (rel=%q)", filepath.Join(dst, "escape"), resolved, rel)
+	if link != "/etc" {
+		t.Errorf("link text = %q, want %q", link, "/etc")
+	}
+}
+
+// TestResolveWithin_SymlinkCycleTerminates pins the SYMLOOP_MAX bound: a
+// layer with a symlink cycle must fail the build, not hang the daemon.
+func TestResolveWithin_SymlinkCycleTerminates(t *testing.T) {
+	dst := t.TempDir()
+	if err := os.Symlink("b", filepath.Join(dst, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", filepath.Join(dst, "b")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveWithin(dst, "a/file"); err == nil {
+		t.Fatal("expected a symlink-cycle error, got nil")
+	}
+}
+
+// TestResolveWithin_MergedUsrTraversal pins the Debian-style layout that a
+// reject-on-ancestor-symlink guard would have broken: "bin -> usr/bin" in
+// one layer, "bin/sh" written in a later one.
+func TestResolveWithin_MergedUsrTraversal(t *testing.T) {
+	dst := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dst, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("usr/bin", filepath.Join(dst, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveEntryPath(dst, "bin/sh")
+	if err != nil {
+		t.Fatalf("merged-usr traversal rejected: %v", err)
+	}
+	want := filepath.Join(dst, "usr", "bin", "sh")
+	if got != want {
+		t.Errorf("resolveEntryPath = %q, want %q", got, want)
+	}
+}
+
+// TestApplyEntry_Symlink_TwoStepChainCannotEscapeWrites pins the attack
+// shape CodeQL's go/unsafe-unzip-symlink query warns about: a malicious tar
+// chaining two symlinks so a purely-syntactic check would let a later WRITE
+// escape the staging root.
+//
+// Attack shape:
+//
+//	subdir/parent -> ..                (link A: from inside subdir, "up")
+//	escape        -> subdir/parent/..  (link B: two levels up = dst's parent)
+//	escape/pwned                       (the actual write attempt)
+//
+// Both links are stored verbatim — they are guest-side strings and harmless
+// on their own. The security boundary is the WRITE: resolveWithin consumes
+// ".." with a clamp at root, so B cannot walk above dst and the payload
+// lands inside staging. Nothing is created next to dst on the host.
+func TestApplyEntry_Symlink_TwoStepChainCannotEscapeWrites(t *testing.T) {
+	parentDir := t.TempDir()
+	dst := filepath.Join(parentDir, "staging")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Canary next to dst: the attack's real goal is to clobber this.
+	canary := filepath.Join(parentDir, "pwned")
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "subdir/parent", Linkname: "..", Typeflag: tar.TypeSymlink, Mode: 0o777,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape", Linkname: "subdir/parent/..", Typeflag: tar.TypeSymlink, Mode: 0o777,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("PWNED")
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape/pwned", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyLayer(dst, tar.NewReader(&buf)); err != nil {
+		t.Fatalf("ApplyLayer on 2-link tar: %v", err)
+	}
+
+	// The canary must NOT exist: the write never escaped dst.
+	if _, err := os.Lstat(canary); err == nil {
+		t.Fatalf("2-step symlink chain escaped staging and wrote %s", canary)
+	}
+	// Nothing at all should have been created outside dst.
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "staging" {
+			t.Errorf("unexpected host-side entry created outside staging: %q", e.Name())
+		}
 	}
 }
 

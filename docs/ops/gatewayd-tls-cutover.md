@@ -203,10 +203,29 @@ sudo systemctl restart faas-gatewayd
 
 ## Follow-ups (not in this runbook)
 
-- `gateway_tls_cert_expiry_seconds` + `gateway_tls_on_demand_denied_total`
-  Prometheus metrics (ADR-024 H3) — alert on a missed renewal before
-  customers notice.
 - Hetzner DNS API token rotation cadence: 90 days, see
   `docs/ops/secrets-rotation.md`.
 - A follow-up PR adds a file-watch reload to `loadSecretFile` so the
   90-day rotation doesn't require a `systemctl restart`.
+
+## Cut-over evidence — metric scrape (ADR-024 H3)
+
+The TLS observability gap closed before cut-over (see ADR-024 "H3
+closed" footer). Operators can confirm both metrics surface on the box:
+
+```sh
+curl -fsSL http://127.0.0.1:9090/metrics | grep gateway_tls_
+# expect: gateway_tls_cert_expiry_seconds <number>
+#         gateway_tls_on_demand_denied_total{reason="allowlist"} 0
+#         gateway_tls_on_demand_denied_total{reason="dns01"} 0
+#         gateway_tls_on_demand_denied_total{reason="token"} 0
+```
+
+A `tls_cert_expiry_seconds` value above 86,400 seconds (1 day) is the
+healthy steady state once a cert has been minted. Pre-mint the gauge is
+unset (Prometheus reports no series), which the alert rule's
+`< 14 * 86400` comparator handles correctly (Prometheus drops
+missing series from the rule evaluation, so the comparison
+returns false). The `dns01` and
+`token` series are pre-instantiated at 0 by design — a frozen-zero there
+is the H3.b follow-up signal.

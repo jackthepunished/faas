@@ -167,4 +167,18 @@ func TestMigrations_00053_DeploymentsSourceURL(t *testing.T) {
 	`, depIDLegacy).Scan(new(bool)); err != nil {
 		t.Fatalf("read legacy: %v", err)
 	}
+
+	// (6) Re-running MigrateUp on the same schema must be a no-op.
+	// Mirrors the precedent at 00049_account_mfa_test.go:212
+	// (TestMigrations_00047_AccountMFA_ReApplyIsIdempotent): the
+	// post-#344 migration convention is "ADD COLUMN IF NOT EXISTS"
+	// + DO-block-guarded constraints, and this assertion pins the
+	// convention. A reviewer who later drops the IF NOT EXISTS (or
+	// adds a bare CREATE TABLE) trips SQLSTATE 42701 (or 42P07)
+	// here, not on the production box at deploy time. The 2026-07-27
+	// cd-digitalocean failure (pattern: schema present, goose row
+	// missing) was the regression that motivated this guard.
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("second MigrateUp must be idempotent: %v", err)
+	}
 }

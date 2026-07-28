@@ -152,6 +152,41 @@ func (c *Client) ParkInstance(ctx context.Context, instanceID, reason string) er
 	return nil
 }
 
+// InstanceStatsRow is the typed mirror of scheddpb.InstanceStatsRow
+// the meterd sampler reads. Defined here so pkg/meter doesn't reach
+// into the protobuf package directly. Issue #279 / PR-B.
+type InstanceStatsRow struct {
+	InstanceID   string
+	AppID        string
+	NodeID       string
+	CPUUsageUsec uint64
+	// CPUValid mirrors instancestats.Validity (0 = Valid, 1 =
+	// Unknown). Callers MUST skip rows where CPUValid != 0.
+	CPUValid uint32
+}
+
+// ListInstanceStats returns the per-instance CPU-µs snapshot the
+// schedd's instancestats.Poller maintains. The meterd sampler calls
+// this once per minute and computes the per-minute CPU delta per
+// instance, writing it to usage_minutes.cpu_usec. Issue #279 / PR-B.
+func (c *Client) ListInstanceStats(ctx context.Context) ([]InstanceStatsRow, error) {
+	resp, err := c.cli.ListInstanceStats(ctx, &scheddpb.ListInstanceStatsRequest{})
+	if err != nil {
+		return nil, liftErr(err)
+	}
+	out := make([]InstanceStatsRow, 0, len(resp.GetRows()))
+	for _, r := range resp.GetRows() {
+		out = append(out, InstanceStatsRow{
+			InstanceID:   r.GetInstanceId(),
+			AppID:        r.GetAppId(),
+			NodeID:       r.GetNodeId(),
+			CPUUsageUsec: r.GetCpuUsec(),
+			CPUValid:     r.GetCpuValid(),
+		})
+	}
+	return out, nil
+}
+
 // liftErr converts a schedd gRPC error back into the platform's *api.Problem so
 // its stable Code + Limit/Observed survive to the gateway. Errors that aren't
 // status-shaped (e.g. a dial failure) pass through unchanged. Mirrors

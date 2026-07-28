@@ -323,8 +323,21 @@ message InstanceStats {
   // treats absent as Unknown and excludes it from the
   // {app,node}-rolled-up Prometheus series until two valid samples
   // are observed. Field is additive per ADR-016 (frozen wire shape)
-  // — see docs/adr/032-instance-metrics-cardinality-rollups.md.
+  // — see docs/adr/036-instance-metrics-cardinality-rollups.md.
   google.protobuf.DoubleValue cpu_pct = 5;
+  // PR-B (CPU-hour visibility, no billing): cumulative CPU-seconds
+  // consumed by this instance's cgroup since the cache was last
+  // reset, i.e. Σ(usage_usec delta) / 1e6 across the cpustats
+  // cache's lifetime. The value resets when the cache detects a
+  // cgroup recreation (usage_usec regression) — this is the
+  // documented per-instance regression contract from the schedd
+  // poller (pkg/sched/instancestats/poller.go). Absent on the wire
+  // when the cache has no baseline for this instance. Rollup
+  // semantics: schedd sums this across siblings of one (app,node)
+  // into a monotonic CounterVec (cpu_seconds is cumulative work,
+  // not a per-tick gauge). The field is additive and informational;
+  // no billing path consumes it yet (issue #279 follow-up).
+  google.protobuf.DoubleValue cpu_seconds = 8;
   // Inflight HTTP forward count from vmmd's ActivityTracker. Zero
   // is a real value ("no requests in flight right now") and is
   // distinct from the empty wire state only by reader-side

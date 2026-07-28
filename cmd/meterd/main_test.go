@@ -22,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -123,6 +124,12 @@ func testPool(t *testing.T) *pgxpool.Pool {
 type nopParker struct{}
 
 func (nopParker) ParkInstance(context.Context, string, string) error { return nil }
+func (nopParker) ListInstanceStats(context.Context) ([]scheddgrpc.InstanceStatsRow, error) {
+	// Issue #279 / PR-B: the test harness returns an empty
+	// snapshot so the meterd sampler writes 0 CPU-µs per minute
+	// without retrying the schedd gRPC.
+	return nil, nil
+}
 
 type nopProvider struct{}
 
@@ -138,6 +145,12 @@ func (nopProvider) VerifyWebhook([]byte, map[string]string, time.Duration) (bill
 }
 func (nopProvider) CreateUpgradeTransaction(context.Context, state.Account, api.Plan) (string, string, error) {
 	return "", "", nil
+}
+
+// Refund is the issue #279 billing.Provider seam. meterd never calls
+// it; returning ErrNotImplemented matches the Paddle contract.
+func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
 }
 
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
@@ -490,6 +503,12 @@ func (r *meterRec) VerifyWebhook([]byte, map[string]string, time.Duration) (bill
 }
 func (r *meterRec) CreateUpgradeTransaction(context.Context, state.Account, api.Plan) (string, string, error) {
 	return "", "", nil
+}
+
+// Refund is the issue #279 billing.Provider seam. meterd never calls
+// it; returning ErrNotImplemented matches the Paddle contract.
+func (r *meterRec) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
+	return nil, billing.ErrNotImplemented
 }
 
 func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, int64) error {

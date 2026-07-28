@@ -65,6 +65,30 @@ service Schedd {
   // exceeded_free" etc). Returns Ok on success; ResourceExhausted / NotFound
   // for the obvious error paths.
   rpc ParkInstance(ParkInstanceRequest) returns (ParkInstanceResponse);
+
+  // ListInstanceStats returns the per-instance CPU-µs snapshot the
+  // schedd's instancestats.Poller maintains (issue #279 / PR-B).
+  // meterdsamp the per-minute CPU delta from this snapshot and
+  // writes it to usage_minutes.cpu_usec. Returned rows are the
+  // same shape the wire rollup observes (pkg/wire.InstanceStatRow
+  // is the typed mirror; the proto is wire-stable so adding a
+  // field is additive).
+  //
+  // CPUUsageUsec is the cumulative host cgroup CPU-µs consumed
+  // since the cgroup was created. On a cgroup recreation (jailer
+  // restart, manual rmdir) the counter resets to a smaller
+  // number — callers must treat the reset as a fresh baseline.
+  // CPUValid mirrors instancestats.Validity: 0 = Valid, 1 =
+  // Unknown (the vmmd cpustats.Cache has no baseline yet, or a
+  // post-regression row). Callers MUST skip rows where CPUValid
+  // != 0; otherwise the baseline becomes "stuck" on the pre-
+  // regression counter and the per-minute delta is meaningless.
+  //
+  // Additive: the RPC is the only piece of new wire metadata
+  // needed for PR-B. The vmmd Stats RPC already carries the per-
+  // instance CPU numbers; this RPC is the schedd-side cache of
+  // those numbers, refreshed by the poller every 200 ms.
+  rpc ListInstanceStats(ListInstanceStatsRequest) returns (ListInstanceStatsResponse);
 }
 
 message WakeRequest {
@@ -174,4 +198,33 @@ message ParkInstanceResponse {
   // ok reports whether the park succeeded. False means the instance
   // was already parked (idempotent) or didn't exist.
   bool ok = 1;
+}
+
+// InstanceStatsRow is the schedd-side per-instance stat row that
+// meterd reads to compute the per-minute CPU delta. The schema
+// mirrors pkg/sched/instancestats.InstanceStat; the wire field
+// numbers follow the spec §12 wire convention (additive — new
+// slots go at the end).
+//
+// CPUUsageUsec is cumulative host cgroup CPU-µs since the cgroup
+// was created. It is monotonically increasing across the lifetime
+// of one cgroup; on a cgroup recreation it resets to a smaller
+// number — the caller absorbs the reset (treats the new reading
+// as a fresh baseline).
+message InstanceStatsRow {
+  string instance_id = 1;
+  string app_id      = 2;
+  string node_id     = 3;
+  uint64 cpu_usec    = 4;
+  // cpu_valid mirrors instancestats.Validity (0 = Valid, 1 =
+  // Unknown). Callers MUST skip rows where cpu_valid != 0.
+  uint32 cpu_valid   = 5;
+}
+
+message ListInstanceStatsRequest {
+  // empty today; reserved for future filtering (per-app, per-node).
+}
+
+message ListInstanceStatsResponse {
+  repeated InstanceStatsRow rows = 1;
 }

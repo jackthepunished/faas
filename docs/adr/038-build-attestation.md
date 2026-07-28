@@ -172,12 +172,42 @@ Compatibility:
 
 ## Open follow-ups (not blocking)
 
-- **Phase 3** (in flight): cosign signer + verifier + SBOM
+- **Phase 3** (landed): cosign signer + verifier + SBOM
   populator. `pkg/cosign/{signer,verifier}.go`,
-  `/etc/faas/secrets/sign.key`, `faas keys init/rotate/status`,
+  `/etc/faas/secrets/sign.key`, `faas sign-keys init/rotate/status`
+  (operator CLI; `cmd/faas/commands_sign_keys.go`),
   fail-loud on missing key, DeployFailed with `error_code =
-  "sig_invalid"` on bad sig. Will land as a separate PR with the
-  same sprint scope.
+  "sig_invalid"` on bad sig. **Amendment (PR that codifies the
+  operator provisioning path, post-merge to main):**
+  - **Rename**: the original §Phase 3 plan named the operator
+    subcommand `faas keys init/rotate/status`, but `faas keys` was
+    already taken by the customer-facing API-key manager
+    (`cmd/faas/commands2.go:725-780` — every leaf calls
+    `authedClient()`). The operator surface landed as
+    `faas sign-keys init|rotate|status` instead, in its own
+    namespace.
+  - **Perm topology**: the canonical install for the DigitalOcean
+    topology is `/etc/faas/secrets/sign.key` at mode `0440
+    root:faas` (not `0400 root:root`), because `faas-imaged` runs
+    as `User=faas-imaged Group=faas` (see
+    `deploy/digitalocean/systemd/faas-imaged.service`) and reads
+    the key via group access. The `pkg/cosign.LoadPrivateKeyFile`
+    verifier already accepts `0o440` (alongside `0o400`), so no
+    schema change. The installer (`deploy/digitalocean/bootstrap.sh`
+    step 11c, `deploy/ansible/roles/control_plane_service/tasks/main.yml`)
+    is responsible for the ownership step because the install
+    context varies (root in bootstrap, the faas user in ansible,
+    the test process in `go test`); the cosign package enforces
+    only the file mode. The owner-only `0o400` path remains
+    available via `pkg/cosign.WriteKeyPair` for single-operator
+    installs that don't need group access.
+  - **Rotate fix**: `pkg/cosign.writeKeyFile` (the helper behind
+    both `WriteKeyPair` and `WriteKeyPairForGroup`) was updated
+    to `os.Remove` the existing file before `os.WriteFile` under
+    `force=true`. A `0440`/`0400` file lacks the owner-w bit, so
+    `O_WRONLY` on the existing path returns `EACCES`; removing
+    first lets the `O_WRONLY|O_CREATE` path take over without
+    touching the inode permissions.
 - **Phase 4** (proposed): KMS-backed signing via cosign's
   `--key` flag. ADR-039 to land when the EX44 picks up a KMS
   endpoint; `FAAS_SIGN_KEY_KMS_URI` env var will switch the

@@ -2158,7 +2158,7 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 	}
 
 	presented := auth.HashRecoveryCode(plaintexts[3])
-	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
 	}
@@ -2167,6 +2167,9 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 	}
 	if lastCode {
 		t.Errorf("lastCode = true, want false (10 codes started, 1 burned, 9 remain)")
+	}
+	if remaining != auth.RecoveryCodeCount-1 {
+		t.Errorf("remaining = %d, want %d (issue #329: mailer needs the count)", remaining, auth.RecoveryCodeCount-1)
 	}
 
 	after, err := m.AccountByID(ctx, acct.ID)
@@ -2205,7 +2208,7 @@ func TestConsumeRecoveryCode_NoMatch(t *testing.T) {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 
-	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, []byte("not-a-real-hash"))
+	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, []byte("not-a-real-hash"))
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
 	}
@@ -2214,6 +2217,9 @@ func TestConsumeRecoveryCode_NoMatch(t *testing.T) {
 	}
 	if lastCode {
 		t.Errorf("lastCode = true, want false on a no-match")
+	}
+	if remaining != 0 {
+		t.Errorf("remaining = %d, want 0 on a no-match (issue #329 contract)", remaining)
 	}
 	after, _ := m.AccountByID(ctx, acct.ID)
 	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount {
@@ -2239,26 +2245,38 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	}
 
 	// Burn 9 of the 10 codes. Each consume reports
-	// lastCode=false (because more than one remains).
+	// lastCode=false (because more than one remains) AND a
+	// monotonically-decreasing `remaining` count (issue #329
+	// wires `remaining` to the mailer tone bucket).
 	for i := 0; i < auth.RecoveryCodeCount-1; i++ {
 		presented := auth.HashRecoveryCode(plaintexts[i])
-		matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+		matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 		if err != nil {
 			t.Fatalf("burn %d: %v", i, err)
 		}
 		if !matched || lastCode {
 			t.Errorf("burn %d: matched=%v lastCode=%v, want true/false", i, matched, lastCode)
 		}
+		if want := auth.RecoveryCodeCount - 1 - i; remaining != want {
+			t.Errorf("burn %d: remaining = %d, want %d", i, remaining, want)
+		}
 	}
 
-	// The 10th burn is the last code. lastCode must be true.
+	// The 10th burn is the last code. lastCode must be true
+	// AND remaining must drop to 0 — issue #329's "NO codes
+	// left" branch only fires via /disable's recovery_code path,
+	// but the store primitive must still report the post-burn
+	// count honestly so the handler can branch correctly.
 	presented := auth.HashRecoveryCode(plaintexts[auth.RecoveryCodeCount-1])
-	matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("last burn: %v", err)
 	}
 	if !matched || !lastCode {
 		t.Errorf("last burn: matched=%v lastCode=%v, want true/true", matched, lastCode)
+	}
+	if remaining != 0 {
+		t.Errorf("last burn: remaining = %d, want 0", remaining)
 	}
 
 	after, _ := m.AccountByID(ctx, acct.ID)
@@ -2290,7 +2308,7 @@ func TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn(t *testing.T) {
 	results := make(chan result, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			matched, lastCode, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+			matched, lastCode, _, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 			if err != nil {
 				t.Errorf("ConsumeRecoveryCode: %v", err)
 			}
@@ -2420,7 +2438,7 @@ func TestMatchRecoveryCode_NoMutation(t *testing.T) {
 	}
 	// And a follow-up Consume on the SAME code still burns
 	// normally — confirms Match didn't pre-empt it.
-	matched2, _, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
+	matched2, _, _, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Consume: %v", err)
 	}

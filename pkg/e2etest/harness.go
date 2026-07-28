@@ -349,7 +349,7 @@ const testDomain = "apps.test.example"
 // match the highest NNNNN_<name>.sql filename under migrations/. The
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
-const e2eMigrationTarget = 48
+const e2eMigrationTarget = 54
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
@@ -565,7 +565,7 @@ func testEnvCommon(dbURL string) []string {
 
 // writeScheddSignPub generates a fresh ECDSA P-256 keypair (the
 // canonical cosign signer/verifier surface — see ADR-038 + the
-// `faas keys init` subcommand) and writes the public half into
+// `faas sign-keys init` subcommand) and writes the public half into
 // h.SockDir at the canonical path + 0444 mode so schedd's fail-loud
 // load at cmd/schedd/main.go:232-239 doesn't reject the boot.
 //

@@ -233,3 +233,90 @@ func countObservations(body, metric string) int {
 	}
 	return 0
 }
+
+// TestMetricsTLSCertExpiryRegisters — ADR-024 H3: the gauge must surface
+// in /metrics from the moment the daemon binds (the closed-label pre-
+// instantiation is for the counter side; the gauge is unlabelled and
+// surfaces as soon as NewMetrics() is called).
+func TestMetricsTLSCertExpiryRegisters(t *testing.T) {
+	m := NewMetrics()
+	m.SetTLSCertExpiry(14 * 24 * time.Hour)
+
+	// Verify the wire shape via the exposition handler.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "gateway_tls_cert_expiry_seconds") {
+		t.Errorf("gauge not in registry output:\n%s", rec.Body.String())
+	}
+	// Numeric readback via the same path the operator's /metrics scrape
+	// uses. PR #345 review: a string-Contains on the literal "1.2096e+06"
+	// is brittle to promhttp encoder format changes (uppercase E, fixed-
+	// point for smaller values, etc); a Gather() assertion survives them
+	// all and matches the gaugeDuration helper in cert_expiry_test.go.
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	var found bool
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_tls_cert_expiry_seconds" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			got = mt.GetGauge().GetValue()
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("gateway_tls_cert_expiry_seconds not in registry gather")
+	}
+	want := float64(14 * 24 * 60 * 60) // 1,209,600 s
+	if got != want {
+		t.Errorf("gauge value = %v, want %v (14d in seconds)", got, want)
+	}
+}
+
+// TestMetricsTLSCertExpiryNilSafe — the gauge setter must not panic when
+// called on a nil receiver (mirrors the ObserveBuildCount /
+// SetResidentGBPerCustomer nil-safe precedent in pkg/wire/metrics.go).
+func TestMetricsTLSCertExpiryNilSafe(t *testing.T) {
+	var m *Metrics
+	m.SetTLSCertExpiry(14 * 24 * time.Hour) // must not panic
+}
+
+// TestMetricsTLSOnDemandDeniedRegistersAndPreInstantiates — ADR-024
+// H3: the counter must surface every closed reason label at 0 from the
+// moment the daemon binds (so the §12 dashboard panel never shows "no
+// data" and so the frozen-zero state for dns01 + token is observable
+// as the H3.b follow-up signal).
+func TestMetricsTLSOnDemandDeniedRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveTLSOnDemandDenied("allowlist")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	// Every reason in the closed set must surface — allowlist at 1,
+	// dns01 + token at 0. The labels are alphabetical in the exposition
+	// output, so the order doesn't matter.
+	for _, want := range []string{
+		`gateway_tls_on_demand_denied_total{reason="allowlist"} 1`,
+		`gateway_tls_on_demand_denied_total{reason="dns01"} 0`,
+		`gateway_tls_on_demand_denied_total{reason="token"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsTLSOnDemandDeniedNilSafe — the counter must not panic when
+// called on a nil receiver (mirrors the ObserveBuildCount /
+// SetResidentGBPerCustomer nil-safe precedent).
+func TestMetricsTLSOnDemandDeniedNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveTLSOnDemandDenied("allowlist") // must not panic
+}

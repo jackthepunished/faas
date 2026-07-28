@@ -767,3 +767,37 @@ func (c *Client) ListInvoices(ctx context.Context, month, before string, limit i
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
+
+// IssueAccountCredit issues a positive-cents credit to the named
+// account via POST /v1/admin/accounts/{id}/credits (issue #279).
+// accountID is the target account's UUID. idemKey is the
+// Idempotency-Key header value; pass an empty string to let the SDK
+// auto-UUIDv4 (the typical path for the dashboard) or a stable
+// string (the CLI's `cli-admin-credit-…` path) so a flaky-network
+// retry returns the same credit_id. reason is operator-supplied
+// (3..500 chars; the handler validates client-side).
+//
+// Auth: requires an admin-scoped API key in c.Token (admin-only
+// endpoint, two-layer auth: requireScope(ScopesAdminOnly) +
+// adminAllows email allowlist).
+func (c *Client) IssueAccountCredit(ctx context.Context, accountID, idemKey string, cents int64, reason string) (AccountCreditResponse, error) {
+	if idemKey == "" {
+		idemKey = newUUIDv4()
+	}
+	body, err := json.Marshal(map[string]any{"cents": cents, "reason": reason})
+	if err != nil {
+		return AccountCreditResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.baseURL+"/v1/admin/accounts/"+accountID+"/credits", bytes.NewReader(body))
+	if err != nil {
+		return AccountCreditResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Idempotency-Key", idemKey)
+	req.Header.Set("Content-Type", "application/json")
+	var out AccountCreditResponse
+	return out, c.doReq(c.http, req, &out)
+}
