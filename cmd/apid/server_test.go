@@ -39,7 +39,7 @@ func setup(t *testing.T, plan api.Plan) testEnv {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_test")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
 }
 
@@ -78,7 +78,7 @@ func setupWithNotifier(t *testing.T, plan api.Plan, hook func(ctx context.Contex
 	}
 	ops := wire.NewOpsMetrics("apid_test")
 	notif := stubNotifier{hook: hook}
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", notif).WithOpsMetrics(ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", notif).WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
 }
 

@@ -117,3 +117,83 @@ func TestFaasFleetDashboardByteIdentical(t *testing.T) {
 		}
 	}
 }
+
+// TestFaasTopTenantsDashboardParses (issue #300, ADR-041) — the
+// per-tenant noisy-customer dashboard at deploy/grafana/top-tenants.json
+// is valid JSON and the 4 panels (ids 1-4) are present with
+// non-empty PromQL expressions. Same parse-only contract as
+// TestFaasFleetDashboardParses: no PromQL evaluation, just shape
+// pins so a typo in the JSON doesn't silently break the §12 panel.
+func TestFaasTopTenantsDashboardParses(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	rel := filepath.Join(repoRoot, "deploy", "grafana", "top-tenants.json")
+	b, err := os.ReadFile(rel)
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	var root dashboardRoot
+	if err := json.Unmarshal(b, &root); err != nil {
+		t.Fatalf("unmarshal %s: %v", rel, err)
+	}
+	// Panel ids are a stable contract (issue #300 acceptance #2):
+	// "Top-10 noisy customers (5m, apid)" → id 1, "Top-10 noisy
+	// apps (5m, gateway)" → id 2, "Customer share of fleet
+	// traffic" → id 3, "Other bucket growth" → id 4. Future
+	// contributors must add new panels with new ids rather than
+	// reusing these, so the assertions stay accurate.
+	for _, want := range []int{1, 2, 3, 4} {
+		var found *panel
+		for i := range root.Panels {
+			if root.Panels[i].ID == want {
+				found = &root.Panels[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Errorf("panel id %d not found in %s", want, rel)
+			continue
+		}
+		if len(found.Targets) == 0 {
+			t.Errorf("panel id %d has no targets", want)
+			continue
+		}
+		if found.Targets[0].Expr == "" {
+			t.Errorf("panel id %d has empty expr on targets[0]", want)
+		}
+	}
+}
+
+// TestFaasTopTenantsDashboardByteIdentical (issue #300, ADR-041)
+// mirrors TestFaasFleetDashboardByteIdentical for the new
+// top-tenants dashboard. The Ansible role copies the file at
+// deploy/ansible/roles/grafana/files/top-tenants.json onto the
+// box; deploy/grafana/top-tenants.json is the developer-facing
+// canonical. Drift between the two silently breaks the dashboard
+// provisioning, so the byte-identical invariant is gated here.
+func TestFaasTopTenantsDashboardByteIdentical(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	canon := filepath.Join(repoRoot, "deploy", "grafana", "top-tenants.json")
+	role := filepath.Join(repoRoot, "deploy", "ansible", "roles", "grafana", "files", "top-tenants.json")
+	canonB, err := os.ReadFile(canon)
+	if err != nil {
+		t.Fatalf("read %s: %v", canon, err)
+	}
+	roleB, err := os.ReadFile(role)
+	if err != nil {
+		t.Fatalf("read %s: %v", role, err)
+	}
+	if len(canonB) != len(roleB) {
+		t.Fatalf("dashboard byte-length differs: %s=%d %s=%d", canon, len(canonB), role, len(roleB))
+	}
+	for i := range canonB {
+		if canonB[i] != roleB[i] {
+			t.Fatalf("dashboard byte-identical invariant broken at offset %d: %s vs %s", i, canon, role)
+		}
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
@@ -38,6 +39,7 @@ type Loop struct {
 	now              func() time.Time
 	flowCounts       FlowCounter
 	ops              *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit            *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
 	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
 	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
 	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
@@ -54,6 +56,16 @@ func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
 		now:        time.Now,
 		flowCounts: noopFlowCounter{},
 	}
+}
+
+// WithAudit attaches the IAM-4 audit seam so the cron-fire path can
+// emit a `cron.fired` events row once the dispatch loop has decided
+// to fire a cron (i.e. after the boundary guard AND the suspended-
+// account guard). nil opts out (legacy / tests that don't care about
+// the audit row).
+func (l *Loop) WithAudit(a *audit.Auditor) *Loop {
+	l.audit = a
+	return l
 }
 
 // WithWatchdog attaches the §6.1 watchdog (commit 3). Tests can skip
@@ -939,6 +951,17 @@ func (l *Loop) runCronTick(ctx context.Context) {
 
 // dispatchOneCron is the per-cron decision tree. Factored out so the
 // test surface can drive one cron with a fake clock.
+// statusStr renders the ok bool as the literal `cron.fired.status`
+// audit payload value. Kept as a tiny helper so the dispatch can use
+// a single `if ok { ... }` set without a second branch on the emit
+// site.
+func statusStr(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "err"
+}
+
 func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time) {
 	sched, err := ParseSchedule(c.Schedule)
 	if err != nil {
@@ -961,22 +984,72 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		// Already fired in the current window.
 		return
 	}
+	// Capture the pre-fire state for the audit row (issue #291
+	// follow-up — schedd emits `cron.fired` after the dispatch path
+	// runs to completion). lastFiredAtBefore is what an operator
+	// reads to reconstruct the boundary that just crossed; the
+	// fireSucceeded/invocationID/instanceID triple is updated below
+	// as the dispatch progresses so the defer-block emit at the
+	// bottom of this function can record status="ok"|"err" without
+	// re-checking the dispatch internals.
+	lastFiredAtBefore := c.LastFiredAt
+	fireSucceeded := false
+	var invocationID, instanceID string
+	var acct state.Account
 	app, err := l.engine.Store().AppByID(ctx, c.AppID)
 	if err != nil {
 		l.log.Warn("cron: app", "cron_id", c.ID, "err", err)
 		return
 	}
-	acct, err := l.engine.Store().AccountByID(ctx, app.AccountID)
+	acctRec, err := l.engine.Store().AccountByID(ctx, app.AccountID)
 	if err != nil {
 		l.log.Warn("cron: account", "cron_id", c.ID, "err", err)
 		return
 	}
-	if !acct.Active() {
+	if !acctRec.Active() {
 		// Suspended accounts don't get cron traffic (spec §11 abuse
 		// guard). The meter hard-stop will park the live instance; we
-		// just skip the synthetic request here.
+		// just skip the synthetic request here. NO audit row — the
+		// cron was scheduled by a customer who is now suspended; we
+		// don't want to surface suspended-account crons in the
+		// per-account audit list (and §5.1's 4xx-invariant covers
+		// the "we didn't fire" semantic too).
 		return
 	}
+	acct = acctRec
+	// Defer the cron.fired emit so ALL post-boundary failure modes
+	// (Wake error, Invoke error, SynthesizeRequest fallback error)
+	// surface a status="err" row. SOC 2 CC7.2 cares about the
+	// "the cron was scheduled but failed to fire" case more than
+	// the happy path — ops needs the audit signal to reconcile
+	// expected vs actual fires. Best-effort semantics from
+	// pkg/audit.Auditor: never rolls back the underlying state
+	// changes (MarkCronFired, EnqueueInvocation, etc.).
+	defer func() {
+		if l.audit == nil {
+			return
+		}
+		// last_fired_at_before is omitted on the first fire (no prior
+		// fire exists — LastFiredAt was zero). The unconditional
+		// format below would have rendered that as the literal
+		// "0001-01-01T00:00:00Z", which an operator can't distinguish
+		// from data corruption. Missing key → JSON renders the field
+		// as absent; payload[k] on the read side returns nil.
+		payload := map[string]any{
+			"cron_id":       c.ID,
+			"app_id":        c.AppID,
+			"schedule":      c.Schedule,
+			"path":          c.Path,
+			"fired_at":      now.UTC().Format(time.RFC3339Nano),
+			"status":        statusStr(fireSucceeded),
+			"invocation_id": invocationID,
+			"instance_id":   instanceID,
+		}
+		if !lastFiredAtBefore.IsZero() {
+			payload["last_fired_at_before"] = lastFiredAtBefore.UTC().Format(time.RFC3339Nano)
+		}
+		l.audit.Emit(ctx, "cron.fired", &acct.ID, payload)
+	}()
 	if _, err := l.engine.Wake(ctx, c.AppID); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return
@@ -1027,6 +1100,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			// SynthesizeRequest call for back-compat assertions.
 			if err := l.gateway.SynthesizeRequest(ctx, c.AppID, "POST", c.Path); err != nil {
 				l.log.Warn("cron: synthesize (legacy)", "cron_id", c.ID, "err", err)
+				// status="err" via defer; fireSucceeded stays false.
 				return
 			}
 		} else if enq.ID != "" {
@@ -1040,6 +1114,17 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			if err := l.engine.Store().CompleteInvocation(ctx, enq.ID, nil); err != nil {
 				l.log.Warn("cron: complete", "cron_id", c.ID, "err", err)
 			}
+			// Success path: the synth invoke produced a live
+			// instance handle. Capture the audit-trail triples so
+			// the deferred emit can record status="ok" with the
+			// wake that served the fire. invocation_id is the
+			// drain row id; instance_id is the live VM that
+			// gatewayd picked. Mirrors the invocations_history
+			// join so an operator can pivot from the audit row to
+			// the wake record with one query.
+			fireSucceeded = true
+			invocationID = enq.ID
+			instanceID = invokeOut.InstanceID
 		}
 	}
 	if err := l.engine.Store().MarkCronFired(ctx, c.ID, now); err != nil {

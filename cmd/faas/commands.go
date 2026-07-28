@@ -226,9 +226,10 @@ func readLineWithTimeout(r io.Reader, d time.Duration) (string, bool) {
 }
 
 func cmdLogout() int {
-	if p, err := tokenPath(); err == nil {
-		_ = os.Remove(p)
-	}
+	// Clear both stores (OS keychain + legacy plaintext file).
+	// Best-effort: a stuck keychain must not block logout, and a
+	// missing file is not an error. Issue #293.
+	deleteToken()
 	PrintOK(osStdout, "Logged out")
 	return 0
 }

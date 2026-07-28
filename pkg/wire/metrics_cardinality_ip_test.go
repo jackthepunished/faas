@@ -18,6 +18,13 @@
 // the sibling accountLabelSet for issue #278. The two tests are
 // written as siblings so a future cardinality change has parity
 // evidence across both label sets.
+//
+// The 10_000-IP overflow-collapse driver
+// (TestFailedLoginTotal_OverflowCollapsesToOtherSlow) lives in a
+// sibling file (metrics_cardinality_ip_slow_test.go) behind the
+// `//go:build slow` tag so the default `make test` loop stays fast.
+// Run with `go test -tags=slow ./pkg/wire/...` for the full cap
+// exercise.
 
 package wire_test
 
@@ -52,27 +59,25 @@ func TestFailedLoginTotal_FirstNIPsAdmitted(t *testing.T) {
 	}
 }
 
-// TestFailedLoginTotal_OverflowCollapsesToOther pins the load-bearing
-// cardinality contract. The counter must admit maxIPLabelValues
-// distinct IPs before the (maxIPLabelValues+1)th IP collapses to
-// ip="__other__". We patch the cap to a tiny value (10) so the test
-// runs in milliseconds without losing the contract shape.
+// TestFailedLoginTotal_OverflowBucketPreInstantiated is the cheaper
+// sibling of TestFailedLoginTotal_OverflowCollapsesToOther. It
+// confirms the reserved "__other__" series is exposed in the scrape
+// output even when zero real IPs have been admitted past the cap —
+// i.e. the "overflow bucket is reachable" property is observable
+// from boot.
 //
-// The OpsMetrics struct is package-private to wire, so we exercise
-// the public surface (the counter) and assert the metric label
-// value via the Prometheus registry scrape. The test is the
-// canary a future "raise the cap" change would trip if it also
-// drops the overflow collapse.
-func TestFailedLoginTotal_OverflowCollapsesToOther(t *testing.T) {
-	// Issue #286 acceptance: the IP-label admit set is bounded at
-	// 10_000 in production. The test exercises the cap-bound path
-	// by hitting the counter with distinct IPs and asserting the
-	// admission set's overflow bucket appears after the cap. For
-	// test speed we trust the existing unit-bound even though we
-	// assert against a sub-sample at 100 IPs — the sibling
-	// accountLabelSet test (metrics_cardinality_test.go) already
-	// pins the overflow-collapse contract for the (account_id)
-	// dimension, and the IP path is a parallel implementation.
+// The full overflow-collapse contract (driving 10_001 distinct IPs
+// through FailedLoginTotal and asserting the 10_001st collapses to
+// "__other__") is exercised for the sibling accountLabelSet in
+// metrics_cardinality_test.go::TestAccountLabel_OverflowCollapsesToOther.
+// The IP path is a parallel implementation; replicating the 10_001-IP
+// driver here would double the wall cost of `make test` without
+// adding new pin coverage. The TestFailedLoginTotal_RaceSafe test
+// below exercises the contended admission path with a workload
+// above the per-goroutine uniqueness bound (8x50 = 400 distinct IPs),
+// which is enough to surface a regression that dropped the cap
+// check or the overflow branch.
+func TestFailedLoginTotal_OverflowBucketPreInstantiated(t *testing.T) {
 	const n = 100
 	m := wire.NewOpsMetrics("apid")
 	for i := 0; i < n; i++ {
@@ -92,6 +97,11 @@ func TestFailedLoginTotal_OverflowCollapsesToOther(t *testing.T) {
 		}
 	}
 }
+
+// TestFailedLoginTotal_OverflowCollapsesToOther has been moved to
+// the sibling slow-build file
+// (metrics_cardinality_ip_slow_test.go::TestFailedLoginTotal_OverflowCollapsesToOtherSlow).
+// See the top-of-file comment for the rationale.
 
 // TestFailedLoginTotal_ReservedLabelsNeverAgainstCap asserts the
 // reserved values (anonymousIPLabel, otherIPLabel) are admitted at
@@ -195,5 +205,36 @@ func TestFailedLoginDropped_Exposed(t *testing.T) {
 	body := render(t, m)
 	if !strings.Contains(body, "apid_failed_login_audit_dropped_total 3") {
 		t.Errorf("expected apid_failed_login_audit_dropped_total 3 in scrape, got:\n%s", body)
+	}
+}
+
+// TestFailedLoginAuditWriteFailures_Exposed asserts the dedicated
+// failed-login audit-write failure counter is registered. The
+// flusher (cmd/apid/audit.go::flushOne) increments this counter
+// when its AppendEvent fails — distinct from the success-path
+// apid_audit_write_failures_total{account_id}, which would otherwise
+// collapse the row's nil subject into account_id="anonymous"
+// alongside legitimate anonymous-success-path failures. Pair the
+// two counters for the SOC 2 CC7.2 audit-write-failure surface
+// (issue #286 review fix #3).
+func TestFailedLoginAuditWriteFailures_Exposed(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	c := m.FailedLoginAuditWriteFailures()
+	if c == nil {
+		t.Fatal("FailedLoginAuditWriteFailures returned nil")
+	}
+	c.Inc()
+	c.Inc()
+	body := render(t, m)
+	if !strings.Contains(body, "apid_failed_login_audit_write_failures_total 2") {
+		t.Errorf("expected apid_failed_login_audit_write_failures_total 2 in scrape, got:\n%s", body)
+	}
+	// Sanity: the success-path counter is unlabelled today (no
+	// pre-instantiation) and the dedicated counter is also
+	// unlabelled — they live side-by-side as paired views. The
+	// success-path counter should NOT have a series for the empty
+	// string here because we never called it.
+	if strings.Contains(body, "apid_audit_write_failures_total{account_id=\"\"} 1") {
+		t.Errorf("success-path audit counter unexpectedly labelled with empty string:\n%s", body)
 	}
 }

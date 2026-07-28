@@ -28,6 +28,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,18 +41,22 @@ import (
 
 // stubFailedOps is the in-memory auditFailedOps the unit tests
 // expect. Mirrors stubAuditOps in audit_test.go: a registry-backed
-// prometheus.Counter per IP, plus one unlabelled drop counter, so
-// the auditor's interface contract is pinned without dragging the
-// full wire.OpsMetrics into the audit unit tests.
+// prometheus.Counter per IP, plus unlabelled drop and
+// audit-write-failure counters, so the auditor's interface
+// contract is pinned without dragging the full wire.OpsMetrics
+// into the audit unit tests.
 //
 // The intention is to mirror the production failure surface — the
-// drop counter is the canonical "the channel is full" signal that
-// the FaasFailedLoginSpike runbook cites.
+// drop counter is the canonical "the channel is full" signal, and
+// the audit-write-failure counter is the canonical "AppendEvent
+// could not be written" signal. Both signals back the SOC 2 CC7.2
+// audit-write-failure surface.
 type stubFailedOps struct {
-	mu       sync.Mutex
-	registry *prometheus.Registry
-	counters map[string]prometheus.Counter
-	dropped  prometheus.Counter
+	mu            sync.Mutex
+	registry      *prometheus.Registry
+	counters      map[string]prometheus.Counter
+	dropped       prometheus.Counter
+	writeFailures prometheus.Counter
 }
 
 // flushCounter is a state.Store wrapper that counts every successful
@@ -99,11 +104,17 @@ func newStubFailedOps() *stubFailedOps {
 		Name: "stub_failed_login_audit_dropped",
 		Help: "test stub for the failed-login drop counter",
 	})
+	writeFailures := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "stub_failed_login_audit_write_failures",
+		Help: "test stub for the failed-login audit-write failure counter",
+	})
 	reg.MustRegister(dropped)
+	reg.MustRegister(writeFailures)
 	return &stubFailedOps{
-		registry: reg,
-		counters: make(map[string]prometheus.Counter),
-		dropped:  dropped,
+		registry:      reg,
+		counters:      make(map[string]prometheus.Counter),
+		dropped:       dropped,
+		writeFailures: writeFailures,
 	}
 }
 
@@ -126,6 +137,10 @@ func (s *stubFailedOps) FailedLoginDropped() prometheus.Counter {
 	return s.dropped
 }
 
+func (s *stubFailedOps) FailedLoginAuditWriteFailures() prometheus.Counter {
+	return s.writeFailures
+}
+
 func (s *stubFailedOps) totalCount(t *testing.T, ip string) float64 {
 	t.Helper()
 	s.mu.Lock()
@@ -139,6 +154,10 @@ func (s *stubFailedOps) totalCount(t *testing.T, ip string) float64 {
 
 func (s *stubFailedOps) droppedCount() float64 {
 	return testutil.ToFloat64(s.dropped)
+}
+
+func (s *stubFailedOps) writeFailureCount() float64 {
+	return testutil.ToFloat64(s.writeFailures)
 }
 
 // newAuditorForTestWithCapacity builds an auditor with a tunable
@@ -228,14 +247,24 @@ func TestAuditFailedLogin_DropOnFullChannel(t *testing.T) {
 }
 
 // TestAuditFailedLogin_AuditWriteFailureIncrementsCounter pins the
-// failure-path counter increment when the underlying AppendEvent
+// failure-path counter increments when the underlying AppendEvent
 // fails. The per-IP counter still has its +1 from the pre-channel
-// Increment; the audit-write-failure counter is the additional
-// signal that the SOC 2 audit log is missing a row.
+// Increment; the dedicated failed-login audit-write-failure
+// counter is the additional signal that the SOC 2 audit log is
+// missing a row.
+//
+// Issue #286 review fix (#3 in the review): the success-path
+// AuditWriteFailures counter MUST NOT be touched on this path,
+// because the row's nil subject would otherwise collapse into
+// account_id="anonymous" alongside legitimate anonymous-success-
+// path failures. The test asserts both:
+//   - failedLoginAuditWriteFailures counter incremented (+1), AND
+//   - success-path auditWriteFailures counter NOT incremented.
 func TestAuditFailedLogin_AuditWriteFailureIncrementsCounter(t *testing.T) {
-	store := failingFlushStore{Store: state.NewMemStore()}
+	failingStore := failingFlushStore{Store: state.NewMemStore()}
 	ops := newStubFailedOps()
-	base := newAuditor(store, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	successOps := newStubAuditOps()
+	base := newAuditor(failingStore, slog.New(slog.NewTextHandler(io.Discard, nil)), successOps)
 	base.failedOps = ops
 	base.closeSignal = make(chan struct{})
 	base.Start(context.Background())
@@ -243,23 +272,19 @@ func TestAuditFailedLogin_AuditWriteFailureIncrementsCounter(t *testing.T) {
 
 	base.EmitFailedLogin("203.0.113.7", "abc123hash", "Mozilla/5.0")
 
-	// Wait for the flusher to attempt + fail the AppendEvent.
+	// Wait for the flusher to attempt + fail the AppendEvent and
+	// the success-path counter to remain untouched.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if got := ops.totalCount(t, "203.0.113.7"); got == 1 {
-			// AppendEvent is called inside the flusher goroutine
-			// after the channel send. The Warn + counter increment
-			// is the failure-path signal. We don't have a direct
-			// counter for the failed-login audit-write failure
-			// (the auditor reuses the existing AuditWriteFailures
-			// counter labelled by subject="" → "anonymous"); so
-			// the assertion is "the channel was drained", which
-			// the per-IP counter Inc implicitly proves.
+		if got := ops.writeFailureCount(); got == 1 {
+			if got := successOps.failureCount(t, ""); got != 0 {
+				t.Fatalf("success-path AuditWriteFailures counter incremented to %v on the failed-login path; the dedicated counter should be the only one touched", got)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("flusher did not drain the channel")
+	t.Fatal("dedicated failedLoginAuditWriteFailures counter did not increment")
 }
 
 // TestAuditFailedLogin_FlappingChannelBatchFlushes asserts the
@@ -381,6 +406,64 @@ func TestAuditFailedLogin_PayloadShape(t *testing.T) {
 			}
 			if len(got) != len(wantKeys) {
 				t.Errorf("data has %d keys, want %d (no reason/method/route discriminator allowed)", len(got), len(wantKeys))
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("flusher did not drain")
+}
+
+// TestAuditFailedLogin_UserAgentSanitizedAtSeam pins the
+// CodeQL go/log-injection closure (issue #286 review fix #9).
+// The user_agent value that lands in the audit row's data field
+// must be the same byte sequence that the slog warn-on-drop line
+// sees — sanitized ONCE at the EmitFailedLogin seam via
+// pkg/logsanitize.Field, which replaces any non-tab ≤0x1F and
+// DEL (0x7F) with U+00B7 (middle dot).
+//
+// The risk: an attacker can submit `User-Agent: curl\r\nFAKE-INJECT`
+// and have the CRLF land in the events.data JSON. The slog and
+// the metric label are already sanitized at their call sites
+// (cmd/apid/audit.go warn-on-drop uses logsanitize.Field; the
+// Prometheus label collapses to a known fixed shape), but the
+// audit row's data field is a direct passthrough unless we
+// sanitize at the seam. This test makes the sanitization at the
+// seam load-bearing: a regression that pushes sanitization to a
+// downstream call site (and misses one) trips the assertion.
+func TestAuditFailedLogin_UserAgentSanitizedAtSeam(t *testing.T) {
+	ms := state.NewMemStore()
+	ops := newStubFailedOps()
+	a := newAuditorForTestWithCapacity(ms, slog.New(slog.NewTextHandler(io.Discard, nil)), ops, 16, 25*time.Millisecond, 100)
+	a.Start(context.Background())
+	defer a.Close()
+
+	// Craft a user_agent containing CRLF + DEL — both must be
+	// replaced with U+00B7 (middle dot). Tab (0x09) is preserved
+	// per logsanitize.Field's documented contract.
+	const malicious = "curl\r\nFAKE\x7FINJECT\thello"
+	const want = "curl··FAKE·INJECT\thello"
+	a.EmitFailedLogin("203.0.113.7", "abc123hash", malicious)
+
+	// Wait for the flusher to drain.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		events, err := ms.ListEvents(context.Background(), "", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 1 {
+			var got map[string]any
+			if err := json.Unmarshal(events[0].Data, &got); err != nil {
+				t.Fatalf("decode data: %v", err)
+			}
+			if ua, _ := got["user_agent"].(string); ua != want {
+				t.Errorf("user_agent in audit row = %q, want %q (sanitization at seam failed; CRLF/DEL leaked through)", ua, want)
+			}
+			// Belt-and-braces: confirm no raw control chars made
+			// it into the row.
+			if ua, _ := got["user_agent"].(string); strings.ContainsAny(ua, "\r\n\x00") {
+				t.Errorf("user_agent contains raw control chars after sanitization: %q", ua)
 			}
 			return
 		}

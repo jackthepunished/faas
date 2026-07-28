@@ -1148,16 +1148,43 @@ func validateRepoSlug(s string) error {
 // and faas queue tail. signal.NotifyContext on os.Interrupt makes
 // Ctrl-C tear down the in-flight request within ~50 ms instead of
 // waiting for the body Close to be GC'd.
+//
+// Issue #309 (tier-2 DX): --grep, --since, --level pass through to
+// the server as query params. Today apid's Move 3 stub accepts but
+// does not yet act on them (Move 4 will filter against vmmd's
+// per-instance ring buffer); the flags land now so the wire
+// contract is stable.
 func cmdLogs(args []string) int {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "follow new lines")
 	deployment := fs.String("deployment", "", "deployment id (default: latest)")
+	grep := fs.String("grep", "", "only show lines matching this substring")
+	since := fs.String("since", "", "only show lines at or after this RFC3339 timestamp")
+	level := fs.String("level", "", "only show lines at this level (info|warn|error)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: faas logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
 		return 1
 	}
 	if fs.NArg() != 1 {
-		PrintUsage(os.Stderr, "usage: faas logs <slug> [--follow] [--deployment ID]", "logs")
+		PrintUsage(os.Stderr, "usage: faas logs <slug> [--follow] [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
 		return 1
+	}
+	// Validate --level early so a typo costs the customer a network
+	// round-trip; --since is validated next so the SDK never sees a
+	// malformed timestamp. Both call api.IsValidLogLevel / time.Parse
+	// to share the wire contract with the apid handler (see
+	// cmd/apid/handlers_ext.go::streamAppLogs), which re-validates
+	// --level on the wire and rejects bad values with an
+	// `event: error` SSE frame.
+	if *level != "" && !api.IsValidLogLevel(*level) {
+		PrintUsage(os.Stderr, "--level must be one of: info, warn, error", "logs")
+		return 2
+	}
+	if *since != "" {
+		if _, err := time.Parse(time.RFC3339, *since); err != nil {
+			PrintUsage(os.Stderr, "--since must be an RFC3339 timestamp (e.g. 2026-07-28T00:00:00Z)", "logs")
+			return 2
+		}
 	}
 	slug := fs.Arg(0)
 	client, err := authedClient()
@@ -1166,7 +1193,11 @@ func cmdLogs(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow)
+	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow, api.LogFilter{
+		Grep:  *grep,
+		Since: *since,
+		Level: *level,
+	})
 	if err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) {

@@ -195,30 +195,49 @@ func TestUpdateAppAutoscaleRPS_FreeGate(t *testing.T) {
 	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
 }
 
-// TestUpdateAppAutoscaleRPS_HobbyZero pins the lower bound: 0 is
-// the explicit-disable form (the Set bit is set, so the column
-// gets overwritten to 0). It must round-trip as 200, NOT 422 — the
-// only invalid value is negative. The PG CHECK constraint
+// TestUpdateAppAutoscaleRPS_ProNegative pins the lower bound on the
+// lowest plan that unlocks the feature: after the 2026-07-28
+// Hobby→Pro re-tier (ADR-037 amendment), only Pro+ accepts the
+// field at all, so this test exercises Pro (gate passes) with a
+// negative value to assert that bounds validation runs and 422
+// invalid_autoscale_target_rps is returned. The PG CHECK constraint
 // `apps_autoscale_target_rps_nonneg` enforces `>= 0 OR NULL`; we
 // rely on the apid-side validation to reject negatives before they
-// reach the DB.
-func TestUpdateAppAutoscaleRPS_HobbyZero(t *testing.T) {
-	e := setup(t, api.PlanHobby)
-	mustSeedApp(t, e, "hobby-rps-zero")
+// reach the DB. Pre-amendment, the equivalent coverage lived in
+// TestUpdateAppAutoscaleRPS_HobbyZero — but after Hobby lost the
+// gate, that test surfaced the plan gate (403) instead of the
+// bounds check (422), so it was renamed/moved here.
+func TestUpdateAppAutoscaleRPS_ProNegative(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-rps-neg")
 	neg := -1
-	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-zero", api.UpdateAppRequest{AutoscaleTargetRPS: &neg}, nil)
+	rec := e.do(t, "PATCH", "/v1/apps/pro-rps-neg", api.UpdateAppRequest{AutoscaleTargetRPS: &neg}, nil)
 	assertProblem(t, rec, 422, api.CodeInvalidAutoscaleTargetRPS)
 }
 
-// TestUpdateAppAutoscaleRPS_HobbyHappy is the happy path: Hobby
-// plans accept autoscale_target_rps and the response carries the
-// new value. Hobby stays RPS-only — setting CPU on Hobby must 403
-// (covered by TestUpdateAppAutoscaleCPU_HobbyGate).
-func TestUpdateAppAutoscaleRPS_HobbyHappy(t *testing.T) {
+// TestUpdateAppAutoscaleRPS_HobbyGate locks the Hobby→Pro re-tier
+// (2026-07-28: ADR-037 amendment): Hobby plans do not unlock
+// autoscale_target_rps. The handler must 403 plan_autoscale_not_allowed
+// even when the value is a perfectly valid 50 — the gate runs first,
+// value validation is irrelevant on a tier-locked feature. Mirrors
+// TestUpdateAppAutoscaleCPU_HobbyGate.
+func TestUpdateAppAutoscaleRPS_HobbyGate(t *testing.T) {
 	e := setup(t, api.PlanHobby)
-	mustSeedApp(t, e, "hobby-rps-ok")
+	mustSeedApp(t, e, "hobby-rps-gate")
 	fifty := 50
-	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-ok", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-gate", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
+}
+
+// TestUpdateAppAutoscaleRPS_ProHappy is the new happy path: Pro is
+// the lowest paid tier that unlocks autoscale_target_rps after the
+// 2026-07-28 Hobby→Pro re-tier (ADR-037 amendment). The response
+// carries the new value. Pro unlocks both RPS and CPU.
+func TestUpdateAppAutoscaleRPS_ProHappy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-rps-ok")
+	fifty := 50
+	rec := e.do(t, "PATCH", "/v1/apps/pro-rps-ok", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
@@ -2206,5 +2225,120 @@ func TestStreamAppLogs_NotImplementedFrame(t *testing.T) {
 	endIdx := strings.Index(body, "event: end")
 	if niIdx < 0 || endIdx < 0 || niIdx >= endIdx {
 		t.Errorf("frame order wrong: not_implemented@%d end@%d", niIdx, endIdx)
+	}
+}
+
+// TestStreamAppLogs_AcceptsFilterQueryParams pins issue #309's wire
+// contract: --grep / --since / --level reach the handler as query
+// params and are accepted by the Move 3 stub. Today the params are
+// advisory (the stub does not act on them yet) but the contract
+// MUST stay stable so neither the SDK URL builder nor the CLI flag
+// set needs to change when Move 4 replaces the body. The
+// `not_implemented` + `end` frames still fire so existing SDK
+// consumers and TestStreamAppLogs_NotImplementedFrame stay green.
+func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "stub-logs-filter")
+	appID := mustSeedApp(t, e, "stub-logs-filter-app")
+	if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	rec := e.do(t, "GET",
+		"/v1/apps/stub-logs-filter-app/logs?follow=0&grep=ERROR&since=2026-07-28T00:00:00Z&level=error",
+		nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	body := rec.Body.String()
+	// The existing Move 3 frames must still appear — params are
+	// advisory today (Move 4 acts on them).
+	if !strings.Contains(body, "event: not_implemented") {
+		t.Errorf("body missing not_implemented frame:\n%s", body)
+	}
+	if !strings.Contains(body, "event: end") {
+		t.Errorf("body missing end frame:\n%s", body)
+	}
+}
+
+// TestStreamAppLogs_RejectsInvalidLevel pins the server-side
+// mirror of the CLI's --level enum check. An invalid value
+// short-circuits the stub with an `event: error` frame followed
+// by the terminal `event: end`. The `not_implemented` frame MUST
+// NOT appear — a bad filter is a structured error, not "not built
+// yet". The CLI validates the same enum client-side (see
+// cmd/faas/commands2.go::cmdLogs) so this is the programmatic
+// SDK's error contract.
+func TestStreamAppLogs_RejectsInvalidLevel(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "stub-logs-bad-level")
+	appID := mustSeedApp(t, e, "stub-logs-bad-level-app")
+	if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/apps/stub-logs-bad-level-app/logs?follow=0&level=trace", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (SSE stream is already open); body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error\ndata: {\"code\":\"invalid_level\"") {
+		t.Errorf("body missing invalid_level error frame:\n%s", body)
+	}
+	if !strings.Contains(body, "event: end\ndata: {}") {
+		t.Errorf("body missing terminal end frame:\n%s", body)
+	}
+	if strings.Contains(body, "event: not_implemented") {
+		t.Errorf("body contains not_implemented; a bad filter is an error, not 'not built yet'")
+	}
+}
+
+// TestStreamAppLogs_RejectsInvalidGrep pins the server-side defence
+// against log-injection through --grep. A grep value containing a
+// newline or carriage return is rejected with an
+// `event: error` frame (`code: "invalid_grep"`) followed by the
+// terminal `event: end`, mirroring the invalid-level path. Move 4's
+// substring matcher MUST NOT see a multi-line grep — otherwise a
+// grep of `INFO\n` would match every line. The CLI doesn't pre-parse
+// grep, so the server is the only defence; without this test, a
+// future Move 4 regression that drops the newline check would slip
+// through silently (same log-injection precedent as
+// `CodeQL go/log-injection sanitisers`).
+func TestStreamAppLogs_RejectsInvalidGrep(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"newline", "grep=foo%0Abar"},
+		{"carriage_return", "grep=foo%0Dbar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setup(t, api.PlanPro)
+			dep := mustSeedDeployment(t, e, "stub-logs-bad-grep-"+tc.name)
+			appID := mustSeedApp(t, e, "stub-logs-bad-grep-app-"+tc.name)
+			if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+				t.Fatalf("CreateInstance: %v", err)
+			}
+
+			path := "/v1/apps/stub-logs-bad-grep-app-" + tc.name + "/logs?follow=0&" + tc.query
+			rec := e.do(t, "GET", path, nil, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (SSE stream is already open); body=%s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "event: error\ndata: {\"code\":\"invalid_grep\"") {
+				t.Errorf("body missing invalid_grep error frame:\n%s", body)
+			}
+			if !strings.Contains(body, "event: end\ndata: {}") {
+				t.Errorf("body missing terminal end frame:\n%s", body)
+			}
+			if strings.Contains(body, "event: not_implemented") {
+				t.Errorf("body contains not_implemented; a bad filter is an error, not 'not built yet'")
+			}
+		})
 	}
 }

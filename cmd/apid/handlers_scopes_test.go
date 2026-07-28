@@ -37,7 +37,7 @@ func setupWithScopes(t *testing.T, scopes []string) testEnv {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_scopes_test")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
 }
 
@@ -67,7 +67,7 @@ func setupWithSession(t *testing.T) (testEnv, *http.Cookie) {
 	ops := wire.NewOpsMetrics("apid_session_test")
 	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
-		nil, 15*60_000_000_000, "").WithOpsMetrics(ops)
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: "", acct: acct, ops: ops},
 		&http.Cookie{Name: sessionCookie, Value: token}
 }

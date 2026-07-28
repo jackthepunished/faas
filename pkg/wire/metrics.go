@@ -149,6 +149,20 @@ type OpsMetrics struct {
 	// auth_limit bucket is shedding the attack but the audit
 	// flusher is the bottleneck".
 	failedLoginDropped prometheus.Counter
+	// failedLoginAuditWriteFailures: counts apid-side failed-login
+	// audit writes (cmd/apid/audit.go::flushOne) whose events row
+	// could not be written. Distinct from auditWriteFailures
+	// (which serves the success-path AuditEmit surface and is
+	// labelled by account_id) because a failed login cannot be
+	// attributed to a known account — routing both failure paths
+	// through AuditWriteFailures("") would conflate "subject is
+	// nil because nobody is logged in" with "subject is nil
+	// because the caller didn't supply one" in the operator's
+	// `account_id="anonymous"` view. Unlabelled — the same
+	// subject-nil rationale applies, and a count over a fixed
+	// baseline is enough to drive a "the flusher can talk to
+	// Postgres?" question.
+	failedLoginAuditWriteFailures prometheus.Counter
 	// ipLabels: the bounded admission set shared by ip-labelled
 	// metrics (failedLoginTotal today). See accountLabelSet docs
 	// for the same fixed-capacity, non-evicting contract.
@@ -156,6 +170,20 @@ type OpsMetrics struct {
 	// differs — IPs grow under attack, account_ids grow under
 	// signup — and the two sets should not share capacity.
 	ipLabels *ipLabelSet
+	// topTenantRPS: introduced in issue #300 — a per-tenant RPS
+	// gauge sampled every 5s by the daemon's topNSampler goroutine
+	// (cmd/apid/topn.go / cmd/gatewayd/listener.go). Bounded at
+	// topAccountSetCap (1000) real customer ids plus the "other"
+	// overflow bucket (see pkg/wire/topn.go). Layered above
+	// accountLabelSet: an id admitted at the 10k level can still
+	// be demoted past the top-1000 here. The gauge is a presentation
+	// view over the already-bounded requestTotal counter, not a
+	// separate source of truth. Help string documents the two-tier
+	// cardinality contract for operators.
+	topTenantRPS *prometheus.GaugeVec
+	// topAccounts: the bounded top-N admission primitive that
+	// drives topTenantRPS. See pkg/wire/topn.go for the contract.
+	topAccounts *topAccountSet
 	// stripePushDur: introduced in feat/m7-stripe-push-observability.
 	// Per-push latency to Stripe, labelled by terminal result code.
 	// Distinct from the dur histogram (which labels by op only) because
@@ -394,6 +422,20 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_failed_login_audit_dropped_total",
 		Help: "Failed-login audit rows dropped because the in-process buffered channel was full. Unlabelled — a non-zero rate is the canary for \"audit flusher is the bottleneck under a credential-stuffing burst\" (issue #286).",
 	})
+	// failedLoginAuditWriteFailures: failed-login audit writes
+	// (cmd/apid/audit.go::flushOne) whose AppendEvent returned an
+	// error. Distinct from audit_write_failures_total (success path
+	// labelled by account_id) because the failed-login row's subject
+	// is always nil — a "subject collapse" through that counter
+	// would conflate this path with the success path's anonymous
+	// failures and make the operator's triage harder. Unlabelled —
+	// the per-IP breakage is not observable on this path (the row
+	// is dropped before the per-IP Prometheus series is touched);
+	// the operator needs only an aggregate signal.
+	failedLoginAuditWriteFailures := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_failed_login_audit_write_failures_total",
+		Help: "Failed-login audit rows whose AppendEvent could not be written (cmd/apid/audit.go::flushOne). Unlabelled — distinct from apid_audit_write_failures_total{account_id} because the failed-login row's subject is always nil, which would collapse to account_id=\"anonymous\" in the success-path counter and conflate the two surfaces (issue #286).",
+	})
 	auditWriteDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_audit_write_failures_duration_seconds",
 		Help: "Latency of state.Store.AppendEvent on the apid audit seam, labelled by terminal result {ok, failed}. Sized for the single-row INSERT round-trip (issue #278).",
@@ -605,6 +647,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_egress_deny_total",
 		Help: "Per-CIDR drop counter for the nftables egress denylist (PR-E, spec §11 + §12). The cidr label is the DenyEntry.CounterName (e.g. \"drop_v4_10_0_0_0_8\") and the family label is the nft family keyword (\"ip\" / \"ip6\"). The vmmd scrape adapter (cmd/vmmd/poller.go) reads `nft list counters` every 15s and emits the per-counter delta so the Prometheus series sees the rate of drops per CIDR. The imaged-side mirror is oci_egress_deny_total on cmd/imaged's registry because the OCI dialer is user-space — nftables counters do not see it.",
 	}, []string{"cidr", "family"})
+	// Issue #300: per-tenant RPS gauge. Sampled 5s by the daemon's
+	// topNSampler goroutine (cmd/apid/topn.go). Bounded at
+	// topAccountSetCap (1000) + "other" via topAccountSet — see
+	// pkg/wire/topn.go for the contract. The "other" label is
+	// distinct from the counter-level "__other__" overflow so a
+	// dashboard panel can filter one without filtering the other.
+	topTenantRPS := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_top_tenant_rps",
+		Help: "Per-tenant 5s RPS sampled by the daemon's topNSampler goroutine (issue #300). Labelled by account_id; bounded at the top 1000 customers by 24h request count with the remainder collapsed to account_id=\"other\" (the panel selector is {account_id!=\"other\"} for the top-N view). The \"other\" label here is distinct from the counter-level \"__other__\" overflow — see topAccountSet docs (pkg/wire/topn.go) for the two-tier cardinality contract. FaasTenantAbuse alert (spec §12) fires when the gauge exceeds 500 rps sustained for 10m. NOTE: the very first /metrics scrape after a daemon restart surfaces the cumulative request count divided by the 5s sample interval (because the sampler has no prior tick to diff against); the value converges to a true 5s delta on the second tick. This is a presentation-view approximation, not a counter drift.",
+	}, []string{"account_id"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the
 	// field stays nil and the imaged-side hook in cmd/imaged/main.go
@@ -631,6 +683,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
 		egressDeny,
 		failedLoginTotal, failedLoginDropped,
+		failedLoginAuditWriteFailures,
+		topTenantRPS,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -752,6 +806,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal"} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
+	// Issue #300: pre-instantiate the ("other",) row of the per-tenant
+	// RPS gauge so the help/TYPE surfaces in /metrics from boot, before
+	// the first 5s sampler tick fires. Same precedent as the closed
+	// scale-up outcome / egress-deny catalog loops above. Real customer
+	// ids are added by TopTenantRPSFor (cmd/apid/topn.go / cmd/gatewayd/
+	// listener.go), which routes through topAccountSet and demotes past
+	// top-1000 into this bucket.
+	topTenantRPS.WithLabelValues(topAccountOtherLabel)
 	// issue #171: pre-instantiate the {park, keep} outcome rows for
 	// the empty-app label so the help/TYPE surfaces in /metrics from
 	// boot, mirroring the scale-up pattern above.
@@ -765,42 +827,45 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// the rollup in ReplaceInstanceStats.
 	instanceCPUSecondsTotal.WithLabelValues("", "")
 	return &OpsMetrics{
-		registry:                   reg,
-		ops:                        ops,
-		dur:                        dur,
-		watchdogKills:              watchdogKills,
-		eventsWriteFail:            eventsWriteFail,
-		auditWriteFail:             auditWriteFail,
-		auditWriteDur:              auditWriteDur,
-		requestFailures:            requestFailures,
-		requestTotal:               requestTotal,
-		accountLabels:              newAccountLabelSet(maxAccountLabelValues),
-		failedLoginTotal:           failedLoginTotal,
-		failedLoginDropped:         failedLoginDropped,
-		ipLabels:                   newIPLabelSet(maxIPLabelValues),
-		cpuSecondsLast:             newCPUSecondsLastSeen(),
-		stripePushDur:              stripePushDur,
-		paddlePushDur:              paddlePushDur,
-		buildDur:                   buildDur,
-		buildQueueWait:             buildQueueWait,
-		residentGBPerCustomer:      residentGBPerCustomer,
-		billingCapExceededTotal:    billingCapExceededTotal,
-		wakeIDV4Fallback:           wakeIDV4Fallback,
-		imagedOCIPull:              imagedOCIPull,
-		instanceCPUPct:             instanceCPUPct,
-		instanceRSSMB:              instanceRSSMB,
-		instanceInflightReqs:       instanceInflightReqs,
-		instanceCPUSecondsTotal:    instanceCPUSecondsTotal,
-		instanceStatsCollectDur:    instanceStatsCollectDur,
-		instanceStatsPartialErrors: instanceStatsPartialErrors,
-		cpuStatsCollectDur:         cpuStatsCollectDurLocal,
-		scaleUpDecisions:           scaleUpDecisions,
-		scaleDownDecisions:         scaleDownDecisions,
-		scaleUpAdmitRPS:            scaleUpAdmitRPS,
-		sseClients:                 sseClients,
-		egressDeny:                 egressDeny,
-		ociEgressDeny:              ociEgressDeny,
-		provenanceWrites:           provenanceWrites,
+		registry:                      reg,
+		ops:                           ops,
+		dur:                           dur,
+		watchdogKills:                 watchdogKills,
+		eventsWriteFail:               eventsWriteFail,
+		auditWriteFail:                auditWriteFail,
+		auditWriteDur:                 auditWriteDur,
+		requestFailures:               requestFailures,
+		requestTotal:                  requestTotal,
+		accountLabels:                 newAccountLabelSet(maxAccountLabelValues),
+		failedLoginTotal:              failedLoginTotal,
+		failedLoginDropped:            failedLoginDropped,
+		failedLoginAuditWriteFailures: failedLoginAuditWriteFailures,
+		ipLabels:                      newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                  topTenantRPS,
+		topAccounts:                   newTopAccountSet(topAccountSetCap),
+		cpuSecondsLast:                newCPUSecondsLastSeen(),
+		stripePushDur:                 stripePushDur,
+		paddlePushDur:                 paddlePushDur,
+		buildDur:                      buildDur,
+		buildQueueWait:                buildQueueWait,
+		residentGBPerCustomer:         residentGBPerCustomer,
+		billingCapExceededTotal:       billingCapExceededTotal,
+		wakeIDV4Fallback:              wakeIDV4Fallback,
+		imagedOCIPull:                 imagedOCIPull,
+		instanceCPUPct:                instanceCPUPct,
+		instanceRSSMB:                 instanceRSSMB,
+		instanceInflightReqs:          instanceInflightReqs,
+		instanceCPUSecondsTotal:       instanceCPUSecondsTotal,
+		instanceStatsCollectDur:       instanceStatsCollectDur,
+		instanceStatsPartialErrors:    instanceStatsPartialErrors,
+		cpuStatsCollectDur:            cpuStatsCollectDurLocal,
+		scaleUpDecisions:              scaleUpDecisions,
+		scaleDownDecisions:            scaleDownDecisions,
+		scaleUpAdmitRPS:               scaleUpAdmitRPS,
+		sseClients:                    sseClients,
+		egressDeny:                    egressDeny,
+		ociEgressDeny:                 ociEgressDeny,
+		provenanceWrites:              provenanceWrites,
 	}
 }
 
@@ -879,6 +944,23 @@ func (m *OpsMetrics) FailedLoginDropped() prometheus.Counter {
 		return nil
 	}
 	return m.failedLoginDropped
+}
+
+// FailedLoginAuditWriteFailures returns the unlabelled counter for
+// failed-login audit rows whose AppendEvent could not be written
+// (issue #286, cmd/apid/audit.go::flushOne). Distinct from the
+// success-path audit counter (which is labelled by account_id) —
+// routing this counter through AuditWriteFailures would conflate
+// "the failed-login row's subject is always nil" with "the success-
+// path caller's subject is empty" in the operator's anonymous
+// bucket. Unlabelled — the per-IP breakage is not observable on
+// this path. Backs the SOC 2 CC7.2 audit-write-failure signal
+// alongside apid_audit_write_failures_total{account_id}.
+func (m *OpsMetrics) FailedLoginAuditWriteFailures() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.failedLoginAuditWriteFailures
 }
 
 // RequestFailure is the primitive counter accessor for
@@ -975,6 +1057,115 @@ func (m *OpsMetrics) RequestTotalFor(r *http.Request, status int, accountID stri
 		route = "unmatched"
 	}
 	return m.RequestTotal(accountID, route, CodeFromStatus(status))
+}
+
+// ObserveTopTenantRPS records a 5s RPS sample for the given accountID
+// into the bounded top-N admission primitive (issue #300). Cheap path:
+// takes the topAccountSet lock, increments the count, releases. Does
+// NOT touch the gauge — that happens once per 5s tick via
+// EmitTopTenantRPS, called from the sampler goroutine.
+//
+// Why the split: a per-sample gauge Set would race under concurrent
+// goroutines because the top-N membership bounces for any given id
+// as more ids arrive. Pushing gauge emission to a single-goroutine
+// once-per-tick snapshot bounds the gauge series set to at most
+// cap + 1 — see pkg/wire/topn.go for the design note.
+//
+// accountID is the raw (pre-admission) account id. The accessor
+// routes it through accountLabelSet so the 10k overflow collapses
+// to "__other__" upstream of the top-N primitive.
+//
+// Safe on a nil receiver.
+func (m *OpsMetrics) ObserveTopTenantRPS(accountID string) {
+	if m == nil || m.topAccounts == nil {
+		return
+	}
+	safe := m.accountLabel(accountID)
+	m.topAccounts.sample(safe)
+}
+
+// EmitTopTenantRPS drives the gauge emission from the sampler
+// goroutine's once-per-tick snapshot. Reads topNSnapshot, sets one
+// gauge row per tuple, and emits the "other" overflow row for any
+// account not in the top-N (this collapses the per-tick overflow
+// into the pre-instantiated "other" series).
+//
+// perAccountRPS is a closure that returns the current 5s rps for
+// the given account id (e.g. from the underlying requestTotal
+// delta). It is called once per tuple in the snapshot.
+//
+// Returns the number of series emitted (always ≤ cap + 1).
+//
+// Safe on a nil receiver — returns 0.
+func (m *OpsMetrics) EmitTopTenantRPS(perAccountRPS func(accountID string) float64) int {
+	if m == nil || m.topAccounts == nil || m.topTenantRPS == nil {
+		return 0
+	}
+	snap := m.topAccounts.topNSnapshot()
+	for _, c := range snap {
+		m.topTenantRPS.WithLabelValues(c.id).Set(perAccountRPS(c.id))
+	}
+	// Always emit the "other" row so the panel selector
+	// {account_id!="other"} never sees "no data" — same precedent
+	// as every other CounterVec pre-instantiation in NewOpsMetrics.
+	m.topTenantRPS.WithLabelValues(topAccountOtherLabel).Set(perAccountRPS(topAccountOtherLabel))
+	return len(snap) + 1
+}
+
+// TopAccountSet exposes the bounded admission primitive so the sampler
+// goroutine can drive its 24h rolling-window reset without going
+// through the gauge accessor. Returns nil on a nil receiver so unit
+// tests can nil-check.
+func (m *OpsMetrics) TopAccountSet() *topAccountSet {
+	if m == nil {
+		return nil
+	}
+	return m.topAccounts
+}
+
+// ShouldReset returns true if the rolling 24h window has elapsed
+// since the last resetWindow. Cheap read; called from the 5s
+// sampler tick. Forwarded from *topAccountSet so the sampler stays
+// decoupled from the primitive's unexported state.
+func (s *topAccountSet) ShouldReset() bool {
+	if s == nil {
+		return false
+	}
+	return s.shouldReset()
+}
+
+// ResetWindow wipes the rolling-window counts and updates
+// lastReset. Called by the sampler goroutine every 24h. Nil-safe so
+// a sampler that races a torn-down primitive no-ops.
+func (s *topAccountSet) ResetWindow() {
+	if s == nil {
+		return
+	}
+	s.resetWindow()
+}
+
+// SnapshotCounts returns a copy of the current per-account rolling
+// counts keyed by account_id (post-accountLabelSet admission). Used
+// by the sampler (cmd/apid/topn.go) to compute the 5s rps diff
+// between successive ticks. The returned map is a fresh allocation;
+// callers may mutate it freely.
+//
+// Implementation note: exposed for the sampler; pkg/wire unit tests
+// in topn_test.go use the lower-level topNSnapshot which returns
+// sorted (id, count) tuples. The sampler wants the raw count map
+// because it tracks per-id prev values keyed by the same id;
+// sorting would force a reverse-lookup.
+func (s *topAccountSet) SnapshotCounts() map[string]uint64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]uint64, len(s.counts))
+	for id, count := range s.counts {
+		out[id] = count
+	}
+	return out
 }
 
 // CodeFromStatus returns the wire-level code label for a recorded
@@ -1460,8 +1651,19 @@ func (m *OpsMetrics) Handler() http.Handler {
 const maxIPLabelValues = 10_000
 
 // anonymousIPLabel is the reserved IP for traffic whose source IP
-// could not be parsed (e.g. an empty/unparseable RemoteAddr). Always
-// admitted without consuming capacity.
+// could not be resolved. Two cases collapse here:
+//   - the RemoteAddr is missing entirely (the Go http server's
+//     RemoteAddr is empty string in pathological cases), and
+//   - pkg/middleware.defaultClientIP returned the "unknown" sentinel
+//     for an unparseable host (the canonical fallback for untrusted
+//     callers — `defaultClientIP` parses the host, returns "unknown"
+//     on parse failure, and ipLabelSet.admit collapses that sentinel
+//     to anonymousIPLabel).
+//
+// Always admitted without consuming capacity, so an operator can
+// distinguish a missing/garbled RemoteAddr from a credential-stuffing
+// burst that crossed the admission cap (which collapses to
+// otherIPLabel).
 const anonymousIPLabel = "anonymous"
 
 // otherIPLabel is the reserved IP for traffic whose IP exceeded the
@@ -1533,8 +1735,9 @@ func newAccountLabelSet(capacity int) *accountLabelSet {
 
 // admit resolves an account id to its label value (issue #278).
 // Empty input normalizes to anonymousAccountLabel. Reserved values
-// (anonymousAccountLabel, otherAccountLabel) are always admitted.
-// Real ids are admitted up to the capacity; further ids collapse to
+// (anonymousAccountLabel, otherAccountLabel) are always admitted
+// without consuming capacity (see reservedCount below). Real ids
+// are admitted up to the capacity; further ids collapse to
 // otherAccountLabel without ever consuming capacity, and the
 // underlying map is never resized past cap.
 //
@@ -1558,7 +1761,16 @@ func (s *accountLabelSet) admit(accountID string) string {
 	if _, ok := s.admitted[accountID]; ok {
 		return accountID
 	}
-	if len(s.admitted) >= s.cap {
+	// Reserved labels are pre-admitted at construction (see
+	// newAccountLabelSet) — their entries count toward len(s.admitted)
+	// but not toward the user-facing capacity. Subtract them so the
+	// real-id budget is exactly `cap - reservedCount`, not
+	// `cap - reservedCount - 2`. Without the subtraction the
+	// reserved labels steal two slots from the real-id budget; the
+	// IP-side sibling (ipLabelSet.admit) caught this same flaw via
+	// TestFailedLoginTotal_OverflowCollapsesToOtherSlow (issue #286).
+	const reservedCount = 2
+	if len(s.admitted)-reservedCount >= s.cap {
 		return otherAccountLabel
 	}
 	s.admitted[accountID] = struct{}{}
@@ -1622,10 +1834,13 @@ func newIPLabelSet(capacity int) *ipLabelSet {
 }
 
 // admit resolves an IP to its label value (issue #286). Empty input
-// (the "unknown" sentinel from pkg/middleware.defaultClientIP) and
-// the reserved IP labels collapse to anonymousIPLabel. New IPs past
-// the capacity collapse to otherIPLabel without ever consuming
-// capacity, and the underlying map is never resized past cap.
+// and the literal "unknown" sentinel from
+// pkg/middleware.defaultClientIP both collapse to anonymousIPLabel,
+// so the counter for "unparseable RemoteAddr" is observable
+// distinctly from a real credential-stuffing burst that crossed the
+// admission cap (which lands in otherIPLabel). New IPs past the
+// capacity collapse to otherIPLabel without ever consuming capacity,
+// and the underlying map is never resized past cap.
 //
 // Concurrency: holds mu across the lookup+insert. The hot path is
 // the "already admitted" lookup, which is O(1) and never inserts.
@@ -1637,12 +1852,12 @@ func newIPLabelSet(capacity int) *ipLabelSet {
 // OpsMetrics in NewOpsMetrics and held as a pointer field.
 func (s *ipLabelSet) admit(ip string) string {
 	switch ip {
-	case "":
-		// The ClientIP helper returns "unknown" for empty RemoteAddr
-		// (pkg/middleware/authlimit.go). Collapse that to the reserved
-		// anonymous label so the counter for "unparseable RemoteAddr"
-		// is observable distinctly from a real credential-stuffing
-		// burst that crossed the admission cap.
+	case "", "unknown":
+		// ClientIP returns "unknown" for an unparseable
+		// RemoteAddr; collapse to anonymousIPLabel so the operator
+		// can distinguish "we couldn't resolve the source IP"
+		// from a credential-stuffing burst that crossed the
+		// admission cap.
 		return anonymousIPLabel
 	case anonymousIPLabel, otherIPLabel:
 		return ip
@@ -1652,7 +1867,17 @@ func (s *ipLabelSet) admit(ip string) string {
 	if _, ok := s.admitted[ip]; ok {
 		return ip
 	}
-	if len(s.admitted) >= s.cap {
+	// Reserved labels (anonymous, __other__) are pre-admitted at
+	// construction (see newIPLabelSet) and consume map entries but
+	// NOT user-facing capacity. The user-facing cap of `s.cap`
+	// distinct REAL IPs must hold. The check is therefore
+	// "real IPs admitted = (len - reserved) >= s.cap", not
+	// "len >= s.cap" (which would steal reservedCount slots from
+	// the real budget — the original bug, surfaced by
+	// TestFailedLoginTotal_OverflowCollapsesToOtherSlow).
+	const reservedCount = 2
+	realAdmitted := len(s.admitted) - reservedCount
+	if realAdmitted >= s.cap {
 		return otherIPLabel
 	}
 	s.admitted[ip] = struct{}{}

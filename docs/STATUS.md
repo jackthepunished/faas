@@ -84,6 +84,16 @@ no longer reachable through `/login`); PR #174 hardened
 covering apps, deployments, plans, domains, crons, keys,
 secrets, usage, and the OAuth device-code flow).
 
+**CLI token now lives in the OS keychain (issue #293, closes gap G5)**
+— `cmd/faas/config.go` writes through `github.com/zalando/go-keyring`
+(macOS Keychain / Linux libsecret via D-Bus / Windows wincred); the
+plaintext file at `~/.config/faas/token` is retained only as a
+fallback for headless hosts with no D-Bus session (CI runners,
+SSH-only servers), and a WARN recommends installing `gnome-keyring`.
+First successful keychain save one-shot-deletes the legacy
+plaintext file so customers do not keep a redundant copy on disk
+after upgrading.
+
 ## M6 — builderd + real image pulls. ✅
 
 Build-in-microVM is wired through (`cmd/builderd`, `pkg/builderd`

@@ -1,12 +1,17 @@
-// auditor is the IAM-4 (ADR-035) seam that apid handlers call to
-// record a security event. It is intentionally thin: a best-effort
-// wrapper around state.Store.AppendEvent that logs failures and
-// increments the audit_write_failures counter. Mirrors the schedd
-// pattern at pkg/sched/engine.go:1317-1329 — a failed audit write
-// never rolls back the action that produced it.
+// Thin in-package wrapper around pkg/audit.Auditor that bakes in the
+// "apid" actor constant and the auditOps interface.
 //
-// The events table is append-only (spec §5) and shared with schedd;
-// IAM-4 is the auth-event front-end on the same surface.
+// The pkg/audit package is the canonical best-effort AppendEvent
+// wrapper (ADR-035); apid and schedd both use it. This file exists so
+// the existing `s.audit.Emit(...)` callsites in handlers don't churn
+// across the cross-daemon lift — the shape stays exactly the same,
+// only the underlying implementation moved to pkg/audit.
+//
+// Lift rationale: pkg/audit/audit.go holds the single best-effort
+// wrapper (ADR-035). Lifting lets schedd reuse it for cron.fired
+// without duplicating the failure contract. The apid wrapper keeps
+// the auditActor const baked in so the 10+ emit sites added in
+// PR #349 stay unchanged.
 //
 // Issue #286 added a second emit path, EmitFailedLogin, that goes
 // through a buffered channel drained by a single background goroutine.
@@ -24,14 +29,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 // auditActor is the value written to events.actor for every IAM-4
-// audit row. Free-form text per spec §5; schedd uses "schedd" so the
-// convention is <daemon-name>.
+// audit row produced by apid. Free-form text per spec §5; schedd uses
+// "schedd" so the convention is <daemon-name>. Baked into the
+// wrapper here so the existing `s.audit.Emit(...)` callsites stay
+// pre-PR shaped.
 const auditActor = "apid"
 
 // KindAuthLoginFailed is the events.kind value written for every
@@ -70,10 +78,12 @@ const failedLoginFlushEvery = 250 * time.Millisecond
 // pinning a Postgres connection for hundreds of inserts at once.
 const failedLoginFlushBatch = 1000
 
-// auditOps is the narrow counter+histogram surface auditor needs.
-// wire.OpsMetrics satisfies it (it has AuditWriteFailures and
-// AuditWriteFailureDuration). Defined as an interface so the
-// helper can be unit-tested with a stub (cmd/apid/audit_test.go).
+// auditOps is the narrow counter+histogram surface the success-path
+// emit needs (mirrors pkg/audit.Ops). wire.OpsMetrics satisfies it
+// (it has AuditWriteFailures and AuditWriteFailureDuration).
+// Defined as an interface here so the async failed-login code path
+// (which sits outside pkg/audit) can share the same testing seam
+// pattern.
 //
 // Issue #278 widened the audit-write surface:
 //   - AuditWriteFailures takes accountID so the counter can be
@@ -94,9 +104,21 @@ type auditOps interface {
 // defined as an interface so the auditor can be unit-tested with a
 // stub. The counter values flow through the bounded
 // ipLabelSet/audit write set documented on wire.OpsMetrics.
+//
+// FailedLoginAuditWriteFailures is on this interface — NOT on
+// auditOps — because the failed-login audit path is structurally
+// distinct from the success path: the row's subject is always nil
+// (a failed login cannot be attributed to a known account), so
+// routing its audit-write failures through the success-path
+// AuditWriteFailures("") counter would collapse them into the
+// `account_id="anonymous"` series alongside legitimate
+// anonymous-success-path failures and make operator triage harder.
+// Pair the dedicated counter with apid_audit_write_failures_total
+// {account_id} for the SOC 2 CC7.2 surface.
 type auditFailedOps interface {
 	FailedLoginTotal(ip string) prometheus.Counter
 	FailedLoginDropped() prometheus.Counter
+	FailedLoginAuditWriteFailures() prometheus.Counter
 }
 
 // failedLoginRow is the in-memory shape that flows through the
@@ -112,11 +134,28 @@ type failedLoginRow struct {
 	At        time.Time
 }
 
-// auditor is the IAM-4 audit seam. Constructed once per server in
-// newServerWithDeps and held as s.audit. Emit is the synchronous
-// path (success-path audit rows); EmitFailedLogin is the async
-// path (failed-login audit rows, issue #286).
+// auditor wraps pkg/audit.Auditor for the success-path emit (so
+// in-package `s.audit.Emit(...)` callsites keep their pre-PR shape)
+// and layers the async-batched failed-login flusher on top. The
+// two paths share the same actor constant + store + log surface,
+// just via different code paths (sync delegation to inner vs.
+// channel→goroutine). store / log / ops are duplicated here
+// because the failed-login flusher must call AppendEvent
+// synchronously — pkg/audit.Auditor doesn't expose its private
+// fields, and adding a "write one row with custom kind" method to
+// pkg/audit just to serve the failed-login case would couple a
+// cross-daemon shared type to an apid-only async shape.
 type auditor struct {
+	// inner holds the success-path pkg/audit.Auditor. The IAM-4
+	// sync emit routes through it; this wrapper exists to bake in
+	// the auditActor constant and the auditOps interface so the
+	// 10+ emit sites added in PR #349 don't churn.
+	inner *audit.Auditor
+
+	// store / log / ops duplicate the inner Auditor's private
+	// fields so flushOne can call AppendEvent directly. The
+	// constructor wires them up identically; the lazy-ops
+	// rebinding in WithOpsMetrics also re-binds these directly.
 	store state.Store
 	log   *slog.Logger
 	ops   auditOps
@@ -141,16 +180,17 @@ type auditor struct {
 	wg        sync.WaitGroup
 }
 
-// newAuditor builds the helper. nil ops is allowed — Emit will skip
-// the counter increment so unit tests can run without an OpsMetrics.
-// The async failed-login channel is NOT started here — the caller
-// must invoke Start(ctx) after WithOpsMetrics has wired the
-// failed-login counter, so the flusher goroutine can talk to a
+// newAuditor builds the helper. nil ops is allowed — the sync emit
+// will skip the counter increment so unit tests can run without an
+// OpsMetrics. The async failed-login channel is NOT started here —
+// the caller must invoke Start(ctx) after SetFailedOps has wired
+// the failed-login counter, so the flusher goroutine can talk to a
 // fully-constructed OpsMetrics. This split keeps the
-// newServerWithDeps → WithOpsMetrics → startFlusher → Close
+// newServerWithDeps → WithOpsMetrics → SetFailedOps → Start → Close
 // lifecycle explicit.
-func newAuditor(store state.Store, log *slog.Logger, ops auditOps) *auditor {
+func newAuditor(store state.Store, log *slog.Logger, ops audit.Ops) *auditor {
 	return &auditor{
+		inner:       audit.New(store, log, ops, auditActor),
 		store:       store,
 		log:         log,
 		ops:         ops,
@@ -161,12 +201,27 @@ func newAuditor(store state.Store, log *slog.Logger, ops auditOps) *auditor {
 	}
 }
 
+// setOps forwards to the inner Auditor so WithOpsMetrics can re-bind
+// the counter after construction. Mirrors the pre-PR s.audit.ops =
+// ops line at server.go:187. Also re-binds the local ops field
+// (used by the failed-login flusher's AuditWriteFailureDuration
+// observation).
+func (a *auditor) setOps(ops audit.Ops) {
+	if a == nil {
+		return
+	}
+	if a.inner != nil {
+		a.inner.SetOps(ops)
+	}
+	a.ops = ops
+}
+
 // SetFailedOps wires the failed-login counter surface. Called by
 // WithOpsMetrics after the OpsMetrics is constructed (issue #286).
 // Mirrors the lazy ops binding pattern used for the success-path
-// auditOps — the auditor is constructed at server-build time so the
-// handler closure has a non-nil receiver, while the metrics layer
-// is wired later so the daemons-without-OpsMetrics test path
+// inner Auditor — the auditor is constructed at server-build time so
+// the handler closure has a non-nil receiver, while the metrics
+// layer is wired later so the daemons-without-OpsMetrics test path
 // remains a valid call shape.
 func (a *auditor) SetFailedOps(ops auditFailedOps) {
 	if a == nil {
@@ -205,64 +260,14 @@ func (a *auditor) Close() {
 	})
 }
 
-// Emit writes one events row synchronously. accountID is optional
-// (nil allowed for system-level events, e.g. cron-fired). data may
-// be nil; marshal into {} on the way down so the column is always
-// valid JSON.
-//
-// Failure semantics (issue #278 widened this surface — see ADR-035
-// for the policy rationale):
-//   - json.Marshal failure on our own map[string]any is a programmer
-//     bug, not a runtime concern — log Error and return. We don't
-//     reach AppendEvent, so no duration observation is recorded.
-//   - AppendEvent failure logs Warn, observes the latency under
-//     result="failed", and increments audit_write_failures labelled
-//     by the resolved subject id (or "anonymous" if subject is nil/
-//     empty). The auth action has already returned 200 by the time
-//     this fires, so the audit row is observation, not source of
-//     truth. Never roll back the action.
-//   - AppendEvent success observes the latency under result="ok"
-//     so the failure-path latency distribution is comparable to
-//     the healthy-path latency distribution (issue #278 acceptance).
+// Emit delegates to pkg/audit.Auditor.Emit. Same signature, same
+// best-effort semantics — see pkg/audit/audit.go for the failure
+// contract (ADR-035).
 func (a *auditor) Emit(ctx context.Context, kind string, accountID *string, data map[string]any) {
-	if data == nil {
-		data = map[string]any{}
-	}
-	payload, err := json.Marshal(data)
-	if err != nil {
-		a.log.Error("audit: marshal", "kind", kind, "err", err)
+	if a == nil || a.inner == nil {
 		return
 	}
-	// Normalize the subject into a string we can label the metric
-	// with. nil and empty collapse to the empty string; accountLabel
-	// upstream in the metric helper maps that to "anonymous". This
-	// keeps the labelled-counter helper on a single non-nil string
-	// argument so auditOps stays a clean two-method interface.
-	subjectStr := ""
-	if accountID != nil {
-		subjectStr = *accountID
-	}
-	var subject *string
-	if subjectStr != "" {
-		subject = accountID
-	}
-	start := time.Now()
-	err = a.store.AppendEvent(ctx, auditActor, kind, subject, payload)
-	dur := time.Since(start)
-	if a.ops != nil {
-		if err != nil {
-			a.ops.AuditWriteFailureDuration("failed").Observe(dur.Seconds())
-		} else {
-			a.ops.AuditWriteFailureDuration("ok").Observe(dur.Seconds())
-		}
-	}
-	if err != nil {
-		a.log.Warn("audit: append event",
-			"kind", kind, "subject", subject, "err", err)
-		if a.ops != nil {
-			a.ops.AuditWriteFailures(subjectStr).Inc()
-		}
-	}
+	a.inner.Emit(ctx, kind, accountID, data)
 }
 
 // EmitFailedLogin is the handler-side entry point for the
@@ -277,13 +282,23 @@ func (a *auditor) Emit(ctx context.Context, kind string, accountID *string, data
 // diverging from that contract would silently make a credential-
 // stuffing burst look like a different (smaller) attack).
 // emailHash is pkg/auth.HashEmail (lowercase+trimmed SHA-256 hex).
-// userAgent is the raw inbound User-Agent header — the slog
-// warning-on-drop path below runs it through logsanitize.Field so
-// the metric label stays free of CRLF/log-injection characters.
+// userAgent is the raw inbound User-Agent header — sanitized at
+// this seam via pkg/logsanitize.Field before any further use, so
+// the value that lands in the events.data JSON, the slog
+// warning-on-drop line, and the per-IP metric label is the same
+// sanitized form (CodeQL go/log-injection closure, issue #286
+// review fix #9).
 func (a *auditor) EmitFailedLogin(ip, emailHash, userAgent string) {
 	if a == nil || a.failedCh == nil {
 		return
 	}
+	// Sanitize the user-agent ONCE at the seam so every downstream
+	// sink (audit row, slog warn-on-drop, future log lines) sees
+	// the same byte sequence. Doing this here rather than at each
+	// sink keeps the sanitization contract in a single place and
+	// avoids the failure mode where one path forgets to sanitize
+	// and an attacker-supplied CRLF lands in a downstream tool.
+	sanitizedUA := logsanitize.Field(userAgent)
 	// Increment the per-IP counter BEFORE the channel write so a
 	// dropped row still produces the Prometheus signal. The audit
 	// row is observation; the counter is the SOC 2 evidence.
@@ -293,7 +308,7 @@ func (a *auditor) EmitFailedLogin(ip, emailHash, userAgent string) {
 	row := failedLoginRow{
 		IP:        ip,
 		EmailHash: emailHash,
-		UserAgent: userAgent,
+		UserAgent: sanitizedUA,
 		At:        time.Now(),
 	}
 	select {
@@ -316,46 +331,30 @@ func (a *auditor) EmitFailedLogin(ip, emailHash, userAgent string) {
 }
 
 // runFlusher is the single-goroutine drain loop for the async
-// failed-login audit channel (issue #286). One loop per daemon;
-// the channel is closed at daemon shutdown and the loop exits naturally.
-//
-// Cadence: every flushEvery (250 ms) OR whenever the channel has
-// flushBatch (1000) rows buffered, whichever fires first. The size
-// threshold is checked at the top of every iteration so a soak-load
-// burst can't outrun the timer.
-//
-// On every drain:
-//  1. Read up to flushBatch rows off the channel.
-//  2. For each row, AppendEvent one row of events. We don't batch
-//     into a single multi-row INSERT — AppendEvent is one row in
-//     the state.Store contract, and a per-row call shape keeps the
-//     schema upgrade path local (this is the same contract Emit
-//     uses; no new SQL surface).
-//  3. On AppendEvent failure, log Warn and increment the audit
-//     failure counter — same posture as Emit. The row is dropped
-//     from the audit surface; the Prometheus counter has already
-//     counted it (EmitFailedLogin ran before the channel send).
-//
-// runFlusher is the single-goroutine drain loop for the async
-// failed-login audit channel (issue #286). One loop per daemon;
-// the channel is closed at daemon shutdown and the loop exits naturally.
+// failed-login audit channel (issue #286). One loop per daemon.
 //
 // Cadence: the loop waits on the ticker + a wakeup channel. The
 // ticker is the low-traffic bound (flushEvery=250ms — the audit
 // row appears within a quarter second of the failed attempt even
-// when the request rate is zero). A separate wakeup channel lets
-// Close notify the goroutine that the queue is closed so the
-// daemon shutdown path doesn't wait up to flushEvery for the
-// final drain.
+// when the request rate is zero). closeSignal lets Close wake
+// the goroutine on shutdown so the daemon doesn't wait up to
+// flushEvery for the final drain.
 //
 // The channel receive on a.failedCh is folded into drainFlusher
-// — a naive "receive-and-discard" in the select would drop the
+// — a naive "receive-and-discard" in this select would drop the
 // row on the floor. drainFlusher is the only place that pops rows.
 //
-// On ctx.Done (daemon shutdown), Close() closes the channel AND
-// sends on the wakeup channel. The loop's drainFlusher sees the
-// `!ok` and exits. The wg.Wait in Close blocks until runFlusher
-// has returned.
+// On Close: failedCh is closed (which makes drainFlusher's
+// `<-a.failedCh` return on `!ok` and exit the loop) AND
+// closeSignal is signalled (which wakes the loop immediately
+// rather than waiting for the next ticker tick). The two are
+// distinct mechanisms: the channel close is the exit, the signal
+// is the wakeup. Close's wg.Wait blocks until runFlusher has
+// returned.
+//
+// On ctx.Done: drain the channel and exit. Used when the parent
+// context is cancelled (e.g. daemon shutdown without Close being
+// called, though Close is the canonical path).
 func (a *auditor) runFlusher(ctx context.Context) {
 	defer a.wg.Done()
 	ticker := time.NewTicker(a.flushEvery)
@@ -363,19 +362,19 @@ func (a *auditor) runFlusher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			a.drainFlusher()
+			a.drainFlusher(ctx)
 			return
 		case <-a.closeSignal:
 			// Channel was closed. The final drain picks up any
 			// rows still buffered (drainFlusher's `case row, ok
 			// := <-a.failedCh` returns on `!ok`).
-			a.drainFlusher()
+			a.drainFlusher(ctx)
 			return
 		case <-ticker.C:
 			// Cadence tick. Drain whatever is buffered so the
 			// audit row latency stays bounded even when the
 			// request rate is low.
-			a.drainFlusher()
+			a.drainFlusher(ctx)
 		}
 	}
 }
@@ -388,7 +387,15 @@ func (a *auditor) runFlusher(ctx context.Context) {
 // The per-IP counter has already been incremented by EmitFailedLogin
 // at enqueue time, so the SOC 2 counter is unaffected by audit-write
 // failures.
-func (a *auditor) drainFlusher() {
+//
+// ctx is the goroutine context the flusher was started with (the
+// daemon main context from WithOpsMetrics, or the test-supplied
+// context from Start). The flusher derives a 5-second timeout
+// context per row in flushOne; the parent ctx is threaded through
+// so a daemon shutdown can short-circuit the in-flight AppendEvent
+// calls rather than waiting the full timeout (contextcheck lint
+// closure, golangci-lint v2.4.0).
+func (a *auditor) drainFlusher(ctx context.Context) {
 	for i := 0; i < a.flushBatch; i++ {
 		select {
 		case row, ok := <-a.failedCh:
@@ -398,7 +405,7 @@ func (a *auditor) drainFlusher() {
 				// pass from the shutdown path.
 				return
 			}
-			a.flushOne(row)
+			a.flushOne(ctx, row)
 		default:
 			// Channel empty. The drain is done for this tick.
 			return
@@ -406,14 +413,28 @@ func (a *auditor) drainFlusher() {
 	}
 }
 
-// flushOne writes one failed-login audit row via the same
-// AppendEvent path Emit uses. Subject is nil because the failed
-// login cannot be attributed to a known account id (the email
-// hash is the joinable seam, not the on-disk row subject). The
-// best-effort posture is identical to Emit — Warn + counter on
-// failure, never roll back the auth response (which has already
-// been returned by the time we get here).
-func (a *auditor) flushOne(row failedLoginRow) {
+// flushOne writes one failed-login audit row via AppendEvent. The
+// failure semantics mirror pkg/audit.Auditor.Emit (Warn + counter
+// on failure, never roll back the auth response). We do NOT
+// delegate to inner.Emit because the failed-login row uses a nil
+// subject (a failed login cannot be attributed to a known account)
+// and a dedicated kind that pkg/audit is agnostic to.
+//
+// The AuditWriteFailureDuration observation IS recorded under
+// result ∈ {ok, failed} — that latency distribution is the same
+// across both paths so an operator looking at
+// apid_audit_write_failure_duration_seconds{result="failed"} sees
+// both surfaces. The success-path AuditWriteFailures counter is
+// NOT incremented for the failed-login path; that counter is
+// labelled by subject, and the dedicated
+// FailedLoginAuditWriteFailures counter preserves the structural
+// separation the SOC 2 CC7.2 surface relies on.
+//
+// ctx is the parent flusher context (see drainFlusher). A 5-second
+// per-row timeout is derived from ctx so a daemon shutdown can
+// short-circuit the in-flight AppendEvent rather than waiting the
+// full timeout.
+func (a *auditor) flushOne(ctx context.Context, row failedLoginRow) {
 	data := map[string]any{
 		"ip":         row.IP,
 		"email_hash": row.EmailHash,
@@ -423,7 +444,8 @@ func (a *auditor) flushOne(row failedLoginRow) {
 	if err != nil {
 		// map[string]any of strings cannot fail marshalling.
 		// Treat as a programmer bug — log Error and skip.
-		a.log.Error("audit: failed-login marshal", "ip", logsanitize.Field(row.IP), "err", err)
+		a.log.Error("audit: failed-login marshal",
+			"ip", logsanitize.Field(row.IP), "err", err)
 		return
 	}
 	// Use the row's At timestamp as the audit-row at value via
@@ -432,7 +454,7 @@ func (a *auditor) flushOne(row failedLoginRow) {
 	// now(). We accept the tiny drift (handler-timestamp vs.
 	// INSERT-now) as the trade-off for not changing the
 	// AppendEvent signature.
-	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	start := time.Now()
 	err = a.store.AppendEvent(flushCtx, auditActor, KindAuthLoginFailed, nil, payload)
 	dur := time.Since(start)
@@ -448,12 +470,17 @@ func (a *auditor) flushOne(row failedLoginRow) {
 		a.log.Warn("audit: failed-login append event",
 			"ip", logsanitize.Field(row.IP),
 			"err", err)
-		if a.ops != nil {
-			// Failure semantics mirror Emit: the row's subject
-			// is nil so the counter is labelled by the empty
-			// string, which accountLabel() maps to "anonymous".
-			// Operators drill into the slog for the IP.
-			a.ops.AuditWriteFailures("").Inc()
+		if a.failedOps != nil {
+			// Use the dedicated failed-login audit-write failure
+			// counter, NOT the success-path AuditWriteFailures.
+			// Routing through AuditWriteFailures would collapse
+			// the row's nil subject to "anonymous" in the
+			// success-path counter, conflating it with
+			// legitimate anonymous-success-path failures. The
+			// dedicated counter preserves the separation; the
+			// SOC 2 CC7.2 surface reads both this and the
+			// success-path counter as paired views.
+			a.failedOps.FailedLoginAuditWriteFailures().Inc()
 		}
 	}
 }

@@ -197,6 +197,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Log:   log,
 		})
 		go func() { _ = loginTokenCleanup.Run(ctx) }()
+		// Issue #300: topNSampler drives the apid_top_tenant_rps
+		// gauge from the rolling per-account count fed by
+		// observeWrap (server.go:observeWrap). 5s tick; runs for
+		// the daemon's lifetime; stops cleanly on ctx cancel.
+		topNSampler := newTopNSampler(srv.ops, log)
+		go topNSampler.run(ctx)
 	}
 	return runWithDeps(ctx, log, deps)
 }
@@ -370,7 +376,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Built unconditionally so /metrics works even with FAAS_APID_METRICS_ADDR
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
-	srv.WithOpsMetrics(ops)
+	srv.WithOpsMetrics(ctx, ops)
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
