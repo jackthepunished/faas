@@ -32,16 +32,27 @@ func (c *Client) sseClient() *http.Client {
 	}
 }
 
-// LogEvent is the parsed shape of one deployment-logs frame. SDK
-// callers wrap StreamDeploymentLogs with their own SSE parser and
+// LogEvent is the parsed shape of one app-logs frame. SDK
+// callers wrap StreamAppLogs with their own SSE parser and
 // json.Unmarshal each frame's data into this type. Defined here so
 // the SDK owns the public type instead of leaking the server-side
 // shape from cmd/apid/handlers_ext.go.
+//
+// Move 4 (issue #254) adds InstanceID so a multi-instance
+// consumer can disambiguate interleaved frames: two instances
+// emitting in parallel produce one LogEvent stream whose
+// InstanceID values differ. The field is additive — old SDKs
+// ignore it via stdlib JSON's default lenient-decoder behaviour
+// (Go's encoding/json does not error on unknown fields).
+//
+// Since: v1.x. The field is empty on the streamDeploymentLogs
+// wire (one deployment = one build VM, no instance granularity).
 type LogEvent struct {
-	Seq       int64  `json:"seq"`
-	Stream    string `json:"stream"` // "stdout" or "stderr"
-	Line      string `json:"line"`
-	WrittenAt string `json:"written_at"`
+	Seq        int64  `json:"seq"`
+	InstanceID string `json:"instance,omitempty"` // per-instance id (Move 4); empty for deployment logs
+	Stream     string `json:"stream"`             // "stdout" or "stderr"
+	Line       string `json:"line"`
+	WrittenAt  string `json:"written_at"`
 }
 
 // Event is one Server-Sent Event frame as defined by the WHATWG

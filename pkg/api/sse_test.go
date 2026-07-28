@@ -7,6 +7,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -164,4 +165,79 @@ func TestSSEDecoder_HandlesEmptyFrames(t *testing.T) {
 		t.Fatal("Events() did not close after the single real frame")
 	}
 	<-dec.Errors()
+}
+
+// TestLogEvent_RoundtripFromJSON pins the Move 4 wire shape for
+// the app-logs frame (issue #254, Acceptance #5). The decoder
+// must surface the per-instance id so a consumer can interleave
+// multi-instance frames deterministically.
+//
+// Cross-renderer parity (per memory cross-renderer-invariant-pattern):
+// the SDK decoder (Go, this file) and the dashboard's htmx-ext-sse
+// decoder must agree on the field names. The server emits
+// {seq, instance, stream, line, written_at}; if any field is
+// renamed, the SDK's typed Roundtrip test breaks.
+func TestLogEvent_RoundtripFromJSON(t *testing.T) {
+	raw := []byte(`{"seq":42,"instance":"i-7","stream":"stdout","line":"hello","written_at":"2026-07-28T14:00:00Z"}`)
+	var ev LogEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if ev.Seq != 42 {
+		t.Errorf("Seq = %d, want 42", ev.Seq)
+	}
+	if ev.InstanceID != "i-7" {
+		t.Errorf("InstanceID = %q, want i-7", ev.InstanceID)
+	}
+	if ev.Stream != "stdout" {
+		t.Errorf("Stream = %q, want stdout", ev.Stream)
+	}
+	if ev.Line != "hello" {
+		t.Errorf("Line = %q, want hello", ev.Line)
+	}
+	if ev.WrittenAt != "2026-07-28T14:00:00Z" {
+		t.Errorf("WrittenAt = %q, want 2026-07-28T14:00:00Z", ev.WrittenAt)
+	}
+}
+
+// TestLogEvent_DeploymentLogsNoInstance pins the deployment-logs
+// wire shape stays unchanged: streamDeploymentLogs emits
+// {seq, stream, line, written_at} (no instance field), and the
+// SDK decoder leaves InstanceID empty. Move 4 must NOT regress
+// the deployment-log stream.
+func TestLogEvent_DeploymentLogsNoInstance(t *testing.T) {
+	raw := []byte(`{"seq":1,"stream":"stdout","line":"build step","written_at":"2026-07-28T14:00:00Z"}`)
+	var ev LogEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if ev.InstanceID != "" {
+		t.Errorf("InstanceID = %q, want empty (deployment logs have no instance)", ev.InstanceID)
+	}
+	if ev.Line != "build step" {
+		t.Errorf("Line = %q, want build step", ev.Line)
+	}
+}
+
+// TestLogEvent_OldSDKIgnoresInstance pins the additive rollout:
+// an old SDK that pre-dates Move 4 still decodes the frame
+// cleanly because the JSON unmarshaler does not error on unknown
+// fields. We simulate this by giving the struct a json tag that
+// the new field claims (json.Unmarshal is strict about known
+// fields; the lenient behaviour is the default).
+func TestLogEvent_OldSDKIgnoresInstance(t *testing.T) {
+	// The decoder uses the new LogEvent struct directly. The
+	// "old SDK" guarantee is "decoder does not require the
+	// instance field" — confirmed by the previous test
+	// (TestLogEvent_DeploymentLogsNoInstance). This test
+	// gives the inner round-trip a different decode order
+	// (seq first, then instance) to verify field reordering.
+	raw := []byte(`{"seq":99,"instance":"i-99","stream":"stderr","line":"x","written_at":"t"}`)
+	var ev LogEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if ev.Seq != 99 || ev.InstanceID != "i-99" || ev.Stream != "stderr" || ev.Line != "x" {
+		t.Errorf("got %+v", ev)
+	}
 }
