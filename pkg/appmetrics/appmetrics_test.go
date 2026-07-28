@@ -27,7 +27,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
-	"github.com/onebox-faas/faas/pkg/promql"
+	pkgpromql "github.com/onebox-faas/faas/pkg/promql"
 )
 
 // stubPromQL is the test double for appmetrics.PromQL. The fn
@@ -164,26 +164,88 @@ func TestAppMetrics_Fetch_NilClient(t *testing.T) {
 	}
 }
 
-// TestAppMetrics_Fetch_TypedNilClient pins the Go-typed-nil gotcha
-// at the package seam. *promql.Client(nil) satisfies the PromQL
-// interface with a non-nil interface value (type info without data);
-// a bare `fetcher == nil` comparison returns false in that case.
-// Without the typed-nil guard the call would dispatch into
-// (*promql.Client)(nil).QueryScalar and surface as "promql: client
-// not configured" — which is a wire-shape change vs. the original
-// handlers_metrics.go behaviour. This test pins the "degraded:
-// prometheus not configured" message even when the apid handler
-// passes a typed-nil client through.
+// TestAppMetrics_Fetch_TypedNilClient pins the typed-nil short-circuit
+// that the production handler relies on. apid wires `*pkg/promql.Client`
+// into the Fetch call site; when the server boots without a Prometheus
+// URL the field is the zero-value concrete pointer, which wraps into
+// the `PromQL` interface as a NON-nil value (the typed-nil gotcha).
+// Without the type-switch guard added in PR #404 review, Fetch would
+// dispatch into QueryScalar on a nil receiver and leak the
+// implementation-detail error "promql: client not configured" up to
+// the dashboard. This test pins the canonical "prometheus not
+// configured" Source form on the typed-nil path.
 func TestAppMetrics_Fetch_TypedNilClient(t *testing.T) {
 	log, _ := captureLog(t)
+	var c *pkgpromql.Client // typed nil
+	var fetcher appmetrics.PromQL = c
 
-	var typedNil *promql.Client
-	resp, src := appmetrics.Fetch(context.Background(), typedNil, log, "app-1", "5m")
+	resp, src := appmetrics.Fetch(context.Background(), fetcher, log, "app-1", "5m")
 	if !strings.Contains(src, "prometheus not configured") {
-		t.Errorf("src = %q, want contains 'prometheus not configured'", src)
+		t.Errorf("typed-nil src = %q, want contains 'prometheus not configured'", src)
 	}
 	if resp.RequestCount != 0 {
 		t.Errorf("typed-nil must zero: %+v", resp)
+	}
+}
+
+// TestAppMetrics_Fetch_RejectsLabelEscape pins the PromQL injection
+// guard (PR #404 review finding BUG-01). The query builder uses %q
+// for the app= label value, but Prometheus label-string literals do
+// NOT recognise Go escaping — a `"` in the appID closes the outer
+// label prematurely and re-opens a new `app=…` selector. The package
+// must refuse any appID containing `"`, `\`, or `\n` BEFORE building
+// any query, returning a degraded response without dispatching to
+// Prometheus. PR 4's meterd caller will pass alert_rules.app_id (a
+// customer-supplied slug), so this guard is load-bearing.
+func TestAppMetrics_Fetch_RejectsLabelEscape(t *testing.T) {
+	log, _ := captureLog(t)
+	stub := okStub(7)
+
+	cases := []string{
+		`evil","class="2xx"`, // closes outer label, re-opens class label
+		"back\\slash",        // backslash is the other Go escape char
+		"line\nfeed",         // newline breaks the query body literally
+	}
+	for _, appID := range cases {
+		t.Run(appID, func(t *testing.T) {
+			// The stub must NOT be called for any of these.
+			seen := false
+			guard := &stubPromQL{fn: func(_ string) (float64, error) {
+				seen = true
+				return 7, nil
+			}}
+			resp, src := appmetrics.Fetch(context.Background(), guard, log, appID, "5m")
+			if seen {
+				t.Errorf("Fetch dispatched to Prometheus with rejected appID %q", appID)
+			}
+			if !strings.Contains(src, "invalid app id") {
+				t.Errorf("src = %q, want contains 'invalid app id'", src)
+			}
+			if resp.RequestCount != 0 {
+				t.Errorf("rejected appID must zero response: %+v", resp)
+			}
+			_ = stub // silence unused
+		})
+	}
+}
+
+// TestAppMetrics_Fetch_SourceHasNoCRLF pins PR #404 review finding
+// BUG-02: the `Source` field on the wire response must NOT contain
+// raw CR or LF even if the upstream Prometheus (or a malicious one)
+// returns an error body containing them. Otherwise the JSON response
+// itself breaks downstream structured-log parsers.
+func TestAppMetrics_Fetch_SourceHasNoCRLF(t *testing.T) {
+	log, _ := captureLog(t)
+	stub := &stubPromQL{fn: func(_ string) (float64, error) {
+		return 0, fmt.Errorf("evil prom error\r\nfake log line 2")
+	}}
+
+	_, src := appmetrics.Fetch(context.Background(), stub, log, "app-1", "5m")
+	if strings.Contains(src, "\r") || strings.Contains(src, "\n") {
+		t.Errorf("Source contains CR/LF: %q", src)
+	}
+	if !strings.Contains(src, "evil prom error") {
+		t.Errorf("Source missing underlying message: %q", src)
 	}
 }
 

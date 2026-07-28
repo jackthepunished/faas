@@ -18,10 +18,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"reflect"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/promql"
 )
 
 // SourcePrometheus is the canonical "Source" value emitted on a
@@ -74,14 +74,34 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, appID, rng str
 		log = slog.Default()
 	}
 	resp := api.AppMetricsResponse{}
-	// Guard against both the bare nil interface AND the typed-nil
-	// gotcha: *promql.Client(nil) satisfies PromQL with a non-nil
-	// interface value (type info without data). The handler does the
-	// concrete-type check too, but defending in the package keeps the
-	// "zero behaviour change" promise intact for future meterd callers
-	// that might also pass a nil *promql.Client.
-	if fetcher == nil || isTypedNil(fetcher) {
+	// Nil-client short-circuit. Two cases fold into one response:
+	//   1. fetcher is the zero interface value (caller passed literal nil).
+	//   2. fetcher wraps a typed-nil *promql.Client (s.promqlClient is
+	//      nil but typed as the concrete pointer). Without the type-
+	//      switch below, QueryScalar would dispatch into the nil
+	//      receiver and return "promql: client not configured" — a
+	//      leaky-abstraction error message that the handler test
+	//      TestAppMetrics_PrometheusDisabled pins against the
+	//      canonical "prometheus not configured" form. We type-switch
+	//      on the canonical implementer (the test stub doesn't satisfy
+	//      *promql.Client and falls through to the dispatch path).
+	if fetcher == nil {
 		return resp, SourceDegradedPrefix + "prometheus not configured"
+	}
+	if c, ok := fetcher.(*promql.Client); ok && c == nil {
+		return resp, SourceDegradedPrefix + "prometheus not configured"
+	}
+	// Reject appID values that would let a caller escape the outer
+	// label literal in the PromQL query. Today every production
+	// caller passes a UUID-shaped app.ID (server-controlled), but
+	// PR 4's meterd caller will pass alert_rules.app_id — a slug the
+	// customer supplies. Without this guard a crafted slug containing
+	// `"` would close the outer label prematurely and re-open a new
+	// `app=…` selector, leaking data across apps. The error path
+	// returns a degraded response so the dashboard's empty-state
+	// branch handles it.
+	if strings.ContainsAny(appID, "\"\n\\") {
+		return resp, SourceDegradedPrefix + "invalid app id"
 	}
 
 	// 1. Request count.
@@ -156,17 +176,21 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, appID, rng str
 // only recognises the two-call pattern below — see
 // memory/codeql-go-log-injection-sanitisers.md for the full
 // precedent. The CR/LF strip is inline at the call site (NOT inside
-// a helper) so the dataflow path is unambiguous to CodeQL.
+// a helper) so the dataflow path is unambiguous to CodeQL. The
+// SAME sanitised string flows into the Source field on the wire —
+// a misbehaving Prometheus returning \r\n in its error body would
+// otherwise land raw in the JSON response, breaking structured-log
+// parsing downstream.
 func degradedFromErr(resp api.AppMetricsResponse, err error, log *slog.Logger, label string) (api.AppMetricsResponse, string) {
+	msg := strings.ReplaceAll(err.Error(), "\r", "")
+	msg = strings.ReplaceAll(msg, "\n", "")
 	if log != nil {
-		msg := strings.ReplaceAll(err.Error(), "\r", "")
-		msg = strings.ReplaceAll(msg, "\n", "")
 		log.Warn("appmetrics: query failed", "label", label, "err", msg)
 	}
 	// Fall back to zeroed fields rather than partially-populated
 	// numbers — the dashboard's empty-state message depends on
 	// RequestCount being 0 when degraded.
-	return api.AppMetricsResponse{}, SourceDegradedPrefix + err.Error()
+	return api.AppMetricsResponse{}, SourceDegradedPrefix + msg
 }
 
 // Ranges returns a copy of the closed-set vocabulary for the range
@@ -221,19 +245,4 @@ func SafePercent(v float64) float64 {
 // banker's rounding has one site to touch. Issue #273 / ADR-042.
 func SafeRoundNonNeg(v float64) float64 {
 	return SafeFloat(v)
-}
-
-// isTypedNil reports whether v is a non-nil interface value that
-// wraps a typed nil pointer. The Go FAQ entry "Why is my nil error
-// value not equal to nil?" documents this gotcha. A future refactor
-// to accept the concrete *promql.Client here would obviate this
-// helper; the package keeps the interface to make the seam
-// stub-friendly.
-func isTypedNil(v PromQL) bool {
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Ptr, reflect.Map, reflect.Chan, reflect.Func, reflect.Interface, reflect.Slice:
-		return rv.IsNil()
-	}
-	return false
 }

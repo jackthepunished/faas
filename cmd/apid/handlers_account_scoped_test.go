@@ -35,6 +35,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -376,8 +377,9 @@ func TestGetAppsMetrics_Degraded_NoPrometheus(t *testing.T) {
 	if out.Range != "5m" {
 		t.Fatalf("range echo: got %q want %q", out.Range, "5m")
 	}
-	if out.Source != "degraded: prometheus not configured" {
-		t.Fatalf("source: got %q want %q", out.Source, "degraded: prometheus not configured")
+	wantSrc := appmetrics.SourceDegradedPrefix + "prometheus not configured"
+	if out.Source != wantSrc {
+		t.Fatalf("source: got %q want %q", out.Source, wantSrc)
 	}
 	if out.Apps != nil {
 		t.Fatalf("apps should be null when degraded, got %+v", out.Apps)

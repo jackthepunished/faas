@@ -137,13 +137,20 @@ func (s *Signer) Verify(unix int64, deliveryID string, body []byte, gotHex strin
 	return nil
 }
 
-// Target is the destination URL for a single delivery. Secret is the
-// per-rule unsealed HMAC key. URL is pre-validated by the handler
-// (PR 3) via oci.EgressIPAllowed; the dispatcher runs the dial-time
-// check via oci.NewEgressHTTPClient (default HTTPClient).
+// Target is the destination URL for a single delivery. URL is
+// pre-validated by the handler (PR 3) via oci.EgressIPAllowed; the
+// dispatcher runs the dial-time check via oci.NewEgressHTTPClient
+// (default HTTPClient).
+//
+// Signer is the per-rule HMAC key. Construct once per (account,
+// rule, secret version) — the secret lifetime equals the
+// dispatcher's, not the per-call delivery. The signature path
+// signs the canonical string "<unix>.<delivery_id>.<body>"; the
+// unix value comes from evt.OccurredAt and the delivery id from
+// evt.ID, so the signer only holds the key.
 type Target struct {
 	URL    string
-	Secret []byte
+	Signer *Signer
 }
 
 // Event is the JSON payload posted to the customer. Payload is the
@@ -200,17 +207,30 @@ type DispatcherOptions struct {
 // Dispatcher is the per-rule outbound webhook poster. PR 3 wires one
 // per (account, rule, secret version); PR 4 calls Dispatch on every
 // alert fire.
+//
+// Dispatcher is NOT safe for concurrent use of Dispatch. The
+// per-target Signer lives on Target, but the per-call body
+// marshalling and the retry loop share d.opts — a caller that
+// fires multiple deliveries in parallel should construct one
+// Dispatcher per delivery stream (or serialise at the caller).
 type Dispatcher struct {
-	signer *Signer
-	opts   DispatcherOptions
+	opts DispatcherOptions
 }
 
-// NewDispatcher returns a Dispatcher. secret is the per-rule unsealed
-// HMAC key (already unsealed by pkg/state in PR 3); opts is documented
-// above. The zero-value opts resolves to all defaults — the production
-// caller does not need to set anything besides an explicit
-// MaxAttempts if it wants fewer retries.
-func NewDispatcher(secret []byte, opts DispatcherOptions) *Dispatcher {
+// NewDispatcher returns a Dispatcher. opts is documented above. The
+// zero-value opts resolves to all defaults — the production caller
+// does not need to set anything besides an explicit MaxAttempts if
+// it wants fewer retries.
+//
+// HTTPClient ownership: when the caller passes nil the dispatcher
+// builds one via oci.NewEgressHTTPClient() (the SSRF-guarded client
+// has no timeout) and applies PerAttempt as the client-level Timeout.
+// When the caller passes their own *http.Client the dispatcher does
+// NOT mutate it — the caller's Timeout (and Transport) stay as-is.
+// PR 3 callers that want the SSRF guard AND a custom timeout should
+// build the client with oci.EgressDialContext and a Timeout, then
+// pass it in.
+func NewDispatcher(opts DispatcherOptions) *Dispatcher {
 	if opts.MaxAttempts == 0 {
 		opts.MaxAttempts = DefaultMaxAttempts
 	}
@@ -220,6 +240,7 @@ func NewDispatcher(secret []byte, opts DispatcherOptions) *Dispatcher {
 	if opts.PerAttempt == 0 {
 		opts.PerAttempt = DefaultPerAttempt
 	}
+	callerHTTPClient := opts.HTTPClient != nil
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = oci.NewEgressHTTPClient()
 	}
@@ -229,12 +250,13 @@ func NewDispatcher(secret []byte, opts DispatcherOptions) *Dispatcher {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	// Per-attempt timeout is the client-level timeout; the SSRF
-	// guard's NewEgressHTTPClient() does not set one, so we set it
-	// here. PR 3 callers that want a custom dialer should pass a
-	// pre-built *http.Client.
-	opts.HTTPClient.Timeout = opts.PerAttempt
-	return &Dispatcher{signer: NewSigner(secret), opts: opts}
+	// Only stamp PerAttempt onto the HTTPClient when we built it
+	// ourselves (SSRF guard returns no-timeout clients). A caller-
+	// supplied *http.Client keeps its own Timeout.
+	if !callerHTTPClient {
+		opts.HTTPClient.Timeout = opts.PerAttempt
+	}
+	return &Dispatcher{opts: opts}
 }
 
 // Dispatch posts evt to target with retry+backoff. See Result for
@@ -248,9 +270,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, t Target, evt Event) Result {
 		// fail; if it does the failure is permanent.
 		return Result{Err: fmt.Errorf("webhookout: marshal event: %w", err)}
 	}
-	signer := NewSigner(t.Secret)
+	if t.Signer == nil {
+		return Result{Err: errors.New("webhookout: Target.Signer is nil")}
+	}
 	unix := evt.OccurredAt.Unix()
-	sig := signer.Sign(unix, evt.ID, body)
+	sig := t.Signer.Sign(unix, evt.ID, body)
 
 	var lastResult Result
 	for attempt := 0; attempt < d.opts.MaxAttempts; attempt++ {
@@ -273,22 +297,49 @@ func (d *Dispatcher) Dispatch(ctx context.Context, t Target, evt Event) Result {
 			// retrying — the next attempt will hit the same cap.
 			break
 		}
+		if errors.Is(lastResult.Err, oci.ErrImageEgressDenied) {
+			// SSRF rejection is terminal. The DNS outcome won't change
+			// inside the 220s retry budget, so re-running the dial
+			// just burns the wall-clock window for no benefit. The
+			// caller (meterd) branches on oci.ErrImageEgressDenied
+			// via errors.Is to render `code: alert_webhook_denied`,
+			// so we leave the sentinel unwrapped below.
+			break
+		}
 		d.logAttempt(t, evt, attempt+1, lastResult)
 	}
 	// Loop exited without success or terminal flag — every attempt
 	// was retryable. Surface ErrAttemptsExhausted wrapped around the
 	// last attempt's underlying error so callers can errors.Is()
-	// for retry-budget exhaustion and still see the root cause (e.g.
-	// oci.ErrImageEgressDenied must remain Is-able through the wrap).
-	if lastResult.Err == nil || errors.Is(lastResult.Err, ErrTerminal) || errors.Is(lastResult.Err, ErrBodyTooLarge) {
+	// for retry-budget exhaustion and still see the root cause.
+	if lastResult.Err == nil ||
+		errors.Is(lastResult.Err, ErrTerminal) ||
+		errors.Is(lastResult.Err, ErrBodyTooLarge) ||
+		errors.Is(lastResult.Err, oci.ErrImageEgressDenied) {
 		return lastResult
 	}
+	d.logExhausted(evt, lastResult)
 	return Result{
 		StatusCode: lastResult.StatusCode,
 		Attempts:   lastResult.Attempts,
 		BodyPrefix: lastResult.BodyPrefix,
 		Err:        fmt.Errorf("%w: %w", ErrAttemptsExhausted, lastResult.Err),
 	}
+}
+
+// logExhausted emits a single closure line on the wrap path so the
+// operator can see the retry budget was consumed. The per-attempt
+// logAttempt already wrote the underlying detail; this is just the
+// "we gave up" beat. Never logs the body / secret / URL.
+func (d *Dispatcher) logExhausted(evt Event, r Result) {
+	d.opts.Logger.Warn(
+		"webhookout: attempts exhausted",
+		"rule", evt.Rule,
+		"app", evt.AppID,
+		"delivery_id", evt.ID,
+		"attempts", r.Attempts,
+		"status", r.StatusCode,
+	)
 }
 
 // attempt performs a single POST with all headers attached. Returns
@@ -317,20 +368,25 @@ func (d *Dispatcher) attempt(ctx context.Context, url, sig string, unix int64, d
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// 32 KiB cap. io.ReadAll + io.LimitReader would work too but
-	// LimitReader truncates silently — the caller wants the flag.
-	prefix := make([]byte, MaxBodyBytes)
+	// Read up to MaxBodyBytes+1 — the extra byte is the "body too
+	// large" probe. io.LimitReader ensures we don't block on the
+	// extra read past the cap, and the defer'd drain step on the
+	// body-too-large branch lets the underlying conn return to the
+	// keep-alive pool instead of hanging.
+	prefix := make([]byte, MaxBodyBytes+1)
 	n, _ := io.ReadFull(resp.Body, prefix)
 	prefix = prefix[:n]
-	if n == MaxBodyBytes {
-		// There may be more bytes — peek one more byte to confirm.
-		var extra [1]byte
-		if _, err := io.ReadFull(resp.Body, extra[:]); err == nil {
-			return Result{
-				StatusCode: resp.StatusCode,
-				BodyPrefix: prefix,
-				Err:        ErrBodyTooLarge,
-			}
+	if n > MaxBodyBytes {
+		// Drain the remainder so the conn is reusable. Bounded by
+		// the larger of (MaxBodyBytes, 1<<20) — a misconfigured
+		// endpoint that streams indefinitely can't keep us here
+		// forever; 1 MiB is enough to release the keep-alive slot
+		// on any sane server while bounding the worst case.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return Result{
+			StatusCode: resp.StatusCode,
+			BodyPrefix: prefix[:MaxBodyBytes],
+			Err:        ErrBodyTooLarge,
 		}
 	}
 

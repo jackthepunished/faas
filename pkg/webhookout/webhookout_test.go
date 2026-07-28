@@ -4,17 +4,20 @@ package webhookout_test
 //
 // Coverage matrix (mirrors the plan §2):
 //
-// Signer (4 tests):
+// Signer (6 tests):
 //   - SignVerify_Vector: round-trip with frozen inputs.
 //   - SignVerify_TamperRejected: one byte of body changed → Verify rejects.
 //   - SignVerify_WrongSecret: different Signer → Verify rejects.
 //   - SignVerify_TimestampBinding: signing with unix, verifying with
 //     unix-1 → Verify rejects (the signer does not enforce a tolerance
 //     window; replay protection is the customer's verifier's policy).
+//   - SignVerify_DeliveryIDBinding: changing the delivery id after
+//     Sign → Verify rejects.
+//   - Sign_HexLength: produced hex is the SHA-256 width.
 //
-// Dispatcher (12 tests):
+// Dispatcher (15 tests):
 //   - Dispatch_RetryThenSucceed: server returns 503 twice then 200;
-//     injected Sleeper records the four delays; assertions on attempts,
+//     injected Sleeper records the delays; assertions on attempts,
 //     status, error, and backoff sequence.
 //   - Dispatch_Terminal4xx: server returns 410 → ErrTerminal, no retry.
 //   - Dispatch_429Retryable: 429 twice then 200 → retry proceeds.
@@ -22,20 +25,23 @@ package webhookout_test
 //   - Dispatch_5xxAttemptsExhausted: always-503 → ErrAttemptsExhausted.
 //   - Dispatch_NetworkErrorAttemptsExhausted: server closes conn →
 //     ErrAttemptsExhausted.
-//   - Dispatch_BodyTooLarge: 64 KiB body → ErrBodyTooLarge, len(BodyPrefix)
-//     == MaxBodyBytes.
+//   - Dispatch_BodyTooLarge: 64 KiB body → ErrBodyTooLarge.
+//   - Dispatch_BodyExactlyAtBoundary: exactly MaxBodyBytes bytes →
+//     nil error (boundary between body-too-large and success).
 //   - Dispatch_NoSecretLog: secret substring must not appear in the
 //     captured slog JSON (CLAUDE.md §11 invariant).
-//   - Dispatch_SSRFRejected: injected resolver pointing at 127.0.0.1,
-//     target URL on the test server → errors.Is(Err, oci.ErrImageEgressDenied).
+//   - Dispatch_SSRFRejected: dial-time egress guard rejects loopback
+//     with oci.ErrImageEgressDenied. With MaxAttempts at the production
+//     default the dispatcher short-circuits after attempt 1
+//     (PR #404 review BUG-03).
 //   - Dispatch_Headers: every X-Faas-Alert-* header present and well-formed.
+//   - Dispatch_AttemptHeaderIncrements: the Attempt header increments
+//     on retry.
 //   - Dispatch_NilLogger: Logger: nil → no panic.
+//   - Dispatch_BodyContainsEvent: body carries rule/app_id/id.
 //
-// Backoff (2 tests):
-//   - BackoffTable: attempt=0→2s±25%, attempt=1→8s±25%, attempt=2→32s±25%,
-//     attempt=3→128s±25%.
-//   - BackoffJitterBounds: jitter=0.0 and jitter=1.0 (RNG-overridable)
-//     delay stays within the bounds.
+// Backoff (1 test + 1 helper):
+//   - BackoffTable: 4 retry positions match 2s/8s/32s/128s ±25%.
 
 import (
 	"context"
@@ -49,6 +55,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,6 +67,13 @@ import (
 )
 
 const testSecret = "the-secret-that-must-never-appear-in-logs"
+
+// testTarget builds a Target with a fresh Signer. Tests use this so
+// the Signer construction is documented in one place (the secret
+// lifetime equals the dispatcher's, not the per-call delivery).
+func testTarget(url string) webhookout.Target {
+	return webhookout.Target{URL: url, Signer: webhookout.NewSigner([]byte(testSecret))}
+}
 
 // ----------------------------------------------------------------------------
 // Signer tests
@@ -190,7 +204,7 @@ func newTestDispatcher(t *testing.T, sleeper *recordingSleeper, client *http.Cli
 	if sleeper != nil {
 		opts.Sleeper = sleeper.Sleep
 	}
-	return webhookout.NewDispatcher([]byte(testSecret), opts)
+	return webhookout.NewDispatcher(opts)
 }
 
 // TestWebhook_Dispatch_RetryThenSucceed: server returns 503 twice then
@@ -212,7 +226,7 @@ func TestWebhook_Dispatch_RetryThenSucceed(t *testing.T) {
 	sleeper := &recordingSleeper{}
 	d := newTestDispatcher(t, sleeper, srv.Client())
 
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if res.Err != nil {
 		t.Fatalf("err = %v, want nil", res.Err)
 	}
@@ -243,7 +257,7 @@ func TestWebhook_Dispatch_Terminal4xx(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := newTestDispatcher(t, nil, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrTerminal) {
 		t.Errorf("err = %v, want ErrTerminal", res.Err)
 	}
@@ -272,7 +286,7 @@ func TestWebhook_Dispatch_429Retryable(t *testing.T) {
 
 	sleeper := &recordingSleeper{}
 	d := newTestDispatcher(t, sleeper, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if res.Err != nil {
 		t.Errorf("err = %v, want nil", res.Err)
 	}
@@ -298,7 +312,7 @@ func TestWebhook_Dispatch_408Retryable(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := newTestDispatcher(t, nil, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if res.Err != nil {
 		t.Errorf("err = %v, want nil", res.Err)
 	}
@@ -321,11 +335,11 @@ func TestWebhook_Dispatch_5xxAttemptsExhausted(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	d := webhookout.NewDispatcher([]byte(testSecret), webhookout.DispatcherOptions{
+	d := webhookout.NewDispatcher(webhookout.DispatcherOptions{
 		HTTPClient:  srv.Client(),
 		BaseBackoff: 1 * time.Millisecond,
 	})
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrAttemptsExhausted) {
 		t.Errorf("err = %v, want ErrAttemptsExhausted", res.Err)
 	}
@@ -361,11 +375,11 @@ func TestWebhook_Dispatch_NetworkErrorAttemptsExhausted(t *testing.T) {
 	}()
 	url := "http://" + ln.Addr().String() + "/x"
 
-	d := webhookout.NewDispatcher([]byte(testSecret), webhookout.DispatcherOptions{
+	d := webhookout.NewDispatcher(webhookout.DispatcherOptions{
 		HTTPClient:  &http.Client{Timeout: 500 * time.Millisecond},
 		BaseBackoff: 1 * time.Millisecond,
 	})
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: url, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(url), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrAttemptsExhausted) {
 		t.Errorf("err = %v, want ErrAttemptsExhausted", res.Err)
 	}
@@ -384,7 +398,7 @@ func TestWebhook_Dispatch_BodyTooLarge(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := newTestDispatcher(t, nil, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrBodyTooLarge) {
 		t.Errorf("err = %v, want ErrBodyTooLarge", res.Err)
 	}
@@ -394,6 +408,26 @@ func TestWebhook_Dispatch_BodyTooLarge(t *testing.T) {
 	// Body too large is a misconfiguration — must NOT retry.
 	if res.Attempts != 1 {
 		t.Errorf("attempts = %d, want 1 (body-too-large must not retry)", res.Attempts)
+	}
+}
+
+// TestWebhook_Dispatch_BodyExactlyAtBoundary: a body of exactly
+// MaxBodyBytes bytes is NOT over the cap — it lands within the
+// read window and the probe byte reads EOF, so Err is nil. Pins
+// the boundary between ErrBodyTooLarge and the success path.
+func TestWebhook_Dispatch_BodyExactlyAtBoundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(make([]byte, webhookout.MaxBodyBytes))
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newTestDispatcher(t, nil, srv.Client())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
+	if res.Err != nil {
+		t.Errorf("err = %v, want nil at boundary", res.Err)
+	}
+	if len(res.BodyPrefix) != webhookout.MaxBodyBytes {
+		t.Errorf("len(BodyPrefix) = %d, want %d", len(res.BodyPrefix), webhookout.MaxBodyBytes)
 	}
 }
 
@@ -415,9 +449,9 @@ func TestWebhook_Dispatch_NoSecretLog(t *testing.T) {
 		Logger:      logger,
 		BaseBackoff: 1 * time.Millisecond, // keep the test fast
 	}
-	d := webhookout.NewDispatcher([]byte(testSecret), opts)
+	d := webhookout.NewDispatcher(opts)
 
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrAttemptsExhausted) {
 		t.Fatalf("expected ErrAttemptsExhausted, got %v", res.Err)
 	}
@@ -431,23 +465,28 @@ func TestWebhook_Dispatch_NoSecretLog(t *testing.T) {
 // address must be denied with oci.ErrImageEgressDenied. Precedent:
 // pkg/oci/egress_test.go:138-156 (TestEgressDialContext_RefusesRFC1918).
 //
-// MaxAttempts: 1 so the test surfaces the SSRF rejection on the first
-// try instead of waiting on the 5-attempt retry budget. The guard
-// denies at dial time so every attempt would also be denied; capping
-// MaxAttempts keeps the test under a second.
+// MaxAttempts stays at the production default (5); the dispatcher
+// must treat the first dial-time SSRF rejection as terminal and not
+// retry. PR #404 review finding BUG-03: re-running the dial across
+// the 220s retry budget burns wall-clock for no benefit because the
+// DNS outcome won't change inside that window.
 func TestWebhook_Dispatch_SSRFRejected(t *testing.T) {
 	dialer := oci.EgressDialContext(&net.Dialer{})
 	tr := &http.Transport{DialContext: dialer}
 	client := &http.Client{Transport: tr, Timeout: 1 * time.Second}
 
-	d := webhookout.NewDispatcher([]byte(testSecret), webhookout.DispatcherOptions{
-		HTTPClient:  client,
-		MaxAttempts: 1,
+	d := webhookout.NewDispatcher(webhookout.DispatcherOptions{
+		HTTPClient: client,
+		// MaxAttempts left at the default (5); the SSRF guard
+		// must short-circuit the loop on the first attempt.
 	})
 
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: "http://localhost:1/x", Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget("http://localhost:1/x"), newTestEvent())
 	if !errors.Is(res.Err, oci.ErrImageEgressDenied) {
 		t.Errorf("err = %v, want oci.ErrImageEgressDenied (loopback must be denied)", res.Err)
+	}
+	if res.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (SSRF rejection must short-circuit; no retries)", res.Attempts)
 	}
 }
 
@@ -467,7 +506,7 @@ func TestWebhook_Dispatch_Headers(t *testing.T) {
 		// canonical string matches what the server recomputes.
 		body, _ := io.ReadAll(r.Body)
 		signer := webhookout.NewSigner([]byte(testSecret))
-		ts, _ := parseInt(gotTS)
+		ts, _ := strconv.ParseInt(gotTS, 10, 64)
 		if err := signer.Verify(ts, gotID, body, strings.TrimPrefix(gotSig, "sha256=")); err != nil {
 			t.Errorf("server-side verify failed: %v", err)
 		}
@@ -477,7 +516,7 @@ func TestWebhook_Dispatch_Headers(t *testing.T) {
 
 	d := newTestDispatcher(t, nil, srv.Client())
 	evt := newTestEvent()
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, evt)
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), evt)
 	if res.Err != nil {
 		t.Fatalf("err = %v", res.Err)
 	}
@@ -516,7 +555,7 @@ func TestWebhook_Dispatch_AttemptHeaderIncrements(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	d := newTestDispatcher(t, nil, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if res.Err != nil {
 		t.Fatalf("err = %v", res.Err)
 	}
@@ -542,11 +581,11 @@ func TestWebhook_Dispatch_NilLogger(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	d := webhookout.NewDispatcher([]byte(testSecret), webhookout.DispatcherOptions{
+	d := webhookout.NewDispatcher(webhookout.DispatcherOptions{
 		HTTPClient: srv.Client(),
 		// Logger: nil — must not panic.
 	})
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if res.Err != nil {
 		t.Errorf("err = %v, want nil", res.Err)
 	}
@@ -566,7 +605,7 @@ func TestWebhook_Dispatch_BodyContainsEvent(t *testing.T) {
 
 	d := newTestDispatcher(t, nil, srv.Client())
 	evt := newTestEvent()
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, evt)
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), evt)
 	if res.Err != nil {
 		t.Fatalf("err = %v", res.Err)
 	}
@@ -608,7 +647,7 @@ func TestWebhook_BackoffTable(t *testing.T) {
 
 	sleeper := &recordingSleeper{}
 	d := newTestDispatcher(t, sleeper, srv.Client())
-	res := d.Dispatch(context.Background(), webhookout.Target{URL: srv.URL, Secret: []byte(testSecret)}, newTestEvent())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
 	if !errors.Is(res.Err, webhookout.ErrAttemptsExhausted) {
 		t.Fatalf("err = %v, want ErrAttemptsExhausted", res.Err)
 	}
@@ -632,19 +671,6 @@ func TestWebhook_BackoffTable(t *testing.T) {
 // ----------------------------------------------------------------------------
 // helpers
 // ----------------------------------------------------------------------------
-
-// parseInt parses a decimal int64. Used by the header test to convert
-// the timestamp header to int64.
-func parseInt(s string) (int64, error) {
-	var v int64
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("not a digit: %c", c)
-		}
-		v = v*10 + int64(c-'0')
-	}
-	return v, nil
-}
 
 // safeBuffer is a tiny mutex-guarded io.Writer so slog's JSONHandler
 // doesn't trip -race when its internal buf writes overlap with our
@@ -671,12 +697,4 @@ func (b *safeBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.buf)
-}
-
-// min is the standard library polyfill for go < 1.21.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
