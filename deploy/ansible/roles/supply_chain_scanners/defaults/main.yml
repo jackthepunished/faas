@@ -20,11 +20,19 @@
 
 # Grype — vulnerability scanner for OCI images and directories.
 # Anchored major.minor on the latest released line; bump on
-# quarterly review (memory note: ci-vacuum-binary-download)
-grype_version: "0.78.0"
+# quarterly review (memory note: ci-vacuum-binary-download).
+# Bumped 0.78.0 → 0.116.0: Anchore ships the vulnerability database
+# baked into each release, and Grype refuses to scan when the bundled
+# DB is older than 5 days (GRYPE_DB_VALIDATE_AGE=true by default).
+# 0.78.0's bundled DB went stale ~20 weeks after release, breaking
+# the image-scan CI job. The matching CI pin is in
+# .github/workflows/ci.yml — keep the two in lock-step.
+grype_version: "0.116.0"
 grype_release:
   "0.78.0":
     sha256_linux_amd64: "6037fd3763b6112302b98db559bb5390fbb06f0011c0585a4be03ca851daa838"
+  "0.116.0":
+    sha256_linux_amd64: "40aff724297312f91ea390d003bed8d8651c74cc7f5b26732db80b3a408d2fc5"
 
 # Syft — SBOM generator (CycloneDX 1.5 JSON). Same quarterly-
 # review cadence as Grype; pinned to a release vetted against

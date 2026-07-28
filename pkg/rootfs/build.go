@@ -359,14 +359,22 @@ func (b *Builder) emitSBOM(ctx context.Context, in BuildInput, staging string) (
 		// rather than aborting the build — the SBOM is observational.
 		return "", nil
 	}
-	blob, err := in.SBOMRun(ctx, staging)
-	if err != nil || len(blob) == 0 {
+	// SBOM emission is best-effort: a failed syft run, an empty
+	// payload, an invalid JSON document, or a transient storage write
+	// failure must NOT regress the build (the ext4 itself is the
+	// load-bearing artefact; the SBOM is observational). The errors
+	// on the two non-returned paths are swallowed with an explicit
+	// nolint annotation so future readers don't mistake the swallow
+	// for a missed return.
+	blob, _ := in.SBOMRun(ctx, staging) //nolint:nilerr
+	if len(blob) == 0 {
 		return "", nil
 	}
 	if !json.Valid(blob) {
 		return "", nil
 	}
-	if err := in.Storage.Put(ctx, in.SBOMStorageKey, bytes.NewReader(blob)); err != nil {
+	if putErr := in.Storage.Put(ctx, in.SBOMStorageKey, bytes.NewReader(blob)); putErr != nil {
+		//nolint:nilerr
 		return "", nil
 	}
 	return in.SBOMStorageKey, nil

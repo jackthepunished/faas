@@ -6,17 +6,24 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="UsageResponse")
 
 
 @_attrs_define
 class UsageResponse:
-    """Per-app usage for one month: GB-hours consumed and a `next_before` cursor for paging deployments within the window."""
+    """Per-app usage for one month: GB-hours consumed, request count, and an informational CPU-µs field (issue #279 /
+    PR-B). The CPU dimension is observable but not yet billed.
+
+    """
 
     app_id: str
     mb_seconds: int
     requests: int
     included_gb_hours: int
+    cpu_usec: int | Unset = UNSET
+    """ Cumulative host cgroup CPU-µs (informational; not billed). issue #279 / PR-B. """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -28,6 +35,8 @@ class UsageResponse:
 
         included_gb_hours = self.included_gb_hours
 
+        cpu_usec = self.cpu_usec
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -38,6 +47,8 @@ class UsageResponse:
                 "included_gb_hours": included_gb_hours,
             }
         )
+        if cpu_usec is not UNSET:
+            field_dict["cpu_usec"] = cpu_usec
 
         return field_dict
 
@@ -52,11 +63,14 @@ class UsageResponse:
 
         included_gb_hours = d.pop("included_gb_hours")
 
+        cpu_usec = d.pop("cpu_usec", UNSET)
+
         usage_response = cls(
             app_id=app_id,
             mb_seconds=mb_seconds,
             requests=requests,
             included_gb_hours=included_gb_hours,
+            cpu_usec=cpu_usec,
         )
 
         usage_response.additional_properties = d

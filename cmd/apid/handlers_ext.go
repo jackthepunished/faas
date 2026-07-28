@@ -2014,7 +2014,7 @@ func (s *server) getBuildSbom(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, prob)
 		return
 	}
-	f, err := os.Open(sbomPath)
+	f, err := os.Open(sbomPath) //nolint:forbidigo // sbomPath is constructed in resolveSbomPath from a server-trusted DB column (build_provenance.sbom_storage_key, written by imaged's populator) joined onto s.sbomRoot; the path-traversal guard at resolveSbomPath:2082-2085 already rejects leading "/", "..", and "." segments. Unlike cmd/faas/commands5.go's openCustomerFile, this is a server-side read of an operator-controlled root, not a customer-supplied path — the Lstat-on-final-component TOCTOU guard the CLI enforces is unnecessary here because the customer cannot influence the sbomRoot or sbomStorageKey contents.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
@@ -2023,7 +2023,7 @@ func (s *server) getBuildSbom(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, api.ErrCapacity("build SBOM unreadable"))
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w.Header().Set("Content-Type", "application/vnd.cyclonedx+json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, f)

@@ -634,7 +634,7 @@ func (m *Manager) bringUpScanCheck(ctx context.Context, baseKey string) error {
 			"scan sidecar missing",
 			fmt.Sprintf("scan sidecar missing for base %q at %q; refusing to boot un-scanned ext4 (issue #299)", baseKey, scanKey))
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	var scan struct {
 		Image    string         `json:"image"`
 		Findings map[string]int `json:"findings"`
