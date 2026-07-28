@@ -1900,6 +1900,15 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // contract (pkg/api/logs.go::StreamAppLogs) keeps returning a 200 with
 // parseable frames and the dashboard's per-app log button doesn't 404.
 // Move 4 replaces the body.
+//
+// Issue #309 (tier-2 DX): --grep/--since/--level are accepted as
+// query params now so the wire contract is stable; the Move 4
+// implementation reads them and applies them against the ring buffer.
+// Today they are parsed, validated, and ignored — Move 3 is a no-op.
+// An invalid --level emits an `event: error` SSE frame and a
+// terminal `end` so programmatic SDK callers get a structured error
+// path; the CLI validates the same enum client-side (see
+// cmd/faas/commands2.go::cmdLogs) so a typo costs no round-trip.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -1910,6 +1919,29 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 			"No running instance", "the app is parked; wake it first"))
 		return
 	}
+	q := r.URL.Query()
+	level := q.Get("level")
+	if level != "" {
+		switch level {
+		case "info", "warn", "error":
+		default:
+			startSSE(w)
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_level\",\"message\":\"level must be one of: info, warn, error\"}\n\n")
+			_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+	}
+	// `grep` and `since` are accepted here but currently have no
+	// effect on the stub. Move 4's vmmd Logs(req) gRPC stream will
+	// apply them against the per-instance ring buffer; the wire
+	// contract is locked now so neither the SDK URL builder nor the
+	// CLI flag set needs to change when the body is replaced.
+	_ = q.Get("grep")
+	_ = q.Get("since")
 	startSSE(w)
 	flusher, _ := w.(http.Flusher)
 	// Two frames then close: a not_implemented signal so a client can

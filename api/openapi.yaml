@@ -1114,6 +1114,18 @@ paths:
           in: query
           schema: { type: integer, enum: [0, 1], default: 0 }
           description: If 1, hold the connection open and stream new entries.
+        - name: grep
+          in: query
+          schema: { type: string }
+          description: Substring filter applied to each log line.
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: RFC3339 lower-bound on the line timestamp.
+        - name: level
+          in: query
+          schema: { type: string, enum: [info, warn, error] }
+          description: Minimum severity filter on the structured `level` field.
       responses:
         '200':
           description: A text/event-stream of structured log lines, terminated by an empty SSE frame when the connection closes.

@@ -2208,3 +2208,71 @@ func TestStreamAppLogs_NotImplementedFrame(t *testing.T) {
 		t.Errorf("frame order wrong: not_implemented@%d end@%d", niIdx, endIdx)
 	}
 }
+
+// TestStreamAppLogs_AcceptsFilterQueryParams pins issue #309's wire
+// contract: --grep / --since / --level reach the handler as query
+// params and are accepted by the Move 3 stub. Today the params are
+// advisory (the stub does not act on them yet) but the contract
+// MUST stay stable so neither the SDK URL builder nor the CLI flag
+// set needs to change when Move 4 replaces the body. The
+// `not_implemented` + `end` frames still fire so existing SDK
+// consumers and TestStreamAppLogs_NotImplementedFrame stay green.
+func TestStreamAppLogs_AcceptsFilterQueryParams(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "stub-logs-filter")
+	appID := mustSeedApp(t, e, "stub-logs-filter-app")
+	if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	rec := e.do(t, "GET",
+		"/v1/apps/stub-logs-filter-app/logs?follow=0&grep=ERROR&since=2026-07-28T00:00:00Z&level=error",
+		nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	body := rec.Body.String()
+	// The existing Move 3 frames must still appear — params are
+	// advisory today (Move 4 acts on them).
+	if !strings.Contains(body, "event: not_implemented") {
+		t.Errorf("body missing not_implemented frame:\n%s", body)
+	}
+	if !strings.Contains(body, "event: end") {
+		t.Errorf("body missing end frame:\n%s", body)
+	}
+}
+
+// TestStreamAppLogs_RejectsInvalidLevel pins the server-side
+// mirror of the CLI's --level enum check. An invalid value
+// short-circuits the stub with an `event: error` frame followed
+// by the terminal `event: end`. The `not_implemented` frame MUST
+// NOT appear — a bad filter is a structured error, not "not built
+// yet". The CLI validates the same enum client-side (see
+// cmd/faas/commands2.go::cmdLogs) so this is the programmatic
+// SDK's error contract.
+func TestStreamAppLogs_RejectsInvalidLevel(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "stub-logs-bad-level")
+	appID := mustSeedApp(t, e, "stub-logs-bad-level-app")
+	if _, err := e.store.CreateInstance(context.Background(), appID, dep.ID, "stopped", 256, "default-local", ""); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	rec := e.do(t, "GET", "/v1/apps/stub-logs-bad-level-app/logs?follow=0&level=trace", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (SSE stream is already open); body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error\ndata: {\"code\":\"invalid_level\"") {
+		t.Errorf("body missing invalid_level error frame:\n%s", body)
+	}
+	if !strings.Contains(body, "event: end\ndata: {}") {
+		t.Errorf("body missing terminal end frame:\n%s", body)
+	}
+	if strings.Contains(body, "event: not_implemented") {
+		t.Errorf("body contains not_implemented; a bad filter is an error, not 'not built yet'")
+	}
+}

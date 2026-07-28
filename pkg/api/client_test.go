@@ -448,7 +448,7 @@ func TestStreamAppLogs_HappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	body, err := c.StreamAppLogs(context.Background(), "x", "", false)
+	body, err := c.StreamAppLogs(context.Background(), "x", "", false, LogFilter{})
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestStreamAppLogs_ProblemError(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	body, err := c.StreamAppLogs(context.Background(), "missing", "", false)
+	body, err := c.StreamAppLogs(context.Background(), "missing", "", false, LogFilter{})
 	if err == nil {
 		_ = body.Close()
 		t.Fatal("expected error on 404")
@@ -719,7 +719,7 @@ func TestStreamAppLogs_CancelOnContextDone(t *testing.T) {
 
 	c := NewClient(srv.URL, "fp_test")
 	ctx, cancel := context.WithCancel(context.Background())
-	body, err := c.StreamAppLogs(ctx, "x", "", true)
+	body, err := c.StreamAppLogs(ctx, "x", "", true, LogFilter{})
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
