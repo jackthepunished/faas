@@ -3968,7 +3968,7 @@ func priorLockAndCheck(ctx context.Context, tx pgx.Tx, providerInvoiceID string)
 	var priorCents int64
 	var hasPrior bool
 	if err := tx.QueryRow(ctx,
-		`select coalesce(sum(-delta_cents), 0), bool_or(delta_cents < 0)
+		`select coalesce(sum(-delta_cents), 0), coalesce(bool_or(delta_cents < 0), false)
 		   from credit_ledger
 		  where provider_invoice_id = $1`,
 		providerInvoiceID).Scan(&priorCents, &hasPrior); err != nil {

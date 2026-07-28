@@ -281,9 +281,43 @@ func TestE2E_CreditConsume_HappyPathAndIdempotent(t *testing.T) {
 		t.Fatalf("seed invoice: %v", err)
 	}
 
+	// Seed a real app + deployment + parked instance so the usage
+	// row's app_id / instance_id columns (uuid not null) accept the
+	// values AppendUsage writes. The instance is Parked so the
+	// meterd sampler doesn't append additional mb_seconds on top of
+	// our seed (spec invariant §6.2-4: parked instance consumes zero
+	// resident RAM and zero billable usage).
+	node, err := store.ComputeNodeByName(ctx, state.DefaultLocalNodeName)
+	if err != nil {
+		t.Fatalf("resolve default-local compute_node: %v", err)
+	}
+	app, err := store.CreateApp(ctx, state.App{
+		AccountID:      targetAcct.ID,
+		Slug:           "consume-e2e",
+		Type:           state.AppTypeApp,
+		RAMMB:          256,
+		MaxConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	dep, err := store.CreateDeployment(ctx, state.Deployment{
+		AppID:       app.ID,
+		Status:      state.DeployLive,
+		Kind:        state.DeploymentKindImage,
+		ImageDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+	})
+	if err != nil {
+		t.Fatalf("seed deployment: %v", err)
+	}
+	ins, err := store.CreateInstance(ctx, app.ID, dep.ID, string(state.StateParked), 256, node.ID, "")
+	if err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
 	// Plant usage that drives 250 cents of overage:
 	//   mb_seconds = 250 * 3600 / 100 = 9_000
-	if err := store.AppendUsage(ctx, targetAcct.ID, "app-1", "inst-1",
+	if err := store.AppendUsage(ctx, targetAcct.ID, app.ID, ins.ID,
 		time.Now().UTC(), 9_000, 0, 0); err != nil {
 		t.Fatalf("seed usage: %v", err)
 	}
