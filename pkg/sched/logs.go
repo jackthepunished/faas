@@ -133,10 +133,17 @@ func (e *Engine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64
 	}()
 	for f := range ch {
 		if err := sink(f.instance, f.seq, f.name, f.line, f.writtenAt); err != nil {
-			return nil
+			// Bubble up so pkg/scheddgrpc.Server.StreamAppLogs can
+			// carry the gRPC trailer (the sink error is the
+			// per-frame Send failure; a context.Canceled or
+			// codes.Unavailable-from-StreamAppLogs). The
+			// per-instance reader goroutines exit on ctx.Done()
+			// inside their select; the closer goroutine drains
+			// them via wg.Wait.
+			return err
 		}
 		if ctx.Err() != nil {
-			return nil
+			return ctx.Err()
 		}
 	}
 	return nil

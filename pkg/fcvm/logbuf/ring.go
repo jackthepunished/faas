@@ -13,6 +13,7 @@
 package logbuf
 
 import (
+	"bytes"
 	"sync"
 	"time"
 )
@@ -108,7 +109,7 @@ func (r *Ring) Write(stream string, p []byte) (int, error) {
 	r.tail = append(r.tail, p...)
 	// Pull every complete line off the tail into committed Lines.
 	for {
-		i := indexByte(r.tail, '\n')
+		i := bytes.IndexByte(r.tail, '\n')
 		if i < 0 {
 			break
 		}
@@ -178,14 +179,16 @@ func (r *Ring) commitLocked(stream, line string, now time.Time) {
 }
 
 // Snapshot returns a copy of every Line whose Seq is >= sinceSeq, in write
-// order. A sinceSeq <= 0 returns the entire retained buffer; a sinceSeq
-// larger than the highest assigned Seq returns nil. The result is a fresh
-// slice — callers may retain, marshal, or modify it without aliasing the
-// ring.
+// order. A sinceSeq <= 0 means "tail from now" — return nil so the
+// consumer (vmmd's Logs handler) opens the live Subscribe channel
+// without replaying history. A sinceSeq > the highest assigned Seq also
+// returns nil (the cursor is past the high-water mark; nothing to replay
+// yet). The result is a fresh slice — callers may retain, marshal, or
+// modify it without aliasing the ring.
 func (r *Ring) Snapshot(sinceSeq int64) []Line {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.size == 0 {
+	if r.size == 0 || sinceSeq <= 0 {
 		return nil
 	}
 	// Find the first retained Line whose Seq >= sinceSeq. A linear scan is
@@ -232,6 +235,13 @@ func (r *Ring) Subscribe() (<-chan Line, func()) {
 	cancel := func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		// Close() may have already detached and closed this channel;
+		// don't double-close (panic). r.closed is set inside the same
+		// lock acquisition Close takes, so reading it under r.mu
+		// gives us the right answer even on a Close/cancel race.
+		if r.closed {
+			return
+		}
 		for i, c := range r.subs {
 			if c == ch {
 				r.subs = append(r.subs[:i], r.subs[i+1:]...)
@@ -279,15 +289,3 @@ var ErrClosed = errClosed{}
 type errClosed struct{}
 
 func (errClosed) Error() string { return "logbuf: ring closed" }
-
-// indexByte is a 1-line shim over the standard library that the compiler
-// inlines, kept as a named helper so the hot Write loop is one line shorter
-// to read and to keep the file gofmt-clean without an inline closure.
-func indexByte(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
-		}
-	}
-	return -1
-}

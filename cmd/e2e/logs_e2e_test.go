@@ -24,7 +24,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -261,10 +260,3 @@ func expectDegradedFrame(t *testing.T, body io.Reader, timeout time.Duration) er
 		return fmt.Errorf("no `event: degraded` frame arrived within %v", timeout)
 	}
 }
-
-// keep these imports alive so future extending of this file
-// can use them without re-adding the import block.
-var (
-	_ = errors.New
-	_ = io.Discard
-)

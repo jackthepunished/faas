@@ -41,7 +41,13 @@ func TestLogs_HappyPath(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	stream, err := cl.Logs(ctx, &vmmdpb.LogsRequest{Instance: "inst-1"})
+	// SinceSeq=1 replays the seeded lines (Seq 1..3). SinceSeq=0 is
+	// the "tail from now" sentinel (per pkg/fcvm/logbuf.Ring.Snapshot
+	// docs) — the handler skips the replay phase and Subscribe only
+	// delivers lines committed after the RPC is opened. We want the
+	// test to assert the initial-page path, so we pass an explicit
+	// cursor of 1.
+	stream, err := cl.Logs(ctx, &vmmdpb.LogsRequest{Instance: "inst-1", SinceSeq: 1})
 	if err != nil {
 		t.Fatalf("Logs dial: %v", err)
 	}

@@ -18,9 +18,9 @@ func TestRing_LineOrdering(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	got := r.Snapshot(0)
+	got := r.Snapshot(1)
 	if len(got) != len(in) {
-		t.Fatalf("Snapshot size = %d, want %d", len(got), len(in))
+		t.Fatalf("Snapshot(1) size = %d, want %d", len(got), len(in))
 	}
 	for i, line := range got {
 		if line.Line != in[i] {
@@ -69,10 +69,12 @@ func TestRing_SnapshotSince(t *testing.T) {
 	if got := r.Snapshot(99); got != nil {
 		t.Errorf("Snapshot(99) = %v, want nil", got)
 	}
-	// sinceSeq=0 returns the entire retained buffer (same as Snapshot(1)).
-	all := r.Snapshot(0)
-	if len(all) != 10 {
-		t.Errorf("Snapshot(0) size = %d, want 10", len(all))
+	// sinceSeq <= 0 is the SDK's "tail from now" cursor (the apid
+	// handler's default). Return nil so vmmdgrpc.Server.Logs skips
+	// replay and goes straight to live Subscribe — the load-bearing
+	// contract for faas logs/CLI.
+	if got := r.Snapshot(0); got != nil {
+		t.Errorf("Snapshot(0) size = %d, want nil (tail-from-now)", len(got))
 	}
 }
 
@@ -108,7 +110,7 @@ func TestRing_Wraparound(t *testing.T) {
 				i, r.totalBytes, ringBytes)
 		}
 	}
-	got := r.Snapshot(0)
+	got := r.Snapshot(1)
 	// 3 lines × 17 bytes = 51 ≤ 64; 4 × 17 = 68 > 64. So ring always
 	// retains 3 lines once steady state is reached.
 	if len(got) != 3 {
@@ -136,14 +138,16 @@ func TestRing_PartialLine(t *testing.T) {
 	}
 	// Snapshot must NOT include the incomplete line yet.
 	if got := r.Snapshot(0); got != nil {
-		t.Errorf("Snapshot after partial Write = %v, want nil", got)
+		t.Errorf("Snapshot(0) after partial Write = %v, want nil (tail-from-now)", got)
 	}
 	if _, err := r.Write("stdout", []byte("world\n")); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	got := r.Snapshot(0)
+	// Snapshot(1) = full replay from seq=1 (the first assigned Seq).
+	// Snapshot(0) = tail from now (returns nil per wire contract).
+	got := r.Snapshot(1)
 	if len(got) != 1 {
-		t.Fatalf("Snapshot after completion = %d lines, want 1", len(got))
+		t.Fatalf("Snapshot(1) after completion = %d lines, want 1", len(got))
 	}
 	if got[0].Line != "hello world" {
 		t.Errorf("joined line = %q, want %q", got[0].Line, "hello world")
@@ -169,7 +173,7 @@ func TestRing_DeterminismMB(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	got := r.Snapshot(0)
+	got := r.Snapshot(1)
 	if len(got) != 131072 {
 		t.Fatalf("retained = %d lines, want 131072", len(got))
 	}
@@ -267,7 +271,7 @@ func TestRing_ConcurrentWrites(t *testing.T) {
 	if int64(perGoroutine*4) != atomic.LoadInt64(&totalWritten) {
 		t.Fatalf("totalWritten = %d, want %d", totalWritten, perGoroutine*4)
 	}
-	snap := r.Snapshot(0)
+	snap := r.Snapshot(1)
 	if int64(len(snap)) != totalWritten {
 		t.Errorf("retained = %d, want %d (lines lost)", len(snap), totalWritten)
 	}
@@ -294,10 +298,10 @@ func TestRing_CloseAfterWrite(t *testing.T) {
 	if _, err := r.Write("stdout", []byte("post-close\n")); err == nil {
 		t.Fatalf("Write after Close = nil, want ErrClosed")
 	}
-	// Snapshot is unaffected by Close.
-	snap := r.Snapshot(0)
+	// Snapshot(1) returns the buffer pre-close (Close only blocks future Writes).
+	snap := r.Snapshot(1)
 	if len(snap) != 1 || snap[0].Line != "before-close" {
-		t.Errorf("post-close Snapshot = %v, want one line %q", snap, "before-close")
+		t.Errorf("post-close Snapshot(1) = %v, want one line %q", snap, "before-close")
 	}
 	// Close is idempotent.
 	if err := r.Close(); err != nil {
@@ -305,13 +309,15 @@ func TestRing_CloseAfterWrite(t *testing.T) {
 	}
 }
 
-// TestRing_Empty pins the Snapshot(sinceSeq<0) → all-lines behaviour and
-// the Snapshot on a fresh ring → nil behaviour. Both are exercise branches
-// in vmmdgrpc.Server.Logs that an empty-firecracker replay would hit.
+// TestRing_Empty pins the Snapshot-on-fresh-ring behaviour and the
+// "sinceSeq <= 0 = tail from now" contract: both return nil so
+// vmmdgrpc.Server.Logs skips the replay phase and goes straight to
+// the live Subscribe. An empty firecracker (no guest output yet)
+// hits this branch on every consumer attach.
 func TestRing_Empty(t *testing.T) {
 	r := New(1 << 20)
 	if got := r.Snapshot(0); got != nil {
-		t.Errorf("Snapshot on empty = %v, want nil", got)
+		t.Errorf("Snapshot(0) on empty = %v, want nil", got)
 	}
 	if got := r.Snapshot(-1); got != nil {
 		t.Errorf("Snapshot(-1) on empty = %v, want nil", got)
@@ -320,5 +326,85 @@ func TestRing_Empty(t *testing.T) {
 	n, err := r.Write("stdout", nil)
 	if n != 0 || err != nil {
 		t.Errorf("Write(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+// TestRing_SnapshotTailFromNow pins the "sinceSeq <= 0 = tail from
+// now" contract (issue #254 Move 4 wire shape: the apid handler
+// passes since_seq=0 as the default "open from now" and the SDK
+// calls StreamAppLogs without specifying a cursor). The ring MUST
+// return nil for sinceSeq <= 0 so the vmmd-side Logs RPC skips the
+// replay phase and goes straight to the live Subscribe channel —
+// otherwise a freshly-attached consumer would receive the full ring
+// contents as "historical" frames, contradicting the doc on
+// pkg/api.LogEvent.StreamAppLogs.
+func TestRing_SnapshotTailFromNow(t *testing.T) {
+	r := New(1 << 20)
+	for i := 0; i < 5; i++ {
+		if _, err := r.Write("stdout", []byte("line\n")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	// sinceSeq=0 and sinceSeq<0 must both return nil even with
+	// retained content.
+	if got := r.Snapshot(0); got != nil {
+		t.Errorf("Snapshot(0) on populated ring = %v, want nil (tail-from-now)", got)
+	}
+	if got := r.Snapshot(-7); got != nil {
+		t.Errorf("Snapshot(-7) on populated ring = %v, want nil", got)
+	}
+	// sinceSeq >= 1 still works as before (replay branch).
+	if got := r.Snapshot(3); len(got) != 3 {
+		t.Errorf("Snapshot(3) on 5-line ring = %d lines, want 3", len(got))
+	}
+}
+
+// TestRing_CloseRaceWithWrite pins the contract that Close and Write
+// (and Subscribe's cancel) are safe to call concurrently without
+// panicking on a closed-channel send. The ring relies on
+// lock-held-during-publish to serialise the publish loop with the
+// subscribe-cancel path: while commitLocked holds r.mu and is
+// iterating r.subs to send, no concurrent goroutine can call
+// r.subs[i] = ... or close(ch) — both of which also take r.mu.
+//
+// The tripwire is run under -race; a regression that drops the lock
+// around the publish loop surfaces as a "send on closed channel"
+// panic or a race-detector violation.
+//
+// PR #388 review finding #1 was that this window looked unsafe; the
+// test exists to lock the safety claim against future refactors.
+func TestRing_CloseRaceWithWrite(t *testing.T) {
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		r := New(1 << 20)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			// Concurrent subscribers; each cancels independently.
+			for j := 0; j < 4; j++ {
+				ch, cancel := r.Subscribe()
+				go func(ch <-chan Line) {
+					for range ch {
+					}
+				}(ch)
+				cancel()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			defer func() { _ = r.Close() }()
+			// Hammer Write with partial-line bytes that complete
+			// on the next call. commitLocked runs many times.
+			for j := 0; j < 64; j++ {
+				if _, err := r.Write("stdout", []byte("a\nb\nc")); err != nil {
+					return
+				}
+				if _, err := r.Write("stdout", []byte("\n")); err != nil {
+					return
+				}
+			}
+		}()
+		wg.Wait()
 	}
 }

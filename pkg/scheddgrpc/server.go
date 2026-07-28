@@ -278,14 +278,23 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	}
 	if err := s.engine.StreamAppLogs(stream.Context(), req.GetAppId(), sinceSeq, sink); err != nil {
 		// Engine.StreamAppLogs surfaces "no live instances" as
-		// state.ErrNotFound; the per-instance vmmd RPCs surface
-		// grpc codes.NotFound when an instance id is stale.
-		// Both keep stable RFC 7807 codes through to api.Problem.
+		// state.ErrNotFound (apid maps this to its 404 "the app
+		// is parked; wake it first"). A clean caller cancel
+		// surfaces as context.Canceled — gRPC's expected
+		// behaviour on a dropped streaming caller (codes.Canceled
+		// is what the apid sees). Anything else (per-instance
+		// vmmd dial failure that escalated to a Send error) lands
+		// here as codes.Unavailable so the apid can render a
+		// degraded frame and let the consumer retry.
 		sendErr = err
-		if errors.Is(err, state.ErrNotFound) {
+		switch {
+		case errors.Is(err, state.ErrNotFound):
 			return status.Error(codes.NotFound, err.Error())
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return status.Error(codes.Canceled, err.Error())
+		default:
+			return status.Error(codes.Unavailable, err.Error())
 		}
-		return status.Error(codes.Unavailable, err.Error())
 	}
 	return nil
 }

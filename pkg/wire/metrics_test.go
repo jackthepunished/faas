@@ -346,6 +346,28 @@ func TestOpsMetrics_ObserveLogEmittedNilSafe(t *testing.T) {
 	m.ObserveLogEmitted("app-1")
 }
 
+// TestOpsMetrics_LogEmittedAcrossPrefixes pins the prefix-on-every-
+// daemon contract (per memory wire-opsmetrics-single-registry):
+// every OpsMetrics instance — regardless of prefix — has the
+// _logs_emitted_total CounterVec pre-instantiated. Only apid's
+// production path increments via ObserveLogEmitted; the others sit
+// at zero. A regression that scopes the collector to a single
+// prefix trips this test before the operator dashboard panel
+// goes dark on a non-apid box.
+func TestOpsMetrics_LogEmittedAcrossPrefixes(t *testing.T) {
+	for _, prefix := range []string{"apid", "vmmd", "schedd", "imaged", "meterd", "builderd"} {
+		m := wire.NewOpsMetrics(prefix)
+		m.ObserveLogEmitted("any-app")
+		body := render(t, m)
+		// Metric name is "<prefix>_logs_emitted_total" — confirm
+		// the literal string is present, not just a substring.
+		want := prefix + `_logs_emitted_total{app="any-app"} 1`
+		if !strings.Contains(body, want) {
+			t.Errorf("prefix=%s missing %q in:\n%s", prefix, want, body)
+		}
+	}
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration
