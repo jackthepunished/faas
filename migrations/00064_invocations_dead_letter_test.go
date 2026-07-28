@@ -79,8 +79,8 @@ func TestMigrations_00064_DeadLetter_LandsStateAndIndex(t *testing.T) {
 		t.Fatalf("seed account: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into apps (id, account_id, slug, plan, ram_mb, created_at)
-		values ($1, $2, $3, 'pro', 512, now())
+		insert into apps (id, account_id, slug, ram_mb, created_at)
+		values ($1, $2, $3, 512, now())
 	`, appID, acct, "dead-letter-test"); err != nil {
 		t.Fatalf("seed app: %v", err)
 	}

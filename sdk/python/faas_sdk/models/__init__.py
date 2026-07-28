@@ -103,12 +103,18 @@ from .password_signup_request import PasswordSignupRequest
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
 from .problem import Problem
 from .put_app_secret_request import PutAppSecretRequest
+from .queue_dead_letter_message import QueueDeadLetterMessage
+from .queue_dead_letter_response import QueueDeadLetterResponse
+from .queue_peek_message import QueuePeekMessage
+from .queue_peek_response import QueuePeekResponse
 from .queue_receive_response import QueueReceiveResponse
 from .queue_receive_response_payload import QueueReceiveResponsePayload
 from .queue_receive_response_result import QueueReceiveResponseResult
 from .queue_send_request import QueueSendRequest
 from .queue_send_request_payload import QueueSendRequestPayload
 from .queue_send_response import QueueSendResponse
+from .queue_state_response import QueueStateResponse
+from .queue_state_response_plan import QueueStateResponsePlan
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .session_info import SessionInfo
@@ -228,12 +234,18 @@ __all__ = (
     "PostAccountSessionsRevokeAllBody",
     "Problem",
     "PutAppSecretRequest",
+    "QueueDeadLetterMessage",
+    "QueueDeadLetterResponse",
+    "QueuePeekMessage",
+    "QueuePeekResponse",
     "QueueReceiveResponse",
     "QueueReceiveResponsePayload",
     "QueueReceiveResponseResult",
     "QueueSendRequest",
     "QueueSendRequestPayload",
     "QueueSendResponse",
+    "QueueStateResponse",
+    "QueueStateResponsePlan",
     "RenameAppRequest",
     "RepoResponse",
     "SessionInfo",
