@@ -1,7 +1,7 @@
 # FaasTenantAbuse
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`,
-the `FaasTenantAbuse` alert block (issue #300, ADR-040).
+the `FaasTenantAbuse` alert block (issue #300, ADR-041).
 
 Metric: `apid_top_tenant_rps{account_id}` — a 5s-sampled presentation
 view over `apid_request_total{account_id, route, code}`. Cardinality

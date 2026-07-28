@@ -118,7 +118,7 @@ func TestFaasFleetDashboardByteIdentical(t *testing.T) {
 	}
 }
 
-// TestFaasTopTenantsDashboardParses (issue #300, ADR-040) — the
+// TestFaasTopTenantsDashboardParses (issue #300, ADR-041) — the
 // per-tenant noisy-customer dashboard at deploy/grafana/top-tenants.json
 // is valid JSON and the 4 panels (ids 1-4) are present with
 // non-empty PromQL expressions. Same parse-only contract as
@@ -166,7 +166,7 @@ func TestFaasTopTenantsDashboardParses(t *testing.T) {
 	}
 }
 
-// TestFaasTopTenantsDashboardByteIdentical (issue #300, ADR-040)
+// TestFaasTopTenantsDashboardByteIdentical (issue #300, ADR-041)
 // mirrors TestFaasFleetDashboardByteIdentical for the new
 // top-tenants dashboard. The Ansible role copies the file at
 // deploy/ansible/roles/grafana/files/top-tenants.json onto the

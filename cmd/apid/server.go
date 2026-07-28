@@ -203,7 +203,7 @@ func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 	// metrics), leave the auditor with a nil ops interface so Emit
 	// silently skips the .Inc().
 	if s.audit != nil {
-		s.audit.ops = ops
+		s.audit.setOps(ops)
 	}
 	return s
 }

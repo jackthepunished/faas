@@ -57,6 +57,13 @@ type Limits struct {
 	// Edge (gatewayd, spec §4.1).
 	RateLimitRPS   int // token-bucket refill rate
 	RateLimitBurst int // token-bucket burst
+	// RateLimitPerAccountRPM is the per-account requests/minute cap
+	// (ADR-040 / issue #292). Distinct from RateLimitRPS/Burst which are
+	// per-app. Bucket parameters consumed by pkg/gateway.Limiter.AllowAccount.
+	// Bounds the cross-app botnet signature — a customer rotating across
+	// many apps stays under per-app rps individually but cannot exceed
+	// the per-minute sum across all their apps.
+	RateLimitPerAccountRPM int
 
 	// Networking (spec §7).
 	EgressMbit int // per-instance egress bandwidth cap via tc
@@ -206,6 +213,9 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
+		// the 1-concurrency plan's traffic envelope.
+		RateLimitPerAccountRPM: 50,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -241,6 +251,10 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
+		// Hobby per-app rps (20) so per-app trips first on a single hot
+		// app, and the account limit catches the cross-app botnet.
+		RateLimitPerAccountRPM: 200,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -280,6 +294,9 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
+		// Pro per-app rps (100), same rationale as Hobby.
+		RateLimitPerAccountRPM: 1000,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -315,8 +332,14 @@ var planLimits = map[Plan]Limits{
 		// per-app ceiling (20→100) and 10× Pro's per-account ceiling
 		// (50→500); the per-account figure absorbs 5× Scale-tier apps
 		// at the per-app cap, the typical SaaS fan-out.
-		CronLimitPerApp:         100,
-		CronLimitPerAccount:     500,
+		CronLimitPerApp:     100,
+		CronLimitPerAccount: 500,
+		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
+		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
+		// (FaasPerAccountRateLimitSpike) triggers well before any single
+		// paid customer's bucket fills, which is the intended signal:
+		// coordinated abuse, not baseline load.
+		RateLimitPerAccountRPM:  5000,
 		ScaleUpTargetCPUAllowed: true,
 	},
 }
@@ -657,6 +680,20 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// RateLimitPerAccountRPM returns the per-account requests/minute cap for
+// the plan (ADR-040 / issue #292). Independent of RateLimitRPS/Burst
+// which are per-app — defends against the N-apps-times-cap-per-app
+// botnet signature. 0 for unknown plans (fail closed; the limiter math
+// then returns zero rps and zero burst, refusing all traffic) — same
+// contract as CronLimitPerAccount above.
+func (p Plan) RateLimitPerAccountRPM() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.RateLimitPerAccountRPM
 }
 
 // ScaleUpTargetRPSAllowed reports whether the plan may set

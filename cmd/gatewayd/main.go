@@ -397,10 +397,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			case <-ctx.Done():
 				return
 			case <-hup:
-				dropped := handler.Limiter().ForgetAll()
+				// Reset both per-app and per-account buckets (ADR-040).
+				// appDropped = per-app buckets cleared; acctDropped =
+				// per-account buckets cleared. Operators see the sum.
+				appDropped := handler.Limiter().ForgetAll()
+				acctDropped := handler.AccountLimiter().ForgetAll()
 				log.Info("gatewayd sighup reload",
 					"action", "rate_limit_buckets_dropped",
-					"count", dropped)
+					"app_count", appDropped,
+					"account_count", acctDropped,
+					"count", appDropped+acctDropped)
 			}
 		}
 	}()

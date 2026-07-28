@@ -1,5 +1,5 @@
 # Synthetic time-series fixture for the FaasTenantAbuse alert
-# (issue #300, ADR-040).
+# (issue #300, ADR-041).
 #
 # What this exercises:
 #   1. FaasTenantAbuse — the per-tenant noisy-customer alert. It must

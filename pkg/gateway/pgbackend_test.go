@@ -37,13 +37,13 @@ func (r *fakeRouter) resolveCalls() int {
 
 func TestPGBackend_LookupCachesAndFallsBack(t *testing.T) {
 	router := &fakeRouter{byID: map[string]gateway.App{
-		"a.apps.example.com": {ID: "app-1", Plan: api.PlanPro},
+		"a.apps.example.com": {ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
 	}}
 	b := gateway.NewPGBackend(router, gateway.NewFakeScheduler(""), nil)
 
 	// Miss → Router resolves and caches.
 	app, ok := b.Lookup(context.Background(), "a.apps.example.com")
-	if !ok || app.ID != "app-1" || app.Plan != api.PlanPro {
+	if !ok || app.ID != "app-1" || app.AccountID != "acct-1" || app.Plan != api.PlanPro {
 		t.Fatalf("first lookup = %+v ok=%v", app, ok)
 	}
 	// Hit → no second Router call.

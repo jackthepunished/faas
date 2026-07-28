@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
@@ -408,6 +409,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// engine got) — needed by the aggressive-reaper scale-down
 		// counter (ObserveScaleDown) and the audit-row emission.
 		WithOpsMetrics(ops).
+		// Audit seam (lifted from cmd/apid/audit.go into pkg/audit
+		// for cross-daemon reuse). schedd uses actor="schedd" so the
+		// cron-fire path can emit a `cron.fired` events row after
+		// MarkCronFired. Best-effort failure semantics from
+		// pkg/audit/audit.go — never rolls back the fire.
+		WithAudit(audit.New(store, log, ops, "schedd")).
 		// Issue #171: aggressive reaper toggle + per-tick park cap.
 		// cfg.ReaperAggressive defaults ON; FAAS_REAPER_AGGRESSIVE=false
 		// disables in-place. cfg.ReaperAggressiveParkCap=0 → default

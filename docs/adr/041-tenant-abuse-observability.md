@@ -1,4 +1,4 @@
-# ADR-040 — per-tenant noisy-customer gauge + FaasTenantAbuse alert (issue #300)
+# ADR-041 — per-tenant noisy-customer gauge + FaasTenantAbuse alert (issue #300)
 
 Status: Accepted, 2026-07-27. Owner: @poyrazK. Closes: #300.
 Related: #278 (per-customer failure observability, the
@@ -303,6 +303,6 @@ copy) — same precedent as `faas-fleet.json`.
 |---|---|
 | 1. `apid_top_tenant_rps{account_id}` + `gateway_top_tenant_rps{account_id}` gauges, 5s sampled | `pkg/wire/metrics.go` (registration); `pkg/wire/topn.go` (top-N primitive); `cmd/apid/topn.go` (sampler goroutine); `pkg/gateway/metrics.go` (gateway gauge); `cmd/gatewayd/topn.go` (gateway sampler); `pkg/gateway/handler.go` (per-request bump) |
 | 2. Grafana panel "Top-10 noisy customers (5m)" at `dashboards/top-tenants.json` | `deploy/grafana/top-tenants.json` (canonical); `deploy/ansible/roles/grafana/files/top-tenants.json` (Ansible copy) |
-| 3. `docs/runbooks/tenant-abuse.md` + `FaasTenantAbuse: apid_top_tenant_rps > 500` for 10m, response = rate-limit + notify, escalation = suspend deployment | `docs/runbooks/tenant-abuse.md` (new); `deploy/ansible/roles/prometheus/files/faas.rules.yml` (new alert block); ADR-040 (this doc) |
+| 3. `docs/runbooks/tenant-abuse.md` + `FaasTenantAbuse: apid_top_tenant_rps > 500` for 10m, response = rate-limit + notify, escalation = suspend deployment | `docs/runbooks/tenant-abuse.md` (new); `deploy/ansible/roles/prometheus/files/faas.rules.yml` (new alert block); ADR-041 (this doc) |
 | 4. `account_id` cardinality bounded to top-1000 by 24h request count; rest under `account_id="other"` | `pkg/wire/topn.go` (`topAccountSet`); `pkg/wire/metrics.go` (`topTenantRPS` gauge pre-instantiates `("other",)`); `cmd/gatewayd/topn.go` (gateway mirror) |
 | 5. Property test asserts `apid_top_tenant_rps` cardinality ≤ 1001 across fuzzed load | `pkg/wire/topn_test.go::TestTopTenantRPS_BoundedCardinality`; `pkg/promqlrules/testdata/tenant_abuse.test.yml` (5 synthetic scenarios) |

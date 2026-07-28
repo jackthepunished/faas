@@ -15,14 +15,21 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			MaxQueueDepth: 0, MaxDelayedTasksPerApp: 0, MaxSourceBytesPerInvocation: 0, AsyncInvokeAllowed: false,
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
-			CronLimitPerApp: 0, CronLimitPerAccount: 0},
+			CronLimitPerApp: 0, CronLimitPerAccount: 0,
+			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
+			// traffic envelope with a 50× burst ceiling.
+			RateLimitPerAccountRPM: 50},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			MaxQueueDepth: 5, MaxDelayedTasksPerApp: 5, MaxSourceBytesPerInvocation: 64 * 1024, AsyncInvokeAllowed: true,
 			// Issue #169 / #172: Hobby unlocks RPS target only (CPU is
 			// gated on Pro+ for cost reasons).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
-			CronLimitPerApp: 5, CronLimitPerAccount: 10},
+			CronLimitPerApp: 5, CronLimitPerAccount: 10,
+			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
+			// so the per-app limit trips first on a single hot app and
+			// the account limit catches the cross-app botnet signature.
+			RateLimitPerAccountRPM: 200},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MinInstancesAllowed: true,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
@@ -30,7 +37,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #169 / #172: Pro unlocks both RPS and CPU targets.
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
-			CronLimitPerApp: 20, CronLimitPerAccount: 50},
+			CronLimitPerApp: 20, CronLimitPerAccount: 50,
+			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
+			RateLimitPerAccountRPM: 1000},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MinInstancesAllowed: true,
@@ -39,7 +48,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #169 / #172: Scale unlocks both targets (same rationale as Pro).
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
-			CronLimitPerApp: 100, CronLimitPerAccount: 500},
+			CronLimitPerApp: 100, CronLimitPerAccount: 500,
+			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
+			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
+			// triggers well before any single paid customer's bucket fills.
+			RateLimitPerAccountRPM: 5000},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -251,6 +264,29 @@ func TestPlanCronLimits(t *testing.T) {
 		}
 		if got := c.plan.CronLimitPerAccount(); got != c.wantPerAcct {
 			t.Errorf("%s.CronLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanRateLimitPerAccount pins the per-account requests/minute cap
+// per plan (ADR-040 / issue #292). Free 50/min, Hobby 200/min, Pro
+// 1000/min, Scale 5000/min. Unknown plans must fail closed (return 0)
+// so a missing row never silently unlocks cross-app botnets — same
+// contract as CronLimitPerAccount above.
+func TestPlanRateLimitPerAccount(t *testing.T) {
+	cases := []struct {
+		plan    Plan
+		wantRPM int
+	}{
+		{PlanFree, 50},
+		{PlanHobby, 200},
+		{PlanPro, 1000},
+		{PlanScale, 5000},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.RateLimitPerAccountRPM(); got != c.wantRPM {
+			t.Errorf("%s.RateLimitPerAccountRPM() = %d, want %d", c.plan, got, c.wantRPM)
 		}
 	}
 }

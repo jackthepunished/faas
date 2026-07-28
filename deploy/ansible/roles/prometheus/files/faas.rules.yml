@@ -340,7 +340,7 @@ groups:
       # The apid_top_tenant_rps{account_id} gauge is a presentation view
       # over the per-account requestTotal counter, bounded at the top-1000
       # by 24h request count with the rest under account_id="other"
-      # (ADR-040). This rule fires when any single customer exceeds
+      # (ADR-041). This rule fires when any single customer exceeds
       # 500 rps for 10m — the abuse threshold from the issue's literal
       # acceptance list. The aggregation uses `topk(20, ...)` so the
       # account_id label survives Alertmanager routing; the page
@@ -640,3 +640,30 @@ groups:
           summary: "On-demand TLS denials > 1/min"
           description: "The denials counter is climbing above 1/min over the rolling 5-minute window. Cross-check reason breakdown via `sum by (reason) (rate(gateway_tls_on_demand_denied_total[5m]))` — an allowlist spike means external scanners hitting :443; a frozen-zero on dns01 or token means the H3.b wire-incrementation follow-up is still pending."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSOnDemandDeniedHigh.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Per-account gateway rate-limit rejections
+      # (gatewayd / gateway_per_account_rate_limited_total{account_id, plan}).
+      # ADR-040 / issue #292 — defends against a botnet rotating across a
+      # single customer's many apps (each app stays under per-app rps, but
+      # the sum easily blows past the account's plan budget).
+      #
+      # Threshold: > 100/min fleet-total for 5m. Tuned as a coordination
+      # signal: a single misbehaving customer peaks well below 100; a
+      # botnet or runaway retry-loop is the realistic source. The §12
+      # dashboard's per-account drill-down pinpoints the offender; the
+      # `__other__` row in the exposition is the bounded admission
+      # overflow bucket (pre-instantiated at zero so a series with no
+      # traffic is visible).
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasPerAccountRateLimitSpike
+        expr: sum(rate(gateway_per_account_rate_limited_total[5m])) > (100 / 60)
+        for: 5m
+        labels:
+          severity: warn
+          component: gatewayd
+          family: per_account_rate_limit
+        annotations:
+          summary: "Per-account gateway rejections above 100/min (fleet)"
+          description: "Fleet-wide per-account gateway rate-limit rejections have exceeded 100/min over the rolling 5-minute window for 5m. account_id=\"__other__\" is the bounded admission overflow bucket — drill down per-account via `topk(20, sum by (account_id, plan) (rate(gateway_per_account_rate_limited_total[5m])))`. Common causes: single customer burst (misdeploy / runaway retry), coordinated abuse (scanners rotating across an account's apps), or a config-driven throttling regression (plan row dropped to zero)."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasPerAccountRateLimitSpike.md"
