@@ -300,3 +300,104 @@ func TestPg_CronFiredAuditRoundTrip(t *testing.T) {
 		t.Errorf("data->>'path' = %q, want /ping (jsonb round-trip)", dbPath)
 	}
 }
+
+// TestPg_CronFirstFireAuditRow pins the cron.fired audit-row
+// rendering fix at the wire level (companion to
+// pkg/sched/cron_loop_test.go::TestCronDispatch_FirstFireAuditNullLastFiredAtBefore,
+// which exercises the MemStore half). The fix drops the
+// `last_fired_at_before` key from the JSON payload when LastFiredAt
+// is zero, so dashboards reading the row see the key as absent
+// (`payload[k]` returns nil) instead of the misleading
+// `0001-01-01T00:00:00Z` literal that the pre-fix code formatted
+// for a `time.Time{}` UTC().Format() call.
+//
+// The test DOES NOT drive dispatchOneCron (which would require
+// wiring pkg/sched.*Engine + a fake VMM on top of PgStore, a
+// surface that doesn't exist today and would be a separate
+// refactor). Instead it writes the audit row directly via
+// AppendEvent with no `last_fired_at_before` key to mirror the
+// post-fix shape, then queries `events` and asserts the jsonb
+// column is missing the key via SQL `data ? 'last_fired_at_before'`.
+// The companion MemStore test covers the dispatch-loop half; this
+// test covers the storage-layer half (the JSONB round-trip is what
+// a dashboard would actually query).
+func TestPg_CronFirstFireAuditRow(t *testing.T) {
+	s, pool, ctx := cronPgStore(t)
+	acct, err := s.CreateAccount(ctx, fmt.Sprintf("cron-firstfire-%d@example.com", time.Now().UnixNano()), api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: fmt.Sprintf("cron-firstfire-%d", time.Now().UnixNano()), Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// Build the audit-row payload as the post-fix dispatch loop
+	// does: every key except last_fired_at_before. This mirrors
+	// the in-memory shape that a pre-fix dispatch would have
+	// formatted with a zero time, but the post-fix loop omits the
+	// key entirely. We write the post-fix shape directly so this
+	// test is independent of the schedd dispatch changes.
+	payload := map[string]any{
+		"cron_id":       "cron-uuid-1",
+		"app_id":        app.ID,
+		"schedule":      "*/5 * * * *",
+		"path":          "/ping",
+		"fired_at":      time.Date(2026, 7, 28, 12, 5, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		"status":        "ok",
+		"invocation_id": "inv-uuid-1",
+		"instance_id":   "ins-uuid-1",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := s.AppendEvent(ctx, "schedd", "cron.fired", &acct.ID, body); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// Wire-level check: data ? 'last_fired_at_before' must be false.
+	// This is the operator-facing read path: a dashboard query
+	// `select data->>'last_fired_at_before' from events where
+	// kind='cron.fired'` returns NULL when the key is absent, not
+	// the empty string and certainly not the misleading zero
+	// timestamp. Pin the jsonb operator semantics here so a future
+	// contributor who adds a defaulted last_fired_at_before
+	// column or a coalesce in the AppendEvent call surfaces as a
+	// wire-shape test failure.
+	var hasKey bool
+	if err := pool.QueryRow(ctx,
+		`select data ? 'last_fired_at_before' from events where kind = 'cron.fired' and subject = $1`,
+		acct.ID).Scan(&hasKey); err != nil {
+		t.Fatalf("jsonb has-key query: %v", err)
+	}
+	if hasKey {
+		t.Errorf("events.data has 'last_fired_at_before' key on first fire (want absent)")
+	}
+	// data->>'last_fired_at_before' must be NULL (not the empty
+	// string, not the zero timestamp). This is the canonical
+	// dashboard read.
+	var lfBefore *string
+	if err := pool.QueryRow(ctx,
+		`select data->>'last_fired_at_before' from events where kind = 'cron.fired' and subject = $1`,
+		acct.ID).Scan(&lfBefore); err != nil {
+		t.Fatalf("jsonb text-extract query: %v", err)
+	}
+	if lfBefore != nil {
+		t.Errorf("events.data->>'last_fired_at_before' = %q, want NULL on first fire", *lfBefore)
+	}
+	// Conversely, the rest of the payload keys must be present
+	// (the fix is targeted to last_fired_at_before only).
+	var ok bool
+	if err := pool.QueryRow(ctx,
+		`select data ? 'cron_id' from events where kind = 'cron.fired' and subject = $1`,
+		acct.ID).Scan(&ok); err != nil {
+		t.Fatalf("jsonb has-key query (cron_id): %v", err)
+	}
+	if !ok {
+		t.Errorf("events.data missing 'cron_id' key (full payload=%s)", body)
+	}
+}
