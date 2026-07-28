@@ -35,6 +35,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -203,6 +204,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// the daemon's lifetime; stops cleanly on ctx cancel.
 		topNSampler := newTopNSampler(srv.ops, log)
 		go topNSampler.run(ctx)
+		// Webhook replay-dedupe sweep (issue #294). The
+		// webhook_deliveries table is written by all three ingresses
+		// (GitHub via gatewayd, Stripe + Paddle via apid); the TTL
+		// expires_at column + the partial index keep the per-tick
+		// DELETE bounded by (60s tick × ~rows added in that window).
+		// 60s matches the meterd dunning sweep cadence.
+		webhookSweeper := webhookdedupe.NewSweeper(srv.store, log, webhookdedupe.DefaultSweepInterval)
+		go func() { _ = webhookSweeper.Run(ctx) }()
 	}
 	return runWithDeps(ctx, log, deps)
 }

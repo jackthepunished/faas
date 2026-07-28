@@ -27,6 +27,18 @@ type stripePushKey struct {
 	hour      time.Time
 }
 
+// webhookDeliveryKey is the (provider, delivery_id) dedupe key the
+// three webhook ingresses on the box use; mirrors the
+// (provider, delivery_id) primary key on the webhook_deliveries
+// table (migration 00056). The value is the expires_at timestamp so
+// the MemStore can answer "is this row within its 5-minute TTL?"
+// without a separate sweep — TTL eviction is O(1) at access time.
+// Issue #294.
+type webhookDeliveryKey struct {
+	provider   string
+	deliveryID string
+}
+
 // paddleOverageKey is the (account, month) dedupe key the daily Paddle
 // overage pusher uses; declared above MemStore so the struct field
 // below can reference it. `month` is the calendar-month start
@@ -169,6 +181,13 @@ type MemStore struct {
 	// Stripe pusher has already pushed; prevents double-billing on
 	// redelivery.
 	stripePushHours map[stripePushKey]struct{}
+	// webhookDeliveries tracks which (provider, delivery_id) pairs the
+	// three webhook ingresses on the box have already processed; the
+	// value is expires_at so CheckWebhookReplay can drop expired rows
+	// inline at access time without a separate sweep goroutine (the
+	// PgStore keeps the same invariant via the apid sweep goroutine).
+	// Issue #294.
+	webhookDeliveries map[webhookDeliveryKey]time.Time
 	// paddleOverageMonths tracks which (account, month) pairs the daily
 	// Paddle overage pusher has already flushed; same role as
 	// stripePushHours but at the calendar-month grain because the
@@ -288,6 +307,11 @@ func NewMemStore() *MemStore {
 		// stripePushHours is the per-(account, hour) dedupe set the
 		// meterd hourly pusher reads/writes.
 		stripePushHours: map[stripePushKey]struct{}{},
+		// webhookDeliveries is the per-(provider, delivery_id) dedupe
+		// set the three webhook ingresses on the box read/write;
+		// expires_at is the value so the TTL is honored at access
+		// time. Issue #294.
+		webhookDeliveries: map[webhookDeliveryKey]time.Time{},
 		// paddleOverageMonths is the per-(account, month) dedupe set
 		// the meterd daily pusher reads/writes. Kept for back-compat
 		// with the deprecated state.Store month-scoped pair; new code
@@ -3536,6 +3560,60 @@ func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string,
 	}
 	m.paddleOverageMonths[paddleOverageKey{accountID: accountID, month: month.UTC()}] = struct{}{}
 	return nil
+}
+
+// CheckWebhookReplay returns true when (provider, delivery_id) has a
+// dedupe row whose received_at >= cutoff. The MemStore drops
+// expired rows inline at read time (PgStore has the apid sweep
+// goroutine for the equivalent background reaping); this keeps the
+// in-memory map size bounded under long test runs. Returns false
+// on an absent row OR on an expired row (caller's `cutoff` is
+// computed as now()-TTL by pkg/webhookdedupe).
+func (m *MemStore) CheckWebhookReplay(_ context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.webhookDeliveries == nil {
+		return false, nil
+	}
+	expiresAt, ok := m.webhookDeliveries[webhookDeliveryKey{provider: provider, deliveryID: deliveryID}]
+	if !ok || expiresAt.UTC().Before(cutoff.UTC()) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// RecordWebhookDelivery inserts (or refreshes) the dedupe row. The
+// value is the expires_at timestamp so CheckWebhookReplay can
+// answer TTL-correctly. ON CONFLICT DO UPDATE in the PgStore is
+// mirrored by an unconditional map write here.
+func (m *MemStore) RecordWebhookDelivery(_ context.Context, provider, deliveryID string, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.webhookDeliveries == nil {
+		m.webhookDeliveries = map[webhookDeliveryKey]time.Time{}
+	}
+	m.webhookDeliveries[webhookDeliveryKey{provider: provider, deliveryID: deliveryID}] = expiresAt.UTC()
+	return nil
+}
+
+// SweepExpiredWebhookDeliveries drops any dedupe row whose
+// expires_at is older than `now`. Returns the number of rows
+// removed. Mirrors the apid sweep goroutine's Postgres DELETE.
+func (m *MemStore) SweepExpiredWebhookDeliveries(_ context.Context, now time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.webhookDeliveries == nil {
+		return 0, nil
+	}
+	var swept int64
+	cutoff := now.UTC()
+	for k, expiresAt := range m.webhookDeliveries {
+		if expiresAt.UTC().Before(cutoff) {
+			delete(m.webhookDeliveries, k)
+			swept++
+		}
+	}
+	return swept, nil
 }
 
 // ClaimPaddleOverageWindow mirrors PgStore.ClaimPaddleOverageWindow

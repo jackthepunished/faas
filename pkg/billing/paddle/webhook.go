@@ -49,6 +49,7 @@ func parsePaddleEvent(payload []byte) (billing.Event, error) {
 	custID, subID, planID := extractIDs(raw.Data)
 
 	return billing.Event{
+		EventID:        raw.EventID,
 		Type:           mapPaddleEventType(raw.EventType),
 		CustomerID:     custID,
 		SubscriptionID: subID,

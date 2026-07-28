@@ -239,6 +239,7 @@ func (c *Client) VerifyWebhook(payload []byte, headers map[string]string, tolera
 		return billing.Event{}, err
 	}
 	var ev struct {
+		ID   string `json:"id"`
 		Type string `json:"type"`
 		Data struct {
 			Object struct {
@@ -259,6 +260,11 @@ func (c *Client) VerifyWebhook(payload []byte, headers map[string]string, tolera
 		return billing.Event{}, fmt.Errorf("stripe: parse webhook body: %w", err)
 	}
 	out := billing.Event{
+		// Issue #294: Stripe event.id is the delivery UUID that apid's
+		// webhook dedupe (pkg/webhookdedupe) consults. Empty when
+		// Stripe did not stamp the field; apid treats an empty EventID
+		// as "no dedupe" (pre-#294 behaviour).
+		EventID:        ev.ID,
 		Type:           mapStripeEventType(ev.Type),
 		CustomerID:     ev.Data.Object.Customer,
 		PlanID:         ev.Data.Object.Plan,

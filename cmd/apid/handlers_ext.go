@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -1132,6 +1133,7 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var ev struct {
+		ID   string `json:"id"`
 		Type string `json:"type"`
 		Data struct {
 			Object struct {
@@ -1151,6 +1153,34 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 		// land via CreateCustomer; we don't auto-provision on a webhook.
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+	// Issue #294: webhook replay dedupe. ev.ID is the Stripe
+	// `event.id` (the delivery UUID). When non-empty, consult the
+	// shared dedupe table; a redelivery within the 5-minute TTL is
+	// rejected with 200 (idempotent — Stripe stops retrying) and
+	// the audit row webhook.replay_rejected is emitted. Empty ev.ID
+	// (older Stripe payloads) skips the check — pre-#294 behaviour.
+	//
+	// The replay check runs AFTER the customer lookup so the audit
+	// row carries the resolved account id as the subject (matching
+	// the refund.processed precedent at spec §5.7 line 336).
+	//
+	// Transport / connection errors from the dedupe table fail open
+	// (log WARN + forward) — the dedupe is defence-in-depth, not the
+	// authenticity gate; HMAC was verified above.
+	if ev.ID != "" {
+		if err := webhookdedupe.CheckReplay(r.Context(), s.store, webhookdedupe.ProviderStripe, ev.ID); err != nil {
+			if webhookdedupe.IsReplay(err) {
+				acctID := acct.ID
+				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
+					"provider":    webhookdedupe.ProviderStripe,
+					"delivery_id": ev.ID,
+				})
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			s.log.Warn("stripe replay-check infra error; forwarding", "event_id", ev.ID, "err", err)
+		}
 	}
 	// Map Stripe's event_type strings to the normalized billing.EventType
 	// the dunning state machine dispatches on. The Paddle webhook (see
@@ -1210,6 +1240,27 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 		// on a webhook.
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+	// Issue #294: webhook replay dedupe. ev.EventID is the Paddle
+	// `event_id` (the delivery UUID). Mirrors stripeWebhook's
+	// replay check (handlers_ext.go:1148); a redelivery within the
+	// 5-minute TTL is rejected with 200 + a webhook.replay_rejected
+	// audit row. Empty ev.EventID (older Paddle payloads) skips the
+	// check — pre-#294 behaviour. Fail-open on dedupe transport
+	// errors (mirrors gatewayd).
+	if ev.EventID != "" {
+		if err := webhookdedupe.CheckReplay(r.Context(), s.store, webhookdedupe.ProviderPaddle, ev.EventID); err != nil {
+			if webhookdedupe.IsReplay(err) {
+				acctID := acct.ID
+				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
+					"provider":    webhookdedupe.ProviderPaddle,
+					"delivery_id": ev.EventID,
+				})
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			s.log.Warn("paddle replay-check infra error; forwarding", "event_id", ev.EventID, "err", err)
+		}
 	}
 	s.handleBillingEvent(r.Context(), ev, acct)
 	w.WriteHeader(http.StatusOK)

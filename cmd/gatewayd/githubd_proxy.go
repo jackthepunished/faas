@@ -8,10 +8,17 @@
 // githubd stays loopback-only so the §11 single-public-listener
 // invariant survives. This proxy is the only way GitHub's POST
 // reaches githubd's webhook handler.
+//
+// Issue #294: after HMAC-verify, we consult the shared webhook
+// dedupe table via pkg/webhookdedupe to reject replays within the
+// 5-minute TTL window with 200 (idempotent — GitHub interprets as
+// success and stops retrying) and emit a webhook.replay_rejected
+// audit row.
 package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,15 +26,27 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubd"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
 
 // githubWebhookPath is the URL GitHub POSTs to (one webhook per app
 // binding; today we use the catch-all path that githubd then
 // routes per-binding from the repo field in the body).
 const githubWebhookPath = "/webhooks/github"
+
+// githubdReplayStore is the slice of the state.Store the githubd
+// proxy needs to consult the dedupe table. Pinning the interface
+// here keeps the proxy free of the full state.Store surface (so
+// tests can inject a tiny fake) while preserving the migration's
+// (provider, delivery_id) primary-key semantics.
+type githubdReplayStore interface {
+	CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error)
+	RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error
+}
 
 // githubdProxy wraps next so /webhooks/github requests are
 // HMAC-verified at the edge and forwarded to githubd's loopback
@@ -39,13 +58,24 @@ type githubdProxy struct {
 	next      http.Handler
 	log       *slog.Logger
 	transport *http.Transport
+	replay    githubdReplayStore
+	auditor   *gatewaydAuditor
 }
 
 // newGithubdProxy builds the proxy. If target is empty or secret
 // is missing, the wrapper is disabled (every /webhooks/github
 // request returns 503 — gatewayd refuses to forward unverified
 // payloads, so missing secret = closed-by-default).
-func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.Logger) http.Handler {
+//
+// replay may be nil (tests that pre-date issue #294); in that
+// case the dedupe check is skipped and the proxy forwards every
+// HMAC-verified request, which matches the pre-#294 behaviour.
+// Production wires a *state.PgStore (cmd/gatewayd/main.go).
+//
+// auditor may be nil; in that case replay rejections are still
+// 200-returned but no audit row is emitted. Tests for replay
+// wiring install an auditor fake.
+func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.Logger, replay githubdReplayStore, auditor *gatewaydAuditor) http.Handler {
 	if target == "" || log == nil {
 		log.Warn("githubd proxy disabled (empty target)")
 		return next
@@ -66,6 +96,8 @@ func newGithubdProxy(target string, secret []byte, next http.Handler, log *slog.
 		next:      next,
 		log:       log,
 		transport: &http.Transport{},
+		replay:    replay,
+		auditor:   auditor,
 	}
 }
 
@@ -88,6 +120,13 @@ func (g *githubdProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // header, and on success reverse-proxies the request verbatim to
 // githubd's loopback listener. Any verify failure returns 401.
 // Body buffering is required so we can both verify AND forward.
+//
+// Issue #294: after the HMAC check we consult the shared webhook
+// dedupe table. A redelivered X-GitHub-Delivery within the 5-minute
+// TTL returns 200 (idempotent — GitHub interprets as success) and
+// emits a webhook.replay_rejected audit row. A missing
+// X-GitHub-Delivery header returns 400 (a misconfigured client, not
+// a replay — GitHub always sets this header).
 func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20)) // 10 MiB cap; pushes are <10 MB typically
 	if err != nil {
@@ -100,6 +139,29 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		g.log.Warn("githubd proxy signature verify failed", "err", err)
 		http.Error(w, "signature verification failed", http.StatusUnauthorized)
 		return
+	}
+	// Issue #294: replay check. We require the delivery UUID header
+	// (GitHub always sends it; a missing one is a misconfigured
+	// client) and consult the shared dedupe table. nil `replay`
+	// (tests without the seam) skips the check — pre-#294 behaviour.
+	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	if deliveryID == "" {
+		g.log.Warn("githubd proxy missing X-GitHub-Delivery header")
+		http.Error(w, "missing delivery id", http.StatusBadRequest)
+		return
+	}
+	if g.replay != nil {
+		if err := g.checkReplay(r.Context(), deliveryID); err != nil {
+			g.log.Info("githubd replay rejected", "delivery_id", deliveryID, "err", err)
+			if g.auditor != nil {
+				g.auditor.Emit(r.Context(), "webhook.replay_rejected", nil, map[string]any{
+					"provider":    webhookdedupe.ProviderGitHub,
+					"delivery_id": deliveryID,
+				})
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 	// Hand the original body back to the upstream via a fresh
 	// request body reader. We rebuild the upstream URL from the
@@ -136,6 +198,32 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// checkReplay is the githubd proxy's thin wrapper around
+// pkg/webhookdedupe.CheckReplay. Returns nil on a fresh delivery,
+// *webhookdedupe.Replay (errors.Is(state.ErrReplay)) on a redelivery
+// within the TTL window. The 200 response is emitted at the call
+// site; audit emission is intentionally deferred to a follow-up so
+// the gatewayd audit seam (mirrors cmd/apid/audit.go) can land in
+// its own PR — see issue #294 ADR-041 follow-up notes.
+//
+// A transport / connection error from the dedupe table is logged
+// at WARN and the request is forwarded anyway — the dedupe table
+// is a defence-in-depth check, not the authenticity gate (the
+// HMAC verify above is the gate). This matches the gatewayd fail-
+// open posture on transient infrastructure failures.
+func (g *githubdProxy) checkReplay(ctx context.Context, deliveryID string) error {
+	now := time.Now()
+	found, err := g.replay.CheckWebhookReplay(ctx, webhookdedupe.ProviderGitHub, deliveryID, now.Add(-webhookdedupe.TTL))
+	if err != nil {
+		g.log.Warn("githubd replay-check infra error; forwarding", "err", err)
+		return nil
+	}
+	if found {
+		return &webhookdedupe.Replay{Provider: webhookdedupe.ProviderGitHub, DeliveryID: deliveryID}
+	}
+	return g.replay.RecordWebhookDelivery(ctx, webhookdedupe.ProviderGitHub, deliveryID, now.Add(webhookdedupe.TTL))
 }
 
 // loadGithubWebhookSecret reads FAAS_GITHUB_WEBHOOK_SECRET from env

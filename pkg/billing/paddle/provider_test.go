@@ -195,6 +195,12 @@ func TestParsePaddleEvent_MapsAllSubscriptionTypes(t *testing.T) {
 			if ev.SubscriptionID != "sub_abc" {
 				t.Errorf("SubscriptionID = %q, want sub_abc", ev.SubscriptionID)
 			}
+			// Issue #294: parsePaddleEvent must populate EventID so
+			// apid's webhook replay dedupe has a stable key.
+			wantEventID := fmt.Sprintf("evt_%s", tc.name)
+			if ev.EventID != wantEventID {
+				t.Errorf("EventID = %q, want %q", ev.EventID, wantEventID)
+			}
 			if tc.want != billing.EventUnknown && tc.name != "unknown" {
 				if ev.PlanID != "pri_test" {
 					t.Errorf("PlanID = %q, want pri_test", ev.PlanID)

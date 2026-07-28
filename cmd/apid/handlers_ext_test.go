@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
 
 // TestDeploymentLogsSSE_Pagination confirms the initial page of a
@@ -1684,9 +1685,22 @@ const stripeWebhookSecretForTest = "whsec_test_signing_secret"
 // postStripeEvent sends a signed Stripe event JSON to the webhook
 // route. Signature matches stripeWebhookSecretForTest so the route's
 // HMAC verification passes.
+//
+// Issue #294: each call uses a fresh synthetic Stripe event.id
+// (evt_test_<nanos>). Tests that want to exercise the replay path
+// should call postStripeEventWithID twice with the same id.
 func postStripeEvent(t *testing.T, h http.Handler, eventType, customer string) *httptest.ResponseRecorder {
 	t.Helper()
+	id := fmt.Sprintf("evt_test_%d", time.Now().UnixNano())
+	return postStripeEventWithID(t, h, eventType, customer, id)
+}
+
+// postStripeEventWithID is the issue-#294-aware variant: pass the
+// same id twice to exercise the replay dedupe.
+func postStripeEventWithID(t *testing.T, h http.Handler, eventType, customer, id string) *httptest.ResponseRecorder {
+	t.Helper()
 	body, _ := json.Marshal(map[string]any{
+		"id":   id,
 		"type": eventType,
 		"data": map[string]any{
 			"object": map[string]any{"customer": customer},
@@ -1760,6 +1774,42 @@ func TestStripePaymentFailed_RedeliveryNoEmail(t *testing.T) {
 	}
 	if n := len(mailer.snapshot()); n != 1 {
 		t.Errorf("after redelivery: %d emails, want 1 (zero additional)", n)
+	}
+}
+
+// TestStripeWebhook_RejectsReplay is issue #294's apid-side
+// coverage: POSTing the same Stripe event with the same `id` twice
+// rejects the second with 200 (idempotent — Stripe stops retrying)
+// without re-running the side effects. We pin this with
+// invoice.payment_failed so the email count is a clean signal: the
+// first delivery sends 1 email, the replay sends 0.
+func TestStripeWebhook_RejectsReplay(t *testing.T) {
+	e, mailer := stripeWebhookHarness(t, api.PlanHobby)
+	const id = "evt_test_replay_1"
+
+	rec1 := postStripeEventWithID(t, e.h, "invoice.payment_failed", "cus_test_123", id)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first delivery status = %d, want 200; body=%s", rec1.Code, rec1.Body.String())
+	}
+	if n := len(mailer.snapshot()); n != 1 {
+		t.Fatalf("first delivery: %d emails, want 1", n)
+	}
+
+	// Replay: same id, same signature shape (Stripe re-signs each
+	// delivery with a fresh timestamp; we mirror the production
+	// behaviour by signing with the current time).
+	rec2 := postStripeEventWithID(t, e.h, "invoice.payment_failed", "cus_test_123", id)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (idempotent); body=%s", rec2.Code, rec2.Body.String())
+	}
+	if n := len(mailer.snapshot()); n != 1 {
+		t.Errorf("after replay: %d emails, want 1 (replay is a no-op)", n)
+	}
+
+	// Round-trip via the webhookdedupe helper to prove the row was
+	// recorded by the first delivery.
+	if err := webhookdedupe.CheckReplay(context.Background(), e.store, webhookdedupe.ProviderStripe, id); !webhookdedupe.IsReplay(err) {
+		t.Errorf("recorded Stripe event should be a replay; err=%v", err)
 	}
 }
 

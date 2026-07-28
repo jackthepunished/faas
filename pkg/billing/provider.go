@@ -195,6 +195,19 @@ func (t EventType) Name() string {
 // dispatches on. Provider-shaped JSON stays inside each
 // implementation; Raw carries the original body for debugging.
 type Event struct {
+	// EventID is the provider's delivery UUID — Stripe event.id
+	// (evt_…) or Paddle event_id. Used by apid's webhook replay
+	// dedupe (issue #294): the same EventID arriving twice inside
+	// the 5-minute TTL is rejected with 200 + a webhook.replay_rejected
+	// audit row. Empty when the upstream provider did not populate
+	// the field; apid treats an empty EventID as "no dedupe" and
+	// forwards the event (pre-#294 behaviour).
+	//
+	// GitHub webhooks carry the same UUID via the X-GitHub-Delivery
+	// header, which gatewayd consults directly without round-tripping
+	// through this struct.
+	EventID string
+
 	// Type drives the apid switch statement. Unknown / unmapped
 	// types render as a 200 no-op.
 	Type EventType
