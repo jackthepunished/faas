@@ -71,6 +71,10 @@ func TestSaveAndLoadToken_FileRoundTrip(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("FAAS_TOKEN", "") // ensure we hit the file path
+	// Force the file-fallback branch so the file is actually written
+	// on hosts where the OS keychain is reachable (issue #293 — the
+	// file is now a fallback, not the primary store).
+	setFakeKeyring(t, withSetErr(errors.New("keychain unavailable")))
 
 	if err := saveToken("file-token-xyz"); err != nil {
 		t.Fatalf("saveToken: %v", err)
@@ -98,6 +102,8 @@ func TestSaveToken_TrimsAndAppendsNewline(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	// Force the file-fallback branch (see TestSaveAndLoadToken_FileRoundTrip).
+	setFakeKeyring(t, withSetErr(errors.New("keychain unavailable")))
 	if err := saveToken("  token-with-whitespace  \n"); err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +125,9 @@ func TestLoadToken_MissingFile(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("FAAS_TOKEN", "")
+	// Empty stub so loadToken's keychain branch returns ErrNotFound
+	// and we exercise the missing-file fall-through.
+	setFakeKeyring(t)
 	if got := loadToken(); got != "" {
 		t.Errorf("loadToken with missing file = %q, want empty", got)
 	}
@@ -218,21 +227,18 @@ func TestCmdLogin_Success(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
 
 	if code := cmdLogin([]string{"--token", "fp_live_x"}); code != 0 {
 		t.Fatalf("cmdLogin success = %d, want 0", code)
 	}
-	// Token must have been persisted.
-	p, err := tokenPath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatalf("token not saved: %v", err)
-	}
-	if !strings.Contains(string(b), "fp_live_x") {
-		t.Errorf("saved token = %q, want contains fp_live_x", b)
+	// Token must have been persisted. After issue #293 the canonical
+	// store is the OS keychain; on a host with a real keychain
+	// the file is no longer written. Use loadToken (priority env
+	// → keychain → file) so the assertion matches production
+	// semantics regardless of which store was written to.
+	if got := loadToken(); got != "fp_live_x" {
+		t.Errorf("loadToken = %q, want fp_live_x", got)
 	}
 }
 
