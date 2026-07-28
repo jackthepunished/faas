@@ -37,7 +37,7 @@ class Problem:
     title: str
     status: int
     code: str
-    """ Stable machine-readable error code. See StatusForCode in pkg/api/errors.go. """
+    """Stable machine-readable error code. See StatusForCode in pkg/api/errors.go."""
     type_: str | Unset = UNSET
     detail: str | Unset = UNSET
     limit: int | None | Unset = UNSET
@@ -45,15 +45,15 @@ class Problem:
     docs_url: str | Unset = UNSET
     billing_portal_url: str | Unset = UNSET
     paddle_checkout_url: str | Unset = UNSET
-    """ Paddle-hosted checkout URL on a `payment_required` 402 when
+    """Paddle-hosted checkout URL on a `payment_required` 402 when
     the box is running on the Paddle billing provider. Mutually
     exclusive with `billing_portal_url`.
-     """
+    """
     tx_id: str | Unset = UNSET
-    """ Paddle transaction handle (`txn_…`) on a `payment_required`
+    """Paddle transaction handle (`txn_…`) on a `payment_required`
     402. Empty on the Stripe path. The dashboard renders this as
     a confirmation id after the customer completes checkout.
-     """
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

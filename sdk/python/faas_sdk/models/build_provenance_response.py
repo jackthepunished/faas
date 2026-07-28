@@ -28,11 +28,11 @@ class BuildProvenanceResponse:
     id: str
     build_id: str
     source_sha256: str
-    """ sha256 of the customer's source tarball (the cache lookup key). """
+    """sha256 of the customer's source tarball (the cache lookup key)."""
     plan: str
-    """ free / hobby / pro / scale — copied from the account at claim time. """
+    """free / hobby / pro / scale — copied from the account at claim time."""
     builder_node_id: str
-    """ compute_node name (default `default-local` on the one-box). """
+    """compute_node name (default `default-local` on the one-box)."""
     started_at: datetime.datetime
     finished_at: datetime.datetime
     buildkit_version: str | Unset = UNSET
@@ -42,7 +42,7 @@ class BuildProvenanceResponse:
     commit_sha: str | Unset = UNSET
     runner_digest: str | Unset = UNSET
     sbom_storage_key: None | str | Unset = UNSET
-    """ Phase 3 populator fills this from `syft` output. Empty string when not yet populated. """
+    """Phase 3 populator fills this from `syft` output. Empty string when not yet populated."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

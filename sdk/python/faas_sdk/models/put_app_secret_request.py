@@ -14,7 +14,7 @@ class PutAppSecretRequest:
     """Set a secret: key name and plaintext (sealed at rest immediately, plaintext discarded after seal)."""
 
     value: str
-    """ Plaintext. Sealed server-side; never persisted in plaintext. """
+    """Plaintext. Sealed server-side; never persisted in plaintext."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

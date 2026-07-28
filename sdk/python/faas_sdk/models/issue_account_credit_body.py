@@ -6,41 +6,47 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-T = TypeVar("T", bound="CreateDeploymentRequest")
+T = TypeVar("T", bound="IssueAccountCreditBody")
 
 
 @_attrs_define
-class CreateDeploymentRequest:
-    """Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload."""
-
-    image: str | Unset = UNSET
-    """registry.DOMAIN/...@sha256:... — digest-pinned OCI reference."""
+class IssueAccountCreditBody:
+    cents: int
+    """Credit amount in EUR cents (integer)."""
+    reason: str
+    """Operator-supplied audit reason."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        image = self.image
+        cents = self.cents
+
+        reason = self.reason
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if image is not UNSET:
-            field_dict["image"] = image
+        field_dict.update(
+            {
+                "cents": cents,
+                "reason": reason,
+            }
+        )
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        image = d.pop("image", UNSET)
+        cents = d.pop("cents")
 
-        create_deployment_request = cls(
-            image=image,
+        reason = d.pop("reason")
+
+        issue_account_credit_body = cls(
+            cents=cents,
+            reason=reason,
         )
 
-        create_deployment_request.additional_properties = d
-        return create_deployment_request
+        issue_account_credit_body.additional_properties = d
+        return issue_account_credit_body
 
     @property
     def additional_keys(self) -> list[str]:

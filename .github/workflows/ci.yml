@@ -489,6 +489,63 @@ jobs:
             exit 1
           }
 
+  sdk-gen:
+    name: sdk-gen (regenerate all SDKs + dirty-diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    # NOTE: job-level `paths:` filters are rejected by GitHub's
+    # workflow-schema validator (see PR #365 review; the error
+    # surfaces at the workflow-file-parse step and aborts the
+    # whole run before any job executes). Path filters must live
+    # under `on.pull_request.paths` at the workflow level, not
+    # here. Defense-in-depth is provided by the per-SDK
+    # `sdk-gen-node` and `sdk-gen-python` jobs (unfiltered, catch
+    # drift outside the aggregator's primary input set). The
+    # `sdk-gen` aggregator runs on every PR — CI cost is ~30s
+    # extra (the venv bootstrap step), which is acceptable.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.10.0'
+          cache: 'npm'
+          cache-dependency-path: sdk/node/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: sdk/python/pyproject.toml
+      # The Makefile's `sdk-gen-python-check` recipe invokes
+      # `.venv/bin/python scripts/gen.py`. The CI runner has no
+      # `.venv`; the per-SDK `sdk-gen-python` job (above) gets
+      # around this by calling `python scripts/gen.py` directly.
+      # Since the aggregator uses the Makefile recipe, we MUST
+      # bootstrap a `.venv` here, otherwise the first regen fails
+      # with a missing-interpreter error.
+      - name: bootstrap Python SDK venv
+        working-directory: sdk/python
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install ruamel.yaml openapi-python-client
+          # `openapi-python-client` 0.29.0 imports the SDK package
+          # to inspect `types.Unset` at generate-time; without the
+          # editable install, the generator emits files with
+          # `from ...types import UNSET, Response` (no `Unset`),
+          # which diverges from HEAD. The standalone `sdk-gen-python`
+          # job does `pip install -e .` for the same reason — we
+          # mirror it here so the aggregator's regen is byte-
+          # identical to the standalone's.
+          .venv/bin/pip install --quiet -e .
+      - name: install Node SDK deps
+        working-directory: sdk/node
+        run: npm ci --no-audit --no-fund
+      - name: make sdk-gen (regenerate + assert clean diff)
+        run: make sdk-gen
+
   sdk-smoke-python:
     name: sdk-smoke-python (Python SDK against fakeapid fixture)
     runs-on: ubuntu-latest
