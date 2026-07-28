@@ -3,6 +3,7 @@
 
 export type { APIKeyExportResponse } from './APIKeyExportResponse.js';
 export type { APIKeyResponse } from './APIKeyResponse.js';
+export type { AccountAppSecretResponse } from './AccountAppSecretResponse.js';
 export type { AccountCreditResponse } from './AccountCreditResponse.js';
 export type { AccountDeletionResponse } from './AccountDeletionResponse.js';
 export type { AccountExportResponse } from './AccountExportResponse.js';
@@ -14,6 +15,7 @@ export type { AppResponse } from './AppResponse.js';
 export type { AppSecretExportResponse } from './AppSecretExportResponse.js';
 export type { AppSecretListResponse } from './AppSecretListResponse.js';
 export type { AppSecretResponse } from './AppSecretResponse.js';
+export type { AppsMetricsResponse } from './AppsMetricsResponse.js';
 export type { AsyncInvokeResponse } from './AsyncInvokeResponse.js';
 export type { AuditEventResponse } from './AuditEventResponse.js';
 export type { BuildExportResponse } from './BuildExportResponse.js';
@@ -43,7 +45,9 @@ export type { InvoiceListResponse } from './InvoiceListResponse.js';
 export type { InvokeRequest } from './InvokeRequest.js';
 export type { InvokeResponse } from './InvokeResponse.js';
 export type { ListAuditEventsResponse } from './ListAuditEventsResponse.js';
+export type { ListInstancesResponse } from './ListInstancesResponse.js';
 export type { ListInvocationsResponse } from './ListInvocationsResponse.js';
+export type { ListSecretsForAccountResponse } from './ListSecretsForAccountResponse.js';
 export type { MFAConfirmRequest } from './MFAConfirmRequest.js';
 export type { MFAConfirmResponse } from './MFAConfirmResponse.js';
 export type { MFADisableRequest } from './MFADisableRequest.js';

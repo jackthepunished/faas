@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
+import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
 import type { UpdateAppRequest } from '../models/UpdateAppRequest.js';
@@ -368,6 +369,51 @@ export class AppsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Account-wide per-app metrics rollup.
+   * One call replaces N per-app `/v1/apps/{slug}/metrics` calls
+   * (issue #393). Returns the same `AppMetricsResponse` shape
+   * per app, keyed by `app_slug`, so the dashboard can render
+   * all apps on a single page without a per-app fan-out.
+   *
+   * Range is the closed vocabulary from the per-app endpoint:
+   * `5m` (default) | `15m` | `1h` | `6h` | `24h` | `7d` | `15d`.
+   * Prometheus failure short-circuits the entire response
+   * (never partial-populated) and emits `source:
+   * "degraded: <reason>"` with zeroed `apps`, matching the
+   * per-app contract exactly.
+   *
+   * PromQL cost: 6 round-trips regardless of N apps (vs. 7N
+   * for the naive per-app loop) — see `pkg/promql.Client.QueryMap`
+   * and `Client.QueryBuckets`.
+   *
+   * @returns AppsMetricsResponse The rollup.
+   * @throws ApiError
+   */
+  public static getAppsMetrics({
+    range = '5m',
+  }: {
+    /**
+     * Time window applied to every per-app rollup row. Default `5m`.
+     */
+    range?: '5m' | '15m' | '1h' | '6h' | '24h' | '7d' | '15d',
+  }): CancelablePromise<AppsMetricsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/metrics',
+      query: {
+        'range': range,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
