@@ -227,6 +227,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		cbm,
 	)
 	mgr.SetHostIdentity(hostID)
+	// issue #299: wire the artifact backend the Manager uses to
+	// read Grype scan sidecars at boot time. Mirrors the VMM's
+	// own WithStorage wiring at line 223 above; the VMM uses
+	// storage to materialize snapshot blobs while the Manager
+	// uses it to fetch the per-runtime scan sidecar. Both share
+	// the same backend (the production PrefixRouter rooted at
+	// /srv/fc).
+	mgr.WithStorage(storageBackend)
 	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,
 		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
 		"host_key_path", keyPath, "recipient_path", pubPath,
@@ -236,6 +244,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// default, tcp/dns optional; tcp targets require a complete mTLS
 	// cluster and the loader rejects partial configs.
 	ops := wire.NewOpsMetrics("vmmd")
+	// issue #299: wire the OpsMetrics the Manager's scan check
+	// feeds per-severity finding counts into (vmmd_trivy_image_vulns_total{image, severity}).
+	// The counter is pre-instantiated at boot on every daemon's
+	// single-registry OpsMetrics (memory note wire/OpsMetrics),
+	// so this call is the vmmd-side producer wiring only — no new
+	// registration, no new listener.
+	mgr.SetImageScanMetrics(ops)
 	serverTLS, err := cfg.LoadServerTLS()
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)

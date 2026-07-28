@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1973,4 +1975,113 @@ func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct
 		return
 	}
 	writeJSON(w, http.StatusOK, s.buildProvenanceResponse(prov))
+}
+
+// getBuildSbom streams the CycloneDX SBOM for a build id (issue #299
+// / ADR-038 Phase 3). `faas build sbom <id>` and the SDK's
+// GetBuildsIdSbom surface route through here.
+//
+// IDOR-safe: every step mirrors getBuildProvenance — Build → Deployment
+// → App → AccountID — so a customer cannot infer the existence of
+// another customer's build id by timing the response. The 404 surface
+// is "no such build" on every negative path so probing returns the
+// same answer as a genuinely-missing id.
+//
+// Three different failure modes, each with its own code so the SDK can
+// branch:
+//
+//   - 404 no such build — id never existed, no build_provenance row,
+//     or the build belongs to another account. Standard path.
+//   - 503 build_sbom_unavailable — the build row exists and belongs
+//     to this account, but imaged's syft populator (pkg/imaged/loop.go)
+//     did not land a build_provenance.sbom_storage_key (pre-Phase-3 build,
+//     or the populator INSERT was best-effort WARNed). The CLI prints
+//     "no SBOM for this build" and exits 1; the customer's branch is
+//     "retry after operator rebuilds imaged" not "abort the audit".
+//   - 503 with sbom_storage_key set but the file missing on disk —
+//     same code (the populator exists in the schema but not on the
+//     filesystem; recoverable by re-running imaged).
+//   - 404 with sbom_storage_key empty string — covered by the first
+//     branch (unavailable).
+//
+// The SBOM is served with `application/vnd.cyclonedx+json` so external
+// tooling (cyclonedx-cli validate, jq's @cdx/manifest formatters) can
+// route on the content-type without sniffing the body. The blob is
+// streamed with io.Copy — sized SBOMs run to ~50 KB compressed JSON,
+// well under the handler heap budget.
+func (s *server) getBuildSbom(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	build, err := s.store.BuildByID(ctx(r), id)
+	if err != nil {
+		s.notFound(w, "no such build")
+		return
+	}
+	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
+	if err != nil {
+		s.notFound(w, "no such build")
+		return
+	}
+	app, err := s.store.AppByID(ctx(r), dep.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such build")
+		return
+	}
+	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
+	if err != nil {
+		// Provenance row absent — Phase-3 populator had not landed
+		// when this build was created. We can still confirm the
+		// account owns the build via Build→Deployment→App→AccountID,
+		// so the SBOM-missing case is genuinely "missing", not
+		// "wrong account".
+		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
+		return
+	}
+	if prov.SBOMStorageKey == "" {
+		// Provenance row exists but the populator didn't write the
+		// sbom_storage_key column. Same shape as ErrBuildProvenanceNotFound's
+		// best-effort WARN — observability broke for this build, the
+		// build itself is final.
+		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
+		return
+	}
+	if s.sbomRoot == "" {
+		// Operationally the operator hasn't wired a SBOM root. The
+		// CLI's "you forgot to deploy imaged Phase 3" message lands
+		// here. Distinct code so future ops automation can branch
+		// on it (this is the only way a customer-visible route can
+		// fail for an operator-side wiring gap).
+		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
+		return
+	}
+	// Defense-in-depth against path traversal in the storage key:
+	// sbom_storage_key is a relative path under sbomRoot, NOT an
+	// absolute one and NOT one with `..` segments. storage/validateKey
+	// is the canonical validator, but the storage key arrives via
+	// imaged's syft populator path which already enforces a fixed
+	// "sboms/<buildID>.cdx.json" shape. We re-check here because
+	// the column is general-purpose and a future populator could
+	// write anything.
+	clean := filepath.Clean(prov.SBOMStorageKey)
+	if strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || clean == "." {
+		api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
+		return
+	}
+	full := filepath.Join(s.sbomRoot, clean)
+	f, err := os.Open(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The populator wrote a storage key the filesystem does
+			// not honour (imaged ran on a different box; the SBOM
+			// directory was gc'd). Same code as the empty-key branch
+			// — the operator's job to re-run imaged.
+			api.WriteProblem(w, api.ErrBuildSBOMUnavailable())
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("build SBOM unreadable"))
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/vnd.cyclonedx+json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, f)
 }

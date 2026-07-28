@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -19,6 +20,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Manager is vmmd's core: it owns the whole per-instance resource lifecycle —
@@ -162,6 +165,22 @@ type Manager struct {
 	// the kernel supports ct expressions in netns (CONFIG_NF_CONNTRACK_NET_NS),
 	// 0 when it doesn't (the ct cap rule is omitted, egress tc cap unaffected).
 	conntrackCap int64
+	// storage is the artifact backend vmmd reads scan sidecars from at
+	// boot time (issue #299). Wired via WithStorage, mirroring the VMM's
+	// own WithStorage setter at pkg/fcvm/vmm.go. nil means "no scan
+	// check" — bringUpScanCheck returns nil and bringUp proceeds; the
+	// unit tests that don't wire a storage backend (most of
+	// pkg/fcvm/manager_test.go) take this path today and continue to
+	// pass after the change.
+	storage storage.StorageBackend
+	// imageScanMetrics is the per-daemon OpsMetrics the scan sidecar
+	// findings get fed into (issue #299). Wired via SetImageScanMetrics,
+	// mirroring SetHostIdentity above (nil-safe). The counter is
+	// vmmd_trivy_image_vulns_total{image, severity}; the vmmd
+	// OpsMetrics is the only caller in production, but every daemon
+	// registers the counter (single-registry pattern, see
+	// pkg/wire/metrics.go: imageScanVulns on commonCollectors).
+	imageScanMetrics *wire.OpsMetrics
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -192,6 +211,41 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 // serving traffic.
 func (m *Manager) SetHostIdentity(id *age.X25519Identity) {
 	m.hostIdentity = id
+}
+
+// WithStorage wires the artifact backend the Manager uses to read
+// Grype scan sidecars at boot time (issue #299). Mirrors the VMM's
+// own WithStorage setter at pkg/fcvm/vmm.go (the VMM uses it to
+// materialize snapshot blobs; the Manager uses it to fetch the
+// per-runtime scan sidecar). NOT safe to call concurrently with
+// Wake; production wires it before serving traffic. Calling
+// WithStorage(nil) clears the override and disables the scan
+// check (bringUpScanCheck returns nil immediately).
+func (m *Manager) WithStorage(s storage.StorageBackend) {
+	m.storage = s
+}
+
+// SetImageScanMetrics wires the OpsMetrics handle the scan sidecar
+// findings get fed into (issue #299). nil-safe (the helper no-ops
+// when nil), mirroring SetHostIdentity's nil-tolerance posture.
+// NOT safe to call concurrently with Wake; production wires it
+// before serving traffic. The counter is registered on every
+// daemon's OpsMetrics (single-registry pattern), so vmmd is the
+// only producer in production but every daemon can hold the field.
+func (m *Manager) SetImageScanMetrics(ops *wire.OpsMetrics) {
+	m.imageScanMetrics = ops
+}
+
+// metricsImageScan forwards a per-severity finding count to the
+// vmmd-side OpsMetrics (issue #299). Nil-safe so the boot-time scan
+// check doesn't have to nil-check the metrics accessor on every
+// (severity, count) iteration — same nil-safe shape as
+// ColdBootMetrics.ObserveFallback at pkg/fcvm/metrics.go:136.
+func (m *Manager) metricsImageScan(image, severity string, count int) {
+	if m.imageScanMetrics == nil {
+		return
+	}
+	m.imageScanMetrics.ObserveImageScanVuln(image, severity, count)
 }
 
 // HostIdentity returns the identity the Manager was constructed with
@@ -472,6 +526,19 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 // WakeColdBoot, so schedd can mark the snapshot stale and schedule a re-snapshot.
 // A non-nil error means even cold boot failed (a real wake failure).
 func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req WakeRequest) (WakeMethod, error) {
+	// issue #299: refuse to bring up an instance whose base ext4
+	// staged with a CRITICAL Grype finding. Runs BEFORE the restore
+	// decision tree because a scan refusal is a policy gate, not a
+	// snapshot-cache decision (ADR-005 doesn't apply — we're not
+	// failing to find a snapshot, we're refusing the boot on a
+	// known-bad CVE). Returns *api.Problem with code = CodeScanCritical
+	// on refusal; schedd surfaces it through the wake path (which is
+	// why the function returns the Problem shape rather than a bare
+	// error — the wake-error channel expects it). No-op when storage
+	// is nil (unit tests that don't wire WithStorage continue to pass).
+	if err := m.bringUpScanCheck(ctx, req.BaseKey); err != nil {
+		return WakeColdBoot, err
+	}
 	if PlanWake(req.Snapshot, m.fcVersion) == WakeRestore {
 		rs := RestoreSpec{
 			VMStatePath: req.Snapshot.VMStatePath,
@@ -525,6 +592,71 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)
 	}
 	return WakeColdBoot, nil
+}
+
+// bringUpScanCheck — issue #299 admission seam: refuse to bring up
+// an instance whose base ext4 staged with a CRITICAL Grype finding.
+//
+// Reads the scan sidecar at wire.ScanKeyForBaseKey(baseKey) and
+// returns *api.Problem with code = api.CodeScanCritical if CRITICAL
+// > 0. The sidecar is written by imaged at base-stage time (see
+// pkg/imaged/base_stage.go) in lock-step with the digest sidecar —
+// a missing sidecar means the base was staged by an imaged that
+// predates issue #299 OR the storage backend lost it (a real ops
+// hazard); treat both as CRITICAL and refuse the boot. Fail-closed
+// here mirrors the imaged-side fail-closed sidecar write
+// (CRITICAL=9999 placeholder when Grype is missing) so a Grype
+// absence on the imaged side propagates as a refusal on the vmmd
+// side — never a silent admit.
+//
+// Returns nil when storage is nil (no scan check configured — the
+// unit tests that don't wire WithStorage take this path). Returns
+// nil on a scan sidecar with CRITICAL=0; per-severity finding
+// counts are forwarded to vmmd's imageScanMetrics counter via
+// metricsImageScan so the §12 dashboard sees the per-image
+// vulnerability posture, not just the gate result.
+//
+// Mirrors the cosign LocalVerifier.Verify read-side pattern at
+// pkg/cosign/verifier.go:49-104 (StorageBackend.Get → parse → return
+// typed error), but runs in vmmd per the issue's gate-placement
+// decision rather than in schedd alongside the cosign verifier. The
+// gate returns the same Problem shape schedd's engine.go:558-595
+// emits (api.NewProblem with HTTP 503), so schedd can render the
+// wake-error path with no extra translation layer.
+func (m *Manager) bringUpScanCheck(ctx context.Context, baseKey string) error {
+	if m.storage == nil {
+		return nil
+	}
+	scanKey := wire.ScanKeyForBaseKey(baseKey)
+	rc, err := m.storage.Get(ctx, scanKey)
+	if err != nil {
+		return api.NewProblem(http.StatusServiceUnavailable, api.CodeScanCritical,
+			"scan sidecar missing",
+			fmt.Sprintf("scan sidecar missing for base %q at %q; refusing to boot un-scanned ext4 (issue #299)", baseKey, scanKey))
+	}
+	defer rc.Close()
+	var scan struct {
+		Image    string         `json:"image"`
+		Findings map[string]int `json:"findings"`
+	}
+	if err := json.NewDecoder(rc).Decode(&scan); err != nil {
+		return api.NewProblem(http.StatusServiceUnavailable, api.CodeScanCritical,
+			"scan sidecar unreadable",
+			fmt.Sprintf("scan sidecar at %q unreadable: %v (issue #299)", scanKey, err))
+	}
+	if n := scan.Findings["CRITICAL"]; n > 0 {
+		return api.NewProblem(http.StatusServiceUnavailable, api.CodeScanCritical,
+			"CRITICAL vulnerability in base ext4",
+			fmt.Sprintf("base %q has %d CRITICAL Grype findings; refusing to boot (issue #299)", baseKey, n))
+	}
+	// Forward per-severity finding counts to the vmmd Prometheus
+	// counter. The image label is the OCI ref imaged wrote into
+	// the sidecar (defensive empty-string fallback if absent —
+	// imaged always populates it in production).
+	for sev, n := range scan.Findings {
+		m.metricsImageScan(scan.Image, sev, n)
+	}
+	return nil
 }
 
 // Park snapshots a running instance then destroys it, freeing all resident RAM

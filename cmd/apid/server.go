@@ -115,6 +115,13 @@ type server struct {
 	// domain-only URL until the customer's id is wired in. Empty
 	// means the 402 still goes out but BillingPortalURL is omitted.
 	billingPortalURL string
+	// sbomRoot is the absolute filesystem directory imaged writes
+	// build SBOMs to (imaged populates build_provenance.sbom_storage_key
+	// with the relative path inside this root). Empty means the
+	// GET /v1/builds/{id}/sbom route 503s (issue #299 / ADR-038 Phase 3
+	// — the SBOM populator hadn't landed yet so the storage key is
+	// empty for every pre-PR build).
+	sbomRoot string
 	// billingProvider is the per-deployment Provider apid's webhook
 	// + changePlan handlers dispatch through. Wired via WithBillingProvider
 	// from cmd/apid/main.go::LoadProviderForAPID. nil = "Stripe path
@@ -206,6 +213,17 @@ func (s *server) WithStatusCache(promURL, htmlPath string) *server {
 // still goes out, just without the BillingPortalURL extension).
 func (s *server) WithBillingPortalURL(template string) *server {
 	s.billingPortalURL = template
+	return s
+}
+
+// WithSBOMRoot records the absolute directory imaged writes build SBOMs
+// to (default /srv/fc on a single-box deploy). Read-side handler joins
+// build_provenance.sbom_storage_key against this root and streams the
+// blob. Empty disables the route — apid returns 503 build_sbom_unavailable
+// rather than 404 so the SDK can distinguish "no SBOM yet" from "no SBOM
+// ever". Issue #299 / ADR-038 Phase 3.
+func (s *server) WithSBOMRoot(root string) *server {
+	s.sbomRoot = root
 	return s
 }
 
@@ -435,6 +453,14 @@ func (s *server) handler() http.Handler {
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
 	mux.HandleFunc("GET /v1/builds/{id}/provenance", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildProvenance)))
+	// Builds (issue #299 / ADR-038 Phase 3). The /sbom route is the
+	// ADR-038 Phase-3 companion to /provenance — same auth, same
+	// scoping, same IDOR-safe Build → Deployment → App → AccountID
+	// check; the handler streams the CycloneDX JSON file from
+	// FAAS_STORAGE_ROOT/<sbom_storage_key> rather than rendering it
+	// through writeJSON. Returns build_sbom_unavailable (503) when
+	// the imaged syft populator hasn't run for this build.
+	mux.HandleFunc("GET /v1/builds/{id}/sbom", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildSbom)))
 	mux.HandleFunc("POST /v1/apps/{slug}/rollback", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.rollbackApp)))))
 	mux.HandleFunc("POST /v1/apps/{slug}/park", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.parkApp))))
 	mux.HandleFunc("POST /v1/apps/{slug}/wake", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.wakeApp))))

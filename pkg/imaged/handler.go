@@ -97,6 +97,26 @@ type Handler struct {
 	// PullLayers path, plus imaged_oci_pull_duration_seconds
 	// per-pull op{manifest,config,blob,above_base}.
 	ops *wire.OpsMetrics
+	// grypeRun is the supply-chain scan runner used at base-stage
+	// time to write the Grype scan sidecar (issue #299). Wired
+	// via WithGrypeRun; nil = default to a subprocess invocation
+	// (grype dir:<outImage> -o json) — production default. Tests
+	// inject a stub returning canned findings so the sidecar write
+	// is hermetic and doesn't require Grype on PATH. Fail-closed
+	// at the sidecar-write site (CRITICAL=9999 placeholder) when
+	// the runner returns an error or nil findings.
+	grypeRun func(ctx context.Context, dir string) (map[string]int, error)
+	// syftRun is the post-build SBOM generator used to populate
+	// build_provenance.sbom_storage_key (issue #299 / ADR-038
+	// Phase 3). Wired via WithSyftRun; nil = default to a
+	// subprocess invocation (`syft dir:<outDir> -o cyclonedx-json`)
+	// — production default. Tests inject a stub returning canned
+	// CycloneDX JSON so the storage write is hermetic and doesn't
+	// require syft on PATH. Best-effort: a syft error writes no
+	// SBOM and leaves sbom_storage_key empty; the build itself
+	// still succeeds (the SBOM is observational, not a deployment
+	// precondition — schema §4.2).
+	syftRun func(ctx context.Context, dir string) ([]byte, error)
 }
 
 // New returns a Handler. The OCI puller is injected so tests can substitute
@@ -180,6 +200,42 @@ func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 func (h *Handler) WithOpsMetrics(ops *wire.OpsMetrics) *Handler {
 	h.ops = ops
 	return h
+}
+
+// WithGrypeRun replaces the default Grype subprocess invocation
+// (issue #299). Default is nil, which falls back to the production
+// runner that shells out to `grype dir:<dir> -o json` and parses
+// the per-severity finding counts. Tests inject a stub returning
+// canned findings so the sidecar write is hermetic. Mirrors the
+// `LayerBuilder` interface injection pattern — same Handler-Builder
+// seam, same With* fluent setter shape.
+func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (map[string]int, error)) *Handler {
+	h.grypeRun = fn
+	return h
+}
+
+// WithSyftRun injects the post-build SBOM generator (issue #299 /
+// ADR-038 Phase 3). Mirrors WithGrypeRun's fluent setter shape.
+// Tests wire a stub returning canned CycloneDX bytes; production
+// leaves the field nil so the default subprocess runner in
+// pkg/imaged/sbom.go fires.
+func (h *Handler) WithSyftRun(fn func(ctx context.Context, dir string) ([]byte, error)) *Handler {
+	h.syftRun = fn
+	return h
+}
+
+// runGrype dispatches to the injected grypeRun or falls back to
+// the default subprocess runner (issue #299). The default shells
+// out to `grype dir:<dir> -o json` and parses the matches[].vulnerability.severity
+// counts into map[string]int. Errors and nil maps are surfaced to
+// the caller (the sidecar-write site fail-closed with a
+// CRITICAL=9999 placeholder). Production wires the default;
+// tests wire a stub via WithGrypeRun.
+func (h *Handler) runGrype(ctx context.Context, dir string) (map[string]int, error) {
+	if h.grypeRun != nil {
+		return h.grypeRun(ctx, dir)
+	}
+	return defaultGrypeRun(ctx, dir)
 }
 
 // storageFor returns the wired StorageBackend, building a default
