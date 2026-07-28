@@ -36,6 +36,45 @@ func (e *QuotaError) Is(target error) bool {
 // Concrete instances are *QuotaError so handlers can read limit/observed.
 var ErrQuotaExceeded = errors.New("state: deployed-app quota exceeded")
 
+// ConsumeAccountCreditParams is the FIFO consumption request (issue
+// #279 PR-C). All fields are required except Reason, which the
+// reducer falls back to a system constant when empty. ProviderInvoiceID
+// must be non-empty — see ConsumeAccountCredit docstring for why.
+type ConsumeAccountCreditParams struct {
+	AccountID         string
+	TargetCents       int64  // >= 0; 0 is a no-op
+	Provider          string // "stripe" | "paddle" (denormalised for audit context)
+	ProviderInvoiceID string // dedupe key; required for the partial unique index to apply
+	InvoiceID         string // for the audit row + ledger reason text
+	Reason            string
+	Actor             string // "apid" for the admin endpoint
+}
+
+// ConsumedCreditRow is one credit's contribution to a consumption call.
+// NewBalance is the post-call cents_remaining for that credit.
+type ConsumedCreditRow struct {
+	CreditID   string
+	DeltaCents int64
+	NewBalance int64
+}
+
+// ConsumeAccountCreditResult is the reducer's outcome.
+//
+// ConsumedCents is the total drained this call (capped at TargetCents).
+// PerCredit captures each drained credit's delta + post-balance.
+// RemainingCreditsCents is the sum of cents_remaining for active
+// credits after the call (for the audit row + response).
+// AlreadyConsumedForInvoice is true when the partial unique index
+// rejected every INSERT — the reducer was a no-op and the operator
+// sees the same ConsumedCents as the first call (re-derived from the
+// existing ledger rows, not the failed INSERT).
+type ConsumeAccountCreditResult struct {
+	ConsumedCents             int64
+	PerCredit                 []ConsumedCreditRow
+	RemainingCreditsCents     int64
+	AlreadyConsumedForInvoice bool
+}
+
 // CronQuotaScope names the cap that CreateCronIfUnderQuota tripped on.
 // The handler renders different copy per scope so the customer can tell
 // whether to delete a cron from this app (Scope="app") or from one of
@@ -1133,6 +1172,13 @@ type Store interface {
 	// responsibility (handler clamps at 25 default). The returned
 	// slice is empty (not nil) when the account has no rows.
 	ListInvoicesForAccount(ctx context.Context, accountID string, month *time.Time, before time.Time, limit int) ([]Invoice, error)
+	// GetInvoiceByID resolves a single invoice by primary key.
+	// Returns ErrNotFound when no row matches. The consumption
+	// reducer (issue #279 PR-C) and the future GET /v1/invoices/{id}
+	// single-invoice endpoint both depend on this primitive; the
+	// list method alone cannot fetch an unknown invoice without
+	// knowing its account_id up-front.
+	GetInvoiceByID(ctx context.Context, id string) (Invoice, error)
 
 	// Account credits (issue #279). The handler is the only writer to
 	// account_credits + credit_ledger; meterd reads overage_cap_cents
@@ -1159,6 +1205,33 @@ type Store interface {
 	// cap". Returned map is keyed by account_id; cents is the integer
 	// monthly ceiling (≥ 0).
 	LoadAllOverageCapCents(ctx context.Context) (map[string]int64, error)
+	// ListActiveCreditsForConsumption returns the account's active credit
+	// rows ordered FIFO (created_at ASC) for the consumption reducer
+	// (issue #279 PR-C). "Active" = cents_remaining > 0 AND
+	// (expires_at IS NULL OR expires_at > now()). Distinct from
+	// ListAccountCredits(onlyActive=true), which returns DESC — the
+	// issuance surface's UI needs newest-first; the reducer needs
+	// oldest-first so a goodwill credit with a near expiry drains
+	// before a perpetual one.
+	ListActiveCreditsForConsumption(ctx context.Context, accountID string) ([]AccountCredit, error)
+	// ConsumeAccountCredit performs an atomic FIFO decrement across the
+	// account's active credits, capped at TargetCents. The unique
+	// (provider_invoice_id, credit_id) partial index on credit_ledger
+	// (migration 00058) makes the call idempotent: re-running with
+	// the same ProviderInvoiceID and credit set is a no-op and
+	// returns AlreadyConsumedForInvoice=true.
+	//
+	// "Atomic" here means: for each credit, the conditional UPDATE
+	// (WHERE cents_remaining >= $amt) cannot return a row that would
+	// have driven cents_remaining negative — the existing CHECK
+	// (cents_remaining >= 0) is the floor. The reducer loops credit
+	// by credit inside ONE transaction so a concurrent operator
+	// issuance on a different credit cannot interleave between read
+	// and update. ProviderInvoiceID must be non-empty — the partial
+	// unique index only kicks in when the column is NOT NULL on the
+	// consumption row, and an empty key would dedupe every credit
+	// against every other.
+	ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCreditParams) (ConsumeAccountCreditResult, error)
 	// CurrentMonthOverageCents returns the account's derived overage
 	// in integer cents for the current UTC month. 1 GB-h = 100 cents
 	// at €0.01/GB-h (CLAUDE.md: integer cents only, never float).

@@ -2291,6 +2291,43 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Operator credit consumption (issue #279 PR-C) ─────────────────────
+  # Admin-only + MFA-gated. Triggers the FIFO credit consumption
+  # reducer against an invoice's overage in integer cents (CLAUDE.md).
+  # Idempotent at two layers: the existing Idempotency-Key middleware
+  # (24 h dedupe) and the partial unique index on credit_ledger
+  # (provider_invoice_id, credit_id) — migration
+  # 00056_credit_consumption.sql. A second call for the same invoice
+  # returns 200 with already_consumed_for_invoice=true and the same
+  # consumed_cents. Emits one credit.consumed audit row per drained
+  # credit.
+  /v1/invoices/{id}/consume-credits:
+    post:
+      tags: [admin]
+      operationId: consumeInvoiceCredits
+      summary: Drain active credits FIFO against an invoice's overage (admin-only, MFA-gated).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Invoice row UUID from GET /v1/invoices.
+      responses:
+        '200':
+          description: Reducer ran (or replayed). consumed_cents is the floored integer cents drained against this invoice.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsumeInvoiceResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — call requires an admin-scoped Bearer with the caller email in FAAS_ADMIN_EMAILS AND a verified MFA factor.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
   # `apid` embeds api/openapi.yaml at build time and serves the same bytes
   # customers see in the repo. The /json variant re-emits the spec in JSON
@@ -2875,6 +2912,40 @@ components:
         reason:         { type: string, minLength: 3, maxLength: 500 }
         created_at:     { type: string, format: date-time }
         expires_at:     { type: [string, "null"], format: date-time }
+
+    ConsumeInvoiceResponse:
+      description: |
+        Returned by POST /v1/invoices/{id}/consume-credits (issue
+        #279 PR-C). consumed_cents is the floored integer cents of
+        overage drained against this invoice. remaining_credits_cents
+        is the sum of cents_remaining across the account's active
+        credits after the call. already_consumed_for_invoice is true
+        on idempotent replays (the reducer returns the same
+        consumed_cents without double-decrementing). per_credit lists
+        FIFO-ordered credit drains with their post-decrement balance.
+        Money is integer cents (CLAUDE.md).
+      type: object
+      required: [invoice_id, consumed_cents, remaining_credits_cents, already_consumed_for_invoice, per_credit]
+      properties:
+        invoice_id:                   { type: string, format: uuid }
+        consumed_cents:               { type: integer, minimum: 0 }
+        remaining_credits_cents:      { type: integer, minimum: 0 }
+        already_consumed_for_invoice: { type: boolean }
+        per_credit:
+          type: array
+          items: { $ref: '#/components/schemas/ConsumedCreditRow' }
+
+    ConsumedCreditRow:
+      description: |
+        One FIFO drain row inside ConsumeInvoiceResponse.per_credit.
+        delta_cents is the negative-cents decrement applied to the
+        credit; new_balance is cents_remaining after the call.
+      type: object
+      required: [credit_id, delta_cents, new_balance]
+      properties:
+        credit_id:   { type: string, format: uuid }
+        delta_cents: { type: integer, maximum: 0, description: 'Negative integer cents applied to the credit.' }
+        new_balance: { type: integer, minimum: 0 }
 
     CreateDeploymentRequest:
       description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload."

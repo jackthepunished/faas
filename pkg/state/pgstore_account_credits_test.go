@@ -310,3 +310,103 @@ func TestPgStoreCurrentMonthOverageCents_PreviousMonthExcluded(t *testing.T) {
 		t.Fatalf("got %d cents, want 0 (previous-month rows excluded)", got)
 	}
 }
+
+// TestPgStoreListActiveCreditsForConsumption_FIFO pins the FIFO
+// order (created_at ASC) on PgStore. Mirrors the memstore test.
+// The credit_consumption reducer (issue #279 PR-C) uses this as its
+// ordered read path.
+func TestPgStoreListActiveCreditsForConsumption_FIFO(t *testing.T) {
+	store, _, ctx := pgStoreAccountCreditsWithPool(t)
+	acct, err := store.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	oldest, err := store.CreateAccountCredit(ctx, state.AccountCredit{
+		AccountID: acct.ID, CentsRemaining: 100, Reason: "oldest",
+	})
+	if err != nil {
+		t.Fatalf("oldest: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	mid, err := store.CreateAccountCredit(ctx, state.AccountCredit{
+		AccountID: acct.ID, CentsRemaining: 200, Reason: "mid",
+	})
+	if err != nil {
+		t.Fatalf("mid: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	newest, err := store.CreateAccountCredit(ctx, state.AccountCredit{
+		AccountID: acct.ID, CentsRemaining: 300, Reason: "newest",
+	})
+	if err != nil {
+		t.Fatalf("newest: %v", err)
+	}
+
+	rows, err := store.ListActiveCreditsForConsumption(ctx, acct.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("len = %d, want 3", len(rows))
+	}
+	if rows[0].ID != oldest.ID || rows[1].ID != mid.ID || rows[2].ID != newest.ID {
+		t.Fatalf("FIFO order violated: got [%s %s %s], want [%s %s %s]",
+			rows[0].ID, rows[1].ID, rows[2].ID,
+			oldest.ID, mid.ID, newest.ID)
+	}
+}
+
+// TestPgStoreConsumeAccountCredit_FIFOAndIdempotent pins FIFO drain
+// + the partial-unique-index idempotency under
+// (provider_invoice_id, credit_id). Mirrors the memstore test.
+func TestPgStoreConsumeAccountCredit_FIFOAndIdempotent(t *testing.T) {
+	store, _, ctx := pgStoreAccountCreditsWithPool(t)
+	acct, err := store.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := store.CreateAccountCredit(ctx, state.AccountCredit{
+		AccountID: acct.ID, CentsRemaining: 100, Reason: "credit",
+	}); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+
+	first, err := store.ConsumeAccountCredit(ctx, state.ConsumeAccountCreditParams{
+		AccountID:         acct.ID,
+		TargetCents:       50,
+		Provider:          "stripe",
+		ProviderInvoiceID: "in_pg_001",
+		Reason:            "first",
+		Actor:             "apid",
+	})
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if first.AlreadyConsumedForInvoice {
+		t.Fatalf("first call reported AlreadyConsumedForInvoice=true")
+	}
+	if first.ConsumedCents != 50 {
+		t.Fatalf("ConsumedCents = %d, want 50", first.ConsumedCents)
+	}
+
+	second, err := store.ConsumeAccountCredit(ctx, state.ConsumeAccountCreditParams{
+		AccountID:         acct.ID,
+		TargetCents:       50,
+		Provider:          "stripe",
+		ProviderInvoiceID: "in_pg_001",
+		Reason:            "replay",
+		Actor:             "apid",
+	})
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if !second.AlreadyConsumedForInvoice {
+		t.Fatalf("second call: AlreadyConsumedForInvoice = false, want true (partial unique index)")
+	}
+	if second.ConsumedCents != first.ConsumedCents {
+		t.Fatalf("ConsumedCents drifted: first=%d second=%d", first.ConsumedCents, second.ConsumedCents)
+	}
+	if len(second.PerCredit) != 0 {
+		t.Fatalf("PerCredit on replay = %d, want 0", len(second.PerCredit))
+	}
+}

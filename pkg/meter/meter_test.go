@@ -65,6 +65,13 @@ func (p *fakeParker) ParkInstance(_ context.Context, instanceID, reason string) 
 	return p.parkErr
 }
 
+// CPUUsageUsec satisfies meter.CPUSource (added in PR #346). The cap
+// tests don't exercise the CPU path; returning (0, false) keeps the
+// sampler at zero CPU delta and avoids polluting the test metrics.
+func (p *fakeParker) CPUUsageUsec(_ string) (uint64, bool) {
+	return 0, false
+}
+
 // fakeMailer records every Send call so quota tests can assert on the
 // customer-facing email surface (dedupe gate, body shape). Mirrors
 // fakeNotifier/fakeParker; satisfies meter.DunningSender's local
