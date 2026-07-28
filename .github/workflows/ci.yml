@@ -725,6 +725,16 @@ jobs:
     name: coverage (Codecov)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # OIDC for the Codecov upload. Codecov accepts a short-lived GitHub
+    # OIDC token in place of a long-lived CODECOV_TOKEN for public repos
+    # (per codecov-action's `use_oidc` input). This is the right path for
+    # PR events where GitHub strips repo secrets — both fork PRs (Dependabot)
+    # and same-repo PRs from actors whose token forwarding is restricted.
+    # `id-token: write` is required at the job level; the workflow-level
+    # default of `contents: read` does not grant it.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -757,17 +767,19 @@ jobs:
         with:
           files: coverage/cover.out
           flags: unittests
-          # secrets.CODECOV_TOKEN is REQUIRED, not an optimisation.
-          # Codecov rejects tokenless uploads on a repo with protected
-          # branches ("Token required because branch is protected"), and
-          # this repo has an active ruleset on main. Without the secret
-          # every upload is refused.
-          token: ${{ secrets.CODECOV_TOKEN }}
+          # OIDC instead of secrets.CODECOV_TOKEN. GitHub strips repo
+          # secrets from PR events opened by Dependabot (and from any
+          # actor whose commits didn't land directly on a trusted
+          # branch), so the previous `token: ${{ secrets.CODECOV_TOKEN }}`
+          # resolved to empty on those PRs and Codecov rejected the
+          # upload ("Token required because branch is protected"). OIDC
+          # gives Codecov a signed JWT instead — no long-lived secret,
+          # works on every PR event the workflow sees. With `use_oidc:
+          # true` any supplied token is ignored.
+          use_oidc: true
           # true, so a refused upload fails the job instead of passing
-          # silently. This was `false`, which is why the uploads above
-          # were rejected on every run from the workflow's introduction
-          # until 2026-07-25 while the job stayed green and Codecov
-          # reported `activated: false` with no coverage data at all.
+          # silently. Pre-OIDC this surfaced the token-strip bug on PR
+          # events from Dependabot.
           fail_ci_if_error: true
 
   load:
