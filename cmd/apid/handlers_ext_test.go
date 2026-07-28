@@ -195,30 +195,49 @@ func TestUpdateAppAutoscaleRPS_FreeGate(t *testing.T) {
 	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
 }
 
-// TestUpdateAppAutoscaleRPS_HobbyZero pins the lower bound: 0 is
-// the explicit-disable form (the Set bit is set, so the column
-// gets overwritten to 0). It must round-trip as 200, NOT 422 — the
-// only invalid value is negative. The PG CHECK constraint
+// TestUpdateAppAutoscaleRPS_ProNegative pins the lower bound on the
+// lowest plan that unlocks the feature: after the 2026-07-28
+// Hobby→Pro re-tier (ADR-037 amendment), only Pro+ accepts the
+// field at all, so this test exercises Pro (gate passes) with a
+// negative value to assert that bounds validation runs and 422
+// invalid_autoscale_target_rps is returned. The PG CHECK constraint
 // `apps_autoscale_target_rps_nonneg` enforces `>= 0 OR NULL`; we
 // rely on the apid-side validation to reject negatives before they
-// reach the DB.
-func TestUpdateAppAutoscaleRPS_HobbyZero(t *testing.T) {
-	e := setup(t, api.PlanHobby)
-	mustSeedApp(t, e, "hobby-rps-zero")
+// reach the DB. Pre-amendment, the equivalent coverage lived in
+// TestUpdateAppAutoscaleRPS_HobbyZero — but after Hobby lost the
+// gate, that test surfaced the plan gate (403) instead of the
+// bounds check (422), so it was renamed/moved here.
+func TestUpdateAppAutoscaleRPS_ProNegative(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-rps-neg")
 	neg := -1
-	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-zero", api.UpdateAppRequest{AutoscaleTargetRPS: &neg}, nil)
+	rec := e.do(t, "PATCH", "/v1/apps/pro-rps-neg", api.UpdateAppRequest{AutoscaleTargetRPS: &neg}, nil)
 	assertProblem(t, rec, 422, api.CodeInvalidAutoscaleTargetRPS)
 }
 
-// TestUpdateAppAutoscaleRPS_HobbyHappy is the happy path: Hobby
-// plans accept autoscale_target_rps and the response carries the
-// new value. Hobby stays RPS-only — setting CPU on Hobby must 403
-// (covered by TestUpdateAppAutoscaleCPU_HobbyGate).
-func TestUpdateAppAutoscaleRPS_HobbyHappy(t *testing.T) {
+// TestUpdateAppAutoscaleRPS_HobbyGate locks the Hobby→Pro re-tier
+// (2026-07-28: ADR-037 amendment): Hobby plans do not unlock
+// autoscale_target_rps. The handler must 403 plan_autoscale_not_allowed
+// even when the value is a perfectly valid 50 — the gate runs first,
+// value validation is irrelevant on a tier-locked feature. Mirrors
+// TestUpdateAppAutoscaleCPU_HobbyGate.
+func TestUpdateAppAutoscaleRPS_HobbyGate(t *testing.T) {
 	e := setup(t, api.PlanHobby)
-	mustSeedApp(t, e, "hobby-rps-ok")
+	mustSeedApp(t, e, "hobby-rps-gate")
 	fifty := 50
-	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-ok", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-rps-gate", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
+	assertProblem(t, rec, 403, api.CodePlanScaleUpNotAllowed)
+}
+
+// TestUpdateAppAutoscaleRPS_ProHappy is the new happy path: Pro is
+// the lowest paid tier that unlocks autoscale_target_rps after the
+// 2026-07-28 Hobby→Pro re-tier (ADR-037 amendment). The response
+// carries the new value. Pro unlocks both RPS and CPU.
+func TestUpdateAppAutoscaleRPS_ProHappy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-rps-ok")
+	fifty := 50
+	rec := e.do(t, "PATCH", "/v1/apps/pro-rps-ok", api.UpdateAppRequest{AutoscaleTargetRPS: &fifty}, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}

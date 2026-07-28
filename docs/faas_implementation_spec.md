@@ -134,6 +134,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 - **Free-tier disk reaper:** free apps with zero requests for 14 days → snapshot + rootfs moved to object storage, state `EVICTED_COLD` (redeploy = one click, re-flatten from stored image). This is the founding doc's ceiling-protection policy (§9.7 there).
 - **Cron:** `crons` table; fire = synthetic `POST` through gatewayd (so metering/limits apply identically). Per-app and per-account caps are enforced in `apid`'s `createCron` under an apps `FOR UPDATE` row lock (mirrors `CreateAppIfUnderQuota`); Free plan is gated to 402 `plan_crons_not_allowed` because the per-app cap is 0. See `pkg/api/limits.go::CronLimitPerApp` / `CronLimitPerAccount`.
 - Single process, single writer to `instances` — no distributed locking on one box. Multi-node later = shard apps by node, one schedd per node, `apid` routes writes (interface kept narrow deliberately: `EnsureInstance`, `Park`, `Evict`).
+- Autoscale target tiering (RPS Pro+, CPU Pro+, plan Hobby→Pro re-tier applied 2026-07-28) — see [ADR-037 §Reconciliation note + §Amendment](adr/037-reactive-scaleup-trigger.md).
 
 ### 4.4 `vmmd` — microVM supervisor
 
