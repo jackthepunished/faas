@@ -34,35 +34,39 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// seedAccountAndApp creates an account + API key + app directly in the
-// store so the e2e test can attach instances/secrets without going
-// through the handler's own quota checks (we want a clean fixture, not
-// to exercise the PUT-secrets handler here). Returns the account ID,
-// the API-key plaintext, and the seeded app. The shared harness's
-// SeedAccount returns only the plaintext — we need the id for the
-// SQL JOIN assertions, so this helper goes one step further.
-func seedAccountAndApp(t *testing.T, h *e2etest.Harness, ctx context.Context,
-	label string, plan api.Plan, appSlug string) (string, string, state.App) {
+// seedAccount creates an account + admin-scoped API key directly in the
+// store. The key plaintext is the bearer token for subsequent
+// doReq calls. Mirrors the pattern in invocations_e2e_test.go but
+// keeps account + key as separate steps (the original combined
+// helper created an app too, which collided with later POST /v1/apps
+// calls when tests needed slug control).
+func seedAccount(t *testing.T, h *e2etest.Harness, ctx context.Context,
+	label string, plan api.Plan) (string, string) {
 	t.Helper()
 	store := state.NewPgStore(h.Pool)
 	acct, err := store.CreateAccount(ctx, "e2e+"+label+"@test.example", plan)
 	if err != nil {
-		// duplicate — fetch and reuse, mimicking SeedAccount's pattern
-		acct, err = store.AccountByEmail(ctx, "e2e+"+label+"@test.example")
-		if err != nil {
-			t.Fatalf("CreateAccount/AccountByEmail: %v", err)
-		}
+		t.Fatalf("CreateAccount: %v", err)
 	}
 	pt, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		t.Fatalf("GenerateAPIKey: %v", err)
 	}
 	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.ScopesAdminOnly); err != nil {
-		t.Logf("CreateAPIKey (might already exist): %v", err)
+		t.Fatalf("CreateAPIKey: %v", err)
 	}
+	return acct.ID, pt
+}
+
+// seedApp creates one app under acct. Used after seedAccount so each
+// test controls slugs without colliding with helper-side defaults.
+func seedApp(t *testing.T, ctx context.Context, h *e2etest.Harness,
+	acctID, slug string) state.App {
+	t.Helper()
+	store := state.NewPgStore(h.Pool)
 	app, err := store.CreateApp(ctx, state.App{
-		AccountID:      acct.ID,
-		Slug:           appSlug,
+		AccountID:      acctID,
+		Slug:           slug,
 		Type:           state.AppTypeApp,
 		RAMMB:          256,
 		MaxConcurrency: 1,
@@ -70,7 +74,7 @@ func seedAccountAndApp(t *testing.T, h *e2etest.Harness, ctx context.Context,
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
-	return acct.ID, pt, app
+	return app
 }
 
 // seedDeployment creates a live deployment for the app. Mirrors the
@@ -185,7 +189,8 @@ func TestE2E_ListInstancesForAccount_CursorPagination(t *testing.T) {
 	ctx := context.Background()
 	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
-	_, key, app := seedAccountAndApp(t, h, ctx, "pagi", api.PlanHobby, "pagi-app")
+	acctID, key := seedAccount(t, h, ctx, "pagi", api.PlanHobby)
+	app := seedApp(t, ctx, h, acctID, "pagi-app")
 	dep := seedDeployment(t, h, ctx, app.ID)
 	for i := 0; i < 5; i++ {
 		if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
@@ -243,8 +248,10 @@ func TestE2E_ListInstancesForAccount_CrossAccountIsolation(t *testing.T) {
 	ctx := context.Background()
 	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
-	_, keyA, appA := seedAccountAndApp(t, h, ctx, "iso-a", api.PlanHobby, "iso-a-app")
-	_, keyB, appB := seedAccountAndApp(t, h, ctx, "iso-b", api.PlanHobby, "iso-b-app")
+	acctA, keyA := seedAccount(t, h, ctx, "iso-a", api.PlanHobby)
+	acctB, keyB := seedAccount(t, h, ctx, "iso-b", api.PlanHobby)
+	appA := seedApp(t, ctx, h, acctA, "iso-a-app")
+	appB := seedApp(t, ctx, h, acctB, "iso-b-app")
 
 	for _, app := range []state.App{appA, appB} {
 		dep := seedDeployment(t, h, ctx, app.ID)
@@ -307,7 +314,8 @@ func TestE2E_ListSecretsForAccount_PlaintextInvariant(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	_, key, _ := seedAccountAndApp(t, h, ctx, "plaintext", api.PlanHobby, "plaintext-app")
+	acctID, key := seedAccount(t, h, ctx, "plaintext", api.PlanHobby)
+	_ = acctID // app "plaintext-app" is created by the test via POST /v1/apps below
 
 	const markerA = "PLAINTEXT-MARKER-ALPHA-99"
 	const markerB = "PLAINTEXT-MARKER-BETA-77"
@@ -379,8 +387,8 @@ func TestE2E_ListSecretsForAccount_CrossAccountIsolation(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	_, keyA, _ := seedAccountAndApp(t, h, ctx, "iso-sa", api.PlanHobby, "sa-app")
-	_, keyB, _ := seedAccountAndApp(t, h, ctx, "iso-sb", api.PlanHobby, "sb-app")
+	_, keyA := seedAccount(t, h, ctx, "iso-sa", api.PlanHobby)
+	_, keyB := seedAccount(t, h, ctx, "iso-sb", api.PlanHobby)
 
 	if statusOnly(t, h, keyA, http.MethodPost, "/v1/apps",
 		api.CreateAppRequest{Slug: "sa-app"}) != http.StatusCreated {
@@ -440,7 +448,7 @@ func TestE2E_GetAppsMetrics_Degraded(t *testing.T) {
 
 	h := e2etest.Start(t, pool, e2etest.APID) // no FAAS_APID_PROM_URL → no prom client
 	ctx := context.Background()
-	_, key, _ := seedAccountAndApp(t, h, ctx, "deg", api.PlanHobby, "deg-app")
+	_, key := seedAccount(t, h, ctx, "deg", api.PlanHobby)
 
 	rec, _ := doReq(t, h, key, http.MethodGet, "/v1/apps/metrics?range=5m", nil)
 	if !strings.HasPrefix(string(rec), "{") {
@@ -477,7 +485,7 @@ func TestE2E_GetAppsMetrics_InvalidRange(t *testing.T) {
 
 	h := e2etest.Start(t, pool, e2etest.APID)
 	ctx := context.Background()
-	_, key, _ := seedAccountAndApp(t, h, ctx, "rng", api.PlanHobby, "rng-app")
+	_, key := seedAccount(t, h, ctx, "rng", api.PlanHobby)
 
 	raw, code := doReq(t, h, key, http.MethodGet, "/v1/apps/metrics?range=99y", nil)
 	if code != http.StatusBadRequest {
