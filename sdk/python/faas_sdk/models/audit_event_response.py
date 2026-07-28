@@ -31,7 +31,8 @@ class AuditEventResponse:
     """Which daemon wrote the row. `apid` for IAM-4 surface; `schedd` for state-transition events (instance wakes /
     parks / watchdog timeouts)."""
     kind: str
-    """Namespaced event kind. Common values: `auth.login`, `auth.logout`, `key.created`, `key.deleted`,
+    """Namespaced event kind. Common values: `auth.login`, `auth.logout`, `auth.session.created`,
+    `auth.session.revoke`, `auth.sessions.revoke_all`, `auth.session.stolen`, `key.created`, `key.deleted`,
     `secret.set`, `secret.deleted`, `account.plan_changed`, `account.deletion_scheduled`,
     `account.deletion_restored`."""
     data: AuditEventResponseData

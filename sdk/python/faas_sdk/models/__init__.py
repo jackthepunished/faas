@@ -47,6 +47,7 @@ from .delayed_task_request import DelayedTaskRequest
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
+from .delete_account_session_body import DeleteAccountSessionBody
 from .deployment_list_response import DeploymentListResponse
 from .deployment_response import DeploymentResponse
 from .gdpr_audit_export_response import GdprAuditExportResponse
@@ -97,6 +98,7 @@ from .password_login_response_plan import PasswordLoginResponsePlan
 from .password_reset_confirm import PasswordResetConfirm
 from .password_reset_request import PasswordResetRequest
 from .password_signup_request import PasswordSignupRequest
+from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
 from .problem import Problem
 from .put_app_secret_request import PutAppSecretRequest
 from .queue_receive_response import QueueReceiveResponse
@@ -107,6 +109,9 @@ from .queue_send_request_payload import QueueSendRequestPayload
 from .queue_send_response import QueueSendResponse
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
+from .session_info import SessionInfo
+from .session_list_response import SessionListResponse
+from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_password_request import SetPasswordRequest
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
@@ -165,6 +170,7 @@ __all__ = (
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
+    "DeleteAccountSessionBody",
     "DeploymentListResponse",
     "DeploymentResponse",
     "GdprAuditExportResponse",
@@ -215,6 +221,7 @@ __all__ = (
     "PasswordResetConfirm",
     "PasswordResetRequest",
     "PasswordSignupRequest",
+    "PostAccountSessionsRevokeAllBody",
     "Problem",
     "PutAppSecretRequest",
     "QueueReceiveResponse",
@@ -225,6 +232,9 @@ __all__ = (
     "QueueSendResponse",
     "RenameAppRequest",
     "RepoResponse",
+    "SessionInfo",
+    "SessionListResponse",
+    "SessionsRevokeAllResponse",
     "SetPasswordRequest",
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
