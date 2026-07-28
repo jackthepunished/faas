@@ -91,7 +91,7 @@ export class AlertRulesService {
         402: `code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied`,
         403: `code: plan_limit_apps | plan_limit_ram | plan_limit_concurrency | plan_min_instances_not_allowed | plan_limit_secrets | plan_cron_quota | app_layer_too_large | image_egress_denied`,
         404: `code: not_found`,
-        409: `code: cron_invalid | plan_crons_not_allowed | plan_cron_quota`,
+        409: `code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

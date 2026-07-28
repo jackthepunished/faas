@@ -142,17 +142,33 @@ func TestAlertRuleResponseFromRow_DropsSealedSecretAndMasks(t *testing.T) {
 		t.Errorf("closed-set strings lost: %+v", resp)
 	}
 
-	// Marshal to JSON and confirm no field accidentally named after the
-	// sealed ciphertext path leaks via a future struct rename.
+	// Marshal to JSON and confirm the wire shape is correct: the
+	// masked-constant field appears with the literal "***" and no
+	// sealed-ciphertext field of any name leaks via a future struct
+	// rename. PR review finding F7: the previous assertion checked
+	// the Go field name (which never appears in JSON) and was
+	// vacuously true — fix below uses the JSON tag name.
 	raw, err := json.Marshal(resp)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if strings.Contains(string(raw), "WebhookSecretSealed") && !strings.Contains(string(raw), api.AlertRuleWebhookSecretMasked) {
-		t.Errorf("JSON carried a non-masked sealed-secret reference: %s", raw)
+	const maskedField = `"webhook_secret_sealed_masked":"***"`
+	if !strings.Contains(string(raw), maskedField) {
+		t.Errorf("JSON missing the masked-constant field %s; got %s", maskedField, raw)
 	}
-	if !strings.Contains(string(raw), api.AlertRuleWebhookSecretMasked) {
-		t.Errorf("JSON missing masked constant: %s", raw)
+	// Belt-and-braces: if a future rename accidentally lands a
+	// sealed-ciphertext field on the wire, the test must catch it
+	// even if the row is the wrong shape. Match any JSON key
+	// containing "secret" or "sealed" (case-insensitive) that is
+	// NOT the masked-constant field.
+	for _, line := range strings.Split(string(raw), ",") {
+		l := strings.ToLower(line)
+		if strings.Contains(l, "secret") || strings.Contains(l, "sealed") {
+			if strings.Contains(line, "***") {
+				continue
+			}
+			t.Errorf("JSON leaked a non-masked secret/sealed field: %s", line)
+		}
 	}
 }
 

@@ -76,19 +76,21 @@ const alertRuleSecretSealLabel = "alert_rule_secret"
 // 403/404 contract: missing app → 404 "no such app" (loadApp
 // handles the IDOR-safe lookup). Unknown plan → 402 via
 // ErrPlanAlertRulesNotAllowed (matches createAlertRule).
+//
+// Plan-tier gate fires BEFORE loadApp so a Free customer posting to
+// a non-existent slug gets a clean 402 instead of a 404 (and the
+// reverse — a Free customer on a real slug gets 402, not a 404
+// masquerading as plan-gating). PR review finding F4: the gate
+// ordering matters because the slug existence is itself a small
+// information leak.
 func (s *server) listAlertRules(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if limits, ok := api.LimitsFor(acct.Plan); !ok || limits.AlertRuleLimitPerApp == 0 {
+		api.WriteProblem(w, api.ErrPlanAlertRulesNotAllowed(acct.Plan))
+		return
+	}
 	slug := r.PathValue("slug")
 	app, ok := s.loadApp(w, r, acct, slug)
 	if !ok {
-		return
-	}
-	// Plan-tier gate is informational here — Free customers can list
-	// even though they can't create. Keep the gate consistent with
-	// the other alert routes so a Free customer gets a clean 402 on
-	// every surface, not a 200 with an empty list on the read path
-	// and a 402 on the write path.
-	if limits, ok := api.LimitsFor(acct.Plan); !ok || limits.AlertRuleLimitPerApp == 0 {
-		api.WriteProblem(w, api.ErrPlanAlertRulesNotAllowed(acct.Plan))
 		return
 	}
 	rows, err := s.store.ListAlertRulesForAccount(ctx(r), acct.ID)
@@ -128,6 +130,16 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
 		return
 	}
+	// Trim the name BEFORE plan/AppID resolution so the validator
+	// sees the trimmed value AND the persisted row doesn't carry a
+	// leading/trailing-whitespace variant of the same string. PR
+	// review finding F3.
+	trimmed, ok := api.TrimNonEmpty(req.Name)
+	if !ok {
+		api.WriteProblem(w, api.ErrAlertRuleInvalid("name must be non-empty"))
+		return
+	}
+	req.Name = trimmed
 	limits, ok := api.LimitsFor(acct.Plan)
 	if !ok || limits.AlertRuleLimitPerApp == 0 {
 		api.WriteProblem(w, api.ErrPlanAlertRulesNotAllowed(acct.Plan))
@@ -535,13 +547,17 @@ func (s *server) rotateAlertRuleSecret(w http.ResponseWriter, r *http.Request, a
 		"account", acct.ID,
 	)
 	// IAM-4 (ADR-035): audit the rotation event. Mirror of
-	// secret.rotated — the audit row carries the rule id and the
-	// fact that a rotation occurred. NO plaintext, no
-	// secret_version (the column does not exist), no sealed
-	// ciphertext (decryptable by anyone with the host key).
+	// secret.rotated — the audit row carries the rule id, the
+	// rotated_at timestamp, and the fact that a rotation occurred.
+	// NO plaintext, no secret_version (the column does not exist),
+	// no sealed ciphertext (decryptable by anyone with the host
+	// key). PR review finding F11: audit row now carries the
+	// timestamp so the dashboard can render "last rotated 6h ago"
+	// without a separate query.
 	s.audit.Emit(ctx(r), "alert_rule.secret_rotated", &acct.ID, map[string]any{
-		"rule_id": id,
-		"app_id":  row.AppID,
+		"rule_id":    id,
+		"app_id":     row.AppID,
+		"rotated_at": now.Format(time.RFC3339),
 	})
 	writeJSON(w, http.StatusOK, api.RotateAlertRuleSecretResponse{
 		RotatedAt:                 now.Format(time.RFC3339),
@@ -612,11 +628,13 @@ func alertRuleCooldownFrom(p *int) int {
 // SSRF-resolve is handled separately by resolveAndCheckEgress so the
 // caller can run the body check BEFORE the network lookup. Returns
 // nil on success, a ready-to-write *api.Problem on failure.
+//
+// The caller (createAlertRule) is responsible for trimming the name
+// before calling this validator; the validator assumes a non-empty
+// trimmed name. The same trim-non-empty check is mirrored on the
+// update path via state.AlertRule.Name (the DB schema enforces
+// non-empty via CHECK).
 func validateAlertRuleBody(req api.CreateAlertRuleRequest) *api.Problem {
-	name, ok := api.TrimNonEmpty(req.Name)
-	if !ok {
-		return api.ErrAlertRuleInvalid("name must be non-empty")
-	}
 	if !api.AllowedAlertRuleMetric(req.Metric) {
 		return api.ErrAlertRuleInvalid("metric must be one of error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations")
 	}
@@ -640,6 +658,10 @@ func validateAlertRuleBody(req api.CreateAlertRuleRequest) *api.Problem {
 	if len(req.WebhookSecret) == 0 {
 		return api.ErrAlertRuleInvalid("webhook_secret must be non-empty")
 	}
+	// Cap on raw bytes (UTF-8) — matches what SealBytes will
+	// actually encrypt. Counting characters (runes) would let a
+	// multi-byte payload pass the validator and then fail at the
+	// seal boundary. PR review finding F5: byte vs rune.
 	if len(req.WebhookSecret) > api.AlertRuleWebhookSecretMaxBytes {
 		return api.ErrAlertRuleInvalid(fmt.Sprintf("webhook_secret exceeds %d-byte cap", api.AlertRuleWebhookSecretMaxBytes))
 	}
@@ -649,9 +671,6 @@ func validateAlertRuleBody(req api.CreateAlertRuleRequest) *api.Problem {
 	if !strings.HasPrefix(req.WebhookURL, "https://") && !strings.HasPrefix(req.WebhookURL, "http://") {
 		return api.ErrAlertRuleInvalid("webhook_url must be http(s)")
 	}
-	// Use the (re-assigned) name variable only to make the lint
-	// happy; the trim result is the same value we'll persist.
-	_ = name
 	return nil
 }
 
@@ -765,6 +784,15 @@ func alertRuleFamily(m state.AlertMetric) string {
 // URL we know the dispatcher (PR 4) would never be able to reach.
 // Defense in depth: meterd re-validates on every dispatch in case
 // the IP set rotates between create-time and fire-time.
+//
+// PR review finding F6 noted that we use net.DefaultResolver here
+// rather than an egress-aware resolver. pkg/oci does not yet expose
+// a standalone resolver handle (EgressDialContext wraps a net.Dialer
+// and the resolver lives inside that). The dispatch-time re-check
+// is the load-bearing layer — the create-time check is a fast-path
+// that catches obvious misconfigurations. We accept the small
+// resolver-discrepancy window because the dispatcher re-validates
+// every fire using the same oci.EgressIPAllowed predicate.
 func resolveAndCheckEgress(c context.Context, rawURL string) *api.Problem {
 	u, err := url.Parse(rawURL)
 	if err != nil {

@@ -1929,7 +1929,7 @@ paths:
         '402': { $ref: '#/components/responses/AlertRuleInvalid' }
         '403': { $ref: '#/components/responses/PlanLimit' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/CronInvalid' }
+        '409': { $ref: '#/components/responses/AlertRuleInvalid' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/apps/{slug}/alerts/{id}:
@@ -3585,9 +3585,9 @@ components:
           type: string
           enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d']
         failure_source:
-          type: [string, "null"]
-          description: 'Source dimension for failed_invocations; null for every other metric.'
-          enum: [any, cron, queue, delayed_task, async_invoke, null]
+          type: string
+          description: 'Source dimension for failed_invocations; omit when metric is not failed_invocations (xor_chk).'
+          enum: [any, cron, queue, delayed_task, async_invoke]
         webhook_url: { type: string, format: uri, example: "https://example.com/hook" }
         webhook_secret_sealed_masked:
           type: string
@@ -3602,8 +3602,8 @@ components:
           type: string
           enum: [ok, firing]
           description: 'Cool-down state machine.'
-        last_fired_at: { type: [string, "null"], format: date-time }
-        last_evaluated_at: { type: [string, "null"], format: date-time }
+        last_fired_at: { type: string, format: date-time }
+        last_evaluated_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -3613,7 +3613,7 @@ components:
       required: [name, metric, comparison, threshold, window_spec, webhook_url, webhook_secret]
       properties:
         name: { type: string, example: "p99 > 500ms" }
-        enabled: { type: [boolean, "null"], example: true }
+        enabled: { type: boolean, example: true }
         metric:
           type: string
           enum: [error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations]
@@ -3621,9 +3621,9 @@ components:
         threshold: { type: number, format: double, example: 500 }
         window_spec: { type: string, enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d'] }
         failure_source:
-          type: [string, "null"]
-          description: 'Required when metric == failed_invocations; null otherwise (xor_chk).'
-          enum: [any, cron, queue, delayed_task, async_invoke, null]
+          type: string
+          description: 'Required when metric == failed_invocations; omit otherwise (xor_chk).'
+          enum: [any, cron, queue, delayed_task, async_invoke]
         webhook_url: { type: string, format: uri, example: "https://example.com/hook" }
         webhook_secret:
           type: string
@@ -3631,30 +3631,30 @@ components:
           maxLength: 256
           example: "shh"
         cooldown_minutes:
-          type: [integer, "null"]
+          type: integer
           minimum: 5
           maximum: 1440
           example: 15
 
     UpdateAlertRuleRequest:
-      description: 'Partial update — every field is optional. Nil/omitted means leave alone.'
+      description: 'Partial update — every field is optional. Omitted means leave alone.'
       type: object
       properties:
-        name: { type: [string, "null"] }
-        enabled: { type: [boolean, "null"] }
+        name: { type: string }
+        enabled: { type: boolean }
         metric:
-          type: [string, "null"]
+          type: string
           description: 'Cannot cross metric families (e.g. error_rate_pct → failed_invocations) — returns 400.'
-          enum: [error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations, null]
-        comparison: { type: [string, "null"], enum: [gt, gte, lt, lte, null] }
-        threshold: { type: [number, "null"], format: double }
-        window_spec: { type: [string, "null"], enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d', null] }
-        webhook_url: { type: [string, "null"], format: uri }
+          enum: [error_rate_pct, latency_p50_ms, latency_p95_ms, latency_p99_ms, cold_start_pct, request_count, failed_invocations]
+        comparison: { type: string, enum: [gt, gte, lt, lte] }
+        threshold: { type: number, format: double }
+        window_spec: { type: string, enum: ['5m', '15m', '1h', '6h', '24h', '7d', '15d'] }
+        webhook_url: { type: string, format: uri }
         webhook_secret:
-          type: [string, "null"]
+          type: string
           description: 'New plaintext HMAC secret. Omit to keep the existing secret.'
           maxLength: 256
-        cooldown_minutes: { type: [integer, "null"], minimum: 5, maximum: 1440 }
+        cooldown_minutes: { type: integer, minimum: 5, maximum: 1440 }
 
     RotateAlertRuleSecretResponse:
       description: 'rotate-secret response — returns the rotated_at timestamp + the masked constant.'

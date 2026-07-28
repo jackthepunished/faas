@@ -31,6 +31,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -352,24 +353,58 @@ func TestCreateAlertRule_AtPerAppLimitReturns403(t *testing.T) {
 }
 
 // TestCreateAlertRule_AtPerAccountLimitReturns403 fills the
-// per-account cap across two apps on the same account and confirms
-// the per-account branch trips. Pro caps per-app at 10 and
-// per-account at 30; 3 apps × 10 = 30 == cap, one more must 403.
+// per-account cap and confirms the per-account branch trips. PR
+// review finding F9: the previous test hardcoded
+// `AlertRuleLimitPerApp × 3 = 30` and silently coupled two
+// unrelated constants. The refactor computes the seeding loop from
+// AlertRuleLimitPerAccount directly and spreads across enough apps
+// to never hit the per-app cap during seeding.
 func TestCreateAlertRule_AtPerAccountLimitReturns403(t *testing.T) {
 	e := setupAlerts(t, api.PlanPro)
 	limits := api.MustLimitsFor(api.PlanPro)
-	mustSeedApp(t, e, "alerts-acct-a")
-	mustSeedApp(t, e, "alerts-acct-b")
-	mustSeedApp(t, e, "alerts-acct-c")
-	for _, slug := range []string{"alerts-acct-a", "alerts-acct-b", "alerts-acct-c"} {
-		for i := 0; i < limits.AlertRuleLimitPerApp; i++ {
+	perAccount := limits.AlertRuleLimitPerAccount
+	perApp := limits.AlertRuleLimitPerApp
+	if perAccount <= 0 {
+		t.Skipf("plan has no per-account cap (LimitPerAccount=%d)", perAccount)
+	}
+	// Spread across enough apps so the seeding loop never trips
+	// the per-app cap. If perApp > 0, numApps = ceil(perAccount/perApp);
+	// otherwise we use a single app and the per-app cap is 0 /
+	// unlimited.
+	var numApps int
+	if perApp > 0 {
+		numApps = (perAccount + perApp - 1) / perApp
+	} else {
+		numApps = 1
+	}
+	slugs := make([]string, 0, numApps)
+	for i := 0; i < numApps; i++ {
+		slug := fmt.Sprintf("alerts-acct-%d", i)
+		mustSeedApp(t, e, slug)
+		slugs = append(slugs, slug)
+	}
+	created := 0
+	for _, slug := range slugs {
+		for i := 0; perApp == 0 || i < perApp; i++ {
+			if created >= perAccount {
+				break
+			}
 			req := alertRuleReq()
 			req.Name = slug + "-" + string(rune('A'+i))
 			mustCreateAlertRule(t, e, slug, req)
+			created++
+		}
+		if created >= perAccount {
+			break
 		}
 	}
-	// per-account is now 30 == cap. One more on appC must 403.
-	rec := e.do(t, "POST", "/v1/apps/alerts-acct-c/alerts", alertRuleReq(), nil)
+	if got, err := e.store.ListAlertRulesForAccount(context.Background(), e.acct.ID); err != nil {
+		t.Fatalf("ListAlertRulesForAccount: %v", err)
+	} else if len(got) != perAccount {
+		t.Fatalf("seeded %d rules, want per-account cap %d", len(got), perAccount)
+	}
+	// One more must 403. Pick the last app.
+	rec := e.do(t, "POST", "/v1/apps/"+slugs[len(slugs)-1]+"/alerts", alertRuleReq(), nil)
 	assertProblem(t, rec, 403, api.CodePlanAlertRuleQuota)
 }
 
@@ -544,5 +579,27 @@ func TestCreateAlertRule_InvalidThresholdRejected(t *testing.T) {
 				t.Errorf("problem code = %q, want %q or %q", prob.Code, api.CodeValidation, api.CodeAlertRuleInvalid)
 			}
 		})
+	}
+}
+
+// TestCreateAlertRule_WebhookSecretByteCap pins the 256-byte cap on
+// the plaintext webhook_secret. The cap is enforced at the API
+// boundary as defense in depth — SealBytes applies the same cap at
+// the seal boundary. PR review finding F5: byte vs rune count was
+// ambiguous; the validator now counts bytes (which is what SealBytes
+// actually encrypts).
+func TestCreateAlertRule_WebhookSecretByteCap(t *testing.T) {
+	e := setupAlerts(t, api.PlanPro)
+	mustSeedApp(t, e, "alerts-bytes")
+	req := alertRuleReq()
+	// 257 bytes is one over the cap. ASCII so byte count == rune count.
+	req.WebhookSecret = strings.Repeat("a", api.AlertRuleWebhookSecretMaxBytes+1)
+	rec := e.do(t, "POST", "/v1/apps/alerts-bytes/alerts", req, nil)
+	assertProblem(t, rec, 400, api.CodeAlertRuleInvalid)
+	// Boundary: exactly 256 bytes (the cap) must be accepted.
+	req.WebhookSecret = strings.Repeat("a", api.AlertRuleWebhookSecretMaxBytes)
+	rec = e.do(t, "POST", "/v1/apps/alerts-bytes/alerts", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("at-cap secret: status = %d, want 201; body = %s", rec.Code, rec.Body)
 	}
 }

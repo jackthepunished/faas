@@ -20,7 +20,7 @@ export type AlertRuleResponse = {
   threshold: number;
   window_spec: '5m' | '15m' | '1h' | '6h' | '24h' | '7d' | '15d';
   /**
-   * Source dimension for failed_invocations; null for every other metric.
+   * Source dimension for failed_invocations; omit when metric is not failed_invocations (xor_chk).
    */
   failure_source?: 'any' | 'cron' | 'queue' | 'delayed_task' | 'async_invoke';
   webhook_url: string;
@@ -33,8 +33,8 @@ export type AlertRuleResponse = {
    * Cool-down state machine.
    */
   state: 'ok' | 'firing';
-  last_fired_at?: string | null;
-  last_evaluated_at?: string | null;
+  last_fired_at?: string;
+  last_evaluated_at?: string;
   created_at: string;
   updated_at: string;
 };

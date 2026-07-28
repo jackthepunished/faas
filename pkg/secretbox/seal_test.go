@@ -180,6 +180,43 @@ func TestSealBytesEnforcesByteCap(t *testing.T) {
 	}
 }
 
+// TestSealBytes_NilRecipient_ReturnsError pins the nil-recipient
+// 503 path. PR review finding F8: the handler tests use
+// `withTestRecipient(t)` to avoid this path, leaving it untested.
+// A future refactor that breaks recipient wiring could silently
+// regress callers — the handler falls through to ErrCapacity on
+// this error, so we want to be sure the error is non-nil.
+func TestSealBytes_NilRecipient_ReturnsError(t *testing.T) {
+	_, err := SealBytes(nil, "alert_rule_secret", []byte("plaintext"), 256)
+	if err == nil {
+		t.Fatal("SealBytes with nil recipient returned nil error")
+	}
+}
+
+// TestOpenBytes_NilIdentity_ReturnsError pins the nil-identity
+// mirror of the above for the OpenBytes path.
+func TestOpenBytes_NilIdentity_ReturnsError(t *testing.T) {
+	_, _, err := OpenBytes(nil, []byte("anything"))
+	if err == nil {
+		t.Fatal("OpenBytes with nil identity returned nil error")
+	}
+}
+
+// TestOpenBytes_EmptyBlob_ReturnsError pins the empty-blob guard.
+// Decrypting an empty age stream is undefined behaviour; the
+// handler must reject it before age even tries.
+func TestOpenBytes_EmptyBlob_ReturnsError(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	_, _, err := OpenBytes(id, nil)
+	if err == nil {
+		t.Fatal("OpenBytes with empty blob returned nil error")
+	}
+	_, _, err = OpenBytes(id, []byte{})
+	if err == nil {
+		t.Fatal("OpenBytes with empty blob returned nil error")
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 // envelopesEqual compares two Envelopes without relying on map ordering.

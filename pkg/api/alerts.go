@@ -193,32 +193,15 @@ type AlertRuleRow struct {
 	UpdatedAt       time.Time
 }
 
-// AlertRuleRowFromResponse is the no-op mapping the handler uses to
-// fold a wire-shaped response back into a row. Defined here (not in
-// the handler) so the test can pin the field-order contract.
-//
-// AlertRuleRowFromResponse is the inverse of AlertRuleResponseFromRow.
-func AlertRuleRowFromResponse(r AlertRuleResponse) AlertRuleRow {
-	return AlertRuleRow{
-		ID:              r.ID,
-		AppID:           r.AppID,
-		Name:            r.Name,
-		Enabled:         r.Enabled,
-		Metric:          r.Metric,
-		Comparison:      r.Comparison,
-		Threshold:       r.Threshold,
-		WindowSpec:      r.WindowSpec,
-		FailureSource:   r.FailureSource,
-		WebhookURL:      r.WebhookURL,
-		CooldownMinutes: r.CooldownMinutes,
-		State:           r.State,
-	}
-}
-
 // AlertRuleResponseFromRow maps a wire-shaped row (closed sets as
 // strings) to the response DTO. Drops the sealed secret; renders the
 // masked constant. Times are RFC3339 strings; zero times serialise as
 // empty so the omitempty tag drops them.
+//
+// This is the load-bearing shape at the pkg/api ↔ pkg/state boundary:
+// pkg/api/alerts.go defines the DTO and the converter; pkg/state
+// defines the typed row. The handler in cmd/apid does the conversion
+// at the seam so neither side imports the other (precedent: PR #327).
 func AlertRuleResponseFromRow(r AlertRuleRow) AlertRuleResponse {
 	return AlertRuleResponse{
 		ID:                        r.ID,
