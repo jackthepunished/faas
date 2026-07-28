@@ -208,7 +208,7 @@ deviations between the issue text and what landed in PR #229.
    - The ceiling already exists as `plan.MaxConcurrency`, the
      hard cap `pkg/sched/admission.go:129` enforces inside
      `AdmitInstance`. The trigger uses `MaxConcurrency` directly
-     (`pkg/sched/scaleup/trigger.go:151`, `Headroom =
+     (`pkg/sched/scaleup/trigger.go:157`, `Headroom =
      MaxConcurrency - Concurrency`). Adding `autoscale_max`
      would be a redundant ceiling: the trigger never overrides
      `MaxConcurrency`, so the column would either be redundant

@@ -188,6 +188,31 @@ func TestPlanMinInstancesAllowed(t *testing.T) {
 	}
 }
 
+// TestPlanScaleUpTargetRPSAllowed pins the per-plan gate that apid's
+// updateApp handler uses for the per-app autoscale_target_rps field
+// (issue #172, ADR-037). Free/Hobby → false (Hobby lost the gate
+// via the 2026-07-28 Hobby→Pro re-tier — ADR-037 amendment); Pro/Scale
+// → true. Unknown plans must default to false (fail-closed: a missing
+// plan never silently unlocks a premium feature). Mirrors
+// TestPlanMinInstancesAllowed above.
+func TestPlanScaleUpTargetRPSAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.ScaleUpTargetRPSAllowed(); got != c.want {
+			t.Errorf("%s.ScaleUpTargetRPSAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
 // TestPlanEgressAllowlistAllowed pins the per-plan gate that apid's
 // updateApp handler uses for the per-app egress allowlist (ADR-031).
 // Free/Hobby → false (no allowlist — abuse-desk hygiene is a Pro+
