@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Shape test for migration 00061 (issue #396 / ADR-045) —
+// Shape test for migration 00062 (issue #396 / ADR-045) —
 // customer-configurable alert rules + deliveries. Mirror of
 // migrations/00057_sessions_test.go (IAM-3, ADR-039) so the same gate
 // catches a hand-edit that drops a constraint, drops an index, or
@@ -42,7 +42,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00061_AlertRules_ShapeAndFK(t *testing.T) {
+func TestMigrations_00062_AlertRules_ShapeAndFK(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -50,7 +50,7 @@ func TestMigrations_00061_AlertRules_ShapeAndFK(t *testing.T) {
 	}
 
 	const (
-		acctID    = "00000000-0000-0000-0000-000000000061"
+		acctID    = "00000000-0000-0000-0000-000000000062"
 		acctID2   = "00000000-0000-0000-0000-00000000006a"
 		appIDFor0 = "00000000-0000-0000-0000-0000000000b0"
 		appIDFor2 = "00000000-0000-0000-0000-0000000000b2"
