@@ -65,6 +65,11 @@ jobs:
         # than if it were the main module"). Same curl+sha256+tar
         # pattern as the vacuum binary download — see memory
         # `ci-vacuum-binary-download.md`.
+        #
+        # Source type is implicit from the `dir:` scheme; syft 1.x dropped
+        # the explicit `--source-type directory` flag. Carrying it forward
+        # fails the job with "unknown flag: --source-type" — pinned here
+        # so a future syft bump doesn't reintroduce the trap.
         env:
           SYFT_VERSION: "1.49.0"
           SYFT_SHA256: "7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe"
@@ -75,7 +80,7 @@ jobs:
           echo "${SYFT_SHA256}  /tmp/syft.tar.gz" | sha256sum -c -
           tar -xzf /tmp/syft.tar.gz -C /tmp syft
           install -m 0755 /tmp/syft /usr/local/bin/syft
-          syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "${{ github.sha }}" --source-type directory
+          syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "${{ github.sha }}"
 
       - name: Upload SBOM.json artifact
         uses: actions/upload-artifact@v4
