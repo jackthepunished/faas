@@ -236,12 +236,19 @@ type InstanceInfo struct {
 //	...
 //
 // Returns both usage_usec (the cumulative CPU time consumed by the
-// scope) and throttled_usec (the cumulative CPU time spent
+// scope) and throttledUsec (the cumulative CPU time spent
 // throttled). Both are read from the same file in a single pass —
 // splitting into two readers would race against the kernel's
 // writes. Returns ok=false on a malformed file (missing usage_usec,
-// non-numeric value) so the poller marks the row Unknown rather
-// than emitting a partial Sample.
+// non-numeric value, scanner error) so the poller marks the row
+// Unknown rather than emitting a partial Sample.
+//
+// usage_usec is REQUIRED. The cgroup v2 kernel always emits it on
+// every scope that has any CPU activity; absence means the file is
+// garbled (mid-write torn page, a manually-edited test fixture, or
+// a non-cgroup file opened by mistake). Returning ok=false on
+// missing usage_usec is the load-bearing guard against emitting a
+// zero-CPU reading that would silently under-report capacity.
 //
 // Throttled_usec may be missing on kernels older than 5.14
 // (cpu.stat throttling accounting landed in 5.14). When absent
@@ -266,6 +273,11 @@ func readCPUStat(path string) (usageUsec, throttledUsec uint64, ok bool) {
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	// cpu.stat lines are short; the default 64 KiB buffer is plenty.
+	// usageSeen tracks whether the parser actually consumed a
+	// usage_usec line — distinguishing "VM just started, zero CPU
+	// time yet" (usageSeen=true, value=0, ok=true) from "the file
+	// is missing usage_usec entirely" (usageSeen=false, ok=false).
+	var usageSeen bool
 	for sc.Scan() {
 		line := sc.Text()
 		key, val, ok := strings.Cut(line, " ")
@@ -279,6 +291,7 @@ func readCPUStat(path string) (usageUsec, throttledUsec uint64, ok bool) {
 				return 0, 0, false
 			}
 			usageUsec = n
+			usageSeen = true
 		case throttledStatField:
 			n, perr := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
 			if perr != nil {
@@ -287,11 +300,20 @@ func readCPUStat(path string) (usageUsec, throttledUsec uint64, ok bool) {
 			throttledUsec = n
 		}
 	}
-	// usageUsec == 0 && throttledUsec == 0 is the genuine "VM just started,
-	// no CPU yet" case — we still want ok=true so the poller records a
-	// baseline. The only fail-closed path is the scanner error below
-	// (file truncated / kernel panic halfway through).
+	// Scanner error (file truncated / kernel panic halfway through)
+	// is fail-closed regardless of the parsed values.
 	if sc.Err() != nil {
+		return 0, 0, false
+	}
+	// usage_usec is required — a missing key means the file is
+	// garbled. The two failure cases the unit tests pin:
+	//   - TestSampleReturnsFalseOnMalformedCpuStat: a non-cgroup
+	//     file ("this is not a cgroup file") has no usage_usec line.
+	//   - TestSampleReturnsFalseOnMissingUsageUsecField: a cgroup
+	//     file with only user_usec/system_usec (no usage_usec).
+	// Both must return ok=false so the poller doesn't emit a
+	// zero-CPU row that would under-report capacity.
+	if !usageSeen {
 		return 0, 0, false
 	}
 	return usageUsec, throttledUsec, true
