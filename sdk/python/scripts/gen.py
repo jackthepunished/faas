@@ -376,6 +376,95 @@ def regen(overwrite: bool = True) -> None:
     print(f"gen: regenerated {OUT} from {SPEC.name}")
 
 
+def _strip_cosmetic(src: bytes) -> bytes:
+    """Return the bytes of `src` with `import`/`from` lines and
+    blank lines removed. Used by `_canonicalise_to_head` to classify
+    a regen/HEAD diff as cosmetic (only these lines changed) vs
+    structural (a body line changed).
+
+    The walker preserves original indentation on the lines it keeps
+    so the byte-equality comparison is meaningful: a body-line delta
+    produces different stripped bytes; whitespace-only changes inside
+    the kept lines are not stripped (they would mask real changes).
+    """
+    lines = []
+    for ln in src.decode("utf-8", errors="replace").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("import ") or s.startswith("from "):
+            continue
+        lines.append(ln)
+    return "\n".join(lines).encode("utf-8")
+
+
+def _fix_docstrings(text: str) -> str:
+    """Strip the per-line padding spaces that openapi-python-client
+    0.29.0's `safe_docstring` Jinja macro emits on the opener and
+    closer lines of multi-line triple-quoted docstrings. Single-line
+    docstrings (both DQ on one line) are handled by the regex in
+    `_patch_generator_bugs` (Fix 3); this helper only walks the
+    opener/closer lines of multi-line blocks.
+
+    Per-line processing is deliberate: a single regex spanning the
+    whole block backtracks greedy `\\s+` in ways that drop the
+    macro's padding space from the captured group. The walker matches
+    the macro's output shape exactly:
+
+      ` DQ-space first-line-of-body`         → ` DQ first-line`
+      `last-line-of-body space-DQ`           → `last-line-of-body DQ`
+      ` INDENT DQ` (closer on its own line)  → ` INDENT-minus-one DQ`
+
+    Body lines pass through unchanged — their inner whitespace is
+    semantically meaningful and must not be touched.
+    """
+    DQ = '"""'
+    out: list[str] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        # Lines that aren't multi-line openers pass through. The
+        # condition excludes single-line docstrings (Fix 3 handles
+        # them) and lines that have no DQ at all.
+        if not stripped.startswith(DQ) or (line.rstrip().endswith(DQ) and line.count(DQ) == 2):
+            out.append(line)
+            i += 1
+            continue
+        # Multi-line OPENER: DQ, exactly one space, then content
+        # that doesn't contain DQ on this line.
+        after_dq = line.lstrip()[3:]
+        if after_dq.startswith(" ") and DQ not in after_dq[1:]:
+            indent = line[: len(line) - len(line.lstrip())]
+            new_line = indent + DQ + after_dq[1:]
+            out.append(new_line)
+            # Body lines pass through unchanged.
+            i += 1
+            while i < len(lines):
+                body = lines[i]
+                out.append(body)
+                stripped_body = body.rstrip()
+                if stripped_body.endswith(DQ):
+                    # Closer line. Detect two cases:
+                    if stripped_body.endswith(" " + DQ):
+                        # `last-line DQ` — drop trailing padding space.
+                        out[-1] = body[: -len(" " + DQ)] + DQ
+                    else:
+                        # Closer on its own line: macro emits 4 indent
+                        # + 1 padding = 5 spaces. Canonical is 4.
+                        indent_count = len(body) - len(body.lstrip(" "))
+                        if indent_count > 4:
+                            out[-1] = body[: indent_count - 1] + body[indent_count:]
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def _patch_generator_bugs(sdk_root: Path) -> None:
     """Fix known bugs in the openapi-python-client 0.29.0 generator output.
 
@@ -445,82 +534,6 @@ def _patch_generator_bugs(sdk_root: Path) -> None:
     # group. Per-line processing is simpler and matches the macro's
     # output shape exactly.
     DQ = '"""'
-
-    def _fix_docstrings(text: str) -> str:
-        # Walk the text, tracking the most-recent `"""` opener and
-        # whether we're inside a multi-line docstring. Single-line
-        # docstrings (`DQ ... DQ` on one line) are handled by Fix 3
-        # below; here we only touch opener/closer lines of multi-
-        # line blocks.
-        out: list[str] = []
-        lines = text.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            # Detect a docstring OPENER on this line: DQ followed by
-            # exactly one space and at least one more character
-            # (so a closing DQ on the same line isn't an opener).
-            # Look at the first DQ occurrence on the line.
-            stripped = line.lstrip()
-            if (
-                not stripped.startswith(DQ)
-                # not a multi-line opener; let regexes below handle
-                # or leave alone
-                or line.rstrip().endswith(DQ)
-                and line.count(DQ) == 2
-            ):
-                out.append(line)
-                i += 1
-                continue
-            # Now we know line starts with some indent + DQ. Check
-            # if there's exactly one space after the opening DQ AND
-            # the line continues (no closing DQ on this line means
-            # we're in multi-line mode).
-            after_dq = line.lstrip()[3:]  # the part after DQ
-            if after_dq.startswith(" ") and DQ not in after_dq[1:]:
-                # OPENER of a multi-line docstring.
-                indent = line[: len(line) - len(line.lstrip())]
-                new_line = indent + DQ + after_dq[1:]
-                out.append(new_line)
-                # Body lines pass through unchanged.
-                i += 1
-                while i < len(lines):
-                    body = lines[i]
-                    out.append(body)
-                    # Body continues until we hit a line whose
-                    # stripped content is exactly DQ (closer on its
-                    # own line) or a line whose stripped tail ends
-                    # with ` DQ` after some content (closer after
-                    # body content).
-                    stripped_body = body.rstrip()
-                    if stripped_body.endswith(DQ):
-                        # This is a closer line (with or without
-                        # body content trailing on the line).
-                        # Detect two cases:
-                        # Case A: `last-line DQ` — closer after
-                        # body content. The DQ sits at end-of-line
-                        # with one optional space before.
-                        # Detect a trailing ` DQ` (single space +
-                        # DQ) before EOL.
-                        if stripped_body.endswith(" " + DQ):
-                            # Drop the trailing padding space.
-                            new_body = body[: -len(" " + DQ)] + DQ
-                            out[-1] = new_body
-                        else:
-                            # Closer on its own line: ` INDENT DQ`
-                            # where INDENT is the class-body indent.
-                            # Macro emits 4 indent + 1 padding = 5
-                            # spaces. Canonical is 4. Strip one.
-                            indent_count = len(body) - len(body.lstrip(" "))
-                            if indent_count > 4:
-                                out[-1] = body[: indent_count - 1] + body[indent_count:]
-                        i += 1
-                        break
-                    i += 1
-                continue
-            out.append(line)
-            i += 1
-        return "\n".join(out)
 
     for path in sdk_root.rglob("*.py"):
         text = path.read_text()
@@ -685,7 +698,18 @@ def _canonicalise_to_head(
 
     Returns the count of files reconciled; logs to stderr.
     """
-    import hashlib
+    # NOTE: `git hash-object` (and therefore the SHA reported by
+    # `git ls-files -s`) applies git's standard object header
+    # (`blob <len>\0`) before SHA-1. Plain `hashlib.sha1(bytes)`
+    # does NOT apply that header, so a raw-bytes SHA can never
+    # equal a git blob SHA. We use `git hash-object` on the regen
+    # bytes to compare apples-to-apples. This also short-circuits
+    # when regen equals HEAD (no restore, no stderr noise).
+    #
+    # Untracked files (no entry in `git ls-files -s` — e.g. brand-
+    # new model modules from a real spec change) are skipped via
+    # `head_sha is None`; the loop `continue`s and the file is
+    # untouched. This is the documented contract.
 
     # 1. Ask git for HEAD blob SHAs of tracked files under sdk_relpath.
     #    `git ls-files -s` prints `<mode> <sha> <stage>\t<path>`.
@@ -704,40 +728,97 @@ def _canonicalise_to_head(
         _, sha, _, relpath = parts
         head_blobs[relpath] = sha
 
-    # 2. Per-file SHA compare. On mismatch, classify as cosmetic vs
-    #    structural by stripping import lines + blanks and re-hashing.
-    reconciled = 0
-    structural = 0
+    # 2. Pass A — walk every regen file, compare SHA against HEAD.
+    #    Mismatches are queued for pass B (batched `git cat-file
+    #    --batch` to fetch HEAD bytes in one subprocess invocation).
+    #    No file write happens here.
+    #
+    #    Note on SHA-comparison strategy: `git hash-object --stdin`
+    #    applies git's standard `blob <len>\0` header before SHA-1,
+    #    so the returned hash lives in the same naming space as
+    #    `git ls-files -s`'s output. Plain `hashlib.sha1(bytes)` does
+    #    NOT apply that header and would never match — we use git's
+    #    hashing primitives so the comparison is apples-to-apples.
+    mismatches: list[tuple[Path, bytes, str]] = []
     for regen_path in sdk_root.rglob("*.py"):
         rel = regen_path.relative_to(repo_root).as_posix()
         head_sha = head_blobs.get(rel)
         if head_sha is None:
             continue  # untracked (e.g. wrapper) — leave alone
         regen_bytes = regen_path.read_bytes()
-        if hashlib.sha1(regen_bytes).hexdigest() == head_sha:
-            continue
-        head_bytes = subprocess.run(
-            ["git", "cat-file", "-p", head_sha],
+        regen_sha_proc = subprocess.run(
+            ["git", "hash-object", "--stdin"],
             cwd=repo_root,
+            input=regen_bytes,
             check=True,
             capture_output=True,
-        ).stdout
+        )
+        if regen_sha_proc.stdout.decode("ascii").strip() == head_sha:
+            continue  # regen equals HEAD — no reconciliation needed
+        mismatches.append((regen_path, regen_bytes, head_sha))
 
-        def _strip_cosmetic(src: bytes) -> bytes:
-            lines = []
-            for ln in src.decode("utf-8", errors="replace").splitlines():
-                s = ln.strip()
-                if not s:
-                    continue
-                if s.startswith("import ") or s.startswith("from "):
-                    continue
-                lines.append(ln)
-            return "\n".join(lines).encode("utf-8")
+    # 3. Pass B — batch-fetch HEAD bytes for all mismatched SHAs in
+    #    one `git cat-file --batch` invocation. The output format
+    #    for each input `<sha>\n` is `<sha> blob <size>\n<bytes>`,
+    #    so we split on the literal ` blob ` marker and drop the
+    #    header line. Records appear in the order we asked, so the
+    #    i-th record corresponds to `unique_shas[i]`. With ~150
+    #    generated files on a cold cache this saves ~150 process
+    #    spawns; on a warm cache the wall-time win is small but the
+    #    syscall count drops noticeably.
+    head_bytes_by_sha: dict[str, bytes] = {}
+    if mismatches:
+        unique_shas = sorted({m[2] for m in mismatches})
+        proc = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=repo_root,
+            input=("\n".join(unique_shas) + "\n").encode("ascii"),
+            check=True,
+            capture_output=True,
+        )
+        # Split records on `<sha> blob <size>\n` headers. The header
+        # line always begins with the SHA we asked for, so we anchor
+        # the split on that — payload bytes are never mis-parsed as
+        # headers.
+        out = proc.stdout
+        records: dict[str, bytes] = {}
+        for sha in unique_shas:
+            header = sha.encode("ascii") + b" blob "
+            header_start = out.find(header)
+            assert header_start == 0 or (header_start > 0 and out[header_start - 1] == ord("\n")), (
+                f"git cat-file --batch: malformed output for {sha}; header_start={header_start}"
+            )
+            # Header ends at the next newline after `blob <size>`.
+            header_end = out.find(b"\n", header_start)
+            assert header_end != -1, f"git cat-file --batch: missing LF after header for {sha}"
+            # Payload is everything up to the next record's header
+            # (or EOF). Each record is contiguous and well-formed,
+            # so we can read until the next literal ` b` (start of
+            # the next `blob` keyword) at a line boundary, or EOF.
+            #
+            # Safer: parse size out of header, then read exactly that
+            # many bytes.
+            header_line = out[header_start:header_end].decode("ascii")
+            # `header_line` is `<sha> blob <size>`.
+            size_str = header_line.rsplit(" ", 1)[1]
+            size = int(size_str)
+            payload_start = header_end + 1
+            payload = out[payload_start : payload_start + size]
+            records[sha] = payload
+            # Advance past the payload. The next record's header
+            # starts immediately after.
+            out = out[payload_start + size :]
+        head_bytes_by_sha = records
 
-        if (
-            hashlib.sha1(_strip_cosmetic(regen_bytes)).hexdigest()
-            == hashlib.sha1(_strip_cosmetic(head_bytes)).hexdigest()
-        ):
+    # 4. Classify each mismatch as cosmetic (stripped bytes match
+    #    HEAD's stripped bytes) or structural. On cosmetic, restore
+    #    HEAD bytes. On structural, leave the regen output intact so
+    #    `git diff --exit-code` still fires for real schema changes.
+    reconciled = 0
+    structural = 0
+    for regen_path, regen_bytes, head_sha in mismatches:
+        head_bytes = head_bytes_by_sha[head_sha]
+        if _strip_cosmetic(regen_bytes) == _strip_cosmetic(head_bytes):
             regen_path.write_bytes(head_bytes)
             reconciled += 1
         else:

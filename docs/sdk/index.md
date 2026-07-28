@@ -37,9 +37,6 @@ either one blocks the PR.
 | `make sdk-smoke-node`      | Build fakeapid + run Node smoke suite                                     |
 | `make sdk-smoke-python`    | Build fakeapid + run Python smoke suite                                   |
 
-Note: the Go SDK at `sdk/go/` has **no regen step** — it's hand-written. Its
-spec-sync invariant is covered by `make sdk-check`.
-
 CI runs `make sdk-gen` (path-filtered on
 `api/openapi.yaml|sdk/**|Makefile|cmd/sdk-coverage/**`) in parallel with the
 per-SDK `sdk-gen-node` and `sdk-gen-python` jobs. The per-SDK jobs are
