@@ -67,15 +67,17 @@ func TestMigrations_00060_AlertRules_ShapeAndFK(t *testing.T) {
 	}
 	// Two apps — one bound to acctID, one to acctID2 — so the
 	// CHECK / CASCADE / null-app-id tests have something to point at.
+	// apps columns (migration 00001 + 00002): id, account_id, slug,
+	// type, runtime, ram_mb, max_concurrency, idle_timeout_s, status,
+	// created_at — no name/source_kind/source_bytes/updated_at.
 	for _, app := range []struct{ id, owner string }{
 		{appIDFor0, acctID},
-		{appIDFor0, acctID2}, // overwrite so appIDFor0 belongs to acctID2
+		{appIDFor0, acctID2}, // on conflict do nothing → no-op; appIDFor0 still belongs to acctID
 	} {
 		if _, err := pool.Exec(ctx, `
-			insert into apps (id, account_id, slug, name, ram_mb, source_kind,
-			                  source_bytes, status, created_at, updated_at)
-			values ($1, $2, $3, 'shape-alerts', 128, 'image', 0,
-			        'active', now(), now())
+			insert into apps (id, account_id, slug, type, ram_mb,
+			                  max_concurrency, status, created_at)
+			values ($1, $2, $3, 'app', 128, 1, 'active', now())
 			on conflict (id) do nothing
 		`, app.id, app.owner, "shape-alerts-"+app.id); err != nil {
 			t.Fatalf("seed app: %v", err)
@@ -83,10 +85,9 @@ func TestMigrations_00060_AlertRules_ShapeAndFK(t *testing.T) {
 	}
 	// appIDFor2 → acctID (separate owner for the FK cascade test).
 	if _, err := pool.Exec(ctx, `
-		insert into apps (id, account_id, slug, name, ram_mb, source_kind,
-		                  source_bytes, status, created_at, updated_at)
-		values ($1, $2, 'shape-alerts-a2', 'shape-alerts', 128, 'image', 0,
-		        'active', now(), now())
+		insert into apps (id, account_id, slug, type, ram_mb,
+		                  max_concurrency, status, created_at)
+		values ($1, $2, 'shape-alerts-a2', 'app', 128, 1, 'active', now())
 		on conflict (id) do nothing
 	`, appIDFor2, acctID); err != nil {
 		t.Fatalf("seed app a2: %v", err)
