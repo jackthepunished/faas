@@ -3831,6 +3831,19 @@ func (s *PgStore) ListActiveCreditsForConsumption(ctx context.Context, accountID
 // call for the same invoice sees zero rows returned for every (invoice,
 // credit) pair and reports AlreadyConsumedForInvoice=true.
 //
+// Concurrent-operator race window: the prior_check reads
+// credit_ledger for the invoice's existing consumption rows; without
+// a lock, two operators firing the endpoint simultaneously could
+// both observe hasPrior=false and both drain. The end state would
+// be correct (no double-decrement — the per-pair partial unique index
+// catches it), but PerCredit and AlreadyConsumedForInvoice would
+// differ between the two callers. Closing the window: at the top of
+// the Tx we take a SHARE lock on every existing credit_ledger row
+// for this provider_invoice_id. A concurrent INSERT ... ON CONFLICT
+// DO NOTHING in another Tx blocks until we commit, so the second
+// operator's prior_check reads our committed rows and reports
+// AlreadyConsumedForInvoice=true with the SAME ConsumedCents.
+//
 // Per credit:
 //  1. amount = min(credit.CentsRemaining, remaining).
 //  2. UPDATE account_credits SET cents_remaining = cents_remaining - $amount
@@ -3870,70 +3883,16 @@ func (s *PgStore) ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCred
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
 
-	rows, err := tx.Query(ctx,
-		`select id, account_id, cents_remaining, reason, created_at, expires_at
-		   from account_credits
-		  where account_id = $1
-		    and cents_remaining > 0
-		    and (expires_at is null or expires_at > now())
-		  order by created_at asc
-		  for update`,
-		p.AccountID)
+	// Race-safe idempotency: lock + check existing consumption
+	// rows for this invoice. See priorLockAndCheck docstring.
+	hasPrior, priorCents, err := priorLockAndCheck(ctx, tx, p.ProviderInvoiceID)
 	if err != nil {
-		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits list: %w", err)
-	}
-	type creditRow struct {
-		credit     AccountCredit
-		newBalance int64
-	}
-	var active []creditRow
-	for rows.Next() {
-		var c AccountCredit
-		if err := rows.Scan(
-			&c.ID, &c.AccountID, &c.CentsRemaining, &c.Reason,
-			&c.CreatedAt, &c.ExpiresAt,
-		); err != nil {
-			rows.Close()
-			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits scan: %w", err)
-		}
-		active = append(active, creditRow{credit: c})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits list_iter: %w", err)
-	}
-
-	res := ConsumeAccountCreditResult{}
-	remaining := p.TargetCents
-	// Idempotency guard: if any consumption ledger row already
-	// exists for this invoice, the invoice was already drained in a
-	// prior call. Return the same ConsumedCents so a webhook re-fire
-	// / admin replay is a no-op. Stronger than the per-(invoice,
-	// credit) pair protection enforced by the partial unique index
-	// — without this guard, a credit issued AFTER the first call
-	// would be drained on replay, double-decrementing the active
-	// balance. Mirrors pkg/state/memstore.go ConsumeAccountCredit.
-	var priorCents int64
-	var hasPrior bool
-	if err := tx.QueryRow(ctx,
-		`select coalesce(sum(-delta_cents), 0), bool_or(delta_cents < 0)
-		   from credit_ledger
-		  where provider_invoice_id = $1`,
-		p.ProviderInvoiceID).Scan(&priorCents, &hasPrior); err != nil {
-		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits prior_check: %w", err)
+		return ConsumeAccountCreditResult{}, err
 	}
 	if hasPrior {
-		// Re-derive RemainingCreditsCents from the live row so the
-		// response shape matches a successful call.
-		var remSum int64
-		if err := tx.QueryRow(ctx,
-			`select coalesce(sum(cents_remaining), 0)
-			   from account_credits
-			  where account_id = $1
-			    and cents_remaining > 0
-			    and (expires_at is null or expires_at > now())`,
-			p.AccountID).Scan(&remSum); err != nil {
-			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits prior_remaining: %w", err)
+		remSum, err := sumActiveCents(ctx, tx, p.AccountID)
+		if err != nil {
+			return ConsumeAccountCreditResult{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits prior_commit: %w", err)
@@ -3945,12 +3904,142 @@ func (s *PgStore) ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCred
 		}, nil
 	}
 
+	active, err := loadActiveForUpdate(ctx, tx, p.AccountID)
+	if err != nil {
+		return ConsumeAccountCreditResult{}, err
+	}
+
+	res, anyInserted, err := drainActive(ctx, tx, active, p)
+	if err != nil {
+		return ConsumeAccountCreditResult{}, err
+	}
+	if !anyInserted && p.TargetCents > 0 {
+		// Re-derive ConsumedCents from existing ledger rows so the
+		// operator sees the same total across calls. The partial
+		// unique index guarantees there is exactly one ledger row
+		// per (invoice, credit) pair.
+		rederived, derr := rederiveConsumed(ctx, tx, p.ProviderInvoiceID)
+		if derr != nil {
+			return ConsumeAccountCreditResult{}, derr
+		}
+		res.ConsumedCents = rederived
+	}
+
+	remSum, err := sumActiveCents(ctx, tx, p.AccountID)
+	if err != nil {
+		return ConsumeAccountCreditResult{}, err
+	}
+	res.RemainingCreditsCents = remSum
+
+	if err := tx.Commit(ctx); err != nil {
+		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits commit: %w", err)
+	}
+	return res, nil
+}
+
+// priorLockAndCheck takes a SHARE lock on every existing credit_ledger
+// row for the provider_invoice_id and reports whether prior
+// consumption rows exist. The SHARE lock conflicts with INSERT (which
+// takes ROW EXCLUSIVE) so a concurrent operator call blocks here
+// until our Tx commits. The second operator's prior_check then reads
+// our committed rows and reports AlreadyConsumedForInvoice=true with
+// the SAME ConsumedCents. Without the lock, two simultaneous
+// operators can both observe hasPrior=false and both proceed to
+// drain — the end state is still correct (no double-decrement via
+// the per-pair partial unique index), but PerCredit and
+// AlreadyConsumedForInvoice differ between the two callers.
+//
+// The FOR SHARE on a zero-row set is a no-op — Postgres acquires a
+// table-level intention lock and proceeds. When another Tx already
+// holds the SHARE lock, INSERT ... ON CONFLICT DO NOTHING blocks at
+// lock acquisition (before uniqueness evaluation), so the hasPrior
+// read below reflects committed state.
+//
+// Returns (hasPrior, priorCents, err). Caller commits/rolls back.
+func priorLockAndCheck(ctx context.Context, tx pgx.Tx, providerInvoiceID string) (bool, int64, error) {
+	if _, err := tx.Exec(ctx,
+		`select 1
+		   from credit_ledger
+		  where provider_invoice_id = $1
+		  for share`,
+		providerInvoiceID); err != nil {
+		return false, 0, fmt.Errorf("state: consume_credits prior_lock: %w", err)
+	}
+	var priorCents int64
+	var hasPrior bool
+	if err := tx.QueryRow(ctx,
+		`select coalesce(sum(-delta_cents), 0), bool_or(delta_cents < 0)
+		   from credit_ledger
+		  where provider_invoice_id = $1`,
+		providerInvoiceID).Scan(&priorCents, &hasPrior); err != nil {
+		return false, 0, fmt.Errorf("state: consume_credits prior_check: %w", err)
+	}
+	return hasPrior, priorCents, nil
+}
+
+// loadActiveForUpdate returns the account's FIFO-locked active
+// credits (created_at ASC) inside the Tx. Mirrors
+// ListActiveCreditsForConsumption's predicate and sort; the FOR UPDATE
+// locks the rows so the conditional UPDATEs in drainActive cannot
+// race with a concurrent operator issuance.
+func loadActiveForUpdate(ctx context.Context, tx pgx.Tx, accountID string) ([]AccountCredit, error) {
+	rows, err := tx.Query(ctx,
+		`select id, account_id, cents_remaining, reason, created_at, expires_at
+		   from account_credits
+		  where account_id = $1
+		    and cents_remaining > 0
+		    and (expires_at is null or expires_at > now())
+		  order by created_at asc
+		  for update`,
+		accountID)
+	if err != nil {
+		return nil, fmt.Errorf("state: consume_credits list: %w", err)
+	}
+	defer rows.Close()
+	out := []AccountCredit{}
+	for rows.Next() {
+		var c AccountCredit
+		if err := rows.Scan(
+			&c.ID, &c.AccountID, &c.CentsRemaining, &c.Reason,
+			&c.CreatedAt, &c.ExpiresAt,
+		); err != nil {
+			return nil, fmt.Errorf("state: consume_credits scan: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: consume_credits list_iter: %w", err)
+	}
+	return out, nil
+}
+
+// drainActive runs the per-credit conditional UPDATE + INSERT ON
+// CONFLICT DO NOTHING loop, capped at p.TargetCents. Returns the
+// per-credit rows plus the total drained and whether any row was
+// successfully inserted (the latter distinguishes a fresh drain from
+// the all-already-consumed path that triggers rederiveConsumed).
+//
+// Per credit:
+//  1. amount = min(credit.CentsRemaining, remaining).
+//  2. UPDATE … WHERE cents_remaining >= $amount RETURNING …
+//     Zero rows ⇒ concurrent drain won; skip and try the next.
+//  3. INSERT … ON CONFLICT DO NOTHING RETURNING id.
+//     Zero rows ⇒ (invoice, credit) pair was already drained on a
+//     prior call; mark AlreadyConsumedForInvoice=true and skip.
+//  4. remaining -= amount. Break when 0.
+//
+// Returns (res, anyInserted, err). Errors abort the loop and surface
+// to the caller; AlreadyConsumedForInvoice=true in res is the
+// partial-success path that lets the caller trigger rederiveConsumed.
+func drainActive(ctx context.Context, tx pgx.Tx, active []AccountCredit, p ConsumeAccountCreditParams) (ConsumeAccountCreditResult, bool, error) {
+	res := ConsumeAccountCreditResult{}
+	remaining := p.TargetCents
 	anyInserted := false
 	for i := range active {
 		if remaining == 0 {
 			break
 		}
-		c := active[i].credit
+		c := active[i]
 		amount := c.CentsRemaining
 		if amount > remaining {
 			amount = remaining
@@ -3974,7 +4063,7 @@ func (s *PgStore) ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCred
 				// the next. The transaction stays valid.
 				continue
 			}
-			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits update: %w", err)
+			return res, anyInserted, fmt.Errorf("state: consume_credits update: %w", err)
 		}
 
 		// Step 3: ledger insert with ON CONFLICT DO NOTHING.
@@ -3995,7 +4084,7 @@ func (s *PgStore) ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCred
 				res.AlreadyConsumedForInvoice = true
 				continue
 			}
-			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits ledger: %w", err)
+			return res, anyInserted, fmt.Errorf("state: consume_credits ledger: %w", err)
 		}
 		_ = insertedID // observational; consumed via RETURNING id
 
@@ -4008,45 +4097,41 @@ func (s *PgStore) ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCred
 		remaining -= amount
 		anyInserted = true
 	}
+	return res, anyInserted, nil
+}
 
-	if !anyInserted && p.TargetCents > 0 {
-		// Re-derive ConsumedCents from existing ledger rows so the
-		// operator sees the same total across calls. The partial
-		// unique index guarantees there is exactly one ledger row
-		// per (invoice, credit) pair.
-		sumRow := tx.QueryRow(ctx,
-			`select coalesce(sum(-delta_cents), 0)
-			   from credit_ledger
-			  where provider_invoice_id = $1
-			    and delta_cents < 0`,
-			p.ProviderInvoiceID)
-		var rederived int64
-		if err := sumRow.Scan(&rederived); err != nil {
-			return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits rederive: %w", err)
-		}
-		res.ConsumedCents = rederived
-	}
-
-	// Sum of remaining active credits after the call — for the
-	// audit row + response. Outside the loop because the post-state
-	// reflects the conditional UPDATEs above.
-	remRow := tx.QueryRow(ctx,
+// sumActiveCents returns the sum of cents_remaining across the
+// account's active (non-zero, non-expired) credits. Used for
+// RemainingCreditsCents in the response. Caller-supplied Tx.
+func sumActiveCents(ctx context.Context, tx pgx.Tx, accountID string) (int64, error) {
+	var remSum int64
+	if err := tx.QueryRow(ctx,
 		`select coalesce(sum(cents_remaining), 0)
 		   from account_credits
 		  where account_id = $1
 		    and cents_remaining > 0
 		    and (expires_at is null or expires_at > now())`,
-		p.AccountID)
-	var remSum int64
-	if err := remRow.Scan(&remSum); err != nil {
-		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits remaining: %w", err)
+		accountID).Scan(&remSum); err != nil {
+		return 0, fmt.Errorf("state: consume_credits remaining: %w", err)
 	}
-	res.RemainingCreditsCents = remSum
+	return remSum, nil
+}
 
-	if err := tx.Commit(ctx); err != nil {
-		return ConsumeAccountCreditResult{}, fmt.Errorf("state: consume_credits commit: %w", err)
+// rederiveConsumed sums the negative-delta ledger rows for the
+// invoice (the partial unique index guarantees exactly one row per
+// (invoice, credit) pair). Used when drainActive inserted nothing —
+// the operator's replay path.
+func rederiveConsumed(ctx context.Context, tx pgx.Tx, providerInvoiceID string) (int64, error) {
+	var rederived int64
+	if err := tx.QueryRow(ctx,
+		`select coalesce(sum(-delta_cents), 0)
+		   from credit_ledger
+		  where provider_invoice_id = $1
+		    and delta_cents < 0`,
+		providerInvoiceID).Scan(&rederived); err != nil {
+		return 0, fmt.Errorf("state: consume_credits rederive: %w", err)
 	}
-	return res, nil
+	return rederived, nil
 }
 
 // LoadAllOverageCapCents returns every (account_id, cap) tuple in one

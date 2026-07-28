@@ -78,7 +78,13 @@ func (s *server) consumeInvoiceCredits(w http.ResponseWriter, r *http.Request, a
 				"Invoice not found", err.Error()))
 			return
 		}
-		api.WriteProblem(w, api.ErrCapacity("could not consume credits for invoice"))
+		// Reducer error is not a "deliberate refusal" (which would
+		// be ErrCapacity / 503); it's an unexpected server-side
+		// failure — DB commit, network blip, partial state. 500 with
+		// the verbatim err.Error() surfaces the breadcrumb in the
+		// operator's browser console; the audit row carries the
+		// same text for the on-call engineer.
+		api.WriteProblem(w, api.ErrInternal(err.Error()))
 		return
 	}
 

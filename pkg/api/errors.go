@@ -163,6 +163,13 @@ const (
 	CodeNotFound   = "not_found"
 	CodeValidation = "validation_failed"
 	CodeConflict   = "conflict"
+	// CodeInternal is returned by handlers when an unexpected server-side
+	// failure surfaces to the caller (DB Tx commit, network blip, partial
+	// state). Distinct from CodeCapacity (503, "we ran out of headroom")
+	// because the failure mode is "we tried and didn't succeed" rather
+	// than "we deliberately refused". Use this for any 500 where the
+	// handler can't recover; pair with api.ErrInternal for a one-liner.
+	CodeInternal = "internal_error"
 	// CodeMFARequired is returned by requireMFA when a session-cookie
 	// principal is mfa_pending and the route is not on the MFA
 	// allowlist (IAM-2 / issue #186). Distinct from CodeForbidden so
@@ -547,6 +554,17 @@ func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
 		WithDocs("https://status.DOMAIN")
+}
+
+// ErrInternal is the catch-all 500 envelope for handler-side failures
+// that aren't a deliberate refusal (use ErrCapacity for those) — DB
+// commit errors, partial state, unexpected plumbing. Pairs with
+// CodeInternal; the detail rides through verbatim because it surfaces
+// in the operator's browser console as the only breadcrumb for the
+// on-call engineer (the audit row carries the same text).
+func ErrInternal(detail string) *Problem {
+	return NewProblem(http.StatusInternalServerError, CodeInternal,
+		"Internal Error", detail)
 }
 
 // ErrBillingNotImplemented is returned by an apid handler that
