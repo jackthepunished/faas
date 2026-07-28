@@ -46,6 +46,9 @@ func TestHandlerHotPathAddsLT2MsAt1kRPS(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.running = true // hot path: no wake, no cold header, no wake latency
 	h.WithLimiter(unlimitedLimiter())
+	// ADR-040: also bypass the per-account bucket so the 1k rps load
+	// doesn't trip the per-minute cap on the seeded AccountID.
+	h.WithAccountLimiter(unlimitedAccountLimiter())
 
 	const (
 		phaseADur = 5 * time.Second

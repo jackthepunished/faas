@@ -92,6 +92,150 @@ func TestLimiterForgetAll(t *testing.T) {
 	}
 }
 
+// --- per-account rate limiter (ADR-040 / issue #292) ----------------------
+
+func TestLimiterAllowAccount_BurstThenRefill(t *testing.T) {
+	l := NewLimiter()
+	clock := time.Now()
+	l.now = func() time.Time { return clock }
+	// Hobby plan: 200/min → burst 200, refill 200/60 = 3.333… rps.
+	allowed := 0
+	for i := 0; i < 220; i++ {
+		if l.AllowAccount("acct", api.PlanHobby) {
+			allowed++
+		}
+	}
+	if allowed != 200 {
+		t.Errorf("burst allowed %d, want 200", allowed)
+	}
+	// After 60 seconds, full burst refills.
+	clock = clock.Add(60 * time.Second)
+	refill := 0
+	for i := 0; i < 220; i++ {
+		if l.AllowAccount("acct", api.PlanHobby) {
+			refill++
+		}
+	}
+	if refill != 200 {
+		t.Errorf("refill after 60s = %d, want 200", refill)
+	}
+}
+
+func TestLimiterAllowAccount_FractionalRefill(t *testing.T) {
+	// Free plan: 50/min → 50/60 = 0.833… tokens/sec, burst 50.
+	l := NewLimiter()
+	clock := time.Now()
+	l.now = func() time.Time { return clock }
+	// Drain the burst.
+	for i := 0; i < 50; i++ {
+		if !l.AllowAccount("acct-free", api.PlanFree) {
+			t.Fatalf("burst should have allowed 50, denied at iteration %d", i)
+		}
+	}
+	if l.AllowAccount("acct-free", api.PlanFree) {
+		t.Fatal("51st request should be denied at burst ceiling")
+	}
+	// Advance 60 seconds; expect ~50 tokens back.
+	clock = clock.Add(60 * time.Second)
+	allowed := 0
+	for i := 0; i < 60; i++ {
+		if l.AllowAccount("acct-free", api.PlanFree) {
+			allowed++
+		}
+	}
+	// Fractional rps means we should get exactly 50 (50 + 60*0.833…=99.9…,
+	// capped at burst 50).
+	if allowed != 50 {
+		t.Errorf("fractional refill after 60s = %d, want 50", allowed)
+	}
+}
+
+func TestLimiterAllowAccount_PerAccountIsolation(t *testing.T) {
+	l := NewLimiter()
+	clock := time.Now()
+	l.now = func() time.Time { return clock }
+	// Drain acct1's Hobby bucket (200).
+	for i := 0; i < 200; i++ {
+		l.AllowAccount("acct1", api.PlanHobby)
+	}
+	if l.AllowAccount("acct1", api.PlanHobby) {
+		t.Error("acct1 should be rate-limited")
+	}
+	// acct2's bucket is independent.
+	if !l.AllowAccount("acct2", api.PlanHobby) {
+		t.Error("acct2 should have its own bucket")
+	}
+}
+
+func TestLimiterAllowAccount_UnknownPlanFailsClosed(t *testing.T) {
+	l := NewLimiter()
+	if l.AllowAccount("acct", api.Plan("unknown")) {
+		t.Error("unknown plan should fail closed (return false)")
+	}
+	// Bucket must NOT be created on the denied path — every call hits the
+	// early return.
+	if l.BucketCount() != 0 {
+		t.Errorf("denied call should not create a bucket; BucketCount = %d", l.BucketCount())
+	}
+}
+
+func TestLimiterAllowAccount_PlanChange(t *testing.T) {
+	l := NewLimiter()
+	clock := time.Now()
+	l.now = func() time.Time { return clock }
+	// Drain Hobby bucket (200) almost empty.
+	for i := 0; i < 199; i++ {
+		l.AllowAccount("acct", api.PlanHobby)
+	}
+	// Flip to Pro mid-flight (1000 burst). Allow should retune rps/burst
+	// without losing tokens (1 token left in the Hobby bucket).
+	if !l.AllowAccount("acct", api.PlanPro) {
+		t.Fatal("flip to Pro should succeed (1 token available)")
+	}
+	// Pro burst is 1000; we have ~1 token, so the next call denies.
+	// Advance 1s to refill at Pro rps (1000/60 = 16.67) — much faster than
+	// Hobby's 3.33.
+	clock = clock.Add(time.Second)
+	allowed := 0
+	for i := 0; i < 30; i++ {
+		if l.AllowAccount("acct", api.PlanPro) {
+			allowed++
+		}
+	}
+	if allowed < 15 {
+		t.Errorf("plan change should restore refill at new rps; got %d allowed in 1s of refill", allowed)
+	}
+}
+
+func TestLimiterForgetAccount(t *testing.T) {
+	l := NewLimiter()
+	l.AllowAccount("a", api.PlanPro)
+	l.AllowAccount("b", api.PlanPro)
+	if l.BucketCount() != 2 {
+		t.Fatalf("setup: BucketCount = %d, want 2", l.BucketCount())
+	}
+	l.ForgetAccount("a")
+	if l.BucketCount() != 1 {
+		t.Errorf("after ForgetAccount(a) BucketCount = %d, want 1", l.BucketCount())
+	}
+	// b's bucket is untouched.
+	if !l.AllowAccount("b", api.PlanPro) {
+		t.Error("b's bucket should still be present")
+	}
+}
+
+// TestNewLimiterWithClock covers the test-only clock-injection seam used by
+// cmd/gatewayd/backend_test.go for the 1001-request acceptance (issue #292).
+func TestNewLimiterWithClock(t *testing.T) {
+	clock := time.Now()
+	l := NewLimiterWithClock(func() time.Time { return clock })
+	// First call uses the injected clock.
+	clock = clock.Add(time.Hour) // bucket caps at burst; doesn't matter for test
+	if !l.Allow("x", api.PlanPro) {
+		t.Fatal("clock injection should produce a working limiter")
+	}
+}
+
 // --- route cache -----------------------------------------------------------
 
 func TestRouteCacheGetPut(t *testing.T) {

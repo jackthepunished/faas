@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -16,8 +17,9 @@ import (
 
 // App is the routing target for a hostname.
 type App struct {
-	ID   string
-	Plan api.Plan
+	ID        string
+	AccountID string // joined in pgRouter.toApp; empty only in fakeBackend unit tests (ADR-040)
+	Plan      api.Plan
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -76,7 +78,12 @@ type Backend interface {
 type Handler struct {
 	backend Backend
 	limiter *Limiter
-	gate    *WakeGate
+	// accountLimiter is the per-account token-bucket throttle (ADR-040 /
+	// issue #292). Runs BEFORE limiter (per-app) in ServeHTTP so a botnet
+	// rotating across many apps is rejected before any per-app bucket
+	// drains and before the wake gate (a schedd gRPC RPC) is touched.
+	accountLimiter *Limiter
+	gate           *WakeGate
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
 	// log may be nil (defaults to slog.Default()).
@@ -102,6 +109,26 @@ type Handler struct {
 	lastSeen LastSeenSink
 }
 
+// emptyAccountWarned is the process-wide trip flag for
+// warnEmptyAccountOnce (ADR-040). Empty AccountID only appears in
+// fakeBackend unit tests; production joins always populate it. Logging
+// every test invocation would flood logs in `-count=10` runs.
+var emptyAccountWarned atomic.Bool
+
+// warnEmptyAccountOnce logs a debug-level warning the first time ServeHTTP
+// sees an App with an empty AccountID (ADR-040). After that, subsequent
+// occurrences are silent. The atomic flag is process-scoped, not per-Handler,
+// because the warning is genuinely a code-path bug and one log line is
+// enough to surface it.
+func (h *Handler) warnEmptyAccountOnce() {
+	if emptyAccountWarned.CompareAndSwap(false, true) {
+		if h.log != nil {
+			h.log.Debug("gateway: app.AccountID empty at rate-limit check; passing through unmetered (ADR-040)",
+				"note", "production joins always populate AccountID; empty only in fakeBackend tests")
+		}
+	}
+}
+
 // NewHandler wires the edge with the spec's defaults (wake queue 512/30 s, spec
 // §4.1) and the new Metrics + slog bundle. The host→app routing cache lives
 // inside the Backend (it fronts Postgres).
@@ -113,11 +140,12 @@ func NewHandler(backend Backend) *Handler {
 // registry) and a custom slog logger.
 func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 	h := &Handler{
-		backend: backend,
-		limiter: NewLimiter(),
-		gate:    NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
-		metrics: m,
-		log:     log,
+		backend:        backend,
+		limiter:        NewLimiter(),
+		accountLimiter: NewLimiter(),
+		gate:           NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
+		metrics:        m,
+		log:            log,
 	}
 	h.proxyFor = defaultProxy
 	return h
@@ -155,6 +183,16 @@ func (h *Handler) WithLimiter(l *Limiter) *Handler {
 	return h
 }
 
+// WithAccountLimiter installs the per-account rate limiter (ADR-040).
+// Production wires the token-bucket Limiter constructed in NewHandlerWith;
+// load tests install an unlimitedAccountLimiter so they aren't constrained
+// by the plan RPM from newTestHandler's PlanPro default. Same test-only
+// contract as WithLimiter — do NOT expose as a config knob.
+func (h *Handler) WithAccountLimiter(l *Limiter) *Handler {
+	h.accountLimiter = l
+	return h
+}
+
 // WithForwarding installs the per-node HTTP→gRPC forwarder built by
 // pkg/gateway/forwardproxy.go (issue #98 / ADR-028). When set, every
 // request dispatches through fn(nodeID) where nodeID is the value
@@ -187,6 +225,12 @@ func (h *Handler) Metrics() *Metrics { return h.metrics }
 // pushing plan changes via Postgres + LISTEN, the gateway's reload path
 // calls ForgetAll() on this limiter.
 func (h *Handler) Limiter() *Limiter { return h.limiter }
+
+// AccountLimiter exposes the per-account rate limiter (ADR-040 / issue #292).
+// Same SIGHUP contract as Limiter — the gateway's reload path calls
+// ForgetAll() on both limiters. Test seam: WithAccountLimiter installs a
+// noop for load tests that need to bypass the account bucket.
+func (h *Handler) AccountLimiter() *Limiter { return h.accountLimiter }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Status-class capture (used for metrics + slog). Doesn't buffer the body
@@ -227,9 +271,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-account rate limit (ADR-040 / issue #292). Runs BEFORE the
+	// per-app limit so a botnet rotating across many apps within an
+	// account cannot evade the throttle by keeping per-app rps low.
+	// Empty AccountID is only reachable from fakeBackend unit tests
+	// (production joins always populate it via pgRouter.toApp) — pass
+	// through unmetered and log once per process so the test suite
+	// keeps working without flooding logs.
+	if app.AccountID == "" {
+		h.warnEmptyAccountOnce()
+	} else if !h.accountLimiter.AllowAccount(app.AccountID, app.Plan) {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("x-faas-rate-limit-scope", "account")
+		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, "rate_limited",
+			"Rate limit exceeded", "slow down and retry"))
+		if h.metrics != nil {
+			h.metrics.ObserveAccountRateLimit(app.AccountID, string(app.Plan))
+		}
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+
 	// Per-app rate limit (spec §4.1). Over-limit → 429.
 	if !h.limiter.Allow(app.ID, app.Plan) {
 		w.Header().Set("Retry-After", "1")
+		w.Header().Set("x-faas-rate-limit-scope", "app")
 		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, "rate_limited",
 			"Rate limit exceeded", "slow down and retry"))
 		if h.metrics != nil {

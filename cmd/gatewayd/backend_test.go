@@ -4,11 +4,16 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -208,4 +213,115 @@ func TestHandleInvalidation_TerminalStatesEvict(t *testing.T) {
 			t.Errorf("state=%q: evicted[i-term] = %q, want app-9", state, got)
 		}
 	}
+}
+
+// TestAccountRateLimit_TenOhOneReturns429 — ADR-040 / issue #292
+// acceptance: 1001 requests from the same account in 60s, the 1001st
+// returns 429. Wires the production gateway handler against a real
+// pgRouter + MemStore + PGBackend so the AccountID plumbing is exercised
+// end-to-end (issue #292 threat model: botnet rotating across one
+// customer's apps). The per-app limiter is bypassed so the test isolates
+// the per-account scope; the per-account limiter uses a frozen clock so
+// 1001 sequential requests don't refill mid-loop (Free plan: 50/min RPM
+// burst = 50 tokens).
+func TestAccountRateLimit_TenOhOneReturns429(t *testing.T) {
+	store := state.NewMemStore()
+	app := seedApp(t, store, "ratelimited", api.PlanFree) // Free: per-account burst 50
+	ctx := context.Background()
+
+	router := pgRouter{store: store, appsSuffix: ".apps.example.com"}
+	// Pre-resolve so the apps cache is warm — the test focuses on the
+	// rate-limit path, not on cold-start latency.
+	if _, ok, err := router.ResolveHost(ctx, "ratelimited.apps.example.com"); !ok || err != nil {
+		t.Fatalf("pre-resolve: ok=%v err=%v", ok, err)
+	}
+
+	// Real upstream the legacy proxy can talk to (no real Firecracker
+	// here — the test only needs the proxy path to return 200 so the
+	// 50 burst requests succeed and the 951 429s fire on the per-account
+	// scope).
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	// FakeScheduler's nodeID is what the legacy proxy dials. Point it
+	// at the upstream listener's address so the 50 successful requests
+	// actually proxy and return 200.
+	sched := gateway.NewFakeScheduler(upstream.Listener.Addr().String()).
+		WithInstanceID("i-rl").
+		WithWakeID("w-rl")
+	backend := gateway.NewPGBackend(router, sched, testLogger())
+
+	// Frozen clock so the per-account bucket doesn't refill during 1001
+	// sequential requests. Without this the Free plan would refill
+	// 50/60 ≈ 0.83 tokens/sec and the test would race.
+	frozen := time.Now()
+	acctLim := gateway.NewLimiterWithClock(func() time.Time { return frozen })
+
+	h := gateway.NewHandlerWith(backend, gateway.NewMetrics(), testLogger())
+	h.SetWakeGateHook()
+	h.WithLimiter(unlimitedLimiterForTest()) // bypass per-app scope
+	h.WithAccountLimiter(acctLim)            // frozen-clock per-account
+
+	// Drive 1001 requests sequentially. The first 50 succeed (Free burst),
+	// 51..1001 all 429 with x-faas-rate-limit-scope: account.
+	var (
+		ok200   int
+		ok429   int
+		last429 *httptest.ResponseRecorder
+	)
+	for i := 0; i < 1001; i++ {
+		req := httptest.NewRequest("GET", "http://ratelimited.apps.example.com/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		switch rec.Code {
+		case http.StatusOK:
+			ok200++
+		case http.StatusTooManyRequests:
+			ok429++
+			last429 = rec
+		default:
+			t.Fatalf("request %d: status = %d, want 200 or 429", i, rec.Code)
+		}
+	}
+	// 50 successful (Free burst), 951 429s.
+	if ok200 != 50 {
+		t.Errorf("ok200 = %d, want 50 (Free per-account burst)", ok200)
+	}
+	if ok429 != 951 {
+		t.Errorf("ok429 = %d, want 951", ok429)
+	}
+	if last429 == nil {
+		t.Fatal("last429 not captured")
+	}
+	if last429.Header().Get("x-faas-rate-limit-scope") != "account" {
+		t.Errorf("1001st request should carry x-faas-rate-limit-scope: account; got %q",
+			last429.Header().Get("x-faas-rate-limit-scope"))
+	}
+	if last429.Header().Get("Retry-After") == "" {
+		t.Error("429 should carry Retry-After")
+	}
+
+	// Scrape the metrics registry and confirm the per-account counter
+	// incremented for this account (at least 951 — could be more if a
+	// follow-up scrape happens).
+	mrec := httptest.NewRecorder()
+	mreq := httptest.NewRequest("GET", "/metrics", nil)
+	h.Metrics().Handler().ServeHTTP(mrec, mreq)
+	body := mrec.Body.String()
+	want := `gateway_per_account_rate_limited_total{account_id="` + app.AccountID + `",plan="free"} `
+	if !strings.Contains(body, want) {
+		t.Errorf("missing exposition line %q in body:\n%s", want, body)
+	}
+}
+
+// unlimitedLimiterForTest is the per-app noop limiter used by the 1001-request
+// acceptance test so the per-app bucket can't 429 the test before the
+// per-account scope is exercised. Mirrors pkg/gateway/limiters_test.go's
+// unlimitedLimiter but lives here because cmd/gatewayd tests are
+// `package main` and can't import test-only helpers from pkg/gateway's
+// _test.go files.
+func unlimitedLimiterForTest() *gateway.Limiter {
+	return gateway.NewLimiter().WithNoop()
 }

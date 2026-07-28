@@ -132,7 +132,7 @@ func newTestHandler(t *testing.T) (*Handler, *fakeBackend, *httptest.Server) {
 	t.Cleanup(upstream.Close)
 
 	b := &fakeBackend{
-		app:      App{ID: "app-1", Plan: api.PlanPro},
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
 		host:     "jane-api.apps.dom",
 		upstream: upstream.Listener.Addr().String(),
 	}
@@ -316,11 +316,59 @@ func TestRateLimitReturns429(t *testing.T) {
 			if rec.Header().Get("Retry-After") == "" {
 				t.Error("429 should include Retry-After")
 			}
+			if rec.Header().Get("x-faas-rate-limit-scope") != "app" {
+				t.Error("app-scope 429 should carry x-faas-rate-limit-scope: app")
+			}
 			break
 		}
 	}
 	if !got429 {
 		t.Error("exceeding the Free burst should yield 429")
+	}
+}
+
+// TestAccountRateLimitReturns429 — ADR-040 / issue #292: when the
+// per-account bucket is exhausted the handler must 429 with
+// x-faas-rate-limit-scope: account. Per-app burst is bypassed with
+// unlimitedLimiter() so the test isolates the account scope — without
+// that bypass the per-app bucket would trip first (burst 500 vs
+// per-account burst 1000 on Pro), and the 429 would carry scope "app".
+func TestAccountRateLimitReturns429(t *testing.T) {
+	h, b, _ := newTestHandler(t)
+	b.setLegacyHot()
+	b.app.Plan = api.PlanPro // per-account burst 1000 (RateLimitPerAccountRPM)
+	b.app.AccountID = "acct-rl"
+	h.WithLimiter(NewLimiter().WithNoop()) // bypass per-app scope
+
+	got429 := false
+	for i := 0; i < 1100; i++ {
+		req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			got429 = true
+			if rec.Header().Get("Retry-After") == "" {
+				t.Error("account-scope 429 should include Retry-After")
+			}
+			if rec.Header().Get("x-faas-rate-limit-scope") != "account" {
+				t.Errorf("account-scope 429 should carry x-faas-rate-limit-scope: account; got %q",
+					rec.Header().Get("x-faas-rate-limit-scope"))
+			}
+			break
+		}
+	}
+	if !got429 {
+		t.Error("exceeding the per-account Pro burst (1000) should yield 429")
+	}
+	// The metric counter for account-scope rejections must have
+	// incremented. Scrape the registry and confirm.
+	mrec := httptest.NewRecorder()
+	mreq := httptest.NewRequest("GET", "/metrics", nil)
+	h.Metrics().Handler().ServeHTTP(mrec, mreq)
+	body := mrec.Body.String()
+	want := `gateway_per_account_rate_limited_total{account_id="acct-rl",plan="pro"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing exposition line %q in body:\n%s", want, body)
 	}
 }
 
@@ -332,6 +380,7 @@ func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.app.Plan = api.PlanFree // cap = 1 → coalesces to one admit
 	h.WithLimiter(unlimitedLimiter())
+	h.WithAccountLimiter(unlimitedAccountLimiter()) // ADR-040 — 50 concurrent > Free per-account burst 50
 
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
@@ -397,6 +446,7 @@ func TestFanOutAdmitsUpToCapThenReuses(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.app.Plan = api.PlanHobby // max_concurrency = 2
 	h.WithLimiter(unlimitedLimiter())
+	h.WithAccountLimiter(unlimitedAccountLimiter()) // ADR-040
 
 	const fans = 4
 	var wg sync.WaitGroup

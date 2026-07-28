@@ -70,12 +70,12 @@ func TestRunbooks_DirectoryHasAllAlertRunbooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", runbooksDir, err)
 	}
-	// The 10 expected Faas*.md files + gate-a.md (covered
-	// by its own test below). At minimum we expect 11
-	// runbooks; assert at least 11 to catch a regression
+	// The 11 expected Faas*.md files + gate-a.md (covered
+	// by its own test below). At minimum we expect 12
+	// runbooks; assert at least 12 to catch a regression
 	// where a runbook was deleted but the rule that
 	// referenced it wasn't updated.
-	const minRunbooks = 11
+	const minRunbooks = 12
 	runbooks := []string{}
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
@@ -83,7 +83,7 @@ func TestRunbooks_DirectoryHasAllAlertRunbooks(t *testing.T) {
 		}
 	}
 	if len(runbooks) < minRunbooks {
-		t.Fatalf("docs/runbooks/ has %d markdown files, want at least %d (10 Faas* + gate-a.md)", len(runbooks), minRunbooks)
+		t.Fatalf("docs/runbooks/ has %d markdown files, want at least %d (11 Faas* + gate-a.md)", len(runbooks), minRunbooks)
 	}
 
 	// Every Faas*.md alert runbook MUST contain at least

@@ -14,6 +14,13 @@ import (
 // Limiter is a per-app token-bucket rate limiter (spec §4.1). Each app refills at
 // its plan's rps with a plan burst; an over-limit request is rejected (the caller
 // returns 429). The clock is injectable so the refill math is tested precisely.
+//
+// The same Limiter type is reused for per-account throttling (ADR-040 / issue
+// #292) via AllowAccount — bucket key is the actor ID (app or account), and the
+// rps/burst parameters come from a different accessor on Plan. Two *Limiter
+// instances are constructed in pkg/gateway/handler.go (one per scope) so SIGHUP
+// ForgetAll can target each scope independently and load tests can bypass one
+// without bypassing the other.
 type Limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -37,6 +44,14 @@ func NewLimiter() *Limiter {
 	return &Limiter{buckets: map[string]*bucket{}, now: time.Now}
 }
 
+// NewLimiterWithClock returns a limiter whose internal clock is the supplied
+// func. Test seam for the cmd/gatewayd/backend_test.go 1001-request
+// acceptance (issue #292 / ADR-040) — frozen-clock tests cannot depend on
+// the package-private now field. Production code uses NewLimiter.
+func NewLimiterWithClock(now func() time.Time) *Limiter {
+	return &Limiter{buckets: map[string]*bucket{}, now: now}
+}
+
 // Allow reports whether a request for appID on plan may proceed, consuming a
 // token if so. Plan rps/burst come from the limits table (never inlined).
 func (l *Limiter) Allow(appID string, plan api.Plan) bool {
@@ -47,17 +62,44 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 	if !ok {
 		return false
 	}
+	return l.allowToken(appID, float64(limits.RateLimitRPS), float64(limits.RateLimitBurst))
+}
+
+// AllowAccount consumes one token from the bucket keyed by accountID (ADR-040 /
+// issue #292). Bucket parameters come from Plan.RateLimitPerAccountRPM —
+// internal math divides by 60 to derive rps and uses the RPM value as the
+// burst ceiling, so an account can absorb a burst of `RPM` requests before
+// the per-minute refill kicks in. Distinct from Allow (per-app) so a botnet
+// rotating across many apps within an account cannot evade this limiter by
+// keeping per-app rps low.
+func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
+	if l.noop {
+		return true
+	}
+	rpm := plan.RateLimitPerAccountRPM()
+	if rpm <= 0 {
+		return false // fail closed on unknown plan (mirrors CronLimitPerAccount)
+	}
+	return l.allowToken(accountID, float64(rpm)/60.0, float64(rpm))
+}
+
+// allowToken is the shared token-bucket math used by both Allow (per-app) and
+// AllowAccount (per-account). Keyed by the actor ID; rps is the refill rate,
+// burst is the bucket ceiling. Returns true on a consumed token, false when
+// the bucket is empty (caller responds 429). Plan changes update rps/burst
+// without losing in-flight tokens — see TestLimiterAllowAccount_PlanChange.
+func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	now := l.now()
-	b := l.buckets[appID]
+	b := l.buckets[id]
 	if b == nil {
-		b = &bucket{tokens: float64(limits.RateLimitBurst), rps: float64(limits.RateLimitRPS), burst: float64(limits.RateLimitBurst), last: now}
-		l.buckets[appID] = b
+		b = &bucket{tokens: burst, rps: rps, burst: burst, last: now}
+		l.buckets[id] = b
 	} else {
 		// A plan change updates the bucket's parameters without losing tokens.
-		b.rps, b.burst = float64(limits.RateLimitRPS), float64(limits.RateLimitBurst)
+		b.rps, b.burst = rps, burst
 		b.tokens += now.Sub(b.last).Seconds() * b.rps
 		if b.tokens > b.burst {
 			b.tokens = b.burst
@@ -76,6 +118,17 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 func (l *Limiter) Forget(appID string) {
 	l.mu.Lock()
 	delete(l.buckets, appID)
+	l.mu.Unlock()
+}
+
+// ForgetAccount drops an account's bucket (ADR-040). Symmetric with Forget
+// for the per-account scope. SIGHUP uses ForgetAll which covers both scopes
+// at once; ForgetAccount is the per-scope escape hatch (e.g. for an admin
+// endpoint that needs to clear one customer's throttle without resetting
+// the whole fleet — not wired today, but the seam is here).
+func (l *Limiter) ForgetAccount(accountID string) {
+	l.mu.Lock()
+	delete(l.buckets, accountID)
 	l.mu.Unlock()
 }
 
