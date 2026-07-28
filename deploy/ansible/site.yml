@@ -36,6 +36,7 @@
     - role: lvm              # verify-only — provisioning is the installer's job
     - role: xfs              # verify prjquota + tmpfs for /srv/fc/jail
     - role: firecracker      # binary + jailer + pinned vmlinux
+    - role: supply_chain_scanners  # issue #299 — Grype + Syft on PATH for imaged's boot-gate sidecar write
     - role: systemd_slices   # memory caps for cp / tenant / build slices
     - role: nftables         # egress denylist per spec §7
     - role: postgres         # install + faas user; schema is M5's job

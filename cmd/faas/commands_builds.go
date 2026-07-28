@@ -35,16 +35,61 @@ const dispatchBuild = "build"
 // immediately rather than silently invoking a sibling.
 func cmdBuild(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: faas build <subcommand> [flags]\n  subcommands: provenance", "build")
+		PrintUsage(os.Stderr, "usage: faas build <subcommand> [flags]\n  subcommands: provenance, sbom", "build")
 		return 1
 	}
 	switch args[0] {
 	case "provenance":
 		return cmdBuildProvenance(args[1:])
+	case "sbom":
+		return cmdBuildSbom(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "faas build: unknown subcommand %q (known: provenance)\n", args[0])
+		fmt.Fprintf(os.Stderr, "faas build: unknown subcommand %q (known: provenance, sbom)\n", args[0])
 		return 1
 	}
+}
+
+// cmdBuildSbom streams the CycloneDX SBOM for a build id (issue
+// #299 / ADR-038 Phase 3). `faas build sbom <id>` writes the raw
+// SBOM JSON to stdout so the operator can pipe it straight to
+// `cyclonedx-cli validate` or to a CI artifact publisher. No -j
+// flag — the SBOM IS the JSON; the binary form is the only shape
+// we ever serve.
+//
+// Errors:
+//   - 401/unauthenticated → "Not logged in"
+//   - 404 build_provenance_not_found → "no SBOM for this build"
+//     (Phase-3 populator hasn't landed; or build predates the
+//     schema column)
+//   - other 4xx/5xx → server-supplied code + message.
+func cmdBuildSbom(args []string) int {
+	if len(args) != 1 {
+		PrintUsage(os.Stderr, "usage: faas build sbom <id>", "build")
+		return 1
+	}
+	id := args[0]
+	if !buildIDPattern.MatchString(id) {
+		PrintUsage(os.Stderr, "usage: faas build sbom <id>   (id is 32 hex chars)", "build")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	body, err := client.GetBuildsIdSbom(context.Background(), id)
+	if err != nil {
+		return printErr("Could not fetch build SBOM", err)
+	}
+	if len(body) == 0 {
+		return printErr("Could not fetch build SBOM", fmt.Errorf("no SBOM for build %s (Phase-3 populator may not have run)", id))
+	}
+	// Write raw bytes — preserves formatting for downstream tools
+	// (jq, cyclonedx-cli validate, etc.). Avoid Fprintf's string
+	// conversion since the body may contain non-UTF-8 bytes
+	// (CycloneDX's package-purl strings are pure UTF-8 today, but
+	// binary SBOM consumers shouldn't depend on that).
+	_, _ = osStdout.Write(body)
+	return 0
 }
 
 // cmdBuildProvenance renders the ADR-038 build_provenance row for

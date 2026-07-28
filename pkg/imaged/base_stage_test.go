@@ -62,6 +62,15 @@ func newBaseHarness(t *testing.T, mp *minimalManifestPuller, b LayerBuilder) *ba
 		builder: b,
 		log:     silentLogger(),
 		storage: be,
+		// Inject a no-op grypeRun so the scan sidecar write at the end
+		// of EnsureBaseExt4 doesn't shell out to grype (which isn't on
+		// the unit-test PATH and would trip the fail-closed CRITICAL=9999
+		// placeholder, polluting tests that aren't asserting on the scan
+		// sidecar's contents). Tests that DO care about the scan sidecar
+		// override the runner with their own stub.
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
 	}
 	return &baseHarness{h: h, be: be}
 }
@@ -113,6 +122,44 @@ func TestEnsureBaseExt4_StagesOnFirstRun(t *testing.T) {
 	}
 	if string(haveDigest) != res.ConfigDigest {
 		t.Errorf("sidecar %q != res.ConfigDigest %q", string(haveDigest), res.ConfigDigest)
+	}
+}
+
+// TestEnsureBaseExt4_GrypeCalledWithFilesystemPath — Critical #1 of the
+// PR #385 review: Grype's `dir:` source walks a filesystem path, NOT an
+// OCI ref. The original implementation passed `ref` (the OCI ref, e.g.
+// "ghcr.io/onebox-faas/builder-base:latest") to grype, which Grype rejects
+// because registry refs belong to a `registry:` source. The fix routes the
+// filesystem path (outImage) to grype while still recording the OCI ref
+// in the sidecar's `image` field for dashboard traceability. This test
+// pins the contract: a captured grypeRun stub must see the outImage path,
+// not the OCI ref.
+func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	b := &fakeBuilder{}
+	hs := newBaseHarness(t, mp, b)
+
+	const ociRef = "ghcr.io/onebox-faas/builder-base:latest"
+	const baseKey = "base/runner-builder-amd64.ext4"
+	const digKey = "base/runner-builder-amd64.ext4.digest"
+	const outImage = "/srv/fc/base/runner-builder-amd64.ext4"
+
+	var capturedDir string
+	hs.h.grypeRun = func(_ context.Context, dir string) (map[string]int, error) {
+		capturedDir = dir
+		return map[string]int{}, nil
+	}
+
+	if _, err := hs.h.EnsureBaseExt4(context.Background(),
+		ociRef, baseKey, digKey, outImage); err != nil {
+		t.Fatalf("EnsureBaseExt4: %v", err)
+	}
+	if capturedDir != outImage {
+		t.Errorf("grypeRun called with %q; want the filesystem path %q (not the OCI ref %q)",
+			capturedDir, outImage, ociRef)
+	}
+	if capturedDir == ociRef {
+		t.Errorf("grypeRun was handed the OCI ref %q — Grype's `dir:` source walks a filesystem path, not a registry ref", capturedDir)
 	}
 }
 

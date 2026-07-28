@@ -37,3 +37,4 @@ vmlinux-*
 # to this list). The cmd/<daemon>/ source dirs still get committed.
 /apid
 /schedd
+/vmmd
