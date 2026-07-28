@@ -66,10 +66,13 @@ func TestMigrations_00060_AlertRules_ShapeAndFK(t *testing.T) {
 		}
 	}
 	// Two apps — one bound to acctID, one to acctID2 — so the
-	// CHECK / CASCADE / null-app-id tests have something to point at.
+	// CHECK / CASCADE / null-app_id tests have something to point at.
 	// apps columns (migration 00001 + 00002): id, account_id, slug,
 	// type, runtime, ram_mb, max_concurrency, idle_timeout_s, status,
 	// created_at — no name/source_kind/source_bytes/updated_at.
+	// appIDFor0 is seeded twice on purpose: the second iteration is a
+	// no-op (on conflict do nothing) and just confirms that re-seeding
+	// is safe across accounts — appIDFor0 stays bound to acctID.
 	for _, app := range []struct{ id, owner string }{
 		{appIDFor0, acctID},
 		{appIDFor0, acctID2}, // on conflict do nothing → no-op; appIDFor0 still belongs to acctID
