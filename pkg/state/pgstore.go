@@ -2723,7 +2723,7 @@ func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID st
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
-		   and ($2 = '' or i.id < $2)
+		   and ($2 = '' or i.id::text < $2)
 		 order by i.started_at desc, i.id desc
 		 limit $3`, accountID, before, limit)
 	if err != nil {
