@@ -240,10 +240,12 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       5,
 		MaxSourceBytesPerInvocation: 64 * 1024,
 		AsyncInvokeAllowed:          true,
-		// Autoscale: Hobby gets the RPS target only. CPU-driven scaling
-		// is gated on Pro+ because the cost shape of "scale on CPU
-		// without a min_instances floor" is unbounded on Hobby.
-		ScaleUpTargetRPSAllowed: true,
+		// Autoscale: Hobby is gated on Pro+ for both RPS and CPU
+		// (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier on
+		// ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
+		// on Pro+ because the cost shape of "scale on CPU without
+		// a min_instances floor" is unbounded on Hobby.
+		ScaleUpTargetRPSAllowed: false,
 		ScaleUpTargetCPUAllowed: false,
 		// Cron: Hobby gets a small per-app budget (5) and a per-account
 		// budget that absorbs ~2 Hobby-tier apps (10). Tracks the

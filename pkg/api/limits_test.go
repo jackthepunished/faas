@@ -21,9 +21,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			RateLimitPerAccountRPM: 50},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			MaxQueueDepth: 5, MaxDelayedTasksPerApp: 5, MaxSourceBytesPerInvocation: 64 * 1024, AsyncInvokeAllowed: true,
-			// Issue #169 / #172: Hobby unlocks RPS target only (CPU is
-			// gated on Pro+ for cost reasons).
-			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: false,
+			// Issue #169 / #172: Hobby is gated on Pro+ for both RPS
+			// and CPU (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier
+			// on ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
+			// on Pro+ for cost reasons.
+			ScaleUpTargetRPSAllowed: false, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
