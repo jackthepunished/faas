@@ -2430,14 +2430,9 @@ func (s *PgStore) AlertRuleByID(ctx context.Context, id string) (AlertRule, erro
 // UpdateAlertRule coalesces the optional fields onto alert_rules.
 // All fields share the nil-skip pattern; WebhookSecretSealed is *[]byte
 // because a nil means "leave the seal alone" (a non-rotation update
-// path) and a non-nil replaces the column.
-//
-// FailureSource is intentionally NOT part of this UPDATE — it is
-// derived from the metric + a separate caller-supplied argument, so
-// the handler must rotate metric and source together via a small
-// wrapper that issues two statements under a tx. Today's API surface
-// doesn't expose FailureSource in PATCH; this is by design (a
-// rotation that swaps only one half is a footgun). See PR 3.
+// path) and a non-nil replaces the column. FailureSource is not on
+// UpdateAlertRuleParams — see the struct godoc for why metric and
+// source rotate together or not at all.
 func (s *PgStore) UpdateAlertRule(ctx context.Context, id string, p UpdateAlertRuleParams) (AlertRule, error) {
 	var nameArg, urlArg any
 	if p.Name != nil {
@@ -2523,6 +2518,14 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 // the stamp. A NULL or stale stamp = the claim wins; a fresh stamp
 // inside the bucket = the claim loses.
 //
+// The Postgres impl is a stamped-only gate (PR 4's evaluator builds
+// the idempotency_key per rule when it wants two-tier dedupe — the
+// rule-id is the wider gate, the bucket is the inner). The bucket
+// parameter is accepted here so the Store interface stays a single
+// signature for both stores; MemStore enforces the bucket-level dedupe
+// via alertClaimKeys (see memstore.go:1149) and PgStore enforces the
+// rule-id-level gate via this CTE.
+//
 // CTE shape captures the OLD stamp explicitly so the "stamp already
 // set" branch is distinguishable from "stamp was NULL". The PR #69
 // regression used returning col = $2; that's always true post-update
@@ -2530,6 +2533,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 // (old + won) is the load-bearing detail.
 func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error) {
 	var existing *time.Time
+	_ = idempotencyKey // accepted on the interface; bucket dedupe lives on MemStore + alert_deliveries UNIQUE
 	err = s.pool.QueryRow(ctx, `
 		with existing as (
 		    select last_fired_at as old
@@ -2537,14 +2541,14 @@ func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey str
 		 ),
 		 upd as (
 		    update alert_rules
-		       set last_fired_at = $3
+		       set last_fired_at = $2
 		     where id = $1
-		       and (last_fired_at is null or last_fired_at < $3)
+		       and (last_fired_at is null or last_fired_at < $2)
 		    returning 1
 		 )
 		 select (select old from existing),
 		        exists(select 1 from upd)`,
-		ruleID, idempotencyKey, at.UTC()).Scan(&existing, &won)
+		ruleID, at.UTC()).Scan(&existing, &won)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, ErrNotFound

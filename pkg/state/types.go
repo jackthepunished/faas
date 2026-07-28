@@ -507,6 +507,15 @@ const (
 // the caller must distinguish "leave alone" from "set to false / 0".
 // The pointer-to-pointer pattern keeps the Store API narrow without
 // falling back on sentinel values.
+//
+// FailureSource is intentionally absent: the column is derived from
+// `metric` via the alert_rules_failure_source_xor_chk constraint, so
+// rotating one half in isolation is rejected by the DB. PR 3's
+// handler must rotate Metric + FailureSource together by issuing a
+// fresh CreateAlertRule if the metric family actually changes, or by
+// an explicit dedicated wrapper. Today's UpdateAlertRule will silently
+// ignore a FailureSource change, which is a footgun — the field
+// exists nowhere on this struct on purpose.
 type UpdateAlertRuleParams struct {
 	Name                *string
 	Enabled             *bool
@@ -514,7 +523,6 @@ type UpdateAlertRuleParams struct {
 	Comparison          *AlertComparison
 	Threshold           *float64
 	WindowSpec          *AlertWindowSpec
-	FailureSource       *AlertFailureSource // nil clears the column
 	WebhookURL          *string
 	WebhookSecretSealed *[]byte // nil = don't reseal; non-nil replaces
 	CooldownMinutes     *int
