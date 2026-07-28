@@ -71,8 +71,82 @@ jobs:
             root@${{ secrets.DO_HOST }} 'bash -s' << 'REMOTE'
           set -euo pipefail
 
+          FAAS_SERVICES="apid schedd gatewayd imaged meterd githubd"
+          BINARIES="apid schedd gatewayd imaged meterd githubd faas migrate"
+          # Deliberately NOT under /opt/faas/bin: this dir survives a failed
+          # deploy (so the previous build stays inspectable) and nothing that
+          # globs the binary directory should ever see it.
+          ROLLBACK_DIR=/opt/faas/rollback
+
+          # --- Snapshot the currently-installed binaries -------------------
+          # Without this a bad merge leaves the box crash-looping until a
+          # human notices: the imaged/rootfs regression racked up 18,991
+          # restarts across ~12 h before anyone looked. The deploy now owns
+          # its own undo.
+          rm -rf "${ROLLBACK_DIR}"
+          mkdir -p "${ROLLBACK_DIR}"
+          for bin in ${BINARIES}; do
+            if [[ -f "/opt/faas/bin/${bin}" ]]; then
+              cp -a "/opt/faas/bin/${bin}" "${ROLLBACK_DIR}/${bin}"
+            fi
+          done
+
+          # wait_healthy polls until every service is active AND the gateway
+          # answers /healthz, or the budget runs out. Replaces the old fixed
+          # `sleep 3`, which raced a slow restart and reported success while
+          # a daemon was still in its restart backoff.
+          wait_healthy() {
+            local deadline=$((SECONDS + 60)) svc bad
+            while (( SECONDS < deadline )); do
+              bad=""
+              for svc in ${FAAS_SERVICES}; do
+                systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
+              done
+              if [[ -z "${bad}" ]] && curl -sf --max-time 5 \
+                   http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+                echo "✓ all services active, gateway healthy"
+                return 0
+              fi
+              sleep 3
+            done
+            echo "::error::health gate timed out after 60s; unhealthy:${bad:- (gateway /healthz)}"
+            for svc in ${FAAS_SERVICES}; do
+              systemctl is-active --quiet "faas-${svc}" || {
+                echo "--- faas-${svc} ---"
+                journalctl -u "faas-${svc}" -n 30 --no-pager || true
+              }
+            done
+            return 1
+          }
+
+          # roll_back restores the previous binaries and restarts. Migrations
+          # are deliberately NOT reverted: goose is append-only (repo rule)
+          # and every migration must stay readable by the previous binary for
+          # one release, so binaries-only is the safe direction.
+          roll_back() {
+            echo "::warning::rolling back to the previous binaries"
+            local bin
+            for bin in ${BINARIES}; do
+              # Plain `if`, not `[[ ... ]] && install`: under `set -e` a
+              # false test makes the && list return 1 and aborts the
+              # rollback halfway through on a first-ever deploy, when
+              # ROLLBACK_DIR has no previous copy of some binary.
+              if [[ -f "${ROLLBACK_DIR}/${bin}" ]]; then
+                install -m 0755 "${ROLLBACK_DIR}/${bin}" "/opt/faas/bin/${bin}"
+              fi
+            done
+            for svc in ${FAAS_SERVICES}; do
+              systemctl restart "faas-${svc}.service" || true
+            done
+            if wait_healthy; then
+              echo "::warning::rollback succeeded — box is serving the PREVIOUS build"
+            else
+              echo "::error::rollback FAILED — box needs manual attention"
+            fi
+          }
+
           # Safely overwrite running binaries using 'install' (unlinks old files)
-          for bin in apid schedd gatewayd imaged meterd githubd faas migrate; do
+          for bin in ${BINARIES}; do
             install -m 0755 /opt/faas/bin/deploy-tmp/$bin /opt/faas/bin/$bin
           done
           rm -rf /opt/faas/bin/deploy-tmp
@@ -122,26 +196,28 @@ jobs:
           fi
 
           # Restart all FaaS services.
-          for svc in apid schedd gatewayd imaged meterd githubd; do
+          for svc in ${FAAS_SERVICES}; do
             systemctl restart "faas-${svc}.service" || true
           done
 
-          # Quick smoke test.
-          # Probes gatewayd (loopback :8080), not apid directly — spec §11
-          # binds apid to loopback-only, and gatewayd reverse-proxies /healthz
-          # onto apid. So this exercises the full proxy chain end-to-end
-          # (issue #85 PR 1 + PR 2).
-          sleep 3
-          curl -sf http://127.0.0.1:8080/healthz > /dev/null \
-            && echo "✓ Gateway healthy (apid reachable via loopback proxy)" \
-            || echo "⚠ Gateway not responding"
+          # Health gate. Probes gatewayd (loopback :8080), not apid directly
+          # — spec §11 binds apid to loopback-only and gatewayd
+          # reverse-proxies /healthz onto apid, so this exercises the full
+          # proxy chain end-to-end (issue #85 PR 1 + PR 2).
+          #
+          # This used to be `curl ... || echo "⚠ Gateway not responding"`,
+          # which swallowed the failure: the step exited 0 with a warning
+          # nobody read, and the job only went red one step later with no
+          # daemon logs attached. Now an unhealthy box rolls back and fails.
+          if ! wait_healthy; then
+            roll_back
+            exit 1
+          fi
+          rm -rf "${ROLLBACK_DIR}"
           REMOTE
 
       - name: Verify deployment
         run: |
-          echo "Waiting 5 seconds for services to settle..."
-          sleep 5
-
           echo "1. Verifying systemd service states via SSH..."
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no root@${{ secrets.DO_HOST }} '
             failed=0
@@ -150,7 +226,16 @@ jobs:
                 echo "✓ faas-$svc is active and running"
               else
                 echo "::error::faas-$svc is not running!"
-                systemctl status faas-$svc -n 20
+                # `systemctl status` on a unit in Restart=on-failure backoff
+                # prints "activating (auto-restart)" and NO application error
+                # — that is why the imaged/rootfs crash-loop needed a manual
+                # SSH session to diagnose. Pull the daemon logs so the CI log
+                # alone is enough, and show the restart counter so a
+                # crash-loop is distinguishable from a slow start.
+                echo "--- journalctl -u faas-$svc (last 40) ---"
+                journalctl -u faas-$svc -n 40 --no-pager || true
+                echo "--- restart counter ---"
+                systemctl show faas-$svc -p NRestarts --value || true
                 failed=1
               fi
             done

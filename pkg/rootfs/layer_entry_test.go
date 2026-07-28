@@ -44,22 +44,28 @@ func TestApplyEntry_TypeRegTruncatesExisting(t *testing.T) {
 	}
 }
 
-func TestApplyEntry_SymlinkExternal(t *testing.T) {
-	// Pin the CodeQL go/path-injection hardening: a header whose Linkname
-	// is an absolute host path is REJECTED before the staging directory is
-	// touched. Previously applyEntry blindly called os.Symlink(hdr.Linkname,
-	// target), letting a malicious layer create a symlink whose target
-	// pointed at /etc/hostname (or anything else on the host). Now safeJoin
-	// runs first and absolute paths get a "rootfs: absolute entry path"
-	// error.
+func TestApplyEntry_SymlinkAbsoluteTargetIsVerbatim(t *testing.T) {
+	// A header whose Linkname is absolute is written VERBATIM — the string
+	// is guest-side data, resolved by the guest kernel once the ext4 is
+	// mounted at "/". Absolute targets are ubiquitous in real OCI layers
+	// (alpine: 306 of them), so rejecting them here bricked imaged.
+	//
+	// The host-escape concern is handled on the WRITE path instead:
+	// resolveEntryPath/resolveWithin clamp ancestor symlinks inside the
+	// staging root, so this link cannot be used to reach the host's /etc.
+	// See TestApplyLayer_WriteThroughSymlinkIsClamped in safety_test.go.
 	dir := t.TempDir()
 	target := filepath.Join(dir, "link")
 	hdr := &tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/hostname"}
-	if err := applyEntry(dir, target, hdr, nil); err == nil {
-		t.Fatal("applyEntry accepted absolute symlink target; expected safeJoin rejection")
+	if err := applyEntry(dir, target, hdr, nil); err != nil {
+		t.Fatalf("applyEntry rejected an absolute symlink target: %v", err)
 	}
-	if _, err := os.Lstat(target); err == nil {
-		t.Errorf("escaped symlink landed on host: %s", target)
+	got, err := os.Readlink(target)
+	if err != nil {
+		t.Fatalf("symlink not created: %v", err)
+	}
+	if got != "/etc/hostname" {
+		t.Errorf("link text = %q, want %q (verbatim)", got, "/etc/hostname")
 	}
 }
 
