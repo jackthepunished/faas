@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubd"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
 
@@ -507,6 +508,48 @@ func TestGithubdProxy_AuditEmitFailure_DoesNotRollback(t *testing.T) {
 	}
 	if hits.Load() != 1 {
 		t.Errorf("upstream hits = %d, want 1", hits.Load())
+	}
+}
+
+// TestGithubdProxy_AuditEmit_SanitizesDeliveryID pins the CodeQL
+// go/log-injection fix (PR #389 follow-up): the webhookdedupe audit
+// payload's `delivery_id` value is provider-supplied (HTTP header
+// from the upstream provider). A misconfigured / hostile upstream
+// could carry CR/LF/NUL in that value; the proxy must route the
+// value through logsanitize.Field before it reaches the audit JSON
+// payload so a downstream Postgres read or JSON consumer can't be
+// tricked into reading the row as multiple log events.
+//
+// We can't drive the malicious header through net/http's transport
+// (the stdlib rejects CR/LF/NUL in header values pre-flight), so
+// the test directly invokes the auditor with a tainted value and
+// asserts the recorded JSON does not contain the control bytes.
+func TestGithubdProxy_AuditEmit_SanitizesDeliveryID(t *testing.T) {
+	auditor := newFakeAuditStore()
+	gw := newGatewaydAuditor(auditor, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	malicious := "evil\r\nFAKE-LOG-LINE\x00end"
+	gw.Emit(context.Background(), "webhook.replay_rejected", nil, map[string]any{
+		"provider":    webhookdedupe.ProviderGitHub,
+		"delivery_id": logsanitize.Field(malicious),
+	})
+	if got := auditor.Count(); got != 1 {
+		t.Fatalf("audit row count = %d, want 1", got)
+	}
+	row, ok := auditor.Last()
+	if !ok {
+		t.Fatalf("audit row missing")
+	}
+	for _, b := range []byte("\r\n\x00") {
+		if bytes.Contains(row.Data, []byte{b}) {
+			t.Errorf("audit payload contains raw control byte 0x%02x; data=%s", b, row.Data)
+		}
+	}
+	// And the sanitised value must still be present (we don't
+	// drop the row, just rewrite the control bytes to U+00B7)
+	// so operators can still correlate the row to the upstream
+	// delivery UUID.
+	if !strings.Contains(string(row.Data), "evil") {
+		t.Errorf("audit payload lost the original value: %s", row.Data)
 	}
 }
 

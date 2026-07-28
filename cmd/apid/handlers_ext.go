@@ -1174,12 +1174,12 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 				acctID := acct.ID
 				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
 					"provider":    webhookdedupe.ProviderStripe,
-					"delivery_id": ev.ID,
+					"delivery_id": logsanitize.Field(ev.ID),
 				})
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			s.log.Warn("stripe replay-check infra error; forwarding", "event_id", ev.ID, "err", err)
+			s.log.Warn("stripe replay-check infra error; forwarding", "event_id", logsanitize.Field(ev.ID), "err", err)
 		}
 	}
 	// Map Stripe's event_type strings to the normalized billing.EventType
@@ -1254,12 +1254,12 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 				acctID := acct.ID
 				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
 					"provider":    webhookdedupe.ProviderPaddle,
-					"delivery_id": ev.EventID,
+					"delivery_id": logsanitize.Field(ev.EventID),
 				})
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			s.log.Warn("paddle replay-check infra error; forwarding", "event_id", ev.EventID, "err", err)
+			s.log.Warn("paddle replay-check infra error; forwarding", "event_id", logsanitize.Field(ev.EventID), "err", err)
 		}
 	}
 	s.handleBillingEvent(r.Context(), ev, acct)

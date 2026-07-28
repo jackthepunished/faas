@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/githubd"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
@@ -138,11 +139,11 @@ func (g *githubdProxy) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := g.checkReplay(r.Context(), deliveryID); err != nil {
-		g.log.Info("githubd replay rejected", "delivery_id", deliveryID, "err", err)
+		g.log.Info("githubd replay rejected", "delivery_id", logsanitize.Field(deliveryID), "err", err)
 		if g.auditor != nil {
 			g.auditor.Emit(r.Context(), "webhook.replay_rejected", nil, map[string]any{
 				"provider":    webhookdedupe.ProviderGitHub,
-				"delivery_id": deliveryID,
+				"delivery_id": logsanitize.Field(deliveryID),
 			})
 		}
 		w.WriteHeader(http.StatusOK)
