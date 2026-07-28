@@ -529,11 +529,23 @@ func (l *Loop) runHeartbeat(ctx context.Context) {
 // contributor adds one we still want the loop to keep ticking).
 // Drift counts are logged inside DiskDrift.Tick; this dispatch
 // helper intentionally has no return path for them.
+//
+// The ctx passed in is wrapped with the per-tick timeout
+// (sched.DefaultDiskDriftTickTimeout = 5s) so a slow /srv/fc/snap
+// ReadDir cannot freeze the loop's 1 Hz tick budget. The
+// direct-call test surface (TestLoopRunDiskDriftDispatchesTick)
+// passes a context that already has its own deadline — the
+// WithTimeout wrap is composable.
 func (l *Loop) runDiskDrift(ctx context.Context) {
 	if l.diskDrift == nil {
+		// Direct-call guard for tests; the select case is already
+		// gated by the nil-ticker pattern in diskDriftTick (a nil
+		// ticker returns a nil channel, so the case never fires).
 		return
 	}
-	if _, err := l.diskDrift.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	tickCtx, cancel := context.WithTimeout(ctx, l.diskDrift.timeout)
+	defer cancel()
+	if _, err := l.diskDrift.Tick(tickCtx); err != nil && !errors.Is(err, context.Canceled) {
 		l.log.Warn("disk-drift tick error", "err", err)
 	}
 }

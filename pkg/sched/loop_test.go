@@ -625,9 +625,10 @@ func wireRenderMetrics(t *testing.T, ops *wire.OpsMetrics) []byte {
 // triad on Loop. The drift component itself (pkg/sched/disk_drift_test.go)
 // owns the per-tick behaviour; this file owns the dispatcher seam:
 // the ticker fires → runDiskDrift is called → Tick runs → log + return.
-// The three cases below cover (1) happy dispatch, (2) nil-safe
-// ticker opt-out, and (3) error-resilience (Tick error doesn't
-// tear the loop down).
+// The two cases below cover (1) happy dispatch and (2) nil-safe
+// ticker opt-out. The dispatcher error-swallowing test is
+// intentionally omitted — see the comment above the absent function
+// for the rationale.
 
 // TestLoopRunDiskDriftDispatchesTick — WithDiskDrift wires a
 // real *DiskDrift; calling runDiskDrift directly invokes Tick
@@ -658,47 +659,38 @@ func TestLoopWithoutDiskDriftIsNilSafe(t *testing.T) {
 	loop.runDiskDrift(context.Background())
 }
 
-// TestRunDiskDriftErrorDoesNotStopLoop — a DiskDrift whose Tick
-// returns an error must log + swallow; the loop must remain
-// ready for the next dispatch tick. Mirrors the runRetention
-// error-swallowing contract — the sweep is diagnostic; errors are
-// logged, never propagated.
-//
-// Uses errLister (defined in disk_drift_test.go) which always
-// returns a non-nil error from ListSnapshotsForGC. DiskDrift.Tick
-// swallows that error and returns (0, nil), so to exercise the
-// error-swallowing path on the dispatch side we need a
-// DiskDrift that itself returns an error from Tick. That shape
-// doesn't exist today (Tick is nil-error-by-construction) but the
-// dispatcher's contract is "log + swallow," so we verify it by
-// making runDiskDrift face an interface whose Tick fails.
-//
-// Approach: use a DiskDrift with a snapshotLister that returns an
-// error from ListSnapshotsForGC. Tick logs the error and returns
-// (0, nil) — so runDiskDrift sees no error. To test the
-// "Tick returns an error" path of the dispatcher we instead inject
-// a *DiskDrift whose store returns an error AND assert that the
-// dispatcher doesn't panic. The contract under test is "don't
-// tear down the loop," and a returned (0, nil) is the same
-// observed behaviour as "errored but recovered." The defensive
-// nil-check + errors.Is(err, context.Canceled) in runDiskDrift is
-// the load-bearing branch; we exercise it by calling
-// runDiskDrift twice (back-to-back) and confirming the loop is
-// still usable.
-func TestRunDiskDriftErrorDoesNotStopLoop(t *testing.T) {
+// TestLoopRunDiskDriftRespectsTickTimeout — runDiskDrift wraps the
+// incoming ctx with a per-tick deadline (sched.DefaultDiskDriftTickTimeout)
+// so a slow /srv/fc/snap mount cannot freeze the loop's 1 Hz tick
+// budget. The wrap is the only behaviour under test here: a
+// pre-cancelled tickCtx must produce a sweep that returns without
+// touching the counter (the per-iteration ctx.Err() guard in
+// Tick short-circuits before any dep dir is read).
+func TestLoopRunDiskDriftRespectsTickTimeout(t *testing.T) {
 	store := state.NewMemStore()
 	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
-	// errLister is defined in disk_drift_test.go (same package).
-	// It always returns an error from ListSnapshotsForGC; DiskDrift.Tick
-	// logs + returns (0, nil). The dispatcher is therefore exercising
-	// the happy path twice — the resilience we want to pin is that
-	// a non-zero, non-Canceled error from Tick (if a future contributor
-	// adds one) is logged and the loop keeps ticking. The two
-	// back-to-back calls below prove the dispatcher returns cleanly
-	// each time, which is the observable contract.
-	dd := NewDiskDrift(&errLister{err: context.Canceled}, testLog())
+	// Force a tight timeout so the wrap is observable in the test.
+	dd := NewDiskDrift(store, testLog()).WithTickTimeout(1 * time.Nanosecond)
+	ops := wire.NewOpsMetrics("schedd")
+	dd.WithMetrics(ops)
 	loop := NewLoop(nil, engine, testLog()).WithDiskDrift(dd)
 
-	loop.runDiskDrift(context.Background())
+	// Sleep past the 1-ns deadline so the inner wrap is already
+	// expired by the time Tick runs. The dispatcher-and-Tick
+	// pipeline must return without panic and without incrementing
+	// the counter (the per-iteration ctx.Err() guard fires before
+	// any disk read).
+	time.Sleep(2 * time.Millisecond)
 	loop.runDiskDrift(context.Background())
 }
+
+// TestRunDiskDriftErrorDoesNotStopLoop is intentionally omitted.
+// Dispatcher error-swallowing for runDiskDrift is identical to
+// runHeartbeat + runRetention, both untested for the same reason:
+// DiskDrift.Tick is nil-error-by-construction today, so an
+// "errored Tick" double would require a test-only injection seam
+// without a corresponding production path. The dispatcher's
+// `errors.Is(err, context.Canceled)` branch is load-bearing but
+// unreachable until a future contributor adds a real error
+// return from Tick — and when they do, the new test should
+// cover the actual emitted error, not a fabricated one.

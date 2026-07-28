@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -67,15 +68,30 @@ type snapshotLister interface {
 // cadence.
 //
 // Fields are unexported; the public surface is NewDiskDrift +
-// WithMetrics + Tick. Constructor injection pattern mirrors
-// Retention and Heartbeat in this package.
+// WithMetrics + WithTickTimeout + WithClock + Tick. Constructor
+// injection pattern mirrors Retention and Heartbeat in this package.
 type DiskDrift struct {
-	store snapshotLister
-	log   *slog.Logger
+	store   snapshotLister
+	log     *slog.Logger
+	now     func() time.Time
+	timeout time.Duration
 	// metrics may be nil; SnapshotDiskDrift() is itself nil-safe so
 	// Tick doesn't have to nil-check before each Inc.
 	metrics *wire.OpsMetrics
 }
+
+// DefaultDiskDriftTickTimeout bounds the per-tick wall-clock cost of
+// the sweep. The Loop runs the drift case inside a 1 Hz select that
+// also serves the reaper, watchdog, cron, and heartbeat tickers — a
+// single slow /srv/fc/snap ReadDir (e.g. due to a remote-attached
+// mount in a future scale-out world) would otherwise freeze the
+// loop for the duration of the call. 5s is a generous ceiling for a
+// sweep that touches ~tens of dep dirs on a healthy box (sub-ms in
+// practice); it leaves the per-tick budget well under the 1 Hz
+// tick interval. The cleaner is a Warn log + sweep abort — the
+// counter is left untouched, so the next tick catches the new
+// state.
+const DefaultDiskDriftTickTimeout = 5 * time.Second
 
 // NewDiskDrift returns a DiskDrift ready for the Loop ticker. The
 // store parameter accepts any snapshotLister; production passes a
@@ -91,7 +107,12 @@ func NewDiskDrift(store snapshotLister, log *slog.Logger) *DiskDrift {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &DiskDrift{store: store, log: log}
+	return &DiskDrift{
+		store:   store,
+		log:     log,
+		now:     time.Now,
+		timeout: DefaultDiskDriftTickTimeout,
+	}
 }
 
 // WithMetrics injects the OpsMetrics receiver the sweep increments on
@@ -101,6 +122,34 @@ func NewDiskDrift(store snapshotLister, log *slog.Logger) *DiskDrift {
 // circuits on nil-receiver, per the metric accessor contract).
 func (d *DiskDrift) WithMetrics(m *wire.OpsMetrics) *DiskDrift {
 	d.metrics = m
+	return d
+}
+
+// WithTickTimeout overrides the per-tick wall-clock budget. 0 or
+// negative reverts to DefaultDiskDriftTickTimeout. Used by the
+// dispatcher (Loop.runDiskDrift) to bound the synchronous ReadDir
+// cost so a slow /srv/fc/snap mount cannot freeze the loop's 1 Hz
+// tick budget. Direct tests of Tick (which run synchronously in
+// the test goroutine) do not consume this timeout — they pass
+// their own context.
+func (d *DiskDrift) WithTickTimeout(t time.Duration) *DiskDrift {
+	if t <= 0 {
+		t = DefaultDiskDriftTickTimeout
+	}
+	d.timeout = t
+	return d
+}
+
+// WithClock injects a frozen time source for tests. Same shape as
+// Retention.WithClock and Loop.WithClock. The sweep does not
+// read the clock today (the size comparison is wall-clock-agnostic);
+// the seam is preserved so a future contributor adding a
+// "first-fire-defer" or "rate-limit" doesn't need to re-thread the
+// dependency.
+func (d *DiskDrift) WithClock(now func() time.Time) *DiskDrift {
+	if now != nil {
+		d.now = now
+	}
 	return d
 }
 
@@ -153,8 +202,19 @@ func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
 
 	// Pass 1: walk every DB-known dep dir; compare files. Counts
 	// missing files, size mismatches, unexpected regular files, and
-	// non-regular entries under each dep dir.
+	// non-regular entries under each dep dir. The per-iteration
+	// ctx.Err() check is the per-tick timeout guard — a slow
+	// /srv/fc/snap mount (e.g. network-attached in a future
+	// scale-out world) cannot freeze the loop's 1 Hz tick budget
+	// because the dispatcher wraps ctx with a bounded deadline via
+	// d.timeout. We check between dep dirs (not between syscalls)
+	// because os.ReadDir is synchronous and not interruptible.
 	for depID, row := range expected {
+		if err := ctx.Err(); err != nil {
+			d.log.Warn("disk-drift: tick timed out",
+				"err", err, "drift", drift, "rows_processed", len(seen))
+			return drift, nil
+		}
 		seen[depID] = struct{}{}
 		drift += d.checkDepDir(depID, row)
 	}
@@ -286,11 +346,14 @@ func isNonRegular(m fs.FileMode) bool {
 // recordDrift increments the OpsMetrics counter and returns 1 so the
 // caller can accumulate the per-tick drift total. Nil-safe on the
 // metrics receiver (SnapshotDiskDrift() short-circuits on a nil
-// receiver). The path argument is logged so a debugging operator can
-// see which file/dir triggered the increment; production ops
-// dashboards read the rate, not the per-tick detail.
+// receiver). The per-drift log is at Debug — a persistent condition
+// increments the counter every hour, which would otherwise spam
+// Info-level logs. The Tick-end Warn summary
+// ("disk-drift: discrepancies observed") is the operator-facing
+// signal; the per-drift Debug line is for a developer tailing
+// the sweep at lower log level.
 func (d *DiskDrift) recordDrift(reason, path string) int {
-	d.log.Info("disk-drift: discrepancy",
+	d.log.Debug("disk-drift: discrepancy",
 		"reason", reason, "path", path)
 	if c := d.metrics.SnapshotDiskDrift(); c != nil {
 		c.Inc()
