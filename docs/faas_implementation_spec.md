@@ -485,6 +485,8 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `lv_fc_used_pct` | — | > 80 % warn, > 90 % page |
 | build queue wait p95 | < 60 s | > 300 s warn |
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
+| `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-041: customer dashboard) |
+| `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-041: customer dashboard; fleet wake latency is the SLO) |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
 | `schedd_instance_cpu_pct{app,node}` | max over siblings | > 90 sustained page (hot loop) |
 | `schedd_instance_rss_mb{app,node}` | sum over siblings | > plan × max_concurrency page |
@@ -501,6 +503,14 @@ explicitly because per-instance Prometheus cardinality is
 unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
+
+`gateway_request_duration_seconds{app,class}` (ADR-041, issue #273)
+is the per-app full-request-duration histogram exposed on the
+customer dashboard and the `GET /v1/apps/{slug}/metrics` endpoint.
+ADR-041 documents the deviation from the #273 acceptance criteria:
+the `route` label is dropped (gatewayd is an opaque reverse proxy)
+and the rename of `gateway_cold_wake_total` →
+`gateway_cold_boot_total` is straight (zero external consumers).
 
 ### 12.1 Autoscale decision telemetry (ADR-037, ADR-038)
 

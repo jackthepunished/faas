@@ -716,6 +716,19 @@ func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, err
 	return out, c.do(ctx, "GET", "/v1/usage?month="+month, nil, &out)
 }
 
+// GetAppMetrics returns the per-app metrics snapshot for slug over
+// the named range window. rng is one of "5m", "15m", "1h", "6h",
+// "24h", "7d", "15d" — empty falls back to the server's default
+// (5m). Issue #273 / ADR-041.
+func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetricsResponse, error) {
+	var out AppMetricsResponse
+	path := "/v1/apps/" + slug + "/metrics"
+	if rng != "" {
+		path += "?range=" + rng
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // UsageSummary returns the account-wide monthly roll-up
 // (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
 // Distinct from GetUsage which returns per-app rows; empty month falls

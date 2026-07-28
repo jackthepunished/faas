@@ -259,10 +259,47 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		Deployments:     deps,
 		Crons:           cronItems,
 		RecentInstances: recentItems,
+		// Issue #273 / ADR-041 — best-effort metrics snapshot.
+		// Failure is non-fatal: Prometheus being down renders the
+		// "degraded" empty state rather than blocking the whole
+		// page render. The 3s timeout matches the per-query timeout
+		// in pkg/promql.
+		Metrics: s.fetchDashboardMetrics(ctx, log, app.ID),
 	}}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}
+}
+
+// fetchDashboardMetrics wraps the Prometheus fetch in a 3s budget
+// so a slow Prometheus can't stall the dashboard render. nil return
+// means "skip the section entirely" (Prometheus not configured, or
+// the fetch timed out). A degraded result still returns a
+// non-nil pointer so the template can render the "degraded" label
+// rather than disappear silently — that's the same shape the
+// public /status/slo.json uses.
+func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, appID string) *dashboard.AppMetricsView {
+	if s.promqlClient == nil {
+		return nil
+	}
+	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	resp, src := s.fetchAppMetrics(dctx, appID, "5m")
+	view := &dashboard.AppMetricsView{
+		Range:        "5m",
+		Source:       src,
+		RequestCount: resp.RequestCount,
+		LatencyP50MS: resp.LatencyP50MS,
+		LatencyP95MS: resp.LatencyP95MS,
+		LatencyP99MS: resp.LatencyP99MS,
+		ErrorRatePct: resp.ErrorRatePct,
+		ColdStartPct: resp.ColdStartPct,
+		WakeP95MS:    resp.WakeP95MS,
+	}
+	if src != sourcePrometheus && log != nil {
+		log.Warn("dashboard renderAppDetail: metrics fetch degraded", "app_id", appID, "source", src)
+	}
+	return view
 }
 
 // renderUsage renders /dashboard/usage — the GB-hours bar for the

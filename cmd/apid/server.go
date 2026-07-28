@@ -18,6 +18,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/promql"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -104,6 +105,13 @@ type server struct {
 	// page). Wired in production via WithStatusCache; nil keeps the
 	// route functional but degraded (returns source=empty payload).
 	statusCache *statusCache
+	// promqlClient is the Prometheus HTTP client shared by the
+	// statusCache and the per-app metrics endpoint (issue #273 /
+	// ADR-041). Owned here so the GET /v1/apps/{slug}/metrics handler
+	// reuses the same tested transport; the client is nil-safe (the
+	// handler falls back to a degraded zero-valued payload when
+	// Prometheus isn't configured). See pkg/promql/client.go.
+	promqlClient *promql.Client
 	// statusPagePath is the on-disk path of the static HTML served
 	// at GET /status. Empty uses /etc/faas/statuspage/index.html.
 	statusPagePath string
@@ -212,8 +220,17 @@ func (s *server) WithOpsMetrics(ops *wire.OpsMetrics) *server {
 // Called from main after the config has loaded the Prometheus URL;
 // the route handlers are mounted regardless so a misconfigured
 // prometheus URL degrades the JSON to "no source" rather than 5xx.
+//
+// The Prometheus HTTP client is shared with the per-app metrics
+// endpoint (issue #273 / ADR-041) so both consumers use the same
+// tested transport. nil promURL keeps both consumers functional but
+// degraded — statusCache returns "no source", the metrics handler
+// returns zeroed fields with Source="degraded".
 func (s *server) WithStatusCache(promURL, htmlPath string) *server {
 	s.statusCache = newStatusCache(promURL, s.log)
+	if promURL != "" {
+		s.promqlClient = promql.NewClient(promURL, nil)
+	}
 	s.statusPagePath = htmlPath
 	return s
 }
@@ -443,6 +460,12 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listApps))))
 	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createApp)))))
 	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getApp))))
+	// Issue #273 / ADR-041 — per-app metrics endpoint. Read-only,
+	// no MFA required (the primary caller is an API key with
+	// ScopesReadSurface). Mirrors getApp's IDOR-safe loadApp so a
+	// cross-account slug is a 404, not a 200 with another tenant's
+	// data.
+	mux.HandleFunc("GET /v1/apps/{slug}/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppMetrics)))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
 

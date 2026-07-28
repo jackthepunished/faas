@@ -21,17 +21,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/promql"
 )
 
 // StatusPage is the JSON shape the public status page reads. Defined
@@ -95,8 +92,8 @@ func (s *server) statusJSONHandler(w http.ResponseWriter, r *http.Request) {
 // cache bounds the work and makes the JSON endpoint safe to scrape
 // from external monitoring (e.g. statuspage.io).
 type statusCache struct {
-	promURL string
-	log     *slog.Logger
+	client *promql.Client
+	log    *slog.Logger
 
 	mu        sync.Mutex
 	lastEval  time.Time
@@ -106,9 +103,16 @@ type statusCache struct {
 
 // newStatusCache builds a cache. promURL is the local Prometheus base
 // (e.g. "http://10.0.0.1:9090"); empty string disables the cache and
-// the JSON handler returns a degraded payload.
+// the JSON handler returns a degraded payload. The HTTP transport
+// lives in pkg/promql so tests can inject an httptest.Server and
+// issue #273 / ADR-041 can reuse the client for the per-app metrics
+// endpoint.
 func newStatusCache(promURL string, log *slog.Logger) *statusCache {
-	return &statusCache{promURL: promURL, log: log}
+	var c *promql.Client
+	if promURL != "" {
+		c = promql.NewClient(promURL, nil)
+	}
+	return &statusCache{client: c, log: log}
 }
 
 // Get returns the current snapshot, refreshing if the cache is stale
@@ -157,17 +161,17 @@ func (c *statusCache) Get(ctx context.Context) (StatusPage, error) {
 // has 0% API availability, 0 ms wake p95, and 0% build success,
 // which is data, not failure.
 func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
-	if c.promURL == "" {
+	if c.client == nil {
 		return StatusPage{}, fmt.Errorf("no prometheus URL configured")
 	}
 
-	snap := StatusPage{AsOf: time.Now().UTC(), Source: "prometheus"}
+	snap := StatusPage{AsOf: time.Now().UTC(), Source: sourcePrometheus}
 	var firstErr error
 	okCount := 0
 
 	// 1. API availability over last 5m: 2xx / total.
 	availQ := `sum(rate(gateway_requests_total{code=~"2.."}[5m])) / sum(rate(gateway_requests_total[5m])) * 100`
-	if pct, err := c.queryScalar(ctx, availQ); err == nil {
+	if pct, err := c.client.QueryScalar(ctx, availQ); err == nil {
 		snap.APIAvailabilityPct = pct
 		okCount++
 	} else {
@@ -179,7 +183,7 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 
 	// 2. Wake p95 (seconds → ms).
 	wakeQ := `histogram_quantile(0.95, sum(rate(gateway_wake_latency_seconds_bucket[5m])) by (le)) * 1000`
-	if ms, err := c.queryScalar(ctx, wakeQ); err == nil {
+	if ms, err := c.client.QueryScalar(ctx, wakeQ); err == nil {
 		snap.WakeP95MS = ms
 		okCount++
 	} else {
@@ -195,7 +199,7 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 	// build counter (ADR-030) — NOT the old vmmd cold-boot proxy, which
 	// measured a different thing entirely (wake success, not build).
 	buildQ := `sum(rate(builderd_ops_total{op="build",code!="user_error"}[5m])) / sum(rate(builderd_ops_total{op="build"}[5m])) * 100`
-	if pct, err := c.queryScalar(ctx, buildQ); err == nil {
+	if pct, err := c.client.QueryScalar(ctx, buildQ); err == nil {
 		snap.BuildSuccessPct = pct
 		okCount++
 	} else {
@@ -214,7 +218,7 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 	// surfaces via Source = "degraded: <error>" because the primary
 	// three queries would have failed first.
 	alertQ := `count(ALERTS{alertstate="firing",severity=~"page|warn"}) > 0`
-	if v, err := c.queryScalar(ctx, alertQ); err == nil {
+	if v, err := c.client.QueryScalar(ctx, alertQ); err == nil {
 		if v > 0 {
 			snap.Degraded = true
 			snap.Source = "degraded: firing alerts"
@@ -230,67 +234,4 @@ func (c *statusCache) fetch(ctx context.Context) (StatusPage, error) {
 		return snap, firstErr
 	}
 	return snap, nil
-}
-
-// queryScalar runs a PromQL `query` against the local Prometheus and
-// returns the first scalar. Returns an error on transport failure,
-// non-2xx response, parse error, or empty result.
-//
-// PromQL has three result shapes; only "scalar" and "vector" can
-// appear here, and they're encoded differently in the JSON envelope:
-//   - vector → {"resultType":"vector",  "result":[{"value":[ts,"x"]}, ...]}
-//   - scalar → {"resultType":"scalar",  "result":[{"value":[ts,"x"]}]}
-//   - matrix → {"resultType":"matrix",  "result":[{"values":[[ts,"x"],...]}], ...}
-//
-// We must support both vector and scalar because e.g.
-// `count(ALERTS{alertstate="firing"}) > 0` returns a scalar — the
-// alert-state PromQL expression the §12 degraded flag depends on.
-// Without this branch the alert query always errors "no data for query"
-// and the degraded pill never flips on. The `Value[0]` is a timestamp
-// in both shapes; the parsed scalar lives at `Value[1]`.
-func (c *statusCache) queryScalar(ctx context.Context, query string) (float64, error) {
-	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	u := c.promURL + "/api/v1/query?query=" + url.QueryEscape(query)
-	req, err := http.NewRequestWithContext(qctx, http.MethodGet, u, nil)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-		return 0, fmt.Errorf("prometheus %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var pr struct {
-		Data struct {
-			ResultType string `json:"resultType"`
-			Result     []struct {
-				Value [2]any `json:"value"`
-			} `json:"result"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return 0, err
-	}
-	if pr.Data.ResultType != "vector" && pr.Data.ResultType != "scalar" {
-		return 0, fmt.Errorf("unsupported resultType %q for query %q", pr.Data.ResultType, query)
-	}
-	if len(pr.Data.Result) == 0 {
-		return 0, fmt.Errorf("no data for query %q", query)
-	}
-	raw, ok := pr.Data.Result[0].Value[1].(string)
-	if !ok {
-		return 0, fmt.Errorf("unexpected value shape for query %q", query)
-	}
-	// ParseFloat (not fmt.Sscanf "%f") — locale-safe and consistent
-	// with pkg/fcvm/metrics.go::DefaultLvFcUsedPct.
-	f, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse %q for query %q: %w", raw, query, err)
-	}
-	return f, nil
 }

@@ -36,6 +36,96 @@ func TestMetricsWakeQueueWaitNilSafe(t *testing.T) {
 	m.ObserveWakeQueueWait(50 * time.Millisecond) // must not panic
 }
 
+// TestMetricsIssue273Exposition pins the new histogram + the cold
+// rename (issue #273 / ADR-041). Catches a rename that the existing
+// cold-wake test would have missed because it reads the Go field
+// rather than the exposition string. Also asserts the request
+// duration histogram is registered with the expected label set.
+func TestMetricsIssue273Exposition(t *testing.T) {
+	m := NewMetrics()
+	m.PreInstantiateApp("app-1")
+	m.ObserveColdBoot("app-1", 250*time.Millisecond)
+	m.ObserveRequestDuration("app-1", "2xx", 12*time.Millisecond)
+	m.ObserveRequestDuration("app-1", "5xx", 500*time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	// Rename: cold_boot must be present, cold_wake must be absent
+	// from active series. The HELP string mentions the old name for
+	// documentation, so the assertion targets the series line (which
+	// starts with the metric name at column 0, not preceded by #).
+	if !strings.Contains(body, "gateway_cold_boot_total{") {
+		t.Errorf("gateway_cold_boot_total series not in registry output:\n%s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "gateway_cold_wake_total{") {
+			t.Errorf("gateway_cold_wake_total series should be absent (issue #273 rename): %q", line)
+		}
+	}
+
+	// New histogram registered with the right label set.
+	if !strings.Contains(body, "gateway_request_duration_seconds_bucket") {
+		t.Errorf("gateway_request_duration_seconds_bucket not in registry output:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="2xx"} 1`) {
+		t.Errorf("expected count for app-1/2xx to be 1:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_request_duration_seconds_count{app="app-1",class="5xx"} 1`) {
+		t.Errorf("expected count for app-1/5xx to be 1:\n%s", body)
+	}
+
+	// Pre-instantiation: all four closed classes surface with count=0
+	// for app-1 (no observation yet on 3xx/4xx). Catches a future
+	// regression that accidentally stops pre-instantiating.
+	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
+		want := fmt.Sprintf(`gateway_request_duration_seconds_count{app="app-1",class=%q}`, class)
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated %s missing:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsPreInstantiateAppBounded asserts the per-app series
+// surface stays at exactly the closed (class) set — protects the
+// ADR-041 cardinality math from a future change that drops the
+// loop or adds a label.
+func TestMetricsPreInstantiateAppBounded(t *testing.T) {
+	m := NewMetrics()
+	m.PreInstantiateApp("alpha")
+	m.PreInstantiateApp("beta")
+	// After pre-instantiation only the 4 closed classes should
+	// exist per app. Calling Observe for an UNRELATED class
+	// ("foo") would mint a new tuple; assert we don't do that
+	// from the pre-instantiation path.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, app := range []string{"alpha", "beta"} {
+		for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
+			needle := fmt.Sprintf(`gateway_request_duration_seconds_count{app=%q,class=%q}`, app, class)
+			if !strings.Contains(body, needle) {
+				t.Errorf("pre-instantiated %s missing:\n%s", needle, body)
+			}
+		}
+	}
+	// And no tuples minted with class="foo" or any unknown class.
+	if strings.Contains(body, `class="foo"`) {
+		t.Errorf("unexpected class tuple minted:\n%s", body)
+	}
+}
+
+// TestObserveRequestDurationNilSafe keeps the histogram usable from
+// nil-Metrics tests.
+func TestObserveRequestDurationNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveRequestDuration("app-1", "2xx", 10*time.Millisecond) // must not panic
+	m.PreInstantiateApp("app-1")                                  // must not panic
+}
+
 // TestWakeGateObservesWaitDuration drives two concurrent Wait calls
 // through the gate and asserts the histogram caught at least one
 // observation. The leader parks until ensure() returns; the follower

@@ -125,6 +125,23 @@ func mustSeedApp(t *testing.T, e testEnv, slug string) string {
 	return app.ID
 }
 
+// mustSeedAppFor provisions an app on a non-env store under the
+// given account. Used by IDOR-safety tests that need a "foreign"
+// app to probe with the env's credentials.
+func mustSeedAppFor(t *testing.T, store *state.MemStore, accountID, slug string) string {
+	t.Helper()
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: accountID,
+		Slug:      slug,
+		Type:      state.AppTypeApp,
+		Status:    state.AppActive,
+	})
+	if err != nil {
+		t.Fatalf("seed app %s on foreign store: %v", slug, err)
+	}
+	return app.ID
+}
+
 // TestUpdateAppMinInstances_Hobby locks the plan-tier gate (ux_spec
 // §6.5): Hobby plans cannot set apps.min_instances. The handler must
 // return 403 plan_min_instances_not_allowed, not 422, because the
