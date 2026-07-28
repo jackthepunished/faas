@@ -3883,6 +3883,54 @@ func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string
 	return err
 }
 
+// CheckWebhookReplay returns ErrReplay if (provider, delivery_id) has
+// a dedupe row received on or after cutoff. The PgStore implementation
+// translates a found-row into ErrReplay so callers can branch on a
+// single errors.Is(err, state.ErrReplay) check at the ingress layer.
+// Backing schema: webhook_deliveries (migration 00059).
+func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from webhook_deliveries
+		 where provider = $1 and delivery_id = $2 and received_at >= $3)`,
+		provider, deliveryID, cutoff.UTC()).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// RecordWebhookDelivery inserts the dedupe row. ON CONFLICT DO UPDATE
+// refreshes expires_at so a delivery that the sweep has not yet
+// reaped gets a fresh 5-minute window — prevents the case where a
+// redelivery arrives after the original expires_at but before the
+// sweep runs. The unique constraint is (provider, delivery_id);
+// the provider column is constrained by the
+// webhook_deliveries_provider_check CHECK (added in migration 00059).
+func (s *PgStore) RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into webhook_deliveries (provider, delivery_id, expires_at)
+		 values ($1, $2, $3)
+		 on conflict (provider, delivery_id) do update set expires_at = excluded.expires_at`,
+		provider, deliveryID, expiresAt.UTC())
+	return err
+}
+
+// SweepExpiredWebhookDeliveries is the apid sweep goroutine's bulk
+// delete. Returns rows affected (informational). Runs on the
+// `pkg/grace.Interval` cadence in cmd/apid/server.go; the partial
+// index webhook_deliveries_expires_idx keeps the predicate scan
+// O(N expired) rather than O(N total).
+func (s *PgStore) SweepExpiredWebhookDeliveries(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`delete from webhook_deliveries where expires_at < $1`,
+		now.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // ClaimPaddleOverageWindow atomically claims the (account_id,
 // window_start) row. The shape mirrors ClaimInvocation
 // (pgstore.go:1297): an INSERT … ON CONFLICT DO NOTHING creates the

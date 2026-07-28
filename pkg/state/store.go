@@ -71,6 +71,13 @@ func (e *CronQuotaError) Is(target error) bool {
 // ErrCronQuotaExceeded is the sentinel callers compare against via errors.Is.
 var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
 
+// ErrReplay is returned by CheckWebhookReplay when a webhook delivery
+// has been seen inside its dedupe window. Webhook ingresses respond
+// 200 on this error (idempotent — the upstream provider interprets
+// as success and stops retrying), then emit a webhook.replay_rejected
+// audit row. Issue #294 closes the gap that SOC 2 CC6.1 expects.
+var ErrReplay = errors.New("state: webhook replay rejected")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -1115,6 +1122,34 @@ type Store interface {
 	// production code paths call them.
 	HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error)
 	RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error
+
+	// WebhookReplayDedup is the dedupe gate for the three webhook
+	// ingresses on the box (GitHub via gatewayd, Stripe + Paddle via
+	// apid). One table covers all three providers; the (provider,
+	// delivery_id) primary key makes a (re-POSTed) webhook within the
+	// TTL window a 200-on-replay no-op. cutoff is the lower bound on
+	// received_at: rows older than the TTL are ignored so a fresh
+	// delivery_id is always accepted. The CheckWebhookReplay caller
+	// MUST treat a non-nil error as ErrReplay via errors.Is — PgStore
+	// returns that sentinel directly when a row is found.
+	//
+	// RecordWebhookDelivery inserts (or refreshes, via ON CONFLICT
+	// DO UPDATE) the dedupe row. expiresAt is stamped on the row so
+	// the apid sweep goroutine (cmd/apid/server.go) can cheaply
+	// delete rows older than the TTL.
+	//
+	// SweepExpiredWebhookDeliveries is the apid sweep's bulk delete:
+	// delete from webhook_deliveries where expires_at < now(). Returns
+	// the rows deleted (informational; sweep callers don't gate on
+	// it). Mirrors the meterd dunning sweep at pkg/meter/dunning.go:223.
+	//
+	// Issue #294. The WebhookReplayDedup interface in pkg/webhookdedupe
+	// is satisfied by both stores via a thin adapter that picks TTL
+	// (=5min, the webhookdedupe.TTL constant) and computes cutoff +
+	// expiresAt on each call.
+	CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error)
+	RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error
+	SweepExpiredWebhookDeliveries(ctx context.Context, now time.Time) (int64, error)
 
 	// ClaimPaddleOverageWindow atomically claims the (acct, window)
 	// pair for the calling pod. Returns claimed=true only if this

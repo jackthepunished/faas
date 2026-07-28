@@ -162,6 +162,11 @@ type runDeps struct {
 	// compute_node_changed pg_notify subscriber (issue #98 / ADR-028).
 	// nil in tests; production wires it after pgStore opens.
 	nodeCache *nodeCache
+	// pgStore is the shared state.Store; used by the githubd proxy
+	// for the issue #294 replay dedupe and by the gatewayd audit
+	// emitter. nil in tests (the githubdProxy then skips the
+	// replay check).
+	pgStore *state.PgStore
 }
 
 func defaultDeps() runDeps {
@@ -332,6 +337,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
+	deps.pgStore = pgStore
 	return runWithDeps(ctx, log, deps)
 }
 
@@ -442,7 +448,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		githubdTarget = "http://127.0.0.1:8083"
 	}
 	githubdSecret := loadGithubWebhookSecret(osGetenv)
-	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log)
+	// Issue #294: wire the githubd proxy with the dedupe check and
+	// the audit emitter. The replay interface is satisfied by
+	// *state.PgStore; the auditStore interface is also satisfied by
+	// *state.PgStore (compile-time checked in audit.go). nil
+	// `deps.pgStore` (tests) skips the replay check, matching the
+	// pre-#294 behaviour.
+	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, newGatewaydAuditor(deps.pgStore, log))
 
 	// Issue #249 / spec §11: mount security response headers at the
 	// outermost wrapper of the public listener.

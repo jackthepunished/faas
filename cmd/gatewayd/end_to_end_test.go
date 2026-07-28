@@ -91,7 +91,7 @@ func TestEndToEnd_RecordedPushToDeployment(t *testing.T) {
 	upstreamSrv := httptest.NewServer(upstream.handler())
 	t.Cleanup(upstreamSrv.Close)
 
-	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body, err := os.ReadFile("../githubd/testdata/push_event.json")
 	if err != nil {
@@ -136,11 +136,12 @@ func TestEndToEnd_NoBindingReturnsIgnored200(t *testing.T) {
 	upstreamSrv := httptest.NewServer(upstream.handler())
 	t.Cleanup(upstreamSrv.Close)
 
-	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body := []byte(`{"ref":"refs/heads/main","after":"deadbeef","repository":{"full_name":"unknown/repo","name":"repo"},"pusher":{"name":"x"}}`)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(body))
 	req.Header.Set("X-Hub-Signature-256", signE2E(body, secret))
+	req.Header.Set("X-GitHub-Delivery", "delivery-rec-ignored")
 
 	rr := httptest.NewRecorder()
 	proxy.ServeHTTP(rr, req)
@@ -168,7 +169,7 @@ func TestEndToEnd_TamperedSignatureRejectedAtEdge(t *testing.T) {
 	upstreamSrv := httptest.NewServer(upstream.handler())
 	t.Cleanup(upstreamSrv.Close)
 
-	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body, err := os.ReadFile("../githubd/testdata/push_event.json")
 	if err != nil {
@@ -219,7 +220,7 @@ func TestEndToEnd_M75_RecordedPushLandsDeployment(t *testing.T) {
 	upstreamSrv := httptest.NewServer(upstream.handler())
 	t.Cleanup(upstreamSrv.Close)
 
-	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy := newGithubdProxy(upstreamSrv.URL, secret, http.NewServeMux(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 	body, err := os.ReadFile("../githubd/testdata/push_event.json")
 	if err != nil {
@@ -229,6 +230,7 @@ func TestEndToEnd_M75_RecordedPushLandsDeployment(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Hub-Signature-256", signE2E(body, secret))
 	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-GitHub-Delivery", "delivery-rec-m75")
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, req)
 

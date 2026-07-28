@@ -158,6 +158,18 @@ historical path bit-for-bit unchanged. apid also mounts
 decision; the operator runbook is
 `docs/ops/billing-provider-switch.md`.
 
+**Webhook signature replay protection (PR for issue #294, ADR-042)**
+— the three webhook ingresses (GitHub via gatewayd, Stripe + Paddle
+via apid) verify HMAC but never checked the delivery UUID against a
+dedupe table; a replayed webhook within the signature-validity
+window succeeded twice. Closes the gap with a single shared
+`webhook_deliveries` table (provider + delivery_id, 5-min TTL), a
+`pkg/webhookdedupe` helper consumed by all three ingresses, one
+sweep goroutine in apid, and a `webhook.replay_rejected` audit row
+on each ingress. Replays return 200 (idempotent — provider
+interprets as success and stops retrying). New gatewayd audit seam
+mirrors the apid pattern.
+
 **§14 M7 acceptance test (24h GB-h shadow, integer-arithmetic exact)**
 — landed via PR #126. See
 `pkg/meter/meter_test.go::TestInvoiceShadow24h` (local math),
