@@ -4067,12 +4067,24 @@ func drainActive(ctx context.Context, tx pgx.Tx, active []AccountCredit, p Consu
 		}
 
 		// Step 3: ledger insert with ON CONFLICT DO NOTHING.
+		//
+		// Postgres requires ON CONFLICT inference to use a unique
+		// index whose column list AND WHERE clause match the
+		// conflict target. The partial unique index
+		// credit_ledger_invoice_credit_idx carries `WHERE
+		// provider_invoice_id IS NOT NULL` (migration 00056), so
+		// the inference clause must repeat it — without the WHERE,
+		// Postgres errors with SQLSTATE 42P10 "there is no unique
+		// or exclusion constraint matching the ON CONFLICT
+		// specification".
 		var insertedID string
 		err = tx.QueryRow(ctx,
 			`insert into credit_ledger
 			   (account_id, credit_id, delta_cents, reason, actor, provider_invoice_id)
 			 values ($1, $2, $3, $4, $5, $6)
-			 on conflict (provider_invoice_id, credit_id) do nothing
+			 on conflict (provider_invoice_id, credit_id)
+			   where provider_invoice_id is not null
+			   do nothing
 			 returning id`,
 			p.AccountID, c.ID, -amount, p.Reason, p.Actor, p.ProviderInvoiceID,
 		).Scan(&insertedID)
