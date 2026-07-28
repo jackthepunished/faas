@@ -68,6 +68,13 @@ func (f *fakeWakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []
 	return nil
 }
 
+// Logs (issue #254 / Move 4) — the cron loop tests never drive
+// the log stream path; the scheddgrpc handler tests do. Returns
+// a closed fakeLogStream so any accidental caller exits cleanly.
+func (f *fakeWakeVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+	return &fakeLogStream{}, nil
+}
+
 // recordingSynth captures every synthesize call. The cron loop's
 // "post a synthetic request through gatewayd so metering applies" path
 // goes through this stub instead of dialing the unix socket.

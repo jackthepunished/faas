@@ -281,3 +281,10 @@ func (stubVMM) Close() error { return nil }
 func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) error {
 	return nil
 }
+
+// Logs (issue #254 / Move 4) — wiring tests don't drive the log
+// stream path; the scheddgrpc handler tests do. Returns nil
+// + io.EOF so any accidental caller exits cleanly.
+func (stubVMM) Logs(context.Context, string, int64) (sched.LogStream, error) {
+	return nil, io.EOF
+}

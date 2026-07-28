@@ -14,6 +14,7 @@ syntax = "proto3";
 package onebox.faas.schedd.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpb";
 
@@ -89,6 +90,35 @@ service Schedd {
   // instance CPU numbers; this RPC is the schedd-side cache of
   // those numbers, refreshed by the poller every 200 ms.
   rpc ListInstanceStats(ListInstanceStatsRequest) returns (ListInstanceStatsResponse);
+
+  // StreamAppLogs (issue #254 / Move 4) fans out an app's per-instance
+  // ring buffers back to the caller as a server-streaming response.
+  // schedd is the policy owner and the only component allowed to talk
+  // to vmmd directly (CLAUDE.md ownership); apid dials this RPC and
+  // multiplexes the per-instance frames into a single SSE response.
+  //
+  // Two phases mirror vmmd's Logs RPC:
+  //
+  //   1. Initial page — every line with Seq > since_seq, emitted in
+  //      per-instance order (then instance order), so a reconnect
+  //      carries the same frame sequence the client last saw.
+  //   2. Live tail — schedd subscribes to each live instance's
+  //      vmmd Logs stream and emits new lines as they arrive. On
+  //      instance death (park/snapshot) the per-instance stream ends
+  //      and the next frame is a global "end" event.
+  //
+  // Wire error mapping:
+  //
+  //   - codes.NotFound when the app has zero live instances — apid
+  //     maps this to its 404 "the app is parked; wake it first"
+  //   - codes.Unavailable when the vmmd is unreachable for SOME
+  //     instances — apid emits a `degraded` event and keeps the
+  //     surviving streams open
+  //   - codes.OK + nil on clean shutdown
+  //
+  // Additive per ADR-016: the field tags on existing messages are
+  // untouched; new RPC + new messages append at the end.
+  rpc StreamAppLogs(StreamAppLogsRequest) returns (stream StreamAppLogsResponse);
 }
 
 message WakeRequest {
@@ -227,4 +257,45 @@ message ListInstanceStatsRequest {
 
 message ListInstanceStatsResponse {
   repeated InstanceStatsRow rows = 1;
+}
+
+// StreamAppLogsRequest kicks off a per-app log stream. The schedd
+// resolves the live instances via the Instances store table (state.ListInstancesForApp)
+// and opens one vmmd Logs RPC per instance; the response carries every
+// frame from those streams in arrival order.
+//
+// since_seq is the per-instance replay cursor: schedd forwards
+// since_seq to each vmmd without translation. Each instance's ring
+// is independent, so Seq scopes are per-instance, not global.
+//
+// Additive per ADR-016.
+message StreamAppLogsRequest {
+  // app_id is apps.id (the gateway resolves host→app).
+  string app_id   = 1;
+  // since_seq is the per-instance replay cursor. 0 = tail from now.
+  // Negative values are treated as 0 by the schedd.
+  int64  since_seq = 2;
+}
+
+// StreamAppLogsResponse is one frame of the per-app log stream.
+// The instance_id is populated so a consumer can interleave
+// multi-instance frames deterministically (Move 4 acceptance #5).
+//
+// Wire is additive: new fields go at the end. The seq/stream/line
+// triple mirrors vmmd's LogsResponse; written_at is the host-side
+// ingest time, never the guest clock (ADR-022 entropy hazard).
+message StreamAppLogsResponse {
+  // instance_id is the instances.id row the frame came from.
+  // Empty on the synthetic "end" terminal frame.
+  string instance_id = 1;
+  // seq is the per-instance monotonically increasing sequence
+  // (vmmd's ring assigns these; schedd does not re-number).
+  int64  seq         = 2;
+  // stream is "stdout" or "stderr".
+  string stream      = 3;
+  // line is the byte-stripped log line (no trailing \n).
+  string line        = 4;
+  // written_at is the host-side time the line was committed to
+  // the per-instance ring (RFC 3339 nano).
+  google.protobuf.Timestamp written_at = 5;
 }

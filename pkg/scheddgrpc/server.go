@@ -23,7 +23,26 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// LogFrameSink is the per-frame callback the StreamAppLogs handler
+// invokes for each frame decoded from the per-instance vmmd Logs
+// RPC. It returns a non-nil error to abort the stream (the gRPC
+// trailer carries it back to the apid caller); a nil return tells
+// the handler to keep delivering the next frame.
+//
+// The production caller (Server.StreamAppLogs) renders the frame
+// to a scheddpb.StreamAppLogsResponse proto and forwards it on
+// the caller's gRPC stream. That work is bounded by the per-frame
+// size (≤ a few KB); long-running work inside the callback would
+// stall backpressure on the matching vmmd Logs stream.
+//
+// The writer goroutine that owns the gRPC stream only ever calls
+// this from the select-arm that owns the Send — so the callback
+// is serialised with the gRPC write and cannot race with the
+// reader-side Recv.
+type LogFrameSink = sched.LogFrameSink
 
 // SchedAPI is the slice of pkg/sched.Engine the handlers need. Defined here (not
 // imported as a concrete type) so unit tests can pass a fake without standing up
@@ -41,6 +60,14 @@ type SchedAPI interface {
 	// The reason string is for the audit log; the park semantics are
 	// identical to the idle-reaper Park.
 	ParkWithReason(ctx context.Context, instanceID, reason string) error
+	// StreamAppLogs (issue #254 / Move 4) fans out the per-instance
+	// log stream to a callback. The engine resolves the live
+	// instances, opens one vmmd Logs RPC per instance, and invokes
+	// the sink for every frame (initial-page + live tail) until
+	// the context cancels. Returns nil on a clean shutdown; the
+	// underlying gRPC / vmmd errors propagate as-is so the
+	// handlers can decide to lift or map them.
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sink LogFrameSink) error
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -182,6 +209,85 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &scheddpb.ParkInstanceResponse{Ok: true}, nil
+}
+
+// StreamAppLogs (issue #254 / Move 4) implements the schedd-side
+// half of the per-app log stream. It fans out the per-instance
+// vmmd Logs RPCs into a single server-streaming response so the
+// apid daemon can render one SSE stream per app.
+//
+// Two phases that mirror the vmmd Logs RPC:
+//
+//  1. Initial page — every line with Seq > since_seq, emitted in
+//     per-instance arrival order (then instance order, so a
+//     reconnect carries the same frame sequence the client last
+//     saw — identical to the vmmd snapshot semantics).
+//  2. Live tail — schedd subscribes to each live instance's
+//     vmmd Logs stream and emits new lines as they arrive. On
+//     instance death (park / snapshot) the per-instance stream
+//     ends with io.EOF and the next iteration of the outer loop
+//     drops that goroutine from the wart set.
+//
+// Backpressure: the per-instance vmmd Logs stream is gRPC; the
+// apid-side caller's gRPC stream is also gRPC. The two-stage
+// pipeline keeps the per-instance ring's Subscribe channel drops
+// bounded by the round-trip time of the matching vmmd RPC.
+//
+// Wire error mapping:
+//
+//   - codes.NotFound when the app has zero live instances — apid
+//     maps this to its 404 "the app is parked; wake it first"
+//   - codes.OK + nil on clean shutdown (caller cancels, all
+//     instances died)
+//
+// Additive per ADR-016: the new RPC + new messages append at the
+// end of the proto file.
+func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream scheddpb.Schedd_StreamAppLogsServer) error {
+	const op = "StreamAppLogs"
+	start := time.Now()
+	var sendErr error
+	defer func() {
+		s.ops.Observe(op, time.Since(start), sendErr)
+	}()
+	if req.GetAppId() == "" {
+		sendErr = status.Error(codes.InvalidArgument, "app_id is required")
+		return sendErr
+	}
+	sinceSeq := req.GetSinceSeq()
+	if sinceSeq < 0 {
+		sinceSeq = 0
+	}
+	// sink is the per-frame callback that writes one
+	// StreamAppLogsResponse onto the caller's gRPC stream. We
+	// synchronise on stream.Context() so a cancelled caller
+	// short-circuits the vmmd-side drain immediately.
+	sink := func(instance string, seq int64, streamName, line string, writtenAt time.Time) error {
+		if stream.Context().Err() != nil {
+			return stream.Context().Err()
+		}
+		resp := &scheddpb.StreamAppLogsResponse{
+			InstanceId: instance,
+			Seq:        seq,
+			Stream:     streamName,
+			Line:       line,
+		}
+		if !writtenAt.IsZero() {
+			resp.WrittenAt = timestamppb.New(writtenAt)
+		}
+		return stream.Send(resp)
+	}
+	if err := s.engine.StreamAppLogs(stream.Context(), req.GetAppId(), sinceSeq, sink); err != nil {
+		// Engine.StreamAppLogs surfaces "no live instances" as
+		// state.ErrNotFound; the per-instance vmmd RPCs surface
+		// grpc codes.NotFound when an instance id is stale.
+		// Both keep stable RFC 7807 codes through to api.Problem.
+		sendErr = err
+		if errors.Is(err, state.ErrNotFound) {
+			return status.Error(codes.NotFound, err.Error())
+		}
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	return nil
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the

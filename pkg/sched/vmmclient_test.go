@@ -8,6 +8,7 @@ package sched_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
@@ -99,12 +101,29 @@ func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	return nil
 }
 
+// Logs (issue #254 / Move 4) — the sched test rig doesn't drive
+// the per-instance log stream; the Move 4 handler tests live in
+// pkg/scheddgrpc and inject a real pkg/vmmdgrpc Server over
+// bufconn. Returns a closed sched.LogStream so the caller's Recv
+// sees EOF immediately (the right no-op for tests that don't care
+// about log content).
+func (f *fakeVMM) Logs(_ context.Context, _ string, _ int64) (sched.LogStream, error) {
+	return nil, io.EOF
+}
+
 // InstancePID (M8 §11) — the sched test rig never drives the
 // SeccompStatus path; cmd/e2e/sec11_seccomp_e2e_test.go dials
 // vmmd directly. Returns (0, false) so any test that accidentally
 // hits the codepath fails fast with NotFound instead of getting
 // a phantom PID.
 func (f *fakeVMM) InstancePID(instance string) (int, bool) { return 0, false }
+
+// LogRing (issue #254 / Move 4) — the sched test rig never drives
+// the per-instance log stream directly; the vmmdgrpc logs_test.go
+// covers the handler. Returns nil so the VmmdAPI contract is
+// satisfied; any call from the sched-side path that hits this
+// will surface as a NotFound from vmmd's handler.
+func (f *fakeVMM) LogRing(_ string) *logbuf.Ring { return nil }
 
 // newClient stands up a vmmdgrpc.Server on bufconn and returns a sched.VMMClient
 // dialed to it.

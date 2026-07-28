@@ -87,6 +87,15 @@ type RoutedVMM interface {
 	// to dial), or the wrapped gRPC error / vmmd-typed problem
 	// on patch failure.
 	UpdateEgressAllowlist(ctx context.Context, nodeID, appID string, allowlist []netip.Prefix) error
+	// Logs (issue #254 / Move 4) opens a server-streaming handle
+	// on the per-instance ring buffer on the vmmd that owns the
+	// instance. The returned LogStream is the typed view of
+	// vmmdpb.Vmmd_LogsClient — the caller drives it in a loop
+	// until EOF or error. Returns *api.Problem Capacity on an
+	// unknown nodeID; codes.NotFound from vmmd surfaces as
+	// the gRPC status (the schedd-side handler lifts it to the
+	// apid-facing 404).
+	Logs(ctx context.Context, nodeID, instance string, sinceSeq int64) (LogStream, error)
 }
 
 // DialFunc is the factory VMMRouter uses to open a per-target VMM
@@ -280,6 +289,19 @@ func (r *VMMRouter) UpdateEgressAllowlist(ctx context.Context, nodeID, appID str
 		return err
 	}
 	return cli.UpdateEgressAllowlist(ctx, appID, allowlist)
+}
+
+// Logs (issue #254 / Move 4) routes the per-instance log stream
+// to the vmmd that owns the instance. Returns *api.Problem Capacity
+// on an unknown nodeID; gRPC-side failures (vmmd dial issue,
+// codes.NotFound when the instance is parked) bubble up as
+// typed errors the schedd-side handler decides to lift or map.
+func (r *VMMRouter) Logs(ctx context.Context, nodeID, instance string, sinceSeq int64) (LogStream, error) {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return cli.Logs(ctx, instance, sinceSeq)
 }
 
 // Compile-time assertion: VMMRouter satisfies the engine-facing

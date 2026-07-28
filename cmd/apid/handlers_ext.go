@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
@@ -1946,21 +1947,29 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 	}
 }
 
-// streamAppLogs streams the running instance's stdout/stderr ring buffer.
-// Move 3 stub: the vmmd Logs(req) gRPC stream is the real implementation
-// (pkg/fcvm/vmmd exposes a per-instance ring buffer). Until that lands,
-// emit a `not_implemented` frame and a terminal `end` so the SDK
-// contract (pkg/api/logs.go::StreamAppLogs) keeps returning a 200 with
-// parseable frames and the dashboard's per-app log button doesn't 404.
-// Move 4 replaces the body.
+// streamAppLogs streams the running instance's stdout/stderr ring buffer
+// (issue #254 / Move 4). The producer half is the schedd-side
+// StreamAppLogs RPC (pkg/scheddgrpc.Server.StreamAppLogs); this
+// handler is a thin SSE wrapper that:
 //
-// Issue #309 (tier-2 DX): --grep / --since / --level are accepted as
-// query params now so the wire contract is stable; the Move 4
-// implementation reads them and applies them against the ring buffer.
-// Today --level is validated; --grep is sanitised against newline
-// injection; --since is forwarded verbatim (the CLI's RFC3339 parse
-// keeps malformed values from ever reaching the wire). Move 3
-// otherwise no-ops the params.
+//  1. Validates the app + auth (loadApp).
+//  2. Confirms the app has at least one live instance (404 otherwise).
+//  3. Validates the issue #309 filter params (--level, --grep, --since)
+//     against the per-instance ring's contract.
+//  4. Parses the `since_seq` query cursor (default 0 = tail from now).
+//  5. Opens the per-app log stream against the schedd, rendering each
+//     frame as `event: log\ndata: {…}\n\n` until the context cancels
+//     or the schedd reports the stream ended (clean park → `event:
+//     end`). Heartbeats every 15 s ("event: ping"), backstop at 10 min.
+//
+// Wire status:
+//   - 404 NotFound when the app is parked (no live instances)
+//   - 200 text/event-stream while the stream is alive
+//   - the SSE frames carry a degraded event on a partial failure
+//
+// Additive per ADR-016: the {seq, instance, stream, line, written_at}
+// payload adds an `instance` field to the deployment-log frame; old
+// SDKs ignore unknown fields.
 func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -2000,18 +2009,134 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 		}
 		return
 	}
+	sinceSeq := parseInt64Query(r, "since_seq", 0)
 	startSSE(w)
 	flusher, _ := w.(http.Flusher)
-	// Two frames then close: a not_implemented signal so a client can
-	// distinguish "not built yet" from "empty stream" + a terminal
-	// `end` so consumers with a structured-frame loop exit cleanly
-	// (the build-tailing streamDeployLogs pattern at
-	// cmd/faas/commands2.go uses the same `end` sentinel).
-	_, _ = fmt.Fprint(w, "event: not_implemented\ndata: {\"reason\":\"vmmd Logs(req) gRPC pending — Move 4\"}\n\n")
-	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+	s.serveAppLogs(ctx(r), w, flusher, app.ID, sinceSeq)
+}
+
+// serveAppLogs is the extracted post-loadApp body of streamAppLogs.
+// Keeping the seam under the handler-limit line lets the test
+// suite wire a stub schedd without standing up the full handler
+// chain (cmd/apid/handlers_ext.go).
+func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64) {
+	stream, err := s.schedd.StreamAppLogs(ctx_, appID, sinceSeq)
+	if err != nil {
+		// codes.Unimplemented from the stub → "schedd not wired
+		// (dev mode)"; codes.NotFound from a real schedd → "no
+		// live instances". Both render as RFC 7807 problems so the
+		// SDK surfaces a stable Error code (pkg/api/decoders).
+		s.renderAppLogsError(w, flusher, err)
+		return
+	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	backstop := time.NewTimer(10 * time.Minute)
+	defer backstop.Stop()
+	for {
+		select {
+		case <-ctx_.Done():
+			return
+		case <-backstop.C:
+			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		case <-ticker.C:
+			_, _ = fmt.Fprint(w, ":\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		default:
+		}
+		frame, err := stream.Recv()
+		if err != nil {
+			// io.EOF = clean shutdown (the schedd's per-
+			// instance streams ended). Emit a terminal
+			// `event: end` so structured-frame consumers
+			// exit the loop cleanly.
+			if errors.Is(err, io.EOF) {
+				_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return
+			}
+			// Partial-failure: the schedd maps a per-
+			// instance vmmd error to codes.Unavailable.
+			// Emit a `degraded` event so the consumer
+			// can decide whether to keep the stream
+			// open or reconnect.
+			_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q}\n\n", err.Error())
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+		writeAppLogEvent(w, flusher, frame)
+	}
+}
+
+// writeAppLogEvent renders one StreamAppLogsResponse frame as
+// the SSE `event: log` envelope. The payload includes every
+// field Move 4 pinned (acceptance #5):
+//
+//	{seq, instance, stream, line, written_at}
+func writeAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f schedLogFrame) {
+	payload, _ := json.Marshal(map[string]any{
+		"seq":        f.Seq,
+		"instance":   f.InstanceID,
+		"stream":     f.Stream,
+		"line":       f.Line,
+		"written_at": f.WrittenAt.UTC().Format(time.RFC3339Nano),
+	})
+	_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload)
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+// renderAppLogsError renders a schedd-side dial error as either
+// a 404 (no live instances) or a stream upgrade to a `degraded`
+// event (the stub returns Unimplemented; that should degrade
+// gracefully instead of 500-ing).
+func (s *server) renderAppLogsError(w http.ResponseWriter, flusher http.Flusher, err error) {
+	if p, ok := grpcerr.FromStatus(err); ok && p != nil && p.Status == http.StatusNotFound {
+		// Already past startSSE — write the degraded event
+		// instead of trying to overwrite the 200 (the
+		// consumer reads the SSE body, not the status).
+		_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q,\"code\":\"not_found\"}\n\n", err.Error())
+		_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"not_found\"}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+	_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q}\n\n", err.Error())
+	_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"schedd_unreachable\"}\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// parseInt64Query parses an int64 query param with a default
+// value. Returns the default if the param is missing or unparseable.
+// Negative values are clamped to 0 — the schedd gRPC stream
+// lifts them to 0 anyway (defence in depth).
+func parseInt64Query(r *http.Request, name string, def int64) int64 {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // startSSE sets the SSE response headers and disables write timeouts for the

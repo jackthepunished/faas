@@ -117,6 +117,14 @@ func (r *recordingRouterVMM) Stats(_ context.Context, _ string) (*StatsSnapshot,
 	return &StatsSnapshot{}, nil
 }
 
+// Logs (issue #254 / Move 4) — the egress_drift test rig doesn't
+// drive log streams, so the recordingRouterVMM returns a no-op
+// fake stream that closes immediately. Tests that exercise the
+// Move 4 path inject a different fake.
+func (r *recordingRouterVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+	return &fakeLogStream{}, nil
+}
+
 // seedEgressApp populates the store with one account + one app +
 // one deployment + a caller-supplied list of live instances, each
 // pinned to a nodeID. Returns the account, app, and the

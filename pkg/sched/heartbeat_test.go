@@ -113,6 +113,13 @@ func (h *heartbeatFakeVMM) UpdateEgressAllowlist(context.Context, string, []neti
 	return nil
 }
 
+// Logs (issue #254 / Move 4) — heartbeat tests don't drive the
+// log stream path; the scheddgrpc handler tests do. Returns a
+// closed fakeLogStream so any accidental caller exits cleanly.
+func (h *heartbeatFakeVMM) Logs(context.Context, string, int64) (LogStream, error) {
+	return &fakeLogStream{}, nil
+}
+
 // Compile-time assertion that the dialer satisfies HeartbeatDialer.
 var _ HeartbeatDialer = (*heartbeatFakeDialer)(nil)
 

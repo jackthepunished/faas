@@ -35,7 +35,8 @@ func (noopEngine) AdmitInstance(context.Context, string) (sched.WakeResult, erro
 func (noopEngine) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {
 	return 0, nil
 }
-func (noopEngine) ParkWithReason(context.Context, string, string) error { return nil }
+func (noopEngine) ParkWithReason(context.Context, string, string) error             { return nil }
+func (noopEngine) StreamAppLogs(context.Context, string, int64, LogFrameSink) error { return nil }
 
 // TestServerNew_NilOpsUsesDefault confirms the
 // "ops == nil → wire.NewOpsMetrics(\"schedd\")" fallback
