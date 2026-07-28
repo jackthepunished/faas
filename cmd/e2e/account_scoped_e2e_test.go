@@ -107,29 +107,7 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	ctx := context.Background()
 	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
-	var key string
-	for _, slug := range []string{"alpha", "beta", "gamma"} {
-		_, k, app := seedAccountAndApp(t, h, ctx, "across-"+slug, api.PlanHobby, slug)
-		if key == "" {
-			key = k // all share the same plan; first key is fine for the GET
-		}
-		dep := seedDeployment(t, h, ctx, app.ID)
-		for i := 0; i < 2; i++ {
-			if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
-				string(state.StateRunning), 256, nodeID, ""); err != nil {
-				t.Fatalf("CreateInstance: %v", err)
-			}
-		}
-	}
-
-	// Re-seed a single account that owns ALL three apps so the
-	// account-scoped GET returns them together. Use a new harness —
-	// the previous apps are under three different accounts and we
-	// need them consolidated to test the cross-app fan-in.
-	h2 := e2etest.Start(t, pool, e2etest.APID)
-	store2 := state.NewPgStore(h2.Pool)
-	nodeID2 := defaultLocalComputeNodeID(t, ctx, store2)
-	acct, err := store2.CreateAccount(ctx, "e2e+fanin@test.example", api.PlanHobby)
+	acct, err := store.CreateAccount(ctx, "e2e+fanin@test.example", api.PlanHobby)
 	if err != nil {
 		t.Fatalf("CreateAccount fanin: %v", err)
 	}
@@ -137,12 +115,12 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateAPIKey: %v", err)
 	}
-	if _, err := store2.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.ScopesAdminOnly); err != nil {
+	if _, err := store.CreateAPIKey(ctx, acct.ID, hash, "e2e", api.ScopesAdminOnly); err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 	faninApps := make([]state.App, 0, 3)
 	for _, slug := range []string{"fa", "fb", "fc"} {
-		app, err := store2.CreateApp(ctx, state.App{
+		app, err := store.CreateApp(ctx, state.App{
 			AccountID:      acct.ID,
 			Slug:           slug,
 			Type:           state.AppTypeApp,
@@ -152,17 +130,17 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateApp: %v", err)
 		}
-		dep := seedDeployment(t, h2, ctx, app.ID)
+		dep := seedDeployment(t, h, ctx, app.ID)
 		for i := 0; i < 2; i++ {
-			if _, err := store2.CreateInstance(ctx, app.ID, dep.ID,
-				string(state.StateRunning), 256, nodeID2, ""); err != nil {
+			if _, err := store.CreateInstance(ctx, app.ID, dep.ID,
+				string(state.StateRunning), 256, nodeID, ""); err != nil {
 				t.Fatalf("CreateInstance: %v", err)
 			}
 		}
 		faninApps = append(faninApps, app)
 	}
 
-	rec, _ := doReq(t, h2, pt, http.MethodGet, "/v1/instances", nil)
+	rec, _ := doReq(t, h, pt, http.MethodGet, "/v1/instances", nil)
 	var out api.ListInstancesResponse
 	if err := json.Unmarshal(rec, &out); err != nil {
 		t.Fatalf("unmarshal: %v (body=%s)", err, rec)
