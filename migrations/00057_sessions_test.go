@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Shape test for migration 00055 (IAM-3, issue #187 + #244 merged,
+// Shape test for migration 00057 (IAM-3, issue #187 + #244 merged,
 // ADR-039). Server-side session revocation.
 //
 // Asserts:
@@ -27,7 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00056_Sessions_ShapeAndFK(t *testing.T) {
+func TestMigrations_00057_Sessions_ShapeAndFK(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
