@@ -2701,18 +2701,27 @@ func (s *PgStore) ListInstancesForAccount(ctx context.Context, accountID string)
 }
 
 // ListInstancesForAccountPaged is the cursor-paginated variant of
-// ListInstancesForAccount (issue #393). Cursor is the instances.id
-// UUIDv7; the SQL filter `id < $before` pages backwards in started_at
-// DESC order. The handler validates `limit` (1..100) before this call
-// so the SQL stays narrow. Cross-account safety is the JOIN on
-// apps.account_id = $1 — there is no per-account guard at the handler
-// layer because the SQL is the only path.
+// ListInstancesForAccount (issue #393). Cursor is the instances.id;
+// the SQL filter `id < $before` partitions rows by id and the
+// handler emits `out[len-1].ID` as the next cursor, so the walk
+// visits every row exactly once regardless of how `id` is generated
+// (the column default is gen_random_uuid() — UUIDv4 — so the cursor
+// order is not insertion-time-ordered, but each row's id is unique
+// and `id::text < cursor` strictly partitions).
 //
-// `instances.id` is a UUIDv7 by construction (PR #338 — id and
-// wake_id both use UUIDv7) so the cursor order is monotonic under the
-// (started_at, id) index and the inner ORDER BY is redundant with
-// the cursor filter, but the explicit ORDER BY keeps the empty-page
-// symmetry with paginated neighbors.
+// Note: PR #338 added UUIDv7 for `wake_id`, not `id`. An earlier
+// comment claimed `id` was UUIDv7; that was wrong. We deliberately
+// ORDER BY id DESC (not started_at DESC) so the cursor walk matches
+// the cursor predicate: with ORDER BY (started_at DESC, id DESC) the
+// cursor (last id of the page) can be lexicographically larger than
+// earlier rows' ids — same started_at, smaller id — and the walk
+// stalls (test CursorPagination). `id DESC` is the only order whose
+// cursor walk is well-defined for both UUIDv4 and UUIDv7.
+//
+// Cross-account safety is the JOIN on apps.account_id = $1 — there
+// is no per-account guard at the handler layer because the SQL is
+// the only path. The handler validates `limit` (1..100) before this
+// call so the SQL stays narrow.
 func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID string, limit int, before string) ([]Instance, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
@@ -2724,7 +2733,7 @@ func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID st
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
 		   and ($2 = '' or i.id::text < $2)
-		 order by i.started_at desc, i.id desc
+		 order by i.id::text desc
 		 limit $3`, accountID, before, limit)
 	if err != nil {
 		return nil, err
