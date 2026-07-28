@@ -49,13 +49,15 @@ so dashboards can drill into e.g. 404 vs 503.
 
 ### 2. Cardinality math (closed-set vs full code)
 
-A Prometheus histogram costs `len(buckets) + 2` series per label
-combination. With the 13 chosen buckets that's 15 series per combo:
+A Prometheus histogram with N buckets emits N + `_sum` + `_count`
+series per label combination — 3 exposition rows per combo. With
+the 11 chosen buckets (`{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+1, 2, 5, 10}`) that's `11 + 3 = 14` series per (app, class) combo:
 
 | Label set | series/app | at 1,000 apps |
 |---|---|---|
-| `{app, plan, code}` full code (~60 realistic values) | ~900 | ~900,000 ✗ |
-| `{app, class}` class ∈ 4 values | **60** | **~60,000** ✓ |
+| `{app, plan, code}` full code (~60 realistic values) | ~840 | ~840,000 ✗ |
+| `{app, class}` class ∈ 4 values | 14 × 4 = **56** | **~56,000** ✓ |
 
 Per-app pre-instantiation of the closed `class` set (via the new
 `Metrics.PreInstantiateApp(appID)` helper, deduped on the Handler
@@ -192,6 +194,15 @@ scope creep reads as deliberate rather than opportunistic.
   new alert — fleet wake latency is the existing SLO signal.
 - No new runbook. The `cold` semantics caveat lives in this ADR
   and the dashboard copy.
+- **No dashboard range selector (follow-up).** The
+  `GET /v1/apps/{slug}/metrics?range=` API endpoint accepts the
+  closed 7-set vocabulary; the dashboard page currently hard-codes
+  `5m` in `fetchDashboardMetrics` rather than reading `?range=` and
+  rendering a `<form method="GET">` picker. Plumbing a range param
+  through `renderAppDetail` → `fetchDashboardMetrics` and adding
+  the picker is a 30-line follow-up that lives in this PR's
+  backlog. The API is the source of truth — the dashboard form is
+  a UI nicety.
 
 ## Deviations from #273 acceptance criteria
 

@@ -210,11 +210,13 @@ func safePercent(v float64) float64 {
 	return x
 }
 
-// safeRoundNonNeg rounds a float to int and clamps to ≥0. Used for
-// request_count which is integral on the wire but comes back as a
-// float from promql (increase() returns a float). Kept as its own
-// helper so a future change that wants, e.g., banker's rounding has
-// one site to touch.
+// safeRoundNonNeg is safeFloat under a name that documents intent:
+// used for `request_count` which is integral on the wire but comes
+// back as a float from promql (increase() returns a float). The
+// call site does the int-conversion (int64(...)) so the rounding
+// policy (currently a float-truncating cast) lives at the call
+// site; keeping this as its own helper means a future change to
+// banker's rounding has one site to touch. Issue #273 / ADR-041.
 func safeRoundNonNeg(v float64) float64 {
 	return safeFloat(v)
 }

@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,6 +147,59 @@ func TestAppMetrics_NoRangeFallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestAppMetrics_NaNGuards pins the safeFloat / safePercent guards
+// on the seven arithmetic paths. Histogram_quantile over an empty
+// window returns NaN; rate() over a missing counter returns 0; the
+// handlers must coerce those into zero-valued wire fields rather
+// than serialise "NaN" / "Inf" to JSON. Issue #273 / ADR-041
+// criterion #7.
+func TestAppMetrics_NaNGuards(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "my-api")
+	installPromFixture(t, &e, func(q string) string {
+		// Histogram_quantile queries return NaN; the rate/division
+		// queries return 0 (no data). The handler must coerce NaN
+		// to 0 via safeFloat / safePercent. The denominator-guarded
+		// queries (error_rate, cold_start) hit zero-division →
+		// NaN; safePercent must clamp to 0.
+		if strings.Contains(q, "histogram_quantile") {
+			return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"NaN"]}]}}`
+		}
+		return `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"0"]}]}}`
+	})
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics?range=5m", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.AppMetricsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (body may contain NaN/Inf literals — should be 0)", err)
+	}
+	// Every numeric field must be a finite, non-negative number.
+	// NaN/Inf from promql must be coerced to 0 by safeFloat /
+	// safePercent; percentages must clamp to [0,100] even if the
+	// upstream had a wrapped-around math value.
+	check := func(name string, v float64) {
+		t.Helper()
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			t.Errorf("%s = %v, want finite non-negative", name, v)
+		}
+	}
+	check("LatencyP50MS", out.LatencyP50MS)
+	check("LatencyP95MS", out.LatencyP95MS)
+	check("LatencyP99MS", out.LatencyP99MS)
+	check("ErrorRatePct", out.ErrorRatePct)
+	check("ColdStartPct", out.ColdStartPct)
+	check("WakeP95MS", out.WakeP95MS)
+	if out.ErrorRatePct > 100 || out.ColdStartPct > 100 {
+		t.Errorf("percentage clamp failed: error=%v cold=%v", out.ErrorRatePct, out.ColdStartPct)
+	}
+	if out.RequestCount != 0 {
+		t.Errorf("RequestCount = %d, want 0 (fixture returned 0)", out.RequestCount)
+	}
+}
+
 // TestAppMetrics_PrometheusDisabled exercises the nil-client path:
 // the handler must NOT 5xx — it returns 200 with Source="degraded:
 // prometheus not configured" and zeroed fields.
@@ -177,4 +231,46 @@ func installPromFixture(t *testing.T, e *testEnv, responder func(query string) s
 	}))
 	t.Cleanup(srv.Close)
 	e.s.WithStatusCache(srv.URL, "")
+}
+
+// TestAppMetrics_NoRequireMFA pins the deliberate omission of
+// requireMFA from the per-app metrics handler chain. Issue #273 /
+// ADR-041: a session cookie without an MFA-cookie-clearance MUST
+// still pass — the route is read-only and the primary caller is an
+// API key that does not carry a session cookie at all. A future
+// refactor that adds requireMFA here would break API-key access.
+//
+// We exercise the cookie path because the bearer-key path is
+// already covered by TestAppMetrics_HappyPath. The cookie path
+// runs through s.requireMFA — proving the route is gated by
+// authLimited only.
+func TestAppMetrics_NoRequireMFA(t *testing.T) {
+	e, cookie := setupWithSession(t)
+	mustSeedApp(t, e, "my-api")
+	// No installPromFixture — the nil-prometheus path falls through
+	// to "degraded: prometheus not configured" which is still a 200,
+	// which is the assertion we care about (the MFA gate, not the
+	// metrics fetch).
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/apps/my-api/metrics", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session-cookie (no MFA completed) status %d, want 200 — the route must NOT requireMFA", rec.Code)
+	}
+}
+
+// TestAppMetrics_ScopeRejected exercises the per-route requireScope
+// gate. Issue #273 / ADR-041: ScopesReadSurface (admin or apps:read)
+// is the only allowed scope; a deploy:write-only key must be 403'd.
+// Mirrors the matrix in handlers_scopes_test.go.
+func TestAppMetrics_ScopeRejected(t *testing.T) {
+	e := setupWithScopes(t, []string{api.ScopeDeployWrite})
+	mustSeedApp(t, e, "my-api")
+
+	rec := e.do(t, "GET", "/v1/apps/my-api/metrics", nil, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("deploy:write-only status %d, want 403", rec.Code)
+	}
 }

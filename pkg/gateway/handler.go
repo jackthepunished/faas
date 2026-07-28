@@ -479,12 +479,12 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 	if appID != "" && appID != "-" && h.topNSample != nil {
 		h.topNSample(appID)
 	}
-	(&requestLogger{log: h.log}).Log(appID, code, time.Since(startTime(r)), cold, requestID)
-	// Use the locally-measured elapsed (request-received → handler-return)
-	// rather than recomputing via time.Since(startTime(r)). WithStartTime
-	// was dead code in the repo (issue #273 / ADR-041); the WithContext
-	// call at the top of ServeHTTP now stamps the real start time so the
-	// slog latency_ms field is no longer effectively ~0.
+	// Use the locally-measured elapsed (request-received → handler-return).
+	// WithStartTime was dead code in the repo (issue #273 / ADR-041); the
+	// WithContext call at the top of ServeHTTP now stamps the real start
+	// time so the slog latency_ms field is no longer effectively ~0. Doing
+	// the time.Since(startTime(r)) call here would yield the same result
+	// but recomputes; `elapsed` was already measured above.
 	(&requestLogger{log: h.log}).Log(appID, code, elapsed, cold, requestID)
 
 	// Idle reaper hook (spec §4.1): 2xx → the instance is alive. 4xx/5xx are
