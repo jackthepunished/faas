@@ -56,8 +56,25 @@ jobs:
         # release page so customers have a verifiable supply-chain
         # artifact. Source-version is the merge commit SHA so the
         # SBOM ties back to the exact git revision on disk.
+        #
+        # SYFT 1.49.0 from the github release tarball — the previous
+        # `go install github.com/anchore/syft/cmd/syft@v1.0.0` step
+        # stopped compiling on Go 1.25 because v1.0.0's go.mod carries
+        # `replace` directives that newer Go rejects ("must not contain
+        # directives that would cause it to be interpreted differently
+        # than if it were the main module"). Same curl+sha256+tar
+        # pattern as the vacuum binary download — see memory
+        # `ci-vacuum-binary-download.md`.
+        env:
+          SYFT_VERSION: "1.49.0"
+          SYFT_SHA256: "7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe"
         run: |
-          go install github.com/anchore/syft/cmd/syft@v1.0.0
+          set -euo pipefail
+          curl -fsSL -o /tmp/syft.tar.gz \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "${SYFT_SHA256}  /tmp/syft.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/syft.tar.gz -C /tmp syft
+          install -m 0755 /tmp/syft /usr/local/bin/syft
           syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "${{ github.sha }}" --source-type directory
 
       - name: Upload SBOM.json artifact

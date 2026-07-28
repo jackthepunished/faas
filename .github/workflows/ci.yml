@@ -190,10 +190,19 @@ jobs:
       # matching what 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11'
       # expects. Drift on the 'protoc v X.Y.Z' header comment is filtered by
       # Makefile's proto-normalize so toolchain patch bumps don't break CI.
+      #
+      # Pass `GITHUB_TOKEN` so the action's release-resolution API calls
+      # authenticate; without it the runner IP is subject to GitHub's
+      # 60/hr per-IP unauthenticated rate limit and the step flakes when
+      # many jobs land simultaneously. Authenticated requests get
+      # 5000/hr per-token, which is plenty. See memory
+      # `ci-arduino-protoc-rate-limit-flake.md`.
       - name: install protoc
         uses: arduino/setup-protoc@v3
         with:
           version: '33.x'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: install protoc plugins
         run: |
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
