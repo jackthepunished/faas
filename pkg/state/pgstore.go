@@ -43,6 +43,22 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
+// payloadOrEmpty normalises a nil payload to an empty JSON object so the
+// alert_deliveries.payload JSONB column never stores NULL when a caller
+// explicitly chose to stamp a payload of zero length. Returning `{}'::jsonb`
+// at the SQL boundary (instead of `null`) keeps dashboard queries that
+// `payload ->> 'metric'` against always observe a JSON object. The few
+// callers that legitimately have no payload (test seeds, the
+// `silent no-op` claim used to keep the row's last_fired_at monotonic)
+// still get an empty object — the dispatcher overwrites the row via
+// UpdateAlertDeliveryStatus post-dispatch with the real envelope.
+func payloadOrEmpty(p []byte) []byte {
+	if len(p) == 0 {
+		return []byte("{}")
+	}
+	return p
+}
+
 // Compile-time check.
 var _ Store = (*PgStore)(nil)
 
@@ -2531,7 +2547,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 // regression used returning col = $2; that's always true post-update
 // and silently breaks the entire dedupe gate. The two-return form
 // (old + won) is the load-bearing detail.
-func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error) {
+func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (won bool, err error) {
 	// The dedupe primitive is `alert_deliveries.idempotency_key`
 	// UNIQUE: the FIRST claim inside a cool-down bucket inserts the
 	// delivery row with status='pending' (the dispatch layer later
@@ -2541,6 +2557,13 @@ func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey str
 	// evaluator loop also reads ClaimAlertFire's won bit so it can
 	// short-circuit before doing the webhook dial — a defensive
 	// parallel to the UNIQUE.
+	//
+	// payload and observed are stamped at INSERT time so the
+	// alert_deliveries row is observable with its full envelope from
+	// the dashboard scrape. payload is JSON-encoded by the dispatcher
+	// (webhookout.Event marshaled once); nil is allowed for callers
+	// that don't track the observed envelope — the column accepts
+	// NULL in that case.
 	//
 	// Wrapped in a single tx so the dedupe-INSERT and the
 	// last_fired_at stamp are atomic. The CTE captures the OLD stamp
@@ -2565,13 +2588,15 @@ func (s *PgStore) ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey str
 
 	// Insert pending delivery as the dedupe gate. UNIQUE on
 	// idempotency_key makes this atomic — a duplicate within the
-	// bucket is a SQLSTATE 23505, mapped to (false, nil).
+	// bucket is a SQLSTATE 23505, mapped to (false, nil). payload is
+	// JSONB so callers can index into it later (issue #396 acceptance
+	// criterion 7: dashboard shows observed value).
 	_, err = tx.Exec(ctx, `
 		insert into alert_deliveries
 			(rule_id, account_id, app_id, idempotency_key, payload, status, observed_value, fired_at)
-		select $1, account_id, app_id, $2, '{}'::jsonb, 'pending', 0, $3
+		select $1, account_id, app_id, $2, $3::jsonb, 'pending', $4, $5
 		  from alert_rules where id = $1`,
-		ruleID, idempotencyKey, at.UTC())
+		ruleID, idempotencyKey, payloadOrEmpty(payload), observed, at.UTC())
 	if err != nil {
 		// 23505 = unique_violation; the per-bucket dedupe hit.
 		var pgErr *pgconn.PgError

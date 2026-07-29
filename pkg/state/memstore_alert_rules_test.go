@@ -217,19 +217,19 @@ func TestMemStoreAlertRule_ClaimDedupe(t *testing.T) {
 	}
 
 	t0 := time.Now()
-	won1, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", t0)
+	won1, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{"metric":"error_rate_pct"}`), 10.5, t0)
 	if err != nil || !won1 {
 		t.Fatalf("first claim = (%v, %v); want (true, nil)", won1, err)
 	}
-	won2, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", t0.Add(time.Second))
+	won2, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{"metric":"error_rate_pct"}`), 10.5, t0.Add(time.Second))
 	if err != nil || won2 {
 		t.Fatalf("duplicate claim = (%v, %v); want (false, nil)", won2, err)
 	}
-	won3, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-2", t0.Add(time.Hour))
+	won3, err := m.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-2", []byte(`{"metric":"error_rate_pct"}`), 10.5, t0.Add(time.Hour))
 	if err != nil || !won3 {
 		t.Fatalf("next-bucket claim = (%v, %v); want (true, nil)", won3, err)
 	}
-	wonMissing, err := m.ClaimAlertFire(ctx, "missing-rule", "x:bucket", t0)
+	wonMissing, err := m.ClaimAlertFire(ctx, "missing-rule", "x:bucket", nil, 0, t0)
 	if err == nil || wonMissing {
 		t.Errorf("unknown rule should error; got (%v, %v)", wonMissing, err)
 	}

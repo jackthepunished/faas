@@ -5326,7 +5326,14 @@ func (m *MemStore) ListEnabledAlertRules(_ context.Context) ([]AlertRule, error)
 // Two-state lookup keyed by the same (ruleID, idempotency_key) tuple
 // MemStore keeps in alertClaimKeys so a duplicate in the same bucket
 // can't slip through.
-func (m *MemStore) ClaimAlertFire(_ context.Context, ruleID, idempotencyKey string, at time.Time) (bool, error) {
+//
+// payload + observed are accepted for parity with PgStore. The
+// in-memory store doesn't pre-insert the delivery row here — the
+// dispatcher (PR 4) calls RecordAlertDelivery on won=true, exactly
+// as it does against Postgres. The args are recorded onto the
+// matched delivery row by RecordAlertDelivery and surfaced via
+// ListAlertDeliveriesForRule.
+func (m *MemStore) ClaimAlertFire(_ context.Context, ruleID, idempotencyKey string, _ []byte, _ float64, at time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.alertRules[ruleID]

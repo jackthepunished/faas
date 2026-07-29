@@ -7,15 +7,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-// Loop runs the five meterd timers (sample / quota / stripe / dunning
-// / residency) until the context cancels. Each timer fires on its own
-// cadence; the first error from any goroutine is surfaced to the
-// caller.
+// Loop runs the six meterd timers (sample / quota / stripe / dunning
+// / residency / alerts) until the context cancels. Each timer fires
+// on its own cadence; the first error from any goroutine is surfaced
+// to the caller.
 //
 // The Loop never blocks the daemon's shutdown — every ticker selects on
 // both its tick and ctx.Done. Production wires this from cmd/meterd;
@@ -43,6 +44,18 @@ type Loop struct {
 	mailer    DunningSender
 	dunning   *Dunning
 	residency *Residency
+	// evaluator is the meterd-side alert evaluator (issue #396 /
+	// ADR-045 PR 4). nil means the alerts tick is skipped — useful
+	// for tests that don't exercise the alert surface, and matches
+	// the residency zero-check below. The wire-up in cmd/meterd
+	// instantiates the evaluator only when FAAS_PROMETHEUS_URL or
+	// FAAS_HOST_AGE_IDENTITY_PATH are configured; on a stripped-down
+	// dev box the evaluator stays nil and the loop runs five ticks.
+	// Held as a concrete *alerts.Evaluator pointer so the loop can
+	// call RunOnce directly (the AlertsEvaluator interface below is
+	// what pkg/alerts implements; meterd holds the concrete pointer
+	// so test doubles don't have to wrap the interface).
+	evaluator *alerts.Evaluator
 	now       func() time.Time
 	log       *slog.Logger
 	cfg       *Config
@@ -51,7 +64,7 @@ type Loop struct {
 	lastTickMu sync.RWMutex
 	// lastTick records the wall-clock time each named tick body last
 	// completed successfully. Keys mirror the runTicks "name" argument:
-	// "sample", "stripe", "dunning", "residency" are populated by
+	// "sample", "stripe", "dunning", "residency", "alerts" are populated by
 	// runTicks; "quota" is populated by runQuotaOnce (same field,
 	// written outside runTicks because quota is loop-shaped, not
 	// single-tick).
@@ -69,7 +82,14 @@ type Loop struct {
 // and must not be skipped in production); the ops.SetResidentGBPerCustomer
 // method is nil-safe so the loop tolerates a nil ops receiver. ops
 // and log likewise may be nil — see the Loop doc comment.
-func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
+//
+// evaluator may be nil; tests that don't exercise alerts pass nil and
+// the sixth goroutine is skipped. The single meterd process today
+// has exactly one evaluator; the loop's contract is "at most one",
+// matching the design note at pkg/alerts/evaluator.go (a future
+// multi-replica meterd would parallelise via the
+// alert_deliveries.idempotency_key UNIQUE constraint).
+func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billing.Provider, notif Notifier, mailer DunningSender, dunning *Dunning, residency *Residency, evaluator *alerts.Evaluator, now func() time.Time, log *slog.Logger, cfg *Config, ops *wire.OpsMetrics) *Loop {
 	if now == nil {
 		now = time.Now
 	}
@@ -87,20 +107,21 @@ func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billi
 	}
 	return &Loop{
 		store: store, cpu: cpu, parker: parker, pusher: pusher, notif: notif,
-		mailer: mailer, dunning: dunning, residency: residency, now: now, log: log, cfg: cfg, ops: ops,
+		mailer: mailer, dunning: dunning, residency: residency, evaluator: evaluator,
+		now: now, log: log, cfg: cfg, ops: ops,
 		lastTick: make(map[string]time.Time),
 	}
 }
 
-// Run starts the five timers and blocks until ctx cancels or any timer
+// Run starts the six timers and blocks until ctx cancels or any timer
 // errors out. Sampler / quota loop / stripe pusher / dunning /
-// residency each log + continue on per-tick errors so a transient
-// Postgres blip doesn't kill the daemon; only a context cancel returns
-// cleanly.
+// residency / alerts each log + continue on per-tick errors so a
+// transient Postgres blip doesn't kill the daemon; only a context
+// cancel returns cleanly.
 func (l *Loop) Run(ctx context.Context) error {
 	sampler := NewSampler(l.store, l.cpu, l.now)
 	pusher := NewPusher(l.store, l.pusher, l.log, l.now, l.ops)
-	errc := make(chan error, 5)
+	errc := make(chan error, 6)
 	go func() {
 		errc <- l.runTicks(ctx, l.cfg.SampleInterval, func(c context.Context) error {
 			_, err := sampler.SampleAndRoll(c)
@@ -128,6 +149,15 @@ func (l *Loop) Run(ctx context.Context) error {
 					_, err := l.residency.RunOnce(c)
 					return err
 				}, "residency")
+		}()
+	}
+	if l.evaluator != nil {
+		go func() {
+			errc <- l.runTicks(ctx, l.cfg.AlertEvalInterval,
+				func(c context.Context) error {
+					_, err := l.evaluator.RunOnce(c)
+					return err
+				}, "alerts")
 		}()
 	}
 	// Block until either ctx cancels or a hard error fires.
@@ -201,6 +231,36 @@ func (l *Loop) runQuotaTicks(ctx context.Context) error {
 func (l *Loop) RunQuotaOnce(ctx context.Context) {
 	l.runQuotaOnce(ctx)
 }
+
+// RunAlertsOnce is the test seam for the alert-evaluator loop. It
+// runs a single tick of the alert evaluator without spinning the
+// ticker, so PR 4 unit tests can pin a synthetic clock and assert
+// per-tick behaviour (claim won/lost, dispatch fired/skipped, state
+// transition). Production callers must use Run, which schedules the
+// alerts tick on the configured AlertEvalInterval.
+//
+// Returns the Stats from the evaluator's RunOnce (matching the
+// pkg/alerts.Evaluator.RunOnce signature) so tests can pin
+// per-evaluation counters (Fired, Delivered, Failed,
+// SkippedDegraded, SkippedNoIdentity) without scraping the metrics
+// registry.
+func (l *Loop) RunAlertsOnce(ctx context.Context) (alerts.Stats, error) {
+	if l.evaluator == nil {
+		return alerts.Stats{}, nil
+	}
+	return l.evaluator.RunOnce(ctx)
+}
+
+// AlertsEvaluator is the thin facade pkg/meter uses to invoke
+// pkg/alerts.Evaluator without taking a direct dependency on the
+// package (preserves the layering: pkg/meter orchestrates timers;
+// pkg/alerts implements the alert-rule evaluation policy). The
+// single RunOnce method is what RunAlertsOnce + Run call.
+//
+// Defined here as an interface so a future PR can substitute a stub
+// evaluator for unit tests that don't exercise the alert surface
+// (mirrors the role of CPUSource, ScheddParker, etc).
+type AlertsEvaluator = alerts.Evaluator
 
 // runQuotaOnce is exposed to tests via the RunQuotaOnce thin wrapper
 // below so the ticker doesn't have to spin. Production's only caller

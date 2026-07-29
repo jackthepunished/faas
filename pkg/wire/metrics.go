@@ -182,6 +182,26 @@ type OpsMetrics struct {
 	// baseline is enough to drive a "the flusher can talk to
 	// Postgres?" question.
 	failedLoginAuditWriteFailures prometheus.Counter
+	// alertEvalSkippedDegradedTotal — counts alert-rule evaluation
+	// ticks skipped because pkg/appmetrics returned a degraded source
+	// string ("degraded: <reason>"). Unlabelled. The dashboard's
+	// "alert evaluation health" panel renders this counter next to
+	// alertEvalFiredTotal so the operator can see a Prometheus
+	// outage correlate with a spike of skipped evaluations.
+	alertEvalSkippedDegradedTotal prometheus.Counter
+	// alertEvalFiredTotal — counts alert-rule evaluations where
+	// the comparison crossed the threshold AND ClaimAlertFire won
+	// the cool-down race. Unlabelled. Paired with
+	// alertEvalSkippedDegradedTotal for the dashboard panel.
+	alertEvalFiredTotal prometheus.Counter
+	// alertDeliveryAttemptsTotal — counts dispatched alert-rule
+	// webhook attempts, labelled by outcome ∈ {delivered, failed}.
+	// Label cardinality budget = 2 (closed vocabulary). The counter
+	// surfaces the dispatcher's success rate without exposing
+	// per-customer detail (account_id is intentionally absent — the
+	// audit events table is the per-customer detail; this is the
+	// fleet-wide counter for the §12 dashboard).
+	alertDeliveryAttemptsTotal *prometheus.CounterVec
 	// ipLabels: the bounded admission set shared by ip-labelled
 	// metrics (failedLoginTotal today). See accountLabelSet docs
 	// for the same fixed-capacity, non-evicting contract.
@@ -632,10 +652,30 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_wake_id_v4_fallback_total",
 		Help: "Count of wake_id mints where uuid.NewV7 returned an error and the engine fell back to uuid.New (v4). Any non-zero rate indicates a broken crypto/rand subsystem and breaks the time-ordering invariant the instances_wake_id_app_idx partial index is built on. Should never increment in production.",
 	})
+	// snapshot_disk_drift (PR scale-out readiness #3): every detected
+	// disk-vs-DB discrepancy under <SnapDir>/<depID>/ increments the
+	// counter. Sweep is read-only; rate(snapshot_disk_drift_total[5m])
+	// alerts on a non-zero rate.
 	snapshotDiskDrift := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_snapshot_disk_drift_total",
 		Help: "Count of disk-vs-DB discrepancies observed by the read-only /srv/fc/snap drift sweep (PR scale-out readiness #3). Each Tick increments once per missing file, size mismatch, unexpected entry, or non-regular entry under <SnapDir>/<depID>/. Repeated sweeps increment the counter while the discrepancy remains; rate(snapshot_disk_drift_total[5m]) alerts on a non-zero rate. Sweep never writes — diagnostic only.",
 	})
+
+	alertEvalSkippedDegradedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_alert_eval_skipped_degraded_total",
+		Help: "Count of alert-rule evaluations skipped because pkg/appmetrics returned a degraded source (Prometheus unreachable, invalid app id, etc). Unlabelled. A non-zero rate indicates a Prometheus outage or a customer-supplied rule with a malformed app id; pair with alertEvalFiredTotal for the dashboard's alert-evaluation-health panel.",
+	})
+	alertEvalFiredTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_alert_eval_fired_total",
+		Help: "Count of alert-rule evaluations where the comparison crossed the threshold AND the cool-down claim won. Unlabelled. Paired with alertEvalSkippedDegradedTotal for the dashboard panel.",
+	})
+	alertDeliveryAttemptsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_alert_delivery_attempts_total",
+		Help: "Count of dispatched alert-rule webhook attempts, labelled by outcome ∈ {delivered, failed} (closed vocabulary, cardinality budget = 2). The counter surfaces the dispatcher's success rate without exposing per-customer detail — the audit events table is the per-customer detail.",
+	}, []string{"outcome"})
+	for _, outcome := range []string{"delivered", "failed"} {
+		alertDeliveryAttemptsTotal.WithLabelValues(outcome)
+	}
 	imagedOCIPull := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_oci_pull_duration_seconds",
 		Help: "Latency of imaged's OCI registry pulls (manifest, config, blob, above-base), in seconds. Sized to api.OCIPullTimeoutSeconds (60 s).",
@@ -1027,6 +1067,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginTotal:              failedLoginTotal,
 		failedLoginDropped:            failedLoginDropped,
 		failedLoginAuditWriteFailures: failedLoginAuditWriteFailures,
+		alertEvalSkippedDegradedTotal: alertEvalSkippedDegradedTotal,
+		alertEvalFiredTotal:           alertEvalFiredTotal,
+		alertDeliveryAttemptsTotal:    alertDeliveryAttemptsTotal,
 		ipLabels:                      newIPLabelSet(maxIPLabelValues),
 		topTenantRPS:                  topTenantRPS,
 		topAccounts:                   newTopAccountSet(topAccountSetCap),
@@ -1810,6 +1853,53 @@ func (m *OpsMetrics) BillingCapExceededTotal(plan string) {
 		return
 	}
 	m.billingCapExceededTotal.WithLabelValues(plan).Inc()
+}
+
+// AlertEvalSkippedDegradedTotal increments the alert-eval skip counter
+// when pkg/appmetrics returns a degraded source. Safe on a nil receiver
+// so meterd unit tests without metrics keep working. The returned closure
+// is what pkg/alerts.Evaluator invokes at the skip site — the closure
+// shape lets pkg/alerts define a narrow Ops interface without importing
+// the prometheus.Counter type (matches the BillingCapExceededTotal API
+// convention, but closure-based so the dispatcher's caller can read
+// "alerts: eval skipped degraded source" without a one-line
+// per-callsite import).
+func (m *OpsMetrics) AlertEvalSkippedDegradedTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.alertEvalSkippedDegradedTotal.Inc()
+	return func() {}
+}
+
+// AlertEvalFiredTotal increments the alert-eval fire counter when a
+// rule crossed its threshold AND ClaimAlertFire won the cool-down race.
+// Returns a no-op closure on a nil receiver (see AlertEvalSkippedDegradedTotal).
+func (m *OpsMetrics) AlertEvalFiredTotal() func() {
+	if m == nil {
+		return func() {}
+	}
+	m.alertEvalFiredTotal.Inc()
+	return func() {}
+}
+
+// AlertDeliveryAttemptsTotal increments the alert-delivery attempts
+// counter, labelled by outcome ∈ {delivered, failed}. An unknown
+// outcome is dropped (the closed-vocabulary contract — see
+// pkg/alerts.evaluator's recordResult). Returns a no-op closure on a
+// nil receiver.
+func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
+	if m == nil {
+		return func() {}
+	}
+	switch outcome {
+	case "delivered", "failed":
+		// admitted
+	default:
+		return func() {}
+	}
+	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
+	return func() {}
 }
 
 // ReplaceInstanceStats rewrites the per-{app,node} instance-stats

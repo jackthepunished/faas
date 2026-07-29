@@ -34,14 +34,22 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/onebox-faas/faas/pkg/alerts"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/promql"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/webhookout"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -330,6 +338,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	applyEnvTick("FAAS_STRIPE_INTERVAL", &mc.StripeInterval, deps.getenv, log)
 	applyEnvTick("FAAS_DUNNING_INTERVAL", &mc.DunningInterval, deps.getenv, log)
 	applyEnvTick("FAAS_RESIDENCY_INTERVAL", &mc.ResidencyInterval, deps.getenv, log)
+	applyEnvTick("FAAS_ALERT_EVAL_INTERVAL", &mc.AlertEvalInterval, deps.getenv, log)
 
 	// Dunning timer: drives the 7-day past_due → suspended and 21-day
 	// suspended → deleted_pending transitions (spec §4.7, §17). Wired
@@ -367,7 +376,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — bounded staleness without forcing a gRPC round trip per
 	// instance.
 	cpu := &scheddCPUAdapter{parker: parker, now: deps.now}
-	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, deps.now, log, mc, ops)
+	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and
+	// hand it to the loop. The evaluator is nil-coerced below when
+	// neither FAAS_PROMETHEUS_URL nor FAAS_HOST_AGE_IDENTITY_PATH is
+	// configured — the dev loop runs five ticks on a stripped-down box
+	// where Prometheus isn't reachable and host age isn't loaded.
+	// The single meterd process today has exactly one evaluator; the
+	// loop's contract is "at most one", matching the design note at
+	// pkg/alerts/evaluator.go.
+	evaluator := buildAlertEvaluator(deps, store, log, ops)
+	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 
@@ -444,4 +462,68 @@ func applyEnvTick(key string, dst *time.Duration, getenv func(string) string, lo
 		return
 	}
 	*dst = d
+}
+
+// buildAlertEvaluator wires the alert-evaluator (issue #396 /
+// ADR-045 PR 4). Returns nil if neither FAAS_PROMETHEUS_URL nor
+// FAAS_HOST_AGE_IDENTITY_PATH is configured — the dev loop runs
+// five ticks on a stripped-down box where Prometheus isn't
+// reachable and host age isn't loaded. The single meterd process
+// today has exactly one evaluator; the loop's contract is "at most
+// one", matching the design note at pkg/alerts/evaluator.go.
+//
+// Both env vars are read fresh on each call (cmd/meterd runs this
+// helper once at startup, not on each tick). The Prometheus URL is
+// used to build a pkg/promql.Client — empty URL means nil PromQL,
+// which the evaluator treats as a "degraded: prometheus not
+// configured" source for every rule. The identity path is loaded
+// strictly; a 0o400 file-mode check (pkg/secretbox.LoadHostKey) is
+// the load-bearing detail for the §11 tripwire.
+func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops *wire.OpsMetrics) *alerts.Evaluator {
+	promURL := deps.getenv("FAAS_PROMETHEUS_URL")
+	identityPath := deps.getenv("FAAS_HOST_AGE_IDENTITY_PATH")
+	if promURL == "" && identityPath == "" {
+		log.Warn("meterd: alert evaluator disabled — both FAAS_PROMETHEUS_URL and FAAS_HOST_AGE_IDENTITY_PATH unset; running with five ticks")
+		return nil
+	}
+
+	var promClient appmetrics.PromQL
+	if promURL != "" {
+		// pkg/promql.NewClient takes an HTTPDoer for testability;
+		// nil resolves to http.DefaultClient. PerAttempt timeout is
+		// applied by pkg/webhookout's dispatcher, not the
+		// evaluator (the evaluator's PromQL calls have their own
+		// per-query deadline via the caller's context).
+		promClient = promql.NewClient(promURL, nil)
+	}
+
+	var identityLoader func() *age.X25519Identity
+	if identityPath != "" {
+		ident, err := secretbox.LoadHostKey(identityPath)
+		if err != nil {
+			// A failure to load the identity is fatal for the
+			// alert evaluator — without it we cannot unseal any
+			// webhook_secret, so every dispatch would be a no-op.
+			// Log loudly and skip the evaluator (the daemon
+			// stays up and the other five ticks run).
+			log.Error("meterd: load host age identity; alert evaluator disabled",
+				"path", identityPath, "err", err)
+			return nil
+		}
+		log.Info("meterd: host age identity loaded for alert evaluator",
+			"path", identityPath)
+		identityLoader = func() *age.X25519Identity { return ident }
+	}
+
+	dispatcher := webhookout.NewDispatcher(webhookout.DispatcherOptions{})
+	auditor := audit.New(store, log, ops, "meterd")
+	return alerts.NewEvaluator(alerts.EvaluatorOptions{
+		Store:      store,
+		PromQL:     promClient,
+		Audit:      auditor,
+		Identity:   identityLoader,
+		Dispatcher: dispatcher,
+		Log:        log,
+		Ops:        ops,
+	})
 }

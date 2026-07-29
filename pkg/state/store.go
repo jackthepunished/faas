@@ -881,13 +881,23 @@ type Store interface {
 	// LoadAndStampLastQuotaWarning (pgstore.go) and captures the OLD
 	// stamp BEFORE the UPDATE so the predicate "$2 = old" doesn't
 	// trivially succeed post-write (the regression CI caught in PR
-	// #69 / memory/pkg-state-usage-monthly-tz-compare.md). Returns:
+	// #69 / memory/pkg-state-usage-monthly-tz-compare.md).
+	//
+	// payload and observed are stamped onto the alert_deliveries row
+	// inside the same transaction so the row exists with its full
+	// payload at insert time (avoids a window where the row is visible
+	// to a dashboard scrape before RecordAlertDelivery would have
+	// attached it). payload may be nil for callers that don't track the
+	// observed envelope (the dispatcher is the only caller today). The
+	// returned `AlertDelivery` on won=true is omitted to keep the
+	// signature stable with PR 3 (callers can re-read the row via
+	// ListAlertDeliveriesForRule). Returns:
 	//   - (won=true, nil)  on a fresh claim — the caller proceeds to
-	//     RecordAlertDelivery
+	//     dispatch + UpdateAlertDeliveryStatus
 	//   - (won=false, nil) on a duplicate inside the bucket — the
 	//     caller stays silent and lets the cool-down carry on
 	//   - (false, ErrNotFound) when the rule row is gone
-	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error)
+	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (won bool, err error)
 	// SetAlertRuleState transitions a rule's cool-down state. Called by
 	// the evaluator on healthy ticks (firing→ok) and after a successful
 	// delivery (ok→firing). returns (true, nil) on a real transition,
