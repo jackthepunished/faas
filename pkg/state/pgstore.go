@@ -6212,6 +6212,13 @@ const appsSelectColumns = `
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, '')`
 
+// Compile-time anchor: the const is interpolated only inside SQL raw-string
+// literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
+// checker doesn't trace. This blank reference keeps the const bound to a
+// Go-level use so deleting it (or a future SQL rewrite that drops all
+// nine callers) trips the linter instead of rotting silently.
+var _ = appsSelectColumns
+
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
 	var kind, statusStr string

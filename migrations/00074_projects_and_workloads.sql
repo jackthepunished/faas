@@ -1,9 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00073_projects_and_workloads.sql
+-- filename: 00074_projects_and_workloads.sql
 --
--- 00073_projects_and_workloads.sql — ADR-050, Phase 1 (schema + project object).
+-- 00074_projects_and_workloads.sql — ADR-050, Phase 1 (schema + project object).
 --
 -- Lands the foundation every later phase reads from. No scanner, no CLI,
 -- no API endpoint — just the projects table, five new columns on apps, the
@@ -180,7 +180,7 @@ update apps a
 -- +goose Down
 -- +goose StatementBegin
 -- Down mirrors up; restore the dropped index so a rolled-back box
--- keeps the pre-00073 invariant that the schema could enforce
+-- keeps the pre-00074 invariant that the schema could enforce
 -- (no second app per (install, repo)).
 alter table apps drop constraint if exists apps_workload_class_chk;
 drop index if exists apps_project_workload_uniq;

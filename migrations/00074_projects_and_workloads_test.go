@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00073 (projects table + apps workload columns,
+// Migration-apply tests for 00074 (projects table + apps workload columns,
 // ADR-050 Phase 1).
 //
 // Pins the Phase 1 acceptance gate verbatim:
@@ -83,9 +83,9 @@ func seedAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
 	return id
 }
 
-// TestMigration_00073_1_ProjectsTableShape asserts the projects schema.
+// TestMigration_00074_1_ProjectsTableShape asserts the projects schema.
 // (1)
-func TestMigration_00073_1_ProjectsTableShape(t *testing.T) {
+func TestMigration_00074_1_ProjectsTableShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -138,9 +138,9 @@ func TestMigration_00073_1_ProjectsTableShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00073_2_AppsWorkloadClassCheck asserts the CHECK constraint.
+// TestMigration_00074_2_AppsWorkloadClassCheck asserts the CHECK constraint.
 // (2)
-func TestMigration_00073_2_AppsWorkloadClassCheck(t *testing.T) {
+func TestMigration_00074_2_AppsWorkloadClassCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -152,7 +152,7 @@ func TestMigration_00073_2_AppsWorkloadClassCheck(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency)
 		values ($1, $2, $3, 256, 1)
-	`, appID, acctID, "wn-00073-2-default"); err != nil {
+	`, appID, acctID, "wn-00074-2-default"); err != nil {
 		t.Fatalf("seed apps row (default workload_class): %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestMigration_00073_2_AppsWorkloadClassCheck(t *testing.T) {
 		_, err := pool.Exec(ctx, `
 			insert into apps (id, account_id, slug, ram_mb, max_concurrency, workload_class)
 			values ($1, $2, $3, 256, 1, $4)
-		`, appIDLocal, acctID, "wn-00073-2-"+valid, valid)
+		`, appIDLocal, acctID, "wn-00074-2-"+valid, valid)
 		if err != nil {
 			t.Errorf("insert with workload_class=%q rejected: %v", valid, err)
 			continue
@@ -173,7 +173,7 @@ func TestMigration_00073_2_AppsWorkloadClassCheck(t *testing.T) {
 		_, err := pool.Exec(ctx, `
 			insert into apps (id, account_id, slug, ram_mb, max_concurrency, workload_class)
 			values ($1, $2, $3, 256, 1, $4)
-		`, appIDBogus, acctID, "wn-00073-2-bogus-"+strings.ReplaceAll(bogus, " ", "_"), bogus)
+		`, appIDBogus, acctID, "wn-00074-2-bogus-"+strings.ReplaceAll(bogus, " ", "_"), bogus)
 		if err == nil {
 			t.Errorf("insert with workload_class=%q accepted; want CHECK violation", bogus)
 			_, _ = pool.Exec(ctx, `delete from apps where id = $1`, appIDBogus)
@@ -181,10 +181,10 @@ func TestMigration_00073_2_AppsWorkloadClassCheck(t *testing.T) {
 	}
 }
 
-// TestMigration_00073_3_PartialUniqueFires asserts
+// TestMigration_00074_3_PartialUniqueFires asserts
 // apps_project_workload_uniq fires for second (project_id, workload_name).
 // (3)
-func TestMigration_00073_3_PartialUniqueFires(t *testing.T) {
+func TestMigration_00074_3_PartialUniqueFires(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -195,7 +195,7 @@ func TestMigration_00073_3_PartialUniqueFires(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into projects (id, account_id, slug, scan_source)
 		values ($1, $2, $3, 'single')
-	`, projID, acctID, "wn-00073-3-proj"); err != nil {
+	`, projID, acctID, "wn-00074-3-proj"); err != nil {
 		t.Fatalf("seed projects row for unique-test: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestMigration_00073_3_PartialUniqueFires(t *testing.T) {
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency,
 		                  project_id, workload_name, workload_class)
 		values ($1, $2, $3, 256, 1, $4, 'web', 'http')
-	`, appA, acctID, "wn-00073-3-A", projID); err != nil {
+	`, appA, acctID, "wn-00074-3-A", projID); err != nil {
 		t.Fatalf("seed first project-member app: %v", err)
 	}
 
@@ -213,7 +213,7 @@ func TestMigration_00073_3_PartialUniqueFires(t *testing.T) {
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency,
 		                  project_id, workload_name, workload_class)
 		values ($1, $2, $3, 256, 1, $4, 'web', 'http')
-	`, appB, acctID, "wn-00073-3-B", projID)
+	`, appB, acctID, "wn-00074-3-B", projID)
 	if err == nil {
 		t.Errorf("second apps row with same (project_id, workload_name) accepted; want 23505")
 		_, _ = pool.Exec(ctx, `delete from apps where id = $1`, appB)
@@ -231,15 +231,15 @@ func TestMigration_00073_3_PartialUniqueFires(t *testing.T) {
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency,
 		                  project_id, workload_name, workload_class)
 		values ($1, $2, $3, 256, 1, $4, 'worker', 'worker')
-	`, appC, acctID, "wn-00073-3-C", projID); err != nil {
+	`, appC, acctID, "wn-00074-3-C", projID); err != nil {
 		t.Errorf("distinct workload_name insert rejected: %v", err)
 	}
 }
 
-// TestMigration_00073_4_DroppedBindingIndex asserts
+// TestMigration_00074_4_DroppedBindingIndex asserts
 // apps_github_install_repo_uniq is gone and the dispatch index survives.
 // (4)
-func TestMigration_00073_4_DroppedBindingIndex(t *testing.T) {
+func TestMigration_00074_4_DroppedBindingIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -273,11 +273,11 @@ func TestMigration_00073_4_DroppedBindingIndex(t *testing.T) {
 	}
 }
 
-// TestMigration_00073_5_BackfillSynthesizesProjects asserts the backfill
+// TestMigration_00074_5_BackfillSynthesizesProjects asserts the backfill
 // creates one project per (account, install_id, repo) and stamps
 // apps.project_id + apps.workload_name = app.slug.
 // (5)
-func TestMigration_00073_5_BackfillSynthesizesProjects(t *testing.T) {
+func TestMigration_00074_5_BackfillSynthesizesProjects(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -288,14 +288,14 @@ func TestMigration_00073_5_BackfillSynthesizesProjects(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency,
 		                  github_install_id, github_repo_full_name, github_production_branch)
-		values ($1, $2, 'wn-00073-5-a', 256, 1, 70001, 'acme/wn-00073-5-a', 'main')
+		values ($1, $2, 'wn-00074-5-a', 256, 1, 70001, 'acme/wn-00074-5-a', 'main')
 	`, boundApp1, boundAcctID); err != nil {
 		t.Fatalf("seed bound app 1: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency,
 		                  github_install_id, github_repo_full_name, github_production_branch)
-		values ($1, $2, 'wn-00073-5-b', 256, 1, 70002, 'acme/wn-00073-5-b', 'main')
+		values ($1, $2, 'wn-00074-5-b', 256, 1, 70002, 'acme/wn-00074-5-b', 'main')
 	`, boundApp2, boundAcctID); err != nil {
 		t.Fatalf("seed bound app 2: %v", err)
 	}
@@ -349,18 +349,18 @@ func TestMigration_00073_5_BackfillSynthesizesProjects(t *testing.T) {
 		if pid == nil || *pid == "" {
 			t.Errorf("backfilled app %s project_id is NULL; want non-null", appIDLocal)
 		}
-		if !strings.HasPrefix(wlname, "wn-00073-5-") {
-			t.Errorf("backfilled app %s workload_name = %q, want wn-00073-5-* (slug verbatim)",
+		if !strings.HasPrefix(wlname, "wn-00074-5-") {
+			t.Errorf("backfilled app %s workload_name = %q, want wn-00074-5-* (slug verbatim)",
 				appIDLocal, wlname)
 		}
 	}
 }
 
-// TestMigration_00073_6_StandaloneAppsUnbound asserts an app without
+// TestMigration_00074_6_StandaloneAppsUnbound asserts an app without
 // github_install_id keeps project_id NULL, workload_name = ”,
 // workload_class = 'http'.
 // (6)
-func TestMigration_00073_6_StandaloneAppsUnbound(t *testing.T) {
+func TestMigration_00074_6_StandaloneAppsUnbound(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
@@ -369,7 +369,7 @@ func TestMigration_00073_6_StandaloneAppsUnbound(t *testing.T) {
 	standaloneApp := uuid.NewString()
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, ram_mb, max_concurrency)
-		values ($1, $2, 'wn-00073-6-standalone', 256, 1)
+		values ($1, $2, 'wn-00074-6-standalone', 256, 1)
 	`, standaloneApp, standaloneAcct); err != nil {
 		t.Fatalf("seed standalone app: %v", err)
 	}
@@ -392,9 +392,9 @@ func TestMigration_00073_6_StandaloneAppsUnbound(t *testing.T) {
 	}
 }
 
-// TestMigration_00073_7_ReplaySafe asserts a second MigrateUp is a no-op.
+// TestMigration_00074_7_ReplaySafe asserts a second MigrateUp is a no-op.
 // (7)
-func TestMigration_00073_7_ReplaySafe(t *testing.T) {
+func TestMigration_00074_7_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t) // first MigrateUp
@@ -404,11 +404,11 @@ func TestMigration_00073_7_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00073_8_PgTierRank asserts the SQL function exists and
+// TestMigration_00074_8_PgTierRank asserts the SQL function exists and
 // the rank table mirrors the Go tierRank in pkg/state/types.go. Both
 // are load-bearing for SetProjectScanSource (Phase 5 reconcile) and
 // must agree.
-func TestMigration_00073_8_PgTierRank(t *testing.T) {
+func TestMigration_00074_8_PgTierRank(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	migrateUpOnce(ctx, t)
