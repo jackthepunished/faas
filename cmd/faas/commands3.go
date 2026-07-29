@@ -181,6 +181,16 @@ func secretsSet(args []string) int {
 		}
 		PrintOK(osStdout, "%s set", p.Key)
 	}
+	// Move 1 PR-A: post-write quota stamp. After every successful
+	// set, follow up with a ListSecrets and print "<slug>: N
+	// secrets" so the customer knows how close they are to the
+	// per-app cap (the cap itself is in pkg/api/limits.go and
+	// surfaced by `faas plan`). Failure here is non-fatal: the
+	// PUT already succeeded, so we log and move on rather than
+	// masking the success with a quota-stamp error.
+	if list, err := client.ListSecrets(context.Background(), *app); err == nil {
+		_, _ = fmt.Fprintf(osStdout, "%s: %d secrets\n", *app, len(list.Secrets))
+	}
 	return 0
 }
 
