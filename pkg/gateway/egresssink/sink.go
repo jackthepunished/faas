@@ -73,10 +73,14 @@ type EgressSink struct {
 	// deterministically without sleeping.
 	now func() time.Time
 
-	// mu protects instances only — each *bucket's* mutex protects
-	// the per-instance minute map. mu is held only when adding a
-	// brand-new instance row or sweeping stale ones; the hot path
-	// (Record/Drain against an already-tracked instance) skips mu.
+	// mu protects the instances map. The per-instance mutex (held
+	// inside each *instanceBuckets) covers the per-instance minute
+	// map. Lock order is s.mu before inst.mu — both RecordResponseBytes
+	// and DrainRecords take s.mu first, then inst.mu. Per-instance
+	// contention is bounded by per-instance request rate, not
+	// fleet-wide; the s.mu serialisation is only on the map operation
+	// (create-new-row / iterate / eviction) and is the natural
+	// bottleneck of any map-backed concurrent structure.
 	mu        sync.Mutex
 	instances map[string]*instanceBuckets
 }
@@ -85,7 +89,7 @@ type EgressSink struct {
 // truncated-minute Unix timestamp; zero-value is the
 // "no-observation" state, eliminating any explicit nil checks on
 // the hot path. mu covers ONLY the (map + lastTouch) pair — never
-// held across I/O, never nested against EgressSink.mu.
+// held across I/O. Always taken after s.mu, never before.
 type instanceBuckets struct {
 	mu        sync.Mutex
 	bytes     map[int64]uint64 // minuteUnix → cumulative bytes
@@ -130,8 +134,23 @@ func (s *EgressSink) RecordResponseBytes(instanceID string, n int64) {
 		return
 	}
 	minute := s.now().UTC().Truncate(time.Minute).Unix()
-	inst := s.getOrCreate(instanceID)
+	// Lock order: s.mu before inst.mu. The drainer (DrainRecords)
+	// holds s.mu while iterating and acquires inst.mu per row, so any
+	// other path that needs both locks MUST take s.mu first to keep
+	// the lock graph acyclic. The previous getOrCreate/then-Lock
+	// sequence released s.mu before inst.mu and raced a concurrent
+	// drainer's eviction, producing ~4.5% loss in CI's
+	// TestRecordResponseBytes_Concurrent under -race.
+	s.mu.Lock()
+	inst, ok := s.instances[instanceID]
+	if !ok {
+		inst = &instanceBuckets{
+			bytes: make(map[int64]uint64, BucketsToKeep),
+		}
+		s.instances[instanceID] = inst
+	}
 	inst.mu.Lock()
+	s.mu.Unlock()
 	inst.bytes[minute] += uint64(n)
 	inst.lastTouch = s.now()
 	inst.mu.Unlock()
@@ -240,22 +259,6 @@ func (s *EgressSink) Tracked() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.instances)
-}
-
-// getOrCreate looks up (or lazily creates) the per-instance row. The
-// EgressSink-level mutex is held only for the map operation; the
-// per-instance mutex is what covers Record/Drain.
-func (s *EgressSink) getOrCreate(instanceID string) *instanceBuckets {
-	s.mu.Lock()
-	inst, ok := s.instances[instanceID]
-	if !ok {
-		inst = &instanceBuckets{
-			bytes: make(map[int64]uint64, BucketsToKeep),
-		}
-		s.instances[instanceID] = inst
-	}
-	s.mu.Unlock()
-	return inst
 }
 
 // Record is the wire-serialisable tuple the gRPC stream emits. One

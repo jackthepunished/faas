@@ -86,6 +86,17 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// GET /v1/audit-events?kind_prefix=stateless.advisory
 			// with optional ?app_id= for the per-app drill-down.
 			s.renderAuditEvents(w, r, log, acct)
+		case path == "/dashboard/stateless":
+			// Move 1 PR-A: customer-facing landing page for the
+			// stateless contract. Renders (a) the contract in
+			// human copy, (b) the 8 base denylist + 10 closed paths,
+			// (c) the account's 50 most recent advisory rows.
+			// Pin: always scoped to the signed-in account, never
+			// cross-account. The data slice sources (pkg/dashboard's
+			// StatelessDenylist + StatelessClosedPaths) are
+			// documentation copy mirrored from pkg/imaged and
+			// guest-init; see dashboard.go for the rationale.
+			s.renderStateless(w, r, log, acct)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
 		default:
@@ -841,6 +852,15 @@ func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *
 			Actor:     e.Actor,
 			Kind:      e.Kind,
 		}
+		// Severity is hoisted from the audit row's data map. Only
+		// stateless.advisory rows carry the field today; the apid
+		// receiver (cmd/apid/advisory_receiver.go) populates it at
+		// emit time. A future audit kind with its own severity
+		// classification can write a similar key without touching
+		// the dashboard.
+		if severity, ok := dataSeverity(e.Data); ok {
+			row.Severity = severity
+		}
 		if e.Subject != nil {
 			row.Subject = e.Subject.String()
 		}
@@ -884,6 +904,83 @@ func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *
 			AppSlug:          appSlug,
 			Events:           items,
 			IncludeAnonymous: includeAnonymous,
+		},
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// renderStateless renders /dashboard/stateless — Move 1 PR-A landing
+// page for the stateless contract. Pulls the account's last 50
+// stateless.advisory audit rows via the same store path as
+// renderAuditEvents, scoped to the signed-in account. The 8-base
+// denylist + 10 closed paths come from pkg/dashboard's package-level
+// slices (mirrored from pkg/imaged and guest-init — see dashboard.go's
+// source-of-truth comment on each slice).
+//
+// Pagination cap is 50 (vs listAuditEventsLimitMax=100 on the public
+// audit-events page) to keep the table scannable. The full set is
+// reachable via /dashboard/audit-events?kind_prefix=stateless.advisory.
+func (s *server) renderStateless(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	const pageSize = 50
+	rows, err := s.store.ListEvents(r.Context(), acct.ID, listAuditEventsOverRead)
+	if err != nil {
+		log.Warn("dashboard renderStateless: list account events", "account_id", acct.ID, "err", err)
+		renderProblem(w, log, api.ErrCapacity("could not list audit events"))
+		return
+	}
+	now := time.Now()
+	items := make([]dashboard.AuditEventRow, 0, pageSize)
+	for _, e := range rows {
+		if !strings.HasPrefix(e.Kind, "stateless.advisory") {
+			continue
+		}
+		row := dashboard.AuditEventRow{
+			ID:        strconv.FormatInt(e.ID, 10),
+			TimeLabel: dashboard.RelativeTime(e.At, now),
+			Actor:     e.Actor,
+			Kind:      e.Kind,
+		}
+		// Severity hoist mirrors renderAuditEvents — see the comment
+		// there. Stateless.advisory rows always carry a "severity"
+		// key (advisory_receiver.go:116) so the badge column renders
+		// for every row on this landing page.
+		if severity, ok := dataSeverity(e.Data); ok {
+			row.Severity = severity
+		}
+		if e.Subject != nil {
+			row.Subject = e.Subject.String()
+		}
+		if len(e.Data) > 0 {
+			var pretty any
+			if err := json.Unmarshal(e.Data, &pretty); err == nil {
+				if b, err := json.MarshalIndent(pretty, "", "  "); err == nil {
+					row.DataPretty = string(b)
+				}
+			}
+		}
+		items = append(items, row)
+		if len(items) >= pageSize {
+			break
+		}
+	}
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderStateless: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	page := dashboard.Page{
+		Title:   "Stateless advisories",
+		Body:    "stateless",
+		Account: dashboardAccountView(view, appCount),
+		Data: dashboard.StatelessData{
+			RecentAdvisories:      items,
+			RecentAdvisoriesEmpty: len(items) == 0,
+			RecentAdvisoriesTotal: len(items),
+			StatelessDenylist:     dashboard.StatelessDenylist,
+			ClosedPaths:           dashboard.StatelessClosedPaths,
 		},
 	}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {

@@ -600,6 +600,18 @@ const (
 	// discrepancy is observed.
 	DefaultDiskDriftInterval = 1 * time.Hour
 
+	// WarmAffinityTTL is how long pkg/sched.WarmAffinity remembers the
+	// last-warm compute node for an app (placement scheduler, ADR-025).
+	// The chooser biases a wake toward the remembered node so a hot
+	// app's snapshot + page cache stay warm (ADR-009). 30 minutes
+	// matches the Pro plan idle-timeout default — a hot app on a
+	// 30-minute TTL keeps the snapshot warm across one reaper cycle.
+	// Overridable via FAAS_WARM_AFFINITY_TTL at the schedd daemon.
+	// Sticky-warm is bias, never a gate (ADR-005: cold boot must
+	// always work); an expired or missing hint falls through to
+	// least-loaded RAM headroom.
+	WarmAffinityTTL = 30 * time.Minute
+
 	// DefaultConntrackCap is the spec §7 per-instance conntrack cap
 	// (docs/faas_implementation_spec.md:344). One platform-wide number;
 	// not per-plan tiered — every tenant sees the same cap because the

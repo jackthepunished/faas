@@ -953,6 +953,31 @@ func TestCmdDashboard_RequiresLogin(t *testing.T) {
 	}
 }
 
+// TestCmdDashboard_StatelessFlag pins `faas dashboard --stateless`
+// (Move 1 PR-A). The flag must route the browser launch to
+// /dashboard/stateless — the customer-facing landing page for the
+// stateless contract — instead of the default /dashboard/account.
+// Without this test a future refactor could silently re-route the
+// flag (or break dashboardStatelessURL in commands2.go) and ship
+// a customer to the wrong page.
+func TestCmdDashboard_StatelessFlag(t *testing.T) {
+	t.Setenv("FAAS_API", "https://api.example.com")
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	rec := withRecorder(t)
+	if code := cmdDashboard([]string{"--stateless"}); code != 0 {
+		t.Errorf("cmdDashboard --stateless = %d, want 0", code)
+	}
+	if len(rec.urls) != 1 {
+		t.Fatalf("recorder saw %d launches, want 1", len(rec.urls))
+	}
+	if !strings.Contains(rec.urls[0], "/dashboard/stateless") {
+		t.Errorf("opened URL = %q, want it to contain /dashboard/stateless", rec.urls[0])
+	}
+	if strings.Contains(rec.urls[0], "/dashboard/account") {
+		t.Errorf("opened URL = %q must NOT contain /dashboard/account (the default path)", rec.urls[0])
+	}
+}
+
 // --- apps ls alias ---------------------------------------------------------
 
 func TestCmdAppsDispatch_LsAlias(t *testing.T) {

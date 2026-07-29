@@ -610,6 +610,14 @@ func cmdPlan(args []string) int {
 // fallback-to-URL pattern as cmdDeployRepo (commands2.go:283-288). Tests
 // substitute browser.Default via withRecorder.
 //
+// --stateless (Move 1 PR-A) opens /dashboard/stateless instead — the
+// customer-facing landing page for the stateless contract (the
+// contract copy, the 8-base denylist, the 10 closed paths, and the
+// account's 50 most recent advisory rows). The flag exists so a
+// customer who just got an advisory row in their terminal can
+// land on the explanation page without clicking through the
+// account nav.
+//
 // Exit code on browser-open failure: 0, intentionally. The URL is
 // printed to stderr so the customer can paste it into a browser
 // themselves — the work the customer asked for (giving them the
@@ -618,14 +626,22 @@ func cmdPlan(args []string) int {
 // would make CI scripts and `&&`-chained shell commands treat a
 // missing $DISPLAY as a hard failure, which is the wrong signal.
 func cmdDashboard(args []string) int {
-	if len(args) != 0 {
-		PrintUsage(os.Stderr, "usage: faas dashboard", "dashboard")
+	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
+	stateless := fs.Bool("stateless", false, "open the stateless-advisory landing page instead of the account page")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: faas dashboard [--stateless]", "dashboard")
 		return 1
 	}
 	if _, err := authedClient(); err != nil {
 		return printErr("Not logged in", err)
 	}
 	target := dashboardAccountURL(apiBase())
+	if *stateless {
+		target = dashboardStatelessURL(apiBase())
+	}
 	_, _ = fmt.Fprintf(osStdout, "Opening %s\n", target)
 	if err := browser.Open(target); err != nil {
 		PrintFail(os.Stderr, "Could not open browser: %v", err)
@@ -707,7 +723,12 @@ func cmdTail(args []string) int {
 	if *includeStateless {
 		_, _ = fmt.Fprintln(osStdout, "Tailing invocations + stateless advisories… Ctrl-C to exit.")
 	} else {
+		// Move 1 PR-A: stamp a discoverability hint so a customer
+		// who hits the tail and gets only invocation lines knows
+		// stateless advisories are a separate stream with their
+		// own flag. Keeps the default invocation list un-cluttered.
 		_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
+		_, _ = fmt.Fprintln(osStdout, "Tip: pass --include-stateless to also see stateless advisories from your app's audit row stream.")
 	}
 	for {
 		select {

@@ -249,6 +249,32 @@ func eventDataHasAppID(data json.RawMessage, want string) bool {
 	return payload.AppID == want
 }
 
+// dataSeverity extracts the "severity" field from an audit row's
+// data map. Move 1 PR-A: the apid receiver writes a "severity" key
+// into stateless.advisory rows (cmd/apid/advisory_receiver.go).
+// The dashboard handler hoists it onto AuditEventRow so the badge
+// column can render without re-parsing the JSON. Unparseable or
+// missing data returns ("", false); the caller falls back to
+// "info" rendering for non-stateless kinds.
+//
+// Kept here (next to eventDataHasAppID) so the post-SQL data
+// extraction helpers live together.
+func dataSeverity(data json.RawMessage) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	var payload struct {
+		Severity string `json:"severity"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", false
+	}
+	if payload.Severity == "" {
+		return "", false
+	}
+	return payload.Severity, true
+}
+
 // auditEventResponse converts one state.Event row into the wire shape.
 // Subject is rendered as a string (uuid canonical form) — the wire
 // contract is string-typed so JSON consumers never see Go's uuid type.

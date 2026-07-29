@@ -400,3 +400,139 @@ func TestCmdSecrets_Set_RotationHint(t *testing.T) {
 		})
 	}
 }
+
+// TestCmdSecrets_Set_QuotaStamp pins the post-write quota stamp
+// (Move 1 PR-A, commands3.go secretsSet → printSecretsQuotaStamp).
+// Three modes, matching the docstring on printSecretsQuotaStamp:
+//
+//   - ListSecrets OK + plan known    → "<slug>: N/M secrets"
+//   - ListSecrets OK + plan unknown  → "<slug>: N secrets" (bare count, no cap)
+//   - ListSecrets fails               → no stamp at all (PUT already succeeded)
+//
+// The third mode is the regression guard: a future change that
+// re-routes the cap lookup to fail noisily (e.g. turn Whoami into
+// a fatal error) would surface as a misleading cap=0 line. The
+// test pins the silent-fallback contract.
+func TestCmdSecrets_Set_QuotaStamp(t *testing.T) {
+	type fakeAccount struct {
+		status int
+		body   any
+		err    bool
+	}
+	type fakeList struct {
+		status int
+		body   any
+		err    bool
+	}
+	cases := []struct {
+		name      string
+		plan      fakeAccount // Whoami
+		list      fakeList    // ListSecrets (after PUT)
+		wantSub   []string    // substrings the output MUST contain
+		wantNot   []string    // substrings the output MUST NOT contain
+		wantEmpty bool        // true: no quota stamp line at all
+	}{
+		{
+			name: "happy_path_prints_N_over_M",
+			plan: fakeAccount{status: 200, body: api.AccountResponse{Plan: "hobby"}},
+			list: fakeList{status: 200, body: api.AppSecretListResponse{
+				Secrets: []api.AppSecretResponse{{Key: "K1"}, {Key: "K2"}, {Key: "K3"}},
+				Quota:   25, Count: 3,
+			}},
+			wantSub: []string{"x: 3/25 secrets"},
+		},
+		{
+			name: "free_plan_uses_free_cap_3",
+			plan: fakeAccount{status: 200, body: api.AccountResponse{Plan: "free"}},
+			list: fakeList{status: 200, body: api.AppSecretListResponse{
+				Secrets: []api.AppSecretResponse{{Key: "K1"}},
+				Quota:   3, Count: 1,
+			}},
+			wantSub: []string{"x: 1/3 secrets"},
+		},
+		{
+			name: "plan_unknown_falls_back_to_bare_count",
+			plan: fakeAccount{status: 200, body: api.AccountResponse{Plan: ""}},
+			list: fakeList{status: 200, body: api.AppSecretListResponse{
+				Secrets: []api.AppSecretResponse{{Key: "K1"}},
+				Quota:   25, Count: 1,
+			}},
+			// bare count, no slash, no cap
+			wantSub: []string{"x: 1 secrets"},
+			wantNot: []string{"/", "25"},
+		},
+		{
+			name: "whoami_fails_falls_back_to_bare_count",
+			plan: fakeAccount{err: true},
+			list: fakeList{status: 200, body: api.AppSecretListResponse{
+				Secrets: []api.AppSecretResponse{{Key: "K1"}, {Key: "K2"}},
+				Quota:   25, Count: 2,
+			}},
+			wantSub: []string{"x: 2 secrets"},
+			wantNot: []string{"/25"},
+		},
+		{
+			name: "list_after_put_fails_silently_no_stamp",
+			plan: fakeAccount{status: 200, body: api.AccountResponse{Plan: "hobby"}},
+			list: fakeList{err: true},
+			// The PUT-OK message still prints; the quota stamp is silent.
+			wantSub: []string{"K1 set"},
+			wantNot: []string{"secrets"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/account":
+					if tc.plan.err {
+						http.Error(w, "boom", http.StatusInternalServerError)
+						return
+					}
+					writeJSONTest(w, tc.plan.body)
+				case r.URL.Path == "/v1/apps/x/secrets":
+					if r.Method == http.MethodGet {
+						if tc.list.err {
+							http.Error(w, "boom", http.StatusInternalServerError)
+							return
+						}
+						writeJSONTest(w, tc.list.body)
+						return
+					}
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				case r.URL.Path == "/v1/apps/x/secrets/K1" && r.Method == http.MethodPut:
+					// SetSecret path: PUT /v1/apps/{slug}/secrets/{key}
+					w.WriteHeader(http.StatusOK)
+				default:
+					http.Error(w, "no", http.StatusNotFound)
+				}
+			})
+			srv := httptest.NewServer(sink)
+			defer srv.Close()
+
+			t.Setenv("FAAS_API", srv.URL)
+			t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+			var stdout bytes.Buffer
+			old := osStdout
+			osStdout = &stdout
+			defer func() { osStdout = old }()
+
+			if code := cmdSecrets([]string{"set", "--app", "x", "K1=v1"}); code != 0 {
+				t.Fatalf("cmdSecrets set = %d, want 0", code)
+			}
+			out := stdout.String()
+			for _, s := range tc.wantSub {
+				if !strings.Contains(out, s) {
+					t.Errorf("output missing %q\nfull: %s", s, out)
+				}
+			}
+			for _, s := range tc.wantNot {
+				if strings.Contains(out, s) {
+					t.Errorf("output unexpectedly contains %q\nfull: %s", s, out)
+				}
+			}
+		})
+	}
+}

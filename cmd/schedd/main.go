@@ -460,15 +460,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"aggressive", cfg.ReaperAggressive)
 	}
 	// Cron dispatch path: route synthetic requests through gatewayd's
-	// internal unix socket so metering + rate limits apply identically
-	// to user traffic (spec §4.4, M7). A failure to dial is logged but
-	// non-fatal — the cron loop tolerates a missing gateway (Wake still
-	// runs, the synth step is best-effort).
-	if cfg.GatewaySynthSocket != "" {
-		synth, dialErr := sched.DialGatewaySynth(cfg.GatewaySynthSocket, log)
+	// internal listener so metering + rate limits apply identically
+	// to user traffic (spec §4.4, M7). Multi-box schedd uses the
+	// GatewaySynthTarget URL (placement scheduler PR, ADR-025 axis 3
+	// Q8); the legacy GatewaySynthSocket field stays as a fallback
+	// for one-box deploys + the e2e harness. A failure to dial is
+	// logged but non-fatal — the cron loop tolerates a missing
+	// gateway (Wake still runs, the synth step is best-effort).
+	synthTarget := cfg.GatewaySynthTarget
+	if synthTarget == "" {
+		synthTarget = "unix://" + cfg.GatewaySynthSocket
+	}
+	if synthTarget != "" {
+		synth, dialErr := sched.DialGatewaySynthTarget(synthTarget, nil, log)
 		if dialErr != nil {
 			log.Warn("gateway synth dial: cron traffic will not flow until gatewayd is up",
-				"socket", cfg.GatewaySynthSocket, "err", dialErr)
+				"target", synthTarget, "err", dialErr)
 		} else {
 			loop.WithGatewaySynth(synth)
 		}
@@ -481,8 +488,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pg_notify channel. Shares the engine + store with the cron
 	// loop; the synth client is the same one the cron loop uses so
 	// the wake path is one consistent admission gate.
-	if cfg.GatewaySynthSocket != "" {
-		synth, dialErr := sched.DialGatewaySynth(cfg.GatewaySynthSocket, log)
+	if synthTarget != "" {
+		synth, dialErr := sched.DialGatewaySynthTarget(synthTarget, nil, log)
 		if dialErr != nil {
 			// A failed dial disables the entire drain — async /
 			// queue / delayed-task rows would still arrive via the
@@ -490,7 +497,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// would 502. Surface loud so the operator notices
 			// before customers start timing out.
 			log.Error("drain: synth dial failed; event-shaped dispatch is disabled",
-				"socket", cfg.GatewaySynthSocket, "err", dialErr)
+				"target", synthTarget, "err", dialErr)
 		} else {
 			drain := sched.NewDrain(engine.Store(), engine,
 				sched.WithDrainGatewaySynth(synth),

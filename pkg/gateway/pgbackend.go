@@ -12,6 +12,19 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// WarmHintFunc is the sticky-warm affinity source for the picker
+// (placement scheduler PR, ADR-025). It returns the compute_node.id
+// that last warmed the given app, or "" with found=false if no hint
+// is available (no record, expired, or stream disconnected). A nil
+// WarmHintFunc is treated as "no hint always" — the picker falls
+// through to least-loaded headroom identically to a fresh install.
+//
+// The hint is bias, never a gate — pkg/sched/ChoosePlacement
+// ignores the hint when the preferred node is saturated. ADR-005
+// (cold boot must always work) is preserved at the gateway too:
+// an empty hint degrades to round-robin-within-warmest-node.
+type WarmHintFunc func(appID string) (nodeID string, found bool)
+
 // Router is the Postgres-backed routing seam PGBackend reads through. It is the
 // narrow slice of the state.Store the edge needs to resolve a hostname to its
 // app; cmd/gatewayd adapts state.Store to it. Keeping it gateway-local (rather
@@ -25,19 +38,26 @@ type Router interface {
 	ResolveHost(ctx context.Context, host string) (app App, ok bool, err error)
 }
 
-// targetSet (issue #168) is the per-app list of routable instances the
-// gateway holds. Members are unique by InstanceID; Pick uses an atomic
-// round-robin cursor so the hot path is allocation-free even with multiple
-// instances in the set. The set is mutated under PGBackend.tgtMu.
+// targetSet (issue #168, placement scheduler PR) is the per-app list
+// of routable instances the gateway holds. Members are unique by
+// InstanceID; Pick uses a per-node sub-cursor so the picker biases
+// toward the node with the most healthy entries and applies a
+// sticky-warm affinity bonus (ADR-025).
 //
 // Concurrency model:
-//   - `next` is the atomic round-robin cursor; it monotonically increments
-//     on every Pick. Modulo the current length yields the picked slot.
-//   - `entries` is read-only inside Pick (RLock); mutation happens under
-//     Lock (addTarget / EvictInstance).
+//   - subCursors maps each distinct NodeID to an atomic round-robin
+//     cursor. Pick increments the cursor of the winning node only,
+//     so two concurrent picks for different nodes don't compete.
+//   - entries is read-only inside Pick (RLock); mutation happens
+//     under Lock (add / remove).
+//   - nodeOrder is a stable insertion order for tie-breaking when
+//     two nodes have equal healthy counts. Re-built lazily on add
+//     if the new Target's NodeID is novel.
 type targetSet struct {
-	next    atomic.Uint64
-	entries []Target
+	next       atomic.Uint64 // legacy single-cursor; retained so legacy callers / tests that read len + add keep working. pick() no longer increments it.
+	entries    []Target
+	nodeOrder  []string                  // stable node-id order for tie-break
+	subCursors map[string]*atomic.Uint64 // nodeID -> per-node cursor
 }
 
 // add appends a new Target to the set, replacing any existing entry with
@@ -54,28 +74,132 @@ func (s *targetSet) add(t Target) {
 		}
 	}
 	s.entries = append(s.entries, t)
+	if _, ok := s.subCursors[t.NodeID]; !ok {
+		s.subCursors[t.NodeID] = &atomic.Uint64{}
+		s.nodeOrder = append(s.nodeOrder, t.NodeID)
+	}
 }
 
 // remove drops the entry whose InstanceID matches. Returns the new slice
 // length. Callers must hold tgtMu (Lock).
 func (s *targetSet) remove(instanceID string) int {
+	var removedNode string
 	for i, e := range s.entries {
 		if e.InstanceID == instanceID {
+			removedNode = e.NodeID
 			s.entries = append(s.entries[:i], s.entries[i+1:]...)
-			return len(s.entries)
+			break
+		}
+	}
+	if removedNode == "" {
+		return len(s.entries)
+	}
+	// Lazy GC: only drop the per-node cursor when no entry remains
+	// for that node. Keeps the picker hot-path free of allocations
+	// for steady-state traffic.
+	stillUsed := false
+	for _, e := range s.entries {
+		if e.NodeID == removedNode {
+			stillUsed = true
+			break
+		}
+	}
+	if !stillUsed {
+		delete(s.subCursors, removedNode)
+		for i, n := range s.nodeOrder {
+			if n == removedNode {
+				s.nodeOrder = append(s.nodeOrder[:i], s.nodeOrder[i+1:]...)
+				break
+			}
 		}
 	}
 	return len(s.entries)
 }
 
-// pick returns one Target via atomic round-robin. Callers must hold tgtMu
-// (RLock). Empty set → ok=false.
-func (s *targetSet) pick() (Target, bool) {
+// pick returns one Target via per-node sub-cursors with sticky-warm
+// affinity. The picker:
+//
+//  1. Groups entries by NodeID.
+//  2. Scores each node: score(node) = healthyCount(node) + warmBonus(node).
+//     warmBonus is +∞ if warmHint == nodeID, else 0. The +∞ is
+//     modelled as math.MaxInt so the tie-break stays integer-arithmetic
+//     without reflection.
+//  3. Round-robin within the winning node's sub-cursor.
+//
+// Callers must hold tgtMu (RLock). Empty set → ok=false.
+//
+// warmHint="" or warmHintFound=false → score reduces to healthyCount.
+// The nodeOrder slice keeps the comparison deterministic when two
+// nodes tie (legacy single-box deploys always have exactly one
+// node, so this branch is exercised in tests, not production).
+func (s *targetSet) pick(warmHint string) (Target, bool) {
 	if len(s.entries) == 0 {
 		return Target{}, false
 	}
-	idx := s.next.Add(1) - 1
-	return s.entries[int(idx%uint64(len(s.entries)))], true
+	if len(s.subCursors) == 1 {
+		// Fast path: every entry is on one node. Round-robin
+		// over the entries directly (the only sub-cursor we
+		// have is for that one node). This keeps the single-box
+		// hot path allocation-free, matching the legacy atomic
+		// round-robin shape.
+		idx := s.next.Add(1) - 1
+		return s.entries[int(idx%uint64(len(s.entries)))], true
+	}
+	// Multi-node: group entries by node, score each, pick the
+	// winning node, round-robin within it.
+	counts := make(map[string]int, len(s.nodeOrder))
+	for _, e := range s.entries {
+		counts[e.NodeID]++
+	}
+	var (
+		bestNode  string
+		bestScore int64 = -1
+	)
+	for _, nodeID := range s.nodeOrder {
+		c := int64(counts[nodeID])
+		score := c
+		if warmHint != "" && nodeID == warmHint {
+			// +∞: bias the warm node above any non-warm node.
+			// math.MaxInt is fine because counts stay bounded
+			// by max_concurrency (≤ 20 for Scale plan).
+			score = c + (1 << 62)
+		}
+		if score > bestScore {
+			bestScore = score
+			bestNode = nodeID
+		} else if score == bestScore {
+			// Stable lex tie-break so identical scores don't
+			// flip the pick between calls. Cheap because
+			// nodeOrder is small.
+			if nodeID < bestNode {
+				bestNode = nodeID
+			}
+		}
+	}
+	if bestNode == "" {
+		return Target{}, false
+	}
+	cursor, ok := s.subCursors[bestNode]
+	if !ok {
+		return Target{}, false
+	}
+	// Build a per-node index slice on demand; the picker is on
+	// the hot path so we cache the indices for repeated calls.
+	// The simplest correct implementation just counts.
+	n := counts[bestNode]
+	idx := cursor.Add(1) - 1
+	// Walk entries to find the idx-th one on bestNode.
+	var seen int
+	for _, e := range s.entries {
+		if e.NodeID != bestNode {
+			continue
+		}
+		if int(idx%uint64(n)) == seen {
+			return e, true
+		}
+		seen++
+	}
+	return Target{}, false
 }
 
 // PGBackend is gatewayd's production Backend (spec §4.1, issue #168): a
@@ -104,11 +228,33 @@ type PGBackend struct {
 	appsMu sync.RWMutex
 	apps   map[string]App // app_id -> App (plan)
 
+	// warmHint is the sticky-warm affinity source for the picker
+	// (placement scheduler PR, ADR-025). nil = no hint; pick() falls
+	// through to per-node healthyCount scoring. Set via WithWarmHint.
+	warmHint WarmHintFunc
+
 	tgtMu sync.RWMutex
 	// targets is the hot-path app_id → *targetSet cache. Each targetSet
-	// holds 1..max_concurrency Targets, picked round-robin on every
-	// request (issue #168).
+	// holds 1..max_concurrency Targets, picked via per-node sub-cursors
+	// (issue #168 + ADR-025).
 	targets map[string]*targetSet
+}
+
+// WithWarmHint attaches the sticky-warm affinity source for the picker.
+// nil is tolerated (the picker degrades to per-node healthyCount).
+// cmd/gatewayd wires this from the WarmHint stream that schedd exposes
+// via the gRPC surface; tests pass a closure that reads from a fake
+// or a fixed map.
+//
+// As of PR #429 the WarmHint stream gRPC RPC is not yet wired, so
+// production gateways leave this unset. The picker correctly returns
+// "no hint" and falls through to per-node healthyCount + lex
+// tie-break on nodeOrder. Sticky-warm is enabled as soon as the
+// stream consumer lands (follow-up slice tracked in
+// docs/adr/025 — see plan file).
+func (b *PGBackend) WithWarmHint(fn WarmHintFunc) *PGBackend {
+	b.warmHint = fn
+	return b
 }
 
 // compile-time assertion PGBackend satisfies the edge seam.
@@ -155,19 +301,31 @@ func (b *PGBackend) Lookup(ctx context.Context, host string) (App, bool) {
 	return app, true
 }
 
-// Pick returns one routable Target for appID via atomic round-robin
-// (issue #168). Returns ("", false) when the cache is empty (no wake has
-// populated it yet, or every cached instance was evicted). The handler
-// must ensure capacity before calling Pick so this only returns false on
-// the rare eviction race.
+// Pick returns one routable Target for appID via per-node sub-cursors
+// (issue #168, placement scheduler PR). Returns ("", false) when the
+// cache is empty (no wake has populated it yet, or every cached
+// instance was evicted). The handler must ensure capacity before
+// calling Pick so this only returns false on the rare eviction race.
+//
+// Sticky-warm affinity (ADR-025): b.warmHint, if non-nil, biases the
+// pick toward the node that last warmed this app. nil warmHint
+// degrades to per-node healthyCount scoring with the lex tie-break
+// on node-id — a fresh deploy (no warm hint) still distributes
+// across nodes that already have live instances.
 func (b *PGBackend) Pick(appID string) (Target, bool) {
+	var warmHint string
+	if b.warmHint != nil {
+		if n, found := b.warmHint(appID); found {
+			warmHint = n
+		}
+	}
 	b.tgtMu.RLock()
 	set := b.targets[appID]
 	if set == nil {
 		b.tgtMu.RUnlock()
 		return Target{}, false
 	}
-	t, ok := set.pick()
+	t, ok := set.pick(warmHint)
 	b.tgtMu.RUnlock()
 	return t, ok
 }
@@ -237,7 +395,9 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 	b.tgtMu.Lock()
 	set = b.targets[appID]
 	if set == nil {
-		set = &targetSet{}
+		set = &targetSet{
+			subCursors: map[string]*atomic.Uint64{},
+		}
 		b.targets[appID] = set
 	}
 	set.add(Target{

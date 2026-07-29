@@ -1669,6 +1669,18 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 	if got.LastHeartbeatAt.IsZero() {
 		t.Errorf("seeded LastHeartbeatAt should be stamped at creation")
 	}
+	// PR #429: region/zone backfill mirrors migrations/00069 so a
+	// single-box deploy has a deterministic ("local","local") tie-break
+	// ordering without needing the migration to have run on the
+	// memstore. Pin the seed here so a future contributor who changes
+	// memstore.seedDefaultLocalNodeLocked (or the migration) sees a
+	// targeted failure if the two drift apart.
+	if got.Region == nil || *got.Region != DefaultLocalityLabel {
+		t.Errorf("Region = %v, want pointer to %q", got.Region, DefaultLocalityLabel)
+	}
+	if got.Zone == nil || *got.Zone != DefaultLocalityLabel {
+		t.Errorf("Zone = %v, want pointer to %q", got.Zone, DefaultLocalityLabel)
+	}
 }
 
 func TestMem_ComputeNodes_NewMemStoreSeedsDefaultLocal(t *testing.T) {

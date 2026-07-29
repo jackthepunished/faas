@@ -226,10 +226,14 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		// realistic order of magnitude for a Hobby app doing
 		// bursty work, picked for a clean 4-decimal render.
 		UsedCPUHours: 0.002778,
+		// ADR-046: informational egress (tx_bytes + net_tx_bytes,
+		// rolled up at the server). 1.234 GB is a non-zero
+		// value so the line is exercised by this test.
+		UsedEgressGB: 1.234,
 	})
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
-	if len(lines) != 6 {
-		t.Fatalf("line count = %d, want 6 (issue #279 added CPU panel)\nraw: %s", len(lines), buf.String())
+	if len(lines) != 7 {
+		t.Fatalf("line count = %d, want 7 (ADR-046 added Egress panel; issue #279 added CPU)\nraw: %s", len(lines), buf.String())
 	}
 	for _, want := range []string{
 		"Month:", "2026-07",
@@ -238,6 +242,7 @@ func TestRenderUsageSummary_PinsColumnLayout(t *testing.T) {
 		"Overage:", "7.345 GB-hours",
 		"Overage cost:", "735 cents",
 		"CPU usage:", "0.002778 CPU-hours",
+		"Egress:", "1.234 GB",
 	} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("rendered output missing %q\nfull: %s", want, buf.String())
@@ -378,6 +383,68 @@ func TestCmdUsage_SummarySubcommand_DispatchesToSummary(t *testing.T) {
 }
 
 // --- run() dispatch --------------------------------------------------------
+
+// TestCmdUsageList_HumanEgressColumn pins the ADR-046 egress column
+// on the per-app usage list. When TXBytes or NetTxBytes is non-zero
+// the human-mode line gains a trailing `· egress X.XXX GB (tx A.AA
+// / net B.BB)` segment. When both are zero the original 4-field
+// line is preserved (no trailing noise on a fresh account).
+func TestCmdUsageList_HumanEgressColumn(t *testing.T) {
+	cases := []struct {
+		name    string
+		tx, net int64
+		wantSub []string
+		wantNot []string
+	}{
+		{
+			name: "zero egress omits column",
+			tx:   0, net: 0,
+			wantSub: []string{"App a1 —", "1 requests", "0.000 GB-hours"},
+			wantNot: []string{"egress"},
+		},
+		{
+			// 1.5 GiB tx + 2.0 GiB net → 3.5 GiB egress, 1.50 / 2.00 split.
+			// Conversion: float64(bytes) / (1024*1024*1024).
+			name: "non-zero egress prints column",
+			tx:   1610612736, net: 2147483648,
+			wantSub: []string{"App a1 —", "1 requests", "egress 3.500 GB", "tx 1.50", "net 2.00"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(api.UsageResponse{
+					AppID: "a1", Requests: 1, MBSeconds: 1, IncludedGBHours: 5,
+					TXBytes: tc.tx, NetTxBytes: tc.net,
+				})
+			}))
+			defer srv.Close()
+
+			var stdout bytes.Buffer
+			oldOut := osStdout
+			osStdout = &stdout
+			defer func() { osStdout = oldOut }()
+
+			t.Setenv("FAAS_API", srv.URL)
+			t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+			if code := cmdUsageList(nil); code != 0 {
+				t.Fatalf("list = %d, want 0", code)
+			}
+			out := stdout.String()
+			for _, want := range tc.wantSub {
+				if !strings.Contains(out, want) {
+					t.Errorf("output missing %q\nfull: %s", want, out)
+				}
+			}
+			for _, deny := range tc.wantNot {
+				if strings.Contains(out, deny) {
+					t.Errorf("output unexpectedly contained %q\nfull: %s", deny, out)
+				}
+			}
+		})
+	}
+}
 
 // TestRun_DispatchUsageSummary pins the main run() switch routes
 // `usage summary` into cmdUsageSummary rather than mis-routing to

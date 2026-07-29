@@ -4125,10 +4125,10 @@ type SnapshotSize struct {
 // is safe: pkg/api has no outbound dependency on pkg/state, so no cycle.
 
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
-	n := ComputeNode{}
+	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.Active,
-		&n.LastHeartbeatAt, &n.CreatedAt); err != nil {
+		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
 	return n, nil
@@ -4137,7 +4137,8 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where active = true
 		 order by name
@@ -4165,7 +4166,8 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 order by name
 	`)
@@ -4187,7 +4189,8 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where id = $1
 	`, id)
@@ -4201,7 +4204,8 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where name = $1
 	`, name)
@@ -4362,14 +4366,22 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// (gen_random_uuid)"; we surface whatever Postgres picked in the
 	// RETURNING so the caller can persist it. A pre-set id is rare —
 	// only useful for restoring a backup or testing.
+	//
+	// region/zone (issue #254 / PR #429) are nullable and default to
+	// NULL on INSERT — schedd's placement chooser doesn't yet surface
+	// them at register time, so we explicitly project NULL when the
+	// caller leaves the pointer nil. RETURNING projects all 12 columns
+	// to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active)
-		values ($1, $2, $3, $4, $5, $6, $7)
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		     region, zone)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at
+		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.Active)
+		node.AdmissionCeilingMB, node.Active, node.Region, node.Zone)
 	return scanComputeNode(row)
 }
 
@@ -4382,10 +4394,16 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // former is the watchdog's heartbeat stamp (next task); the latter is
 // the row's creation time and stays monotonic.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	// region/zone are projected to match scanComputeNode's 12-column
+	// scan. On conflict the existing region/zone values are preserved
+	// (operator-driven locality label, not a vmmd-side knob); see
+	// migrations/00069_compute_nodes_region_zone.sql for the
+	// default-local backfill. RETURNING projects all 12 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active)
-		values ($1, $2, $3, $4, $5, $6, true)
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		     region, zone)
+		values ($1, $2, $3, $4, $5, $6, true, $7, $8)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -4394,9 +4412,10 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      active              = true
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at
+		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB)
+		node.AdmissionCeilingMB, node.Region, node.Zone)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node %q: %w", node.Name, err)

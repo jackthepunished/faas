@@ -3310,9 +3310,15 @@ func parseSubjectID(s string) *uuid.UUID {
 // row. Called once by NewMemStore after the struct literal so the
 // seeded row carries a real id + created_at. Idempotent on a fresh
 // store; production never calls this (the migration handles it).
+//
+// Region/Zone are seeded to 'local'/'local' to mirror migrations/
+// 00069_compute_nodes_region_zone.sql — the single-box deploy has a
+// deterministic (region, name) tie-break ordering without needing
+// the migration to have run on the memstore (which is test-only).
 func (m *MemStore) seedDefaultLocalNodeLocked() {
 	now := time.Now()
 	id := newID()
+	local := DefaultLocalityLabel
 	m.computeNodes[id] = ComputeNode{
 		ID:             id,
 		Name:           DefaultLocalNodeName,
@@ -3327,6 +3333,8 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 		Active:             true,
 		LastHeartbeatAt:    now,
 		CreatedAt:          now,
+		Region:             &local,
+		Zone:               &local,
 	}
 }
 
