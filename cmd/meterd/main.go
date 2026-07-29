@@ -357,7 +357,7 @@ func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client gateway
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
-			if err != io.EOF && log != nil {
+			if !errors.Is(err, io.EOF) && log != nil {
 				log.Debug("gatewayEgressAdapter: stream recv ended", "err", err)
 			}
 			return

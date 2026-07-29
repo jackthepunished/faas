@@ -13,6 +13,7 @@ package egressgrpc_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -168,7 +169,7 @@ func TestServer_StreamBytes_EmptyStreamOnIdleSink(t *testing.T) {
 	if !strings.Contains(err.Error(), "Deadline") &&
 		!strings.Contains(err.Error(), "deadline") &&
 		!strings.Contains(err.Error(), "context") &&
-		err != io.EOF {
+		!errors.Is(err, io.EOF) {
 		t.Fatalf("unexpected error (want DeadlineExceeded-or-EOF): %v", err)
 	}
 }
