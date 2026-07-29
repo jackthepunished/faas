@@ -245,6 +245,13 @@ type PGBackend struct {
 // cmd/gatewayd wires this from the WarmHint stream that schedd exposes
 // via the gRPC surface; tests pass a closure that reads from a fake
 // or a fixed map.
+//
+// As of PR #429 the WarmHint stream gRPC RPC is not yet wired, so
+// production gateways leave this unset. The picker correctly returns
+// "no hint" and falls through to per-node healthyCount + lex
+// tie-break on nodeOrder. Sticky-warm is enabled as soon as the
+// stream consumer lands (follow-up slice tracked in
+// docs/adr/025 — see plan file).
 func (b *PGBackend) WithWarmHint(fn WarmHintFunc) *PGBackend {
 	b.warmHint = fn
 	return b

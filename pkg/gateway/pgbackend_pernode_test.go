@@ -16,6 +16,7 @@ package gateway_test
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -37,32 +38,7 @@ func (r *rotatingScheduler) AdmitInstance(context.Context, string) (string, stri
 	idx := r.calls.Add(1)
 	nodeID := r.nextNodeID()
 	// Scheduler signature: (instanceID, nodeID, wakeID, method, atCapacity, err).
-	return "i-" + itoa(idx), nodeID, "wake-" + itoa(idx), r.method, false, nil
-}
-
-// itoa is a tiny int→string without pulling strconv into a test
-// file that's otherwise stdlib-light.
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := false
-	if n < 0 {
-		neg = true
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
+	return "i-" + strconv.FormatInt(idx, 10), nodeID, "wake-" + strconv.FormatInt(idx, 10), r.method, false, nil
 }
 
 // TestPGBackend_PickRotatesWithinWinningNode seeds two nodes with

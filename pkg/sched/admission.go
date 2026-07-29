@@ -198,17 +198,15 @@ func (l *NodeLedger) Admit(r Request) error {
 // verified headroom at placement time, this is the load-bearing
 // enforcement that survives a stale hint.
 func (l *NodeLedger) ceilingForNode_locked(nodeID string, _ api.Limits) int {
-	if nodeID == "" {
-		return api.RAMAdmissionCeilingMB
-	}
-	// Future slice: a per-node map populated by an admin RPC can
-	// override the row ceiling without re-routing every call site
-	// through the Request struct. For now the Engine passes the
-	// ceiling on the Request itself (see admitAndDispatch in
-	// pkg/sched/engine.go), so this resolver returns the row value
-	// indirectly via the caller. The global constant stays as the
-	// safe fallback for un-registered nodes and pre-multi-node
-	// test seams.
+	// Per-node ceiling enforcement lives on Request.NodeCeilingMB
+	// (admission.go:107), populated by the chooser from
+	// compute_nodes.admission_ceiling_mb at placement time. This
+	// resolver is the safe fallback for callers that didn't thread
+	// the row ceiling through the Request — i.e. un-registered
+	// nodes, pre-multi-node test seams, and external callers that
+	// build a Request with NodeCeilingMB=0. The global constant
+	// is the floor in every case (CLAUDE.md invariant 2 — fleet
+	// RAM admission ceiling 47,600 MB).
 	return api.RAMAdmissionCeilingMB
 }
 
