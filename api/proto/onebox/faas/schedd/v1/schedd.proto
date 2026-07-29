@@ -119,6 +119,31 @@ service Schedd {
   // Additive per ADR-016: the field tags on existing messages are
   // untouched; new RPC + new messages append at the end.
   rpc StreamAppLogs(StreamAppLogsRequest) returns (stream StreamAppLogsResponse);
+
+  // StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
+  // schedd is the only writer to pkg/sched.WarmAffinity; every successful
+  // admit stamps (app_id → node_id) and we forward the stamp as an event
+  // so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+  // warm node on multi-box fleets.
+  //
+  // Semantics:
+  //   - Server-streaming; gatewayd opens one stream at startup and keeps
+  //     it open for the lifetime of the connection.
+  //   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
+  //     guarantees an empty hint falls through to least-loaded, so a
+  //     gatewayd that reconnects with no hint still routes correctly.
+  //   - Events are emitted only on state change (RecordWake actually
+  //     changed app_id → node_id); a periodic RecordWake to the same node
+  //     is a no-op event-source-wise. The producer filters at emit time.
+  //
+  // Wire error mapping:
+  //   - codes.OK + nil on clean shutdown (caller cancels)
+  //   - codes.Canceled when the gateway cancels
+  //   - codes.Unavailable for any unexpected drain failure
+  //
+  // Additive per ADR-016: new RPC + new messages append at the end;
+  // existing field tags are untouched.
+  rpc StreamWarmHints(StreamWarmHintsRequest) returns (stream StreamWarmHintsResponse);
 }
 
 message WakeRequest {
@@ -311,3 +336,35 @@ message StreamAppLogsResponse {
   // the per-instance ring (RFC 3339 nano).
   google.protobuf.Timestamp written_at = 5;
 }
+
+// StreamWarmHintsRequest kicks off the sticky-warm affinity stream.
+// Empty today; reserved for future filters (per-node subscription,
+// app-id whitelist). Kept as a separate message so additive evolution
+// does not change the RPC signature (ADR-016).
+//
+// Additive per ADR-016.
+message StreamWarmHintsRequest {
+}
+
+// StreamWarmHintsResponse is one event on the sticky-warm affinity
+// stream. Emitted only when WarmAffinity's app_id → node_id mapping
+// actually changes (idempotent RecordWake to the same node is a no-op
+// at the wire). Tail-from-now: late subscribers do NOT receive a
+// snapshot of current hints — they see future changes only. An empty
+// hint on the gateway side degrades to least-loaded (ADR-005).
+//
+// Wire is additive: new fields go at the end. The instance_id is
+// intentionally absent — hints are app-scoped, not instance-scoped.
+//
+// Additive per ADR-016.
+message StreamWarmHintsResponse {
+  // app_id is the apps.id whose affinity hint just changed.
+  string app_id = 1;
+  // node_id is the compute_node.id the engine just admitted to.
+  string node_id = 2;
+  // written_at is the host-side time schedd stamped the entry (the
+  // WarmAffinity.lastSeen). Lets gatewayd detect clock skew in
+  // diagnostics; the gateway's hint cache treats this as advisory.
+  google.protobuf.Timestamp written_at = 3;
+}
+

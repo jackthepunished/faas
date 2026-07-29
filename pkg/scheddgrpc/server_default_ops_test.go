@@ -37,6 +37,7 @@ func (noopEngine) ReportActivity(context.Context, []state.InstanceTouch) (int, e
 }
 func (noopEngine) ParkWithReason(context.Context, string, string) error             { return nil }
 func (noopEngine) StreamAppLogs(context.Context, string, int64, LogFrameSink) error { return nil }
+func (noopEngine) StreamWarmHints(context.Context, WarmHintSink) error              { return nil }
 
 // TestServerNew_NilOpsUsesDefault confirms the
 // "ops == nil → wire.NewOpsMetrics(\"schedd\")" fallback
