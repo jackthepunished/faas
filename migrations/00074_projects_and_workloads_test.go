@@ -47,21 +47,19 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// migrateUpOnce runs MigrateUp once per test process. The migrations
-// package is process-global state, so calling it on a fresh schema in
-// every Test function would just re-apply the full ledger.
-var migrateUpOnce = func() func(ctx context.Context, t *testing.T) {
-	done := false
-	return func(ctx context.Context, t *testing.T) {
-		if done {
-			return
-		}
-		if err := db.MigrateUp(ctx, pgtest.Open(t)); err != nil {
-			t.Fatalf("db.MigrateUp: %v", err)
-		}
-		done = true
+// migrateUpOnce runs MigrateUp against the per-test pool. pgtest.Open
+// creates a fresh isolated schema for every test (each call gets its own
+// faas_test_<random> schema), so caching the MigrateUp across tests would
+// only ever migrate the first schema; tests 2..N would see no tables.
+// Mirrors 00052_build_provenance_test.go: a direct call inside every
+// Test function. Goose's idempotency makes the per-test re-application
+// cheap on a fresh schema (it skips already-applied versions).
+func migrateUpOnce(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
 	}
-}()
+}
 
 // pgErrCode renders a *pgconn.PgError.Code safely (nil-safe).
 func pgErrCode(pgErr *pgconn.PgError) string {
@@ -88,7 +86,7 @@ func seedAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
 func TestMigration_00074_1_ProjectsTableShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	expectedCols := map[string]struct{ dataType, nullable string }{
 		"id":                {"uuid", "NO"},
@@ -143,7 +141,7 @@ func TestMigration_00074_1_ProjectsTableShape(t *testing.T) {
 func TestMigration_00074_2_AppsWorkloadClassCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	acctID := seedAccount(t, ctx, pool)
 
@@ -187,7 +185,7 @@ func TestMigration_00074_2_AppsWorkloadClassCheck(t *testing.T) {
 func TestMigration_00074_3_PartialUniqueFires(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	acctID := seedAccount(t, ctx, pool)
 
@@ -242,7 +240,7 @@ func TestMigration_00074_3_PartialUniqueFires(t *testing.T) {
 func TestMigration_00074_4_DroppedBindingIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	var droppedCount int
 	if err := pool.QueryRow(ctx, `
@@ -280,7 +278,7 @@ func TestMigration_00074_4_DroppedBindingIndex(t *testing.T) {
 func TestMigration_00074_5_BackfillSynthesizesProjects(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	boundAcctID := seedAccount(t, ctx, pool)
 	boundApp1 := uuid.NewString()
@@ -363,7 +361,7 @@ func TestMigration_00074_5_BackfillSynthesizesProjects(t *testing.T) {
 func TestMigration_00074_6_StandaloneAppsUnbound(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	standaloneAcct := seedAccount(t, ctx, pool)
 	standaloneApp := uuid.NewString()
@@ -397,7 +395,7 @@ func TestMigration_00074_6_StandaloneAppsUnbound(t *testing.T) {
 func TestMigration_00074_7_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t) // first MigrateUp
+	migrateUpOnce(ctx, t, pool) // first MigrateUp
 
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Errorf("second MigrateUp failed (replay-safety violation): %v", err)
@@ -411,7 +409,7 @@ func TestMigration_00074_7_ReplaySafe(t *testing.T) {
 func TestMigration_00074_8_PgTierRank(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
-	migrateUpOnce(ctx, t)
+	migrateUpOnce(ctx, t, pool)
 
 	// Function must exist.
 	var fnCount int
