@@ -34,10 +34,10 @@
 -- Slot history: 69 (next free after 00068_builder_usage.sql).
 
 CREATE INDEX IF NOT EXISTS usage_minutes_account_minute_idx
-    ON public.usage_minutes (account_id, minute DESC);
+    ON usage_minutes (account_id, minute DESC);
 
 CREATE INDEX IF NOT EXISTS usage_minutes_minute_idx
-    ON public.usage_minutes (minute);
+    ON usage_minutes (minute);
 
 -- +goose StatementEnd
 

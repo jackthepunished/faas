@@ -8,18 +8,27 @@
 package migrations_test
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
 func TestMigrations_00069_MeteringOpsSurfaces(t *testing.T) {
 	pool := pgtest.Open(t)
 	defer pool.Close()
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("db.MigrateUp: %v", err)
+	}
 
+	// Schema-agnostic assertion: pgtest.Open uses a per-test schema
+	// (e.g. faas_test_e29aacc9bd8d3477), so the indexdef will always
+	// carry the literal schema name. We pin the suffix after `ON `.
 	want := map[string]string{
-		"usage_minutes_account_minute_idx": "CREATE INDEX usage_minutes_account_minute_idx ON public.usage_minutes USING btree (account_id, minute DESC)",
-		"usage_minutes_minute_idx":         "CREATE INDEX usage_minutes_minute_idx ON public.usage_minutes USING btree (minute)",
+		"usage_minutes_account_minute_idx": "usage_minutes USING btree (account_id, minute DESC)",
+		"usage_minutes_minute_idx":         "usage_minutes USING btree (minute)",
 	}
 	rows, err := pool.Query(t.Context(),
 		`select indexname, indexdef from pg_indexes
@@ -35,6 +44,13 @@ func TestMigrations_00069_MeteringOpsSurfaces(t *testing.T) {
 		var name, def string
 		if err := rows.Scan(&name, &def); err != nil {
 			t.Fatalf("scan: %v", err)
+		}
+		// Strip the "ON <schema>." prefix pg stamps on indexdef.
+		if i := strings.Index(def, "ON "); i >= 0 {
+			rest := def[i+3:]
+			if j := strings.Index(rest, "."); j >= 0 {
+				def = rest[j+1:]
+			}
 		}
 		got[name] = def
 	}

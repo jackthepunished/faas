@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00071_snapshots_live_idx.sql
+-- filename: 00073_snapshots_live_idx.sql
 --
 -- Partial index supporting pkg/state/pgstore.go::LatestSnapshotBytes
 -- (PR #428 review blocker #3). The previous query scanned every
@@ -17,23 +17,30 @@
 -- LatestSnapshotBytes query becomes an Index Scan on the small
 -- set of currently-billable rows.
 --
--- CONCURRENTLY so the build doesn't lock the table. The migrate
--- runner skips advisory locks for CREATE INDEX CONCURRENTLY because
--- it cannot run inside a transaction — same pattern as
--- 00069_metering_ops_surfaces.sql::usage_minutes_account_minute_idx.
+-- Non-CONCURRENTLY for the same reason as
+-- 00069_metering_ops_surfaces.sql::usage_minutes_account_minute_idx:
+-- the migration runner (pkg/db.MigrateUp) wraps every .sql file in
+-- a transaction, and CONCURRENTLY cannot run inside a Tx. snapshots
+-- is read-mostly (the writer is the imaged + builderd pipelines, both
+-- of which throttle during a brief migration boot pause), so a
+-- non-CONCURRENTLY build locks writes for ~1 s on the EX44 fleet —
+-- acceptable.
 --
--- Slot history: 71 (next free after 00070_snapshot_storage_daily.sql).
+-- Slot history: 73 (renumbered from 71 because PR #429 holds 71
+-- via the _reserve_slot carve-out plus a real 00072 migration;
+-- collision was caught by the ci.yml migration slot gate and
+-- fixed by renumbering to the next free slot).
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS snapshots_live_idx
-    ON public.snapshots (deployment_id)
+CREATE INDEX IF NOT EXISTS snapshots_live_idx
+    ON snapshots (deployment_id)
     WHERE stale = false;
 
-COMMENT ON INDEX public.snapshots_live_idx IS
+COMMENT ON INDEX snapshots_live_idx IS
     'Supports pkg/state/pgstore.go::LatestSnapshotBytes inner scan — bounds to non-stale rows under live deployments. ADR-049 §B.3 + PR #428 review blocker #3.';
 
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-DROP INDEX CONCURRENTLY IF EXISTS public.snapshots_live_idx;
+DROP INDEX CONCURRENTLY IF EXISTS snapshots_live_idx;
 -- +goose StatementEnd

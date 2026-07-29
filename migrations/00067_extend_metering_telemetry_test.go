@@ -43,10 +43,10 @@ func TestMigrations_00067_ExtendMeteringTelemetry(t *testing.T) {
 	//     is text with default 'none'. information_schema.columns is
 	//     the same source pg_dump uses — canonical probe.
 	type colExpect struct {
-		name      string
-		wantType  string
-		wantNull  string
-		wantDef   string
+		name     string
+		wantType string
+		wantNull string
+		wantDef  string
 	}
 	cases := []colExpect{
 		{"net_rx_bytes", "bigint", "NO", "0"},
@@ -152,10 +152,10 @@ func TestMigrations_00067_ExtendMeteringTelemetry(t *testing.T) {
 		t.Fatalf("insert usage_minutes with new columns: %v", err)
 	}
 	var got struct {
-		rx       int64
-		cold     int32
-		bSec     int64
-		bKind    string
+		rx    int64
+		cold  int32
+		bSec  int64
+		bKind string
 	}
 	if err := pool.QueryRow(ctx, `
 		select net_rx_bytes, cold_boot_count, builder_seconds, builder_kind
@@ -264,7 +264,7 @@ func TestMigrations_00067_ExtendMeteringTelemetry(t *testing.T) {
 	//     do this; the test pins the table accepts writes) and
 	//     verify the additive-merge contract under ON CONFLICT
 	//     (the cron's idempotency mechanism).
-	day := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -7) // pinned past day
+	day := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -7) // pinned past day
 	if _, err := pool.Exec(ctx, `
 		insert into usage_daily (account_id, app_id, day, mb_seconds, requests, net_rx_bytes, cold_boot_count, builder_seconds)
 		values ($1, $2, $3, 5000, 9, 4096, 1, 60)

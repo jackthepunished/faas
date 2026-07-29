@@ -189,7 +189,7 @@ type VMInstanceStat struct {
 	// non-nil into instancestats.InstanceStat.TXBytes and
 	// stamps TX=Valid. Only meterd's SampleAndRoll reads
 	// the row (pkg/meter/sampler.go, PR-2 fold-in).
-	NetTxBytes       *int64
+	NetTxBytes *int64
 	// NetRxBytes (ADR-048) is the per-tick byte delta on
 	// root-side vethHost.tx_bytes — mirror of NetTxBytes on
 	// the root→guest (= ingress) direction. Same nil-on-wire

@@ -25,7 +25,7 @@ type stubProvider struct {
 	err    error
 }
 
-func (s *stubProvider) EnsurePlanProducts(context.Context) error    { return nil }
+func (s *stubProvider) EnsurePlanProducts(context.Context) error { return nil }
 func (s *stubProvider) CreateCustomer(context.Context, state.Account) (string, error) {
 	return "", nil
 }
