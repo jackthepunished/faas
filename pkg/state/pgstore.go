@@ -894,7 +894,20 @@ func (s *PgStore) CreateProject(ctx context.Context, p Project) (Project, error)
 		p.AccountID, p.Slug, nullString(p.RepoFullName), nullString(p.ProductionBranch),
 		p.InstallID, string(p.ScanSource),
 	)
-	return scanProject(row)
+	proj, err := scanProject(row)
+	if err != nil {
+		// FK violation on account_id means the owning account row is
+		// gone. Surface as ErrNotFound so handlers can branch on a
+		// single sentinel instead of distinguishing 23503 from
+		// pgx.ErrNoRows. The pgErr.ConstraintName preserves the
+		// diagnosis for operator logs.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ForeignKeyViolation {
+			return Project{}, fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+		}
+		return Project{}, mapErr(err)
+	}
+	return proj, nil
 }
 
 func (s *PgStore) ProjectByID(ctx context.Context, projectID string) (Project, error) {
@@ -921,15 +934,30 @@ func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Pr
 
 // ProjectByRepo is the push-dispatch lookup. install_id is non-null on
 // bound projects only; we surface ErrNotFound when the row is gone
-// rather than swallowing it as an empty result.
+// rather than swallowing it as an empty result. The account_id filter
+// is only applied when a non-empty accountID is supplied — passing ""
+// (the cross-account push dispatch, or a test that hasn't bound an
+// account yet) skips the account predicate so the uuid→text coercion
+// in `account_id = ''` doesn't trip on an empty string.
 func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
+	if accountID == "" {
+		row := s.pool.QueryRow(ctx, `
+			select id, account_id, slug, coalesce(repo_full_name,''),
+			       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+			       created_at, updated_at
+			  from projects
+			 where install_id = $1 and repo_full_name = $2
+			 limit 1
+		`, installID, repoFullName)
+		return scanProject(row)
+	}
 	row := s.pool.QueryRow(ctx, `
 		select id, account_id, slug, coalesce(repo_full_name,''),
 		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		       created_at, updated_at
 		  from projects
 		 where install_id = $1 and repo_full_name = $2
-		   and ((account_id = $3) or ($3 = ''))
+		   and account_id = $3
 		 limit 1
 	`, installID, repoFullName, accountID)
 	return scanProject(row)
