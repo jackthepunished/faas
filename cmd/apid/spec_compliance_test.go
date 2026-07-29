@@ -48,32 +48,34 @@ const (
 // /dashboard/account/set-password into the public spec — the
 // dashboard auth surface is now real auth, not a backstop fallback.
 var routeExclude = map[string]bool{
-	"GET /v1/account/dpa":             true, // public markdown (no auth)
-	"POST /v1/webhooks/stripe":        true, // HMAC-signed webhook
-	"POST /v1/webhooks/paddle":        true, // HMAC-signed webhook (PR #3 / ADR-025)
-	"GET /v1/compute-nodes":           true, // operator-only (ADR-029)
-	"POST /v1/compute-nodes":          true, // operator-only
-	"DELETE /v1/compute-nodes/{name}": true, // operator-only
-	"GET /v1/events":                  true, // SSE (cookie+Bearer, not s.auth)
-	"GET /login":                      true, // dashboard magic-link GET (HTML form, browser-only)
-	"POST /logout":                    true, // dashboard logout (HTML form, browser-only)
-	"GET /auth/verify":                true, // magic-link consume (legacy; PR #1 closed; kept for compat)
-	"GET /oauth/callback":             true, // GitHub App install callback
-	"GET /oauth/code-callback":        true, // GitHub App user-to-server OAuth callback (PR-C)
-	"POST /dashboard/install/connect": true, // GitHub App "Connect GitHub" button (PR-C)
-	"GET /dashboard":                  true, // HTML dashboard
-	"GET /dashboard/":                 true, // HTML dashboard
-	"POST /dashboard/account/delete":  true, // HTML form
-	"POST /dashboard/account/restore": true, // HTML form
-	"GET /dashboard/account/export":   true, // session-auth twin of /v1/account/export
-	"GET /dashboard/account/dpa":      true, // session-auth twin of DPA
-	"POST /v1/cli-auth/code":          true, // CLI device-code mint
-	"POST /v1/cli-auth/exchange":      true, // CLI device-code exchange
-	"GET /cli-auth":                   true, // dashboard claim form
-	"POST /cli-auth":                  true, // dashboard claim form submit
-	"GET /status":                     true, // public HTML status page
-	"GET /status/slo.json":            true, // public status JSON
-	"GET /healthz":                    true, // loopback infra probe
+	"GET /v1/account/dpa":                     true, // public markdown (no auth)
+	"POST /v1/webhooks/stripe":                true, // HMAC-signed webhook
+	"POST /v1/webhooks/paddle":                true, // HMAC-signed webhook (PR #3 / ADR-025)
+	"GET /v1/compute-nodes":                   true, // operator-only (ADR-029)
+	"POST /v1/compute-nodes":                  true, // operator-only
+	"DELETE /v1/compute-nodes/{name}":         true, // operator-only
+	"GET /v1/compute-nodes/{name}/heartbeats": true, // CP-1: operator-only (heartbeat history; schedd-owned)
+	"GET /v1/compute-nodes/events":            true, // CP-1: operator-only SSE on compute_node_changed
+	"GET /v1/events":                          true, // SSE (cookie+Bearer, not s.auth)
+	"GET /login":                              true, // dashboard magic-link GET (HTML form, browser-only)
+	"POST /logout":                            true, // dashboard logout (HTML form, browser-only)
+	"GET /auth/verify":                        true, // magic-link consume (legacy; PR #1 closed; kept for compat)
+	"GET /oauth/callback":                     true, // GitHub App install callback
+	"GET /oauth/code-callback":                true, // GitHub App user-to-server OAuth callback (PR-C)
+	"POST /dashboard/install/connect":         true, // GitHub App "Connect GitHub" button (PR-C)
+	"GET /dashboard":                          true, // HTML dashboard
+	"GET /dashboard/":                         true, // HTML dashboard
+	"POST /dashboard/account/delete":          true, // HTML form
+	"POST /dashboard/account/restore":         true, // HTML form
+	"GET /dashboard/account/export":           true, // session-auth twin of /v1/account/export
+	"GET /dashboard/account/dpa":              true, // session-auth twin of DPA
+	"POST /v1/cli-auth/code":                  true, // CLI device-code mint
+	"POST /v1/cli-auth/exchange":              true, // CLI device-code exchange
+	"GET /cli-auth":                           true, // dashboard claim form
+	"POST /cli-auth":                          true, // dashboard claim form submit
+	"GET /status":                             true, // public HTML status page
+	"GET /status/slo.json":                    true, // public status JSON
+	"GET /healthz":                            true, // loopback infra probe
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the

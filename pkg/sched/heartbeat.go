@@ -36,22 +36,31 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// DefaultHeartbeatInterval is the per-node liveness cadence
-// (issue #97 / ADR-025 axis 3, PR #114). 30s matches the freshness
-// contract: a future staleness gate (last_heartbeat_at > 2 ×
-// interval ⇒ flip inactive) gets a 60s detection window while
-// keeping the per-tick load on Postgres minimal (one UPDATE per
-// active node, every 30s, with at most a single-digit fleet for
-// v1.0). Overridable via FAAS_HEARTBEAT_INTERVAL on cmd/schedd's
-// runDeps seam for tests that want a sub-second cadence.
-const DefaultHeartbeatInterval = 30 * time.Second
+// DefaultHeartbeatInterval is the per-node liveness cadence. Defined
+// in pkg/state/heartbeat_gap.go (CP-1) so apid can import it without
+// crossing the schedd ownership boundary (spec §Component ownership);
+// schedd re-exports it here for the rest of the package's callers.
+const DefaultHeartbeatInterval = state.DefaultHeartbeatInterval
 
 // DefaultHeartbeatStaleness is the age threshold at which a stale
-// last_heartbeat_at flips active=false. 90s = 3× the 30s tick; the
-// ratio gives one retry a chance before deactivation kicks in
-// (issue #98 / ADR-028 acceptance: "Watchdog marks a node
-// active=false after 90s of missed pings").
-const DefaultHeartbeatStaleness = 90 * time.Second
+// last_heartbeat_at flips active=false. Defined in
+// pkg/state/heartbeat_gap.go; schedd re-exports it for callers that
+// already import pkg/sched.
+const DefaultHeartbeatStaleness = state.DefaultHeartbeatStaleness
+
+// HeartbeatGapSummary is re-exported from pkg/state for the same
+// reason: schedd callers use it in the property test
+// (heartbeat_gap_test.go) without importing pkg/state directly.
+type HeartbeatGapSummary = state.HeartbeatGapSummary
+
+// ClassifyHeartbeatGap is re-exported from pkg/state. The classifier
+// is intentionally pure — no clock, no store, no side effects — so
+// the test oracle (this package's heartbeat_gap_test.go) and the
+// production wire shape (apid's GET /v1/compute-nodes/{name}/heartbeats)
+// share one function via pkg/state.
+func ClassifyHeartbeatGap(prev, curr time.Time, interval, staleness time.Duration) state.HeartbeatGapSummary {
+	return state.ClassifyHeartbeatGap(prev, curr, interval, staleness)
+}
 
 // Heartbeat owns one tick of the per-node liveness sweep. It is
 // stateless across ticks — each tick queries the store fresh —
@@ -196,6 +205,33 @@ func (h *Heartbeat) Tick(ctx context.Context) error {
 			}
 			h.log.Warn("heartbeat: stamp failed",
 				"node_id", n.ID, "err", err)
+		}
+		// CP-1: append one row to the heartbeat history. The
+		// received_at / last_heartbeat_at pair uses now() — the
+		// same wall-clock the stamp above used — so the wire
+		// shape's gap classification reflects the operator's clock,
+		// not the database's. A duplicate (node_id, received_at)
+		// from a hot tick is OBSERVED (logged as a warning) rather
+		// than silently deduped; ErrConflict from the store is the
+		// canonical signal. Other errors are logged and the sweep
+		// continues — observability must never abort the stamp
+		// loop.
+		now := h.now()
+		// source='heartbeat_tick' is the only value the routine
+		// stamp path writes today. The migration 00065 CHECK also
+		// permits 'deactivation' and 'reactivation' for the future
+		// watchdog integration (the last contact attempt before a
+		// deactivation + the recovery stamp); no code writes them
+		// yet. Widening the CHECK when those writes land is the
+		// expected evolution; do NOT add them here speculatively.
+		if err := h.store.AppendComputeNodeHeartbeat(ctx, n.ID, now, now, "heartbeat_tick"); err != nil {
+			if errors.Is(err, state.ErrConflict) {
+				h.log.Warn("heartbeat: history append duplicate",
+					"node_id", n.ID, "received_at", now.Format(time.RFC3339Nano))
+			} else {
+				h.log.Warn("heartbeat: history append failed",
+					"node_id", n.ID, "err", err)
+			}
 		}
 	}
 	return nil

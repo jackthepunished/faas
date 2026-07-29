@@ -943,6 +943,38 @@ func (q *Queries) GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetS
 	return i, err
 }
 
+const insertComputeNodeHeartbeat = `-- name: InsertComputeNodeHeartbeat :exec
+insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source)
+values ($1, $2, $3, $4)
+`
+
+type InsertComputeNodeHeartbeatParams struct {
+	NodeID          pgtype.UUID
+	ReceivedAt      pgtype.Timestamptz
+	LastHeartbeatAt pgtype.Timestamptz
+	Source          string
+}
+
+// CP-1 (operator observability): append one row to the heartbeat
+// history. The schedd Heartbeat.Tick goroutine is the only writer.
+// We deliberately do NOT use ON CONFLICT DO NOTHING — a duplicate
+// (node_id, received_at) is observable as a SQLSTATE 23505 unique-
+// violation, which the writer logs as a warning. A silently-deduped
+// stamp would mask a future bug where the scheduler tick fires twice.
+// received_at and last_heartbeat_at are passed by the caller; the
+// column default now() is intentionally NOT used so the writer
+// controls the wall-clock pair (the property test depends on
+// caller-supplied timestamps for deterministic gap classification).
+func (q *Queries) InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg InsertComputeNodeHeartbeatParams) error {
+	_, err := db.Exec(ctx, insertComputeNodeHeartbeat,
+		arg.NodeID,
+		arg.ReceivedAt,
+		arg.LastHeartbeatAt,
+		arg.Source,
+	)
+	return err
+}
+
 const instanceByID = `-- name: InstanceByID :one
 select id, app_id, deployment_id, state, coalesce(netns, ''), coalesce(guest_uid, 0),
        coalesce(host_ip::text, ''), ram_mb, started_at, last_request_at, parked_at
@@ -1156,6 +1188,58 @@ func (q *Queries) ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) 
 			&i.Status,
 			&i.Manifest,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listComputeNodeHeartbeats = `-- name: ListComputeNodeHeartbeats :many
+select id, node_id, received_at, last_heartbeat_at, source
+from compute_node_heartbeats
+where node_id = $1
+  and ($2::timestamptz is null or received_at >= $2)
+order by received_at desc
+limit $3
+`
+
+type ListComputeNodeHeartbeatsParams struct {
+	NodeID  pgtype.UUID
+	Column2 pgtype.Timestamptz
+	Limit   int32
+}
+
+// CP-1: read heartbeat history for one node, newest first. The
+// $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
+// zero value, mapped to SQL NULL by sqlc) means "no lower bound,
+// return most-recent N"; passing a populated timestamptz means
+// "history since t". The composite index
+// compute_node_heartbeats_node_at_idx (node_id, received_at desc)
+// matches this read shape.
+//
+// The endpoint passes a hard-cap limit (default 200, max 2000). The
+// composite index is enough for the routine 30s × 60 nodes × 24h
+// steady-state workload; a 7-day retention sweep is a follow-on.
+func (q *Queries) ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ComputeNodeHeartbeat, error) {
+	rows, err := db.Query(ctx, listComputeNodeHeartbeats, arg.NodeID, arg.Column2, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ComputeNodeHeartbeat{}
+	for rows.Next() {
+		var i ComputeNodeHeartbeat
+		if err := rows.Scan(
+			&i.ID,
+			&i.NodeID,
+			&i.ReceivedAt,
+			&i.LastHeartbeatAt,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -1914,15 +1998,23 @@ type UsageByMonthParams struct {
 	Month     pgtype.Interval
 }
 
-func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageMonthly, error) {
+type UsageByMonthRow struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Month     pgtype.Interval
+	MbSeconds int64
+	Requests  int64
+}
+
+func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error) {
 	rows, err := db.Query(ctx, usageByMonth, arg.AccountID, arg.Month)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []UsageMonthly{}
+	items := []UsageByMonthRow{}
 	for rows.Next() {
-		var i UsageMonthly
+		var i UsageByMonthRow
 		if err := rows.Scan(
 			&i.AccountID,
 			&i.AppID,

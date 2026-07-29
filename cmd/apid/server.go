@@ -782,6 +782,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/compute-nodes", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.listComputeNodes))))
 	mux.HandleFunc("POST /v1/compute-nodes", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.createOrUpdateComputeNode)))))
 	mux.HandleFunc("DELETE /v1/compute-nodes/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteComputeNode))))
+	// CP-1: heartbeat history (schedd Heartbeat.Tick writes; the
+	// endpoint reads from the append-only compute_node_heartbeats
+	// table). Auth chain mirrors the rest of /v1/compute-nodes.
+	mux.HandleFunc("GET /v1/compute-nodes/{name}/heartbeats", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.listComputeNodeHeartbeats))))
+	// CP-1: SSE stream on compute_node_changed. Operator-only,
+	// unfiltered (no per-account scoping — operators want raw
+	// fleet upserts, not the dashboard's mixed-workload feed).
+	mux.HandleFunc("GET /v1/compute-nodes/events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.computeNodeEventsHandler))))
 
 	// M7.5 SSE live-update (ADR-011). Handles session-cookie OR
 	// API-key auth itself — the cookie path is for the dashboard,

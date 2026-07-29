@@ -1277,6 +1277,40 @@ type Store interface {
 	// the id is unknown.
 	DeleteComputeNode(ctx context.Context, id string) error
 
+	// AppendComputeNodeHeartbeat stamps one row in the append-only
+	// compute_node_heartbeats table (CP-1, migration 00065). The
+	// schedd Heartbeat.Tick goroutine is the only writer on the
+	// routine path; the deactivation/reactivation sources are also
+	// stamped but on rarer paths. The endpoint read shape is
+	// ListComputeNodeHeartbeats (below). received_at and
+	// last_heartbeat_at are caller-supplied so the schedd-side
+	// wall-clock pair is what the operator's wire shape shows —
+	// the column default now() is intentionally NOT used here.
+	// Returns ErrConflict when (node_id, received_at) collides
+	// (the unique constraint is observed, not folded).
+	AppendComputeNodeHeartbeat(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string) error
+	// ListComputeNodeHeartbeats returns up to limit rows for the
+	// given node. **MUST return rows newest-first** (received_at
+	// DESC); the heartbeat-history handler in
+	// cmd/apid/handlers_compute_nodes_heartbeats.go relies on this
+	// ordering to walk oldest-to-newest when emitting the response
+	// so row 0 carries the baseline summary. Changing the order
+	// here silently breaks the gap classification on the wire.
+	//
+	// since.IsZero() means "no lower bound, return most-recent N";
+	// a non-zero since restricts to rows whose received_at >= since.
+	// The composite index compute_node_heartbeats_node_at_idx
+	// (node_id, received_at desc) matches this read shape. CP-1's
+	// heartbeat-history endpoint uses this with default limit 200
+	// and a 24h hard cap on since.
+	//
+	// An empty result set is NOT an error — a fresh node has no
+	// history rows, the endpoint surfaces that as
+	// { "heartbeats": [] }. The endpoint resolves the parent
+	// compute_node by name first; a "no such node" path is the
+	// store's ComputeNodeByName, not this call.
+	ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error)
+
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
