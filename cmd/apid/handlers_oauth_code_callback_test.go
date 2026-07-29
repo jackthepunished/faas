@@ -118,7 +118,7 @@ func newOAuthCodeCallbackServer(t *testing.T, gh *oauthCodeCallbackFake) (http.H
 		t.Fatalf("issue session: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{}, "", noopMailer{}, gh, mgr, nil, 15*60_000_000_000, "")
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, gh, mgr, nil, 15*60_000_000_000, "")
 	return srv.handler(), mgr, acct.ID, &http.Cookie{Name: sessionCookie, Value: cookie}
 }
 

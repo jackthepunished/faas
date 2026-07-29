@@ -50,7 +50,7 @@ func sbomTestServer(t *testing.T, sbomRoot string) (h http.Handler, key string, 
 	if _, err = store.CreateAPIKey(context.Background(), acct.ID, hash, "sbom-test", api.ScopesAdminOnly); err != nil {
 		t.Fatal(err)
 	}
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	srv.sbomRoot = sbomRoot
 	return srv.handler(), pt, store, acct
 }

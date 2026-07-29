@@ -22,7 +22,7 @@ info:
     (`/v1/cli-auth/*`) are not part of this public spec.
   contact:
     name: one-box FaaS
-    url: https://docs.DOMAIN
+    url: https://docs.gregale.dev
   license:
     name: Proprietary
     identifier: LicenseRef-onebox-internal
@@ -32,8 +32,8 @@ servers:
     description: Public endpoint (proxied through gatewayd).
     variables:
       host:
-        default: api.example.com
-        description: Public hostname (e.g. `api.DOMAIN`).
+        default: api.gregale.dev
+        description: Public hostname (one-box FaaS).
 
 tags:
   - name: account
@@ -3766,7 +3766,7 @@ components:
       properties:
         image:
           type: string
-          description: 'registry.DOMAIN/...@sha256:... — digest-pinned OCI reference.'
+          description: 'registry.gregale.dev/...@sha256:... — digest-pinned OCI reference.'
 
     # ─── Instances ────────────────────────────────────────────────────────
 
@@ -4660,16 +4660,16 @@ components:
         Exactly one of `billing_portal_url` or `paddle_checkout_url` is
         populated on a given 402 — never both.
       example:
-        type: "https://docs.DOMAIN/errors/validation_failed"
+        type: "https://docs.gregale.dev/errors/validation_failed"
         title: Validation failed
         status: 422
         code: validation_failed
         detail: "ram_mb must be one of [128, 256, 512, 1024, 2048]"
         limit: null
         observed: null
-        docs_url: "https://docs.DOMAIN/errors/validation_failed"
+        docs_url: "https://docs.gregale.dev/errors/validation_failed"
       properties:
-        type: { type: string, format: uri , example: "https://docs.DOMAIN/errors/validation_failed"}
+        type: { type: string, format: uri , example: "https://docs.gregale.dev/errors/validation_failed"}
         title: { type: string , example: "Validation failed"}
         status: { type: integer , example: 422}
         code: { type: string, description: 'Stable machine-readable error code. See StatusForCode in pkg/api/errors.go.' }

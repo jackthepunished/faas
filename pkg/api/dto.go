@@ -119,7 +119,7 @@ type AppResponse struct {
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
 // variant is used for tarball/dockerfile deploys).
 type CreateDeploymentRequest struct {
-	Image string `json:"image,omitempty"` // registry.DOMAIN/...@sha256:...
+	Image string `json:"image,omitempty"` // registry.gregale.dev/...@sha256:...
 }
 
 // BuildProvenanceResponse is the public surface of build_provenance
@@ -660,7 +660,7 @@ func ValidateAppConfig(l Limits, ramMB, maxConcurrency int) *Problem {
 			"Concurrency over plan limit",
 			fmt.Sprintf("%s plan caps max_concurrency at %d; requested %d.", l.Plan, l.MaxConcurrency, maxConcurrency)).
 			WithLimit(int64(l.MaxConcurrency), int64(maxConcurrency)).
-			WithDocs("https://docs.DOMAIN/plans#concurrency")
+			WithDocs("https://docs.gregale.dev/plans#concurrency")
 	}
 	return nil
 }

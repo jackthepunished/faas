@@ -92,7 +92,7 @@ type Handler struct {
 	metrics *Metrics
 	// log may be nil (defaults to slog.Default()).
 	log *slog.Logger
-	// appsSuffix is the configured apps.DOMAIN suffix (e.g. ".apps.example.com").
+	// appsSuffix is the configured apps.gregale.dev suffix (e.g. ".apps.gregale.dev").
 	// Non-empty enables a pre-Lookup host suffix check that 404s anything
 	// outside it (spec §4.1 noise filter). Custom domains (Pro+) bypass this
 	// constraint implicitly by being keys in the routing cache — see
@@ -180,7 +180,7 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 	return h
 }
 
-// WithAppsSuffix sets the *.apps.DOMAIN suffix filter (call before serving).
+// WithAppsSuffix sets the *.apps.gregale.dev suffix filter (call before serving).
 // When set, every request whose Host doesn't end in this suffix is rejected
 // with 404 BEFORE consulting the cache. Custom domains on a different suffix
 // are intended to be reached via the Lookup table directly (M5); this PR only
@@ -317,7 +317,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := hostname(r.Host)
 
-	// Host allowlist suffix check (spec §4.1: *.apps.DOMAIN). Closes the
+	// Host allowlist suffix check (spec §4.1: *.apps.gregale.dev). Closes the
 	// door on stale DNS records that land on the edge post-TLS by rejecting
 	// anything not matching the configured suffix before the cache is touched.
 	// Set via NewHandlerWithSuffix or WithAppsSuffix; empty suffix disables

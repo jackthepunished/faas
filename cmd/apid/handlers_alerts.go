@@ -843,7 +843,7 @@ func resolveAndCheckEgress(c context.Context, rawURL string) *api.Problem {
 		if !oci.EgressIPAllowed(addr.Unmap()) {
 			return &api.Problem{
 				Status: 403,
-				Type:   "https://docs.DOMAIN/problems/image-egress-denied",
+				Type:   "https://docs.gregale.dev/problems/image-egress-denied",
 				Title:  "Egress denied",
 				Detail: fmt.Sprintf("webhook_url resolves to %s, which is in the egress denylist", ipa.IP),
 				Code:   api.CodeImageEgressDenied,

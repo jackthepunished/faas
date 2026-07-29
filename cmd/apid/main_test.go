@@ -238,14 +238,14 @@ func TestDefaultDeps_ReturnExpected(t *testing.T) {
 
 func TestNewServer_DefaultDomain(t *testing.T) {
 	s := newServer(state.NewMemStore(), discardLogger(), "", noopNotifier{})
-	if s.domain != "DOMAIN" {
-		t.Errorf("domain = %q, want DOMAIN fallback", s.domain)
+	if s.domain != "unset" {
+		t.Errorf("domain = %q, want unset sentinel fallback", s.domain)
 	}
 }
 
 func TestNewServer_CustomDomain(t *testing.T) {
-	s := newServer(state.NewMemStore(), discardLogger(), "apps.example.com", noopNotifier{})
-	if s.domain != "apps.example.com" {
+	s := newServer(state.NewMemStore(), discardLogger(), "apps.gregale.dev", noopNotifier{})
+	if s.domain != "apps.gregale.dev" {
 		t.Errorf("domain = %q", s.domain)
 	}
 }

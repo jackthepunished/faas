@@ -44,7 +44,7 @@ func newComputeNodeEventsFixture(t *testing.T, notif *recordingNotifier, allowli
 	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatalf("seed key: %v", err)
 	}
-	srv := newServerWithDeps(store, nil, "example.com", notif, "", nil, nil, nil, nil, 0, "")
+	srv := newServerWithDeps(store, nil, "gregale.dev", notif, "", nil, nil, nil, nil, 0, "")
 	srv.WithAdminAllowlist(allowlistEmail)
 	return srv.handler(), key
 }

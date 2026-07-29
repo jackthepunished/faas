@@ -17,8 +17,8 @@
 // stub.
 //
 // The challenge TXT record name is "_acme-challenge" prefixed to the host
-// passed in by certmagic. For a wildcard *.apps.example.com challenge the
-// host passed in is already "_acme-challenge.apps.example.com" (certmagic
+// passed in by certmagic. For a wildcard *.apps.gregale.dev challenge the
+// host passed in is already "_acme-challenge.apps.gregale.dev" (certmagic
 // resolves the relative name vs the zone for us); we just write
 // Name=host, Type=TXT, Value=<token>.
 package gateway
@@ -53,7 +53,7 @@ type HetznerDNSProvider struct {
 // Hetzner DNS API. token is the Auth-API-Token value (loaded by
 // loadHetznerDNSToken from /etc/faas/secrets/hetzner-dns.token with a 0400
 // perm check). zone is the zone name (e.g. "example.com") that this provider
-// serves; the wildcard cert *.apps.example.com lives in this zone.
+// serves; the wildcard cert *.apps.gregale.dev lives in this zone.
 func NewHetznerDNSProvider(token, zone string) *HetznerDNSProvider {
 	return &HetznerDNSProvider{
 		token:  strings.TrimSpace(token),

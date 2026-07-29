@@ -1,6 +1,6 @@
 [Unit]
 Description=onebox-faas meterd — metering, billing, and quota enforcement (spec §4.7)
-Documentation=https://docs.DOMAIN/ops/meterd
+Documentation=https://docs.gregale.dev/ops/meterd
 After=network.target faas-cp.slice
 Wants=faas-cp.slice
 

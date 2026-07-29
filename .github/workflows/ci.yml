@@ -176,7 +176,7 @@ jobs:
       - name: daemon smoke (--help)
         run: |
           set -e
-          for d in apid builderd faas gatewayd imaged meterd schedd vmmd; do
+          for d in apid builderd gregale gatewayd imaged meterd schedd vmmd; do
             out=$(./bin/$d --help 2>&1)
             if [ -z "$out" ]; then
               echo "::error::$d --help returned no output"

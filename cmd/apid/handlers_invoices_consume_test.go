@@ -49,7 +49,7 @@ func newConsumeEnv(t *testing.T, scopes []string, adminEmail, callerEmail string
 	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "consume-test", scopes); err != nil {
 		t.Fatal(err)
 	}
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	srv.WithAdminAllowlist(adminEmail)
 	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
 }

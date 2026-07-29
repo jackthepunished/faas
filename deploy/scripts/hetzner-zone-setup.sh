@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # hetzner-zone-setup.sh — idempotent Hetzner DNS bootstrap for gatewayd TLS.
 #
-# Spec §4.1: gatewayd terminates TLS for *.apps.DOMAIN via DNS-01 against
+# Spec §4.1: gatewayd terminates TLS for *.apps.gregale.dev via DNS-01 against
 # the Hetzner DNS API. Three records have to exist before the first
 # daemon start:
 #
-#   *.apps.DOMAIN  A     <EX44 public IP>   wildcard cert cover
-#   edge.DOMAIN    CNAME <EX44 public IP>   customer-facing alias (HTTP-01)
+#   *.apps.gregale.dev  A     <EX44 public IP>   wildcard cert cover
+#   edge.gregale.dev    CNAME <EX44 public IP>   customer-facing alias (HTTP-01)
 #   _faas-verify   TXT   faas-domain-ok=1   proof-of-control marker for
 #                                           DNS-01 sanity checks (optional)
 #
@@ -18,9 +18,9 @@
 #
 # Usage:
 #   sudo bash hetzner-zone-setup.sh \
-#       --zone example.com \
-#       --apps-domain apps.example.com \
-#       --edge-host edge.example.com \
+#       --zone gregale.dev \
+#       --apps-domain apps.gregale.dev \
+#       --edge-host edge.gregale.dev \
 #       --host-ip 1.2.3.4 \
 #       [--token-file /etc/faas/secrets/hetzner-dns.token] \
 #       [--verify-record _faas-verify] \
@@ -184,7 +184,7 @@ echo "    zone_id=$ZONE_ID"
 
 # The wildcard A: certmagic wants *.apps.<zone> to resolve to the
 # gatewayd box. We write it as the bare apps.<zone> (Hetzner treats
-# "apps.example.com" as the record name and serves both apex + wildcard
+# "apps.gregale.dev" as the record name and serves both apex + wildcard
 # lookups; the wildcard `*` prefix isn't a record on its own).
 echo "==> A $APPS_DOMAIN -> $HOST_IP"
 hz_upsert_record "$ZONE_ID" "A" "$APPS_DOMAIN" "$HOST_IP"

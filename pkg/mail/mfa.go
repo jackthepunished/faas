@@ -86,7 +86,7 @@ temporarily via /v1/account/mfa/disable (with your password) and
 re-enroll fresh.
 
 If this was not you, change your password immediately and contact
-support@DOMAIN.
+support@gregale.dev.
 
 — onebox faas
 `, email, atStr)
@@ -101,7 +101,7 @@ one — disable MFA from your dashboard now (Settings → Security →
 MFA → Disable) and re-enroll to get a fresh set of 10 codes.
 
 If this was not you, change your password immediately and contact
-support@DOMAIN.
+support@gregale.dev.
 
 — onebox faas
 `, email, atStr)
@@ -112,7 +112,7 @@ A recovery code for your faas account (%s) was used at %s. You have
 %d recovery codes remaining.
 
 If this was not you, change your password immediately and contact
-support@DOMAIN.
+support@gregale.dev.
 
 — onebox faas
 `, email, atStr, remaining)
@@ -156,7 +156,7 @@ trusted device:
 
 If you did not request this, do nothing — the request expires after
 24 hours and no action is taken. You should also change your
-password and contact support@DOMAIN so we can investigate.
+password and contact support@gregale.dev so we can investigate.
 
 — onebox faas
 `, email, atStr, confirmAfter, confirmURL)

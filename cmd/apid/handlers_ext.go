@@ -1808,7 +1808,7 @@ func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time
 			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 				"Bad limit", "expected 1..100").
 				WithLimit(int64(limitMax), observed).
-				WithDocs("https://docs.DOMAIN/billing#invoices")
+				WithDocs("https://docs.gregale.dev/billing#invoices")
 		}
 		limit = n
 	}

@@ -47,7 +47,7 @@ import (
 //     but pinned here against future drift)
 func TestLogin_ArbitraryEmailDoesNotSetSession(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	// Use a victim-style email. It does not need to exist in the
@@ -100,7 +100,7 @@ func TestLogin_ArbitraryEmailDoesNotSetSession(t *testing.T) {
 // response.
 func TestLogin_UnknownEmailWithoutKeyCollapsesTo401(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"ghost@example.com"}, "password": {"any-password-1234567890"}}
@@ -127,7 +127,7 @@ func TestLogin_UnknownEmailWithoutKeyCollapsesTo401(t *testing.T) {
 // leak "valid email, missing password" as a distinct response.
 func TestLogin_EmptyPasswordReturns400(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"alice@example.com"}}
@@ -167,7 +167,7 @@ func TestLogin_BoundEmailPasswordMismatchReturns401(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"alice@example.com"}, "password": {"wrong-password-1234567890"}}
@@ -216,7 +216,7 @@ func TestLogin_ValidPasswordIssuesSessionAndNoAPIKeyInBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {email}, "password": {password}}
@@ -263,7 +263,7 @@ func TestLogin_ValidPasswordIssuesSessionAndNoAPIKeyInBody(t *testing.T) {
 // store after a 401.
 func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"newcomer@example.com"}, "password": {"any-password-1234567890"}}
@@ -302,7 +302,7 @@ func TestLogin_DoesNotAutoCreateAccount(t *testing.T) {
 // ` would re-open the timing oracle and trip this test.
 func TestVerifyPasswordOrPad_TimingPadEqualisesThreeFailurePaths(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 
 	// Pre-seed: one OAuth-only account (no password row), one
 	// password account with a real Argon2id hash.
@@ -468,7 +468,7 @@ func TestLogin_FailedLoginEmitsAuditRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	const victim = "alice@example.com"
@@ -511,7 +511,7 @@ func TestLogin_FailedLoginEmitsAuditRow(t *testing.T) {
 // test.
 func TestLogin_NoSuchUserEmitsAuditRow(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"ghost@example.com"}, "password": {"any-password-1234567890"}}
@@ -558,7 +558,7 @@ func TestLogin_OAuthOnlyAccountEmitsAuditRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"oauth-only@example.com"}, "password": {"any-password-1234567890"}}
@@ -600,7 +600,7 @@ func TestSignup_WrongPasswordOnExistingEmitsAuditRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"alice@example.com"}, "password": {"different-password-1234567890"}}
@@ -649,7 +649,7 @@ func TestLogin_FailedLoginAuditDoesNotBlock401(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	h := srv.handler()
 
 	form := url.Values{"email": {"alice@example.com"}, "password": {"wrong-password"}}

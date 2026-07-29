@@ -43,9 +43,9 @@ func seedApp(t *testing.T, store state.Store, slug string, plan api.Plan) state.
 func TestPgRouter_ResolveSlugHost(t *testing.T) {
 	store := state.NewMemStore()
 	app := seedApp(t, store, "blog", api.PlanPro)
-	r := pgRouter{store: store, appsSuffix: ".apps.example.com"}
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
 
-	got, ok, err := r.ResolveHost(context.Background(), "blog.apps.example.com")
+	got, ok, err := r.ResolveHost(context.Background(), "blog.apps.gregale.dev")
 	if err != nil || !ok {
 		t.Fatalf("ResolveHost ok=%v err=%v", ok, err)
 	}
@@ -55,8 +55,8 @@ func TestPgRouter_ResolveSlugHost(t *testing.T) {
 }
 
 func TestPgRouter_UnknownSlugIsNotFound(t *testing.T) {
-	r := pgRouter{store: state.NewMemStore(), appsSuffix: ".apps.example.com"}
-	if _, ok, err := r.ResolveHost(context.Background(), "ghost.apps.example.com"); ok || err != nil {
+	r := pgRouter{store: state.NewMemStore(), appsSuffix: ".apps.gregale.dev"}
+	if _, ok, err := r.ResolveHost(context.Background(), "ghost.apps.gregale.dev"); ok || err != nil {
 		t.Fatalf("ghost host ok=%v err=%v, want false/nil", ok, err)
 	}
 }
@@ -64,10 +64,10 @@ func TestPgRouter_UnknownSlugIsNotFound(t *testing.T) {
 func TestPgRouter_MultiLabelPrefixRejected(t *testing.T) {
 	store := state.NewMemStore()
 	seedApp(t, store, "blog", api.PlanFree)
-	r := pgRouter{store: store, appsSuffix: ".apps.example.com"}
-	// "x.blog.apps.example.com" must NOT route to slug "blog" — only a single
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
+	// "x.blog.apps.gregale.dev" must NOT route to slug "blog" — only a single
 	// label under the suffix is a platform subdomain.
-	if _, ok, _ := r.ResolveHost(context.Background(), "x.blog.apps.example.com"); ok {
+	if _, ok, _ := r.ResolveHost(context.Background(), "x.blog.apps.gregale.dev"); ok {
 		t.Fatal("multi-label prefix routed to an app")
 	}
 }
@@ -79,7 +79,7 @@ func TestPgRouter_CustomDomainVerifiedOnly(t *testing.T) {
 	if _, err := store.CreateCustomDomain(ctx, "shop.io", app.ID, "tok"); err != nil {
 		t.Fatalf("CreateCustomDomain: %v", err)
 	}
-	r := pgRouter{store: store, appsSuffix: ".apps.example.com"}
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
 
 	// Unverified → not routable.
 	if _, ok, _ := r.ResolveHost(ctx, "shop.io"); ok {
@@ -104,8 +104,8 @@ func TestPgRouter_DeletedAppNotRouted(t *testing.T) {
 	if err := store.DeleteApp(context.Background(), app.ID); err != nil {
 		t.Fatalf("DeleteApp: %v", err)
 	}
-	r := pgRouter{store: store, appsSuffix: ".apps.example.com"}
-	if _, ok, _ := r.ResolveHost(context.Background(), "gone.apps.example.com"); ok {
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
+	if _, ok, _ := r.ResolveHost(context.Background(), "gone.apps.gregale.dev"); ok {
 		t.Fatal("deleted app still routed")
 	}
 }
@@ -113,8 +113,8 @@ func TestPgRouter_DeletedAppNotRouted(t *testing.T) {
 func TestAppsSuffix(t *testing.T) {
 	cases := map[string]string{
 		"":                   "",
-		"apps.example.com":   ".apps.example.com",
-		".apps.example.com":  ".apps.example.com",
+		"apps.gregale.dev":   ".apps.gregale.dev",
+		".apps.gregale.dev":  ".apps.gregale.dev",
 		" apps.Example.COM ": ".apps.example.com",
 	}
 	for in, want := range cases {
@@ -229,10 +229,10 @@ func TestAccountRateLimit_TenOhOneReturns429(t *testing.T) {
 	app := seedApp(t, store, "ratelimited", api.PlanFree) // Free: per-account burst 50
 	ctx := context.Background()
 
-	router := pgRouter{store: store, appsSuffix: ".apps.example.com"}
+	router := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
 	// Pre-resolve so the apps cache is warm — the test focuses on the
 	// rate-limit path, not on cold-start latency.
-	if _, ok, err := router.ResolveHost(ctx, "ratelimited.apps.example.com"); !ok || err != nil {
+	if _, ok, err := router.ResolveHost(ctx, "ratelimited.apps.gregale.dev"); !ok || err != nil {
 		t.Fatalf("pre-resolve: ok=%v err=%v", ok, err)
 	}
 
@@ -272,7 +272,7 @@ func TestAccountRateLimit_TenOhOneReturns429(t *testing.T) {
 		last429 *httptest.ResponseRecorder
 	)
 	for i := 0; i < 1001; i++ {
-		req := httptest.NewRequest("GET", "http://ratelimited.apps.example.com/", nil)
+		req := httptest.NewRequest("GET", "http://ratelimited.apps.gregale.dev/", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		switch rec.Code {

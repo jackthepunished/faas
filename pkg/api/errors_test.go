@@ -122,7 +122,7 @@ func TestErrPlanLimitApps(t *testing.T) {
 	if p.Observed == nil || *p.Observed != 6 {
 		t.Errorf("Observed = %v, want 6", p.Observed)
 	}
-	if !strings.Contains(p.DocsURL, "docs.DOMAIN") {
+	if !strings.Contains(p.DocsURL, "docs.gregale.dev") {
 		t.Errorf("DocsURL = %q", p.DocsURL)
 	}
 }
@@ -166,7 +166,7 @@ func TestErrCapacity(t *testing.T) {
 	if p.Detail != "no RAM headroom" {
 		t.Errorf("Detail = %q", p.Detail)
 	}
-	if !strings.Contains(p.DocsURL, "status.DOMAIN") {
+	if !strings.Contains(p.DocsURL, "apps.gregale.dev/status") {
 		t.Errorf("DocsURL = %q", p.DocsURL)
 	}
 }

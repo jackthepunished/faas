@@ -26,7 +26,7 @@ set -euo pipefail
 
 REPO="${FAAS_SMOKE_REPO:-owner/sandbox-repo}"
 SLUG="${FAAS_SMOKE_SLUG:-sandbox}"
-BOX="${FAAS_BOX_DOMAIN:-api.DOMAIN}"
+BOX="${FAAS_BOX_DOMAIN:-api.gregale.dev}"
 SECRETS_DIR="${FAAS_SECRETS_DIR:-/etc/faas/secrets}"
 GITHUB_PEM="$SECRETS_DIR/github-app.pem"
 GITHUB_WEBHOOK_SECRET="$SECRETS_DIR/github-webhook-secret"

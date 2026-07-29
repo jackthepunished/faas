@@ -7,7 +7,7 @@
  */
 export type CreateDeploymentRequest = {
   /**
-   * registry.DOMAIN/...@sha256:... — digest-pinned OCI reference.
+   * registry.gregale.dev/...@sha256:... — digest-pinned OCI reference.
    */
   image?: string;
 };
