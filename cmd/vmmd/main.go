@@ -355,7 +355,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// The schedd poller pulls the value via Stats at its own
 	// 200 ms cadence; meterd's sampler appends to
 	// usage_minutes.net_tx_bytes additively per minute.
-	go runNetworkEgressPoll(ctx, mgr, netCache, ops, nil, nil, 0, log)
+	go runNetworkEgressPoll(ctx, mgr, netCache, ops, nil, nil, nil, 0, log)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

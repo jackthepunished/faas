@@ -301,6 +301,24 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			row.TXBytes = uint64(*in.NetTxBytes)
 			row.TX = Valid
 		}
+		// NetRxBytes (ADR-048): per-tick byte delta on
+		// root-side vethHost.tx_bytes — mirror of NetTxBytes
+		// on the ingress direction (root → guest). Same
+		// unsigned→signed + nil-wrapper contract as egress:
+		// vmmd clamps tx_bytes to math.MaxInt64 before
+		// shipping, so the wrapper is only nil when the
+		// netstats cache has regressed / never observed /
+		// missed — the poller stamps RX=Unknown and the
+		// meterd sampler (when wired) skips the row. The
+		// wire field awaits `make proto` regen (PR-A commit
+		// #2 follow-up); today NetRxBytes is always nil on
+		// the typed wire mirror, RX stays Unknown, and the
+		// sampler writes 0 to usage_minutes.net_rx_bytes
+		// (safe under additive-merge).
+		if in.NetRxBytes != nil {
+			row.RXBytes = uint64(*in.NetRxBytes)
+			row.RX = Valid
+		}
 		// RSS: wire sends *int64. nil → Unknown; non-nil →
 		// convert bytes → MiB.
 		if in.ResidentBytes != nil {

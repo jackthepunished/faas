@@ -190,6 +190,16 @@ type VMInstanceStat struct {
 	// stamps TX=Valid. Only meterd's SampleAndRoll reads
 	// the row (pkg/meter/sampler.go, PR-2 fold-in).
 	NetTxBytes       *int64
+	// NetRxBytes (ADR-048) is the per-tick byte delta on
+	// root-side vethHost.tx_bytes — mirror of NetTxBytes on
+	// the root→guest (= ingress) direction. Same nil-on-wire
+	// contract as NetTxBytes; vmmd ships a wrapper only when
+	// the netstats.Cache has a Valid reading for both
+	// directions. The wire field awaits make proto regen on
+	// the vmmd side; today the field stays nil end-to-end
+	// (the poller stamps RX=Unknown, the meterd sampler
+	// writes 0 to net_rx_bytes — safe under additive-merge).
+	NetRxBytes       *int64
 	InflightRequests int64
 	LastRequestAt    time.Time
 }

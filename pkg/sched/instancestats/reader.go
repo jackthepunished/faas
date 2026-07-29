@@ -138,6 +138,21 @@ type InstanceStat struct {
 	// per-minute accumulator does not double-count a
 	// baseline row.
 	TX Validity
+	// RXBytes (ADR-048) is the per-tick byte delta on
+	// root-side vethHost.tx_bytes for this instance (root →
+	// guest = ingress), surfaced via the vmmd `net_rx_bytes`
+	// wire field. Unit is interface bytes; same kernel
+	// counter family as TXBytes. Valid only when RX ==
+	// Valid; 0 with RX=Unknown is the sentinel shape. Wire
+	// field awaits make proto regen (PR-A commit #2
+	// follow-up); today the field stays 0 end-to-end. The
+	// mirror field on scheddgrpc.InstanceStatsRow is
+	// NetRxBytes; the schedd poller populates it from the
+	// vmmd wire row once regen lands.
+	RXBytes uint64
+	// RX is the validity of RXBytes. Mirrors TX semantics:
+	// Unknown on first sample / regression / cache miss.
+	RX Validity
 }
 
 // Reader is the stable, concurrency-safe read API the future

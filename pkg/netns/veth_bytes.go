@@ -78,3 +78,39 @@ func (e errSentinel) Error() string { return string(e) }
 // package-level indirection so tests can swap the production
 // reader without touching the package's exported function.
 var ReadVethRXBytesForPoll = ReadVethRXBytes
+
+// ReadVethTXBytes reads the kernel byte counter at
+// `/sys/class/net/<vethHost>/statistics/tx_bytes` and returns
+// the cumulative byte count. The ingress direction — bytes
+// root → guest (gateway → vethHost → vethPeer → tap0 → guest).
+// Same error contract as ReadVethRXBytes (ErrVethMissing on
+// gone, ErrParseFail on malformed content). Added by ADR-048
+// to extend the metering surface to ingress bytes (audit
+// finding: a customer could otherwise shovel arbitrary bytes
+// into a guest for free).
+func ReadVethTXBytes(vethHost string) (uint64, error) {
+	if vethHost == "" {
+		return 0, ErrVethMissing
+	}
+	path := "/sys/class/net/" + vethHost + "/statistics/tx_bytes"
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, ErrVethMissing
+		}
+		return 0, err
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, ErrParseFail
+	}
+	return n, nil
+}
+
+// ReadVethTXBytesForPoll is the function-typed seam the
+// ingress network poller (cmd/vmmd/network_poller.go) uses when
+// no explicit readTXBytes override is provided. It mirrors
+// ReadVethRXBytesForPoll exactly — same package-level
+// indirection so tests can swap the production reader without
+// touching the exported function.
+var ReadVethTXBytesForPoll = ReadVethTXBytes
