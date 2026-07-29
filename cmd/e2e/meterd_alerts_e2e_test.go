@@ -264,7 +264,10 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 	// and what we exercise there is "loopback blocked, last_error
 	// contains oci.ErrImageEgressDenied".
 	const alertEvalInterval = 2 * time.Second
-	const cooldownMin = 1
+	// alert_rules_cooldown_chk (migrations/00062) requires
+	// BETWEEN 5 AND 1440 — pick the minimum so the
+	// backdate-and-refire path doesn't have to wait long.
+	const cooldownMin = 5
 
 	t.Setenv("FAAS_EGRESS_ALLOW_LOOPBACK", "1")
 	receiver := newSigningReceiver(plaintextHappy)
@@ -494,7 +497,11 @@ func TestMeterdAlertEvaluator_SSRFBlocked(t *testing.T) {
 		FailureSource:       state.AlertFailureAny,
 		WebhookURL:          "http://127.0.0.1:1/hook",
 		WebhookSecretSealed: sealed,
-		CooldownMinutes:     1,
+		// Cooldown must satisfy alert_rules_cooldown_chk
+		// (migrations/00062: BETWEEN 5 AND 1440). We pick the
+		// minimum (5) so the backdate-and-refire path below
+		// doesn't have to wait long.
+		CooldownMinutes: 5,
 	})
 	if err != nil {
 		t.Fatalf("CreateAlertRule: %v", err)
