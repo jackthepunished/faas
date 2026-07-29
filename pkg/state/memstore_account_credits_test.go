@@ -124,7 +124,7 @@ func TestMemStoreCurrentMonthOverageCents_Formula(t *testing.T) {
 	const wantCents = int64(1200)
 	mbSeconds := wantCents * 3600 / 100 // 43_200_000
 	now := time.Now().UTC()
-	if err := s.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now, mbSeconds, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now, mbSeconds, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 
@@ -148,7 +148,7 @@ func TestMemStoreCurrentMonthOverageCents_BeforeMonthStart(t *testing.T) {
 	// Plant usage in the previous UTC month — must not be counted.
 	now := time.Now().UTC()
 	prevMonth := time.Date(now.Year(), now.Month()-1, 15, 12, 0, 0, 0, time.UTC)
-	if err := s.AppendUsage(ctx, acct.ID, "app-1", "inst-1", prevMonth, 3_600_000, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acct.ID, "app-1", "inst-1", prevMonth, 3_600_000, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 

@@ -14,5 +14,13 @@ export type UsageExportResponse = {
    * Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue #279 / PR-B.
    */
   cpu_usec?: number;
+  /**
+   * Per-(app, month) HTTP response bytes (informational; not billed). ADR-046. The gateway-side producer lands in PR-2; until then this field stays 0.
+   */
+  tx_bytes?: number;
+  /**
+   * Per-(app, month) byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads.
+   */
+  net_tx_bytes?: number;
 };
 

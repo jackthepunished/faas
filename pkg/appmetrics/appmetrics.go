@@ -179,6 +179,27 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, appID, rng str
 		return degradedFromErr(resp, err, log, "wake_p95")
 	}
 
+	// 8. ADR-046 (step 10): per-app egress byte delta over
+	// the window. Source: the schedd Prom rollup of
+	// usage_minutes.net_tx_bytes (PR-2 wires the rollup;
+	// until then the query returns 0 / errors and the
+	// response degrades silently — the dashboard's
+	// empty-state branch handles it). Best-effort:
+	// unlike the seven core queries above, a Prometheus
+	// failure here does NOT flip the response to
+	// degraded — the rest of the per-app panel is still
+	// useful, and the egress field's "not measured"
+	// state is the correct UX (matches how the CPU
+	// `instance_cpu_seconds_total` mirrors the same
+	// additive-merge shape).
+	egressQ := fmt.Sprintf(
+		`sum(increase(schedd_egress_net_tx_bytes_total{app=%q}[%s]))`, appID, rng)
+	if v, err := fetcher.QueryScalar(ctx, egressQ); err == nil {
+		resp.EgressBytes = int64(SafeRoundNonNeg(v))
+	} else {
+		log.Warn("appmetrics: egress_bytes query failed", "app_id", appID, "err", err)
+	}
+
 	return resp, SourcePrometheus
 }
 

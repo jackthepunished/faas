@@ -971,6 +971,17 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 			// when no CPU has been recorded yet (boot, or the
 			// app has not been woken). Not billed.
 			CPUUsageUsec: u.CPUUsec,
+			// ADR-046 (step 10): per-app monthly egress
+			// bytes — informational only, not billed.
+			// The two columns are sourced independently
+			// (TXBytes = gateway response bytes via
+			// cmd/gatewayd statusRecorder;
+			// NetTxBytes = root-side vethHost.rx_bytes
+			// delta via vmmd netstats.Cache). The
+			// gateway-side tx_bytes producer lands in
+			// PR-2; both fields are 0 until then.
+			TXBytes:    u.TXBytes,
+			NetTxBytes: u.NetTxBytes,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

@@ -27,6 +27,9 @@ class UsageSummaryResponse:
     """Integer cents. Overages are €0.01/GB-h."""
     used_cpu_hours: float | Unset = UNSET
     """Per-month CPU-hours (informational; not billed). issue #279 / PR-B."""
+    used_egress_gb: float | Unset = UNSET
+    """Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB.
+    ADR-046."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +45,8 @@ class UsageSummaryResponse:
 
         used_cpu_hours = self.used_cpu_hours
 
+        used_egress_gb = self.used_egress_gb
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -55,6 +60,8 @@ class UsageSummaryResponse:
         )
         if used_cpu_hours is not UNSET:
             field_dict["used_cpu_hours"] = used_cpu_hours
+        if used_egress_gb is not UNSET:
+            field_dict["used_egress_gb"] = used_egress_gb
 
         return field_dict
 
@@ -73,6 +80,8 @@ class UsageSummaryResponse:
 
         used_cpu_hours = d.pop("used_cpu_hours", UNSET)
 
+        used_egress_gb = d.pop("used_egress_gb", UNSET)
+
         usage_summary_response = cls(
             month=month,
             used_gb_hours=used_gb_hours,
@@ -80,6 +89,7 @@ class UsageSummaryResponse:
             overage_gb_hours=overage_gb_hours,
             overage_cents=overage_cents,
             used_cpu_hours=used_cpu_hours,
+            used_egress_gb=used_egress_gb,
         )
 
         usage_summary_response.additional_properties = d

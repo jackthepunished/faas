@@ -431,13 +431,19 @@ type UsageMinute struct {
 	Requests   int32
 	// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
 	CpuUsec int64
+	// Cumulative HTTP response body bytes the gateway forwarded for this instance in this minute. Source: pkg/gateway/handler.go statusRecorder.Bytes → per-(instance, minute) ring buffer → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed.
+	TxBytes int64
+	// Cumulative byte delta on root-side vethHost.rx_bytes for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache reading /sys/class/net/<vethHost>/statistics/rx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).
+	NetTxBytes int64
 }
 
 type UsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	CpuUsec   int64
-	Requests  int64
+	AccountID  pgtype.UUID
+	AppID      pgtype.UUID
+	Month      pgtype.Interval
+	MbSeconds  int64
+	CpuUsec    int64
+	Requests   int64
+	TxBytes    int64
+	NetTxBytes int64
 }

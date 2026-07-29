@@ -328,6 +328,21 @@ type UsageResponse struct {
 	// accumulated yet (boot, or the schedd reader has no row for
 	// this app).
 	CPUUsageUsec int64 `json:"cpu_usec"`
+	// TXBytes (ADR-046, step 10) is the per-app monthly
+	// HTTP-response byte delta — informational only. Source:
+	// gateway statusRecorder.Bytes → meterd SampleAndRoll →
+	// usage_minutes.tx_bytes. Not billed (ADR-046 §6); the
+	// gateway-side producer lands in PR-2. 0 when no meterd
+	// sample has accumulated yet.
+	TXBytes int64 `json:"tx_bytes"`
+	// NetTxBytes (ADR-046, step 10) is the per-app monthly
+	// byte delta on root-side vethHost.rx_bytes —
+	// informational only. Source: vmmd netstats.Cache →
+	// schedd instancestats.Poller → schedd
+	// ListInstanceStats → meterd SampleAndRoll →
+	// usage_minutes.net_tx_bytes. Not billed (ADR-046 §6).
+	// 0 when no meterd sample has accumulated yet.
+	NetTxBytes int64 `json:"net_tx_bytes"`
 }
 
 // CPUHours returns CPUUsageUsec converted to CPU-hours. 1 hour
@@ -335,6 +350,32 @@ type UsageResponse struct {
 // dashboard can compute the same value with `pkg/meter.CPUHours`.
 func (u UsageResponse) CPUHours() float64 {
 	return float64(u.CPUUsageUsec) / 3.6e9
+}
+
+// TotalEgressGB returns (TXBytes + NetTxBytes) converted to GB
+// (1 GB = 1024^3 bytes).
+//
+// IMPORTANT (ADR-046, PR-414 I5): the value INCLUDES Ethernet
+// framing (~14 + 20 bytes per packet) because net_tx_bytes
+// reads the kernel `/sys/class/net/<vethHost>/statistics/rx_bytes`
+// counter — interface bytes, not IP-payload bytes. A 1 GB HTTP
+// workload can show as ~1.2-1.5 GB on this counter. The two
+// columns are exposed separately so callers can distinguish
+// gateway response bytes (HTTP only, exact) from netns tap0
+// egress (HTTP + 80/443/53 + DNS, includes framing).
+//
+// For HTTP-payload-only bytes, callers should use TXBytes
+// directly (do not divide by 1 GiB and call it "egress GB").
+// The future billing PR will pick the unit; this convenience
+// getter exists so the SDK and the CLI have a single
+// "all-bytes" surface for informational dashboards.
+//
+// Convention:
+//   - TotalEgressGB = interface bytes, includes framing.
+//   - TXBytes = HTTP response bytes, exact.
+//   - NetTxBytes = interface bytes on root-side vethHost.rx_bytes.
+func (u UsageResponse) TotalEgressGB() float64 {
+	return float64(u.TXBytes+u.NetTxBytes) / (1024 * 1024 * 1024)
 }
 
 // DeploymentListResponse is the page shape for GET /v1/deployments.
@@ -514,6 +555,12 @@ type SetPasswordRequest struct {
 // The billing math is on UsedGBHours (plan RAM + 8 MB per running
 // second). The CPU dimension is a measurement the dashboard will
 // surface in a separate panel without affecting the billing total.
+//
+// ADR-046 (step 10): UsedEgressGB is informational and NOT
+// billed. The two egress columns (tx_bytes + net_tx_bytes) are
+// exposed separately at the per-app UsageResponse level; the
+// summary rolls them up for the dashboard's single-number
+// panel. The gateway-side tx_bytes producer lands in PR-2.
 type UsageSummaryResponse struct {
 	Month           string  `json:"month"`             // YYYY-MM
 	UsedGBHours     float64 `json:"used_gb_hours"`     // Σ mb_seconds / 3_600_000
@@ -524,6 +571,13 @@ type UsageSummaryResponse struct {
 	// 3.6e9. Informational only — billing is on UsedGBHours.
 	// Issue #279 / PR-B.
 	UsedCPUHours float64 `json:"used_cpu_hours"`
+	// UsedEgressGB is the per-month egress Σ (TXBytes +
+	// NetTxBytes) / 1024^3. Informational only — not
+	// billed (ADR-046 §6). The two columns are exposed
+	// separately at the per-app level; this is the
+	// single-number roll-up for the dashboard's
+	// "egress this month" panel.
+	UsedEgressGB float64 `json:"used_egress_gb"`
 }
 
 // ValidateAppConfig checks a requested app config against its plan caps (spec
@@ -596,6 +650,13 @@ type UsageExportResponse struct {
 	MBSeconds    int64  `json:"mb_seconds"`
 	Requests     int64  `json:"requests"`
 	CPUUsageUsec int64  `json:"cpu_usec"`
+	// ADR-046 (step 10): per-app monthly egress bytes —
+	// informational only, not billed. Mirrors the new
+	// UsageResponse.TXBytes / UsageResponse.NetTxBytes fields
+	// (the export bundle and the API shape stay in lockstep).
+	// The gateway-side tx_bytes producer lands in PR-2.
+	TXBytes    int64 `json:"tx_bytes"`
+	NetTxBytes int64 `json:"net_tx_bytes"`
 }
 
 // CPUHours returns CPUUsageUsec converted to CPU-hours. Mirror
@@ -1018,6 +1079,17 @@ type AppMetricsResponse struct {
 	// as such in the UI; here it's named plainly because the
 	// dashboard copy does the labelling.
 	WakeP95MS float64 `json:"wake_p95_ms"`
+	// EgressBytes (ADR-046, step 10) is the total
+	// per-app egress byte delta over the window,
+	// queried from vmmd_egress_net_tx_bytes_total{app}
+	// (the Prometheus mirror of usage_minutes.net_tx_bytes;
+	// the gateway-side tx_bytes mirror lands in PR-2).
+	// Informational only — not billed. 0 when Prometheus
+	// is degraded or the metric hasn't been emitted yet.
+	// Unit: interface bytes (includes framing). The
+	// future egress-billing PR picks the unit; this field
+	// reports the Prometheus counter verbatim.
+	EgressBytes int64 `json:"egress_bytes"`
 }
 
 // --- Account-scoped metrics rollup (issue #393) --------------------------

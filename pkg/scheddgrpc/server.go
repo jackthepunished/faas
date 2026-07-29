@@ -338,6 +338,8 @@ func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstance
 				NodeId:     r.NodeID,
 				CpuUsec:    r.CPUUsageUsec,
 				CpuValid:   uint32(r.CPU),
+				NetTxBytes: r.TXBytes,
+				TxValid:    uint32(r.TX),
 			}
 			rows = append(rows, row)
 		}

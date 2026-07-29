@@ -119,6 +119,25 @@ type InstanceStat struct {
 	// across ticks (e.g. cumulative hour rollup) should
 	// store their own baseline.
 	CPUHour float64
+	// TXBytes (ADR-046, step 7) is the per-tick byte delta
+	// on root-side vethHost.rx_bytes for this instance,
+	// surfaced via the vmmd `net_tx_bytes` wire field.
+	// Unit is interface bytes (includes Ethernet framing);
+	// the same kernel counter the per-plan tc tbf qdisc
+	// reads. The value is the most-recent reading from
+	// pkg/fcvm/netstats.Cache.Lookup (computed at the cache's
+	// own 250 ms cadence, not the schedd poller's 200 ms
+	// cadence — the alignment is best-effort). Valid only
+	// when TX == Valid; 0 with TX=Unknown is the sentinel
+	// shape.
+	TXBytes uint64
+	// TX is the validity of TXBytes. Unknown on a first
+	// sample / regression / netstats cache miss; Valid when
+	// the wire emits a value. The meterd sampler (PR-2
+	// sampler fold-in) skips rows where TX != Valid so the
+	// per-minute accumulator does not double-count a
+	// baseline row.
+	TX Validity
 }
 
 // Reader is the stable, concurrency-safe read API the future

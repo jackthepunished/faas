@@ -416,6 +416,13 @@ func listUsageForAccountExport(ctx context.Context, st state.Store, accountID st
 			// when the meterd sampler has not accumulated
 			// any CPU for this row yet.
 			CPUUsageUsec: u.CPUUsec,
+			// ADR-046 (step 10): per-(app, month) egress
+			// bytes — informational only, not billed.
+			// Mirrors UsageResponse.TXBytes / NetTxBytes.
+			// Gateway-side tx_bytes producer lands in
+			// PR-2.
+			TXBytes:    u.TXBytes,
+			NetTxBytes: u.NetTxBytes,
 		})
 	}
 	return out, nil

@@ -18,5 +18,9 @@ export type UsageSummaryResponse = {
    * Per-month CPU-hours (informational; not billed). issue #279 / PR-B.
    */
   used_cpu_hours?: number;
+  /**
+   * Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB. ADR-046.
+   */
+  used_egress_gb?: number;
 };
 

@@ -638,7 +638,19 @@ type InstanceStatsRow struct {
 	CpuUsec    uint64                 `protobuf:"varint,4,opt,name=cpu_usec,json=cpuUsec,proto3" json:"cpu_usec,omitempty"`
 	// cpu_valid mirrors instancestats.Validity (0 = Valid, 1 =
 	// Unknown). Callers MUST skip rows where cpu_valid != 0.
-	CpuValid      uint32 `protobuf:"varint,5,opt,name=cpu_valid,json=cpuValid,proto3" json:"cpu_valid,omitempty"`
+	CpuValid uint32 `protobuf:"varint,5,opt,name=cpu_valid,json=cpuValid,proto3" json:"cpu_valid,omitempty"`
+	// ADR-046 (step 7): per-tick byte delta on root-side
+	// vethHost.rx_bytes for this instance, summed across the
+	// schedd poller's 250 ms window. Unit is interface bytes
+	// (includes Ethernet framing); same kernel counter the
+	// per-plan tc tbf qdisc reads. tx_valid mirrors
+	// instancestats.Validity (0 = Valid, 1 = Unknown — first
+	// sample / regression / netstats cache miss); callers MUST
+	// skip rows where tx_valid != 0. Addative field per
+	// ADR-016 wire discipline; only meterd's SampleAndRoll reads
+	// it (pkg/meter/sampler.go).
+	NetTxBytes    uint64 `protobuf:"varint,6,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
+	TxValid       uint32 `protobuf:"varint,7,opt,name=tx_valid,json=txValid,proto3" json:"tx_valid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -704,6 +716,20 @@ func (x *InstanceStatsRow) GetCpuUsec() uint64 {
 func (x *InstanceStatsRow) GetCpuValid() uint32 {
 	if x != nil {
 		return x.CpuValid
+	}
+	return 0
+}
+
+func (x *InstanceStatsRow) GetNetTxBytes() uint64 {
+	if x != nil {
+		return x.NetTxBytes
+	}
+	return 0
+}
+
+func (x *InstanceStatsRow) GetTxValid() uint32 {
+	if x != nil {
+		return x.TxValid
 	}
 	return 0
 }
@@ -982,14 +1008,17 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"instanceId\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"&\n" +
 	"\x14ParkInstanceResponse\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x9b\x01\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"\xd8\x01\n" +
 	"\x10InstanceStatsRow\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x15\n" +
 	"\x06app_id\x18\x02 \x01(\tR\x05appId\x12\x17\n" +
 	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12\x19\n" +
 	"\bcpu_usec\x18\x04 \x01(\x04R\acpuUsec\x12\x1b\n" +
-	"\tcpu_valid\x18\x05 \x01(\rR\bcpuValid\"\x1a\n" +
+	"\tcpu_valid\x18\x05 \x01(\rR\bcpuValid\x12 \n" +
+	"\fnet_tx_bytes\x18\x06 \x01(\x04R\n" +
+	"netTxBytes\x12\x19\n" +
+	"\btx_valid\x18\a \x01(\rR\atxValid\"\x1a\n" +
 	"\x18ListInstanceStatsRequest\"X\n" +
 	"\x19ListInstanceStatsResponse\x12;\n" +
 	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"J\n" +

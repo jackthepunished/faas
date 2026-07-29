@@ -24,6 +24,32 @@ type CPUSource interface {
 	CPUUsageUsec(instanceID string) (uint64, bool)
 }
 
+// EgressSource (ADR-046, step 8) is the per-instance egress-byte
+// reader the sampler uses to compute the per-minute byte delta
+// for usage_minutes.tx_bytes (gateway response bytes) and
+// usage_minutes.net_tx_bytes (netns tap0 egress from vmmd). The
+// two columns are sourced independently: production wires
+// scheddEgressAdapter (reads netTxBytes from scheddgrpc.
+// InstanceStatsRow, which vmmd populated from
+// pkg/fcvm/netstats.Cache) and gatewayEgressAdapter (reads the
+// gateway's per-instance ring buffer). ok=false means the
+// reader has no row for this instance this tick (gone, never
+// polled, regression). The TX and NetTX returned values are
+// already per-tick deltas; the sampler appends them additively
+// to the (instance, minute) row.
+type EgressSource interface {
+	// EgressBytes returns (txBytes, netTxBytes, ok). txBytes is
+	// the gateway-side HTTP response byte count for this
+	// instance this tick; netTxBytes is the root-side
+	// vethHost.rx_bytes delta for this instance this tick. The
+	// sampler does NOT compute a delta itself — the readers
+	// own regression handling (mirroring cpustats's
+	// drop-baseline contract). nil is OK for either field when
+	// the corresponding source has no data; the sampler
+	// writes 0 for that column and stamps the other normally.
+	EgressBytes(instanceID string) (txBytes, netTxBytes uint64, ok bool)
+}
+
 // Sampler writes one minute of billable usage per live instance. It walks
 // every app on the box (one-box scale; schedd's ListAllApps is the canonical
 // source) and lists its instances; for each one in a state that counts
@@ -56,7 +82,11 @@ type Sampler struct {
 	// skips the CPU walk and writes 0; this is the test-harness
 	// convention (no schedd in unit tests).
 	cpu CPUSource
-	now func() time.Time // injectable for tests
+	// egress is the per-instance egress-byte reader
+	// (ADR-046, step 8). nil is OK — the sampler writes 0
+	// for both egress columns; the test-harness convention.
+	egress EgressSource
+	now    func() time.Time // injectable for tests
 
 	// cpuBaselineMu guards the per-(instance, minute) baseline the
 	// sampler uses to compute the per-minute CPU delta. The map is
@@ -91,12 +121,29 @@ type cpuBaseline struct {
 
 // NewSampler wires the sampler. now defaults to time.Now if nil. cpu
 // may be nil — the sampler skips the CPU walk and writes 0; this is
-// the test-harness convention (no schedd in unit tests).
+// the test-harness convention (no schedd in unit tests). egress may
+// be nil — the sampler writes 0 for both egress columns; same
+// convention. PR-2 (ADR-046) replaces this with a 4-arg signature
+// `NewSampler(store, cpu, egress, now)` that wires both seams.
 func NewSampler(store state.Store, cpu CPUSource, now func() time.Time) *Sampler {
 	if now == nil {
 		now = time.Now
 	}
 	return &Sampler{store: store, cpu: cpu, now: now}
+}
+
+// NewSamplerWithEgress is the ADR-046 wiring: store + cpu + egress +
+// now. cmd/meterd passes scheddEgressAdapter and
+// gatewayEgressAdapter here. now defaults to time.Now if nil. cpu
+// and egress may both be nil — the sampler writes 0 for the
+// respective column; the test-harness convention. The legacy
+// NewSampler is kept for callers (cmd/meterd, e2e tests) that have
+// not yet been migrated to the 4-arg form.
+func NewSamplerWithEgress(store state.Store, cpu CPUSource, egress EgressSource, now func() time.Time) *Sampler {
+	if now == nil {
+		now = time.Now
+	}
+	return &Sampler{store: store, cpu: cpu, egress: egress, now: now}
 }
 
 // RolledRow is one (instance, minute) billable line. Returned alongside any
@@ -114,6 +161,20 @@ type RolledRow struct {
 	// has no row for this instance this tick (test stubs, or the
 	// instance has not yet been polled). Issue #279 / PR-B.
 	CPUUsec int64
+	// TXBytes (ADR-046, step 8) is the per-minute
+	// HTTP-response byte delta the sampler appended to
+	// usage_minutes.tx_bytes. Source: gateway
+	// statusRecorder.Bytes. Zero when no source is wired
+	// or the source has no data this tick.
+	TXBytes int64
+	// NetTxBytes (ADR-046, step 8) is the per-minute
+	// byte delta on root-side vethHost.rx_bytes the
+	// sampler appended to usage_minutes.net_tx_bytes.
+	// Source: vmmd netstats.Cache → schedd
+	// instancestats.Poller → scheddgrpc.InstanceStatsRow.
+	// Zero when no source is wired or the source has no
+	// data this tick.
+	NetTxBytes int64
 }
 
 // SampleAndRoll walks every app's live instances and appends one minute of
@@ -169,7 +230,22 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 				return out, fmt.Errorf("meter: sample %s/%s: %w", app.ID, ins.ID, err)
 			}
 			row.CPUUsec = s.cpuDeltaForMinute(ins.ID, minute)
-			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec); err != nil {
+			// PR 2 (ADR-046): wire EgressSource so this row
+			// carries tx_bytes (gateway response bytes) and
+			// net_tx_bytes (root-side vethHost.rx_bytes
+			// delta) instead of zeros. nil EgressSource
+			// keeps the legacy PR-1 behaviour for tests +
+			// cmd/meterd prior to the 4-arg wiring.
+			// egressBytes returns (0, 0, false) when no source
+			// is wired (the legacy PR-1 path) or the source has
+			// no row for this instance; in both cases the
+			// additive-merge baseline stays put (mirrors the
+			// cpu path's contract — same idempotency).
+			if txBytes, netTxBytes, ok := s.egressBytes(ins.ID); ok {
+				row.TXBytes = int64(txBytes)
+				row.NetTxBytes = int64(netTxBytes)
+			}
+			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec, row.TXBytes, row.NetTxBytes); err != nil {
 				return out, err
 			}
 			out = append(out, row)
@@ -242,4 +318,23 @@ func (s *Sampler) cpuDeltaForMinute(instanceID string, minute time.Time) int64 {
 		lastMinute:  minute,
 	}
 	return int64(delta)
+}
+
+// egressBytes returns (txBytes, netTxBytes, ok) for the given
+// instance, mirroring the cpuDeltaForMinute shape but without
+// the baseline state: the source readers (vmmd netstats.Cache
+// via schedd, the gateway ring buffer) own their own regression
+// handling, so the sampler is just a fan-out. Returns 0, 0, false
+// when s.egress is nil (legacy PR-1 wiring; tests). Returns 0, 0,
+// false when the source has no row for the instance (gone /
+// never-polled). The sampler does NOT cache per-instance state;
+// the source readers are themselves per-(instance, minute)
+// accumulators on the producer side (mirror of the cpu baseline
+// but moved across the wire boundary so the per-tick delta is
+// computed where the counter lives).
+func (s *Sampler) egressBytes(instanceID string) (uint64, uint64, bool) {
+	if s.egress == nil {
+		return 0, 0, false
+	}
+	return s.egress.EgressBytes(instanceID)
 }

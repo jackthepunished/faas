@@ -149,8 +149,109 @@ type parkInstanceParker interface {
 	// meterd sampler reads once per minute. Issue #279 / PR-B.
 	// Returns an empty slice when schedd has no rows for this
 	// tick (boot, between ticks); the sampler treats that as
-	// "no CPU data this minute" and writes 0.
+	// "no CPU data this minute" and writes 0. ADR-046 (PR-2)
+	// extends the returned row with NetTxBytes + TxValid so
+	// the scheddEgressAdapter below can read the net_tx_bytes
+	// value alongside cpu_usec on the same gRPC round trip.
 	ListInstanceStats(ctx context.Context) ([]scheddgrpc.InstanceStatsRow, error)
+}
+
+// scheddEgressAdapter (ADR-046, step 8) exposes the schedd gRPC
+// client as a meter.EgressSource for the net_tx_bytes column
+// (root-side vethHost.rx_bytes). It reuses the scheddCPUAdapter
+// 's snapshot machinery so the egress and CPU readings share a
+// single gRPC round trip and refresh cadence.
+//
+// The tx_bytes column (gateway response bytes) is sourced from
+// gatewayEgressAdapter below — the two columns are NOT the
+// same data and the schedd wire only carries net_tx_bytes
+// (vmmd is the canonical producer for that column; the
+// gateway is the canonical producer for tx_bytes).
+type scheddEgressAdapter struct {
+	cpu *scheddCPUAdapter
+}
+
+func (a *scheddEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bool) {
+	if a == nil || a.cpu == nil {
+		return 0, 0, false
+	}
+	a.cpu.refresh()
+	a.cpu.mu.Lock()
+	defer a.cpu.mu.Unlock()
+	row, ok := a.cpu.rows[instanceID]
+	if !ok {
+		return 0, 0, false
+	}
+	// TxValid mirrors instancestats.Validity: 0 = Valid, 1 =
+	// Unknown (first sample / regression / netstats cache
+	// miss). The meterd sampler must NOT treat a non-Valid
+	// row as a baseline — the vmmd netstats.Cache already
+	// absorbed the regression (Unknown: it dropped the
+	// baseline). In either case the next valid sample picks
+	// up from the new counter; the meterd side returns
+	// ok=false so AppendUsage writes 0 net_tx_bytes for
+	// that minute (mirrors the cpu path's contract above).
+	if row.TxValid != 0 {
+		return 0, 0, false
+	}
+	// txBytes = 0 (gateway column is NOT sourced from schedd;
+	// gatewayEgressAdapter owns it). netTxBytes = the schedd
+	// value. ok = true signals "I have a row" so the
+	// sampler stamps the row's netTxBytes even when
+	// netTxBytes is 0 (zero egress in this tick is a real
+	// value, distinct from "no source wired").
+	return 0, row.NetTxBytes, true
+}
+
+// gatewayEgressAdapter (ADR-046, step 8) is the meterd-side
+// source for usage_minutes.tx_bytes (gateway HTTP response
+// bytes). Production wires this against the gatewayd's
+// EgressTxService gRPC stream (PR-2, gateway side); the
+// adapter maintains a per-instance ring buffer and the
+// Drain method returns the per-(instance, minute) delta.
+//
+// In PR-1 (no gateway stream yet), this adapter returns
+// 0 for tx_bytes unconditionally — the schema layer is
+// landed without the gateway-side producer, and the
+// append-time semantics are correct (tx_bytes stays at 0).
+// PR-2 wires the gRPC client.
+type gatewayEgressAdapter struct {
+	// reserved for PR-2 — populated with the gRPC stream
+	// client + ring buffer drainer.
+}
+
+func (a *gatewayEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bool) {
+	// PR-1: tx_bytes is always 0 (no gateway stream wired).
+	// netTxBytes is also 0 here — scheddEgressAdapter owns
+	// that column. ok=true would be misleading (we have no
+	// row); return ok=false so the sampler falls through to
+	// its no-source branch and writes 0 to BOTH egress
+	// columns. PR-2 re-implements this method to read the
+	// gateway ring buffer and return (tx, 0, true) when a
+	// row is present.
+	_ = instanceID
+	return 0, 0, false
+}
+
+// egressAggregator combines scheddEgressAdapter (net_tx_bytes)
+// and gatewayEgressAdapter (tx_bytes) into a single
+// meter.EgressSource. The two columns are sourced from
+// independent producers (ADR-046 §2) so a single tick may
+// have one or both; the aggregator ORs ok from the underlying
+// adapters and zeros out the column the underlying adapter
+// didn't report.
+type egressAggregator struct {
+	schedd *scheddEgressAdapter
+	gw     *gatewayEgressAdapter
+}
+
+func (a *egressAggregator) EgressBytes(instanceID string) (uint64, uint64, bool) {
+	// PR-1: both adapters return ok=false. Aggregator
+	// also returns ok=false so the sampler writes 0 to
+	// both columns. PR-2 swaps the bodies for real
+	// adapter calls.
+	_ = instanceID
+	return 0, 0, false
 }
 
 func main() {
@@ -376,6 +477,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — bounded staleness without forcing a gRPC round trip per
 	// instance.
 	cpu := &scheddCPUAdapter{parker: parker, now: deps.now}
+	// ADR-046 (PR-1 + PR-2): wire the egress adapters so the
+	// sampler can append tx_bytes + net_tx_bytes to
+	// usage_minutes. PR-1 leaves the gateway adapter as a
+	// no-op (the ring-buffer producer lands in PR-2) so the
+	// aggregator returns ok=false from gatewayEgressAdapter;
+	// the schedd adapter is real (reads NetTxBytes from the
+	// existing schedd gRPC round trip on the same rows map
+	// cpu already fetched). The aggregator stays in place
+	// across PR-1 and PR-2; PR-2 replaces gatewayEgressAdapter's
+	// body without changing the wiring. WithEgress passes the
+	// aggregator into NewLoop so the loop's sampler uses the
+	// 4-arg NewSamplerWithEgress instead of the legacy
+	// 3-arg NewSampler. Loop.WithEgress is nil-safe so a
+	// future test harness can omit the egress wire without
+	// touching the constructor.
+	scheddEgress := &scheddEgressAdapter{cpu: cpu}
+	gwEgress := &gatewayEgressAdapter{}
+	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and
 	// hand it to the loop. The evaluator is nil-coerced below when
 	// neither FAAS_PROMETHEUS_URL nor FAAS_HOST_AGE_IDENTITY_PATH is
@@ -385,7 +504,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// loop's contract is "at most one", matching the design note at
 	// pkg/alerts/evaluator.go.
 	evaluator := buildAlertEvaluator(deps, store, log, ops)
-	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops)
+	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
+		WithEgress(egress)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 

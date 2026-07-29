@@ -313,6 +313,25 @@ spinner) and PR #51 (the closeout batch):
   and the financial model are explicitly untouched. The data
   path is the seam for the future billing PR (extends
   `Provider.PushUsageRecord` with `cpu_usec`).
+- **Egress-byte visibility (issue #<TBD> / PR #<TBD> / ADR-046) —
+  in progress** — per-instance customer egress is sampled from the
+  kernel byte counter on root-side `vethHost.rx_bytes` (vmmd
+  `pkg/fcvm/netstats.Cache` reads
+  `/sys/class/net/<vethHost>/statistics/rx_bytes`, cumulative
+  with regression-safe deltas) and from the gateway HTTP response
+  writer (`pkg/gateway/handler.go:statusRecorder.Bytes`). Both
+  accumulate additively in `usage_minutes.net_tx_bytes` (vmmd)
+  and `usage_minutes.tx_bytes` (gateway). `usage_monthly` sums
+  both columns; `GET /v1/usage`, `/v1/usage/summary`,
+  `/v1/account/export`, and `faas usage` expose the per-(account,
+  app, month) totals; `pkg/appmetrics` rolls up
+  `gateway_response_bytes_total{app,plan}` for the dashboard.
+  **Informational only — no billing change.**
+  `pkg/billing/{provider.go,stripe,paddle}`,
+  `pkg/meter/pusher.go`, `pkg/api/limits.go`, plan limits, the
+  Stripe/Paddle `gb_ram_hour` push shape, and the financial model
+  remain untouched. The columns are the seam for the future
+  egress-billing PR (extends `Provider.PushUsageRecord`).
 
 **Networking & egress (PRs #128, #151, #159):**
 

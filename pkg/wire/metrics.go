@@ -471,6 +471,23 @@ type OpsMetrics struct {
 	// vs. denylist catalog edit). Cardinality is identical to
 	// egressDeny — same catalog, same (cidr, family) label set.
 	ociEgressDeny *prometheus.CounterVec
+	// egressSourceErrors: counter of per-instance sysfs read
+	// failures from cmd/vmmd/network_poller.go (ADR-046, step
+	// 7). The loop polls /sys/class/net/<vethHost>/statistics/
+	// rx_bytes for every live instance on a 250 ms tick; any
+	// read failure (veth gone between snapshot and read, kernel
+	// counter unparseable, EACCES) increments this counter and
+	// the cache baseline is preserved so the next successful
+	// tick picks up where the failed one left off. A persistent
+	// rate is the alert source — `vmmd_egress_source_errors > 0`
+	// for 5m is a tripwire. The metric name matches the §12
+	// conventions and the single-registry pattern (memory
+	// wire-opsmetrics-single-registry); no per-instance label,
+	// only the empty-label Counter so Prometheus cardinality
+	// stays bounded. The byte data itself lives in
+	// usage_minutes.net_tx_bytes (the canonical source per
+	// ADR-046 §1); this counter is the failure-channel.
+	egressSourceErrors prometheus.Counter
 	// provenanceWrites: ADR-038 / Tier 3 / issue #197 B3.1
 	// observability. Counter labelled by code ∈ {ok, error} so the
 	// dashboard surfaces the populator success rate alongside the
@@ -848,6 +865,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_logs_emitted_total",
 		Help: "Per-app SSE log frames emitted to clients (issue #254, Move 4). One Increment per `event: log` frame written to the SSE response body in cmd/apid/handlers_ext.go::writeAppLogEvent. The series is registered on every daemon so the struct is a single-registry; only apid's production path increments. Use this rate with apid_ops_total{op=\"app_logs\"} to break out per-app log throughput — that op label is already on every streamAppLogs handler entry.",
 	}, []string{"app"})
+	// egressSourceErrors: per-instance sysfs read failures
+	// (ADR-046, step 7). The network poller in cmd/vmmd reads
+	// /sys/class/net/<vethHost>/statistics/rx_bytes for every
+	// live instance on a 250 ms tick; a read failure increments
+	// this Counter. The metric name is intentionally bare
+	// (no labels) so it does not blow the Prometheus
+	// cardinality budget — the failure instance is recoverable
+	// from the cache's last-known vethHost. Persistent rate
+	// is the alert source. Registered on every daemon so the
+	// single-registry pattern (memory wire-opsmetrics-single-
+	// registry) holds; only vmmd's production path increments.
+	egressSourceErrors := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_egress_source_errors_total",
+		Help: "Count of per-instance sysfs read failures from the vmmd network poll adapter (ADR-046, step 7). Each increment corresponds to one (live instance, 250ms tick) where reading /sys/class/net/<vethHost>/statistics/rx_bytes returned an error; the cache baseline for that instance is preserved so the next successful tick picks up where the failed one left off. Alert: rate > 0 for 5m on vmmd.",
+	})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the
 	// field stays nil and the imaged-side hook in cmd/imaged/main.go
@@ -879,6 +911,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		throttleSecondsTotal, throttleRatio,
+		egressSourceErrors,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -1131,6 +1164,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		provenanceWrites:              provenanceWrites,
 		imageScanVulns:                imageScanVulns,
 		apidLogsEmittedTotal:          apidLogsEmittedTotal,
+		egressSourceErrors:            egressSourceErrors,
 	}
 }
 
@@ -1714,6 +1748,25 @@ func (m *OpsMetrics) OCIEgressDeny(cidr, family string) prometheus.Counter {
 // for the canonical call site; this is for admin/debug iteration.
 func (m *OpsMetrics) OCIEgressDenySeries() *prometheus.CounterVec {
 	return m.ociEgressDeny
+}
+
+// EgressSourceErrors returns the bare Counter that records per-
+// instance sysfs read failures from the vmmd network poll adapter
+// (ADR-046, step 7). Safe on a nil receiver so call sites can be
+// written without a nil-check; the caller's expected use is:
+//
+//	ops.EgressSourceErrors().Inc()
+//
+// on each per-instance read failure inside the 250 ms tick. The
+// counter is registered on every daemon via the single-registry
+// pattern; only vmmd's production path increments. The byte data
+// itself lives in usage_minutes.net_tx_bytes; this counter is the
+// failure-channel for the alert pipeline.
+func (m *OpsMetrics) EgressSourceErrors() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.egressSourceErrors
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor

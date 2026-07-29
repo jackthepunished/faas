@@ -214,10 +214,17 @@ jobs:
   # Owns the 4:20 long pole — runs in parallel with `test` and `spec-check`
   # so the wall time is bounded by the slowest of the three (≈ 4:40).
   # Postgres service + DATABASE_URL mirror the previous combined job.
+  #
+  # Timeout was 10 min (2026-07-29 cut it twice on the rebased PR #414
+  # head; race detector + recent additions to pkg/sched/scaleup +
+  # pkg/sched/instancestats pushed the wall past the 10 min budget).
+  # Bumped to 20 min (PR #414 follow-up) so the long pole has two
+  # budgets of headroom — wall is still ~5 min in steady state, this
+  # is contingency for slow windows on a shared GH runner pool.
   unit-tests:
     name: unit tests + pg integration + SDK
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:15

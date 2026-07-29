@@ -68,14 +68,14 @@ func TestComputeInvoiceOverageCents_Floor(t *testing.T) {
 
 	// Outside the window — must NOT contribute.
 	if err := store.AppendUsage(ctx, acct.ID, "app-prior", "inst-prior",
-		periodStart.Add(-time.Hour), 100_000_000, 0, 0); err != nil {
+		periodStart.Add(-time.Hour), 100_000_000, 0, 0, 0, 0); err != nil {
 		t.Fatalf("prior-month usage: %v", err)
 	}
 
 	// Inside the window — exactly 3_600_000 mb-seconds (one hour at
 	// 1000 MB), which divides cleanly: 3_600_000 * 100 / 3600 = 100_000.
 	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1",
-		periodStart.Add(2*time.Hour), 3_600_000, 0, 0); err != nil {
+		periodStart.Add(2*time.Hour), 3_600_000, 0, 0, 0, 0); err != nil {
 		t.Fatalf("mid-month usage: %v", err)
 	}
 
@@ -93,7 +93,7 @@ func TestComputeInvoiceOverageCents_Floor(t *testing.T) {
 	inv2.ID = uuid.NewString()
 	inv2.ProviderInvoiceID = "in_test_002"
 	if err := store.AppendUsage(ctx, acct.ID, "app-2", "inst-2",
-		periodStart.Add(3*time.Hour), 3_599_999, 0, 0); err != nil {
+		periodStart.Add(3*time.Hour), 3_599_999, 0, 0, 0, 0); err != nil {
 		t.Fatalf("floor usage: %v", err)
 	}
 	store.SeedInvoiceForTest(inv2)
@@ -175,7 +175,7 @@ func TestConsumeCreditsForInvoice_EndToEnd(t *testing.T) {
 	//   250 cents = mb_seconds * 100 / 3600
 	//   mb_seconds = 250 * 3600 / 100 = 9_000
 	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1",
-		periodStart.Add(24*time.Hour), 9_000, 0, 0); err != nil {
+		periodStart.Add(24*time.Hour), 9_000, 0, 0, 0, 0); err != nil {
 		t.Fatalf("usage: %v", err)
 	}
 

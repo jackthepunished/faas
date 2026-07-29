@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/leakcheck"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
+	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
@@ -89,19 +90,36 @@ type Server struct {
 	// in cmd/vmmd; nil-safe so unit tests that don't care about
 	// CPU can pass nil to NewWithCPU.
 	cpuCache *cpustats.Cache
+	// netCache holds the per-instance byte counter cache used by
+	// Stats() to populate net_tx_bytes on the wire (ADR-046,
+	// step 7). The cache is fed by cmd/vmmd/network_poller.go
+	// on a 250 ms tick; nil-safe so tests that don't care about
+	// egress can pass nil to NewWithCPUAndNet. Wire unit is
+	// interface bytes (includes Ethernet framing) — the same
+	// kernel counter the per-plan tc tbf qdisc reads.
+	netCache *netstats.Cache
 }
 
 // New wires the server. ops may be nil (noop metrics), log may be nil
 // (slog default).
 func New(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger) *Server {
-	return NewWithCPU(vmm, ops, fcVer, log, nil)
+	return NewWithCPUAndNet(vmm, ops, fcVer, log, nil, nil)
 }
 
 // NewWithCPU is New plus an explicit CPU cache handle. Pass nil for
 // the cache to keep the legacy behaviour (cpu_pct / cpu_seconds
 // always absent on the wire); production cmd/vmmd passes
-// cpustats.NewWithDefaults().
+// cpustats.NewWithDefaults(). Net cache stays nil — callers that
+// need it use NewWithCPUAndNet directly.
 func NewWithCPU(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger, cpu *cpustats.Cache) *Server {
+	return NewWithCPUAndNet(vmm, ops, fcVer, log, cpu, nil)
+}
+
+// NewWithCPUAndNet wires both caches. ADR-046 (step 7) — net
+// must be passed by cmd/vmmd's wiring (netstats.NewWithDefaults()
+// from cmd/vmmd/main.go); nil is the safe default for unit tests
+// that don't assert egress bytes.
+func NewWithCPUAndNet(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger, cpu *cpustats.Cache, net *netstats.Cache) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -110,7 +128,7 @@ func NewWithCPU(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logge
 		// never exported. Tests that don't assert metrics use this path.
 		ops = wire.NewOpsMetrics("vmmd_test")
 	}
-	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu}
+	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net}
 }
 
 // ForgetCPU drops the cache baseline for an instance. Called from
@@ -121,6 +139,17 @@ func (s *Server) ForgetCPU(instance string) {
 		return
 	}
 	s.cpuCache.Forget(instance)
+}
+
+// ForgetNet drops the netstats cache baseline for an instance.
+// ADR-046 (step 7): parallel to ForgetCPU. Called from the Destroy
+// path so the cache map does not grow unbounded across the vmmd
+// process lifetime. Safe on a nil receiver / nil cache.
+func (s *Server) ForgetNet(instance string) {
+	if s == nil || s.netCache == nil {
+		return
+	}
+	s.netCache.Forget(instance)
 }
 
 // Register binds s to a gRPC server.
@@ -232,6 +261,7 @@ func (s *Server) Destroy(ctx context.Context, req *vmmdpb.DestroyRequest) (*vmmd
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	s.ForgetCPU(req.GetInstance())
+	s.ForgetNet(req.GetInstance())
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.DestroyResponse{Instance: req.GetInstance(), ExitCode: int32(code)}, nil
 }
@@ -299,45 +329,81 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 	resp.Instances = make([]*vmmdpb.InstanceStats, 0, len(resident))
 	for inst, b := range resident {
 		total += b
-		row := &vmmdpb.InstanceStats{
-			Instance:      inst,
-			ResidentBytes: wrapperspb.Int64(b),
-		}
-		// Populate CPU fields from the cache if present. Reading
-		// under the cache's mutex is O(1) and never blocks
-		// schedd's poller on cgroup I/O — the sample loop owns
-		// the disk reads. The cumulative wall-clock of the
-		// per-instance Lookup loop is observed separately on
-		// `vmmd_stats_cpu_collect_seconds` (issue #279 / PR-B /
-		// ADR-039) so an operator can graph the CPU rate-and-
-		// accumulator hot path in isolation from the rest of
-		// the Stats RPC.
-		if s.cpuCache != nil {
-			cpuStart := time.Now()
-			if reading, ok := s.cpuCache.Lookup(inst); ok && reading.Valid {
-				row.CpuPct = wrapperspb.Double(reading.CPUPct)
-				row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
-				// PR-D (issue #301, ADR-044): the
-				// cumulative throttled-seconds reading.
-				// Source: same Reading as cpu_seconds,
-				// driven by the same regression contract
-				// (absent on baseline / cgroup
-				// recreation). The Prometheus rollup
-				// lives in pkg/wire/topn_app.go
-				// (topAppSet admission, cap=100) — the
-				// wire shape stays per-instance and
-				// the {account_id, app_id} cardinality
-				// stays bounded.
-				row.CpuThrottledSeconds = wrapperspb.Double(reading.ThrottledSeconds)
-			}
-			if h := s.ops.CPUStatsCollectDuration(); h != nil {
-				h.Observe(time.Since(cpuStart).Seconds())
-			}
-		}
+		row := buildInstanceStatsRow(inst, b, s.cpuCache, s.netCache, s.ops)
 		resp.Instances = append(resp.Instances, row)
 	}
 	resp.TotalResidentBytes = wrapperspb.Int64(total)
 	return resp, nil
+}
+
+// buildInstanceStatsRow assembles one wire row from the per-instance
+// resident bytes plus the CPU + netstats cache lookups. Pulled out of
+// the Stats handler so the per-row wire shape can be unit-tested on
+// a non-Linux host (issue #279 / PR-B / ADR-046 — without this seam
+// the schedd-side and downstream consumers cannot verify the byte
+// counter actually reaches the wire).
+//
+// Wire semantics:
+//
+//   - ResidentBytes: always populated when leakcheck reports the
+//     instance (the caller guarantees it).
+//   - CpuPct / CpuSeconds / CpuThrottledSeconds: wrappers, absent
+//     on baseline / cgroup regression — schedd stamps Unknown and
+//     the {app,node} rollup excludes the row (cpustats regression
+//     contract, ADR-039 §3.1).
+//   - NetTxBytes (ADR-046, step 7): per-tick byte delta on root-side
+//     vethHost.rx_bytes from vmmd's netstats cache. Same wrapper
+//     semantics as cpu_pct (absent = baseline / veth recreation).
+//     schedd sums across the 250 ms window into per-(instance,
+//     minute) accumulator and exposes via pkg/scheddgrpc.
+//     ListInstanceStats as a uint64 byte counter; meterd's
+//     SampleAndRoll appends to usage_minutes.net_tx_bytes.
+//
+// The CPU `Lookup` and the netstats `Lookup` are O(1) under their
+// own mutexes and never block on sysfs I/O — the sample loop in
+// cmd/vmmd owns the disk reads. The per-row CPU collect duration is
+// observed separately on `vmmd_stats_cpu_collect_seconds` so the
+// hot path can be graphed in isolation from the rest of the Stats
+// RPC.
+func buildInstanceStatsRow(
+	instance string,
+	resident int64,
+	cpuCache *cpustats.Cache,
+	netCache *netstats.Cache,
+	ops *wire.OpsMetrics,
+) *vmmdpb.InstanceStats {
+	row := &vmmdpb.InstanceStats{
+		Instance:      instance,
+		ResidentBytes: wrapperspb.Int64(resident),
+	}
+	if cpuCache != nil {
+		cpuStart := time.Now()
+		if reading, ok := cpuCache.Lookup(instance); ok && reading.Valid {
+			row.CpuPct = wrapperspb.Double(reading.CPUPct)
+			row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
+			// PR-D (issue #301, ADR-044): the
+			// cumulative throttled-seconds reading.
+			// Source: same Reading as cpu_seconds,
+			// driven by the same regression contract
+			// (absent on baseline / cgroup
+			// recreation). The Prometheus rollup
+			// lives in pkg/wire/topn_app.go
+			// (topAppSet admission, cap=100) — the
+			// wire shape stays per-instance and
+			// the {account_id, app_id} cardinality
+			// stays bounded.
+			row.CpuThrottledSeconds = wrapperspb.Double(reading.ThrottledSeconds)
+		}
+		if h := ops.CPUStatsCollectDuration(); h != nil {
+			h.Observe(time.Since(cpuStart).Seconds())
+		}
+	}
+	if netCache != nil {
+		if nReading, nok := netCache.Lookup(instance); nok && nReading.Valid {
+			row.NetTxBytes = wrapperspb.Int64(int64(nReading.DeltaBytes))
+		}
+	}
+	return row
 }
 
 // Ping is a wire-only liveness probe (issue #97 / ADR-025 axis 3,

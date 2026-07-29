@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.app_metrics_response_range import AppMetricsResponseRange, check_app_metrics_response_range
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="AppMetricsResponse")
 
@@ -48,6 +49,10 @@ class AppMetricsResponse:
     """
     wake_p95_ms: float
     """FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."""
+    egress_bytes: int | Unset = UNSET
+    """Per-app egress byte delta over the window (informational; not billed). ADR-046. Source:
+    schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until
+    then this field stays 0)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +78,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = self.wake_p95_ms
 
+        egress_bytes = self.egress_bytes
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,6 +97,8 @@ class AppMetricsResponse:
                 "wake_p95_ms": wake_p95_ms,
             }
         )
+        if egress_bytes is not UNSET:
+            field_dict["egress_bytes"] = egress_bytes
 
         return field_dict
 
@@ -118,6 +127,8 @@ class AppMetricsResponse:
 
         wake_p95_ms = d.pop("wake_p95_ms")
 
+        egress_bytes = d.pop("egress_bytes", UNSET)
+
         app_metrics_response = cls(
             app_id=app_id,
             range_=range_,
@@ -130,6 +141,7 @@ class AppMetricsResponse:
             error_rate_pct=error_rate_pct,
             cold_start_pct=cold_start_pct,
             wake_p95_ms=wake_p95_ms,
+            egress_bytes=egress_bytes,
         )
 
         app_metrics_response.additional_properties = d

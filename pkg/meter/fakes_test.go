@@ -62,3 +62,56 @@ func (f *fakeCPUSource) CPUUsageUsec(instanceID string) (uint64, bool) {
 	v, ok := f.values[instanceID]
 	return v, ok
 }
+
+// fakeEgressSource is a programmatic EgressSource for sampler
+// tests (ADR-046, step 11). Reader is keyed by instanceID;
+// Set programs the per-tick (txBytes, netTxBytes) values and
+// SetMissing exercises the "no source wired" branch (which
+// returns 0, 0, false — the legacy PR-1 contract).
+type fakeEgressSource struct {
+	mu      sync.Mutex
+	values  map[string][2]uint64
+	missing map[string]struct{}
+}
+
+func newFakeEgressSource() *fakeEgressSource {
+	return &fakeEgressSource{
+		values:  map[string][2]uint64{},
+		missing: map[string]struct{}{},
+	}
+}
+
+// Set programs the source to return (tx, net, true) for
+// instanceID. tx is the gateway response byte count for this
+// tick; net is the root-side vethHost.rx_bytes delta.
+func (f *fakeEgressSource) Set(instanceID string, tx, net uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.values[instanceID] = [2]uint64{tx, net}
+	delete(f.missing, instanceID)
+}
+
+// SetMissing programs the source to return (0, 0, false) for
+// instanceID. Used to exercise the "no row for this tick"
+// branch — the sampler writes 0 to BOTH egress columns in
+// that case (mirrors the cpu path's contract).
+func (f *fakeEgressSource) SetMissing(instanceID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.values, instanceID)
+	f.missing[instanceID] = struct{}{}
+}
+
+// EgressBytes satisfies the meter.EgressSource interface.
+func (f *fakeEgressSource) EgressBytes(instanceID string) (uint64, uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.missing[instanceID]; ok {
+		return 0, 0, false
+	}
+	v, ok := f.values[instanceID]
+	if !ok {
+		return 0, 0, false
+	}
+	return v[0], v[1], true
+}
