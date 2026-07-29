@@ -38,6 +38,8 @@ from .apps_metrics_response_range import AppsMetricsResponseRange
 from .async_invoke_response import AsyncInvokeResponse
 from .audit_event_response import AuditEventResponse
 from .audit_event_response_data import AuditEventResponseData
+from .auth_capabilities import AuthCapabilities
+from .auth_providers import AuthProviders
 from .build_export_response import BuildExportResponse
 from .build_provenance_response import BuildProvenanceResponse
 from .change_plan_request import ChangePlanRequest
@@ -112,6 +114,7 @@ from .mfa_recover_request import MFARecoverRequest
 from .mfa_recover_response import MFARecoverResponse
 from .mfa_verify_request import MFAVerifyRequest
 from .mfa_verify_response import MFAVerifyResponse
+from .o_auth_provider_capability import OAuthProviderCapability
 from .password_forgot_response_200 import PasswordForgotResponse200
 from .password_forgot_response_200_status import PasswordForgotResponse200Status
 from .password_login_request import PasswordLoginRequest
@@ -195,6 +198,8 @@ __all__ = (
     "AsyncInvokeResponse",
     "AuditEventResponse",
     "AuditEventResponseData",
+    "AuthCapabilities",
+    "AuthProviders",
     "BuildExportResponse",
     "BuildProvenanceResponse",
     "ChangePlanRequest",
@@ -269,6 +274,7 @@ __all__ = (
     "MFARecoverResponse",
     "MFAVerifyRequest",
     "MFAVerifyResponse",
+    "OAuthProviderCapability",
     "PasswordForgotResponse200",
     "PasswordForgotResponse200Status",
     "PasswordLoginRequest",
