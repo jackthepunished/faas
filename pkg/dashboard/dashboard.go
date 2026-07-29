@@ -41,6 +41,12 @@ type Page struct {
 	// /login + /auth/*; dashboardAuth rejects unauthed requests for the
 	// rest of /dashboard/*.
 	Account *AccountView
+	// Auth is the sign-in OAuth capability surface (issue #419 /
+	// ADR-046). Set only on /login (the only unauthed template that
+	// needs to render OAuth buttons); nil/zero elsewhere means
+	// "render no OAuth buttons" so a future template that fails to
+	// populate Auth can't accidentally show a 500-bound button.
+	Auth *AuthCapabilitiesView
 	// Nonce is the per-request CSP nonce minted by the
 	// httpsec.Nonce middleware (cmd/apid/server.go). Render stamps it
 	// onto every <script> and <style> tag inside the rendered HTML so
@@ -390,6 +396,17 @@ type AccountData struct {
 	// Kept here (not Page.Flash) so the danger-zone partial stays a
 	// self-contained block the layout file can render unconditionally.
 	FlashSurface string
+}
+
+// AuthCapabilitiesView is the dashboard-facing slice of
+// auth.SignInConfig (issue #419 / ADR-046). The handler populates
+// these bools from the boot-resolved s.oauthConfig so the login
+// template can conditionally render each OAuth button. Source is
+// auth.SignInProvider.Enabled() — never re-read os.Getenv from a
+// template or a handler.
+type AuthCapabilitiesView struct {
+	GoogleEnabled bool
+	GitHubEnabled bool
 }
 
 // Render writes the page to w. It parses the templates on first use

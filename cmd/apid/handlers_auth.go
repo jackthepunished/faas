@@ -79,6 +79,15 @@ func (a *authHandlers) renderLoginForm(w http.ResponseWriter, r *http.Request) {
 	page := dashboard.Page{
 		Title: "Sign in",
 		Body:  "login",
+		// Issue #419 / ADR-046: gate the OAuth buttons on the
+		// boot-resolved provider state. With both vars unset the
+		// buttons render as nothing (no 500-bound links); the
+		// SignInConfig is read here — not at request time — so
+		// there is no per-request os.Getenv cost.
+		Auth: &dashboard.AuthCapabilitiesView{
+			GoogleEnabled: a.srv.oauthConfig.Google.Enabled(),
+			GitHubEnabled: a.srv.oauthConfig.GitHub.Enabled(),
+		},
 	}
 	if err := dashboard.Render(w, a.log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		a.log.Error("dashboard render login form", "err", err)

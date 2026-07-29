@@ -37,8 +37,8 @@
     </form>
     <p>No account? <a href="/signup">Sign up</a></p>
     <div class="providers">
-      <a class="oauth-link" href="/v1/auth/google">Sign in with Google</a>
-      <a class="oauth-link" href="/v1/auth/github">Sign in with GitHub</a>
+      {{if .Auth}}{{if .Auth.GoogleEnabled}}<a class="oauth-link" href="/v1/auth/google">Sign in with Google</a>{{end}}{{end}}
+      {{if .Auth}}{{if .Auth.GitHubEnabled}}<a class="oauth-link" href="/v1/auth/github">Sign in with GitHub</a>{{end}}{{end}}
     </div>
   </main>
 </body>

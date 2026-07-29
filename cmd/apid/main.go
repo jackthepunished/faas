@@ -356,7 +356,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if sessionsWarn != "" {
 		log.Warn("session manager in dev mode; sessions reset on restart", "warning", sessionsWarn)
 	}
+	// Issue #419 / ADR-046: validate the sign-in OAuth env vars at
+	// boot. Half-configured (e.g. GOOGLE_CLIENT_ID set but
+	// GOOGLE_CLIENT_SECRET unset) refuses to start — that's the
+	// 500-into-customer-request footgun the loader exists to close.
+	// Both-unset is permitted: the operator chose not to ship OAuth
+	// on this host, the handlers return 503 oauth_provider_unavailable,
+	// and the dashboard's login template hides the buttons. The
+	// resolved config rides on *server via WithOAuthConfig so the
+	// handlers, /v1/auth/capabilities, and renderLoginForm share one
+	// source of truth (no os.Getenv at request time).
+	oauthCfg, err := auth.LoadSignInConfigFromEnv(deps.getenv)
+	if err != nil {
+		return fmt.Errorf("apid OAuth configuration: %w", err)
+	}
+	if !oauthCfg.Google.Enabled() && !oauthCfg.GitHub.Enabled() {
+		log.Warn("OAuth disabled on this host — both providers unset; /v1/auth/{google,github} return 503 oauth_provider_unavailable, /login hides the OAuth buttons",
+			"google_enabled", oauthCfg.Google.Enabled(),
+			"github_enabled", oauthCfg.GitHub.Enabled())
+	} else {
+		log.Info("OAuth sign-in capability",
+			"google_enabled", oauthCfg.Google.Enabled(),
+			"github_enabled", oauthCfg.GitHub.Enabled())
+	}
 	srv := newServerWithDeps(store, log, deps.getenv("FAAS_APPS_DOMAIN"), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	srv.WithOAuthConfig(oauthCfg)
 
 	// Issue #142: Stripe billing portal URL template for the changePlan
 	// 402 response. Empty = 402 omits billing_portal_url; the dashboard

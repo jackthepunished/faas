@@ -445,6 +445,18 @@ type OpsMetrics struct {
 	// cardinality stays well inside Prometheus' "tens of thousands
 	// of series per metric" guideline.
 	apidLogsEmittedTotal *prometheus.CounterVec
+	// oauthDisabledTotal: issue #419 / ADR-046. Sign-in OAuth
+	// disabled-redirect counter. Labelled by provider ∈
+	// {google, github} — the closed set pkg/auth.SignInConfig
+	// knows about. Pre-instantiated in NewOpsMetrics so both
+	// rows surface in /metrics from the moment the daemon boots,
+	// matching the provenance_writes_total precedent (a panel
+	// querying `rate(apid_oauth_disabled_total[5m])` shows zero
+	// on a healthy box and a non-zero rate when the dashboard
+	// gating is bypassed or a customer hits a stale bookmark.
+	// Single-registry: registered on every daemon; only apid
+	// increments via ObserveOAuthDisabled.
+	oauthDisabledTotal *prometheus.CounterVec
 	// egressDeny: per-CIDR drop counter for the nftables egress
 	// denylist (PR-E). Labelled by (cidr, family) — the cidr label
 	// is the DenyEntry.CounterName (e.g. "drop_v4_10_0_0_0_8") and
@@ -880,6 +892,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_egress_source_errors_total",
 		Help: "Count of per-instance sysfs read failures from the vmmd network poll adapter (ADR-046, step 7). Each increment corresponds to one (live instance, 250ms tick) where reading /sys/class/net/<vethHost>/statistics/rx_bytes returned an error; the cache baseline for that instance is preserved so the next successful tick picks up where the failed one left off. Alert: rate > 0 for 5m on vmmd.",
 	})
+	// issue #419 / ADR-046: sign-in OAuth disabled-redirect counter.
+	// Closed `provider` label set {google, github} — the two values
+	// pkg/auth.SignInConfig knows about. One increment per click on a
+	// consent route when the provider is SignInProviderDisabled (so
+	// the handler returns 503 oauth_provider_unavailable). Single-
+	// registry pattern (memory wire-opsmetrics-single-registry):
+	// registered on every daemon even though only apid increments.
+	// Distinguishing "dead OAuth button" from the historical 500
+	// *_oauth_misconfigured path is the operator's first signal that
+	// either (a) the dashboard gating (PR's second half) didn't take,
+	// or (b) a customer has a stale bookmark to a now-disabled button.
+	oauthDisabledTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_oauth_disabled_total",
+		Help: "Click-through counter for sign-in OAuth consent routes when the provider is disabled at boot (issue #419 / ADR-046). provider ∈ {google, github}. One increment per click — handler returns 503 oauth_provider_unavailable. A non-zero rate means either the dashboard gating is bypassed (operators see this scrape first) or a customer is hitting a stale bookmark. Distinct from the historical 500 *_oauth_misconfigured which is now unreachable at boot (the half-configured pair fails the load).",
+	}, []string{"provider"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the
 	// field stays nil and the imaged-side hook in cmd/imaged/main.go
@@ -910,6 +937,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginAuditWriteFailures,
 		topTenantRPS,
 		apidLogsEmittedTotal,
+		oauthDisabledTotal,
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
 	}
@@ -969,6 +997,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// the same change in ObserveProvenanceWrite below.
 	for _, code := range []string{"ok", "error"} {
 		provenanceWrites.WithLabelValues(code)
+	}
+	// issue #419 / ADR-046: closed `provider` label set is the
+	// two sign-in OAuth providers `pkg/auth.SignInConfig` knows
+	// about. Extending this loop is the right place to add a
+	// future provider (e.g. "gitlab"); match the same change in
+	// ObserveOAuthDisabled below.
+	for _, provider := range []string{"google", "github"} {
+		oauthDisabledTotal.WithLabelValues(provider)
 	}
 	// issue #299: pre-instantiate the closed `severity` label set
 	// for imageScanVulns so the rows surface in /metrics from boot
@@ -1165,6 +1201,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		imageScanVulns:                imageScanVulns,
 		apidLogsEmittedTotal:          apidLogsEmittedTotal,
 		egressSourceErrors:            egressSourceErrors,
+		oauthDisabledTotal:            oauthDisabledTotal,
 	}
 }
 
@@ -2269,6 +2306,25 @@ func (m *OpsMetrics) ObserveLogEmitted(app string) {
 		return
 	}
 	m.apidLogsEmittedTotal.WithLabelValues(app).Inc()
+}
+
+// ObserveOAuthDisabled increments apid_oauth_disabled_total{provider}
+// (issue #419 / ADR-046). Called from the sign-in OAuth consent
+// handlers when the provider's SignInConfig entry is Disabled —
+// the handler has just returned 503 oauth_provider_unavailable.
+// provider is "google" or "github"; unknown values produce no
+// increment (the CounterVec has no matching label), so callers
+// MUST guard on auth.SignInConfig.Enabled(provider) first. Nil
+// receiver is allowed for parity with ObserveLogEmitted above —
+// tests that don't wire metrics keep working.
+func (m *OpsMetrics) ObserveOAuthDisabled(provider string) {
+	if m == nil || m.oauthDisabledTotal == nil {
+		return
+	}
+	switch provider {
+	case "google", "github":
+		m.oauthDisabledTotal.WithLabelValues(provider).Inc()
+	}
 }
 
 // Handler returns an http.Handler that serves the registry's metrics.

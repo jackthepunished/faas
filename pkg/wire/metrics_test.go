@@ -491,3 +491,39 @@ func TestOpsMetrics_SnapshotDiskDriftNilSafe(t *testing.T) {
 		t.Errorf("SnapshotDiskDrift on nil receiver = %v, want nil", got)
 	}
 }
+
+// TestOpsMetrics_ObserveOAuthDisabled (issue #419 / ADR-046) — the
+// sign-in OAuth consent handlers increment
+// `apid_oauth_disabled_total{provider}` on every 503
+// `oauth_provider_unavailable` response. The accessor must:
+//   - increment by 1 for the closed set ("google", "github"),
+//   - leave the metric untouched for unknown providers so a
+//     future caller can't widen the label set by accident,
+//   - be no-op on a nil receiver so apid unit tests that don't
+//     wire metrics keep working (parity with ObserveLogEmitted
+//     above).
+func TestOpsMetrics_ObserveOAuthDisabled(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.ObserveOAuthDisabled("google")
+	m.ObserveOAuthDisabled("google")
+	m.ObserveOAuthDisabled("github")
+	// Unknown provider: accessor must not create a label series.
+	m.ObserveOAuthDisabled("facebook")
+
+	body := render(t, m)
+	wantGoogle := `apid_oauth_disabled_total{provider="google"} 2`
+	if !strings.Contains(body, wantGoogle) {
+		t.Errorf("missing line %q in:\n%s", wantGoogle, body)
+	}
+	wantGitHub := `apid_oauth_disabled_total{provider="github"} 1`
+	if !strings.Contains(body, wantGitHub) {
+		t.Errorf("missing line %q in:\n%s", wantGitHub, body)
+	}
+	if strings.Contains(body, `provider="facebook"`) {
+		t.Errorf("facebook label series must not be created, got:\n%s", body)
+	}
+
+	// Nil-receiver parity with the other Observe* accessors.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveOAuthDisabled("google") // must not panic
+}

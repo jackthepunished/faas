@@ -42,3 +42,9 @@ rules:
   # do support JS clients that prefer camelCase we can flip this back on
   # alongside a separate camelCase-shadow spec at /v1/openapi.camel.json.
   camel-case-properties: off
+  # Same wire-shape rationale: path segments mirror Go struct field names
+  # (revoke_all mirrors pkg/auth.Session.RevokeAll; dead_letter mirrors
+  # pkg/queue.Row.State). Renaming would break every SDK method, every
+  # event-kind string, and every customer URL — out of scope for any
+  # single PR. Tracked for a separate path-alias cleanup (issue TBD).
+  paths-kebab-case: warn

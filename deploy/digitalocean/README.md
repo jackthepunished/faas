@@ -132,6 +132,45 @@ sudo bash /opt/faas/src/deploy/digitalocean/deploy.sh
 
 This pulls latest source, rebuilds, migrates, and restarts.
 
+## OAuth sign-in (optional)
+
+apid boots in three modes with respect to OAuth sign-in
+(issue #419 / ADR-046):
+
+| `GOOGLE_*` envs | `GITHUB_*` envs | Outcome |
+| --- | --- | --- |
+| both unset | both unset | OAuth disabled — `/v1/auth/google` and `/v1/auth/github` return 503 `oauth_provider_unavailable`; `/login` hides the buttons |
+| both set per provider | both set per provider | OAuth enabled for that provider — `/v1/auth/<provider>` 302s to the consent screen |
+| exactly one of `(ID, SECRET)` set | (same shape) | apid refuses to boot with a wrapped error naming which vars diverge |
+
+To enable Google sign-in, set:
+
+```bash
+GOOGLE_CLIENT_ID=<oauth-client-id>.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=<oauth-client-secret>
+# Optional: override the redirect_uri (default = host-derived https://<box>/v1/auth/google/callback)
+# GOOGLE_REDIRECT_URI=
+```
+
+To enable GitHub sign-in, set:
+
+```bash
+GITHUB_CLIENT_ID=<oauth-app-client-id>
+GITHUB_CLIENT_SECRET=<oauth-app-client-secret>
+# Optional: override the redirect_uri (default = host-derived https://<box>/v1/auth/github/callback)
+# GITHUB_REDIRECT_URI=
+```
+
+After editing `/etc/faas/sealed.env`, restart apid: `sudo systemctl restart faas-apid`.
+Verify with:
+
+```bash
+# Should redirect to https://accounts.google.com/o/oauth2/v2/auth?... when configured.
+curl -i https://<box>/v1/auth/google
+# Should report the per-provider enabled flag.
+curl -b cookies.txt https://<box>/v1/auth/capabilities
+```
+
 ## Logs & debugging
 
 ```bash

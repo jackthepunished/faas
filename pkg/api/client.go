@@ -360,6 +360,23 @@ func (c *Client) PostAccountLogout(ctx context.Context) error {
 	return c.do(ctx, "POST", "/v1/auth/logout", struct{}{}, nil)
 }
 
+// GetAuthCapabilities returns the per-provider sign-in OAuth enabled
+// flag for the calling host (issue #419 / ADR-046). The endpoint is
+// session-cookie-authed and intended for the dashboard's /login
+// surface; SDK callers (e.g. a CLI sub-command that wants to know
+// whether to render the OAuth button on a custom page) reuse it.
+//
+// The route is mounted behind dashboardChain(sessionAuth(...)) but
+// not behind dashboardAuthChain, so the SDK client does not need a
+// bearer token — the underlying cookie session is what authenticates
+// the request. Callers that pre-mint a token via the device-code CLI
+// flow can also use it; the bearer branch of s.auth sees the same
+// account.
+func (c *Client) GetAuthCapabilities(ctx context.Context) (AuthCapabilities, error) {
+	var out AuthCapabilities
+	return out, c.do(ctx, "GET", "/v1/auth/capabilities", nil, &out)
+}
+
 func (c *Client) GetAccountSessions(ctx context.Context) (SessionListResponse, error) {
 	var out SessionListResponse
 	return out, c.do(ctx, "GET", "/v1/auth/sessions", nil, &out)

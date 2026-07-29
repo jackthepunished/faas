@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AuthCapabilities } from '../models/AuthCapabilities.js';
 import type { PasswordLoginRequest } from '../models/PasswordLoginRequest.js';
 import type { PasswordLoginResponse } from '../models/PasswordLoginResponse.js';
 import type { PasswordResetConfirm } from '../models/PasswordResetConfirm.js';
@@ -188,6 +189,12 @@ export class AuthService {
    * userinfo, and verifies `email_verified=true` before
    * minting a session (issue #165 PR #2, ADR-032).
    *
+   * Returns 503 `oauth_provider_unavailable` when the operator
+   * did not configure Google sign-in on this host (both
+   * `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` unset at
+   * boot, issue #419 / ADR-046). The same shape is returned
+   * for the half-set case, which fails to boot.
+   *
    * @returns void
    * @throws ApiError
    */
@@ -197,7 +204,15 @@ export class AuthService {
       url: '/v1/auth/google',
       errors: {
         302: `Redirect to Google consent.`,
-        500: `OAuth misconfigured (GOOGLE_CLIENT_ID unset).`,
+        500: `Google OAuth misconfigured at runtime. Defensive
+        catch — boot validation (ADR-046) should make this
+        unreachable in production.
+        `,
+        503: `Google sign-in not configured on this host. Operator
+        must set both \`GOOGLE_CLIENT_ID\` and
+        \`GOOGLE_CLIENT_SECRET\` and restart apid (ADR-046).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
       },
     });
   }
@@ -246,6 +261,11 @@ export class AuthService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
+        503: `OAuth provider not configured on this host (stale
+        cookie or direct callback hit before operator wired
+        \`GOOGLE_CLIENT_ID\`/\`GOOGLE_CLIENT_SECRET\`).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
       },
     });
   }
@@ -257,6 +277,11 @@ export class AuthService {
    * a primary && verified email before minting a session
    * (issue #165 PR #2, ADR-032).
    *
+   * Returns 503 `oauth_provider_unavailable` when the operator
+   * did not configure GitHub sign-in on this host (both
+   * `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+   * boot, issue #419 / ADR-046).
+   *
    * @returns void
    * @throws ApiError
    */
@@ -266,7 +291,15 @@ export class AuthService {
       url: '/v1/auth/github',
       errors: {
         302: `Redirect to GitHub consent.`,
-        500: `OAuth misconfigured (GITHUB_CLIENT_ID unset).`,
+        500: `GitHub OAuth misconfigured at runtime. Defensive
+        catch — boot validation (ADR-046) should make this
+        unreachable in production.
+        `,
+        503: `GitHub sign-in not configured on this host. Operator
+        must set both \`GITHUB_CLIENT_ID\` and
+        \`GITHUB_CLIENT_SECRET\` and restart apid (ADR-046).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
       },
     });
   }
@@ -337,6 +370,42 @@ export class AuthService {
         \`api.github.com/user\`, or \`api.github.com/user/emails\`
         unreachable. Surfaces as \`github_unreachable\`.
         `,
+        503: `OAuth provider not configured on this host (stale
+        cookie or direct callback hit before operator wired
+        \`GITHUB_CLIENT_ID\`/\`GITHUB_CLIENT_SECRET\`).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
+      },
+    });
+  }
+  /**
+   * Sign-in OAuth capability signal for the dashboard.
+   * Returns the boot-resolved OAuth provider state for this apid
+   * host (issue #419 / ADR-046). The dashboard reads this on
+   * `/login` to decide whether to render the "Sign in with
+   * Google" / "Sign in with GitHub" buttons.
+   *
+   * Mounted behind the dashboard's session-cookie auth — a
+   * scanner without a session gets 302 to `/login` first, so
+   * this is not a brute-force amplification surface even though
+   * it surfaces provider enablement. The set of provider names
+   * is closed (`google`, `github`); future providers land as
+   * new keys, not by adding a list.
+   *
+   * `enabled=true` means the provider's `/v1/auth/<provider>`
+   * consent route will issue a 302 to the upstream consent
+   * screen on a fresh request. `enabled=false` means it will
+   * return 503 `oauth_provider_unavailable`.
+   *
+   * @returns AuthCapabilities Per-provider enabled signal.
+   * @throws ApiError
+   */
+  public static getAuthCapabilities(): CancelablePromise<AuthCapabilities> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/auth/capabilities',
+      errors: {
+        302: `No valid session cookie; redirected to /login.`,
       },
     });
   }

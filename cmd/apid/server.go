@@ -12,6 +12,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	"github.com/onebox-faas/faas/pkg/auth"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -163,6 +164,21 @@ type server struct {
 	//
 	// ADR-044.
 	authMw *authmw.Middleware
+	// oauthConfig is the boot-resolved sign-in OAuth provider state
+	// (issue #419 / ADR-046). Computed once in cmd/apid/main.go
+	// via auth.LoadSignInConfigFromEnv, passed into newServerWithDeps,
+	// and read by:
+	//   - handlers_google.go / handlers_github.go to gate the
+	//     consent redirect on a non-empty Enabled() value;
+	//   - /v1/auth/capabilities to surface the per-provider bool;
+	//   - the dashboard login template (templates/login.html) via
+	//     Page.Auth to suppress buttons that would 503.
+	// The zero value of SignInConfig (both providers Disabled)
+	// is the in-test default so unit tests that don't pass an
+	// explicit config behave as if the deploy operator never set
+	// any OAuth env — the per-handler 503 path is then exercised
+	// on every redirect.
+	oauthConfig auth.SignInConfig
 }
 
 // anonymousAccountLabel is the literal value of the `account_id`
@@ -266,6 +282,25 @@ func (s *server) WithBillingProvider(p billing.Provider) *server {
 	return s
 }
 
+// WithOAuthConfig attaches the sign-in OAuth provider state
+// resolved at boot via auth.LoadSignInConfigFromEnv (issue #419 /
+// ADR-046). Distinct from newServerWithDeps's positional args so
+// the dozens of existing test call sites keep compiling — the
+// setter lives after construction. Production wiring in
+// cmd/apid/main.go::runWithDeps:
+//
+//	oauthCfg, err := auth.LoadSignInConfigFromEnv(deps.getenv)
+//	if err != nil { return fmt.Errorf("...: %w", err) }
+//	srv := newServer(...).WithOAuthConfig(oauthCfg).
+//	    WithOpsMetrics(...).WithBillingProvider(...)
+//
+// Tests that don't care about OAuth pass nothing and read the
+// zero value (both providers Disabled → consent routes 503).
+func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
+	s.oauthConfig = cfg
+	return s
+}
+
 // billingPortalURLFor returns the rendered URL for the customer. Empty
 // template yields empty string so the handler can omitempty the field.
 func (s *server) billingPortalURLFor(acct state.Account) string {
@@ -323,6 +358,10 @@ func newServer(store state.Store, log *slog.Logger, domain string, notif Notifie
 // Production (cmd/apid/main.go) calls this with env-loaded values;
 // tests use the simpler newServer (no secret, noop mailer, stub
 // githubd, nil sessions → ephemeral key, default 15m login TTL).
+// The sign-in OAuth config (issue #419 / ADR-046) is wired
+// separately via (*server).WithOAuthConfig after construction —
+// same pattern as WithBillingProvider, WithOpsMetrics, etc. so the
+// existing positional call sites in tests don't need editing.
 func newServerWithDeps(
 	store state.Store,
 	log *slog.Logger,
@@ -413,8 +452,6 @@ func newServerWithDeps(
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
 		audit:                  newAuditor(store, log, nil),
-		// schedd (issue #254 / Move 4) defaults to a stub that
-		// returns Unimplemented. Production wires the real client
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the
@@ -430,6 +467,12 @@ func newServerWithDeps(
 			log,
 			apiAuthLimiter,
 		),
+		// oauthConfig (issue #419 / ADR-046) is left at the
+		// zero value here (both providers Disabled); production
+		// wires the env-resolved config via (*server).WithOAuthConfig
+		// from cmd/apid/main.go, mirroring the With* setter pattern
+		// used by WithBillingProvider / WithOpsMetrics so existing
+		// positional callers in tests don't need editing.
 	}
 }
 
@@ -751,6 +794,15 @@ func (s *server) handler() http.Handler {
 	mux.Handle("GET /v1/auth/github/callback", s.dashboardAuthChain(middleware.AuthLimitConfig{
 		CountStatuses: []int{middleware.CountEveryAttempt},
 	}, http.HandlerFunc(s.handleGitHubOAuthCallback)))
+	// Issue #419 / ADR-046: sign-in OAuth capability signal for the
+	// dashboard. Behind sessionAuth so the response doesn't reveal
+	// the configured-provider set to random scanners; behind
+	// dashboardChain (not dashboardAuthChain) because the route
+	// only returns a 200 with the per-provider enabled flag — it
+	// isn't a brute-force surface, and not counting it keeps the
+	// §11 auth bucket honest. s.renderAuthCapabilities reads
+	// s.oauthConfig (loaded once at boot via (*server).WithOAuthConfig).
+	mux.Handle("GET /v1/auth/capabilities", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.renderAuthCapabilities))))
 
 	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd's
 	// /dashboard/* reverse-proxy (spec §11 single-public-listener).

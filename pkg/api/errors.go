@@ -413,6 +413,19 @@ const (
 	CodeResetTokenInvalid  = "reset_token_invalid"
 	CodeResetTokenExpired  = "reset_token_expired"
 	CodeAccountExists      = "account_exists"
+
+	// CodeOAuthProviderUnavailable is the 503 returned by the
+	// /v1/auth/{google,github}{,/callback} handlers when the
+	// boot-resolved auth.SignInConfig reports the provider
+	// Disabled — i.e. both ID and SECRET are unset on this host
+	// (issue #419 / ADR-046). The half-set case refuses to boot at
+	// runWithDeps, so this code is the operator-chose-not-to-ship-it
+	// shape (single-box dev with OAuth off, or a tier-2 fleet where
+	// only one provider is wired). The same code covers the stale-
+	// cookie / direct-callback-hit case on a host whose operator
+	// later unset both vars; the dashboard's /v1/auth/capabilities
+	// signal keeps the button off in steady state.
+	CodeOAuthProviderUnavailable = "oauth_provider_unavailable"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -443,7 +456,7 @@ func StatusForCode(code string) int {
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
 		CodeAlertRuleInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
-	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout:
+	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable:
 		return http.StatusServiceUnavailable
 	case CodeScanCritical:
 		// 503 — the base ext4 has a CRITICAL Grype finding

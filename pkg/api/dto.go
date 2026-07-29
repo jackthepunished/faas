@@ -483,6 +483,40 @@ const (
 	OAuthProviderGitHub OAuthProvider = "github"
 )
 
+// AuthCapabilities is the body of GET /v1/auth/capabilities
+// (issue #419 / ADR-046). The dashboard reads this on /login to
+// decide whether to render the "Sign in with Google" / "Sign in
+// with GitHub" buttons. Each per-provider entry reports whether
+// the consent route is wired (Enabled == true) or whether it would
+// 503 with oauth_provider_unavailable because both ID+SECRET were
+// unset at boot.
+//
+// The set of provider names is closed; new providers land as new
+// keys, not as a list. The Wire-shape deliberately keeps the keys
+// named (`providers.google`, `providers.github`) so the dashboard
+// template can reach them directly via {{.Auth.GoogleEnabled}}-
+// style guards, and the spec_compliance_test (cmd/apid/spec_compliance_test.go)
+// can pin the schema parity.
+type AuthCapabilities struct {
+	Providers AuthProviders `json:"providers"`
+}
+
+// AuthProviders is the per-provider capability map. Closed set
+// (google, github) — handlers MUST add a new field here when
+// adding a new provider, not relax this to map[string]… .
+type AuthProviders struct {
+	Google OAuthProviderCapability `json:"google"`
+	GitHub OAuthProviderCapability `json:"github"`
+}
+
+// OAuthProviderCapability is one provider's capability flag.
+// Source is auth.SignInProvider.Enabled() — the boot-resolved
+// state loaded once at apid startup and pinned for the process
+// lifetime.
+type OAuthProviderCapability struct {
+	Enabled bool `json:"enabled"`
+}
+
 // PasswordLoginRequest is the body of POST /login. The email is the
 // canonical handle (lowercase + trim — the handler runs the same
 // canonicalisation the account-create path uses so an "alice@example.com

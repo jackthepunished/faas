@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -124,21 +125,60 @@ func withGitHubTransport(t *testing.T, f *fakeGitHubAPI) func() {
 	return func() { http.DefaultClient.Transport = prev }
 }
 
+// defaultGitHubTestOAuthCfg is the issue #419 / ADR-046 pre-wired
+// SignInConfig the GitHub callback tests assume. With
+// GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET both Configured, the
+// handler's boot-resolved-state guard is satisfied and the
+// credential exchange runs as it did before #419. Tests that want
+// the 503 path call newGitHubTestServer(t) instead, which leaves
+// the oauthConfig at the zero (both-Disabled) value.
+var defaultGitHubTestOAuthCfg = auth.SignInConfig{
+	GitHub: auth.SignInProvider{
+		Status:       auth.SignInProviderConfigured,
+		ClientID:     "test_gh_client_id",
+		ClientSecret: "test_gh_client_secret",
+	},
+}
+
 func newGitHubTestServer(t *testing.T) http.Handler {
+	t.Helper()
+	store := state.NewMemStore()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
+}
+
+// newGitHubTestServerDisabled is the issue #419 / ADR-046 helper for
+// tests that need the disabled-provider 503 (both vars unset at
+// boot). Use newGitHubTestServer for the Configured shape.
+func newGitHubTestServerDisabled(t *testing.T) http.Handler {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return newServer(store, log, "example.com", noopNotifier{}).handler()
 }
 
+// newGitHubTestServerWithOAuth is the variant that takes a custom
+// SignInConfig — useful for tests that need a non-default config
+// (e.g. an explicit RedirectURI override). Tests that need the
+// standard Configured shape should call newGitHubTestServer; tests
+// that need the disabled-provider 503 should call
+// newGitHubTestServerDisabled.
+func newGitHubTestServerWithOAuth(t *testing.T, cfg auth.SignInConfig) http.Handler {
+	t.Helper()
+	store := state.NewMemStore()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(cfg).handler()
+}
+
 // --- 1. Consent redirect -------------------------------------------------
 
-// TestGitHubAuthRedirect drives GET /v1/auth/github with
-// GITHUB_CLIENT_ID set. Expects a 302 to github.com/login/oauth/authorize
-// carrying the requested scope, plus a faas_github_state CSRF cookie
-// scoped to /v1/auth/github/callback.
+// TestGitHubAuthRedirect drives GET /v1/auth/github with the OAuth
+// config wired as Configured (issue #419 / ADR-046: the handler now
+// reads s.oauthConfig, not os.Getenv). Expects a 302 to
+// github.com/login/oauth/authorize carrying the requested scope, plus
+// a faas_github_state CSRF cookie scoped to /v1/auth/github/callback.
 func TestGitHubAuthRedirect(t *testing.T) {
-	t.Setenv("GITHUB_CLIENT_ID", "test_gh_client_id")
 	h := newGitHubTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/auth/github", nil)
@@ -186,25 +226,31 @@ func TestGitHubAuthRedirect(t *testing.T) {
 	}
 }
 
-// TestGitHubAuthRedirect_MissingClientID asserts the consent-redirect
-// path is fail-closed when GITHUB_CLIENT_ID is unset. 500
-// github_oauth_misconfigured so operators see the misconfiguration in
-// logs immediately rather than a misleading CSRF flow.
-func TestGitHubAuthRedirect_MissingClientID(t *testing.T) {
-	t.Setenv("GITHUB_CLIENT_ID", "")
-	h := newGitHubTestServer(t)
+// TestGitHubAuthRedirect_BothEnvUnset asserts the consent-redirect
+// path is fail-closed when both GITHUB_CLIENT_ID and
+// GITHUB_CLIENT_SECRET are unset on this host (issue #419 /
+// ADR-046). 503 oauth_provider_unavailable so operators see the
+// misconfiguration in logs immediately rather than a misleading CSRF
+// flow. Distinct from the legacy 500 github_oauth_misconfigured,
+// which is reserved for the defence-in-depth case where a Configured
+// provider somehow read an empty value at request time. The name
+// reflects the post-#419 shape: "both unset" is what reaches the
+// runtime — half-set (one env var set) refuses to boot, so the
+// runtime never sees it.
+func TestGitHubAuthRedirect_BothEnvUnset(t *testing.T) {
+	h := newGitHubTestServerDisabled(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/auth/github", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
 	}
 	var p map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &p)
-	if p["code"] != "github_oauth_misconfigured" {
-		t.Errorf("code = %v, want github_oauth_misconfigured", p["code"])
+	if p["code"] != "oauth_provider_unavailable" {
+		t.Errorf("code = %v, want oauth_provider_unavailable", p["code"])
 	}
 }
 
@@ -270,22 +316,36 @@ func TestGitHubAuthCallback_MissingCode(t *testing.T) {
 
 // TestGitHubAuthCallback_OAuthMisconfigured asserts the callback is
 // fail-closed when GITHUB_CLIENT_SECRET is unset (even if the
-// consent-redirect path is configured). 500 github_oauth_misconfigured.
+// consent-redirect path is configured). Issue #419 / ADR-046:
+// half-set config refuses to boot in production; at request time
+// the disabled-provider guard fires first and the callback returns
+// 503 oauth_provider_unavailable, not the legacy 500
+// github_oauth_misconfigured (the legacy 500 is the defence-in-depth
+// path that never fires under normal boot).
 func TestGitHubAuthCallback_OAuthMisconfigured(t *testing.T) {
-	t.Setenv("GITHUB_CLIENT_ID", "test_gh_client_id")
-	t.Setenv("GITHUB_CLIENT_SECRET", "")
-	h := newGitHubTestServer(t)
+	cfg := auth.SignInConfig{
+		GitHub: auth.SignInProvider{
+			Status:   auth.SignInProviderConfigured,
+			ClientID: "test_gh_client_id",
+			// ClientSecret intentionally empty — the handler's
+			// guard runs at the .Enabled() level, so a half-set
+			// Configured provider reads as Disabled and returns
+			// 503 oauth_provider_unavailable rather than 500.
+			ClientSecret: "",
+		},
+	}
+	h := newGitHubTestServerWithOAuth(t, cfg)
 	req := httptest.NewRequest(http.MethodGet, "/v1/auth/github/callback?state=any&code=any", nil)
 	req.AddCookie(&http.Cookie{Name: githubAuthStateCookie, Value: "any"})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
 	}
 	var p map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &p)
-	if p["code"] != "github_oauth_misconfigured" {
-		t.Errorf("code = %v, want github_oauth_misconfigured", p["code"])
+	if p["code"] != "oauth_provider_unavailable" {
+		t.Errorf("code = %v, want oauth_provider_unavailable", p["code"])
 	}
 }
 
@@ -343,7 +403,14 @@ func TestGitHubAuthCallback_UnverifiedEmail(t *testing.T) {
 	// fail loudly.
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).handler()
+	// Same Configured OAuth config as the primary call (issue #419 /
+	// ADR-046): the handler now refuses to do credential work unless
+	// the boot-resolved SignInConfig is Configured. Without this the
+	// second call would 503 oauth_provider_unavailable before the
+	// 401 path runs, and the anti-takeover assertion would never
+	// execute.
+	srv := newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 	rec2 := httptest.NewRecorder()
 	srv.ServeHTTP(rec2, req)
 	if rec2.Code != http.StatusUnauthorized {
@@ -371,7 +438,8 @@ func TestGitHubAuthCallback_FreshAccount(t *testing.T) {
 
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).handler()
+	h := newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("st", "cd")
 	rec := httptest.NewRecorder()
@@ -438,7 +506,8 @@ func TestGitHubAuthCallback_LegacyAccountBind(t *testing.T) {
 		t.Fatalf("seed pre-existing: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).handler()
+	h := newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("st2", "cd2")
 	rec := httptest.NewRecorder()
@@ -485,7 +554,8 @@ func TestGitHubAuthCallback_SubFirstAntiTakeover(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).handler()
+	h := newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	// --- First login: (sub, email=shared@example.com) lands on a
 	// fresh Free account.
@@ -570,7 +640,8 @@ func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 	store := state.NewMemStore()
 	slogBuf := &safeBuffer{}
 	log := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	h := newServer(store, log, "example.com", noopNotifier{}).handler()
+	h := newServer(store, log, "example.com", noopNotifier{}).
+		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("audit-state", "audit-code")
 	rec := httptest.NewRecorder()

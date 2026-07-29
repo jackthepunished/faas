@@ -29,6 +29,11 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_500
 
+    if response.status_code == 503:
+        response_503 = Problem.from_dict(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -55,6 +60,11 @@ def sync_detailed(
     with `scope=read:user user:email`. The callback requires
     a primary && verified email before minting a session
     (issue #165 PR #2, ADR-032).
+
+    Returns 503 `oauth_provider_unavailable` when the operator
+    did not configure GitHub sign-in on this host (both
+    `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+    boot, issue #419 / ADR-046).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -85,6 +95,11 @@ def sync(
     a primary && verified email before minting a session
     (issue #165 PR #2, ADR-032).
 
+    Returns 503 `oauth_provider_unavailable` when the operator
+    did not configure GitHub sign-in on this host (both
+    `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+    boot, issue #419 / ADR-046).
+
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
@@ -109,6 +124,11 @@ async def asyncio_detailed(
     with `scope=read:user user:email`. The callback requires
     a primary && verified email before minting a session
     (issue #165 PR #2, ADR-032).
+
+    Returns 503 `oauth_provider_unavailable` when the operator
+    did not configure GitHub sign-in on this host (both
+    `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+    boot, issue #419 / ADR-046).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -136,6 +156,11 @@ async def asyncio(
     with `scope=read:user user:email`. The callback requires
     a primary && verified email before minting a session
     (issue #165 PR #2, ADR-032).
+
+    Returns 503 `oauth_provider_unavailable` when the operator
+    did not configure GitHub sign-in on this host (both
+    `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+    boot, issue #419 / ADR-046).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
