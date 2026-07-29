@@ -18,12 +18,12 @@ import (
 // base image is denied regardless of registry, tag, or digest format.
 func TestStatefulDenyListMatch_KnownStateful(t *testing.T) {
 	cases := []string{
-		"postgres",                       // bare Docker Hub short-form
-		"postgres:16",                    // bare + tag
-		"postgres:16-alpine",             // bare + tag
-		"library/postgres",               // explicit Docker Hub library path
-		"docker.io/library/postgres:16",  // full Docker Hub ref
-		"docker.io/postgres:16",          // Docker Hub short-form with registry
+		"postgres",                      // bare Docker Hub short-form
+		"postgres:16",                   // bare + tag
+		"postgres:16-alpine",            // bare + tag
+		"library/postgres",              // explicit Docker Hub library path
+		"docker.io/library/postgres:16", // full Docker Hub ref
+		"docker.io/postgres:16",         // Docker Hub short-form with registry
 		"redis",
 		"redis:7-alpine",
 		"mysql:8.0",
@@ -32,7 +32,10 @@ func TestStatefulDenyListMatch_KnownStateful(t *testing.T) {
 		"cockroach:v23.1",
 		"cassandra:5.0",
 		"clickhouse:24.1",
-		"localhost:5000/myrepo/postgres:dev", // local registry + stateful image
+		"localhost:5000/myrepo/postgres:dev", // port + path + stateful image
+		"127.0.0.1:5000/myrepo/postgres:dev", // IP-literal registry (no DNS name)
+		"myreg.example.com/x/y/postgres:tag", // registry + nested path + stateful
+		"postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000", // digest-pinned
 	}
 	for _, ref := range cases {
 		t.Run(ref, func(t *testing.T) {
@@ -55,13 +58,13 @@ func TestStatefulDenyListMatch_KnownClean(t *testing.T) {
 	cases := []string{
 		"ghcr.io/onebox-faas/runner-node22:latest", // platform's own base
 		"ghcr.io/onebox-faas/runner-python312:latest",
-		"node:22-slim",                  // not in the deny-list
-		"ghcr.io/me/postgres-fork:1.0",  // postgres-fork is NOT postgres
-		"my-postgres-app",               // hyphenated name does not match "postgres"
+		"node:22-slim",                 // not in the deny-list
+		"ghcr.io/me/postgres-fork:1.0", // postgres-fork is NOT postgres
+		"my-postgres-app",              // hyphenated name does not match "postgres"
 		"alpine:3.20",
 		"nginx:1.27",
 		"python:3.12-slim",
-		"",                              // empty ref → fail-open
+		"", // empty ref → fail-open
 		"docker.io/library/alpine:latest",
 	}
 	for _, ref := range cases {
@@ -101,15 +104,17 @@ func TestStatefulDenyListMatch_DigestForm(t *testing.T) {
 // (e.g. to expose it for tests in pkg/oci) has a clear acceptance test.
 func TestPathSegmentsAfterRegistry_EdgeCases(t *testing.T) {
 	cases := map[string][]string{
-		"postgres":                         {"postgres"},
-		"postgres:16":                      {"postgres"},
-		"postgres@sha256:deadbeef":         {"postgres"},
-		"library/postgres":                 {"library", "postgres"},
-		"docker.io/library/postgres:16":    {"library", "postgres"},
-		"docker.io/postgres:16":            {"postgres"},
-		"ghcr.io/me/myapp:abc1234":         {"me", "myapp"},
-		"localhost:5000/myrepo/myapp":      {"myrepo", "myapp"},
-		"myreg.example.com/x/y/z:tag":      {"x", "y", "z"},
+		"postgres":                           {"postgres"},
+		"postgres:16":                        {"postgres"},
+		"postgres@sha256:deadbeef":           {"postgres"},
+		"library/postgres":                   {"library", "postgres"},
+		"docker.io/library/postgres:16":      {"library", "postgres"},
+		"docker.io/postgres:16":              {"postgres"},
+		"ghcr.io/me/myapp:abc1234":           {"me", "myapp"},
+		"localhost:5000/myrepo/myapp":        {"myrepo", "myapp"},
+		"127.0.0.1:5000/myrepo/postgres:dev": {"myrepo", "postgres"},
+		"myreg.example.com/x/y/z:tag":        {"x", "y", "z"},
+		"docker.io/":                         nil, // registry-only, empty path
 	}
 	for in, want := range cases {
 		t.Run(in, func(t *testing.T) {

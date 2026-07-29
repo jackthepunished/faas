@@ -584,17 +584,72 @@ func TestCreateDeploymentMultipart_FunctionHappyPath(t *testing.T) {
 	// test (server_test.go::TestCreateDeploymentImage).
 }
 
+// TestCreateDeploymentMultipart_StatelessRejection: end-to-end wire-
+// shape test for the Wave 0 stateless contract. A multipart deploy
+// whose source tarball has a top-level data/ directory must come
+// back as 422 application/problem+json with code=stateless_only_viola
+// tion and a detail that mentions both the directory name and the
+// docs page. Pinned because the unit-level scan tests above proved
+// the predicate but not the wire shape — a future regression in
+// api.WriteProblem or the handler glue would silently let a stateful
+// deploy through the API surface while the predicate still worked.
+func TestCreateDeploymentMultipart_StatelessRejection(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "stateful-app"}, nil)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/index.js"},
+		{Name: "myproject/data/"},
+		{Name: "myproject/data/payments.db"},
+	}, map[string][]byte{
+		"myproject/index.js":         []byte("exports.handler = () => 1;\n"),
+		"myproject/data/payments.db": {},
+	})
+	body, ct := multipartUpload(t, map[string]multipartPart{
+		"source": {filename: "src.tgz", body: raw},
+	})
+	req := httptest.NewRequest("POST", "/v1/apps/stateful-app/deployments", body)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Errorf("Content-Type = %q, want application/problem+json", ct)
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("body is not problem+json: %v (body=%s)", err, rec.Body)
+	}
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	}
+	if !strings.Contains(prob.Detail, "data/") {
+		t.Errorf("detail %q does not mention data/", prob.Detail)
+	}
+	if prob.DocsURL == "" {
+		t.Errorf("expected DocsURL pointing at storage page, got empty")
+	}
+}
+
 // ─── Wave 0 stateless-only tests ────────────────────────────────────────
 //
 // Pinned for PR-A of Wave 0. Every test below targets a single check
 // inside scanForStatefulShape / scanDockerfileForStatefulShape so a
 // future refactor can't silently regress one branch while keeping the
-// others green. The HTTP-level integration (the actual 403 in the
-// problem+json body) is covered by TestCreateDeploymentMultipart_*
+// others green. The HTTP-level integration (the 422 in the
+// problem+json body) is covered by TestCreateDeploymentMultipart_StatelessRejection
 // above — these tests pin the unit-level predicates.
 
-// TestScanForStatefulShape_HappyPath: a clean source deploy is accepted
-// (returns nil) regardless of the dockerfile flag.
+// TestScanForStatefulShape_HappyPath: a clean source deploy (no
+// Dockerfile, no stateful top-level dirs) is accepted regardless of
+// the dockerfile flag.
 func TestScanForStatefulShape_HappyPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("FAAS_SPOOL_ROOT", dir)
@@ -610,8 +665,54 @@ func TestScanForStatefulShape_HappyPath(t *testing.T) {
 	if prob := scanForStatefulShape(path, false); prob != nil {
 		t.Fatalf("clean deploy rejected: code=%s detail=%s", prob.Code, prob.Detail)
 	}
+}
+
+// TestScanForStatefulShape_DockerfileFlagWithoutDockerfile: when
+// dockerfile=true was sent but no Dockerfile is in the archive root,
+// the scan fails FAST with CodeSourceInvalid rather than silently
+// punting to a build-time failure later. Pinned because the OLD
+// behaviour (accept-then-builderd-fails) wasted a build slot and was
+// unclear to the customer.
+func TestScanForStatefulShape_DockerfileFlagWithoutDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/index.js"},
+	}, map[string][]byte{
+		"myproject/index.js": []byte("exports.handler = () => 1;\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, true)
+	if prob == nil {
+		t.Fatal("expected fail-fast on missing Dockerfile, got nil")
+	}
+	if prob.Code != api.CodeSourceInvalid {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeSourceInvalid)
+	}
+	if !strings.Contains(prob.Detail, "Dockerfile") {
+		t.Errorf("detail %q does not mention Dockerfile", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_DockerfileFlagWithCleanDockerfile: when
+// dockerfile=true is sent AND a clean Dockerfile is present, the scan
+// passes (no violation). Pinned alongside the HappyPath case so the
+// flag-and-Dockerfile happy branch is also covered.
+func TestScanForStatefulShape_DockerfileFlagWithCleanDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+		{Name: "myproject/index.js"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM node:22-slim\nWORKDIR /app\nCOPY index.js .\n"),
+		"myproject/index.js":   []byte("exports.handler = () => 1;\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
 	if prob := scanForStatefulShape(path, true); prob != nil {
-		t.Fatalf("clean deploy rejected (dockerfile=true): code=%s detail=%s", prob.Code, prob.Detail)
+		t.Fatalf("clean Dockerfile+flag deploy rejected: code=%s detail=%s", prob.Code, prob.Detail)
 	}
 }
 

@@ -662,6 +662,12 @@ func ErrStatelessOnlyViolation(kind, detail string) *Problem {
 		fmt.Sprintf("%s: %s — this platform is stateless in year one; "+
 			"use a managed service (S3/R2/Neon/Upstash/MongoDB Atlas).",
 			kind, detail)).
+		// docs.DOMAIN is the placeholder convention used by every
+		// WithDocs() in this file — the placeholder resolves to the
+		// real domain when the docs site ships. The actual /storage page
+		// is added by PR-B (Wave 0, faas init + reference templates).
+		// Until PR-B ships, the 404 is consistent with every other
+		// placeholder URL in the file.
 		WithDocs("https://docs.DOMAIN/storage")
 }
 

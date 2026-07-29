@@ -342,6 +342,18 @@ func escapesArchiveRoot(p string) bool {
 	return false
 }
 
+// statefulTopLevelDirs is the set of top-level directory names that
+// flag the deploy as stateful. Empty directories are fine — the tar
+// entry exists either way, so a zero-byte `data/` is caught the same
+// as a populated one. Both names are the canonical "I'm trying to
+// persist" signal that bypasses Dockerfile detection entirely.
+var statefulTopLevelDirs = map[string]string{} //nolint:gochecknoglobals // constant lookup table
+
+func init() {
+	statefulTopLevelDirs["data"] = "top-level data/ directory — this platform is stateless"
+	statefulTopLevelDirs["db"] = "top-level db/ directory — this platform is stateless"
+}
+
 // scanForStatefulShape is the Wave 0 stateless-only accept-time check.
 // Reads the spooled tarball once and rejects with CodeStatelessOnlyViolation
 // when the deploy shape is a persistent one. Three checks, all in one pass:
@@ -352,6 +364,9 @@ func escapesArchiveRoot(p string) bool {
 //     of the Dockerfile so a multi-MB heredoc can't pin apid.
 //  2. Reject a top-level data/ or db/ directory — the canonical
 //     "this is a database" signal that bypasses Dockerfile detection.
+//     Short-circuits the scan: as soon as the offending entry is
+//     observed, the loop returns without reading the rest of the
+//     tarball (customer pays for one entry, not the whole archive).
 //  3. The base-image deny-list runs in pkg/imaged, not here — apid only
 //     sees a tarball or an image: ref; the image: branch is enforced
 //     where the image is pulled (pkg/imaged/handler.go buildImageLayer).
@@ -371,7 +386,6 @@ func scanForStatefulShape(path string, dockerfileFlag bool) *api.Problem {
 	tr := tar.NewReader(gz)
 
 	var dockerfileBytes []byte
-	topLevelDirs := make(map[string]struct{})
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -380,14 +394,17 @@ func scanForStatefulShape(path string, dockerfileFlag bool) *api.Problem {
 		if err != nil {
 			return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid, "Bad tar", err.Error())
 		}
-		// Capture top-level directory name once. tar paths are
-		// `<root>/<sub>/<file>`; the first segment is the archive
-		// root (already enforced single-root by validateTarballShape)
-		// so the second segment names the customer's top-level dir.
-		// We collect anything that isn't a Dockerfile itself.
+		// tar paths are `<root>/<sub>/<file>`; the first segment is the
+		// archive root (already enforced single-root by
+		// validateTarballShape) so the second segment names the
+		// customer's top-level dir.
 		parts := strings.SplitN(hdr.Name, "/", 3)
 		if len(parts) >= 2 {
-			topLevelDirs[parts[1]] = struct{}{}
+			if reason, denied := statefulTopLevelDirs[parts[1]]; denied {
+				// Short-circuit: we don't need to read the rest of
+				// the tarball now that we've found the violation.
+				return api.ErrStatelessOnlyViolation("tarball", reason)
+			}
 		}
 		// Only read the Dockerfile at the archive root. We do this
 		// lazily — dockerfileMaxBytes caps the read so a hostile
@@ -398,26 +415,17 @@ func scanForStatefulShape(path string, dockerfileFlag bool) *api.Problem {
 		}
 	}
 
-	// Check 2: top-level data/ or db/ directory. Both are the
-	// canonical "I'm trying to persist" signal. Empty dirs are fine
-	// (the tar entry exists either way).
-	if _, ok := topLevelDirs["data"]; ok {
-		return api.ErrStatelessOnlyViolation("tarball", "top-level data/ directory — this platform is stateless")
+	// Check 1: Dockerfile scan. If dockerfile=true but no Dockerfile
+	// was found in the archive root, fail fast at accept time rather
+	// than punting to a build-time failure — the customer asked for a
+	// Dockerfile deploy and we shouldn't have to start a build slot to
+	// tell them they forgot to include one.
+	if dockerfileFlag && len(dockerfileBytes) == 0 {
+		return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid,
+			"Dockerfile missing",
+			"`dockerfile=true` was set but no Dockerfile was found at the archive root")
 	}
-	if _, ok := topLevelDirs["db"]; ok {
-		return api.ErrStatelessOnlyViolation("tarball", "top-level db/ directory — this platform is stateless")
-	}
-
-	// Check 1: Dockerfile scan. If the customer marked dockerfile=true
-	// but no Dockerfile was found, builderd will fail downstream; we
-	// don't pre-empt that here. If we found a Dockerfile, scan it.
-	if len(dockerfileBytes) > 0 || dockerfileFlag {
-		if len(dockerfileBytes) == 0 {
-			// dockerfile=true but no Dockerfile in the archive root —
-			// not our problem to flag (CodeSourceInvalid will catch it
-			// at build time via Railpack); just skip the scan.
-			return nil
-		}
+	if len(dockerfileBytes) > 0 {
 		if reason := scanDockerfileForStatefulShape(dockerfileBytes); reason != "" {
 			return api.ErrStatelessOnlyViolation("dockerfile", reason)
 		}
