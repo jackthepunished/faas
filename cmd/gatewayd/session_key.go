@@ -41,8 +41,17 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) *session.M
 		return m
 	}
 	key, err := hex.DecodeString(raw)
-	if err != nil || len(key) != 32 {
-		log.Error("FAAS_SESSION_KEY must be 64 hex chars (32 bytes)", "got_len", len(raw))
+	if err != nil {
+		// Not hex (or odd length). Distinct from a wrong-byte-length
+		// failure so the operator can tell from the log line which
+		// axis is broken — the bootstrap.sh script emits the canonical
+		// 64-hex string, but a hand-edited secrets file could easily
+		// truncate or paste non-hex bytes.
+		log.Error("FAAS_SESSION_KEY is not valid hex", "got_len", len(raw), "err", err)
+		return nil
+	}
+	if len(key) != 32 {
+		log.Error("FAAS_SESSION_KEY has wrong byte length", "got_bytes", len(key), "want_bytes", 32)
 		return nil
 	}
 	m, err := session.NewManager(key, 7*24*time.Hour)

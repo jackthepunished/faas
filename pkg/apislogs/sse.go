@@ -69,6 +69,16 @@ func RenderAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f scheddgrpc
 // ...) when the app is parked, and that error has no
 // *api.Problem payload. Inspecting codes.NotFound directly is
 // the load-bearing branch.
+//
+// Wire shape: the `data:` line is SSE text, NOT JSON. The error
+// string is embedded with `%q` (Go-string escaping) so embedded
+// quotes / backslashes / control bytes are safe to round-trip
+// through the SSE stream — but the resulting line is NOT valid
+// JSON, and a future consumer that parses the data: line as JSON
+// will see `"error":"...\\n..."` style escapes. The SDK decoder
+// matches on the SSE event name + the literal `"code":"not_found"`
+// substring, so the escaping is benign there. New helpers that
+// emit structured data should use json.Marshal instead.
 func RenderAppLogsError(w http.ResponseWriter, flusher http.Flusher, err error) {
 	if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
 		// Already past StartSSE — write the degraded event
@@ -184,6 +194,15 @@ func ParseInt64Query(r *http.Request, name string, def int64) int64 {
 // cheapest check; the SDK reads the full line anyway. Exposed
 // here so the apid tail (PR-A) and the gatewayd handler (PR-2)
 // agree on which event names end the stream.
+//
+// Post-condition: every terminal frame in the wire shape is
+// followed by an `event: end` sentinel (renderAppLogsError,
+// WriteInvalidLevelError, WriteInvalidGrepError all emit end
+// after their terminal frame). The SDK decoder matches on the
+// event name; the post-condition is what guarantees a
+// structured-frame loop exits after exactly one terminal frame
+// rather than spinning through a residual "degraded" + "end"
+// pair twice.
 func IsTerminalFrame(event string) bool {
 	switch event {
 	case "end", "error", "degraded":

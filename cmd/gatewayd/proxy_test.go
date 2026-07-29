@@ -579,6 +579,56 @@ func TestApidProxy_LogsCarveOutToHandler(t *testing.T) {
 	}
 }
 
+// TestApidProxy_LogsCarveOutMethodFilter pins the method-filter
+// contract: isApidLogsPath matches on path only (no method check),
+// so a POST to /v1/apps/{slug}/logs also dispatches through the
+// carve-out to the logsHandler. The logsHandler in production is a
+// *http.ServeMux that registered the route with
+// `mux.Handle("GET /v1/apps/{slug}/logs", ...)` — the mux's
+// method-aware dispatcher returns 405 Method Not Allowed for the
+// POST. This test mirrors that shape so a future regression that
+// filters methods in the proxy (or drops the GET filter on the
+// mux registration) is loud.
+//
+// Failure mode: a future refactor that adds a method filter to
+// the carve-out would dispatch POST /v1/apps/{slug}/logs to apid
+// (where the route is gone) and the customer would see a 404
+// instead of the 405 the SDK treats as "method not allowed".
+func TestApidProxy_LogsCarveOutMethodFilter(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHits++
+	}))
+	t.Cleanup(upstream.Close)
+
+	// Production-shape logs handler: a tiny ServeMux with a
+	// GET-only registration. The mux returns 405 for non-GET
+	// requests (stdlib contract), which is the contract we pin.
+	logsMux := http.NewServeMux()
+	logsMux.HandleFunc("GET /v1/apps/{slug}/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("logs: streamed"))
+	})
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newApidProxyWithLogs(upstream.URL,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("next handler invoked; should have been proxied to logs handler")
+		}),
+		logsMux, log)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/apps/foo/logs", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /v1/apps/foo/logs code = %d, want 405 (mux GET filter)", rec.Code)
+	}
+	if upstreamHits != 0 {
+		t.Errorf("upstream hits = %d, want 0 (carve-out must dispatch before apid)", upstreamHits)
+	}
+}
+
 // TestApidProxy_LogsCarveOutDisabledWhenHandlerNil pins the
 // disabled case: when logsHandler is nil, the carve-out is
 // silently skipped and the path flows through to apid like

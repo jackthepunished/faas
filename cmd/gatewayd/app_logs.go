@@ -33,10 +33,12 @@ import (
 
 // logStreamer is the minimal surface the AppLogsHandler needs
 // from the schedd client. *scheddgrpc.Client satisfies it; the
-// whitebox tests inject a stub. Keeping the interface here
-// (rather than reaching for *scheddgrpc.Client directly) lets the
-// test surface stay in `package main` without an additional fake
-// gRPC dial — see cmd/gatewayd/app_logs_test.go.
+// whitebox tests inject a controllable stub that satisfies the
+// interface without standing up a real gRPC dial — that's the
+// point of the interface. Reusing *scheddgrpc.Client directly
+// would force every test through `//go:build metal` and a fake
+// gRPC server, neither of which fits the unit-test loop. See
+// cmd/gatewayd/app_logs_test.go::controllableScheddClient.
 type logStreamer interface {
 	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (scheddgrpc.LogStream, error)
 }
