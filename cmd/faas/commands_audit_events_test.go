@@ -90,7 +90,7 @@ func TestCmdAuditEvents_Verbose_ExpandedColumns(t *testing.T) {
 		"i-abc123", // instance
 		"4",        // count
 		"/data/foo,/data/bar",
-		"4242", // sample pid
+		"4242",       // sample pid
 		"2026-07-28", // last_ts formatted
 	} {
 		if !strings.Contains(out, want) {
