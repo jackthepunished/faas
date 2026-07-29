@@ -117,7 +117,7 @@ jobs:
           set -euo pipefail
 
           FAAS_SERVICES="apid schedd gatewayd imaged meterd githubd"
-          BINARIES="apid schedd gatewayd imaged meterd githubd faas migrate"
+          BINARIES="apid schedd gatewayd imaged meterd githubd gregale migrate"
           # Deliberately NOT under /opt/faas/bin: this dir survives a failed
           # deploy (so the previous build stays inspectable) and nothing that
           # globs the binary directory should ever see it.
