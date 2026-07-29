@@ -56,16 +56,33 @@ import (
 // httputil.ReverseProxy per request — the stdlib proxy keeps no
 // per-request state worth reusing, and rebuilding avoids any chance
 // of a stale Director closure.
+//
+// logsHandler is the issue #254 / Move 4 PR-2 carve-out handler
+// (cmd/gatewayd/app_logs.go). When set, requests matching
+// isApidLogsPath route to logsHandler instead of the apid
+// loopback. nil-safe — tests omit it and the carve-out is silently
+// disabled.
 type apidProxy struct {
-	target *url.URL
-	next   http.Handler
-	log    *slog.Logger
+	target      *url.URL
+	next        http.Handler
+	logsHandler http.Handler
+	log         *slog.Logger
 }
 
 // newApidProxy parses target and returns the wrapping handler.
 // If target is empty or unparseable, the wrapper is disabled and
 // every request falls through to next — useful for unit tests.
 func newApidProxy(target string, next http.Handler, log *slog.Logger) http.Handler {
+	return newApidProxyWithLogs(target, next, nil, log)
+}
+
+// newApidProxyWithLogs is the same constructor with the
+// Move 4 PR-2 carve-out: requests matching isApidLogsPath route
+// to logsHandler before falling through to the apidProxy's
+// normal next behaviour. Production wires this with the
+// AppLogsHandler; unit tests omit it (logsHandler=nil) and
+// the carve-out is benign.
+func newApidProxyWithLogs(target string, next http.Handler, logsHandler http.Handler, log *slog.Logger) http.Handler {
 	if target == "" || log == nil {
 		return next
 	}
@@ -75,18 +92,75 @@ func newApidProxy(target string, next http.Handler, log *slog.Logger) http.Handl
 		return next
 	}
 	log.Info("apid proxy armed", "target", u.String())
-	return &apidProxy{target: u, next: next, log: log}
+	return &apidProxy{target: u, next: next, logsHandler: logsHandler, log: log}
 }
 
 // ServeHTTP routes isApidPath requests to apid. The rest falls
 // through to next (gateway.Handler's normal wake/rate-limit/proxy
 // flow).
+//
+// Carve-out (issue #254 / Move 4 PR-2): requests to
+// `/v1/apps/{slug}/logs` are owned by cmd/gatewayd's
+// AppLogsHandler — the customer-facing log stream runs through
+// the gatewayd → schedd dial so the route table stays out of
+// apid. The match is run before isApidPath so the loopback
+// proxy never sees the path. The pattern is matched by
+// isApidLogsPath (hand-rolled, not regexp — per-request regex
+// is expensive).
 func (a *apidProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isApidLogsPath(r.URL.Path) && a.logsHandler != nil {
+		a.logsHandler.ServeHTTP(w, r)
+		return
+	}
 	if isApidPath(r.URL.Path) {
 		a.proxyToApid(w, r)
 		return
 	}
 	a.next.ServeHTTP(w, r)
+}
+
+// isApidLogsPath matches the `GET /v1/apps/{slug}/logs` family
+// that the AppLogsHandler claims. Anchored at `/v1/apps/` so
+// bare `/v1/apps/logs` (no slug) does NOT match — that's a
+// 404 on the apid mux. We deliberately do NOT use regexp:
+// per-request regex compilation is expensive, and the pattern
+// is small enough to hand-roll.
+//
+// Match set:
+//
+//	/v1/apps/{slug}/logs         ✓
+//	/v1/apps/{slug}/logs/        ✓  (root, trailing slash)
+//	/v1/apps/{slug}/logs?follow=1  ✓  (queries don't appear in r.URL.Path)
+//	/v1/apps/{slug}/logs/{anything}  ✗  (no nested routes today)
+//	/v1/apps/{slug}/logsbar      ✗  (anchor regression)
+//	/v1/apps//logs               ✗  (empty slug)
+//	/v1/apps/{slug}              ✗  (no /logs suffix)
+//	/v1/apps                     ✗  (no slug)
+//	/v1                          ✗  (no /apps)
+//	/v1.zip                      ✗  (anchor regression, review finding #6)
+//
+// The matcher is also the predicate the AppLogsHandler tests
+// pin (cmd/gatewayd/proxy_test.go::TestIsApidLogsPath) so any
+// future change to the route shape is loud.
+func isApidLogsPath(p string) bool {
+	const prefix = "/v1/apps/"
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	rest := p[len(prefix):]
+	if rest == "" {
+		return false
+	}
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
+		return false
+	}
+	slug := rest[:i]
+	if slug == "" {
+		return false
+	}
+	tail := rest[i:]
+	return tail == "/logs" || strings.HasPrefix(tail, "/logs/")
 }
 
 // hasApidPrefix reports whether p begins with prefix anchored at

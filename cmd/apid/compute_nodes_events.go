@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apislogs"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -50,7 +51,7 @@ func (s *server) computeNodeEventsHandler(w http.ResponseWriter, r *http.Request
 		defer s.ops.SSEClients().Dec()
 	}
 
-	startSSE(w)
+	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
 
 	ch, cancel, err := s.notif.Subscribe(r.Context(), []string{db.NotifyComputeNodeChanged})

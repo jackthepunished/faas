@@ -485,3 +485,180 @@ func TestApidProxy_DoesNotSetXForwardedForWhenNoRemoteAddr(t *testing.T) {
 		t.Errorf("upstream saw X-Forwarded-For %d times, want 0", seenHeaderCount)
 	}
 }
+
+// TestIsApidLogsPath pins the AppLogsHandler carve-out matcher
+// (issue #254 / Move 4 PR-2). The handler claims the
+// `/v1/apps/{slug}/logs` family; the apidProxy short-circuits
+// these requests to it before the loopback hop. Anchor
+// discipline: a bare `/v1/apps/{slug}/logsbar` MUST NOT match
+// (review finding #6 from the proxy_test.go history).
+func TestIsApidLogsPath(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// Happy paths.
+		{"/v1/apps/foo/logs", true},
+		{"/v1/apps/foo/logs/", true},
+		// Query stripping happens at r.URL.Path — the matcher
+		// never sees `?follow=1`. Pin that the matcher is just
+		// on the path component.
+		// Shadowing regressions.
+		{"/v1/apps/foo/logsbar", false},
+		{"/v1/apps//logs", false},
+		{"/v1/apps/foo", false},
+		{"/v1/apps", false},
+		{"/v1", false},
+		{"/v1.zip", false},
+		// Per-spec the matched route is GET-only; the path
+		// match shape is method-agnostic, so the apidProxy's
+		// GET filter is a separate concern (the
+		// `mux.Handle("GET /v1/apps/{slug}/logs", ...)` line
+		// in main.go enforces that).
+		{"/dashboard/foo/logs", false},
+		{"", false},
+		{"/", false},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			if got := isApidLogsPath(c.path); got != c.want {
+				t.Errorf("isApidLogsPath(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
+	}
+}
+
+// TestApidProxy_LogsCarveOutToHandler pins the wiring: when
+// isApidLogsPath matches AND logsHandler is wired, the proxy
+// dispatches to logsHandler and does NOT touch the apid
+// upstream. When logsHandler is nil, the carve-out is silently
+// disabled (the path falls through to apid like every other
+// /v1/* path).
+func TestApidProxy_LogsCarveOutToHandler(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("apid: ok"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	var logsHits int
+	logsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logsHits++
+		if r.URL.Path != "/v1/apps/foo/logs" {
+			t.Errorf("logsHandler saw path %q, want /v1/apps/foo/logs", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("logs: streamed"))
+	})
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newApidProxyWithLogs(upstream.URL,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("next handler invoked; should have been proxied")
+		}),
+		logsHandler, log)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/apps/foo/logs", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if logsHits != 1 {
+		t.Errorf("logsHandler hits = %d, want 1", logsHits)
+	}
+	if upstreamHits != 0 {
+		t.Errorf("upstream hits = %d, want 0 (logs path must not proxy to apid)", upstreamHits)
+	}
+	if !strings.Contains(rec.Body.String(), "logs: streamed") {
+		t.Errorf("body = %q, want the logs handler envelope", rec.Body.String())
+	}
+}
+
+// TestApidProxy_LogsCarveOutMethodFilter pins the method-filter
+// contract: isApidLogsPath matches on path only (no method check),
+// so a POST to /v1/apps/{slug}/logs also dispatches through the
+// carve-out to the logsHandler. The logsHandler in production is a
+// *http.ServeMux that registered the route with
+// `mux.Handle("GET /v1/apps/{slug}/logs", ...)` — the mux's
+// method-aware dispatcher returns 405 Method Not Allowed for the
+// POST. This test mirrors that shape so a future regression that
+// filters methods in the proxy (or drops the GET filter on the
+// mux registration) is loud.
+//
+// Failure mode: a future refactor that adds a method filter to
+// the carve-out would dispatch POST /v1/apps/{slug}/logs to apid
+// (where the route is gone) and the customer would see a 404
+// instead of the 405 the SDK treats as "method not allowed".
+func TestApidProxy_LogsCarveOutMethodFilter(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHits++
+	}))
+	t.Cleanup(upstream.Close)
+
+	// Production-shape logs handler: a tiny ServeMux with a
+	// GET-only registration. The mux returns 405 for non-GET
+	// requests (stdlib contract), which is the contract we pin.
+	logsMux := http.NewServeMux()
+	logsMux.HandleFunc("GET /v1/apps/{slug}/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("logs: streamed"))
+	})
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newApidProxyWithLogs(upstream.URL,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("next handler invoked; should have been proxied to logs handler")
+		}),
+		logsMux, log)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/apps/foo/logs", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /v1/apps/foo/logs code = %d, want 405 (mux GET filter)", rec.Code)
+	}
+	if upstreamHits != 0 {
+		t.Errorf("upstream hits = %d, want 0 (carve-out must dispatch before apid)", upstreamHits)
+	}
+}
+
+// TestApidProxy_LogsCarveOutDisabledWhenHandlerNil pins the
+// disabled case: when logsHandler is nil, the carve-out is
+// silently skipped and the path flows through to apid like
+// every other /v1/* path. This is the test-suite default — the
+// production gatewayd wires the handler; tests don't.
+func TestApidProxy_LogsCarveOutDisabledWhenHandlerNil(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("apid: ok"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newApidProxyWithLogs(upstream.URL,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("next handler invoked; should have been proxied")
+		}),
+		nil, log)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/apps/foo/logs", nil)
+	handler.ServeHTTP(rec, req)
+
+	if upstreamHits != 1 {
+		t.Errorf("upstream hits = %d, want 1 (logs path falls through to apid when handler is nil)", upstreamHits)
+	}
+	if !strings.Contains(rec.Body.String(), "apid: ok") {
+		t.Errorf("body = %q, want the apid upstream envelope", rec.Body.String())
+	}
+}

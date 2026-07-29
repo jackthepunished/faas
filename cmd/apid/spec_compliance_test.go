@@ -311,9 +311,28 @@ func recordMedia(status string, content map[string]any, into map[string]map[stri
 func testRoutesParity(t *testing.T, root string, spec *specDoc) {
 	t.Helper()
 
-	codeRoutes, err := scanServerRoutes(filepath.Join(root, "cmd/apid", serverSrcPath))
-	if err != nil {
-		t.Fatalf("scan server.go: %v", err)
+	// `serverSrcPath` is the canonical apid route table. After
+	// issue #254 / Move 4 PR-2 (gatewayd AppLogsHandler) the
+	// `GET /v1/apps/{slug}/logs` route is owned by cmd/gatewayd
+	// (ADR-043: gatewayd is the only public listener and already
+	// imports pkg/scheddgrpc). The scanner therefore walks both
+	// daemons' route tables — apid's server.go plus the gatewayd
+	// files that mount a `mux.Handle` for customer-facing routes.
+	// The gatewayd AppLogsHandler dispatch is wired via
+	// `mux.Handle("GET /v1/apps/{slug}/logs", ...)` in
+	// cmd/gatewayd/main.go; the applogs route is the only route
+	// the two daemons share today.
+	sources := []string{
+		filepath.Join(root, "cmd/apid", serverSrcPath),
+		filepath.Join(root, "cmd/gatewayd", "main.go"),
+	}
+	var codeRoutes []string
+	for _, p := range sources {
+		rs, err := scanServerRoutes(p)
+		if err != nil {
+			t.Fatalf("scan %s: %v", p, err)
+		}
+		codeRoutes = append(codeRoutes, rs...)
 	}
 	// Apply exclude list.
 	var kept []string

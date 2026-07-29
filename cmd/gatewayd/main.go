@@ -35,10 +35,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/audit"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
+	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -171,6 +175,36 @@ type runDeps struct {
 	// emitter. nil in tests (the githubdProxy then skips the
 	// replay check).
 	pgStore *state.PgStore
+	// authMw is the pkg/auth.Middleware that powers the AppLogsHandler
+	// (issue #254 / Move 4 PR-2). It hosts the bearer / session / MFA
+	// / scope checks + the IDOR-safe LoadApp + the shared per-IP
+	// AuthLimit bucket. nil in tests → the AppLogsHandler is constructed
+	// in non-auth mode (the whitebox tests in cmd/gatewayd/app_logs_test.go
+	// drive `serveAppLogs` directly with a stub stream and bypass the
+	// chain). ADR-046.
+	authMw *authmw.Middleware
+	// apiAuthLimiter is the shared per-IP bucket that backs
+	// `authMw.RequireLimited`. cmd/apid carries its own instance of
+	// the same bucket so the spec §11 10/min/IP rule is per-process
+	// (the gatewayd-edge counter is the load-bearing one for
+	// internet-facing traffic; apid's bucket is the loopback-only
+	// counter for management plane traffic). nil in tests.
+	apiAuthLimiter *middleware.Limiter
+	// sessions is the *session.Manager that issues + verifies the
+	// session cookie. cmd/apid shares the same construct; the two
+	// daemons are independent processes so the AEAD keys are loaded
+	// separately per daemon. nil in tests.
+	sessions *session.Manager
+	// audit is the *pkg/audit.Auditor that emits the auth.mfa_gate_hit
+	// / auth.session.stolen rows. nil in tests.
+	audit *audit.Auditor
+	// scheddClient is the gRPC stream client AppLogsHandler dials
+	// (issue #254 / Move 4 PR-2). The same client is used by
+	// gateway.Backend for the wake RPC, so the dial is shared —
+	// a second client would burn an extra conn to /run/faas/schedd.sock.
+	// nil in tests (the AppLogsHandler constructor guards + the
+	// carve-out is silently disabled).
+	scheddClient *scheddgrpc.Client
 }
 
 func defaultDeps() runDeps {
@@ -353,6 +387,34 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	deps.pgStore = pgStore
+	// Issue #254 / Move 4 PR-2: pkg/auth.Middleware construction.
+	// AppLogsHandler (cmd/gatewayd/app_logs.go) shares the auth chain
+	// with cmd/apid via ADR-046 — same bearer / session / MFA / scope
+	// / IDOR-safe LoadApp, same per-IP AuthLimit bucket family. The
+	// session manager is loaded from FAAS_SESSION_KEY (see
+	// session_key.go); the auditor is the same pkg/audit.Auditor
+	// gatewayd already uses for githubd replay-dedupe audit rows
+	// (cmd/gatewayd/auditor.go). nil-safe when the env is unset so
+	// the e2e harness + these dev-mode paths still boot.
+	sessions := loadSessionManager(osGetenv, log)
+	if sessions == nil {
+		return fmt.Errorf("gatewayd: session manager init failed")
+	}
+	deps.sessions = sessions
+	deps.apiAuthLimiter = middleware.NewLimiter(middleware.AuthLimitConfig{Log: log})
+	deps.audit = audit.New(pgStore, log, nil, "gatewayd")
+	deps.authMw = authmw.New(
+		storeAsAuthenticator(pgStore),
+		sessions,
+		storeAsSessionLookup(pgStore),
+		auditorAsAuthAuditor(deps.audit),
+		log,
+		deps.apiAuthLimiter,
+	)
+	// The scheddClient reference is needed by AppLogsHandler (PR-2).
+	// It outlives `run` because we want the AppLogsHandler to keep a
+	// pointer to the same client; defers Close.
+	deps.scheddClient = sched
 	return runWithDeps(ctx, log, deps)
 }
 
@@ -450,7 +512,41 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if apidTarget == "" {
 		apidTarget = "http://127.0.0.1:8081"
 	}
-	apidHandler := newApidProxy(apidTarget, handler, log)
+	// Issue #254 / Move 4 PR-2: the AppLogsHandler claims the
+	// customer-facing `GET /v1/apps/{slug}/logs` route. gatewayd
+	// already imports pkg/scheddgrpc (ADR-018) so the schedd dial
+	// stays in one daemon (depguard apid-control-plane-only blocks
+	// cmd/apid from importing pkg/scheddgrpc). The auth chain
+	// (bearer / session / MFA / scope / IDOR-safe LoadApp) is
+	// shared with cmd/apid via pkg/auth.Middleware (ADR-046), so
+	// the spec §11 10/min/IP rule covers both gateways.
+	//
+	// The handler is mounted on a tiny *http.ServeMux so the
+	// `{slug}` path parameter binds (the AppLogsHandler reads
+	// r.PathValue("slug")). The mux is wrapped by the apidProxy
+	// carve-out (cmd/gatewayd/proxy.go::isApidLogsPath) so the
+	// public listener dispatches the path straight to the handler
+	// without consulting pkg/gateway.Handler's wake/proxy logic
+	// (the route is hostname-agnostic — it owns /v1/apps/{slug}/logs
+	// regardless of the Host header).
+	//
+	// The handler is wired only when deps.authMw is non-nil — tests
+	// default deps.authMw to nil and the carve-out is silently
+	// disabled (the path falls through to apid, matching the
+	// pre-PR-2 behaviour).
+	var logsHandler http.Handler
+	if deps.authMw != nil && deps.pgStore != nil && deps.scheddClient != nil {
+		logsMux := http.NewServeMux()
+		logsMux.Handle("GET /v1/apps/{slug}/logs", &AppLogsHandler{
+			Auth:   deps.authMw,
+			Schedd: deps.scheddClient,
+			Store:  deps.pgStore,
+			Log:    log,
+			Ops:    nil,
+		})
+		logsHandler = logsMux
+	}
+	apidHandler := newApidProxyWithLogs(apidTarget, handler, logsHandler, log)
 
 	// Slice 7: githubd webhook HMAC-verify at the edge, then proxy
 	// to githubd's loopback listener (ADR-012, §11 single-public-

@@ -1227,7 +1227,7 @@ func cmdLogs(args []string) int {
 			// side). Move 3's `not_implemented` shape is dead code;
 			// removed.
 			if e.Event == "degraded" {
-				fmt.Fprintln(os.Stderr, "schedd StreamAppLogs gRPC pending — production wiring")
+				fmt.Fprintln(os.Stderr, "Log stream degraded: the scheduler is temporarily unavailable")
 				return 0
 			}
 			if e.Event == "end" {

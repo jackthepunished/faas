@@ -17,17 +17,16 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apislogs"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
-	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
-	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // --- apps CRUD --------------------------------------------------------------
@@ -1841,7 +1840,7 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 	}
 	follow := r.URL.Query().Get("follow") != "0"
 
-	startSSE(w)
+	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
 
 	// Walk backwards: the table returns DESC by seq, the SSE stream
@@ -1957,284 +1956,6 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 	if flusher != nil {
 		flusher.Flush()
 	}
-}
-
-// streamAppLogs streams the running instance's stdout/stderr ring buffer
-// (issue #254 / Move 4). The producer half is the schedd-side
-// StreamAppLogs RPC (pkg/scheddgrpc.Server.StreamAppLogs); this
-// handler is a thin SSE wrapper that:
-//
-//  1. Validates the app + auth (loadApp).
-//  2. Confirms the app has at least one live instance (404 otherwise).
-//  3. Validates the issue #309 filter params (--level, --grep, --since)
-//     against the per-instance ring's contract.
-//  4. Parses the `since_seq` query cursor (default 0 = tail from now).
-//  5. Opens the per-app log stream against the schedd, rendering each
-//     frame as `event: log\ndata: {…}\n\n` until the context cancels
-//     or the schedd reports the stream ended (clean park → `event:
-//     end`). Heartbeats every 15 s ("event: ping"), backstop at 10 min.
-//
-// Wire status:
-//   - 404 NotFound when the app is parked (no live instances)
-//   - 200 text/event-stream while the stream is alive
-//   - the SSE frames carry a degraded event on a partial failure
-//
-// Additive per ADR-016: the {seq, instance, stream, line, written_at}
-// payload adds an `instance` field to the deployment-log frame; old
-// SDKs ignore unknown fields.
-func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
-	if !ok {
-		return
-	}
-	if _, err := s.store.ListInstancesForApp(ctx(r), app.ID); err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
-			"No running instance", "the app is parked; wake it first"))
-		return
-	}
-	q := r.URL.Query()
-	// --level: enum match against api.IsValidLogLevel so the CLI and
-	// the server share the same source of truth. A bad value emits an
-	// `event: error` SSE frame + terminal `end` so programmatic SDK
-	// callers get a structured error path; the CLI validates the same
-	// enum client-side so a typo costs no round-trip.
-	if level := q.Get("level"); level != "" && !api.IsValidLogLevel(level) {
-		startSSE(w)
-		flusher, _ := w.(http.Flusher)
-		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_level\",\"message\":\"level must be one of: info, warn, error\"}\n\n")
-		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
-	// --grep: reject embedded newlines so Move 4's substring matcher
-	// can never match across log line boundaries (same log-injection
-	// precedent as `CodeQL go/log-injection sanitisers`).
-	if grep := q.Get("grep"); strings.ContainsAny(grep, "\n\r") {
-		startSSE(w)
-		flusher, _ := w.(http.Flusher)
-		_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_grep\",\"message\":\"grep must not contain newline or carriage return\"}\n\n")
-		_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
-	sinceSeq := parseInt64Query(r, "since_seq", 0)
-	startSSE(w)
-	flusher, _ := w.(http.Flusher)
-	s.serveAppLogs(ctx(r), w, flusher, app.ID, sinceSeq)
-}
-
-// serveAppLogs is the extracted post-loadApp body of streamAppLogs.
-// Keeping the seam under the handler-limit line lets the test
-// suite wire a stub schedd without standing up the full handler
-// chain (cmd/apid/handlers_ext.go).
-//
-// Issue #254 / Move 4: the receive pump runs in a dedicated
-// goroutine so ctx cancel, the heartbeat, and the backstop all
-// fire while the upstream stream is idle. The previous
-// select-with-default loop only checked timers between frames; on
-// a quiet but open stream, stream.Recv() blocks indefinitely and
-// the SSE looks hung to htmx-ext-sse's auto-reconnect logic.
-// PR-B's production wiring makes that pattern reachable, so the
-// pump is fixed here in PR-A.
-// recvResult carries one upstream delivery on the receive channel
-// from serveAppLogs's receive goroutine (below). Exactly one of
-// frame or err is meaningful per result. The receive goroutine
-// closes the channel on its way out so the handler can treat a
-// missing result as a clean EOF and emit the terminal `event: end
-// {}` sentinel.
-type recvResult struct {
-	frame schedLogFrame
-	err   error
-}
-
-func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64) {
-	stream, err := s.schedd.StreamAppLogs(ctx_, appID, sinceSeq)
-	if err != nil {
-		// codes.Unimplemented from the stub → "schedd not wired
-		// (dev mode)"; codes.NotFound from a real schedd → "no
-		// live instances". Both render as RFC 7807 problems so the
-		// SDK surfaces a stable Error code (pkg/api/decoders).
-		s.renderAppLogsError(w, flusher, err)
-		return
-	}
-	// Per-server durations: 15s heartbeat / 10m backstop in
-	// production, configurable per-server for whitebox tests
-	// (cmd/apid/server.go:appLogsHeartbeat/appLogsBackstop).
-	heartbeat := s.appLogsHeartbeat
-	if heartbeat <= 0 {
-		heartbeat = 15 * time.Second
-	}
-	backstop := s.appLogsBackstop
-	if backstop <= 0 {
-		backstop = 10 * time.Minute
-	}
-	// Derive a cancellable context so the receive goroutine exits
-	// the moment the handler goroutine returns (ctx cancel,
-	// terminal frame, or backstop).
-	streamCtx, cancelStream := context.WithCancel(ctx_)
-	defer cancelStream()
-
-	// Capacity 1 + non-blocking send keeps the receive goroutine
-	// from blocking when the SSE writer is slow; a dropped frame
-	// is no worse than a missed frame on a quiet stream because
-	// the heartbeat keeps the client alive.
-	recvCh := make(chan recvResult, 1)
-	go func() {
-		defer close(recvCh)
-		for {
-			f, err := stream.Recv()
-			select {
-			case <-streamCtx.Done():
-				return
-			default:
-			}
-			select {
-			case recvCh <- recvResult{frame: f, err: err}:
-			case <-streamCtx.Done():
-				return
-			default:
-				// Channel full — the SSE writer is behind.
-				// Drop rather than block; the heartbeat keeps
-				// the client alive, and the per-instance ring
-				// is the durable source of truth.
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	ticker := time.NewTicker(heartbeat)
-	defer ticker.Stop()
-	backstopTimer := time.NewTimer(backstop)
-	defer backstopTimer.Stop()
-	for {
-		select {
-		case <-ctx_.Done():
-			return
-		case <-backstopTimer.C:
-			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
-			if flusher != nil {
-				flusher.Flush()
-			}
-			return
-		case <-ticker.C:
-			_, _ = fmt.Fprint(w, ":\n\n")
-			if flusher != nil {
-				flusher.Flush()
-			}
-		case r, ok := <-recvCh:
-			if !ok {
-				// Receive goroutine exited without writing a
-				// terminal result — treat as a clean EOF so
-				// structured-frame consumers exit the loop.
-				_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
-				return
-			}
-			if r.err != nil {
-				// io.EOF = clean shutdown; everything else
-				// delegates to renderAppLogsError so the
-				// NotFound / Unavailable envelopes stay the
-				// source of truth (not open-coded here).
-				if errors.Is(r.err, io.EOF) {
-					_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
-					if flusher != nil {
-						flusher.Flush()
-					}
-					return
-				}
-				s.renderAppLogsError(w, flusher, r.err)
-				return
-			}
-			writeAppLogEvent(w, flusher, r.frame, appID, s.ops)
-		}
-	}
-}
-
-// writeAppLogEvent renders one StreamAppLogsResponse frame as
-// the SSE `event: log` envelope. The payload includes every
-// field Move 4 pinned (acceptance #5):
-//
-//	{seq, instance, stream, line, written_at}
-//
-// The appID argument is plumbed through so we can also
-// increment apid_logs_emitted_total{app=appID} per frame —
-// the §12 dashboard panel needs the per-app throughput rate.
-// nil-safe: a nil ops no-ops (per ObserveLogEmitted receiver
-// contract) so unit tests that don't wire metrics keep working.
-func writeAppLogEvent(w http.ResponseWriter, flusher http.Flusher, f schedLogFrame, appID string, ops *wire.OpsMetrics) {
-	payload, _ := json.Marshal(map[string]any{
-		"seq":        f.Seq,
-		"instance":   f.InstanceID,
-		"stream":     f.Stream,
-		"line":       f.Line,
-		"written_at": f.WrittenAt.UTC().Format(time.RFC3339Nano),
-	})
-	_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload)
-	if flusher != nil {
-		flusher.Flush()
-	}
-	ops.ObserveLogEmitted(appID)
-}
-
-// renderAppLogsError renders a schedd-side dial error as either
-// a 404 (no live instances) or a stream upgrade to a `degraded`
-// event (the stub returns Unimplemented; that should degrade
-// gracefully instead of 500-ing).
-func (s *server) renderAppLogsError(w http.ResponseWriter, flusher http.Flusher, err error) {
-	if p, ok := grpcerr.FromStatus(err); ok && p != nil && p.Status == http.StatusNotFound {
-		// Already past startSSE — write the degraded event
-		// instead of trying to overwrite the 200 (the
-		// consumer reads the SSE body, not the status).
-		_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q,\"code\":\"not_found\"}\n\n", err.Error())
-		_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"not_found\"}\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
-	_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q}\n\n", err.Error())
-	_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"schedd_unreachable\"}\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
-}
-
-// parseInt64Query parses an int64 query param with a default
-// value. Returns the default if the param is missing or unparseable.
-// Negative values are clamped to 0 — the schedd gRPC stream
-// lifts them to 0 anyway (defence in depth).
-func parseInt64Query(r *http.Request, name string, def int64) int64 {
-	v := r.URL.Query().Get(name)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return def
-	}
-	if n < 0 {
-		return 0
-	}
-	return n
-}
-
-// startSSE sets the SSE response headers and disables write timeouts for the
-// lifetime of the request.
-func startSSE(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	w.(http.Flusher).Flush()
 }
 
 // getBuildProvenance returns the ADR-038 provenance row for a build
