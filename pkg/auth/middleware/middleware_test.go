@@ -8,6 +8,7 @@
 package middleware_test
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
@@ -834,5 +835,189 @@ func TestClearSessionCookie_Attributes(t *testing.T) {
 	}
 	if c.MaxAge >= 0 {
 		t.Errorf("cookie MaxAge = %d, want < 0 (eviction)", c.MaxAge)
+	}
+}
+
+// --- log-injection sanitisation (CodeQL go/log-injection) ----------------
+//
+// The four sites below cover the CodeQL alerts (128-131) raised on
+// pkg/auth/middleware/middleware.go:471/583/594. The contract is
+// that any attacker-controllable value reaching a slog attribute is
+// passed through logsanitize.Field, which strips ASCII control
+// characters (preserving tab). Lock the behaviour with explicit
+// injection tests so a future refactor that drops the sanitiser
+// surfaces as a unit test failure rather than a re-opened alert.
+
+// captureLogger returns a slog.Logger that writes JSON to a buffer
+// the test can read back, so the assertions below can verify the
+// sanitised output literally. slog.Default is fine for production
+// wiring but its output goes to stderr; we need a deterministic
+// sink.
+//
+// The returned buffer is a safeBuffer (sync.Mutex-guarded io.Writer)
+// because some log sites fire from detached goroutines
+// (RequireSessionCookie's sessionDebounce touch). A plain
+// *bytes.Buffer trips -race when the test reads concurrent writes.
+func captureLogger() (*slog.Logger, *safeLogBuffer) {
+	buf := &safeLogBuffer{}
+	h := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return slog.New(h), buf
+}
+
+// safeLogBuffer is a minimal mutex-guarded io.Writer for slog's
+// JSONHandler. Inline here (rather than pulling pkg/e2etest) so
+// pkg/auth/middleware has no test-only deps. Used by
+// TestLog_*StripsControlChars to read the slog output without
+// racing the detached touch goroutine.
+type safeLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeLogBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// TestLog_SessionCrossCheckErrorStripsControlChars pins alert #128:
+// the cookie-branch "session cross-check error" warn line at
+// middleware.go:471 must strip CR/LF from r.URL.Path. The path is
+// attacker-controlled (the customer types it into the browser);
+// without the sanitiser, an injected newline would break the log
+// stream one-line-per-event invariant that every downstream
+// consumer relies on for tail/grep.
+//
+// Pre-fix replay (commit 61ecab45, before PR-1 logsanitize fix):
+//
+//	{"level":"WARN","msg":"session cross-check error",
+//	 "path":"/v1/apps\nforged-log-line","error":"session lookup: ..."}
+//
+// The trailing "\nforged-log-line" survives because the warn line
+// passed r.URL.Path straight into slog. The fix wraps r.URL.Path in
+// logsanitize.Field, which replaces control bytes with U+00B7:
+//
+//	{"level":"WARN","msg":"session cross-check error",
+//	 "path":"/v1/apps·forged-log-line","error":"session lookup: ..."}
+//
+// nonNotFoundErr is a synthetic error distinct from state.ErrNotFound
+// so the cookie-branch's `if cookieErr != nil { ... log ... }` path
+// fires. state.ErrNotFound returns handled=true,nil (no log); any
+// other error wraps and logs.
+type nonNotFoundErr struct{}
+
+func (nonNotFoundErr) Error() string { return "synthetic pg conn error" }
+
+func TestLog_SessionCrossCheckErrorStripsControlChars(t *testing.T) {
+	log, buf := captureLogger()
+	sess := &fakeSessions{env: session.Envelope{AccountID: "acct-1", Sid: "sid-1"}}
+	mw := newMW(t, newFakeAuthn(), sess, &fakeLookups{getErr: nonNotFoundErr{}}, nil)
+	mw.Log = log
+
+	w := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", nil, map[string]string{"faas_sid": "valid-cookie"})
+	// httptest.NewRequest rejects CR/LF in the request-target; inject
+	// the control char directly into URL.Path after construction so
+	// the cookie-branch warn line sees it as the attacker would.
+	r.URL.Path = "/v1/apps\nforged-log-line"
+	mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		t.Errorf("handler must not run when cross-check fails")
+	})(w, r)
+
+	out := buf.String()
+	if strings.Contains(out, "\nforged-log-line") {
+		t.Errorf("control char CR/LF from r.URL.Path leaked into log: %q", out)
+	}
+	if !strings.Contains(out, "forged-log-line") {
+		t.Errorf("sanitised log should still contain the printable payload: %q", out)
+	}
+	if !strings.Contains(out, `"path":"/v1/apps`) {
+		t.Errorf("path prefix should survive verbatim: %q", out)
+	}
+}
+
+// TestLog_SessionAccountMismatchStripsControlChars pins alerts #129
+// and #130 (both at middleware.go:583): the "session account
+// mismatch (AEAD bind broken?)" warn line. Both env.Sid AND
+// r.URL.Path must be sanitised — env.Sid is AEAD-bound today so the
+// attacker can't tamper with it directly, but CodeQL tracks the
+// raw Sid value through the verify→stolen-audit→log chain and
+// flags the alert regardless.
+//
+// Pre-fix replay: env.Sid is a UUID today, but a future cookie
+// format that embeds a customer-typed token would re-introduce the
+// injection. The logsanitize wrapper is the load-bearing defence.
+func TestLog_SessionAccountMismatchStripsControlChars(t *testing.T) {
+	log, buf := captureLogger()
+	authn := newFakeAuthn()
+	authn.acctByID["acct-1"] = mkActiveAccount("acct-1")
+	// Different AccountID on the row vs the envelope → mismatch path.
+	sess := &fakeSessions{env: session.Envelope{AccountID: "acct-1", Sid: "sid-1\nFAKE"}}
+	lookups := &fakeLookups{sess: state.Session{ID: "sid-1", AccountID: "acct-2"}}
+	mw := newMW(t, authn, sess, lookups, nil)
+	mw.Log = log
+
+	w := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", nil, map[string]string{"faas_sid": "valid-cookie"})
+	r.URL.Path = "/v1/apps\nattacker-log-line"
+	mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		t.Errorf("handler must not run when mismatch detected")
+	})(w, r)
+
+	out := buf.String()
+	if strings.Contains(out, "\nattacker-log-line") {
+		t.Errorf("r.URL.Path control char leaked into log: %q", out)
+	}
+	if strings.Contains(out, "\nFAKE") {
+		t.Errorf("env.Sid control char leaked into log: %q", out)
+	}
+}
+
+// TestLog_SessionTouchFailedStripsControlChars pins alert #131 at
+// middleware.go:594: the "session last_seen_at touch failed" warn
+// inside the detached touch goroutine. The sid here is env.Sid
+// (AEAD-bound) but the warn is emitted from a goroutine, so a
+// regression would be invisible to integration tests until the
+// log consumer crashed. Locking the sanitiser behaviour with a
+// unit test makes the contract enforceable.
+func TestLog_SessionTouchFailedStripsControlChars(t *testing.T) {
+	log, buf := captureLogger()
+	authn := newFakeAuthn()
+	authn.acctByID["acct-1"] = mkActiveAccount("acct-1")
+	sess := &fakeSessions{env: session.Envelope{AccountID: "acct-1", Sid: "sid-1\nINJECT"}}
+	// lookups returns a valid row, but the touch itself fails so
+	// the warn line fires.
+	lookups := &fakeLookups{
+		sess:     state.Session{ID: "sid-1", AccountID: "acct-1"},
+		touchErr: state.ErrNotFound, // any error works
+	}
+	mw := newMW(t, authn, sess, lookups, nil)
+	mw.Log = log
+
+	w := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", nil, map[string]string{"faas_sid": "valid-cookie"})
+	mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {})(w, r)
+
+	// The touch goroutine is detached; give it a beat to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "session last_seen_at touch failed") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "\nINJECT") {
+		t.Errorf("env.Sid control char leaked into detached touch log: %q", out)
+	}
+	if !strings.Contains(out, "INJECT") {
+		t.Errorf("sanitised log should still contain the printable payload: %q", out)
 	}
 }

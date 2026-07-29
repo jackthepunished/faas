@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -468,7 +469,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 					if cookieErr != nil {
 						if m.Log != nil {
 							m.Log.Warn("session cross-check error",
-								"path", r.URL.Path, "error", cookieErr.Error())
+								"path", logsanitize.Field(r.URL.Path), "error", cookieErr.Error())
 						}
 						m.clearSessionCookie(w)
 						api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
@@ -580,7 +581,7 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 			"Session invalid", "session and account binding mismatch"))
 		if m.Log != nil {
 			m.Log.Warn("session account mismatch (AEAD bind broken?)",
-				"sid", env.Sid, "path", r.URL.Path)
+				"sid", logsanitize.Field(env.Sid), "path", logsanitize.Field(r.URL.Path))
 		}
 		return state.Session{}, true, nil
 	}
@@ -591,7 +592,7 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 			c, cancel := context.WithTimeout(parentCtx, 2*time.Second)
 			defer cancel()
 			if err := m.Lookups.TouchSessionLastSeen(c, sid); err != nil && m.Log != nil {
-				m.Log.Warn("session last_seen_at touch failed", "sid", sid, "error", err.Error())
+				m.Log.Warn("session last_seen_at touch failed", "sid", logsanitize.Field(sid), "error", err.Error())
 			}
 		}(ctx, env.Sid, t)
 	}
