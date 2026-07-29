@@ -46,6 +46,7 @@ Commands:
   account      Self-service: export your data, delete account, restore
   usage        Show this month's usage (faas usage [--month YYYY-MM])
   usage summary  Account-wide usage roll-up (faas usage summary [--month YYYY-MM])
+  metrics      Per-app request / latency / cold-boot metrics (faas metrics <slug> [--range 5m])
   logs         Tail app or deployment logs (--follow)
   version      Print the CLI version
   connect      Connect a third-party service (github)
@@ -188,6 +189,11 @@ func run(args []string) int {
 		// the Wave 0 use case); --include-anonymous surfaces the
 		// rare subject=NULL defensive rows.
 		return cmdAuditEvents(args[1:])
+	case "metrics":
+		// Move 1 PR-A: CLI twin for GET /v1/apps/{slug}/metrics.
+		// Same data shape the dashboard panel renders, in the
+		// terminal where the rest of the debugging happens.
+		return cmdMetrics(args[1:])
 	case "queue":
 		return cmdQueueDispatch(args[1:])
 	default:
