@@ -135,7 +135,7 @@ func runCmdInit(tpl, dest string, deploy bool, name string, stdout, stderr io.Wr
 	PrintProgress(stdout, "Wrote %s template to %s", tpl, absDest)
 	PrintProgress(stdout, "Next:")
 	for _, line := range nextStepsFor(tpl) {
-		fmt.Fprintf(stdout, "  %s\n", line)
+		_, _ = fmt.Fprintf(stdout, "  %s\n", line)
 	}
 	PrintProgress(stdout, "Docs: https://docs.DOMAIN/storage")
 
