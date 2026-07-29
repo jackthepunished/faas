@@ -27,6 +27,10 @@ export type AuditEventResponse = {
    */
   subject?: string;
   /**
+   * Highest-severity classification for stateless.advisory rows (`high` for /data, /db, /var/lib/postgresql, /var/lib/mysql; `warn` for other closed paths; `info` for an empty batch). Omitted for non-stateless kinds and for pre-PR-427 stateless.advisory rows where the data.severity key is absent. Mega-PR B / stateless-DX work.
+   */
+  severity?: 'high' | 'warn' | 'info';
+  /**
    * Kind-specific payload. Always a JSON object; the inner shape depends on `kind`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`.
    */
   data: Record<string, any>;
