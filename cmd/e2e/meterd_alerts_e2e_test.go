@@ -319,7 +319,10 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 	// AsyncInvoke). Mirrors the alert evaluator's summariseFailed
 	// path which sums across all four sources for source='any'.
 	for i := 0; i < 5; i++ {
-		src := []string{"cron", "queue", "delayed_task", "async_invoke", ""}[i%5]
+		// invocations_source_check requires source in the closed
+		// set {cron, queue, delayed_task, async_invoke}. Empty
+		// source is rejected by the CHECK constraint.
+		src := []string{"cron", "queue", "delayed_task", "async_invoke"}[i%4]
 		// invocations.id is uuid-typed; invocations.state (not
 		// 'status') carries the lifecycle column. The id is a fresh
 		// UUID — not derived from rule.ID — because the table has no
