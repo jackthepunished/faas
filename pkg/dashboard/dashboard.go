@@ -502,3 +502,82 @@ type AuditEventRow struct {
 	Subject    string
 	DataPretty string
 }
+
+// StatelessDenylistEntry is one row of the customer-facing contract
+// page (/dashboard/stateless). Name is the lower-cased base image
+// substring that imaged rejects (e.g. "postgres"). Hint is the
+// managed-service suggestion embedded in the RFC 7807 Detail field.
+//
+// Mirrored in the dashboard package (not imported from pkg/imaged)
+// so a future read-only rendering surface (the docs site, the SDKs)
+// can reuse the same shape without dragging in the imaged
+// dependency. Keep these two lists in lockstep with
+// pkg/imaged/base.go's StatefulBaseImageDenylist.
+type StatelessDenylistEntry struct {
+	Name string
+	Hint string
+}
+
+// StatelessClosedPath is one path the guest-init fanotify advisory
+// watches. Severity is "high" for /data, /db, and the well-known
+// stateful daemon data dirs the customer is most likely to trip
+// (postgres, mysql); "warn" for the rest. Mirrors
+// guest/init/stateless_advisory_linux.go's statelessRuntimePaths.
+//
+// The dashboard classifies by prefix so a future watch-dir addition
+// (e.g. /var/lib/etcd) lands in lockstep with guest-init without
+// re-touching this list.
+type StatelessClosedPath struct {
+	Path     string
+	Severity string // "high" | "warn"
+}
+
+// StatelessDenylist is the static copy rendered on the /dashboard/stateless
+// landing page. Source of truth remains pkg/imaged/base.go — this
+// slice exists so the dashboard template renders the contract
+// without re-importing imaged's StatefulBaseImageDenylist (which
+// would couple the dashboard to the build pipeline).
+var StatelessDenylist = []StatelessDenylistEntry{
+	{Name: "postgres", Hint: "use Neon (https://neon.tech) or Supabase Postgres"},
+	{Name: "redis", Hint: "use Upstash Redis (https://upstash.com)"},
+	{Name: "mysql", Hint: "use PlanetScale (https://planetscale.com)"},
+	{Name: "mariadb", Hint: "use PlanetScale (https://planetscale.com)"},
+	{Name: "mongo", Hint: "use MongoDB Atlas (https://mongodb.com/atlas)"},
+	{Name: "cockroach", Hint: "use CockroachDB Cloud (https://cockroachlabs.cloud)"},
+	{Name: "cassandra", Hint: "use Astra DB (https://astra.datastax.com)"},
+	{Name: "clickhouse", Hint: "use ClickHouse Cloud (https://clickhouse.cloud)"},
+}
+
+// StatelessClosedPaths mirrors guest/init/stateless_advisory_linux.go's
+// statelessRuntimePaths. "high" severity for the top-level dirs + the
+// best-known stateful daemon data dirs; "warn" for the rest. Adding
+// a path means a new entry in BOTH this slice AND the guest-init
+// source — see ADR-047 for the rationale.
+var StatelessClosedPaths = []StatelessClosedPath{
+	{Path: "/data", Severity: "high"},
+	{Path: "/db", Severity: "high"},
+	{Path: "/var/lib/postgresql", Severity: "high"},
+	{Path: "/var/lib/mysql", Severity: "high"},
+	{Path: "/var/lib/mongodb", Severity: "warn"},
+	{Path: "/var/lib/mongo", Severity: "warn"},
+	{Path: "/var/lib/redis", Severity: "warn"},
+	{Path: "/var/lib/cockroach", Severity: "warn"},
+	{Path: "/var/lib/cassandra", Severity: "warn"},
+	{Path: "/var/lib/clickhouse", Severity: "warn"},
+}
+
+// StatelessData is the /dashboard/stateless landing page payload.
+// RecentAdvisories is the last 50 stateless.advisory rows scoped to
+// the account (same shape as AuditEventRow but capped + sorted by
+// recency). RecentAdvisoriesEmpty is true when there are zero rows
+// so the template can render the empty-state copy without inspecting
+// the slice. StatelessDenylist + ClosedPaths are the package-level
+// constants re-exported as struct fields so the template can reach
+// them without a separate {{$pkg.Var}} lookup.
+type StatelessData struct {
+	RecentAdvisories      []AuditEventRow
+	RecentAdvisoriesEmpty bool
+	RecentAdvisoriesTotal int
+	StatelessDenylist     []StatelessDenylistEntry
+	ClosedPaths           []StatelessClosedPath
+}

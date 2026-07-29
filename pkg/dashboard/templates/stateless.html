@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- /dashboard/stateless — Move 1 PR-A landing page. Makes the
+       stateless contract visible to customers (the audit row at
+       GET /v1/audit-events?kind_prefix=stateless.advisory existed
+       since Wave 0 PR-C but had no entry point). The page renders:
+         (1) the contract in human copy
+         (2) the 8-base denylist (StatelessDenylist) and the
+             10 closed paths (StatelessClosedPaths) as static tables
+         (3) the account's 50 most recent advisory rows
+       Source-of-truth data lives in pkg/dashboard/dashboard.go's
+       StatelessDenylist + StatelessClosedPaths slices. -->
+  <title>{{.Title}} — onebox faas</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4" nonce="{{.Nonce}}" defer></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2" nonce="{{.Nonce}}" defer></script>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    nav a.active { font-weight: 600; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; vertical-align: top; }
+    code { font-family: ui-monospace, Menlo, monospace; }
+    pre { font-family: ui-monospace, Menlo, monospace; background: #f3f4f6; padding: 0.4rem 0.6rem; border-radius: 4px; max-width: 36rem; overflow-x: auto; font-size: 0.85rem; }
+    .card { padding: 1rem 0; }
+    .card h2 { margin: 0 0 0.5rem 0; font-size: 1.1rem; }
+    .card .lede { color: #4b5563; font-size: 0.95rem; max-width: 56rem; }
+    .denylist th:first-child { width: 12rem; }
+    .closedpaths th:first-child { width: 18rem; }
+    .badge { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 500; }
+    .badge.high { background: #fee2e2; color: #991b1b; }
+    .badge.warn { background: #fef3c7; color: #92400e; }
+    .empty { padding: 2rem 0; max-width: 36rem; }
+    .empty h2 { margin-top: 0; }
+    .empty pre { background: #f3f4f6; padding: 0.6rem 0.8rem; border-radius: 6px; overflow-x: auto; }
+    .empty .muted { color: #6b7280; font-size: 0.9rem; }
+    .breadcrumb { font-size: 0.9rem; color: #6b7280; margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body hx-ext="sse" sse-connect="/v1/events">
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/stateless" class="active">Stateless</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>{{.Title}}</h1>
+
+    <section class="card">
+      <h2>What this is</h2>
+      <p class="lede">
+        onebox faas is <strong>stateless backend compute</strong>: each
+        invocation boots a fresh microVM, runs your handler, and the
+        VM is torn down on park. There is no on-disk state between
+        invocations. State lives in <em>managed services</em> you
+        point your handler at — Neon for Postgres, Upstash for Redis,
+        S3 for blobs, etc. — and the connection details travel as
+        sealed secrets.
+      </p>
+      <p class="lede">
+        The platform enforces this in two layers: <strong>accept-time</strong>
+        rejects stateful base images (postgres, redis, mysql, etc.)
+        with a 422 pointing at a managed alternative;
+        <strong>runtime</strong> watches a small closed path set
+        inside the guest and writes a
+        <code>stateless.advisory</code> audit row when your handler
+        writes to one of them. Advisories are observation, not
+        enforcement — your wake still completes — but they show up
+        here so you can see what your code is trying to do.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Base image denylist</h2>
+      <p class="lede">
+        Eight base image substrings are rejected at
+        <code>faas deploy</code> accept time. Each rejection carries
+        a managed-service hint so the customer has a one-click path
+        to the right replacement.
+      </p>
+      <table class="denylist">
+        <thead>
+          <tr>
+            <th>Substring</th>
+            <th>Suggested replacement</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.StatelessDenylist}}
+          <tr>
+            <td><code>{{.Name}}</code></td>
+            <td>{{.Hint}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Closed runtime paths</h2>
+      <p class="lede">
+        Ten guest-side paths the fanotify watcher observes. Writes
+        to these trip a <code>stateless.advisory</code> audit row;
+        <strong>high</strong>-severity paths are the ones most
+        customers hit by accident (top-level <code>/data</code>,
+        <code>/db</code>, and the well-known daemon data dirs).
+      </p>
+      <table class="closedpaths">
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Severity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.ClosedPaths}}
+          <tr>
+            <td><code>{{.Path}}</code></td>
+            <td><span class="badge {{.Severity}}">{{.Severity}}</span></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Recent advisories</h2>
+      <p class="lede">
+        Last 50 <code>stateless.advisory</code> audit rows for this
+        account. Same data as
+        <code>faas audit-events --kind-prefix=stateless.advisory</code>
+        or <code>GET /v1/audit-events?kind_prefix=stateless.advisory</code>.
+        Drill into a specific app with
+        <code>faas audit-events --kind-prefix=stateless.advisory --app-id &lt;uuid&gt;</code>
+        or by adding <code>&amp;app_id=&lt;uuid&gt;</code> to the
+        URL.
+      </p>
+      {{with .Data}}
+      {{if .RecentAdvisoriesEmpty}}
+      <div class="empty">
+        <p class="muted">
+          No advisories recorded for this account yet. The watcher
+          only writes a row when your handler writes to a closed
+          path; a fresh deployment that talks to a managed service
+          will produce zero rows.
+        </p>
+      </div>
+      {{else}}
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>App</th>
+            <th>Data</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .RecentAdvisories}}
+          <tr>
+            <td>{{.TimeLabel}}</td>
+            <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<span class="empty muted">∅</span>{{end}}</td>
+            <td>{{if .DataPretty}}<pre>{{.DataPretty}}</pre>{{else}}<span class="empty muted">—</span>{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{end}}
+      {{end}}
+    </section>
+  </main>
+  <footer>onebox faas · stateless contract landing page (Move 1 PR-A)</footer>
+</body>
+</html>
