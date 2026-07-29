@@ -1,19 +1,20 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00071_compute_nodes_region_zone.sql
+-- filename: 00072_compute_nodes_region_zone.sql
 --
--- 00071_compute_nodes_region_zone.sql — multi-box placement scheduler
--- (ADR-025/028/029, scale-out worktree). Renumbered twice during PR
--- review (00067 → 00069 → 00071) as PR #428 (wip: extend metering
--- telemetry, ADR-048) expanded its migration set to claim slots
--- 67/68/69/70 while #429 was being reviewed. Slot 71 is the next
--- free one. The semantic content is unchanged across renumbers —
--- only the slot moved. Per ADR-041, the renumber commits carry
--- reservations at the abandoned slots (00067_reserve_slot.sql,
--- 00068_reserve_slot.sql, 00069_reserve_slot.sql,
--- 00070_reserve_slot.sql) so the embedded FS stays contiguous and
--- TestMigrationsContiguous passes.
+-- 00072_compute_nodes_region_zone.sql — multi-box placement scheduler
+-- (ADR-025/028/029, scale-out worktree). Renumbered three times during
+-- PR review (00067 → 00069 → 00071 → 00072) as PR #428 (wip: extend
+-- metering telemetry, ADR-048) kept expanding its migration set to
+-- claim the slots #429 was abandoning. The semantic content is
+-- unchanged across renumbers — only the slot moved. Per ADR-041, the
+-- renumber commits carry reservations at the abandoned slots
+-- (00067_reserve_slot.sql, 00068_reserve_slot.sql,
+-- 00069_reserve_slot.sql, 00070_reserve_slot.sql,
+-- 00071_reserve_slot.sql) so the embedded FS stays contiguous and
+-- TestMigrationsContiguous passes. Slot 72 is the next free slot
+-- after PR #428 claimed 67/68/69/70/71.
 --
 -- Two additive columns on compute_nodes:
 --   region  — free-form locality label (e.g. "eu-fsn1", "us-east",
@@ -25,7 +26,7 @@
 --             "b"). Currently informational; lets a future per-zone
 --             scheduler split capacity without a schema change.
 --
--- The columns are nullable so pre-00071 schedd rows (the seeded
+-- The columns are nullable so pre-00072 schedd rows (the seeded
 -- 'default-local' row, plus any operator-added rows since 00024)
 -- accept the schema without a separate backfill transaction. This
 -- migration backfills the seeded default-local row to ('local',
@@ -63,7 +64,7 @@ alter table compute_nodes
     add column if not exists zone   text null;
 
 comment on column compute_nodes.region is
-    'Locality label for the chooser tie-break (pkg/sched/placement.go). Free-form text; nullable so pre-00071 rows accept the schema. The seeded default-local row is backfilled to ''local''. ADR-025.';
+    'Locality label for the chooser tie-break (pkg/sched/placement.go). Free-form text; nullable so pre-00072 rows accept the schema. The seeded default-local row is backfilled to ''local''. ADR-025.';
 
 comment on column compute_nodes.zone is
     'Finer locality inside region. Currently informational; nullable. ADR-025.';
@@ -73,7 +74,7 @@ comment on column compute_nodes.zone is
 -- additional compute_nodes since 00024 are not backfilled here —
 -- those rows either (a) already have region/zone set by the
 -- operator, or (b) rely on the chooser falling through to lex
--- tie-break on name, which is the pre-00071 behaviour.
+-- tie-break on name, which is the pre-00072 behaviour.
 update compute_nodes
    set region = 'local',
        zone   = 'local'

@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00071 (multi-box placement scheduler:
+// Migration-apply test for 00072 (multi-box placement scheduler:
 // region/zone columns on compute_nodes).
 //
 // Pins the load-bearing contract from the placement scheduler PR
 // (ADR-025/028/029, scale-out worktree):
 //
-//   1. The migration set applies cleanly through 00071.
+//   1. The migration set applies cleanly through 00072.
 //   2. compute_nodes gains nullable region text and zone text columns.
 //   3. The seeded default-local row is backfilled to ('local', 'local')
 //      so the chooser tie-break is deterministic on a single-box deploy.
@@ -32,7 +32,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00071_ComputeNodesRegionZone(t *testing.T) {
+func TestMigrations_00072_ComputeNodesRegionZone(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -40,7 +40,7 @@ func TestMigrations_00071_ComputeNodesRegionZone(t *testing.T) {
 	}
 
 	// (1) Both columns exist on compute_nodes and are nullable text.
-	//     Region/zone are deliberately NOT NULL=YES so pre-00071
+	//     Region/zone are deliberately NOT NULL=YES so pre-00072
 	//     operator rows accept the schema without a backfill.
 	for _, col := range []string{"region", "zone"} {
 		var dataType, nullable string
@@ -58,7 +58,7 @@ func TestMigrations_00071_ComputeNodesRegionZone(t *testing.T) {
 			t.Errorf("compute_nodes.%s data_type = %q, want text", col, dataType)
 		}
 		if nullable != "YES" {
-			t.Errorf("compute_nodes.%s is_nullable = %q, want YES (nullable so pre-00071 rows accept the schema)", col, nullable)
+			t.Errorf("compute_nodes.%s is_nullable = %q, want YES (nullable so pre-00072 rows accept the schema)", col, nullable)
 		}
 	}
 
@@ -112,11 +112,11 @@ func TestMigrations_00071_ComputeNodesRegionZone(t *testing.T) {
 
 	// (4) INSERT a row without region/zone — must succeed because
 	//     the columns are nullable. This is the contract that lets
-	//     operator-added rows accept the 00071 schema without a
+	//     operator-added rows accept the 00072 schema without a
 	//     one-time backfill transaction.
 	if _, err := pool.Exec(ctx, `
 		insert into compute_nodes (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active)
-		values ('00071-no-region-test', 'tcp://127.0.0.1:1', 1, 256, 1, 256, true)
+		values ('00072-no-region-test', 'tcp://127.0.0.1:1', 1, 256, 1, 256, true)
 	`); err != nil {
 		t.Errorf("insert compute_nodes with NULL region/zone (must succeed under nullable): %v", err)
 	}

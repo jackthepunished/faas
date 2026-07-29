@@ -44,7 +44,7 @@ import (
 // initCmdUsage is the top-of-failure-line shown for `faas init` errors.
 // Mirrors PrintUsage's docs URL convention (output.go:144) so the line
 // carries the stable docs site pointer.
-const initCmdUsage = "usage: faas init --template <name> --path <dir> [--deploy] [--name <slug>]"
+const initCmdUsage = "usage: faas init --template <name> --path <dir> [--deploy] [--name <slug>] | --list"
 
 // initCmdDocsTopic is the docs topic slug appended to docsURLBase when
 // PrintUsage emits the trailing "Docs:" row. Keeps the CLI's help line
@@ -60,12 +60,19 @@ func cmdInit(args []string) int {
 	dest := fs.String("path", "", "destination directory (created if missing; refused if non-empty)")
 	deploy := fs.Bool("deploy", false, "after materializing, chain into `faas deploy --template <name> --name <slug>`")
 	name := fs.String("name", "", "app slug to pass to --deploy (default: derive from --path basename)")
+	list := fs.Bool("list", false, "print available templates grouped by category and exit")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
 		PrintUsage(os.Stderr, initCmdUsage, initCmdDocsTopic)
 		return 1
+	}
+	// --list is a discovery short-circuit. It runs before --template /
+	// --path validation so the customer can run `faas init --list` on
+	// its own (the most common onboarding-trail invocation).
+	if *list {
+		return runCmdInitList(osStdout)
 	}
 	if *tpl == "" {
 		PrintUsage(os.Stderr, initCmdUsage+"\n  error: --template is required", initCmdDocsTopic)
@@ -76,6 +83,37 @@ func cmdInit(args []string) int {
 		return 1
 	}
 	return runCmdInit(*tpl, *dest, *deploy, *name, osStdout, os.Stderr)
+}
+
+// runCmdInitList prints the 13 templates grouped by category, in the
+// canonical order pinned by templates.CategoryOrder. Each category
+// gets a header (category name) + a count + a comma-separated list
+// of names. This is the only place the grouping is rendered; the
+// underlying classification lives in templates.CategoryFor so future
+// surfaces (CLI help, dashboard template picker) can reuse it.
+//
+// Output is human-only; the machine-readable surface is the
+// `templates.Names` slice (and the matching `//go:embed` directive).
+// A future `--json` flag could re-use this layout; we don't ship
+// it yet because no consumer (CI, dashboard) needs it.
+func runCmdInitList(stdout io.Writer) int {
+	for _, cat := range templates.CategoryOrder {
+		var inCat []string
+		for _, n := range templates.Names {
+			if templates.CategoryFor(n) == cat {
+				inCat = append(inCat, n)
+			}
+		}
+		if len(inCat) == 0 {
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "%s (%d):\n", cat, len(inCat))
+		for _, n := range inCat {
+			_, _ = fmt.Fprintf(stdout, "  %s\n", n)
+		}
+	}
+	_, _ = fmt.Fprintf(stdout, "Docs: https://docs.DOMAIN/templates\n")
+	return 0
 }
 
 // runCmdInit is the pure-logic entry point. Pulled out so the test in
@@ -224,6 +262,27 @@ func nextStepsFor(tpl string) []string {
 			"  faas secrets set --app <slug> QSTASH_TOKEN=... UPSTASH_REDIS_REST_URL=... UPSTASH_REDIS_REST_TOKEN=...",
 			"Wire QStash to invoke the function (curl or the QStash dashboard):",
 			"  curl -X POST https://qstash.upstash.io/v2/publish/<slug> -H \"Authorization: Bearer $QSTASH_TOKEN\"",
+			"Deploy from the new directory:",
+			"  cd <dest> && faas deploy",
+		}
+	case "webhook-receiver":
+		return []string{
+			"Set the shared webhook secret (a 32-byte hex string):",
+			"  faas secrets set --app <slug> WEBHOOK_SECRET=$(openssl rand -hex 32)",
+			"Optional: scope the receiver to specific paths:",
+			"  faas secrets set --app <slug> WEBHOOK_ALLOWED_PATHS=/stripe,/github",
+			"Wire the provider's webhook URL to https://<slug>.<DOMAIN>/<your-path>",
+			"Deploy from the new directory:",
+			"  cd <dest> && faas deploy",
+		}
+	case "ai-chat":
+		return []string{
+			"Pick a provider — set exactly one of:",
+			"  faas secrets set --app <slug> OPENAI_API_KEY=sk-...",
+			"  faas secrets set --app <slug> ANTHROPIC_API_KEY=sk-ant-...",
+			"Optional: pin a model or prepend a system prompt:",
+			"  faas secrets set --app <slug> OPENAI_MODEL=gpt-4o",
+			"  faas secrets set --app <slug> SYSTEM_PROMPT='You are a helpful assistant for ...'",
 			"Deploy from the new directory:",
 			"  cd <dest> && faas deploy",
 		}
