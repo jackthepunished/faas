@@ -5323,34 +5323,63 @@ func (m *MemStore) ListEnabledAlertRules(_ context.Context) ([]AlertRule, error)
 // ClaimAlertFire mirrors the Postgres CTE shape: a duplicate
 // idempotency_key always loses regardless of `at` ordering, and a
 // fresh key whose at advances past the rule's last_fired_at wins.
-// Two-state lookup keyed by the same (ruleID, idempotency_key) tuple
-// MemStore keeps in alertClaimKeys so a duplicate in the same bucket
-// can't slip through.
+// MemStore keeps the dedupe set in alertClaimKeys (keyed by
+// (ruleID, idempotency_key)) and ALSO inserts a delivery row into
+// alertDeliveries — mirroring the PgStore contract (PR #409 fix to
+// ensure both stores have identical dedupe + row-creation shapes;
+// the previous "MemStore defers the insert to RecordAlertDelivery"
+// comment was wrong about pg's contract and produced the
+// alert_deliveries_idempotency_uniq 23505 every 2 s when the test
+// ticks cycled through the same bucket).
 //
-// payload + observed are accepted for parity with PgStore. The
-// in-memory store doesn't pre-insert the delivery row here — the
-// dispatcher (PR 4) calls RecordAlertDelivery on won=true, exactly
-// as it does against Postgres. The args are recorded onto the
-// matched delivery row by RecordAlertDelivery and surfaced via
-// ListAlertDeliveriesForRule.
-func (m *MemStore) ClaimAlertFire(_ context.Context, ruleID, idempotencyKey string, _ []byte, _ float64, at time.Time) (bool, error) {
+// payload + observed are stamped onto the row at insert time so the
+// test/dashboard can immediately observe the claimed delivery with
+// its full envelope (parity with pgstore's
+// alert_deliveries.payload + observed_value).
+//
+// On won=true the returned deliveryID is the new row's UUID; on
+// won=false it is "".
+func (m *MemStore) ClaimAlertFire(_ context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.alertRules[ruleID]
 	if !ok {
-		return false, ErrNotFound
+		return "", false, ErrNotFound
 	}
 	cacheKey := ruleID + "\x00" + idempotencyKey
 	if _, dup := m.alertClaimKeys[cacheKey]; dup {
-		return false, nil
+		return "", false, nil
 	}
-	if r.LastFiredAt.IsZero() || r.LastFiredAt.Before(at) {
+	if r.LastFiredAt.Before(at) || r.LastFiredAt.IsZero() {
 		r.LastFiredAt = at.UTC()
 		m.alertRules[ruleID] = r
 		m.alertClaimKeys[cacheKey] = at.UTC()
-		return true, nil
+		// Insert the pending delivery row, mirroring PgStore. The
+		// m.alertDeliveries map is already keyed by idempotency_key
+		// (RecordAlertDelivery's contract), so a duplicate here would
+		// only occur if a parallel caller snuck a row in between our
+		// dedupe-check and this write — but MemStore has no
+		// concurrency (single goroutine owning the test) so that
+		// race is impossible today. Empty payload normalises to "{}"
+		// to match pgstore.
+		if len(payload) == 0 {
+			payload = []byte("{}")
+		}
+		id := newID()
+		m.alertDeliveries[idempotencyKey] = AlertDelivery{
+			ID:             id,
+			RuleID:         r.ID,
+			AccountID:      r.AccountID,
+			AppID:          r.AppID,
+			IdempotencyKey: idempotencyKey,
+			Payload:        payload,
+			Status:         AlertDeliveryPending,
+			ObservedValue:  observed,
+			FiredAt:        at.UTC(),
+		}
+		return id, true, nil
 	}
-	return false, nil
+	return "", false, nil
 }
 
 func (m *MemStore) SetAlertRuleState(_ context.Context, ruleID string, to AlertState, at time.Time) (bool, error) {

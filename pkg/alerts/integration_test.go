@@ -67,9 +67,9 @@ func TestPgStore_ClaimAlertFire_StampsPayload(t *testing.T) {
 	}
 
 	payload := []byte(`{"metric":"error_rate_pct","observed":12.5,"threshold":5,"comparison":"gt"}`)
-	won, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", payload, 12.5, time.Now())
-	if err != nil || !won {
-		t.Fatalf("ClaimAlertFire: (%v, %v); want (true, nil)", won, err)
+	deliveryID, won, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", payload, 12.5, time.Now())
+	if err != nil || !won || deliveryID == "" {
+		t.Fatalf("ClaimAlertFire: (%q, %v, %v); want (nonempty, true, nil)", deliveryID, won, err)
 	}
 
 	deliveries, err := s.ListAlertDeliveriesForRule(ctx, rule.ID, 5)
@@ -122,13 +122,13 @@ func TestPgStore_ClaimAlertFire_DuplicateBucket(t *testing.T) {
 	}
 
 	t0 := time.Now()
-	won1, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, t0)
-	if err != nil || !won1 {
-		t.Fatalf("first claim: (%v, %v); want (true, nil)", won1, err)
+	id1, won1, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, t0)
+	if err != nil || !won1 || id1 == "" {
+		t.Fatalf("first claim: (%q, %v, %v); want (nonempty, true, nil)", id1, won1, err)
 	}
-	won2, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, t0.Add(time.Second))
-	if err != nil || won2 {
-		t.Fatalf("duplicate claim: (%v, %v); want (false, nil)", won2, err)
+	id2, won2, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, t0.Add(time.Second))
+	if err != nil || won2 || id2 != "" {
+		t.Fatalf("duplicate claim: (%q, %v, %v); want (\"\", false, nil)", id2, won2, err)
 	}
 }
 
@@ -169,9 +169,9 @@ func TestPgStore_DeleteAccount_CascadesAlertRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAlertRule: %v", err)
 	}
-	won, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, time.Now())
-	if err != nil || !won {
-		t.Fatalf("ClaimAlertFire: (%v, %v); want (true, nil)", won, err)
+	deliveryID, won, err := s.ClaimAlertFire(ctx, rule.ID, rule.ID+":bucket-1", []byte(`{}`), 10.5, time.Now())
+	if err != nil || !won || deliveryID == "" {
+		t.Fatalf("ClaimAlertFire: (%q, %v, %v); want (nonempty, true, nil)", deliveryID, won, err)
 	}
 
 	if err := s.DeleteAccount(ctx, acct.ID); err != nil {

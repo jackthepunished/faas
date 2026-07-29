@@ -62,7 +62,7 @@ type Store interface {
 	ListEnabledAlertRules(ctx context.Context) ([]state.AlertRule, error)
 	AlertRuleByID(ctx context.Context, id string) (state.AlertRule, error)
 	CountFailedInvocationsSince(ctx context.Context, accountID, appID string, source state.InvocationSource, since time.Time) (int, error)
-	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (won bool, err error)
+	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (deliveryID string, won bool, err error)
 	SetAlertRuleState(ctx context.Context, ruleID string, to state.AlertState, at time.Time) (changed bool, err error)
 	SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, at time.Time) error
 	RecordAlertDelivery(ctx context.Context, d state.AlertDelivery) (state.AlertDelivery, error)
@@ -293,7 +293,7 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 		return
 	}
 
-	won, err := e.store.ClaimAlertFire(ctx, rule.ID, idempotencyKey, payloadBytes, observed, now)
+	deliveryID, won, err := e.store.ClaimAlertFire(ctx, rule.ID, idempotencyKey, payloadBytes, observed, now)
 	if err != nil {
 		// ErrNotFound is a TOCTOU race (rule deleted between
 		// ListEnabledAlertRules and the claim) — log + skip.
@@ -312,31 +312,18 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 		e.ops.AlertEvalFiredTotal()()
 	}
 
-	// Persist the alert_deliveries row. PgStore inserts this inside
-	// ClaimAlertFire's CTE; MemStore leaves the insert to the caller
-	// (the original PR 3 design had the dispatcher call RecordAlertDelivery
-	// post-claim). The evaluator owns the canonical row-write so the
-	// dashboard's "recent deliveries" pane renders immediately after
-	// the claim. payloadBytes carries the JSON envelope that the
-	// dashboard's payload ->> 'metric' query will index into.
-	delivery, err := e.store.RecordAlertDelivery(ctx, state.AlertDelivery{
-		RuleID:         rule.ID,
-		AccountID:      rule.AccountID,
-		AppID:          rule.AppID,
-		IdempotencyKey: idempotencyKey,
-		Payload:        payloadBytes,
-		Status:         state.AlertDeliveryPending,
-		ObservedValue:  observed,
-		FiredAt:        now,
-	})
-	if err != nil {
-		// ErrConflict means a parallel claim landed first — the
-		// cool-down UNIQUE constraint rejected our duplicate insert.
-		// Treat as a duplicate bucket: silent skip.
-		e.log.Warn("alerts: record delivery", "rule", rule.ID, "err", err)
-		return
-	}
-	deliveryID := delivery.ID
+	// The alert_deliveries row is now created AND stamped with the
+	// full envelope (payloadBytes + observed + fired_at) by
+	// ClaimAlertFire itself — both PgStore and MemStore insert the
+	// row inside their claim path (parity contract from PR #409
+	// review). ClaimAlertFire returns the new row's UUID so we can
+	// transition it to delivered/failed via
+	// UpdateAlertDeliveryStatus. Previously the evaluator called
+	// RecordAlertDelivery here too, which collided with the row
+	// ClaimAlertFire had just inserted and short-circuited the
+	// dispatch (CI run 30436032609: 'alerts: record delivery' state:
+	// conflict + 'receiver never received a delivery within 11 s').
+	_ = payloadBytes // envelope is already stamped on the row
 
 	// Flip state to firing on a successful claim. ok→firing audit
 	// is emitted AFTER the delivery succeeds (mirrors the resolved
