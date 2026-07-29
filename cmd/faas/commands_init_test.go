@@ -353,7 +353,7 @@ func TestCmdInit_List_GroupsByCategory(t *testing.T) {
 			t.Errorf("missing category header %q in --list output:\n%s", k, out)
 		}
 	}
-	if !(idx["hello"] < idx["function"] && idx["function"] < idx["stateless-contract"] && idx["stateless-contract"] < idx["ai"]) {
+	if idx["hello"] >= idx["function"] || idx["function"] >= idx["stateless-contract"] || idx["stateless-contract"] >= idx["ai"] {
 		t.Errorf("category order drift: %v\noutput:\n%s", idx, out)
 	}
 	// Spot-check expected contents under each category so a future

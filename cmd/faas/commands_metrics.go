@@ -94,5 +94,4 @@ func renderAppMetrics(w io.Writer, m api.AppMetricsResponse) {
 	if m.WakeP95MS > 0 {
 		_, _ = fmt.Fprintf(w, "Wake p95:   %.0fms (fleet-wide)\n", m.WakeP95MS)
 	}
-	return
 }
