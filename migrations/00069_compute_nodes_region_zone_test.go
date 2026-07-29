@@ -98,9 +98,15 @@ func TestMigrations_00069_ComputeNodesRegionZone(t *testing.T) {
 		// the chooser's filter-and-sort scan will fall back to a
 		// full table scan, not a failure, so the rename is silent.
 		// This assertion makes the rename loud.
-		wantSubstr := "WHERE active"
-		if !strings.Contains(idxDef, wantSubstr) {
-			t.Errorf("compute_nodes_region_zone_idx indexdef = %q, want substring %q (partial predicate)", idxDef, wantSubstr)
+		//
+		// PostgreSQL formats partial-index predicates as
+		// "WHERE (active = true)" (parenthesised boolean) starting
+		// from PG 9.x; a bare "WHERE active" form is never emitted.
+		// The substring probe below matches that real output while
+		// still rejecting a non-partial index (which would have no
+		// "WHERE" predicate at all).
+		if !strings.Contains(idxDef, "WHERE (active") {
+			t.Errorf("compute_nodes_region_zone_idx indexdef = %q, want substring %q (partial predicate on active)", idxDef, "WHERE (active")
 		}
 	}
 
