@@ -3258,3 +3258,191 @@ func TestMemStore_Session_TouchAllowedOnRevoked(t *testing.T) {
 		t.Errorf("post-revoke Touch did not bump LastSeenAt: %v", got2.LastSeenAt)
 	}
 }
+
+// --- Projects (ADR-050, Phase 1) --------------------------------------------
+//
+// MemStore mirror of the pgstore Project tests. The contract is
+// implementation-agnostic: same error sentinels, same monotonic-upgrade
+// semantics, same account scoping.
+
+func TestMem_CreateProject_UniqueSlug(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, err := m.CreateAccount(ctx, "mem-uniq@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	p, err := m.CreateProject(ctx, Project{
+		AccountID: acc.ID,
+		Slug:      "phase1-mem-uniq",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject happy: %v", err)
+	}
+	if p.ID == "" {
+		t.Errorf("CreateProject ID = %q, want non-empty", p.ID)
+	}
+	if p.ScanSource != ProjectScanSourceUnknown {
+		t.Errorf("default ScanSource = %q, want 'unknown'", p.ScanSource)
+	}
+
+	_, err = m.CreateProject(ctx, Project{
+		AccountID: acc.ID,
+		Slug:      "phase1-mem-uniq",
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("CreateProject dup = %v, want ErrConflict", err)
+	}
+}
+
+func TestMem_CreateProject_AccountMissing(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	_, err := m.CreateProject(ctx, Project{
+		AccountID: "00000000-0000-0000-0000-000000000000",
+		Slug:      "phase1-mem-orphan",
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("CreateProject with missing account = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMem_ProjectByRepo_BackfilledHit(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, err := m.CreateAccount(ctx, "mem-backfill@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	installID := int64(90011)
+	repoFull := "acme/phase1-mem-backfill"
+
+	p, err := m.CreateProject(ctx, Project{
+		AccountID:        acc.ID,
+		Slug:             "phase1-mem-backfill",
+		RepoFullName:     repoFull,
+		ProductionBranch: "main",
+		InstallID:        installID,
+		ScanSource:       ProjectScanSourceCompose,
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	got, err := m.ProjectByRepo(ctx, acc.ID, installID, repoFull)
+	if err != nil {
+		t.Fatalf("ProjectByRepo: %v", err)
+	}
+	if got.ID != p.ID {
+		t.Errorf("ProjectByRepo.ID = %q, want %q", got.ID, p.ID)
+	}
+	if got.ScanSource != ProjectScanSourceCompose {
+		t.Errorf("ScanSource = %q, want 'compose'", got.ScanSource)
+	}
+}
+
+func TestMem_ProjectByRepo_Missing(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, err := m.CreateAccount(ctx, "mem-missing@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	_, err = m.ProjectByRepo(ctx, acc.ID, 88888, "does/not-exist")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("ProjectByRepo missing = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMem_AppsForProject_AccountScoped(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	accA, err := m.CreateAccount(ctx, "mem-scope-a@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount A: %v", err)
+	}
+	accB, err := m.CreateAccount(ctx, "mem-scope-b@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+
+	p, err := m.CreateProject(ctx, Project{
+		AccountID: accA.ID,
+		Slug:      "phase1-mem-scope",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	// Seed an app with project_id + workload_name set on the struct.
+	projStr := p.ID
+	_, err = m.CreateApp(ctx, App{
+		AccountID:      accA.ID,
+		Slug:           "phase1-mem-scope-member",
+		Type:           AppTypeApp,
+		RAMMB:          256,
+		MaxConcurrency: 1,
+		Status:         AppActive,
+		ProjectID:      projStr,
+		WorkloadName:   "web",
+		WorkloadClass:  WorkloadClassHTTP,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	got, err := m.AppsForProject(ctx, accA.ID, p.ID)
+	if err != nil {
+		t.Fatalf("AppsForProject same-account: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("AppsForProject same-account len = %d, want 1", len(got))
+	}
+
+	_, err = m.AppsForProject(ctx, accB.ID, p.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AppsForProject cross-account = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMem_SetProjectScanSource_MonotonicUp(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, err := m.CreateAccount(ctx, "mem-mono@example.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	p, err := m.CreateProject(ctx, Project{
+		AccountID:  acc.ID,
+		Slug:       "phase1-mem-mono",
+		ScanSource: ProjectScanSourceSingle,
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	// single → compose: ok.
+	p2, err := m.SetProjectScanSource(ctx, p.ID, ProjectScanSourceCompose)
+	if err != nil {
+		t.Fatalf("SetProjectScanSource single→compose: %v", err)
+	}
+	if p2.ScanSource != ProjectScanSourceCompose {
+		t.Errorf("after single→compose = %q, want 'compose'", p2.ScanSource)
+	}
+
+	// compose → single: rejected.
+	_, err = m.SetProjectScanSource(ctx, p.ID, ProjectScanSourceSingle)
+	if !errors.Is(err, ErrScanSourceDowngrade) {
+		t.Errorf("SetProjectScanSource compose→single = %v, want ErrScanSourceDowngrade", err)
+	}
+
+	// compose → compose: same-tier no-op.
+	p3, err := m.SetProjectScanSource(ctx, p.ID, ProjectScanSourceCompose)
+	if err != nil {
+		t.Fatalf("SetProjectScanSource compose→compose: %v", err)
+	}
+	if p3.ScanSource != ProjectScanSourceCompose {
+		t.Errorf("same-tier write ScanSource = %q, want 'compose'", p3.ScanSource)
+	}
+}

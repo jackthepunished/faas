@@ -655,7 +655,9 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		           coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		           workload_class, coalesce(start_command, '')`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
 	return scanApp(row)
 }
@@ -722,7 +724,9 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		           coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		           workload_class, coalesce(start_command, '')`,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
 	created, err := scanApp(row)
 	if err != nil {
@@ -738,7 +742,9 @@ func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		        coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		        workload_class, coalesce(start_command, '')
 		 from apps where id = $1`, id)
 	return scanApp(row)
 }
@@ -747,7 +753,9 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		        coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		        workload_class, coalesce(start_command, '')
 		 from apps where slug = $1 and status <> 'deleted'`, slug)
 	return scanApp(row)
 }
@@ -756,7 +764,9 @@ func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error)
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		        coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		        workload_class, coalesce(start_command, '')
 		 from apps where account_id = $1 and status <> 'deleted' order by created_at desc`, accountID)
 	if err != nil {
 		return nil, err
@@ -769,7 +779,9 @@ func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		        coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		        workload_class, coalesce(start_command, '')
 		 from apps where status <> 'deleted' order by created_at desc`)
 	if err != nil {
 		return nil, err
@@ -805,7 +817,9 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		 where id = $1
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		           coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		           workload_class, coalesce(start_command, '')`,
 		id,
 		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
@@ -848,7 +862,9 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 		 where account_id = $1 and slug = $2 and status <> 'deleted'
 		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		           coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		           workload_class, coalesce(start_command, '')`,
 		accountID, oldSlug, newSlug)
 	return scanApp(row)
 }
@@ -856,6 +872,230 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 func (s *PgStore) DeleteApp(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `update apps set status = 'deleted' where id = $1`, id)
 	return err
+}
+
+// --- Projects (ADR-050, Phase 1) ----------------------------------
+//
+// Phase 1 lands the storage seam: a project row + 7 methods. The
+// patterns below mirror the existing App methods (RETURNING-id style,
+// scanApp helper, ErrConflict/ErrNotFound mapErr translation). The
+// monotonic-upgrade check in SetProjectScanSource is enforced by a
+// rank comparison in pure SQL — Phase 5 reconcile calls it; Phase 1
+// only exercises the no-op path and the upgrade path through tests.
+
+func scanProject(row pgx.Row) (Project, error) {
+	var (
+		p          Project
+		scanSource string
+	)
+	if err := row.Scan(
+		&p.ID, &p.AccountID, &p.Slug, &p.RepoFullName, &p.ProductionBranch,
+		&p.InstallID, &scanSource, &p.CreatedAt, &p.UpdatedAt,
+	); err != nil {
+		return Project{}, mapErr(err)
+	}
+	p.ScanSource = ProjectScanSource(scanSource)
+	return p, nil
+}
+
+func scanProjects(rows pgx.Rows) ([]Project, error) {
+	var out []Project
+	for rows.Next() {
+		p, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// CreateProject inserts a new project row. The accounts FK is enforced
+// by Postgres; an unknown accountID surfaces as ErrFKViolation via
+// mapErr → 23503. The (account_id, slug) unique projects_account_slug_uniq
+// surfaces as ErrConflict via 23505. scan_source defaults to 'unknown'
+// at the DB level when the caller passes the empty string.
+func (s *PgStore) CreateProject(ctx context.Context, p Project) (Project, error) {
+	if p.ScanSource == "" {
+		p.ScanSource = ProjectScanSourceUnknown
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into projects
+		    (account_id, slug, repo_full_name, production_branch, install_id, scan_source)
+		values ($1, $2, $3, $4, $5, $6)
+		returning id, account_id, slug, repo_full_name, production_branch,
+		          install_id, scan_source, created_at, updated_at
+	`,
+		p.AccountID, p.Slug, nullStr(p.RepoFullName), nullStr(p.ProductionBranch),
+		p.InstallID, string(p.ScanSource),
+	)
+	return scanProject(row)
+}
+
+func (s *PgStore) ProjectByID(ctx context.Context, projectID string) (Project, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), install_id, scan_source,
+		       created_at, updated_at
+		  from projects
+		 where id = $1
+	`, projectID)
+	return scanProject(row)
+}
+
+func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Project, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), install_id, scan_source,
+		       created_at, updated_at
+		  from projects
+		 where account_id = $1 and slug = $2
+	`, accountID, slug)
+	return scanProject(row)
+}
+
+// ProjectByRepo is the push-dispatch lookup. install_id is non-null on
+// bound projects only; we surface ErrNotFound when the row is gone
+// rather than swallowing it as an empty result.
+func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), install_id, scan_source,
+		       created_at, updated_at
+		  from projects
+		 where install_id = $1 and repo_full_name = $2
+		   and ((account_id = $3) or ($3 = ''))
+		 limit 1
+	`, installID, repoFullName, accountID)
+	return scanProject(row)
+}
+
+func (s *PgStore) ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), install_id, scan_source,
+		       created_at, updated_at
+		  from projects
+		 where account_id = $1
+		 order by created_at desc
+	`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanProjects(rows)
+}
+
+// AppsForProject returns live apps currently bound to projectID. The
+// account scope is enforced at the SQL level: a project_id owned by
+// a different account returns ErrNotFound (not an empty slice) so
+// handlers can 404 cleanly without leaking membership.
+func (s *PgStore) AppsForProject(ctx context.Context, accountID, projectID string) ([]App, error) {
+	// Project ownership check first: returns ErrNotFound cleanly.
+	proj, err := s.ProjectByID(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if proj.AccountID != accountID {
+		return nil, ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
+		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+		        coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+		        workload_class, coalesce(start_command, '')
+		   from apps
+		  where project_id = $1 and status <> 'deleted'
+		  order by workload_name asc, created_at asc
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// SetProjectScanSource updates scan_source monotonically upward. The
+// rank literal below must mirror tierRank in pkg/state/types.go. We
+// inline the SQL CASE because the projects table does not have a
+// procedural rank column — the rank is the property of the
+// ScanSource, not the row. If requested_rank <= stored_rank, the
+// UPDATE zero-rows-affects and we return ErrScanSourceDowngrade.
+func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, src ProjectScanSource) (Project, error) {
+	if src == "" {
+		src = ProjectScanSourceUnknown
+	}
+	row := s.pool.QueryRow(ctx, `
+		update projects
+		   set scan_source = $2,
+		       updated_at  = now()
+		 where id = $1
+		   and (
+		     case scan_source
+		       when 'compose'    then 8
+		       when 'k8s'        then 8
+		       when 'render'     then 8
+		       when 'fly'        then 8
+		       when 'serverless' then 8
+		       when 'procfile'   then 6
+		       when 'workspace'  then 4
+		       when 'convention' then 2
+		       when 'single'     then 1
+		       else 0
+		     end
+		   ) <= (
+		     case $2
+		       when 'compose'    then 8
+		       when 'k8s'        then 8
+		       when 'render'     then 8
+		       when 'fly'        then 8
+		       when 'serverless' then 8
+		       when 'procfile'   then 6
+		       when 'workspace'  then 4
+		       when 'convention' then 2
+		       when 'single'     then 1
+		       else 0
+		     end
+		   )
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), install_id, scan_source,
+		          created_at, updated_at
+	`, projectID, string(src))
+	// Postgres returns zero rows when the WHERE didn't match. We need
+	// to distinguish "downgrade rejected" from "row gone" — probe the
+	// row by id first, then apply the upgrade predicate.
+	p, err := scanProject(row)
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Project{}, err
+	}
+	// Either the row is gone or the upgrade is a downgrade. Probe.
+	existing, getErr := s.ProjectByID(ctx, projectID)
+	if getErr != nil {
+		return Project{}, getErr
+	}
+	if tierRank(existing.ScanSource) > tierRank(src) {
+		return Project{}, ErrScanSourceDowngrade
+	}
+	// Same tier: the row already has scan_source == src; return it
+	// unchanged. Update updated_at so observers see the touch.
+	row2 := s.pool.QueryRow(ctx, `
+		update projects set updated_at = now() where id = $1
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), install_id, scan_source,
+		          created_at, updated_at
+	`, projectID)
+	return scanProject(row2)
+}
+
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // RecordGitHubBinding writes the (install_id, repo_full_name,
@@ -5991,13 +6231,25 @@ func scanApp(row pgx.Row) (App, error) {
 	var typeStr, statusStr string
 	var manifestBytes []byte
 	var allowlistText string
+	var workloadClassStr string
+	// Phase 1 (ADR-050, migration 00073): apps gains project_id,
+	// root_dir, workload_name, workload_class, start_command. The
+	// five new columns are appended to every apps SELECT/RETURNING
+	// below and consumed here in lockstep. project_id is a nullable
+	// uuid, so we cast to text and coalesce to '' — mirrors the
+	// runtime / idle_timeout_s pattern. start_command is nullable
+	// text; coalesce to '' for the same reason. root_dir and
+	// workload_name are NOT NULL DEFAULT '' in SQL but we still
+	// read them as strings; the DB constraint is the safety net.
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
-		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
+		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
+		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand); err != nil {
 		return App{}, mapErr(err)
 	}
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
+	a.WorkloadClass = WorkloadClass(workloadClassStr)
 	if len(manifestBytes) > 0 {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
@@ -6012,13 +6264,16 @@ func scanApps(rows pgx.Rows) ([]App, error) {
 		var typeStr, statusStr string
 		var manifestBytes []byte
 		var allowlistText string
+		var workloadClassStr string
 		if err := rows.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
-			&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
+			&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
+			&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand); err != nil {
 			return nil, err
 		}
 		a.Type = AppType(typeStr)
 		a.Status = AppStatus(statusStr)
+		a.WorkloadClass = WorkloadClass(workloadClassStr)
 		if len(manifestBytes) > 0 {
 			_ = json.Unmarshal(manifestBytes, &a.Manifest)
 		}

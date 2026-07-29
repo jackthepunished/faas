@@ -114,6 +114,11 @@ type App struct {
 	GithubInstallBindingID pgtype.Text
 	GithubInstallAccountID pgtype.UUID
 	GithubInstallLinkedAt  pgtype.Timestamptz
+	ProjectID              pgtype.UUID
+	RootDir                string
+	WorkloadName           string
+	WorkloadClass          string
+	StartCommand           pgtype.Text
 }
 
 type AppEnv struct {
@@ -387,6 +392,18 @@ type PaddleOverageDedupe struct {
 	State       string
 	ClaimedAt   pgtype.Timestamptz
 	ClaimedBy   pgtype.Text
+}
+
+type Project struct {
+	ID               pgtype.UUID
+	AccountID        pgtype.UUID
+	Slug             string
+	RepoFullName     pgtype.Text
+	ProductionBranch pgtype.Text
+	InstallID        pgtype.Int8
+	ScanSource       string
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
 }
 
 type RecentBuildClaim struct {
