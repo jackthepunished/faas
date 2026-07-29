@@ -831,6 +831,21 @@ func cmdUsageList(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(u))
 	}
+	// ADR-046: tx_bytes (HTTP response bytes, gateway-side) and
+	// net_tx_bytes (root-side vethHost interface bytes, includes
+	// framing) are informational, NOT billed. Surfaced as a
+	// trailing column so a customer can spot egress anomalies
+	// without grepping --json. Only printed when at least one
+	// counter is non-zero — most months most apps are 0 and the
+	// trailing column is noise.
+	if u.TXBytes > 0 || u.NetTxBytes > 0 {
+		_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d) · egress %.3f GB (tx %.2f / net %.2f)\n",
+			u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours,
+			u.TotalEgressGB(),
+			float64(u.TXBytes)/(1024*1024*1024),
+			float64(u.NetTxBytes)/(1024*1024*1024))
+		return 0
+	}
 	_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
 	return 0
 }
@@ -959,6 +974,11 @@ func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
 	// sees the measurement next to the billing total without
 	// confusing the two.
 	_, _ = fmt.Fprintf(w, "  %-*s %.6f CPU-hours\n", labelWidth, "CPU usage:", s.UsedCPUHours)
+	// ADR-046: per-month egress is informational, NOT billed
+	// (the future billing PR will pick the unit). Same shape as
+	// CPU usage — a separate line, never folded into "Used:"
+	// so the customer never confuses the two.
+	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB\n", labelWidth, "Egress:", s.UsedEgressGB)
 }
 
 func boolPtr(b bool) *bool { return &b }
