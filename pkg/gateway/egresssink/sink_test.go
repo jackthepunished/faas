@@ -285,17 +285,19 @@ func TestRecordResponseBytes_Concurrent(t *testing.T) {
 	close(doneCh)
 	wgDrained.Wait()
 
+	// The lock-order fix in RecordResponseBytes (sink.go) closes the
+	// orphan-row race that the previous getOrCreate/then-Lock
+	// sequence triggered at ~4.5% under -race in CI (~9/200 fails on
+	// ubuntu-latest). The fix holds s.mu across the row lookup AND
+	// inst.mu acquisition, so the drainer's eviction branch sees the
+	// row (or doesn't, and re-creates it on its next read). After
+	// wg.Wait() returns every producer's last Record has been
+	// committed, and the drainer's final drain after close(doneCh)
+	// must catch all of them — so we can assert exact equality, not a
+	// slack budget.
 	got := atomic.LoadInt64(&drainedTotal)
 	if got != scheduledTotal {
-		// Concurrent drainer closes doneCh while producers are still
-		// finishing; the final drain after close(doneCh) catches the
-		// residual. Allow a small bounded slack for the in-flight
-		// last-Record-between-last-drain-and-doneCh signal.
-		loss := scheduledTotal - got
-		if loss > int64(bytesPerRecord*goroutines) {
-			t.Fatalf("drained total = %d, want %d (lost > %d bytes-per-record * goroutines budget)", got, scheduledTotal, bytesPerRecord*int64(goroutines))
-		}
-		t.Logf("concurrent test: lost %d/%d bytes (in-flight drainer close signal); within budget", loss, scheduledTotal)
+		t.Fatalf("drained total = %d, want %d (concurrent drainer lost records — lock-order in RecordResponseBytes regressed)", got, scheduledTotal)
 	}
 }
 

@@ -245,10 +245,23 @@ func TestServeAppLogs_HeartbeatOnIdleStream(t *testing.T) {
 // reach the client in the order Recv returned them. The bounded
 // channel-of-1 introduces drop semantics; this test ensures the
 // drop path doesn't reshuffle or skip.
+//
+// Producer-side timing matters: pushing both frames BEFORE the
+// receive goroutine starts races the channel-of-1 drop — the Recv
+// loop can pick up frame 1, send to recvCh, then loop back and pick
+// up frame 2 before the main loop has consumed frame 1, hitting the
+// "channel full" branch. The earlier test pushed 2 frames in the
+// goroutine before serveAppLogs started; CI hit the drop ~1/50 times
+// on the 2-vCPU ubuntu-latest runner. The fix is to start the
+// handler first, let the receive goroutine settle into Recv, then
+// push a frame and wait for it to land in the body before pushing
+// the next one. The settle + wait-for-body pattern is what the
+// heartbeat test (and the rest of the receive-pump suite) already
+// uses.
 func TestServeAppLogs_FramesRenderInOrder(t *testing.T) {
 	h := &AppLogsHandler{
 		Heartbeat: 10 * time.Second,
-		Backstop:  200 * time.Millisecond,
+		Backstop:  10 * time.Second,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	stream := newControllableScheddStream()
@@ -256,11 +269,25 @@ func TestServeAppLogs_FramesRenderInOrder(t *testing.T) {
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "first\n", WrittenAt: time.Now()})
-		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 2, Stream: "stdout", Line: "second\n", WrittenAt: time.Now()})
 		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
 		close(done)
 	}()
+	// Let the receive goroutine settle into Recv().
+	time.Sleep(20 * time.Millisecond)
+
+	stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "first\n", WrittenAt: time.Now()})
+	// Wait for frame 1 to land in the body so the main loop has
+	// consumed it from recvCh before we push frame 2. The 2-vCPU
+	// CI runner is occasionally slow enough to drop on cap-1.
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(rec.body.String(), `"seq":1,`) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 2, Stream: "stdout", Line: "second\n", WrittenAt: time.Now()})
+
+	// Close the stream so the handler returns; otherwise the
+	// backstop would block the test for 10s.
+	stream.closeStream()
 	<-done
 	body := rec.body.String()
 	i1 := strings.Index(body, `"seq":1,`)

@@ -1,4 +1,4 @@
-// Package templates ships the eleven `faas deploy --template <name>`
+// Package templates ships the thirteen `faas deploy --template <name>`
 // starter projects as an embed.FS so the CLI is a single static
 // binary. Precedent: migrations/embed.go:13 — `//go:embed` pulls in
 // the sibling subdirectories at compile time.
@@ -33,17 +33,17 @@ import (
 // FS holds the embedded starter projects. The root is the directory
 // this file lives in, so subdirs are accessed by their template name.
 //
-//go:embed hello-node hello-python hello-go cron-example function-node function-python function-go s3-uploader slack-bot rest-api-postgres cron-worker
+//go:embed hello-node hello-python hello-go cron-example function-node function-python function-go s3-uploader slack-bot rest-api-postgres cron-worker webhook-receiver ai-chat
 var FS embed.FS
 
 // Names is the canonical template list, kept here so the CLI can
 // validate --template before touching the embed FS. The seven
-// "hello/function" scaffolds ship with `faas deploy`; the four
-// stateless-contract scaffolds (Wave 0 PR-B) are scaffolded by
-// `faas init` (commands_init.go) and tell the customer which
-// managed service to plug in. Names must stay in lockstep with
-// the //go:embed directive above — adding a template means a
-// new entry in BOTH places.
+// "hello/function" scaffolds ship with `faas deploy`; the six
+// stateless-contract scaffolds (Wave 0 PR-B + Move 1 PR-A) are
+// scaffolded by `faas init` (commands_init.go) and tell the
+// customer which managed service to plug in. Names must stay in
+// lockstep with the //go:embed directive above — adding a template
+// means a new entry in BOTH places.
 var Names = []string{
 	"hello-node",
 	"hello-python",
@@ -56,6 +56,8 @@ var Names = []string{
 	"slack-bot",
 	"rest-api-postgres",
 	"cron-worker",
+	"webhook-receiver",
+	"ai-chat",
 }
 
 // Exists reports whether name is a known template.
@@ -190,3 +192,36 @@ func NameIsValid(name string) bool {
 	}
 	return true
 }
+
+// CategoryFor returns the customer-facing group label for a template
+// name. Used by `faas init --list` (commands_init.go) to bucket the
+// 13 templates by what the customer is trying to do, not by alphabetical
+// order. Recognised categories:
+//
+//	"hello"              — first-touch smoke tests (3)
+//	"function"           — generic runtimes the customer customises (3)
+//	"stateless-contract" — managed-service scaffolds that BYO credentials (5)
+//	"ai"                 — LLM-facing scaffolds that BYO keys (1)
+//	""                   — unknown / not in Names
+//
+// The grouping mirrors the doc structure on docs.DOMAIN/templates:
+// hello/function are the "just run it" tier, stateless-contract
+// scaffolds are the "BYO managed service" tier, ai is the LLM tier.
+// Adding a template means a new entry in BOTH Names AND this switch.
+func CategoryFor(name string) string {
+	switch name {
+	case "hello-node", "hello-python", "hello-go":
+		return "hello"
+	case "function-node", "function-python", "function-go", "cron-example":
+		return "function"
+	case "s3-uploader", "slack-bot", "rest-api-postgres", "cron-worker", "webhook-receiver":
+		return "stateless-contract"
+	case "ai-chat":
+		return "ai"
+	}
+	return ""
+}
+
+// CategoryOrder is the canonical order in which `faas init --list`
+// prints categories. Pins against accidental reorders in CategoryFor.
+var CategoryOrder = []string{"hello", "function", "stateless-contract", "ai"}

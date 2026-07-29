@@ -330,3 +330,90 @@ func TestRender_AccountNoInlineOnclick(t *testing.T) {
 		t.Errorf("per-page script block missing confirm copy\n--- body ---\n%s", body)
 	}
 }
+
+// TestRender_StatelessPage pins the /dashboard/stateless landing
+// page (Move 1 PR-A). Confirms the page renders, includes the 8-base
+// denylist and the 10 closed paths, and shows the empty-state when
+// no advisories are present.
+func TestRender_StatelessPage(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Stateless advisories",
+		Body:  "stateless",
+		Data: dashboard.StatelessData{
+			RecentAdvisoriesEmpty: true,
+			StatelessDenylist:     dashboard.StatelessDenylist,
+			ClosedPaths:           dashboard.StatelessClosedPaths,
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// All 8 base denylist entries must appear so a future rename of
+	// one entry can't silently ship without a dashboard refresh.
+	for _, name := range []string{"postgres", "redis", "mysql", "mariadb", "mongo", "cockroach", "cassandra", "clickhouse"} {
+		if !strings.Contains(body, "<code>"+name+"</code>") {
+			t.Errorf("denylist row missing %q\n--- body ---\n%s", name, body)
+		}
+	}
+	// The two "high" closed paths and at least one "warn" path must
+	// appear; pinning both severities keeps the badge column honest.
+	for _, p := range []string{"/data", "/db", "/var/lib/postgresql", "/var/lib/redis"} {
+		if !strings.Contains(body, "<code>"+p+"</code>") {
+			t.Errorf("closed-path row missing %q\n--- body ---\n%s", p, body)
+		}
+	}
+	if !strings.Contains(body, `class="badge high"`) {
+		t.Errorf("high-severity badge missing\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, `class="badge warn"`) {
+		t.Errorf("warn-severity badge missing\n--- body ---\n%s", body)
+	}
+	// Empty-state copy must render when no advisories are present.
+	if !strings.Contains(body, "No advisories recorded") {
+		t.Errorf("empty-state copy missing\n--- body ---\n%s", body)
+	}
+	// Nav link to /dashboard/stateless must be present + active.
+	if !strings.Contains(body, `href="/dashboard/stateless"`) {
+		t.Errorf("nav link to /dashboard/stateless missing\n--- body ---\n%s", body)
+	}
+}
+
+// TestStatelessSlices_Shape pins the package-level slices so a future
+// drift in pkg/imaged or guest-init is caught on the dashboard side.
+// Adding a base to the denylist means updating BOTH pkg/imaged/base.go
+// AND pkg/dashboard/dashboard.go's StatelessDenylist; this test fails
+// if either is forgotten (count + names are pinned).
+func TestStatelessSlices_Shape(t *testing.T) {
+	if got := len(dashboard.StatelessDenylist); got != 8 {
+		t.Errorf("StatelessDenylist len = %d, want 8 (mirror of pkg/imaged/base.go)", got)
+	}
+	if got := len(dashboard.StatelessClosedPaths); got != 10 {
+		t.Errorf("StatelessClosedPaths len = %d, want 10 (mirror of guest/init/stateless_advisory_linux.go)", got)
+	}
+	// Every closed path must have a severity, and severities must
+	// be in the closed vocabulary.
+	for _, p := range dashboard.StatelessClosedPaths {
+		if p.Severity != "high" && p.Severity != "warn" {
+			t.Errorf("closed-path %q has bad severity %q", p.Path, p.Severity)
+		}
+	}
+	// The two top-level dirs must be high severity; pinning this
+	// keeps the badge column honest if a future refactor mis-classifies.
+	highs := map[string]bool{}
+	for _, p := range dashboard.StatelessClosedPaths {
+		if p.Severity == "high" {
+			highs[p.Path] = true
+		}
+	}
+	for _, want := range []string{"/data", "/db"} {
+		if !highs[want] {
+			t.Errorf("expected %q to be high severity; got %v", want, highs)
+		}
+	}
+}
