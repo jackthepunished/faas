@@ -28,6 +28,12 @@ faas secrets set --app <slug> DATABASE_URL='postgres://user:pass@host:port/db?ss
 If `DATABASE_URL` is missing, the handler exits at startup with the
 exact `faas secrets set` command.
 
+> **SSL — keep `?sslmode=require` (or `verify-full`) on the URL.**
+> The pool reads the query string and sets `rejectUnauthorized: true`
+> only when one of those is present; without it, the pool silently
+> falls back to an unencrypted connection. Every managed Postgres
+> provider above ships TLS by default — keep the suffix on your URL.
+
 ## Deploy
 
 From this directory:

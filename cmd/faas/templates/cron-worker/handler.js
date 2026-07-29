@@ -84,7 +84,7 @@ export async function handler(event, ctx) {
   if (missing.length > 0) {
     fail(
       `missing env: ${missing.join(", ")}`,
-      `run: faas secrets set --app <slug> ${missing.join("=... ")}=...`,
+      `run: faas secrets set --app <slug> ${missing.map((k) => k + "=...").join(" ")}`,
     );
   }
 
@@ -109,10 +109,11 @@ export async function handler(event, ctx) {
     payload = { raw: rawBody };
   }
 
-  // Bump a counter to demonstrate durable progress. The key is
-  // per-invocation-id-derived so a customer's "how many times has
-  // my cron fired" is a single Redis GET.
-  const count = await bumpRedisCounter(`cron-worker:${ctx.invocation_id.slice(0, 8)}`);
+  // Bump a single counter so a customer's "how many times has my
+  // cron fired" is a single Redis GET on `cron-worker:fired`. The
+  // counter survives cold boots (park + wake), which is the whole
+  // point of using a managed Redis instead of local filesystem state.
+  const count = await bumpRedisCounter("cron-worker:fired");
 
   ctx.log.info("cron-worker fired", {
     invocation_id: ctx.invocation_id,

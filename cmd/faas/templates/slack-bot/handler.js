@@ -76,12 +76,14 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 // Slack sends `application/x-www-form-urlencoded` for the URL-verification
-// handshake AND JSON for everything else. We capture the raw bytes for the
-// HMAC check (express's built-in JSON parser would re-serialise and break
-// the signature), then parse manually.
+// handshake AND `application/json` for everything else. We capture the
+// raw bytes for the HMAC check (express's built-in JSON parser would
+// re-serialise and break the signature), then parse manually. The
+// `type: () => true` predicate accepts any content-type so we don't
+// reject Slack's two distinct encodings.
 app.use(
   express.raw({
-    type: () => true, // accept anything
+    type: () => true,
     limit: "1mb",
   }),
 );

@@ -83,9 +83,9 @@ func sub(name string) (fs.FS, error) {
 
 // Materialize copies the template named name into dest. dest should be
 // an empty directory (the CLI uses os.MkdirTemp; tests use
-// MaterializeForTest). Skips dotfiles — the embed FS shouldn't have
-// any today, but if a future template adds one we don't want it
-// polluting the customer's repo.
+// MaterializeForTest). Delegates to os.CopyFS — no dotfile filtering,
+// no header munging. TarGz is the path that wraps the result for the
+// accept-time tarball scan; TarGz is the one that skips dotfiles.
 func Materialize(name, dest string) error {
 	subFS, err := sub(name)
 	if err != nil {
