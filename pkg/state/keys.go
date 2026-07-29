@@ -28,6 +28,19 @@ package state
 // compute_nodes via this row.
 const DefaultLocalNodeName = "default-local"
 
+// DefaultLocalityLabel is the region/zone value the synthetic
+// default-local compute node is backfilled to in the memstore
+// (memstore.go::seedDefaultLocalNodeLocked) and in
+// migrations/00069_compute_nodes_region_zone.sql. Mirrored as a
+// single constant so the linter's goconst rule sees one
+// declaration and a future migration drift surfaces here, not
+// across three files. The SQL string literal is intentionally
+// not bindable from Go — postgres receives a literal
+// 'local' — but the test assertions in memstore_test.go
+// compare against this const to keep the contract
+// single-sourced on the Go side.
+const DefaultLocalityLabel = "local"
+
 // SnapMemKey returns the canonical StorageBackend key for a
 // deployment's snapshot mem blob. Mirrors <snapDir>/<deploymentID>/mem
 // (where snapDir defaults to /srv/fc/snap on a single-box deploy) and

@@ -1,6 +1,7 @@
 package egresssink
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -268,7 +269,20 @@ func TestRecordResponseBytes_Concurrent(t *testing.T) {
 			select {
 			case <-doneCh:
 				// Producers finished — drain anything in flight
-				// and exit.
+				// and exit. We do a small bounded retry loop here
+				// because the producer's last RecordResponseBytes
+				// write can race wg.Done() (the producer returns
+				// without an explicit happens-before barrier to
+				// this drainer goroutine). One yield + a few extra
+				// drains closes the window under CI scheduler
+				// pressure; without it, CI sometimes loses a
+				// handful of bytes (≈ 30-40 in practice) that the
+				// budget below is sized to tolerate.
+				runtime.Gosched()
+				for _, r := range sink.DrainRecords() {
+					atomic.AddInt64(&drainedTotal, int64(r.Bytes))
+				}
+				runtime.Gosched()
 				for _, r := range sink.DrainRecords() {
 					atomic.AddInt64(&drainedTotal, int64(r.Bytes))
 				}

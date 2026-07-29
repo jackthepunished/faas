@@ -9,6 +9,7 @@ package sched
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -904,18 +905,36 @@ type GatewaySynth interface {
 	Invoke(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error)
 }
 
-// httpGatewaySynth is the production GatewaySynth: a unix-socket HTTP
-// client pointed at gatewayd's /v1/synthesize endpoint.
+// httpGatewaySynth is the production GatewaySynth: an HTTP client
+// pointed at gatewayd's internal listener. The transport is chosen
+// by the dial target:
+//
+//   - unix:// — net.Dial("unix", ...) over a unix socket; the host
+//     component of the URL is the literal "unix" so http.Client
+//     can shape the request line. basePrefix = "http://unix".
+//   - tcp://|dns:// — plain http.Client.Do on the address; basePrefix
+//     = "http://<addr>" or "https://<addr>" depending on tlsCfg.
+//
+// basePrefix is host-only (no path) so each method appends its own
+// route: SynthesizeRequest → /v1/synthesize, Invoke →
+// /v1/invocations:dispatch.
 type httpGatewaySynth struct {
-	client  *http.Client
-	baseURL string
-	log     *slog.Logger
+	client     *http.Client
+	basePrefix string
+	log        *slog.Logger
 }
 
 // DialGatewaySynth opens an HTTP unix-socket client targeting
 // gatewayd's internal listener. The client is stateless — the unix
 // socket is opened per request by the transport — so dial failures
 // surface on the first SynthesizeRequest call.
+//
+// This is the legacy one-box dial. Multi-box schedd uses
+// DialGatewaySynthTarget instead, which accepts a wire.ParseTarget-
+// style URL (unix://|tcp://|dns://). The legacy function is kept
+// because every test in cron_loop_test.go / drain_test.go uses
+// it directly; renaming would be a much larger blast radius than
+// this PR can afford.
 func DialGatewaySynth(socketPath string, log *slog.Logger) (GatewaySynth, error) {
 	if socketPath == "" {
 		return nil, errors.New("sched: gateway synth socket path is empty")
@@ -930,10 +949,67 @@ func DialGatewaySynth(socketPath string, log *slog.Logger) (GatewaySynth, error)
 	}
 	c := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	return &httpGatewaySynth{
-		client:  c,
-		baseURL: "http://unix/v1/synthesize",
-		log:     log,
+		client:     c,
+		basePrefix: "http://unix",
+		log:        log,
 	}, nil
+}
+
+// DialGatewaySynthTarget opens an HTTP client targeting gatewayd's
+// internal listener over a wire.ParseTarget-style URL
+// (unix://|tcp://|dns://). Placement scheduler PR / ADR-025 axis 3
+// (Q8): in a multi-box deploy, schedd and gatewayd are not on the
+// same host, so the unix-socket dial is no longer reachable. The
+// TCP path uses TLS when the env wires a TLS config
+// (FAAS_GATEWAY_SYNTH_TLS_CA / CERT / KEY; spec §7); the dns path
+// delegates resolution to the stdlib. A nil tlsCfg falls through to
+// plain HTTP — fine for tailnet-only deployments where the overlay
+// is private (PR #120 / ADR-028 §Out of scope explicitly leaves
+// tailnet ACLs to operator config).
+//
+// The baseURL scheme is "http" for tcp+dns (TLS-off) and "https"
+// when tlsCfg is set; the unix path always uses "http" because the
+// dialer writes bytes directly to the socket.
+func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logger) (GatewaySynth, error) {
+	if rawTarget == "" {
+		return nil, errors.New("sched: gateway synth target is empty")
+	}
+	t, err := wire.ParseTarget(rawTarget)
+	if err != nil {
+		return nil, fmt.Errorf("sched: gateway synth parse %q: %w", rawTarget, err)
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	switch t.Scheme {
+	case wire.SchemeUnix:
+		tr := &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", t.Address)
+			},
+		}
+		return &httpGatewaySynth{
+			client:     &http.Client{Transport: tr, Timeout: 30 * time.Second},
+			basePrefix: "http://unix",
+			log:        log,
+		}, nil
+	case wire.SchemeTCP, wire.SchemeDNS:
+		scheme := "http"
+		if tlsCfg != nil {
+			scheme = "https"
+		}
+		tr := &http.Transport{
+			TLSClientConfig:       tlsCfg,
+			ResponseHeaderTimeout: 30 * time.Second,
+		}
+		return &httpGatewaySynth{
+			client:     &http.Client{Transport: tr, Timeout: 30 * time.Second},
+			basePrefix: scheme + "://" + t.Address,
+			log:        log,
+		}, nil
+	default:
+		return nil, fmt.Errorf("sched: gateway synth target scheme %q not supported", t.Scheme)
+	}
 }
 
 // SynthesizeRequest posts {app_id, method, path} to gatewayd's internal
@@ -946,7 +1022,7 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 	if err != nil {
 		return fmt.Errorf("sched: synth marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.basePrefix+"/v1/synthesize", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("sched: synth request: %w", err)
 	}
@@ -977,7 +1053,7 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 	if err != nil {
 		return inv, fmt.Errorf("sched: invocation marshal: %w", err)
 	}
-	url := "http://unix/v1/invocations:dispatch"
+	url := h.basePrefix + "/v1/invocations:dispatch"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return inv, fmt.Errorf("sched: invocation request: %w", err)

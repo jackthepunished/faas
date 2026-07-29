@@ -791,6 +791,16 @@ type Instance struct {
 // The struct's field names track the SQL columns 1:1; Active == false
 // is a runtime "drained" flag (placement skips), distinct from a row
 // delete (re-registration is idempotent on conflict).
+//
+// Region / Zone are nullable locality labels added by
+// migrations/00069_compute_nodes_region_zone.sql. The chooser
+// (pkg/sched/ChoosePlacement) uses them as a secondary tie-break
+// when two nodes have equal RAM headroom. Pointer types so a SQL
+// NULL round-trips as nil rather than collapsing into "" — that
+// distinction matters when the chooser compares for ordering and
+// the seeded default-local row is backfilled to ('local','local')
+// in the migration so the single-box deploy has a deterministic
+// ordering.
 type ComputeNode struct {
 	ID                 string
 	Name               string
@@ -802,6 +812,15 @@ type ComputeNode struct {
 	Active             bool
 	LastHeartbeatAt    time.Time
 	CreatedAt          time.Time
+	// Region is a free-form locality label (e.g. "eu-fsn1", "local").
+	// nil means the row was inserted before 00069 OR the operator
+	// didn't set a region on registration. The chooser treats nil
+	// and "" identically.
+	Region *string
+	// Zone is the finer-grained locality inside a region. Currently
+	// informational; pkg/sched/ChoosePlacement uses it as a tertiary
+	// tie-break after (headroom DESC, region ASC, name ASC).
+	Zone *string
 }
 
 // ComputeNodeHeartbeat is one row in the append-only

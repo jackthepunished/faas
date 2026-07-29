@@ -141,6 +141,14 @@ type Engine struct {
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
+	// warmAffinity is the sticky-warm cache (placement scheduler PR,
+	// ADR-025). Defaults to a zero-TTL cache that always returns "no
+	// hint" so pre-PR test fixtures keep their existing behaviour.
+	// Production wires a real cache via WithWarmAffinity (cmd/schedd/
+	// main.go). nil is tolerated by RecordWake / LastWarmNode so a
+	// missed wiring is a silent no-op rather than a nil-deref panic.
+	warmAffinity *WarmAffinity
+
 	// defaultLocalNodeID is the resolved UUID of the 'default-local'
 	// compute_node (issue #97 / ADR-025 axis 3). Looked up once at
 	// construction via ComputeNodeByName so the router can resolve
@@ -228,6 +236,17 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 // counter. Returns the engine for builder-style wiring.
 func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 	e.ops = ops
+	return e
+}
+
+// WithWarmAffinity attaches the sticky-warm cache (placement scheduler
+// PR, ADR-025). The engine reads LastWarmNode for the request hint
+// before calling ChoosePlacement and records the chosen node on a
+// successful admit. nil is tolerated (records become no-ops, hints
+// always empty) so legacy test fixtures that don't wire this keep
+// their existing single-box behaviour.
+func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
+	e.warmAffinity = w
 	return e
 }
 
@@ -442,14 +461,30 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// the tie-break. The chooser is invoked under appMu so a
 	// concurrent wake for the same app sees a coherent (fleet,
 	// per-node used_mb) view.
+	//
+	// Sticky-warm affinity (placement scheduler PR, ADR-025): the
+	// WarmAffinity hint is read here so a hot app's snapshot + page
+	// cache stay warm across reaper cycles (ADR-009). The hint is
+	// bias, never a gate — the chooser falls through to
+	// least-loaded when the preferred node is saturated. ADR-005
+	// (cold boot must always work) is preserved: an empty hint
+	// behaves identically to a fresh install.
+	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
+		PreferredNodeID: warmHint,
 	})
 	if err != nil {
 		release()
 		return WakeResult{}, err // *api.Problem from chooser
 	}
+	// Sticky-warm record: stamp the chosen node so the NEXT wake
+	// for this app picks it back up. Recorded after a successful
+	// admit only — a rejection doesn't "warm" anything. Per-app
+	// lock is held here so a concurrent burst for the same app
+	// sees a coherent (RecordWake, hint) sequence.
+	e.warmAffinity.RecordWake(appID, placement.NodeID)
 	ins, err := e.store.CreateInstance(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID)
 	if err != nil {
 		release()
@@ -460,7 +495,8 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	if err := e.ledger.Admit(Request{
 		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		NodeID: placement.NodeID,
+		NodeID:        placement.NodeID,
+		NodeCeilingMB: placement.CeilingMB,
 	}); err != nil {
 		// Admit failed (capacity / concurrency). The two rejection
 		// modes differ in how loudly the engine surfaces them:
@@ -883,7 +919,8 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	if err := e.ledger.Admit(Request{
 		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		NodeID: placement.NodeID,
+		NodeID:        placement.NodeID,
+		NodeCeilingMB: placement.CeilingMB,
 	}); err != nil {
 		e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_admit_denied")
 		return err
@@ -1067,6 +1104,26 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sched: seed ledger: list apps: %w", err)
 	}
+	// Per-node ceiling cache so we don't fire a ComputeNodeByID
+	// per instance row (PR scale-out readiness #4, this would
+	// otherwise be O(instances × nodes) on a busy fleet). The
+	// map is local to SeedLedger — once the daemon's loop is
+	// running, choosePlacementLocked reloads from the store on
+	// every wake so a node row edited at runtime is picked up
+	// the next time the chooser runs.
+	ceilings := map[string]int{}
+	loadCeiling := func(ctx context.Context, nodeID string) int {
+		if c, ok := ceilings[nodeID]; ok {
+			return c
+		}
+		n, err := e.store.ComputeNodeByID(ctx, nodeID)
+		if err != nil || n.AdmissionCeilingMB <= 0 {
+			ceilings[nodeID] = 0
+			return 0
+		}
+		ceilings[nodeID] = n.AdmissionCeilingMB
+		return n.AdmissionCeilingMB
+	}
 	for _, app := range apps {
 		acct, err := e.store.AccountByID(ctx, app.AccountID)
 		if err != nil {
@@ -1091,7 +1148,8 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 			if err := e.ledger.Admit(Request{
 				Instance: ins.ID, AppID: app.ID, Plan: acct.Plan,
 				RAMMB: ins.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-				NodeID: nodeID,
+				NodeID:        nodeID,
+				NodeCeilingMB: loadCeiling(ctx, nodeID),
 			}); err != nil {
 				e.log.Warn("seed ledger: admit", "instance", ins.ID, "err", err)
 				continue

@@ -1108,6 +1108,135 @@ func TestPg_ComputeNodes_ByID_NotFoundAndByName_NotFound(t *testing.T) {
 	}
 }
 
+// TestPg_ComputeNodes_RegionZone_ProjectedByAllReads pins the
+// migrations/00069 region/zone columns end-to-end through every read
+// path that PR #429 modified (scanComputeNode, ActiveComputeNodes,
+// ListAllComputeNodes, ComputeNodeByID, ComputeNodeByName). The chooser
+// reads these columns to tie-break on (headroom, region, zone, name);
+// if any of the five read paths drops a column, a chooser call will
+// panic on a nil *string compare or silently order wrong.
+//
+// We bypass CreateComputeNode because it doesn't yet accept region/zone
+// (multi-box registration is the next slice; see plan follow-up). The
+// raw insert exercises the schema directly. Postgres' NOT NULL
+// constraint on the other columns still fires if a future refactor
+// drifts.
+func TestPg_ComputeNodes_RegionZone_ProjectedByAllReads(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+
+	// Insert a node with non-null region/zone.
+	var idWithVals string
+	if err := pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency,
+		     admission_ceiling_mb, active, region, zone)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		returning id
+	`, "rgz-with-vals", "unix:///run/faas/vmmd.sock",
+		80, 28000, 100, 23800, true, "eu-fra", "eu-fra-1").Scan(&idWithVals); err != nil {
+		t.Fatalf("insert with region/zone: %v", err)
+	}
+
+	// Insert a node with NULL region/zone (pre-00069 shape — a row
+	// created before the migration ran, or by a future
+	// CreateComputeNode that doesn't populate the columns).
+	var idNullCols string
+	if err := pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency,
+		     admission_ceiling_mb, active)
+		values ($1, $2, $3, $4, $5, $6, $7)
+		returning id
+	`, "rgz-null-cols", "unix:///run/faas/vmmd.sock",
+		80, 28000, 100, 23800, true).Scan(&idNullCols); err != nil {
+		t.Fatalf("insert with null region/zone: %v", err)
+	}
+
+	// ComputeNodeByID — populated case.
+	got, err := s.ComputeNodeByID(ctx, idWithVals)
+	if err != nil {
+		t.Fatalf("ComputeNodeByID(with-vals): %v", err)
+	}
+	if got.Region == nil || *got.Region != "eu-fra" {
+		t.Errorf("Region = %v, want pointer to \"eu-fra\"", got.Region)
+	}
+	if got.Zone == nil || *got.Zone != "eu-fra-1" {
+		t.Errorf("Zone = %v, want pointer to \"eu-fra-1\"", got.Zone)
+	}
+
+	// ComputeNodeByName — populated case.
+	gotByName, err := s.ComputeNodeByName(ctx, "rgz-with-vals")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName(with-vals): %v", err)
+	}
+	if gotByName.Region == nil || *gotByName.Region != "eu-fra" {
+		t.Errorf("ByName.Region = %v, want pointer to \"eu-fra\"", gotByName.Region)
+	}
+	if gotByName.Zone == nil || *gotByName.Zone != "eu-fra-1" {
+		t.Errorf("ByName.Zone = %v, want pointer to \"eu-fra-1\"", gotByName.Zone)
+	}
+
+	// ComputeNodeByID — null case. nil must round-trip as nil
+	// (pointer type), not as a deref panic or an empty-string collapse.
+	gotNull, err := s.ComputeNodeByID(ctx, idNullCols)
+	if err != nil {
+		t.Fatalf("ComputeNodeByID(null-cols): %v", err)
+	}
+	if gotNull.Region != nil {
+		t.Errorf("Region = %v, want nil for pre-00069 row", *gotNull.Region)
+	}
+	if gotNull.Zone != nil {
+		t.Errorf("Zone = %v, want nil for pre-00069 row", *gotNull.Zone)
+	}
+
+	// ActiveComputeNodes must project region/zone for every entry.
+	active, err := s.ActiveComputeNodes(ctx)
+	if err != nil {
+		t.Fatalf("ActiveComputeNodes: %v", err)
+	}
+	found := map[string]state.ComputeNode{}
+	for _, n := range active {
+		found[n.Name] = n
+	}
+	for _, want := range []string{"rgz-with-vals", "rgz-null-cols"} {
+		if _, ok := found[want]; !ok {
+			t.Errorf("ActiveComputeNodes missing %q (got %v)", want, namesOf(active))
+			continue
+		}
+	}
+	if n, ok := found["rgz-with-vals"]; ok {
+		if n.Region == nil || *n.Region != "eu-fra" {
+			t.Errorf("ActiveComputeNodes[rgz-with-vals].Region = %v, want pointer to \"eu-fra\"", n.Region)
+		}
+	}
+	if n, ok := found["rgz-null-cols"]; ok {
+		if n.Region != nil {
+			t.Errorf("ActiveComputeNodes[rgz-null-cols].Region = %v, want nil", *n.Region)
+		}
+	}
+
+	// ListAllComputeNodes projects region/zone the same way.
+	all, err := s.ListAllComputeNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListAllComputeNodes: %v", err)
+	}
+	for _, n := range all {
+		if n.Name == "rgz-with-vals" {
+			if n.Region == nil || *n.Region != "eu-fra" {
+				t.Errorf("ListAllComputeNodes[rgz-with-vals].Region = %v, want pointer to \"eu-fra\"", n.Region)
+			}
+		}
+	}
+}
+
+func namesOf(nodes []state.ComputeNode) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.Name)
+	}
+	return out
+}
+
 func TestPg_ComputeNodes_Heartbeat_BumpsAndUnknownReturnsNotFound(t *testing.T) {
 	s, ctx := pgStore(t)
 

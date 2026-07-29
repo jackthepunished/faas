@@ -24,6 +24,9 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	if cfg.GatewaySynthSocket != "/run/faas/gatewayd-internal.sock" {
 		t.Errorf("GatewaySynthSocket = %q, want default", cfg.GatewaySynthSocket)
 	}
+	if cfg.GatewaySynthTarget != "" {
+		t.Errorf("GatewaySynthTarget = %q, want default empty (fallback lives in cmd/schedd/main.go)", cfg.GatewaySynthTarget)
+	}
 	if cfg.OwnerUser != "faas-schedd" {
 		t.Errorf("OwnerUser = %q, want default", cfg.OwnerUser)
 	}
