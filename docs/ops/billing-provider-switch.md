@@ -60,7 +60,7 @@ clock-skew tolerance.
 2. **Provision the Paddle credentials.**
    - Generate a Paddle API key (sandbox or live).
    - Create a webhook endpoint in the Paddle dashboard pointing at
-     `https://apid.DOMAIN/v1/webhooks/paddle`. Copy the webhook secret.
+     `https://apid.gregale.dev/v1/webhooks/paddle`. Copy the webhook secret.
 
 3. **Stand up the new billing surface in parallel.** The two providers
    can coexist in different environments — do not point the production

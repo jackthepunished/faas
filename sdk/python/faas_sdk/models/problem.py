@@ -28,9 +28,9 @@ class Problem:
     populated on a given 402 — never both.
 
         Example:
-            {'type': 'https://docs.DOMAIN/errors/validation_failed', 'title': 'Validation failed', 'status': 422, 'code':
+            {'type': 'https://docs.gregale.dev/errors/validation_failed', 'title': 'Validation failed', 'status': 422, 'code':
                 'validation_failed', 'detail': 'ram_mb must be one of [128, 256, 512, 1024, 2048]', 'limit': None, 'observed':
-                None, 'docs_url': 'https://docs.DOMAIN/errors/validation_failed'}
+                None, 'docs_url': 'https://docs.gregale.dev/errors/validation_failed'}
 
     """
 

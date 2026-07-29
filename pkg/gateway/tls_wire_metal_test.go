@@ -12,7 +12,7 @@
 //
 //	export HETZNER_DNS_API_TOKEN=...                  # required, Hetzner DNS API token
 //	export FAAS_METAL_TLS_ZONE=example.com            # zone the test mints under
-//	export FAAS_METAL_TLS_APPS_DOMAIN=apps.example.com  # wildcard host + zone apex
+//	export FAAS_METAL_TLS_APPS_DOMAIN=apps.gregale.dev  # wildcard host + zone apex
 //	export FAAS_METAL_TLS_CUSTOM_DOMAIN=on-demand.example.com  # for on-demand test
 //	export FAAS_RUN_TLS_METAL=1                        # gate (tests skip without it)
 //	export FAAS_METAL_TLS_PUBLIC_HTTP_LISTENER=1       # only needed for the on-demand test
@@ -106,7 +106,7 @@ func metalStorageDir(t *testing.T) string {
 	return dir
 }
 
-// TestMetalCertMagic_StagingE2E — mint the wildcard *.apps.example.com cert
+// TestMetalCertMagic_StagingE2E — mint the wildcard *.apps.gregale.dev cert
 // against acme-staging-v02.api.letsencrypt.org. Asserts ManageSync returns
 // nil within 90 s — the production timeout the operator runbook budgets for.
 //

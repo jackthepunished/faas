@@ -60,19 +60,19 @@ faas deploy
 ```sh
 # Health probe — shows whether the secret is configured and what
 # paths are allowed.
-curl https://<slug>.<DOMAIN>/healthz
+curl https://<slug>.gregale.dev/healthz
 
 # Unauthenticated POST when WEBHOOK_SECRET is unset:
 curl -X POST -H 'content-type: application/json' \
      -d '{"event":"test","data":{"hello":"world"}}' \
-     https://<slug>.<DOMAIN>/stripe
+     https://<slug>.gregale.dev/stripe
 
 # Authenticated POST when WEBHOOK_SECRET is set:
 curl -X POST \
      -H 'X-Webhook-Secret: <the-secret>' \
      -H 'content-type: application/json' \
      -d '{"event":"test","data":{"hello":"world"}}' \
-     https://<slug>.<DOMAIN>/stripe
+     https://<slug>.gregale.dev/stripe
 ```
 
 ## Adding provider-specific verification

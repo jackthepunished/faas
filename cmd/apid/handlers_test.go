@@ -145,7 +145,7 @@ func TestCreateDeployment_AppNotOwned(t *testing.T) {
 		AccountID: acctA.ID, Slug: "a-app", Status: state.AppActive,
 	})
 
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).handler()
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).handler()
 	digest := "sha256:" + repeat("a", 64)
 
 	// B tries to deploy to A's slug.

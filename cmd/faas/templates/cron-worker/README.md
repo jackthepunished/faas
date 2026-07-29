@@ -50,7 +50,7 @@ function templates (commands2.go:298), so no extra flags are needed.
 In the QStash console (or via curl), publish to your function URL:
 
 ```sh
-curl -X POST https://qstash.upstash.io/v2/publish/<slug>.<DOMAIN> \
+curl -X POST https://qstash.upstash.io/v2/publish/<slug>.gregale.dev \
   -H "Authorization: Bearer $QSTASH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"task":"tick"}'

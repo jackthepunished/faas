@@ -1,6 +1,6 @@
 [Unit]
 Description=onebox-faas apid — public control-plane API (spec §4.1)
-Documentation=https://docs.DOMAIN/ops/apid
+Documentation=https://docs.gregale.dev/ops/apid
 After=network.target faas-cp.slice
 Wants=faas-cp.slice
 

@@ -18,7 +18,7 @@ func TestTLSConfigPartialRejects(t *testing.T) {
 	// (Validate returns ErrTLSAllowlistMissing first if it's nil). Leave
 	// HetznerDNSAPITokenPath empty — that is the "partial" defect.
 	cfg := TLSConfig{
-		WildcardCertDomain:      "apps.example.com",
+		WildcardCertDomain:      "apps.gregale.dev",
 		OnDemandHTTP01Allowlist: func(string) bool { return false },
 	}
 	err := cfg.Validate()
@@ -32,7 +32,7 @@ func TestTLSConfigPartialRejects(t *testing.T) {
 // reach :80 would otherwise mint certs for arbitrary hostnames.
 func TestTLSConfig_RejectsAllowlistMissing(t *testing.T) {
 	cfg := TLSConfig{
-		WildcardCertDomain:     "apps.example.com",
+		WildcardCertDomain:     "apps.gregale.dev",
 		HetznerDNSAPITokenPath: "/etc/faas/secrets/hetzner-dns.token",
 		HetznerZone:            "example.com",
 		StorageDir:             "/var/lib/faas/certs",
@@ -46,7 +46,7 @@ func TestTLSConfig_RejectsAllowlistMissing(t *testing.T) {
 
 func TestTLSConfigFullAccepts(t *testing.T) {
 	cfg := TLSConfig{
-		WildcardCertDomain:      "apps.example.com",
+		WildcardCertDomain:      "apps.gregale.dev",
 		HetznerDNSAPITokenPath:  "/etc/faas/secrets/hetzner-dns.token",
 		HetznerZone:             "example.com",
 		StorageDir:              "/var/lib/faas/certs",

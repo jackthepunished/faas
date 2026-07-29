@@ -118,7 +118,7 @@ func newBindPickerTestServer(t *testing.T, gh GithubdClient) (http.Handler, *ses
 		t.Fatalf("issue session: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{}, "", noopMailer{}, gh, mgr, nil, 15*60_000_000_000, "").handler()
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, gh, mgr, nil, 15*60_000_000_000, "").handler()
 	return srv, mgr, acct.ID, cookie
 }
 

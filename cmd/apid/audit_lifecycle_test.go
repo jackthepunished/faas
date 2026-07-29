@@ -61,7 +61,7 @@ func (e failingAppendError) Error() string { return e.msg }
 func TestAuditLifecycle_StartFlushClose(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).
 		WithOpsMetrics(context.Background(), ops)
 	defer srv.audit.Close()
 
@@ -116,7 +116,7 @@ func TestAuditLifecycle_StartFlushClose(t *testing.T) {
 func TestAuditLifecycle_CloseDrainsInFlightRows(t *testing.T) {
 	store := state.NewMemStore()
 	ops := wire.NewOpsMetrics("apid")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).
 		WithOpsMetrics(context.Background(), ops)
 	h := srv.handler()
 
@@ -168,7 +168,7 @@ func TestAuditLifecycle_CloseDrainsInFlightRows(t *testing.T) {
 func TestAuditLifecycle_FailingStoreIncrementsDedicatedCounter(t *testing.T) {
 	store := failingAppendStore{Store: state.NewMemStore()}
 	ops := wire.NewOpsMetrics("apid")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).
 		WithOpsMetrics(context.Background(), ops)
 	defer srv.audit.Close()
 

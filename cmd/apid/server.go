@@ -376,7 +376,7 @@ func newServerWithDeps(
 	dpaPath string,
 ) *server {
 	if domain == "" {
-		domain = "DOMAIN"
+		domain = domainUnset
 	}
 	if notif == nil {
 		notif = noopNotifier{}

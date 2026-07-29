@@ -35,7 +35,7 @@ func newAuthLimitServer(t *testing.T) http.Handler {
 	if _, err := store.CreateAccount(context.Background(), "alice@example.com", api.PlanPro); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	return srv.handler()
 }
 

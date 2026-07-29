@@ -45,11 +45,11 @@ faas deploy
 ## Try it
 
 ```sh
-curl https://<slug>.<DOMAIN>/healthz       # → {"ok":true,"db":"ok"}
+curl https://<slug>.gregale.dev/healthz       # → {"ok":true,"db":"ok"}
 curl -X POST -H 'content-type: application/json' \
      -d '{"body":"hello from faas"}' \
-     https://<slug>.<DOMAIN>/notes          # → {"ok":true,"note":{...}}
-curl https://<slug>.<DOMAIN>/notes          # → {"ok":true,"notes":[{...}]}
+     https://<slug>.gregale.dev/notes          # → {"ok":true,"note":{...}}
+curl https://<slug>.gregale.dev/notes          # → {"ok":true,"notes":[{...}]}
 ```
 
 ## Re-deploy after edits

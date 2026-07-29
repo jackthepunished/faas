@@ -18,17 +18,17 @@ import (
 const sampleConfig = `
 public_addr = ":443"
 control_addr = "127.0.0.1:9090"
-apps_domain = "apps.example.com"
+apps_domain = "apps.gregale.dev"
 apid_loopback = "http://127.0.0.1:8081"
 githubd_loopback = "http://127.0.0.1:8083"
 
 [tls]
 disabled = false
-wildcard_cert_domain = "apps.example.com"
+wildcard_cert_domain = "apps.gregale.dev"
 hetzner_dns_api_token_path = "/etc/faas/secrets/hetzner-dns.token"
-hetzner_zone = "example.com"
+hetzner_zone = "gregale.dev"
 storage_dir = "/var/lib/faas/certs"
-contact_email = "ops@example.com"
+contact_email = "ops@gregale.dev"
 use_staging_ca = true
 `
 
@@ -61,28 +61,28 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 	if c.PublicAddr != ":443" {
 		t.Errorf("PublicAddr = %q, want :443", c.PublicAddr)
 	}
-	if c.AppsDomain != "apps.example.com" {
-		t.Errorf("AppsDomain = %q, want apps.example.com", c.AppsDomain)
+	if c.AppsDomain != "apps.gregale.dev" {
+		t.Errorf("AppsDomain = %q, want apps.gregale.dev", c.AppsDomain)
 	}
 	if c.TLS.Disabled {
 		t.Error("TLS.Disabled should be false")
 	}
-	if c.TLS.WildcardCertDomain != "apps.example.com" {
+	if c.TLS.WildcardCertDomain != "apps.gregale.dev" {
 		t.Errorf("WildcardCertDomain = %q", c.TLS.WildcardCertDomain)
 	}
-	if c.TLS.HetznerZone != "example.com" {
+	if c.TLS.HetznerZone != "gregale.dev" {
 		t.Errorf("HetznerZone = %q", c.TLS.HetznerZone)
 	}
 	if c.TLS.StorageDir != "/var/lib/faas/certs" {
 		t.Errorf("StorageDir = %q", c.TLS.StorageDir)
 	}
-	if c.TLS.ContactEmail != "ops@example.com" {
-		t.Errorf("ContactEmail = %q, want ops@example.com", c.TLS.ContactEmail)
+	if c.TLS.ContactEmail != "ops@gregale.dev" {
+		t.Errorf("ContactEmail = %q, want ops@gregale.dev", c.TLS.ContactEmail)
 	}
 	if !c.TLS.UseStagingCA {
 		t.Error("UseStagingCA should be true from the fixture")
 	}
-	if got := c.resolveTLSConfig(func(string) bool { return true }); !got.UseStagingCA || got.ContactEmail != "ops@example.com" {
+	if got := c.resolveTLSConfig(func(string) bool { return true }); !got.UseStagingCA || got.ContactEmail != "ops@gregale.dev" {
 		t.Errorf("resolveTLSConfig lost TLS fields: %+v", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestConfig_ResolveTLSConfig(t *testing.T) {
 	if got.OnDemandHTTP01Allowlist == nil {
 		t.Fatal("resolved allowlist is nil")
 	}
-	if !got.OnDemandHTTP01Allowlist("any.example.com") {
+	if !got.OnDemandHTTP01Allowlist("any.gregale.dev") {
 		t.Error("allowlist returned false on a permissive closure")
 	}
 	if !called {

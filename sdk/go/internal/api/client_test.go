@@ -304,7 +304,7 @@ func TestDo_ProblemDecodedAsAPIError(t *testing.T) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusForbidden)
 		_ = json.NewEncoder(w).Encode(Problem{
-			Type:   "https://docs.DOMAIN/plans#apps",
+			Type:   "https://docs.gregale.dev/plans#apps",
 			Title:  "App limit reached",
 			Status: 403,
 			Code:   CodePlanLimitApps,

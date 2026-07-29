@@ -775,7 +775,7 @@ func TestCmdAppRename_NoOpOnSameSlug(t *testing.T) {
 func TestCmdAppRename_ConflictRendersProblem(t *testing.T) {
 	sink := &multiSink{onRename: func(string) (int, any, []byte) {
 		return http.StatusConflict, api.Problem{
-			Type:   "https://docs.DOMAIN/errors/app_rename_failed",
+			Type:   "https://docs.gregale.dev/errors/app_rename_failed",
 			Title:  "Slug already in use",
 			Status: http.StatusConflict,
 			Code:   "app_rename_failed",

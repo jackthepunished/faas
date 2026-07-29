@@ -56,7 +56,7 @@ permanently deleted from our database. There is no recovery option
 after that point.
 
 If this request was not made by you, change your password immediately
-and contact support@DOMAIN.
+and contact support@gregale.dev.
 
 — onebox faas
 `, email, scheduled, deadline, deadline)
@@ -69,7 +69,7 @@ and contact support@DOMAIN.
 // tone and a different set of next-action links).
 //
 // accountEmail is the email address that was on the deleted row; we
-// keep it on the message so a forward of this email to support@DOMAIN
+// keep it on the message so a forward of this email to support@gregale.dev
 // lets us identify the account without a separate lookup.
 func AccountDeletionCompleteBody(accountEmail string) (subject, body string) {
 	subject = "Your faas account has been deleted"
@@ -80,7 +80,7 @@ every row tied to it — apps, deployments, builds, secrets, API keys,
 domains, crons, and usage history — has been permanently deleted from
 our database.
 
-If this was not your intent, contact support@DOMAIN within 24 hours
+If this was not your intent, contact support@gregale.dev within 24 hours
 and we'll work with you to recover what we can from our backups.
 
 — onebox faas
@@ -111,7 +111,7 @@ next quota tick (within 60 s). If the payment does not arrive within
 21 days of the original failure (i.e. %s — 14 days from now), your
 account will be scheduled for permanent deletion.
 
-If this charge is unexpected, contact support@DOMAIN.
+If this charge is unexpected, contact support@gregale.dev.
 
 — onebox faas
 `, email, atStr, atStr)
@@ -152,7 +152,7 @@ To fix this:
 Once Stripe confirms the payment, meterd will resume your apps on the
 next quota tick (within 60 s) and send you a confirmation email.
 
-If this charge is unexpected, contact support@DOMAIN.
+If this charge is unexpected, contact support@gregale.dev.
 
 — onebox faas
 `, email, atStr, deadline)
@@ -183,7 +183,7 @@ If you don't see your apps come back within a minute, run:
 
     faas status
 
-If that doesn't show them resuming, contact support@DOMAIN and we'll
+If that doesn't show them resuming, contact support@gregale.dev and we'll
 sort it out.
 
 — onebox faas

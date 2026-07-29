@@ -166,7 +166,7 @@ func TestRequireMFA_BearerBypasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_mfa_bypass_test")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 
 	// Bearer key + non-allowlisted route. The requireMFA
 	// middleware must NOT 403.

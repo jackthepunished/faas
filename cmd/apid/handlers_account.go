@@ -232,7 +232,7 @@ func (s *server) dpaTemplate(w http.ResponseWriter, r *http.Request) {
 	if s.dpaPath == "" {
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable,
 			api.CodeCapacity, "DPA template unavailable",
-			"FAAS_DPA_PATH is unset; contact support@DOMAIN for the DPA"))
+			"FAAS_DPA_PATH is unset; contact support@gregale.dev for the DPA"))
 		return
 	}
 	body, err := os.ReadFile(s.dpaPath)

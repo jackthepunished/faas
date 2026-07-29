@@ -41,7 +41,7 @@ func newAuthedDashboardServer(t *testing.T) (http.Handler, *http.Cookie) {
 		t.Fatalf("issue session: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, "")
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, "")
 	return srv.handler(), &http.Cookie{Name: sessionCookie, Value: cookie}
 }
 
@@ -77,7 +77,7 @@ func TestDashboardHandler_RendersIndex(t *testing.T) {
 // TestDashboardHandler_LoginPage confirms GET /login renders the
 // magic-link form (slice-3 wires the real flow).
 func TestDashboardHandler_LoginPage(t *testing.T) {
-	srv := newServer(state.NewMemStore(), slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).handler()
+	srv := newServer(state.NewMemStore(), slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).handler()
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/login", nil)
 	srv.ServeHTTP(rec, r)
@@ -156,7 +156,7 @@ func TestDashboardHandler_AppsList(t *testing.T) {
 	if !strings.Contains(body, "faas deploy --template=hello-node") {
 		t.Errorf("body missing deploy quickstart; got:\n%s", body)
 	}
-	if !strings.Contains(body, "https://docs.DOMAIN/storage") {
+	if !strings.Contains(body, "https://docs.gregale.dev/storage") {
 		t.Errorf("body missing storage docs URL; got:\n%s", body)
 	}
 }
@@ -186,7 +186,7 @@ func TestDashboardHandler_OtherPages(t *testing.T) {
 // dpaPath on the server so the test does NOT depend on the production
 // /etc/faas layout. The dashboard must surface the markdown text
 // body (between <pre class="dpa">…</pre>) and the back-link to
-// /dashboard/account. This regresses the "support@DOMAIN" gap —
+// /dashboard/account. This regresses the "support@gregale.dev" gap —
 // the dashboard now has a real link, not a placeholder.
 func TestDashboardAccountDPA_RendersMarkdown(t *testing.T) {
 	store := state.NewMemStore()
@@ -208,7 +208,7 @@ func TestDashboardAccountDPA_RendersMarkdown(t *testing.T) {
 		t.Fatalf("write DPA: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, dpaPath)
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, dpaPath)
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/dashboard/account/dpa", nil)
@@ -263,7 +263,7 @@ func TestDashboardHandler_RecoversFromPanic(t *testing.T) {
 // state badge. Without the map entry the default badge is used.
 func TestAppListItem_WithLatestInstance(t *testing.T) {
 	srv := newServer(state.NewMemStore(), slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{})
+		"gregale.dev", noopNotifier{})
 	app := state.App{ID: "a1", Slug: "my-api", Status: state.AppActive}
 	latest := map[string]state.Instance{
 		"a1": {ID: "i1", AppID: "a1", State: string(state.StateRunning)},
@@ -272,15 +272,15 @@ func TestAppListItem_WithLatestInstance(t *testing.T) {
 	if item.StateBadgeLabel == "" {
 		t.Errorf("StateBadgeLabel empty, want a label for state=running")
 	}
-	if item.URL != "https://my-api.apps.example.com" {
-		t.Errorf("URL = %q, want apps.example.com hostname", item.URL)
+	if item.URL != "https://my-api.apps.gregale.dev" {
+		t.Errorf("URL = %q, want apps.gregale.dev hostname", item.URL)
 	}
 }
 
 // TestAppListItem_DefaultBadge: no latest instance → default badge.
 func TestAppListItem_DefaultBadge(t *testing.T) {
 	srv := newServer(state.NewMemStore(), slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{})
+		"gregale.dev", noopNotifier{})
 	app := state.App{ID: "a1", Slug: "ghost", Status: state.AppActive}
 	item := srv.appListItem(t.Context(), app, map[string]state.Instance{}, time.Time{})
 	if item.StateBadgeLabel == "" {

@@ -37,8 +37,8 @@ This is the spine. Each step has a time budget and a defined success/failure sur
 ### 2.1 Install (budget: 30 s)
 
 ```
-curl -fsSL https://get.DOMAIN | sh          # single static Go binary, no deps
-# or: brew install DOMAIN/tap/faas · scoop · nix
+curl -fsSL https://get.gregale.dev | sh          # single static Go binary, no deps
+# or: brew install gregale.dev/tap/faas · scoop · nix
 ```
 
 Post-install prints exactly one next step: `Run 'faas login' to get started.` No telemetry prompt walls, no account required to install.
@@ -49,7 +49,7 @@ Browser-paste flow (no local web server, works over SSH):
 
 ```
 $ faas login
-→ Opening https://DOMAIN/cli-auth?code=WXYZ-1234 in your browser…
+→ Opening https://gregale.dev/cli-auth?code=WXYZ-1234 in your browser…
   (or visit that URL and paste the code below)
 Paste token: ●●●●●●●●
 ✓ Logged in as jane@example.com (free plan)
@@ -78,7 +78,7 @@ If detection fails, we do **not** dump a stack trace — we say what we looked f
   Looked for: package.json, requirements.txt, go.mod, Dockerfile.
   Fixes:
     • add a Dockerfile, or
-    • see supported stacks: https://docs.DOMAIN/build/detect
+    • see supported stacks: https://docs.gregale.dev/build/detect
 ```
 
 ### 2.4 Build (budget: 60–180 s, streamed live)
@@ -95,7 +95,7 @@ Build logs stream to the terminal in real time (implementation spec §4.5, build
 On success the CLI prints the live URL and sets expectations honestly:
 
 ```
-✓ Deployed. https://jane-api.apps.DOMAIN
+✓ Deployed. https://jane-api.apps.gregale.dev
   Your app scales to zero when idle. The first request after idle takes
   ~0.3–0.8s to wake; requests after that are instant. This is normal and free.
 ```
@@ -254,7 +254,7 @@ All three screens obey the §7 three-line shape (headline → cause → one next
 - **Templates:** `faas deploy --template <name>` scaffolds a minimal working app (hello-node, hello-python, hello-go, cron-example, function-node, function-python) so a user with no repo still reaches a URL in 5 minutes. **Wave 0 PR-B adds a second template family** for the stateless contract: `faas init --template={s3-uploader,slack-bot,rest-api-postgres,cron-worker}` scaffolds a project whose docs header names the managed service to plug in (S3/R2, Slack signing secret, Neon, Upstash QStash) and fails clearly if the customer forgot to `faas secrets set` the relevant env var.
 - **Empty dashboard:** one primary CTA (Connect GitHub / Deploy via CLI), a link to the quickstart, nothing else. No fake sample data.
 - **Docs site (static, launch-critical):** Quickstart · How scale-to-zero works (§6) · Build detection & Dockerfiles · **External storage (stateless contract)** · Plans & pricing (mirrors the model) · Secrets · Custom domains · Functions (node22/python312 contract) · CLI reference (generated from the CLI) · Status. Docs are part of the product, not an afterthought; the €3/mo domain line already budgets hosting.
-- **External storage page:** one canonical `docs.DOMAIN/storage` page. Header: *"This platform is stateless. Your code runs in an ephemeral microVM that wakes, executes, parks, and forgets. Bring your own state."* Sections: **Why stateless** (one paragraph), **Recommended providers** (table — object: S3/R2/B2; SQL: Neon / Supabase / PlanetScale / CockroachDB Cloud; KV/cache: Upstash; document: MongoDB Atlas / Turso; queue: Upstash QStash / SQS — each row names the env-var keys), **Wiring it up** (`faas secrets set` → env injected at wake, app reads it like any env var), **Don't** (VOLUME in your Dockerfile, `postgres:16` as a base image, writes to `/var/lib/postgresql`), **Templates** (one line per `faas init --template=`). The empty-state dashboard CTA also links here when the account has zero apps. Wave 0 PR-B ships this page (`docs/storage.md`); the docs site lifts it when the docs builder lands.
+- **External storage page:** one canonical `docs.gregale.dev/storage` page. Header: *"This platform is stateless. Your code runs in an ephemeral microVM that wakes, executes, parks, and forgets. Bring your own state."* Sections: **Why stateless** (one paragraph), **Recommended providers** (table — object: S3/R2/B2; SQL: Neon / Supabase / PlanetScale / CockroachDB Cloud; KV/cache: Upstash; document: MongoDB Atlas / Turso; queue: Upstash QStash / SQS — each row names the env-var keys), **Wiring it up** (`faas secrets set` → env injected at wake, app reads it like any env var), **Don't** (VOLUME in your Dockerfile, `postgres:16` as a base image, writes to `/var/lib/postgresql`), **Templates** (one line per `faas init --template=`). The empty-state dashboard CTA also links here when the account has zero apps. Wave 0 PR-B ships this page (`docs/storage.md`); the docs site lifts it when the docs builder lands.
 - **Status page (§12 of impl spec, SLOs):** public, honest about the one-box reality until Gate A, links from `faas status` and every capacity error.
 
 ---

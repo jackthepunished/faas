@@ -144,7 +144,7 @@ func newGitHubTestServer(t *testing.T) http.Handler {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newServer(store, log, "example.com", noopNotifier{}).
+	return newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 }
 
@@ -155,7 +155,7 @@ func newGitHubTestServerDisabled(t *testing.T) http.Handler {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newServer(store, log, "example.com", noopNotifier{}).handler()
+	return newServer(store, log, "gregale.dev", noopNotifier{}).handler()
 }
 
 // newGitHubTestServerWithOAuth is the variant that takes a custom
@@ -168,7 +168,7 @@ func newGitHubTestServerWithOAuth(t *testing.T, cfg auth.SignInConfig) http.Hand
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(cfg).handler()
+	return newServer(store, log, "gregale.dev", noopNotifier{}).WithOAuthConfig(cfg).handler()
 }
 
 // --- 1. Consent redirect -------------------------------------------------
@@ -409,7 +409,7 @@ func TestGitHubAuthCallback_UnverifiedEmail(t *testing.T) {
 	// second call would 503 oauth_provider_unavailable before the
 	// 401 path runs, and the anti-takeover assertion would never
 	// execute.
-	srv := newServer(store, log, "example.com", noopNotifier{}).
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 	rec2 := httptest.NewRecorder()
 	srv.ServeHTTP(rec2, req)
@@ -438,7 +438,7 @@ func TestGitHubAuthCallback_FreshAccount(t *testing.T) {
 
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).
+	h := newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("st", "cd")
@@ -506,7 +506,7 @@ func TestGitHubAuthCallback_LegacyAccountBind(t *testing.T) {
 		t.Fatalf("seed pre-existing: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).
+	h := newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("st2", "cd2")
@@ -554,7 +554,7 @@ func TestGitHubAuthCallback_SubFirstAntiTakeover(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := newServer(store, log, "example.com", noopNotifier{}).
+	h := newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	// --- First login: (sub, email=shared@example.com) lands on a
@@ -640,7 +640,7 @@ func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 	store := state.NewMemStore()
 	slogBuf := &safeBuffer{}
 	log := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	h := newServer(store, log, "example.com", noopNotifier{}).
+	h := newServer(store, log, "gregale.dev", noopNotifier{}).
 		WithOAuthConfig(defaultGitHubTestOAuthCfg).handler()
 
 	req := newSignedGitHubRequest("audit-state", "audit-code")

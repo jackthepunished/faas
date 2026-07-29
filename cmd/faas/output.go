@@ -108,8 +108,8 @@ var testOnlyTTY *bool
 // docsURLBase is the canonical root for the customer-facing CLI docs.
 // Used by PrintUsage so every `usage:` line carries a stable, namespaced
 // link to the docs site. Mirrors how the systemd unit files use
-// `https://docs.DOMAIN/ops/<daemon>` — same host, same convention.
-const docsURLBase = "https://docs.DOMAIN/cli/"
+// `https://docs.gregale.dev/ops/<daemon>` — same host, same convention.
+const docsURLBase = "https://docs.gregale.dev/cli/"
 
 // RenderTitle emits the title row of an APIError render. When Enabled()
 // the leading `✗ ` glyph prefixes the title; otherwise the row is just
@@ -142,7 +142,7 @@ func RenderDocsRow(w io.Writer, url string) {
 }
 
 // PrintUsage emits a one-line "usage:" hint followed by a "Docs:" line
-// pointing at docs.DOMAIN/cli/<topic>. Always plain (no glyphs) —
+// pointing at docs.gregale.dev/cli/<topic>. Always plain (no glyphs) —
 // usage lines go to stderr on bad argv and customers grep them; the
 // glyph would just be noise there. Topic is the slug from the table in
 // the §3.2 plan (cli/apps, cli/ps, cli/logs, etc.). Fprintf errors

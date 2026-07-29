@@ -154,7 +154,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	}
 	if !isDigestPinned(req.Image) {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeImageRequired,
-			"Image required", "image: deploys require a digest-pinned reference, e.g. registry.DOMAIN/app@sha256:..."))
+			"Image required", "image: deploys require a digest-pinned reference, e.g. registry.gregale.dev/app@sha256:..."))
 		return
 	}
 	// PR-B: the prior-deployment supersede is folded into

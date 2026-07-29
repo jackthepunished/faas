@@ -16,7 +16,7 @@ import (
 // an empty prometheus URL the handler must return 200 + a payload
 // whose Source explains the gap — never 5xx.
 func TestStatusJSONHandlerNoPrometheusURL(t *testing.T) {
-	s := newServer(nil, slog.Default(), "DOMAIN", nil)
+	s := newServer(nil, slog.Default(), "unset", nil)
 	s.WithStatusCache("", "")
 
 	rec := httptest.NewRecorder()
@@ -122,7 +122,7 @@ func TestStatusHandler_ServesHTMLFile(t *testing.T) {
 	if err := os.WriteFile(page, []byte("<!doctype html><h1>status ok</h1>"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := newServer(nil, slog.Default(), "DOMAIN", nil)
+	s := newServer(nil, slog.Default(), "unset", nil)
 	s.WithStatusCache("", page)
 
 	rec := httptest.NewRecorder()
@@ -144,7 +144,7 @@ func TestStatusHandler_ServesHTMLFile(t *testing.T) {
 // the handler must fall back to the embedded "source unavailable"
 // page (spec §12: never 5xx just because the file is missing).
 func TestStatusHandler_MissingFileFallback(t *testing.T) {
-	s := newServer(nil, slog.Default(), "DOMAIN", nil)
+	s := newServer(nil, slog.Default(), "unset", nil)
 	s.WithStatusCache("", "/nonexistent/path/index.html")
 
 	rec := httptest.NewRecorder()

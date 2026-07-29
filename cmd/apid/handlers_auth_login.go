@@ -62,10 +62,10 @@ const (
 	// triggers the dev-mode defaults in other handlers). The
 	// forgot-password path treats both the empty string and
 	// domainUnset as "use the request Host verbatim" so a misconfigured
-	// dev deploy never mails out a "DOMAIN" link.
+	// dev deploy never mails out a "<domain>.unset" link.
 	// schemeHTTP / schemeHTTPS live in handlers_google.go alongside
 	// googleAuthStateCookie so all auth handlers share them.
-	domainUnset = "DOMAIN"
+	domainUnset = "unset"
 
 	// passwordResetTTL is how long a reset token stays valid. 15 min
 	// matches industry convention (NIST SP 800-63B password recovery

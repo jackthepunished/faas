@@ -112,7 +112,7 @@ func runCmdInitList(stdout io.Writer) int {
 			_, _ = fmt.Fprintf(stdout, "  %s\n", n)
 		}
 	}
-	_, _ = fmt.Fprintf(stdout, "Docs: https://docs.DOMAIN/templates\n")
+	_, _ = fmt.Fprintf(stdout, "Docs: https://docs.gregale.dev/templates\n")
 	return 0
 }
 
@@ -175,7 +175,7 @@ func runCmdInit(tpl, dest string, deploy bool, name string, stdout, stderr io.Wr
 	for _, line := range nextStepsFor(tpl) {
 		_, _ = fmt.Fprintf(stdout, "  %s\n", line)
 	}
-	PrintProgress(stdout, "Docs: https://docs.DOMAIN/storage")
+	PrintProgress(stdout, "Docs: https://docs.gregale.dev/storage")
 
 	// Step 7: optional deploy chain. When --deploy is set, we hand off
 	// to cmdDeployTarball with --template + --name; cmdDeployTarball
@@ -271,7 +271,7 @@ func nextStepsFor(tpl string) []string {
 			"  faas secrets set --app <slug> WEBHOOK_SECRET=$(openssl rand -hex 32)",
 			"Optional: scope the receiver to specific paths:",
 			"  faas secrets set --app <slug> WEBHOOK_ALLOWED_PATHS=/stripe,/github",
-			"Wire the provider's webhook URL to https://<slug>.<DOMAIN>/<your-path>",
+			"Wire the provider's webhook URL to https://<slug>.gregale.dev/<your-path>",
 			"Deploy from the new directory:",
 			"  cd <dest> && faas deploy",
 		}

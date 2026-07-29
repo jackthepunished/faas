@@ -6,8 +6,8 @@
 # listen_addr = "127.0.0.1:8081"
 
 # base_domain: the apps.<domain> suffix for app URLs.
-# Default: example.com
-# base_domain = "example.com"
+# Default: gregale.dev
+# base_domain = "gregale.dev"
 
 # db_url: Postgres DSN. Empty => use $DATABASE_URL from the environment
 # (sealed.env on the production box; gap G2 — sealed at rest).

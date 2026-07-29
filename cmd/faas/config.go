@@ -28,7 +28,7 @@ import (
 // one-shot: on the first successful keychain Set, the old file is
 // removed if present. Issue #293 closes gap G5 (impl spec §17).
 
-const defaultAPIBase = "https://api.DOMAIN"
+const defaultAPIBase = "https://api.gregale.dev"
 
 // keyringService is the OS-portable service identifier written to the
 // platform keychain. Lowercase + hyphens per platform conventions;

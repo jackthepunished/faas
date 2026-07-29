@@ -227,7 +227,7 @@ func TestPrintWarn_DropsBangWhenDisabled(t *testing.T) {
 // per-command usage error surfaces:
 //
 //	usage: faas <cmd> <args>
-//	  Docs: https://docs.DOMAIN/cli/<topic>
+//	  Docs: https://docs.gregale.dev/cli/<topic>
 //
 // Two lines, leading-whitespace on the second, exact namespace, no
 // glyphs (usage errors go to stderr; customers grep them — the
@@ -245,7 +245,7 @@ func TestPrintUsage_EmitsTwoLinesWithTopic(t *testing.T) {
 	if lines[0] != "usage: faas ps <app>" {
 		t.Errorf("line 0 = %q, want exact usage string", lines[0])
 	}
-	want := "  Docs: https://docs.DOMAIN/cli/ps"
+	want := "  Docs: https://docs.gregale.dev/cli/ps"
 	if lines[1] != want {
 		t.Errorf("line 1 = %q, want %q", lines[1], want)
 	}

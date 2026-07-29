@@ -143,7 +143,7 @@ func TestListInstancesForAccount_BadLimit(t *testing.T) {
 // IDOR guard; this test pins that contract).
 func TestListInstancesForAccount_CrossAccountIsolation(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	alice, keyAlice := mustCreateAccount(t, store, "alice", api.PlanHobby)
 	bob, keyBob := mustCreateAccount(t, store, "bob", api.PlanHobby)
 	envA := testEnv{h: srv.handler(), store: store, key: keyAlice, acct: alice}
@@ -309,7 +309,7 @@ func TestListSecretsForAccount_BadLimit(t *testing.T) {
 // account from the auth principal and SQL JOIN is the only guard.
 func TestListSecretsForAccount_CrossAccountIsolation(t *testing.T) {
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	alice, keyAlice := mustCreateAccount(t, store, "alice", api.PlanHobby)
 	bob, keyBob := mustCreateAccount(t, store, "bob", api.PlanHobby)
 	envA := testEnv{h: srv.handler(), store: store, key: keyAlice, acct: alice}

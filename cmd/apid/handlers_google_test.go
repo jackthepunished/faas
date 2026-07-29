@@ -28,7 +28,7 @@ func TestGoogleAuthRedirect(t *testing.T) {
 	}
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(cfg)
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).WithOAuthConfig(cfg)
 
 	req := httptest.NewRequest("GET", "/v1/auth/google", nil)
 	w := httptest.NewRecorder()
@@ -75,7 +75,7 @@ func TestGoogleAuthRedirect_BothEnvUnset(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// oauthConfig zero-value = both providers Disabled (the issue
 	// #419 shape, before cmd/apid/main.go::runWithDeps runs).
-	srv := newServer(store, log, "example.com", noopNotifier{})
+	srv := newServer(store, log, "gregale.dev", noopNotifier{})
 
 	req := httptest.NewRequest("GET", "/v1/auth/google", nil)
 	w := httptest.NewRecorder()
@@ -96,7 +96,7 @@ func TestGoogleAuthRedirect_BothEnvUnset(t *testing.T) {
 func TestGoogleAuthCallbackCSRFMismatch(t *testing.T) {
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{})
+	srv := newServer(store, log, "gregale.dev", noopNotifier{})
 
 	req := httptest.NewRequest("GET", "/v1/auth/google/callback?state=invalid_state&code=test_code", nil)
 	w := httptest.NewRecorder()

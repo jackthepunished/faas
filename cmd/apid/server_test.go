@@ -40,7 +40,7 @@ func setup(t *testing.T, plan api.Plan) testEnv {
 		t.Fatal(err)
 	}
 	ops := wire.NewOpsMetrics("apid_test")
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), s: srv, store: store, key: pt, acct: acct, ops: ops}
 }
 
@@ -79,7 +79,7 @@ func setupWithNotifier(t *testing.T, plan api.Plan, hook func(ctx context.Contex
 	}
 	ops := wire.NewOpsMetrics("apid_test")
 	notif := stubNotifier{hook: hook}
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", notif).WithOpsMetrics(context.Background(), ops)
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", notif).WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: pt, acct: acct, ops: ops}
 }
 
@@ -152,7 +152,7 @@ func TestCreateAppSuccess(t *testing.T) {
 	if out.RAMMB != 512 { // Pro default
 		t.Errorf("ram default = %d, want 512", out.RAMMB)
 	}
-	if out.URL != "https://my-api.apps.example.com" {
+	if out.URL != "https://my-api.apps.gregale.dev" {
 		t.Errorf("url = %q", out.URL)
 	}
 }

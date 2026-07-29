@@ -39,7 +39,7 @@ faas deploy
 
 ```sh
 faas open                         # browser, opens the app
-curl -X POST --data 'hello world' https://<slug>.<DOMAIN>/upload/hello.txt
+curl -X POST --data 'hello world' https://<slug>.gregale.dev/upload/hello.txt
 ```
 
 The response is `{"ok":true,"key":"hello.txt","bucket":"my-bucket"}`.

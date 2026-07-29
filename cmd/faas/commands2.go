@@ -1331,7 +1331,7 @@ streamLoop:
 				if json.Unmarshal([]byte(e.Data), &status) == nil &&
 					(status.Status == statusLive || status.Status == "failed") {
 					if status.Status == statusLive {
-						PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", dep.AppID)
+						PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", dep.AppID)
 						printDeployColdWakeSentence()
 						return 0
 					}
@@ -1392,7 +1392,7 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 // row (which has the canonical Error string from the DB).
 func terminalExitForDeployment(d api.DeploymentResponse) int {
 	if d.Status == statusLive {
-		PrintOK(osStdout, "Deployed. https://%s.apps.DOMAIN", d.AppID)
+		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", d.AppID)
 		printDeployColdWakeSentence()
 		return 0
 	}

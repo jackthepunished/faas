@@ -115,7 +115,7 @@ of data subjects via the documented faas endpoints:
 | Right to erasure (Art. 17) | `DELETE /v1/account` (30-day grace) |
 | Right to restriction (Art. 18) | `POST /v1/account/restore` cancels a pending erasure |
 | Right to portability (Art. 20) | `GET /v1/account/export` returns the JSON bundle |
-| Right to object (Art. 21) | Contact support@DOMAIN |
+| Right to object (Art. 21) | Contact support@gregale.dev |
 
 The DPA itself is publicly available at
 `GET /v1/account/dpa` (no auth required) so prospects can read it
@@ -124,7 +124,7 @@ before signing up.
 ## 7. Sub-processors
 
 The current sub-processor list is maintained at
-https://docs.DOMAIN/dpa/subprocessors and includes the categories:
+https://docs.gregale.dev/dpa/subprocessors and includes the categories:
 
 - **Postgres hosting** (database): single-tenant managed Postgres
   with encryption at rest + TLS in transit. Daily encrypted
@@ -160,7 +160,7 @@ required by Art. 32 GDPR, including:
   (pkg/secretbox, ADR-020). Plaintext VALUES never touch PG.
 - TLS 1.3 in transit; HSTS + Strict CSP on the dashboard.
 
-Full security checklist lives at https://docs.DOMAIN/security.
+Full security checklist lives at https://docs.gregale.dev/security.
 
 ## 9. Audit rights
 
