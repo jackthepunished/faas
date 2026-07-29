@@ -107,7 +107,8 @@ func (a *advisoryReceiver) ForwardStatelessAdvisory(ctx context.Context, req *ap
 	// be triaged without inspecting the events[] list. Computed at
 	// emit time so the audit row is self-describing — a reader
 	// doesn't need the closed-path list to know whether the row is
-	// "high" (/data, /var/lib/postgresql) or "warn" (/var/lib/redis).
+	// "high" (/data, /db, /var/lib/postgresql, /var/lib/mysql) or
+	// "warn" (other closed paths).
 	data := map[string]any{
 		"instance": req.Instance,
 		"app_id":   req.AppId,

@@ -25,6 +25,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // osStdout and osStdin are the package-level I/O seams so tests can pipe
@@ -182,16 +184,42 @@ func secretsSet(args []string) int {
 		PrintOK(osStdout, "%s set", p.Key)
 	}
 	// Move 1 PR-A: post-write quota stamp. After every successful
-	// set, follow up with a ListSecrets and print "<slug>: N
+	// set, follow up with a ListSecrets and print "<slug>: N/M
 	// secrets" so the customer knows how close they are to the
-	// per-app cap (the cap itself is in pkg/api/limits.go and
-	// surfaced by `faas plan`). Failure here is non-fatal: the
-	// PUT already succeeded, so we log and move on rather than
-	// masking the success with a quota-stamp error.
-	if list, err := client.ListSecrets(context.Background(), *app); err == nil {
-		_, _ = fmt.Fprintf(osStdout, "%s: %d secrets\n", *app, len(list.Secrets))
-	}
+	// per-app cap (Free 3 / Hobby 25 / Pro 50 / Scale 100, in
+	// pkg/api/limits.go's SecretCountMax). The cap is looked up
+	// from /v1/account's plan via the local limits table — no
+	// server round-trip beyond the one already needed for the
+	// ListSecrets count.
+	//
+	// Failure here is non-fatal: the PUT already succeeded, so we
+	// log and move on rather than masking the success with a
+	// quota-stamp error. Three modes:
+	//
+	//   - both succeed   → "<slug>: N/M secrets"
+	//   - ListSecrets OK, plan unknown → "<slug>: N secrets" (no cap)
+	//   - ListSecrets fails → no stamp (can't compute N without it)
+	printSecretsQuotaStamp(client, *app)
 	return 0
+}
+
+// printSecretsQuotaStamp prints "<app>: N/M secrets" after a
+// successful secrets set. Both inputs come from cheap GET endpoints;
+// failure is silent. Pulled out so the failure-mode logic stays out
+// of secretsSet's body.
+func printSecretsQuotaStamp(client *api.Client, app string) {
+	list, err := client.ListSecrets(context.Background(), app)
+	if err != nil {
+		return
+	}
+	used := len(list.Secrets)
+	if acct, err := client.Whoami(context.Background()); err == nil {
+		if l, ok := api.LimitsFor(api.Plan(acct.Plan)); ok && l.SecretCountMax > 0 {
+			_, _ = fmt.Fprintf(osStdout, "%s: %d/%d secrets\n", app, used, l.SecretCountMax)
+			return
+		}
+	}
+	_, _ = fmt.Fprintf(osStdout, "%s: %d secrets\n", app, used)
 }
 
 type secretsPair struct {

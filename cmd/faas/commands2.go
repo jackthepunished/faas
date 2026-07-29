@@ -1088,6 +1088,16 @@ func dashboardAccountURL(api string) string {
 	return dashboardBaseURL(api) + "/dashboard/account"
 }
 
+// dashboardStatelessURL is the customer-facing landing page for the
+// stateless contract (Move 1 PR-A): the contract copy, the 8-base
+// denylist, the 10 closed paths, and the account's 50 most recent
+// stateless.advisory audit rows. Reached via `faas dashboard --stateless`
+// (commands5.go). Mirrors the apid route registered at
+// /dashboard/stateless (handlers_dashboard.go:89).
+func dashboardStatelessURL(api string) string {
+	return dashboardBaseURL(api) + "/dashboard/stateless"
+}
+
 // dashboardAppURL is the canonical per-app dashboard page.
 //
 // Review finding #10: the previous url.PathEscape mismatch with the
