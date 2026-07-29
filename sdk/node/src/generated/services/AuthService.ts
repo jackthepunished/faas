@@ -204,8 +204,15 @@ export class AuthService {
       url: '/v1/auth/google',
       errors: {
         302: `Redirect to Google consent.`,
-        500: `OAuth misconfigured at runtime (defence-in-depth).`,
-        503: `OAuth provider not configured on this host.`,
+        500: `Google OAuth misconfigured at runtime. Defensive
+        catch — boot validation (ADR-046) should make this
+        unreachable in production.
+        `,
+        503: `Google sign-in not configured on this host. Operator
+        must set both \`GOOGLE_CLIENT_ID\` and
+        \`GOOGLE_CLIENT_SECRET\` and restart apid (ADR-046).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
       },
     });
   }
@@ -284,8 +291,15 @@ export class AuthService {
       url: '/v1/auth/github',
       errors: {
         302: `Redirect to GitHub consent.`,
-        500: `OAuth misconfigured at runtime (defence-in-depth).`,
-        503: `OAuth provider not configured on this host.`,
+        500: `GitHub OAuth misconfigured at runtime. Defensive
+        catch — boot validation (ADR-046) should make this
+        unreachable in production.
+        `,
+        503: `GitHub sign-in not configured on this host. Operator
+        must set both \`GITHUB_CLIENT_ID\` and
+        \`GITHUB_CLIENT_SECRET\` and restart apid (ADR-046).
+        Surfaces as \`oauth_provider_unavailable\`.
+        `,
       },
     });
   }

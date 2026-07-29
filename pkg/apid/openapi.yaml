@@ -590,12 +590,19 @@ paths:
             Location:
               schema: { type: string, format: uri }
         '503':
-          description: OAuth provider not configured on this host.
+          description: |
+            Google sign-in not configured on this host. Operator
+            must set both `GOOGLE_CLIENT_ID` and
+            `GOOGLE_CLIENT_SECRET` and restart apid (ADR-046).
+            Surfaces as `oauth_provider_unavailable`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '500':
-          description: OAuth misconfigured at runtime (defence-in-depth).
+          description: |
+            Google OAuth misconfigured at runtime. Defensive
+            catch — boot validation (ADR-046) should make this
+            unreachable in production.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -671,12 +678,19 @@ paths:
             Location:
               schema: { type: string, format: uri }
         '503':
-          description: OAuth provider not configured on this host.
+          description: |
+            GitHub sign-in not configured on this host. Operator
+            must set both `GITHUB_CLIENT_ID` and
+            `GITHUB_CLIENT_SECRET` and restart apid (ADR-046).
+            Surfaces as `oauth_provider_unavailable`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '500':
-          description: OAuth misconfigured at runtime (defence-in-depth).
+          description: |
+            GitHub OAuth misconfigured at runtime. Defensive
+            catch — boot validation (ADR-046) should make this
+            unreachable in production.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
