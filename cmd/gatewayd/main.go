@@ -39,6 +39,8 @@ import (
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
@@ -123,6 +125,12 @@ type runDeps struct {
 	// dispatch (spec §4.4, M7). nil in tests; production wires it after
 	// the schedd client is dialed.
 	synth *gateway.SynthServer
+	// egressGRPC is the ADR-046 PR-2 producer channel — a
+	// *grpc.Server on a second unix socket dedicated to the egress
+	// stream (one unix socket can serve either HTTP or gRPC, not
+	// both; the synth socket stays HTTP). nil in tests; production
+	// wires it after the Handler + EgressSink are constructed.
+	egressGRPC *egressGRPCListener
 	// lastSeen flushes per-instance last_request_at to schedd (spec §4.1). nil in
 	// tests (the wake/routing path doesn't need it); production wires the
 	// schedFlushSink.
@@ -434,6 +442,44 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
 	handler.SetWakeGateHook()
+	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
+	// producer channel. The sink is shared between Handler.recordEgress
+	// (writer) and egressgrpc.Server (drainer-on-cadence reader).
+	// The gRPC server runs on a second unix socket (FAAS_GATEWAY_EGRESS_SOCKET)
+	// because the existing synth socket serves an HTTP/1.1 listener
+	// (pkg/gateway/synth.go) and a single unix socket cannot host both
+	// HTTP and gRPC simultaneously; the DAC auth posture (ADR-015) is
+	// identical — group `faas` ownership + 0660 mode. netns dialer is
+	// unchanged.
+	egressSink := egresssink.NewEgressSink()
+	handler.WithEgressSink(egressSink)
+	egressGRPCSocket := egressGRPCSocketPath()
+	egressGRPCSrv := egressgrpc.NewServer(egressSink, log)
+	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, egressGRPCSrv, log)
+	// Best-effort start, mirroring the synth listener pattern
+	// (runWithDeps internal RPC). If the unix socket can't bind
+	// (e.g. /run/faas doesn't exist on a dev/test box), log + continue
+	// — the public + control listeners are still up, and the
+	// per-instance egress sink continues to accumulate in memory
+	// even though no consumer can dial the stream. The meterd side
+	// reports ok=false on every EgressBytes read during the gap;
+	// AppendUsage writes 0 to tx_bytes for that minute. Once the
+	// socket becomes bindable (deploy-time /run/faas exists), the
+	// next daemon restart picks up the stream automatically.
+	if err := deps.egressGRPC.start(); err != nil {
+		log.Warn("gatewayd egress listen failed; tx_bytes will stay 0 until restart",
+			"socket", egressGRPCSocket, "err", err)
+		deps.egressGRPC = nil
+	}
+	//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx per net/http + gRPC GracefulStop contract.
+	defer func() {
+		if deps.egressGRPC == nil {
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = deps.egressGRPC.stop(shutdownCtx)
+	}()
 	// Issue #300: topNSampler drives the gateway_top_tenant_rps
 	// gauge from the rolling per-app count fed by Handler.observe
 	// (pkg/gateway/handler.go:observe). 5s tick; runs for the
