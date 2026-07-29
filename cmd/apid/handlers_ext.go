@@ -2029,9 +2029,12 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 // the SSE looks hung to htmx-ext-sse's auto-reconnect logic.
 // PR-B's production wiring makes that pattern reachable, so the
 // pump is fixed here in PR-A.
-//
-// recvResult is one upstream delivery on the receive channel;
-// exactly one of frame or err is meaningful per result.
+// recvResult carries one upstream delivery on the receive channel
+// from serveAppLogs's receive goroutine (below). Exactly one of
+// frame or err is meaningful per result. The receive goroutine
+// closes the channel on its way out so the handler can treat a
+// missing result as a clean EOF and emit the terminal `event: end
+// {}` sentinel.
 type recvResult struct {
 	frame schedLogFrame
 	err   error
