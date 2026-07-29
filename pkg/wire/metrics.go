@@ -457,6 +457,29 @@ type OpsMetrics struct {
 	// Single-registry: registered on every daemon; only apid
 	// increments via ObserveOAuthDisabled.
 	oauthDisabledTotal *prometheus.CounterVec
+	// advisoryBatchesEmittedTotal: stateless-advisory forward
+	// outcomes (Mega-PR B). Labelled by `result` ∈
+	// {ok, dial_failed, rejected, unavailable_after_retry} — the
+	// four observable outcomes from vmmd's AdvisoryClient
+	// (pkg/vmmdgrpc/advisory_client.go). Closed set pre-instantiated
+	// in NewOpsMetrics so the §12 dashboard panel surfaces zero on
+	// a healthy box and surfaces a non-zero rate for any of the
+	// three failure paths. Single-registry: registered on every
+	// daemon; only vmmd increments via ObserveAdvisoryBatchResult.
+	// Increments per BATCH (one ForwardStatelessAdvisory RPC), not
+	// per event — the path-level taxonomy at vmmd is batch-grained.
+	advisoryBatchesEmittedTotal *prometheus.CounterVec
+	// apidStatelessAdvisoryEventsTotal: per-batch inbound advisory
+	// counter on the receiver side (Mega-PR B). Labelled by
+	// `severity` ∈ {high, warn, info} — mirrors the same vocabulary
+	// the receiver already computes via advisoryBatchSeverity. Closed
+	// set pre-instantiated in NewOpsMetrics so the panel surfaces
+	// zero at boot. Single-registry: registered on every daemon;
+	// only apid increments via ObserveStatelessAdvisory. Symmetric
+	// pair with advisoryBatchesEmittedTotal — that one counts the
+	// producer side (vmmd forward outcomes), this one counts the
+	// consumer side (apid landed advisories).
+	apidStatelessAdvisoryEventsTotal *prometheus.CounterVec
 	// egressDeny: per-CIDR drop counter for the nftables egress
 	// denylist (PR-E). Labelled by (cidr, family) — the cidr label
 	// is the DenyEntry.CounterName (e.g. "drop_v4_10_0_0_0_8") and
@@ -907,6 +930,30 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_oauth_disabled_total",
 		Help: "Click-through counter for sign-in OAuth consent routes when the provider is disabled at boot (issue #419 / ADR-046). provider ∈ {google, github}. One increment per click — handler returns 503 oauth_provider_unavailable. A non-zero rate means either the dashboard gating is bypassed (operators see this scrape first) or a customer is hitting a stale bookmark. Distinct from the historical 500 *_oauth_misconfigured which is now unreachable at boot (the half-configured pair fails the load).",
 	}, []string{"provider"})
+	// Mega-PR B / stateless-advisory observability. Two counters
+	// sharing the same single-registry pattern as
+	// oauthDisabledTotal: registered on every daemon, only the
+	// forward daemon (vmmd) / the receiver daemon (apid) increment
+	// in production. See the field doc comments on
+	// advisoryBatchesEmittedTotal / apidStatelessAdvisoryEventsTotal
+	// for the closed-set semantics.
+	//
+	// Note: HELP strings must NOT mention another daemon's metric
+	// name verbatim — TestOpsMetrics_IndependentRegistries greps for
+	// "vmmd_" / "builderd_" / etc. in the body to detect registry
+	// leaks, and every daemon registers every metric per the
+	// single-registry pattern (memory wire-opsmetrics-single-registry),
+	// so cross-daemon names in HELP would false-positive the test.
+	// The "this counter's pair" relationship is documented here in
+	// the field comment instead, where the leak-grep doesn't reach.
+	advisoryBatchesEmittedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_stateless_advisory_batches_emitted_total",
+		Help: "Per-batch stateless-advisory forward outcomes (Mega-PR B). result ∈ {ok, dial_failed, rejected, unavailable_after_retry}. One increment per ForwardStatelessAdvisory RPC at the forward daemon, not per underlying fanotify event (the forward-side taxonomy is batch-grained). result=ok fires when the receiver accepted the RPC; the three failure labels track the observable failure paths (dial errors before any RPC, InvalidArgument rejection at the receiver, Unavailable after the retry budget). Single-registry: registered on every daemon; only the forward daemon increments via ObserveAdvisoryBatchResult.",
+	}, []string{"result"})
+	apidStatelessAdvisoryEventsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_stateless_advisory_events_total",
+		Help: "Per-batch stateless-advisory inbound counter (Mega-PR B). severity ∈ {high, warn, info} — mirrors the same vocabulary the receiver already computes via advisoryBatchSeverity. One increment per ForwardStatelessAdvisory RPC at the receiver daemon whose audit row was written. Pair-counter (documented in pkg/wire/metrics.go's field doc): a healthy box has rate(receiver_stateless_advisory_events_total[5m]) ≈ rate(forward_stateless_advisory_batches_emitted_total{result=\"ok\"}[5m]). Single-registry: registered on every daemon; only the receiver daemon increments via ObserveStatelessAdvisory.",
+	}, []string{"severity"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the
 	// field stays nil and the imaged-side hook in cmd/imaged/main.go
@@ -938,6 +985,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		oauthDisabledTotal,
+		advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal,
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
 	}
@@ -1005,6 +1054,22 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ObserveOAuthDisabled below.
 	for _, provider := range []string{"google", "github"} {
 		oauthDisabledTotal.WithLabelValues(provider)
+	}
+	// Mega-PR B / stateless-advisory observability. Closed label
+	// sets: result ∈ {ok, dial_failed, rejected,
+	// unavailable_after_retry} for the vmmd-side forward outcome
+	// counter; severity ∈ {high, warn, info} for the apid-side
+	// inbound counter. Pre-instantiation means the §12 dashboard
+	// panel surfaces zero at boot. Extending either set is the
+	// right place to add a new label (e.g. "rate_limited" on the
+	// forward side) — match the same change in the switch in
+	// ObserveAdvisoryBatchResult / ObserveStatelessAdvisory below
+	// so the closed-set guard doesn't silently drop the value.
+	for _, result := range []string{"ok", "dial_failed", "rejected", "unavailable_after_retry"} {
+		advisoryBatchesEmittedTotal.WithLabelValues(result)
+	}
+	for _, sev := range []string{"high", "warn", "info"} {
+		apidStatelessAdvisoryEventsTotal.WithLabelValues(sev)
 	}
 	// issue #299: pre-instantiate the closed `severity` label set
 	// for imageScanVulns so the rows surface in /metrics from boot
@@ -1150,58 +1215,60 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// before the first sampler tick.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
-		registry:                      reg,
-		ops:                           ops,
-		dur:                           dur,
-		watchdogKills:                 watchdogKills,
-		eventsWriteFail:               eventsWriteFail,
-		auditWriteFail:                auditWriteFail,
-		auditWriteDur:                 auditWriteDur,
-		requestFailures:               requestFailures,
-		requestTotal:                  requestTotal,
-		accountLabels:                 newAccountLabelSet(maxAccountLabelValues),
-		failedLoginTotal:              failedLoginTotal,
-		failedLoginDropped:            failedLoginDropped,
-		failedLoginAuditWriteFailures: failedLoginAuditWriteFailures,
-		alertEvalSkippedDegradedTotal: alertEvalSkippedDegradedTotal,
-		alertEvalFiredTotal:           alertEvalFiredTotal,
-		alertDeliveryAttemptsTotal:    alertDeliveryAttemptsTotal,
-		alertEvaluatorEnabled:         alertEvaluatorEnabled,
-		ipLabels:                      newIPLabelSet(maxIPLabelValues),
-		topTenantRPS:                  topTenantRPS,
-		topAccounts:                   newTopAccountSet(topAccountSetCap),
-		throttleSecondsTotal:          throttleSecondsTotal,
-		throttleRatio:                 throttleRatio,
-		topApps:                       newTopAppSet(topAppSetCap),
-		throttleSecondsLastSeen:       newCPUThrottleLastSeen(),
-		cpuSecondsLast:                newCPUSecondsLastSeen(),
-		stripePushDur:                 stripePushDur,
-		paddlePushDur:                 paddlePushDur,
-		buildDur:                      buildDur,
-		buildQueueWait:                buildQueueWait,
-		residentGBPerCustomer:         residentGBPerCustomer,
-		billingCapExceededTotal:       billingCapExceededTotal,
-		wakeIDV4Fallback:              wakeIDV4Fallback,
-		snapshotDiskDrift:             snapshotDiskDrift,
-		imagedOCIPull:                 imagedOCIPull,
-		instanceCPUPct:                instanceCPUPct,
-		instanceRSSMB:                 instanceRSSMB,
-		instanceInflightReqs:          instanceInflightReqs,
-		instanceCPUSecondsTotal:       instanceCPUSecondsTotal,
-		instanceStatsCollectDur:       instanceStatsCollectDur,
-		instanceStatsPartialErrors:    instanceStatsPartialErrors,
-		cpuStatsCollectDur:            cpuStatsCollectDurLocal,
-		scaleUpDecisions:              scaleUpDecisions,
-		scaleDownDecisions:            scaleDownDecisions,
-		scaleUpAdmitRPS:               scaleUpAdmitRPS,
-		sseClients:                    sseClients,
-		egressDeny:                    egressDeny,
-		ociEgressDeny:                 ociEgressDeny,
-		provenanceWrites:              provenanceWrites,
-		imageScanVulns:                imageScanVulns,
-		apidLogsEmittedTotal:          apidLogsEmittedTotal,
-		egressSourceErrors:            egressSourceErrors,
-		oauthDisabledTotal:            oauthDisabledTotal,
+		registry:                         reg,
+		ops:                              ops,
+		dur:                              dur,
+		watchdogKills:                    watchdogKills,
+		eventsWriteFail:                  eventsWriteFail,
+		auditWriteFail:                   auditWriteFail,
+		auditWriteDur:                    auditWriteDur,
+		requestFailures:                  requestFailures,
+		requestTotal:                     requestTotal,
+		accountLabels:                    newAccountLabelSet(maxAccountLabelValues),
+		failedLoginTotal:                 failedLoginTotal,
+		failedLoginDropped:               failedLoginDropped,
+		failedLoginAuditWriteFailures:    failedLoginAuditWriteFailures,
+		alertEvalSkippedDegradedTotal:    alertEvalSkippedDegradedTotal,
+		alertEvalFiredTotal:              alertEvalFiredTotal,
+		alertDeliveryAttemptsTotal:       alertDeliveryAttemptsTotal,
+		alertEvaluatorEnabled:            alertEvaluatorEnabled,
+		ipLabels:                         newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                     topTenantRPS,
+		topAccounts:                      newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:             throttleSecondsTotal,
+		throttleRatio:                    throttleRatio,
+		topApps:                          newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:          newCPUThrottleLastSeen(),
+		cpuSecondsLast:                   newCPUSecondsLastSeen(),
+		stripePushDur:                    stripePushDur,
+		paddlePushDur:                    paddlePushDur,
+		buildDur:                         buildDur,
+		buildQueueWait:                   buildQueueWait,
+		residentGBPerCustomer:            residentGBPerCustomer,
+		billingCapExceededTotal:          billingCapExceededTotal,
+		wakeIDV4Fallback:                 wakeIDV4Fallback,
+		snapshotDiskDrift:                snapshotDiskDrift,
+		imagedOCIPull:                    imagedOCIPull,
+		instanceCPUPct:                   instanceCPUPct,
+		instanceRSSMB:                    instanceRSSMB,
+		instanceInflightReqs:             instanceInflightReqs,
+		instanceCPUSecondsTotal:          instanceCPUSecondsTotal,
+		instanceStatsCollectDur:          instanceStatsCollectDur,
+		instanceStatsPartialErrors:       instanceStatsPartialErrors,
+		cpuStatsCollectDur:               cpuStatsCollectDurLocal,
+		scaleUpDecisions:                 scaleUpDecisions,
+		scaleDownDecisions:               scaleDownDecisions,
+		scaleUpAdmitRPS:                  scaleUpAdmitRPS,
+		sseClients:                       sseClients,
+		egressDeny:                       egressDeny,
+		ociEgressDeny:                    ociEgressDeny,
+		provenanceWrites:                 provenanceWrites,
+		imageScanVulns:                   imageScanVulns,
+		apidLogsEmittedTotal:             apidLogsEmittedTotal,
+		egressSourceErrors:               egressSourceErrors,
+		oauthDisabledTotal:               oauthDisabledTotal,
+		advisoryBatchesEmittedTotal:      advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal: apidStatelessAdvisoryEventsTotal,
 	}
 }
 
@@ -2324,6 +2391,75 @@ func (m *OpsMetrics) ObserveOAuthDisabled(provider string) {
 	switch provider {
 	case "google", "github":
 		m.oauthDisabledTotal.WithLabelValues(provider).Inc()
+	}
+}
+
+// advisoryBatchResult labels for ObserveAdvisoryBatchResult
+// (Mega-PR B). Defined as constants so the goconst gate doesn't
+// fire on the receiver-side switch and the test fixtures share
+// the same vocabulary. Adding a new outcome means extending
+// both the const block and the pre-instantiation loop in
+// NewOpsMetrics; the switch below is the load-bearing closed-set
+// guard that prevents accidentally creating a new series.
+const (
+	advisoryResultOK                    = "ok"
+	advisoryResultDialFailed            = "dial_failed"
+	advisoryResultRejected              = "rejected"
+	advisoryResultUnavailableAfterRetry = "unavailable_after_retry"
+)
+
+// advisorySeverity labels for ObserveStatelessAdvisory (Mega-PR
+// B). Mirrors the cmd/apid/advisory_receiver.go vocabulary
+// (severityHigh / severityWarn / severityInfo) but defined here
+// as the canonical wire-side labels so the test fixtures share
+// the same values across both packages.
+const (
+	advisorySeverityHigh = "high"
+	advisorySeverityWarn = "warn"
+	advisorySeverityInfo = "info"
+)
+
+// ObserveAdvisoryBatchResult increments
+// stateless_advisory_batches_emitted_total{result} (Mega-PR B).
+// Called from pkg/vmmdgrpc/advisory_client.go on each
+// ForwardStatelessAdvisory RPC outcome:
+//
+//   - ok                       — apid returned success
+//   - dial_failed              — couldn't reach apid's unix socket
+//   - rejected                 — apid returned codes.InvalidArgument
+//     (validation failure; not retried)
+//   - unavailable_after_retry  — apid returned codes.Unavailable
+//     after the retry budget was spent
+//
+// Unknown result values produce no increment (the CounterVec has
+// no matching label), so the closed-set switch here is the
+// load-bearing cardinality guard. Nil receiver is allowed for
+// parity with the other Observe* accessors — vmmd unit tests
+// that don't wire metrics keep working.
+func (m *OpsMetrics) ObserveAdvisoryBatchResult(result string) {
+	if m == nil || m.advisoryBatchesEmittedTotal == nil {
+		return
+	}
+	switch result {
+	case advisoryResultOK, advisoryResultDialFailed, advisoryResultRejected, advisoryResultUnavailableAfterRetry:
+		m.advisoryBatchesEmittedTotal.WithLabelValues(result).Inc()
+	}
+}
+
+// ObserveStatelessAdvisory increments
+// stateless_advisory_events_total{severity} (Mega-PR B). Called
+// from cmd/apid/advisory_receiver.go's ForwardStatelessAdvisory
+// handler on each landed advisory. severity is "high" / "warn"
+// / "info" — the same vocabulary advisoryBatchSeverity already
+// produces. Unknown values produce no increment (closed-set
+// guard). Nil receiver is allowed for parity.
+func (m *OpsMetrics) ObserveStatelessAdvisory(severity string) {
+	if m == nil || m.apidStatelessAdvisoryEventsTotal == nil {
+		return
+	}
+	switch severity {
+	case advisorySeverityHigh, advisorySeverityWarn, advisorySeverityInfo:
+		m.apidStatelessAdvisoryEventsTotal.WithLabelValues(severity).Inc()
 	}
 }
 
