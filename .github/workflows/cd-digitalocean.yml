@@ -107,7 +107,7 @@ jobs:
             root@${{ secrets.DO_HOST }} "mkdir -p /opt/faas/bin/deploy-tmp"
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             bin/apid bin/schedd bin/gatewayd bin/imaged bin/meterd \
-            bin/githubd bin/faas bin/migrate \
+            bin/githubd bin/gregale bin/migrate \
             root@${{ secrets.DO_HOST }}:/opt/faas/bin/deploy-tmp/
 
       - name: Install binaries, run migrations & restart services
@@ -260,7 +260,7 @@ jobs:
           SIGN_PUB_PATH=/etc/faas/secrets/sign-pub.pem
           if [[ ! -f "${SIGN_KEY_PATH}" || ! -f "${SIGN_PUB_PATH}" ]]; then
             echo "→ Provisioning cosign sign keypair..."
-            /opt/faas/bin/faas sign-keys init \
+            /opt/faas/bin/gregale sign-keys init \
               --sign-key "${SIGN_KEY_PATH}" --verify-key "${SIGN_PUB_PATH}"
             chown root:faas "${SIGN_KEY_PATH}"; chmod 0440 "${SIGN_KEY_PATH}"
             chown root:root "${SIGN_PUB_PATH}"; chmod 0444 "${SIGN_PUB_PATH}"
