@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/auth"
+	"github.com/onebox-faas/faas/pkg/authcode"
 )
 
 // TestPg_ConsumeRecoveryCode_RemainingCount pins the SELECT … FOR
@@ -39,7 +39,7 @@ func TestPg_ConsumeRecoveryCode_RemainingCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, err := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, err := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}
@@ -48,37 +48,37 @@ func TestPg_ConsumeRecoveryCode_RemainingCount(t *testing.T) {
 	}
 
 	// Case 1: burn one of ten. remaining must drop to 9.
-	matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, auth.HashRecoveryCode(plaintexts[0]))
+	matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, authcode.HashRecoveryCode(plaintexts[0]))
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
 	}
 	if !matched || lastCode {
 		t.Errorf("burn #1: matched=%v lastCode=%v, want true/false", matched, lastCode)
 	}
-	if remaining != auth.RecoveryCodeCount-1 {
-		t.Errorf("burn #1: remaining = %d, want %d (issue #329 mailer tone bucket)", remaining, auth.RecoveryCodeCount-1)
+	if remaining != authcode.RecoveryCodeCount-1 {
+		t.Errorf("burn #1: remaining = %d, want %d (issue #329 mailer tone bucket)", remaining, authcode.RecoveryCodeCount-1)
 	}
 
 	// Case 2: burn down to zero by driving the store primitive
 	// directly (the /recover handler refuses the last code; the
 	// store contract is allowed to consume it).
-	for i := 1; i < auth.RecoveryCodeCount; i++ {
-		matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, auth.HashRecoveryCode(plaintexts[i]))
+	for i := 1; i < authcode.RecoveryCodeCount; i++ {
+		matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, authcode.HashRecoveryCode(plaintexts[i]))
 		if err != nil {
 			t.Fatalf("burn %d: %v", i, err)
 		}
 		if !matched {
 			t.Errorf("burn %d: matched = false, want true", i)
 		}
-		if i == auth.RecoveryCodeCount-1 {
+		if i == authcode.RecoveryCodeCount-1 {
 			if !lastCode {
 				t.Errorf("burn %d: lastCode = false, want true (final consume)", i)
 			}
 			if remaining != 0 {
 				t.Errorf("burn %d: remaining = %d, want 0 (mailer NO-codes-left branch)", i, remaining)
 			}
-		} else if remaining != auth.RecoveryCodeCount-1-i {
-			t.Errorf("burn %d: remaining = %d, want %d", i, remaining, auth.RecoveryCodeCount-1-i)
+		} else if remaining != authcode.RecoveryCodeCount-1-i {
+			t.Errorf("burn %d: remaining = %d, want %d", i, remaining, authcode.RecoveryCodeCount-1-i)
 		}
 	}
 
@@ -104,7 +104,7 @@ func TestPg_ConsumeRecoveryCode_NoMatchReturnsZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	_, hashes, err := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	_, hashes, err := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}

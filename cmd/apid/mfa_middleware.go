@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -129,65 +128,13 @@ func isMFAAllowlisted(path string) bool {
 	return false
 }
 
-// requireMFA gates every session-cookie route behind the
-// mfa-pending flag. It is a no-op on bearer-key requests
-// (mfaPendingFrom returns false/ok=false → key path bypass).
-// Composes as
-//
-//	s.authLimited(s.requireMFA(s.requireScope(...)(s.handler)))
-//
-// because the wrap order is auth → mfa → scope → idempotent →
-// handler: auth stashes the principal + mfa-pending flag, mfa
-// short-circuits to 403 if the flag is true and the path isn't
-// allowlisted, scope enforces the per-route authorization,
-// idempotent caches the response, and the handler runs only when
-// all four pass.
-//
-// Returning a 403 (not a redirect) is deliberate: the dashboard
-// reads the RFC 7807 problem document and renders the "complete
-// MFA to continue" prompt in-place. A redirect would force the
-// browser to round-trip the dashboard through the gateway and
-// would lose the original request method + body.
-//
-// RequireMFA returns 403 on the allowlisted paths too — the
-// dashboard can still render the prompt, but the customer still
-// can't reach /v1/apps while pending. The /v1/account whoami is
-// the only handler that needs to run *and* render the prompt.
-func (s *server) requireMFA(next accountHandler) accountHandler {
-	return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
-		pending, ok := mfaPendingFrom(r)
-		if !ok {
-			// Bearer-key principal or unwired test: bypass.
-			next(w, r, acct)
-			return
-		}
-		if !pending {
-			// Cookie was issued by a login path that already
-			// cleared MFA, OR by /v1/account/mfa/verify after a
-			// successful TOTP step-up. No gate.
-			next(w, r, acct)
-			return
-		}
-		if isMFAAllowlisted(r.URL.Path) {
-			// Render the prompt / drive the MFA flow.
-			next(w, r, acct)
-			return
-		}
-		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
-			api.CodeMFARequired, "MFA required",
-			"complete /v1/account/mfa/enroll or /v1/account/mfa/verify to access this route"))
-		// Best-effort audit: a session cookie repeatedly hitting a
-		// gated route is the same threat signal as a 401 on the
-		// login path. The dashboard reads these rows to surface
-		// "session expired / MFA required" rather than crashing.
-		if s.audit != nil {
-			s.audit.Emit(r.Context(), "auth.mfa_gate_hit", &acct.ID, map[string]any{
-				"path":   r.URL.Path,
-				"method": r.Method,
-			})
-		}
-	}
-}
+// requireMFA is the cmd/apid-side facade. The body lives in
+// pkg/auth (cmd/apid/auth_facade.go::requireMFA is the bridge).
+// This file keeps the unexported MFA helpers — mfaPendingFrom,
+// withMFAPending, isMFAAllowlisted, mfaEnrollRequired — because
+// the cookie-branch of s.auth still stamps the mfa-pending flag
+// directly (the follow-up slice will route that through
+// pkg/auth's WithMFAPending once RequireSession lands). ADR-044.
 
 // mfaEnrollRequired is the predicate the login handlers check to
 // decide whether to stamp MfaPending=true on the new session

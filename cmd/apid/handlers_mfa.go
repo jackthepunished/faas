@@ -28,6 +28,8 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/authcode"
 	mailpkg "github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -133,7 +135,7 @@ func (s *server) mfaEnroll(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrCapacity("could not render TOTP QR"))
 		return
 	}
-	plaintexts, hashes, err := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, err := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err != nil {
 		s.log.Error("mfa.enroll.recovery", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not generate recovery codes"))
@@ -286,7 +288,7 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 			"Invalid request", "malformed JSON body"))
 		return
 	}
-	presented := auth.HashRecoveryCode(req.Code)
+	presented := authcode.HashRecoveryCode(req.Code)
 	// Step 1 — match without mutating. The split (match → refuse
 	// → consume) lets us reject the last-code burn atomically,
 	// rather than burning first and noticing later (issue #186
@@ -512,7 +514,7 @@ func (s *server) disableByPassword(w http.ResponseWriter, r *http.Request, acct 
 // the customer is about to ClearMFA anyway, so the locked-out
 // terminal state from /recover doesn't apply here.
 func (s *server) disableByRecoveryCode(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
-	presentedHash := auth.HashRecoveryCode(presented)
+	presentedHash := authcode.HashRecoveryCode(presented)
 	// `remaining` is discarded on this path: the customer is about
 	// to ClearMFA anyway, so the count of codes left on the row is
 	// irrelevant. The /recover handler is the one that hands the
@@ -610,7 +612,7 @@ func SetMFAIdentity(f func() *age.X25519Identity) { mfaIdentity = f }
 // 500 + a log line, so the wiring bug surfaces instead of
 // hiding.
 func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool) error {
-	current, ok := sessionFrom(r)
+	current, ok := authmw.SessionFromContext(r)
 	if !ok {
 		if s.log != nil {
 			s.log.Error("reissueSessionCookie: no session in context — refusing to mint sid-less envelope",

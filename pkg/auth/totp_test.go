@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/authcode"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
@@ -106,15 +107,15 @@ func TestVerifyCode_RejectsMalformed(t *testing.T) {
 // opposite order from the plaintext (so an attacker reading the
 // hash table can't link which entry corresponds to which code).
 func TestNewRecoveryCodes_ShapeAndUniqueness(t *testing.T) {
-	plain, hashes, err := NewRecoveryCodes(RecoveryCodeCount)
+	plain, hashes, err := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}
-	if len(plain) != RecoveryCodeCount {
-		t.Errorf("len(plain) = %d, want %d", len(plain), RecoveryCodeCount)
+	if len(plain) != authcode.RecoveryCodeCount {
+		t.Errorf("len(plain) = %d, want %d", len(plain), authcode.RecoveryCodeCount)
 	}
-	if len(hashes) != RecoveryCodeCount {
-		t.Errorf("len(hashes) = %d, want %d", len(hashes), RecoveryCodeCount)
+	if len(hashes) != authcode.RecoveryCodeCount {
+		t.Errorf("len(hashes) = %d, want %d", len(hashes), authcode.RecoveryCodeCount)
 	}
 	seen := make(map[string]struct{}, len(plain))
 	for i, p := range plain {
@@ -142,8 +143,8 @@ func TestNewRecoveryCodes_ShapeAndUniqueness(t *testing.T) {
 // accept lowercase. The hash of the uppercase plaintext stored at
 // enrollment must match the hash of the lowercase presented code.
 func TestHashRecoveryCode_CaseInsensitive(t *testing.T) {
-	h1 := HashRecoveryCode("ABCD2345EF")
-	h2 := HashRecoveryCode("abcd2345ef")
+	h1 := authcode.HashRecoveryCode("ABCD2345EF")
+	h2 := authcode.HashRecoveryCode("abcd2345ef")
 	if string(h1) != string(h2) {
 		t.Errorf("HashRecoveryCode is case-sensitive: %x vs %x", h1, h2)
 	}
@@ -153,12 +154,12 @@ func TestHashRecoveryCode_CaseInsensitive(t *testing.T) {
 // NewRecoveryCodes: hashing the same plaintext produces the same
 // output. This is the property /v1/account/mfa/recover depends on.
 func TestHashRecoveryCode_MatchesGenerate(t *testing.T) {
-	plain, hashes, err := NewRecoveryCodes(4)
+	plain, hashes, err := authcode.NewRecoveryCodes(4)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}
 	for i, p := range plain {
-		got := HashRecoveryCode(p)
+		got := authcode.HashRecoveryCode(p)
 		if string(got) != string(hashes[i]) {
 			t.Errorf("hash[%d] mismatch: %x vs %x", i, got, hashes[i])
 		}

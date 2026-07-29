@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/auth"
+	"github.com/onebox-faas/faas/pkg/authcode"
 )
 
 // --- Account / Account.Active ------------------------------------------------
@@ -2472,7 +2472,7 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, err := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, err := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}
@@ -2481,7 +2481,7 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 
-	presented := auth.HashRecoveryCode(plaintexts[3])
+	presented := authcode.HashRecoveryCode(plaintexts[3])
 	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
@@ -2492,16 +2492,16 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 	if lastCode {
 		t.Errorf("lastCode = true, want false (10 codes started, 1 burned, 9 remain)")
 	}
-	if remaining != auth.RecoveryCodeCount-1 {
-		t.Errorf("remaining = %d, want %d (issue #329: mailer needs the count)", remaining, auth.RecoveryCodeCount-1)
+	if remaining != authcode.RecoveryCodeCount-1 {
+		t.Errorf("remaining = %d, want %d (issue #329: mailer needs the count)", remaining, authcode.RecoveryCodeCount-1)
 	}
 
 	after, err := m.AccountByID(ctx, acct.ID)
 	if err != nil {
 		t.Fatalf("AccountByID: %v", err)
 	}
-	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount-1 {
-		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1)
+	if len(after.MFARecoveryCodesHash) != authcode.RecoveryCodeCount-1 {
+		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), authcode.RecoveryCodeCount-1)
 	}
 	// Sealed secret must survive the burn (UpdateMFARecoveryCodes
 	// would have been the wrong call — it's preserved by the new
@@ -2527,7 +2527,7 @@ func TestConsumeRecoveryCode_NoMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	_, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	_, hashes, _ := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
@@ -2546,8 +2546,8 @@ func TestConsumeRecoveryCode_NoMatch(t *testing.T) {
 		t.Errorf("remaining = %d, want 0 on a no-match (issue #329 contract)", remaining)
 	}
 	after, _ := m.AccountByID(ctx, acct.ID)
-	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount {
-		t.Errorf("hash slice size = %d, want %d (no-match must not mutate)", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount)
+	if len(after.MFARecoveryCodesHash) != authcode.RecoveryCodeCount {
+		t.Errorf("hash slice size = %d, want %d (no-match must not mutate)", len(after.MFARecoveryCodesHash), authcode.RecoveryCodeCount)
 	}
 }
 
@@ -2563,7 +2563,7 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, _ := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
@@ -2572,8 +2572,8 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	// lastCode=false (because more than one remains) AND a
 	// monotonically-decreasing `remaining` count (issue #329
 	// wires `remaining` to the mailer tone bucket).
-	for i := 0; i < auth.RecoveryCodeCount-1; i++ {
-		presented := auth.HashRecoveryCode(plaintexts[i])
+	for i := 0; i < authcode.RecoveryCodeCount-1; i++ {
+		presented := authcode.HashRecoveryCode(plaintexts[i])
 		matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 		if err != nil {
 			t.Fatalf("burn %d: %v", i, err)
@@ -2581,7 +2581,7 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 		if !matched || lastCode {
 			t.Errorf("burn %d: matched=%v lastCode=%v, want true/false", i, matched, lastCode)
 		}
-		if want := auth.RecoveryCodeCount - 1 - i; remaining != want {
+		if want := authcode.RecoveryCodeCount - 1 - i; remaining != want {
 			t.Errorf("burn %d: remaining = %d, want %d", i, remaining, want)
 		}
 	}
@@ -2591,7 +2591,7 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	// left" branch only fires via /disable's recovery_code path,
 	// but the store primitive must still report the post-burn
 	// count honestly so the handler can branch correctly.
-	presented := auth.HashRecoveryCode(plaintexts[auth.RecoveryCodeCount-1])
+	presented := authcode.HashRecoveryCode(plaintexts[authcode.RecoveryCodeCount-1])
 	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("last burn: %v", err)
@@ -2622,11 +2622,11 @@ func TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, _ := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
-	presented := auth.HashRecoveryCode(plaintexts[5])
+	presented := authcode.HashRecoveryCode(plaintexts[5])
 
 	type result struct{ matched, lastCode bool }
 	results := make(chan result, 2)
@@ -2651,8 +2651,8 @@ func TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn(t *testing.T) {
 		t.Errorf("matchCount = %d, want 1 (exactly one of two racing consumes must burn)", matchCount)
 	}
 	after, _ := m.AccountByID(ctx, acct.ID)
-	if len(after.MFARecoveryCodesHash) != auth.RecoveryCodeCount-1 {
-		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1)
+	if len(after.MFARecoveryCodesHash) != authcode.RecoveryCodeCount-1 {
+		t.Errorf("remaining hashes = %d, want %d", len(after.MFARecoveryCodesHash), authcode.RecoveryCodeCount-1)
 	}
 }
 
@@ -2738,12 +2738,12 @@ func TestMatchRecoveryCode_NoMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, _ := auth.NewRecoveryCodes(auth.RecoveryCodeCount)
+	plaintexts, hashes, _ := authcode.NewRecoveryCodes(authcode.RecoveryCodeCount)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 	// Match the first code.
-	presented := auth.HashRecoveryCode(plaintexts[0])
+	presented := authcode.HashRecoveryCode(plaintexts[0])
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)
@@ -2757,8 +2757,8 @@ func TestMatchRecoveryCode_NoMutation(t *testing.T) {
 
 	// Crucially: the stored hashes are unchanged.
 	after, _ := m.AccountByID(ctx, acct.ID)
-	if got := len(after.MFARecoveryCodesHash); got != auth.RecoveryCodeCount {
-		t.Errorf("codes after Match = %d, want %d (Match must not mutate)", got, auth.RecoveryCodeCount)
+	if got := len(after.MFARecoveryCodesHash); got != authcode.RecoveryCodeCount {
+		t.Errorf("codes after Match = %d, want %d (Match must not mutate)", got, authcode.RecoveryCodeCount)
 	}
 	// And a follow-up Consume on the SAME code still burns
 	// normally — confirms Match didn't pre-empt it.
@@ -2783,12 +2783,12 @@ func TestMatchRecoveryCode_LastCodeFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	plaintexts, hashes, _ := auth.NewRecoveryCodes(1)
+	plaintexts, hashes, _ := authcode.NewRecoveryCodes(1)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 
-	presented := auth.HashRecoveryCode(plaintexts[0])
+	presented := authcode.HashRecoveryCode(plaintexts[0])
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)
@@ -2816,11 +2816,11 @@ func TestMatchRecoveryCode_NoMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	_, hashes, _ := auth.NewRecoveryCodes(3)
+	_, hashes, _ := authcode.NewRecoveryCodes(3)
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
-	presented := auth.HashRecoveryCode("DEFINITELY-NOT-A-STORED-CODE")
+	presented := authcode.HashRecoveryCode("DEFINITELY-NOT-A-STORED-CODE")
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)

@@ -41,7 +41,6 @@ package auth
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
 	"image/png"
@@ -59,12 +58,13 @@ import (
 // steals chars from the AccountName field.
 const TOTPIssuer = "FaaS"
 
-// RecoveryCodeCount is the number of single-use recovery codes
-// minted at enrollment. 10 is the Google Authenticator default and
-// the lowest power of 10 that survives one lost phone without a
-// customer panic. The metadata comment in the migration notes the
-// memory cost: 10 codes * 32 B = 320 B per MFA-enrolled account.
-const RecoveryCodeCount = 10
+// Recovery-code primitives moved to pkg/authcode so pkg/state's
+// tests can use them without closing an import cycle (pkg/auth
+// imports pkg/state since the middleware lift, ADR-044).
+//
+// New code MUST import pkg/authcode directly. The pkg/auth package
+// no longer re-exports RecoveryCodeCount / NewRecoveryCodes /
+// HashRecoveryCode — cmd/apid/handlers_mfa.go has been updated.
 
 // GenerateSecret returns a fresh 160-bit base32-encoded secret. The
 // returned string has base32 padding stripped (RFC 4648 §3.5) so the
@@ -135,48 +135,4 @@ func VerifyCode(secret, code string) bool {
 			Algorithm: otp.AlgorithmSHA1,
 		})
 	return err == nil && ok
-}
-
-// NewRecoveryCodes returns n plaintext recovery codes (base32, 10
-// chars each, no padding) plus the SHA-256 hashes of the same
-// plaintexts. The plaintexts are returned to the dashboard ONCE
-// (the enroll response); the hashes are what /v1/account/mfa/recover
-// compares against.
-//
-// Entropy breakdown: 10 bytes of CSPRNG source = 80 bits; the
-// base32-no-padding encoding of 10 bytes is 16 chars; we truncate to
-// 10 chars (50 bits customer-visible — 10 × 5 bits/char over the
-// base32 alphabet A-Z + 2-7). 50 bits is enough that brute-forcing
-// a 10-entry hash table from a leaked blob is computationally
-// infeasible without offline storage of the plaintexts, which never
-// leaves the customer's account. The CSPRNG draws 80 bits so we
-// don't bias the alphabet by reading fewer source bytes (a 50-bit
-// draw under-produces characters outside the visible alphabet).
-func NewRecoveryCodes(n int) (plaintexts []string, hashes [][]byte, err error) {
-	plaintexts = make([]string, n)
-	hashes = make([][]byte, n)
-	for i := 0; i < n; i++ {
-		raw := make([]byte, 10) // 80 bits = 16 base32 chars; truncate to 10
-		if _, err := rand.Read(raw); err != nil {
-			return nil, nil, fmt.Errorf("auth/totp: rand: %w", err)
-		}
-		encoded := strings.TrimRight(base32.StdEncoding.EncodeToString(raw), "=")
-		plaintexts[i] = strings.ToUpper(encoded[:10])
-		h := sha256.Sum256([]byte(plaintexts[i]))
-		hashes[i] = h[:]
-	}
-	return plaintexts, hashes, nil
-}
-
-// HashRecoveryCode is the SHA-256 single-shot helper used by
-// /v1/account/mfa/recover to test a presented code against the
-// stored hashes. The caller uppercases the presented code before
-// passing it in — the recovery-code generator above emits
-// uppercase, and case-insensitive matching is the customer's
-// expectation (RFC 6238 doesn't mandate case for the TOTP secret,
-// but the recovery codes are user-typed and so should accept
-// either case).
-func HashRecoveryCode(code string) []byte {
-	h := sha256.Sum256([]byte(strings.ToUpper(code)))
-	return h[:]
 }
