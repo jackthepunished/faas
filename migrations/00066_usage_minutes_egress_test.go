@@ -87,10 +87,19 @@ func TestMigrations_00065_Egress_AddsTxBytesAndNetTxBytes(t *testing.T) {
 	`, depID, appID); err != nil {
 		t.Fatalf("seed deployment: %v", err)
 	}
+	// instances.node_id is NOT NULL (migrations/00024). Look up the
+	// seeded default-local compute_node id (any active node would do;
+	// the egress columns aren't node-scoped, but the FK is).
+	var nodeID string
+	if err := pool.QueryRow(ctx, `
+		select id from compute_nodes where name = 'default-local' limit 1
+	`).Scan(&nodeID); err != nil {
+		t.Fatalf("lookup default-local compute_node id: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
-		insert into instances (id, app_id, deployment_id, state, ram_mb, started_at)
-		values ($1, $2, $3, 'running', 256, now())
-	`, insID, appID, depID); err != nil {
+		insert into instances (id, app_id, deployment_id, node_id, state, ram_mb, started_at)
+		values ($1, $2, $3, $4, 'running', 256, now())
+	`, insID, appID, depID, nodeID); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 

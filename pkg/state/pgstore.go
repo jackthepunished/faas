@@ -5301,13 +5301,21 @@ func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string
 // accumulation; the Stripe pusher still pushes only mb_seconds-based
 // usage (billing stays on plan RAM) but the column is available for
 // future per-hour dashboards without re-rolling per-minute rows.
+//
+// tx_bytes and net_tx_bytes (ADR-046) are summed in the same query
+// so the per-hour rollup exposes both contributions. The asymmetry
+// the same as cpu_usec: additive on (instance_id, minute) conflict
+// so the SUM over the hour window is the full amount. Future
+// per-hour egress dashboards feed off this without a re-roll.
 func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error) {
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id,
 		        date_trunc('hour', minute) as hour,
-		        sum(mb_seconds)::bigint as mb_seconds,
-		        sum(cpu_usec)::bigint   as cpu_usec,
-		        sum(requests)::bigint as requests
+		        sum(mb_seconds)::bigint   as mb_seconds,
+		        sum(cpu_usec)::bigint     as cpu_usec,
+		        sum(requests)::bigint     as requests,
+		        sum(tx_bytes)::bigint     as tx_bytes,
+		        sum(net_tx_bytes)::bigint as net_tx_bytes
 		 from usage_minutes
 		 where account_id = $1 and minute >= $2 and minute < $3
 		 group by account_id, app_id, hour
@@ -5321,7 +5329,7 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 	for rows.Next() {
 		u := Usage{}
 		var hour time.Time
-		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes); err != nil {
 			return nil, err
 		}
 		u.Month = hour
