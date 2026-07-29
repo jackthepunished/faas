@@ -75,6 +75,24 @@ func TestCmdInit_AllTemplatesMaterialize(t *testing.T) {
 				"faas secrets set",
 			},
 		},
+		{
+			name:  "webhook-receiver",
+			files: []string{"handler.js", "package.json", "README.md"},
+			readmeHas: []string{
+				"WEBHOOK_SECRET",
+				"X-Webhook-Secret",
+				"faas secrets set",
+			},
+		},
+		{
+			name:  "ai-chat",
+			files: []string{"handler.js", "package.json", "README.md"},
+			readmeHas: []string{
+				"OPENAI_API_KEY",
+				"ANTHROPIC_API_KEY",
+				"faas secrets set",
+			},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -127,7 +145,7 @@ func TestCmdInit_UnknownTemplate(t *testing.T) {
 	}
 	// Must list at least the four Wave 0 PR-B templates by name so
 	// the customer can see what's available.
-	for _, want := range []string{"s3-uploader", "slack-bot", "rest-api-postgres", "cron-worker"} {
+	for _, want := range []string{"s3-uploader", "slack-bot", "rest-api-postgres", "cron-worker", "webhook-receiver", "ai-chat"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("stderr missing template name %q; got: %q", want, got)
 		}
@@ -229,6 +247,8 @@ func TestCmdInit_NextStepsFor(t *testing.T) {
 		{"slack-bot", []string{"SLACK_SIGNING_SECRET", "faas secrets set", "cd <dest>"}},
 		{"rest-api-postgres", []string{"DATABASE_URL", "faas secrets set", "cd <dest>"}},
 		{"cron-worker", []string{"QSTASH_TOKEN", "UPSTASH_REDIS_REST_URL", "faas secrets set", "cd <dest>"}},
+		{"webhook-receiver", []string{"WEBHOOK_SECRET", "openssl rand", "faas secrets set", "cd <dest>"}},
+		{"ai-chat", []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "faas secrets set", "cd <dest>"}},
 		{"hello-node", []string{"cd <dest>", "faas deploy"}}, // default branch
 	}
 	for _, c := range cases {

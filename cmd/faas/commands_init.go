@@ -227,6 +227,27 @@ func nextStepsFor(tpl string) []string {
 			"Deploy from the new directory:",
 			"  cd <dest> && faas deploy",
 		}
+	case "webhook-receiver":
+		return []string{
+			"Set the shared webhook secret (a 32-byte hex string):",
+			"  faas secrets set --app <slug> WEBHOOK_SECRET=$(openssl rand -hex 32)",
+			"Optional: scope the receiver to specific paths:",
+			"  faas secrets set --app <slug> WEBHOOK_ALLOWED_PATHS=/stripe,/github",
+			"Wire the provider's webhook URL to https://<slug>.<DOMAIN>/<your-path>",
+			"Deploy from the new directory:",
+			"  cd <dest> && faas deploy",
+		}
+	case "ai-chat":
+		return []string{
+			"Pick a provider — set exactly one of:",
+			"  faas secrets set --app <slug> OPENAI_API_KEY=sk-...",
+			"  faas secrets set --app <slug> ANTHROPIC_API_KEY=sk-ant-...",
+			"Optional: pin a model or prepend a system prompt:",
+			"  faas secrets set --app <slug> OPENAI_MODEL=gpt-4o",
+			"  faas secrets set --app <slug> SYSTEM_PROMPT='You are a helpful assistant for ...'",
+			"Deploy from the new directory:",
+			"  cd <dest> && faas deploy",
+		}
 	default:
 		// The seven pre-existing templates don't need secrets; print
 		// the bare deploy hint. Keeps the existing
