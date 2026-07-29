@@ -852,6 +852,15 @@ func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *
 			Actor:     e.Actor,
 			Kind:      e.Kind,
 		}
+		// Severity is hoisted from the audit row's data map. Only
+		// stateless.advisory rows carry the field today; the apid
+		// receiver (cmd/apid/advisory_receiver.go) populates it at
+		// emit time. A future audit kind with its own severity
+		// classification can write a similar key without touching
+		// the dashboard.
+		if severity, ok := dataSeverity(e.Data); ok {
+			row.Severity = severity
+		}
 		if e.Subject != nil {
 			row.Subject = e.Subject.String()
 		}
@@ -932,6 +941,13 @@ func (s *server) renderStateless(w http.ResponseWriter, r *http.Request, log *sl
 			TimeLabel: dashboard.RelativeTime(e.At, now),
 			Actor:     e.Actor,
 			Kind:      e.Kind,
+		}
+		// Severity hoist mirrors renderAuditEvents — see the comment
+		// there. Stateless.advisory rows always carry a "severity"
+		// key (advisory_receiver.go:116) so the badge column renders
+		// for every row on this landing page.
+		if severity, ok := dataSeverity(e.Data); ok {
+			row.Severity = severity
 		}
 		if e.Subject != nil {
 			row.Subject = e.Subject.String()

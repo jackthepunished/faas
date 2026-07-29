@@ -164,6 +164,7 @@
         <thead>
           <tr>
             <th>When</th>
+            <th>Severity</th>
             <th>App</th>
             <th>Data</th>
           </tr>
@@ -172,6 +173,7 @@
           {{range .RecentAdvisories}}
           <tr>
             <td>{{.TimeLabel}}</td>
+            <td>{{if .Severity}}<span class="badge {{.Severity}}">{{.Severity}}</span>{{else}}<span class="badge info">info</span>{{end}}</td>
             <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<span class="empty muted">∅</span>{{end}}</td>
             <td>{{if .DataPretty}}<pre>{{.DataPretty}}</pre>{{else}}<span class="empty muted">—</span>{{end}}</td>
           </tr>

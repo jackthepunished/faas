@@ -32,6 +32,15 @@
     .empty .muted { color: #6b7280; font-size: 0.9rem; }
     .breadcrumb { font-size: 0.9rem; color: #6b7280; margin-bottom: 0.5rem; }
     .breadcrumb a { color: #6b7280; }
+    /* Move 1 PR-A: severity badge column for stateless.advisory
+       rows. .high / .warn are populated by cmd/apid/advisory_receiver.go's
+       advisoryBatchSeverity (high = /data, /db, /var/lib/{postgresql,mysql};
+       warn = other closed paths). .info is the fallback for rows
+       without a severity field (non-stateless audit kinds). */
+    .badge { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 500; }
+    .badge.high { background: #fee2e2; color: #991b1b; }
+    .badge.warn { background: #fef3c7; color: #92400e; }
+    .badge.info { background: #e5e7eb; color: #374151; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -78,6 +87,7 @@
       <thead>
         <tr>
           <th>When</th>
+          <th>Severity</th>
           <th>Actor</th>
           <th>Kind</th>
           <th>Subject</th>
@@ -88,6 +98,7 @@
         {{range .Data.Events}}
         <tr>
           <td>{{.TimeLabel}}</td>
+          <td>{{if .Severity}}<span class="badge {{.Severity}}">{{.Severity}}</span>{{else}}<span class="badge info">info</span>{{end}}</td>
           <td><code>{{.Actor}}</code></td>
           <td><code>{{.Kind}}</code></td>
           <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<span class="empty muted">∅</span>{{end}}</td>

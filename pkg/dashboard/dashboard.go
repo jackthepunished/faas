@@ -494,6 +494,13 @@ type AuditEventsData struct {
 // AuditEventRow is one row of the audit table. TimeLabel is a
 // pre-formatted relative timestamp ("3m ago" / "just now" / "—")
 // computed at the handler edge so the template stays a pure renderer.
+//
+// Severity is populated only for stateless.advisory rows (Move 1
+// PR-A) — the apid receiver writes a "severity" key into the
+// audit row's data map and the dashboard handler hoists it here.
+// Closed vocabulary: "high" | "warn" | "info" | "" (empty for
+// non-stateless kinds, which the template renders as a muted
+// dash so the column stays present but unobtrusive).
 type AuditEventRow struct {
 	ID         string
 	TimeLabel  string
@@ -501,6 +508,7 @@ type AuditEventRow struct {
 	Kind       string
 	Subject    string
 	DataPretty string
+	Severity   string
 }
 
 // StatelessDenylistEntry is one row of the customer-facing contract
