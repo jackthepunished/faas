@@ -501,6 +501,12 @@ type AuditEventsData struct {
 // Closed vocabulary: "high" | "warn" | "info" | "" (empty for
 // non-stateless kinds, which the template renders as a muted
 // dash so the column stays present but unobtrusive).
+//
+// Mega-PR B: the same value is also exposed at the top level of
+// api.AuditEventResponse (json:"severity",omitempty) — the
+// /v1/audit-events JSON wire shape carries Severity alongside
+// the data JSONB. Pre-PR-427 rows render with no Severity at all
+// (the omitempty tag is the backwards-compat contract).
 type AuditEventRow struct {
 	ID         string
 	TimeLabel  string

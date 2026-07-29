@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.audit_event_response_severity import AuditEventResponseSeverity, check_audit_event_response_severity
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -41,6 +42,10 @@ class AuditEventResponse:
     subject: str | Unset = UNSET
     """Account id (uuid string form) the event was recorded against. Omitted when the event has no subject (e.g.
     system-level)."""
+    severity: AuditEventResponseSeverity | Unset = UNSET
+    """Highest-severity classification for stateless.advisory rows (`high` for /data, /db, /var/lib/postgresql,
+    /var/lib/mysql; `warn` for other closed paths; `info` for an empty batch). Omitted for non-stateless kinds and
+    for pre-PR-427 stateless.advisory rows where the data.severity key is absent. Mega-PR B / stateless-DX work."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +61,10 @@ class AuditEventResponse:
 
         subject = self.subject
 
+        severity: str | Unset = UNSET
+        if not isinstance(self.severity, Unset):
+            severity = self.severity
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -69,6 +78,8 @@ class AuditEventResponse:
         )
         if subject is not UNSET:
             field_dict["subject"] = subject
+        if severity is not UNSET:
+            field_dict["severity"] = severity
 
         return field_dict
 
@@ -89,6 +100,13 @@ class AuditEventResponse:
 
         subject = d.pop("subject", UNSET)
 
+        _severity = d.pop("severity", UNSET)
+        severity: AuditEventResponseSeverity | Unset
+        if isinstance(_severity, Unset):
+            severity = UNSET
+        else:
+            severity = check_audit_event_response_severity(_severity)
+
         audit_event_response = cls(
             id=id,
             at=at,
@@ -96,6 +114,7 @@ class AuditEventResponse:
             kind=kind,
             data=data,
             subject=subject,
+            severity=severity,
         )
 
         audit_event_response.additional_properties = d

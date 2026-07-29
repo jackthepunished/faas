@@ -527,3 +527,109 @@ func TestOpsMetrics_ObserveOAuthDisabled(t *testing.T) {
 	var nilM *wire.OpsMetrics
 	nilM.ObserveOAuthDisabled("google") // must not panic
 }
+
+// TestOpsMetrics_ObserveAdvisoryBatchResult (Mega-PR B) — the
+// stateless-advisory forward outcome counter increments per
+// closed-set result value (ok / dial_failed / rejected /
+// unavailable_after_retry) and refuses to widen the label set
+// for unknown values, mirroring the OAuth-counter pattern above.
+// Pair-counter with stateless_advisory_events_total: a healthy
+// box has rate(apid_..{severity="high"})[5m] ≈
+// rate(vmmd_..{result="ok"})[5m].
+func TestOpsMetrics_ObserveAdvisoryBatchResult(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	m.ObserveAdvisoryBatchResult("ok")
+	m.ObserveAdvisoryBatchResult("ok")
+	m.ObserveAdvisoryBatchResult("dial_failed")
+	m.ObserveAdvisoryBatchResult("rejected")
+	m.ObserveAdvisoryBatchResult("unavailable_after_retry")
+	// Unknown result: accessor must NOT create a label series.
+	m.ObserveAdvisoryBatchResult("mystery")
+
+	body := render(t, m)
+	wantLines := []string{
+		`vmmd_stateless_advisory_batches_emitted_total{result="ok"} 2`,
+		`vmmd_stateless_advisory_batches_emitted_total{result="dial_failed"} 1`,
+		`vmmd_stateless_advisory_batches_emitted_total{result="rejected"} 1`,
+		`vmmd_stateless_advisory_batches_emitted_total{result="unavailable_after_retry"} 1`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `result="mystery"`) {
+		t.Errorf("mystery label series must not be created, got:\n%s", body)
+	}
+
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveAdvisoryBatchResult("ok") // must not panic
+}
+
+// TestOpsMetrics_PreInstantiatesAdvisoryBatchSeries — the closed
+// result set must surface in /metrics from the moment the
+// daemon boots, all four rows at value 0. This is the
+// pre-instantiation contract that lets the §12 dashboard panel
+// render "no data → 0" rather than "no data → missing series"
+// on an idle box.
+func TestOpsMetrics_PreInstantiatesAdvisoryBatchSeries(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	body := render(t, m)
+	for _, result := range []string{"ok", "dial_failed", "rejected", "unavailable_after_retry"} {
+		want := `vmmd_stateless_advisory_batches_emitted_total{result="` + result + `"} 0`
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated line %q missing in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_ObserveStatelessAdvisory (Mega-PR B) — apid
+// receiver-side counter. Same closed-set semantics as the vmmd
+// forward counter but labels by severity ∈ {high, warn, info}.
+// Mirrors cmd/apid/advisory_receiver.go's advisoryBatchSeverity
+// vocabulary; an unknown severity (e.g. "urgent") must NOT
+// create a label series.
+func TestOpsMetrics_ObserveStatelessAdvisory(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.ObserveStatelessAdvisory("high")
+	m.ObserveStatelessAdvisory("high")
+	m.ObserveStatelessAdvisory("warn")
+	m.ObserveStatelessAdvisory("info")
+	// Unknown severity: closed-set guard.
+	m.ObserveStatelessAdvisory("urgent")
+
+	body := render(t, m)
+	wantLines := []string{
+		`apid_stateless_advisory_events_total{severity="high"} 2`,
+		`apid_stateless_advisory_events_total{severity="warn"} 1`,
+		`apid_stateless_advisory_events_total{severity="info"} 1`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `severity="urgent"`) {
+		t.Errorf("urgent label series must not be created, got:\n%s", body)
+	}
+
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveStatelessAdvisory("high") // must not panic
+}
+
+// TestOpsMetrics_PreInstantiatesStatelessAdvisorySeries — the
+// closed severity set must surface in /metrics from boot, all
+// three rows at value 0. Same pre-instantiation contract as the
+// vmmd forward counter above.
+func TestOpsMetrics_PreInstantiatesStatelessAdvisorySeries(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+	for _, sev := range []string{"high", "warn", "info"} {
+		want := `apid_stateless_advisory_events_total{severity="` + sev + `"} 0`
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated line %q missing in:\n%s", want, body)
+		}
+	}
+}

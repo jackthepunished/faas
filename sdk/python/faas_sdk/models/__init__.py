@@ -38,6 +38,7 @@ from .apps_metrics_response_range import AppsMetricsResponseRange
 from .async_invoke_response import AsyncInvokeResponse
 from .audit_event_response import AuditEventResponse
 from .audit_event_response_data import AuditEventResponseData
+from .audit_event_response_severity import AuditEventResponseSeverity
 from .auth_capabilities import AuthCapabilities
 from .auth_providers import AuthProviders
 from .build_export_response import BuildExportResponse
@@ -202,6 +203,7 @@ __all__ = (
     "AsyncInvokeResponse",
     "AuditEventResponse",
     "AuditEventResponseData",
+    "AuditEventResponseSeverity",
     "AuthCapabilities",
     "AuthProviders",
     "BuildExportResponse",

@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // advisoryStore is the minimal slice of state.Store the receiver needs.
@@ -44,12 +45,19 @@ type auditEmitter interface {
 // advisoryReceiver is the in-package server implementation of
 // apidpb.AdvisoryServer. Wired by registerAdvisoryReceiver onto a
 // *grpc.Server that runAdvisoryServer in main.go owns.
+//
+// ops is the apid daemon's *wire.OpsMetrics — used to increment
+// the stateless_advisory_events_total counter on each landed
+// advisory (Mega-PR B). Pass nil if metrics are not wired; the
+// accessor is nil-receiver safe and unit tests that don't wire
+// metrics keep working without stubs.
 type advisoryReceiver struct {
 	apidpb.UnimplementedAdvisoryServer
 	store  advisoryStore
 	audit  auditEmitter
 	notif  Notifier
 	logger slogLike
+	ops    *wire.OpsMetrics
 }
 
 // slogLike is the minimal *slog.Logger surface the receiver needs.
@@ -109,17 +117,43 @@ func (a *advisoryReceiver) ForwardStatelessAdvisory(ctx context.Context, req *ap
 	// doesn't need the closed-path list to know whether the row is
 	// "high" (/data, /db, /var/lib/postgresql, /var/lib/mysql) or
 	// "warn" (other closed paths).
+	//
+	// Mega-PR B: compute the severity ONCE per call. The audit row's
+	// `data.severity` field and the counter increment use the same
+	// value so they can't drift if severityForPath ever gains a new
+	// branch (e.g. a future "low" tier). advisoryBatchSeverity's
+	// vocabulary is the receiver-internal set (severityHigh /
+	// severityWarn / severityInfo) and is exactly the wire-side
+	// counter vocabulary (AdvisorySeverity{High,Warn,Info}) so no
+	// translation is needed.
+	severity := advisoryBatchSeverity(req.Events)
 	data := map[string]any{
 		"instance": req.Instance,
 		"app_id":   req.AppId,
 		"count":    len(req.Events),
 		"events":   advisoryEventsToMap(req.Events),
-		"severity": advisoryBatchSeverity(req.Events),
+		"severity": severity,
 	}
 
 	if a.audit != nil {
+		// TODO: when auditEmitter.Emit grows an error return, the
+		// counter below must move inside the success branch — the
+		// pair-counter invariant (apid events vs vmmd ok) requires
+		// the audit row to be durably stored before the metric
+		// increments. Today Emit swallows write-failures into its
+		// own internal counter, so the order is currently safe.
 		a.audit.Emit(ctx, "stateless.advisory", subject, data)
 	}
+
+	// Mega-PR B: increment apid_stateless_advisory_events_total
+	// off the batch severity we just computed. Pair-counter with
+	// vmmd_stateless_advisory_batches_emitted_total{result="ok"} —
+	// a healthy box has rate(apid_..)[5m] ≈ rate(vmmd_..{ok})[5m].
+	// Placed AFTER the audit emit so a hypothetical write-failure
+	// path (audit row missing) doesn't double-count on the metric;
+	// the audit seam is best-effort and the metric is observation-
+	// only, but the order keeps the two surfaces consistent.
+	a.ops.ObserveStatelessAdvisory(severity)
 
 	// Fire the pg_notify channel that cmd/apid/handlers_events.go
 	// subscribes to for live SSE frames. The payload is a SMALL
@@ -292,11 +326,18 @@ func strContains(haystack, needle string) bool {
 // registerAdvisoryReceiver binds the AdvisoryServer onto a gRPC
 // server. Called from runAdvisoryServer in main.go alongside the
 // HTTP server lifecycle.
-func registerAdvisoryReceiver(s *grpc.Server, store advisoryStore, audit *auditor, notif Notifier, logger slogLike) {
+//
+// ops is the apid daemon's *wire.OpsMetrics — passed through to
+// the receiver so it can increment
+// apid_stateless_advisory_events_total on each landed advisory
+// (Mega-PR B). Pass nil if metrics are not wired; the accessor is
+// nil-receiver safe.
+func registerAdvisoryReceiver(s *grpc.Server, store advisoryStore, audit *auditor, notif Notifier, logger slogLike, ops *wire.OpsMetrics) {
 	apidpb.RegisterAdvisoryServer(s, &advisoryReceiver{
 		store:  store,
 		audit:  audit,
 		notif:  notif,
 		logger: logger,
+		ops:    ops,
 	})
 }

@@ -44,9 +44,16 @@ const advisoryRetryDelay = 200 * time.Millisecond
 // because the underlying *grpc.ClientConn is safe for concurrent use
 // but we want one dial to coalesce a burst of advisories into a
 // single connection.
+//
+// ops is the vmmd daemon's *wire.OpsMetrics — used to increment
+// the stateless_advisory_batches_emitted_total counter at each
+// Forward outcome (Mega-PR B). It is safe to pass nil; the accessor
+// is nil-receiver safe and treats a nil *OpsMetrics as a no-op, so
+// unit tests that don't wire metrics keep working without stubs.
 type AdvisoryClient struct {
 	target string // "unix:///run/faas/apid.sock"
 	log    *slog.Logger
+	ops    *wire.OpsMetrics
 
 	mu   sync.Mutex
 	conn *grpc.ClientConn
@@ -57,17 +64,25 @@ type AdvisoryClient struct {
 // target (e.g. "unix:///run/faas/apid.sock"). The connection is NOT
 // dialled until the first Forward call — keeps boot cheap and
 // tolerates a transiently-down apid (the unit test path).
-func NewAdvisoryClient(target string, log *slog.Logger) *AdvisoryClient {
+//
+// ops is the vmmd daemon's *wire.OpsMetrics. Pass nil if metrics
+// are not wired (the accessor is nil-receiver safe). Mega-PR B
+// promotes this to a positional parameter (rather than a setter)
+// so the receiver loop's race against late-binding is closed at
+// construction time — the alternative (SetOpsMetrics after
+// construction) would race the AdvisoryClient's Forward goroutines
+// for every advisory batch.
+func NewAdvisoryClient(target string, log *slog.Logger, ops *wire.OpsMetrics) *AdvisoryClient {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &AdvisoryClient{target: target, log: log}
+	return &AdvisoryClient{target: target, log: log, ops: ops}
 }
 
 // Forward sends one stateless advisory batch to apid. ADR-035
 // best-effort: on failure we log Warn, increment the
-// vmmd_advisory_forward_failures counter (TODO: wire when
-// pkg/wire.OpsMetrics gets the metric), and drop the batch.
+// stateless_advisory_batches_emitted_total{result} counter (Mega-PR
+// B), and drop the batch.
 //
 // Returns nil even on apid-side NotFound — the advisory row was
 // already observation; a missing app row is information, not an
@@ -84,6 +99,7 @@ func (c *AdvisoryClient) Forward(ctx context.Context, instance, appID string, ev
 	cli, err := c.dial(ctx)
 	if err != nil {
 		c.log.Warn("advisory forward: dial failed", "target", c.target, "err", err)
+		c.ops.ObserveAdvisoryBatchResult(wire.AdvisoryResultDialFailed)
 		return nil
 	}
 
@@ -104,16 +120,19 @@ func (c *AdvisoryClient) Forward(ctx context.Context, instance, appID string, ev
 		_, err := cli.ForwardStatelessAdvisory(callCtx, req)
 		cancel()
 		if err == nil {
+			c.ops.ObserveAdvisoryBatchResult(wire.AdvisoryResultOK)
 			return nil
 		}
 		st, ok := status.FromError(err)
 		if !ok || st.Code() != codes.Unavailable {
 			c.log.Warn("advisory forward: apid rejected", "err", err, "attempt", attempt+1)
+			c.ops.ObserveAdvisoryBatchResult(wire.AdvisoryResultRejected)
 			return nil
 		}
 		c.log.Warn("advisory forward: apid unavailable; retrying once", "attempt", attempt+1, "err", err)
 	}
 	c.log.Warn("advisory forward: giving up after retry", "instance", instance, "app_id", appID, "events", len(events))
+	c.ops.ObserveAdvisoryBatchResult(wire.AdvisoryResultUnavailableAfterRetry)
 	return nil
 }
 

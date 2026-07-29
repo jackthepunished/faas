@@ -670,13 +670,21 @@ type ListInvocationsResponse struct {
 // not the raw uuid UUID type — pkg/api stays string-typed for wire
 // stability). Data is the raw jsonb the apid auditor wrote; the schema
 // varies by kind and is documented per-kind in the ADR.
+//
+// Severity (Mega-PR B) is the highest-severity classification for
+// stateless.advisory rows; "" for all other kinds. omitempty keeps
+// the wire shape stable for non-stateless kinds and pre-PR-427 rows.
+// Mirrors pkg/api.AuditEventResponse — keep in lockstep with the
+// canonical DTO via the spec-sync invariant
+// (`make sdk-check`).
 type AuditEventResponse struct {
-	ID      string          `json:"id"`    // bigint as string
-	At      string          `json:"at"`    // RFC 3339
-	Actor   string          `json:"actor"` // "apid" today; "schedd" for state-transition events
-	Kind    string          `json:"kind"`
-	Subject string          `json:"subject,omitempty"` // account_id (uuid string form)
-	Data    json.RawMessage `json:"data"`
+	ID       string          `json:"id"`    // bigint as string
+	At       string          `json:"at"`    // RFC 3339
+	Actor    string          `json:"actor"` // "apid" today; "schedd" for state-transition events
+	Kind     string          `json:"kind"`
+	Subject  string          `json:"subject,omitempty"` // account_id (uuid string form)
+	Severity string          `json:"severity,omitempty"`
+	Data     json.RawMessage `json:"data"`
 }
 
 // ListAuditEventsResponse is the wire shape for GET /v1/audit-events.
