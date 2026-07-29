@@ -1014,30 +1014,13 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 	if src == "" {
 		src = ProjectScanSourceUnknown
 	}
-	// Single round-trip: pg_tier_rank(scan_source) <= pg_tier_rank($2)
-	// is the upgrade predicate, and `updated_at` bumps only when
-	// scan_source actually changes (same-tier writes are a no-op on
-	// the timestamp). Rows not matching the predicate (downgrade) or
-	// absent (row gone) return zero rows — we probe by id to
-	// distinguish the two.
-	row := s.pool.QueryRow(ctx, `
-		update projects
-		   set scan_source = $2,
-		       updated_at  = case when scan_source <> $2 then now() else updated_at end
-		 where id = $1
-		   and pg_tier_rank(scan_source) <= pg_tier_rank($2)
-		returning id, account_id, slug, coalesce(repo_full_name,''),
-		          coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
-		          created_at, updated_at
-	`, projectID, string(src))
-	p, err := scanProject(row)
-	if err == nil {
-		return p, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return Project{}, err
-	}
-	// Zero rows: either the row is gone or the upgrade is a downgrade.
+	// First round-trip: probe the existing row to learn its current
+	// scan_source. We need this to distinguish downgrade (existing
+	// rank > requested rank) from row-gone (no row at all) without
+	// relying on a single UPDATE+RETURNING where the WHERE double-
+	// duties both predicates. Splitting it gives us two clean signals:
+	// pgx.ErrNoRows on the SELECT means row-gone; a non-empty result
+	// lets us compare ranks directly.
 	existing, getErr := s.ProjectByID(ctx, projectID)
 	if getErr != nil {
 		return Project{}, getErr
@@ -1045,11 +1028,19 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 	if tierRank(existing.ScanSource) > tierRank(src) {
 		return Project{}, ErrScanSourceDowngrade
 	}
-	// Same-tier: the row already has scan_source == src. The CASE
-	// above preserves updated_at on same-tier writes, and the row's
-	// current state was fetched by ProjectByID above. Return the
-	// existing row unchanged.
-	return existing, nil
+	// Second round-trip: apply the upgrade (or same-tier no-op). The
+	// CASE preserves updated_at on same-tier writes so the timestamp
+	// moves only when scan_source actually changes.
+	row := s.pool.QueryRow(ctx, `
+		update projects
+		   set scan_source = $2,
+		       updated_at  = case when scan_source <> $2 then now() else updated_at end
+		 where id = $1
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		          created_at, updated_at
+	`, projectID, string(src))
+	return scanProject(row)
 }
 
 // RecordGitHubBinding writes the (install_id, repo_full_name,
