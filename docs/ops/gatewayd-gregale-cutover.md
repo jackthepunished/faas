@@ -176,5 +176,14 @@ flip back.
 | Status page served             | `https://apps.gregale.dev/status` returns the HTML        | `curl -fsS https://apps.gregale.dev/status`  |
 | Alert rules scrape cert expiry | `faas_tls_cert_expiry_seconds{host="*.gregale.dev"} > 30d` | Prometheus `/api/v1/query?query=faas_tls_cert_expiry_seconds` |
 
+Note: the `faas_tls_*` metric family is intentionally not renamed in
+this PR. The Prometheus scrape config and existing alert rules
+(`gatewayd-tls-cutover.md` §4) key off these names, and renaming
+would orphan dashboards + page rules on merge. The metric surfaces
+the cert host as a label, so the data is already keyed by
+`*.gregale.dev` — only the metric *name* stays as `faas_*` for
+backwards compatibility. A separate ops-decomposition PR can rename
+the family once alerts and Grafana panels are migrated.
+
 If any check fails, the cut-over is not complete — do not announce
 the new domain to customers until the matrix is green.

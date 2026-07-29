@@ -62,7 +62,8 @@ const (
 	// triggers the dev-mode defaults in other handlers). The
 	// forgot-password path treats both the empty string and
 	// domainUnset as "use the request Host verbatim" so a misconfigured
-	// dev deploy never mails out a "<domain>.unset" link.
+	// dev deploy never emails a customer a link stamped with a literal
+	// "unset" string in place of their hostname.
 	// schemeHTTP / schemeHTTPS live in handlers_google.go alongside
 	// googleAuthStateCookie so all auth handlers share them.
 	domainUnset = "unset"

@@ -38,24 +38,24 @@ This is the spine. Each step has a time budget and a defined success/failure sur
 
 ```
 curl -fsSL https://get.gregale.dev | sh          # single static Go binary, no deps
-# or: brew install gregale.dev/tap/faas · scoop · nix
+# or: brew install gregale.dev/tap/gregale · scoop · nix
 ```
 
-Post-install prints exactly one next step: `Run 'faas login' to get started.` No telemetry prompt walls, no account required to install.
+Post-install prints exactly one next step: `Run 'gregale login' to get started.` No telemetry prompt walls, no account required to install.
 
 ### 2.2 Login (budget: 45 s) — implements gap G5
 
 Browser-paste flow (no local web server, works over SSH):
 
 ```
-$ faas login
+$ gregale login
 → Opening https://gregale.dev/cli-auth?code=WXYZ-1234 in your browser…
   (or visit that URL and paste the code below)
 Paste token: ●●●●●●●●
 ✓ Logged in as jane@example.com (free plan)
 ```
 
-Token stored in the OS keychain (macOS Keychain / libsecret / wincred), never a plaintext dotfile. `faas login --token $FAAS_TOKEN` for CI. First successful login creates the account row (implementation spec §5) if the email is new — signup and login are the same door.
+Token stored in the OS keychain (macOS Keychain / libsecret / wincred), never a plaintext dotfile. `gregale login --token $FAAS_TOKEN` for CI. First successful login creates the account row (implementation spec §5) if the email is new — signup and login are the same door.
 
 ### 2.3 Deploy (budget: the user's 10 seconds; then we work)
 
