@@ -2020,6 +2020,26 @@ func (s *server) streamAppLogs(w http.ResponseWriter, r *http.Request, acct stat
 // Keeping the seam under the handler-limit line lets the test
 // suite wire a stub schedd without standing up the full handler
 // chain (cmd/apid/handlers_ext.go).
+//
+// Issue #254 / Move 4: the receive pump runs in a dedicated
+// goroutine so ctx cancel, the heartbeat, and the backstop all
+// fire while the upstream stream is idle. The previous
+// select-with-default loop only checked timers between frames; on
+// a quiet but open stream, stream.Recv() blocks indefinitely and
+// the SSE looks hung to htmx-ext-sse's auto-reconnect logic.
+// PR-B's production wiring makes that pattern reachable, so the
+// pump is fixed here in PR-A.
+// recvResult carries one upstream delivery on the receive channel
+// from serveAppLogs's receive goroutine (below). Exactly one of
+// frame or err is meaningful per result. The receive goroutine
+// closes the channel on its way out so the handler can treat a
+// missing result as a clean EOF and emit the terminal `event: end
+// {}` sentinel.
+type recvResult struct {
+	frame schedLogFrame
+	err   error
+}
+
 func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64) {
 	stream, err := s.schedd.StreamAppLogs(ctx_, appID, sinceSeq)
 	if err != nil {
@@ -2030,15 +2050,62 @@ func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flush
 		s.renderAppLogsError(w, flusher, err)
 		return
 	}
-	ticker := time.NewTicker(15 * time.Second)
+	// Per-server durations: 15s heartbeat / 10m backstop in
+	// production, configurable per-server for whitebox tests
+	// (cmd/apid/server.go:appLogsHeartbeat/appLogsBackstop).
+	heartbeat := s.appLogsHeartbeat
+	if heartbeat <= 0 {
+		heartbeat = 15 * time.Second
+	}
+	backstop := s.appLogsBackstop
+	if backstop <= 0 {
+		backstop = 10 * time.Minute
+	}
+	// Derive a cancellable context so the receive goroutine exits
+	// the moment the handler goroutine returns (ctx cancel,
+	// terminal frame, or backstop).
+	streamCtx, cancelStream := context.WithCancel(ctx_)
+	defer cancelStream()
+
+	// Capacity 1 + non-blocking send keeps the receive goroutine
+	// from blocking when the SSE writer is slow; a dropped frame
+	// is no worse than a missed frame on a quiet stream because
+	// the heartbeat keeps the client alive.
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		defer close(recvCh)
+		for {
+			f, err := stream.Recv()
+			select {
+			case <-streamCtx.Done():
+				return
+			default:
+			}
+			select {
+			case recvCh <- recvResult{frame: f, err: err}:
+			case <-streamCtx.Done():
+				return
+			default:
+				// Channel full — the SSE writer is behind.
+				// Drop rather than block; the heartbeat keeps
+				// the client alive, and the per-instance ring
+				// is the durable source of truth.
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
-	backstop := time.NewTimer(10 * time.Minute)
-	defer backstop.Stop()
+	backstopTimer := time.NewTimer(backstop)
+	defer backstopTimer.Stop()
 	for {
 		select {
 		case <-ctx_.Done():
 			return
-		case <-backstop.C:
+		case <-backstopTimer.C:
 			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"timeout\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
@@ -2049,33 +2116,34 @@ func (s *server) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flush
 			if flusher != nil {
 				flusher.Flush()
 			}
-		default:
-		}
-		frame, err := stream.Recv()
-		if err != nil {
-			// io.EOF = clean shutdown (the schedd's per-
-			// instance streams ended). Emit a terminal
-			// `event: end` so structured-frame consumers
-			// exit the loop cleanly.
-			if errors.Is(err, io.EOF) {
+		case r, ok := <-recvCh:
+			if !ok {
+				// Receive goroutine exited without writing a
+				// terminal result — treat as a clean EOF so
+				// structured-frame consumers exit the loop.
 				_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
 				return
 			}
-			// Partial-failure: the schedd maps a per-
-			// instance vmmd error to codes.Unavailable.
-			// Emit a `degraded` event so the consumer
-			// can decide whether to keep the stream
-			// open or reconnect.
-			_, _ = fmt.Fprintf(w, "event: degraded\ndata: {\"error\":%q}\n\n", err.Error())
-			if flusher != nil {
-				flusher.Flush()
+			if r.err != nil {
+				// io.EOF = clean shutdown; everything else
+				// delegates to renderAppLogsError so the
+				// NotFound / Unavailable envelopes stay the
+				// source of truth (not open-coded here).
+				if errors.Is(r.err, io.EOF) {
+					_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+					if flusher != nil {
+						flusher.Flush()
+					}
+					return
+				}
+				s.renderAppLogsError(w, flusher, r.err)
+				return
 			}
-			return
+			writeAppLogEvent(w, flusher, r.frame, appID, s.ops)
 		}
-		writeAppLogEvent(w, flusher, frame, appID, s.ops)
 	}
 }
 
