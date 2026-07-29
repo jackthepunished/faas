@@ -30,6 +30,17 @@
     .badge.sleeping { background: #e5e7eb; color: #374151; }
     .badge.waking   { background: #dbeafe; color: #1e40af; }
     .badge.dim      { background: #f3f4f6; color: #6b7280; }
+    /* Wave 0 PR-B (ux_spec §8): one primary CTA + a secondary docs
+       link for the bring-your-own-storage story. .btn-cta is local
+       to this template (the dashboard ships per-template CSS — see
+       dashboard.go:333-336). Copy hover matches the rest of the
+       navigation links. */
+    .empty { padding: 2rem 0; max-width: 36rem; }
+    .empty h2 { margin-top: 0; }
+    .empty pre { background: #f3f4f6; padding: 0.6rem 0.8rem; border-radius: 6px; overflow-x: auto; }
+    .empty .btn-cta { display: inline-block; padding: 0.5rem 1rem; border: 1px solid #2563eb; border-radius: 6px; color: #2563eb; text-decoration: none; }
+    .empty .btn-cta:hover { background: #2563eb; color: #fff; }
+    .empty .muted { color: #6b7280; font-size: 0.9rem; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -70,10 +81,28 @@
           </tbody>
         </table>
       {{else}}
-        <p>No apps yet. Create one with <code>faas apps create &lt;slug&gt;</code>.</p>
+        <div class="empty">
+          <h2>Deploy your first app</h2>
+          <p>From a project directory:</p>
+          <pre>faas deploy --template=hello-node</pre>
+          <p class="muted">Or scaffold a stateless-storage starter:</p>
+          <pre>faas init --template=s3-uploader --path=./uploader</pre>
+          <p>
+            <a class="btn-cta" href="https://docs.DOMAIN/storage">Bring your own storage →</a>
+          </p>
+        </div>
       {{end}}
     {{else}}
-      <p>No apps yet. Create one with <code>faas apps create &lt;slug&gt;</code>.</p>
+      <div class="empty">
+        <h2>Deploy your first app</h2>
+        <p>From a project directory:</p>
+        <pre>faas deploy --template=hello-node</pre>
+        <p class="muted">Or scaffold a stateless-storage starter:</p>
+        <pre>faas init --template=s3-uploader --path=./uploader</pre>
+        <p>
+          <a class="btn-cta" href="https://docs.DOMAIN/storage">Bring your own storage →</a>
+        </p>
+      </div>
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

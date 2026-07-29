@@ -1,0 +1,17 @@
+{
+  "name": "s3-uploader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "handler.js",
+  "scripts": {
+    "start": "node handler.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.654.0",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

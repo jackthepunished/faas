@@ -1,4 +1,4 @@
-// Package templates ships the seven `faas deploy --template <name>`
+// Package templates ships the eleven `faas deploy --template <name>`
 // starter projects as an embed.FS so the CLI is a single static
 // binary. Precedent: migrations/embed.go:13 — `//go:embed` pulls in
 // the sibling subdirectories at compile time.
@@ -33,11 +33,17 @@ import (
 // FS holds the embedded starter projects. The root is the directory
 // this file lives in, so subdirs are accessed by their template name.
 //
-//go:embed hello-node hello-python hello-go cron-example function-node function-python function-go
+//go:embed hello-node hello-python hello-go cron-example function-node function-python function-go s3-uploader slack-bot rest-api-postgres cron-worker
 var FS embed.FS
 
 // Names is the canonical template list, kept here so the CLI can
-// validate --template before touching the embed FS.
+// validate --template before touching the embed FS. The seven
+// "hello/function" scaffolds ship with `faas deploy`; the four
+// stateless-contract scaffolds (Wave 0 PR-B) are scaffolded by
+// `faas init` (commands_init.go) and tell the customer which
+// managed service to plug in. Names must stay in lockstep with
+// the //go:embed directive above — adding a template means a
+// new entry in BOTH places.
 var Names = []string{
 	"hello-node",
 	"hello-python",
@@ -46,6 +52,10 @@ var Names = []string{
 	"function-node",
 	"function-python",
 	"function-go",
+	"s3-uploader",
+	"slack-bot",
+	"rest-api-postgres",
+	"cron-worker",
 }
 
 // Exists reports whether name is a known template.
@@ -73,9 +83,9 @@ func sub(name string) (fs.FS, error) {
 
 // Materialize copies the template named name into dest. dest should be
 // an empty directory (the CLI uses os.MkdirTemp; tests use
-// MaterializeForTest). Skips dotfiles — the embed FS shouldn't have
-// any today, but if a future template adds one we don't want it
-// polluting the customer's repo.
+// MaterializeForTest). Delegates to os.CopyFS — no dotfile filtering,
+// no header munging. TarGz is the path that wraps the result for the
+// accept-time tarball scan; TarGz is the one that skips dotfiles.
 func Materialize(name, dest string) error {
 	subFS, err := sub(name)
 	if err != nil {

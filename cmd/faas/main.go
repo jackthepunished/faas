@@ -23,6 +23,7 @@ Commands:
   logout       Remove the stored token
   whoami       Show the authenticated account
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
+  init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   deployments  List deployments (--limit N | --before C | --all)
   deployment   Get one deployment (<id>)
   apps         List your apps
@@ -103,6 +104,8 @@ func run(args []string) int {
 		return cmdWhoami()
 	case "deploy":
 		return cmdDeployTarball(args[1:])
+	case "init":
+		return cmdInit(args[1:])
 	case "connect":
 		return cmdConnect(args[1:])
 	case "open":
