@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux
 
 // Stateless-runtime advisory (spec §17 G13, ADR-047). Closes the
 // runtime half of the Wave 0 stateless-only contract — PR-A gates
@@ -510,7 +510,10 @@ func advisoryShipper(sock int, appID string, pipe *advisoryPipe, log *slog.Logge
 			CID:  unix.VMADDR_CID_HOST,
 			Port: VsockStatelessAdvisoryPort,
 		}
-		if err := unix.SendtoN(sock, payload, 0, dst); err != nil {
+		// SendmsgN is the cross-arch form (SendtoN is amd64-only on
+		// golang.org/x/sys). DGRAM semantics are identical: kernel
+		// takes the buffer atomically, no scatter/gather needed.
+		if _, err := unix.SendmsgN(sock, payload, nil, dst, 0); err != nil {
 			// Drop on EAGAIN (DGRAM queue full — host can't keep up)
 			// or any other error. ADR-035 — silent on drop.
 			log.Warn("stateless advisory vsock send failed", "err", err, "events", len(batch))

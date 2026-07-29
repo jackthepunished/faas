@@ -633,6 +633,49 @@ func TestAuditEvents_ListEndpointRespectsStatelessAdvisoryKindPrefix(t *testing.
 	if !seen {
 		t.Errorf("stateless.advisory not in unfiltered list response; events=%+v", unified.Events)
 	}
+
+	// 4) ?app_id=<uuid> filters the overscan window to events whose
+	//    data.app_id matches. The dashboard's app_detail.html
+	//    "Stateless advisories" link uses this combo with
+	//    kind_prefix=stateless.advisory to drill into a single app.
+	//    Must return ONLY the accounted row (a-accounted) and not
+	//    the anonymous row (a-deleted) — because a-deleted has
+	//    data.app_id = "a-deleted", not "a-accounted".
+	rec = e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=stateless.&app_id=a-accounted", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?app_id=a-accounted: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var perApp api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &perApp); err != nil {
+		t.Fatalf("decode per-app: %v", err)
+	}
+	if len(perApp.Events) != 1 {
+		t.Fatalf("app_id=a-accounted: got %d rows, want 1; events=%+v", len(perApp.Events), perApp.Events)
+	}
+	if perApp.Events[0].Subject != uuidStringOf(e.acct.ID) {
+		t.Errorf("app_id filter Subject = %q, want %s", perApp.Events[0].Subject, uuidStringOf(e.acct.ID))
+	}
+	var perAppData map[string]any
+	if err := json.Unmarshal([]byte(perApp.Events[0].Data), &perAppData); err != nil {
+		t.Fatalf("perApp[0].Data not JSON: %v", err)
+	}
+	if perAppData["app_id"] != "a-accounted" {
+		t.Errorf("perApp[0].Data.app_id = %v, want a-accounted", perAppData["app_id"])
+	}
+
+	// 5) ?app_id=<unknown-uuid> returns zero rows (post-SQL filter
+	//    excludes every event).
+	rec = e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=stateless.&app_id=a-nobody", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?app_id=a-nobody: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var empty api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("decode empty: %v", err)
+	}
+	if len(empty.Events) != 0 {
+		t.Errorf("app_id=a-nobody: got %d rows, want 0; events=%+v", len(empty.Events), empty.Events)
+	}
 }
 
 // TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated drives

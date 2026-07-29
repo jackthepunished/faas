@@ -2579,6 +2579,17 @@ paths:
             audit emit. Default `false` (the customer never sees
             subject=NULL rows); operators can flip to `true` via
             `?include_anonymous=true` for post-mortems.
+        - name: app_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: |
+            Wave 0 PR-C / ADR-047: filter the overscan window to
+            events whose `data.app_id` matches the given uuid. The
+            dashboard's `app_detail.html` "Stateless advisories"
+            link uses this combo with `kind_prefix=stateless.advisory`
+            to drill into a single app's advisories. Resolved
+            post-SQL on the bounded overscan window; the events
+            table is not indexed on `data`.
       responses:
         '200':
           description: Newest-first audit events for the caller.

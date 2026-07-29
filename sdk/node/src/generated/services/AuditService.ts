@@ -26,6 +26,8 @@ export class AuditService {
     since,
     kindPrefix,
     limit = 50,
+    includeAnonymous = false,
+    appId,
   }: {
     /**
      * Only return rows with `at >= since` (RFC 3339). Omit to read from the newest row.
@@ -39,6 +41,27 @@ export class AuditService {
      * Max rows to return. Silently capped at 100.
      */
     limit?: number,
+    /**
+     * Wave 0 PR-C / ADR-047: also surface rows with `subject =
+     * NULL`. The defensive case where the customer's app row
+     * was deleted between wake and the stateless-advisory
+     * audit emit. Default `false` (the customer never sees
+     * subject=NULL rows); operators can flip to `true` via
+     * `?include_anonymous=true` for post-mortems.
+     *
+     */
+    includeAnonymous?: boolean,
+    /**
+     * Wave 0 PR-C / ADR-047: filter the overscan window to
+     * events whose `data.app_id` matches the given uuid. The
+     * dashboard's `app_detail.html` "Stateless advisories"
+     * link uses this combo with `kind_prefix=stateless.advisory`
+     * to drill into a single app's advisories. Resolved
+     * post-SQL on the bounded overscan window; the events
+     * table is not indexed on `data`.
+     *
+     */
+    appId?: string,
   }): CancelablePromise<ListAuditEventsResponse> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -47,6 +70,8 @@ export class AuditService {
         'since': since,
         'kind_prefix': kindPrefix,
         'limit': limit,
+        'include_anonymous': includeAnonymous,
+        'app_id': appId,
       },
       errors: {
         400: `Bad request — malformed \`since\` or \`limit\`.`,

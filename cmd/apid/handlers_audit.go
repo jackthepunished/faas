@@ -32,9 +32,13 @@
 //     reads; this endpoint is the daily-driver "who deleted my key
 //     last Tuesday?" UI surface.
 //   - No filter by free-text data payload (e.g. "any event where
-//     data.app_id = X"). kind_prefix is the only filter because the
-//     events table is not indexed on data — an opportunistic scan
-//     would force a sequential read.
+//     data.app_id = X"). kind_prefix is the only SQL-anchored filter
+//     because the events table is not indexed on data — an
+//     opportunistic scan would force a sequential read. The app_id
+//     filter added by Wave 0 PR-C / ADR-047 is a Go-side filter on
+//     the bounded (200-row) overscan window; the cost is one
+//     json.RawMessage.Unmarshal per row, which is dwarfed by the
+//     SQL round-trip.
 //   - No PATCH / DELETE on individual rows. The events table is
 //     append-only (spec §5 / §6.1); the spec doesn't grant customers
 //     a tamper interface and the auditor helper never exposes one.
@@ -42,6 +46,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
@@ -99,6 +104,14 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 	// ops can flip" — not "false forever" — so the toggle is part
 	// of the public surface from Wave 0.
 	includeAnonymous := r.URL.Query().Get("include_anonymous") == "true"
+	// app_id (Wave 0 PR-C / ADR-047): filter the overscan window to
+	// events whose data.app_id matches. The dashboard's
+	// app_detail.html "Stateless advisories" link uses this with
+	// kind_prefix=stateless.advisory to drill into a single app.
+	// Resolved in Go (json.RawMessage → map[string]any) because the
+	// events table is not indexed on data — the SQL over-read is
+	// already bounded by listAuditEventsOverRead.
+	appIDFilter := r.URL.Query().Get("app_id")
 	limit := listAuditEventsLimitDefault
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -161,6 +174,9 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 		if prefix != "" && !strings.HasPrefix(e.Kind, prefix) {
 			continue
 		}
+		if appIDFilter != "" && !eventDataHasAppID(e.Data, appIDFilter) {
+			continue
+		}
 		out = append(out, auditEventResponse(e))
 		if len(out) >= limit {
 			break
@@ -211,6 +227,26 @@ func (s *server) getAuditEvent(w http.ResponseWriter, r *http.Request, acct stat
 	}
 	api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 		"Audit event not found", "no event with that id belongs to this account"))
+}
+
+// eventDataHasAppID returns true iff data is a JSON object whose
+// "app_id" field equals the requested uuid. Wave 0 PR-C / ADR-047
+// uses this to filter the audit overscan window by app_id post-SQL.
+// Cheap: one json.Unmarshal per row, allocations limited to the
+// small map. Unparseable data yields false (safer default): an
+// unparseable row can't be proven to belong to the requested app
+// and is filtered out, not surfaced cross-app.
+func eventDataHasAppID(data json.RawMessage, want string) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var payload struct {
+		AppID string `json:"app_id"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return false
+	}
+	return payload.AppID == want
 }
 
 // auditEventResponse converts one state.Event row into the wire shape.

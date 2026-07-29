@@ -5,9 +5,11 @@
 // own audit events, newest-first, capped at 50 (server-side bound;
 // silently capped at 100). --kind-prefix filters (e.g.
 // "stateless.advisory" for the runtime persistence advisory rows).
-// --include-anonymous flips the include_anonymous query param so an
-// operator can see subject=NULL rows (the defensive case where the
-// app row was deleted between wake and the advisory emit).
+// --app-id filters to one app's events (the dashboard's per-app
+// drill-down). --include-anonymous flips the include_anonymous
+// query param so an operator can see subject=NULL rows (the
+// defensive case where the app row was deleted between wake and the
+// advisory emit).
 //
 // Auth: the route is s.auth + requireScope(api.ScopesReadSurface) —
 // the same gating as the rest of the read surface. A session-cookie
@@ -27,11 +29,13 @@ import (
 )
 
 // cmdAuditEvents implements `faas audit-events [--kind-prefix P]
-// [--since RFC3339] [--limit N] [--include-anonymous]`. Returns 0 on
-// success, 2 on operator error (bad flags), 1 on transport / 5xx.
+// [--app-id <uuid>] [--since RFC3339] [--limit N]
+// [--include-anonymous]`. Returns 0 on success, 2 on operator error
+// (bad flags), 1 on transport / 5xx.
 func cmdAuditEvents(args []string) int {
 	fs := flag.NewFlagSet("audit-events", flag.ContinueOnError)
 	kindPrefix := fs.String("kind-prefix", "", "filter by `kind` prefix (e.g. stateless.advisory)")
+	appID := fs.String("app-id", "", "filter to one app's events (matches data.app_id)")
 	since := fs.String("since", "", "RFC 3339 lower bound on `at`")
 	limit := fs.Int("limit", 50, "max rows (1..100; server caps at 100)")
 	includeAnon := fs.Bool("include-anonymous", false, "also surface subject=NULL rows (operator post-mortem)")
@@ -39,7 +43,7 @@ func cmdAuditEvents(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: faas audit-events [--kind-prefix P] [--since RFC3339] [--limit N] [--include-anonymous]")
+		fmt.Fprintln(os.Stderr, "usage: faas audit-events [--kind-prefix P] [--app-id <uuid>] [--since RFC3339] [--limit N] [--include-anonymous]")
 		return 2
 	}
 	if *since != "" {
@@ -56,7 +60,7 @@ func cmdAuditEvents(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	resp, err := client.ListAuditEvents(ctx, *since, *kindPrefix, *limit, *includeAnon)
+	resp, err := client.ListAuditEvents(ctx, *since, *kindPrefix, *appID, *limit, *includeAnon)
 	if err != nil {
 		return printErr("Could not list audit events", err)
 	}

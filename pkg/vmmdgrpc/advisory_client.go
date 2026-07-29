@@ -14,7 +14,6 @@ package vmmdgrpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -179,10 +178,3 @@ func advisoryEventsToProto(in []fcvm.AdvisoryEvent) []*apidpb.AdvisoryEvent {
 	}
 	return out
 }
-
-// errAdvisoryNoop is the sentinel returned by Forward when the
-// client is nil (default-local vmmd). Never returned to callers
-// because Forward already drops nil at the top, but exported so
-// the wire receiver can guard with errors.Is if it ever wires a
-// typed error.
-var errAdvisoryNoop = errors.New("advisory: noop (nil client)")

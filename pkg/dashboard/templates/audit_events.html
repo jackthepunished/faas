@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Wave 0 PR-C / ADR-047: stateless-advisory audit drill-down.
+       Mirrors the same SSE channel + nav header as the rest of the
+       dashboard. The page is server-rendered on the handler side; the
+       htmx SSE plumbing is in place so a future "live" filter can be
+       layered on without a template rewrite. -->
+  <title>{{.Title}} — onebox faas</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4" nonce="{{.Nonce}}" defer></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2" nonce="{{.Nonce}}" defer></script>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; vertical-align: top; }
+    code { font-family: ui-monospace, Menlo, monospace; }
+    pre { font-family: ui-monospace, Menlo, monospace; background: #f3f4f6; padding: 0.4rem 0.6rem; border-radius: 4px; max-width: 36rem; overflow-x: auto; font-size: 0.85rem; }
+    .filters { display: flex; gap: 1rem; align-items: center; padding: 0.5rem 0; flex-wrap: wrap; }
+    .filters label { display: inline-flex; gap: 0.3rem; align-items: center; font-size: 0.9rem; }
+    .filters input[type=text] { padding: 0.25rem 0.5rem; font-family: inherit; }
+    .filters button { padding: 0.25rem 0.7rem; cursor: pointer; }
+    .empty { padding: 2rem 0; max-width: 36rem; }
+    .empty h2 { margin-top: 0; }
+    .empty pre { background: #f3f4f6; padding: 0.6rem 0.8rem; border-radius: 6px; overflow-x: auto; }
+    .empty .muted { color: #6b7280; font-size: 0.9rem; }
+    .breadcrumb { font-size: 0.9rem; color: #6b7280; margin-bottom: 0.5rem; }
+    .breadcrumb a { color: #6b7280; }
+  </style>
+</head>
+<body hx-ext="sse" sse-connect="/v1/events">
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>{{.Title}}</h1>
+    <p class="breadcrumb">
+      <a href="/dashboard/audit-events">Audit events</a>
+      {{if .Data.AppSlug}} · app <a href="/dashboard/apps/{{.Data.AppSlug}}">{{.Data.AppSlug}}</a>{{end}}
+      {{if .Data.KindPrefix}} · kind <code>{{.Data.KindPrefix}}</code>{{end}}
+    </p>
+
+    <form method="GET" action="/dashboard/audit-events" class="filters">
+      <label>kind_prefix
+        <input type="text" name="kind_prefix" value="{{.Data.KindPrefix}}" placeholder="e.g. stateless.advisory">
+      </label>
+      <label>app_id
+        <input type="text" name="app_id" value="{{.Data.AppID}}" placeholder="(any)">
+      </label>
+      <label>limit
+        <input type="text" name="limit" value="50" size="4">
+      </label>
+      <label>
+        <input type="checkbox" name="include_anonymous" value="true" {{if .Data.IncludeAnonymous}}checked{{end}}>
+        include anonymous (subject=NULL)
+      </label>
+      <button type="submit">Apply</button>
+    </form>
+
+    {{if .Data.Events}}
+    <table>
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Actor</th>
+          <th>Kind</th>
+          <th>Subject</th>
+          <th>Data</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Data.Events}}
+        <tr>
+          <td>{{.TimeLabel}}</td>
+          <td><code>{{.Actor}}</code></td>
+          <td><code>{{.Kind}}</code></td>
+          <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<span class="empty muted">∅</span>{{end}}</td>
+          <td>{{if .DataPretty}}<pre>{{.DataPretty}}</pre>{{else}}<span class="empty muted">—</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="empty">
+      <h2>No matching events</h2>
+      <p class="muted">
+        No audit events match the current filter. Try clearing
+        <code>kind_prefix</code> or <code>app_id</code>; the
+        filter is post-SQL on the bounded overscan window so a
+        too-narrow filter can land on an empty result even when
+        rows exist.
+      </p>
+      <p>
+        The same data is exposed via the HTTP API:
+        <code>faas audit-events --kind-prefix=stateless.advisory</code>
+        or <code>GET /v1/audit-events?kind_prefix=stateless.advisory</code>.
+      </p>
+    </div>
+    {{end}}
+  </main>
+  <footer>onebox faas · audit events surface (Wave 0 PR-C / ADR-047)</footer>
+</body>
+</html>

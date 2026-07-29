@@ -243,8 +243,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// disables (matches apid's explicit-empty pattern); nil client
 	// short-circuits Manager.ForwardStatelessAdvisory to a no-op.
 	advisoryTarget := envOr("FAAS_APID_ADVISORY_SOCK", "unix:///run/faas/apid.sock")
+	var advisoryCli *vmmdgrpc.AdvisoryClient
 	if advisoryTarget != "" {
-		advisoryCli := vmmdgrpc.NewAdvisoryClient(advisoryTarget, log)
+		advisoryCli = vmmdgrpc.NewAdvisoryClient(advisoryTarget, log)
 		mgr.SetAdvisoryClient(advisoryCli)
 		log.Info("vmmd: stateless advisory client wired", "target", advisoryTarget)
 	}
@@ -384,6 +385,12 @@ heartbeat:
 		_ = httpSrv.Shutdown(stopCtx)
 	}
 	_ = lis.Close()
+	// Advisory gRPC client holds the dial to /run/faas/apid.sock
+	// open for ~30s of keepalive if we don't close it explicitly.
+	// Idempotent at the gRPC layer (pkg/vmmdgrpc uses sync.Once).
+	if advisoryCli != nil {
+		advisoryCli.Close()
+	}
 	return nil
 }
 
