@@ -149,6 +149,21 @@ type Engine struct {
 	// missed wiring is a silent no-op rather than a nil-deref panic.
 	warmAffinity *WarmAffinity
 
+	// warmBroadcaster is the push-side of sticky-warm affinity
+	// (ADR-025 axis 4). Every RecordWake that actually changes the
+	// (appID → nodeID) entry fans out a WarmHintEvent to every
+	// subscribed consumer (today: every gatewayd's StreamWarmHints
+	// gRPC stream). nil is tolerated by admitAndDispatch (the emit
+	// call becomes a no-op) so pre-PR test fixtures that don't wire
+	// the broadcaster keep their existing single-box behaviour.
+	//
+	// Initialised eagerly inside NewEngine (not lazily via
+	// WithWarmBroadcaster) because the only producer is the engine
+	// itself, and a nil broadcaster at emit time would mask a missed
+	// wiring as a silent no-op — eager init catches that mistake at
+	// daemon startup.
+	warmBroadcaster *warmHintBroadcaster
+
 	// defaultLocalNodeID is the resolved UUID of the 'default-local'
 	// compute_node (issue #97 / ADR-025 axis 3). Looked up once at
 	// construction via ComputeNodeByName so the router can resolve
@@ -207,13 +222,14 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		log = slog.Default()
 	}
 	e := &Engine{
-		store:  store,
-		ledger: ledger,
-		vmm:    vmm,
-		notif:  notif,
-		fcVer:  fcVer,
-		log:    log,
-		appMu:  map[string]*sync.Mutex{},
+		store:           store,
+		ledger:          ledger,
+		vmm:             vmm,
+		notif:           notif,
+		fcVer:           fcVer,
+		log:             log,
+		appMu:           map[string]*sync.Mutex{},
+		warmBroadcaster: newWarmHintBroadcaster(),
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
 	// doesn't block the daemon's boot forever — the watchdog goroutine
@@ -484,7 +500,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// admit only — a rejection doesn't "warm" anything. Per-app
 	// lock is held here so a concurrent burst for the same app
 	// sees a coherent (RecordWake, hint) sequence.
-	e.warmAffinity.RecordWake(appID, placement.NodeID)
+	//
+	// Push-side fanout (ADR-025 axis 4): if the new entry actually
+	// changed appID's warm node, broadcast a WarmHintEvent to every
+	// gatewayd subscribed via Engine.StreamWarmHints. Same per-app
+	// lock guards the cache write + the emit so the gRPC stream
+	// observes writes in the same order the cache does. nil
+	// broadcaster is a no-op (the test-only path that constructs
+	// Engine without NewEngine's eager init).
+	_, changed := e.warmAffinity.RecordWakeIfChanged(appID, placement.NodeID)
+	if changed && e.warmBroadcaster != nil {
+		e.warmBroadcaster.emit(WarmHintEvent{
+			AppID:     appID,
+			NodeID:    placement.NodeID,
+			WrittenAt: time.Now(),
+		})
+	}
 	ins, err := e.store.CreateInstance(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID)
 	if err != nil {
 		release()
@@ -1645,4 +1676,60 @@ type PoolNotifier struct{ Pool *pgxpool.Pool }
 
 func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error {
 	return db.Notify(ctx, p.Pool, channel, payload)
+}
+
+// StreamWarmHints (ADR-025 axis 4) is the push-side fanout for
+// sticky-warm affinity. It subscribes to the engine's broadcaster
+// and invokes sink for every WarmHintEvent until the context
+// cancels. Returns nil on a clean shutdown (caller cancels); a
+// non-nil sink error propagates so pkg/scheddgrpc.Server.
+// StreamWarmHints can carry it back to the gateway caller.
+//
+// Implementation mirrors Engine.StreamAppLogs (logs.go:60) but
+// inverts the channel direction — broadcaster → sink. One
+// subscriber channel (buffered at 32, matching StreamAppLogs),
+// one writer goroutine reads the channel and invokes the sink.
+// The sink runs on the writer goroutine so the proto marshal is
+// serialised with the gRPC Send on the scheddgrpc.Server side.
+//
+// nil broadcaster (a pre-axis-4 fixture that constructed Engine
+// without going through NewEngine) is treated as a no-op stream:
+// the method returns nil immediately. This keeps the existing
+// test fixtures working without a panic — scheddgrpc.Server.
+// StreamWarmHints still satisfies the SchedAPI interface, and a
+// test that exercises the SchedAPI stub doesn't need the
+// broadcaster.
+func (e *Engine) StreamWarmHints(ctx context.Context, sink WarmHintSink) error {
+	if e.warmBroadcaster == nil {
+		// Pre-axis-4 fixture. Treat as a clean empty stream so the
+		// caller (pkg/scheddgrpc) returns codes.OK + nil and the
+		// gateway's consumer treats the early EOF as a normal
+		// shutdown.
+		<-ctx.Done()
+		return nil
+	}
+	if sink == nil {
+		return errors.New("sched: StreamWarmHints requires a non-nil sink")
+	}
+	ch, unsubscribe := e.warmBroadcaster.subscribe(defaultWarmHintBufCap)
+	defer unsubscribe()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev, ok := <-ch:
+			if !ok {
+				// Broadcaster closed the channel (Engine shutdown).
+				return nil
+			}
+			if err := sink(ev); err != nil {
+				return err
+			}
+			// On the next loop iteration the select arms
+			// <-ctx.Done() again, so a cancellation arriving
+			// during sink(ev) is honoured at the top of the
+			// next pass — no race against a missed event, and
+			// no need for a duplicated ctx.Err() check here.
+		}
+	}
 }

@@ -44,6 +44,17 @@ import (
 // reader-side Recv.
 type LogFrameSink = sched.LogFrameSink
 
+// WarmHintSink is the per-event callback the StreamWarmHints
+// handler invokes for each WarmHintEvent decoded from the engine's
+// warmHintBroadcaster. Same shape as LogFrameSink — non-nil error
+// aborts the stream, nil keeps delivering.
+//
+// Type-aliased here (not defined) so the SchedAPI interface
+// signature can name scheddgrpc.WarmHintSink without pulling pkg/
+// sched into every test that fakes the engine. Mirrors the
+// LogFrameSink alias above.
+type WarmHintSink = sched.WarmHintSink
+
 // SchedAPI is the slice of pkg/sched.Engine the handlers need. Defined here (not
 // imported as a concrete type) so unit tests can pass a fake without standing up
 // a store + vmmd.
@@ -68,6 +79,15 @@ type SchedAPI interface {
 	// underlying gRPC / vmmd errors propagate as-is so the
 	// handlers can decide to lift or map them.
 	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sink LogFrameSink) error
+	// StreamWarmHints (ADR-025 axis 4) is the push-side
+	// sticky-warm affinity stream. The engine fans out
+	// WarmHintEvents from its warmHintBroadcaster to the sink
+	// until the context cancels. Returns nil on a clean
+	// shutdown; a non-nil sink error propagates so the
+	// handler can carry it back as a gRPC trailer. Engine
+	// emits only on (appID, nodeID) changes, so the wire is
+	// quiet for the steady-state "same-app-same-node" path.
+	StreamWarmHints(ctx context.Context, sink WarmHintSink) error
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -290,6 +310,72 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 		switch {
 		case errors.Is(err, state.ErrNotFound):
 			return status.Error(codes.NotFound, err.Error())
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return status.Error(codes.Canceled, err.Error())
+		default:
+			return status.Error(codes.Unavailable, err.Error())
+		}
+	}
+	return nil
+}
+
+// StreamWarmHints (ADR-025 axis 4) implements the schedd-side
+// half of the sticky-warm affinity stream. The engine owns the
+// warmHintBroadcaster (pkg/sched/warmhint.go) and emits a
+// WarmHintEvent every time a RecordWake actually changes
+// (appID → nodeID); this handler subscribes via
+// Engine.StreamWarmHints and forwards each event on the caller's
+// gRPC stream until the context cancels.
+//
+// Wire error mapping:
+//
+//   - codes.OK + nil on clean shutdown (caller cancels, or
+//     Engine returns nil after the broadcaster closes)
+//   - codes.Canceled when the caller cancels mid-stream
+//   - codes.Unavailable for any other unexpected drain failure
+//     (a non-nil sink error from the proto Send, or an unexpected
+//     state from the engine). The gateway consumer freezes its
+//     cache on Unavailable and reconnects — see
+//     cmd/gatewayd/warmhints.go::Run for the policy.
+//
+// Observability note: the single Observe call below times the
+// entire stream lifetime (open → close), not per-event. Long-
+// lived streams skew the latency histogram toward minute-scale
+// buckets; the next metric-review pass should split this into
+// a per-event observation (or a separate events-counter) so the
+// histogram bucket boundaries can be tuned to admission bursts
+// rather than connection duration. The shape is consistent with
+// StreamAppLogs; fixing both together is a follow-up ADR.
+//
+// Additive per ADR-016: new RPC + new messages append at the end.
+func (s *Server) StreamWarmHints(req *scheddpb.StreamWarmHintsRequest, stream scheddpb.Schedd_StreamWarmHintsServer) error {
+	const op = "StreamWarmHints"
+	start := time.Now()
+	var sendErr error
+	defer func() {
+		s.ops.Observe(op, time.Since(start), sendErr)
+	}()
+	// sink is the per-event callback that writes one
+	// StreamWarmHintsResponse onto the caller's gRPC stream.
+	// Same shape as StreamAppLogs's sink: synchronise on
+	// stream.Context() so a cancelled caller short-circuits the
+	// engine-side drain immediately.
+	sink := func(ev sched.WarmHintEvent) error {
+		if stream.Context().Err() != nil {
+			return stream.Context().Err()
+		}
+		resp := &scheddpb.StreamWarmHintsResponse{
+			AppId:  ev.AppID,
+			NodeId: ev.NodeID,
+		}
+		if !ev.WrittenAt.IsZero() {
+			resp.WrittenAt = timestamppb.New(ev.WrittenAt)
+		}
+		return stream.Send(resp)
+	}
+	if err := s.engine.StreamWarmHints(stream.Context(), sink); err != nil {
+		sendErr = err
+		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			return status.Error(codes.Canceled, err.Error())
 		default:

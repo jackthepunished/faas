@@ -213,6 +213,13 @@ type runDeps struct {
 	// nil in tests (the AppLogsHandler constructor guards + the
 	// carve-out is silently disabled).
 	scheddClient *scheddgrpc.Client
+	// warmHints is the long-lived StreamWarmHints consumer
+	// (ADR-025 axis 4) that drains the sticky-warm affinity
+	// stream from schedd and updates the picker's hint cache.
+	// nil in tests; production wires it after the schedd client
+	// is dialed so the consumer goroutine shares the existing
+	// /run/faas/schedd.sock connection (no second dial).
+	warmHints *warmHintConsumer
 }
 
 func defaultDeps() runDeps {
@@ -262,7 +269,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		appsDomain = cfg.AppsDomain
 	}
 	router := pgRouter{store: state.NewPgStore(pool), appsSuffix: appsSuffix(appsDomain)}
-	backend := gateway.NewPGBackend(router, sched, log)
+	// ADR-025 axis 4: sticky-warm affinity cache. Built first so the
+	// picker's WarmHintFunc reads from it on every Pick. The cache
+	// itself is empty at this point — it gets populated by the
+	// warmHintConsumer goroutine below as the schedd stream delivers
+	// events. An empty cache degrades to per-node healthyCount
+	// scoring, identical to a fresh install (ADR-005 cold boot must
+	// always work).
+	warmHintCache := gateway.NewWarmHintCache()
+	backend := gateway.NewPGBackend(router, sched, log).WithWarmHint(warmHintCache.HintFunc())
 
 	// Keep the routing + target caches fresh from apid/schedd's pg_notify
 	// stream (spec §4.1): an instance state change evicts the app's cached
@@ -423,6 +438,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
 	deps.scheddClient = sched
+	// ADR-025 axis 4: StreamWarmHints consumer. Long-lived
+	// goroutine under the same ctx as the rest of the daemon —
+	// drains the sticky-warm affinity stream from schedd into
+	// the picker's hint cache. Reconnects with backoff on
+	// transient errors; freezes the cache on persistent errors
+	// (Phase 3 review policy). nil in tests (the e2e harness
+	// doesn't drive the stream; the picker falls through to
+	// per-node healthyCount as it always did).
+	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
+	go deps.warmHints.Run(ctx)
 	return runWithDeps(ctx, log, deps)
 }
 

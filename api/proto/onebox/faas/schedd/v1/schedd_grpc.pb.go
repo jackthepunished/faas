@@ -34,6 +34,7 @@ const (
 	Schedd_ParkInstance_FullMethodName      = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
 	Schedd_ListInstanceStats_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
 	Schedd_StreamAppLogs_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
+	Schedd_StreamWarmHints_FullMethodName   = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -136,6 +137,30 @@ type ScheddClient interface {
 	// Additive per ADR-016: the field tags on existing messages are
 	// untouched; new RPC + new messages append at the end.
 	StreamAppLogs(ctx context.Context, in *StreamAppLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamAppLogsResponse], error)
+	// StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
+	// schedd is the only writer to pkg/sched.WarmAffinity; every successful
+	// admit stamps (app_id → node_id) and we forward the stamp as an event
+	// so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+	// warm node on multi-box fleets.
+	//
+	// Semantics:
+	//   - Server-streaming; gatewayd opens one stream at startup and keeps
+	//     it open for the lifetime of the connection.
+	//   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
+	//     guarantees an empty hint falls through to least-loaded, so a
+	//     gatewayd that reconnects with no hint still routes correctly.
+	//   - Events are emitted only on state change (RecordWake actually
+	//     changed app_id → node_id); a periodic RecordWake to the same node
+	//     is a no-op event-source-wise. The producer filters at emit time.
+	//
+	// Wire error mapping:
+	//   - codes.OK + nil on clean shutdown (caller cancels)
+	//   - codes.Canceled when the gateway cancels
+	//   - codes.Unavailable for any unexpected drain failure
+	//
+	// Additive per ADR-016: new RPC + new messages append at the end;
+	// existing field tags are untouched.
+	StreamWarmHints(ctx context.Context, in *StreamWarmHintsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamWarmHintsResponse], error)
 }
 
 type scheddClient struct {
@@ -214,6 +239,25 @@ func (c *scheddClient) StreamAppLogs(ctx context.Context, in *StreamAppLogsReque
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_StreamAppLogsClient = grpc.ServerStreamingClient[StreamAppLogsResponse]
+
+func (c *scheddClient) StreamWarmHints(ctx context.Context, in *StreamWarmHintsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamWarmHintsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Schedd_ServiceDesc.Streams[1], Schedd_StreamWarmHints_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamWarmHintsRequest, StreamWarmHintsResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Schedd_StreamWarmHintsClient = grpc.ServerStreamingClient[StreamWarmHintsResponse]
 
 // ScheddServer is the server API for Schedd service.
 // All implementations must embed UnimplementedScheddServer
@@ -315,6 +359,30 @@ type ScheddServer interface {
 	// Additive per ADR-016: the field tags on existing messages are
 	// untouched; new RPC + new messages append at the end.
 	StreamAppLogs(*StreamAppLogsRequest, grpc.ServerStreamingServer[StreamAppLogsResponse]) error
+	// StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
+	// schedd is the only writer to pkg/sched.WarmAffinity; every successful
+	// admit stamps (app_id → node_id) and we forward the stamp as an event
+	// so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+	// warm node on multi-box fleets.
+	//
+	// Semantics:
+	//   - Server-streaming; gatewayd opens one stream at startup and keeps
+	//     it open for the lifetime of the connection.
+	//   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
+	//     guarantees an empty hint falls through to least-loaded, so a
+	//     gatewayd that reconnects with no hint still routes correctly.
+	//   - Events are emitted only on state change (RecordWake actually
+	//     changed app_id → node_id); a periodic RecordWake to the same node
+	//     is a no-op event-source-wise. The producer filters at emit time.
+	//
+	// Wire error mapping:
+	//   - codes.OK + nil on clean shutdown (caller cancels)
+	//   - codes.Canceled when the gateway cancels
+	//   - codes.Unavailable for any unexpected drain failure
+	//
+	// Additive per ADR-016: new RPC + new messages append at the end;
+	// existing field tags are untouched.
+	StreamWarmHints(*StreamWarmHintsRequest, grpc.ServerStreamingServer[StreamWarmHintsResponse]) error
 	mustEmbedUnimplementedScheddServer()
 }
 
@@ -342,6 +410,9 @@ func (UnimplementedScheddServer) ListInstanceStats(context.Context, *ListInstanc
 }
 func (UnimplementedScheddServer) StreamAppLogs(*StreamAppLogsRequest, grpc.ServerStreamingServer[StreamAppLogsResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamAppLogs not implemented")
+}
+func (UnimplementedScheddServer) StreamWarmHints(*StreamWarmHintsRequest, grpc.ServerStreamingServer[StreamWarmHintsResponse]) error {
+	return status.Error(codes.Unimplemented, "method StreamWarmHints not implemented")
 }
 func (UnimplementedScheddServer) mustEmbedUnimplementedScheddServer() {}
 func (UnimplementedScheddServer) testEmbeddedByValue()                {}
@@ -465,6 +536,17 @@ func _Schedd_StreamAppLogs_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_StreamAppLogsServer = grpc.ServerStreamingServer[StreamAppLogsResponse]
 
+func _Schedd_StreamWarmHints_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamWarmHintsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ScheddServer).StreamWarmHints(m, &grpc.GenericServerStream[StreamWarmHintsRequest, StreamWarmHintsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Schedd_StreamWarmHintsServer = grpc.ServerStreamingServer[StreamWarmHintsResponse]
+
 // Schedd_ServiceDesc is the grpc.ServiceDesc for Schedd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -497,6 +579,11 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamAppLogs",
 			Handler:       _Schedd_StreamAppLogs_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamWarmHints",
+			Handler:       _Schedd_StreamWarmHints_Handler,
 			ServerStreams: true,
 		},
 	},

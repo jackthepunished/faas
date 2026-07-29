@@ -35,6 +35,10 @@ type fakeEngine struct {
 	// (returns nil immediately), so the existing test suite stays
 	// broken-free.
 	streamLogFn func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error
+	// streamWarmHintsFn (ADR-025 axis 4) drives the per-event
+	// fan-out in the StreamWarmHints handler tests. Default nil =
+	// no-op (returns nil immediately).
+	streamWarmHintsFn func(ctx context.Context, sink scheddgrpc.WarmHintSink) error
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID string) (sched.WakeResult, error) {
@@ -72,6 +76,19 @@ func (f *fakeEngine) StreamAppLogs(ctx context.Context, appID string, sinceSeq i
 	if f.streamLogFn != nil {
 		return f.streamLogFn(ctx, appID, sinceSeq, sink)
 	}
+	return nil
+}
+
+// StreamWarmHints (ADR-025 axis 4) — the default fake blocks on
+// ctx.Done (the engine's actual StreamWarmHints returns nil on
+// ctx cancel even with no emits). Tests that exercise the
+// per-event wire (warmhints_test.go) inject a custom
+// streamWarmHintsFn that drives events into the sink.
+func (f *fakeEngine) StreamWarmHints(ctx context.Context, sink scheddgrpc.WarmHintSink) error {
+	if f.streamWarmHintsFn != nil {
+		return f.streamWarmHintsFn(ctx, sink)
+	}
+	<-ctx.Done()
 	return nil
 }
 

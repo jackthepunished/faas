@@ -1544,3 +1544,126 @@ func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
 		t.Errorf("HasHeader(Retry-After) = %v, want [\"5\"]", got)
 	}
 }
+
+// TestEngine_StreamWarmHintsSeesRecordWake drives a RecordWake
+// through WarmAffinity and asserts the engine's StreamWarmHints
+// sink receives the broadcast event. End-to-end test of the
+// change-detect + fan-out path used by scheddgrpc.Server.
+func TestEngine_StreamWarmHintsSeesRecordWake(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+	e.WithWarmAffinity(NewWarmAffinity(0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	got := make(chan WarmHintEvent, 4)
+	sink := func(ev WarmHintEvent) error {
+		got <- ev
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- e.StreamWarmHints(ctx, sink)
+	}()
+
+	// Give the subscriber goroutine a moment to register before
+	// we emit.
+	time.Sleep(20 * time.Millisecond)
+
+	e.warmAffinity.RecordWake(app.ID, "node-a")
+	e.warmBroadcaster.emit(WarmHintEvent{AppID: app.ID, NodeID: "node-a", WrittenAt: time.Now()})
+
+	select {
+	case ev := <-got:
+		if ev.AppID != app.ID {
+			t.Errorf("ev.AppID = %q, want %q", ev.AppID, app.ID)
+		}
+		if ev.NodeID != "node-a" {
+			t.Errorf("ev.NodeID = %q, want node-a", ev.NodeID)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for WarmHintEvent")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("StreamWarmHints returned %v on ctx cancel, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("StreamWarmHints did not return after ctx cancel")
+	}
+}
+
+// TestEngine_StreamWarmHintsCtxCancelStops asserts the stream
+// returns nil on ctx cancel — the scheddgrpc handler relies on
+// this to surface codes.Canceled cleanly.
+func TestEngine_StreamWarmHintsCtxCancelStops(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := func(ev WarmHintEvent) error { return nil }
+	done := make(chan error, 1)
+	go func() {
+		done <- e.StreamWarmHints(ctx, sink)
+	}()
+
+	// No emit ever fires; cancel immediately.
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("StreamWarmHints returned %v on cancel, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("StreamWarmHints did not return after ctx cancel")
+	}
+}
+
+// TestEngine_StreamWarmHintsNilBroadcaster returns nil cleanly
+// when warmBroadcaster is nil (the pre-axis-4 fixture path).
+// StreamWarmHints must NOT panic so legacy test harnesses that
+// don't go through NewEngine can still build.
+func TestEngine_StreamWarmHintsNilBroadcaster(t *testing.T) {
+	t.Parallel()
+	e := &Engine{warmBroadcaster: nil} // intentionally zero
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- e.StreamWarmHints(ctx, func(ev WarmHintEvent) error { return nil })
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("StreamWarmHints(nil broadcaster) returned %v, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("StreamWarmHints(nil broadcaster) did not return after cancel")
+	}
+}
+
+// TestEngine_StreamWarmHintsNilSink surfaces a typed error so
+// pkg/scheddgrpc.Server.StreamWarmHints can lift it to a gRPC
+// status rather than silently dropping events.
+func TestEngine_StreamWarmHintsNilSink(t *testing.T) {
+	t.Parallel()
+	e := &Engine{warmBroadcaster: newWarmHintBroadcaster()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := e.StreamWarmHints(ctx, nil)
+	if err == nil {
+		t.Fatal("StreamWarmHints(nil sink) returned nil, want error")
+	}
+}

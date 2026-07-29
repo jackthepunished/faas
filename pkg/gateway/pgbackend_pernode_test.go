@@ -251,3 +251,78 @@ func TestPGBackend_PickAfterEvictNodeEntry(t *testing.T) {
 		}
 	}
 }
+
+// TestPGBackend_PickFollowsWarmHintCache wires a real
+// *gateway.WarmHintCache (the same type cmd/gatewayd constructs)
+// as the picker's WarmHintFunc, then drives cache.Update the way
+// the warmHintConsumer would after a StreamWarmHints event. End-
+// to-end picker coverage for the WarmHintCache → HintFunc →
+// pick → Target.NodeID path.
+//
+// Two nodes seeded with equal healthy counts (2 each). The cache
+// is initially empty (cold-start, ADR-005) — picker falls through
+// to lex tie-break (node-A wins). cache.Update("app", "node-B")
+// flips the bias; subsequent picks all land on node-B.
+func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
+	admitIdx := atomic.Int64{}
+	sched := &rotatingScheduler{
+		nextNodeID: func() string {
+			n := admitIdx.Add(1)
+			if n%2 == 1 {
+				return "node-A"
+			}
+			return "node-B"
+		},
+		method: gateway.WireWakeColdBoot,
+	}
+	cache := gateway.NewWarmHintCache()
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).
+		WithWarmHint(cache.HintFunc())
+
+	// Seed: 2 admits on each node (A, B, A, B → 2/2 split).
+	for i := 0; i < 4; i++ {
+		if _, _, _, err := b.Admit(context.Background(), "app", 5); err != nil {
+			t.Fatalf("Admit #%d: %v", i+1, err)
+		}
+	}
+
+	// Phase 1: empty cache. Picker uses healthyCount + lex
+	// tie-break → node-A wins. 4 picks all from node-A.
+	for i := 0; i < 4; i++ {
+		t1, ok := b.Pick("app")
+		if !ok {
+			t.Fatalf("Pick #%d = !ok (phase 1)", i)
+		}
+		if t1.NodeID != "node-A" {
+			t.Errorf("Pick #%d (phase 1) = NodeID %q, want node-A (lex tie-break, empty cache)", i, t1.NodeID)
+		}
+	}
+
+	// Phase 2: hint flips to node-B. All subsequent picks land
+	// on node-B (warm-bonus overrides lex tie-break on tied
+	// counts — same shape as TestPGBackend_PickPrefersWarmAffinityNode
+	// but driven through the real cache instead of a closure).
+	cache.Update("app", "node-B")
+	for i := 0; i < 4; i++ {
+		t1, ok := b.Pick("app")
+		if !ok {
+			t.Fatalf("Pick #%d = !ok (phase 2)", i)
+		}
+		if t1.NodeID != "node-B" {
+			t.Errorf("Pick #%d (phase 2) = NodeID %q, want node-B (warm hint via cache)", i, t1.NodeID)
+		}
+	}
+
+	// Phase 3: Forget clears the hint; picker reverts to lex
+	// tie-break (node-A).
+	cache.Forget("app")
+	for i := 0; i < 4; i++ {
+		t1, ok := b.Pick("app")
+		if !ok {
+			t.Fatalf("Pick #%d = !ok (phase 3)", i)
+		}
+		if t1.NodeID != "node-A" {
+			t.Errorf("Pick #%d (phase 3) = NodeID %q, want node-A (hint cleared via Forget)", i, t1.NodeID)
+		}
+	}
+}

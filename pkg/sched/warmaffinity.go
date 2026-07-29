@@ -78,6 +78,46 @@ func (w *WarmAffinity) RecordWake(appID, nodeID string) {
 	w.m[appID] = warmEntry{nodeID: nodeID, lastSeen: w.now()}
 }
 
+// RecordWakeIfChanged is the change-detecting variant (ADR-025
+// axis 4). It stamps (appID → nodeID) AND reports whether the new
+// nodeID differs from the entry it replaced. Callers use the
+// return value to decide whether to fan out a WarmHintEvent.
+//
+// Returns (previousNodeID, changed). changed is true iff:
+//   - there was no prior entry, OR
+//   - the prior entry had a different nodeID.
+//
+// changed is false on a fresh entry whose nodeID equals the
+// existing entry's nodeID (idempotent re-wake, the existing
+// entry's lastSeen is still bumped). This keeps the broadcaster
+// quiet on the hot "same-app-same-node" path that dominates
+// production traffic.
+//
+// Callers should hold the Engine's per-app lock so a concurrent
+// wake for the same app can't race the change-detect + write.
+// The map write itself is locked here for safety; the per-app
+// lock is for cache-write / emit ordering only.
+//
+// nil receiver or empty appID/nodeID is a silent no-op (returns
+// "", false).
+func (w *WarmAffinity) RecordWakeIfChanged(appID, nodeID string) (string, bool) {
+	if w == nil || appID == "" || nodeID == "" {
+		return "", false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	prev, ok := w.m[appID]
+	w.m[appID] = warmEntry{nodeID: nodeID, lastSeen: w.now()}
+	if !ok {
+		// No prior entry — any nodeID counts as a change because
+		// the gatewayd hint cache had "" before and now has
+		// nodeID. The first wake for a cold app MUST broadcast so
+		// other gatewayds in the fleet see the new affinity.
+		return "", true
+	}
+	return prev.nodeID, prev.nodeID != nodeID
+}
+
 // LastWarmNode returns the remembered nodeID for appID, or "" with
 // found=false if no entry exists or the entry has expired. The read
 // is O(1); expired entries are evicted in place (no second pass).
