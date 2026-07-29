@@ -92,7 +92,7 @@ func snapshotExistenceViolations(
 }
 
 // TestSnapshotExistenceInvariant_TableDriven exercises the helper
-// across the six cases the plan enumerates. Subtest names match the
+// across the cases the plan enumerates. Subtest names match the
 // pkg/sched/heartbeat_test.go:282 space-separated convention. Each
 // row records both the fixture shape and the expected violation
 // count, so a future contributor who breaks a positive case surfaces
@@ -102,6 +102,15 @@ func snapshotExistenceViolations(
 // would require a new state.Store query (ListInstancesForApp +
 // LatestSnapshot per app, scoped to parked), which exceeds the test
 // scaffolding scope of PR scale-out readiness #4.
+//
+// Subtests fall in two groups:
+//
+//   - 7 §6.2-3 cases (parked instances + their durability): the
+//     invariant under test.
+//   - 3 diagnostic cases (orphan parked row, running instance, nil
+//     snapshots map): the helper's stability under odd inputs.
+//     Distinguishing the two groups is purely reader scaffolding;
+//     the violation-counting assertion applies uniformly.
 func TestSnapshotExistenceInvariant_TableDriven(t *testing.T) {
 	type fixture struct {
 		name        string
@@ -234,19 +243,39 @@ func TestSnapshotExistenceInvariant_TableDriven(t *testing.T) {
 			wantContains: "d-3",
 		},
 		{
-			name: "parked instance without deployment row fails",
+			name: "orphan parked row surfaces diagnostic (not §6.2-3)",
 			instances: []state.Instance{
 				// Orphan parked row: no matching deployment in
 				// the lookup. The helper surfaces this as a
 				// distinct violation so a future scanner can
 				// alarm on "parked without deployment" without
-				// conflating it with the §6.2-3 case.
+				// conflating it with the §6.2-3 case. This
+				// subtest is diagnostic scaffolding, not a
+				// pin on the invariant itself — its name
+				// reflects that distinction.
 				{ID: "i-1", State: string(state.StateParked), DeploymentID: "d-missing"},
 			},
 			deployments:  map[string]state.Deployment{},
 			snapshots:    map[string]state.Snapshot{},
 			wantCount:    1,
 			wantContains: "i-1",
+		},
+		{
+			name: "nil snapshots map is no different from empty",
+			// A future caller passing nil instead of an empty
+			// map shouldn't get a nil-pointer panic and
+			// shouldn't change the answer. Go map indexing on
+			// a nil map returns the zero value, so the helper
+			// should evaluate identically to the empty-map case.
+			instances: []state.Instance{
+				{ID: "i-1", State: string(state.StateParked), DeploymentID: "d-1"},
+			},
+			deployments: map[string]state.Deployment{
+				"d-1": {ID: "d-1"},
+			},
+			snapshots:    nil,
+			wantCount:    1,
+			wantContains: "d-1",
 		},
 	}
 	for _, tc := range cases {

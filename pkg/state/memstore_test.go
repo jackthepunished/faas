@@ -1653,6 +1653,16 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 		t.Errorf("AdmissionCeilingMB=%d, want %d (api.DefaultComputeNodeCeilingMB())",
 			got.AdmissionCeilingMB, api.DefaultComputeNodeCeilingMB())
 	}
+	// PR scale-out readiness #4: independent literal pin. The helper
+	// check above catches drift between the seed and the helper; this
+	// pin catches drift between the helper and the platform baseline
+	// (47_600 MB), so a future contributor who changes both at once
+	// still gets a targeted failure here. Mirrors the value-pinning
+	// assertion in TestDefaultComputeNodeCeilingMB.
+	if got.AdmissionCeilingMB != 47_600 {
+		t.Errorf("AdmissionCeilingMB=%d, want 47_600 (platform baseline pin)",
+			got.AdmissionCeilingMB)
+	}
 	if got.TargetURL != "unix:///run/faas/vmmd.sock" {
 		t.Errorf("TargetURL=%q, want %q", got.TargetURL, "unix:///run/faas/vmmd.sock")
 	}

@@ -137,27 +137,28 @@ func TestAdmissionCeilingIs85Percent(t *testing.T) {
 // TestDefaultComputeNodeCeilingMB pins the helper that the synthetic
 // default-local row (pkg/state/memstore.go) and the vmmd LoadConfig
 // default (cmd/vmmd/config.go) both consume. Today it delegates to
-// RAMAdmissionCeilingMB; the test catches any future drift between the
-// helper and the constant. The value-pinning assertion below is
-// intentional: a future multi-node world that wants per-node shares
-// must revisit this helper, not silently change the constant.
+// RAMAdmissionCeilingMB; the test catches any future drift between
+// the helper and the constant.
+//
+// Two assertions cover two regressions:
+//   - the value-pinning literal at 47_600 catches a future contributor
+//     changing RAMAdmissionCeilingMB without updating the helper, OR
+//     changing the helper's body to a non-delegating expression;
+//   - the headroom check (helper == 85% of TenantRAMBudgetMB) is the
+//     invariant underlying both values, so a regression in either
+//     constant alone still surfaces with a targeted message instead
+//     of the value-pin's hard-coded number.
+//
+// PR scale-out readiness #4 callers (memstore seed + vmmd default)
+// are pinned in their own test sites so a regression localised to
+// the helper surfaces here, not at the production call sites.
 func TestDefaultComputeNodeCeilingMB(t *testing.T) {
-	if got := DefaultComputeNodeCeilingMB(); got != RAMAdmissionCeilingMB {
-		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want %d (RAMAdmissionCeilingMB)",
-			got, RAMAdmissionCeilingMB)
-	}
-	// Hard pin to the platform baseline. PR scale-out readiness #4
-	// migrated two production literals (memstore seed + vmmd default)
-	// to this helper; both callers must keep emitting this exact number.
 	const want = 47_600
 	if got := DefaultComputeNodeCeilingMB(); got != want {
-		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want %d", got, want)
+		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want %d (platform baseline pin)", got, want)
 	}
-	// Same headroom invariant as TestAdmissionCeilingIs85Percent —
-	// duplicate here so a regression in the helper alone surfaces with
-	// a targeted message instead of the 85% check's general wording.
 	if got := TenantRAMBudgetMB * 85 / 100; got != DefaultComputeNodeCeilingMB() {
-		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want 85%% of %d = %d",
+		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want 85%% of %d = %d (headroom invariant)",
 			DefaultComputeNodeCeilingMB(), TenantRAMBudgetMB, got)
 	}
 }
