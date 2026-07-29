@@ -60,14 +60,14 @@ type Config struct {
 
 	// GatewaySynthTarget is the wire.ParseTarget-style URL schedd
 	// uses to dial gatewayd's internal listener (placement scheduler
-	// PR, ADR-025 axis 3, Q8). Accepts unix://|tcp://|dns://; the
-	// default "unix:///run/faas/gatewayd-internal.sock" preserves the
-	// one-box behaviour. Multi-box operators set this to
+	// PR, ADR-025 axis 3, Q8). Accepts unix://|tcp://|dns://.
+	// Multi-box operators set this to
 	// tcp://<gatewayd-overlay-ip>:9090 (or https://... when the
 	// tailnet ACL isn't enough on its own). Empty GatewaySynthTarget
 	// falls back to the legacy GatewaySynthSocket for backwards
 	// compatibility — existing tests + the e2e harness rely on the
-	// legacy field name.
+	// legacy field name. The fallback lives in cmd/schedd/main.go
+	// so LoadConfig stays a thin TOML-to-struct mapping.
 	GatewaySynthTarget string `toml:"gateway_synth_target"`
 
 	// OwnerUser owns the socket file (looked up by name). Defaults to
@@ -186,13 +186,21 @@ func LoadConfig(path string) (*Config, error) {
 		SocketPath:         "/run/faas/schedd.sock",
 		VMMDSocket:         "/run/faas/vmmd.sock",
 		GatewaySynthSocket: "/run/faas/gatewayd-internal.sock",
-		// Default GatewaySynthTarget to the legacy unix-socket
-		// path so one-box deploys pick up the new field without a
-		// TOML edit. Multi-box operators override via the
-		// gateway_synth_target TOML key or FAAS_GATEWAY_SYNTH_TARGET
-		// env (env path is wired in cmd/schedd/main.go via the
-		// fallback "unix://" + GatewaySynthSocket concatenation).
-		GatewaySynthTarget: "unix:///run/faas/gatewayd-internal.sock",
+		// GatewaySynthTarget stays empty by default so the fallback
+		// in cmd/schedd/main.go (synthTarget == "" → "unix://"+
+		// GatewaySynthSocket) owns the default-target resolution.
+		// That preserves the one-box path (synthTarget resolves to
+		// "unix:///run/faas/gatewayd-internal.sock") AND lets the
+		// e2e harness's gateway_synth_socket TOML entry actually
+		// override the dial — a previous PR landed a non-empty
+		// default here, which silently shadowed the legacy socket
+		// and broke the drain goroutine in
+		// TestE2E_AsyncInvoke_PostEnqueuesRowAndDrainCompletesIt
+		// and TestE2E_QueueSend_DrainLongPoll (e2e harness points
+		// gateway_synth_socket at /tmp/.../gatewayd-internal.sock).
+		// Multi-box operators set gateway_synth_target TOML or
+		// FAAS_GATEWAY_SYNTH_TARGET env to take precedence.
+		GatewaySynthTarget: "",
 		OwnerUser:          "faas-schedd",
 		// Issue #169 / #172: default to gatewayd's loopback
 		// control listener. Empty disables the trigger (the
