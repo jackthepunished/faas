@@ -1669,7 +1669,7 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 	if got.LastHeartbeatAt.IsZero() {
 		t.Errorf("seeded LastHeartbeatAt should be stamped at creation")
 	}
-	// PR #429: region/zone backfill mirrors migrations/00067 so a
+	// PR #429: region/zone backfill mirrors migrations/00069 so a
 	// single-box deploy has a deterministic ("local","local") tie-break
 	// ordering without needing the migration to have run on the
 	// memstore. Pin the seed here so a future contributor who changes

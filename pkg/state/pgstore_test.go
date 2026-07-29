@@ -1109,7 +1109,7 @@ func TestPg_ComputeNodes_ByID_NotFoundAndByName_NotFound(t *testing.T) {
 }
 
 // TestPg_ComputeNodes_RegionZone_ProjectedByAllReads pins the
-// migrations/00067 region/zone columns end-to-end through every read
+// migrations/00069 region/zone columns end-to-end through every read
 // path that PR #429 modified (scanComputeNode, ActiveComputeNodes,
 // ListAllComputeNodes, ComputeNodeByID, ComputeNodeByName). The chooser
 // reads these columns to tie-break on (headroom, region, zone, name);
@@ -1137,7 +1137,7 @@ func TestPg_ComputeNodes_RegionZone_ProjectedByAllReads(t *testing.T) {
 		t.Fatalf("insert with region/zone: %v", err)
 	}
 
-	// Insert a node with NULL region/zone (pre-00067 shape — a row
+	// Insert a node with NULL region/zone (pre-00069 shape — a row
 	// created before the migration ran, or by a future
 	// CreateComputeNode that doesn't populate the columns).
 	var idNullCols string
@@ -1183,10 +1183,10 @@ func TestPg_ComputeNodes_RegionZone_ProjectedByAllReads(t *testing.T) {
 		t.Fatalf("ComputeNodeByID(null-cols): %v", err)
 	}
 	if gotNull.Region != nil {
-		t.Errorf("Region = %v, want nil for pre-00067 row", *gotNull.Region)
+		t.Errorf("Region = %v, want nil for pre-00069 row", *gotNull.Region)
 	}
 	if gotNull.Zone != nil {
-		t.Errorf("Zone = %v, want nil for pre-00067 row", *gotNull.Zone)
+		t.Errorf("Zone = %v, want nil for pre-00069 row", *gotNull.Zone)
 	}
 
 	// ActiveComputeNodes must project region/zone for every entry.

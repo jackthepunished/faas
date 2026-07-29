@@ -16,14 +16,14 @@ import (
 
 // strPtr is a tiny helper for table rows that need region/zone
 // pointers (placement.go tie-break orders on these; nil must sort the
-// same as "" so pre-00067 rows don't bias the result).
+// same as "" so pre-00069 rows don't bias the result).
 func strPtr(s string) *string { return &s }
 
 // node is a tiny constructor for test fixtures; keeps the table-driven
 // cases readable (the alternative — full struct literals — is verbose
 // for 5 scenarios). Sets Active=true and a default ceiling; individual
 // cases override as needed. Region/Zone are nil so callers opt in
-// explicitly (pre-00067 shape).
+// explicitly (pre-00069 shape).
 func node(id, name string, usedMB int64, ceilingMB int) state.ComputeNode {
 	return state.ComputeNode{
 		ID: id, Name: name, TargetURL: "unix:///run/faas/" + name + ".sock",
@@ -216,7 +216,7 @@ func TestChoosePlacement_Table(t *testing.T) {
 			wantID: "b-id",
 		},
 		{
-			// Pre-00067 rows have nil region/zone. nil and "" must
+			// Pre-00069 rows have nil region/zone. nil and "" must
 			// sort identically so a fleet mid-rollout doesn't bias
 			// toward the post-migration rows.
 			name: "nil region sorts as empty string",

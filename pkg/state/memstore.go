@@ -3279,7 +3279,7 @@ func parseSubjectID(s string) *uuid.UUID {
 // store; production never calls this (the migration handles it).
 //
 // Region/Zone are seeded to 'local'/'local' to mirror migrations/
-// 00067_compute_nodes_region_zone.sql — the single-box deploy has a
+// 00069_compute_nodes_region_zone.sql — the single-box deploy has a
 // deterministic (region, name) tie-break ordering without needing
 // the migration to have run on the memstore (which is test-only).
 func (m *MemStore) seedDefaultLocalNodeLocked() {

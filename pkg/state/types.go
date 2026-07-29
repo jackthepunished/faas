@@ -793,7 +793,7 @@ type Instance struct {
 // delete (re-registration is idempotent on conflict).
 //
 // Region / Zone are nullable locality labels added by
-// migrations/00067_compute_nodes_region_zone.sql. The chooser
+// migrations/00069_compute_nodes_region_zone.sql. The chooser
 // (pkg/sched/ChoosePlacement) uses them as a secondary tie-break
 // when two nodes have equal RAM headroom. Pointer types so a SQL
 // NULL round-trips as nil rather than collapsing into "" — that
@@ -813,7 +813,7 @@ type ComputeNode struct {
 	LastHeartbeatAt    time.Time
 	CreatedAt          time.Time
 	// Region is a free-form locality label (e.g. "eu-fsn1", "local").
-	// nil means the row was inserted before 00067 OR the operator
+	// nil means the row was inserted before 00069 OR the operator
 	// didn't set a region on registration. The chooser treats nil
 	// and "" identically.
 	Region *string

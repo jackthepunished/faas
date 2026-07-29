@@ -11,7 +11,7 @@
 //
 // Why a pure function:
 //   - The decision is O(N) over the active set with a deterministic tie-break
-//     (lexicographic name, secondary on Region/Zone from migration 00067).
+//     (lexicographic name, secondary on Region/Zone from migration 00069).
 //     No distributed state, no leader election, no eventual consistency —
 //     single schedd process owns placement.
 //   - The single-box path (one 'default-local' row with the legacy
@@ -146,9 +146,9 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 	// Pick by (headroom DESC, region ASC, zone ASC, name ASC).
 	//
 	// Region/Zone are *string; treat nil and "" identically so a
-	// pre-00067 row (nil pointers) sorts the same as an operator-
+	// pre-00069 row (nil pointers) sorts the same as an operator-
 	// inserted row with empty strings. The seeded default-local row
-	// is backfilled to ('local','local') in migration 00067 so the
+	// is backfilled to ('local','local') in migration 00069 so the
 	// single-box deploy has a deterministic ordering.
 	best := candidates[0]
 	for _, n := range candidates[1:] {
@@ -182,7 +182,7 @@ func betterCandidate(n state.ComputeNode, nUsed int64, best state.ComputeNode, b
 	// comparator sees a single shape. Tied on headroom → prefer
 	// lower region, then lower zone, then lower name. The seeded
 	// default-local row is backfilled to ('local','local') in
-	// migration 00067, so single-box deploys see a deterministic
+	// migration 00069, so single-box deploys see a deterministic
 	// ordering with no operator-added rows competing.
 	nRegion := derefRegion(n.Region)
 	bestRegion := derefRegion(best.Region)

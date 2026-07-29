@@ -1,0 +1,41 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00067_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #429 (placement scheduler) renumbered 00067 → 00069 after
+-- the cross-PR collision detector found open PR #428 (wip: extend
+-- usage_minutes schema, ADR-048) had already claimed slot 67 with
+-- migrations/00067_extend_metering_telemetry.sql. Without this
+-- reservation at 67, the branch's embedded FS would have a gap
+-- and TestMigrationsContiguous would fail at PR time.
+--
+-- PR #428 already carries its own 00067_extend_metering_telemetry.sql
+-- at this slot; this file is the canonical reservation pair per
+-- ADR-041 — both are intentionally present and the first one to
+-- merge wins. Whichever PR lands first, the other drops this
+-- reservation on rebase (or the gate catches the duplicate-prefix
+-- violation at merge time and the renumbering PR re-numbers
+-- again).
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
