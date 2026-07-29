@@ -60,6 +60,13 @@ type Loop struct {
 	log       *slog.Logger
 	cfg       *Config
 	ops       *wire.OpsMetrics
+	// egress is the per-instance egress-byte reader (ADR-046,
+	// step 8). nil falls back to the legacy 3-arg Sampler so
+	// tests and consumers that have not been migrated to the
+	// egress-aware form continue to pass without egress writes.
+	// Set via Loop.WithEgress (the NewLoop-set path comes in
+	// PR-2 once the gateway gRPC stream is wired).
+	egress EgressSource
 
 	lastTickMu sync.RWMutex
 	// lastTick records the wall-clock time each named tick body last
@@ -113,13 +120,44 @@ func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billi
 	}
 }
 
+// WithEgress attaches an EgressSource to the loop. cmd/meterd calls
+// this once at boot with the scheddEgressAdapter +
+// gatewayEgressAdapter aggregator; tests that don't exercise
+// egress leave it unwired (the loop falls back to the
+// egress=nil branch and writes 0/0 to both columns). Returns
+// the receiver so the call site is one line:
+//
+//	loop := meter.NewLoop(...).WithEgress(egress)
+//
+// ADR-046 (step 8). PR-2 extends the aggregator's body to read
+// the gateway ring buffer; this setter is stable across both
+// PRs.
+func (l *Loop) WithEgress(egress EgressSource) *Loop {
+	l.egress = egress
+	return l
+}
+
 // Run starts the six timers and blocks until ctx cancels or any timer
 // errors out. Sampler / quota loop / stripe pusher / dunning /
 // residency / alerts each log + continue on per-tick errors so a
 // transient Postgres blip doesn't kill the daemon; only a context
 // cancel returns cleanly.
+// errors out. Sampler / quota loop / stripe pusher / dunning /
+// residency / alerts each log + continue on per-tick errors so a
+// transient Postgres blip doesn't kill the daemon; only a context
+// cancel returns cleanly.
 func (l *Loop) Run(ctx context.Context) error {
-	sampler := NewSampler(l.store, l.cpu, l.now)
+	// Sampler wiring (ADR-046, step 8): when WithEgress has
+	// been called, use the 4-arg constructor so the per-tick
+	// loop reads the egress adapters. When nil, fall through
+	// to the legacy 3-arg path (writes 0/0 for both egress
+	// columns — same observable behaviour as before PR-1).
+	var sampler *Sampler
+	if l.egress != nil {
+		sampler = NewSamplerWithEgress(l.store, l.cpu, l.egress, l.now)
+	} else {
+		sampler = NewSampler(l.store, l.cpu, l.now)
+	}
 	pusher := NewPusher(l.store, l.pusher, l.log, l.now, l.ops)
 	errc := make(chan error, 6)
 	go func() {

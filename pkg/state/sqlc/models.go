@@ -429,29 +429,21 @@ type UsageMinute struct {
 	Minute     pgtype.Timestamptz
 	MbSeconds  int64
 	Requests   int32
-// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
+	// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
 	CpuUsec int64
-	// ADR-046 (issue #415): cumulative HTTP response bytes the
-	// gateway forwarded for this instance in this minute
-	// (TxBytes) and cumulative byte delta on root-side
-	// vethHost.rx_bytes (NetTxBytes). Sampled from gateway
-	// statusRecorder.Bytes and vmmd netstats.Cache respectively.
-	// Informational — not billed. See pkg/meter/sampler.go for
-	// the additive-merge semantics.
-	TxBytes    int64
+	// Cumulative HTTP response body bytes the gateway forwarded for this instance in this minute. Source: pkg/gateway/handler.go statusRecorder.Bytes → per-(instance, minute) ring buffer → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed.
+	TxBytes int64
+	// Cumulative byte delta on root-side vethHost.rx_bytes for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache reading /sys/class/net/<vethHost>/statistics/rx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).
 	NetTxBytes int64
 }
 
 type UsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	CpuUsec   int64
-	Requests  int64
-	// ADR-046 (issue #415): per-(account, app, month) egress
-	// column sums (Σ over usage_minutes). Informational — not
-	// billed. Mirrors the UsageMinute egress columns.
+	AccountID  pgtype.UUID
+	AppID      pgtype.UUID
+	Month      pgtype.Interval
+	MbSeconds  int64
+	CpuUsec    int64
+	Requests   int64
 	TxBytes    int64
 	NetTxBytes int64
 }

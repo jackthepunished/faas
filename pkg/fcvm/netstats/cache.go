@@ -230,3 +230,25 @@ func (c *Cache) Size() int {
 	defer c.mu.Unlock()
 	return len(c.last)
 }
+
+// Diff returns the cache's currently-tracked instance ids that
+// are NOT present in `live`. The command-line poller calls this
+// every tick and Calls Forget for each returned id so the
+// baseline map does not grow unbounded when the canonical
+// teardown path (vmmdgrpc.Destroy) is bypassed (notably
+// pkg/fcvm.Manager.Park, which deletes m.live without going
+// through the gRPC server). Reading the cache's instance set
+// requires the same mutex as Forget; the helper takes the
+// lock once and returns the diff so callers can iterate
+// without serialising the slow per-tick sysfs reads.
+func (c *Cache) Diff(live map[string]struct{}) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0)
+	for id := range c.last {
+		if _, ok := live[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}

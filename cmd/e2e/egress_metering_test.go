@@ -168,12 +168,16 @@ func TestEgressMetering_GETUsage_SurfacesTxAndNetTxBytes(t *testing.T) {
 	if rows[0].NetTxBytes != 4_000_000 {
 		t.Errorf("net_tx_bytes = %d, want 4_000_000", rows[0].NetTxBytes)
 	}
-	// EgressGB() is the informational byte→GB conversion the
+	// TotalEgressGB() is the informational byte→GB conversion the
 	// dashboard uses to render the egress column. Pin it so a
-	// future DTO drift breaks the test, not the dashboard.
-	gotGB := rows[0].EgressGB()
+	// future DTO drift breaks the test, not the dashboard. NOTE
+	// (ADR-046 PR-414 I5): the value INCLUDES Ethernet framing
+	// because net_tx_bytes is the root-side kernel interface
+	// counter. Future billing will pick the unit; this is a
+	// dashboard-only surface today.
+	gotGB := rows[0].TotalEgressGB()
 	wantBytes := float64(1_000_000+4_000_000) / (1024 * 1024 * 1024)
 	if diff := gotGB - wantBytes; diff < -1e-9 || diff > 1e-9 {
-		t.Errorf("EgressGB = %g, want %g", gotGB, wantBytes)
+		t.Errorf("TotalEgressGB = %g, want %g", gotGB, wantBytes)
 	}
 }

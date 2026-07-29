@@ -2015,23 +2015,15 @@ type UsageByMonthParams struct {
 	Month     pgtype.Interval
 }
 
-type UsageByMonthRow struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	Requests  int64
-}
-
-func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error) {
+func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageMonthly, error) {
 	rows, err := db.Query(ctx, usageByMonth, arg.AccountID, arg.Month)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []UsageByMonthRow{}
+	items := []UsageMonthly{}
 	for rows.Next() {
-		var i UsageByMonthRow
+		var i UsageMonthly
 		if err := rows.Scan(
 			&i.AccountID,
 			&i.AppID,

@@ -1,9 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00065_usage_minutes_egress.sql
+-- filename: 00066_usage_minutes_egress.sql
 --
--- 00065_usage_minutes_egress.sql — ADR-046 (per-instance egress
+-- 00066_usage_minutes_egress.sql — ADR-046 (per-instance egress
 -- metering, visibility only).
 --
 -- Two additive-merge columns on usage_minutes:
@@ -74,6 +74,15 @@ create or replace view usage_monthly as
 -- and drop the new columns. Down is a clean reversal of Up; we do
 -- not touch 00055 — the next migration that recreates the view
 -- will overwrite this one again on its own Up.
+--
+-- NOTE (PR-414 I7): 00055's Down does NOT recreate the view
+-- because it predates the multi-column view-recreation pattern.
+-- This Down DOES recreate it (parity with Up) because any
+-- future migration that depends on the pre-046 columns being
+-- present when going Down (e.g. a downstream column-add that
+-- expects a known view shape) must see a stable view. A
+-- maintainer "fixing" 00065 to match 00055 will silently break
+-- that contract. The asymmetry is intentional.
 
 drop view if exists usage_monthly;
 create or replace view usage_monthly as

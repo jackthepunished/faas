@@ -119,8 +119,14 @@ func TestListInstanceStats_NetTxBytesPopulatedWhenValid(t *testing.T) {
 	if rows[0].GetNetTxBytes() != 4096 {
 		t.Errorf("net_tx_bytes = %d, want 4096", rows[0].GetNetTxBytes())
 	}
-	if rows[0].GetTxValid() != uint32(instancestats.Valid) {
-		t.Errorf("tx_valid = %d, want %d (Valid)", rows[0].GetTxValid(), instancestats.Valid)
+	// Wire contract (ADR-046 PR-414 I8): tx_valid is the
+	// instancestats.Validity enum literal cast to uint32.
+	// 0 = Valid, 1 = Unknown (matches the cpu_valid wire
+	// convention). Pin the literal so a future enum reorder
+	// in pkg/sched/instancestats breaks this test, not the
+	// wire.
+	if rows[0].GetTxValid() != uint32(0) {
+		t.Errorf("tx_valid = %d, want 0 (Valid)", rows[0].GetTxValid())
 	}
 }
 
@@ -149,7 +155,10 @@ func TestListInstanceStats_TxUnknown_RoundTripsUnknown(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0].GetTxValid() != uint32(instancestats.Unknown) {
-		t.Errorf("tx_valid = %d, want %d (Unknown)", rows[0].GetTxValid(), instancestats.Unknown)
+	// Wire contract (ADR-046 PR-414 I8): see
+	// TestListInstanceStats_TxValid_RoundTripsValid — 1 =
+	// Unknown on the wire.
+	if rows[0].GetTxValid() != uint32(1) {
+		t.Errorf("tx_valid = %d, want 1 (Unknown)", rows[0].GetTxValid())
 	}
 }

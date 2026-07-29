@@ -477,18 +477,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — bounded staleness without forcing a gRPC round trip per
 	// instance.
 	cpu := &scheddCPUAdapter{parker: parker, now: deps.now}
-	// ADR-046 (PR-2): wire the egress adapters so the sampler
-	// can append tx_bytes + net_tx_bytes to usage_minutes.
-	// PR-1 leaves both adapters as no-ops (the schema is in
-	// place; the producers land in PR-2). The aggregator is
-	// passed to meter.NewSamplerWithEgress so the legacy
-	// NewSampler stays for callers that have not yet
-	// migrated to the 4-arg form (none today; this is the
-	// only wiring point).
+	// ADR-046 (PR-1 + PR-2): wire the egress adapters so the
+	// sampler can append tx_bytes + net_tx_bytes to
+	// usage_minutes. PR-1 leaves the gateway adapter as a
+	// no-op (the ring-buffer producer lands in PR-2) so the
+	// aggregator returns ok=false from gatewayEgressAdapter;
+	// the schedd adapter is real (reads NetTxBytes from the
+	// existing schedd gRPC round trip on the same rows map
+	// cpu already fetched). The aggregator stays in place
+	// across PR-1 and PR-2; PR-2 replaces gatewayEgressAdapter's
+	// body without changing the wiring. WithEgress passes the
+	// aggregator into NewLoop so the loop's sampler uses the
+	// 4-arg NewSamplerWithEgress instead of the legacy
+	// 3-arg NewSampler. Loop.WithEgress is nil-safe so a
+	// future test harness can omit the egress wire without
+	// touching the constructor.
 	scheddEgress := &scheddEgressAdapter{cpu: cpu}
 	gwEgress := &gatewayEgressAdapter{}
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
-	_ = egress
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and
 	// hand it to the loop. The evaluator is nil-coerced below when
 	// neither FAAS_PROMETHEUS_URL nor FAAS_HOST_AGE_IDENTITY_PATH is
@@ -498,7 +504,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// loop's contract is "at most one", matching the design note at
 	// pkg/alerts/evaluator.go.
 	evaluator := buildAlertEvaluator(deps, store, log, ops)
-	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops)
+	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
+		WithEgress(egress)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 

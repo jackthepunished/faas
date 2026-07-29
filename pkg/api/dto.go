@@ -352,14 +352,29 @@ func (u UsageResponse) CPUHours() float64 {
 	return float64(u.CPUUsageUsec) / 3.6e9
 }
 
-// EgressGB returns (TXBytes + NetTxBytes) converted to GB
-// (1 GB = 1024^3 bytes). The two columns are exposed
-// separately so the dashboard can distinguish gateway
-// response bytes (HTTP only) from netns tap0 egress (HTTP
-// + 80/443/53 + DNS, includes framing). Convenience
-// getter for the SDK and the CLI; the dashboard can
-// compute the same value with `pkg/meter.EgressGB`.
-func (u UsageResponse) EgressGB() float64 {
+// TotalEgressGB returns (TXBytes + NetTxBytes) converted to GB
+// (1 GB = 1024^3 bytes).
+//
+// IMPORTANT (ADR-046, PR-414 I5): the value INCLUDES Ethernet
+// framing (~14 + 20 bytes per packet) because net_tx_bytes
+// reads the kernel `/sys/class/net/<vethHost>/statistics/rx_bytes`
+// counter — interface bytes, not IP-payload bytes. A 1 GB HTTP
+// workload can show as ~1.2-1.5 GB on this counter. The two
+// columns are exposed separately so callers can distinguish
+// gateway response bytes (HTTP only, exact) from netns tap0
+// egress (HTTP + 80/443/53 + DNS, includes framing).
+//
+// For HTTP-payload-only bytes, callers should use TXBytes
+// directly (do not divide by 1 GiB and call it "egress GB").
+// The future billing PR will pick the unit; this convenience
+// getter exists so the SDK and the CLI have a single
+// "all-bytes" surface for informational dashboards.
+//
+// Convention:
+//   - TotalEgressGB = interface bytes, includes framing.
+//   - TXBytes = HTTP response bytes, exact.
+//   - NetTxBytes = interface bytes on root-side vethHost.rx_bytes.
+func (u UsageResponse) TotalEgressGB() float64 {
 	return float64(u.TXBytes+u.NetTxBytes) / (1024 * 1024 * 1024)
 }
 

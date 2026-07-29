@@ -289,13 +289,17 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 		// SampleAndRoll consumes this row (pkg/meter/
 		// sampler.go, PR-2 fold-in). Future readers (the
 		// reaper, the dashboard) can ignore it.
+		//
+		// The unsigned→signed cast on the wire cannot
+		// produce a negative value: cmd/vmmd/network_poller.go
+		// clamps `rx > math.MaxInt64` to math.MaxInt64 before
+		// passing the reading into the cache. So `*in.NetTxBytes
+		// < 0` is unreachable — the vmmd stream can only emit
+		// nil (absent) or a non-negative int64. Treat any
+		// absent wrapper as Unknown; present as Valid.
 		if in.NetTxBytes != nil {
-			if *in.NetTxBytes < 0 {
-				row.TX = Unknown
-			} else {
-				row.TXBytes = uint64(*in.NetTxBytes)
-				row.TX = Valid
-			}
+			row.TXBytes = uint64(*in.NetTxBytes)
+			row.TX = Valid
 		}
 		// RSS: wire sends *int64. nil → Unknown; non-nil →
 		// convert bytes → MiB.

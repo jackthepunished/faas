@@ -20,10 +20,17 @@ type Querier interface {
 	AppByID(ctx context.Context, db DBTX, id pgtype.UUID) (AppByIDRow, error)
 	AppBySlug(ctx context.Context, db DBTX, slug string) (AppBySlugRow, error)
 	AppendEvent(ctx context.Context, db DBTX, arg AppendEventParams) error
-	// Idempotent: a redelivered (instance_id, minute) is a no-op. First write
-	// wins (M7 hardening, PR feat/m7-beta-hardening). Prevents silent
-	// double-billing when meterd restarts, the network blips, or two meterd
-	// instances ever run concurrently.
+	// Idempotent on (instance_id, minute) for mb_seconds / requests
+	// (M7 hardening, PR feat/m7-beta-hardening): a redelivered
+	// minute is a no-op for the billing-floor columns so a meterd
+	// restart / network blip / two meterd instances cannot inflate
+	// billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
+	// the same conflict key — the schedd / meterd accumulators can
+	// each call AppendUsage many times within the same minute; the
+	// columns are the sum of all per-tick deltas.
+	//   cpu_usec     — issue #279 / PR-B / ADR-039
+	//   tx_bytes     — ADR-046 (gateway HTTP response body bytes)
+	//   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
 	AppendUsage(ctx context.Context, db DBTX, arg AppendUsageParams) error
 	BuildByDeployment(ctx context.Context, db DBTX, deploymentID pgtype.UUID) (Build, error)
 	BuildByID(ctx context.Context, db DBTX, id pgtype.UUID) (Build, error)
@@ -134,7 +141,7 @@ type Querier interface {
 	UpdateCron(ctx context.Context, db DBTX, arg UpdateCronParams) (UpdateCronRow, error)
 	UpdateDeploymentStatus(ctx context.Context, db DBTX, arg UpdateDeploymentStatusParams) error
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
-	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
+	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageMonthly, error)
 }
 
 var _ Querier = (*Queries)(nil)

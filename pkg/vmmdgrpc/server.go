@@ -329,60 +329,81 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 	resp.Instances = make([]*vmmdpb.InstanceStats, 0, len(resident))
 	for inst, b := range resident {
 		total += b
-		row := &vmmdpb.InstanceStats{
-			Instance:      inst,
-			ResidentBytes: wrapperspb.Int64(b),
-		}
-		// Populate CPU fields from the cache if present. Reading
-		// under the cache's mutex is O(1) and never blocks
-		// schedd's poller on cgroup I/O — the sample loop owns
-		// the disk reads. The cumulative wall-clock of the
-		// per-instance Lookup loop is observed separately on
-		// `vmmd_stats_cpu_collect_seconds` (issue #279 / PR-B /
-		// ADR-039) so an operator can graph the CPU rate-and-
-		// accumulator hot path in isolation from the rest of
-		// the Stats RPC.
-		if s.cpuCache != nil {
-			cpuStart := time.Now()
-			if reading, ok := s.cpuCache.Lookup(inst); ok && reading.Valid {
-				row.CpuPct = wrapperspb.Double(reading.CPUPct)
-				row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
-				// PR-D (issue #301, ADR-044): the
-				// cumulative throttled-seconds reading.
-				// Source: same Reading as cpu_seconds,
-				// driven by the same regression contract
-				// (absent on baseline / cgroup
-				// recreation). The Prometheus rollup
-				// lives in pkg/wire/topn_app.go
-				// (topAppSet admission, cap=100) — the
-				// wire shape stays per-instance and
-				// the {account_id, app_id} cardinality
-				// stays bounded.
-				row.CpuThrottledSeconds = wrapperspb.Double(reading.ThrottledSeconds)
-			}
-			if h := s.ops.CPUStatsCollectDuration(); h != nil {
-				h.Observe(time.Since(cpuStart).Seconds())
-			}
-		}
-		// ADR-046 (step 7): per-instance cumulative byte
-		// delta on root-side vethHost.rx_bytes. Same wire
-		// wrapper semantics as cpu_pct (absent = baseline /
-		// regression). schedd's poller sums across the 250 ms
-		// window into per-(instance, minute) accumulator and
-		// exposes via pkg/scheddgrpc.ListInstanceStats as a
-		// uint64 byte counter; meterd's SampleAndRoll appends
-		// to usage_minutes.net_tx_bytes. Lookup is O(1) under
-		// the cache mutex, never blocks schedd on sysfs I/O —
-		// the sample loop in cmd/vmmd owns the disk reads.
-		if s.netCache != nil {
-			if nReading, nok := s.netCache.Lookup(inst); nok && nReading.Valid {
-				row.NetTxBytes = wrapperspb.Int64(int64(nReading.DeltaBytes))
-			}
-		}
+		row := buildInstanceStatsRow(inst, b, s.cpuCache, s.netCache, s.ops)
 		resp.Instances = append(resp.Instances, row)
 	}
 	resp.TotalResidentBytes = wrapperspb.Int64(total)
 	return resp, nil
+}
+
+// buildInstanceStatsRow assembles one wire row from the per-instance
+// resident bytes plus the CPU + netstats cache lookups. Pulled out of
+// the Stats handler so the per-row wire shape can be unit-tested on
+// a non-Linux host (issue #279 / PR-B / ADR-046 — without this seam
+// the schedd-side and downstream consumers cannot verify the byte
+// counter actually reaches the wire).
+//
+// Wire semantics:
+//
+//   - ResidentBytes: always populated when leakcheck reports the
+//     instance (the caller guarantees it).
+//   - CpuPct / CpuSeconds / CpuThrottledSeconds: wrappers, absent
+//     on baseline / cgroup regression — schedd stamps Unknown and
+//     the {app,node} rollup excludes the row (cpustats regression
+//     contract, ADR-039 §3.1).
+//   - NetTxBytes (ADR-046, step 7): per-tick byte delta on root-side
+//     vethHost.rx_bytes from vmmd's netstats cache. Same wrapper
+//     semantics as cpu_pct (absent = baseline / veth recreation).
+//     schedd sums across the 250 ms window into per-(instance,
+//     minute) accumulator and exposes via pkg/scheddgrpc.
+//     ListInstanceStats as a uint64 byte counter; meterd's
+//     SampleAndRoll appends to usage_minutes.net_tx_bytes.
+//
+// The CPU `Lookup` and the netstats `Lookup` are O(1) under their
+// own mutexes and never block on sysfs I/O — the sample loop in
+// cmd/vmmd owns the disk reads. The per-row CPU collect duration is
+// observed separately on `vmmd_stats_cpu_collect_seconds` so the
+// hot path can be graphed in isolation from the rest of the Stats
+// RPC.
+func buildInstanceStatsRow(
+	instance string,
+	resident int64,
+	cpuCache *cpustats.Cache,
+	netCache *netstats.Cache,
+	ops *wire.OpsMetrics,
+) *vmmdpb.InstanceStats {
+	row := &vmmdpb.InstanceStats{
+		Instance:      instance,
+		ResidentBytes: wrapperspb.Int64(resident),
+	}
+	if cpuCache != nil {
+		cpuStart := time.Now()
+		if reading, ok := cpuCache.Lookup(instance); ok && reading.Valid {
+			row.CpuPct = wrapperspb.Double(reading.CPUPct)
+			row.CpuSeconds = wrapperspb.Double(reading.CPUSeconds)
+			// PR-D (issue #301, ADR-044): the
+			// cumulative throttled-seconds reading.
+			// Source: same Reading as cpu_seconds,
+			// driven by the same regression contract
+			// (absent on baseline / cgroup
+			// recreation). The Prometheus rollup
+			// lives in pkg/wire/topn_app.go
+			// (topAppSet admission, cap=100) — the
+			// wire shape stays per-instance and
+			// the {account_id, app_id} cardinality
+			// stays bounded.
+			row.CpuThrottledSeconds = wrapperspb.Double(reading.ThrottledSeconds)
+		}
+		if h := ops.CPUStatsCollectDuration(); h != nil {
+			h.Observe(time.Since(cpuStart).Seconds())
+		}
+	}
+	if netCache != nil {
+		if nReading, nok := netCache.Lookup(instance); nok && nReading.Valid {
+			row.NetTxBytes = wrapperspb.Int64(int64(nReading.DeltaBytes))
+		}
+	}
+	return row
 }
 
 // Ping is a wire-only liveness probe (issue #97 / ADR-025 axis 3,

@@ -57,6 +57,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
@@ -141,6 +142,14 @@ func runNetworkEgressPoll(
 			now := time.Now()
 			snapshot := snapshotLive()
 			for instanceID, vethHost := range snapshot {
+				// I2 (review): re-check context between
+				// per-instance sysfs reads so graceful
+				// shutdown does not stall past
+				// systemd's 30 s TimeoutStopSec on a
+				// box with hundreds of live instances.
+				if ctx.Err() != nil {
+					return
+				}
 				if vethHost == "" {
 					continue
 				}
@@ -155,12 +164,72 @@ func runNetworkEgressPoll(
 					}
 					continue
 				}
+				// I6 (review): clamp the kernel
+				// counter to math.MaxInt64 before
+				// downstream int64 casts. The
+				// wire / store column is signed
+				// (wrapperspb.Int64Value /
+				// usage_minutes bigint); a wrap
+				// on the unsigned-→signed cast
+				// would look like a regression
+				// and silently zero future
+				// deltas (the cache drops the
+				// baseline on any non-monotonic
+				// step). Practically unreachable
+				// on a 1 Gbit uplink, but the
+				// guard is cheap.
+				if rx > math.MaxInt64 {
+					log.Warn("egress rx_bytes exceeds int64 range; clamping",
+						"instance", instanceID,
+						"veth", vethHost,
+						"rx", rx)
+					rx = math.MaxInt64
+				}
 				cache.Observe(netstats.Observation{
 					InstanceID: instanceID,
 					RXBytes:    rx,
 					At:         now,
 				})
 			}
+			// I1 (review): evict cache entries for
+			// instances that vanished since the
+			// previous tick. Manager.Park deletes
+			// m.live without going through the
+			// vmmdgrpc.Destroy handler, so the
+			// explicit ForgetNet on teardown is
+			// bypassed. Without this sweep the
+			// cache grows unbounded across
+			// park/park/park cycles. The
+			// snapshot map is fresh per tick; we
+			// drop any cache key whose instance
+			// is not in the snapshot. The cost
+			// is O(N) on a transient set per
+			// tick — bounded by the live set
+			// size.
+			evictStaleCacheEntries(cache, snapshot)
 		}
+	}
+}
+
+// evictStaleCacheEntries drops cache entries whose instance id is
+// not in `live`. Called once per tick from runNetworkEgressPoll so
+// instances that bypass the vmmdgrpc.Destroy handler (notably
+// Manager.Park, which deletes m.live without going through the
+// gRPC server) still see their baseline removed. The cache's own
+// Diff method holds the cache mutex once and returns the stale
+// ids; this function iterates them outside the lock and calls
+// Forget per-id (each Forget takes the mutex briefly — O(N)
+// work is fine because the live set is bounded by
+// max_concurrency × apps).
+func evictStaleCacheEntries(cache *netstats.Cache, live map[string]string) {
+	if cache == nil || len(live) == 0 {
+		return
+	}
+	liveSet := make(map[string]struct{}, len(live))
+	for id := range live {
+		liveSet[id] = struct{}{}
+	}
+	for _, stale := range cache.Diff(liveSet) {
+		cache.Forget(stale)
 	}
 }

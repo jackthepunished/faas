@@ -890,7 +890,9 @@ CREATE TABLE public.usage_minutes (
     minute timestamp with time zone NOT NULL,
     mb_seconds bigint NOT NULL,
     requests integer DEFAULT 0 NOT NULL,
-    cpu_usec bigint DEFAULT 0 NOT NULL
+    cpu_usec bigint DEFAULT 0 NOT NULL,
+    tx_bytes bigint DEFAULT 0 NOT NULL,
+    net_tx_bytes bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -899,6 +901,20 @@ CREATE TABLE public.usage_minutes (
 --
 
 COMMENT ON COLUMN public.usage_minutes.cpu_usec IS 'Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.';
+
+
+--
+-- Name: COLUMN usage_minutes.tx_bytes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.tx_bytes IS 'Cumulative HTTP response body bytes the gateway forwarded for this instance in this minute. Source: pkg/gateway/handler.go statusRecorder.Bytes → per-(instance, minute) ring buffer → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed.';
+
+
+--
+-- Name: COLUMN usage_minutes.net_tx_bytes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.net_tx_bytes IS 'Cumulative byte delta on root-side vethHost.rx_bytes for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache reading /sys/class/net/<vethHost>/statistics/rx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).';
 
 
 --
@@ -911,7 +927,9 @@ CREATE VIEW public.usage_monthly AS
     date_trunc('month'::text, minute) AS month,
     sum(mb_seconds) AS mb_seconds,
     sum(cpu_usec) AS cpu_usec,
-    sum(requests) AS requests
+    sum(requests) AS requests,
+    sum(tx_bytes) AS tx_bytes,
+    sum(net_tx_bytes) AS net_tx_bytes
    FROM public.usage_minutes
   GROUP BY account_id, app_id, (date_trunc('month'::text, minute));
 
