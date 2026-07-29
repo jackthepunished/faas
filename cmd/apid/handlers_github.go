@@ -38,6 +38,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -80,12 +81,24 @@ type GitHubEmail struct {
 // renderGitHubAuthRedirect (GET /v1/auth/github)
 // Redirects the user to GitHub's OAuth authorize endpoint.
 func (s *server) renderGitHubAuthRedirect(w http.ResponseWriter, r *http.Request) {
-	clientID := os.Getenv("GITHUB_CLIENT_ID")
-	if clientID == "" {
-		s.log.Error("GITHUB_CLIENT_ID environment variable is not configured")
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "github_oauth_misconfigured", "OAuth Misconfigured", "GITHUB_CLIENT_ID environment variable is required"))
+	// Issue #419 / ADR-046: same boot-resolved SignInConfig guard
+	// as the Google flow. Half-set configs fail to start at boot;
+	// the Disabled case below is the operator-chose-not-to-ship-it
+	// path.
+	if !s.oauthConfig.GitHub.Enabled() {
+		s.log.Warn("github OAuth disabled on this host",
+			"missing_env", "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"provider", "github")
+		s.ops.ObserveOAuthDisabled(auth.GitHubProviderName)
+		api.WriteProblem(w, api.NewProblem(
+			http.StatusServiceUnavailable,
+			"oauth_provider_unavailable",
+			"OAuth Provider Unavailable",
+			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
+		))
 		return
 	}
+	clientID := s.oauthConfig.GitHub.ClientID
 
 	stateTokenBytes := make([]byte, 16)
 	if _, err := rand.Read(stateTokenBytes); err != nil {
@@ -104,7 +117,7 @@ func (s *server) renderGitHubAuthRedirect(w http.ResponseWriter, r *http.Request
 		MaxAge:   300, // 5 minutes
 	})
 
-	redirectURI := os.Getenv("GITHUB_REDIRECT_URI")
+	redirectURI := s.oauthConfig.GitHub.RedirectURI
 	if redirectURI == "" {
 		host := r.Host
 		scheme := schemeHTTP
@@ -163,14 +176,28 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	clientID := os.Getenv("GITHUB_CLIENT_ID")
-	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
-	if clientID == "" || clientSecret == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "github_oauth_misconfigured", "OAuth Misconfigured", "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are required"))
+	// Issue #419 / ADR-046: same guard as the consent redirect.
+	// The callback should never be reached if the provider is
+	// disabled, but a 503 here is the correct shape if a stale
+	// cookie or direct callback hit slips past the dashboard's
+	// disabled-button gating.
+	if !s.oauthConfig.GitHub.Enabled() {
+		s.log.Warn("github OAuth disabled on this host",
+			"missing_env", "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"provider", "github")
+		s.ops.ObserveOAuthDisabled(auth.GitHubProviderName)
+		api.WriteProblem(w, api.NewProblem(
+			http.StatusServiceUnavailable,
+			"oauth_provider_unavailable",
+			"OAuth Provider Unavailable",
+			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
+		))
 		return
 	}
+	clientID := s.oauthConfig.GitHub.ClientID
+	clientSecret := s.oauthConfig.GitHub.ClientSecret
 
-	redirectURI := os.Getenv("GITHUB_REDIRECT_URI")
+	redirectURI := s.oauthConfig.GitHub.RedirectURI
 	if redirectURI == "" {
 		host := r.Host
 		scheme := schemeHTTP

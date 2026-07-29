@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -42,12 +43,24 @@ type GoogleUserInfo struct {
 // renderGoogleAuthRedirect (GET /v1/auth/google)
 // Redirects user to Google OAuth 2.0 consent screen.
 func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request) {
-	clientID := os.Getenv("GOOGLE_CLIENT_ID")
-	if clientID == "" {
-		s.log.Error("GOOGLE_CLIENT_ID environment variable is not configured")
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "google_oauth_misconfigured", "OAuth Misconfigured", "GOOGLE_CLIENT_ID environment variable is required"))
+	// Issue #419 / ADR-046: the boot-resolved SignInConfig is the
+	// only source of truth for whether Google OAuth is configured.
+	// Half-set configs fail to start at boot (cmd/apid/main.go); the
+	// Disabled case below is the operator-chose-not-to-ship-it path.
+	if !s.oauthConfig.Google.Enabled() {
+		s.log.Warn("google OAuth disabled on this host",
+			"missing_env", "GOOGLE_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"provider", "google")
+		s.ops.ObserveOAuthDisabled(auth.GoogleProviderName)
+		api.WriteProblem(w, api.NewProblem(
+			http.StatusServiceUnavailable,
+			"oauth_provider_unavailable",
+			"OAuth Provider Unavailable",
+			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
+		))
 		return
 	}
+	clientID := s.oauthConfig.Google.ClientID
 
 	// Real Google OAuth 2.0 flow
 	stateTokenBytes := make([]byte, 16)
@@ -68,7 +81,7 @@ func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request
 		MaxAge:   300, // 5 minutes
 	})
 
-	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
+	redirectURI := s.oauthConfig.Google.RedirectURI
 	if redirectURI == "" {
 		host := r.Host
 		scheme := schemeHTTP
@@ -128,14 +141,31 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	clientID := os.Getenv("GOOGLE_CLIENT_ID")
-	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
-	if clientID == "" || clientSecret == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "google_oauth_misconfigured", "OAuth Misconfigured", "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required"))
+	// Issue #419 / ADR-046: same guard as the consent redirect —
+	// the callback should never be reached if the provider is
+	// disabled, but a 503 here is the correct shape if a stale
+	// cookie or direct callback hit slips past the dashboard's
+	// disabled-button gating. The auth-result audit row is
+	// emitted at the existing EmitFailedLogin call sites above;
+	// no extra audit is needed on the disabled path because we
+	// have no email yet to hash.
+	if !s.oauthConfig.Google.Enabled() {
+		s.log.Warn("google OAuth disabled on this host",
+			"missing_env", "GOOGLE_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"provider", "google")
+		s.ops.ObserveOAuthDisabled(auth.GoogleProviderName)
+		api.WriteProblem(w, api.NewProblem(
+			http.StatusServiceUnavailable,
+			"oauth_provider_unavailable",
+			"OAuth Provider Unavailable",
+			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
+		))
 		return
 	}
+	clientID := s.oauthConfig.Google.ClientID
+	clientSecret := s.oauthConfig.Google.ClientSecret
 
-	redirectURI := os.Getenv("GOOGLE_REDIRECT_URI")
+	redirectURI := s.oauthConfig.Google.RedirectURI
 	if redirectURI == "" {
 		host := r.Host
 		scheme := schemeHTTP

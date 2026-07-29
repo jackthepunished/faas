@@ -577,14 +577,25 @@ paths:
         the code at `oauth2.googleapis.com/token`, fetches the
         userinfo, and verifies `email_verified=true` before
         minting a session (issue #165 PR #2, ADR-032).
+
+        Returns 503 `oauth_provider_unavailable` when the operator
+        did not configure Google sign-in on this host (both
+        `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` unset at
+        boot, issue #419 / ADR-046). The same shape is returned
+        for the half-set case, which fails to boot.
       responses:
         '302':
           description: Redirect to Google consent.
           headers:
             Location:
               schema: { type: string, format: uri }
+        '503':
+          description: OAuth provider not configured on this host.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500':
-          description: OAuth misconfigured (GOOGLE_CLIENT_ID unset).
+          description: OAuth misconfigured at runtime (defence-in-depth).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -639,14 +650,24 @@ paths:
         with `scope=read:user user:email`. The callback requires
         a primary && verified email before minting a session
         (issue #165 PR #2, ADR-032).
+
+        Returns 503 `oauth_provider_unavailable` when the operator
+        did not configure GitHub sign-in on this host (both
+        `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` unset at
+        boot, issue #419 / ADR-046).
       responses:
         '302':
           description: Redirect to GitHub consent.
           headers:
             Location:
               schema: { type: string, format: uri }
+        '503':
+          description: OAuth provider not configured on this host.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500':
-          description: OAuth misconfigured (GITHUB_CLIENT_ID unset).
+          description: OAuth misconfigured at runtime (defence-in-depth).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -723,6 +744,37 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/capabilities:
+    get:
+      tags: [auth]
+      operationId: getAuthCapabilities
+      summary: Sign-in OAuth capability signal for the dashboard.
+      description: |
+        Returns the boot-resolved OAuth provider state for this apid
+        host (issue #419 / ADR-046). The dashboard reads this on
+        `/login` to decide whether to render the "Sign in with
+        Google" / "Sign in with GitHub" buttons.
+
+        Mounted behind the dashboard's session-cookie auth — a
+        scanner without a session gets 302 to `/login` first, so
+        this is not a brute-force amplification surface even though
+        it surfaces provider enablement. The set of provider names
+        is closed (`google`, `github`); future providers land as
+        new keys, not by adding a list.
+
+        `enabled=true` means the provider's `/v1/auth/<provider>`
+        consent route will issue a 302 to the upstream consent
+        screen on a fresh request. `enabled=false` means it will
+        return 503 `oauth_provider_unavailable`.
+      responses:
+        '200':
+          description: Per-provider enabled signal.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthCapabilities' }
+        '302':
+          description: No valid session cookie; redirected to /login.
 
   /v1/auth/logout:
     post:
@@ -2945,6 +2997,48 @@ components:
       properties:
         account_id: { type: string, pattern: '^[a-f0-9]{32}$' }
         plan: { type: string, enum: [free, hobby, pro, scale] }
+
+    # Issue #419 / ADR-046: sign-in OAuth capability signal
+    # (GET /v1/auth/capabilities). Per-provider enabled flag; the
+    # dashboard reads this on /login to decide whether to render
+    # the "Sign in with <provider>" button. The set of provider
+    # keys is closed (google, github); future providers land as
+    # new keys.
+    AuthCapabilities:
+      description: |
+        Boot-resolved OAuth provider state for this apid host.
+        `enabled=true` means the consent route (`/v1/auth/<name>`)
+        will issue a 302 to the upstream consent screen;
+        `enabled=false` means the consent route returns 503
+        `oauth_provider_unavailable` because both the provider's
+        `*_CLIENT_ID` and `*_CLIENT_SECRET` were unset at boot.
+      type: object
+      required: [providers]
+      properties:
+        providers:
+          $ref: '#/components/schemas/AuthProviders'
+
+    AuthProviders:
+      description: |
+        Per-provider capability map. Closed set (google, github) —
+        handlers MUST add a new field here when adding a new
+        provider, not relax this to a free-form map.
+      type: object
+      required: [google, github]
+      properties:
+        google:
+          $ref: '#/components/schemas/OAuthProviderCapability'
+        github:
+          $ref: '#/components/schemas/OAuthProviderCapability'
+
+    OAuthProviderCapability:
+      description: |
+        One provider's capability flag. Source is
+        `auth.SignInProvider.Enabled()` — the boot-resolved state.
+      type: object
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
 
     PasswordSignupRequest:
       description: "Email + password for signup. Same shape as PasswordLoginRequest so the create-or-claim race detection reuses the verifier."

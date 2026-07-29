@@ -23,6 +23,13 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 # DATABASE_URL carries the Postgres DSN; secrets live in /etc/faas/sealed.env
 # (gap G2 — sealed at rest, dec only by systemd EnvironmentFile).
+# Sign-in OAuth envs (issue #419 / ADR-046) — GOOGLE_CLIENT_ID +
+# GOOGLE_CLIENT_SECRET, GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET,
+# and the optional GOOGLE_REDIRECT_URI / GITHUB_REDIRECT_URI
+# overrides — also live in sealed.env. Half-set pairs cause apid
+# to refuse to boot; both-unset disables the provider (the consent
+# route returns 503 oauth_provider_unavailable and the dashboard
+# hides the button). See deploy/digitalocean/README.md#oauth-sign-in-optional.
 EnvironmentFile=/etc/faas/sealed.env
 # Session signing key (security review A4). LoadCredential surfaces
 # /etc/faas/secrets/session.key inside the unit's credentials dir;
