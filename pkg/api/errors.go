@@ -346,6 +346,21 @@ const (
 	CodeImageEgressDenied    = "image_egress_denied"
 	CodeImageManifestInvalid = "image_manifest_invalid"
 
+	// CodeStatelessOnlyViolation is the single customer-facing code for
+	// the stateless-only contract (Wave 0, year-one positioning). It
+	// fires in three cases:
+	//   - apid at deploy-accept time when a Dockerfile contains a
+	//     VOLUME instruction, a mkfs/mount -t ext4|xfs call inside a
+	//     RUN, or a top-level data/ or db/ directory (cmd/apid/deploy_inputs.go).
+	//   - imaged at build time when the resolved OCI base image matches
+	//     StatefulBaseImageDenylist (pkg/imaged/base.go).
+	//   - guest-init at runtime (advisory only, never blocking — see
+	//     guest/init/stateless_advisory_linux.go).
+	// The single code keeps the customer-facing remediation path
+	// identical (bring your own managed state) regardless of where the
+	// violation was caught. The Detail field distinguishes the three.
+	CodeStatelessOnlyViolation = "stateless_only_violation"
+
 	// CLI auth (spec §2.2 device-code flow). Pending is the "user has
 	// not yet approved" signal the CLI's poll loop keys off; the CLI
 	// keeps polling until it sees 200 OK or a different 4xx. The
@@ -460,6 +475,14 @@ func StatusForCode(code string) int {
 		return http.StatusUnprocessableEntity
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
+	case CodeStatelessOnlyViolation:
+		// 422 — the deploy shape (or resolved base image) is a stateful
+		// one this platform does not support in year one. Sits next to
+		// CodeDeployFailed: well-formed request, content policy refuses.
+		// imaged also lifts this code onto deployments.error_code, so
+		// the GET /v1/deployments/{id} response and the CLI's
+		// `faas deployment <id>` render it identically.
+		return http.StatusUnprocessableEntity
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
@@ -621,6 +644,25 @@ func ErrSourceInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSourceInvalid,
 		"Source invalid", reason).
 		WithDocs("https://docs.DOMAIN/build/source")
+}
+
+// ErrStatelessOnlyViolation is returned when a deploy shape (or resolved
+// base image) requires persistent state — VOLUME in Dockerfile, mkfs/mount
+// of a block device, a top-level data/ or db/ directory in the tarball, or
+// a base image like postgres:16 / redis:7 / mysql:8 — and the platform is
+// stateless-only in year one.
+//
+// kind classifies where the violation was caught so the customer can fix
+// the right thing: "dockerfile" → edit the Dockerfile, "tarball" → move
+// data/, "base_image" → switch to a managed service. detail is the offending
+// path/image and lands verbatim in the RFC 7807 body.
+func ErrStatelessOnlyViolation(kind, detail string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeStatelessOnlyViolation,
+		"Stateless-only platform",
+		fmt.Sprintf("%s: %s — this platform is stateless in year one; "+
+			"use a managed service (S3/R2/Neon/Upstash/MongoDB Atlas).",
+			kind, detail)).
+		WithDocs("https://docs.DOMAIN/storage")
 }
 
 // ErrDomainNotVerified is returned when a customer tries to bind a domain

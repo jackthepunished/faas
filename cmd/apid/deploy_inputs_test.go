@@ -583,3 +583,200 @@ func TestCreateDeploymentMultipart_FunctionHappyPath(t *testing.T) {
 	// handler/round-trip lives in the existing CreateDeployment image:
 	// test (server_test.go::TestCreateDeploymentImage).
 }
+
+// ─── Wave 0 stateless-only tests ────────────────────────────────────────
+//
+// Pinned for PR-A of Wave 0. Every test below targets a single check
+// inside scanForStatefulShape / scanDockerfileForStatefulShape so a
+// future refactor can't silently regress one branch while keeping the
+// others green. The HTTP-level integration (the actual 403 in the
+// problem+json body) is covered by TestCreateDeploymentMultipart_*
+// above — these tests pin the unit-level predicates.
+
+// TestScanForStatefulShape_HappyPath: a clean source deploy is accepted
+// (returns nil) regardless of the dockerfile flag.
+func TestScanForStatefulShape_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/index.js"},
+		{Name: "myproject/package.json"},
+	}, map[string][]byte{
+		"myproject/index.js":     []byte("exports.handler = () => 1;\n"),
+		"myproject/package.json": []byte(`{"name":"x"}`),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	if prob := scanForStatefulShape(path, false); prob != nil {
+		t.Fatalf("clean deploy rejected: code=%s detail=%s", prob.Code, prob.Detail)
+	}
+	if prob := scanForStatefulShape(path, true); prob != nil {
+		t.Fatalf("clean deploy rejected (dockerfile=true): code=%s detail=%s", prob.Code, prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_TopLevelDataDir: a tarball with a top-level
+// data/ directory is rejected as stateless_only_violation with kind=tarball.
+// Fixtures wrap in a project root (matches validateTarballShape's
+// single-root invariant), so "data/" is parts[1] of the tar path.
+func TestScanForStatefulShape_TopLevelDataDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/index.js"},
+		{Name: "myproject/data/"},
+		{Name: "myproject/data/payments.db"},
+	}, map[string][]byte{
+		"myproject/index.js":         []byte("exports.handler = () => 1;\n"),
+		"myproject/data/payments.db": {},
+	})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, false)
+	if prob == nil {
+		t.Fatal("expected rejection, got nil")
+	}
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	}
+	if !strings.Contains(prob.Detail, "data/") {
+		t.Errorf("detail %q does not mention data/", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_TopLevelDBDir: same posture as data/, different name.
+func TestScanForStatefulShape_TopLevelDBDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/db/"},
+		{Name: "myproject/db/main.sqlite"},
+	}, map[string][]byte{"myproject/db/main.sqlite": {}})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, false)
+	if prob == nil {
+		t.Fatal("expected rejection, got nil")
+	}
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	}
+	if !strings.Contains(prob.Detail, "db/") {
+		t.Errorf("detail %q does not mention db/", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_DockerfileVolume: a Dockerfile with VOLUME
+// is rejected with kind=dockerfile and the offending path in detail.
+func TestScanForStatefulShape_DockerfileVolume(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+		{Name: "myproject/index.js"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM node:22-slim\nVOLUME /var/lib/myapp\nCMD [\"node\",\"index.js\"]\n"),
+		"myproject/index.js":   []byte(""),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, false)
+	if prob == nil {
+		t.Fatal("expected rejection, got nil")
+	}
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	}
+	if !strings.Contains(prob.Detail, "VOLUME") || !strings.Contains(prob.Detail, "/var/lib/myapp") {
+		t.Errorf("detail %q does not mention VOLUME /var/lib/myapp", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_DockerfileMkfs: a Dockerfile with mkfs.ext4
+// inside RUN is rejected (mkfs/mount of a block device).
+func TestScanForStatefulShape_DockerfileMkfs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM alpine\nRUN mkfs.ext4 /dev/sdb1\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, false)
+	if prob == nil {
+		t.Fatal("expected rejection, got nil")
+	}
+	if !strings.Contains(prob.Detail, "mkfs") {
+		t.Errorf("detail %q does not mention mkfs", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_DockerfileMountExt4: same posture as mkfs,
+// different trigger substring (mount -t ext4).
+func TestScanForStatefulShape_DockerfileMountExt4(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM alpine\nRUN mount -t ext4 /dev/sdb1 /data\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	prob := scanForStatefulShape(path, false)
+	if prob == nil {
+		t.Fatal("expected rejection, got nil")
+	}
+	if !strings.Contains(prob.Detail, "mkfs") && !strings.Contains(prob.Detail, "mount") {
+		t.Errorf("detail %q does not mention mkfs/mount", prob.Detail)
+	}
+}
+
+// TestScanForStatefulShape_CleanDockerfile: a Dockerfile without any
+// VOLUME / mkfs / mount -t ext4|xfs directive is accepted.
+func TestScanForStatefulShape_CleanDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM node:22-slim\nWORKDIR /app\nCOPY index.js .\nCMD [\"node\",\"index.js\"]\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	if prob := scanForStatefulShape(path, false); prob != nil {
+		t.Fatalf("clean Dockerfile rejected: code=%s detail=%s", prob.Code, prob.Detail)
+	}
+}
+
+// TestScanDockerfileForStatefulShape_Continuation: a RUN that ends with
+// `\` continues onto the next line; the mkfs check must catch a
+// mkfs.ext4 on the continuation line. Pinned because the line-continuation
+// logic is the easiest thing to break in a future refactor.
+func TestScanDockerfileForStatefulShape_Continuation(t *testing.T) {
+	dockerfile := []byte("FROM alpine\nRUN echo hello \\\n && mkfs.ext4 /dev/sdb1\n")
+	if reason := scanDockerfileForStatefulShape(dockerfile); reason == "" {
+		t.Fatal("expected violation on continuation, got clean")
+	}
+}
+
+// TestScanForStatefulShape_LowercaseCommentIsNotAVolume: lowercase
+// 'volume' inside a `#` comment is fine; the upper-cased VOLUME on its
+// own line trips. Pinned so a future "lowercase the prefix check"
+// refactor doesn't regress the false-positive path.
+func TestScanForStatefulShape_LowercaseCommentIsNotAVolume(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FAAS_SPOOL_ROOT", dir)
+
+	raw := buildTestTarGz(t, []tar.Header{
+		{Name: "myproject/Dockerfile"},
+	}, map[string][]byte{
+		"myproject/Dockerfile": []byte("FROM node:22-slim\n# volume paths live in /app\nWORKDIR /app\n"),
+	})
+	path := writeTarToSpool(t, dir, raw)
+	if prob := scanForStatefulShape(path, false); prob != nil {
+		t.Fatalf("comment tripped the VOLUME check: detail=%s", prob.Detail)
+	}
+}

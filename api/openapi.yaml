@@ -4635,7 +4635,7 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
     DeployFailed:
-      description: 'code: deploy_failed | image_not_found | image_manifest_invalid | build_oom | build_timeout'
+      description: 'code: deploy_failed | image_not_found | image_manifest_invalid | build_oom | build_timeout | stateless_only_violation'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

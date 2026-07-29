@@ -48,6 +48,16 @@ var ErrImageEgressDenied = errors.New("oci: egress denied by policy")
 // (see pkg/imaged/handler.go::aboveBaseLayers).
 var ErrImageManifestInvalid = errors.New("oci: manifest invalid")
 
+// ErrStatelessOnlyViolation is wrapped into the error returned from
+// imaged's buildImageLayer when the resolved OCI image name matches
+// StatefulBaseImageDenylist (pkg/imaged/base.go). Wave 0 / year-one
+// stateless-only contract — the platform does not run a stateful
+// service (postgres / redis / mysql / mongo) as the customer's base
+// image; they must use a managed service (Neon / Upstash / PlanetScale
+// / MongoDB Atlas) and inject credentials via `faas secrets set`.
+// Lifted to RFC 7807 CodeStatelessOnlyViolation (422) by SentinelToCode.
+var ErrStatelessOnlyViolation = errors.New("oci: stateless-only violation")
+
 // (Legacy ErrEgressDenied is declared in pkg/oci/egress.go to keep its
 // original home; IsImageTerminal below consults it directly.)
 
@@ -67,6 +77,7 @@ func IsImageTerminal(err error) bool {
 	return errors.Is(err, ErrImageNotFound) ||
 		errors.Is(err, ErrImageEgressDenied) ||
 		errors.Is(err, ErrImageManifestInvalid) ||
+		errors.Is(err, ErrStatelessOnlyViolation) ||
 		errors.Is(err, ErrEgressDenied)
 }
 
@@ -92,6 +103,8 @@ func SentinelToCode(err error) (code string, ok bool) {
 		return api.CodeImageEgressDenied, true
 	case errors.Is(err, ErrImageManifestInvalid):
 		return api.CodeImageManifestInvalid, true
+	case errors.Is(err, ErrStatelessOnlyViolation):
+		return api.CodeStatelessOnlyViolation, true
 	}
 	return "", false
 }

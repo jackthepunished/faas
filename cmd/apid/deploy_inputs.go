@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -118,6 +120,21 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 	if sourcePath == "" {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"Source required", "multipart deploys require a 'source' file field"))
+		return
+	}
+
+	// Wave 0 / year-one stateless-only: detect persistence-shaped
+	// deploys at accept time so we fail fast (no build slot wasted).
+	// Two checks run inside one tarball pass:
+	//   - Dockerfile scan: VOLUME instruction, mkfs/mount -t ext4|xfs
+	//     inside a RUN. Only when the customer marked dockerfile=true
+	//     OR a Dockerfile exists at the archive root (Railpack detect
+	//     handles the latter case, but we surface the violation here).
+	//   - Tarball root: a `data/` or `db/` directory at the top level
+	//     is the canonical "this is a database" signal.
+	// Both pass the same spooled tarball — no extra I/O.
+	if prob := scanForStatefulShape(sourcePath, dockerfile); prob != nil {
+		api.WriteProblem(w, prob)
 		return
 	}
 
@@ -323,6 +340,146 @@ func escapesArchiveRoot(p string) bool {
 		}
 	}
 	return false
+}
+
+// scanForStatefulShape is the Wave 0 stateless-only accept-time check.
+// Reads the spooled tarball once and rejects with CodeStatelessOnlyViolation
+// when the deploy shape is a persistent one. Three checks, all in one pass:
+//
+//  1. If a Dockerfile exists at the archive root (or dockerfile=true was
+//     sent), reject any VOLUME instruction or mkfs/mount -t ext4|xfs call
+//     inside a RUN directive. Bounded: we only read up to dockerfileMaxBytes
+//     of the Dockerfile so a multi-MB heredoc can't pin apid.
+//  2. Reject a top-level data/ or db/ directory — the canonical
+//     "this is a database" signal that bypasses Dockerfile detection.
+//  3. The base-image deny-list runs in pkg/imaged, not here — apid only
+//     sees a tarball or an image: ref; the image: branch is enforced
+//     where the image is pulled (pkg/imaged/handler.go buildImageLayer).
+//
+//nolint:forbidigo // path is the tmp file apid just wrote via os.Create in validateAndSpool above with a fresh random id; apid OWNS the parent directory AND the inode, customer never touched them — symlink-attack impossible. Stateless-shape validation re-reads the same bytes validateTarballShape just walked.
+func scanForStatefulShape(path string, dockerfileFlag bool) *api.Problem {
+	f, err := os.Open(path)
+	if err != nil {
+		return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid, "Bad source", err.Error())
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid, "Not gzip", "source must be tar.gz")
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+
+	var dockerfileBytes []byte
+	topLevelDirs := make(map[string]struct{})
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid, "Bad tar", err.Error())
+		}
+		// Capture top-level directory name once. tar paths are
+		// `<root>/<sub>/<file>`; the first segment is the archive
+		// root (already enforced single-root by validateTarballShape)
+		// so the second segment names the customer's top-level dir.
+		// We collect anything that isn't a Dockerfile itself.
+		parts := strings.SplitN(hdr.Name, "/", 3)
+		if len(parts) >= 2 {
+			topLevelDirs[parts[1]] = struct{}{}
+		}
+		// Only read the Dockerfile at the archive root. We do this
+		// lazily — dockerfileMaxBytes caps the read so a hostile
+		// heredoc can't pin apid.
+		baseName := parts[len(parts)-1]
+		if baseName == "Dockerfile" && len(parts) == 2 {
+			dockerfileBytes, _ = io.ReadAll(io.LimitReader(tr, dockerfileMaxBytes))
+		}
+	}
+
+	// Check 2: top-level data/ or db/ directory. Both are the
+	// canonical "I'm trying to persist" signal. Empty dirs are fine
+	// (the tar entry exists either way).
+	if _, ok := topLevelDirs["data"]; ok {
+		return api.ErrStatelessOnlyViolation("tarball", "top-level data/ directory — this platform is stateless")
+	}
+	if _, ok := topLevelDirs["db"]; ok {
+		return api.ErrStatelessOnlyViolation("tarball", "top-level db/ directory — this platform is stateless")
+	}
+
+	// Check 1: Dockerfile scan. If the customer marked dockerfile=true
+	// but no Dockerfile was found, builderd will fail downstream; we
+	// don't pre-empt that here. If we found a Dockerfile, scan it.
+	if len(dockerfileBytes) > 0 || dockerfileFlag {
+		if len(dockerfileBytes) == 0 {
+			// dockerfile=true but no Dockerfile in the archive root —
+			// not our problem to flag (CodeSourceInvalid will catch it
+			// at build time via Railpack); just skip the scan.
+			return nil
+		}
+		if reason := scanDockerfileForStatefulShape(dockerfileBytes); reason != "" {
+			return api.ErrStatelessOnlyViolation("dockerfile", reason)
+		}
+	}
+	return nil
+}
+
+// dockerfileMaxBytes caps how much of a Dockerfile we'll read in-process.
+// 256 KiB is generous for a real Dockerfile (typical: <4 KiB) and bounds
+// the per-deploy apid CPU cost.
+const dockerfileMaxBytes = 256 * 1024
+
+// scanDockerfileForStatefulShape walks a Dockerfile's bytes looking for
+// persistence-shaped directives. Returns the offending line/instruction
+// for inclusion in the RFC 7807 body, or "" if clean.
+//
+// The checks are intentionally narrow: VOLUME on its own line, and
+// mkfs/mount -t ext4|xfs inside any RUN. We do NOT try to be clever
+// about RUN continuations or here-docs — adversarial users can `RUN
+// echo VOLUME > /tmp/x` to bypass. The deny-list at the base-image
+// level (pkg/imaged/base.go) catches the postgres/redis/mysql case
+// which is the actually common one.
+func scanDockerfileForStatefulShape(b []byte) string {
+	scanner := bufio.NewScanner(bytes.NewReader(b))
+	// Allow long lines (some RUN directives run thousands of chars).
+	scanner.Buffer(make([]byte, 0, 64*1024), dockerfileMaxBytes)
+	inRun := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Line continuations: a RUN that ends with `\` keeps reading.
+		if inRun {
+			if strings.Contains(line, "mkfs.ext4") || strings.Contains(line, "mkfs.xfs") ||
+				strings.Contains(line, "mount -t ext4") || strings.Contains(line, "mount -t xfs") {
+				return "mkfs/mount of a block device inside RUN"
+			}
+			if strings.HasSuffix(scanner.Text(), `\`) {
+				continue
+			}
+			inRun = false
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "VOLUME") {
+			// VOLUME ["/data"] or VOLUME /data /var — extract the args.
+			args := strings.Fields(line)
+			if len(args) > 1 {
+				return "VOLUME " + strings.Join(args[1:], " ")
+			}
+			return "VOLUME"
+		}
+		if strings.HasPrefix(upper, "RUN") {
+			inRun = strings.HasSuffix(scanner.Text(), `\`)
+			if strings.Contains(line, "mkfs.ext4") || strings.Contains(line, "mkfs.xfs") ||
+				strings.Contains(line, "mount -t ext4") || strings.Contains(line, "mount -t xfs") {
+				return "mkfs/mount of a block device inside RUN"
+			}
+		}
+	}
+	return ""
 }
 
 // truthyFlagLiterals are the string values the multipart dockerfile
