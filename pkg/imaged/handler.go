@@ -482,6 +482,18 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 // deploys (issue #53 / M5 acceptance on Lima).
 func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) error {
 	ref := dep.ImageDigest
+
+	// Wave 0 / year-one stateless-only: refuse well-known stateful
+	// base images before we burn the PullDigest round-trip. The check
+	// runs first because PullDigest is the expensive part of the
+	// build (registry dial + manifest GET); a stateful base is going
+	// to fail anyway, just later.
+	if hint, denied := StatefulDenyListMatch(ref); denied {
+		err := fmt.Errorf("%w: %s — %s", errStatefulViolation, ref, hint)
+		_ = h.markDeployFailed(ctx, dep.ID, err, "stateful base image denied")
+		return err
+	}
+
 	digest, err := h.oci.PullDigest(ctx, ref)
 	if err != nil {
 		_ = h.markDeployFailed(ctx, dep.ID, err, "oci pull failed")

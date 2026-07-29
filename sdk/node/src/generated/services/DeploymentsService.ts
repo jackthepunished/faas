@@ -56,7 +56,7 @@ export class DeploymentsService {
         401: `code: unauthorized`,
         403: `code: image_egress_denied — registry is in RFC1918 / IMDS / link-local, or blocked egress range.`,
         413: `code: source_too_large`,
-        422: `code: deploy_failed | image_not_found | image_manifest_invalid | build_oom | build_timeout`,
+        422: `code: deploy_failed | image_not_found | image_manifest_invalid | build_oom | build_timeout | stateless_only_violation`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
