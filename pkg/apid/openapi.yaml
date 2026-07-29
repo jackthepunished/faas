@@ -3884,6 +3884,16 @@ components:
           type: string
           description: "Account id (uuid string form) the event was recorded against. Omitted when the event has no subject (e.g. system-level)."
           example: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+        # Mega-PR B / stateless-advisory severity hoist. Top-level
+        # projection of the audit row's data.severity key so an SDK
+        # consumer can triage without re-parsing the data JSONB.
+        # Closed vocabulary; "" (omitted on the wire) for non-
+        # stateless kinds and pre-PR-427 stateless.advisory rows.
+        severity:
+          type: string
+          description: "Highest-severity classification for stateless.advisory rows (`high` for /data, /db, /var/lib/postgresql, /var/lib/mysql; `warn` for other closed paths; `info` for an empty batch). Omitted for non-stateless kinds and for pre-PR-427 stateless.advisory rows where the data.severity key is absent. Mega-PR B / stateless-DX work."
+          enum: [high, warn, info]
+          example: high
         data:
           type: object
           description: "Kind-specific payload. Always a JSON object; the inner shape depends on `kind`. Plaintext values (e.g. secret VALUE) are NEVER carried in `data`."
