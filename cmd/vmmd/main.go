@@ -237,26 +237,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// /srv/fc).
 	mgr.WithStorage(storageBackend)
 
-	// Wave 0 PR-C / ADR-047: vmmd becomes a gRPC client for the
-	// first time. The AdvisoryClient dials /run/faas/apid.sock to
-	// forward guest-init fanotify batches. Empty FAAS_APID_ADVISORY_SOCK
-	// disables (matches apid's explicit-empty pattern); nil client
-	// short-circuits Manager.ForwardStatelessAdvisory to a no-op.
-	advisoryTarget := envOr("FAAS_APID_ADVISORY_SOCK", "unix:///run/faas/apid.sock")
-	var advisoryCli *vmmdgrpc.AdvisoryClient
-	if advisoryTarget != "" {
-		advisoryCli = vmmdgrpc.NewAdvisoryClient(advisoryTarget, log)
-		mgr.SetAdvisoryClient(advisoryCli)
-		log.Info("vmmd: stateless advisory client wired", "target", advisoryTarget)
-	}
-	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,
-		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
-		"host_key_path", keyPath, "recipient_path", pubPath,
-		"recipient", hostID.Recipient().String())
-
 	// Ops + listener. Resolve the listen target (issue #95): unix://
 	// default, tcp/dns optional; tcp targets require a complete mTLS
 	// cluster and the loader rejects partial configs.
+	//
+	// Hoisted above NewAdvisoryClient (Mega-PR B): the advisory
+	// client increments vmmd_stateless_advisory_batches_emitted_total
+	// on every Forward outcome, so OpsMetrics must exist before the
+	// client constructor captures it. Same single-registry pattern
+	// (memory wire-opsmetrics-single-registry) as every other
+	// vmmd-side metric.
 	ops := wire.NewOpsMetrics("vmmd")
 	// issue #299: wire the OpsMetrics the Manager's scan check
 	// feeds per-severity finding counts into (vmmd_trivy_image_vulns_total{image, severity}).
@@ -265,6 +255,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// so this call is the vmmd-side producer wiring only — no new
 	// registration, no new listener.
 	mgr.SetImageScanMetrics(ops)
+
+	// Wave 0 PR-C / ADR-047: vmmd becomes a gRPC client for the
+	// first time. The AdvisoryClient dials /run/faas/apid.sock to
+	// forward guest-init fanotify batches. Empty FAAS_APID_ADVISORY_SOCK
+	// disables (matches apid's explicit-empty pattern); nil client
+	// short-circuits Manager.ForwardStatelessAdvisory to a no-op.
+	//
+	// Mega-PR B: pass `ops` so the AdvisoryClient can increment
+	// stateless_advisory_batches_emitted_total{result} on every
+	// Forward outcome. The accessor is nil-receiver safe, so a
+	// nil ops is also a clean no-op (kept for symmetry / unit
+	// tests that don't wire metrics).
+	advisoryTarget := envOr("FAAS_APID_ADVISORY_SOCK", "unix:///run/faas/apid.sock")
+	var advisoryCli *vmmdgrpc.AdvisoryClient
+	if advisoryTarget != "" {
+		advisoryCli = vmmdgrpc.NewAdvisoryClient(advisoryTarget, log, ops)
+		mgr.SetAdvisoryClient(advisoryCli)
+		log.Info("vmmd: stateless advisory client wired", "target", advisoryTarget)
+	}
+	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,
+		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
+		"host_key_path", keyPath, "recipient_path", pubPath,
+		"recipient", hostID.Recipient().String())
 	serverTLS, err := cfg.LoadServerTLS()
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)

@@ -2395,28 +2395,32 @@ func (m *OpsMetrics) ObserveOAuthDisabled(provider string) {
 }
 
 // advisoryBatchResult labels for ObserveAdvisoryBatchResult
-// (Mega-PR B). Defined as constants so the goconst gate doesn't
-// fire on the receiver-side switch and the test fixtures share
-// the same vocabulary. Adding a new outcome means extending
-// both the const block and the pre-instantiation loop in
-// NewOpsMetrics; the switch below is the load-bearing closed-set
-// guard that prevents accidentally creating a new series.
+// (Mega-PR B). Exported so the vmmd-side producer
+// (pkg/vmmdgrpc/advisory_client.go) can call Observe with the
+// exact closed-set label values rather than re-literal-string the
+// vocabulary. Adding a new outcome means extending both the const
+// block and the pre-instantiation loop in NewOpsMetrics; the
+// switch in ObserveAdvisoryBatchResult is the load-bearing
+// closed-set guard that prevents accidentally creating a new
+// series.
 const (
-	advisoryResultOK                    = "ok"
-	advisoryResultDialFailed            = "dial_failed"
-	advisoryResultRejected              = "rejected"
-	advisoryResultUnavailableAfterRetry = "unavailable_after_retry"
+	AdvisoryResultOK                    = "ok"
+	AdvisoryResultDialFailed            = "dial_failed"
+	AdvisoryResultRejected              = "rejected"
+	AdvisoryResultUnavailableAfterRetry = "unavailable_after_retry"
 )
 
 // advisorySeverity labels for ObserveStatelessAdvisory (Mega-PR
-// B). Mirrors the cmd/apid/advisory_receiver.go vocabulary
+// B). Exported so cmd/apid/advisory_receiver.go's receiver can
+// call Observe with the exact closed-set label values. Mirrors
+// the cmd/apid/advisory_receiver.go vocabulary
 // (severityHigh / severityWarn / severityInfo) but defined here
 // as the canonical wire-side labels so the test fixtures share
 // the same values across both packages.
 const (
-	advisorySeverityHigh = "high"
-	advisorySeverityWarn = "warn"
-	advisorySeverityInfo = "info"
+	AdvisorySeverityHigh = "high"
+	AdvisorySeverityWarn = "warn"
+	AdvisorySeverityInfo = "info"
 )
 
 // ObserveAdvisoryBatchResult increments
@@ -2424,11 +2428,11 @@ const (
 // Called from pkg/vmmdgrpc/advisory_client.go on each
 // ForwardStatelessAdvisory RPC outcome:
 //
-//   - ok                       — apid returned success
-//   - dial_failed              — couldn't reach apid's unix socket
-//   - rejected                 — apid returned codes.InvalidArgument
+//   - AdvisoryResultOK                    — apid returned success
+//   - AdvisoryResultDialFailed            — couldn't reach apid's unix socket
+//   - AdvisoryResultRejected              — apid returned codes.InvalidArgument
 //     (validation failure; not retried)
-//   - unavailable_after_retry  — apid returned codes.Unavailable
+//   - AdvisoryResultUnavailableAfterRetry — apid returned codes.Unavailable
 //     after the retry budget was spent
 //
 // Unknown result values produce no increment (the CounterVec has
@@ -2441,7 +2445,7 @@ func (m *OpsMetrics) ObserveAdvisoryBatchResult(result string) {
 		return
 	}
 	switch result {
-	case advisoryResultOK, advisoryResultDialFailed, advisoryResultRejected, advisoryResultUnavailableAfterRetry:
+	case AdvisoryResultOK, AdvisoryResultDialFailed, AdvisoryResultRejected, AdvisoryResultUnavailableAfterRetry:
 		m.advisoryBatchesEmittedTotal.WithLabelValues(result).Inc()
 	}
 }
@@ -2449,16 +2453,17 @@ func (m *OpsMetrics) ObserveAdvisoryBatchResult(result string) {
 // ObserveStatelessAdvisory increments
 // stateless_advisory_events_total{severity} (Mega-PR B). Called
 // from cmd/apid/advisory_receiver.go's ForwardStatelessAdvisory
-// handler on each landed advisory. severity is "high" / "warn"
-// / "info" — the same vocabulary advisoryBatchSeverity already
-// produces. Unknown values produce no increment (closed-set
-// guard). Nil receiver is allowed for parity.
+// handler on each landed advisory. severity is
+// AdvisorySeverityHigh / Warn / Info — the same vocabulary
+// advisoryBatchSeverity already produces. Unknown values produce
+// no increment (closed-set guard). Nil receiver is allowed for
+// parity.
 func (m *OpsMetrics) ObserveStatelessAdvisory(severity string) {
 	if m == nil || m.apidStatelessAdvisoryEventsTotal == nil {
 		return
 	}
 	switch severity {
-	case advisorySeverityHigh, advisorySeverityWarn, advisorySeverityInfo:
+	case AdvisorySeverityHigh, AdvisorySeverityWarn, AdvisorySeverityInfo:
 		m.apidStatelessAdvisoryEventsTotal.WithLabelValues(severity).Inc()
 	}
 }
