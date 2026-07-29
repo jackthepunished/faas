@@ -1675,11 +1675,11 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 	// memstore. Pin the seed here so a future contributor who changes
 	// memstore.seedDefaultLocalNodeLocked (or the migration) sees a
 	// targeted failure if the two drift apart.
-	if got.Region == nil || *got.Region != "local" {
-		t.Errorf("Region = %v, want pointer to \"local\"", got.Region)
+	if got.Region == nil || *got.Region != DefaultLocalityLabel {
+		t.Errorf("Region = %v, want pointer to %q", got.Region, DefaultLocalityLabel)
 	}
-	if got.Zone == nil || *got.Zone != "local" {
-		t.Errorf("Zone = %v, want pointer to \"local\"", got.Zone)
+	if got.Zone == nil || *got.Zone != DefaultLocalityLabel {
+		t.Errorf("Zone = %v, want pointer to %q", got.Zone, DefaultLocalityLabel)
 	}
 }
 

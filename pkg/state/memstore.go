@@ -3285,7 +3285,7 @@ func parseSubjectID(s string) *uuid.UUID {
 func (m *MemStore) seedDefaultLocalNodeLocked() {
 	now := time.Now()
 	id := newID()
-	local := "local"
+	local := DefaultLocalityLabel
 	m.computeNodes[id] = ComputeNode{
 		ID:             id,
 		Name:           DefaultLocalNodeName,
