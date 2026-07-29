@@ -164,6 +164,24 @@ type Engine struct {
 	// daemon startup.
 	warmBroadcaster *warmHintBroadcaster
 
+	// capacityTable is the vmmd→schedd live-capacity cache
+	// (ADR-025 axis 5). The handler in pkg/scheddgrpc drives
+	// table.Replace on every ReportCapacity RPC event; the
+	// chooser (engine.go::applyLiveCapacityMB, PR-2) reads via
+	// Lookup before falling back to store.ComputeNodeUsedMB.
+	//
+	// Initialised eagerly inside NewEngine (not lazily via
+	// WithCapacityTable) because the only writer is the gRPC
+	// handler and a nil table at lookup time would silently
+	// degrade to stale-store — eager init catches a missed
+	// wiring at daemon startup.
+	//
+	// nil is tolerated by the chooser (Lookup returns false)
+	// and by the handler (the SchedAPI seam surfaces a nil-safe
+	// accessor) so pre-axis-5 test fixtures that don't wire a
+	// table keep their existing single-box behaviour.
+	capacityTable *nodeCapacityTable
+
 	// defaultLocalNodeID is the resolved UUID of the 'default-local'
 	// compute_node (issue #97 / ADR-025 axis 3). Looked up once at
 	// construction via ComputeNodeByName so the router can resolve
@@ -230,6 +248,7 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		log:             log,
 		appMu:           map[string]*sync.Mutex{},
 		warmBroadcaster: newWarmHintBroadcaster(),
+		capacityTable:   newNodeCapacityTable(),
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
 	// doesn't block the daemon's boot forever — the watchdog goroutine
@@ -275,6 +294,34 @@ func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
 	e.verifier = v
 	return e
+}
+
+// CapacityTable returns the per-node live-capacity table for
+// the ReportCapacity gRPC handler to drive (ADR-025 axis 5).
+// The handler calls table.Replace per stream Recv; the chooser
+// (PR-2) reads via Lookup.
+//
+// nil-safe: pre-axis-5 fixtures that bypass NewEngine return nil,
+// and the handler treats nil as "no table, drop the wire".
+// Production paths always go through NewEngine so the table is
+// eagerly initialised.
+func (e *Engine) CapacityTable() *nodeCapacityTable { return e.capacityTable }
+
+// CapacitySink returns the table-apply sink the ReportCapacity
+// handler invokes per stream Recv (ADR-025 axis 5). The closure
+// applies the report to the engine's per-node table; a non-nil
+// error aborts the stream (today the closure never errors —
+// kept as a func-returning-closure to match the SchedAPI /
+// WarmHintSink shape and to give tests a stable seam).
+//
+// Returning the sink rather than the table itself keeps the
+// nodeCapacityTable type unexported in pkg/sched and presents a
+// narrow surface to the gRPC layer — the handler cannot read or
+// mutate table state outside the per-event Replace path.
+//
+// nil table (pre-axis-5 fixture) returns a no-op sink.
+func (e *Engine) CapacitySink() CapacitySink {
+	return e.capacityTable.CapacitySink()
 }
 
 // WakeResult is what the gateway needs back from a wake: which instance

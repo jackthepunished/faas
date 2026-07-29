@@ -35,6 +35,7 @@ const (
 	Schedd_ListInstanceStats_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
 	Schedd_StreamAppLogs_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
 	Schedd_StreamWarmHints_FullMethodName   = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
+	Schedd_ReportCapacity_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -161,6 +162,44 @@ type ScheddClient interface {
 	// Additive per ADR-016: new RPC + new messages append at the end;
 	// existing field tags are untouched.
 	StreamWarmHints(ctx context.Context, in *StreamWarmHintsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamWarmHintsResponse], error)
+	// ReportCapacity (ADR-025 axis 5) is the vmmd→schedd live-capacity
+	// push. vmmd is the gRPC client and opens one stream per daemon at
+	// startup, sending a CapacityReport at ~1 s cadence (constant
+	// cmd/vmmd.CapacityInterval). schedd updates a per-node in-memory
+	// table that the placement chooser reads before falling back to the
+	// store's stale-sum aggregate.
+	//
+	// Trust model: the chooser reads capacity as one input to
+	// ChoosePlacement, never as the only input. The per-node
+	// AdmissionCeilingMB check inside ChoosePlacement
+	// (pkg/sched/placement.go:104-107) and the per-node ledger floor
+	// (pkg/sched/engine.go::applyLiveCapacityMB, PR-2) are the
+	// load-bearing enforcement; capacity reports inform, never gate.
+	// A stale-low or hostile vmmd cannot shrink the live accounting
+	// below the ledger's per-node ResidentRAM and force schedd to
+	// over-admit (§6.2-2 invariant).
+	//
+	// Semantics:
+	//   - Client-streaming; vmmd is the producer.
+	//   - "Tail from now": the consumer accepts reports as they arrive;
+	//     a slow vmmd never back-pressures because reports are best-effort.
+	//   - An empty capacity table (no reports within
+	//     CapacityFreshness = 5 s) falls back to
+	//     store.ComputeNodeUsedMB — the legacy single-box behaviour.
+	//     Single-box installs without a publisher configured see
+	//     identical behaviour to pre-axis-5.
+	//
+	// Wire error mapping:
+	//   - codes.OK + nil on clean shutdown (vmmd cancels after CloseAndRecv
+	//     completes)
+	//   - codes.Canceled when vmmd cancels mid-stream
+	//   - codes.Unavailable for any unexpected drain failure
+	//   - codes.InvalidArgument if a report's node_id is empty (a
+	//     programming bug in vmmd; the handler must NOT silently drop).
+	//
+	// Additive per ADR-016: new RPC + new messages append at the end;
+	// existing field tags are untouched.
+	ReportCapacity(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CapacityReport, ReportCapacityAck], error)
 }
 
 type scheddClient struct {
@@ -258,6 +297,19 @@ func (c *scheddClient) StreamWarmHints(ctx context.Context, in *StreamWarmHintsR
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_StreamWarmHintsClient = grpc.ServerStreamingClient[StreamWarmHintsResponse]
+
+func (c *scheddClient) ReportCapacity(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CapacityReport, ReportCapacityAck], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Schedd_ServiceDesc.Streams[2], Schedd_ReportCapacity_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CapacityReport, ReportCapacityAck]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Schedd_ReportCapacityClient = grpc.ClientStreamingClient[CapacityReport, ReportCapacityAck]
 
 // ScheddServer is the server API for Schedd service.
 // All implementations must embed UnimplementedScheddServer
@@ -383,6 +435,44 @@ type ScheddServer interface {
 	// Additive per ADR-016: new RPC + new messages append at the end;
 	// existing field tags are untouched.
 	StreamWarmHints(*StreamWarmHintsRequest, grpc.ServerStreamingServer[StreamWarmHintsResponse]) error
+	// ReportCapacity (ADR-025 axis 5) is the vmmd→schedd live-capacity
+	// push. vmmd is the gRPC client and opens one stream per daemon at
+	// startup, sending a CapacityReport at ~1 s cadence (constant
+	// cmd/vmmd.CapacityInterval). schedd updates a per-node in-memory
+	// table that the placement chooser reads before falling back to the
+	// store's stale-sum aggregate.
+	//
+	// Trust model: the chooser reads capacity as one input to
+	// ChoosePlacement, never as the only input. The per-node
+	// AdmissionCeilingMB check inside ChoosePlacement
+	// (pkg/sched/placement.go:104-107) and the per-node ledger floor
+	// (pkg/sched/engine.go::applyLiveCapacityMB, PR-2) are the
+	// load-bearing enforcement; capacity reports inform, never gate.
+	// A stale-low or hostile vmmd cannot shrink the live accounting
+	// below the ledger's per-node ResidentRAM and force schedd to
+	// over-admit (§6.2-2 invariant).
+	//
+	// Semantics:
+	//   - Client-streaming; vmmd is the producer.
+	//   - "Tail from now": the consumer accepts reports as they arrive;
+	//     a slow vmmd never back-pressures because reports are best-effort.
+	//   - An empty capacity table (no reports within
+	//     CapacityFreshness = 5 s) falls back to
+	//     store.ComputeNodeUsedMB — the legacy single-box behaviour.
+	//     Single-box installs without a publisher configured see
+	//     identical behaviour to pre-axis-5.
+	//
+	// Wire error mapping:
+	//   - codes.OK + nil on clean shutdown (vmmd cancels after CloseAndRecv
+	//     completes)
+	//   - codes.Canceled when vmmd cancels mid-stream
+	//   - codes.Unavailable for any unexpected drain failure
+	//   - codes.InvalidArgument if a report's node_id is empty (a
+	//     programming bug in vmmd; the handler must NOT silently drop).
+	//
+	// Additive per ADR-016: new RPC + new messages append at the end;
+	// existing field tags are untouched.
+	ReportCapacity(grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]) error
 	mustEmbedUnimplementedScheddServer()
 }
 
@@ -413,6 +503,9 @@ func (UnimplementedScheddServer) StreamAppLogs(*StreamAppLogsRequest, grpc.Serve
 }
 func (UnimplementedScheddServer) StreamWarmHints(*StreamWarmHintsRequest, grpc.ServerStreamingServer[StreamWarmHintsResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamWarmHints not implemented")
+}
+func (UnimplementedScheddServer) ReportCapacity(grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]) error {
+	return status.Error(codes.Unimplemented, "method ReportCapacity not implemented")
 }
 func (UnimplementedScheddServer) mustEmbedUnimplementedScheddServer() {}
 func (UnimplementedScheddServer) testEmbeddedByValue()                {}
@@ -547,6 +640,13 @@ func _Schedd_StreamWarmHints_Handler(srv interface{}, stream grpc.ServerStream) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_StreamWarmHintsServer = grpc.ServerStreamingServer[StreamWarmHintsResponse]
 
+func _Schedd_ReportCapacity_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ScheddServer).ReportCapacity(&grpc.GenericServerStream[CapacityReport, ReportCapacityAck]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Schedd_ReportCapacityServer = grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]
+
 // Schedd_ServiceDesc is the grpc.ServiceDesc for Schedd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -585,6 +685,11 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "StreamWarmHints",
 			Handler:       _Schedd_StreamWarmHints_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "ReportCapacity",
+			Handler:       _Schedd_ReportCapacity_Handler,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "onebox/faas/schedd/v1/schedd.proto",

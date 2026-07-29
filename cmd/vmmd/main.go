@@ -79,6 +79,24 @@ type runDeps struct {
 	// bound to ctx + ops + popCounters + log. Tests inject a no-op to
 	// skip the loop entirely, or a callback to observe the seam args.
 	startEgressPoll func(ctx context.Context, ops *wire.OpsMetrics, pop popCountersFunc, interval time.Duration, log *slog.Logger)
+	// scheddTarget: ADR-025 axis 5 — vmmd's outbound gRPC target for
+	// the capacity publisher. Empty disables the publisher entirely
+	// (single-box dev default). Tests inject a fake target to drive
+	// the seam without a real schedd.
+	scheddTarget string
+	// capacityInterval: ADR-025 axis 5 — override for the publisher's
+	// tick cadence. nil → CapacityInterval (1 s). Tests inject
+	// sub-second cadence so the loop has observable ticks in a unit
+	// test.
+	capacityInterval *time.Duration
+	// residentFn: ADR-025 axis 5 — leakcheck seam. nil → leakcheck.ResidentBytes.
+	// Tests inject a stub returning a fixed map.
+	residentFn func() (map[string]int64, bool)
+	// startCapacityPublish: ADR-025 axis 5 — seam for the publisher
+	// goroutine. nil → start the production loop rooted at runCapacityPublish.
+	// Tests inject a no-op to skip the loop or a callback to drive
+	// the seam args.
+	startCapacityPublish func(ctx context.Context, mgr *fcvm.Manager, nodeID string, cfg ComputeNodeConfig, scheddTarget string, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
 }
 
 func defaultDeps() runDeps {
@@ -95,6 +113,12 @@ func defaultDeps() runDeps {
 		popCounters:        netns.PopCounters,
 		egressPollInterval: durationPtr(EgressPollInterval),
 		startEgressPoll:    nil, // defaultDeps() leaves nil so the runtime branch can detect "use production"
+		scheddTarget:       envOr("FAAS_VMMD_SCHEDD_TARGET", "unix:///run/faas/schedd.sock"),
+		capacityInterval:   durationPtr(CapacityInterval),
+		// residentFn left nil; runWithDeps fills it with
+		// leakcheck.ResidentBytes once the resolver runs.
+		// startCapacityPublish left nil; the runtime branch
+		// detects "use production" and calls runCapacityPublish.
 	}
 }
 
@@ -185,6 +209,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// path (NodeName empty) skips the DB entirely — no migration
 	// is required on a fresh single-box dev install beyond what
 	// already exists.
+	var nodeID string
 	if cfg.ComputeNode.NodeName != "" {
 		dbURL := cfg.DBURL
 		if dbURL == "" {
@@ -199,9 +224,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		defer pool.Close()
 		store := deps.openStore(pool)
-		if _, err := registerComputeNode(ctx, store, cfg.ComputeNode, listenTarget, deps.detectOverlayIP, log); err != nil {
+		cn, err := registerComputeNode(ctx, store, cfg.ComputeNode, listenTarget, deps.detectOverlayIP, log)
+		if err != nil {
 			return err
 		}
+		nodeID = cn.ID
 	}
 
 	cbm := fcvm.NewColdBootMetrics()
@@ -369,6 +396,33 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// 200 ms cadence; meterd's sampler appends to
 	// usage_minutes.net_tx_bytes additively per minute.
 	go runNetworkEgressPoll(ctx, mgr, netCache, ops, nil, nil, nil, 0, log)
+
+	// ADR-025 axis 5: vmmd publishes live capacity (live_count,
+	// leased_count, used_mb, ram_headroom_mb, vcpu_busy) to
+	// schedd on a 1 s cadence. The publisher only runs on the
+	// multi-node path (NodeName set, nodeID non-empty). The
+	// single-box default-local vmmd skips the loop entirely,
+	// preserving backward compatibility (ADR-005 cold-boot).
+	//
+	// residentFn is the leakcheck seam — leakcheck.ResidentBytes
+	// on Linux, nil on non-Linux dev boxes (the chooser then
+	// falls back to the store sum).
+	if nodeID != "" && deps.scheddTarget != "" {
+		interval := CapacityInterval
+		if deps.capacityInterval != nil {
+			interval = *deps.capacityInterval
+		}
+		resident := deps.residentFn
+		if resident == nil {
+			resident = leakcheckResidentBytes
+		}
+		if deps.startCapacityPublish != nil {
+			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, interval, resident, log)
+		} else {
+			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, interval, resident, log)
+		}
+		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())
+	}
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)
