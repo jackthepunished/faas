@@ -938,7 +938,7 @@ func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Pr
 // is only applied when a non-empty accountID is supplied — passing ""
 // (the cross-account push dispatch, or a test that hasn't bound an
 // account yet) skips the account predicate so the uuid→text coercion
-// in `account_id = ''` doesn't trip on an empty string.
+// in `account_id = ”` doesn't trip on an empty string.
 func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
 	if accountID == "" {
 		row := s.pool.QueryRow(ctx, `
