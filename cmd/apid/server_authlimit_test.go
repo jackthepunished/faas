@@ -187,7 +187,6 @@ var v1RoutesRequiringAuth = []struct {
 	{"POST", "/v1/apps/example-slug/park"},
 	{"POST", "/v1/apps/example-slug/wake"},
 	{"GET", "/v1/apps/example-slug/instances"},
-	{"GET", "/v1/apps/example-slug/logs"},
 	{"GET", "/v1/domains"},
 	{"POST", "/v1/domains"},
 	{"DELETE", "/v1/domains/example.test"},

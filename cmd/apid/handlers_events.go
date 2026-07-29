@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apislogs"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -86,7 +87,7 @@ func (s *server) eventsHandler(log *slog.Logger) http.HandlerFunc {
 		}
 		ownedApps := s.buildOwnedAppCache(r.Context(), acct.ID)
 
-		startSSE(w)
+		apislogs.StartSSE(w)
 		flusher, _ := w.(http.Flusher)
 
 		ch, cancel, err := s.notif.Subscribe(r.Context(), eventsChannels)

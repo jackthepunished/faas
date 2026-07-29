@@ -152,13 +152,6 @@ type server struct {
 	// roll back the action). nil falls back to a no-op helper so
 	// older tests can build a server without an audit handle.
 	audit *auditor
-	// schedd is the typed handle to the schedd daemon (issue #254 /
-	// Move 4). apid uses it to drive the per-app log stream — the
-	// schedd fans out per-instance vmmd Logs RPCs and emits
-	// frames back over the gRPC stream. nil falls back to a
-	// stub that returns codes.Unimplemented so the SSE handler
-	// degrades gracefully when the daemon is unreachable.
-	schedd scheddClient
 	// authMw is the pkg/auth.Middleware that backs the
 	// s.requireMFA + s.requireScope facade methods
 	// (cmd/apid/auth_facade.go). Constructed in
@@ -170,13 +163,6 @@ type server struct {
 	//
 	// ADR-044.
 	authMw *authmw.Middleware
-	// appLogsHeartbeat and appLogsBackstop bound the serveAppLogs
-	// receive pump. Defaults are 15s heartbeat and 10m backstop
-	// (set by newServerWithDeps); whitebox tests shorten these
-	// via direct field assignment so timer cases don't have to
-	// wait the production interval. Issue #254.
-	appLogsHeartbeat time.Duration
-	appLogsBackstop  time.Duration
 }
 
 // anonymousAccountLabel is the literal value of the `account_id`
@@ -325,41 +311,6 @@ type Notifier interface {
 	WaitFor(ctx context.Context, channel string, predicate func(payload string) bool, timeout time.Duration) (string, error)
 }
 
-// scheddClient is the typed seam to the schedd daemon for the
-// per-app log stream (issue #254 / Move 4). Defined here so the
-// SSE handler stays decoupled from the gRPC client — tests pass
-// a recording stub without standing up the daemon.
-//
-// The production wiring is a *scheddgrpc.Client over a unix
-// socket (cmd/apid/main.go::dialSchedd). The nil fall-back
-// triggers the SSE handler's "schedd unreachable" branch which
-// emits a 503-style Problem frame and closes the stream.
-type scheddClient interface {
-	// StreamAppLogs fans out per-instance vmmd Logs RPCs into
-	// a single server-streaming response. Each frame is a
-	// scheddpb.StreamAppLogsResponse carrying the per-instance
-	// identity. Returns an error if the dialer / stream fails;
-	// the SSE handler maps that to its `degraded` event.
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (schedLogStream, error)
-}
-
-// schedLogStream is the typed view of scheddpb.Schedd_StreamAppLogsClient.
-// Decoupled from the proto so the SSE handler doesn't import
-// the generated package.
-type schedLogStream interface {
-	// Recv blocks until the next frame or the stream ends.
-	// Returns io.EOF on a clean shutdown.
-	Recv() (schedLogFrame, error)
-}
-
-type schedLogFrame struct {
-	InstanceID string
-	Seq        int64
-	Stream     string
-	Line       string
-	WrittenAt  time.Time
-}
-
 func newServer(store state.Store, log *slog.Logger, domain string, notif Notifier) *server {
 	return newServerWithDeps(store, log, domain, notif, "", nil, nil, nil, nil, 0, "")
 }
@@ -464,10 +415,6 @@ func newServerWithDeps(
 		audit:                  newAuditor(store, log, nil),
 		// schedd (issue #254 / Move 4) defaults to a stub that
 		// returns Unimplemented. Production wires the real client
-		// via withScheddClient (cmd/apid/main.go).
-		schedd:           stubScheddClient{},
-		appLogsHeartbeat: 15 * time.Second,
-		appLogsBackstop:  10 * time.Minute,
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the
@@ -602,7 +549,6 @@ func (s *server) handler() http.Handler {
 	// (ADR-040) fires at the gatewayd edge; this route charges 1
 	// token via authLimited just like every other /v1/* call.
 	mux.HandleFunc("GET /v1/instances", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInstancesForAccount))))
-	mux.HandleFunc("GET /v1/apps/{slug}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamAppLogs))))
 
 	// Custom domains.
 	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDomains))))
