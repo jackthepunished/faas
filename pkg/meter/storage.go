@@ -56,35 +56,64 @@ type AppRow struct {
 // snapshot bytes, and upserts the row for day=today (UTC). Idempotent
 // on PK (account_id, app_id, day). Returns the number of rows
 // touched (useful for metrics + test assertions).
-func StorageRollupOnce(ctx context.Context, store Store, now time.Time, layerFn func(ctx context.Context, appID string) (int64, error)) (int, error) {
+//
+// FAIL-SOFT per app (PR #428 review warning #3). A transient
+// lookup error for one app (e.g. LatestSnapshotBytes failing
+// mid-loop because pgxpool is saturated, or a flaky layerFn)
+// must NOT abort the whole rollup — the next tick covers the
+// gap. The first error is logged via log at Warn and returned
+// alongside the rows-written-so-far so the loop can decide
+// whether to count the tick as a partial success. log may be
+// nil (tests pass nil and assert no panic).
+func StorageRollupOnce(ctx context.Context, store Store, now time.Time, layerFn func(ctx context.Context, appID string) (int64, error), log *slog.Logger) (int, error) {
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	apps, err := store.ListAllApps(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("list apps: %w", err)
 	}
 	written := 0
+	var firstErr error
 	for _, a := range apps {
 		memBytes, diskBytes, err := store.LatestSnapshotBytes(ctx, a.AppID)
 		if err != nil {
-			// Fail-soft per app: a transient lookup error for one
-			// app should not abort the whole rollup. Log via
-			// caller; the rollup's metric records the skip.
-			return written, fmt.Errorf("snapshot bytes app=%s: %w", a.AppID, err)
+			// Fail-soft: log + skip this app, keep walking.
+			if log != nil {
+				log.Warn("storage rollup: snapshot bytes lookup failed; skipping app",
+					"app_id", a.AppID, "err", err)
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("snapshot bytes app=%s: %w", a.AppID, err)
+			}
+			continue
 		}
 		var layerBytes int64
 		if layerFn != nil {
 			layerBytes, err = layerFn(ctx, a.AppID)
 			if err != nil {
-				return written, fmt.Errorf("layer bytes app=%s: %w", a.AppID, err)
+				if log != nil {
+					log.Warn("storage rollup: layer bytes lookup failed; skipping app",
+						"app_id", a.AppID, "err", err)
+				}
+				if firstErr == nil {
+					firstErr = fmt.Errorf("layer bytes app=%s: %w", a.AppID, err)
+				}
+				continue
 			}
 		}
 		snapshotBytes := memBytes + diskBytes
 		if err := store.AppendSnapshotStorage(ctx, a.AccountID, a.AppID, day, snapshotBytes, layerBytes); err != nil {
-			return written, fmt.Errorf("upsert rollup app=%s: %w", a.AppID, err)
+			if log != nil {
+				log.Warn("storage rollup: upsert failed; skipping app",
+					"app_id", a.AppID, "err", err)
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("upsert rollup app=%s: %w", a.AppID, err)
+			}
+			continue
 		}
 		written++
 	}
-	return written, nil
+	return written, firstErr
 }
 
 // StorageRollupLoop is the free-function goroutine that calls
@@ -102,10 +131,11 @@ func StorageRollupLoop(ctx context.Context, store Store, layerFn func(ctx contex
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := StorageRollupOnce(ctx, store, time.Now().UTC(), layerFn)
+			n, err := StorageRollupOnce(ctx, store, time.Now().UTC(), layerFn, log)
 			if err != nil {
 				if log != nil {
-					log.Error("storage rollup tick failed", "err", err, "written", n)
+					log.Warn("storage rollup tick had per-app errors; partial success",
+						"err", err, "written", n)
 				}
 				continue
 			}

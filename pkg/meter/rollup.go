@@ -8,15 +8,28 @@
 // table (migrations/00067_extend_metering_telemetry.sql::usage_daily)
 // carries the day-grain so the hot path is one Indexed tuple read.
 //
-// The rollup is an additive merge — re-running on the same
-// (account, app, day) tuple sums onto the prior partial, never
-// overwrites. A missed tick or a meterd restart is safe: the next
-// tick covers the gap.
+// The rollup is a point-in-time overwrite — re-running for the
+// same (account, app, day) tuple REPLACES the existing row with
+// the freshly summed values. This is the right contract for a
+// repeating cron: the SUM over the full day window is a pure
+// function of the underlying usage_minutes rows in that window,
+// so re-aggregating must converge to the same answer. Additive
+// merge would multiply the day total by the number of cron ticks
+// (~288× per day at 5-min cadence) and silently inflate the
+// dashboard. The session-isolation invariant ("a missed tick or
+// a meterd restart covers the gap") is preserved because the cron
+// always re-aggregates the FULL day window for yesterday on every
+// tick — the next-tick-after-gap covers the same data.
 //
 // The rollup never pushes to billing providers — it is informational
 // only, mirroring the per-row additivity of the underlying minute
 // grain. Provider push stays on the 24 h StripeInterval loop
 // (pkg/meter/loop.go).
+//
+// NOTE — the new `usage_daily.builder_seconds` column is NOT
+// populated by this rollup. builder_seconds are written to a
+// separate grain (`builder_usage`, migration 00068) and rolled up
+// in a follow-up PR; the column stays at 0 today.
 package meter
 
 import (
@@ -37,9 +50,12 @@ type execer interface {
 // rollupSQL is the half-open [start, end) INSERT ... ON CONFLICT
 // statement that rolls one window of usage_minutes rows into
 // usage_daily. Mirrors the column set declared in
-// migrations/00067_extend_metering_telemetry.sql; the on-conflict
-// update uses additive merge so re-running the same window is
-// safe under any number of redeliveries.
+// migrations/00067_extend_metering_telemetry.sql. The on-conflict
+// clause uses OVERWRITE (col = EXCLUDED.col) — re-running for the
+// same window converges to the same day total, which is the right
+// contract for a repeating 5-minute cron. Additive merge would
+// multiply the day total by the number of cron ticks. See the
+// package doc comment for the full rationale.
 const rollupSQL = `
 INSERT INTO public.usage_daily (
     account_id, app_id, day,
@@ -58,14 +74,14 @@ FROM public.usage_minutes
 WHERE minute >= $1 AND minute < $2
 GROUP BY 1, 2, 3
 ON CONFLICT (account_id, app_id, day) DO UPDATE SET
-    mb_seconds      = usage_daily.mb_seconds      + EXCLUDED.mb_seconds,
-    requests        = usage_daily.requests        + EXCLUDED.requests,
-    cpu_usec        = usage_daily.cpu_usec        + EXCLUDED.cpu_usec,
-    tx_bytes        = usage_daily.tx_bytes        + EXCLUDED.tx_bytes,
-    net_tx_bytes    = usage_daily.net_tx_bytes    + EXCLUDED.net_tx_bytes,
-    net_rx_bytes    = usage_daily.net_rx_bytes    + EXCLUDED.net_rx_bytes,
-    cold_boots      = usage_daily.cold_boots      + EXCLUDED.cold_boots,
-    builder_seconds = usage_daily.builder_seconds + EXCLUDED.builder_seconds,
+    mb_seconds      = EXCLUDED.mb_seconds,
+    requests        = EXCLUDED.requests,
+    cpu_usec        = EXCLUDED.cpu_usec,
+    tx_bytes        = EXCLUDED.tx_bytes,
+    net_tx_bytes    = EXCLUDED.net_tx_bytes,
+    net_rx_bytes    = EXCLUDED.net_rx_bytes,
+    cold_boots      = EXCLUDED.cold_boots,
+    builder_seconds = EXCLUDED.builder_seconds,
     rolled_up_at    = EXCLUDED.rolled_up_at
 `
 

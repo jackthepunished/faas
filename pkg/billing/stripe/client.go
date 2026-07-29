@@ -351,20 +351,17 @@ func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64)
 // non-Stripe provider drift is still detected via the Paddle path
 // when that lands.
 //
-// Returns (0, nil) when subscription_item is missing (the brand-
-// new account interregnum) so the reconciler doesn't false-
-// positive.
-func (c *Client) ReconcileUsage(_ context.Context, acct state.Account, _, _ time.Time) (int64, error) {
-	if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
-		return 0, nil
-	}
-	// Stub: full SDK summation lands in the follow-up PR. Returning
-	// (0, nil) tells the reconciler "Stripe has nothing to say",
-	// which is honest — until the implementation lands, we can't
-	// distinguish "Stripe dropped a push" from "Stripe has no push
-	// to reconcile yet". The reconciler's local-sum gate keeps
-	// the alert meaningful.
-	return 0, nil
+// Returns ErrNotImplemented until the SDK summation lands in a
+// follow-up PR. Returning (0, nil) here would make the reconciler
+// compute drift_ratio = abs(local − 0) / max(local, 0) = 1.0 for
+// every paying account and page the BillingDrift alert from the
+// moment this PR ships. ErrNotImplemented is the documented
+// "no drift signal yet" sentinel: the reconciler's
+// `errors.Is(err, billing.ErrNotImplemented)` short-circuit
+// (pkg/billing/reconciler/reconciler.go) skips the gauge emission
+// for this account entirely, matching the Paddle stub's behaviour.
+func (c *Client) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
 }
 
 // centsToMillicents converts integer EUR cents to Stripe's native

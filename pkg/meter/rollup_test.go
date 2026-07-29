@@ -1,21 +1,25 @@
-// Usage_daily rollup tests (ADR-048 §5). Exercises the additive-
-// merge contract under three scenarios:
+// Usage_daily rollup tests (ADR-048 §5). Exercises the OVERWRITE
+// (point-in-time) contract under three scenarios:
 //
 //   1. First tick on a fresh window — INSERT path.
 //   2. Second tick on the same window — UPDATE path; the SUM
-//      adds onto the prior partial.
+//      REPLACES the prior partial (NOT additive merge — additive
+//      would inflate ~288× per day at 5-min cadence; see PR #428
+//      review blocker #1).
 //   3. Empty window — 0 rows touched; no error.
 //
 // Tests use a stub execer so pkg/meter stays pgxpool-free. The
 // full SQL is exercised by migrations/00067_test.go against a
 // real Postgres; here we assert the contract of RollupOnce /
-// RollupLoop on the surface that unit tests can reach.
+// RollupLoop on the surface that unit tests can reach — most
+// importantly, that rollupSQL does NOT use additive merge.
 
 package meter
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -139,4 +143,92 @@ func TestRollupLoop_DefaultInterval(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 	<-done
+}
+
+// TestRollupSQL_OverwriteSemantics pins the overwrite contract.
+// Additive merge on `usage_daily` would multiply the day's totals
+// by the number of cron ticks (~288× per day at 5-min cadence) and
+// silently inflate the dashboard. If a future refactor flips this
+// back to additive, the dashboard's "yesterday's traffic" panel
+// would diverge from `usage_minutes` totals — this test catches
+// the regression at unit-test time.
+//
+// We assert that for every numeric column, the ON CONFLICT clause
+// uses "col = EXCLUDED.col" rather than "col = col + EXCLUDED.col".
+func TestRollupSQL_OverwriteSemantics(t *testing.T) {
+	checkCols := []string{
+		"mb_seconds", "requests", "cpu_usec", "tx_bytes",
+		"net_tx_bytes", "net_rx_bytes", "cold_boots",
+		"builder_seconds",
+	}
+	for _, c := range checkCols {
+		// Restrict the assertion to the UPDATE SET clause so we don't
+		// pick up the column name from the SELECT projection above.
+		updateClause := extractUpdateClause(rollupSQL)
+		if updateClause == "" {
+			t.Fatalf("rollupSQL has no ON CONFLICT … DO UPDATE SET clause")
+		}
+		// Additive form we want to reject.
+		if strings.Contains(updateClause, c+" = usage_daily."+c+" + EXCLUDED."+c) {
+			t.Errorf("rollupSQL uses additive merge for %q — switch to overwrite (col = EXCLUDED.col); see ADR-048 §5 and PR #428 review blocker #1", c)
+		}
+		// Overwrite form: allow leading whitespace before `col = EXCLUDED.col`.
+		// Strip interior whitespace before matching so the SQL formatter's
+		// padding doesn't matter.
+		if !containsAssignment(updateClause, c, "EXCLUDED."+c) {
+			t.Errorf("rollupSQL missing overwrite assignment for %q in UPDATE SET; got clause: %q", c, updateClause)
+		}
+	}
+}
+
+// extractUpdateClause returns everything from "ON CONFLICT" to the
+// end of the SQL — the UPDATE SET clause is at the tail.
+func extractUpdateClause(sql string) string {
+	idx := strings.Index(sql, "ON CONFLICT")
+	if idx < 0 {
+		return ""
+	}
+	return sql[idx:]
+}
+
+// containsAssignment returns true if `clause` contains a column
+// assignment of the form `<column>[whitespace]=[whitespace]<rhs>`
+// (the SQL formatter pads both sides of `=`; we tolerate that).
+func containsAssignment(clause, column, rhs string) bool {
+	// Normalise whitespace runs to a single space for the lookup.
+	needle := column
+	// Try all positions of the column name in the clause.
+	for i := 0; i < len(clause); {
+		j := strings.Index(clause[i:], needle)
+		if j < 0 {
+			return false
+		}
+		j += i
+		i = j + len(needle)
+		// Skip whitespace after column.
+		k := i
+		for k < len(clause) && (clause[k] == ' ' || clause[k] == '\t' || clause[k] == '\n') {
+			k++
+		}
+		if k >= len(clause) || clause[k] != '=' {
+			continue
+		}
+		// Skip whitespace after `=`.
+		k++
+		for k < len(clause) && (clause[k] == ' ' || clause[k] == '\t' || clause[k] == '\n') {
+			k++
+		}
+		if k+len(rhs) > len(clause) {
+			continue
+		}
+		if clause[k:k+len(rhs)] == rhs {
+			// Make sure the next char (if any) is end-of-token: ',' or
+			// whitespace, not part of a longer identifier.
+			end := k + len(rhs)
+			if end == len(clause) || clause[end] == ',' || clause[end] == ' ' || clause[end] == '\t' || clause[end] == '\n' {
+				return true
+			}
+		}
+	}
+	return false
 }

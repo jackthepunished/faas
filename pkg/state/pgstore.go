@@ -5338,7 +5338,7 @@ func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string
 func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error) {
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id,
-		        date_trunc('hour', minute) as hour,
+		        date_trunc('hour', minute AT TIME ZONE 'UTC') as hour,
 		        sum(mb_seconds)::bigint      as mb_seconds,
 		        sum(cpu_usec)::bigint        as cpu_usec,
 		        sum(requests)::bigint        as requests,
@@ -5424,10 +5424,16 @@ func (s *PgStore) AppendSnapshotStorage(ctx context.Context, accountID, appID st
 }
 
 // LatestSnapshotBytes returns mem_bytes + disk_bytes for the app's
-// latest non-stale snapshot. We join deployments to find the
-// app's currently active deployment_id, then look up the most
-// recently created snapshot row. Returns (0, 0, nil) when the app
-// has no snapshot — a cold start, not an error. ADR-049 §B.3.
+// latest non-stale snapshot under the currently-live deployment.
+// We join deployments to filter to status='live' (the only state
+// that can serve wake — `pending`/`building`/`imaging`/`failed`/
+// `superseded` rows must not be billed for storage) and look up
+// the most recently created non-stale snapshot row. The
+// `snapshots_live_idx` partial index (migration 00071) on
+// (deployment_id) WHERE stale=false makes the inner lookup a
+// bounded Index Scan instead of a per-app heap scan. Returns
+// (0, 0, nil) when the app has no live deployment yet — a cold
+// start, not an error. ADR-049 §B.3.
 func (s *PgStore) LatestSnapshotBytes(ctx context.Context, appID string) (int64, int64, error) {
 	var memBytes, diskBytes int64
 	err := s.pool.QueryRow(ctx,
@@ -5435,6 +5441,7 @@ func (s *PgStore) LatestSnapshotBytes(ctx context.Context, appID string) (int64,
 		   from snapshots s
 		   join deployments d on s.deployment_id = d.id
 		  where d.app_id = $1
+		    and d.status  = 'live'
 		    and s.stale = false
 		  order by s.created_at desc
 		  limit 1`,
@@ -6870,7 +6877,7 @@ func (s *PgStore) UsageByAccount(ctx context.Context, accountID string, since ti
 	var err error
 	if since.IsZero() {
 		rows, err = s.pool.Query(ctx,
-			`select account_id, app_id, date_trunc('month', minute) as month,
+			`select account_id, app_id, date_trunc('month', minute AT TIME ZONE 'UTC') as month,
 			        sum(mb_seconds)::bigint, sum(requests)::bigint
 			 from usage_minutes
 			 where account_id = $1
@@ -6878,7 +6885,7 @@ func (s *PgStore) UsageByAccount(ctx context.Context, accountID string, since ti
 			 order by app_id, month`, accountID)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select account_id, app_id, date_trunc('month', minute) as month,
+			`select account_id, app_id, date_trunc('month', minute AT TIME ZONE 'UTC') as month,
 			        sum(mb_seconds)::bigint, sum(requests)::bigint
 			 from usage_minutes
 			 where account_id = $1 and minute >= $2
