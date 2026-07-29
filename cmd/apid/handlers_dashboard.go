@@ -14,10 +14,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -77,6 +80,12 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderPricing(w, r, log, acct)
 		case path == "/dashboard/invoices":
 			s.renderInvoices(w, r, log, acct)
+		case path == "/dashboard/audit-events":
+			// Wave 0 PR-C / ADR-047: the operator/customer surface
+			// for stateless-advisory audit rows. Mirrors
+			// GET /v1/audit-events?kind_prefix=stateless.advisory
+			// with optional ?app_id= for the per-app drill-down.
+			s.renderAuditEvents(w, r, log, acct)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
 		default:
@@ -745,4 +754,139 @@ func max(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// renderAuditEvents renders /dashboard/audit-events — the
+// customer-facing drill-down on the audit log. Wave 0 PR-C /
+// ADR-047. The handler reuses the same store path as the public
+// GET /v1/audit-events handler (handlers_audit.go::listAuditEvents)
+// by calling ListEvents directly with the same constraints:
+//
+//   - The kind_prefix filter is the SQL-anchored one (cheap).
+//   - The app_id filter is the Go-side post-SQL filter added in
+//     handlers_audit.go (no events-table migration).
+//   - include_anonymous surfaces subject=NULL rows (the rare
+//     defensive case where the app row was deleted between wake
+//     and advisory).
+//
+// Resolving the app_id → slug for the header chip is a single
+// indexed GetApp call; on AppNotFound the chip is empty (the row
+// may legitimately be from an app that was deleted before the
+// dashboard rendered).
+//
+// Pagination limit is the same as the public handler (50 default,
+// 100 max) — the dashboard renders the same rows the API would
+// return, so a customer toggling between "view source" and the
+// hosted page sees the same shape.
+func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	q := r.URL.Query()
+	prefix := q.Get("kind_prefix")
+	appIDFilter := q.Get("app_id")
+	includeAnonymous, _ := strconv.ParseBool(q.Get("include_anonymous"))
+
+	limit := listAuditEventsLimitDefault
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			renderProblem(w, log, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid limit", "limit must be a positive integer"))
+			return
+		}
+		if n > listAuditEventsLimitMax {
+			n = listAuditEventsLimitMax
+		}
+		limit = n
+	}
+
+	rows, err := s.store.ListEvents(r.Context(), acct.ID, listAuditEventsOverRead)
+	if err != nil {
+		log.Warn("dashboard renderAuditEvents: list account events", "account_id", acct.ID, "err", err)
+		renderProblem(w, log, api.ErrCapacity("could not list audit events"))
+		return
+	}
+	var anonRows []state.Event
+	if includeAnonymous {
+		anonRows, err = s.store.ListEvents(r.Context(), "", listAuditEventsOverRead)
+		if err != nil {
+			log.Warn("dashboard renderAuditEvents: list anonymous events", "account_id", acct.ID, "err", err)
+			renderProblem(w, log, api.ErrCapacity("could not list anonymous audit events"))
+			return
+		}
+	}
+	merged := append([]state.Event{}, rows...)
+	merged = append(merged, anonRows...)
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].At.After(merged[j].At)
+	})
+
+	now := time.Now()
+	// Cap the backing array at listAuditEventsLimitMax (the same
+	// bound the request handler applies to ?limit=…) regardless of
+	// the caller-supplied limit value. CodeQL go/allocation-rule
+	// flags `make([]T, 0, limit)` because `limit` is a parsed
+	// query-string value the taint analysis can't bound. The render
+	// loop's `if len(items) >= limit { break }` truncates the actual
+	// number of rows. Mirrors handlers_audit.go:169's shape.
+	items := make([]dashboard.AuditEventRow, 0, listAuditEventsLimitMax)
+	for _, e := range merged {
+		if prefix != "" && !strings.HasPrefix(e.Kind, prefix) {
+			continue
+		}
+		if appIDFilter != "" && !eventDataHasAppID(e.Data, appIDFilter) {
+			continue
+		}
+		row := dashboard.AuditEventRow{
+			ID:        strconv.FormatInt(e.ID, 10),
+			TimeLabel: dashboard.RelativeTime(e.At, now),
+			Actor:     e.Actor,
+			Kind:      e.Kind,
+		}
+		if e.Subject != nil {
+			row.Subject = e.Subject.String()
+		}
+		// Pretty-print the JSON for the dashboard table; raw JSON
+		// would be hostile to operators. The detail surface is
+		// GET /v1/audit-events/{id} for the structured view.
+		if len(e.Data) > 0 {
+			var pretty any
+			if err := json.Unmarshal(e.Data, &pretty); err == nil {
+				if b, err := json.MarshalIndent(pretty, "", "  "); err == nil {
+					row.DataPretty = string(b)
+				}
+			}
+		}
+		items = append(items, row)
+		if len(items) >= limit {
+			break
+		}
+	}
+
+	appSlug := ""
+	if appIDFilter != "" {
+		if a, err := s.store.AppByID(r.Context(), appIDFilter); err == nil && a.AccountID == acct.ID {
+			appSlug = a.Slug
+		}
+	}
+
+	view, _ := AccountFrom(r.Context())
+	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderAuditEvents: count deployed apps", "account_id", acct.ID, "err", err)
+		appCount = 0
+	}
+	page := dashboard.Page{
+		Title:   "Audit events",
+		Body:    "audit_events",
+		Account: dashboardAccountView(view, appCount),
+		Data: dashboard.AuditEventsData{
+			KindPrefix:       prefix,
+			AppID:            appIDFilter,
+			AppSlug:          appSlug,
+			Events:           items,
+			IncludeAnonymous: includeAnonymous,
+		},
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
 }

@@ -1561,6 +1561,151 @@ func TestFaasTail_AppFilterOnSlugAndID(t *testing.T) {
 	t.Fatal("cmdTail did not exit within SIGINT_RETRY budget")
 }
 
+// TestFaasTail_StatelessAdvisoryFlag locks the `--include-stateless`
+// flag added by Wave 0 PR-C / ADR-047. The flag is OFF by default —
+// a stateless_advisory frame must NOT be printed — and ON when set,
+// in which case the frame is printed as
+// "stateless <app_id> <n> <sample_path>".
+//
+// The wire payload mirrors cmd/apid/advisory_receiver.go:124-130 —
+// {"app_id", "instance", "n", "sample_path"}.
+func TestFaasTail_StatelessAdvisoryFlag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("FAAS_TOKEN", "test-token")
+	resetJSONOutput()
+	t.Cleanup(resetJSONOutput)
+
+	gate := make(chan struct{})
+	emit := make(chan string, 1)
+	sink := &sseHoldSink{gate: gate, written: make(chan struct{}, 1), emit: emit, t: t}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+
+	probeReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/events", nil)
+	probeResp, err := http.DefaultClient.Do(probeReq)
+	if err != nil {
+		t.Fatalf("probe GET /v1/events: %v", err)
+	}
+	probeResp.Body.Close()
+
+	// Phase 1: flag OFF — stateless_advisory frame must be hidden.
+	offStdout, offRestore := captureStdout(t)
+	done := make(chan int, 1)
+	go func() { done <- cmdTail(nil) }()
+
+	select {
+	case <-sink.written:
+	case <-time.After(2 * time.Second):
+		offRestore()
+		t.Fatal("cmdTail never reached the streaming loop (flag OFF)")
+	}
+	time.Sleep(50 * time.Millisecond) // SIGINT_RETRY_SETTLE
+
+	emit <- "event: stateless_advisory\ndata: {\"app_id\":\"a-secret\",\"n\":2,\"sample_path\":\"/data/x\"}\n\n"
+	// Also emit an invocation_done so we know the loop is alive.
+	emit <- "event: invocation_done\ndata: {\"invocation_id\":\"i-1\",\"app_slug\":\"hello\",\"state\":\"completed\"}\n\n"
+
+	offDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(offDeadline) {
+		if strings.Contains(offStdout.String(), "i-1 hello completed") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if strings.Contains(offStdout.String(), "stateless a-secret") {
+		offRestore()
+		t.Fatalf("flag-OFF path printed stateless_advisory; stdout=%q", offStdout.String())
+	}
+	if !strings.Contains(offStdout.String(), "i-1 hello completed") {
+		offRestore()
+		t.Fatal("flag-OFF path did not print invocation_done (loop stuck?)")
+	}
+	// SIGINT to exit the first cmdTail.
+	const maxSIGINTAttempts = 3
+	for attempt := 1; attempt <= 3; attempt++ {
+		_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+		select {
+		case <-done:
+			goto flagON
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	offRestore()
+	t.Fatal("cmdTail (flag OFF) did not exit within SIGINT_RETRY budget")
+flagON:
+	offRestore()
+
+	// Phase 2: flag ON — stateless_advisory frame must be printed.
+	emit2 := make(chan string, 1)
+	sink2 := &sseHoldSink{gate: gate, written: make(chan struct{}, 1), emit: emit2, t: t}
+	srv2 := httptest.NewServer(sink2)
+	defer srv2.Close()
+	t.Setenv("FAAS_API", srv2.URL)
+
+	probeReq2, _ := http.NewRequest(http.MethodGet, srv2.URL+"/v1/events", nil)
+	probeResp2, err := http.DefaultClient.Do(probeReq2)
+	if err != nil {
+		t.Fatalf("probe GET /v1/events (flag ON): %v", err)
+	}
+	probeResp2.Body.Close()
+
+	onStdout, onRestore := captureStdout(t)
+	go func() { done <- cmdTail([]string{"--include-stateless"}) }()
+
+	select {
+	case <-sink2.written:
+	case <-time.After(2 * time.Second):
+		onRestore()
+		t.Fatal("cmdTail never reached the streaming loop (flag ON)")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	emit2 <- "event: stateless_advisory\ndata: {\"app_id\":\"a-77\",\"n\":3,\"sample_path\":\"/data/y\"}\n\n"
+	emit2 <- "event: invocation_done\ndata: {\"invocation_id\":\"i-2\",\"app_slug\":\"world\",\"state\":\"failed\"}\n\n"
+
+	// The flag-on path prints both stateless AND invocation_done.
+	// Wait for both lines.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s := onStdout.String()
+		if strings.Contains(s, "stateless a-77 3 /data/y") && strings.Contains(s, "i-2 world failed") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	on := onStdout.String()
+	if !strings.Contains(on, "stateless a-77 3 /data/y") {
+		onRestore()
+		t.Fatalf("flag-ON path missing 'stateless a-77 3 /data/y'; got %q", on)
+	}
+	if !strings.Contains(on, "i-2 world failed") {
+		onRestore()
+		t.Fatalf("flag-ON path missing 'i-2 world failed'; got %q", on)
+	}
+
+	// Finally exit.
+	for attempt := 1; attempt <= maxSIGINTAttempts; attempt++ {
+		_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+		select {
+		case <-done:
+			close(gate)
+			close(emit)
+			close(emit2)
+			onRestore()
+			return
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	onRestore()
+	close(gate)
+	close(emit)
+	close(emit2)
+	t.Fatal("cmdTail (flag ON) did not exit within SIGINT_RETRY budget")
+}
+
 // TestFaasQueueTail_PrintsDequeuedRow locks the cmdQueueTail
 // long-poll → print path. The fake apid returns a 200 with a JSON
 // payload on the first call and hangs on the second. cmdQueueTail

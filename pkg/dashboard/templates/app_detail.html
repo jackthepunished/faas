@@ -42,7 +42,7 @@
       <a href="/dashboard/account">Account</a>
     </nav>
   </header>
-  <main hx-trigger="sse:app_changed, sse:deployment_changed, sse:instance_changed, sse:invocation_done" hx-get="/dashboard/apps/{{.Data.App.Slug}}" hx-swap="innerHTML" hx-select="main" hx-push-url="false">
+  <main hx-trigger="sse:app_changed, sse:deployment_changed, sse:instance_changed, sse:invocation_done, sse:stateless_advisory" hx-get="/dashboard/apps/{{.Data.App.Slug}}" hx-swap="innerHTML" hx-select="main" hx-push-url="false">
     {{if .Data}}
       <h1>App: <code>{{.Data.App.Slug}}</code></h1>
       <p>
@@ -90,6 +90,19 @@
       {{else}}
         <p>No deployments yet.</p>
       {{end}}
+
+      <h2>Stateless advisories</h2>
+      <p class="muted">
+        Wave 0 PR-C / ADR-047. fanotify-marked writes to state-shaped
+        paths (e.g. <code>/data</code>, <code>/var/lib/postgresql</code>)
+        emit one audit row per debounced batch. The contract is
+        advisory-only — the data is gone after the next park — but the
+        row surfaces here so a customer running <code>touch /data/x</code>
+        at request time can see why their state doesn't survive scale-to-zero.
+      </p>
+      <p>
+        <a href="/dashboard/audit-events?kind_prefix=stateless.advisory&app_id={{.Data.App.ID}}">Recent advisories →</a>
+      </p>
 
       <h2>Recent wakes</h2>
       {{if .Data.RecentInstances}}

@@ -655,26 +655,35 @@ func cmdQueueDispatch(args []string) int {
 }
 
 // cmdTail subscribes to /v1/events and prints one line per
-// `invocation_done` frame: "<invocation_id> <app_slug> <state>". Exits
-// 130 on Ctrl-C so a chained shell command can detect a deliberate
-// interrupt (POSIX 128 + SIGINT(2)); exits 0 on a clean SSE close.
+// `invocation_done` frame: "<invocation_id> <app_slug> <state>". With
+// `--include-stateless`, also prints one line per `stateless_advisory`
+// frame: "stateless <app_id> <n> <sample_path>". Exits 130 on Ctrl-C
+// so a chained shell command can detect a deliberate interrupt
+// (POSIX 128 + SIGINT(2)); exits 0 on a clean SSE close.
 //
 // Authentication is the dashboard Bearer token; apid's
 // eventsFrameForAccount filter (handlers_events.go:148-167) ensures the
-// caller only sees their own account's invocations. There is no
-// escalation path — a customer's `faas tail` will never see another
-// customer's frames.
+// caller only sees their own account's frames. There is no escalation
+// path — a customer's `faas tail` will never see another customer's
+// invocations or stateless advisories.
 //
 // Move 3 / M7.5 prep: the dashboard uses the same /v1/events route via
 // the browser EventSource; this command is the CLI twin.
+//
+// Wave 0 PR-C / ADR-047: `--include-stateless` surfaces the runtime
+// stateless-advisory signal the same way the dashboard's "Stateless
+// advisories" tab does. Default OFF — the common `faas tail` use case
+// is watching invocations, and advisory frames are noisy (one per
+// debounce window per state-shaped path).
 func cmdTail(args []string) int {
 	fs := flag.NewFlagSet("tail", flag.ContinueOnError)
 	onlySlug := fs.String("app", "", "filter to a single app slug (optional)")
+	includeStateless := fs.Bool("include-stateless", false, "also print stateless.advisory frames (default: hide)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: faas tail [--app <slug>]", "tail")
+		PrintUsage(os.Stderr, "usage: faas tail [--app <slug>] [--include-stateless]", "tail")
 		return 1
 	}
 	client, err := authedClient()
@@ -695,7 +704,11 @@ func cmdTail(args []string) int {
 	dec.SetCloseFn(body.Close)
 	defer func() { _ = dec.Close() }()
 
-	_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
+	if *includeStateless {
+		_, _ = fmt.Fprintln(osStdout, "Tailing invocations + stateless advisories… Ctrl-C to exit.")
+	} else {
+		_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -704,29 +717,44 @@ func cmdTail(args []string) int {
 			if !ok {
 				return 0
 			}
-			if e.Event != "invocation_done" {
-				continue
+			switch e.Event {
+			case "invocation_done":
+				var p struct {
+					InvocationID string `json:"invocation_id"`
+					AppID        string `json:"app_id"`
+					AppSlug      string `json:"app_slug"`
+					State        string `json:"state"`
+				}
+				if err := json.Unmarshal([]byte(e.Data), &p); err != nil {
+					// Unparseable frame — print raw so the customer
+					// can see it; the next frame is independent.
+					_, _ = fmt.Fprintln(osStdout, e.Data)
+					continue
+				}
+				if *onlySlug != "" && p.AppSlug != *onlySlug && p.AppID != *onlySlug {
+					continue
+				}
+				display := p.AppSlug
+				if display == "" {
+					display = p.AppID
+				}
+				_, _ = fmt.Fprintf(osStdout, "%s %s %s\n", p.InvocationID, display, p.State)
+			case "stateless_advisory":
+				if !*includeStateless {
+					continue
+				}
+				var p struct {
+					AppID      string `json:"app_id"`
+					Instance   string `json:"instance"`
+					N          int    `json:"n"`
+					SamplePath string `json:"sample_path"`
+				}
+				if err := json.Unmarshal([]byte(e.Data), &p); err != nil {
+					_, _ = fmt.Fprintln(osStdout, e.Data)
+					continue
+				}
+				_, _ = fmt.Fprintf(osStdout, "stateless %s %d %s\n", p.AppID, p.N, p.SamplePath)
 			}
-			var p struct {
-				InvocationID string `json:"invocation_id"`
-				AppID        string `json:"app_id"`
-				AppSlug      string `json:"app_slug"`
-				State        string `json:"state"`
-			}
-			if err := json.Unmarshal([]byte(e.Data), &p); err != nil {
-				// Unparseable frame — print raw so the customer
-				// can see it; the next frame is independent.
-				_, _ = fmt.Fprintln(osStdout, e.Data)
-				continue
-			}
-			if *onlySlug != "" && p.AppSlug != *onlySlug && p.AppID != *onlySlug {
-				continue
-			}
-			display := p.AppSlug
-			if display == "" {
-				display = p.AppID
-			}
-			_, _ = fmt.Fprintf(osStdout, "%s %s %s\n", p.InvocationID, display, p.State)
 		case err := <-dec.Errors():
 			if err != nil && !errors.Is(err, io.EOF) {
 				PrintWarn(os.Stderr, "stream closed: %v", err)

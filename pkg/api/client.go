@@ -820,7 +820,13 @@ func (c *Client) DeleteKey(ctx context.Context, id string) error {
 // larger are silently capped per the same convention as ListSecrets.
 
 // ListAuditEvents returns the caller's auth audit events newest-first.
-func (c *Client) ListAuditEvents(ctx context.Context, since, kindPrefix string, limit int) (ListAuditEventsResponse, error) {
+// includeAnonymous (Wave 0 PR-C / ADR-047) toggles subject=NULL rows —
+// the defensive case where the app row was deleted between wake and
+// the stateless-advisory audit emit. Default false to match the
+// /v1/audit-events route's customer-facing default. appID (Wave 0
+// PR-C / ADR-047) filters the overscan window to events whose
+// data.app_id matches — the dashboard's per-app drill-down.
+func (c *Client) ListAuditEvents(ctx context.Context, since, kindPrefix, appID string, limit int, includeAnonymous bool) (ListAuditEventsResponse, error) {
 	var out ListAuditEventsResponse
 	q := url.Values{}
 	if since != "" {
@@ -829,8 +835,14 @@ func (c *Client) ListAuditEvents(ctx context.Context, since, kindPrefix string, 
 	if kindPrefix != "" {
 		q.Set("kind_prefix", kindPrefix)
 	}
+	if appID != "" {
+		q.Set("app_id", appID)
+	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
+	}
+	if includeAnonymous {
+		q.Set("include_anonymous", "true")
 	}
 	path := "/v1/audit-events"
 	if encoded := q.Encode(); encoded != "" {

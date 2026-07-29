@@ -236,6 +236,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the same backend (the production PrefixRouter rooted at
 	// /srv/fc).
 	mgr.WithStorage(storageBackend)
+
+	// Wave 0 PR-C / ADR-047: vmmd becomes a gRPC client for the
+	// first time. The AdvisoryClient dials /run/faas/apid.sock to
+	// forward guest-init fanotify batches. Empty FAAS_APID_ADVISORY_SOCK
+	// disables (matches apid's explicit-empty pattern); nil client
+	// short-circuits Manager.ForwardStatelessAdvisory to a no-op.
+	advisoryTarget := envOr("FAAS_APID_ADVISORY_SOCK", "unix:///run/faas/apid.sock")
+	var advisoryCli *vmmdgrpc.AdvisoryClient
+	if advisoryTarget != "" {
+		advisoryCli = vmmdgrpc.NewAdvisoryClient(advisoryTarget, log)
+		mgr.SetAdvisoryClient(advisoryCli)
+		log.Info("vmmd: stateless advisory client wired", "target", advisoryTarget)
+	}
 	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,
 		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
 		"host_key_path", keyPath, "recipient_path", pubPath,
@@ -372,6 +385,12 @@ heartbeat:
 		_ = httpSrv.Shutdown(stopCtx)
 	}
 	_ = lis.Close()
+	// Advisory gRPC client holds the dial to /run/faas/apid.sock
+	// open for ~30s of keepalive if we don't close it explicitly.
+	// Idempotent at the gRPC layer (pkg/vmmdgrpc uses sync.Once).
+	if advisoryCli != nil {
+		_ = advisoryCli.Close()
+	}
 	return nil
 }
 

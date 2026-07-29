@@ -104,12 +104,43 @@ type VMM interface {
 	// children firecracker; the bool trips the test before the handler
 	// does).
 	InstancePID(instance string) (int, bool)
+	// SendStatelessAdvisory is the host-side receiver for one
+	// batch guest-init stateless_advisory_linux.go sent over vsock.
+	// The host-side vsock parser (cmd/vmmd's wire receiver) verifies
+	// the wire format and dispatches here. Implementations may
+	// forward to apid over the AdvisoryClient seam (Wave 0 PR-C) or
+	// return nil on a default-local build that has no apid.sock to
+	// dial. ADR-035: best-effort, never blocks the vsock reader; on
+	// forward failure we drop the batch + log Warn.
+	SendStatelessAdvisory(ctx context.Context, l Lease, appID string, batch []AdvisoryEvent) error
 }
 
 // Paths locates the kernel and base images on disk (spec §8). Injected so tests
 // don't touch the filesystem.
 type Paths struct {
 	Kernel string // /srv/fc/base/vmlinux-6.1.x
+}
+
+// AdvisoryEvent is one fanotify event the guest-init
+// stateless_advisory_linux.go observed and shipped over vsock DGRAM.
+// Wire-shaped at guest/init/stateless_advisory_linux.go::advisoryEvent
+// and forwarded to apid via pkg/vmmdgrpc/advisory_client.go. ADR-047
+// records the chain end-to-end; spec §17 G13 names the closed path
+// set this event belongs to.
+type AdvisoryEvent struct {
+	Path   string   // path observed (resolved from fanotify fd)
+	Masks  []string // canonical verbs: "create" | "modify" | "move" | "access" | "delete" | "other"
+	PID    int      // host-side process id at event time (best effort)
+	TsUnix int64    // ms since unix epoch
+}
+
+// AdvisoryForwarder is the seam the Manager uses to ship a guest-init
+// advisory batch to apid. pkg/vmmdgrpc.AdvisoryClient satisfies it
+// (Wave 0 PR-C); tests inject a stub. Defined here (not in
+// pkg/vmmdgrpc) to avoid an import cycle: pkg/vmmdgrpc already
+// imports pkg/fcvm for Lease + LogRing types.
+type AdvisoryForwarder interface {
+	Forward(ctx context.Context, instance, appID string, events []AdvisoryEvent) error
 }
 
 // Instance is a live (or booting) microVM tracked by the Manager.
@@ -205,6 +236,21 @@ type Manager struct {
 	// registers the counter (single-registry pattern, see
 	// pkg/wire/metrics.go: imageScanVulns on commonCollectors).
 	imageScanMetrics *wire.OpsMetrics
+	// advisoryClient is the vmmd-side forwarder that ships
+	// guest-init fanotify batches to apid (Wave 0 PR-C /
+	// ADR-047). nil means "no apid.sock to dial" —
+	// Manager.ForwardStatelessAdvisory then short-circuits
+	// without sending, which is the default-local vmmd posture
+	// and the unit-test seam (cmd/e2e harness,
+	// pkg/fcvm/manager_test.go). Wired via SetAdvisoryClient at
+	// daemon startup; mirror of SetImageScanMetrics /
+	// SetHostIdentity.
+	//
+	// Held as the AdvisoryForwarder interface (not the concrete
+	// *vmmdgrpc.AdvisoryClient) to avoid an import cycle:
+	// pkg/vmmdgrpc already imports pkg/fcvm for Lease +
+	// LogRing types.
+	advisoryClient AdvisoryForwarder
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -258,6 +304,40 @@ func (m *Manager) WithStorage(s storage.StorageBackend) {
 // only producer in production but every daemon can hold the field.
 func (m *Manager) SetImageScanMetrics(ops *wire.OpsMetrics) {
 	m.imageScanMetrics = ops
+}
+
+// SetAdvisoryClient wires the vmmd-side forwarder that ships
+// guest-init fanotify batches to apid (Wave 0 PR-C / ADR-047).
+// nil-safe — the default-local vmmd has no apid.sock to dial and
+// Manager.ForwardStatelessAdvisory short-circuits without sending.
+// NOT safe to call concurrently with Wake; production wires it at
+// daemon startup. The forwarder is held as AdvisoryForwarder
+// (interface) so pkg/fcvm does not need to import pkg/vmmdgrpc.
+func (m *Manager) SetAdvisoryClient(c AdvisoryForwarder) {
+	m.advisoryClient = c
+}
+
+// ForwardStatelessAdvisory is the public Manager seam that turns
+// one guest-init fanotify batch into one apid audit row. The vsock
+// DGRAM receiver in cmd/vmmd calls this with the parsed batch.
+//
+// ADR-035 best-effort: returns nil on a nil client (default-local)
+// and on a forward failure — the advisory is observation, not
+// source of truth. Caller should not retry.
+func (m *Manager) ForwardStatelessAdvisory(ctx context.Context, instance, appID string, batch []AdvisoryEvent) error {
+	if len(batch) == 0 {
+		return nil // no-op; matches cmd/apid/advisory_receiver.go
+	}
+	if m.advisoryClient == nil {
+		// Default-local vmmd has no apid.sock; silent drop is correct.
+		m.log.Debug("advisory forward: no apid client (default-local); dropping", "instance", instance, "events", len(batch))
+		return nil
+	}
+	if err := m.advisoryClient.Forward(ctx, instance, appID, batch); err != nil {
+		m.log.Warn("advisory forward: client returned error", "err", err, "instance", instance)
+		return nil // ADR-035: silent on forward failure
+	}
+	return nil
 }
 
 // metricsImageScan forwards a per-severity finding count to the

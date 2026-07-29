@@ -87,8 +87,13 @@ type fakeVMM struct {
 	// M6 builder-VM path: DestroyWithExport returns this exit code, copies
 	// nothing. App VMs just see "destroyed" the same way Kill did.
 	destroyWithExportExit int
-	destroyWithExportErr  error
-	destroyedWithExport   []string
+	// advisoryCalls records every SendStatelessAdvisory the VMM saw
+	// (Wave 0 PR-C / ADR-047). Tests assert the wire receiver
+	// routed the batch through here when running through the
+	// in-process Manager path. Mutex is the existing fakeVMM.mu.
+	advisoryCalls        []advisoryCall
+	destroyWithExportErr error
+	destroyedWithExport  []string
 	// G2 secrets staging.
 	stagedSecrets   []stagedSecret
 	stageSecretsErr error
@@ -443,6 +448,33 @@ func (v *fakeVMM) InstancePID(instance string) (int, bool) {
 // returns nil; tests that want to drive the Logs handler through
 // the fake should embed a real *logbuf.Ring and override LogRing.
 func (v *fakeVMM) LogRing(_ string) *logbuf.Ring { return nil }
+
+// SendStatelessAdvisory is the VMM-interface hook the guest-init
+// fanotify path uses (Wave 0 PR-C / ADR-047). The default no-op
+// matches production-stub behaviour: the real wire receiver lives
+// in cmd/vmmd and dials the manager, not the VMM. Tests that want
+// to drive the VMM-seam path can override.
+func (v *fakeVMM) SendStatelessAdvisory(_ context.Context, l Lease, appID string, batch []AdvisoryEvent) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.advisoryCalls == nil {
+		v.advisoryCalls = []advisoryCall{}
+	}
+	v.advisoryCalls = append(v.advisoryCalls, advisoryCall{
+		Instance: l.Instance,
+		AppID:    appID,
+		Batch:    batch,
+	})
+	return nil
+}
+
+// advisoryCall mirrors the VMM.SendStatelessAdvisory arguments so
+// the test can assert what the VMM saw.
+type advisoryCall struct {
+	Instance string
+	AppID    string
+	Batch    []AdvisoryEvent
+}
 
 func (v *fakeVMM) restoredInstance(id string) bool {
 	v.mu.Lock()

@@ -144,6 +144,7 @@ func TestSSEChannels_Contract(t *testing.T) {
 		db.NotifyQuotaWarning:      true,
 		db.NotifyBillingPastDue:    true,
 		db.NotifyInvocationDone:    true,
+		db.NotifyStatelessAdvisory: true,
 	}
 	got := map[string]bool{}
 	for _, ch := range sseChannels {

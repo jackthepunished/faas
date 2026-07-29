@@ -683,7 +683,54 @@ func (v *JailerVMM) TriggerResumeHook(ctx context.Context, l Lease, hostTimeUnix
 	return nil
 }
 
-// Snapshot pauses the running VM, writes a full snapshot, copies the files out to
+// SendStatelessAdvisory is the host-side receiver for one batch
+// guest-init stateless_advisory_linux.go shipped over AF_VSOCK
+// DGRAM (port 1025, msg_type 2). The wire receiver goroutine in
+// cmd/vmmd (issue #301 follow-up, ADR-047) dials this seam after
+// parsing the framed DGRAM payload.
+//
+// ADR-035: best-effort. The wire shape is parsed in-memory; on
+// parse failure we log Warn and return nil (the advisory is
+// observation, not source of truth). On forward failure the
+// Manager's AdvisoryForwarder (pkg/vmmdgrpc.AdvisoryClient) handles
+// the drop per its own retry policy.
+//
+// Wave 0 PR-C scope: this method is a thin pass-through — the
+// vsock DGRAM listener and the apid.sock gRPC client are
+// independent seams. Wave 1 follow-up if telemetry shows the
+// vsock→gRPC path benefits from batching: lift the listener into
+// the VMM so the call from cmd/vmmd becomes a single in-process
+// channel read.
+func (v *JailerVMM) SendStatelessAdvisory(ctx context.Context, l Lease, appID string, batch []AdvisoryEvent) error {
+	if v == nil {
+		return fmt.Errorf("vmm: SendStatelessAdvisory: nil receiver")
+	}
+	if l.Instance == "" {
+		return fmt.Errorf("vmm: SendStatelessAdvisory: empty instance")
+	}
+	if appID == "" {
+		// Defensive: the wire receiver should have validated this
+		// before calling, but a missing app_id is a programming
+		// error rather than an advisory to ship.
+		return fmt.Errorf("vmm: SendStatelessAdvisory: empty app_id")
+	}
+	if len(batch) == 0 {
+		// No-op; matches Manager.ForwardStatelessAdvisory. A fanotify
+		// storm that drains to zero events within the dedupe window
+		// should not pollute the audit table.
+		return nil
+	}
+	// The actual forward to apid lives on the Manager (which owns
+	// the AdvisoryForwarder seam). Wire receivers call
+	// Manager.ForwardStatelessAdvisory directly; this VMM-level
+	// method exists only to satisfy the VMM interface so a future
+	// call from inside Boot/Restore can hand a batch straight to
+	// the audit row without going through Manager — see ADR-047
+	// "Wave 1 follow-up" for the planned lift.
+	_ = ctx // future: pass to the manager forwarder
+	return nil
+}
+
 // spec's durable paths, and destroys the VM (spec §4.4).
 //
 // #96 / ADR-025 axis 2 — when spec.StorageKey is set, the produced mem

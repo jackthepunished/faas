@@ -181,6 +181,13 @@ func run(args []string) int {
 		return cmdLogs(args[1:])
 	case "tail":
 		return cmdTail(args[1:])
+	case "audit-events":
+		// Wave 0 PR-C / ADR-047: customer/operator CLI for the
+		// /v1/audit-events surface. Default scope = caller's own
+		// account; --kind-prefix filters (stateless.advisory is
+		// the Wave 0 use case); --include-anonymous surfaces the
+		// rare subject=NULL defensive rows.
+		return cmdAuditEvents(args[1:])
 	case "queue":
 		return cmdQueueDispatch(args[1:])
 	default:

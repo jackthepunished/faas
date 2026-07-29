@@ -27,6 +27,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
@@ -105,6 +106,19 @@ var metricsAddr = func() string {
 	}
 	return v
 }()
+
+// resolveAdvisorySock reads FAAS_APID_ADVISORY_SOCK via the test
+// seam (deps.getenv). Empty string disables the listener. Tests
+// disable by default (their getenv stub returns "" for unknown
+// keys) so macOS dev boxes don't try to bind /run/faas
+// (read-only on macOS). Production wires defaultDeps.getenv to
+// os.Getenv; the systemd unit stamps FAAS_APID_ADVISORY_SOCK=
+// /run/faas/apid.sock explicitly so the default doesn't matter
+// in prod — the explicit assignment is what enables the
+// listener there.
+func resolveAdvisorySock(getenv func(string) string) string {
+	return getenv("FAAS_APID_ADVISORY_SOCK")
+}
 
 // runDeps is the DI seam for run — same pattern as vmmd / gatewayd so we can
 // exercise the listener lifecycle without binding :8081 from tests.
@@ -521,6 +535,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
+	// Wave 0 PR-C / ADR-047: stateless-advisory gRPC listener. vmmd
+	// dials /run/faas/apid.sock to forward fanotify batches from
+	// guest-init. Empty FAAS_APID_ADVISORY_SOCK disables (matches the
+	// metricsAddr explicit-empty pattern so the e2e harness can stamp
+	// empty and avoid the bind race).
+	var advisorySrv *grpc.Server
+	var advisoryLis net.Listener
+	if sock := resolveAdvisorySock(deps.getenv); sock != "" {
+		advisorySrv, advisoryLis, err = runAdvisoryServer(sock, srv.store, srv.audit, srv.notif, log)
+		if err != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: advisory listen %q: %w", sock, err)
+		}
+		go func() {
+			log.Info("apid advisory listening", "sock", sock)
+			if err := advisorySrv.Serve(advisoryLis); err != nil {
+				log.Error("apid advisory serve", "err", err)
+			}
+		}()
+	}
+
 	errc := make(chan error, 1)
 	go func() {
 		log.Info("apid listening", "addr", listenAddr)
@@ -539,6 +574,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if metricsSrv != nil {
 			//nolint:contextcheck // shutdown context must outlive request ctx; detached from caller per net/http contract.
 			_ = metricsSrv.Shutdown(shutdownCtx)
+		}
+		if advisorySrv != nil {
+			// GracefulStop lets in-flight ForwardStatelessAdvisory
+			// calls finish writing their audit row before exit.
+			advisorySrv.GracefulStop()
 		}
 		// Issue #286: drain the async failed-login audit channel
 		// so in-flight rows land in the events table before the
@@ -674,4 +714,24 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 	}
 	log.Info("audit HMAC key generated and persisted", "path", path)
 	return key, nil
+}
+
+// runAdvisoryServer binds the AdvisoryService gRPC server onto a
+// fresh /run/faas/apid.sock (or wherever FAAS_APID_ADVISORY_SOCK
+// points). The owner is the apid daemon user (lookup via
+// pkg/wire.ListenOrRecreateByName), the group is `faas` so vmmd can
+// dial without root, and the mode is 0660 — the standing repo
+// convention (pkg/wire.DefaultSocketMode).
+//
+// Returns the server (caller calls Serve) and the listener. Errors
+// here are fatal — without the advisory listener vmmd has no way to
+// forward fanotify batches and the audit loop is silently broken.
+func runAdvisoryServer(sock string, store state.Store, audit *auditor, notif Notifier, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("advisory listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAdvisoryReceiver(srv, store, audit, notif, log)
+	return srv, lis, nil
 }

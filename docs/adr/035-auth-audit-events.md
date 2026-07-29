@@ -38,8 +38,9 @@
   | `account.plan_changed` | `changePlan` (success branch) | `{from, to}` |
   | `account.deletion_scheduled` | `scheduleDeletion` (REST + dashboard) | `{via: "rest"\|"dashboard"}` |
   | `account.deletion_restored` | `cancelDeletion` (REST + dashboard) | `{via: ...}` |
+  | `stateless.advisory` | `cmd/apid/advisory_receiver.go` (vmmd → apid gRPC forward) | `{instance, app_id, count, events: [{path, mask, pid, ts_unix_ms}, ...]}` — Wave 0 PR-C / ADR-047 |
 
-  All `auth.*`, `key.*`, `secret.*`, and `account.*` values are namespaced
+  All `auth.*`, `key.*`, `secret.*`, `account.*`, and `stateless.*` values are namespaced
   with a dot prefix; schedd's existing kinds (`state_transition`,
   `wake_boot_error`, `park_snapshot_error`, `watchdog_timeout`) are
   bare names. Grep verifies no overlap.

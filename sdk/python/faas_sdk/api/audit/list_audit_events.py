@@ -1,6 +1,7 @@
 import datetime
 from http import HTTPStatus
 from typing import Any
+from uuid import UUID
 
 import httpx
 
@@ -16,6 +17,8 @@ def _get_kwargs(
     since: datetime.datetime | Unset = UNSET,
     kind_prefix: str | Unset = UNSET,
     limit: int | Unset = 50,
+    include_anonymous: bool | Unset = False,
+    app_id: UUID | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -28,6 +31,13 @@ def _get_kwargs(
     params["kind_prefix"] = kind_prefix
 
     params["limit"] = limit
+
+    params["include_anonymous"] = include_anonymous
+
+    json_app_id: str | Unset = UNSET
+    if not isinstance(app_id, Unset):
+        json_app_id = str(app_id)
+    params["app_id"] = json_app_id
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -86,6 +96,8 @@ def sync_detailed(
     since: datetime.datetime | Unset = UNSET,
     kind_prefix: str | Unset = UNSET,
     limit: int | Unset = 50,
+    include_anonymous: bool | Unset = False,
+    app_id: UUID | Unset = UNSET,
 ) -> Response[ListAuditEventsResponse | Problem]:
     """List the caller's auth audit events.
 
@@ -102,6 +114,8 @@ def sync_detailed(
         since (datetime.datetime | Unset):
         kind_prefix (str | Unset):
         limit (int | Unset):  Default: 50.
+        include_anonymous (bool | Unset):  Default: False.
+        app_id (UUID | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -115,6 +129,8 @@ def sync_detailed(
         since=since,
         kind_prefix=kind_prefix,
         limit=limit,
+        include_anonymous=include_anonymous,
+        app_id=app_id,
     )
 
     response = client.get_httpx_client().request(
@@ -130,6 +146,8 @@ def sync(
     since: datetime.datetime | Unset = UNSET,
     kind_prefix: str | Unset = UNSET,
     limit: int | Unset = 50,
+    include_anonymous: bool | Unset = False,
+    app_id: UUID | Unset = UNSET,
 ) -> ListAuditEventsResponse | Problem | None:
     """List the caller's auth audit events.
 
@@ -146,6 +164,8 @@ def sync(
         since (datetime.datetime | Unset):
         kind_prefix (str | Unset):
         limit (int | Unset):  Default: 50.
+        include_anonymous (bool | Unset):  Default: False.
+        app_id (UUID | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -160,6 +180,8 @@ def sync(
         since=since,
         kind_prefix=kind_prefix,
         limit=limit,
+        include_anonymous=include_anonymous,
+        app_id=app_id,
     ).parsed
 
 
@@ -169,6 +191,8 @@ async def asyncio_detailed(
     since: datetime.datetime | Unset = UNSET,
     kind_prefix: str | Unset = UNSET,
     limit: int | Unset = 50,
+    include_anonymous: bool | Unset = False,
+    app_id: UUID | Unset = UNSET,
 ) -> Response[ListAuditEventsResponse | Problem]:
     """List the caller's auth audit events.
 
@@ -185,6 +209,8 @@ async def asyncio_detailed(
         since (datetime.datetime | Unset):
         kind_prefix (str | Unset):
         limit (int | Unset):  Default: 50.
+        include_anonymous (bool | Unset):  Default: False.
+        app_id (UUID | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -198,6 +224,8 @@ async def asyncio_detailed(
         since=since,
         kind_prefix=kind_prefix,
         limit=limit,
+        include_anonymous=include_anonymous,
+        app_id=app_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -211,6 +239,8 @@ async def asyncio(
     since: datetime.datetime | Unset = UNSET,
     kind_prefix: str | Unset = UNSET,
     limit: int | Unset = 50,
+    include_anonymous: bool | Unset = False,
+    app_id: UUID | Unset = UNSET,
 ) -> ListAuditEventsResponse | Problem | None:
     """List the caller's auth audit events.
 
@@ -227,6 +257,8 @@ async def asyncio(
         since (datetime.datetime | Unset):
         kind_prefix (str | Unset):
         limit (int | Unset):  Default: 50.
+        include_anonymous (bool | Unset):  Default: False.
+        app_id (UUID | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -242,5 +274,7 @@ async def asyncio(
             since=since,
             kind_prefix=kind_prefix,
             limit=limit,
+            include_anonymous=include_anonymous,
+            app_id=app_id,
         )
     ).parsed

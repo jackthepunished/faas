@@ -450,3 +450,38 @@ func parseTemplates() (*template.Template, error) {
 	})
 	return tmplTree, tmplErr
 }
+
+// AuditEventsData is the dashboard-facing payload for
+// /dashboard/audit-events — the customer-facing drill-down on the
+// stateless-advisory audit log. Wave 0 PR-C / ADR-047. The rows
+// come from GET /v1/audit-events?kind_prefix=stateless.advisory
+// (handled by cmd/apid/handlers_dashboard.go::renderAuditEvents);
+// the dashboard re-renders them in a tabular view with a
+// "scroll for more" hint and a link back to the per-app detail.
+//
+// Filter reflects the URL query: empty AppID/KindPrefix render the
+// account-wide unified history (the same rows the HTTP API returns
+// without a filter). AppID is the dashboard's primary entry point
+// — the app_detail.html "Stateless advisories" link passes
+// ?kind_prefix=stateless.advisory&app_id={uuid}.
+type AuditEventsData struct {
+	KindPrefix string
+	AppID      string
+	AppSlug    string
+	Events     []AuditEventRow
+	// IncludeAnonymous is echoed back so the template can render a
+	// checkbox pre-toggled to the operator's previous choice.
+	IncludeAnonymous bool
+}
+
+// AuditEventRow is one row of the audit table. TimeLabel is a
+// pre-formatted relative timestamp ("3m ago" / "just now" / "—")
+// computed at the handler edge so the template stays a pure renderer.
+type AuditEventRow struct {
+	ID         string
+	TimeLabel  string
+	Actor      string
+	Kind       string
+	Subject    string
+	DataPretty string
+}
