@@ -37,6 +37,8 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,6 +48,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
+	"github.com/onebox-faas/faas/pkg/billing/reconciler"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
@@ -606,11 +609,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 
 	pusher := deps.pusher
+	var provName string
 	if pusher == nil {
 		if deps.loadBillingProvider == nil {
 			return fmt.Errorf("meterd: nil loadBillingProvider and nil pusher (refusing to start unbounded)")
 		}
-		var provName string
 		var err error
 		pusher, provName, err = deps.loadBillingProvider(deps.getenv, store, log)
 		if err != nil {
@@ -653,6 +656,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	applyEnvTick("FAAS_RESIDENCY_INTERVAL", &mc.ResidencyInterval, deps.getenv, log)
 	applyEnvTick("FAAS_ALERT_EVAL_INTERVAL", &mc.AlertEvalInterval, deps.getenv, log)
 	applyEnvTick("FAAS_ROLLUP_INTERVAL", &mc.RollupInterval, deps.getenv, log)
+	// ADR-049 §B.1/§B.3/§B.4 — drift detector, storage rollup,
+	// and retention cadences. Defaults live in pkg/meter/{config,
+	// storage, retention}.go so cmd/meterd stays thin.
+	applyEnvTick("FAAS_RECONCILE_INTERVAL", &mc.ReconcileInterval, deps.getenv, log)
+	applyEnvTick("FAAS_STORAGE_ROLLUP_INTERVAL", &mc.StorageRollupInterval, deps.getenv, log)
+	applyEnvTick("FAAS_RETENTION_INTERVAL", &mc.RetentionInterval, deps.getenv, log)
 
 	// Dunning timer: drives the 7-day past_due → suspended and 21-day
 	// suspended → deleted_pending transitions (spec §4.7, §17). Wired
@@ -750,6 +759,34 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (Exec(ctx, sql, args...) → (rows int64, err error)).
 	go meter.RollupLoop(ctx, poolAdapter{pool}, mc.RollupInterval, log)
 
+	// ADR-049 §B.1: drift detector. The reconciler owns its own
+	// Prometheus registry (not wire.OpsMetrics) so it can be wired
+	// alongside the existing gauges without coupling — the two
+	// registries are merged at the /metrics scrape below. We hand
+	// it the same billing.Provider the pusher uses (no second SDK
+	// client load). provName defaults to "stripe" for the historical
+	// loader that returns an empty string; cmd/meterd/main.go:613
+	// guarantees the pusher is loaded before we get here.
+	recRegistry := prometheus.NewRegistry()
+	if provName == "" {
+		provName = "stripe"
+	}
+	rec := reconciler.New(provName, store, pusher, log, recRegistry)
+	go rec.Loop(ctx, mc.ReconcileInterval)
+
+	// ADR-049 §B.3: snapshot/app-layer storage rollup. The store
+	// interface (pkg/meter/storage.go) is a narrow projection over
+	// state.Store so pkg/meter doesn't import the whole surface.
+	// layerFn is nil this PR — overlay staging byte accounting
+	// lands in a follow-up (ADR-049 §B.3 follow-up bullet); the
+	// rollup still emits snapshot_bytes daily.
+	storageStore := storageStoreAdapter{s: store}
+	go meter.StorageRollupLoop(ctx, storageStore, nil, mc.StorageRollupInterval, log)
+
+	// ADR-049 §B.4: 13-month retention DELETE cron. The pool
+	// satisfies the retentionExecer contract.
+	go meter.RetentionLoop(ctx, poolAdapter{pool}, mc.RetentionInterval, log)
+
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
@@ -762,7 +799,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("meterd: nil metricsListenAndServe (refusing to start with MetricsAddr set)")
 		}
 		mux := http.NewServeMux()
-		mux.Handle(metricsPath, ops.Handler())
+		// /metrics merges the wire.OpsMetrics registry with the
+		// reconciler's per-package registry via a Gatherers, so a
+		// single scrape endpoint exposes both. Both registries are
+		// isolated so pkg/billing/reconciler stays free of an
+		// import on pkg/wire. ADR-049 §B.1.
+		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry}
+		mux.Handle(metricsPath, promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
 		// /healthz — 200 when every tracked timer (sample / quota /
 		// stripe / dunning) has fired within
 		// meter.StaleAfterMultiplier × its interval (spec §14 M7,
@@ -901,4 +944,33 @@ func (a poolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, 
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// storageStoreAdapter narrows state.Store to the meter.Store
+// projection pkg/meter/storage.go needs. Defined here so pkg/meter
+// doesn't import the entire state.Store surface just for the
+// rollup. The cast is safe at the SQL layer — every column the
+// rollup reads (apps.account_id, apps.id, snapshots.mem_bytes,
+// snapshots.disk_bytes, snapshot_storage_daily.*) is exposed on
+// state.Store today.
+type storageStoreAdapter struct{ s state.Store }
+
+func (a storageStoreAdapter) ListAllApps(ctx context.Context) ([]meter.AppRow, error) {
+	rows, err := a.s.ListAllApps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]meter.AppRow, len(rows))
+	for i, r := range rows {
+		out[i] = meter.AppRow{AccountID: r.AccountID, AppID: r.ID}
+	}
+	return out, nil
+}
+
+func (a storageStoreAdapter) LatestSnapshotBytes(ctx context.Context, appID string) (int64, int64, error) {
+	return a.s.LatestSnapshotBytes(ctx, appID)
+}
+
+func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
+	return a.s.AppendSnapshotStorage(ctx, accountID, appID, day, snapshotBytes, layerBytes)
 }

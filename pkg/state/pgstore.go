@@ -5405,6 +5405,76 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	return out, rows.Err()
 }
 
+// AppendSnapshotStorage upserts one snapshot_storage_daily row.
+// NOT additive merge: the storage rollup is a point-in-time snapshot
+// of the current snapshot+layer bytes (pkg/meter/storage.go computes
+// the cumulative total for the day, then writes). Re-running for the
+// same day overwrites the existing row. ADR-049 §B.3.
+func (s *PgStore) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into snapshot_storage_daily
+		    (account_id, app_id, day, snapshot_bytes, layer_bytes, computed_at)
+		 values ($1, $2, $3::timestamptz, $4, $5, now())
+		 on conflict (account_id, app_id, day) do update set
+		    snapshot_bytes = excluded.snapshot_bytes,
+		    layer_bytes    = excluded.layer_bytes,
+		    computed_at    = excluded.computed_at`,
+		accountID, appID, day.UTC(), snapshotBytes, layerBytes)
+	return err
+}
+
+// LatestSnapshotBytes returns mem_bytes + disk_bytes for the app's
+// latest non-stale snapshot. We join deployments to find the
+// app's currently active deployment_id, then look up the most
+// recently created snapshot row. Returns (0, 0, nil) when the app
+// has no snapshot — a cold start, not an error. ADR-049 §B.3.
+func (s *PgStore) LatestSnapshotBytes(ctx context.Context, appID string) (int64, int64, error) {
+	var memBytes, diskBytes int64
+	err := s.pool.QueryRow(ctx,
+		`select coalesce(s.mem_bytes, 0), coalesce(s.disk_bytes, 0)
+		   from snapshots s
+		   join deployments d on s.deployment_id = d.id
+		  where d.app_id = $1
+		    and s.stale = false
+		  order by s.created_at desc
+		  limit 1`,
+		appID).Scan(&memBytes, &diskBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	return memBytes, diskBytes, nil
+}
+
+// StorageUsage returns the per-(account, app, day) storage rollup
+// rows. day is a UTC midnight timestamp; only the date portion is
+// used in the predicate (mirrors UsageDaily's AT TIME ZONE 'UTC'
+// conversion). ADR-049 §B.3.
+func (s *PgStore) StorageUsage(ctx context.Context, accountID string, day time.Time) ([]StorageUsage, error) {
+	rows, err := s.pool.Query(ctx,
+		`select app_id, day, snapshot_bytes, layer_bytes
+		   from snapshot_storage_daily
+		  where account_id = $1
+		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
+		  order by app_id`,
+		accountID, day.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StorageUsage
+	for rows.Next() {
+		u := StorageUsage{AccountID: accountID}
+		if err := rows.Scan(&u.AppID, &u.Day, &u.SnapshotBytes, &u.LayerBytes); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // HasStripePushHour is the dedupe gate the meterd hourly pusher reads
 // before issuing the Stripe call. Backed by a unique index on
 // (account_id, hour) in the stripe_push_dedupe table (added in

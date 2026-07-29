@@ -703,6 +703,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getUsage))))
 	mux.HandleFunc("GET /v1/usage/summary", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.usageSummary))))
 	mux.HandleFunc("GET /v1/usage/daily", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.usageDaily))))
+	mux.HandleFunc("GET /v1/usage/storage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.usageStorage))))
 	// Billing history (issue #259). Listing one's own invoices is the
 	// same access tier as usage/summary — usage:read is enough.
 	// Wrapped in requireMFA for consistency with the other

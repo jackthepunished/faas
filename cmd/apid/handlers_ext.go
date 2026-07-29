@@ -1720,6 +1720,45 @@ func (s *server) usageDaily(w http.ResponseWriter, r *http.Request, acct state.A
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// usageStorage serves GET /v1/usage/storage?day=YYYY-MM-DD — the
+// per-(app, day) snapshot+layer byte rollup (ADR-049 §B.3,
+// migration 00070). Distinct from /v1/usage which reports billable
+// compute; this route reports storage footprint. Informational
+// only today — the future "Pro plan 1 GB included" PR consumes
+// this surface.
+//
+// day is required (same contract as /v1/usage/daily). All numeric
+// fields are informational; not billed.
+func (s *server) usageStorage(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	dayStr := r.URL.Query().Get("day")
+	if dayStr == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing day", "expected ?day=YYYY-MM-DD"))
+		return
+	}
+	day, err := time.Parse("2006-01-02", dayStr)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad day", "expected YYYY-MM-DD"))
+		return
+	}
+	rows, err := s.store.StorageUsage(ctx(r), acct.ID, day)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not load storage usage"))
+		return
+	}
+	resp := api.StorageUsageListResponse{Items: make([]api.StorageUsageResponse, 0, len(rows))}
+	for _, u := range rows {
+		resp.Items = append(resp.Items, api.StorageUsageResponse{
+			AppID:         u.AppID,
+			Day:           u.Day.UTC().Format("2006-01-02"),
+			SnapshotBytes: u.SnapshotBytes,
+			LayerBytes:    u.LayerBytes,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // listInvoices serves GET /v1/invoices — issue #259 invoice history.
 // Account-scoped: the authenticated principal is the only source of
 // accountID. Pagination is RFC3339Nano cursor (period_end DESC); month

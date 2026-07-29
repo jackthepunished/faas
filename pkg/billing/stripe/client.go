@@ -333,6 +333,40 @@ func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64)
 	}, nil
 }
 
+// ReconcileUsage queries Stripe for the mb_seconds total pushed in
+// the [start, end) window via stripe.UsageRecordSummaries.List and
+// returns it as int64 mb_seconds. ADR-049 §B.1.
+//
+// Read-only against Stripe — does NOT mutate customer /
+// subscription state. Returns (0, err) on any SDK error so the
+// reconciler can fail-soft log-and-skip the account.
+//
+// The actual Stripe SDK call is intentionally a stub for this PR.
+// The interface contract is the load-bearing seam — wiring the
+// SDK's TotalUsage summation lands in a follow-up PR against the
+// stripe sandbox. Today we return (0, nil) so the reconciler's
+// local-only drift signal (usage_minutes total) drives the
+// BillingDrift alert. The reconciler skips Stripe on the
+// "0 returned" path; the alert is gated on ratio > 0.005 so a
+// non-Stripe provider drift is still detected via the Paddle path
+// when that lands.
+//
+// Returns (0, nil) when subscription_item is missing (the brand-
+// new account interregnum) so the reconciler doesn't false-
+// positive.
+func (c *Client) ReconcileUsage(_ context.Context, acct state.Account, _, _ time.Time) (int64, error) {
+	if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
+		return 0, nil
+	}
+	// Stub: full SDK summation lands in the follow-up PR. Returning
+	// (0, nil) tells the reconciler "Stripe has nothing to say",
+	// which is honest — until the implementation lands, we can't
+	// distinguish "Stripe dropped a push" from "Stripe has no push
+	// to reconcile yet". The reconciler's local-sum gate keeps
+	// the alert meaningful.
+	return 0, nil
+}
+
 // centsToMillicents converts integer EUR cents to Stripe's native
 // millicents (×10). CLAUDE.md invariant: integer cents/millicents
 // only; never float on money. The factor is fixed (Stripe's wire

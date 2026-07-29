@@ -1,6 +1,10 @@
 package meter
 
-import "time"
+import (
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/billing/reconciler"
+)
 
 // Config is the meterd daemon's TOML-backed settings. Defaults match
 // the spec §4.7 cadence:
@@ -61,6 +65,25 @@ type Config struct {
 	// window adds onto the prior partial sum, never overwrites —
 	// so a missed tick is safe; the next tick covers the gap.
 	RollupInterval time.Duration
+	// ReconcileInterval (ADR-049 §B.1) is how often the drift
+	// detector (pkg/billing/reconciler) walks the paid-account
+	// list and compares local usage_minutes totals against the
+	// provider's pushed totals. Zero means the production
+	// default (6 h). Fail-soft per account: a transient
+	// provider error skips that account, the loop continues.
+	ReconcileInterval time.Duration
+	// StorageRollupInterval (ADR-049 §B.3) is how often the
+	// storage rollup tick (pkg/meter/storage.go) populates
+	// snapshot_storage_daily. Zero means the production default
+	// (1 h). The rollup overwrites the row for the current
+	// day — distinct from usage_daily's additive-merge contract.
+	StorageRollupInterval time.Duration
+	// RetentionInterval (ADR-049 §B.4) is how often the retention
+	// cron (pkg/meter/retention.go) DELETEs usage_minutes rows
+	// older than 13 months. Zero means the production default
+	// (1 day). The DELETE is idempotent — a second run on the
+	// same day finds nothing to delete.
+	RetentionInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -91,5 +114,14 @@ func (c *Config) Defaults() {
 	}
 	if c.RollupInterval == 0 {
 		c.RollupInterval = 5 * time.Minute
+	}
+	if c.ReconcileInterval == 0 {
+		c.ReconcileInterval = reconciler.DefaultInterval
+	}
+	if c.StorageRollupInterval == 0 {
+		c.StorageRollupInterval = DefaultStorageRollupInterval
+	}
+	if c.RetentionInterval == 0 {
+		c.RetentionInterval = DefaultRetentionInterval
 	}
 }

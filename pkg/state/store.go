@@ -1364,6 +1364,26 @@ type Store interface {
 	// day is a UTC midnight time; the returned rows cover the
 	// single day. Empty when no rollup has fired yet. ADR-048 §5.
 	UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error)
+	// AppendSnapshotStorage writes a snapshot_storage_daily row
+	// for the given (account, app, day). Idempotent on PK
+	// (account_id, app_id, day): a redelivered tick or a meterd
+	// restart overwrites the existing row with the cumulative
+	// total for that day (not additive merge — the storage rollup
+	// is a point-in-time snapshot, not an accumulator). ADR-049 §B.3.
+	AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error
+	// LatestSnapshotBytes returns mem_bytes + disk_bytes for the
+	// app's latest non-stale snapshot (the latest row in
+	// public.snapshots joined to the app's active deployment,
+	// filtered by stale=false). Returns (0, 0, nil) when the app
+	// has no snapshot yet — a cold start, not an error. ADR-049
+	// §B.3.
+	LatestSnapshotBytes(ctx context.Context, appID string) (memBytes, diskBytes int64, err error)
+	// StorageUsage returns the per-(account, app, day) storage
+	// rollup rows (migrations/00070_snapshot_storage_daily.sql
+	// ::snapshot_storage_daily). day is a UTC midnight time;
+	// empty when the storage rollup has not fired for that day
+	// yet. ADR-049 §B.3.
+	StorageUsage(ctx context.Context, accountID string, day time.Time) ([]StorageUsage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
 	// first, ordered by (period_end DESC, id DESC) for deterministic
 	// pagination. month is optional: when non-nil, the result is

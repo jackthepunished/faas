@@ -905,6 +905,20 @@ type DailyUsage struct {
 	BuilderSeconds int64
 }
 
+// StorageUsage is the per-(account, app, day) row read by
+// Store.StorageUsage (ADR-049 §B.3). Mirrors
+// migrations/00070_snapshot_storage_daily.sql::snapshot_storage_daily.
+// Day is a UTC midnight date; PK is (account_id, app_id, day).
+// Informational — not billed today; the future "Pro plan 1 GB
+// included" PR consumes this surface.
+type StorageUsage struct {
+	AccountID     string
+	AppID         string
+	Day           time.Time
+	SnapshotBytes int64
+	LayerBytes    int64
+}
+
 // Invoice is one persisted invoice from a billing provider (issue #259,
 // BILLING: plan comparison + invoice history). Rows arrive via the
 // webhook ingestion path (PR B); the read API and dashboard read this

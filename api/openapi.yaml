@@ -2815,6 +2815,37 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # Storage rollup (ADR-049 §B.3). Per-(app, day) snapshot+layer
+  # byte totals from the meterd storage rollup cron. Informational
+  # only — the future "Pro plan 1 GB included" PR consumes this
+  # surface. Distinct from /v1/usage which reports billable compute.
+  /v1/usage/storage:
+    get:
+      tags: [usage]
+      operationId: usageStorage
+      summary: Per-app daily storage rollup (informational).
+      parameters:
+        - name: day
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: '2026-07-29' }
+          description: Calendar day in `YYYY-MM-DD` form (UTC). Required for the storage rollup.
+      responses:
+        '200':
+          description: Per-app storage rollup rows for the requested day.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageUsageListResponse'
+              example: {"items":[{"app_id":"0123456789abcdef0123456789abcdef","day":"2026-07-29","snapshot_bytes":130000000,"layer_bytes":256000000}]}
+        '400':
+          description: Missing or malformed `day` query parameter on the storage rollup surface.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Billing history (issue #259) ──────────────────────────────────────
   # Account-scoped read of the billing-provider invoices persisted from
   # the Stripe / Paddle webhooks. Empty history returns 200 with items=[].
@@ -3363,6 +3394,35 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/DailyUsageResponse' }
+      x-since: "2026-08"
+      x-issue: "436"
+
+    StorageUsageResponse:
+      description: "Per-app storage rollup for one calendar day (informational; not billed today). Mirrors the `snapshot_storage_daily` table populated by the meterd storage rollup loop (ADR-049 §B.3, migration 00070)."
+      type: object
+      required: [app_id, day, snapshot_bytes, layer_bytes]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        day: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-07-29" }
+        snapshot_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative snapshot bytes (mem_bytes + disk_bytes) for the day (informational; not billed today). ADR-049 §B.3."
+        layer_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative overlay-staging layer bytes for the day (informational; not billed today). ADR-049 §B.3."
+      x-since: "2026-08"
+      x-issue: "436"
+
+    StorageUsageListResponse:
+      description: "Page shape for GET /v1/usage/storage — wraps an array of per-app storage rollup rows."
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/StorageUsageResponse' }
       x-since: "2026-08"
       x-issue: "436"
 

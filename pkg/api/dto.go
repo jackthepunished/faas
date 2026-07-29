@@ -767,6 +767,25 @@ type DailyUsageListResponse struct {
 	Items []DailyUsageResponse `json:"items"`
 }
 
+// StorageUsageResponse is one row of GET /v1/usage/storage — the
+// per-(account, app, day) storage rollup (migrations/
+// 00070_snapshot_storage_daily.sql). Mirrors the snapshot+layer
+// byte totals that the meterd storage rollup cron (pkg/meter/
+// storage.go) populates. ADR-049 §B.3.
+type StorageUsageResponse struct {
+	AppID         string `json:"app_id"`
+	Day           string `json:"day"` // YYYY-MM-DD
+	SnapshotBytes int64  `json:"snapshot_bytes"`
+	LayerBytes    int64  `json:"layer_bytes"`
+}
+
+// StorageUsageListResponse is the page shape for GET /v1/usage/storage.
+// Items is always non-nil so the JSON encodes an empty array, not
+// null, when the requested day has no rollup rows yet.
+type StorageUsageListResponse struct {
+	Items []StorageUsageResponse `json:"items"`
+}
+
 // APIKeyExportResponse is one row in the export's API key slice.
 // The plaintext key never appears here (and never reappears after
 // the create response, per §4.2). Only the prefix + label + scopes +

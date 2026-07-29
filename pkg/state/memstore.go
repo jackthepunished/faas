@@ -4285,6 +4285,27 @@ func (m *MemStore) UsageDaily(_ context.Context, _ string, _ time.Time) ([]Daily
 	return nil, nil
 }
 
+// AppendSnapshotStorage + StorageUsage mirror pgstore for the storage
+// rollup (ADR-049 §B.3). The MemStore does not maintain the rollup —
+// pkg/meter/storage.go wires directly to PgStore in production. Returns
+// nil so handlers do not crash on dev/host builds.
+func (m *MemStore) AppendSnapshotStorage(_ context.Context, _, _ string, _ time.Time, _, _ int64) error {
+	return nil
+}
+
+func (m *MemStore) StorageUsage(_ context.Context, _ string, _ time.Time) ([]StorageUsage, error) {
+	return nil, nil
+}
+
+// LatestSnapshotBytes mirrors pgstore for the storage rollup
+// (ADR-049 §B.3). The MemStore does not maintain a snapshot set;
+// returns (0, 0, nil) so the rollup writes a zero-byte day rather
+// than crashing. Tests that exercise the rollup's write path use
+// PgStore against a real Postgres (migrations/00070_snapshot_storage_daily_test.go).
+func (m *MemStore) LatestSnapshotBytes(_ context.Context, _ string) (int64, int64, error) {
+	return 0, 0, nil
+}
+
 // HasStripePushHour + RecordStripePushHour implement the pkg/billing/stripe
 // PushDedupe interface. The MemStore keeps a flat set keyed by
 // (account, hour); PgStore keeps a dedicated table.

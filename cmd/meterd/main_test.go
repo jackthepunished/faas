@@ -156,6 +156,14 @@ func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult
 	return nil, billing.ErrNotImplemented
 }
 
+// ReconcileUsage is the ADR-049 §B.1 drift-detector seam. meterd
+// calls it via the reconciler (cmd/meterd/main.go). Returning
+// ErrNotImplemented matches the Paddle contract — the reconciler
+// treats that as "no provider drift signal yet".
+func (nopProvider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
+}
+
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
 // pins the production default (deploy/etc/meterd.toml.example leaves
@@ -512,6 +520,13 @@ func (r *meterRec) CreateUpgradeTransaction(context.Context, state.Account, api.
 // it; returning ErrNotImplemented matches the Paddle contract.
 func (r *meterRec) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
 	return nil, billing.ErrNotImplemented
+}
+
+// ReconcileUsage is the ADR-049 §B.1 drift-detector seam. Stub:
+// the meterd main tests don't drive the reconciler, so we return
+// (0, nil) — no drift signal.
+func (r *meterRec) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
+	return 0, nil
 }
 
 func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, int64) error {

@@ -1075,6 +1075,14 @@ func (c *Client) UsageDaily(ctx context.Context, day string) (DailyUsageListResp
 	return out, c.do(ctx, "GET", "/v1/usage/daily?day="+day, nil, &out)
 }
 
+// StorageUsage returns the per-(app, day) snapshot+layer byte rollup
+// (ADR-049 §B.3). day is "YYYY-MM-DD" and is required; the server
+// 400s on empty. Informational only — not billed today.
+func (c *Client) StorageUsage(ctx context.Context, day string) (StorageUsageListResponse, error) {
+	var out StorageUsageListResponse
+	return out, c.do(ctx, "GET", "/v1/usage/storage?day="+day, nil, &out)
+}
+
 // ListDeployments returns a single page of deployments with a
 // "next_before" cursor (RFC3339Nano). Use ListDeploymentsAll (added in
 // commit 2) to walk every page automatically.

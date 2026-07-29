@@ -335,6 +335,14 @@ func (f *fakeBillingProvider) Refund(_ context.Context, _ string, _ int64) (*bil
 	return nil, billing.ErrNotImplemented
 }
 
+// ReconcileUsage is the drift-detector seam (ADR-049 §B.1). The
+// changePlan tests don't drive the reconciler, so the fake
+// returns ErrNotImplemented — the reconciler treats that as
+// "provider has no drift signal" and skips the account.
+func (f *fakeBillingProvider) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
+}
+
 // TestChangePlan_PaddleCheckout_RendersPaddleExtension pins the
 // Paddle dispatch on the changePlan 402 path (PR #3 / ADR-025). The
 // fakeBillingProvider returns ("txn_abc", "https://paddle.example/checkout/xyz", nil);
