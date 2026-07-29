@@ -10,6 +10,12 @@
 // so both pkg/auth and pkg/state (and their tests) can depend on it
 // without creating a cycle.
 //
+// Error prefixes keep the legacy "auth/totp:" tag (not "authcode:")
+// so log greps + errors.Is probes written before the lift (e.g.
+// "auth/totp: rand:" in cmd/apid's deploy error budget tracker) keep
+// matching. The package itself is new; the error prefix is a log
+// compatibility shim.
+//
 // Entropy breakdown (mirrored from the original pkg/auth/totp.go):
 // 10 bytes of CSPRNG source = 80 bits; the base32-no-padding encoding
 // of 10 bytes is 16 chars; we truncate to 10 chars (50 bits
@@ -46,7 +52,7 @@ func NewRecoveryCodes(n int) (plaintexts []string, hashes [][]byte, err error) {
 	for i := 0; i < n; i++ {
 		raw := make([]byte, 10) // 80 bits = 16 base32 chars; truncate to 10
 		if _, err := rand.Read(raw); err != nil {
-			return nil, nil, fmt.Errorf("authcode: rand: %w", err)
+			return nil, nil, fmt.Errorf("auth/totp: rand: %w", err)
 		}
 		encoded := strings.TrimRight(base32.StdEncoding.EncodeToString(raw), "=")
 		plaintexts[i] = strings.ToUpper(encoded[:10])

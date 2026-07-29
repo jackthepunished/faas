@@ -83,25 +83,24 @@ func (s *server) loadApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 
 // authAccountHandler converts a pkg/middleware.AccountHandler back to
 // cmd/apid's unexported accountHandler. Structurally identical so
-// this is a free conversion (no allocation, no closure capture).
-// Cast via the function-pointer round-trip so a future divergence
-// in either type surfaces as a compile error here.
+// the conversion is a free cast (no allocation, no closure capture)
+// — the round-trip through interface{} is the only thing that lets
+// Go assign across two distinct named function types. A future
+// signature divergence between AccountHandler and accountHandler
+// fails the cast at compile time; the var assertion below pins the
+// union the other direction so cmd/apid's handlers compose with the
+// pkg/auth chain by typing, not by conversion.
 func authAccountHandler(h middleware.AccountHandler) accountHandler {
-	// Type assertion: if pkg/auth changes AccountHandler's
-	// signature, the compiler fails this line. The free cast
-	// (no closure capture) is the load-bearing property — every
-	// request that flows through RequireMFA must not allocate
-	// a new closure.
-	if v, ok := interface{}(h).(accountHandler); ok {
-		return v
-	}
-	// Unreachable in practice; the conversion is always valid
-	// because the two function types are structurally identical.
-	// The fallback wraps in a closure so the type checker is
-	// happy even if a future type divergence breaks the cast.
-	return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
-		h(w, r, acct)
-	}
+	return accountHandler(h)
+}
+
+// Compile-time assertion: both function types must be
+// structurally identical. If pkg/auth changes AccountHandler
+// (e.g. adds an argument), the round-trip below fails and the
+// bridge stops compiling — the surface area is the contract.
+var _ = func() accountHandler {
+	var pkg middleware.AccountHandler
+	return accountHandler(pkg)
 }
 
 // sessionFrom is the cmd/apid-side bridge to pkg/middleware.SessionFromContext.

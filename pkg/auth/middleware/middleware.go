@@ -1,7 +1,7 @@
-// Package auth lifts the authentication + authorization middleware
-// out of cmd/apid so cmd/gatewayd (and any future daemon that needs
-// to authenticate a customer request) can compose the same chain
-// without duplicating cmd/apid's auth surface.
+// Package middleware lifts the authentication + authorization
+// middleware out of cmd/apid so cmd/gatewayd (and any future daemon
+// that needs to authenticate a customer request) can compose the
+// same chain without duplicating cmd/apid's auth surface.
 //
 // The shape is the five pieces that today wrap every /v1/* route in
 // cmd/apid (cmd/apid/server.go, cmd/apid/mfa_middleware.go,
@@ -161,17 +161,116 @@ type Middleware struct {
 	// fire per keyTouchWindow. Hot keys (high-RPS cron apps)
 	// would mint 1k+ UPDATEs/sec on api_keys.last_used_at
 	// without this; with it the working set is "active keys in
-	// the last 30 s" per the eviction rule in touchTicket.
+	// the last 30 s" per the eviction rule in TouchTicket.
 	keyDebounce keyTouchDebounce
 
 	// sessionDebounce gates per-sid last_seen_at touches to one
 	// fire per sessionTouchWindow. Same pattern as keyDebounce.
 	sessionDebounce sessionTouchDebounce
+
+	// keyTouchWindowForTest overrides the production 30s window
+	// when non-zero. Tests set this to a small value (50ms) to
+	// exercise the eviction contract without sleeping half a
+	// minute per case.
+	keyTouchWindowForTest time.Duration
+	// sessionTouchWindowForTest: same override for sessions.
+	sessionTouchWindowForTest time.Duration
 }
 
-// New returns the Middleware value. Panics on nil Authenticator
-// because every method requires it; nil Sessions/Lookups/Audit/Log
-// are tolerated (the corresponding paths are guarded).
+// keyTouchWindow returns the production 30s window unless an
+// in-package test override has been set on keyTouchWindowForTest.
+func (m *Middleware) keyTouchWindow() time.Duration {
+	if m.keyTouchWindowForTest > 0 {
+		return m.keyTouchWindowForTest
+	}
+	return keyTouchWindow
+}
+
+// sessionTouchWindow returns the production 5min window unless
+// an in-package test override has been set.
+func (m *Middleware) sessionTouchWindow() time.Duration {
+	if m.sessionTouchWindowForTest > 0 {
+		return m.sessionTouchWindowForTest
+	}
+	return sessionTouchWindow
+}
+
+// KeyDebounceMapSize returns the current size of the per-key
+// debounce map. Exported for whitebox tests that pin the eviction
+// contract (pkg/auth/middleware/debounce_whitebox_test.go).
+func (m *Middleware) KeyDebounceMapSize() int {
+	n := 0
+	m.keyDebounce.tickets.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// SessionDebounceMapSize returns the current size of the per-sid
+// debounce map. Exported for whitebox tests.
+func (m *Middleware) SessionDebounceMapSize() int {
+	n := 0
+	m.sessionDebounce.tickets.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// KeyTouchWindowForTest overrides the production 30s window.
+// Tests set a small value (e.g. 30ms) so they can validate the
+// eviction contract in milliseconds.
+func (m *Middleware) KeyTouchWindowForTest(d time.Duration) { m.keyTouchWindowForTest = d }
+
+// SessionTouchWindowForTest overrides the production 5min window.
+func (m *Middleware) SessionTouchWindowForTest(d time.Duration) { m.sessionTouchWindowForTest = d }
+
+// KeyTouchWindow returns the active key debounce window.
+func (m *Middleware) KeyTouchWindow() time.Duration { return m.keyTouchWindow() }
+
+// SessionTouchWindow returns the active session debounce window.
+func (m *Middleware) SessionTouchWindow() time.Duration { return m.sessionTouchWindow() }
+
+// KeyDebounceShouldTouch wraps the unexported debouncer
+// shouldTouch so whitebox tests in package middleware_test can
+// drive the election contract without making every test an
+// internal-package test (which would force them to rebuild
+// helpers that already exist in the blackbox file).
+func (m *Middleware) KeyDebounceShouldTouch(keyID string, now time.Time) (*TouchTicket, bool) {
+	return m.keyDebounce.shouldTouch(keyID, now, m.keyTouchWindow())
+}
+
+// SessionDebounceShouldTouch mirrors KeyDebounceShouldTouch for
+// the per-sid debouncer.
+func (m *Middleware) SessionDebounceShouldTouch(sid string, now time.Time) (*TouchTicket, bool) {
+	return m.sessionDebounce.shouldTouch(sid, now, m.sessionTouchWindow())
+}
+
+// FiredAtSet backdates the ticket's firedAt stamp. Test-only seam
+// for the CAS-replace invariant: a test stamps a past time, then
+// calls shouldTouch again to drive the CAS-replace branch and
+// validate that the stale ticket's eventual CompareAndDelete is a
+// no-op (it doesn't delete the freshly-stamped entry).
+func (t *TouchTicket) FiredAtSet(ts time.Time) { t.firedAt.Store(&ts) }
+
+// New returns the Middleware value.
+//
+// Required:
+//
+//   - authn — every method reads from it. nil → panic.
+//   - limiter — shared per-IP bucket for RequireLimited. nil → panic;
+//     pass middleware.NewLimiter(cfg).
+//
+// Optional (nil tolerated, corresponding paths guarded):
+//
+//   - sessions + lookups — together they enable the cookie branch
+//     of RequireSession (the AEAD-verify + IAM-3 live-row cross-
+//     check). Either nil disables the cookie branch: a request with
+//     a session cookie falls through to the no-credentials 401.
+//     Production callers wire both; tests that only exercise the
+//     bearer branch pass nil/nil.
+//   - auditor — nil disables audit-row emission. RequireMFA's
+//     auth.mfa_gate_hit row, the session-stolen row, and the
+//     bearer-inactive row are all gated on this. Production always
+//     passes a non-nil auditor; unit tests pass nil.
+//   - log — nil disables the Warn path. The middleware never logs
+//     anything at Info or above; Warn is for cross-check failures
+//     and detached-touch errors.
 func New(authn Authenticator, sessions Sessions, lookups SessionLookup,
 	auditor Auditor, log *slog.Logger, limiter *middleware.Limiter) *Middleware {
 	if authn == nil {
@@ -200,54 +299,76 @@ const defaultSessionCookieName = "faas_sid"
 const keyTouchWindow = 30 * time.Second
 
 // keyTouchDebounce is the per-key debounce map. sync.Map idiom;
-// reads are lock-free, writes go through LoadOrStore so two
+// reads are lock-free, writes go through CompareAndSwap so two
 // concurrent first-time callers don't both schedule a touch.
 //
-// Cleanup: every accepted touch is keyed by a fresh *touchTicket
-// pointer returned by LoadOrStore. After the touch goroutine fires
-// its update it calls ticket.AfterFire(window) which atomically
-// deletes the entry IFF no concurrent firer has stamped a newer
-// ticket in the meantime. Working set stays at "active keys in the
-// last 30 s" rather than "all keys ever authenticated".
+// Cleanup: every accepted touch is keyed by a fresh *TouchTicket
+// pointer. The firing goroutine calls ticket.AfterFire(window) which
+// sleeps for the window then atomically deletes the entry via
+// CompareAndDelete IFF no concurrent firer has stamped a newer
+// ticket in the meantime (pointer-identity check). Working set
+// stays at "active keys in the last 30 s" rather than "all keys
+// ever authenticated".
 type keyTouchDebounce struct {
-	tickets sync.Map // key string → *touchTicket
+	tickets sync.Map // key string → *TouchTicket
 }
 
-type touchTicket struct {
-	firedAt atomic.Pointer[time.Time] // store.Load() reads through here
+// TouchTicket carries the map reference + the key id so AfterFire
+// can atomically delete the entry without the caller threading
+// extra arguments through the detached-goroutine path.
+type TouchTicket struct {
+	m       *sync.Map // pointer to debouncer.tickets; load-bearing for CompareAndDelete
+	id      string    // map key for CompareAndDelete
+	firedAt atomic.Pointer[time.Time]
 }
 
-func (t *touchTicket) AfterFire(window time.Duration) {
+// AfterFire sleeps for window then atomically deletes the
+// debouncer's map entry IFF the stored ticket still matches this
+// pointer. A fresher firer stamping its own ticket leaves this
+// goroutine's CompareAndDelete as a no-op — pointer-identity is the
+// eviction version. Pre-extraction cmd/apid used the same shape
+// (server.touchDebounce + the deleted session_middleware.go
+// sessionTouchDebounce).
+func (t *TouchTicket) AfterFire(window time.Duration) {
+	if t == nil {
+		return
+	}
 	now := time.Now()
 	t.firedAt.Store(&now)
-	// The per-key entry is dropped by the ShouldTouch helper
-	// itself when it next sees the same key — no separate
-	// sweeper goroutine. matches cmd/apid's server.touchDebounce.
+	time.Sleep(window)
+	t.m.CompareAndDelete(t.id, t)
 }
 
 // shouldTouch elects exactly one firer per window and returns a
-// *touchTicket; the firing goroutine calls ticket.AfterFire at the
+// *TouchTicket; the firing goroutine calls ticket.AfterFire at the
 // end (success or failure) so the per-key map entry is removed
 // keyTouchWindow later.
-func (d *keyTouchDebounce) shouldTouch(keyID string, now time.Time) (*touchTicket, bool) {
+func (d *keyTouchDebounce) shouldTouch(keyID string, now time.Time, window time.Duration) (*TouchTicket, bool) {
 	if existing, ok := d.tickets.Load(keyID); ok {
-		t := existing.(*touchTicket)
-		if last := t.firedAt.Load(); last != nil && now.Sub(*last) < keyTouchWindow {
+		t := existing.(*TouchTicket)
+		if last := t.firedAt.Load(); last != nil && now.Sub(*last) < window {
 			return nil, false
 		}
-		// Stale ticket; replace with a fresh one so the next
-		// goroutine's AfterFire deletes this map entry but the
-		// fresh firer gets its own ticket pointer.
+		// Stale ticket: CAS-replace so the next firer wins
+		// without losing the election-on-window-elapsed property.
+		// If a concurrent firer already swapped the ticket in
+		// between, our CompareAndSwap fails and we read the
+		// winner — fall through to the conditional second check
+		// so the post-CAS ticket is honored.
+		fresh := &TouchTicket{m: &d.tickets, id: keyID}
+		fresh.firedAt.Store(&now)
+		if d.tickets.CompareAndSwap(keyID, t, fresh) {
+			return fresh, true
+		}
+		if cur, ok := d.tickets.Load(keyID); ok {
+			latest := cur.(*TouchTicket)
+			if last := latest.firedAt.Load(); last != nil && now.Sub(*last) < window {
+				return nil, false
+			}
+		}
 	}
-	t := &touchTicket{}
-	// Stamp firedAt NOW so the next caller within keyTouchWindow
-	// sees the debounce-active state immediately, without waiting
-	// for the goroutine to call AfterFire. The detached goroutine
-	// later calls AfterFire which atomically extends the stamp
-	// (records the actual touch wall-clock) but the entry is
-	// already debounced.
-	nowCopy := now
-	t.firedAt.Store(&nowCopy)
+	t := &TouchTicket{m: &d.tickets, id: keyID}
+	t.firedAt.Store(&now)
 	d.tickets.Store(keyID, t)
 	return t, true
 }
@@ -290,10 +411,10 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 				// cannot block the user's request, and a canceled
 				// client (tab close, SSE disconnect) still leaves
 				// a stamp.
-				if t, fire := m.keyDebounce.shouldTouch(key.ID, time.Now()); fire {
+				if t, fire := m.keyDebounce.shouldTouch(key.ID, time.Now(), m.keyTouchWindow()); fire {
 					//nolint:contextcheck // detached-context is load-bearing; matches cmd/apid.
-					go func(parent context.Context, id string, ticket *touchTicket) {
-						defer ticket.AfterFire(keyTouchWindow)
+					go func(parent context.Context, id string, ticket *TouchTicket) {
+						defer ticket.AfterFire(m.keyTouchWindow())
 						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 						defer cancel()
 						if err := m.Authn.TouchKeyLastUsed(ctx, id); err != nil && m.Log != nil {
@@ -312,7 +433,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 			if c, err := r.Cookie(m.SessionCookieName); err == nil && c.Value != "" {
 				env, err := m.Sessions.Verify(c.Value)
 				if err == nil {
-					sess, handled, cookieErr := m.requireSessionCookie(w, r, env)
+					sess, handled, cookieErr := m.RequireSessionCookie(w, r, env)
 					if cookieErr != nil {
 						if m.Log != nil {
 							m.Log.Warn("session cross-check error",
@@ -360,22 +481,16 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 	}
 }
 
-// requireSessionCookie is the live-row cross-check (IAM-3).
+// RequireSessionCookie is the live-row cross-check (IAM-3).
 // Returns (Session{}, handled=true, nil) on any 401 path — the
 // caller stops. Returns (sess, handled=false, nil) on success.
 // Returns (Session{}, handled=true, err) on a real DB failure.
-func (m *Middleware) requireSessionCookie(w http.ResponseWriter,
-	r *http.Request, env session.Envelope) (state.Session, bool, error) {
-	return m.RequireSessionCookie(w, r, env)
-}
-
-// RequireSessionCookie is the exported test seam for the live-row
-// cross-check (IAM-3). Production callers go through RequireSession
-// (the cookie branch invokes this internally). Cross-package tests
-// that need to exercise the defensive branches (account-mismatch,
-// found-revoked, empty-sid) call this directly with a forged envelope
-// — Manager.Seal + Manager.Verify construct one without going through
-// the route table.
+//
+// Exported because cross-package tests (cmd/apid/handlers_sessions_test.go)
+// need to exercise the defensive branches (account-mismatch,
+// found-revoked, empty-sid) with a forged envelope. Production
+// callers go through RequireSession (the cookie branch invokes
+// this directly).
 func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 	r *http.Request, env session.Envelope) (state.Session, bool, error) {
 	ctx := r.Context()
@@ -425,9 +540,9 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 		return state.Session{}, true, nil
 	}
 	// (5) stamp + async touch. Detached; bounded.
-	if t, fire := m.sessionDebounce.shouldTouch(env.Sid, time.Now()); fire {
-		go func(parentCtx context.Context, sid string, ticket *touchTicket) {
-			defer ticket.AfterFire(sessionTouchWindow)
+	if t, fire := m.sessionDebounce.shouldTouch(env.Sid, time.Now(), m.sessionTouchWindow()); fire {
+		go func(parentCtx context.Context, sid string, ticket *TouchTicket) {
+			defer ticket.AfterFire(m.sessionTouchWindow())
 			c, cancel := context.WithTimeout(parentCtx, 2*time.Second)
 			defer cancel()
 			if err := m.Lookups.TouchSessionLastSeen(c, sid); err != nil && m.Log != nil {
@@ -440,18 +555,36 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 
 const sessionTouchWindow = 5 * time.Minute
 
+// sessionTouchDebounce mirrors keyTouchDebounce but keyed on the
+// session id (sid) rather than the API key id. Same pointer-version
+// CompareAndDelete contract (see TouchTicket.AfterFire).
 type sessionTouchDebounce struct {
-	tickets sync.Map
+	tickets sync.Map // sid string → *TouchTicket
 }
 
-func (d *sessionTouchDebounce) shouldTouch(sid string, now time.Time) (*touchTicket, bool) {
+func (d *sessionTouchDebounce) shouldTouch(sid string, now time.Time, window time.Duration) (*TouchTicket, bool) {
 	if existing, ok := d.tickets.Load(sid); ok {
-		t := existing.(*touchTicket)
-		if last := t.firedAt.Load(); last != nil && now.Sub(*last) < sessionTouchWindow {
+		t := existing.(*TouchTicket)
+		if last := t.firedAt.Load(); last != nil && now.Sub(*last) < window {
 			return nil, false
 		}
+		// Stale ticket: CAS-replace so a concurrent firer that
+		// already swapped the ticket wins; if our CAS loses, fall
+		// through to the second conditional check on the winner.
+		fresh := &TouchTicket{m: &d.tickets, id: sid}
+		fresh.firedAt.Store(&now)
+		if d.tickets.CompareAndSwap(sid, t, fresh) {
+			return fresh, true
+		}
+		if cur, ok := d.tickets.Load(sid); ok {
+			latest := cur.(*TouchTicket)
+			if last := latest.firedAt.Load(); last != nil && now.Sub(*last) < window {
+				return nil, false
+			}
+		}
 	}
-	t := &touchTicket{}
+	t := &TouchTicket{m: &d.tickets, id: sid}
+	t.firedAt.Store(&now)
 	d.tickets.Store(sid, t)
 	return t, true
 }

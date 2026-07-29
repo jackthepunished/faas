@@ -93,6 +93,11 @@ type fakeSessions struct {
 func (s *fakeSessions) Verify(_ string) (session.Envelope, error) { return s.env, s.err }
 
 type fakeLookups struct {
+	// sessBySid keys state.Session rows by sid so tests that
+	// drive multiple sessions through RequireSession see the
+	// correct row per request. Default lookup falls back to the
+	// single `sess` field for tests that only seed one row.
+	sessBySid  map[string]state.Session
 	sess       state.Session
 	getErr     error
 	touchCalls []string
@@ -100,7 +105,12 @@ type fakeLookups struct {
 	mu         sync.Mutex
 }
 
-func (l *fakeLookups) GetSession(_ context.Context, _ string) (state.Session, error) {
+func (l *fakeLookups) GetSession(_ context.Context, sid string) (state.Session, error) {
+	if l.sessBySid != nil {
+		if row, ok := l.sessBySid[sid]; ok {
+			return row, nil
+		}
+	}
 	return l.sess, l.getErr
 }
 func (l *fakeLookups) TouchSessionLastSeen(_ context.Context, sid string) error {
@@ -155,6 +165,25 @@ func newMW(t *testing.T, a *fakeAuthn, sess *fakeSessions, lk *fakeLookups, au *
 	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
 	mw := authmw.New(a, sess, lk, au, slog.Default(), lim)
 	return mw
+}
+
+func TestNew_NilAuthenticatorPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic on nil Authenticator")
+		}
+	}()
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	_ = authmw.New(nil, nil, nil, nil, slog.Default(), lim)
+}
+
+func TestNew_NilLimiterPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic on nil Limiter (RequireLimited cannot share an empty bucket)")
+		}
+	}()
+	_ = authmw.New(newFakeAuthn(), nil, nil, nil, slog.Default(), nil)
 }
 
 func mkActiveAccount(id string) state.Account {
@@ -736,4 +765,45 @@ func TestTouchKeyLastUsed_DetachedGoroutineCompletes(t *testing.T) {
 	authn.mu.Lock()
 	defer authn.mu.Unlock()
 	t.Errorf("touch did not complete after request cancel; calls = %d", len(authn.touchCalls))
+}
+
+// TestClearSessionCookie_Attributes pins the cookie attribute set
+// on the eviction Set-Cookie. The issuer in handlers_auth.go sets
+// Path=/ + Secure + SameSite=Lax + HttpOnly; the eviction must use
+// the same attributes so the browser overwrites the live cookie
+// instead of keeping a second entry with a different scope.
+//
+// Test the attr shape via http.ParseSetCookie so a future "let me
+// drop HttpOnly because it's local dev" edit surfaces immediately.
+func TestClearSessionCookie_Attributes(t *testing.T) {
+	mw := newMW(t, newFakeAuthn(), nil, nil, nil)
+	rec := httptest.NewRecorder()
+	mw.ClearSessionCookie(rec)
+
+	setCookies := rec.Result().Cookies()
+	if len(setCookies) != 1 {
+		t.Fatalf("Set-Cookie count = %d, want 1 (got %v)", len(setCookies), setCookies)
+	}
+	c := setCookies[0]
+	if c.Name != "faas_sid" {
+		t.Errorf("cookie name = %q, want faas_sid", c.Name)
+	}
+	if c.Value != "" {
+		t.Errorf("cookie value = %q, want empty (eviction)", c.Value)
+	}
+	if c.Path != "/" {
+		t.Errorf("cookie Path = %q, want / (must match issuer scope)", c.Path)
+	}
+	if !c.Secure {
+		t.Errorf("cookie Secure = false; want true (§11 ship-blocker)")
+	}
+	if !c.HttpOnly {
+		t.Errorf("cookie HttpOnly = false; want true")
+	}
+	if c.SameSite != http.SameSiteLaxMode {
+		t.Errorf("cookie SameSite = %v, want Lax", c.SameSite)
+	}
+	if c.MaxAge >= 0 {
+		t.Errorf("cookie MaxAge = %d, want < 0 (eviction)", c.MaxAge)
+	}
 }
