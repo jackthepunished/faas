@@ -801,10 +801,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		mux := http.NewServeMux()
 		// /metrics merges the wire.OpsMetrics registry with the
 		// reconciler's per-package registry via a Gatherers, so a
-		// single scrape endpoint exposes both. Both registries are
-		// isolated so pkg/billing/reconciler stays free of an
-		// import on pkg/wire. ADR-049 §B.1.
-		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry}
+		// single scrape endpoint exposes both. prometheus.DefaultGatherer
+		// is also included so the promhttp internals
+		// (promhttp_metric_handler_errors_total) and the Go runtime
+		// collector show up — TestRun_MetricsAddrServesEndpoints pins
+		// the promhttp internals line as the load-bearing proof the
+		// handler is mounted. Both wire + reconciler registries are
+		// isolated so pkg/billing/reconciler stays free of an import
+		// on pkg/wire. ADR-049 §B.1.
+		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry, prometheus.DefaultGatherer}
 		mux.Handle(metricsPath, promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
 		// /healthz — 200 when every tracked timer (sample / quota /
 		// stripe / dunning) has fired within
