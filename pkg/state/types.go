@@ -246,7 +246,9 @@ type App struct {
 	// StartCommand overrides the OCI image's CMD when present.
 	// Phase 3 writes it from compose/Procfile declarations; Phase
 	// 1 carries the column through but the apid handler does not
-	// yet set it.
+	// yet set it. Nullable text in SQL; the empty-string-means-NULL
+	// convention is enforced by `nullString` on writes and `coalesce`
+	// on reads (same shape as Runtime).
 	StartCommand string
 	Manifest     AppManifest
 	CreatedAt    time.Time

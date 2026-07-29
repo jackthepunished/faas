@@ -18,6 +18,7 @@ package state_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/state"
@@ -204,5 +205,72 @@ func TestPg_SetProjectScanSource_MonotonicUp(t *testing.T) {
 	_, err = s.SetProjectScanSource(ctx, p.ID, state.ProjectScanSourceRender)
 	if err != nil {
 		t.Errorf("SetProjectScanSource unknown→render: %v", err)
+	}
+}
+
+// TestPg_ListProjectsForAccount verifies the per-account listing:
+// returns every project under the account, scoped to that account
+// only (a project under acctB does not leak into acctA's list).
+// Mirrors the memstore parity test in memstore_test.go.
+func TestPg_ListProjectsForAccount(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	acctA, err := s.CreateAccount(ctx, "proj-list-a@example.test", "free")
+	if err != nil {
+		t.Fatalf("CreateAccount A: %v", err)
+	}
+	acctB, err := s.CreateAccount(ctx, "proj-list-b@example.test", "free")
+	if err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+
+	// 3 under acctA, 1 under acctB.
+	for _, slug := range []string{"phase1-pg-list-a1", "phase1-pg-list-a2", "phase1-pg-list-a3"} {
+		if _, err := s.CreateProject(ctx, state.Project{
+			AccountID: acctA.ID,
+			Slug:      slug,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+	}
+	if _, err := s.CreateProject(ctx, state.Project{
+		AccountID: acctB.ID,
+		Slug:      "phase1-pg-list-b1",
+	}); err != nil {
+		t.Fatalf("seed acctB project: %v", err)
+	}
+
+	got, err := s.ListProjectsForAccount(ctx, acctA.ID)
+	if err != nil {
+		t.Fatalf("ListProjectsForAccount: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("ListProjectsForAccount acctA len = %d, want 3", len(got))
+	}
+	// Account scoping: every returned row belongs to acctA.
+	for _, p := range got {
+		if p.AccountID != acctA.ID {
+			t.Errorf("ListProjectsForAccount returned row %s account_id=%q, want %q",
+				p.ID, p.AccountID, acctA.ID)
+		}
+	}
+	// Slug uniqueness: every result has the acctA namespace.
+	for _, p := range got {
+		if !strings.HasPrefix(p.Slug, "phase1-pg-list-a") {
+			t.Errorf("ListProjectsForAccount leaked slug %q into acctA", p.Slug)
+		}
+	}
+
+	// Empty account returns nil slice, not error.
+	emptyAcct, err := s.CreateAccount(ctx, "proj-list-empty@example.test", "free")
+	if err != nil {
+		t.Fatalf("CreateAccount empty: %v", err)
+	}
+	gotEmpty, err := s.ListProjectsForAccount(ctx, emptyAcct.ID)
+	if err != nil {
+		t.Errorf("ListProjectsForAccount empty: %v", err)
+	}
+	if len(gotEmpty) != 0 {
+		t.Errorf("empty list len = %d, want 0", len(gotEmpty))
 	}
 }

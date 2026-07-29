@@ -111,6 +111,30 @@ create unique index if not exists apps_project_workload_uniq
 -- (migrations/00050_github_bindings_account.sql:61) survives.
 drop index if exists apps_github_install_repo_uniq;
 
+-- Single-source the scan_source ranking. pg_tier_rank(text) returns
+-- the monotonic-upgrade rank used by SetProjectScanSource (Phase 5
+-- reconcile). The rank table must mirror ScanSource in
+-- pkg/state/types.go: compose=8 (the strongest tier discovered),
+-- procfile=6, k8s=8, render=8, fly=8, serverless=8, workspace=4,
+-- convention=2, single=1, unknown=0. CREATE OR REPLACE makes the
+-- function block idempotent — the box can re-apply on a drifted
+-- schema without touching the body if the rank table doesn't change.
+-- Mirror in Go lives in pkg/state/types.go:tierRank.
+CREATE OR REPLACE FUNCTION pg_tier_rank(tier text) RETURNS int AS $$
+    SELECT CASE tier
+        WHEN 'compose'    THEN 8
+        WHEN 'k8s'        THEN 8
+        WHEN 'render'     THEN 8
+        WHEN 'fly'        THEN 8
+        WHEN 'serverless' THEN 8
+        WHEN 'procfile'   THEN 6
+        WHEN 'workspace'  THEN 4
+        WHEN 'convention' THEN 2
+        WHEN 'single'     THEN 1
+        ELSE 0
+    END
+$$ LANGUAGE sql IMMUTABLE;
+
 -- Backfill: one project per (install_id, repo_full_name), then
 -- stamp the bound apps' project_id + workload_name.
 --
@@ -168,6 +192,7 @@ alter table apps
   drop column if exists project_id;
 drop index if exists projects_install_repo_uniq;
 drop table if exists projects;
+drop function if exists pg_tier_rank(text);
 create unique index if not exists apps_github_install_repo_uniq
   on apps (github_install_id, github_repo_full_name)
   where github_install_id is not null and github_repo_full_name is not null;
