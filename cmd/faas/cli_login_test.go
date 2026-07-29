@@ -244,6 +244,7 @@ func TestCmdLogin_BrowserOpenFailure_FallsBackToURL(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
 	stubBrowser(t, errors.New("no display"))
+	setFakeKeyring(t) // hermetic on macOS: success branch reaches saveToken
 	out, _ := captureStdout(t)
 	errBuf, _ := captureStderr(t)
 	pipeStdin(t, "WXYZ-1234\n")
@@ -424,6 +425,7 @@ func TestCmdLogin_PollingBackoff(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "")
 	stubBrowser(t, nil)
+	setFakeKeyring(t) // hermetic on macOS: success branch reaches saveToken
 	pipeStdin(t, "\n")
 
 	start := time.Now()
