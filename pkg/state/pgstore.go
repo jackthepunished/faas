@@ -650,10 +650,10 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	row := s.pool.QueryRow(ctx,
-		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
-		 returning appsSelectColumns`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
 	return scanApp(row)
 }
@@ -715,10 +715,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	row := tx.QueryRow(ctx,
-		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
-		 returning appsSelectColumns`,
+		 returning ` + appsSelectColumns
+	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
 	created, err := scanApp(row)
 	if err != nil {
@@ -731,23 +731,20 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 }
 
 func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`select appsSelectColumns
-		 from apps where id = $1`, id)
+	sel := `select ` + appsSelectColumns + ` from apps where id = $1`
+	row := s.pool.QueryRow(ctx, sel, id)
 	return scanApp(row)
 }
 
 func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`select appsSelectColumns
-		 from apps where slug = $1 and status <> 'deleted'`, slug)
+	sel := `select ` + appsSelectColumns + ` from apps where slug = $1 and status <> 'deleted'`
+	row := s.pool.QueryRow(ctx, sel, slug)
 	return scanApp(row)
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
-	rows, err := s.pool.Query(ctx,
-		`select appsSelectColumns
-		 from apps where account_id = $1 and status <> 'deleted' order by created_at desc`, accountID)
+	sel := `select ` + appsSelectColumns + ` from apps where account_id = $1 and status <> 'deleted' order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -756,9 +753,8 @@ func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error)
 }
 
 func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
-	rows, err := s.pool.Query(ctx,
-		`select appsSelectColumns
-		 from apps where status <> 'deleted' order by created_at desc`)
+	sel := `select ` + appsSelectColumns + ` from apps where status <> 'deleted' order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -779,8 +775,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 	if p.Manifest != nil {
 		manifestBytes, _ = json.Marshal(*p.Manifest)
 	}
-	row := s.pool.QueryRow(ctx,
-		`update apps set
+	upd := `update apps set
 		   ram_mb          = coalesce($2, ram_mb),
 		   idle_timeout_s  = case when $3 then $4 else idle_timeout_s end,
 		   max_concurrency = coalesce($5, max_concurrency),
@@ -791,7 +786,8 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
 		 where id = $1
-		 returning appsSelectColumns`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, upd,
 		id,
 		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
@@ -829,10 +825,10 @@ func (s *PgStore) SetAppMinInstances(ctx context.Context, appID string, min int)
 // Both PgStore and MemStore share the same error contract so the apid
 // handler can branch on errors.Is without checking the concrete type.
 func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`update apps set slug = $3
+	upd := `update apps set slug = $3
 		 where account_id = $1 and slug = $2 and status <> 'deleted'
-		 returning appsSelectColumns`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, upd,
 		accountID, oldSlug, newSlug)
 	return scanApp(row)
 }
@@ -967,12 +963,11 @@ func (s *PgStore) AppsForProject(ctx context.Context, accountID, projectID strin
 	if proj.AccountID != accountID {
 		return nil, ErrNotFound
 	}
-	rows, err := s.pool.Query(ctx, `
-		select appsSelectColumns
+	sel := `select ` + appsSelectColumns + `
 		   from apps
 		  where project_id = $1 and status <> 'deleted'
-		  order by workload_name asc, created_at asc
-	`, projectID)
+		  order by workload_name asc, created_at asc`
+	rows, err := s.pool.Query(ctx, sel, projectID)
 	if err != nil {
 		return nil, err
 	}
