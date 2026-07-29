@@ -46,6 +46,16 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 // Compile-time check.
 var _ Store = (*PgStore)(nil)
 
+// heartbeatHistoryMaxRows is the upper bound used to pre-size the
+// result slice in ListComputeNodeHeartbeats. The apid handler
+// enforces a 2000-row hard cap on ?limit= and the store defaults
+// to 200 when limit <= 0; 2000 is the highest value the slice
+// ever grows to in practice. Pre-sizing with a constant keeps
+// CodeQL's slice-allocation rule from flagging the call site as
+// user-input-driven (the rule wants a constant capacity; append
+// will grow past it if a future change ever raises the cap).
+const heartbeatHistoryMaxRows = 2000
+
 // --- accounts ---------------------------------------------------------------
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
@@ -4280,7 +4290,12 @@ func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, 
 		return nil, fmt.Errorf("state: list compute_node_heartbeats: %w", err)
 	}
 	defer rows.Close()
-	out := make([]ComputeNodeHeartbeat, 0, limit)
+	// Pre-size with a bounded capacity. limit is already capped
+	// above (200 default; the apid handler caps at 2000). The
+	// constant capacity avoids CodeQL flagging the slice
+	// allocation as user-input-driven; append will grow the slice
+	// past the capacity if limit is genuinely a larger value.
+	out := make([]ComputeNodeHeartbeat, 0, heartbeatHistoryMaxRows)
 	for rows.Next() {
 		var h ComputeNodeHeartbeat
 		var nodeUUID string
