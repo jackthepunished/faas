@@ -38,7 +38,7 @@ func newResidencyTestHarness(t *testing.T, now time.Time) (*meter.Residency, *st
 // to keep the math readable.
 func appendUsage(t *testing.T, store *state.MemStore, accountID string, mbSec int64, when time.Time) {
 	t.Helper()
-	if err := store.AppendUsage(context.Background(), accountID, "app-"+accountID, "inst-"+accountID, when, mbSec, 1, 0); err != nil {
+	if err := store.AppendUsage(context.Background(), accountID, "app-"+accountID, "inst-"+accountID, when, mbSec, 1, 0, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 }

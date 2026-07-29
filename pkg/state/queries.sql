@@ -226,16 +226,26 @@ select id, at, actor, kind, subject, data
 from events where subject = $1 order by at desc limit $2;
 
 -- name: AppendUsage :exec
--- Idempotent: a redelivered (instance_id, minute) is a no-op. First write
--- wins (M7 hardening, PR feat/m7-beta-hardening). Prevents silent
--- double-billing when meterd restarts, the network blips, or two meterd
--- instances ever run concurrently.
-insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests)
-values ($1, $2, $3, $4, $5, $6)
-on conflict (instance_id, minute) do nothing;
+-- Idempotent on (instance_id, minute) for mb_seconds / requests
+-- (M7 hardening, PR feat/m7-beta-hardening): a redelivered
+-- minute is a no-op for the billing-floor columns so a meterd
+-- restart / network blip / two meterd instances cannot inflate
+-- billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
+-- the same conflict key — the schedd / meterd accumulators can
+-- each call AppendUsage many times within the same minute; the
+-- columns are the sum of all per-tick deltas.
+--   cpu_usec     — issue #279 / PR-B / ADR-039
+--   tx_bytes     — ADR-046 (gateway HTTP response body bytes)
+--   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
+insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+on conflict (instance_id, minute) do update
+   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
+       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
+       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes;
 
 -- name: UsageByMonth :many
-select account_id, app_id, month, mb_seconds, requests
+select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes
 from usage_monthly
 where account_id = $1 and month = $2
 order by app_id, month;

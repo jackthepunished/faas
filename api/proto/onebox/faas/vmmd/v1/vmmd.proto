@@ -416,6 +416,23 @@ message InstanceStats {
   // request observed yet on this instance" — the poller falls back
   // to state.Instance.LastRequestAt in that case.
   google.protobuf.Timestamp last_request_at = 7;
+  // ADR-046 (PR-1 → PR-2): per-tick cumulative byte delta on
+  // root-side vethHost.rx_bytes for this instance. Wrapper so
+  // "absent" means "first sample after cache reset (baseline not
+  // yet established) OR cgroup regression (veth recreation
+  // detected by pkg/fcvm/netstats.Cache)" — distinct from a real
+  // 0 delta. The schedd-side poller (pkg/sched/instancestats/
+  // poller.go) sums this across the 250 ms window into the
+  // per-(instance, minute) accumulator and serves it via
+  // pkg/scheddgrpc.ListInstanceStats as a uint64 additive byte
+  // counter; meterd's SampleAndRoll then appends to
+  // usage_minutes.net_tx_bytes (additive on (instance_id,
+  // minute)). Source: cmd/vmmd/network_poller.go +
+  // pkg/fcvm/netstats.Cache. The /sys/class/net/<vethHost>/
+  // statistics/rx_bytes counter is the same kernel counter the
+  // per-plan tc tbf qdisc reads, so the cap and the meter are
+  // consistent. Informational — not billed (ADR-046 §6).
+  google.protobuf.Int64Value net_tx_bytes = 10;
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the

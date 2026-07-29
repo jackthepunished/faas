@@ -266,6 +266,14 @@ type UsageData struct {
 	IncludedGBHours int64
 	OverageGBHours  float64
 	UsedPct         float64 // 0..100+
+	// UsedEgressGB (ADR-046, step 10) is the per-month
+	// informational egress roll-up (Σ tx_bytes +
+	// net_tx_bytes across all apps). Not billed; the
+	// template renders it next to the GB-h panel as a
+	// "this much egress" line. The gateway-side tx_bytes
+	// producer lands in PR-2; until then the value is
+	// 0 because NetTxBytes is the only source populated.
+	UsedEgressGB float64
 }
 
 // BillingData is the /dashboard/billing page payload.

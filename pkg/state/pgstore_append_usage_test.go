@@ -25,12 +25,12 @@ func TestPg_AppendUsage_IdempotentSameMinute(t *testing.T) {
 	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 	// First write — wins.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 0, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Redelivered minute — a no-op. Different mb_seconds / requests must
 	// NOT overwrite the first write.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 0, 0); err != nil {
 		t.Fatalf("redelivered append: %v", err)
 	}
 
@@ -70,10 +70,10 @@ func TestPg_AppendUsage_AccumulatesAcrossMinutes(t *testing.T) {
 	m0 := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	m1 := m0.Add(time.Minute)
 
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1, 0, 0, 0); err != nil {
 		t.Fatalf("append m0: %v", err)
 	}
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2, 0, 0, 0); err != nil {
 		t.Fatalf("append m1: %v", err)
 	}
 
@@ -116,12 +116,12 @@ func TestPg_AppendUsage_AddsCpuUsecOnConflict(t *testing.T) {
 	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 	// First write: billing-floor + 5_000_000 µs of CPU work.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 5_000_000); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 5_000_000, 0, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Second write: same minute, different billing-floor (must be
 	// discarded), additive CPU delta (10_000_000 µs).
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 10_000_000); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 10_000_000, 0, 0); err != nil {
 		t.Fatalf("second append: %v", err)
 	}
 
@@ -148,7 +148,88 @@ func TestPg_AppendUsage_AddsCpuUsecOnConflict(t *testing.T) {
 	}
 }
 
-// TestPg_AppendUsage_NoUniqueViolationReturned locks down the API contract:
+// TestPg_AppendUsage_AddsTxBytesAndNetTxBytesOnConflict (ADR-046,
+// step 11) pins the additive-merge contract for the egress
+// columns. Mirrors TestPg_AppendUsage_AddsCpuUsecOnConflict: two
+// writes for the same (instance_id, minute) ADD their tx_bytes
+// and net_tx_bytes values. The sampler's net_tx_bytes comes
+// from vmmd netstats.Cache (250 ms cadence, ~240 ticks per
+// minute) and tx_bytes from the gateway ring buffer; both
+// sources can fire within the same minute, and the merge must
+// be additive. The asymmetry with mb_seconds / requests
+// (first-write-wins) is the same ADR-039 §3.2 shape —
+// billing-floor metrics stay stable once the minute is
+// decided; sampled metrics accumulate across per-tick deltas.
+//
+// The read-back path uses UsageByMonth (not UsageByHour) to
+// pin the usage_monthly view sums the new columns correctly,
+// closing the weak assertion the cpu_usec test had at lines
+// 70-79 (which silently discarded the read).
+func TestPg_AppendUsage_AddsTxBytesAndNetTxBytesOnConflict(t *testing.T) {
+	s, ctx := pgStore(t)
+	acctID, appID, depID := seedLiveDeploy(t, s, ctx)
+	ins, err := s.CreateInstance(ctx, appID, depID, string(state.StateRunning), 512, resolveDefaultLocal(t, ctx, s), "")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	minute := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+
+	// First write: tx_bytes=1_000_000 (gateway HTTP response),
+	// net_tx_bytes=4_000_000 (vmmd netstats). Both are interface
+	// bytes; the units are identical on the wire so a straight
+	// additive merge is correct.
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 1_000_000, 4_000_000); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	// Second write: same minute, additional tx_bytes + net_tx_bytes.
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 2_500_000, 8_000_000); err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+
+	rows, err := s.UsageByHour(ctx, acctID,
+		time.Date(2026, 8, 17, 11, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 17, 13, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("UsageByHour: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	// mb_seconds / requests: first-wins (the existing contract).
+	if rows[0].MBSeconds != 30_720 {
+		t.Errorf("MBSeconds = %d, want 30_720 (first write wins)", rows[0].MBSeconds)
+	}
+	if rows[0].Requests != 1 {
+		t.Errorf("Requests = %d, want 1 (first write wins)", rows[0].Requests)
+	}
+	// tx_bytes: additive across the conflict.
+	if rows[0].TXBytes != 3_500_000 {
+		t.Errorf("TXBytes = %d, want 3_500_000 (1M + 2.5M additive merge)", rows[0].TXBytes)
+	}
+	// net_tx_bytes: additive across the conflict.
+	if rows[0].NetTxBytes != 12_000_000 {
+		t.Errorf("NetTxBytes = %d, want 12_000_000 (4M + 8M additive merge)", rows[0].NetTxBytes)
+	}
+
+	// usage_monthly view (close the weak read-back from the cpu_usec
+	// test): sum both columns across all instances for the month.
+	monthRows, err := s.UsageByMonth(ctx, acctID,
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("UsageByMonth: %v", err)
+	}
+	if len(monthRows) != 1 {
+		t.Fatalf("month rows = %d, want 1", len(monthRows))
+	}
+	if monthRows[0].TXBytes != 3_500_000 {
+		t.Errorf("month TXBytes = %d, want 3_500_000 (view sum)", monthRows[0].TXBytes)
+	}
+	if monthRows[0].NetTxBytes != 12_000_000 {
+		t.Errorf("month NetTxBytes = %d, want 12_000_000 (view sum)", monthRows[0].NetTxBytes)
+	}
+}
+
 // AppendUsage never surfaces a unique-violation error from the underlying
 // ON CONFLICT DO NOTHING. Before the M7 hardening fix this would have leaked
 // a `state.ErrConflict`-mappable error on every redelivered minute; today
@@ -164,7 +245,7 @@ func TestPg_AppendUsage_NoUniqueViolationReturned(t *testing.T) {
 
 	// 50 same-minute writes — every one must succeed and not surface ErrConflict.
 	for i := 0; i < 50; i++ {
-		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1, 0); err != nil {
+		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1, 0, 0, 0); err != nil {
 			if errors.Is(err, state.ErrConflict) {
 				t.Fatalf("call %d returned ErrConflict: %v", i, err)
 			}

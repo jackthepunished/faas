@@ -890,6 +890,30 @@ func (m *Manager) LiveCount() int {
 	return len(m.live)
 }
 
+// SnapshotLive returns a copy of the (instanceID, vethHost) map
+// for every live instance. The vmmd network_poller (ADR-046)
+// uses this to read the kernel byte counter for each instance
+// without keeping its own mirror of `m.live` in sync — the
+// returned map is a fresh copy taken under m.mu, so concurrent
+// Destroy / Wake updates do not race the poller's iteration.
+//
+// Empty map (not nil) when no instances are live, matching the
+// meter_egress_adapter's `for instID, veth := range snapshot`
+// idiom. instanceIDs are the strings the schedd speaks; vethHosts
+// are the host-side veth names the kernel counter lives under.
+func (m *Manager) SnapshotLive() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(m.live))
+	for id, inst := range m.live {
+		if inst == nil {
+			continue
+		}
+		out[id] = inst.Net.VethHost
+	}
+	return out
+}
+
 // LeasedCount reports how many allocator slots are held. After a clean teardown
 // of everything, LiveCount and LeasedCount must both be zero — the leak check.
 func (m *Manager) LeasedCount() int { return m.alloc.InUse() }

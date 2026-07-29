@@ -97,6 +97,8 @@ func TestInvoiceShadow24h_Sandbox(t *testing.T) {
 			billableMB*60, // one minute of billable MB = billable * 60 mb_seconds
 			0,
 			0,
+			0,
+			0,
 		); err != nil {
 			t.Fatalf("AppendUsage minute %d: %v", i, err)
 		}

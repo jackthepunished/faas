@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
+	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -266,8 +267,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cpustats.NewWithDefaults() and skip the sample loop
 	// entirely via runCPUSampleInterval=0.
 	cpuCache := cpustats.NewWithDefaults()
+	// Netstats cache: per-instance byte-counter over root-side
+	// vethHost.rx_bytes, fed by runNetworkEgressPoll below and
+	// consumed by vmmdgrpc.Server.Stats as the net_tx_bytes
+	// wire field. ADR-046 (step 7). nil-safe so tests can pass
+	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
+	// loop entirely.
+	netCache := netstats.NewWithDefaults()
 	gsrv := grpc.NewServer()
-	impl := vmmdgrpc.NewWithCPU(mgr, ops, fcVersion, log, cpuCache)
+	impl := vmmdgrpc.NewWithCPUAndNet(mgr, ops, fcVersion, log, cpuCache, netCache)
 	impl.Register(gsrv)
 
 	// Optional /metrics endpoint.
@@ -328,6 +336,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// non-Linux hosts cgroupstats.Sample returns ok=false; the
 	// loop is a no-op there, leaving cpuCache cold.
 	go runCPUSampleLoop(ctx, cpuCache, log)
+	// Network egress poll loop (ADR-046, step 7): reads
+	// /sys/class/net/<vethHost>/statistics/rx_bytes for every
+	// live instance on a 250 ms tick and feeds netstats.Cache.
+	// The schedd poller pulls the value via Stats at its own
+	// 200 ms cadence; meterd's sampler appends to
+	// usage_minutes.net_tx_bytes additively per minute.
+	go runNetworkEgressPoll(ctx, mgr, netCache, ops, nil, nil, 0, log)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

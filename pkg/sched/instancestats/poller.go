@@ -279,6 +279,24 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 		if in.CpuThrottledSeconds != nil {
 			wireRow.ThrottledUsec = *in.CpuThrottledSeconds * 1e6
 		}
+		// NetTxBytes (ADR-046, step 7): per-tick byte delta
+		// on root-side vethHost.rx_bytes from vmmd's
+		// netstats cache. Wrapper so "absent" means "first
+		// sample after cache reset OR cgroup regression
+		// (veth recreation detected by netstats.Cache)" —
+		// distinct from a real 0-byte delta. The poller
+		// stamps TX=Unknown on absent; only meterd's
+		// SampleAndRoll consumes this row (pkg/meter/
+		// sampler.go, PR-2 fold-in). Future readers (the
+		// reaper, the dashboard) can ignore it.
+		if in.NetTxBytes != nil {
+			if *in.NetTxBytes < 0 {
+				row.TX = Unknown
+			} else {
+				row.TXBytes = uint64(*in.NetTxBytes)
+				row.TX = Valid
+			}
+		}
 		// RSS: wire sends *int64. nil → Unknown; non-nil →
 		// convert bytes → MiB.
 		if in.ResidentBytes != nil {

@@ -181,8 +181,17 @@ type VMInstanceStat struct {
 	// vmmd_cpu_throttle_seconds_total counter via
 	// wire.OpsMetrics.ReplaceInstanceStats.
 	CpuThrottledSeconds *float64
-	InflightRequests    int64
-	LastRequestAt       time.Time
+	// NetTxBytes (ADR-046, step 7) is the per-tick byte
+	// delta on root-side vethHost.rx_bytes from vmmd's
+	// netstats cache. nil on the wire when the cache has
+	// no baseline for the instance (first sample /
+	// regression / netstats cache miss); schedd decodes
+	// non-nil into instancestats.InstanceStat.TXBytes and
+	// stamps TX=Valid. Only meterd's SampleAndRoll reads
+	// the row (pkg/meter/sampler.go, PR-2 fold-in).
+	NetTxBytes       *int64
+	InflightRequests int64
+	LastRequestAt    time.Time
 }
 
 // AppSpec is the flat set of fields vmmd needs to boot an instance (ADR-014).
@@ -541,6 +550,10 @@ func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
 	if v := in.GetCpuThrottledSeconds(); v != nil {
 		s := v.GetValue()
 		row.CpuThrottledSeconds = &s
+	}
+	if v := in.GetNetTxBytes(); v != nil {
+		b := v.GetValue()
+		row.NetTxBytes = &b
 	}
 	if t := in.GetLastRequestAt(); t != nil {
 		row.LastRequestAt = t.AsTime()

@@ -172,6 +172,16 @@ type InstanceStatsRow struct {
 	// CPUValid mirrors instancestats.Validity (0 = Valid, 1 =
 	// Unknown). Callers MUST skip rows where CPUValid != 0.
 	CPUValid uint32
+	// NetTxBytes (ADR-046, step 7) is the per-tick byte delta
+	// on root-side vethHost.rx_bytes for this instance,
+	// surfaced via the vmmd `net_tx_bytes` wire field. Unit
+	// is interface bytes; same kernel counter the per-plan
+	// tc tbf qdisc reads. TxValid mirrors instancestats.
+	// Validity (0 = Valid, 1 = Unknown — first sample /
+	// regression / netstats cache miss); callers MUST skip
+	// rows where TxValid != 0.
+	NetTxBytes uint64
+	TxValid    uint32
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the
@@ -191,6 +201,8 @@ func (c *Client) ListInstanceStats(ctx context.Context) ([]InstanceStatsRow, err
 			NodeID:       r.GetNodeId(),
 			CPUUsageUsec: r.GetCpuUsec(),
 			CPUValid:     r.GetCpuValid(),
+			NetTxBytes:   r.GetNetTxBytes(),
+			TxValid:      r.GetTxValid(),
 		})
 	}
 	return out, nil

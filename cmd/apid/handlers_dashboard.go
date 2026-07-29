@@ -377,10 +377,17 @@ func (s *server) renderUsage(w http.ResponseWriter, r *http.Request, log *slog.L
 		return
 	}
 	var mbSec int64
+	var egressBytes int64
 	for _, u := range rows {
 		mbSec += u.MBSeconds
+		// ADR-046 (step 10): sum both egress columns so
+		// the dashboard's "egress this month" panel
+		// surfaces a single GB number. Informational;
+		// not billed.
+		egressBytes += u.TXBytes + u.NetTxBytes
 	}
 	used := float64(mbSec) / 3_600_000.0
+	usedEgressGB := float64(egressBytes) / (1024 * 1024 * 1024)
 	limits := api.MustLimitsFor(acct.Plan)
 	included := int64(limits.IncludedGBHours)
 	pct := 0.0
@@ -399,6 +406,7 @@ func (s *server) renderUsage(w http.ResponseWriter, r *http.Request, log *slog.L
 		IncludedGBHours: included,
 		OverageGBHours:  max(0, used-float64(included)),
 		UsedPct:         pct,
+		UsedEgressGB:    usedEgressGB,
 	}}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)

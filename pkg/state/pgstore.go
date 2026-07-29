@@ -4547,7 +4547,7 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec int64) error {
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error {
 	// Idempotent on (instance_id, minute) for mb_seconds / requests
 	// (mirrors the sqlc source in queries.sql::AppendUsage — make
 	// sqlc-check verifies these stay in lockstep). The first write
@@ -4556,21 +4556,28 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	// instances cannot inflate billing. M7 hardening, PR
 	// feat/m7-beta-hardening.
 	//
-	// cpu_usec is ADDITIVE on the same conflict key: the schedd
-	// accumulator (pkg/sched/instancestats/poller.go) can call
-	// AppendUsage many times within the same minute — the
-	// accumulator fires every 250 ms, and a 1-minute slice can
-	// see 240 observations per instance. We add EXCLUDED.cpu_usec
-	// to the existing row so the column is the sum of all
-	// per-tick deltas. The pusher (meter → billing) deduplicates
-	// on a coarser window before pushing, so the additive merge
-	// is safe end-to-end. issue #279 / PR-B.
+	// cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on the
+	// same conflict key: the schedd / meterd accumulators
+	// (pkg/sched/instancestats/poller.go for cpu; the vmmd
+	// netstats.Cache + gateway statusRecorder fed by the meterd
+	// sampler's egress adapters for tx_bytes / net_tx_bytes) can
+	// each call AppendUsage many times within the same minute.
+	// We add EXCLUDED.<col> to the existing row so the columns
+	// are the sum of all per-tick deltas. The pusher (meter →
+	// billing) deduplicates on a coarser window before pushing,
+	// so the additive merge is safe end-to-end.
+	//
+	//   cpu_usec    — issue #279 / PR-B / ADR-039
+	//   tx_bytes    — ADR-046 (gateway HTTP response body bytes)
+	//   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec)
-		 values ($1, $2, $3, $4, $5, $6, $7)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 on conflict (instance_id, minute) do update
-		   set cpu_usec = usage_minutes.cpu_usec + EXCLUDED.cpu_usec`,
-		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec)
+		   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
+		       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
+		       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes)
 	return err
 }
 
@@ -4587,7 +4594,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	// explicit cast). date_trunc normalizes both sides to the month's start
 	// in UTC, sidestepping session-TZ semantics entirely.
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, cpu_usec, requests from usage_monthly
+		`select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes from usage_monthly
 		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
 		accountID, monthStart)
 	if err != nil {
@@ -4597,7 +4604,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	var out []Usage
 	for rows.Next() {
 		u := Usage{}
-		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes); err != nil {
 			return nil, err
 		}
 		out = append(out, u)

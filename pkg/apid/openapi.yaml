@@ -3111,6 +3111,18 @@ components:
           description: "Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue #279 / PR-B."
           x-since: "2026-07"
           x-issue: "279"
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-(app, month) HTTP response bytes (informational; not billed). ADR-046. The gateway-side producer lands in PR-2; until then this field stays 0."
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
+        net_tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-(app, month) byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads."
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
@@ -3824,6 +3836,18 @@ components:
           description: "Cumulative host cgroup CPU-µs (informational; not billed). issue #279 / PR-B."
           x-since: "2026-07"
           x-issue: "279"
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-app monthly HTTP response bytes the gateway forwarded (informational; not billed). ADR-046. The gateway-side producer lands in PR-2; until then this field stays 0. The future egress-billing PR picks the unit; this field reports interface bytes (includes Ethernet framing)."
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
+        net_tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-app monthly byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads, so the cap and the meter are consistent."
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
 
     AppMetricsResponse:
       description: |
@@ -3914,6 +3938,12 @@ components:
           description: "FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI."
           x-since: "2026-07"
           x-issue: "273"
+        egress_bytes:
+          type: integer
+          format: int64
+          description: "Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0)."
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
 
     ListInstancesResponse:
       description: |
@@ -4050,6 +4080,11 @@ components:
           description: 'Per-month CPU-hours (informational; not billed). issue #279 / PR-B.'
           x-since: "2026-07"
           x-issue: "279"
+        used_egress_gb:
+          type: number
+          description: 'Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB. ADR-046.'
+          x-since: "2026-08"
+          x-issue: "TBD-ADR-046"
 
     # ─── Event-driven surface (Move 2) ───────────────────────────────────
 

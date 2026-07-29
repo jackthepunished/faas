@@ -858,6 +858,19 @@ type Usage struct {
 	// rows.
 	CPUUsec  int64
 	Requests int64
+	// TXBytes is the cumulative HTTP response body bytes the
+	// gateway forwarded for this app in this month. Source:
+	// pkg/gateway/handler.go statusRecorder.Bytes → per-(instance,
+	// minute) ring buffer → meterd Sampler.SampleAndRoll →
+	// AppendUsage. ADR-046. Informational — not billed.
+	TXBytes int64
+	// NetTxBytes is the cumulative byte delta on root-side
+	// vethHost.rx_bytes for this app in this month. Source:
+	// vmmd pkg/fcvm/netstats.Cache → vmmd.Stats → schedd
+	// instancestats.Poller → meterd Sampler.SampleAndRoll →
+	// AppendUsage. ADR-046. Informational — not billed. Unit
+	// = interface bytes (includes Ethernet/IP framing).
+	NetTxBytes int64
 }
 
 // Invoice is one persisted invoice from a billing provider (issue #259,

@@ -249,6 +249,18 @@ message InstanceStatsRow {
   // cpu_valid mirrors instancestats.Validity (0 = Valid, 1 =
   // Unknown). Callers MUST skip rows where cpu_valid != 0.
   uint32 cpu_valid   = 5;
+  // ADR-046 (step 7): per-tick byte delta on root-side
+  // vethHost.rx_bytes for this instance, summed across the
+  // schedd poller's 250 ms window. Unit is interface bytes
+  // (includes Ethernet framing); same kernel counter the
+  // per-plan tc tbf qdisc reads. tx_valid mirrors
+  // instancestats.Validity (0 = Valid, 1 = Unknown — first
+  // sample / regression / netstats cache miss); callers MUST
+  // skip rows where tx_valid != 0. Addative field per
+  // ADR-016 wire discipline; only meterd's SampleAndRoll reads
+  // it (pkg/meter/sampler.go).
+  uint64 net_tx_bytes = 6;
+  uint32 tx_valid     = 7;
 }
 
 message ListInstanceStatsRequest {

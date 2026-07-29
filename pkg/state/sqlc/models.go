@@ -429,8 +429,17 @@ type UsageMinute struct {
 	Minute     pgtype.Timestamptz
 	MbSeconds  int64
 	Requests   int32
-	// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
+// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
 	CpuUsec int64
+	// ADR-046 (issue #415): cumulative HTTP response bytes the
+	// gateway forwarded for this instance in this minute
+	// (TxBytes) and cumulative byte delta on root-side
+	// vethHost.rx_bytes (NetTxBytes). Sampled from gateway
+	// statusRecorder.Bytes and vmmd netstats.Cache respectively.
+	// Informational — not billed. See pkg/meter/sampler.go for
+	// the additive-merge semantics.
+	TxBytes    int64
+	NetTxBytes int64
 }
 
 type UsageMonthly struct {
@@ -440,4 +449,9 @@ type UsageMonthly struct {
 	MbSeconds int64
 	CpuUsec   int64
 	Requests  int64
+	// ADR-046 (issue #415): per-(account, app, month) egress
+	// column sums (Σ over usage_minutes). Informational — not
+	// billed. Mirrors the UsageMinute egress columns.
+	TxBytes    int64
+	NetTxBytes int64
 }
