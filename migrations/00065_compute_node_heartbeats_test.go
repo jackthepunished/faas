@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -131,7 +132,11 @@ func TestMigrations_00065_ComputeNodeHeartbeats(t *testing.T) {
 	if err == nil {
 		// If the two now()s happened to differ, force the collision
 		// by re-reading the row and re-inserting with the same key.
-		var receivedAt string
+		// Scan into time.Time (pgx native timestamptz codec) — the
+		// *string codec fails under the CI runner's binary format
+		// negotiation (cannot scan timestamptz (OID 1184) in binary
+		// format into *string).
+		var receivedAt time.Time
 		if err := pool.QueryRow(ctx, `
 			select received_at from compute_node_heartbeats where node_id = $1 limit 1
 		`, nodeID).Scan(&receivedAt); err != nil {
@@ -139,7 +144,7 @@ func TestMigrations_00065_ComputeNodeHeartbeats(t *testing.T) {
 		}
 		_, err = pool.Exec(ctx, `
 			insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source)
-			values ($1, $2::timestamptz, $2::timestamptz, 'heartbeat_tick')
+			values ($1, $2, $2, 'heartbeat_tick')
 		`, nodeID, receivedAt)
 	}
 	if err == nil {
