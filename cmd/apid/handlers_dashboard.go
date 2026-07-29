@@ -266,6 +266,11 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		// page render. The 3s timeout matches the per-query timeout
 		// in pkg/promql.
 		Metrics: s.fetchDashboardMetrics(ctx, log, app.ID),
+		// Issue #396 / ADR-045 PR 4 — best-effort alert-rule
+		// snapshot. Failure is non-fatal: a Postgres blip on the
+		// alert_rules read renders the panel's warning empty-state
+		// instead of killing the whole page.
+		Alerts: s.fetchDashboardAlerts(ctx, log, acct, app),
 	}}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
@@ -301,6 +306,65 @@ func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, ap
 		log.Warn("dashboard renderAppDetail: metrics fetch degraded", "app_id", appID, "source", src)
 	}
 	return view
+}
+
+// fetchDashboardAlerts returns the per-app alert-rule snapshot for the
+// Alerts panel (issue #396 / ADR-045, PR 4). Returns a non-nil
+// AlertDetailData on success; on Postgres blip it logs + returns an
+// empty struct so the template renders the panel header and a single
+// "alert rules unavailable" row instead of falling off the cliff.
+//
+// Scope rule mirrors handlers_alerts.go:106-110 — visible rules are
+// rule.AppID == app.ID (per-app) OR rule.AppID == "" (account-wide).
+// PR 1's plan-tier gate stops a Free-tier account from creating an
+// alert rule, so today this read never sees Free-tier account-wide
+// rules; the visibility filter is forward-compatible for a future
+// "account-wide" loosening.
+//
+// The 5-row deliveries cap matches the public /v1/alert-rules/{id}/deliveries
+// default (handlers_alerts.go); PR 3 set the contract, PR 4 mirrors
+// it on the dashboard so the operator sees the same per-rule recent
+// surface on both surfaces.
+func (s *server) fetchDashboardAlerts(ctx context.Context, log *slog.Logger, acct state.Account, app state.App) *dashboard.AlertDetailData {
+	rules, err := s.store.ListAlertRulesForAccount(ctx, acct.ID)
+	if err != nil {
+		log.Warn("dashboard renderAppDetail: list alert rules", "account_id", acct.ID, "app_id", app.ID, "err", err)
+		return &dashboard.AlertDetailData{Rules: nil}
+	}
+	items := make([]dashboard.AlertItem, 0, len(rules))
+	now := time.Now().UTC()
+	for i := range rules {
+		rule := rules[i]
+		if rule.AppID != "" && rule.AppID != app.ID {
+			continue
+		}
+		item := dashboard.AlertItem{Rule: rule}
+		if !rule.LastFiredAt.IsZero() {
+			item.LastFiredAtLabel = dashboard.RelativeTime(rule.LastFiredAt, now)
+		} else {
+			item.LastFiredAtLabel = "—"
+		}
+		deliveries, derr := s.store.ListAlertDeliveriesForRule(ctx, rule.ID, 5)
+		if derr != nil {
+			// Per-rule read failure is non-fatal — log once and
+			// render an empty recent-deliveries row for that rule.
+			log.Warn("dashboard renderAppDetail: list alert deliveries", "account_id", acct.ID, "rule_id", rule.ID, "err", derr)
+			deliveries = nil
+		} else {
+			// Truncate LastError at the store boundary so the
+			// template is a pure renderer. The helper lives in
+			// pkg/dashboard and is also exercised by
+			// pkg/dashboard/dashboard_test.go.
+			for i := range deliveries {
+				if deliveries[i].LastError != "" {
+					deliveries[i].LastError = dashboard.FormatAlertError(deliveries[i].LastError)
+				}
+			}
+		}
+		item.RecentDeliveries = deliveries
+		items = append(items, item)
+	}
+	return &dashboard.AlertDetailData{Rules: items}
 }
 
 // renderUsage renders /dashboard/usage — the GB-hours bar for the

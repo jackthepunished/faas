@@ -881,13 +881,22 @@ type Store interface {
 	// LoadAndStampLastQuotaWarning (pgstore.go) and captures the OLD
 	// stamp BEFORE the UPDATE so the predicate "$2 = old" doesn't
 	// trivially succeed post-write (the regression CI caught in PR
-	// #69 / memory/pkg-state-usage-monthly-tz-compare.md). Returns:
-	//   - (won=true, nil)  on a fresh claim — the caller proceeds to
-	//     RecordAlertDelivery
-	//   - (won=false, nil) on a duplicate inside the bucket — the
-	//     caller stays silent and lets the cool-down carry on
-	//   - (false, ErrNotFound) when the rule row is gone
-	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, at time.Time) (won bool, err error)
+	// #69 / memory/pkg-state-usage-monthly-tz-compare.md).
+	//
+	// payload and observed are stamped onto the alert_deliveries row
+	// inside the same transaction so the row exists with its full
+	// payload at insert time (avoids a window where the row is visible
+	// to a dashboard scrape before the dispatcher would have stamped
+	// it). payload may be empty for callers that don't track the
+	// observed envelope — the INSERT writes '{}' so the dashboard's
+	// `payload ->> 'metric'` query is safe.
+	//
+	// On won=true the returned deliveryID is the inserted row's UUID;
+	// callers pass that to UpdateAlertDeliveryStatus after the
+	// dispatch. On won=false the deliveryID is empty (the caller
+	// stays silent and lets the cool-down carry on). On a missing
+	// rule row, returns ("", false, ErrNotFound).
+	ClaimAlertFire(ctx context.Context, ruleID, idempotencyKey string, payload []byte, observed float64, at time.Time) (deliveryID string, won bool, err error)
 	// SetAlertRuleState transitions a rule's cool-down state. Called by
 	// the evaluator on healthy ticks (firing→ok) and after a successful
 	// delivery (ok→firing). returns (true, nil) on a real transition,
@@ -900,10 +909,15 @@ type Store interface {
 	// call site and never propagate.
 	SetAlertRuleLastEvaluated(ctx context.Context, ruleID string, at time.Time) error
 
-	// Alert deliveries (issue #396, ADR-045). RecordAlertDelivery
-	// inserts a fresh row after ClaimAlertFire returns won=true. The
-	// idempotency_key UNIQUE rejects a duplicate at the database floor
-	// (defence-in-depth on top of ClaimAlertFire's race check).
+	// Alert deliveries (issue #396, ADR-045). ClaimAlertFire is the
+	// canonical row-creation path: both PgStore and MemStore insert
+	// the alert_deliveries row inside the claim transaction (UNIQUE
+	// on idempotency_key is the load-bearing bucket dedupe). The
+	// meterd evaluator (PR 4) consumes the returned deliveryID and
+	// calls UpdateAlertDeliveryStatus after the dispatcher fires.
+	// RecordAlertDelivery remains on the interface for ad-hoc
+	// callers (test seeds, future dispatcher-direct paths, etc.)
+	// and surfaces SQLSTATE 23505 / ErrConflict on a duplicate.
 	RecordAlertDelivery(ctx context.Context, d AlertDelivery) (AlertDelivery, error)
 	// UpdateAlertDeliveryStatus mutates the retry record in place.
 	// Called after each attempt by the dispatcher (PR 2 / PR 4).

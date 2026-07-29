@@ -163,6 +163,7 @@ type Event struct {
 	ID         string         `json:"id"`          // X-Faas-Alert-Id header value
 	OccurredAt time.Time      `json:"occurred_at"` // X-Faas-Alert-Timestamp header value
 	Rule       string         `json:"rule"`        // rule name, for audit
+	RuleName   string         `json:"rule_name"`   // alias of Rule — surfaced on the wire for downstream consumers that key dashboards off `rule_name`
 	AppID      string         `json:"app_id"`      // app slug, for the customer
 	Payload    map[string]any `json:"payload"`     // arbitrary JSON-able content
 }
@@ -242,7 +243,18 @@ func NewDispatcher(opts DispatcherOptions) *Dispatcher {
 	}
 	callerHTTPClient := opts.HTTPClient != nil
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = oci.NewEgressHTTPClient()
+		// Test-only escape hatch: cmd/e2e/meterd_alerts_e2e_test.go
+		// sets FAAS_EGRESS_ALLOW_LOOPBACK=1 BEFORE spawning meterd so
+		// the dispatcher can POST to an httptest.NewServer bound on
+		// 127.0.0.1. The flag is read fresh on every dispatcher
+		// construction (NewDispatcher is called once at meterd boot
+		// today, so this is a no-op cost). Production daemons must
+		// NOT export this env var — see oci.NewEgressHTTPClientAllowLoopback.
+		if hc := oci.NewEgressHTTPClientAllowLoopback(); hc != nil {
+			opts.HTTPClient = hc
+		} else {
+			opts.HTTPClient = oci.NewEgressHTTPClient()
+		}
 	}
 	if opts.Sleeper == nil {
 		opts.Sleeper = time.Sleep

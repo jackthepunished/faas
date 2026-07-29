@@ -68,6 +68,7 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -125,6 +126,7 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -175,6 +177,7 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -224,6 +227,7 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {
@@ -273,6 +277,7 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 		nil, /* mailer */
 		nil, /* dunning */
 		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
 		func() time.Time { return now },
 		discardLog(),
 		func() *meter.Config {

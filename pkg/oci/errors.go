@@ -81,6 +81,16 @@ func IsImageTerminal(err error) bool {
 		errors.Is(err, ErrEgressDenied)
 }
 
+// EgressDeniedMessage is the literal substring sentinels carry
+// ("oci: egress denied by policy" → "egress denied"). Surfaced so
+// callers comparing against a persisted LastError *string* (not an
+// error value, where errors.Is is the right tool) can pin the
+// marker without taking a hard dependency on the full sentinel text.
+// cmd/e2e asserts against this constant; a future tweak to the
+// sentinel's Error() must keep this substring for backwards
+// compatibility.
+const EgressDeniedMessage = "egress denied"
+
 // SentinelToCode maps a pkg/oci puller-side sentinel error to its
 // stable RFC 7807 code from pkg/api (ADR-021). Returns ("", false)
 // when err doesn't wrap any of the three sentinels — callers fall

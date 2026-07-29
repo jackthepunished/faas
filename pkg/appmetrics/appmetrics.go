@@ -36,6 +36,23 @@ const SourcePrometheus = "prometheus"
 // "degraded:" branch off this prefix.
 const SourceDegradedPrefix = "degraded: "
 
+// SourceDegraded is the bare "degraded:" prefix WITHOUT the trailing
+// space, exported so alert evaluators and other callers that gate on
+// "is this a degraded source?" can compare against the canonical
+// prefix without slicing SourceDegradedPrefix[:len(...)-1] in their
+// hot path. Pair with IsDegradedSource for the idiomatic check.
+const SourceDegraded = "degraded:"
+
+// IsDegradedSource returns true iff source has the "degraded: "
+// prefix. The dashboard's empty-state branch, the public
+// /status/slo.json renderer, and the alert evaluator (issue #396 /
+// ADR-045 PR 4) all share this check; centralising it here means a
+// future change to the prefix (e.g. swapping ":" for ";") only
+// touches one site.
+func IsDegradedSource(source string) bool {
+	return strings.HasPrefix(source, SourceDegradedPrefix)
+}
+
 // DefaultRange is the range the server applies when the caller passes
 // no range. Matches the §12 status-page window so customers don't see
 // two different "current" periods on the same dashboard.

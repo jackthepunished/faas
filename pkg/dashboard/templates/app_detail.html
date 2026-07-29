@@ -171,6 +171,66 @@
       {{else}}
         <p>No crons scheduled.</p>
       {{end}}
+
+      {{/* Issue #396 / ADR-045 — alert rule + recent deliveries panel.
+           The handler (fetchDashboardAlerts) attaches a non-nil
+           AlertDetailData; .Rules may be empty (renders the empty-state
+           line) or carry per-app and account-wide rules. The metric /
+           comparison / threshold columns echo the same closed vocab
+           the public API uses (state.AlertMetric, AlertComparison,
+           AlertWindowSpec) so the page reads like the API docs. */}}
+      <h2>Alerts</h2>
+      {{if .Data.Alerts}}
+        {{if .Data.Alerts.Rules}}
+          <table>
+            <thead><tr><th>Name</th><th>Metric</th><th>Threshold</th><th>Window</th><th>State</th><th>Last fired</th></tr></thead>
+            <tbody>
+              {{range .Data.Alerts.Rules}}
+                <tr>
+                  <td>{{.Rule.Name}}</td>
+                  <td><code>{{.Rule.Metric}} {{.Rule.Comparison}}</code></td>
+                  <td>{{printf "%g" .Rule.Threshold}}</td>
+                  <td><code>{{.Rule.WindowSpec}}</code></td>
+                  <td>
+                    {{if eq .Rule.State "firing"}}<strong style="color:#c62828">firing</strong>
+                    {{else}}ok
+                    {{end}}
+                  </td>
+                  <td>{{.LastFiredAtLabel}}</td>
+                </tr>
+                {{if .RecentDeliveries}}
+                  <tr>
+                    <td colspan="6" style="background:#fafafa; padding:0.5em 1em;">
+                      <strong>Recent deliveries:</strong>
+                      <table style="margin:0.25em 0 0 0;">
+                        <thead><tr><th>Fired at</th><th>Status</th><th>HTTP</th><th>Attempts</th><th>Error</th></tr></thead>
+                        <tbody>
+                          {{range .RecentDeliveries}}
+                            <tr>
+                              <td>{{.FiredAt}}</td>
+                              <td>
+                                {{if eq .Status "delivered"}}<span style="color:#2e7d32">delivered</span>
+                                {{else if eq .Status "failed"}}<span style="color:#c62828">failed</span>
+                                {{else}}<span style="color:#888">pending</span>
+                                {{end}}
+                              </td>
+                              <td>{{.LastStatusCode}}</td>
+                              <td>{{.AttemptCount}}</td>
+                              <td><small>{{.LastError}}</small></td>
+                            </tr>
+                          {{end}}
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>
+                {{end}}
+              {{end}}
+            </tbody>
+          </table>
+        {{else}}
+          <p>No alert rules configured for this app. Create one via the public API at <code>POST /v1/apps/{slug}/alerts</code>.</p>
+        {{end}}
+      {{end}}
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

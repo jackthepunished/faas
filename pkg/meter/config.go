@@ -5,12 +5,14 @@ import "time"
 // Config is the meterd daemon's TOML-backed settings. Defaults match
 // the spec §4.7 cadence:
 //
-//   - sample tick: 60 s  (every minute flush)
-//   - quota tick:  60 s  (every minute verdict per account)
-//   - stripe tick: 24 h  (every day push, integer-arithmetic wire quantity)
-//   - dunning tick: 1 h  (dunning state machine 7d/21d clocks)
+//   - sample tick:    60 s  (every minute flush)
+//   - quota tick:     60 s  (every minute verdict per account)
+//   - stripe tick:    24 h  (every day push, integer-arithmetic wire quantity)
+//   - dunning tick:   1 h   (dunning state machine 7d/21d clocks)
+//   - residency tick: 60 s  (§12 dashboard panel)
+//   - alerts tick:    60 s  (issue #396 / ADR-045 alert evaluator)
 //
-// The four timers run independently — a slow quota loop never blocks the
+// The six timers run independently — a slow quota loop never blocks the
 // minute sampler and vice versa. Production wires this from
 // cmd/meterd/main.go via wire.ConfigFromTOML; tests use zero-value
 // defaults.
@@ -43,6 +45,15 @@ type Config struct {
 	// §12 alert rule's `for: 1h` window with enough resolution to
 	// catch a fast-migrating plan without spending DB scans.
 	ResidencyInterval time.Duration
+	// AlertEvalInterval is how often the alert evaluator walks
+	// ListEnabledAlertRules (issue #396 / ADR-045, PR 4). Zero means
+	// the production default (60 s). The 60 s cadence matches the
+	// §12 dashboard's "alert evaluations per minute" panel and
+	// matches the cool-down bucket for the shortest meaningful
+	// customer-side cool-down window (1 minute). The evaluator loop
+	// is single-goroutine today; a future meterd replica would
+	// parallelise via the alert_deliveries.idempotency_key UNIQUE.
+	AlertEvalInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -67,5 +78,8 @@ func (c *Config) Defaults() {
 	}
 	if c.ResidencyInterval == 0 {
 		c.ResidencyInterval = 60 * time.Second
+	}
+	if c.AlertEvalInterval == 0 {
+		c.AlertEvalInterval = 60 * time.Second
 	}
 }
