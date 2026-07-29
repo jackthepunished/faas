@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -101,12 +102,18 @@ func (a *advisoryReceiver) ForwardStatelessAdvisory(ctx context.Context, req *ap
 	// Translate the proto events into a map shape pkg/audit can
 	// serialise. count + instance are denormalised for ops dashboards
 	// (so a single /v1/audit-events query answers "which instance
-	// wrote the most").
+	// wrote the most"). severity is the highest-severity path in
+	// the batch (Move 1 PR-A) so a single /v1/audit-events row can
+	// be triaged without inspecting the events[] list. Computed at
+	// emit time so the audit row is self-describing — a reader
+	// doesn't need the closed-path list to know whether the row is
+	// "high" (/data, /var/lib/postgresql) or "warn" (/var/lib/redis).
 	data := map[string]any{
 		"instance": req.Instance,
 		"app_id":   req.AppId,
 		"count":    len(req.Events),
 		"events":   advisoryEventsToMap(req.Events),
+		"severity": advisoryBatchSeverity(req.Events),
 	}
 
 	if a.audit != nil {
@@ -172,6 +179,62 @@ func joinMasksForJSON(masks []string) string {
 		out += m
 	}
 	return out
+}
+
+// statelessAdvisoryHighPaths is the subset of the closed-path list
+// that warrants the "high" severity badge (Move 1 PR-A). Mirrors
+// pkg/dashboard/dashboard.go's StatelessClosedPaths severity field
+// and guest/init/stateless_advisory_linux.go's statelessRuntimePaths.
+// Kept here as the single source of truth for the apid-side emit;
+// the dashboard mirrors the same set so a future path addition
+// means touching both — see ADR-048 for the lockstep rationale.
+var statelessAdvisoryHighPaths = []string{
+	"/data",
+	"/db",
+	"/var/lib/postgresql",
+	"/var/lib/mysql",
+}
+
+// severityForPath returns "high" / "warn" for a closed-path string,
+// or "info" for paths outside the closed list. Pure function —
+// the events list is processed by advisoryBatchSeverity. Tests
+// pin the classification (advisory_receiver_test.go).
+//
+// Match rule: a path is "high" if it equals one of the high-paths
+// OR is a strict sub-path (e.g. /data/foo matches /data, /db/log
+// matches /db). The closed-path list is the *root* of each
+// watched directory; the guest-init fanotify watcher matches by
+// prefix (spec §17 G13), so we mirror that here. Without the
+// prefix match, a customer writing /data/foo would render as
+// "warn" because /data/foo isn't a member of the high list.
+func severityForPath(p string) string {
+	for _, hp := range statelessAdvisoryHighPaths {
+		if p == hp || strings.HasPrefix(p, hp+"/") {
+			return "high"
+		}
+	}
+	return "warn"
+}
+
+// advisoryBatchSeverity returns the highest severity in the batch.
+// A batch with any "high" path is "high"; otherwise "warn". An
+// empty batch is "info" (no paths to classify — defensive default
+// so the audit row's severity field is always populated).
+func advisoryBatchSeverity(events []*apidpb.AdvisoryEvent) string {
+	if len(events) == 0 {
+		return "info"
+	}
+	high := false
+	for _, e := range events {
+		if severityForPath(e.Path) == "high" {
+			high = true
+			break
+		}
+	}
+	if high {
+		return "high"
+	}
+	return "warn"
 }
 
 // isStateNotFound recognises pkg/state's "not found" sentinel.

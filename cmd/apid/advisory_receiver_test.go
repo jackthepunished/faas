@@ -415,3 +415,123 @@ func TestAdvisoryReceiver_SamplePathFromFirstEvent(t *testing.T) {
 		t.Errorf("payload = %q, want n = 2", p)
 	}
 }
+
+// --- Move 1 PR-A: severity classification ---------------------------------
+
+// TestSeverityForPath_PinClassification pins the closed-path severity
+// table so a future path addition (or a path-list drift between
+// guest-init, dashboard, and the apid receiver) is caught at test
+// time. The four cases below mirror pkg/dashboard/dashboard.go's
+// StatelessClosedPaths severity field — keeping both lists in sync
+// is the lockstep the dashboard tests pin on the other side.
+func TestSeverityForPath_PinClassification(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/data", "high"},
+		{"/db", "high"},
+		{"/var/lib/postgresql", "high"},
+		{"/var/lib/mysql", "high"},
+		{"/var/lib/redis", "warn"},
+		{"/var/lib/mongodb", "warn"},
+		{"/var/lib/cockroach", "warn"},
+		{"/var/lib/cassandra", "warn"},
+		{"/var/lib/clickhouse", "warn"},
+		{"/tmp/foo", "warn"}, // unwatched paths still classify as warn (defensive)
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			if got := severityForPath(c.path); got != c.want {
+				t.Errorf("severityForPath(%q) = %q, want %q", c.path, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAdvisoryBatchSeverity_EmptyBatchIsInfo: an empty events list
+// returns "info" (defensive default — the audit row's severity
+// field is always populated so the dashboard's badge column
+// never renders an empty cell).
+func TestAdvisoryBatchSeverity_EmptyBatchIsInfo(t *testing.T) {
+	if got := advisoryBatchSeverity(nil); got != "info" {
+		t.Errorf("advisoryBatchSeverity(nil) = %q, want info", got)
+	}
+	if got := advisoryBatchSeverity([]*apidpb.AdvisoryEvent{}); got != "info" {
+		t.Errorf("advisoryBatchSeverity([]) = %q, want info", got)
+	}
+}
+
+// TestAdvisoryBatchSeverity_HighestWins: a batch containing one
+// "high" path returns "high" even when other events are "warn".
+// This is the triaging signal Move 1 PR-A's dashboard badge column
+// relies on — a single /data write in a 100-event batch is still
+// "high" for the row.
+func TestAdvisoryBatchSeverity_HighestWins(t *testing.T) {
+	cases := []struct {
+		name   string
+		events []*apidpb.AdvisoryEvent
+		want   string
+	}{
+		{
+			name: "all warn",
+			events: []*apidpb.AdvisoryEvent{
+				{Path: "/var/lib/redis"},
+				{Path: "/var/lib/mongodb"},
+			},
+			want: "warn",
+		},
+		{
+			name: "one high + many warn",
+			events: []*apidpb.AdvisoryEvent{
+				{Path: "/var/lib/redis"},
+				{Path: "/data/first"},
+				{Path: "/var/lib/cockroach"},
+			},
+			want: "high",
+		},
+		{
+			name: "only high",
+			events: []*apidpb.AdvisoryEvent{
+				{Path: "/db"},
+			},
+			want: "high",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := advisoryBatchSeverity(c.events); got != c.want {
+				t.Errorf("advisoryBatchSeverity(%v) = %q, want %q", c.events, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAdvisoryReceiver_DataIncludesSeverityField: end-to-end check
+// that the emitted audit row's data map carries the "severity"
+// key. The dashboard's --verbose renderer reads this field; if
+// it goes missing the badge column drops to "info" silently.
+func TestAdvisoryReceiver_DataIncludesSeverityField(t *testing.T) {
+	acct := "acct-1"
+	store := &advisoryStubStore{app: state.App{ID: "app-uuid", AccountID: acct, Slug: "test"}}
+	audit := &advisoryStubAudit{}
+	recv := newAdvisoryReceiver(store, audit, nil)
+
+	_, err := recv.ForwardStatelessAdvisory(context.Background(), &apidpb.ForwardStatelessAdvisoryRequest{
+		AppId: "app-uuid", Instance: "i-1",
+		Events: []*apidpb.AdvisoryEvent{
+			{Path: "/data/foo", Mask: []string{"create"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if audit.callCount() != 1 {
+		t.Fatalf("audit calls = %d, want 1", audit.callCount())
+	}
+	call := audit.calls[0]
+	got, _ := call.Data["severity"].(string)
+	if got != "high" {
+		t.Errorf("data.severity = %q, want high (path /data/foo is high)", got)
+	}
+}
