@@ -361,6 +361,30 @@ func TestNewAdvisoryClient_NilLogDefaults(t *testing.T) {
 // emit only matched series and lose the pre-instantiated zero
 // rows we want to assert on. We need the full body so the
 // "must stay 0" assertions actually surface the row.
+//
+// Assumptions (load-bearing for correctness):
+//
+//   - The OpenMetrics text format emits counter samples as
+//     "<name>{label=\"v\",...} <value>\n" — the metric name and
+//     the value are always separated by exactly one space, and
+//     the value is always the trailing token of the line.
+//   - All label values passed to this helper come from the
+//     closed-set constants in pkg/wire/metrics.go (AdvisoryResult*
+//     / AdvisorySeverity*) and contain no spaces or quotes. The
+//     Prometheus exposition format forbids them at the spec
+//     level; if a future label set widens, change the helper to
+//     parse the label block first rather than treating the
+//     trailing token as the value.
+//   - Scientific notation ("1e+09") is not exercised by this
+//     project today; the Sscanf %f path accepts it but is not
+//     asserted by any test. If counter values grow past 2^53
+//     (CounterVec.Inc is float64), tighten the parse.
+//
+// Returns 0 if the line is absent (pre-instantiated but never
+// incremented), so test assertions can rely on the absence/zero
+// symmetry: a missing series and a zero-valued series both
+// surface as 0. Callers that need to distinguish the two must
+// add a presence check before calling.
 func scrapeCounter(t *testing.T, ops *wire.OpsMetrics, linePrefix string) float64 {
 	t.Helper()
 	srv := httptest.NewServer(ops.Handler())
@@ -380,6 +404,8 @@ func scrapeCounter(t *testing.T, ops *wire.OpsMetrics, linePrefix string) float6
 			continue
 		}
 		// The trailing value sits after the last space.
+		// Closed-set label values guarantee no spaces inside the
+		// labelled suffix, so last-space is the value separator.
 		idx := strings.LastIndex(ln, " ")
 		if idx < 0 || idx == len(ln)-1 {
 			continue

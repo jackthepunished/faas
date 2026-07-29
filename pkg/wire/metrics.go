@@ -948,11 +948,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// the field comment instead, where the leak-grep doesn't reach.
 	advisoryBatchesEmittedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_stateless_advisory_batches_emitted_total",
-		Help: "Per-batch stateless-advisory forward outcomes (Mega-PR B). result ∈ {ok, dial_failed, rejected, unavailable_after_retry}. One increment per ForwardStatelessAdvisory RPC at the forward daemon, not per underlying fanotify event (the forward-side taxonomy is batch-grained). result=ok fires when the receiver accepted the RPC; the three failure labels track the observable failure paths (dial errors before any RPC, InvalidArgument rejection at the receiver, Unavailable after the retry budget). Single-registry: registered on every daemon; only the forward daemon increments via ObserveAdvisoryBatchResult.",
+		Help: "Per-batch stateless-advisory forward outcomes (Mega-PR B). result ∈ {ok, dial_failed, rejected, unavailable_after_retry}. One increment per ForwardStatelessAdvisory RPC at the forward daemon, not per underlying fanotify event (the forward-side taxonomy is batch-grained). Single-registry: registered on every daemon; only the forward daemon increments via ObserveAdvisoryBatchResult.",
 	}, []string{"result"})
 	apidStatelessAdvisoryEventsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_stateless_advisory_events_total",
-		Help: "Per-batch stateless-advisory inbound counter (Mega-PR B). severity ∈ {high, warn, info} — mirrors the same vocabulary the receiver already computes via advisoryBatchSeverity. One increment per ForwardStatelessAdvisory RPC at the receiver daemon whose audit row was written. Pair-counter (documented in pkg/wire/metrics.go's field doc): a healthy box has rate(receiver_stateless_advisory_events_total[5m]) ≈ rate(forward_stateless_advisory_batches_emitted_total{result=\"ok\"}[5m]). Single-registry: registered on every daemon; only the receiver daemon increments via ObserveStatelessAdvisory.",
+		Help: "Per-batch stateless-advisory inbound counter (Mega-PR B). severity ∈ {high, warn, info}. One increment per ForwardStatelessAdvisory RPC at the receiver daemon whose audit row was written. Mirrors advisoryBatchesEmittedTotal on the forward side. Single-registry: registered on every daemon; only the receiver daemon increments via ObserveStatelessAdvisory.",
 	}, []string{"severity"})
 	// PR-E sister collector for the user-space OCI dialer. Only
 	// registered when prefix == "imaged" — on every other daemon the

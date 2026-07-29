@@ -136,6 +136,12 @@ func (a *advisoryReceiver) ForwardStatelessAdvisory(ctx context.Context, req *ap
 	}
 
 	if a.audit != nil {
+		// TODO: when auditEmitter.Emit grows an error return, the
+		// counter below must move inside the success branch — the
+		// pair-counter invariant (apid events vs vmmd ok) requires
+		// the audit row to be durably stored before the metric
+		// increments. Today Emit swallows write-failures into its
+		// own internal counter, so the order is currently safe.
 		a.audit.Emit(ctx, "stateless.advisory", subject, data)
 	}
 

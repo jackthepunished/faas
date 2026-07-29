@@ -27,8 +27,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-// TestAdvisorySeverity_ChainFromEmitToWire pins the full Mega-PR B
-// chain:
+// TestAdvisorySeverity_StubChainFromEmitToWire pins the full
+// Mega-PR B chain against the receiver's stub seam:
 //
 //  1. Receiver writes data.severity="high" into the audit row's
 //     data map at emit time (cmd/apid/advisory_receiver.go:135).
@@ -42,7 +42,17 @@ import (
 // in ObserveStatelessAdvisory / dataSeverity means a stray label
 // value would silently drop, so the test runs all three severities
 // (high / warn / info).
-func TestAdvisorySeverity_ChainFromEmitToWire(t *testing.T) {
+//
+// Scope: this test exercises the receiver with a stub audit
+// emitter and a NIL notifier. It does NOT cover the live pg_notify
+// path (handlers_events.go:cmdSubscriptionFrame) or the live
+// auditor's batched-flush path (cmd/apid/audit.go::flushOne).
+// Cross-process invariants between the vmmd and apid counters
+// are Tier-A e2e territory — see the review note on Mega-PR B
+// and the §6.2 invariants testing matrix. Anything tighter than
+// that should land in cmd/e2e (per memory make-e2e-target-post-tier-a)
+// rather than here.
+func TestAdvisorySeverity_StubChainFromEmitToWire(t *testing.T) {
 	cases := []struct {
 		name  string
 		event *apidpb.AdvisoryEvent
