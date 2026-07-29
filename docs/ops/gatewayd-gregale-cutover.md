@@ -129,9 +129,9 @@ curl -vI https://my-app.apps.gregale.dev/
 #         wildcard SAN — proves the cert covers <slug>.apps.gregale.dev.
 
 # On-demand HTTP-01 mints for a verified custom_domain row.
-# (Requires a customer to have added the domain via `faas domains add`
+# (Requires a customer to have added the domain via `gregale domains add`
 #  and verified the _faas-verify TXT record.)
-faas domains add my-app shop.acme.com
+gregale domains add my-app shop.acme.com
 # Operator-side: `dig TXT _faas-verify.shop.acme.com` confirms verification,
 # then gatewayd mints the cert on first hit.
 curl -vI https://shop.acme.com/
@@ -172,7 +172,7 @@ flip back.
 | Cert chain trusted             | Let's Encrypt prod (not staging)                          | `openssl s_client -connect apps.gregale.dev:443 -servername apps.gregale.dev < /dev/null` |
 | DNS-01 round-trip              | TXT record appears + disappears during renewal            | `watch dig TXT _acme-challenge.apps.gregale.dev @dns.hetzner.com +short` |
 | App routing via wildcard       | `<slug>.apps.gregale.dev` resolves and serves a wake       | deploy a test app, `curl https://<slug>.apps.gregale.dev/` |
-| Custom-domain HTTP-01 mint     | cert mints for the verified domain only                   | `faas domains add` + `journalctl -u faas-gatewayd` |
+| Custom-domain HTTP-01 mint     | cert mints for the verified domain only                   | `gregale domains add` + `journalctl -u faas-gatewayd` |
 | Status page served             | `https://apps.gregale.dev/status` returns the HTML        | `curl -fsS https://apps.gregale.dev/status`  |
 | Alert rules scrape cert expiry | `faas_tls_cert_expiry_seconds{host="*.gregale.dev"} > 30d` | Prometheus `/api/v1/query?query=faas_tls_cert_expiry_seconds` |
 

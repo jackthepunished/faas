@@ -4,7 +4,7 @@
 GO      ?= go
 PKGS    := ./...
 COVERAGE_DIR := coverage
-DAEMONS := apid gatewayd schedd vmmd builderd imaged meterd faas githubd hostage-gen
+DAEMONS := apid gatewayd schedd vmmd builderd imaged meterd gregale githubd hostage-gen
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
