@@ -30,6 +30,12 @@ class UsageSummaryResponse:
     used_egress_gb: float | Unset = UNSET
     """Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB.
     ADR-046."""
+    used_ingress_gb: float | Unset = UNSET
+    """Per-month ingress GB (informational; not billed). Σ net_rx_bytes across all apps, converted to GB. ADR-048.
+    Mirror of `used_egress_gb` for the inbound direction."""
+    cold_boots: int | Unset = UNSET
+    """Per-month sum of WAKE_RESTORE→WAKE_COLD_BOOT transitions across every app on the account (informational; not
+    billed). ADR-048."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +53,10 @@ class UsageSummaryResponse:
 
         used_egress_gb = self.used_egress_gb
 
+        used_ingress_gb = self.used_ingress_gb
+
+        cold_boots = self.cold_boots
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -62,6 +72,10 @@ class UsageSummaryResponse:
             field_dict["used_cpu_hours"] = used_cpu_hours
         if used_egress_gb is not UNSET:
             field_dict["used_egress_gb"] = used_egress_gb
+        if used_ingress_gb is not UNSET:
+            field_dict["used_ingress_gb"] = used_ingress_gb
+        if cold_boots is not UNSET:
+            field_dict["cold_boots"] = cold_boots
 
         return field_dict
 
@@ -82,6 +96,10 @@ class UsageSummaryResponse:
 
         used_egress_gb = d.pop("used_egress_gb", UNSET)
 
+        used_ingress_gb = d.pop("used_ingress_gb", UNSET)
+
+        cold_boots = d.pop("cold_boots", UNSET)
+
         usage_summary_response = cls(
             month=month,
             used_gb_hours=used_gb_hours,
@@ -90,6 +108,8 @@ class UsageSummaryResponse:
             overage_cents=overage_cents,
             used_cpu_hours=used_cpu_hours,
             used_egress_gb=used_egress_gb,
+            used_ingress_gb=used_ingress_gb,
+            cold_boots=cold_boots,
         )
 
         usage_summary_response.additional_properties = d

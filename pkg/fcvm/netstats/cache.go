@@ -56,7 +56,20 @@ import (
 type Observation struct {
 	InstanceID string
 	RXBytes    uint64
-	At         time.Time
+	// TXBytes (ADR-048) is the cumulative byte counter from
+	// root-side vethHost.tx_bytes — the ingress direction (root →
+	// guest). Same kernel counter family, same interface-bytes
+	// unit; the cache treats it as a parallel counter to RXBytes
+	// with the same regression-safe semantics (drop baseline on
+	// tx_bytes regression, return Valid=false for one tick,
+	// re-baseline on the next). A reading that supplies RXBytes
+	// without TXBytes is fine — the cache updates only the rx
+	// baseline, the tx baseline stays at the previous value (and
+	// will appear as a stale delta until the next tx reading
+	// arrives). In practice both are read from the same sysfs
+	// poll and arrive together.
+	TXBytes uint64
+	At      time.Time
 }
 
 // Reading is the cache's output: the per-tick byte delta since the
@@ -78,6 +91,21 @@ type Reading struct {
 	// across observations and is the seam the future billing PR
 	// reads. Resets to 0 on regression (veth recreation).
 	CumulativeBytes uint64
+	// IngressDeltaBytes (ADR-048) is the per-tick byte delta
+	// on the root-side vethHost.tx_bytes counter
+	// (root → guest = ingress). Mirrors DeltaBytes on the
+	// egress direction. Zero on baseline / regression /
+	// partial observation (rx reading without tx). The
+	// schedd-side wire carries the cumulative value, not
+	// the delta; the poller subtracts the prior value
+	// across ticks via its own state (see pkg/sched/
+	// instancestats/poller.go).
+	IngressDeltaBytes uint64
+	// IngressCumulativeBytes is the cumulative tx_bytes
+	// reading this cache has tracked since the last
+	// regression. Mirrors CumulativeBytes. Resets to 0 on
+	// regression (veth recreation).
+	IngressCumulativeBytes uint64
 	// Valid is false when the cache has only one observation
 	// (baseline not yet established) or the previous observation
 	// was dropped on regression. Callers MUST treat Valid=false
@@ -88,9 +116,12 @@ type Reading struct {
 
 type lastSample struct {
 	rx              uint64
+	tx              uint64
 	at              time.Time
 	accumCumulative uint64
 	lastDelta       uint64
+	ingressAccum    uint64
+	ingressLast     uint64
 }
 
 // Cache is a per-instance byte-counter cache. Construct with New
@@ -145,36 +176,49 @@ func (c *Cache) Observe(o Observation) (Reading, bool) {
 	prev, hadPrev := c.last[o.InstanceID]
 	// First observation: just record the baseline; no delta yet.
 	if !hadPrev {
-		c.last[o.InstanceID] = lastSample{rx: o.RXBytes, at: now}
+		c.last[o.InstanceID] = lastSample{rx: o.RXBytes, tx: o.TXBytes, at: now}
 		return Reading{Valid: false}, false
 	}
 	// Regression: veth recreation (instance teardown + new
 	// vethHost). Drop baseline, start fresh. Mirrors
 	// pkg/fcvm/cpustats.Cache.Observe exactly — the kernel
 	// counter starts over, and the previous interval's egress
-	// is not patched across the break.
-	if o.RXBytes < prev.rx {
-		c.last[o.InstanceID] = lastSample{rx: o.RXBytes, at: now}
+	// is not patched across the break. Both rx and tx are
+	// treated as a single "veth alive" event — a regression
+	// on either side drops the baseline for both.
+	if o.RXBytes < prev.rx || o.TXBytes < prev.tx {
+		c.last[o.InstanceID] = lastSample{rx: o.RXBytes, tx: o.TXBytes, at: now}
 		return Reading{Valid: false}, false
 	}
 	// No wall-clock progression: degenerate. Keep the previous
 	// accumulator and return Valid=false so callers don't divide
 	// by zero or claim a delta of zero.
 	if !now.After(prev.at) {
-		return Reading{CumulativeBytes: prev.accumCumulative, Valid: false}, false
+		return Reading{
+			CumulativeBytes:        prev.accumCumulative,
+			IngressCumulativeBytes: prev.ingressAccum,
+			Valid:                  false,
+		}, false
 	}
 	delta := o.RXBytes - prev.rx
 	accum := prev.accumCumulative + delta
+	ingressDelta := o.TXBytes - prev.tx
+	ingressAccum := prev.ingressAccum + ingressDelta
 	c.last[o.InstanceID] = lastSample{
 		rx:              o.RXBytes,
+		tx:              o.TXBytes,
 		at:              now,
 		accumCumulative: accum,
 		lastDelta:       delta,
+		ingressAccum:    ingressAccum,
+		ingressLast:     ingressDelta,
 	}
 	return Reading{
-		DeltaBytes:      delta,
-		CumulativeBytes: accum,
-		Valid:           true,
+		DeltaBytes:             delta,
+		CumulativeBytes:        accum,
+		IngressDeltaBytes:      ingressDelta,
+		IngressCumulativeBytes: ingressAccum,
+		Valid:                  true,
 	}, true
 }
 
@@ -217,9 +261,11 @@ func (c *Cache) Lookup(instanceID string) (Reading, bool) {
 		return Reading{Valid: false}, false
 	}
 	return Reading{
-		DeltaBytes:      prev.lastDelta,
-		CumulativeBytes: prev.accumCumulative,
-		Valid:           true,
+		DeltaBytes:             prev.lastDelta,
+		CumulativeBytes:        prev.accumCumulative,
+		IngressDeltaBytes:      prev.ingressLast,
+		IngressCumulativeBytes: prev.ingressAccum,
+		Valid:                  true,
 	}, true
 }
 

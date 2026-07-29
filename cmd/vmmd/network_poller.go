@@ -79,6 +79,11 @@ type snapshotLiveFunc func() map[string]string
 // passes netns.ReadVethRXBytes; tests inject a stub.
 type readRXBytesFunc func(vethHost string) (uint64, error)
 
+// readTXBytesFunc is the per-instance sysfs read seam for the
+// ingress direction (ADR-048). Production passes
+// netns.ReadVethTXBytes; tests inject a stub.
+type readTXBytesFunc func(vethHost string) (uint64, error)
+
 // runNetworkEgressPoll starts the per-instance veth byte poll
 // goroutine and returns when ctx is cancelled. It is launched
 // alongside runEgressPoll and runCPUSampleLoop from main.go.
@@ -109,6 +114,7 @@ func runNetworkEgressPoll(
 	ops *wire.OpsMetrics,
 	snapshotLive snapshotLiveFunc,
 	readRXBytes readRXBytesFunc,
+	readTXBytes readTXBytesFunc,
 	interval time.Duration,
 	log *slog.Logger,
 ) {
@@ -117,6 +123,9 @@ func runNetworkEgressPoll(
 	}
 	if readRXBytes == nil {
 		readRXBytes = netns.ReadVethRXBytesForPoll
+	}
+	if readTXBytes == nil {
+		readTXBytes = netns.ReadVethTXBytesForPoll
 	}
 	if interval <= 0 {
 		interval = EgressBytesPollInterval
@@ -185,9 +194,38 @@ func runNetworkEgressPoll(
 						"rx", rx)
 					rx = math.MaxInt64
 				}
+				// ADR-048: read the tx_bytes counter in the same
+				// tick so the cache's parallel ingress baseline
+				// stays in lockstep with the egress baseline. A
+				// tx read failure does not invalidate the rx
+				// reading — we Observe with rx populated and
+				// tx=0, and the cache's tx baseline regresses
+				// (it sees 0 < prev.tx), drops the tx
+				// baseline, and re-establishes it on the next
+				// successful tick. The egress direction is
+				// unaffected.
+				tx, txErr := readTXBytes(vethHost)
+				if txErr != nil {
+					log.Warn("ingress tx_bytes read failed",
+						"instance", instanceID,
+						"veth", vethHost,
+						"err", txErr)
+					if c := ops.EgressSourceErrors(); c != nil {
+						c.Inc()
+					}
+					// tx stays 0 — see ADR-048 §3.2 on
+					// tx baseline drop policy.
+				} else if tx > math.MaxInt64 {
+					log.Warn("ingress tx_bytes exceeds int64 range; clamping",
+						"instance", instanceID,
+						"veth", vethHost,
+						"tx", tx)
+					tx = math.MaxInt64
+				}
 				cache.Observe(netstats.Observation{
 					InstanceID: instanceID,
 					RXBytes:    rx,
+					TXBytes:    tx,
 					At:         now,
 				})
 			}

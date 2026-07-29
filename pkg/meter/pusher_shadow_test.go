@@ -107,6 +107,13 @@ func (r *recordingStripe) Refund(_ context.Context, _ string, _ int64) (*billing
 	return nil, billing.ErrNotImplemented
 }
 
+// ReconcileUsage is the ADR-049 §B.1 drift-detector seam. The
+// pusher_shadow tests don't drive the reconciler, so we return
+// (0, nil) — the recording stub doesn't need to record drift.
+func (r *recordingStripe) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

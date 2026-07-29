@@ -182,6 +182,15 @@ type InstanceStatsRow struct {
 	// rows where TxValid != 0.
 	NetTxBytes uint64
 	TxValid    uint32
+	// NetRxBytes (ADR-048) is the per-tick byte delta on
+	// root-side vethHost.tx_bytes for this instance — mirror of
+	// NetTxBytes but on the root→guest (= ingress) direction.
+	// Same kernel counter family (interface bytes, includes
+	// Ethernet framing); same TxValid gate as egress (a cache
+	// regression / first-sample state zeroes BOTH columns).
+	// Wire field awaits make proto regen (task A.3a follow-up);
+	// today the field stays at 0 end-to-end.
+	NetRxBytes uint64
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the

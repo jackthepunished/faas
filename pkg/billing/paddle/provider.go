@@ -343,3 +343,12 @@ func (p *Provider) VerifyWebhook(payload []byte, headers map[string]string, tole
 func (p *Provider) Refund(_ context.Context, _ string, _ int64) (*billing.RefundResult, error) {
 	return nil, billing.ErrNotImplemented
 }
+
+// ReconcileUsage is the drift detector seam (ADR-049 §B.1). Paddle
+// Billing does not yet expose a usage-summary endpoint, so the
+// reconciler observes ErrNotImplemented and skips Paddle accounts.
+// When Paddle adds the surface, this implementation will call it
+// and return the mb_seconds total for [start, end).
+func (p *Provider) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
+}

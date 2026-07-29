@@ -53,6 +53,15 @@ func NewPusher(store state.Store, pusher billing.Provider, log *slog.Logger, now
 	return &Pusher{store: store, pusher: pusher, log: log, now: now, ops: ops}
 }
 
+// Provider returns the underlying billing.Provider so sibling
+// goroutines (the drift-detector reconciler, ADR-049 §B.1) can
+// share the same Stripe/Paddle handle without meterd loading a
+// second client. cmd/meterd/main.go uses this accessor to wire
+// reconciler.New(...) once at boot.
+func (p *Pusher) Provider() billing.Provider {
+	return p.pusher
+}
+
 // HourWindow returns the [start, end) hour boundary the pusher aggregates
 // against. end is exclusive so a tick at 14:00:00 covers 13:00–14:00. The
 // caller (PushHour) reads usage rows whose minute ∈ [start, end).

@@ -156,6 +156,14 @@ func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult
 	return nil, billing.ErrNotImplemented
 }
 
+// ReconcileUsage is the ADR-049 §B.1 drift-detector seam. meterd
+// calls it via the reconciler (cmd/meterd/main.go). Returning
+// ErrNotImplemented matches the Paddle contract — the reconciler
+// treats that as "no provider drift signal yet".
+func (nopProvider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
+}
+
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
 // pins the production default (deploy/etc/meterd.toml.example leaves
@@ -285,8 +293,18 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 		t.Errorf("/metrics status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "promhttp_metric_handler_errors_total") {
-		t.Errorf("/metrics body missing promhttp internals (handler may be unconfigured):\n%s", body)
+	// The handler is mounted iff the Gatherers we wired
+	// (ops + recRegistry + DefaultGatherer) all respond on the
+	// scrape. promhttp_metric_handler_errors_total is created per
+	// HandlerFor instance on its bound registry, so it's NOT
+	// guaranteed to surface via the merged Gatherers — but the
+	// DefaultGatherer line for Go runtime (`go_goroutines`) IS
+	// always present once promhttp's runtime collector is loaded,
+	// which it is on any prometheus.Handler() call anywhere in
+	// the daemon's process. The line is the load-bearing proof the
+	// handler is mounted and DefaultGatherer is reachable.
+	if !strings.Contains(body, "go_goroutines") {
+		t.Errorf("/metrics body missing Go runtime metrics (handler may be unconfigured or DefaultGatherer dropped):\n%s", body)
 	}
 	if !strings.Contains(body, "meterd_ops_total") {
 		t.Errorf("/metrics body missing meterd_ops_total (Observe not wired?):\n%s", body)
@@ -512,6 +530,13 @@ func (r *meterRec) CreateUpgradeTransaction(context.Context, state.Account, api.
 // it; returning ErrNotImplemented matches the Paddle contract.
 func (r *meterRec) Refund(context.Context, string, int64) (*billing.RefundResult, error) {
 	return nil, billing.ErrNotImplemented
+}
+
+// ReconcileUsage is the ADR-049 §B.1 drift-detector seam. Stub:
+// the meterd main tests don't drive the reconciler, so we return
+// (0, nil) — no drift signal.
+func (r *meterRec) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
+	return 0, nil
 }
 
 func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, int64) error {

@@ -343,6 +343,26 @@ type UsageResponse struct {
 	// usage_minutes.net_tx_bytes. Not billed (ADR-046 §6).
 	// 0 when no meterd sample has accumulated yet.
 	NetTxBytes int64 `json:"net_tx_bytes"`
+	// NetRxBytes (ADR-048) is the per-app monthly byte
+	// delta on root-side vethHost.tx_bytes — mirror of
+	// NetTxBytes on the ingress direction (root → guest).
+	// Source: vmmd netstats.Cache TX path → schedd
+	// instancestats.Poller → meterd SampleAndRoll →
+	// usage_minutes.net_rx_bytes. Informational only —
+	// not billed (ADR-048 §5). 0 when no meterd sample has
+	// accumulated yet or the wire regen that surfaces the
+	// ingress field has not yet landed (PR-A commit #2
+	// follow-up).
+	NetRxBytes int64 `json:"net_rx_bytes"`
+	// ColdBootCount (ADR-048) is the per-app monthly
+	// count of WAKE_RESTORE → WAKE_COLD_BOOT transitions
+	// observed across this app's instances. Source:
+	// scheddgrpc.InstanceStatsRow.LastWakeMethod, sampled
+	// by meterd SampleAndRoll → usage_minutes.
+	// cold_boot_count. Informational only — not billed.
+	// 0 when no meterd sample has accumulated yet or the
+	// wire regen has not yet landed.
+	ColdBootCount int64 `json:"cold_boots"`
 }
 
 // CPUHours returns CPUUsageUsec converted to CPU-hours. 1 hour
@@ -612,6 +632,20 @@ type UsageSummaryResponse struct {
 	// single-number roll-up for the dashboard's
 	// "egress this month" panel.
 	UsedEgressGB float64 `json:"used_egress_gb"`
+	// UsedIngressGB (ADR-048) is the per-month ingress Σ
+	// NetRxBytes / 1024^3. Informational only — not billed
+	// (ADR-048 §5). Same Ethernet-framing caveat as
+	// UsageResponse.TotalEgressGB. The dashboard's "ingress
+	// this month" panel reads this single number; the
+	// per-app breakdown lives at UsageResponse.NetRxBytes.
+	UsedIngressGB float64 `json:"used_ingress_gb"`
+	// ColdBootTotal (ADR-048) is the per-month Σ of
+	// WAKE_RESTORE → WAKE_COLD_BOOT transitions across
+	// every app on this account. Informational only — not
+	// billed. The dashboard's "this customer's cold-boot
+	// bill of health" panel reads this single number; the
+	// per-app breakdown lives at UsageResponse.ColdBootCount.
+	ColdBootTotal int64 `json:"cold_boots"`
 }
 
 // ValidateAppConfig checks a requested app config against its plan caps (spec
@@ -691,6 +725,31 @@ type UsageExportResponse struct {
 	// The gateway-side tx_bytes producer lands in PR-2.
 	TXBytes    int64 `json:"tx_bytes"`
 	NetTxBytes int64 `json:"net_tx_bytes"`
+	// ADR-048: mirror of UsageResponse.NetRxBytes /
+	// UsageResponse.ColdBootCount on the export surface.
+	// Informational only — not billed.
+	NetRxBytes    int64 `json:"net_rx_bytes"`
+	ColdBootCount int64 `json:"cold_boots"`
+}
+
+// DailyUsageResponse is one row of GET /v1/usage/daily — the
+// per-(account, app, day) rollup the dashboard's hot path reads
+// (migrations/00067_extend_metering_telemetry.sql::usage_daily).
+// Distinct from UsageResponse which is the per-app monthly
+// rollup (pkg/state.UsageByMonth); the daily route is for
+// yesterday / today / single-day queries where the monthly grain
+// is over-aggregated. ADR-048 §5.
+type DailyUsageResponse struct {
+	AppID          string `json:"app_id"`
+	Day            string `json:"day"` // YYYY-MM-DD
+	MBSeconds      int64  `json:"mb_seconds"`
+	Requests       int64  `json:"requests"`
+	CPUUsageUsec   int64  `json:"cpu_usec"`
+	TXBytes        int64  `json:"tx_bytes"`
+	NetTxBytes     int64  `json:"net_tx_bytes"`
+	NetRxBytes     int64  `json:"net_rx_bytes"`
+	ColdBootCount  int64  `json:"cold_boots"`
+	BuilderSeconds int64  `json:"builder_seconds"`
 }
 
 // CPUHours returns CPUUsageUsec converted to CPU-hours. Mirror
@@ -698,6 +757,33 @@ type UsageExportResponse struct {
 // shape stay in lockstep.
 func (u UsageExportResponse) CPUHours() float64 {
 	return float64(u.CPUUsageUsec) / 3.6e9
+}
+
+// DailyUsageListResponse is the page shape for GET /v1/usage/daily.
+// Mirrors the invoice / deployment list shapes — Items is always
+// non-nil so the JSON encodes an empty array, not null, when the
+// requested day has no rollup rows yet (ADR-048 §5).
+type DailyUsageListResponse struct {
+	Items []DailyUsageResponse `json:"items"`
+}
+
+// StorageUsageResponse is one row of GET /v1/usage/storage — the
+// per-(account, app, day) storage rollup (migrations/
+// 00070_snapshot_storage_daily.sql). Mirrors the snapshot+layer
+// byte totals that the meterd storage rollup cron (pkg/meter/
+// storage.go) populates. ADR-049 §B.3.
+type StorageUsageResponse struct {
+	AppID         string `json:"app_id"`
+	Day           string `json:"day"` // YYYY-MM-DD
+	SnapshotBytes int64  `json:"snapshot_bytes"`
+	LayerBytes    int64  `json:"layer_bytes"`
+}
+
+// StorageUsageListResponse is the page shape for GET /v1/usage/storage.
+// Items is always non-nil so the JSON encodes an empty array, not
+// null, when the requested day has no rollup rows yet.
+type StorageUsageListResponse struct {
+	Items []StorageUsageResponse `json:"items"`
 }
 
 // APIKeyExportResponse is one row in the export's API key slice.

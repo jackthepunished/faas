@@ -531,6 +531,11 @@ func (b *Builderd) markSucceeded(ctx context.Context, buildID, code string, buil
 	if err := b.store.UpdateBuildStatus(ctx, buildID, state.BuildSucceeded, "", false, true); err != nil {
 		b.log.Warn("builderd: mark succeeded", "build", buildID, "err", err)
 	}
+	// ADR-048 §4: best-effort builder-time metering. The
+	// lookup can fail (DB outage, race with another writer) — a
+	// dropped row loses this build's telemetry but does NOT
+	// affect the build outcome (already stamped succeeded).
+	b.recordBuilderUsage(ctx, buildID, buildStart, string(state.BuildSucceeded))
 }
 
 // markFailed updates the build row with a failure_class + error and finished=true,
@@ -555,6 +560,49 @@ func (b *Builderd) markFailed(ctx context.Context, depID, buildID string, fc sta
 	// account-DR sweep.
 	if err := b.store.UpdateDeploymentStatus(ctx, depID, state.DeployFailed, msg); err != nil {
 		b.log.Warn("builderd: mark deployment failed", "deployment", depID, "build", buildID, "err", err)
+	}
+	// ADR-048 §4: builder-time metering on terminal build
+	// events, success or failure — the box burned cycles
+	// either way. The AppendBuilderUsage call is idempotent on
+	// (build_id) so a redelivered webhook / meterd restart /
+	// sweeper re-flip is a no-op.
+	b.recordBuilderUsage(ctx, buildID, buildStart, string(state.BuildFailed))
+}
+
+// recordBuilderUsage is the ADR-048 §4 helper: looks up the
+// build → deployment → app → account chain and stamps one
+// builder_usage row at build completion. Best-effort — a
+// failure logs Warn but does NOT propagate; the build row
+// stays authoritative for the dashboard. Caller has already
+// stamped the build status before this helper runs.
+func (b *Builderd) recordBuilderUsage(ctx context.Context, buildID string, buildStart time.Time, kind string) {
+	build, err := b.store.BuildByID(ctx, buildID)
+	if err != nil {
+		b.log.Warn("builderd: builder-usage lookup", "build", buildID, "err", err)
+		return
+	}
+	dep, err := b.store.DeploymentByID(ctx, build.DeploymentID)
+	if err != nil {
+		b.log.Warn("builderd: builder-usage deployment lookup",
+			"build", buildID, "deployment", build.DeploymentID, "err", err)
+		return
+	}
+	app, err := b.store.AppByID(ctx, dep.AppID)
+	if err != nil {
+		b.log.Warn("builderd: builder-usage app lookup",
+			"build", buildID, "app", dep.AppID, "err", err)
+		return
+	}
+	finishedAt := time.Now()
+	seconds := int64(finishedAt.Sub(buildStart).Seconds())
+	if seconds < 0 {
+		// Clock skew or buildStart stamped in the future;
+		// clamp to 0 so the SUM rollup never inflates with
+		// a negative delta.
+		seconds = 0
+	}
+	if err := b.store.AppendBuilderUsage(ctx, app.AccountID, app.ID, buildID, finishedAt, string(build.Kind), seconds); err != nil {
+		b.log.Warn("builderd: append builder usage", "build", buildID, "err", err)
 	}
 }
 

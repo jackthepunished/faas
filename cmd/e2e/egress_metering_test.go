@@ -126,7 +126,7 @@ func TestEgressMetering_GETUsage_SurfacesTxAndNetTxBytes(t *testing.T) {
 	// test's clock and Postgres's clock.
 	minute := time.Now().UTC().Add(-time.Minute).Truncate(time.Minute)
 	if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID,
-		minute, 0, 0, 0, 1_000_000, 4_000_000); err != nil {
+		minute, 0, 0, 0, 1_000_000, 4_000_000, 0, 0); err != nil {
 		t.Fatalf("AppendUsage: %v", err)
 	}
 

@@ -4566,7 +4566,7 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error {
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
 	// Idempotent on (instance_id, minute) for mb_seconds / requests
 	// (mirrors the sqlc source in queries.sql::AppendUsage — make
 	// sqlc-check verifies these stay in lockstep). The first write
@@ -4575,28 +4575,56 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	// instances cannot inflate billing. M7 hardening, PR
 	// feat/m7-beta-hardening.
 	//
-	// cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on the
-	// same conflict key: the schedd / meterd accumulators
-	// (pkg/sched/instancestats/poller.go for cpu; the vmmd
-	// netstats.Cache + gateway statusRecorder fed by the meterd
-	// sampler's egress adapters for tx_bytes / net_tx_bytes) can
-	// each call AppendUsage many times within the same minute.
-	// We add EXCLUDED.<col> to the existing row so the columns
-	// are the sum of all per-tick deltas. The pusher (meter →
-	// billing) deduplicates on a coarser window before pushing,
-	// so the additive merge is safe end-to-end.
+	// cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, and
+	// cold_boot_count are ADDITIVE on the same conflict key: the
+	// schedd / meterd accumulators (pkg/sched/instancestats/poller.go
+	// for cpu; the vmmd netstats.Cache + gateway statusRecorder fed
+	// by the meterd sampler's egress adapters for tx_bytes /
+	// net_tx_bytes; the new ingress Tx cache for net_rx_bytes; the
+	// new LastWakeMethod propagation for cold_boot_count) can each
+	// call AppendUsage many times within the same minute. We add
+	// EXCLUDED.<col> to the existing row so the columns are the sum
+	// of all per-tick deltas. The pusher (meter → billing)
+	// deduplicates on a coarser window before pushing, so the
+	// additive merge is safe end-to-end.
 	//
-	//   cpu_usec    — issue #279 / PR-B / ADR-039
-	//   tx_bytes    — ADR-046 (gateway HTTP response body bytes)
-	//   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
+	//   cpu_usec         — issue #279 / PR-B / ADR-039
+	//   tx_bytes         — ADR-046 (gateway HTTP response body bytes)
+	//   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
+	//   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
+	//   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 on conflict (instance_id, minute) do update
-		   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
-		       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
-		       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes`,
-		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes)
+		   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+		       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
+		       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
+		       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
+		       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount)
+	return err
+}
+
+// AppendBuilderUsage records one builder-time usage row at build
+// completion (ADR-048 §4). Idempotent on (build_id): a redelivered
+// meterd / webhook / builderd restart sees ON CONFLICT DO NOTHING
+// and the row stays as the first write. The per-build grain lives
+// in a separate `builder_usage` table (PK build_id) created by
+// migrations/00067_extend_metering_telemetry.sql so it can be rolled
+// up into usage_daily.builder_seconds via the meterd rollup cron.
+//
+// seconds is wall-clock seconds from builds.started_at to
+// finishedAt — matches the existing builderd histogram
+// (`build_duration_seconds{outcome}`). Caller computes
+// finishedAt.Sub(startedAt) before calling; this function does NOT
+// re-read the build row (cheap + race-free).
+func (s *PgStore) AppendBuilderUsage(ctx context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into builder_usage (build_id, account_id, app_id, finished_at, kind, seconds)
+		 values ($1, $2, $3, $4, $5, $6)
+		 on conflict (build_id) do nothing`,
+		buildID, accountID, appID, finishedAt, kind, seconds)
 	return err
 }
 
@@ -4613,7 +4641,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	// explicit cast). date_trunc normalizes both sides to the month's start
 	// in UTC, sidestepping session-TZ semantics entirely.
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes from usage_monthly
+		`select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count from usage_monthly
 		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
 		accountID, monthStart)
 	if err != nil {
@@ -4623,7 +4651,7 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 	var out []Usage
 	for rows.Next() {
 		u := Usage{}
-		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &u.Month, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -5329,12 +5357,14 @@ func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string
 func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error) {
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id,
-		        date_trunc('hour', minute) as hour,
-		        sum(mb_seconds)::bigint   as mb_seconds,
-		        sum(cpu_usec)::bigint     as cpu_usec,
-		        sum(requests)::bigint     as requests,
-		        sum(tx_bytes)::bigint     as tx_bytes,
-		        sum(net_tx_bytes)::bigint as net_tx_bytes
+		        date_trunc('hour', minute AT TIME ZONE 'UTC') as hour,
+		        sum(mb_seconds)::bigint      as mb_seconds,
+		        sum(cpu_usec)::bigint        as cpu_usec,
+		        sum(requests)::bigint        as requests,
+		        sum(tx_bytes)::bigint        as tx_bytes,
+		        sum(net_tx_bytes)::bigint    as net_tx_bytes,
+		        sum(net_rx_bytes)::bigint    as net_rx_bytes,
+		        sum(cold_boot_count)::bigint as cold_boot_count
 		 from usage_minutes
 		 where account_id = $1 and minute >= $2 and minute < $3
 		 group by account_id, app_id, hour
@@ -5348,10 +5378,124 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 	for rows.Next() {
 		u := Usage{}
 		var hour time.Time
-		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes); err != nil {
+		if err := rows.Scan(&u.AccountID, &u.AppID, &hour, &u.MBSeconds, &u.CPUUsec, &u.Requests, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount); err != nil {
 			return nil, err
 		}
 		u.Month = hour
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// UsageDaily returns the per-(account, app, day) rollup rows that the
+// meterd rollup loop (pkg/meter/rollup.go) populated into the
+// usage_daily table (ADR-048 §5, migration 00067). day is a UTC
+// midnight timestamp; only the date portion is used in the predicate
+// so a caller that already normalised to midnight does not have to
+// truncate again.
+//
+// Empty result means either: (a) the requested day is in the future
+// and no rows exist yet, or (b) the rollup loop has not yet fired
+// since the rows were sampled into usage_minutes. Callers should NOT
+// fall back to UsageByHour here — the dashboard wants the rollup row
+// specifically so the cron cadence is observable.
+func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error) {
+	rows, err := s.pool.Query(ctx,
+		`select app_id, day, mb_seconds, requests, cpu_usec,
+		        tx_bytes, net_tx_bytes, net_rx_bytes,
+		        cold_boot_count, builder_seconds
+		   from usage_daily
+		  where account_id = $1
+		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
+		  order by app_id`,
+		accountID, day.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DailyUsage
+	for rows.Next() {
+		u := DailyUsage{AccountID: accountID}
+		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// AppendSnapshotStorage upserts one snapshot_storage_daily row.
+// NOT additive merge: the storage rollup is a point-in-time snapshot
+// of the current snapshot+layer bytes (pkg/meter/storage.go computes
+// the cumulative total for the day, then writes). Re-running for the
+// same day overwrites the existing row. ADR-049 §B.3.
+func (s *PgStore) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into snapshot_storage_daily
+		    (account_id, app_id, day, snapshot_bytes, layer_bytes, computed_at)
+		 values ($1, $2, $3::timestamptz, $4, $5, now())
+		 on conflict (account_id, app_id, day) do update set
+		    snapshot_bytes = excluded.snapshot_bytes,
+		    layer_bytes    = excluded.layer_bytes,
+		    computed_at    = excluded.computed_at`,
+		accountID, appID, day.UTC(), snapshotBytes, layerBytes)
+	return err
+}
+
+// LatestSnapshotBytes returns mem_bytes + disk_bytes for the app's
+// latest non-stale snapshot under the currently-live deployment.
+// We join deployments to filter to status='live' (the only state
+// that can serve wake — `pending`/`building`/`imaging`/`failed`/
+// `superseded` rows must not be billed for storage) and look up
+// the most recently created non-stale snapshot row. The
+// `snapshots_live_idx` partial index (migration 00071) on
+// (deployment_id) WHERE stale=false makes the inner lookup a
+// bounded Index Scan instead of a per-app heap scan. Returns
+// (0, 0, nil) when the app has no live deployment yet — a cold
+// start, not an error. ADR-049 §B.3.
+func (s *PgStore) LatestSnapshotBytes(ctx context.Context, appID string) (int64, int64, error) {
+	var memBytes, diskBytes int64
+	err := s.pool.QueryRow(ctx,
+		`select coalesce(s.mem_bytes, 0), coalesce(s.disk_bytes, 0)
+		   from snapshots s
+		   join deployments d on s.deployment_id = d.id
+		  where d.app_id = $1
+		    and d.status  = 'live'
+		    and s.stale = false
+		  order by s.created_at desc
+		  limit 1`,
+		appID).Scan(&memBytes, &diskBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	return memBytes, diskBytes, nil
+}
+
+// StorageUsage returns the per-(account, app, day) storage rollup
+// rows. day is a UTC midnight timestamp; only the date portion is
+// used in the predicate (mirrors UsageDaily's AT TIME ZONE 'UTC'
+// conversion). ADR-049 §B.3.
+func (s *PgStore) StorageUsage(ctx context.Context, accountID string, day time.Time) ([]StorageUsage, error) {
+	rows, err := s.pool.Query(ctx,
+		`select app_id, day, snapshot_bytes, layer_bytes
+		   from snapshot_storage_daily
+		  where account_id = $1
+		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
+		  order by app_id`,
+		accountID, day.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StorageUsage
+	for rows.Next() {
+		u := StorageUsage{AccountID: accountID}
+		if err := rows.Scan(&u.AppID, &u.Day, &u.SnapshotBytes, &u.LayerBytes); err != nil {
+			return nil, err
+		}
 		out = append(out, u)
 	}
 	return out, rows.Err()
@@ -6752,7 +6896,7 @@ func (s *PgStore) UsageByAccount(ctx context.Context, accountID string, since ti
 	var err error
 	if since.IsZero() {
 		rows, err = s.pool.Query(ctx,
-			`select account_id, app_id, date_trunc('month', minute) as month,
+			`select account_id, app_id, date_trunc('month', minute AT TIME ZONE 'UTC') as month,
 			        sum(mb_seconds)::bigint, sum(requests)::bigint
 			 from usage_minutes
 			 where account_id = $1
@@ -6760,7 +6904,7 @@ func (s *PgStore) UsageByAccount(ctx context.Context, accountID string, since ti
 			 order by app_id, month`, accountID)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select account_id, app_id, date_trunc('month', minute) as month,
+			`select account_id, app_id, date_trunc('month', minute AT TIME ZONE 'UTC') as month,
 			        sum(mb_seconds)::bigint, sum(requests)::bigint
 			 from usage_minutes
 			 where account_id = $1 and minute >= $2

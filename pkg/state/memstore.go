@@ -161,6 +161,10 @@ type MemStore struct {
 	// per-app shape unchanged. (M7 fix; the previous shape was wrong.)
 	usage        []usageMinute
 	usageByMonth []Usage
+	// builderUsage is the per-build grain backing AppendBuilderUsage
+	// (ADR-048 §4). PK is build_id; the meterd rollup cron sums
+	// into usage_daily.builder_seconds per (account, app, day).
+	builderUsage []builderUsageRow
 	idem         map[string]idemEntry
 	// stripeByCustomer is the reverse-lookup index used by
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
@@ -309,6 +313,35 @@ type usageMinute struct {
 	// (instance_id, minute). Unit = interface bytes (incl.
 	// framing).
 	NetTxBytes int64
+	// NetRxBytes is the cumulative byte delta on root-side
+	// vethHost.tx_bytes (root→guest = ingress) for this
+	// instance in this minute. Source: vmmd pkg/fcvm/netstats
+	// TX cache → schedd instancestats.Poller → meterd Sampler.
+	// ADR-048. Informational — not billed. Additive on conflict
+	// (instance_id, minute). Unit = interface bytes.
+	NetRxBytes int64
+	// ColdBootCount is the per-minute count of
+	// WAKE_RESTORE→WAKE_COLD_BOOT transitions observed for this
+	// instance. Source: scheddgrpc.InstanceStatsRow.LastWakeMethod,
+	// sampled by meterd Sampler. ADR-048. Informational — not
+	// billed. Additive on conflict (idempotent — only the
+	// transition counts; a redelivered tick within the same
+	// minute is a no-op).
+	ColdBootCount int32
+}
+
+// builderUsageRow is the per-build grain (ADR-048 §4) backing
+// AppendBuilderUsage. Mirrors public.builder_usage created by
+// migrations/00068_builder_usage.sql. PK is BuildID; first write
+// wins, a redelivered webhook / meterd restart is a no-op. The
+// meterd rollup cron sums Seconds into usage_daily.builder_seconds.
+type builderUsageRow struct {
+	BuildID    string
+	AccountID  string
+	AppID      string
+	FinishedAt time.Time
+	Kind       string
+	Seconds    int64
 }
 
 // NewMemStore returns an empty in-memory store with the synthetic
@@ -3657,7 +3690,7 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 // migrations/00055_usage_minutes_cpu.sql, and
 // migrations/00065_usage_minutes_egress.sql for the production
 // rationale.
-func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error {
+func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := minute.UTC().Truncate(time.Minute)
@@ -3665,9 +3698,10 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 		if m.usage[i].InstanceID == instanceID && m.usage[i].Minute.Equal(key) {
 			// Idempotent for mb_seconds / requests (first write wins,
 			// so a restart-driven redelivery cannot inflate billing).
-			// cpu_usec / tx_bytes / net_tx_bytes are additive: the
-			// schedd / meterd accumulators can call AppendUsage many
-			// times per minute, and we sum the deltas.
+			// cpu_usec / tx_bytes / net_tx_bytes / net_rx_bytes /
+			// cold_boot_count are additive: the schedd / meterd
+			// accumulators can call AppendUsage many times per
+			// minute, and we sum the deltas.
 			if m.usage[i].MBSeconds == 0 && m.usage[i].Requests == 0 {
 				m.usage[i].MBSeconds = mbSeconds
 				m.usage[i].Requests = requests
@@ -3675,6 +3709,8 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 			m.usage[i].CPUUsec += cpuUsec
 			m.usage[i].TXBytes += txBytes
 			m.usage[i].NetTxBytes += netTxBytes
+			m.usage[i].NetRxBytes += netRxBytes
+			m.usage[i].ColdBootCount += coldBootCount
 			m.recomputeMonthLocked(accountID, appID, key)
 			return nil
 		}
@@ -3683,8 +3719,35 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 		AccountID: accountID, AppID: appID, InstanceID: instanceID,
 		Minute: key, MBSeconds: mbSeconds, Requests: requests,
 		CPUUsec: cpuUsec, TXBytes: txBytes, NetTxBytes: netTxBytes,
+		NetRxBytes: netRxBytes, ColdBootCount: coldBootCount,
 	})
 	m.recomputeMonthLocked(accountID, appID, key)
+	return nil
+}
+
+// AppendBuilderUsage mirrors pgstore's AppendBuilderUsage
+// (ADR-048 §4). Idempotent on build_id — first write wins; a
+// redelivered webhook is a no-op. The meterd rollup cron sums
+// these into usage_daily.builder_seconds. seconds is wall-clock
+// seconds from builds.started_at to finishedAt (matches the
+// existing builderd build_duration_seconds histogram unit).
+func (m *MemStore) AppendBuilderUsage(_ context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.builderUsage {
+		if m.builderUsage[i].BuildID == buildID {
+			// First write wins.
+			return nil
+		}
+	}
+	m.builderUsage = append(m.builderUsage, builderUsageRow{
+		BuildID:    buildID,
+		AccountID:  accountID,
+		AppID:      appID,
+		FinishedAt: finishedAt,
+		Kind:       kind,
+		Seconds:    seconds,
+	})
 	return nil
 }
 
@@ -4221,6 +4284,36 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 	return out, nil
 }
 
+// UsageDaily mirrors pgstore.UsageDaily. The MemStore does not maintain
+// the rollup table — usage_daily is a cron-populated rollup, and the
+// in-process unit-test surface for the rollup loop uses stubExecer
+// instead. Returns nil + nil so handlers do not crash on dev/host
+// builds where Postgres is not wired.
+func (m *MemStore) UsageDaily(_ context.Context, _ string, _ time.Time) ([]DailyUsage, error) {
+	return nil, nil
+}
+
+// AppendSnapshotStorage + StorageUsage mirror pgstore for the storage
+// rollup (ADR-049 §B.3). The MemStore does not maintain the rollup —
+// pkg/meter/storage.go wires directly to PgStore in production. Returns
+// nil so handlers do not crash on dev/host builds.
+func (m *MemStore) AppendSnapshotStorage(_ context.Context, _, _ string, _ time.Time, _, _ int64) error {
+	return nil
+}
+
+func (m *MemStore) StorageUsage(_ context.Context, _ string, _ time.Time) ([]StorageUsage, error) {
+	return nil, nil
+}
+
+// LatestSnapshotBytes mirrors pgstore for the storage rollup
+// (ADR-049 §B.3). The MemStore does not maintain a snapshot set;
+// returns (0, 0, nil) so the rollup writes a zero-byte day rather
+// than crashing. Tests that exercise the rollup's write path use
+// PgStore against a real Postgres (migrations/00070_snapshot_storage_daily_test.go).
+func (m *MemStore) LatestSnapshotBytes(_ context.Context, _ string) (int64, int64, error) {
+	return 0, 0, nil
+}
+
 // HasStripePushHour + RecordStripePushHour implement the pkg/billing/stripe
 // PushDedupe interface. The MemStore keeps a flat set keyed by
 // (account, hour); PgStore keeps a dedicated table.
@@ -4437,7 +4530,8 @@ type appHourKey struct {
 // stays bounded (one minute × max_concurrency(plan) × apps).
 func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Time) {
 	month := time.Date(minute.Year(), minute.Month(), 1, 0, 0, 0, 0, time.UTC)
-	var mbSec, req, cpuUsec, txBytes, netTxBytes int64
+	var mbSec, req, cpuUsec, txBytes, netTxBytes, netRxBytes int64
+	var coldBoots int32
 	for _, u := range m.usage {
 		if u.AccountID != accountID || u.AppID != appID {
 			continue
@@ -4450,6 +4544,8 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 		cpuUsec += u.CPUUsec
 		txBytes += u.TXBytes
 		netTxBytes += u.NetTxBytes
+		netRxBytes += u.NetRxBytes
+		coldBoots += u.ColdBootCount
 	}
 	// Drop the existing row for this (account, app, month) if any, then append.
 	for i := range m.usageByMonth {
@@ -4464,6 +4560,7 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 		AccountID: accountID, AppID: appID, Month: month,
 		MBSeconds: mbSec, Requests: req, CPUUsec: cpuUsec,
 		TXBytes: txBytes, NetTxBytes: netTxBytes,
+		NetRxBytes: netRxBytes, ColdBootCount: int64(coldBoots),
 	})
 }
 

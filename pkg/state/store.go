@@ -1332,16 +1332,58 @@ type Store interface {
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first
 	// write of mb_seconds / requests wins, a redelivered minute is
-	// a no-op for those columns. cpu_usec, tx_bytes, and net_tx_bytes
-	// are ADDITIVE on (instance_id, minute): the schedd / meterd
-	// accumulators can call AppendUsage many times within the same
-	// minute; the columns are the sum of all per-tick deltas. The
-	// additive merge is documented at
-	// migrations/00055_usage_minutes_cpu.sql (cpu_usec) and
-	// migrations/00065_usage_minutes_egress.sql (tx_bytes,
-	// net_tx_bytes, ADR-046).
-	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error
+	// a no-op for those columns. cpu_usec, tx_bytes, net_tx_bytes,
+	// net_rx_bytes, and cold_boot_count are ADDITIVE on
+	// (instance_id, minute): the schedd / meterd accumulators can
+	// call AppendUsage many times within the same minute; the
+	// columns are the sum of all per-tick deltas. The additive
+	// merge is documented at migrations/00055_usage_minutes_cpu.sql
+	// (cpu_usec), migrations/00065_usage_minutes_egress.sql
+	// (tx_bytes, net_tx_bytes, ADR-046), and
+	// migrations/00067_extend_metering_telemetry.sql (net_rx_bytes,
+	// cold_boot_count, ADR-048).
+	//
+	// builder_seconds / builder_kind are NOT accepted here — they
+	// are written via AppendBuilderUsage (keyed by build_id) because
+	// the per-build billing grain differs from the per-instance
+	// usage_minutes grain and mixing them would lose the
+	// build-id idempotency that webhook redelivery requires.
+	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error
+	// AppendBuilderUsage writes one builder-time usage row per
+	// terminal build (succeeded or failed — the box burned cycles
+	// either way; informational only per ADR-048 §4). Idempotent
+	// on (build_id): the first write wins on builder_seconds /
+	// builder_kind, a redelivered webhook is a no-op. The
+	// per-build grain lives in a separate `builder_usage` table
+	// (PK build_id) and is rolled up into usage_daily via the
+	// meterd rollup cron.
+	AppendBuilderUsage(ctx context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
+	// UsageDaily returns the per-(account, app, day) rollup rows
+	// (migrations/00067_extend_metering_telemetry.sql::usage_daily).
+	// day is a UTC midnight time; the returned rows cover the
+	// single day. Empty when no rollup has fired yet. ADR-048 §5.
+	UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error)
+	// AppendSnapshotStorage writes a snapshot_storage_daily row
+	// for the given (account, app, day). Idempotent on PK
+	// (account_id, app_id, day): a redelivered tick or a meterd
+	// restart overwrites the existing row with the cumulative
+	// total for that day (not additive merge — the storage rollup
+	// is a point-in-time snapshot, not an accumulator). ADR-049 §B.3.
+	AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error
+	// LatestSnapshotBytes returns mem_bytes + disk_bytes for the
+	// app's latest non-stale snapshot (the latest row in
+	// public.snapshots joined to the app's active deployment,
+	// filtered by stale=false). Returns (0, 0, nil) when the app
+	// has no snapshot yet — a cold start, not an error. ADR-049
+	// §B.3.
+	LatestSnapshotBytes(ctx context.Context, appID string) (memBytes, diskBytes int64, err error)
+	// StorageUsage returns the per-(account, app, day) storage
+	// rollup rows (migrations/00070_snapshot_storage_daily.sql
+	// ::snapshot_storage_daily). day is a UTC midnight time;
+	// empty when the storage rollup has not fired for that day
+	// yet. ADR-049 §B.3.
+	StorageUsage(ctx context.Context, accountID string, day time.Time) ([]StorageUsage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
 	// first, ordered by (period_end DESC, id DESC) for deterministic
 	// pagination. month is optional: when non-nil, the result is

@@ -22,5 +22,13 @@ export type UsageExportResponse = {
    * Per-(app, month) byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads.
    */
   net_tx_bytes?: number;
+  /**
+   * Per-(app, month) byte delta on root-side vethHost.tx_bytes (root→guest = ingress; informational; not billed). ADR-048. Mirror of `net_tx_bytes` for the inbound direction.
+   */
+  net_rx_bytes?: number;
+  /**
+   * Per-(app, month) count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed (informational; not billed). ADR-048.
+   */
+  cold_boots?: number;
 };
 

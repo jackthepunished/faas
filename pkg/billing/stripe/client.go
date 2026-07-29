@@ -333,6 +333,37 @@ func (c *Client) Refund(ctx context.Context, chargeID string, amountCents int64)
 	}, nil
 }
 
+// ReconcileUsage queries Stripe for the mb_seconds total pushed in
+// the [start, end) window via stripe.UsageRecordSummaries.List and
+// returns it as int64 mb_seconds. ADR-049 §B.1.
+//
+// Read-only against Stripe — does NOT mutate customer /
+// subscription state. Returns (0, err) on any SDK error so the
+// reconciler can fail-soft log-and-skip the account.
+//
+// The actual Stripe SDK call is intentionally a stub for this PR.
+// The interface contract is the load-bearing seam — wiring the
+// SDK's TotalUsage summation lands in a follow-up PR against the
+// stripe sandbox. Today we return (0, nil) so the reconciler's
+// local-only drift signal (usage_minutes total) drives the
+// BillingDrift alert. The reconciler skips Stripe on the
+// "0 returned" path; the alert is gated on ratio > 0.005 so a
+// non-Stripe provider drift is still detected via the Paddle path
+// when that lands.
+//
+// Returns ErrNotImplemented until the SDK summation lands in a
+// follow-up PR. Returning (0, nil) here would make the reconciler
+// compute drift_ratio = abs(local − 0) / max(local, 0) = 1.0 for
+// every paying account and page the BillingDrift alert from the
+// moment this PR ships. ErrNotImplemented is the documented
+// "no drift signal yet" sentinel: the reconciler's
+// `errors.Is(err, billing.ErrNotImplemented)` short-circuit
+// (pkg/billing/reconciler/reconciler.go) skips the gauge emission
+// for this account entirely, matching the Paddle stub's behaviour.
+func (c *Client) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
+	return 0, billing.ErrNotImplemented
+}
+
 // centsToMillicents converts integer EUR cents to Stripe's native
 // millicents (×10). CLAUDE.md invariant: integer cents/millicents
 // only; never float on money. The factor is fixed (Stripe's wire

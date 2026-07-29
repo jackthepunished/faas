@@ -2785,6 +2785,67 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # Daily rollup row (ADR-048 §5). Distinct from /v1/usage/summary
+  # which is monthly; the dashboard's per-day hot path reads this.
+  # All fields are informational; not billed.
+  /v1/usage/daily:
+    get:
+      tags: [usage]
+      operationId: usageDaily
+      summary: Per-app daily rollup (informational).
+      parameters:
+        - name: day
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: '2026-07-29' }
+          description: Calendar day in `YYYY-MM-DD` form (UTC). Required.
+      responses:
+        '200':
+          description: Per-app daily rollup rows for the requested day.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyUsageListResponse'
+              example: {"items":[{"app_id":"0123456789abcdef0123456789abcdef","day":"2026-07-29","mb_seconds":1234,"requests":42,"cpu_usec":5678,"tx_bytes":12345,"net_tx_bytes":23456,"net_rx_bytes":34567,"cold_boots":1,"builder_seconds":12}]}
+        '400':
+          description: Missing or malformed `day` query parameter.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # Storage rollup (ADR-049 §B.3). Per-(app, day) snapshot+layer
+  # byte totals from the meterd storage rollup cron. Informational
+  # only — the future "Pro plan 1 GB included" PR consumes this
+  # surface. Distinct from /v1/usage which reports billable compute.
+  /v1/usage/storage:
+    get:
+      tags: [usage]
+      operationId: usageStorage
+      summary: Per-app daily storage rollup (informational).
+      parameters:
+        - name: day
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: '2026-07-29' }
+          description: Calendar day in `YYYY-MM-DD` form (UTC). Required for the storage rollup.
+      responses:
+        '200':
+          description: Per-app storage rollup rows for the requested day.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageUsageListResponse'
+              example: {"items":[{"app_id":"0123456789abcdef0123456789abcdef","day":"2026-07-29","snapshot_bytes":130000000,"layer_bytes":256000000}]}
+        '400':
+          description: Missing or malformed `day` query parameter on the storage rollup surface.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Billing history (issue #259) ──────────────────────────────────────
   # Account-scoped read of the billing-provider invoices persisted from
   # the Stripe / Paddle webhooks. Empty history returns 200 with items=[].
@@ -3270,6 +3331,100 @@ components:
           description: "Per-(app, month) byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads."
           x-since: "2026-08"
           x-issue: "415"
+        net_rx_bytes:
+          type: integer
+          format: int64
+          description: "Per-(app, month) byte delta on root-side vethHost.tx_bytes (root→guest = ingress; informational; not billed). ADR-048. Mirror of `net_tx_bytes` for the inbound direction."
+          x-since: "2026-08"
+          x-issue: "436"
+        cold_boots:
+          type: integer
+          format: int64
+          description: "Per-(app, month) count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed (informational; not billed). ADR-048."
+          x-since: "2026-08"
+          x-issue: "436"
+
+    DailyUsageResponse:
+      description: "Per-app rollup for one calendar day (informational; not billed). Mirrors the `usage_daily` table populated by the meterd rollup loop (ADR-048 §5, migration 00067)."
+      type: object
+      required: [app_id, day, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boots, builder_seconds]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        day: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-07-29" }
+        mb_seconds:
+          type: integer
+          format: int64
+          description: "Cumulative mb_seconds for the day (informational; not billed)."
+        requests:
+          type: integer
+          format: int64
+          description: "Cumulative request count for the day (informational; not billed)."
+        cpu_usec:
+          type: integer
+          format: int64
+          description: "Cumulative host cgroup CPU-µs for the day (informational; not billed). ADR-046 / #279."
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "HTTP response bytes for the day (informational; not billed). ADR-046."
+        net_tx_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative net_tx_bytes for the day (informational; not billed). ADR-046."
+        net_rx_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative ingress bytes for the day (informational; not billed). ADR-048."
+        cold_boots:
+          type: integer
+          format: int64
+          description: "Per-day WAKE_RESTORE→WAKE_COLD_BOOT transition count (informational; not billed). ADR-048."
+        builder_seconds:
+          type: integer
+          format: int64
+          description: "Builder VM seconds burned by this app on this day (informational; not billed). ADR-048."
+      x-since: "2026-08"
+      x-issue: "436"
+
+    DailyUsageListResponse:
+      description: "Page shape for GET /v1/usage/daily — wraps an array of per-app daily rollup rows."
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DailyUsageResponse' }
+      x-since: "2026-08"
+      x-issue: "436"
+
+    StorageUsageResponse:
+      description: "Per-app storage rollup for one calendar day (informational; not billed today). Mirrors the `snapshot_storage_daily` table populated by the meterd storage rollup loop (ADR-049 §B.3, migration 00070)."
+      type: object
+      required: [app_id, day, snapshot_bytes, layer_bytes]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        day: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-07-29" }
+        snapshot_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative snapshot bytes (mem_bytes + disk_bytes) for the day (informational; not billed today). ADR-049 §B.3."
+        layer_bytes:
+          type: integer
+          format: int64
+          description: "Cumulative overlay-staging layer bytes for the day (informational; not billed today). ADR-049 §B.3."
+      x-since: "2026-08"
+      x-issue: "436"
+
+    StorageUsageListResponse:
+      description: "Page shape for GET /v1/usage/storage — wraps an array of per-app storage rollup rows."
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/StorageUsageResponse' }
+      x-since: "2026-08"
+      x-issue: "436"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
@@ -3995,6 +4150,18 @@ components:
           description: "Per-app monthly byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan tc tbf qdisc reads, so the cap and the meter are consistent."
           x-since: "2026-08"
           x-issue: "415"
+        net_rx_bytes:
+          type: integer
+          format: int64
+          description: "Per-app monthly byte delta on root-side vethHost.tx_bytes (root→guest = ingress; informational; not billed). ADR-048. Mirror of `net_tx_bytes` for the inbound direction. Same sysfs source — `/sys/class/net/<vethHost>/statistics/tx_bytes`."
+          x-since: "2026-08"
+          x-issue: "436"
+        cold_boots:
+          type: integer
+          format: int64
+          description: "Per-app monthly count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed (informational; not billed). ADR-048. Source: schedd instancestats.Poller → meterd Sampler."
+          x-since: "2026-08"
+          x-issue: "436"
 
     AppMetricsResponse:
       description: |
@@ -4232,6 +4399,17 @@ components:
           description: 'Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB. ADR-046.'
           x-since: "2026-08"
           x-issue: "415"
+        used_ingress_gb:
+          type: number
+          description: 'Per-month ingress GB (informational; not billed). Σ net_rx_bytes across all apps, converted to GB. ADR-048. Mirror of `used_egress_gb` for the inbound direction.'
+          x-since: "2026-08"
+          x-issue: "436"
+        cold_boots:
+          type: integer
+          format: int64
+          description: 'Per-month sum of WAKE_RESTORE→WAKE_COLD_BOOT transitions across every app on the account (informational; not billed). ADR-048.'
+          x-since: "2026-08"
+          x-issue: "436"
 
     # ─── Event-driven surface (Move 2) ───────────────────────────────────
 

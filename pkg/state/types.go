@@ -890,6 +890,52 @@ type Usage struct {
 	// AppendUsage. ADR-046. Informational — not billed. Unit
 	// = interface bytes (includes Ethernet/IP framing).
 	NetTxBytes int64
+	// NetRxBytes is the cumulative byte delta on root-side
+	// vethHost.tx_bytes (root→guest = ingress) for this app
+	// in this month. Source: vmmd pkg/fcvm/netstats.Cache TX
+	// path → vmmd.Stats → schedd instancestats.Poller → meterd
+	// Sampler.SampleAndRoll → AppendUsage. ADR-048.
+	// Informational — not billed. Unit = interface bytes.
+	NetRxBytes int64
+	// ColdBootCount is the per-month sum of WAKE_RESTORE→
+	// WAKE_COLD_BOOT transitions observed across this app's
+	// instances. Source: scheddgrpc.InstanceStatsRow.
+	// LastWakeMethod, sampled by meterd Sampler.
+	// ADR-048. Informational — not billed.
+	ColdBootCount int64
+}
+
+// DailyUsage is the per-(account, app, day) row read by
+// Store.UsageDaily (ADR-048 §5). Mirrors the columns declared
+// in migrations/00067_extend_metering_telemetry.sql::usage_daily.
+// Day is a UTC midnight date; PK is (account_id, app_id, day).
+// Informational — not billed.
+type DailyUsage struct {
+	AccountID      string
+	AppID          string
+	Day            time.Time
+	MBSeconds      int64
+	Requests       int64
+	CPUUsec        int64
+	TXBytes        int64
+	NetTxBytes     int64
+	NetRxBytes     int64
+	ColdBootCount  int64
+	BuilderSeconds int64
+}
+
+// StorageUsage is the per-(account, app, day) row read by
+// Store.StorageUsage (ADR-049 §B.3). Mirrors
+// migrations/00070_snapshot_storage_daily.sql::snapshot_storage_daily.
+// Day is a UTC midnight date; PK is (account_id, app_id, day).
+// Informational — not billed today; the future "Pro plan 1 GB
+// included" PR consumes this surface.
+type StorageUsage struct {
+	AccountID     string
+	AppID         string
+	Day           time.Time
+	SnapshotBytes int64
+	LayerBytes    int64
 }
 
 // Invoice is one persisted invoice from a billing provider (issue #259,

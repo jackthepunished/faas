@@ -95,6 +95,29 @@ type Provider interface {
 	// upgrade click doesn't create a duplicate Transaction.
 	CreateUpgradeTransaction(ctx context.Context, acct state.Account, targetPlan api.Plan) (txID, checkoutURL string, err error)
 
+	// ReconcileUsage is the read-only drift detector (ADR-049 §B.1).
+	// meterd's pkg/billing/reconciler runs every
+	// FAAS_RECONCILE_INTERVAL and asks each implementation how
+	// many mb_seconds it has actually pushed for the given hour
+	// window. The reconciler compares that sum against the local
+	// `usage_minutes` total and exposes the diff as Prometheus
+	// gauges + the BillingDrift alert.
+	//
+	// Read-only against the provider — implementations MUST NOT
+	// mutate customer / subscription state from this call.
+	// Failure mode: the implementation should return (0, err)
+	// on network / 5xx / rate-limit and let the reconciler
+	// log-and-skip the account (the FAAS_BILLING_PROVIDER-
+	// specific quota costs live inside the implementation, not
+	// the interface).
+	//
+	// Stripe: stripe.UsageRecordSummaries.list(subscription_item,
+	// start, end) summed. Paddle: Paddle Billing does not yet
+	// expose a usage-summary endpoint, so the Paddle
+	// implementation returns ErrNotImplemented until the upstream
+	// adds one.
+	ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (pushedMBSeconds int64, err error)
+
 	// Refund issues an operator-initiated refund against a charge
 	// (issue #279). amountCents is integer cents (the financial
 	// model's unit; never float on money). The implementation is

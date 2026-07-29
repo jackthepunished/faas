@@ -2,7 +2,9 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { DailyUsageListResponse } from '../models/DailyUsageListResponse.js';
 import type { InvoiceListResponse } from '../models/InvoiceListResponse.js';
+import type { StorageUsageListResponse } from '../models/StorageUsageListResponse.js';
 import type { UsageResponse } from '../models/UsageResponse.js';
 import type { UsageSummaryResponse } from '../models/UsageSummaryResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -57,6 +59,64 @@ export class UsageService {
         'month': month,
       },
       errors: {
+        401: `code: unauthorized`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app daily rollup (informational).
+   * @returns DailyUsageListResponse Per-app daily rollup rows for the requested day.
+   * @throws ApiError
+   */
+  public static usageDaily({
+    day,
+  }: {
+    /**
+     * Calendar day in `YYYY-MM-DD` form (UTC). Required.
+     */
+    day: string,
+  }): CancelablePromise<DailyUsageListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/usage/daily',
+      query: {
+        'day': day,
+      },
+      errors: {
+        400: `Missing or malformed \`day\` query parameter.`,
+        401: `code: unauthorized`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app daily storage rollup (informational).
+   * @returns StorageUsageListResponse Per-app storage rollup rows for the requested day.
+   * @throws ApiError
+   */
+  public static usageStorage({
+    day,
+  }: {
+    /**
+     * Calendar day in `YYYY-MM-DD` form (UTC). Required for the storage rollup.
+     */
+    day: string,
+  }): CancelablePromise<StorageUsageListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/usage/storage',
+      query: {
+        'day': day,
+      },
+      errors: {
+        400: `Missing or malformed \`day\` query parameter on the storage rollup surface.`,
         401: `code: unauthorized`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
