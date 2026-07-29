@@ -41,7 +41,6 @@ import (
 	"time"
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
-	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -51,14 +50,19 @@ import (
 // reports on the wire for no freshness gain).
 const CapacityInterval = 1 * time.Second
 
-// CapacityReportTTL bounds how long the publisher keeps
-// trying to maintain a single stream before treating the
-// failure as a fatal vmmd→schedd break. 5 minutes is
-// generous: a healthy reconnect on a transient schedd
-// restart completes in < 30 s. The TTL prevents a long-
-// running test or a misconfigured environment from holding
-// a half-open stream indefinitely.
-const CapacityReportTTL = 5 * time.Minute
+// initialBackoff is the first sleep in the ladder. The
+// ladder doubles (1s → 2s → 4s → 8s → 16s → 30s) until
+// it hits MaxBackoff. The reset on a successful drain
+// returns the next loop iteration to this value.
+//
+// Why reset on success. A long-lived vmmd that completes
+// 30+ successful reports and then hits one transient error
+// would otherwise stay at 30 s for the rest of its life —
+// the loop accumulates `backoff` across drains even when
+// each drain was clean. The gatewayd warmhints publisher
+// (cmd/gatewayd/warmhints.go:121) resets on a clean drain;
+// we mirror that shape here. (Issue raised in PR-1 review.)
+const initialBackoff = 1 * time.Second
 
 // residentBytesFn is the leakcheck seam. Production wires
 // `leakcheck.ResidentBytes`; tests inject a stub that
@@ -69,15 +73,42 @@ const CapacityReportTTL = 5 * time.Minute
 // back to the store sum (ADR-005).
 type residentBytesFn func() (map[string]int64, bool)
 
+// countReader is the Manager stub seam. Production wires
+// fcvm.Manager; tests inject a stub that returns fixed
+// live/leased counts without booting a real Manager (which
+// requires /dev/kvm + a fixture cgroup). The interface is
+// the load-bearing test seam for end-to-end bufconn tests
+// (cmd/vmmd/capacity_publisher_e2e_test.go). Returning a
+// 0 from either method is treated as "manager empty" and
+// is the same shape the production nil-check implements.
+type countReader interface {
+	LiveCount() int
+	LeasedCount() int
+}
+
 // runCapacityPublish is the outer reconnect loop. It is
 // invoked as a goroutine from main.go and exits when ctx
 // fires. The loop is intentionally simple: dial → stream
 // → tick → send → drain-on-error → reconnect. The policy
 // lives in schedd's chooser (PR-2); vmmd's only job is to
 // keep the stream alive.
+//
+// Backoff policy. `backoff` starts at `initialBackoff`,
+// doubles on each drain failure (1s → 2s → 4s → 8s → 16s
+// → 30s capped), and resets to `initialBackoff` after a
+// clean drain return (nil error). This matches the
+// gatewayd warmhints cadence and prevents a long-lived
+// vmmd from getting stuck at the cap after one transient
+// error.
+//
+// TTL removal. The earlier draft had a 5-minute TTL that
+// silently exited the loop; removed in PR-1 review. The
+// daemon's ctx already terminates the loop on shutdown,
+// and a misconfigured environment is caught earlier by
+// the empty-target guard at the top.
 func runCapacityPublish(
 	ctx context.Context,
-	mgr *fcvm.Manager,
+	counts countReader,
 	nodeID string,
 	cfg ComputeNodeConfig,
 	scheddTarget string,
@@ -95,22 +126,46 @@ func runCapacityPublish(
 	if tick <= 0 {
 		tick = CapacityInterval
 	}
-	backoff := time.Second
-	deadline := time.Now().Add(CapacityReportTTL)
+	streamer := prodStreamer{
+		scheddTarget: scheddTarget,
+		nodeID:       nodeID,
+		log:          log,
+	}
+	runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
+}
+
+// runCapacityPublishWithStreamer is the test-friendly entry
+// point. Production goes through runCapacityPublish (which
+// constructs a prodStreamer); the e2e tests inject a bufconn-
+// backed streamer via this seam.
+func runCapacityPublishWithStreamer(
+	ctx context.Context,
+	counts countReader,
+	nodeID string,
+	cfg ComputeNodeConfig,
+	streamer capacityStreamer,
+	tick time.Duration,
+	resident residentBytesFn,
+	log *slog.Logger,
+) {
+	if tick <= 0 {
+		tick = CapacityInterval
+	}
+	backoff := initialBackoff
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Now().After(deadline) {
-			log.Warn("vmmd: capacity publisher exceeded TTL; giving up",
-				"node_id", nodeID, "ttl", CapacityReportTTL.String())
-			return
-		}
-		err := drainCapacityPublish(ctx, mgr, nodeID, cfg, scheddTarget, tick, resident, log)
+		err := drainCapacityPublish(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
+		if err == nil {
+			// Clean drain — schedd closed the stream
+			// (e.g. graceful restart). Reset the ladder
+			// so the next reconnect doesn't sit at 30 s.
+			backoff = initialBackoff
+		} else {
 			log.Warn("vmmd: capacity stream ended; reconnecting",
 				"node_id", nodeID, "err", err, "retry_in", backoff.String())
 		}
@@ -129,27 +184,21 @@ func runCapacityPublish(
 // the outer reconnect loop.
 func drainCapacityPublish(
 	ctx context.Context,
-	mgr *fcvm.Manager,
+	counts countReader,
 	nodeID string,
 	cfg ComputeNodeConfig,
-	scheddTarget string,
+	streamer capacityStreamer,
 	tick time.Duration,
 	resident residentBytesFn,
 	log *slog.Logger,
 ) error {
-	cli, cleanup, err := openCapacityStream(ctx, scheddTarget, nodeID, log)
+	cli, cleanup, err := streamer.Open(ctx)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	log.Info("vmmd: capacity stream connected", "node_id", nodeID, "target", scheddTarget)
-	// Reset backoff after a successful dial (mirrors the
-	// gatewayd warmhints pattern, cmd/gatewayd/warmhints.go:119-121).
-	// This is implicit: the outer loop resets backoff when
-	// drainCapacityPublish returns nil; we keep the
-	// document-where-the-policy-lives note here so a future
-	// reader sees the shape.
+	log.Info("vmmd: capacity stream connected", "node_id", nodeID)
 
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -161,7 +210,7 @@ func drainCapacityPublish(
 			// wait for it here — the ctx is already Done.
 			return nil
 		case <-t.C:
-			report := buildCapacityReport(mgr, nodeID, cfg, resident)
+			report := buildCapacityReport(counts, nodeID, cfg, resident)
 			if err := cli.Send(report); err != nil {
 				return err
 			}
@@ -169,21 +218,35 @@ func drainCapacityPublish(
 	}
 }
 
-// openCapacityStream dials schedd and opens a client-streaming
-// ReportCapacity session. The returned cleanup func closes
-// the underlying conn on drain return. Done here rather than
-// inline so a test can inject a stub `newCapacityStreamer`
-// without rebuilding the dial math.
-func openCapacityStream(
-	ctx context.Context,
-	scheddTarget string,
-	nodeID string,
-	log *slog.Logger,
-) (scheddpb.Schedd_ReportCapacityClient, func(), error) {
+// capacityStreamer is the gRPC-dial seam. Production wires
+// the unix-socket path (`openCapacityStream`); tests inject a
+// bufconn-backed streamer to drive `runCapacityPublish` end-to-
+// end without booting a real /run/faas/schedd.sock (PR-1
+// review fix).
+type capacityStreamer interface {
+	Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityClient, func(), error)
+}
+
+// prodStreamer is the production streamer. It dials schedd
+// over a unix (or tcp+TLS) target and opens the client-
+// streaming ReportCapacity RPC.
+type prodStreamer struct {
+	scheddTarget string
+	nodeID       string
+	log          *slog.Logger
+}
+
+// Open dials schedd and opens a client-streaming ReportCapacity
+// session. The returned cleanup func closes the underlying
+// conn on drain return. Done as a method on prodStreamer
+// rather than a free function so a test can swap the
+// capacityStreamer seam in `drainCapacityPublish` (PR-1
+// review fix).
+func (p prodStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityClient, func(), error) {
 	// Lazy dial: gRPC's blocking dial happens at first RPC;
 	// we want stream-open failures to surface inside the
 	// outer reconnect loop's backoff, not at boot.
-	conn, err := wire.DialContext(ctx, scheddTarget, nil)
+	conn, err := wire.DialContext(ctx, p.scheddTarget, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -198,7 +261,7 @@ func openCapacityStream(
 		// SendAndClose returns. Errors here are expected
 		// when ctx is already canceled.
 		if _, err := stream.CloseAndRecv(); err != nil {
-			log.Debug("vmmd: capacity stream close", "node_id", nodeID, "err", err)
+			p.log.Debug("vmmd: capacity stream close", "node_id", p.nodeID, "err", err)
 		}
 		_ = conn.Close()
 	}
@@ -221,20 +284,20 @@ func openCapacityStream(
 // is conservative and matches the §4.5 future-work note
 // in ADR-025.
 func buildCapacityReport(
-	mgr *fcvm.Manager,
+	counts countReader,
 	nodeID string,
 	cfg ComputeNodeConfig,
 	resident residentBytesFn,
 ) *scheddpb.CapacityReport {
-	// nil manager → live=0, leased=0. Lets the unit tests
+	// nil counts → live=0, leased=0. Lets the unit tests
 	// run without a real *fcvm.Manager (which requires
-	// /dev/kvm). Production always passes a non-nil mgr
-	// because main.go constructs one before the publisher
-	// goroutine starts.
+	// /dev/kvm). Production always passes a non-nil
+	// countReader because main.go constructs the Manager
+	// before the publisher goroutine starts.
 	var live, leased int32
-	if mgr != nil {
-		live = int32(mgr.LiveCount())
-		leased = int32(mgr.LeasedCount())
+	if counts != nil {
+		live = int32(counts.LiveCount())
+		leased = int32(counts.LeasedCount())
 	}
 
 	var usedMB int64
@@ -253,12 +316,8 @@ func buildCapacityReport(
 	// Avoid overflow on the int32 typed wire field. The
 	// chooser applies the floored int64 in PR-2; here we
 	// just clamp the wire representation.
-	if usedMB > 1<<31-1 {
-		usedMB = 1<<31 - 1
-	}
-	if headroom > 1<<31-1 {
-		headroom = 1<<31 - 1
-	}
+	usedMB = clampInt32(usedMB)
+	headroom = clampInt32(headroom)
 
 	return &scheddpb.CapacityReport{
 		NodeId:          nodeID,
@@ -269,4 +328,13 @@ func buildCapacityReport(
 		RamHeadroomMb:   int32(headroom),
 		VcpuBusy:        live * 2,
 	}
+}
+
+// clampInt32 caps v at the int32 max. Used to avoid
+// overflow on wire fields typed int32. (PR-1 review.)
+func clampInt32(v int64) int64 {
+	if v > 1<<31-1 {
+		return 1<<31 - 1
+	}
+	return v
 }

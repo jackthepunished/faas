@@ -1,29 +1,27 @@
 // capacity_publisher_test.go — vmmd's capacity-publisher unit
 // tests (ADR-025 axis 5).
 //
-// Scope. The publisher's gRPC-client half (openCapacityStream,
-// dial, send) is exercised by main_test.go's runDeps integration
-// in a follow-up slice. The unit tests here pin the pure
-// pieces:
+// Scope. The proto-field + control-flow tests here pin the
+// pure pieces of the publisher:
 //
 //  1. buildCapacityReport: the proto field contract.
 //  2. buildCapacityReport with non-Linux resident: ok=false
 //     emits used_mb=0 (ADR-005 cold-boot fallback).
 //  3. buildCapacityReport with over-commit: ram_headroom_mb
 //     clamped at 0 (no negative wire value).
-//  4. runCapacityPublish with empty target: returns immediately
+//  4. buildCapacityReport vCPU placeholder contract.
+//  5. buildCapacityReport sampled_at monotonic within
+//     [before, after] window.
+//  6. runCapacityPublish with empty target: returns immediately
 //     and never dials.
-//  5. runCapacityPublish with cancelled ctx: returns within
-//     100ms (no infinite loop).
+//  7. runCapacityPublish with cancelled ctx: returns within
+//     2 s of cancel (no infinite loop).
 //
-// The bufconn-driven ticker / reconnect tests are deferred
-// to a follow-up because the publisher hard-codes `*fcvm.Manager`
-// in its signature, and constructing a stub manager with
-// non-zero LiveCount/LeasedCount requires either a new
-// constructor or a seam injection. That work is part of
-// PR-2 (chooser integration), which depends on the same
-// stub. The proto-field tests here are the load-bearing
-// contract for PR-1.
+// End-to-end bufconn tests (ticker fires, reconnect after
+// server error) live in capacity_publisher_e2e_test.go
+// (PR-1 review fix: introduced the countReader seam so the
+// end-to-end tests can inject live/leased counts without
+// a real *fcvm.Manager).
 
 package main
 
@@ -33,8 +31,6 @@ import (
 	"log/slog"
 	"testing"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/fcvm"
 )
 
 // TestBuildCapacityReport_NodeIDPropagated asserts the proto's
@@ -45,7 +41,7 @@ import (
 // break the chooser's per-node table.
 func TestBuildCapacityReport_NodeIDPropagated(t *testing.T) {
 	t.Parallel()
-	mgr := (*fcvm.Manager)(nil) // buildCapacityReport reads via interfaces; nil is treated as zero
+	var counts countReader // nil — buildCapacityReport reads via interfaces; nil is treated as zero
 	resident := func() (map[string]int64, bool) {
 		return map[string]int64{
 			"i-1": 100 * 1024 * 1024,
@@ -53,7 +49,7 @@ func TestBuildCapacityReport_NodeIDPropagated(t *testing.T) {
 		}, true
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000}
-	got := buildCapacityReport(mgr, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident)
+	got := buildCapacityReport(counts, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident)
 	if got.GetNodeId() != "0193f7c0-uuid-7bbb-9def-0123456789ab" {
 		t.Errorf("node_id = %q, want 0193f7c0-uuid-7bbb-9def-0123456789ab", got.GetNodeId())
 	}

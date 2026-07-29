@@ -3,17 +3,17 @@
 //
 // Covers the three documented properties:
 //
-//   1. nextBackoff doubles up to max: 1s → 2s → 5s → 10s → 30s,
-//      and 30s + 30s doubles → 30s (cap held).
+//   1. nextBackoff doubles up to max: 1s → 2s → 4s → 8s →
+//      16s → 30s, and 30s + 30s doubles → 30s (cap held).
 //
 //   2. backoffLadder returns the canonical sequence and the
 //      final element equals MaxBackoff. The two helpers are
 //      pinned together so a future refactor that breaks one
 //      breaks the other loudly.
 //
-//   3. sleepCtx jitter is bounded [0, jitterBound): a 1000-call
-//      sample over a seeded RNG never exceeds the bound; the
-//      min is 0 (uniform).
+//   3. sleepCtx jitter is bounded [0, jitterBound): a 5000-
+//      call sample over a seeded RNG never exceeds the bound;
+//      the min is 0 (uniform).
 //
 // Plus two safety nets that aren't property-pinning but catch
 // regressions cheaply:
@@ -129,7 +129,9 @@ func TestBackoffLadder_Pinned(t *testing.T) {
 // sleepCtx calls (which the parallel test suite exercises)
 // don't race on math/rand's internal state.
 func TestSleepCtx_JitterWithinBounds(t *testing.T) {
-	t.Parallel()
+	// Not t.Parallel: this test mutates the package-level
+	// defaultRng via setRngForTest. A parallel sibling would
+	// race the swap (PR-1 review).
 	seeded := newLockedRng(rand.New(rand.NewSource(42)))
 	restore := setRngForTest(seeded)
 	defer restore()

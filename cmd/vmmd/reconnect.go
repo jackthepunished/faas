@@ -3,14 +3,15 @@
 //
 // Background. cmd/vmmd/capacity_publisher.go's outer reconnect
 // loop dials schedd, opens a stream, and on transient failure
-// re-dials with an exponential backoff ladder: 1s → 2s → 5s →
-// 10s → 30s (capped). The same shape exists in cmd/gatewayd's
-// warmhints publisher (gatewayd/warmhints.go:103-138) and the
-// schedd-side pg_notify subscribe loop (cmd/schedd/main.go:558-
-// 613). This file pins the vmmd-side helpers so the capacity
-// publisher and any future vmmd-stream (egress-allowlist push,
-// health-heartbeat out, etc.) share the same cadence without
-// copy-pasting ~25 LoC of jitter math.
+// re-dials with an exponential backoff ladder: 1s → 2s → 4s →
+// 8s → 16s → 30s (capped; pure doubling until cap). The same
+// shape exists in cmd/gatewayd's warmhints publisher
+// (gatewayd/warmhints.go:103-138) and the schedd-side pg_notify
+// subscribe loop (cmd/schedd/main.go:558-613). This file pins
+// the vmmd-side helpers so the capacity publisher and any
+// future vmmd-stream (egress-allowlist push, health-heartbeat
+// out, etc.) share the same cadence without copy-pasting ~25
+// LoC of jitter math.
 //
 // The shape is intentionally tiny: nextBackoff is pure math
 // (no I/O, no time), and sleepCtx is a time.Timer + select. A
@@ -75,13 +76,34 @@ func (cryptoRand) Int31n(n int32) int32 {
 		// without the spread.
 		return 0
 	}
-	return int32(binary.BigEndian.Uint32(b[:]) % uint32(n))
+	// Unbiased reduction (PR-1 review): the previous
+	// implementation used `uint32(b) % uint32(n)` which has
+	// a modulo bias of `(2^32 mod n) / 2^32` extra hits on
+	// the lower residues (≈ 2% for n=500). For jitter this
+	// is invisible, but the multiplication trick is one
+	// line and removes the bias without changing the
+	// contract: `x * n >> 32` is uniform in [0, n) for any
+	// 0 ≤ x < 2^32.
+	v := binary.BigEndian.Uint32(b[:])
+	return int32((uint64(v) * uint64(uint32(n))) >> 32)
 }
 
 // defaultRng is the process-wide RNG used by jitterMs. We keep
 // it as a package-level var so tests can swap it for a seeded
 // source without threading a pointer through every call site.
 // The single-cryptoRand instance is goroutine-safe.
+//
+// Production hazard note (PR-1 review). If a test calls
+// setRngForTest but forgets to invoke the returned restore
+// closure (or runs in parallel with a production goroutine
+// that calls jitterMs), the production reconnect loop will
+// observe the seeded RNG. The package does not run with -race
+// in production and the swap has no observer to detect this,
+// so callers must:
+//
+//  1. defer the restore closure immediately after the swap.
+//  2. NOT use t.Parallel() — parallel tests sharing the same
+//     package-global would race the restore.
 var (
 	defaultRng   rng = cryptoRand{}
 	defaultRngMu sync.RWMutex
@@ -90,6 +112,9 @@ var (
 // setRngForTest swaps the production RNG for a test-supplied
 // one. Returns a teardown closure that restores the original.
 // Used only from _test.go; live callers must not call this.
+//
+// See the "Production hazard note" above for the two
+// invariants the caller must uphold.
 func setRngForTest(r rng) func() {
 	defaultRngMu.Lock()
 	prev := defaultRng

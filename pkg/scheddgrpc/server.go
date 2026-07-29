@@ -69,6 +69,28 @@ type WarmHintSink = sched.WarmHintSink
 // per-node table via this sink.
 type CapacitySink = sched.CapacitySink
 
+// mapStreamErr translates a non-nil Recv / engine-drain
+// error into the wire codes the gateway / vmmd reconnect
+// loops speak. Used by StreamWarmHints and ReportCapacity
+// (and any future client-streaming handler that follows the
+// same shape).
+//
+//   - io.EOF → caller handles separately (SendAndClose ack)
+//   - context.Canceled / DeadlineExceeded → codes.Canceled
+//   - everything else → codes.Unavailable
+//
+// Extracted from the inline switch in PR-1 review to keep
+// each handler body under the "≤ 50 lines" cap from
+// CLAUDE.md.
+func mapStreamErr(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.Canceled, err.Error())
+	default:
+		return status.Error(codes.Unavailable, err.Error())
+	}
+}
+
 // SchedAPI is the slice of pkg/sched.Engine the handlers need. Defined here (not
 // imported as a concrete type) so unit tests can pass a fake without standing up
 // a store + vmmd.
@@ -400,12 +422,7 @@ func (s *Server) StreamWarmHints(req *scheddpb.StreamWarmHintsRequest, stream sc
 	}
 	if err := s.engine.StreamWarmHints(stream.Context(), sink); err != nil {
 		sendErr = err
-		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			return status.Error(codes.Canceled, err.Error())
-		default:
-			return status.Error(codes.Unavailable, err.Error())
-		}
+		return mapStreamErr(err)
 	}
 	return nil
 }
@@ -464,12 +481,7 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 		}
 		if err != nil {
 			sendErr = err
-			switch {
-			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-				return status.Error(codes.Canceled, err.Error())
-			default:
-				return status.Error(codes.Unavailable, err.Error())
-			}
+			return mapStreamErr(err)
 		}
 		// ADR-016: empty node_id is a programming bug.
 		// Surface as codes.InvalidArgument so vmmd's publisher

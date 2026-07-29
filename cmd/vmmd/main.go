@@ -96,7 +96,12 @@ type runDeps struct {
 	// goroutine. nil → start the production loop rooted at runCapacityPublish.
 	// Tests inject a no-op to skip the loop or a callback to drive
 	// the seam args.
-	startCapacityPublish func(ctx context.Context, mgr *fcvm.Manager, nodeID string, cfg ComputeNodeConfig, scheddTarget string, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
+	//
+	// `counts` is a countReader (PR-1 review) rather than a concrete
+	// *fcvm.Manager so the production wiring still passes `mgr` (which
+	// satisfies the interface) and tests can inject a stub without
+	// booting a real Manager.
+	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
 }
 
 func defaultDeps() runDeps {
