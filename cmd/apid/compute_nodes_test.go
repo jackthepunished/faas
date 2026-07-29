@@ -322,6 +322,56 @@ func TestComputeNodes_Heartbeats_SinceFilter(t *testing.T) {
 
 // TestComputeNodes_Heartbeats_MissingNode confirms a name that
 // doesn't resolve returns 404 with the documented "no such
+// TestComputeNodes_Heartbeats_SinceClamped confirms the
+// `since_clamped` wire field surfaces when the operator asks for
+// an older window than the 24h hard cap (F4). The clamped `since`
+// is still emitted; the flag tells the operator their query was
+// narrowed so a "did the box flap at 14:32 last Tuesday?" query
+// doesn't silently get a 24h response.
+func TestComputeNodes_Heartbeats_SinceClamped(t *testing.T) {
+	ts, tok, _ := seedHeartbeatTestNode(t)
+	// 7 days ago — well past the 24h cap.
+	wayBack := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
+	resp := doJSON(t, "GET", "/v1/compute-nodes/box-hb/heartbeats?since="+wayBack, "", tok, ts)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET: status=%d", resp.StatusCode)
+	}
+	var out computeNodeHeartbeatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.SinceClamped {
+		t.Errorf("since_clamped = false, want true (asked for 7d ago, capped at 24h)")
+	}
+	if out.Since == "" {
+		t.Errorf("since empty despite a (clamped) query param")
+	}
+}
+
+// TestComputeNodes_Heartbeats_SinceNotClamped confirms the inverse:
+// a recent timestamp does NOT set since_clamped, so the field stays
+// in the default false position (omitempty on the wire).
+func TestComputeNodes_Heartbeats_SinceNotClamped(t *testing.T) {
+	ts, tok, _ := seedHeartbeatTestNode(t)
+	recent := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339Nano)
+	resp := doJSON(t, "GET", "/v1/compute-nodes/box-hb/heartbeats?since="+recent, "", tok, ts)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET: status=%d", resp.StatusCode)
+	}
+	var out computeNodeHeartbeatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.SinceClamped {
+		t.Errorf("since_clamped = true, want false (5m ago is within the 24h window)")
+	}
+	if out.Since == "" {
+		t.Errorf("since empty despite a query param")
+	}
+}
+
 // compute_node" problem detail (not a 500 — a typo from the
 // operator must not look like a server bug).
 func TestComputeNodes_Heartbeats_MissingNode(t *testing.T) {

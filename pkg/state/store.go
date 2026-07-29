@@ -1290,16 +1290,25 @@ type Store interface {
 	// (the unique constraint is observed, not folded).
 	AppendComputeNodeHeartbeat(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string) error
 	// ListComputeNodeHeartbeats returns up to limit rows for the
-	// given node, newest first. since.IsZero() means "no lower
-	// bound, return most-recent N"; a non-zero since restricts to
-	// rows whose received_at >= since. The composite index
-	// compute_node_heartbeats_node_at_idx (node_id, received_at desc)
-	// matches this read shape. CP-1's heartbeat-history endpoint
-	// uses this with default limit 200 and a 24h hard cap on since.
-	// Returns ErrNotFound when the node has no history rows
-	// (different from the parent compute_nodes row missing — the
-	// endpoint resolves the parent by name first, so a missing
-	// history here is a fresh node, not a 404).
+	// given node. **MUST return rows newest-first** (received_at
+	// DESC); the heartbeat-history handler in
+	// cmd/apid/handlers_compute_nodes_heartbeats.go relies on this
+	// ordering to walk oldest-to-newest when emitting the response
+	// so row 0 carries the baseline summary. Changing the order
+	// here silently breaks the gap classification on the wire.
+	//
+	// since.IsZero() means "no lower bound, return most-recent N";
+	// a non-zero since restricts to rows whose received_at >= since.
+	// The composite index compute_node_heartbeats_node_at_idx
+	// (node_id, received_at desc) matches this read shape. CP-1's
+	// heartbeat-history endpoint uses this with default limit 200
+	// and a 24h hard cap on since.
+	//
+	// An empty result set is NOT an error — a fresh node has no
+	// history rows, the endpoint surfaces that as
+	// { "heartbeats": [] }. The endpoint resolves the parent
+	// compute_node by name first; a "no such node" path is the
+	// store's ComputeNodeByName, not this call.
 	ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error)
 
 	// Audit (append-only, spec §6.1).

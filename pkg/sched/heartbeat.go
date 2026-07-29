@@ -217,6 +217,13 @@ func (h *Heartbeat) Tick(ctx context.Context) error {
 		// continues — observability must never abort the stamp
 		// loop.
 		now := h.now()
+		// source='heartbeat_tick' is the only value the routine
+		// stamp path writes today. The migration 00065 CHECK also
+		// permits 'deactivation' and 'reactivation' for the future
+		// watchdog integration (the last contact attempt before a
+		// deactivation + the recovery stamp); no code writes them
+		// yet. Widening the CHECK when those writes land is the
+		// expected evolution; do NOT add them here speculatively.
 		if err := h.store.AppendComputeNodeHeartbeat(ctx, n.ID, now, now, "heartbeat_tick"); err != nil {
 			if errors.Is(err, state.ErrConflict) {
 				h.log.Warn("heartbeat: history append duplicate",

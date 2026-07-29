@@ -59,12 +59,19 @@ type computeNodeHeartbeatRow struct {
 // computeNodeHeartbeatsResponse is the JSON wire shape for the
 // /v1/compute-nodes/{name}/heartbeats endpoint. The `since` field
 // is omitted when the operator didn't pass one (the handler
-// defaults to heartbeatDefaultSinceWindow).
+// defaults to heartbeatDefaultSinceWindow). `since_clamped` is
+// `true` when the operator asked for an older window than the
+// heartbeatMaxSinceWindow hard cap — the response reflects the
+// clamped window, and the flag tells the operator the request was
+// narrowed (F4: silent clamping is surprising; the operator
+// debugging "did the box flap at 14:32 last Tuesday?" needs to
+// see their query was capped at 24h, not just get a 24h response).
 type computeNodeHeartbeatsResponse struct {
-	NodeID     string                    `json:"node_id"`
-	Name       string                    `json:"name"`
-	Since      string                    `json:"since,omitempty"`
-	Heartbeats []computeNodeHeartbeatRow `json:"heartbeats"`
+	NodeID       string                    `json:"node_id"`
+	Name         string                    `json:"name"`
+	Since        string                    `json:"since,omitempty"`
+	SinceClamped bool                      `json:"since_clamped,omitempty"`
+	Heartbeats   []computeNodeHeartbeatRow `json:"heartbeats"`
 }
 
 // listComputeNodeHeartbeats handles GET /v1/compute-nodes/{name}/heartbeats.
@@ -84,7 +91,7 @@ func (s *server) listComputeNodeHeartbeats(w http.ResponseWriter, r *http.Reques
 		s.notFound(w, "no such compute_node")
 		return
 	}
-	since, prob := parseComputeNodeHeartbeatSince(r, time.Now())
+	since, clamped, prob := parseComputeNodeHeartbeatSince(r, time.Now())
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
@@ -97,9 +104,10 @@ func (s *server) listComputeNodeHeartbeats(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	out := computeNodeHeartbeatsResponse{
-		NodeID:     node.ID,
-		Name:       node.Name,
-		Heartbeats: make([]computeNodeHeartbeatRow, 0, len(rows)),
+		NodeID:       node.ID,
+		Name:         node.Name,
+		SinceClamped: clamped,
+		Heartbeats:   make([]computeNodeHeartbeatRow, 0, len(rows)),
 	}
 	// Only emit the `since` field when the caller passed one
 	// (so the wire shape is "what I asked for"). The default
@@ -145,31 +153,42 @@ func (s *server) listComputeNodeHeartbeats(w http.ResponseWriter, r *http.Reques
 // to the response. The default (no ?since=) is the past 30 minutes,
 // clamped to a 24h hard cap. A future timestamp is a 400 — the
 // operator is asking for hidden data.
-func parseComputeNodeHeartbeatSince(r *http.Request, now time.Time) (time.Time, *api.Problem) {
+//
+// The second return is `clamped` — true when the operator passed a
+// timestamp older than heartbeatMaxSinceWindow and the function
+// silently narrowed the window to 24h. The handler surfaces this on
+// the wire as `since_clamped: true` so the operator knows their
+// query was capped (F4: silent clamping is surprising; an operator
+// debugging a historical flap needs to see their query was narrowed,
+// not get a silent 24h response).
+func parseComputeNodeHeartbeatSince(r *http.Request, now time.Time) (time.Time, bool, *api.Problem) {
 	raw := r.URL.Query().Get("since")
 	if raw == "" {
-		return now.Add(-heartbeatDefaultSinceWindow), nil
+		return now.Add(-heartbeatDefaultSinceWindow), false, nil
 	}
 	t, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		return time.Time{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+		return time.Time{}, false, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"Invalid since", `"since" must be an RFC 3339 timestamp (e.g. 2026-07-29T00:00:00Z)`)
 	}
 	if t.After(now) {
-		return time.Time{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+		return time.Time{}, false, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"Invalid since", `"since" must not be in the future`)
 	}
 	minSince := now.Add(-heartbeatMaxSinceWindow)
 	if t.Before(minSince) {
-		return minSince, nil
+		return minSince, true, nil
 	}
-	return t, nil
+	return t, false, nil
 }
 
 // parseComputeNodeHeartbeatLimit parses ?limit= and applies the
 // documented bounds (default 200, hard cap 2000). A bad value
-// (negative, non-numeric) is a 400 — the operator clearly meant
-// something specific.
+// (negative, non-numeric) silently falls back to the default
+// rather than 400'ing — operators prefer "I typo'd, you gave me
+// the safe default" over a problem detail they have to decode.
+// This matches the existing ?limit= parsing convention in
+// handlers_audit.go.
 func parseComputeNodeHeartbeatLimit(r *http.Request) int {
 	raw := r.URL.Query().Get("limit")
 	if raw == "" {
