@@ -820,7 +820,14 @@ func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *
 	})
 
 	now := time.Now()
-	items := make([]dashboard.AuditEventRow, 0, limit)
+	// Cap the backing array at listAuditEventsLimitMax (the same
+	// bound the request handler applies to ?limit=…) regardless of
+	// the caller-supplied limit value. CodeQL go/allocation-rule
+	// flags `make([]T, 0, limit)` because `limit` is a parsed
+	// query-string value the taint analysis can't bound. The render
+	// loop's `if len(items) >= limit { break }` truncates the actual
+	// number of rows. Mirrors handlers_audit.go:169's shape.
+	items := make([]dashboard.AuditEventRow, 0, listAuditEventsLimitMax)
 	for _, e := range merged {
 		if prefix != "" && !strings.HasPrefix(e.Kind, prefix) {
 			continue
