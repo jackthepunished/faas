@@ -134,6 +134,35 @@ func TestAdmissionCeilingIs85Percent(t *testing.T) {
 	}
 }
 
+// TestDefaultComputeNodeCeilingMB pins the helper that the synthetic
+// default-local row (pkg/state/memstore.go) and the vmmd LoadConfig
+// default (cmd/vmmd/config.go) both consume. Today it delegates to
+// RAMAdmissionCeilingMB; the test catches any future drift between
+// the helper and the constant.
+//
+// Two assertions cover two regressions:
+//   - the value-pinning literal at 47_600 catches a future contributor
+//     changing RAMAdmissionCeilingMB without updating the helper, OR
+//     changing the helper's body to a non-delegating expression;
+//   - the headroom check (helper == 85% of TenantRAMBudgetMB) is the
+//     invariant underlying both values, so a regression in either
+//     constant alone still surfaces with a targeted message instead
+//     of the value-pin's hard-coded number.
+//
+// PR scale-out readiness #4 callers (memstore seed + vmmd default)
+// are pinned in their own test sites so a regression localised to
+// the helper surfaces here, not at the production call sites.
+func TestDefaultComputeNodeCeilingMB(t *testing.T) {
+	const want = 47_600
+	if got := DefaultComputeNodeCeilingMB(); got != want {
+		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want %d (platform baseline pin)", got, want)
+	}
+	if got := TenantRAMBudgetMB * 85 / 100; got != DefaultComputeNodeCeilingMB() {
+		t.Errorf("DefaultComputeNodeCeilingMB() = %d, want 85%% of %d = %d (headroom invariant)",
+			DefaultComputeNodeCeilingMB(), TenantRAMBudgetMB, got)
+	}
+}
+
 // TestPlansAreMonotonic asserts every quota grows (or holds) from Free→Scale, so
 // an upgrade never reduces a customer's allowance.
 func TestPlansAreMonotonic(t *testing.T) {
