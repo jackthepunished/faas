@@ -103,7 +103,7 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 	// for post-mortems. The product call here is "false by default,
 	// ops can flip" — not "false forever" — so the toggle is part
 	// of the public surface from Wave 0.
-	includeAnonymous := r.URL.Query().Get("include_anonymous") == "true"
+	includeAnonymous, _ := strconv.ParseBool(r.URL.Query().Get("include_anonymous"))
 	// app_id (Wave 0 PR-C / ADR-047): filter the overscan window to
 	// events whose data.app_id matches. The dashboard's
 	// app_detail.html "Stateless advisories" link uses this with

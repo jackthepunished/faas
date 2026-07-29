@@ -782,7 +782,7 @@ func (s *server) renderAuditEvents(w http.ResponseWriter, r *http.Request, log *
 	q := r.URL.Query()
 	prefix := q.Get("kind_prefix")
 	appIDFilter := q.Get("app_id")
-	includeAnonymous := q.Get("include_anonymous") == "true"
+	includeAnonymous, _ := strconv.ParseBool(q.Get("include_anonymous"))
 
 	limit := listAuditEventsLimitDefault
 	if raw := q.Get("limit"); raw != "" {

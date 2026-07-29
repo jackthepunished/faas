@@ -389,7 +389,7 @@ heartbeat:
 	// open for ~30s of keepalive if we don't close it explicitly.
 	// Idempotent at the gRPC layer (pkg/vmmdgrpc uses sync.Once).
 	if advisoryCli != nil {
-		advisoryCli.Close()
+		_ = advisoryCli.Close()
 	}
 	return nil
 }

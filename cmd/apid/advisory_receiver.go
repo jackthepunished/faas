@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"google.golang.org/grpc"
@@ -182,7 +183,7 @@ func isStateNotFound(err error) bool {
 		return false
 	}
 	// state.ErrNotFound sentinel — pkg/state/store.go exports it.
-	if err == state.ErrNotFound {
+	if errors.Is(err, state.ErrNotFound) {
 		return true
 	}
 	// Defensive: pgx returns pgx.ErrNoRows, which state.PgStore

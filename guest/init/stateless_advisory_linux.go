@@ -221,11 +221,16 @@ func runStatelessAdvisory(log *slog.Logger) error {
 // We tolerate any parse error so a missing app.json doesn't kill the
 // advisory goroutine.
 func readAppIDFromManifest() (string, error) {
+	//nolint:forbidigo // Vetted-id path: /etc/faas/app.json is injected
+	// by imaged at guest-init injection time (see pkg/imaged/inject.go)
+	// and is the only path the guest reads at runtime. No customer
+	// input ever reaches this line; the openCustomerFile guard is for
+	// code paths that handle customer-controlled paths.
 	f, err := os.Open("/etc/faas/app.json")
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var m struct {
 		AppID string `json:"app_id"`
 	}
@@ -279,6 +284,11 @@ func readFanotify(fd int, pipe *advisoryPipe, log *slog.Logger) {
 		// Parse one or more events out of the buffer.
 		off := 0
 		for off+int(unsafe.Sizeof(fanotifyEventMetadata{})) <= n {
+			//nolint:gosec // fanotify wire format: the kernel writes
+			// a packed fanotify_event_metadata header at buf[off]. The
+			// bounds check above (off + sizeof(header) <= n) prevents
+			// out-of-bounds reads; the cast is unavoidable to decode
+			// the syscall payload.
 			meta := (*fanotifyEventMetadata)(unsafe.Pointer(&buf[off]))
 			ev := advisoryEvent{
 				Masks:  maskNames(uint64(meta.Events)),
@@ -435,13 +445,6 @@ func (p *advisoryPipe) drain(window time.Duration) []advisoryEvent {
 	p.pending = make(map[string]*advisoryEvent)
 	p.lastSeen = make(map[string]time.Time)
 	return out
-}
-
-func (p *advisoryPipe) close() {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
-	p.cond.Broadcast()
 }
 
 // joinMasks is a stable string for the mask-set so the dedupe key is

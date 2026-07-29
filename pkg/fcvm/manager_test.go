@@ -476,16 +476,6 @@ type advisoryCall struct {
 	Batch    []AdvisoryEvent
 }
 
-// advisoryCalls returns a copy of the recorded calls (safe under the
-// fakeVMM mutex).
-func (v *fakeVMM) advisoryCallsSnapshot() []advisoryCall {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	out := make([]advisoryCall, len(v.advisoryCalls))
-	copy(out, v.advisoryCalls)
-	return out
-}
-
 func (v *fakeVMM) restoredInstance(id string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
