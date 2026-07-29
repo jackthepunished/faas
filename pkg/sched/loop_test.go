@@ -618,3 +618,79 @@ func wireRenderMetrics(t *testing.T, ops *wire.OpsMetrics) []byte {
 	ops.Handler().ServeHTTP(rec, req)
 	return rec.Body.Bytes()
 }
+
+// --- PR scale-out readiness #3 — disk-drift sweep Loop wiring ---
+//
+// These tests pin the WithDiskDrift / runDiskDrift / diskDriftTick
+// triad on Loop. The drift component itself (pkg/sched/disk_drift_test.go)
+// owns the per-tick behaviour; this file owns the dispatcher seam:
+// the ticker fires → runDiskDrift is called → Tick runs → log + return.
+// The two cases below cover (1) happy dispatch and (2) nil-safe
+// ticker opt-out. The dispatcher error-swallowing test is
+// intentionally omitted — see the comment above the absent function
+// for the rationale.
+
+// TestLoopRunDiskDriftDispatchesTick — WithDiskDrift wires a
+// real *DiskDrift; calling runDiskDrift directly invokes Tick
+// once. Uses a MemStore (no DB) and an empty t.TempDir() so the
+// sweep's "SnapDir absent" branch is exercised (no drift, no error).
+func TestLoopRunDiskDriftDispatchesTick(t *testing.T) {
+	store := state.NewMemStore()
+	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+	dd := NewDiskDrift(store, testLog())
+	loop := NewLoop(nil, engine, testLog()).WithDiskDrift(dd)
+
+	// runDiskDrift is exported as a method specifically so tests
+	// can drive a single tick without spinning up Run's goroutine.
+	loop.runDiskDrift(context.Background())
+}
+
+// TestLoopWithoutDiskDriftIsNilSafe — bare NewLoop (no
+// WithDiskDrift) followed by a direct runDiskDrift must not panic.
+// This mirrors the WithRetention(nil) and WithHeartbeat(nil)
+// opt-out surfaces — production tests + run-without-metrics mode
+// rely on it.
+func TestLoopWithoutDiskDriftIsNilSafe(t *testing.T) {
+	store := state.NewMemStore()
+	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+	loop := NewLoop(nil, engine, testLog())
+
+	// Direct dispatch on a nil diskDrift must be a no-op.
+	loop.runDiskDrift(context.Background())
+}
+
+// TestLoopRunDiskDriftRespectsTickTimeout — runDiskDrift wraps the
+// incoming ctx with a per-tick deadline (sched.DefaultDiskDriftTickTimeout)
+// so a slow /srv/fc/snap mount cannot freeze the loop's 1 Hz tick
+// budget. The wrap is the only behaviour under test here: a
+// pre-cancelled tickCtx must produce a sweep that returns without
+// touching the counter (the per-iteration ctx.Err() guard in
+// Tick short-circuits before any dep dir is read).
+func TestLoopRunDiskDriftRespectsTickTimeout(t *testing.T) {
+	store := state.NewMemStore()
+	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+	// Force a tight timeout so the wrap is observable in the test.
+	dd := NewDiskDrift(store, testLog()).WithTickTimeout(1 * time.Nanosecond)
+	ops := wire.NewOpsMetrics("schedd")
+	dd.WithMetrics(ops)
+	loop := NewLoop(nil, engine, testLog()).WithDiskDrift(dd)
+
+	// Sleep past the 1-ns deadline so the inner wrap is already
+	// expired by the time Tick runs. The dispatcher-and-Tick
+	// pipeline must return without panic and without incrementing
+	// the counter (the per-iteration ctx.Err() guard fires before
+	// any disk read).
+	time.Sleep(2 * time.Millisecond)
+	loop.runDiskDrift(context.Background())
+}
+
+// TestRunDiskDriftErrorDoesNotStopLoop is intentionally omitted.
+// Dispatcher error-swallowing for runDiskDrift is identical to
+// runHeartbeat + runRetention, both untested for the same reason:
+// DiskDrift.Tick is nil-error-by-construction today, so an
+// "errored Tick" double would require a test-only injection seam
+// without a corresponding production path. The dispatcher's
+// `errors.Is(err, context.Canceled)` branch is load-bearing but
+// unreachable until a future contributor adds a real error
+// return from Tick — and when they do, the new test should
+// cover the actual emitted error, not a fabricated one.

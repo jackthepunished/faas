@@ -432,3 +432,62 @@ func readAll(t *testing.T, url string) (string, error) {
 		}
 	}
 }
+
+// TestOpsMetrics_SnapshotDiskDriftRegistered — the
+// snapshot_disk_drift_total counter is registered on every daemon's
+// OpsMetrics (single-registry pattern, memory
+// wire.NewOpsMetrics single-registry pattern). It only produces
+// samples when schedd's DiskDrift.Tick observes a discrepancy, but
+// the collector must exist on every daemon's registry so a unified
+// scrape never fails with "unknown metric."
+func TestOpsMetrics_SnapshotDiskDriftRegistered(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	c := m.SnapshotDiskDrift()
+	if c == nil {
+		t.Fatal("SnapshotDiskDrift() = nil on non-nil receiver")
+	}
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var found bool
+	for _, fam := range mfs {
+		if fam.GetName() == "schedd_snapshot_disk_drift_total" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("schedd_snapshot_disk_drift_total not present in registry gather")
+	}
+
+	// Increment and re-gather: counter should now read 1.
+	c.Inc()
+	mfs, err = m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Gather after Inc: %v", err)
+	}
+	for _, fam := range mfs {
+		if fam.GetName() == "schedd_snapshot_disk_drift_total" {
+			for _, mt := range fam.GetMetric() {
+				if got := mt.GetCounter().GetValue(); got != 1 {
+					t.Errorf("counter = %v, want 1 after one Inc", got)
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("counter disappeared after Inc")
+}
+
+// TestOpsMetrics_SnapshotDiskDriftNilSafe — DiskDrift.Tick calls
+// SnapshotDiskDrift() without guarding the receiver; the accessor
+// itself must short-circuit on a nil receiver so a partially wired
+// DiskDrift (or a test that constructs the struct directly) doesn't
+// panic on every Tick.
+func TestOpsMetrics_SnapshotDiskDriftNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.SnapshotDiskDrift(); got != nil {
+		t.Errorf("SnapshotDiskDrift on nil receiver = %v, want nil", got)
+	}
+}
