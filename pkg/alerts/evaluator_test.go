@@ -306,11 +306,11 @@ func TestEvaluator_NoIdentityAtBoot(t *testing.T) {
 	store := state.NewMemStore()
 	seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
 	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200}}
-	ev, _ := makeEvaluator(t, store, &stubPromQL{value: 10}, nil, dispatch)
-	// Override identity loader to return nil (production wire-up when
-	// FAAS_HOST_AGE_IDENTITY_PATH is unset).
-	// Re-construct with a nil-loader to mirror the production case.
-	ev = alerts.NewEvaluator(alerts.EvaluatorOptions{
+	// Construct directly with a nil-loader to mirror the production
+	// case (FAAS_HOST_AGE_IDENTITY_PATH unset). makeEvaluator always
+	// wires a non-nil identity, so the canonical re-construct below
+	// is the only path that exercises the production condition.
+	ev := alerts.NewEvaluator(alerts.EvaluatorOptions{
 		Store:      store,
 		PromQL:     &stubPromQL{value: 10},
 		Audit:      audit.New(store, discardLog(), nil, "meterd"),
@@ -339,9 +339,9 @@ func TestEvaluator_DuplicateBucket(t *testing.T) {
 	seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
 	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200, Attempts: 1}}
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	ev, _ := makeEvaluator(t, store, &stubPromQL{value: 10}, nil, dispatch)
-	// Override Now via direct construction (the helper hard-codes now).
-	ev = alerts.NewEvaluator(alerts.EvaluatorOptions{
+	// Construct directly: makeEvaluator hard-codes Now, and this test
+	// needs the bucket-aligned timestamp for the cool-down claim.
+	ev := alerts.NewEvaluator(alerts.EvaluatorOptions{
 		Store:      store,
 		PromQL:     &stubPromQL{value: 10},
 		Audit:      audit.New(store, discardLog(), nil, "meterd"),
@@ -501,9 +501,10 @@ func TestEvaluator_FailedInvocations(t *testing.T) {
 		}
 	}
 	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200, Attempts: 1}}
-	ev, _ := makeEvaluator(t, store, nil, ident, dispatch)
-	// Override Now via direct construction.
-	ev = alerts.NewEvaluator(alerts.EvaluatorOptions{
+	// Construct directly: makeEvaluator hard-codes Now, and the
+	// failed-invocations count is window-relative so the test needs
+	// the bucket-aligned timestamp below.
+	ev := alerts.NewEvaluator(alerts.EvaluatorOptions{
 		Store:      store,
 		PromQL:     nil, // failed_invocations doesn't touch PromQL
 		Audit:      audit.New(store, discardLog(), nil, "meterd"),

@@ -328,10 +328,7 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 	// PromQL-backed metrics gate to "degraded:" skipped, but
 	// failed_invocations is Postgres-backed so it still fires).
 	deadline := time.Now().Add(alertEvalInterval*3 + 5*time.Second)
-	for {
-		if receiver.snapshotCount() >= 1 {
-			break
-		}
+	for receiver.snapshotCount() < 1 {
 		if time.Now().After(deadline) {
 			t.Fatalf("receiver never received a delivery within %s (alerts tick did not fire)\n%s",
 				alertEvalInterval*3+5*time.Second, h.MeterdLogs())
@@ -414,10 +411,7 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 	}
 
 	deadline = time.Now().Add(alertEvalInterval*3 + 5*time.Second)
-	for {
-		if receiver.snapshotCount() >= 2 {
-			break
-		}
+	for receiver.snapshotCount() < 2 {
 		if time.Now().After(deadline) {
 			t.Fatalf("after backdate: receiver count stayed at %d (expected 2 within %s)\n%s",
 				receiver.snapshotCount(), alertEvalInterval*3+5*time.Second, h.MeterdLogs())
