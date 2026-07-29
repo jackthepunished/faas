@@ -1,0 +1,98 @@
+package scheddgrpc
+
+import (
+	"context"
+	"errors"
+	"io"
+	"time"
+
+	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
+	"google.golang.org/grpc"
+)
+
+// LogFrame is the transport-neutral mirror of
+// scheddpb.StreamAppLogsResponse (ADR-043 / Move 4 acceptance #5).
+// Owned by pkg/scheddgrpc so callers don't reach into the generated
+// protobuf package — cmd/apid's private schedLogFrame is a separate
+// type to keep the apid/server.go interface decoupled from this one.
+//
+// instance_id is empty on the synthetic terminal frame (none emitted
+// by Move 4 today; reserved for a future "end" marker).
+type LogFrame struct {
+	InstanceID string
+	Seq        int64
+	Stream     string
+	Line       string
+	WrittenAt  time.Time
+}
+
+// LogStream is the per-app log stream returned by Client.StreamAppLogs.
+// Recv blocks until the next frame or the stream ends. A successful
+// Recv returns (frame, nil) for a data frame; (zero, io.EOF) for a
+// clean shutdown; (zero, gRPC-status) for any error.
+//
+// Errors pass through unchanged so callers can map gRPC codes
+// (NotFound, Unavailable, Canceled) themselves. Do not call
+// liftErr on these — the SSE renderer relies on the raw code to
+// distinguish "no live instances" from "schedd unreachable".
+type LogStream interface {
+	Recv() (LogFrame, error)
+}
+
+// StreamAppLogs opens a server-streaming RPC against the schedd's
+// StreamAppLogs endpoint (issue #254 / Move 4). The schedd fans
+// out per-instance vmmd Logs RPCs into one server stream; this
+// method hands the caller a typed view of that stream.
+//
+// sinceSeq is the per-instance replay cursor forwarded verbatim
+// to each vmmd (each instance's ring is independent; Seq scopes
+// are per-instance, not global — see schedd.proto:268).
+//
+// Returned errors pass through unchanged. The caller owns error
+// mapping; this method never lifts gRPC statuses to *api.Problem
+// because the SSE renderer needs the raw code.
+func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (LogStream, error) {
+	stream, err := c.cli.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+		AppId:    appID,
+		SinceSeq: sinceSeq,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &logStreamAdapter{inner: stream}, nil
+}
+
+// logStreamAdapter converts the proto stream into the typed
+// LogStream surface. It does not transform errors — the raw gRPC
+// status (or io.EOF) flows back to the caller so the SSE handler
+// can map it via renderAppLogsError.
+type logStreamAdapter struct {
+	inner grpc.ServerStreamingClient[scheddpb.StreamAppLogsResponse]
+}
+
+var _ LogStream = (*logStreamAdapter)(nil)
+
+// Recv blocks for the next frame or end-of-stream. WrittenAt is
+// converted via timestamppb.AsTime; an unset proto timestamp
+// yields the zero time.Time, which writeAppLogEvent renders as
+// "0001-01-01T00:00:00Z" — Move 4's schedd always sets it, so
+// callers can rely on the field being populated.
+func (a *logStreamAdapter) Recv() (LogFrame, error) {
+	resp, err := a.inner.Recv()
+	if err != nil {
+		// io.EOF and gRPC status errors pass through untouched.
+		// The SSE handler distinguishes them via errors.Is(err,
+		// io.EOF) and status.FromError respectively.
+		if errors.Is(err, io.EOF) {
+			return LogFrame{}, io.EOF
+		}
+		return LogFrame{}, err
+	}
+	return LogFrame{
+		InstanceID: resp.GetInstanceId(),
+		Seq:        resp.GetSeq(),
+		Stream:     resp.GetStream(),
+		Line:       resp.GetLine(),
+		WrittenAt:  resp.GetWrittenAt().AsTime(),
+	}, nil
+}

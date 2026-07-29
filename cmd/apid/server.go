@@ -159,6 +159,13 @@ type server struct {
 	// stub that returns codes.Unimplemented so the SSE handler
 	// degrades gracefully when the daemon is unreachable.
 	schedd scheddClient
+	// appLogsHeartbeat and appLogsBackstop bound the serveAppLogs
+	// receive pump. Defaults are 15s heartbeat and 10m backstop
+	// (set by newServerWithDeps); whitebox tests shorten these
+	// via direct field assignment so timer cases don't have to
+	// wait the production interval. Issue #254.
+	appLogsHeartbeat time.Duration
+	appLogsBackstop  time.Duration
 	// touchDebounce coalesces per-key last_used_at updates (PR #232
 	// review #7). Without this, every successful bearer auth would
 	// spawn a goroutine issuing an UPDATE api_keys SET last_used_at =
@@ -486,7 +493,9 @@ func newServerWithDeps(
 		// schedd (issue #254 / Move 4) defaults to a stub that
 		// returns Unimplemented. Production wires the real client
 		// via withScheddClient (cmd/apid/main.go).
-		schedd: stubScheddClient{},
+		schedd:           stubScheddClient{},
+		appLogsHeartbeat: 15 * time.Second,
+		appLogsBackstop:  10 * time.Minute,
 	}
 }
 

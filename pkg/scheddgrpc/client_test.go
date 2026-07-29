@@ -3,6 +3,7 @@ package scheddgrpc_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -297,4 +298,175 @@ func TestClientParkInstance_PlainErrorPassesThrough(t *testing.T) {
 	if code := status.Code(got); code != codes.Internal {
 		t.Errorf("code = %v, want Internal", code)
 	}
+}
+
+// --- Issue #254 / Move 4 — pkg/scheddgrpc.Client.StreamAppLogs ---
+//
+// These cases pin the transport-neutral conversion in client_logs.go:
+// every StreamAppLogsResponse field round-trips into a LogFrame field,
+// io.EOF flows back as exactly io.EOF (no lifting), and gRPC status
+// errors pass through untouched so the apid SSE handler's
+// renderAppLogsError can map codes directly. They use the bufconn
+// newClient helper from the top of this file.
+
+// TestClientStreamAppLogs_FrameConversion asserts that every field
+// of the upstream scheddpb.StreamAppLogsResponse reaches the typed
+// LogFrame 1:1, including time.Time nanosecond equality. The schedd
+// fan-out populates all five fields per frame (issue #254 acceptance
+// #5); this is the contract cmd/apid's writeAppLogEvent depends on.
+func TestClientStreamAppLogs_FrameConversion(t *testing.T) {
+	const (
+		wantAppID = "app-1"
+		wantSeq   = int64(42)
+		wantLine  = "hello world\n"
+	)
+	wantWrittenAt := time.Date(2026, 7, 29, 12, 0, 0, 123_000_000, time.UTC)
+	var gotAppID string
+	var gotSinceSeq int64
+
+	c := newClient(t, &fakeEngine{
+		streamLogFn: func(_ context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+			gotAppID = appID
+			gotSinceSeq = sinceSeq
+			return sink("i-99", wantSeq, "stdout", wantLine, wantWrittenAt)
+		},
+	})
+
+	stream, err := c.StreamAppLogs(context.Background(), wantAppID, 7)
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	t.Cleanup(func() { _ = stream }) // typed interface — no Close
+
+	f, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if f.InstanceID != "i-99" {
+		t.Errorf("InstanceID = %q, want i-99", f.InstanceID)
+	}
+	if f.Seq != wantSeq {
+		t.Errorf("Seq = %d, want %d", f.Seq, wantSeq)
+	}
+	if f.Stream != "stdout" {
+		t.Errorf("Stream = %q, want stdout", f.Stream)
+	}
+	if f.Line != wantLine {
+		t.Errorf("Line = %q, want %q", f.Line, wantLine)
+	}
+	if !f.WrittenAt.Equal(wantWrittenAt) {
+		t.Errorf("WrittenAt = %v, want %v", f.WrittenAt, wantWrittenAt)
+	}
+	if gotAppID != wantAppID {
+		t.Errorf("engine appID = %q, want %q", gotAppID, wantAppID)
+	}
+	if gotSinceSeq != 7 {
+		t.Errorf("engine sinceSeq = %d, want 7", gotSinceSeq)
+	}
+}
+
+// TestClientStreamAppLogs_CleanEOFReturnsExactEOF asserts that the
+// adapter propagates io.EOF verbatim, not wrapped (no fmt.Errorf
+// "EOF" decorations that would break errors.Is in the apid loop).
+// The recvCh close + error path in serveAppLogs hinges on this
+// branch (handlers_ext.go).
+func TestClientStreamAppLogs_CleanEOFReturnsExactEOF(t *testing.T) {
+	c := newClient(t, &fakeEngine{
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+			return nil
+		},
+	})
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	_, err = stream.Recv()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Recv err = %v, want io.EOF", err)
+	}
+}
+
+// TestClientStreamAppLogs_NotFoundPassesThrough asserts the
+// transport-neutral contract: state.ErrNotFound from the engine
+// surfaces as a raw gRPC NotFound status on Recv, NOT as an
+// *api.Problem. liftErr is not applied because the SSE handler
+// needs the raw code (cmd/apid/handlers_ext.go::renderAppLogsError).
+func TestClientStreamAppLogs_NotFoundPassesThrough(t *testing.T) {
+	c := newClient(t, &fakeEngine{
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+			return state.ErrNotFound
+		},
+	})
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	_, err = stream.Recv()
+	if err == nil {
+		t.Fatal("Recv: want error, got nil")
+	}
+	if code := status.Code(err); code != codes.NotFound {
+		t.Errorf("code = %v, want NotFound", code)
+	}
+}
+
+// TestClientStreamAppLogs_GenericErrorIsUnavailable asserts the
+// second branch of server.go:289-297: anything that isn't
+// ErrNotFound / context-cancel surfaces as codes.Unavailable so the
+// apid SSE handler's `event: degraded {reason: schedd_unreachable}`
+// envelope fires.
+func TestClientStreamAppLogs_GenericErrorIsUnavailable(t *testing.T) {
+	c := newClient(t, &fakeEngine{
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+			return errors.New("vmmd dial failed")
+		},
+	})
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	_, err = stream.Recv()
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Errorf("code = %v, want Unavailable", code)
+	}
+}
+
+// TestClientStreamAppLogs_ContextCancelUnblocks asserts that
+// cancelling the caller's context unblocks a blocked Recv without
+// a hang. The receive goroutine in cmd/apid/handlers_ext.go relies
+// on streamCtx cancellation to exit; without this guarantee the
+// apid would leak a goroutine on every closed SSE.
+func TestClientStreamAppLogs_ContextCancelUnblocks(t *testing.T) {
+	release := make(chan struct{})
+	c := newClient(t, &fakeEngine{
+		streamLogFn: func(ctx context.Context, _ string, _ int64, sink scheddgrpc.LogFrameSink) error {
+			// Block until the caller cancels — emulate an idle
+			// vmmd stream that hasn't seen new bytes.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-release:
+				return nil
+			}
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream, err := c.StreamAppLogs(ctx, "app-1", 0)
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := stream.Recv(); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Recv returned nil after cancel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recv did not unblock after cancel; goroutine leak")
+	}
+	close(release)
 }
