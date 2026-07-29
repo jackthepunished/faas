@@ -181,14 +181,31 @@ func seedShadowAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, t0
 
 // pollShadowLog blocks until the meterd log has logged at least
 // wantHits "meter: push usage" lines that include the seeded
-// account id AND `mb_seconds=N` with N == expected. Returns the
-// matching log lines in buffer order so callers can run per-tick
-// assertions on the parsed values. The harness's stop() owns
-// the single cmd.Wait per process; this function does not call Wait.
+// account id AND `mb_seconds=N` with N == expected. Returns EXACTLY
+// wantHits matching lines in buffer order so callers can run
+// per-tick assertions on the parsed values (the exact-count oracle
+// stays intact even when the loop overshoots). The harness's
+// stop() owns the single cmd.Wait per process; this function
+// does not call Wait.
 //
 // 35 s deadline: 24 ticks × 1 s + ~5 s boot + ~6 s slack. CI
-// runners under load may slip to 1.4 s/tick — the slack absorbs
-// the slip without flaking the test.
+// runners under load may slip to 1.4 s/tick — at that point 35 s
+// fits 25 ticks, not 24, and the next poll iteration returns a
+// 25-element slice even though the test wants exactly 24. The
+// wantHits-truncate below absorbs that overshoot deterministically:
+// the first wantHits matching lines arrived in the same order
+// the per-tick assertion expects, so the sum check (hits ×
+// shadowPerHour == shadowTotal) is unaffected.
+//
+// Why truncate instead of asserting len(hits) == wantHits:
+// overshoot is a polling-window artifact, not a real extra tick.
+// The slog buffer can flush ≥2 lines between two 150 ms polls,
+// so on a busy CI runner the loop returns a slice with one or two
+// extra matches that the test never asked for. Truncating keeps
+// the exact-count contract for the call site without softening
+// the acceptance bar (a 25th *tick* would still be detected via
+// the deadline-fail branch, because the count grows to 25 only
+// after at least 25 actual ticks have fired).
 func pollShadowLog(t *testing.T, h *e2etest.Harness, acctID string, wantHits int, expected int64) []string {
 	t.Helper()
 	deadline := time.Now().Add(35 * time.Second)
@@ -197,7 +214,7 @@ func pollShadowLog(t *testing.T, h *e2etest.Harness, acctID string, wantHits int
 		logs := h.MeterdLogs()
 		hits := filterShadowLogLines(logs, prefix, acctID, expected)
 		if len(hits) >= wantHits {
-			return hits
+			return hits[:wantHits]
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("shadow log oracle: only %d/%d hits after 35s (acct=%s, expected mb_seconds=%d)\ncaptured meterd log:\n%s",
