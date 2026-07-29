@@ -293,8 +293,18 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 		t.Errorf("/metrics status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "promhttp_metric_handler_errors_total") {
-		t.Errorf("/metrics body missing promhttp internals (handler may be unconfigured):\n%s", body)
+	// The handler is mounted iff the Gatherers we wired
+	// (ops + recRegistry + DefaultGatherer) all respond on the
+	// scrape. promhttp_metric_handler_errors_total is created per
+	// HandlerFor instance on its bound registry, so it's NOT
+	// guaranteed to surface via the merged Gatherers — but the
+	// DefaultGatherer line for Go runtime (`go_goroutines`) IS
+	// always present once promhttp's runtime collector is loaded,
+	// which it is on any prometheus.Handler() call anywhere in
+	// the daemon's process. The line is the load-bearing proof the
+	// handler is mounted and DefaultGatherer is reachable.
+	if !strings.Contains(body, "go_goroutines") {
+		t.Errorf("/metrics body missing Go runtime metrics (handler may be unconfigured or DefaultGatherer dropped):\n%s", body)
 	}
 	if !strings.Contains(body, "meterd_ops_total") {
 		t.Errorf("/metrics body missing meterd_ops_total (Observe not wired?):\n%s", body)
