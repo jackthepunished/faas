@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
@@ -29,6 +31,16 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	// Issue #95: server-mTLS paths default empty.
 	if cfg.ListenAddr != "" || cfg.TLSCertPath != "" || cfg.TLSKeyPath != "" || cfg.TLSCAPath != "" {
 		t.Errorf("TLS/listen defaults not all empty: %+v", cfg)
+	}
+	// PR scale-out readiness #4: the compute-node default
+	// AdmissionCeilingMB must route through api.DefaultComputeNodeCeilingMB
+	// so the vmmd default and the MemStore seed share a single source
+	// of truth. This is the load-bearing assertion that proves
+	// cmd/vmmd/config.go is wired to the helper (changing fixtures in
+	// other tests wouldn't catch a literal regression here).
+	if got := cfg.ComputeNode.AdmissionCeilingMB; got != api.DefaultComputeNodeCeilingMB() {
+		t.Errorf("ComputeNode.AdmissionCeilingMB = %d, want %d (api.DefaultComputeNodeCeilingMB())",
+			got, api.DefaultComputeNodeCeilingMB())
 	}
 }
 

@@ -3255,13 +3255,16 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 	now := time.Now()
 	id := newID()
 	m.computeNodes[id] = ComputeNode{
-		ID:                 id,
-		Name:               DefaultLocalNodeName,
-		TargetURL:          "unix:///run/faas/vmmd.sock",
-		VPCPUs:             160,
-		MemMB:              56000,
-		MaxConcurrency:     200,
-		AdmissionCeilingMB: 47600,
+		ID:             id,
+		Name:           DefaultLocalNodeName,
+		TargetURL:      "unix:///run/faas/vmmd.sock",
+		VPCPUs:         160,
+		MemMB:          56000,
+		MaxConcurrency: 200,
+		// PR scale-out readiness #4: routed through api.DefaultComputeNodeCeilingMB
+		// so the helper and cmd/vmmd/config.go share a single source of truth.
+		// Resolves to the same integer (47_600) as before — no behavior change.
+		AdmissionCeilingMB: api.DefaultComputeNodeCeilingMB(),
 		Active:             true,
 		LastHeartbeatAt:    now,
 		CreatedAt:          now,

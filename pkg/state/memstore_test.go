@@ -1635,6 +1635,10 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 	// target URL the legacy unix socket, admission ceiling the legacy
 	// 47,600 MB. The id is non-empty and the name matches
 	// DefaultLocalNodeName (the canonical name callers resolve against).
+	// PR scale-out readiness #4: the AdmissionCeilingMB assertion
+	// compares against api.DefaultComputeNodeCeilingMB() so a future
+	// helper change surfaces here with a targeted message instead of
+	// a hard-coded drift between the seed and the platform baseline.
 	got, err := m.ComputeNodeByName(ctx, DefaultLocalNodeName)
 	if err != nil {
 		t.Fatalf("ComputeNodeByName(default-local): %v", err)
@@ -1645,8 +1649,9 @@ func TestMem_ComputeNodes_DefaultLocalSeededOnNewStore(t *testing.T) {
 	if !got.Active {
 		t.Errorf("seeded default-local should be active, got %v", got.Active)
 	}
-	if got.AdmissionCeilingMB != 47600 {
-		t.Errorf("AdmissionCeilingMB=%d, want 47600", got.AdmissionCeilingMB)
+	if got.AdmissionCeilingMB != api.DefaultComputeNodeCeilingMB() {
+		t.Errorf("AdmissionCeilingMB=%d, want %d (api.DefaultComputeNodeCeilingMB())",
+			got.AdmissionCeilingMB, api.DefaultComputeNodeCeilingMB())
 	}
 	if got.TargetURL != "unix:///run/faas/vmmd.sock" {
 		t.Errorf("TargetURL=%q, want %q", got.TargetURL, "unix:///run/faas/vmmd.sock")

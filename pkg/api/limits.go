@@ -618,6 +618,20 @@ const (
 	ConntrackCap = DefaultConntrackCap
 )
 
+// DefaultComputeNodeCeilingMB is the per-compute-node admission ceiling
+// schedd hands out when no operator override is present. It mirrors
+// RAMAdmissionCeilingMB (85% of the tenant budget) because a single
+// compute node today owns the entire tenant slice on the one-box; when
+// a future multi-node world splits tenant traffic across nodes, this
+// helper is the single place to revisit (e.g. per-node share = ceiling
+// / node count). Migrated from inline literals in
+// pkg/state/memstore.go:seedDefaultLocalNodeLocked and
+// cmd/vmmd/config.go:LoadConfig (PR scale-out readiness #4). The
+// helper resolves to the same integer today — no behavior change.
+func DefaultComputeNodeCeilingMB() int {
+	return RAMAdmissionCeilingMB
+}
+
 // ConntrackCapProbe returns the effective per-instance conntrack cap.
 const (
 	probeNS        = "faas-ct-probe"

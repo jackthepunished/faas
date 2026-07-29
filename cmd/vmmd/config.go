@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -127,10 +128,14 @@ func LoadConfig(path string) (*Config, error) {
 			// still has a coherent self-registration on first boot.
 			// Operators scaling beyond one box override every
 			// [compute_node] field explicitly via vmmd.toml.
+			// PR scale-out readiness #4: AdmissionCeilingMB routes
+			// through api.DefaultComputeNodeCeilingMB so the
+			// MemStore seed (pkg/state/memstore.go) and vmmd
+			// share a single source of truth. Resolves to 47_600.
 			VPCPUs:             160,
 			MemMB:              56000,
 			MaxConcurrency:     200,
-			AdmissionCeilingMB: 47600,
+			AdmissionCeilingMB: api.DefaultComputeNodeCeilingMB(),
 		},
 	}
 	b, err := os.ReadFile(path)
