@@ -423,6 +423,10 @@ func listUsageForAccountExport(ctx context.Context, st state.Store, accountID st
 			// PR-2.
 			TXBytes:    u.TXBytes,
 			NetTxBytes: u.NetTxBytes,
+			// ADR-048: ingress + cold-boot transitions.
+			// Informational only — not billed.
+			NetRxBytes:    u.NetRxBytes,
+			ColdBootCount: u.ColdBootCount,
 		})
 	}
 	return out, nil

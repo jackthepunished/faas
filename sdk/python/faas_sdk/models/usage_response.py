@@ -32,6 +32,13 @@ class UsageResponse:
     """Per-app monthly byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced from
     vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-plan
     tc tbf qdisc reads, so the cap and the meter are consistent."""
+    net_rx_bytes: int | Unset = UNSET
+    """Per-app monthly byte delta on root-side vethHost.tx_bytes (root→guest = ingress; informational; not billed).
+    ADR-048. Mirror of `net_tx_bytes` for the inbound direction. Same sysfs source —
+    `/sys/class/net/<vethHost>/statistics/tx_bytes`."""
+    cold_boots: int | Unset = UNSET
+    """Per-app monthly count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed (informational; not billed).
+    ADR-048. Source: schedd instancestats.Poller → meterd Sampler."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,6 +56,10 @@ class UsageResponse:
 
         net_tx_bytes = self.net_tx_bytes
 
+        net_rx_bytes = self.net_rx_bytes
+
+        cold_boots = self.cold_boots
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -65,6 +76,10 @@ class UsageResponse:
             field_dict["tx_bytes"] = tx_bytes
         if net_tx_bytes is not UNSET:
             field_dict["net_tx_bytes"] = net_tx_bytes
+        if net_rx_bytes is not UNSET:
+            field_dict["net_rx_bytes"] = net_rx_bytes
+        if cold_boots is not UNSET:
+            field_dict["cold_boots"] = cold_boots
 
         return field_dict
 
@@ -85,6 +100,10 @@ class UsageResponse:
 
         net_tx_bytes = d.pop("net_tx_bytes", UNSET)
 
+        net_rx_bytes = d.pop("net_rx_bytes", UNSET)
+
+        cold_boots = d.pop("cold_boots", UNSET)
+
         usage_response = cls(
             app_id=app_id,
             mb_seconds=mb_seconds,
@@ -93,6 +112,8 @@ class UsageResponse:
             cpu_usec=cpu_usec,
             tx_bytes=tx_bytes,
             net_tx_bytes=net_tx_bytes,
+            net_rx_bytes=net_rx_bytes,
+            cold_boots=cold_boots,
         )
 
         usage_response.additional_properties = d

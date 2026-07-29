@@ -161,6 +161,10 @@ type MemStore struct {
 	// per-app shape unchanged. (M7 fix; the previous shape was wrong.)
 	usage        []usageMinute
 	usageByMonth []Usage
+	// builderUsage is the per-build grain backing AppendBuilderUsage
+	// (ADR-048 §4). PK is build_id; the meterd rollup cron sums
+	// into usage_daily.builder_seconds per (account, app, day).
+	builderUsage []builderUsageRow
 	idem         map[string]idemEntry
 	// stripeByCustomer is the reverse-lookup index used by
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
@@ -324,6 +328,20 @@ type usageMinute struct {
 	// transition counts; a redelivered tick within the same
 	// minute is a no-op).
 	ColdBootCount int32
+}
+
+// builderUsageRow is the per-build grain (ADR-048 §4) backing
+// AppendBuilderUsage. Mirrors public.builder_usage created by
+// migrations/00068_builder_usage.sql. PK is BuildID; first write
+// wins, a redelivered webhook / meterd restart is a no-op. The
+// meterd rollup cron sums Seconds into usage_daily.builder_seconds.
+type builderUsageRow struct {
+	BuildID    string
+	AccountID  string
+	AppID      string
+	FinishedAt time.Time
+	Kind       string
+	Seconds    int64
 }
 
 // NewMemStore returns an empty in-memory store with the synthetic
@@ -3699,6 +3717,32 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 	return nil
 }
 
+// AppendBuilderUsage mirrors pgstore's AppendBuilderUsage
+// (ADR-048 §4). Idempotent on build_id — first write wins; a
+// redelivered webhook is a no-op. The meterd rollup cron sums
+// these into usage_daily.builder_seconds. seconds is wall-clock
+// seconds from builds.started_at to finishedAt (matches the
+// existing builderd build_duration_seconds histogram unit).
+func (m *MemStore) AppendBuilderUsage(_ context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.builderUsage {
+		if m.builderUsage[i].BuildID == buildID {
+			// First write wins.
+			return nil
+		}
+	}
+	m.builderUsage = append(m.builderUsage, builderUsageRow{
+		BuildID:    buildID,
+		AccountID:  accountID,
+		AppID:      appID,
+		FinishedAt: finishedAt,
+		Kind:       kind,
+		Seconds:    seconds,
+	})
+	return nil
+}
+
 // UsageByMonth returns the per-app aggregates for one (account, month) —
 // the read shape the dashboard and the meter aggregator rely on. The
 // per-minute grain is internal; consumers see the rolled-up row.
@@ -4230,6 +4274,15 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 		})
 	}
 	return out, nil
+}
+
+// UsageDaily mirrors pgstore.UsageDaily. The MemStore does not maintain
+// the rollup table — usage_daily is a cron-populated rollup, and the
+// in-process unit-test surface for the rollup loop uses stubExecer
+// instead. Returns nil + nil so handlers do not crash on dev/host
+// builds where Postgres is not wired.
+func (m *MemStore) UsageDaily(_ context.Context, _ string, _ time.Time) ([]DailyUsage, error) {
+	return nil, nil
 }
 
 // HasStripePushHour + RecordStripePushHour implement the pkg/billing/stripe

@@ -54,6 +54,13 @@ type Config struct {
 	// is single-goroutine today; a future meterd replica would
 	// parallelise via the alert_deliveries.idempotency_key UNIQUE.
 	AlertEvalInterval time.Duration
+	// RollupInterval (ADR-048) is how often meterd rolls the
+	// minute-grain usage_minutes rows into usage_daily (PK
+	// account_id, app_id, day). Zero means the production default
+	// (5 min). The rollup is idempotent — re-running on the same
+	// window adds onto the prior partial sum, never overwrites —
+	// so a missed tick is safe; the next tick covers the gap.
+	RollupInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -81,5 +88,8 @@ func (c *Config) Defaults() {
 	}
 	if c.AlertEvalInterval == 0 {
 		c.AlertEvalInterval = 60 * time.Second
+	}
+	if c.RollupInterval == 0 {
+		c.RollupInterval = 5 * time.Minute
 	}
 }

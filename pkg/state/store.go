@@ -1349,7 +1349,21 @@ type Store interface {
 	// usage_minutes grain and mixing them would lose the
 	// build-id idempotency that webhook redelivery requires.
 	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error
+	// AppendBuilderUsage writes one builder-time usage row per
+	// terminal build (succeeded or failed — the box burned cycles
+	// either way; informational only per ADR-048 §4). Idempotent
+	// on (build_id): the first write wins on builder_seconds /
+	// builder_kind, a redelivered webhook is a no-op. The
+	// per-build grain lives in a separate `builder_usage` table
+	// (PK build_id) and is rolled up into usage_daily via the
+	// meterd rollup cron.
+	AppendBuilderUsage(ctx context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
+	// UsageDaily returns the per-(account, app, day) rollup rows
+	// (migrations/00067_extend_metering_telemetry.sql::usage_daily).
+	// day is a UTC midnight time; the returned rows cover the
+	// single day. Empty when no rollup has fired yet. ADR-048 §5.
+	UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
 	// first, ordered by (period_end DESC, id DESC) for deterministic
 	// pagination. month is optional: when non-nil, the result is

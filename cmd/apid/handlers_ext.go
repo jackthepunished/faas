@@ -981,6 +981,13 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 			// PR-2; both fields are 0 until then.
 			TXBytes:    u.TXBytes,
 			NetTxBytes: u.NetTxBytes,
+			// ADR-048: ingress + cold-boot transition
+			// count. Informational only — not billed.
+			// Wire regen (PR-A commit #2 follow-up)
+			// gates the live data path; today both stay
+			// 0 from the meterd sampler.
+			NetRxBytes:    u.NetRxBytes,
+			ColdBootCount: u.ColdBootCount,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -1627,10 +1634,12 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, api.ErrCapacity("could not load usage"))
 		return
 	}
-	var mbSec, cpuUsec int64
+	var mbSec, cpuUsec, netRxBytes, coldBoots int64
 	for _, u := range rows {
 		mbSec += u.MBSeconds
 		cpuUsec += u.CPUUsec
+		netRxBytes += u.NetRxBytes
+		coldBoots += u.ColdBootCount
 	}
 	usedGB := float64(mbSec) / 3_600_000.0
 	// usedCPUHours is the per-month CPU-hours — informational only
@@ -1658,7 +1667,57 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 		OverageGBHours:  overage,
 		OverageCents:    overageCents,
 		UsedCPUHours:    usedCPUHours,
+		// ADR-048: ingress Σ + cold-boot Σ across every
+		// app on this account for the month. Both
+		// informational, not billed.
+		UsedIngressGB: float64(netRxBytes) / (1024 * 1024 * 1024),
+		ColdBootTotal: coldBoots,
 	})
+}
+
+// usageDaily serves GET /v1/usage/daily?day=YYYY-MM-DD — the
+// per-app rollup row the meterd rollup loop has populated into
+// usage_daily (ADR-048 §5, migration 00067). Distinct from
+// usageSummary's per-month SUM: this is a single-day read for the
+// dashboard hot path. All numeric fields are informational per ADR-048.
+//
+// day is required; without it we 400 to keep the dashboard
+// unambiguously anchored. A future ?month= query can layer on
+// top if needed.
+func (s *server) usageDaily(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	dayStr := r.URL.Query().Get("day")
+	if dayStr == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing day", "expected ?day=YYYY-MM-DD"))
+		return
+	}
+	day, err := time.Parse("2006-01-02", dayStr)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad day", "expected YYYY-MM-DD"))
+		return
+	}
+	rows, err := s.store.UsageDaily(ctx(r), acct.ID, day)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not load daily usage"))
+		return
+	}
+	resp := api.DailyUsageListResponse{Items: make([]api.DailyUsageResponse, 0, len(rows))}
+	for _, u := range rows {
+		resp.Items = append(resp.Items, api.DailyUsageResponse{
+			AppID:          u.AppID,
+			Day:            u.Day.UTC().Format("2006-01-02"),
+			MBSeconds:      u.MBSeconds,
+			Requests:       u.Requests,
+			CPUUsageUsec:   u.CPUUsec,
+			TXBytes:        u.TXBytes,
+			NetTxBytes:     u.NetTxBytes,
+			NetRxBytes:     u.NetRxBytes,
+			ColdBootCount:  u.ColdBootCount,
+			BuilderSeconds: u.BuilderSeconds,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // listInvoices serves GET /v1/invoices — issue #259 invoice history.

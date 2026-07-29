@@ -64,6 +64,8 @@ from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
 from .cron_response import CronResponse
 from .custom_domain_response import CustomDomainResponse
+from .daily_usage_list_response import DailyUsageListResponse
+from .daily_usage_response import DailyUsageResponse
 from .delayed_task_request import DelayedTaskRequest
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
@@ -224,6 +226,8 @@ __all__ = (
     "CreateKeyRequestScopesItem",
     "CronResponse",
     "CustomDomainResponse",
+    "DailyUsageListResponse",
+    "DailyUsageResponse",
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",

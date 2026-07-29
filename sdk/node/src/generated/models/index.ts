@@ -37,6 +37,8 @@ export type { CreateDeploymentRequest } from './CreateDeploymentRequest.js';
 export type { CreateKeyRequest } from './CreateKeyRequest.js';
 export type { CronResponse } from './CronResponse.js';
 export type { CustomDomainResponse } from './CustomDomainResponse.js';
+export type { DailyUsageListResponse } from './DailyUsageListResponse.js';
+export type { DailyUsageResponse } from './DailyUsageResponse.js';
 export type { DelayedTaskRequest } from './DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './DelayedTaskResponse.js';
 export type { DeploymentListResponse } from './DeploymentListResponse.js';

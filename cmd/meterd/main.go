@@ -652,6 +652,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	applyEnvTick("FAAS_DUNNING_INTERVAL", &mc.DunningInterval, deps.getenv, log)
 	applyEnvTick("FAAS_RESIDENCY_INTERVAL", &mc.ResidencyInterval, deps.getenv, log)
 	applyEnvTick("FAAS_ALERT_EVAL_INTERVAL", &mc.AlertEvalInterval, deps.getenv, log)
+	applyEnvTick("FAAS_ROLLUP_INTERVAL", &mc.RollupInterval, deps.getenv, log)
 
 	// Dunning timer: drives the 7-day past_due → suspended and 21-day
 	// suspended → deleted_pending transitions (spec §4.7, §17). Wired
@@ -741,6 +742,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		WithEgress(egress)
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
+
+	// ADR-048 §5: usage_daily rollup goroutine. Free-function
+	// (mirrors pkg/builderd/reaper.go) so the Loop struct's
+	// surface stays focused on its existing 6 timer ticks.
+	// The pgxpool.Pool satisfies the meter.execer contract
+	// (Exec(ctx, sql, args...) → (rows int64, err error)).
+	go meter.RollupLoop(ctx, poolAdapter{pool}, mc.RollupInterval, log)
 
 	// Metrics + healthz listener. Mirrors cmd/schedd/main.go:143-158 —
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
@@ -879,4 +887,18 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 		Log:        log,
 		Ops:        ops,
 	})
+}
+
+// poolAdapter adapts *pgxpool.Pool to the meter.execer contract
+// (Exec returns (rows int64, err error) instead of
+// pgconn.CommandTag). Defined here so cmd/meterd/main.go wires the
+// real pool without pkg/meter importing pgxpool.
+type poolAdapter struct{ p *pgxpool.Pool }
+
+func (a poolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, error) {
+	tag, err := a.p.Exec(ctx, sql, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

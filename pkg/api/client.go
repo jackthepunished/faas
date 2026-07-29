@@ -1066,6 +1066,15 @@ func (c *Client) UsageSummary(ctx context.Context, month string) (UsageSummaryRe
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// UsageDaily returns the per-(app, day) rollup rows the meterd rollup
+// loop populated into usage_daily (ADR-048 §5). day is "YYYY-MM-DD"
+// and is required; the server 400s on empty so callers don't get
+// ambiguous "current day" semantics from the SDK side.
+func (c *Client) UsageDaily(ctx context.Context, day string) (DailyUsageListResponse, error) {
+	var out DailyUsageListResponse
+	return out, c.do(ctx, "GET", "/v1/usage/daily?day="+day, nil, &out)
+}
+
 // ListDeployments returns a single page of deployments with a
 // "next_before" cursor (RFC3339Nano). Use ListDeploymentsAll (added in
 // commit 2) to walk every page automatically.

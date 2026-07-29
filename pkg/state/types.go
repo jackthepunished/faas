@@ -886,6 +886,25 @@ type Usage struct {
 	ColdBootCount int64
 }
 
+// DailyUsage is the per-(account, app, day) row read by
+// Store.UsageDaily (ADR-048 §5). Mirrors the columns declared
+// in migrations/00067_extend_metering_telemetry.sql::usage_daily.
+// Day is a UTC midnight date; PK is (account_id, app_id, day).
+// Informational — not billed.
+type DailyUsage struct {
+	AccountID      string
+	AppID          string
+	Day            time.Time
+	MBSeconds      int64
+	Requests       int64
+	CPUUsec        int64
+	TXBytes        int64
+	NetTxBytes     int64
+	NetRxBytes     int64
+	ColdBootCount  int64
+	BuilderSeconds int64
+}
+
 // Invoice is one persisted invoice from a billing provider (issue #259,
 // BILLING: plan comparison + invoice history). Rows arrive via the
 // webhook ingestion path (PR B); the read API and dashboard read this

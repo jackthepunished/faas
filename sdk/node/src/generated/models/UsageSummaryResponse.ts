@@ -22,5 +22,13 @@ export type UsageSummaryResponse = {
    * Per-month egress GB (informational; not billed). Σ tx_bytes + net_tx_bytes across all apps, converted to GB. ADR-046.
    */
   used_egress_gb?: number;
+  /**
+   * Per-month ingress GB (informational; not billed). Σ net_rx_bytes across all apps, converted to GB. ADR-048. Mirror of `used_egress_gb` for the inbound direction.
+   */
+  used_ingress_gb?: number;
+  /**
+   * Per-month sum of WAKE_RESTORE→WAKE_COLD_BOOT transitions across every app on the account (informational; not billed). ADR-048.
+   */
+  cold_boots?: number;
 };
 

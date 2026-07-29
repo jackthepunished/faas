@@ -4587,6 +4587,28 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	return err
 }
 
+// AppendBuilderUsage records one builder-time usage row at build
+// completion (ADR-048 §4). Idempotent on (build_id): a redelivered
+// meterd / webhook / builderd restart sees ON CONFLICT DO NOTHING
+// and the row stays as the first write. The per-build grain lives
+// in a separate `builder_usage` table (PK build_id) created by
+// migrations/00067_extend_metering_telemetry.sql so it can be rolled
+// up into usage_daily.builder_seconds via the meterd rollup cron.
+//
+// seconds is wall-clock seconds from builds.started_at to
+// finishedAt — matches the existing builderd histogram
+// (`build_duration_seconds{outcome}`). Caller computes
+// finishedAt.Sub(startedAt) before calling; this function does NOT
+// re-read the build row (cheap + race-free).
+func (s *PgStore) AppendBuilderUsage(ctx context.Context, accountID, appID, buildID string, finishedAt time.Time, kind string, seconds int64) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into builder_usage (build_id, account_id, app_id, finished_at, kind, seconds)
+		 values ($1, $2, $3, $4, $5, $6)
+		 on conflict (build_id) do nothing`,
+		buildID, accountID, appID, finishedAt, kind, seconds)
+	return err
+}
+
 func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error) {
 	monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
 	// Compare via date_trunc('month', ...) on the parameter side too.
@@ -5341,6 +5363,43 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 			return nil, err
 		}
 		u.Month = hour
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// UsageDaily returns the per-(account, app, day) rollup rows that the
+// meterd rollup loop (pkg/meter/rollup.go) populated into the
+// usage_daily table (ADR-048 §5, migration 00067). day is a UTC
+// midnight timestamp; only the date portion is used in the predicate
+// so a caller that already normalised to midnight does not have to
+// truncate again.
+//
+// Empty result means either: (a) the requested day is in the future
+// and no rows exist yet, or (b) the rollup loop has not yet fired
+// since the rows were sampled into usage_minutes. Callers should NOT
+// fall back to UsageByHour here — the dashboard wants the rollup row
+// specifically so the cron cadence is observable.
+func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error) {
+	rows, err := s.pool.Query(ctx,
+		`select app_id, day, mb_seconds, requests, cpu_usec,
+		        tx_bytes, net_tx_bytes, net_rx_bytes,
+		        cold_boot_count, builder_seconds
+		   from usage_daily
+		  where account_id = $1
+		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
+		  order by app_id`,
+		accountID, day.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DailyUsage
+	for rows.Next() {
+		u := DailyUsage{AccountID: accountID}
+		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds); err != nil {
+			return nil, err
+		}
 		out = append(out, u)
 	}
 	return out, rows.Err()
