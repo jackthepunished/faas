@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 
 	"github.com/onebox-faas/faas/pkg/netns"
 )
@@ -260,6 +261,42 @@ func NewEgressHTTPClient() *http.Client {
 		DialContext: EgressDialContext(nil),
 	}
 	return &http.Client{Transport: tr}
+}
+
+// NewEgressHTTPClientAllowLoopback is the dev/test-only escape hatch
+// from the §11 egress policy. It builds an HTTP client whose
+// DialContext is the standard net.Dialer (no deny check) so a
+// webhook receiver on 127.0.0.1 can be reached. The companion
+// helper EgressAllowLoopbackFromEnv() gates the env var
+// FAAS_EGRESS_ALLOW_LOOPBACK=1 that callers (pkg/webhookout.NewDispatcher)
+// consult before choosing this client over the production one.
+//
+// DO NOT call this from production code paths. The whole point of
+// the dial-time SSRF guard is that no customer-supplied URL can
+// reach loopback/RFC1918/metadata — this helper bypasses that.
+//
+// Returns nil if the env var is unset so a typo or a missing env
+// passthrough silently falls back to NewEgressHTTPClient (the safe
+// default).
+func NewEgressHTTPClientAllowLoopback() *http.Client {
+	if !EgressAllowLoopbackFromEnv() {
+		return nil
+	}
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{}).DialContext,
+	}
+	return &http.Client{Transport: tr}
+}
+
+// EgressAllowLoopbackFromEnv reports whether the dial-time SSRF
+// guard is opted out via the test-only env var
+// FAAS_EGRESS_ALLOW_LOOPBACK=1. The check is exact-match
+// (no case folding) and tolerates no extra characters so a typo
+// ("=true", "=yes") defaults to "deny loopback" — the safe
+// fallback. The constant lives in pkg/oci so cmd/meterd and
+// pkg/webhookout can both read it without duplicating the env key.
+func EgressAllowLoopbackFromEnv() bool {
+	return os.Getenv("FAAS_EGRESS_ALLOW_LOOPBACK") == "1"
 }
 
 // ipAllowed reports whether ip is in a publicly routable range. It is the

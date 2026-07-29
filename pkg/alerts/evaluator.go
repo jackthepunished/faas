@@ -267,11 +267,32 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 	}
 
 	// Comparison fires. Build the cool-down bucket key.
+	//
+	// The bucket is `last_fired_at / cooldownSeconds` (when the rule
+	// has fired before) or `now / cooldownSeconds` (first-ever fire
+	// — last_fired_at is the zero time). The crucial invariant:
+	// ClaimAlertFire re-stamps `last_fired_at` to `now`, so the
+	// bucket key after a successful fire is `now /
+	// cooldownSeconds`; subsequent ticks within the cooldown window
+	// read the same stamped `last_fired_at` and compute the SAME
+	// bucket key — UNIQUE collides, dedupe holds. Backdating
+	// `last_fired_at` by 2× cooldown (cmd/e2e/meterd_alerts_e2e_test.go
+	// Phase 3) shifts the bucket by exactly 2, landing the next
+	// claim in a fresh key. The +1 from the previous revision is
+	// gone: it was producing a different key on the first vs second
+	// tick because last_fired_at advanced from zero to now in a
+	// single step.
 	cooldownSeconds := int64(rule.CooldownMinutes) * 60
 	if cooldownSeconds <= 0 {
 		cooldownSeconds = 60 // belt + braces; the schema defaults to ≥ 1
 	}
-	bucket := now.Unix() / cooldownSeconds
+	var bucketUnix int64
+	if rule.LastFiredAt.IsZero() {
+		bucketUnix = now.Unix()
+	} else {
+		bucketUnix = rule.LastFiredAt.Unix()
+	}
+	bucket := bucketUnix / cooldownSeconds
 	idempotencyKey := rule.ID + ":" + strconv.FormatInt(bucket, 10)
 
 	// Stamp last_evaluated_at up-front so a successful claim still
@@ -371,6 +392,7 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 		ID:         deliveryID,
 		OccurredAt: now,
 		Rule:       rule.Name,
+		RuleName:   rule.Name,
 		AppID:      rule.AppID, // "" for account-wide rules; customer keys off Payload.metric + threshold
 		Payload:    payloadMap,
 	}
@@ -561,6 +583,7 @@ func compareFloat(observed float64, op state.AlertComparison, threshold float64)
 func buildPayload(rule state.AlertRule, observed float64) ([]byte, map[string]any, error) {
 	m := map[string]any{
 		"rule_id":    rule.ID,
+		"rule_name":  rule.Name,
 		"metric":     string(rule.Metric),
 		"comparison": string(rule.Comparison),
 		"threshold":  rule.Threshold,

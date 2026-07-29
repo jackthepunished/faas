@@ -2678,7 +2678,8 @@ func scanAlertDelivery(row pgx.Row) (AlertDelivery, error) {
 	var lastError *string
 	var deliveredAt *time.Time
 	var payload []byte
-	var attemptCount, lastStatusCode int
+	var attemptCount int
+	var lastStatusCode *int
 	if err := row.Scan(
 		&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
 		&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
@@ -2688,7 +2689,10 @@ func scanAlertDelivery(row pgx.Row) (AlertDelivery, error) {
 	}
 	d.Status = AlertDeliveryStatus(status)
 	d.AttemptCount = attemptCount
-	d.LastStatusCode = lastStatusCode
+	// last_status_code is nullable; mirror the slice-scanner above.
+	if lastStatusCode != nil {
+		d.LastStatusCode = *lastStatusCode
+	}
 	if lastError != nil {
 		d.LastError = *lastError
 	}
@@ -2713,7 +2717,8 @@ func scanAlertDeliveries(rows pgx.Rows) ([]AlertDelivery, error) {
 		var lastError *string
 		var deliveredAt *time.Time
 		var payload []byte
-		var attemptCount, lastStatusCode int
+		var attemptCount int
+		var lastStatusCode *int
 		if err := rows.Scan(
 			&d.ID, &d.RuleID, &d.AccountID, &appID, &d.IdempotencyKey, &payload,
 			&status, &attemptCount, &lastStatusCode, &lastError, &d.ObservedValue,
@@ -2723,7 +2728,14 @@ func scanAlertDeliveries(rows pgx.Rows) ([]AlertDelivery, error) {
 		}
 		d.Status = AlertDeliveryStatus(status)
 		d.AttemptCount = attemptCount
-		d.LastStatusCode = lastStatusCode
+		// last_status_code is nullable in alert_deliveries (a pending
+		// row from ClaimAlertFire hasn't been dispatched yet — no
+		// status code). Mirror lastError/deliveredAt/appID and treat
+		// NULL as 0 on the read side; UpdateAlertDeliveryStatus fills
+		// the column once dispatch lands.
+		if lastStatusCode != nil {
+			d.LastStatusCode = *lastStatusCode
+		}
 		if lastError != nil {
 			d.LastError = *lastError
 		}

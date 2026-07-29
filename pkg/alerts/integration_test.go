@@ -184,6 +184,14 @@ func TestPgStore_DeleteAccount_CascadesAlertRules(t *testing.T) {
 		t.Fatalf("ClaimAlertFire: (%q, %v, %v); want (nonempty, true, nil)", deliveryID, won, err)
 	}
 
+	// Flip the account to deleted_pending first; the unconditional
+	// DeleteAccount sentinel (pgstore.go:6537-6542) requires the
+	// soft-delete state before it'll touch the parent row and let
+	// the FK ON DELETE CASCADE fire on alert_rules /
+	// alert_deliveries.
+	if err := s.MarkAccountDeletionPending(ctx, acct.ID); err != nil {
+		t.Fatalf("MarkAccountDeletionPending: %v", err)
+	}
 	if err := s.DeleteAccount(ctx, acct.ID); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}

@@ -38,7 +38,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -520,7 +519,7 @@ func TestMeterdAlertEvaluator_SSRFBlocked(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if _, err := pool.Exec(ctx,
 			`insert into invocations (id, account_id, app_id, source, state, created_at) values ($1, $2, $3, $4, 'failed', now())`,
-			fmt.Sprintf("ssrf-inv-%s-%d", rule.ID, i), acct.ID, app.ID, "queue"); err != nil {
+			uuid.NewString(), acct.ID, app.ID, "queue"); err != nil {
 			t.Fatalf("seed ssrf invocation %d: %v", i, err)
 		}
 	}
