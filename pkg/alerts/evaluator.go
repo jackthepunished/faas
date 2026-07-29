@@ -28,11 +28,9 @@ package alerts
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +84,12 @@ type Ops interface {
 	AlertEvalSkippedDegradedTotal() (inc func())
 	AlertEvalFiredTotal() (inc func())
 	AlertDeliveryAttemptsTotal(outcome string) (inc func())
+	// SetAlertEvaluatorEnabled stamps the alert-evaluator-enabled
+	// gauge. The Evaluator calls this once at construction (and again
+	// whenever the boot identity changes) so /healthz and the
+	// §12 self-healing alert can tell "evaluator wired?" without
+	// scraping the full metric set.
+	SetAlertEvaluatorEnabled(enabled bool)
 }
 
 // Evaluator wires the dependencies RunOnce needs. The struct is
@@ -135,7 +139,7 @@ func NewEvaluator(o EvaluatorOptions) *Evaluator {
 	if o.Dispatcher == nil {
 		o.Dispatcher = webhookout.NewDispatcher(webhookout.DispatcherOptions{})
 	}
-	return &Evaluator{
+	e := &Evaluator{
 		store:      o.Store,
 		promQL:     o.PromQL,
 		audit:      o.Audit,
@@ -147,6 +151,19 @@ func NewEvaluator(o EvaluatorOptions) *Evaluator {
 		log:        o.Log,
 		ops:        o.Ops,
 	}
+	// Stamp the alert-evaluator-enabled gauge at construction. The
+	// gauge is "wired iff identity is non-nil" — without the host.age
+	// identity, the evaluator can list rules but cannot unseal
+	// webhook secrets, so it is operationally disabled (MED-4). A
+	// future cmd/meterd that can swap the identity mid-process would
+	// call SetAlertEvaluatorEnabled directly; today the boot-time
+	// decision is final. Nil-coerced: unit tests that pass Ops=nil
+	// (no metrics) keep working — the interface already nil-coerces
+	// at the call sites.
+	if e.ops != nil {
+		e.ops.SetAlertEvaluatorEnabled(o.Identity != nil)
+	}
+	return e
 }
 
 // Stats is the per-tick observability summary. Counters in
@@ -265,18 +282,14 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 			"rule", rule.ID, "err", err)
 	}
 
-	// Marshal the webhook envelope FIRST so the dedupe row carries
-	// the same payload we'll hand to the dispatcher. The CTE in
-	// ClaimAlertFire accepts []byte; the dashboard scrape will
-	// payload ->> 'metric' the JSON object directly.
-	payload, err := buildPayload(rule, observed)
+	// Marshal the webhook envelope ONCE so the dedupe row carries
+	// the same payload we'll hand to the dispatcher. ClaimAlertFire
+	// takes the bytes directly; the same bytes are re-decoded later
+	// (webhookout's HTTP body) so we never re-serialise on the
+	// dispatch hot path.
+	payloadBytes, payloadMap, err := buildPayload(rule, observed)
 	if err != nil {
 		e.log.Warn("alerts: marshal payload", "rule", rule.ID, "err", err)
-		return
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		e.log.Warn("alerts: marshal payload bytes", "rule", rule.ID, "err", err)
 		return
 	}
 
@@ -372,7 +385,7 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 		OccurredAt: now,
 		Rule:       rule.Name,
 		AppID:      rule.AppID, // "" for account-wide rules; customer keys off Payload.metric + threshold
-		Payload:    payload,
+		Payload:    payloadMap,
 	}
 
 	// Serialise Dispatch calls. pkg/webhookout.Dispatcher is
@@ -396,6 +409,19 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 const (
 	skipDegraded   = "degraded"
 	skipNoIdentity = "no_identity"
+)
+
+// AlertOutcomeDelivered / AlertOutcomeFailed are the closed-vocab
+// strings the alert-delivery metric labels use (the wire-side
+// AlertDeliveryStatus enum in pkg/state has its own values — see
+// state.AlertDeliveryDelivered — which intentionally differ because
+// the metric label is a one-axis bucket and the row column is a
+// four-state lifecycle). Pinning these as exported constants keeps
+// pkg/alerts and pkg/wire/metrics.go in lockstep; goconst catches
+// drift if a future rename happens in only one place.
+const (
+	AlertOutcomeDelivered = "delivered"
+	AlertOutcomeFailed    = "failed"
 )
 
 // observe returns the metric value for `rule` plus a "fires?"
@@ -429,13 +455,13 @@ func (e *Evaluator) observe(ctx context.Context, rule state.AlertRule) (float64,
 	default:
 		// PromQL-driven metrics.
 		resp, source := appmetrics.Fetch(ctx, e.promQL, e.log, rule.AppID, string(rule.WindowSpec))
-		if !strings.HasPrefix(source, appmetrics.SourceDegradedPrefix[:len(appmetrics.SourceDegradedPrefix)-1]) && source != appmetrics.SourcePrometheus {
+		if !appmetrics.IsDegradedSource(source) && source != appmetrics.SourcePrometheus {
 			// Defensive: any unexpected Source value is treated
 			// as degraded so a future appmetrics source type
 			// can't silently disable evaluation.
 			return 0, false, skipDegraded
 		}
-		if strings.HasPrefix(source, appmetrics.SourceDegradedPrefix[:len(appmetrics.SourceDegradedPrefix)-1]) {
+		if appmetrics.IsDegradedSource(source) {
 			return 0, false, skipDegraded
 		}
 		var observed float64
@@ -538,7 +564,14 @@ func compareFloat(observed float64, op state.AlertComparison, threshold float64)
 // alert_deliveries.payload and sent to the customer webhook. Same
 // shape for the dashboard scrape + the wire — saves a second
 // marshal on the dispatch hot path.
-func buildPayload(rule state.AlertRule, observed float64) (map[string]any, error) {
+//
+// Returns ([]byte, map, error). The bytes are what ClaimAlertFire
+// stores on alert_deliveries.payload (JSONB column); the map is
+// what webhookout.Dispatcher encodes into the HTTP body. By sharing
+// the canonical map across both sides, we guarantee the dashboard
+// scrape and the customer's webhook see the same envelope — one
+// source of truth, one marshal per firing.
+func buildPayload(rule state.AlertRule, observed float64) ([]byte, map[string]any, error) {
 	m := map[string]any{
 		"rule_id":    rule.ID,
 		"metric":     string(rule.Metric),
@@ -551,12 +584,11 @@ func buildPayload(rule state.AlertRule, observed float64) (map[string]any, error
 	if rule.FailureSource != "" {
 		m["failure_source"] = string(rule.FailureSource)
 	}
-	// Round-trip through json.Marshal so the dashboard's payload
-	// ->> 'metric' never sees a non-JSON scalar.
-	if _, err := json.Marshal(m); err != nil {
-		return nil, fmt.Errorf("alerts: marshal payload: %w", err)
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, nil, fmt.Errorf("alerts: marshal payload: %w", err)
 	}
-	return m, nil
+	return b, m, nil
 }
 
 // recordResult closes the loop: UpdateAlertDeliveryStatus stamps the
@@ -572,13 +604,13 @@ func (e *Evaluator) recordResult(ctx context.Context, rule state.AlertRule, deli
 		status = state.AlertDeliveryDelivered
 		stats.Delivered++
 		if e.ops != nil {
-			e.ops.AlertDeliveryAttemptsTotal("delivered")()
+			e.ops.AlertDeliveryAttemptsTotal(AlertOutcomeDelivered)()
 		}
 		deliveredAt = &now
 	} else {
 		stats.Failed++
 		if e.ops != nil {
-			e.ops.AlertDeliveryAttemptsTotal("failed")()
+			e.ops.AlertDeliveryAttemptsTotal(AlertOutcomeFailed)()
 		}
 		if result.Err != nil {
 			lastErr = result.Err.Error()
@@ -627,6 +659,3 @@ func (e *Evaluator) recordFailure(ctx context.Context, rule state.AlertRule, del
 		})
 	}
 }
-
-// compile-time guard: errors.As for any wrapped error.
-var _ = errors.Is

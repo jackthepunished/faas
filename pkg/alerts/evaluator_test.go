@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -106,6 +107,8 @@ type stubOps struct {
 	fired             int
 	deliveredAttempts int
 	failedAttempts    int
+	enabledStamp      bool
+	enabledValue      float64
 }
 
 func (s *stubOps) AlertEvalSkippedDegradedTotal() func() {
@@ -125,13 +128,24 @@ func (s *stubOps) AlertEvalFiredTotal() func() {
 func (s *stubOps) AlertDeliveryAttemptsTotal(outcome string) func() {
 	s.mu.Lock()
 	switch outcome {
-	case "delivered":
+	case alerts.AlertOutcomeDelivered:
 		s.deliveredAttempts++
-	case "failed":
+	case alerts.AlertOutcomeFailed:
 		s.failedAttempts++
 	}
 	s.mu.Unlock()
 	return func() {}
+}
+
+func (s *stubOps) SetAlertEvaluatorEnabled(enabled bool) {
+	s.mu.Lock()
+	s.enabledStamp = true
+	if enabled {
+		s.enabledValue = 1
+	} else {
+		s.enabledValue = 0
+	}
+	s.mu.Unlock()
 }
 
 // discardLog returns a logger that drops everything. Mirrors the
@@ -508,5 +522,191 @@ func TestEvaluator_FailedInvocations(t *testing.T) {
 	}
 	if dispatch.callCount() != 1 {
 		t.Errorf("dispatch calls = %d; want 1", dispatch.callCount())
+	}
+}
+
+// TestEvaluator_NamespaceMismatch — webhook_secret sealed under a
+// foreign secretbox namespace ("other") is rejected before the
+// dispatcher is invoked. Claim still wins (the row exists), but
+// dispatch is skipped, the delivery row is recorded with status=
+// failed and last_error carrying the namespace tag, and no metric
+// delivery counter is incremented. The Pinning-via-namespace is the
+// load-bearing cross-PR gap closer that stops a stolen-alert_rule
+// blob (sealed for a different app) from being signed and dispatched.
+func TestEvaluator_NamespaceMismatch(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(), "ns-mismatch@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "ns-mismatch-app", Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 1, IdleTimeoutS: 30,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	ident, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("GenerateX25519Identity: %v", err)
+	}
+	// Seal under "other" namespace — the open-side check (AlertSecretNamespace)
+	// must reject and bail.
+	plaintext := []byte("super-secret-shared-key")
+	foreignSealed, err := secretbox.SealBytes(ident.Recipient(), "other", plaintext, 256)
+	if err != nil {
+		t.Fatalf("SealBytes (other): %v", err)
+	}
+	rule, err := store.CreateAlertRule(context.Background(), state.AlertRule{
+		AccountID:           acct.ID,
+		AppID:               app.ID,
+		Name:                "ns-mismatch",
+		Enabled:             true,
+		Metric:              state.AlertMetricErrorRate,
+		Comparison:          state.AlertGt,
+		Threshold:           5,
+		WindowSpec:          state.AlertWindow5m,
+		WebhookURL:          "https://example.com/hook",
+		WebhookSecretSealed: foreignSealed,
+		CooldownMinutes:     30,
+	})
+	if err != nil {
+		t.Fatalf("CreateAlertRule: %v", err)
+	}
+	dispatch := &recordingDispatcher{result: webhookout.Result{StatusCode: 200, Attempts: 1}}
+	ev, ops := makeEvaluator(t, store, &stubPromQL{value: 10}, ident, dispatch)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// Claim still ran (the row is what fails the dedupe bucket); but
+	// dispatch never fires and the delivery lands as failed.
+	if dispatch.callCount() != 0 {
+		t.Errorf("dispatch calls = %d; want 0 (namespace mismatch bails before Dispatch)", dispatch.callCount())
+	}
+	if stats.Fired != 1 {
+		t.Errorf("stats.Fired = %d; want 1 (claim won)", stats.Fired)
+	}
+	// Note: stats.Failed is only incremented on dispatch-side
+	// failures (the metric counter shape is "delivery attempts").
+	// Pre-dispatch failures (namespace mismatch, secret-open error)
+	// land via recordFailure → UpdateAlertDeliveryStatus + audit
+	// alert.failed, NOT stats.Failed. The below assertions cover
+	// the DB-row shape and audit shape; stats.Failed stays 0.
+	if stats.Failed != 0 {
+		t.Errorf("stats.Failed = %d; want 0 (pre-dispatch failure path does not increment the dispatch metric)", stats.Failed)
+	}
+	if ops.failedAttempts != 0 {
+		t.Errorf("ops.failedAttempts = %d; want 0 (pre-dispatch failure does not increment the dispatch metric)", ops.failedAttempts)
+	}
+	if ops.deliveredAttempts != 0 {
+		t.Errorf("ops.deliveredAttempts = %d; want 0 (no successful dispatch)", ops.deliveredAttempts)
+	}
+
+	deliveries, err := store.ListAlertDeliveriesForRule(context.Background(), rule.ID, 5)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("ListAlertDeliveriesForRule: err=%v count=%d", err, len(deliveries))
+	}
+	if deliveries[0].Status != state.AlertDeliveryFailed {
+		t.Errorf("delivery status = %q; want failed", deliveries[0].Status)
+	}
+	if !strings.Contains(deliveries[0].LastError, "namespace mismatch") {
+		t.Errorf("delivery last_error = %q; want substring 'namespace mismatch'", deliveries[0].LastError)
+	}
+	if !strings.Contains(deliveries[0].LastError, "other") {
+		t.Errorf("delivery last_error = %q; want substring 'other' (the foreign namespace)", deliveries[0].LastError)
+	}
+}
+
+// TestEvaluator_SignerFailure — dispatch returns a 4xx terminal
+// (handshake-style failure that retrying won't fix). The evaluator
+// records the delivery as failed and stamps last_error with the
+// dispatcher's error message. The metric counter increments failed
+// exactly once. A future retry-budget fix would re-classify 4xx as
+// a hard-skip (different from the 5xx transient); today both roll
+// into the failed bucket.
+func TestEvaluator_SignerFailure(t *testing.T) {
+	store := state.NewMemStore()
+	rule, ident, _ := seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
+	dispatch := &recordingDispatcher{result: webhookout.Result{
+		StatusCode: 401,
+		Attempts:   1,
+		Err:        errors.New("webhookout: terminal 401: receiver rejected signature"),
+	}}
+	ev, ops := makeEvaluator(t, store, &stubPromQL{value: 10}, ident, dispatch)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Fired != 1 || stats.Failed != 1 || stats.Delivered != 0 {
+		t.Errorf("stats = %+v; want Fired=1, Failed=1, Delivered=0", stats)
+	}
+	if ops.failedAttempts != 1 || ops.deliveredAttempts != 0 {
+		t.Errorf("ops = %+v; want failed=1, delivered=0", ops)
+	}
+	deliveries, err := store.ListAlertDeliveriesForRule(context.Background(), rule.ID, 5)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("ListAlertDeliveriesForRule: err=%v count=%d", err, len(deliveries))
+	}
+	if deliveries[0].Status != state.AlertDeliveryFailed {
+		t.Errorf("delivery status = %q; want failed", deliveries[0].Status)
+	}
+	if deliveries[0].LastStatusCode != 401 {
+		t.Errorf("delivery last_status_code = %d; want 401", deliveries[0].LastStatusCode)
+	}
+	if !strings.Contains(deliveries[0].LastError, "401") {
+		t.Errorf("delivery last_error = %q; want substring '401'", deliveries[0].LastError)
+	}
+	if !deliveries[0].DeliveredAt.IsZero() {
+		t.Errorf("delivery delivered_at = %v; want zero on failure", deliveries[0].DeliveredAt)
+	}
+}
+
+// TestEvaluator_PayloadOversized — buildPayload marshals a payload
+// larger than the rule's payload-size envelope. The dispatcher
+// surfaces a Result with the size-violation error and the evaluator
+// records the failure. (Synthetic oversized payload is injected by
+// overriding the metric field to carry an extra-large observation;
+// the wire format stays identical — observed floats are normalised
+// to JSON anyway. This test exists so the gauge-side future alert
+// `alertPayloadSizeHigh` has a stable regression case once the
+// payload-size histogram lands.)
+func TestEvaluator_PayloadOversized(t *testing.T) {
+	store := state.NewMemStore()
+	rule, ident, _ := seedRule(t, store, state.AlertMetricErrorRate, state.AlertGt, 5)
+	// Dispatcher returns a Result with a payload-size error. Mirrors
+	// webhookout's future ErrPayloadTooLarge contract: StatusCode=
+	// 413, Err wraps the size violation.
+	dispatch := &recordingDispatcher{result: webhookout.Result{
+		StatusCode: 413,
+		Attempts:   1,
+		Err:        errors.New("webhookout: payload too large: 4096 > 2048"),
+	}}
+	ev, ops := makeEvaluator(t, store, &stubPromQL{value: 1e9}, ident, dispatch)
+
+	stats, err := ev.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Fired != 1 || stats.Failed != 1 {
+		t.Errorf("stats = %+v; want Fired=1, Failed=1", stats)
+	}
+	if ops.failedAttempts != 1 {
+		t.Errorf("ops.failedAttempts = %d; want 1", ops.failedAttempts)
+	}
+	deliveries, err := store.ListAlertDeliveriesForRule(context.Background(), rule.ID, 5)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("ListAlertDeliveriesForRule: err=%v count=%d", err, len(deliveries))
+	}
+	if deliveries[0].Status != state.AlertDeliveryFailed {
+		t.Errorf("delivery status = %q; want failed", deliveries[0].Status)
+	}
+	if deliveries[0].LastStatusCode != 413 {
+		t.Errorf("delivery last_status_code = %d; want 413", deliveries[0].LastStatusCode)
+	}
+	if !strings.Contains(deliveries[0].LastError, "payload too large") {
+		t.Errorf("delivery last_error = %q; want substring 'payload too large'", deliveries[0].LastError)
 	}
 }

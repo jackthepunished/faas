@@ -202,6 +202,24 @@ type OpsMetrics struct {
 	// audit events table is the per-customer detail; this is the
 	// fleet-wide counter for the §12 dashboard).
 	alertDeliveryAttemptsTotal *prometheus.CounterVec
+	// alertEvaluatorEnabled — operator-facing gauge scraped by
+	// /healthz and the dashboard's alert-evaluation-health panel.
+	// 1 when the Evaluator tick is wired and running on the current
+	// meterd process; 0 when it isn't (Prometheus not configured,
+	// FAAS_HOST_AGE_IDENTITY_PATH empty, meterd's caller skipped the
+	// loop, etc). Unlabelled — the gauge is a fleet-level status
+	// signal, not a per-rule status. Pair with
+	// alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the
+	// operator's "is meterd actually evaluating rules?" view.
+	alertEvaluatorEnabled prometheus.Gauge
+	// alertEvaluatorMu + alertEvaluatorEnabledValue shadow the gauge
+	// so AlertEvaluatorEnabled() can return a bool without scraping
+	// /metrics or relying on a non-existent prometheus.Gauge.Value()
+	// accessor (the interface exposes only Set/Inc/Dec/Add/Sub/Write).
+	// Lock contention is non-issue: the gauge is stamped at boot and
+	// potentially at identity-rotation time, not per-tick.
+	alertEvaluatorMu           sync.Mutex
+	alertEvaluatorEnabledValue bool
 	// ipLabels: the bounded admission set shared by ip-labelled
 	// metrics (failedLoginTotal today). See accountLabelSet docs
 	// for the same fixed-capacity, non-evicting contract.
@@ -676,6 +694,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"delivered", "failed"} {
 		alertDeliveryAttemptsTotal.WithLabelValues(outcome)
 	}
+	alertEvaluatorEnabled := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_alert_evaluator_enabled",
+		Help: "1 when the pkg/alerts.Evaluator tick is wired and running on this meterd process; 0 when it isn't (Prometheus not configured, FAAS_HOST_AGE_IDENTITY_PATH empty, no host.age on disk, or meterd's caller skipped the loop). Unlabelled. Pair with alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the dashboard's alert-evaluation-health panel; alert rule 'alertEvalDisabled' queries this gauge for the §12 self-healing alert.",
+	})
+	// Initialise to 0 so /healthz reports "evaluator disabled" from
+	// boot until cmd/meterd explicitly enables it — the absence of a
+	// gauge series would otherwise look like "never scraped", which
+	// Prometheus treats as a missing time series rather than zero.
+	alertEvaluatorEnabled.Set(0)
 	imagedOCIPull := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_oci_pull_duration_seconds",
 		Help: "Latency of imaged's OCI registry pulls (manifest, config, blob, above-base), in seconds. Sized to api.OCIPullTimeoutSeconds (60 s).",
@@ -1070,6 +1097,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		alertEvalSkippedDegradedTotal: alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:           alertEvalFiredTotal,
 		alertDeliveryAttemptsTotal:    alertDeliveryAttemptsTotal,
+		alertEvaluatorEnabled:         alertEvaluatorEnabled,
 		ipLabels:                      newIPLabelSet(maxIPLabelValues),
 		topTenantRPS:                  topTenantRPS,
 		topAccounts:                   newTopAccountSet(topAccountSetCap),
@@ -1900,6 +1928,43 @@ func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
 	}
 	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
 	return func() {}
+}
+
+// SetAlertEvaluatorEnabled stamps the alert-evaluator-enabled gauge.
+// cmd/meterd calls this once at boot (1 when the Evaluator tick is
+// wired and 0 when the boot decision disabled it) and the gauge is
+// scraped by /healthz plus the §12 self-healing alert
+// alertEvalDisabled. Safe on a nil receiver.
+func (m *OpsMetrics) SetAlertEvaluatorEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	if enabled {
+		m.alertEvaluatorEnabled.Set(1)
+	} else {
+		m.alertEvaluatorEnabled.Set(0)
+	}
+	m.alertEvaluatorMu.Lock()
+	m.alertEvaluatorEnabledValue = enabled
+	m.alertEvaluatorMu.Unlock()
+}
+
+// AlertEvaluatorEnabled returns the current gauge value. Used by
+// the meterd /healthz handler so a curl from the operator can tell
+// "evaluator wired?" without scraping /metrics. Returns false on a
+// nil receiver.
+//
+// Note: prometheus.Gauge has no Value() reader (its surface is
+// Set/Inc/Dec/Add/Sub/Write); this method tracks the same state in
+// a shadow bool updated under a tiny mutex so the /healthz handler
+// can answer "is the evaluator wired?" without scraping /metrics.
+func (m *OpsMetrics) AlertEvaluatorEnabled() bool {
+	if m == nil {
+		return false
+	}
+	m.alertEvaluatorMu.Lock()
+	defer m.alertEvaluatorMu.Unlock()
+	return m.alertEvaluatorEnabledValue
 }
 
 // ReplaceInstanceStats rewrites the per-{app,node} instance-stats

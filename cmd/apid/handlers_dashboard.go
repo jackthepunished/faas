@@ -352,9 +352,9 @@ func (s *server) fetchDashboardAlerts(ctx context.Context, log *slog.Logger, acc
 			deliveries = nil
 		} else {
 			// Truncate LastError at the store boundary so the
-			// template is a pure renderer. The constant lives in
-			// pkg/dashboard (FormatAlertError) and is used both
-			// here and in pkg/dashboard/dashboard_test.go.
+			// template is a pure renderer. The helper lives in
+			// pkg/dashboard and is also exercised by
+			// pkg/dashboard/dashboard_test.go.
 			for i := range deliveries {
 				if deliveries[i].LastError != "" {
 					deliveries[i].LastError = dashboard.FormatAlertError(deliveries[i].LastError)

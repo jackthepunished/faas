@@ -195,7 +195,10 @@ const alertDeliveryErrorLimit = 200
 
 // FormatAlertError trims LastError to alertDeliveryErrorLimit bytes.
 // The handler applies this before handing to the template; the
-// helper is exported so cmd/e2e can share the rule.
+// helper is exported because cmd/apid/handlers_dashboard.go is
+// outside pkg/dashboard and needs to reach it. Kept as a thin
+// formatter rather than a method on AlertDelivery so the truncation
+// policy is testable in isolation (pkg/dashboard/dashboard_test.go).
 func FormatAlertError(s string) string {
 	if len(s) <= alertDeliveryErrorLimit {
 		return s
@@ -203,14 +206,12 @@ func FormatAlertError(s string) string {
 	return s[:alertDeliveryErrorLimit-1] + "…"
 }
 
-// RelativeTime labels a timestamp with a coarse "Ns ago / Nm ago /
-// Nh ago / just now" string suitable for the dashboard's "Last fired"
-// column. Negative diffs (clock skew) render as "just now" rather
-// than "<future>".
-//
-// Exported so cmd/e2e and unit tests can pin the same vocabulary the
-// dashboard renders — operators expect what they see on the page to
-// match what they see in the e2e logs.
+// RelativeTime labels a timestamp with a coarse "just now / Nm ago /
+// Nh ago" string suitable for the dashboard's "Last fired" column.
+// Negative diffs (clock skew) render as "just now" rather than
+// "<future>". Exported for the same reason as FormatAlertError;
+// cmd/apid/handlers_dashboard.go applies it on the data-loader side
+// before the template renders.
 func RelativeTime(t time.Time, now time.Time) string {
 	if t.IsZero() {
 		return "—"

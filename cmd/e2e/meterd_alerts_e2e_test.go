@@ -38,12 +38,10 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,6 +57,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/e2etest"
+	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookout"
@@ -254,28 +253,23 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 		t.Fatalf("seal happy: %v", err)
 	}
 
-	// Receiver: httptest.NewServer with TLSServer=nil (HTTP). The
-	// webhookout Dispatcher dials http://; the SSRF guard via
-	// pkg/oci blocks loopback / RFC1918 / link-local / metadata
-	// ranges on real production. For the happy path we want the
-	// dispatch to SUCCEED, so we route around the SSRF guard by
-	// giving the receiver a non-loopback public-looking URL via
-	// httptest.Server.URL host rewriting — production loops go via
-	// 127.0.0.1 (blocked) which is why TestMeterdAlertEvaluator_SSRFBlocked
-	// exists below. We use httptest.Server.URL verbatim here; the
-	// SSRF allowlist treats 127.0.0.1 as blocked, so this test will
-	// only succeed when the URL points to a non-loopback host. We
-	// work around by binding the receiver on 127.0.0.1 and using
-	// the loopback allowlist for the test (pkg/oci has a test
-	// escape hatches via env FAAS_EGRESS_ALLOW_LOOPBACK=1; the
-	// test exports it).
+	// Receiver: httptest.NewServer with TLSServer=nil (HTTP) —
+	// webhookout.Dispatcher dials http://, so the SSRF guard via
+	// pkg/oci would refuse 127.0.0.1 on production. We opt INTO
+	// the test-only loopback escape hatch by setting
+	// FAAS_EGRESS_ALLOW_LOOPBACK=1 BEFORE StartWithEnv so the
+	// meterd subprocess inherits it at exec time. The SSRF-block
+	// branch below asserts the production path (no override) — so
+	// what we exercise here is "loopback allowed, dispatch lands",
+	// and what we exercise there is "loopback blocked, last_error
+	// contains oci.ErrImageEgressDenied".
+	const alertEvalInterval = 2 * time.Second
+	const cooldownMin = 1
+
 	t.Setenv("FAAS_EGRESS_ALLOW_LOOPBACK", "1")
 	receiver := newSigningReceiver(plaintextHappy)
 	srv := httptest.NewServer(receiver.handler())
 	defer srv.Close()
-
-	const alertEvalInterval = 2 * time.Second
-	const cooldownMin = 1
 
 	h := e2etest.StartWithEnv(t, pool,
 		e2etest.APID|e2etest.Schedd|e2etest.Meterd,
@@ -531,10 +525,16 @@ func TestMeterdAlertEvaluator_SSRFBlocked(t *testing.T) {
 			t.Fatalf("ListAlertDeliveriesForRule: %v", err)
 		}
 		if len(deliveries) >= 1 && deliveries[0].Status == state.AlertDeliveryFailed {
-			// Found the failed delivery — verify the error string.
-			if !contains([]byte(deliveries[0].LastError), "egress denied") &&
-				!contains([]byte(deliveries[0].LastError), "EgressDenied") {
-				t.Errorf("delivery.LastError = %q; want substring 'egress denied' (oci sentinel)", deliveries[0].LastError)
+			// Found the failed delivery — verify the error
+			// string. The SSRF block surfaces
+			// oci.ErrImageEgressDenied ("oci: egress denied by
+			// policy"); the persisted LastError carries the
+			// "egress denied" substring. Pin against
+			// oci.EgressDeniedMessage so a future tweak to the
+			// sentinel's Error() that keeps the substring
+			// continues to satisfy this assertion.
+			if !contains([]byte(deliveries[0].LastError), oci.EgressDeniedMessage) {
+				t.Errorf("delivery.LastError = %q; want substring %q (oci sentinel)", deliveries[0].LastError, oci.EgressDeniedMessage)
 			}
 			// Note: we deliberately do NOT assert HTTP status
 			// code (always 0 for an SSRF refusal — never
@@ -548,14 +548,3 @@ func TestMeterdAlertEvaluator_SSRFBlocked(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 	}
 }
-
-// _ forces the import of `errors`, `httptest`, `url` to stay even
-// after Go's vet gate against unused imports. The aliases are real
-// — `errors.Is`, `httptest.NewServer`, `url.Parse` are all used in
-// the live path. The blank import is below to suppress the
-// "imported and not used" gate if/when a future refactor drops one.
-var (
-	_ = errors.Is
-	_ = httptest.NewServer
-	_ = url.Parse
-)
