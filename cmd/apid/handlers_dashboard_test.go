@@ -131,9 +131,11 @@ func TestDashboardHandler_PropagatesInboundRequestID(t *testing.T) {
 
 // TestDashboardHandler_AppsList confirms GET /dashboard/apps renders
 // 200 for an authed user, even when there are no apps yet (the
-// "create your first app" copy). Slice 4 wires the page; this is a
-// smoke-level guard against regressions where the dashboardChain
-// silently drops the route.
+// empty-state CTA). Slice 4 wires the page; this is a smoke-level
+// guard against regressions where the dashboardChain silently drops
+// the route. Wave 0 PR-B replaced the old "No apps yet" copy with
+// the §8 contract: one primary `faas deploy` quickstart + a
+// "Bring your own storage" link to the external-storage docs page.
 func TestDashboardHandler_AppsList(t *testing.T) {
 	srv, cookie := newAuthedDashboardServer(t)
 	rec := httptest.NewRecorder()
@@ -148,8 +150,14 @@ func TestDashboardHandler_AppsList(t *testing.T) {
 	if !strings.Contains(body, "Apps") {
 		t.Errorf("body missing apps-list header\n%s", body)
 	}
-	if !strings.Contains(body, "No apps yet") {
-		t.Errorf("body missing empty-state copy\n%s", body)
+	// §8 contract: the empty-state CTA surfaces the deploy quickstart
+	// and the storage docs link. We don't pin "faas apps create" —
+	// that was the old §8 contradiction this PR fixes.
+	if !strings.Contains(body, "faas deploy --template=hello-node") {
+		t.Errorf("body missing deploy quickstart; got:\n%s", body)
+	}
+	if !strings.Contains(body, "https://docs.DOMAIN/storage") {
+		t.Errorf("body missing storage docs URL; got:\n%s", body)
 	}
 }
 

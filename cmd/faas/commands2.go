@@ -249,7 +249,7 @@ func cmdAppsRm(args []string) int {
 // opens the dashboard's repo-picker page (slice 8) where the customer binds
 // the repo + branch; subsequent pushes auto-deploy via the webhook path.
 //
-// `--template NAME` materializes one of the six embedded starter
+// `--template NAME` materializes one of the eleven embedded starter
 // projects (cmd/faas/templates/embed.go) into a tempdir, tars+gzip it,
 // and proceeds down the --tarball path. For the function templates
 // (function-node, function-python) we force --runtime / --handler so
@@ -260,7 +260,7 @@ func cmdDeployTarball(args []string) int {
 	image := fs.String("image", "", "digest-pinned image reference")
 	tarball := fs.String("tarball", "", "path to source archive (tar.gz)")
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
-	templateName := fs.String("template", "", "start from an embedded template (hello-node|hello-python|hello-go|cron-example|function-node|function-python|function-go)")
+	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
