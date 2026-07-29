@@ -48,16 +48,9 @@ func (s *server) renderGoogleAuthRedirect(w http.ResponseWriter, r *http.Request
 	// Half-set configs fail to start at boot (cmd/apid/main.go); the
 	// Disabled case below is the operator-chose-not-to-ship-it path.
 	if !s.oauthConfig.Google.Enabled() {
-		s.log.Warn("google OAuth disabled on this host",
-			"missing_env", "GOOGLE_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
-			"provider", "google")
-		s.ops.ObserveOAuthDisabled(auth.GoogleProviderName)
-		api.WriteProblem(w, api.NewProblem(
-			http.StatusServiceUnavailable,
-			"oauth_provider_unavailable",
-			"OAuth Provider Unavailable",
-			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
-		))
+		s.disabledOAuthResponse(w, auth.GoogleProviderName,
+			"GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET unset",
+			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.")
 		return
 	}
 	clientID := s.oauthConfig.Google.ClientID
@@ -150,16 +143,9 @@ func (s *server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 	// no extra audit is needed on the disabled path because we
 	// have no email yet to hash.
 	if !s.oauthConfig.Google.Enabled() {
-		s.log.Warn("google OAuth disabled on this host",
-			"missing_env", "GOOGLE_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
-			"provider", "google")
-		s.ops.ObserveOAuthDisabled(auth.GoogleProviderName)
-		api.WriteProblem(w, api.NewProblem(
-			http.StatusServiceUnavailable,
-			"oauth_provider_unavailable",
-			"OAuth Provider Unavailable",
-			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
-		))
+		s.disabledOAuthResponse(w, auth.GoogleProviderName,
+			"GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET unset",
+			"Google sign-in is not configured on this host. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in /etc/faas/sealed.env and restart.")
 		return
 	}
 	clientID := s.oauthConfig.Google.ClientID

@@ -226,15 +226,18 @@ func TestGitHubAuthRedirect(t *testing.T) {
 	}
 }
 
-// TestGitHubAuthRedirect_MissingClientID asserts the consent-redirect
-// path is fail-closed when GITHUB_CLIENT_ID/SECRET are unset on this
-// host (issue #419 / ADR-046). 503 oauth_provider_unavailable so
-// operators see the misconfiguration in logs immediately rather than a
-// misleading CSRF flow. Distinct from the legacy 500
-// github_oauth_misconfigured, which is reserved for the
-// defence-in-depth case where a Configured provider somehow read an
-// empty value at request time.
-func TestGitHubAuthRedirect_MissingClientID(t *testing.T) {
+// TestGitHubAuthRedirect_BothEnvUnset asserts the consent-redirect
+// path is fail-closed when both GITHUB_CLIENT_ID and
+// GITHUB_CLIENT_SECRET are unset on this host (issue #419 /
+// ADR-046). 503 oauth_provider_unavailable so operators see the
+// misconfiguration in logs immediately rather than a misleading CSRF
+// flow. Distinct from the legacy 500 github_oauth_misconfigured,
+// which is reserved for the defence-in-depth case where a Configured
+// provider somehow read an empty value at request time. The name
+// reflects the post-#419 shape: "both unset" is what reaches the
+// runtime — half-set (one env var set) refuses to boot, so the
+// runtime never sees it.
+func TestGitHubAuthRedirect_BothEnvUnset(t *testing.T) {
 	h := newGitHubTestServerDisabled(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/auth/github", nil)

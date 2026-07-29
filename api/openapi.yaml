@@ -637,6 +637,15 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            OAuth provider not configured on this host (stale
+            cookie or direct callback hit before operator wired
+            `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`).
+            Surfaces as `oauth_provider_unavailable`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/auth/github:
@@ -740,6 +749,15 @@ paths:
             `github.com/login/oauth/access_token`,
             `api.github.com/user`, or `api.github.com/user/emails`
             unreachable. Surfaces as `github_unreachable`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            OAuth provider not configured on this host (stale
+            cookie or direct callback hit before operator wired
+            `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`).
+            Surfaces as `oauth_provider_unavailable`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

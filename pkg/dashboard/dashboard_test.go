@@ -60,6 +60,116 @@ func TestRender_LoginBody(t *testing.T) {
 	}
 }
 
+// TestRender_LoginBody_GoogleEnabled (issue #419 / ADR-046) — when
+// the boot-resolved auth.SignInConfig reports Google Enabled, the
+// /login surface must render the "Sign in with Google" link. The
+// dashboard hits GET /v1/auth/capabilities to learn this, but the
+// template gates per provider on the AuthCapabilitiesView bools the
+// handler populates from s.oauthConfig.
+func TestRender_LoginBody_GoogleEnabled(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Sign in",
+		Body:  "login",
+		Auth:  &dashboard.AuthCapabilitiesView{GoogleEnabled: true},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), `href="/v1/auth/google"`) {
+		t.Errorf("google link missing\n--- body ---\n%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `href="/v1/auth/github"`) {
+		t.Errorf("github link should not render when only Google is enabled\n--- body ---\n%s", rec.Body.String())
+	}
+}
+
+// TestRender_LoginBody_GitHubEnabled — the GitHub mirror of
+// TestRender_LoginBody_GoogleEnabled above. Both providers
+// independent — the dashboard reads each provider's bool off
+// .Auth.<Name>Enabled, and a one-provider host gates the other
+// off in steady state.
+func TestRender_LoginBody_GitHubEnabled(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Sign in",
+		Body:  "login",
+		Auth:  &dashboard.AuthCapabilitiesView{GitHubEnabled: true},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), `href="/v1/auth/github"`) {
+		t.Errorf("github link missing\n--- body ---\n%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `href="/v1/auth/google"`) {
+		t.Errorf("google link should not render when only GitHub is enabled\n--- body ---\n%s", rec.Body.String())
+	}
+}
+
+// TestRender_LoginBody_NeitherEnabled — the single-box-dev /
+// operator-chose-not-to-ship-OAuth shape. With both providers
+// Disabled, /login must not render either OAuth link — the
+// password-only path stays usable but the dead buttons that lead
+// to 500 *_oauth_misconfigured (the pre-#419 symptom) are gone.
+// Also covers the nil-safety branch: Auth == nil must render
+// nothing, not panic with a nil-pointer deref inside the
+// `{{if .Auth}}…{{end}}` guard.
+func TestRender_LoginBody_NeitherEnabled(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("AuthExplicitlyEmpty", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		page := dashboard.Page{Title: "Sign in", Body: "login"}
+		if err := dashboard.Render(rec, log, "", page); err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, `href="/v1/auth/google"`) {
+			t.Errorf("google link should not render when Auth is zero-value\n--- body ---\n%s", body)
+		}
+		if strings.Contains(body, `href="/v1/auth/github"`) {
+			t.Errorf("github link should not render when Auth is zero-value\n--- body ---\n%s", body)
+		}
+	})
+
+	t.Run("AuthPointerNil", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		page := dashboard.Page{Title: "Sign in", Body: "login", Auth: nil}
+		if err := dashboard.Render(rec, log, "", page); err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, `href="/v1/auth/google"`) {
+			t.Errorf("google link should not render when Auth is nil\n--- body ---\n%s", body)
+		}
+		if strings.Contains(body, `href="/v1/auth/github"`) {
+			t.Errorf("github link should not render when Auth is nil\n--- body ---\n%s", body)
+		}
+	})
+
+	t.Run("BothBoolsFalse", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		page := dashboard.Page{
+			Title: "Sign in",
+			Body:  "login",
+			Auth:  &dashboard.AuthCapabilitiesView{GoogleEnabled: false, GitHubEnabled: false},
+		}
+		if err := dashboard.Render(rec, log, "", page); err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, `href="/v1/auth/google"`) {
+			t.Errorf("google link should not render when both bools are false\n--- body ---\n%s", body)
+		}
+		if strings.Contains(body, `href="/v1/auth/github"`) {
+			t.Errorf("github link should not render when both bools are false\n--- body ---\n%s", body)
+		}
+	})
+}
+
 // TestRender_MissingTemplate confirms an unknown Body returns a 500
 // error from Render rather than silently rendering empty.
 func TestRender_MissingTemplate(t *testing.T) {

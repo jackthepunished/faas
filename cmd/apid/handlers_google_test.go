@@ -61,12 +61,16 @@ func TestGoogleAuthRedirect(t *testing.T) {
 	}
 }
 
-// TestGoogleAuthRedirect_MissingClientID asserts the consent-redirect
-// path is fail-closed when GOOGLE_CLIENT_ID/SECRET are unset on this
-// host (issue #419 / ADR-046). 503 oauth_provider_unavailable so
-// operators see the misconfiguration in logs immediately. Distinct
-// from the legacy 500 google_oauth_misconfigured (defence-in-depth).
-func TestGoogleAuthRedirect_MissingClientID(t *testing.T) {
+// TestGoogleAuthRedirect_BothEnvUnset asserts the consent-redirect
+// path is fail-closed when both GOOGLE_CLIENT_ID and
+// GOOGLE_CLIENT_SECRET are unset on this host (issue #419 /
+// ADR-046). 503 oauth_provider_unavailable so operators see the
+// misconfiguration in logs immediately. Distinct from the legacy
+// 500 google_oauth_misconfigured (defence-in-depth). The name
+// reflects the post-#419 shape: "both unset" is what reaches the
+// runtime — half-set (one env var set) refuses to boot, so the
+// runtime never sees it.
+func TestGoogleAuthRedirect_BothEnvUnset(t *testing.T) {
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// oauthConfig zero-value = both providers Disabled (the issue

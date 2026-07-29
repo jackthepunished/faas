@@ -130,3 +130,35 @@ func TestRenderAuthCapabilities_Mixed(t *testing.T) {
 		t.Errorf("expected GitHub disabled, got %+v", got.Providers.GitHub)
 	}
 }
+
+// TestAuthCapabilitiesRoute_MountedAndAuthed — end-to-end through
+// the full server.handler() mux, exercising the sessionAuth gate on
+// /v1/auth/capabilities. The previous three tests bypass sessionAuth
+// by calling srv.renderAuthCapabilities directly; this one verifies
+// the route is actually mounted under dashboardChain(sessionAuth(...))
+// (cmd/apid/server.go:857) and that an authed dashboard session gets
+// the JSON shape end-to-end. Issue #419 closes the original 500
+// symptom; the wire-shape contract is part of that closure.
+func TestAuthCapabilitiesRoute_MountedAndAuthed(t *testing.T) {
+	h, cookie := newAuthedDashboardServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/capabilities", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authed GET /v1/auth/capabilities: code = %d, want 200\nbody = %s",
+			rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want application/json; charset=utf-8", ct)
+	}
+	var got api.AuthCapabilities
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v (body=%q)", err, rec.Body.String())
+	}
+	if got.Providers.Google.Enabled || got.Providers.GitHub.Enabled {
+		t.Errorf("zero-value SignInConfig must report both providers disabled, got %+v", got)
+	}
+}

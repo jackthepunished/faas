@@ -86,16 +86,9 @@ func (s *server) renderGitHubAuthRedirect(w http.ResponseWriter, r *http.Request
 	// the Disabled case below is the operator-chose-not-to-ship-it
 	// path.
 	if !s.oauthConfig.GitHub.Enabled() {
-		s.log.Warn("github OAuth disabled on this host",
-			"missing_env", "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
-			"provider", "github")
-		s.ops.ObserveOAuthDisabled(auth.GitHubProviderName)
-		api.WriteProblem(w, api.NewProblem(
-			http.StatusServiceUnavailable,
-			"oauth_provider_unavailable",
-			"OAuth Provider Unavailable",
-			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
-		))
+		s.disabledOAuthResponse(w, auth.GitHubProviderName,
+			"GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.")
 		return
 	}
 	clientID := s.oauthConfig.GitHub.ClientID
@@ -182,16 +175,9 @@ func (s *server) handleGitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 	// cookie or direct callback hit slips past the dashboard's
 	// disabled-button gating.
 	if !s.oauthConfig.GitHub.Enabled() {
-		s.log.Warn("github OAuth disabled on this host",
-			"missing_env", "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
-			"provider", "github")
-		s.ops.ObserveOAuthDisabled(auth.GitHubProviderName)
-		api.WriteProblem(w, api.NewProblem(
-			http.StatusServiceUnavailable,
-			"oauth_provider_unavailable",
-			"OAuth Provider Unavailable",
-			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.",
-		))
+		s.disabledOAuthResponse(w, auth.GitHubProviderName,
+			"GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET unset",
+			"GitHub sign-in is not configured on this host. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in /etc/faas/sealed.env and restart.")
 		return
 	}
 	clientID := s.oauthConfig.GitHub.ClientID
