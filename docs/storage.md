@@ -58,7 +58,38 @@ faas secrets set --app <slug> DATABASE_URL='postgres://user:pass@host/db?sslmode
   ever wakes.
 - **Don't** write to database-shaped local paths
   (`/var/lib/postgresql`, `/data`, `/db`). The guest-init advisory
-  (Wave 0 PR-C, ships separately) flags these writes at runtime.
+  (Wave 0 PR-C / ADR-047, shipped) flags these writes at runtime.
+
+## Operational notes
+
+Once the stateless advisory is in (Wave 0 PR-C / ADR-047), every
+write to a state-shaped path emits one `stateless.advisory` audit
+row per debounced 1-second batch. The contract is advisory-only by
+design (no EROFS), so a customer app that *does* try to persist
+state will continue to run — the audit row is the operator's only
+signal that the data will not survive the next park.
+
+- **Querying the audit log:**
+  `faas audit-events --kind-prefix=stateless.advisory` lists
+  recent batches. The dashboard's app-detail page links to the
+  same view at `/dashboard/audit-events?kind_prefix=
+  stateless.advisory&app_id={uuid}`. The HTTP API is
+  `GET /v1/audit-events?kind_prefix=stateless.advisory&limit=50`.
+- **Live SSE:** the `db.NotifyStatelessAdvisory` pg_notify channel
+  fires one summary frame per batch
+  (`{app_id, instance, n, sample_path}`) on
+  `GET /v1/events`. Operators see a frame within ~2s of the
+  guest write. Toggle on the CLI with
+  `faas tail --include-stateless`.
+- **Anonymous rows:** if the app row was deleted between wake and
+  advisory, the row lands with `subject=NULL`. Pass
+  `?include_anonymous=true` on the HTTP query, or
+  `--include-anonymous` on `faas audit-events`, to surface
+  those rows.
+- **Noise:** a noisy app that writes `/data` on every request
+  produces one advisory row per second. ADR-035's "audit rows
+  are observation, not source of truth" already covers the
+  noise; the dashboard UI dedupes repeat rows at `+1 more`.
 
 ## Templates
 

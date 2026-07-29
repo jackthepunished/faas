@@ -2569,6 +2569,16 @@ paths:
           in: query
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
           description: "Max rows to return. Silently capped at 100."
+        - name: include_anonymous
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            Wave 0 PR-C / ADR-047: also surface rows with `subject =
+            NULL`. The defensive case where the customer's app row
+            was deleted between wake and the stateless-advisory
+            audit emit. Default `false` (the customer never sees
+            subject=NULL rows); operators can flip to `true` via
+            `?include_anonymous=true` for post-mortems.
       responses:
         '200':
           description: Newest-first audit events for the caller.

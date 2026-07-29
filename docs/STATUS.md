@@ -572,3 +572,45 @@ sometimes implied they were closed; they aren't.
   `pkg/netns/denylist_external_test.go::TestAllThreeConsumersAgreeOnDenySet`.
 - **#90** — document `/v1/*` as a permanent platform path
   reservation (issue #85 follow-up).
+
+## Wave 0 — stateless-only contract. ✅
+
+G13 ("the platform is stateless-only but nothing encodes it") closed
+across three PRs and an ADR:
+
+- **PR-A (PR #413):** deploy-accept gate. New RFC 7807 code
+  `CodeStatelessOnlyViolation` (422); apid tarball scan rejects
+  `VOLUME` / `mkfs.{ext4,xfs}` / `mount -t ext4/xfs` / top-level
+  `data/`+`db/` before any build slot is consumed;
+  `pkg/imaged::buildImageLayer` consults `pkg/imaged/base.go::
+  StatefulDenyListMatch` against the resolved OCI ref
+  (postgres / redis / mysql / mariadb / mongo / cockroach /
+  cassandra / clickhouse). Both paths feed
+  `pkg/oci::SentinelToCode` → `deployments.error_code`.
+- **PR-B (PR #417):** customer-facing pattern. Four
+  `faas init --template={s3-uploader, slack-bot,
+  rest-api-postgres, cron-worker}` templates plus
+  `docs/storage.md` teaching the managed-service pattern.
+- **PR-C (ADR-047, this PR):** runtime advisory. Guest-init
+  `fanotify` mark on the closed path set (`/data`, `/db`,
+  `/var/lib/postgresql`, etc.) → debounced 1s per
+  `(path, mask-set)` batch → AF_VSOCK DGRAM
+  (`port=1025, msg_type=2`, distinct from
+  `VsockResumePort=1024`) → vmmd gRPC client
+  (`/run/faas/apid.sock`, first vmmd-issued gRPC client) →
+  apid `pkg/audit.Auditor.Emit("stateless.advisory", ...)`.
+  Surfaced via `GET /v1/audit-events?kind_prefix=stateless.advisory`,
+  the new `db.NotifyStatelessAdvisory` SSE channel,
+  `faas audit-events --kind-prefix=stateless.advisory`, and the
+  dashboard `app_detail.html` "Stateless advisories" section.
+  Advisory-only — spec §17 G13 explicitly forbids EROFS for Wave 0.
+  vmmd default-local stays DB-less
+  (`Manager.advisoryClient == nil` short-circuits to a no-op).
+
+The three-ship-blockers contract: PR-A blocks at deploy time,
+PR-B teaches the right pattern, PR-C makes the runtime failure
+visible. Wave 1 follow-ups: EROFS on state-shaped paths (gated
+on PR-C telemetry showing customer misuse), apps_list "warnings
+detected: N" badge (deferred — backend count endpoint not in
+this PR's scope), and vmmd-side `vmmd_node_id` stamp on the
+audit row for traceability (currently `actor='apid'`).

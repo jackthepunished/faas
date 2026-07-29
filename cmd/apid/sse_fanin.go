@@ -47,6 +47,10 @@ var sseChannels = []string{
 	db.NotifyQuotaWarning,
 	db.NotifyBillingPastDue,
 	db.NotifyInvocationDone,
+	// Wave 0 PR-C / ADR-047: stateless-advisory fan-in mirror.
+	// MUST stay in lock-step with cmd/apid/handlers_events.go::
+	// eventsChannels — see the comment there.
+	db.NotifyStatelessAdvisory,
 }
 
 // sseSubscribeFn is the subscription seam sseFanIn depends on.

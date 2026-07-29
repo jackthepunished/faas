@@ -53,6 +53,14 @@ var eventsChannels = []string{
 	db.NotifyQuotaWarning,
 	db.NotifyBillingPastDue,
 	db.NotifyInvocationDone,
+	// Wave 0 PR-C / ADR-047: stateless-advisory frame from
+	// cmd/apid/advisory_receiver.go::ForwardStatelessAdvisory.
+	// Payload is the small summary (app_id, instance, n, sample_path);
+	// the audit row at /v1/audit-events?kind_prefix=stateless.advisory
+	// is the detail surface. eventsFrameForAccount below enforces
+	// account-scoping; consumers can subscribe via `faas tail
+	// --include-stateless` or the dashboard's advisory tab.
+	db.NotifyStatelessAdvisory,
 }
 
 // eventsHandler is the SSE handler. It accepts either a session cookie

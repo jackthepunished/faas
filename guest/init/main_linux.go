@@ -69,6 +69,15 @@ func boot() error {
 		slog.Default().Warn("vsock resume listener unavailable", "err", err)
 	}
 
+	// Wave 0 PR-C / ADR-047: stateless-runtime advisory. FAN_CLASS_NOTIF
+	// on a closed set of state-shaped paths; debounced batches shipped
+	// over AF_VSOCK DGRAM (port=1025, msg_type=2) to the host. Returns
+	// are tolerated — a guest without CONFIG_FANOTIFY=y still boots,
+	// the contract is "no signal" not "won't boot".
+	if err := runStatelessAdvisory(slog.Default()); err != nil {
+		slog.Default().Warn("stateless advisory unavailable", "err", err)
+	}
+
 	mode, buildManifest, err := decideMode(os.DirFS("/"))
 	if err != nil {
 		return err

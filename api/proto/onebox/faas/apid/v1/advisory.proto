@@ -1,0 +1,49 @@
+// Advisory — Wave 0 PR-C / ADR-047. vmmd dials apid on
+// /run/faas/apid.sock to forward fanotify advisories the guest-init
+// stateless_advisory_linux.go emits. apid dispatches to
+// pkg/audit.Auditor.Emit("stateless.advisory", ...).
+//
+// Direction note: vmmd → apid only. apid never dials this service
+// (CLAUDE.md ownership: apid is control-plane, vmmd owns firecracker).
+// The depguard apid-control-plane-only deny list
+// (.golangci.yml lines 50-78) explicitly prevents apid from importing
+// pkg/vmmdgrpc or the vmmd/v1 proto — the new apid/v1 proto is the
+// inverse direction and is allowed.
+
+syntax = "proto3";
+
+package onebox.faas.apid.v1;
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1;apidpb";
+
+service Advisory {
+  // ForwardStatelessAdvisory carries one fanotify batch the guest
+  // emitted. Each call writes one audit row of kind
+  // "stateless.advisory" with subject=apps.account_id resolved from
+  // app_id. ADR-035 best-effort: a failed audit write is logged and
+  // dropped — the advisory is observation, not source of truth.
+  rpc ForwardStatelessAdvisory(ForwardStatelessAdvisoryRequest) returns (ForwardStatelessAdvisoryResponse);
+}
+
+message AdvisoryEvent {
+  string path = 1;
+  // Canonical verb names: "create" | "modify" | "move" | "access" |
+  // "delete" | "other" (matches guest/init::maskNames).
+  repeated string mask = 2;
+  int32 pid = 3;
+  int64 ts_unix_ms = 4;
+}
+
+message ForwardStatelessAdvisoryRequest {
+  // vmmd-assigned instance id (e.g. "i-..."). Stamped on the audit
+  // row for ops correlation.
+  string instance = 1;
+  // Apps row UUID (apps.app_id). apid resolves account_id from this.
+  string app_id = 2;
+  repeated AdvisoryEvent events = 3;
+}
+
+message ForwardStatelessAdvisoryResponse {
+  // Empty for Wave 0; reserved for Wave 1 if apid needs to ask vmmd
+  // to back off (e.g. row budget exceeded).
+}

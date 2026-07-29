@@ -169,6 +169,16 @@ const (
 	// no listener is wired. Add the listener when §11 introduces
 	// the public-listener SSE channel design.
 	NotifyCliAuthCodeActivated = "cli_auth_code_activated"
+	// NotifyStatelessAdvisory {"app_id":uuid, "instance":..., "n":N,
+	//                          "sample_path":"..."}
+	//   Wave 0 PR-C / ADR-047: vmmd → apid → events row →
+	//   pg_notify for the /v1/events SSE consumer. Small summary
+	//   payload (NOT the full batch — the audit row at
+	//   /v1/audit-events?kind_prefix=stateless.advisory is the
+	//   detail surface). Subscriber: cmd/apid/handlers_events.go
+	//   (live dashboard) and pkg/sched/engine.go (optional wake
+	//   correlation, future).
+	NotifyStatelessAdvisory = "stateless_advisory"
 	// NotifyAlertRuleChanged {"rule_id":uuid, "account_id":uuid,
 	//                         "op":"created|updated|deleted|fired"}
 	//   apid → meterd: any rule-change path invalidates the

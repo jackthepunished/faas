@@ -456,6 +456,17 @@ func TestHandleDeployment_PullDigestSentinel_PersistsErrorCode(t *testing.T) {
 			want: api.CodeImageManifestInvalid,
 		},
 		{
+			// Wave 0 PR-A / PR-C: stateless base image lifts to
+			// stateless_only_violation. The base deny-list in
+			// pkg/imaged/base.go returns this sentinel for
+			// postgres/redis/mysql/etc — the deploy path's
+			// error_code column carries it so a customer can
+			// branch on a stable string.
+			name: "stateless base image lifts to stateless_only_violation",
+			err:  fmt.Errorf("base deny-list: %w", oci.ErrStatelessOnlyViolation),
+			want: api.CodeStatelessOnlyViolation,
+		},
+		{
 			name: "non-sentinel error leaves code empty (free-text only)",
 			err:  errors.New("net down"),
 			want: "",

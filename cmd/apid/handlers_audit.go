@@ -43,6 +43,7 @@ package main
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -89,6 +90,15 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 		since = t
 	}
 	prefix := r.URL.Query().Get("kind_prefix")
+	// include_anonymous (Wave 0 PR-C / ADR-047): also surface
+	// events rows with subject=NULL — the defensive case where the
+	// app row was deleted between wake and the stateless-advisory
+	// audit emit. Default false (customer never sees subject=NULL
+	// rows); operators can flip to true via ?include_anonymous=true
+	// for post-mortems. The product call here is "false by default,
+	// ops can flip" — not "false forever" — so the toggle is part
+	// of the public surface from Wave 0.
+	includeAnonymous := r.URL.Query().Get("include_anonymous") == "true"
 	limit := listAuditEventsLimitDefault
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -113,6 +123,20 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrCapacity("could not list audit events"))
 		return
 	}
+	// include_anonymous (Wave 0 PR-C / ADR-047): when set, also pull
+	// subject=NULL rows. PgStore.ListEvents with subject="" returns
+	// subject=NULL rows (the SQL is "WHERE subject IS NULL" not
+	// "WHERE subject = $1") so we can re-use the existing method —
+	// no new store API. Merged in-Go below to keep the dedup window
+	// bounded by listAuditEventsOverRead on the wire side.
+	var anonRows []state.Event
+	if includeAnonymous {
+		anonRows, err = s.store.ListEvents(r.Context(), "", listAuditEventsOverRead)
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not list anonymous audit events"))
+			return
+		}
+	}
 	// Cap the backing array at listAuditEventsLimitMax (the same bound
 	// the request handler applies to ?limit=…) regardless of the
 	// caller-supplied limit value. This keeps the allocation shape
@@ -120,8 +144,17 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request, acct st
 	// limit)` form was flagged by codeql go/allocation-rule because
 	// `limit` is a parsed query-string value the analysis can't bound.
 	// Limit the audit-events list response to listAuditEventsLimitMax rows.
+	merged := make([]state.Event, 0, len(rows)+len(anonRows))
+	merged = append(merged, rows...)
+	merged = append(merged, anonRows...)
+	// Sort merged newest-first so include_anonymous doesn't put the
+	// anonymous tail ahead of the account-scoped head. sort.Slice is
+	// fine here — both halves are bounded by listAuditEventsOverRead.
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].At.After(merged[j].At)
+	})
 	out := make([]api.AuditEventResponse, 0, listAuditEventsLimitMax)
-	for _, e := range rows {
+	for _, e := range merged {
 		if !since.IsZero() && e.At.Before(since) {
 			continue
 		}

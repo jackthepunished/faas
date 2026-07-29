@@ -469,6 +469,172 @@ func TestAuditEvents_ListEndpointReturnsCronFired(t *testing.T) {
 	}
 }
 
+// TestAuditEvents_ListEndpointRespectsStatelessAdvisoryKindPrefix
+// (Wave 0 PR-C / ADR-047) pins the customer surface for the new
+// "stateless.advisory" audit kind. Mints one row directly via
+// AppendEvent (the gRPC receiver path is covered by
+// advisory_receiver_test.go; this one exercises only the apid read
+// surface), then asserts:
+//
+//   - ?kind_prefix=stateless. returns the row with the right
+//     actor=apid (matches advisory_receiver.go's audit.Emit call
+//     site) and the events.data JSON shape (instance, app_id,
+//     events[0].path, events[0].mask).
+//   - Without ?kind_prefix, the row is in the unified history (no
+//     implicit kind filter was added to the list endpoint).
+//   - ?include_anonymous=true surfaces a stateless.advisory row
+//     with subject=NULL (the rare defensive case where the app row
+//     was deleted between wake and advisory).
+//
+// Mirrors TestAuditEvents_ListEndpointReturnsCronFired's shape —
+// same scaffolding (store.AppendEvent seed + GET /v1/audit-events
+// reads), different kind, same dashboard contract.
+func TestAuditEvents_ListEndpointRespectsStatelessAdvisoryKindPrefix(t *testing.T) {
+	e := setup(t, api.PlanPro)
+
+	// Seed an anonymous-row variant (subject=NULL) for the
+	// include_anonymous path. Order matters: account-scoped first,
+	// then anonymous, so a sort.Slice regression surfaces here.
+	accountedPayload, err := json.Marshal(map[string]any{
+		"instance": "i-accounted",
+		"app_id":   "a-accounted",
+		"count":    1,
+		"events": []map[string]any{
+			{"path": "/data/foo", "mask": "create,modify", "pid": 42, "ts_unix_ms": 1700000000000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal accounted payload: %v", err)
+	}
+	if err := e.store.AppendEvent(context.Background(), "apid", "stateless.advisory", &e.acct.ID, accountedPayload); err != nil {
+		t.Fatalf("AppendEvent accounted: %v", err)
+	}
+	anonPayload, err := json.Marshal(map[string]any{
+		"instance": "i-anon",
+		"app_id":   "a-deleted",
+		"count":    1,
+		"events": []map[string]any{
+			{"path": "/data/orphan", "mask": "create", "pid": 99, "ts_unix_ms": 1700000001000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal anon payload: %v", err)
+	}
+	if err := e.store.AppendEvent(context.Background(), "apid", "stateless.advisory", nil, anonPayload); err != nil {
+		t.Fatalf("AppendEvent anon: %v", err)
+	}
+
+	// 1) kind_prefix=stateless. returns ONLY stateless.advisory rows.
+	//    The accounted row is in scope (subject == acct.ID); the
+	//    anonymous row is not (subject=NULL, include_anonymous=false).
+	rec := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=stateless.", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?kind_prefix=stateless.: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var list api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v body=%s", err, rec.Body.String())
+	}
+	if list.Limit != 50 {
+		t.Errorf("Limit = %d, want 50", list.Limit)
+	}
+	// Account-scoped row present, anonymous row absent (default
+	// include_anonymous=false).
+	var accounted *api.AuditEventResponse
+	for i := range list.Events {
+		if list.Events[i].Kind == "stateless.advisory" {
+			if list.Events[i].Subject == "" {
+				continue // anonymous row — must not appear here
+			}
+			accounted = &list.Events[i]
+			break
+		}
+	}
+	if accounted == nil {
+		t.Fatalf("no accounted stateless.advisory row in list response; events=%+v", list.Events)
+	}
+	if accounted.Actor != "apid" {
+		t.Errorf("accounted.Actor = %q, want apid", accounted.Actor)
+	}
+	if accounted.Subject != uuidStringOf(e.acct.ID) {
+		t.Errorf("accounted.Subject = %q, want %s", accounted.Subject, uuidStringOf(e.acct.ID))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(accounted.Data), &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v (data=%q)", err, accounted.Data)
+	}
+	if data["instance"] != "i-accounted" {
+		t.Errorf("Data.instance = %v, want i-accounted", data["instance"])
+	}
+	if data["app_id"] != "a-accounted" {
+		t.Errorf("Data.app_id = %v, want a-accounted", data["app_id"])
+	}
+	eventsList, ok := data["events"].([]any)
+	if !ok || len(eventsList) == 0 {
+		t.Fatalf("Data.events shape = %T (value=%v), want non-empty []any", data["events"], data["events"])
+	}
+	first, _ := eventsList[0].(map[string]any)
+	if first["path"] != "/data/foo" {
+		t.Errorf("Data.events[0].path = %v, want /data/foo", first["path"])
+	}
+	if first["mask"] != "create,modify" {
+		t.Errorf("Data.events[0].mask = %v, want create,modify", first["mask"])
+	}
+
+	// 2) include_anonymous=true surfaces BOTH rows, newest first.
+	//    The two rows have the same At (memstore.AppendEvent uses
+	//    time.Now() and the seeded events land within microseconds);
+	//    sort.Slice is stable on equal keys, so we just assert both
+	//    are present rather than pin a specific order.
+	rec = e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=stateless.&include_anonymous=true", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?include_anonymous=true: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var merged api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &merged); err != nil {
+		t.Fatalf("decode merged: %v", err)
+	}
+	var accountedSeen, anonSeen bool
+	for _, ev := range merged.Events {
+		if ev.Kind != "stateless.advisory" {
+			continue
+		}
+		if ev.Subject == "" {
+			anonSeen = true
+		} else {
+			accountedSeen = true
+		}
+	}
+	if !accountedSeen {
+		t.Errorf("include_anonymous=true missed accounted row; events=%+v", merged.Events)
+	}
+	if !anonSeen {
+		t.Errorf("include_anonymous=true missed anonymous row; events=%+v", merged.Events)
+	}
+
+	// 3) Without a prefix the stateless.advisory row is in the
+	//    unified history — no implicit kind filter was added to
+	//    the list endpoint.
+	rec = e.do(t, http.MethodGet, "/v1/audit-events", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var unified api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &unified); err != nil {
+		t.Fatalf("decode unified: %v", err)
+	}
+	var seen bool
+	for _, ev := range unified.Events {
+		if ev.Kind == "stateless.advisory" {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Errorf("stateless.advisory not in unfiltered list response; events=%+v", unified.Events)
+	}
+}
+
 // TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated drives
 // the full device-code flow (POST /v1/cli-auth/code → claim → POST
 // /v1/cli-auth/exchange) and asserts BOTH audit rows landed:
