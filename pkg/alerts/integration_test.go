@@ -21,6 +21,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -36,6 +37,9 @@ import (
 func TestPgStore_ClaimAlertFire_StampsPayload(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	s := state.NewPgStore(pool)
 
 	acct, err := s.CreateAccount(ctx, "alerts-pg-"+time.Now().Format(time.RFC3339Nano)+"@example.com", api.PlanHobby)
@@ -91,6 +95,9 @@ func TestPgStore_ClaimAlertFire_StampsPayload(t *testing.T) {
 func TestPgStore_ClaimAlertFire_DuplicateBucket(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	s := state.NewPgStore(pool)
 
 	acct, err := s.CreateAccount(ctx, "alerts-pg-dup-"+time.Now().Format(time.RFC3339Nano)+"@example.com", api.PlanHobby)
@@ -140,6 +147,9 @@ func TestPgStore_ClaimAlertFire_DuplicateBucket(t *testing.T) {
 func TestPgStore_DeleteAccount_CascadesAlertRules(t *testing.T) {
 	pool := pgtest.Open(t)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	s := state.NewPgStore(pool)
 
 	acct, err := s.CreateAccount(ctx, "alerts-pg-fk-"+time.Now().Format(time.RFC3339Nano)+"@example.com", api.PlanHobby)
