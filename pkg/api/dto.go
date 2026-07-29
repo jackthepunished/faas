@@ -786,6 +786,19 @@ type StorageUsageListResponse struct {
 	Items []StorageUsageResponse `json:"items"`
 }
 
+// BillingPortalResponse is the wire shape for GET /v1/billing/portal
+// (issue #253). URL is the operator-configured billing portal link —
+// today: FAAS_BILLING_PORTAL_URL with `{account_id}` substituted.
+// Empty URL is a 200 (the request itself succeeded); it is the
+// "absent" sentinel meaning the box has no portal configured and
+// the CLI should print a friendly hint instead of opening the
+// browser to "". The field is omitempty so an unset URL on a Free
+// account does not surface as JSON null in either the dashboard's
+// SSR page or the SDK response.
+type BillingPortalResponse struct {
+	URL string `json:"url,omitempty"`
+}
+
 // APIKeyExportResponse is one row in the export's API key slice.
 // The plaintext key never appears here (and never reappears after
 // the create response, per §4.2). Only the prefix + label + scopes +

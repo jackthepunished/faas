@@ -41,6 +41,7 @@ from .audit_event_response_data import AuditEventResponseData
 from .audit_event_response_severity import AuditEventResponseSeverity
 from .auth_capabilities import AuthCapabilities
 from .auth_providers import AuthProviders
+from .billing_portal_response import BillingPortalResponse
 from .build_export_response import BuildExportResponse
 from .build_provenance_response import BuildProvenanceResponse
 from .change_plan_request import ChangePlanRequest
@@ -206,6 +207,7 @@ __all__ = (
     "AuditEventResponseSeverity",
     "AuthCapabilities",
     "AuthProviders",
+    "BillingPortalResponse",
     "BuildExportResponse",
     "BuildProvenanceResponse",
     "ChangePlanRequest",

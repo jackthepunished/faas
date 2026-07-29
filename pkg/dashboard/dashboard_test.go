@@ -417,3 +417,141 @@ func TestStatelessSlices_Shape(t *testing.T) {
 		}
 	}
 }
+
+// TestRender_Billing_HidesPortalForFree pins the issue #253
+// acceptance #5: a Free-plan account never sees the "Manage
+// billing" section or the "Open Stripe billing portal" link, even
+// if the operator-configured PortalURL is set. This guards against
+// a future template refactor that accidentally moves the {{if
+// .Data.HasPaidPlan}} gate or makes PortalURL conditional on
+// something else.
+func TestRender_Billing_HidesPortalForFree(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Billing",
+		Body:  "billing",
+		Data: dashboard.BillingData{
+			Plan:        "free",
+			RAMMB:       128,
+			Included:    5,
+			AppsCap:     1,
+			AppLayer:    256,
+			IdleSec:     30,
+			HasPaidPlan: false,
+			// Deliberately populated — even with a non-empty
+			// URL, a Free account must not see the link. The
+			// dashboard gates on HasPaidPlan, not on PortalURL.
+			PortalURL: "https://billing.example.com/portal?account=acct_xyz",
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	for _, banned := range []string{
+		"Manage billing",
+		"Open Stripe billing portal",
+		"Last invoice",
+	} {
+		if strings.Contains(body, banned) {
+			t.Errorf("Free-plan body should NOT contain %q\n--- body ---\n%s", banned, body)
+		}
+	}
+	// The plan card + usage section must still render (regression).
+	for _, want := range []string{"Plan: free", "GB-hours used", "Max concurrent instances"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+// TestRender_Billing_PaidPlanShowsPortal pins the issue #253
+// acceptance #2 + #4: a paid-plan account sees the portal link,
+// the last-invoice table, and the current-month usage summary.
+// Pinned substrings match the literal template copy so a future
+// copy edit does not silently drift.
+func TestRender_Billing_PaidPlanShowsPortal(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Billing",
+		Body:  "billing",
+		Data: dashboard.BillingData{
+			Plan:                      "hobby",
+			RAMMB:                     256,
+			Included:                  50,
+			AppsCap:                   5,
+			AppLayer:                  512,
+			IdleSec:                   60,
+			MaxConcurrency:            2,
+			UsedGBHours:               12.5,
+			UsedPct:                   25,
+			UsedEgressGB:              0.42,
+			LastInvoiceDate:           "2026-07-31",
+			LastInvoiceStatus:         "paid",
+			LastInvoiceTotalFormatted: "€12.40",
+			LastInvoiceCurrency:       "EUR",
+			HasPaidPlan:               true,
+			PortalURL:                 "https://billing.example.com/portal?account=acct_abc",
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Plan: hobby",
+		"Max concurrent instances", // new field from limits.MaxConcurrency
+		"GB-hours used",
+		"Egress this month (GB)",
+		"Manage billing",
+		"Open Stripe billing portal",
+		"Last invoice",
+		"2026-07-31",
+		"€12.40",
+		"EUR",
+		`href="https://billing.example.com/portal?account=acct_abc"`,
+		"rel=\"noopener\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// Free-tier fallback copy must NOT appear for a paid account.
+	if strings.Contains(body, "faas plan &lt;plan&gt;") {
+		t.Errorf("paid-plan body should NOT contain Free-tier upgrade hint\n--- body ---\n%s", body)
+	}
+}
+
+// TestRender_Billing_PaidPortalUnset pins the operator-misconfig
+// fallback: a paid account on a box that has FAAS_BILLING_PORTAL_URL
+// unset sees a clear "use the CLI" hint instead of a broken button.
+// The CLI hint is the escape hatch; the dashboard never silently
+// renders an empty link.
+func TestRender_Billing_PaidPortalUnset(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	page := dashboard.Page{
+		Title: "Billing",
+		Body:  "billing",
+		Data: dashboard.BillingData{
+			Plan:        "hobby",
+			HasPaidPlan: true,
+			PortalURL:   "",
+		},
+	}
+	if err := dashboard.Render(rec, log, "", page); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Stripe portal is not configured") {
+		t.Errorf("body missing operator-misconfig fallback\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, "faas billing portal") {
+		t.Errorf("body missing CLI hint\n--- body ---\n%s", body)
+	}
+	if strings.Contains(body, "Open Stripe billing portal") {
+		t.Errorf("body should NOT contain the portal link button when URL is empty\n--- body ---\n%s", body)
+	}
+}

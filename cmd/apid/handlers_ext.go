@@ -1759,6 +1759,26 @@ func (s *server) usageStorage(w http.ResponseWriter, r *http.Request, acct state
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// getBillingPortal serves GET /v1/billing/portal — issue #253. It
+// returns the operator-configured Stripe billing portal URL for the
+// authenticated account. The URL itself does not mutate anything; the
+// customer-facing mutations (card update, cancel, plan change) live
+// inside the Stripe-hosted portal that the URL points to.
+//
+// Auth: standard /v1/* Bearer-or-cookie chain (server.go:703 cluster).
+// We deliberately do NOT require MFA — viewing a portal link is a
+// read; the mutations gated by the portal itself happen after the
+// customer has authenticated to Stripe with 2FA on their side.
+//
+// Empty URL response means the box has FAAS_BILLING_PORTAL_URL unset.
+// We return 200 with `{"url":""}` (omitempty) rather than 404 because
+// the request itself succeeded; the absence is conveyed in the
+// payload, not the status. The CLI branches on the empty string to
+// print a friendly "portal not configured" hint.
+func (s *server) getBillingPortal(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	writeJSON(w, http.StatusOK, api.BillingPortalResponse{URL: s.billingPortalURLFor(acct)})
+}
+
 // listInvoices serves GET /v1/invoices — issue #259 invoice history.
 // Account-scoped: the authenticated principal is the only source of
 // accountID. Pagination is RFC3339Nano cursor (period_end DESC); month

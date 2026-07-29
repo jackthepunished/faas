@@ -460,3 +460,90 @@ func TestChangePlan_NoProvider_StripeDefault(t *testing.T) {
 		t.Errorf("Paddle extensions must not appear on no-provider path: %+v", prob)
 	}
 }
+
+// TestGetBillingPortal is the issue #253 surface pin for
+// GET /v1/billing/portal. The handler is intentionally trivial
+// (one line: writeJSON BillingPortalURL) — this test pins:
+//  1. 200 status (the URL is "absent" sentinel, not 404)
+//  2. account_id substitution on the FAAS_BILLING_PORTAL_URL template
+//  3. Bearer API-key auth works (the dashboard Bearer-or-cookie cluster)
+//  4. empty URL response when WithBillingPortalURL is not called
+//     (operator-misconfig path that the CLI branches on)
+//  5. NO MFA gate: viewing a portal link is a read; mutations happen
+//     inside the Stripe-hosted portal after Stripe-side 2FA. Adding
+//     requireMFA back to the route would break this test.
+func TestGetBillingPortal(t *testing.T) {
+	t.Run("configured", func(t *testing.T) {
+		env, _ := setupChangePlan(t, api.PlanHobby, "si_test")
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/billing/portal", nil)
+		r.Header.Set("Authorization", "Bearer "+env.key)
+		env.h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+		}
+		var resp api.BillingPortalResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		want := "https://billing.example.com/portal?account=" + env.acct.ID
+		if resp.URL != want {
+			t.Errorf("url = %q, want %q", resp.URL, want)
+		}
+		if strings.Contains(resp.URL, "{account_id}") {
+			t.Errorf("url leaked unsubstituted template placeholder: %q", resp.URL)
+		}
+	})
+	t.Run("no_mfa_required", func(t *testing.T) {
+		// Pin the no-MFA contract: a Bearer-key request must return
+		// 200 even when the account has MFA enrolled. Viewing a
+		// portal link is a read; mutations are gated by Stripe 2FA
+		// after the customer lands on the portal. Adding requireMFA
+		// back to the route would flip this to 401 + the MFA-required
+		// problem and fail this test.
+		env, _ := setupChangePlan(t, api.PlanHobby, "si_test")
+		if err := env.store.MarkMFAEnrolled(context.Background(), env.acct.ID); err != nil {
+			t.Fatalf("mark mfa: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/billing/portal", nil)
+		r.Header.Set("Authorization", "Bearer "+env.key)
+		env.h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Errorf("code = %d, want 200 (portal-link read should NOT require MFA)\nbody = %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("unconfigured", func(t *testing.T) {
+		// Fresh server with no WithBillingPortalURL — operator left
+		// FAAS_BILLING_PORTAL_URL unset on the box. The endpoint must
+		// return 200 + empty URL (the CLI prints a friendly hint
+		// instead of opening the browser to "").
+		store := state.NewMemStore()
+		acct, err := store.CreateAccount(context.Background(), "no-portal@example.com", api.PlanHobby)
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		pt, hash, _ := api.GenerateAPIKey()
+		if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
+			t.Fatalf("seed key: %v", err)
+		}
+		srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+			"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, nil, nil,
+			15*24, "")
+		// Deliberately NOT calling srv.WithBillingPortalURL.
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/billing/portal", nil)
+		r.Header.Set("Authorization", "Bearer "+pt)
+		srv.handler().ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+		}
+		var resp api.BillingPortalResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		if resp.URL != "" {
+			t.Errorf("url = %q, want empty when WithBillingPortalURL is not set", resp.URL)
+		}
+	})
+}

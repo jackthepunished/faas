@@ -46,6 +46,7 @@ Commands:
   account      Self-service: export your data, delete account, restore
   usage        Show this month's usage (faas usage [--month YYYY-MM])
   usage summary  Account-wide usage roll-up (faas usage summary [--month YYYY-MM])
+  billing      Manage billing (faas billing portal)
   metrics      Per-app request / latency / cold-boot metrics (faas metrics <slug> [--range 5m])
   logs         Tail app or deployment logs (--follow)
   version      Print the CLI version
@@ -176,6 +177,11 @@ func run(args []string) int {
 		return cmdUsage(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
+	case "billing":
+		// Issue #253: dashboard's "Open Stripe billing portal"
+		// button has a CLI twin. Subcommands live in
+		// commands_billing.go.
+		return cmdBilling(args[1:])
 	case "admin":
 		return cmdAdmin(args[1:])
 	case "logs":

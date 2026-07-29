@@ -23,6 +23,7 @@ export type { AsyncInvokeResponse } from './AsyncInvokeResponse.js';
 export type { AuditEventResponse } from './AuditEventResponse.js';
 export type { AuthCapabilities } from './AuthCapabilities.js';
 export type { AuthProviders } from './AuthProviders.js';
+export type { BillingPortalResponse } from './BillingPortalResponse.js';
 export type { BuildExportResponse } from './BuildExportResponse.js';
 export type { BuildProvenanceResponse } from './BuildProvenanceResponse.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
