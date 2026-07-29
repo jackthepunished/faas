@@ -182,6 +182,19 @@ func joinMasksForJSON(masks []string) string {
 	return out
 }
 
+// Severity labels written into the stateless.advisory audit row's
+// "severity" field (Move 1 PR-A). Defined here as named consts so
+// the goconst gate doesn't fire (test and receiver share the same
+// vocabulary, and the previous string literals appeared >3× each).
+// Mirrors pkg/dashboard/templates/audit_events.html's .badge.high /
+// .badge.warn / .badge.info CSS — a future vocabulary change means
+// touching both.
+const (
+	severityHigh = "high"
+	severityWarn = "warn"
+	severityInfo = "info"
+)
+
 // statelessAdvisoryHighPaths is the subset of the closed-path list
 // that warrants the "high" severity badge (Move 1 PR-A). Mirrors
 // pkg/dashboard/dashboard.go's StatelessClosedPaths severity field
@@ -196,10 +209,11 @@ var statelessAdvisoryHighPaths = []string{
 	"/var/lib/mysql",
 }
 
-// severityForPath returns "high" / "warn" for a closed-path string,
-// or "info" for paths outside the closed list. Pure function —
-// the events list is processed by advisoryBatchSeverity. Tests
-// pin the classification (advisory_receiver_test.go).
+// severityForPath returns severityHigh / severityWarn for a
+// closed-path string, or severityInfo for paths outside the closed
+// list. Pure function — the events list is processed by
+// advisoryBatchSeverity. Tests pin the classification
+// (advisory_receiver_test.go).
 //
 // Match rule: a path is "high" if it equals one of the high-paths
 // OR is a strict sub-path (e.g. /data/foo matches /data, /db/log
@@ -211,31 +225,32 @@ var statelessAdvisoryHighPaths = []string{
 func severityForPath(p string) string {
 	for _, hp := range statelessAdvisoryHighPaths {
 		if p == hp || strings.HasPrefix(p, hp+"/") {
-			return "high"
+			return severityHigh
 		}
 	}
-	return "warn"
+	return severityWarn
 }
 
 // advisoryBatchSeverity returns the highest severity in the batch.
-// A batch with any "high" path is "high"; otherwise "warn". An
-// empty batch is "info" (no paths to classify — defensive default
-// so the audit row's severity field is always populated).
+// A batch with any "high" path is severityHigh; otherwise
+// severityWarn. An empty batch is severityInfo (no paths to
+// classify — defensive default so the audit row's severity field
+// is always populated).
 func advisoryBatchSeverity(events []*apidpb.AdvisoryEvent) string {
 	if len(events) == 0 {
-		return "info"
+		return severityInfo
 	}
 	high := false
 	for _, e := range events {
-		if severityForPath(e.Path) == "high" {
+		if severityForPath(e.Path) == severityHigh {
 			high = true
 			break
 		}
 	}
 	if high {
-		return "high"
+		return severityHigh
 	}
-	return "warn"
+	return severityWarn
 }
 
 // isStateNotFound recognises pkg/state's "not found" sentinel.
