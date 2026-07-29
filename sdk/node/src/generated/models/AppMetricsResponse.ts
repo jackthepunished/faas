@@ -57,5 +57,9 @@ export type AppMetricsResponse = {
    * FLEET p95 wake latency (the unlabeled histogram). Labelled as such in the UI.
    */
   wake_p95_ms: number;
+  /**
+   * Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0).
+   */
+  egress_bytes?: number;
 };
 

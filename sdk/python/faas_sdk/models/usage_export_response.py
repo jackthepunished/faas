@@ -25,6 +25,13 @@ class UsageExportResponse:
     cpu_usec: int | Unset = UNSET
     """Cumulative host cgroup CPU-µs consumed by the app in the export window (informational; not billed). issue
     #279 / PR-B."""
+    tx_bytes: int | Unset = UNSET
+    """Per-(app, month) HTTP response bytes (informational; not billed). ADR-046. The gateway-side producer lands
+    in PR-2; until then this field stays 0."""
+    net_tx_bytes: int | Unset = UNSET
+    """Per-(app, month) byte delta on root-side vethHost.rx_bytes (informational; not billed). ADR-046. Sourced
+    from vmmd netstats.Cache via schedd ListInstanceStats. Includes Ethernet framing — same kernel counter the per-
+    plan tc tbf qdisc reads."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -38,6 +45,10 @@ class UsageExportResponse:
 
         cpu_usec = self.cpu_usec
 
+        tx_bytes = self.tx_bytes
+
+        net_tx_bytes = self.net_tx_bytes
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -50,6 +61,10 @@ class UsageExportResponse:
         )
         if cpu_usec is not UNSET:
             field_dict["cpu_usec"] = cpu_usec
+        if tx_bytes is not UNSET:
+            field_dict["tx_bytes"] = tx_bytes
+        if net_tx_bytes is not UNSET:
+            field_dict["net_tx_bytes"] = net_tx_bytes
 
         return field_dict
 
@@ -66,12 +81,18 @@ class UsageExportResponse:
 
         cpu_usec = d.pop("cpu_usec", UNSET)
 
+        tx_bytes = d.pop("tx_bytes", UNSET)
+
+        net_tx_bytes = d.pop("net_tx_bytes", UNSET)
+
         usage_export_response = cls(
             app_id=app_id,
             month=month,
             mb_seconds=mb_seconds,
             requests=requests,
             cpu_usec=cpu_usec,
+            tx_bytes=tx_bytes,
+            net_tx_bytes=net_tx_bytes,
         )
 
         usage_export_response.additional_properties = d
