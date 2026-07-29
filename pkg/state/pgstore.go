@@ -887,8 +887,9 @@ func (s *PgStore) CreateProject(ctx context.Context, p Project) (Project, error)
 		insert into projects
 		    (account_id, slug, repo_full_name, production_branch, install_id, scan_source)
 		values ($1, $2, $3, $4, $5, $6)
-		returning id, account_id, slug, repo_full_name, production_branch,
-		          install_id, scan_source, created_at, updated_at
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id,0),
+		          scan_source, created_at, updated_at
 	`,
 		p.AccountID, p.Slug, nullString(p.RepoFullName), nullString(p.ProductionBranch),
 		p.InstallID, string(p.ScanSource),
@@ -899,7 +900,7 @@ func (s *PgStore) CreateProject(ctx context.Context, p Project) (Project, error)
 func (s *PgStore) ProjectByID(ctx context.Context, projectID string) (Project, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, account_id, slug, coalesce(repo_full_name,''),
-		       coalesce(production_branch,''), install_id, scan_source,
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		       created_at, updated_at
 		  from projects
 		 where id = $1
@@ -910,7 +911,7 @@ func (s *PgStore) ProjectByID(ctx context.Context, projectID string) (Project, e
 func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Project, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, account_id, slug, coalesce(repo_full_name,''),
-		       coalesce(production_branch,''), install_id, scan_source,
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		       created_at, updated_at
 		  from projects
 		 where account_id = $1 and slug = $2
@@ -924,7 +925,7 @@ func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Pr
 func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, account_id, slug, coalesce(repo_full_name,''),
-		       coalesce(production_branch,''), install_id, scan_source,
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		       created_at, updated_at
 		  from projects
 		 where install_id = $1 and repo_full_name = $2
@@ -937,7 +938,7 @@ func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID
 func (s *PgStore) ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, account_id, slug, coalesce(repo_full_name,''),
-		       coalesce(production_branch,''), install_id, scan_source,
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		       created_at, updated_at
 		  from projects
 		 where account_id = $1
@@ -998,7 +999,7 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 		 where id = $1
 		   and pg_tier_rank(scan_source) <= pg_tier_rank($2)
 		returning id, account_id, slug, coalesce(repo_full_name,''),
-		          coalesce(production_branch,''), install_id, scan_source,
+		          coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
 		          created_at, updated_at
 	`, projectID, string(src))
 	p, err := scanProject(row)
