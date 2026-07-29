@@ -707,7 +707,12 @@ func cmdTail(args []string) int {
 	if *includeStateless {
 		_, _ = fmt.Fprintln(osStdout, "Tailing invocations + stateless advisories… Ctrl-C to exit.")
 	} else {
+		// Move 1 PR-A: stamp a discoverability hint so a customer
+		// who hits the tail and gets only invocation lines knows
+		// stateless advisories are a separate stream with their
+		// own flag. Keeps the default invocation list un-cluttered.
 		_, _ = fmt.Fprintln(osStdout, "Tailing invocations… Ctrl-C to exit.")
+		_, _ = fmt.Fprintln(osStdout, "Tip: pass --include-stateless to also see stateless advisories from your app's audit row stream.")
 	}
 	for {
 		select {
