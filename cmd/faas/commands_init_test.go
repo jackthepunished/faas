@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/cmd/faas/templates"
 )
 
 // TestCmdInit_AllTemplatesMaterialize: every Wave 0 PR-B template
@@ -324,6 +326,100 @@ func TestCheckDestEmpty(t *testing.T) {
 			t.Errorf("error message should say 'not empty'; got: %v", err)
 		}
 	})
+}
+
+// TestCmdInit_List_GroupsByCategory: `faas init --list` short-circuits
+// before materialization and renders the 13 templates grouped by
+// category. Pins both the group ordering (templates.CategoryOrder) and
+// the per-category content (CategoryFor). A future template addition
+// must add a Names entry, a CategoryFor case, and (if it's a new group)
+// a CategoryOrder entry — this test fails if any of the three drift.
+func TestCmdInit_List_GroupsByCategory(t *testing.T) {
+	var buf bytes.Buffer
+	if code := runCmdInitList(&buf); code != 0 {
+		t.Fatalf("runCmdInitList = %d, want 0", code)
+	}
+	out := buf.String()
+	// Order: hello → function → stateless-contract → ai (the pinned
+	// CategoryOrder). Find each header line; assert relative order.
+	idx := map[string]int{
+		"hello":              strings.Index(out, "hello ("),
+		"function":           strings.Index(out, "function ("),
+		"stateless-contract": strings.Index(out, "stateless-contract ("),
+		"ai":                 strings.Index(out, "ai ("),
+	}
+	for k, i := range idx {
+		if i < 0 {
+			t.Errorf("missing category header %q in --list output:\n%s", k, out)
+		}
+	}
+	if !(idx["hello"] < idx["function"] && idx["function"] < idx["stateless-contract"] && idx["stateless-contract"] < idx["ai"]) {
+		t.Errorf("category order drift: %v\noutput:\n%s", idx, out)
+	}
+	// Spot-check expected contents under each category so a future
+	// CategoryFor mis-classification can't ship silently.
+	wantPerCat := map[string][]string{
+		"hello":              {"hello-node", "hello-python", "hello-go"},
+		"function":           {"function-node", "function-python", "function-go", "cron-example"},
+		"stateless-contract": {"s3-uploader", "slack-bot", "rest-api-postgres", "cron-worker", "webhook-receiver"},
+		"ai":                 {"ai-chat"},
+	}
+	for cat, names := range wantPerCat {
+		for _, n := range names {
+			needle := "\n  " + n + "\n"
+			if !strings.Contains(out, needle) {
+				t.Errorf("category %q missing template %q (looked for %q); output:\n%s", cat, n, needle, out)
+			}
+		}
+	}
+	// Trailing docs link so the customer lands on the canonical page.
+	if !strings.Contains(out, "docs.DOMAIN/templates") {
+		t.Errorf("--list missing docs URL; output:\n%s", out)
+	}
+}
+
+// TestCmdInit_ListShortCircuits: `--list` must skip the validation
+// paths that run when --template / --path are required. A bare
+// `faas init --list` (no other args) must succeed even though
+// --template and --path are unset.
+func TestCmdInit_ListShortCircuits(t *testing.T) {
+	var stdout bytes.Buffer
+	oldOut := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = oldOut }()
+	if code := cmdInit([]string{"--list"}); code != 0 {
+		t.Errorf("cmdInit --list = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "hello") {
+		t.Errorf("cmdInit --list stdout missing category header; got: %q", stdout.String())
+	}
+}
+
+// TestTemplates_CategoryForCoversAllNames: every entry in templates.Names
+// must have a non-empty CategoryFor — an empty category would render
+// as an ungrouped row in `faas init --list` (silently dropped by the
+// runCmdInitList loop). This pins the contract: "adding a template
+// means a new entry in BOTH Names AND CategoryFor".
+func TestTemplates_CategoryForCoversAllNames(t *testing.T) {
+	for _, n := range templates.Names {
+		if cat := templates.CategoryFor(n); cat == "" {
+			t.Errorf("templates.CategoryFor(%q) = \"\", want a category; missing switch arm", n)
+		}
+	}
+	// And the reverse: every CategoryOrder entry must classify at
+	// least one name (else the order contains an empty bucket).
+	for _, cat := range templates.CategoryOrder {
+		has := false
+		for _, n := range templates.Names {
+			if templates.CategoryFor(n) == cat {
+				has = true
+				break
+			}
+		}
+		if !has {
+			t.Errorf("templates.CategoryOrder contains %q but no template classifies under it", cat)
+		}
+	}
 }
 
 // TestCmdInit_PreservesStdoutBytes: the package-level osStdout seam
