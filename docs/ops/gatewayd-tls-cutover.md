@@ -57,12 +57,12 @@ sudo $EDITOR /etc/faas/gatewayd.toml
 Set at minimum:
 
 ```toml
-apps_domain          = "apps.example.com"
+apps_domain          = "apps.gregale.dev"
 contact_email        = "ops@example.com"   # monitored inbox for expiry warnings
 
 [tls]
 disabled             = false                # <-- the flip
-wildcard_cert_domain = "apps.example.com"
+wildcard_cert_domain = "apps.gregale.dev"
 hetzner_zone         = "example.com"
 storage_dir          = "/var/lib/faas/certs"
 ```
@@ -93,8 +93,8 @@ sudo chown root:faas /etc/faas/secrets/hetzner-dns.token
 ```sh
 sudo bash deploy/scripts/hetzner-zone-setup.sh \
     --zone example.com \
-    --apps-domain apps.example.com \
-    --edge-host edge.example.com \
+    --apps-domain apps.gregale.dev \
+    --edge-host edge.gregale.dev \
     --host-ip $(curl -fsSL https://api.ipify.org)
 ```
 
@@ -106,8 +106,8 @@ out of scope for the script and must be done in the registrar UI.
 Validate the records propagated before continuing:
 
 ```sh
-dig +short apps.example.com      # expect: <HOST_IP>
-dig +short edge.example.com      # expect: apps.example.com.
+dig +short apps.gregale.dev      # expect: <HOST_IP>
+dig +short edge.gregale.dev      # expect: apps.gregale.dev.
 ```
 
 ### 5. Restart gatewayd
@@ -138,14 +138,14 @@ the mint.
 
 | # | Check | Command | Expected |
 |---|-------|---------|----------|
-| 1 | Cert subject + issuer | `openssl s_client -connect apps.example.com:443 -servername apps.example.com </dev/null 2>&1 \| grep -E 'subject=\|issuer='` | `subject=CN = *.apps.example.com`, `issuer=O = Let's Encrypt` |
-| 2 | TLS protocol | `openssl s_client -connect apps.example.com:443 -tls1_2 </dev/null 2>&1 \| grep 'handshake failure'` | `handshake failure` (we pinned TLS 1.3) |
-| 3 | Customer HTTPS | `curl -fsSL -o /dev/null -w '%{http_code}\n' https://apps.example.com/` | `200` (after wake gate) |
-| 4 | :80 → :443 redirect | `curl -fsSL -o /dev/null -w '%{http_code}\n' http://apps.example.com/` | `308` |
-| 5 | ACME path reachable | `curl -fsSL -o /dev/null -w '%{http_code}\n' http://apps.example.com/.well-known/acme-challenge/probe` | `404` (certmagic's handler responds; only the token matters) |
-| 6 | Cert-mint abuse vector | `openssl s_client -connect apps.example.com:443 -servername attacker.example.com </dev/null 2>&1 \| grep -E 'handshake failure\|verify return code'` | `handshake failure` (allowlist denies → no cert minted) |
+| 1 | Cert subject + issuer | `openssl s_client -connect apps.gregale.dev:443 -servername apps.gregale.dev </dev/null 2>&1 \| grep -E 'subject=\|issuer='` | `subject=CN = *.apps.gregale.dev`, `issuer=O = Let's Encrypt` |
+| 2 | TLS protocol | `openssl s_client -connect apps.gregale.dev:443 -tls1_2 </dev/null 2>&1 \| grep 'handshake failure'` | `handshake failure` (we pinned TLS 1.3) |
+| 3 | Customer HTTPS | `curl -fsSL -o /dev/null -w '%{http_code}\n' https://apps.gregale.dev/` | `200` (after wake gate) |
+| 4 | :80 → :443 redirect | `curl -fsSL -o /dev/null -w '%{http_code}\n' http://apps.gregale.dev/` | `308` |
+| 5 | ACME path reachable | `curl -fsSL -o /dev/null -w '%{http_code}\n' http://apps.gregale.dev/.well-known/acme-challenge/probe` | `404` (certmagic's handler responds; only the token matters) |
+| 6 | Cert-mint abuse vector | `openssl s_client -connect apps.gregale.dev:443 -servername attacker.example.com </dev/null 2>&1 \| grep -E 'handshake failure\|verify return code'` | `handshake failure` (allowlist denies → no cert minted) |
 | 7 | apid status unaffected | `curl -fsSL http://127.0.0.1:8081/status/slo.json \| jq .` | `200`, SLO JSON unchanged |
-| 8 | Cert expiry | `openssl s_client -connect apps.example.com:443 -servername apps.example.com </dev/null 2>&1 \| openssl x509 -noout -dates` | `notAfter=` ≥ 60 days out |
+| 8 | Cert expiry | `openssl s_client -connect apps.gregale.dev:443 -servername apps.gregale.dev </dev/null 2>&1 \| openssl x509 -noout -dates` | `notAfter=` ≥ 60 days out |
 
 ### 7. Record evidence
 
@@ -192,7 +192,7 @@ sudo systemctl restart faas-gatewayd
   on the Hetzner zone. The daemon does not block startup; the wildcard
   is obtained lazily on the first inbound request via certmagic's
   OnDemand path. If the first request returns a 5xx, hit
-  `https://apps.example.com/` again and watch the journal — each
+  `https://apps.gregale.dev/` again and watch the journal — each
   request re-triggers the mint attempt.
 
 - **Cert-mint abuse vector test fails** (validation #6 returns a

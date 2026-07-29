@@ -1,6 +1,6 @@
 [Unit]
 Description=onebox-faas schedd — scheduler + instance state machine owner (spec §4.3, §6)
-Documentation=https://docs.DOMAIN/ops/schedd
+Documentation=https://docs.gregale.dev/ops/schedd
 After=network.target faas-cp.slice
 Wants=faas-cp.slice
 

@@ -52,10 +52,10 @@ func TestRecoveryCodeBurnedBody_ThreeBranches(t *testing.T) {
 			if !strings.Contains(body, "2026-07-27 19:05 UTC") {
 				t.Errorf("body missing burned-at timestamp; got:\n%s", body)
 			}
-			// All branches mention support@DOMAIN so a confused
+			// All branches mention support@gregale.dev so a confused
 			// customer has a way out.
-			if !strings.Contains(body, "support@DOMAIN") {
-				t.Errorf("body missing support@DOMAIN; got:\n%s", body)
+			if !strings.Contains(body, "support@gregale.dev") {
+				t.Errorf("body missing support@gregale.dev; got:\n%s", body)
 			}
 		})
 	}

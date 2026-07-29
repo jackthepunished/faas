@@ -40,7 +40,7 @@ One physical host runs everything. Every box below is a systemd unit; every arro
                         ┌───────────────────────────────── EX44 ─────────────────────────────────┐
                         │                                                                        │
   client ── TLS ──►  gatewayd ──── route lookup (cache→PG) ────┐                                 │
-  *.apps.DOMAIN         │                                      │                                 │
+  *.apps.gregale.dev         │                                      │                                 │
   custom domains        │ wake needed?                         ▼                                 │
                         ├────────► schedd ─────────► vmmd ── jailer ── firecracker ── microVM    │
                         │           │  admission,     │        (one process per running VM)      │
@@ -82,7 +82,7 @@ Format for future ADRs: `ADR-NNN · title · status · decision · consequences`
 | 004 | Zero-config engine: **Railpack** (BuildKit-based, Go); **Dockerfile** escape hatch; **pre-built OCI** accepted | Railpack is Nixpacks' successor (Nixpacks in maintenance mode), produces far smaller images — directly protects the 130 MB fleet snapshot target | Nixpacks (larger images), CNB Buildpacks (multi-GB builder images don't fit our RAM/disk budget) |
 | 005 | Park/wake via **Firecracker snapshot–restore**, file-backed memory; **cold boot from rootfs must always work** as fallback | Restore ≈ 150–300 ms with app already warm; snapshots are version-coupled to Firecracker, so they are cache, not truth | Cold boot always (1–3 s wakes), CRIU (fragile), keeping VMs resident (destroys the economics) |
 | 006 | **Postgres 16** single node, one database, `sqlc`-generated queries | One state store for routes, apps, builds, usage; WAL-shipped to Storage Box | SQLite (concurrent writers: meterd + apid + schedd), etcd (nothing to consense on one box) |
-| 007 | Edge: **gatewayd is our own Go binary** using CertMagic; wildcard `*.apps.DOMAIN` via DNS-01; custom domains via on-demand HTTP-01 | Wake-blocking (hold request during restore) is core product logic — we own it; CertMagic is Caddy's battle-tested TLS core as a library | Stock Caddy/Traefik + sidecar wake logic (two hops, split brain), nginx+lua (unmaintainable) |
+| 007 | Edge: **gatewayd is our own Go binary** using CertMagic; wildcard `*.apps.gregale.dev` via DNS-01; custom domains via on-demand HTTP-01 | Wake-blocking (hold request during restore) is core product logic — we own it; CertMagic is Caddy's battle-tested TLS core as a library | Stock Caddy/Traefik + sidecar wake logic (two hops, split brain), nginx+lua (unmaintainable) |
 | 008 | Host: **Ubuntu 24.04 LTS, cgroups v2 only**, KVM, systemd slices | Firecracker snapshot restore documented slow on cgroups v1; v2 is mandatory | Debian (fine too — pick one and stop) |
 | 009 | Per-instance **network namespace with identical inner TAP** (`tap0`, guest 10.0.0.2/30) | Snapshots bake device topology + guest IP; identical-netns trick lets one snapshot restore as N concurrent instances; host side NATs per-instance | Per-instance IP baked in snapshot (breaks concurrency > 1), vsock-only (no inbound HTTP) |
 | 010 | Billing: **Stripe subscriptions + metered overage item**; usage pushed hourly | Matches financial model (2.9 % + €0.30 assumption); dunning states in §10 | Homegrown invoicing (no), Paddle/LemonSqueezy (MoR fees eat the margin math — revisit only if VAT pain demands) |
@@ -98,7 +98,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 **Owns:** TLS termination, routing, wake-blocking, request accounting, per-tenant rate limits.
 
 - Listeners: `:443` (HTTPS, HTTP/1.1 + h2), `:80` (redirect + ACME HTTP-01).
-- TLS: CertMagic. Wildcard cert for `*.apps.DOMAIN` via DNS-01 (Hetzner DNS API token). Custom domains (Pro+): on-demand HTTP-01 with an allowlist check against `custom_domains` table before issuance (prevents cert-mint abuse).
+- TLS: CertMagic. Wildcard cert for `*.apps.gregale.dev` via DNS-01 (Hetzner DNS API token). Custom domains (Pro+): on-demand HTTP-01 with an allowlist check against `custom_domains` table before issuance (prevents cert-mint abuse).
 - Routing: hostname → `app_id` via in-memory cache (LRU, 10k entries) backed by Postgres `LISTEN app_routes_changed`. Cache miss = one indexed PG lookup.
 - Wake-blocking: if app has no `RUNNING` instance, enqueue request (per-app queue, cap 512 requests / 30 s TTL, then `503 + Retry-After`), call `schedd.EnsureInstance(app_id)`, stream queued requests once readiness passes.
 - **Fan-out across `max_concurrency` (issue #168):** the routing cache is a per-app set of `Target{NodeID, InstanceID, WakeID}` (size ≤ plan's effective `max_concurrency`), picked via atomic round-robin so the hot path is allocation-free. `Backend.Admit(ctx, app_id, max_concurrency)` is the scale-out admission primitive; it atomically checks `HealthyCount < max_concurrency` before the gRPC round-trip so concurrent callers cannot collectively over-admit past the cap. At-capacity refusals surface as a typed `atCapacity=true` result (no gRPC status); the gateway treats them as a benign no-op when it already has ≥1 cached target. On every proxied request the handler stamps `x-faas-instance` with the picked `InstanceID`, overwriting any inbound header (trust model). Per-instance `last_request_at` is keyed by `instance_id` directly — the addr→instance resolver hop is gone.
@@ -115,7 +115,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 
 - Auth: API keys (`fp_live_…`, SHA-256 stored), per-user; sessions for the dashboard later. Every key scoped to an account.
 - Resources (all JSON; full endpoint table in Appendix A): accounts, apps, deployments, builds, instances (read-only), usage, plans, custom_domains.
-- Deploy inputs (three, ADR-004): `POST /v1/apps/{app}/deployments` with (a) tarball upload `source` (≤ 100 MB Free/Hobby, ≤ 250 MB Pro/Scale — reject larger with `413` and a docs link), (b) `dockerfile: true` flag if tarball root has one, or (c) `image: registry.DOMAIN/...@sha256:...` reference.
+- Deploy inputs (three, ADR-004): `POST /v1/apps/{app}/deployments` with (a) tarball upload `source` (≤ 100 MB Free/Hobby, ≤ 250 MB Pro/Scale — reject larger with `413` and a docs link), (b) `dockerfile: true` flag if tarball root has one, or (c) `image: registry.gregale.dev/...@sha256:...` reference.
 - Function deploys: `type: function`, `runtime: node22 | python312`, tarball contains `handler.{js,py}` (+ optional `package.json` / `requirements.txt`). apid rewrites this into an App deployment using the runner scaffold (§4.9) and the same pipeline runs.
 - Validation enforces plan quotas *before* work happens: deployed-sandbox count, RAM size ≤ plan cap, concurrency setting ≤ plan cap.
 - Idempotency: `Idempotency-Key` header on all POSTs, stored 24 h.
@@ -227,7 +227,7 @@ create table api_keys (
 create table apps (
   id uuid primary key default gen_random_uuid(),
   account_id uuid not null references accounts(id),
-  slug text unique not null,                    -- {slug}.apps.DOMAIN
+  slug text unique not null,                    -- {slug}.apps.gregale.dev
   type text not null default 'app',             -- app|function
   runtime text,                                 -- node22|python312 when function
   ram_mb int not null,                          -- ≤ plan cap
@@ -402,7 +402,7 @@ Measured end-to-end as `gateway_wake_latency_seconds`. Regression gate in CI-on-
 - **Per-instance egress metering (ADR-046, telemetry seam only):** vmmd samples the kernel byte counter at `/sys/class/net/<vethHost>/statistics/rx_bytes` for every RUNNING instance (root-side `vethHost`, since customer egress traverses `tap0 → vethPeer → vethHost` and lands as RX on the host side); cumulative readings are converted to regression-safe deltas in `pkg/fcvm/netstats.Cache` and exposed through `vmmd.Stats` → `schedd.ListInstanceStats` → `meterd.Sampler.SampleAndRoll`. The gateway additionally records HTTP response body bytes via `pkg/gateway/handler.go:statusRecorder.Bytes`. Both accumulate additively in `usage_minutes.tx_bytes` (gateway) and `usage_minutes.net_tx_bytes` (vmmd). **No billing change:** Stripe/Paddle push shapes remain `gb_ram_hour`; per-plan shaping is unchanged.
 - **Per-app egress IP allowlist (ADR-031 + ADR-033, M8 tier-2):** operators may pin `apps.egress_allowlist cidr[]` on a v4 or v6 CIDR list (Pro ≤16 entries combined, Scale ≤64 combined; Free/Hobby gate). Empty list = current default-allow behaviour preserved. Non-empty list emits one rule per non-empty family inside the per-netns forward chains — `iifname "tap0" ip daddr { v4 CIDRs… } accept` on `ip faas forward` and/or `iifname "tap0" ip6 daddr { v6 CIDRs… } accept` on `ip6 faas forward` — each placed **after** its chain's lateral-movement deny + SMTP drops so deny > allow on overlap and **before** the chain's default policy so unlisted destinations drop. Live instances keep their old ruleset until the next wake (same contract as `RAMMB` / `MaxConcurrency`). Non-`/0` contract held by the DB trigger `apps_egress_allowlist_cidr` (migration 00033); the apid + vmmd wire layers are defence-in-depth.
 - Egress (builder VMs): allow 443/80/53 to package registries only via a squid allowlist in v1.1; v1 = same as tenant policy. Deny everything inbound always.
-- DNS names: `{slug}.apps.DOMAIN` wildcard A record → host IP. Custom domains: customer CNAMEs to `edge.DOMAIN`, apid verifies via TXT `_faas-verify.{domain}` before gatewayd will mint a cert.
+- DNS names: `{slug}.apps.gregale.dev` wildcard A record → host IP. Custom domains: customer CNAMEs to `edge.gregale.dev`, apid verifies via TXT `_faas-verify.{domain}` before gatewayd will mint a cert.
 
 ---
 
@@ -668,7 +668,7 @@ Conventions (agents: treat as lint): errors wrapped with `%w` + operation contex
 
 | # | Gap | Resolution lean | Decide by |
 |---|---|---|---|
-| G1 | **Registry unspecced** — §4.2 accepts `image: registry.DOMAIN/...` but no registry component exists | v1: accept **public registries only** (Docker Hub, ghcr.io), digest-pinned, pulled by imaged through the build egress policy. Own registry (CNCF `distribution` behind gatewayd) only if private images become a paid ask | M5 |
+| G1 | **Registry unspecced** — §4.2 accepts `image: registry.gregale.dev/...` but no registry component exists | v1: accept **public registries only** (Docker Hub, ghcr.io), digest-pinned, pulled by imaged through the build egress policy. Own registry (CNCF `distribution` behind gatewayd) only if private images become a paid ask | M5 |
 | G2 | **Customer secrets** — apps need env secrets; no encryption/injection/redaction design | `faas secrets set KEY=…` → sealed with a host age key, stored encrypted in PG, injected into `/etc/faas/app.json` env at boot only, values redacted from build/app logs by pattern; never in snapshots of *other* deployments | **Closed by ADR-020 (PR #73 + M8 readiness PR for vmmd host-key lifecycle).** Sealed with X25519 host age key (filippo.io/age); injected into `/etc/faas/secrets.env` on every wake; values never cross the VM boundary in cleartext; vmmd generates/loads the host key at boot. |
 | G3 | **Dashboard/web UI** — spec is API+CLI only | **RESOLVED (ADR-011, `ux_spec.md` §4/§11):** CLI-first, but a *thin* server-rendered dashboard (apid, Go templates + HTMX) ships **at launch** because GitHub connect-repo needs an OAuth callback + repo picker. Scope kept minimal: auth, GitHub connect, apps/logs, usage/billing, account | M7.5 (was post-M8) |
 | G8 | **GitHub push-to-deploy** — chosen at launch; no component exists | **RESOLVED (ADR-012, `ux_spec.md` §5):** `githubd` (or apid module) — push-webhook receiver on `gatewayd /webhooks/github` (signature-verified), Checks-API status writer, per-repo install-token cache, least-privilege scopes. PR-preview envs deferred to v1.1 | M7.5 |

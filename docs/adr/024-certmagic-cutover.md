@@ -11,7 +11,7 @@
   described in `docs/ops/gatewayd-tls-cutover.md`.
 - **Why:** Spec §4.1 makes gatewayd the only public listener on the box
   and the only path that terminates TLS for customer traffic. Spec §11
-  ship-blocking requires (a) wildcard `*.apps.DOMAIN` via DNS-01 against
+  ship-blocking requires (a) wildcard `*.apps.gregale.dev` via DNS-01 against
   a zone the operator controls and (b) on-demand HTTP-01 certs for
   customer custom_domains gated by the `custom_domains` allowlist so an
   attacker who reaches `:80` cannot mint a cert for an unrelated

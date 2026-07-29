@@ -48,7 +48,7 @@ func newCliAuthTestServer(t *testing.T) (http.Handler, *state.MemStore) {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{}, "",
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "",
 		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "").handler()
 	return srv, store
 }
@@ -103,7 +103,7 @@ func newCliAuthTestServerWithNotifier(t *testing.T) (http.Handler, *state.MemSto
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	notif := newCliAuthTestNotifier()
-	srv := newServerWithDeps(store, log, "example.com", notif, "",
+	srv := newServerWithDeps(store, log, "gregale.dev", notif, "",
 		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "").handler()
 	return srv, store, notif
 }

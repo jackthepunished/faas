@@ -22,7 +22,7 @@ import (
 func TestRenderAuthCapabilities_NoSession_RedirectsToLogin(t *testing.T) {
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).handler()
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/auth/capabilities", nil)
 	rec := httptest.NewRecorder()
@@ -45,7 +45,7 @@ func TestRenderAuthCapabilities_NoSession_RedirectsToLogin(t *testing.T) {
 func TestRenderAuthCapabilities_AllDisabled(t *testing.T) {
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(auth.SignInConfig{})
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).WithOAuthConfig(auth.SignInConfig{})
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/v1/auth/capabilities", nil)
@@ -75,7 +75,7 @@ func TestRenderAuthCapabilities_AllConfigured(t *testing.T) {
 	}
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(cfg)
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).WithOAuthConfig(cfg)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/v1/auth/capabilities", nil)
@@ -110,7 +110,7 @@ func TestRenderAuthCapabilities_Mixed(t *testing.T) {
 	}
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(store, log, "example.com", noopNotifier{}).WithOAuthConfig(cfg)
+	srv := newServer(store, log, "gregale.dev", noopNotifier{}).WithOAuthConfig(cfg)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/v1/auth/capabilities", nil)

@@ -19,7 +19,7 @@ operator's leading indicator for the monthly SLO.
 
 ```bash
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=sum(rate(gateway_requests_total{code=~"2.."}[5m]))/sum(rate(gateway_requests_total[5m]))'
-curl -fsS https://DOMAIN/status/slo.json | jq .
+curl -fsS https://apps.gregale.dev/status/slo.json | jq .
 ```
 
 ## Check

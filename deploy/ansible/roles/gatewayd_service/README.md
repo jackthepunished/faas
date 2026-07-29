@@ -24,7 +24,7 @@ and the only public listener on the box). Mirrors the `vmmd_service` role.
   silently ships a config with the wrong apps_domain.
 - **does not enable or start the daemon** — production runs the role, then
   `systemctl enable --now faas-gatewayd` once the config + token are in
-  place and the operator has validated `curl -fsSL https://<slug>.apps.DOMAIN/`
+  place and the operator has validated `curl -fsSL https://<slug>.apps.gregale.dev/`
   round-trips through CertMagic.
 
 ## Production enablement checklist
@@ -35,7 +35,7 @@ and the only public listener on the box). Mirrors the `vmmd_service` role.
 3. `install -m 0400 -o root -g faas /dev/stdin /etc/faas/secrets/hetzner-dns.token <<<"$HETZNER_DNS_TOKEN"`
 4. `systemctl enable --now faas-gatewayd`.
 5. `journalctl -u faas-gatewayd -f` — wait for "public listening (TLS) addr=:443".
-6. `curl -fsSL https://<slug>.apps.DOMAIN/` — expect 200 over TLS 1.3.
+6. `curl -fsSL https://<slug>.apps.gregale.dev/` — expect 200 over TLS 1.3.
 
 ## Fail-fast contracts
 

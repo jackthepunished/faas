@@ -204,11 +204,11 @@ OAuth callbacks, GitHub webhooks, and Stripe webhooks (all of which require
 HTTPS). To enable TLS:
 
 1. **Point a real domain at the Droplet.** Buy / repoint a domain
-   (e.g. `apps.example.com`), set an A record to the Droplet's public IPv4,
-   and (optional) set a wildcard `*.apps.example.com` CNAME.
+   (e.g. `apps.gregale.dev`), set an A record to the Droplet's public IPv4,
+   and (optional) set a wildcard `*.apps.gregale.dev` CNAME.
 2. **Update `gatewayd.toml`:**
    ```toml
-   apps_domain = "apps.example.com"
+   apps_domain = "apps.gregale.dev"
 
    [tls]
    disabled = false
@@ -228,9 +228,9 @@ HTTPS). To enable TLS:
    sudo ufw allow 80/tcp    # ACME http-01 challenges (CertMagic uses it)
    ```
 4. **Regenerate the GitHub App** (or edit it) with HTTPS URLs:
-   - Homepage: `https://apps.example.com`
-   - Callback: `https://apps.example.com/oauth/github/callback`
-   - Webhook:  `https://apps.example.com/webhooks/github`
+   - Homepage: `https://apps.gregale.dev`
+   - Callback: `https://apps.gregale.dev/oauth/github/callback`
+   - Webhook:  `https://apps.gregale.dev/webhooks/github`
 5. **Restart gatewayd** so it picks up the new TOML:
    ```bash
    sudo systemctl restart faas-gatewayd

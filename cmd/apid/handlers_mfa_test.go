@@ -1022,8 +1022,8 @@ func TestMFARecover_SendsBurnEmail(t *testing.T) {
 	if !strings.Contains(got.TextBody, "9 recovery codes remaining") {
 		t.Errorf("body missing '9 recovery codes remaining'; got:\n%s", got.TextBody)
 	}
-	if !strings.Contains(got.TextBody, "support@DOMAIN") {
-		t.Errorf("body missing support@DOMAIN; got:\n%s", got.TextBody)
+	if !strings.Contains(got.TextBody, "support@gregale.dev") {
+		t.Errorf("body missing support@gregale.dev; got:\n%s", got.TextBody)
 	}
 }
 

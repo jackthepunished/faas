@@ -1505,7 +1505,7 @@ func TestUsageSummary_BadMonth(t *testing.T) {
 // TestDeploymentResponse_RoundTrip confirms every field flows through.
 func TestDeploymentResponse_RoundTrip(t *testing.T) {
 	srv := newServer(state.NewMemStore(), slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"example.com", noopNotifier{})
+		"gregale.dev", noopNotifier{})
 	d := state.Deployment{
 		ID: "d1", AppID: "a1", ImageDigest: "sha256:x", Kind: state.DeploymentKindImage,
 		Status: state.DeployLive, Error: "boom", ErrorCode: "image_not_found",
@@ -1576,7 +1576,7 @@ func newStripeServer(t *testing.T, secret string) http.Handler {
 	t.Helper()
 	store := state.NewMemStore()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newServerWithDeps(store, log, "example.com", noopNotifier{}, secret,
+	return newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, secret,
 		noopMailer{}, stubGithubdClient{}, nil, nil, 15*time.Minute, "").handler()
 }
 
@@ -1687,7 +1687,7 @@ func stripeWebhookHarness(t *testing.T, plan api.Plan) (testEnv, *recordingMaile
 	// Wire a real signing secret — main's A2 fail-closed behavior
 	// (handlers_ext.go) returns 503 on empty secret, so the harness
 	// must sign events to exercise the dunning state machine.
-	srv := newServerWithDeps(store, log, "example.com", noopNotifier{},
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{},
 		stripeWebhookSecretForTest, mailer,
 		stubGithubdClient{}, nil, nil, 0, "")
 	return testEnv{h: srv.handler(), store: store, acct: acct}, mailer

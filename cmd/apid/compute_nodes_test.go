@@ -42,7 +42,7 @@ func newComputeNodeTestServer(t *testing.T, adminCSV, email string) (*httptest.S
 	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatalf("seed key: %v", err)
 	}
-	srv := newServerWithDeps(store, nil, "example.com", nil, "", nil, nil, nil, nil, 0, "")
+	srv := newServerWithDeps(store, nil, "gregale.dev", nil, "", nil, nil, nil, nil, 0, "")
 	srv.WithAdminAllowlist(adminCSV)
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)
@@ -261,7 +261,7 @@ func seedHeartbeatSingleRow(t *testing.T, at time.Time) (*httptest.Server, strin
 	if err := store.AppendComputeNodeHeartbeat(context.Background(), node.ID, at, at, "heartbeat_tick"); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
-	srv := newServerWithDeps(store, nil, "example.com", nil, "", nil, nil, nil, nil, 0, "")
+	srv := newServerWithDeps(store, nil, "gregale.dev", nil, "", nil, nil, nil, nil, 0, "")
 	srv.WithAdminAllowlist("ops@example.com")
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)
@@ -293,7 +293,7 @@ func TestComputeNodes_Heartbeats_SinceFilter(t *testing.T) {
 			t.Fatalf("seed row %d: %v", i, err)
 		}
 	}
-	srv := newServerWithDeps(store, nil, "example.com", nil, "", nil, nil, nil, nil, 0, "")
+	srv := newServerWithDeps(store, nil, "gregale.dev", nil, "", nil, nil, nil, nil, 0, "")
 	srv.WithAdminAllowlist("ops@example.com")
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)
@@ -455,7 +455,7 @@ func TestComputeNodes_Heartbeats_GapClassification(t *testing.T) {
 			t.Fatalf("seed row %d: %v", i, err)
 		}
 	}
-	srv := newServerWithDeps(store, nil, "example.com", nil, "", nil, nil, nil, nil, 0, "")
+	srv := newServerWithDeps(store, nil, "gregale.dev", nil, "", nil, nil, nil, nil, 0, "")
 	srv.WithAdminAllowlist("ops@example.com")
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)

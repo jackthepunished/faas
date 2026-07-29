@@ -557,7 +557,7 @@ func ErrPlanLimitApps(l Limits, observed int) *Problem {
 		"App limit reached",
 		fmt.Sprintf("%s plan allows %d deployed app(s); you have %d.", l.Plan, l.DeployedApps, observed)).
 		WithLimit(int64(l.DeployedApps), int64(observed)).
-		WithDocs("https://docs.DOMAIN/plans#apps")
+		WithDocs("https://docs.gregale.dev/plans#apps")
 }
 
 // ErrPlanLimitRAM is returned when a requested ram_mb exceeds the plan cap.
@@ -566,7 +566,7 @@ func ErrPlanLimitRAM(l Limits, requestedMB int) *Problem {
 		"RAM over plan limit",
 		fmt.Sprintf("%s plan caps %d MB/app; requested %d MB.", l.Plan, l.RAMMB, requestedMB)).
 		WithLimit(int64(l.RAMMB), int64(requestedMB)).
-		WithDocs("https://docs.DOMAIN/plans#ram")
+		WithDocs("https://docs.gregale.dev/plans#ram")
 }
 
 // ErrAppLayerTooLarge is returned when the built app layer (deps + code) exceeds
@@ -579,7 +579,7 @@ func ErrAppLayerTooLarge(l Limits, observedBytes int64) *Problem {
 		fmt.Sprintf("%s plan caps the app layer at %d MB; built layer is %.1f MB.",
 			l.Plan, l.AppLayerMaxMB, float64(observedBytes)/(1024*1024))).
 		WithLimit(capBytes, observedBytes).
-		WithDocs("https://docs.DOMAIN/build/limits#app-layer")
+		WithDocs("https://docs.gregale.dev/build/limits#app-layer")
 }
 
 // ErrPlanLimitConcurrency is returned when waking another instance would exceed
@@ -589,7 +589,7 @@ func ErrPlanLimitConcurrency(l Limits, observed int) *Problem {
 		"Concurrency limit reached",
 		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
 		WithLimit(int64(l.MaxConcurrency), int64(observed)).
-		WithDocs("https://docs.DOMAIN/plans#concurrency")
+		WithDocs("https://docs.gregale.dev/plans#concurrency")
 }
 
 // ErrCapacity is returned when admission is refused for lack of box capacity
@@ -606,13 +606,13 @@ func ErrAppConcurrencyReached(l Limits, observed int) *Problem {
 		"App concurrency reached",
 		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
 		WithLimit(int64(l.MaxConcurrency), int64(observed)).
-		WithDocs("https://docs.DOMAIN/plans#concurrency")
+		WithDocs("https://docs.gregale.dev/plans#concurrency")
 }
 
 func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
-		WithDocs("https://status.DOMAIN")
+		WithDocs("https://apps.gregale.dev/status")
 }
 
 // ErrInternal is the catch-all 500 envelope for handler-side failures
@@ -638,7 +638,7 @@ func ErrInternal(detail string) *Problem {
 func ErrBillingNotImplemented(detail string) *Problem {
 	return NewProblem(http.StatusNotImplemented, CodeBillingNotImplemented,
 		"Billing provider does not support this surface", detail).
-		WithDocs("https://docs.DOMAIN/billing/providers")
+		WithDocs("https://docs.gregale.dev/billing/providers")
 }
 
 // ErrSourceTooLarge is returned when an uploaded tarball exceeds the plan cap.
@@ -648,7 +648,7 @@ func ErrSourceTooLarge(l Limits, observedBytes int64) *Problem {
 		"Source too large",
 		fmt.Sprintf("%s plan caps source at %d MB.", l.Plan, l.SourceTarballMaxMB)).
 		WithLimit(capBytes, observedBytes).
-		WithDocs("https://docs.DOMAIN/build/limits")
+		WithDocs("https://docs.gregale.dev/build/limits")
 }
 
 // ErrSourceInvalid is returned when a tarball fails shape validation
@@ -656,7 +656,7 @@ func ErrSourceTooLarge(l Limits, observedBytes int64) *Problem {
 func ErrSourceInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSourceInvalid,
 		"Source invalid", reason).
-		WithDocs("https://docs.DOMAIN/build/source")
+		WithDocs("https://docs.gregale.dev/build/source")
 }
 
 // ErrStatelessOnlyViolation is returned when a deploy shape (or resolved
@@ -675,13 +675,11 @@ func ErrStatelessOnlyViolation(kind, detail string) *Problem {
 		fmt.Sprintf("%s: %s — this platform is stateless in year one; "+
 			"use a managed service (S3/R2/Neon/Upstash/MongoDB Atlas).",
 			kind, detail)).
-		// docs.DOMAIN is the placeholder convention used by every
-		// WithDocs() in this file — the placeholder resolves to the
-		// real domain when the docs site ships. The actual /storage page
-		// is added by PR-B (Wave 0, faas init + reference templates).
-		// Until PR-B ships, the 404 is consistent with every other
-		// placeholder URL in the file.
-		WithDocs("https://docs.DOMAIN/storage")
+		// Every WithDocs() in this file points at docs.gregale.dev; the
+		// /storage page is added by PR-B (Wave 0, faas init + reference
+		// templates) — until then the URL 404s, consistent with every
+		// other docs URL in the file.
+		WithDocs("https://docs.gregale.dev/storage")
 }
 
 // ErrDomainNotVerified is returned when a customer tries to bind a domain
@@ -690,14 +688,14 @@ func ErrDomainNotVerified(domain string) *Problem {
 	return NewProblem(http.StatusConflict, CodeDomainNotVerified,
 		"Domain not verified",
 		fmt.Sprintf("TXT challenge for %q not yet satisfied; publish the required TXT record and retry.", domain)).
-		WithDocs("https://docs.DOMAIN/domains/verify")
+		WithDocs("https://docs.gregale.dev/domains/verify")
 }
 
 // ErrCronInvalid is returned for malformed cron expressions.
 func ErrCronInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeCronInvalid,
 		"Invalid cron schedule", reason).
-		WithDocs("https://docs.DOMAIN/crons")
+		WithDocs("https://docs.gregale.dev/crons")
 }
 
 // CodePlanCronsNotAllowed is the 402 the customer sees when the
@@ -736,7 +734,7 @@ func ErrPlanCronsNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanCronsNotAllowed,
 		"Crons unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include cron; upgrade to Hobby or above to schedule synthetic requests.", p)).
-		WithDocs("https://docs.DOMAIN/plans#crons")
+		WithDocs("https://docs.gregale.dev/plans#crons")
 }
 
 // ErrPlanCronQuota is returned when CreateCronIfUnderQuota surfaces
@@ -756,7 +754,7 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 		fmt.Sprintf("%s plan caps crons at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.DOMAIN/plans#crons")
+		WithDocs("https://docs.gregale.dev/plans#crons")
 }
 
 // ErrAlertRuleInvalid is returned for malformed alert-rule bodies:
@@ -768,7 +766,7 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 func ErrAlertRuleInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeAlertRuleInvalid,
 		"Invalid alert rule", reason).
-		WithDocs("https://docs.DOMAIN/alerts")
+		WithDocs("https://docs.gregale.dev/alerts")
 }
 
 // ErrPlanAlertRulesNotAllowed is returned by apid's createAlertRule
@@ -781,7 +779,7 @@ func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanAlertRulesNotAllowed,
 		"Alert rules unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include alert rules; upgrade to Hobby or above to fire alerts.", p)).
-		WithDocs("https://docs.DOMAIN/plans#alerts")
+		WithDocs("https://docs.gregale.dev/plans#alerts")
 }
 
 // ErrPlanAlertRuleQuota is returned when
@@ -802,7 +800,7 @@ func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Proble
 		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.DOMAIN/plans#alerts")
+		WithDocs("https://docs.gregale.dev/plans#alerts")
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't
@@ -811,7 +809,7 @@ func ErrHandlerMissing() *Problem {
 	return NewProblem(http.StatusBadRequest, CodeHandlerMissing,
 		"Handler required",
 		"function deploys require a handler path (e.g. handler.handler)").
-		WithDocs("https://docs.DOMAIN/functions")
+		WithDocs("https://docs.gregale.dev/functions")
 }
 
 // ErrDeployFailed wraps a deployment failure message into a Problem so the
@@ -819,7 +817,7 @@ func ErrHandlerMissing() *Problem {
 func ErrDeployFailed(detail string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeDeployFailed,
 		"Deploy failed", detail).
-		WithDocs("https://docs.DOMAIN/deploys")
+		WithDocs("https://docs.gregale.dev/deploys")
 }
 
 // ErrNoRollbackTarget is returned by POST /v1/apps/{slug}/rollback when no
@@ -828,7 +826,7 @@ func ErrNoRollbackTarget() *Problem {
 	return NewProblem(http.StatusConflict, CodeNoRollbackTarget,
 		"No previous deployment",
 		"there's no superseded deployment to roll back to; deploy at least twice.").
-		WithDocs("https://docs.DOMAIN/deploys#rollback")
+		WithDocs("https://docs.gregale.dev/deploys#rollback")
 }
 
 // ErrPlanLimitSecrets is returned when a secret PUT would exceed the plan's
@@ -838,7 +836,7 @@ func ErrPlanLimitSecrets(l Limits, observed int) *Problem {
 		"Secret count limit reached",
 		fmt.Sprintf("%s plan allows %d secret(s) per app; you have %d.", l.Plan, l.SecretCountMax, observed)).
 		WithLimit(int64(l.SecretCountMax), int64(observed)).
-		WithDocs("https://docs.DOMAIN/secrets#limits")
+		WithDocs("https://docs.gregale.dev/secrets#limits")
 }
 
 // ErrSecretInvalidKey is returned when a secret key fails the
@@ -848,7 +846,7 @@ func ErrSecretInvalidKey(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSecretInvalidKey,
 		"Invalid secret key",
 		fmt.Sprintf("secret keys must match %s; %s", SecretKeyPattern, detail)).
-		WithDocs("https://docs.DOMAIN/secrets#keys")
+		WithDocs("https://docs.gregale.dev/secrets#keys")
 }
 
 // ErrSecretValueTooLarge is returned when a PUT value exceeds
@@ -860,7 +858,7 @@ func ErrSecretValueTooLarge(l Limits, observedBytes int) *Problem {
 		"Secret value too large",
 		fmt.Sprintf("%s plan caps secret values at %d bytes; got %d.", l.Plan, l.SecretValueMaxBytes, observedBytes)).
 		WithLimit(int64(l.SecretValueMaxBytes), int64(observedBytes)).
-		WithDocs("https://docs.DOMAIN/secrets#limits")
+		WithDocs("https://docs.gregale.dev/secrets#limits")
 }
 
 // ErrSecretNotFound is returned by DELETE /v1/apps/{slug}/secrets/{key} when
@@ -870,7 +868,7 @@ func ErrSecretNotFound(key string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSecretNotFound,
 		"Secret not set",
 		fmt.Sprintf("no secret named %q on this app.", key)).
-		WithDocs("https://docs.DOMAIN/secrets")
+		WithDocs("https://docs.gregale.dev/secrets")
 }
 
 // ErrPlanLimitEnvVars is returned when an env PUT would exceed the plan's
@@ -882,7 +880,7 @@ func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
 		"Env var count limit reached",
 		fmt.Sprintf("%s plan allows %d env var(s) per app; you have %d.", l.Plan, l.EnvVarsMax, observed)).
 		WithLimit(int64(l.EnvVarsMax), int64(observed)).
-		WithDocs("https://docs.DOMAIN/env#limits")
+		WithDocs("https://docs.gregale.dev/env#limits")
 }
 
 // ErrEnvVarInvalidKey is returned when an env key fails the
@@ -895,7 +893,7 @@ func ErrEnvVarInvalidKey(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeEnvVarInvalidKey,
 		"Invalid env var key",
 		fmt.Sprintf("env var keys must match %s; %s", SecretKeyPattern, detail)).
-		WithDocs("https://docs.DOMAIN/env#keys")
+		WithDocs("https://docs.gregale.dev/env#keys")
 }
 
 // ErrEnvVarValueTooLarge is returned when a PUT value exceeds
@@ -907,7 +905,7 @@ func ErrEnvVarValueTooLarge(l Limits, observedBytes int) *Problem {
 		"Env var value too large",
 		fmt.Sprintf("%s plan caps env values at %d bytes; got %d.", l.Plan, l.EnvValueMaxBytes, observedBytes)).
 		WithLimit(int64(l.EnvValueMaxBytes), int64(observedBytes)).
-		WithDocs("https://docs.DOMAIN/env#limits")
+		WithDocs("https://docs.gregale.dev/env#limits")
 }
 
 // ErrEnvVarNotFound is returned by DELETE /v1/apps/{slug}/env/{key} when
@@ -918,7 +916,7 @@ func ErrEnvVarNotFound(key string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeEnvVarNotFound,
 		"Env var not set",
 		fmt.Sprintf("no env var named %q on this app.", key)).
-		WithDocs("https://docs.DOMAIN/env")
+		WithDocs("https://docs.gregale.dev/env")
 }
 
 // ErrPlanMinInstancesNotAllowed is returned when a Free or Hobby account
@@ -930,7 +928,7 @@ func ErrPlanMinInstancesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanMinInstancesNotAllowed,
 		"Plan doesn't allow a min-instances floor",
 		fmt.Sprintf("the %s plan always scales to zero; upgrade to Pro or Scale to keep instances warm.", p)).
-		WithDocs("https://docs.DOMAIN/plans#min-instances")
+		WithDocs("https://docs.gregale.dev/plans#min-instances")
 }
 
 // ErrInvalidMinInstances is returned when the requested min_instances
@@ -941,7 +939,7 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		"Invalid min_instances",
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
-		WithDocs("https://docs.DOMAIN/apps#min-instances")
+		WithDocs("https://docs.gregale.dev/apps#min-instances")
 }
 
 // ErrPlanEgressAllowlistNotAllowed (ADR-031) is returned when a Free or Hobby
@@ -954,7 +952,7 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanEgressAllowlistNotAllowed,
 		"Plan doesn't allow an egress allowlist",
 		fmt.Sprintf("the %s plan cannot pin an egress IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
-		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
 }
 
 // ErrEgressAllowlistTooLong (ADR-031) is returned when the PATCH carries more
@@ -966,7 +964,7 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		"Egress allowlist too long",
 		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
 		WithLimit(int64(maxSize), int64(got)).
-		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
 }
 
 // ErrInvalidEgressAllowlist (ADR-031 + ADR-032) is a 400 for
@@ -979,7 +977,7 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeInvalidEgressAllowlist,
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
-		WithDocs("https://docs.DOMAIN/apps#egress-allowlist")
+		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by
@@ -1002,7 +1000,7 @@ func ErrPlanQueueDepth(limit, observed int) *Problem {
 		"Per-app queue depth exceeded",
 		fmt.Sprintf("the plan caps this app at %d pending + dispatching rows; observed %d.", limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.DOMAIN/event-driven#queue-depth")
+		WithDocs("https://docs.gregale.dev/event-driven#queue-depth")
 }
 
 // ErrPlanSourceBytes is returned when a request body for an event-shaped
@@ -1013,7 +1011,7 @@ func ErrPlanSourceBytes(limit int, observed int64) *Problem {
 		"Invocation payload too large",
 		fmt.Sprintf("this plan caps each invocation at %d bytes; observed %d.", limit, observed)).
 		WithLimit(int64(limit), observed).
-		WithDocs("https://docs.DOMAIN/event-driven#payload-size")
+		WithDocs("https://docs.gregale.dev/event-driven#payload-size")
 }
 
 // ErrPlanFeatureGated is returned when the customer's plan does not
@@ -1025,7 +1023,7 @@ func ErrPlanFeatureGated(feature string, p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanFeatureGated,
 		"Plan doesn't include this feature",
 		fmt.Sprintf("the %s plan doesn't unlock %s; upgrade to Hobby or higher to use event-driven features.", p, feature)).
-		WithDocs("https://docs.DOMAIN/plans#event-driven")
+		WithDocs("https://docs.gregale.dev/plans#event-driven")
 }
 
 // ErrPlanDelayedTasksCap is the variant surfaced when a delayed-task
@@ -1037,7 +1035,7 @@ func ErrPlanDelayedTasksCap(limit, observed int) *Problem {
 		"Per-app delayed-task cap exceeded",
 		fmt.Sprintf("the plan caps this app at %d scheduled delayed_tasks; observed %d.", limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
+		WithDocs("https://docs.gregale.dev/event-driven#delayed-tasks")
 }
 
 // ErrInvocationNotFound is the Move 1 counterpart to ErrSecretNotFound:
@@ -1047,7 +1045,7 @@ func ErrInvocationNotFound(id string) *Problem {
 	return NewProblem(http.StatusNotFound, CodeInvocationNotFound,
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
-		WithDocs("https://docs.DOMAIN/event-driven#invocations")
+		WithDocs("https://docs.gregale.dev/event-driven#invocations")
 }
 
 // ErrBuildProvenanceNotFound is the ADR-038 surface for a build
@@ -1061,7 +1059,7 @@ func ErrBuildProvenanceNotFound() *Problem {
 	return NewProblem(http.StatusNotFound, CodeBuildProvenanceNotFound,
 		"Build provenance not found",
 		"the build succeeded but no provenance row exists; builderd logged a warning when the populator failed").
-		WithDocs("https://docs.DOMAIN/builds#provenance")
+		WithDocs("https://docs.gregale.dev/builds#provenance")
 }
 
 // ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface
@@ -1076,7 +1074,7 @@ func ErrBuildSBOMUnavailable() *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeBuildSBOMUnavailable,
 		"Build SBOM unavailable",
 		"no SBOM has been generated for this build; imaged's syft populator did not run or did not persist the artefact").
-		WithDocs("https://docs.DOMAIN/builds#sbom")
+		WithDocs("https://docs.gregale.dev/builds#sbom")
 }
 
 // ErrLongPollTimeout is returned by the long-poll handlers (sync
@@ -1089,7 +1087,7 @@ func ErrLongPollTimeout() *Problem {
 	return NewProblem(http.StatusGatewayTimeout, "long_poll_timeout",
 		"Long-poll wait budget ran out",
 		"the server waited for the configured long-poll window and the event did not arrive; retry.").
-		WithDocs("https://docs.DOMAIN/event-driven#long-poll")
+		WithDocs("https://docs.gregale.dev/event-driven#long-poll")
 }
 
 // ErrInvalidScheduledAt is returned when a delayed-task POST carries a
@@ -1100,7 +1098,7 @@ func ErrInvalidScheduledAt() *Problem {
 	return NewProblem(http.StatusBadRequest, "invalid_scheduled_at",
 		"Invalid scheduled_at",
 		"scheduled_at must be a future timestamp; the server clock rejected the value").
-		WithDocs("https://docs.DOMAIN/event-driven#delayed-tasks")
+		WithDocs("https://docs.gregale.dev/event-driven#delayed-tasks")
 }
 
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
@@ -1116,7 +1114,7 @@ func ErrInvalidCredentials() *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeInvalidCredentials,
 		"Sign in failed",
 		"email or password is incorrect.").
-		WithDocs("https://docs.DOMAIN/auth/sign-in")
+		WithDocs("https://docs.gregale.dev/auth/sign-in")
 }
 
 // ErrEmailNotVerified is the 401 returned by the Google / GitHub OAuth
@@ -1128,7 +1126,7 @@ func ErrEmailNotVerified(provider string) *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeEmailNotVerified,
 		"Email not verified",
 		fmt.Sprintf("the %s account's primary email is not verified; verify it on the provider and retry.", provider)).
-		WithDocs("https://docs.DOMAIN/auth/oauth")
+		WithDocs("https://docs.gregale.dev/auth/oauth")
 }
 
 // ErrPasswordTooWeak is the 400 returned by POST /signup and POST
@@ -1138,7 +1136,7 @@ func ErrEmailNotVerified(provider string) *Problem {
 func ErrPasswordTooWeak(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodePasswordTooWeak,
 		"Password too weak", reason).
-		WithDocs("https://docs.DOMAIN/auth/password")
+		WithDocs("https://docs.gregale.dev/auth/password")
 }
 
 // ErrResetTokenInvalid is the 410 returned by GET / POST /auth/reset
@@ -1149,7 +1147,7 @@ func ErrResetTokenInvalid() *Problem {
 	return NewProblem(http.StatusGone, CodeResetTokenInvalid,
 		"Reset link invalid",
 		"this password-reset link is unknown or has already been used.").
-		WithDocs("https://docs.DOMAIN/auth/reset")
+		WithDocs("https://docs.gregale.dev/auth/reset")
 }
 
 // ErrResetTokenExpired is the 410 returned by GET / POST /auth/reset
@@ -1160,5 +1158,5 @@ func ErrResetTokenExpired() *Problem {
 	return NewProblem(http.StatusGone, CodeResetTokenExpired,
 		"Reset link expired",
 		"this password-reset link has expired; request a new one.").
-		WithDocs("https://docs.DOMAIN/auth/reset")
+		WithDocs("https://docs.gregale.dev/auth/reset")
 }

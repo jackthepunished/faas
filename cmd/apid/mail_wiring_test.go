@@ -237,7 +237,7 @@ func TestLoginSetsSessionAndSendsNoEmail(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &recordingSender{}
-	srv := newServer(store, discardLogger(), "example.com", noopNotifier{})
+	srv := newServer(store, discardLogger(), "gregale.dev", noopNotifier{})
 	srv.mailer = newMailerAdapter(rec)
 	h := srv.handler()
 

@@ -244,7 +244,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	if dbr := os.Getenv("FAAS_DEPLOY_BASE_REF"); dbr != "" {
 		ref, err := oci.ParseReference(dbr)
 		if err != nil || ref.Digest == "" {
-			return fmt.Errorf("imaged: FAAS_DEPLOY_BASE_REF %q must be a digest-pinned reference (e.g. registry.DOMAIN/img@sha256:...)", dbr)
+			return fmt.Errorf("imaged: FAAS_DEPLOY_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", dbr)
 		}
 		h.WithDeployBaseRef(dbr)
 		log.Info("imaged: deploy base ref override", "ref", dbr)
@@ -262,7 +262,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// every parked app's restore path.
 		ref, err := oci.ParseReference(v)
 		if err != nil || ref.Digest == "" {
-			return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.DOMAIN/img@sha256:...)", v)
+			return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
 		}
 	}
 	basePath := envOr("FAAS_BUILDER_BASE_PATH", "/srv/fc/base/builder-base.ext4")

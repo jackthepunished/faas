@@ -432,7 +432,7 @@ func TestScheduleDeletion_EmitsAccountDeletionPending(t *testing.T) {
 	}
 	notif := &spyNotifier{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(store, log, "example.com", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "")
+	srv := newServerWithDeps(store, log, "gregale.dev", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "")
 
 	pt, hash, _ := api.GenerateAPIKey()
 	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
@@ -515,7 +515,7 @@ func TestExportAccount_PartialFailure_Returns500(t *testing.T) {
 	}}
 	notif := &spyNotifier{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(wrap, log, "example.com", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "").handler()
+	srv := newServerWithDeps(wrap, log, "gregale.dev", notif, "", noopMailer{}, stubGithubdClient{}, nil, nil, 0, "").handler()
 	req := httptest.NewRequest("GET", "/v1/account/export", nil)
 	req.Header.Set("Authorization", "Bearer "+e.key)
 	rec := httptest.NewRecorder()
@@ -721,7 +721,7 @@ func TestGDPRFlow_EmailsAndAuditLedger(t *testing.T) {
 	mailer := &recordingMailer{}
 	notif := &spyNotifier{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServerWithDeps(e.store, log, "example.com", notif, "", mailer, stubGithubdClient{}, nil, nil, 0, "")
+	srv := newServerWithDeps(e.store, log, "gregale.dev", notif, "", mailer, stubGithubdClient{}, nil, nil, 0, "")
 
 	// Customer fires DELETE /v1/account. Captures the pending email +
 	// the pg_notify + the initial delete row in the ledger.

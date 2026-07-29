@@ -37,17 +37,17 @@ func (r *fakeRouter) resolveCalls() int {
 
 func TestPGBackend_LookupCachesAndFallsBack(t *testing.T) {
 	router := &fakeRouter{byID: map[string]gateway.App{
-		"a.apps.example.com": {ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		"a.apps.gregale.dev": {ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
 	}}
 	b := gateway.NewPGBackend(router, gateway.NewFakeScheduler(""), nil)
 
 	// Miss → Router resolves and caches.
-	app, ok := b.Lookup(context.Background(), "a.apps.example.com")
+	app, ok := b.Lookup(context.Background(), "a.apps.gregale.dev")
 	if !ok || app.ID != "app-1" || app.AccountID != "acct-1" || app.Plan != api.PlanPro {
 		t.Fatalf("first lookup = %+v ok=%v", app, ok)
 	}
 	// Hit → no second Router call.
-	if _, ok := b.Lookup(context.Background(), "a.apps.example.com"); !ok {
+	if _, ok := b.Lookup(context.Background(), "a.apps.gregale.dev"); !ok {
 		t.Fatal("second lookup missed")
 	}
 	if n := router.resolveCalls(); n != 1 {
@@ -65,7 +65,7 @@ func TestPGBackend_LookupUnknownHost(t *testing.T) {
 func TestPGBackend_LookupRouterErrorIsNotFound(t *testing.T) {
 	router := &fakeRouter{err: errors.New("pg down")}
 	b := gateway.NewPGBackend(router, gateway.NewFakeScheduler(""), nil)
-	if _, ok := b.Lookup(context.Background(), "a.apps.example.com"); ok {
+	if _, ok := b.Lookup(context.Background(), "a.apps.gregale.dev"); ok {
 		t.Fatal("router error should surface as not-found, not a route")
 	}
 }
@@ -278,15 +278,15 @@ func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, 
 
 func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
 	router := &fakeRouter{byID: map[string]gateway.App{
-		"a.apps.example.com": {ID: "app-1", Plan: api.PlanFree},
+		"a.apps.gregale.dev": {ID: "app-1", Plan: api.PlanFree},
 	}}
 	b := gateway.NewPGBackend(router, gateway.NewFakeScheduler(""), nil)
 
-	if _, ok := b.Lookup(context.Background(), "a.apps.example.com"); !ok {
+	if _, ok := b.Lookup(context.Background(), "a.apps.gregale.dev"); !ok {
 		t.Fatal("seed lookup failed")
 	}
 	b.FlushRoutes()
-	if _, ok := b.Lookup(context.Background(), "a.apps.example.com"); !ok {
+	if _, ok := b.Lookup(context.Background(), "a.apps.gregale.dev"); !ok {
 		t.Fatal("post-flush lookup failed")
 	}
 	if n := router.resolveCalls(); n != 2 {

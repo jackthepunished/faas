@@ -165,7 +165,7 @@ emerges.
 if v := os.Getenv("FAAS_BUILDER_BASE_REF"); v != "" {
     ref, err := oci.ParseReference(v)
     if err != nil || ref.Digest == "" {
-        return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.DOMAIN/img@sha256:...)", v)
+        return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
     }
     h.WithDeployBaseRef(v)
 }

@@ -9,6 +9,7 @@ package scheddgrpc
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"time"
 
@@ -55,6 +56,41 @@ type LogFrameSink = sched.LogFrameSink
 // LogFrameSink alias above.
 type WarmHintSink = sched.WarmHintSink
 
+// CapacitySink is the per-event callback the ReportCapacity
+// handler invokes for each CapacityReport decoded from the
+// vmmd→schedd stream (ADR-025 axis 5). Same shape as
+// WarmHintSink — non-nil error aborts the stream, nil keeps
+// delivering.
+//
+// Type-aliased here so the SchedAPI interface can name
+// scheddgrpc.CapacitySink without pulling pkg/sched into every
+// test that fakes the engine. The production caller
+// (Server.ReportCapacity) applies the report to the engine's
+// per-node table via this sink.
+type CapacitySink = sched.CapacitySink
+
+// mapStreamErr translates a non-nil Recv / engine-drain
+// error into the wire codes the gateway / vmmd reconnect
+// loops speak. Used by StreamWarmHints and ReportCapacity
+// (and any future client-streaming handler that follows the
+// same shape).
+//
+//   - io.EOF → caller handles separately (SendAndClose ack)
+//   - context.Canceled / DeadlineExceeded → codes.Canceled
+//   - everything else → codes.Unavailable
+//
+// Extracted from the inline switch in PR-1 review to keep
+// each handler body under the "≤ 50 lines" cap from
+// CLAUDE.md.
+func mapStreamErr(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.Canceled, err.Error())
+	default:
+		return status.Error(codes.Unavailable, err.Error())
+	}
+}
+
 // SchedAPI is the slice of pkg/sched.Engine the handlers need. Defined here (not
 // imported as a concrete type) so unit tests can pass a fake without standing up
 // a store + vmmd.
@@ -88,6 +124,17 @@ type SchedAPI interface {
 	// emits only on (appID, nodeID) changes, so the wire is
 	// quiet for the steady-state "same-app-same-node" path.
 	StreamWarmHints(ctx context.Context, sink WarmHintSink) error
+
+	// CapacitySink (ADR-025 axis 5) returns a closure the
+	// ReportCapacity handler invokes per stream Recv. The
+	// closure applies the report to the engine's per-node
+	// table; nil is tolerated (the handler treats nil as
+	// "no cache; silently drop every report"). Returning
+	// the sink rather than a full table reference keeps
+	// the table type unexported in pkg/sched — a deliberate
+	// narrow seam so tests can fake the engine with a
+	// single function field.
+	CapacitySink() CapacitySink
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -375,14 +422,90 @@ func (s *Server) StreamWarmHints(req *scheddpb.StreamWarmHintsRequest, stream sc
 	}
 	if err := s.engine.StreamWarmHints(stream.Context(), sink); err != nil {
 		sendErr = err
-		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			return status.Error(codes.Canceled, err.Error())
-		default:
+		return mapStreamErr(err)
+	}
+	return nil
+}
+
+// ReportCapacity (ADR-025 axis 5) is the schedd-side half of the
+// vmmd→schedd live-capacity push. vmmd is the gRPC client and
+// sends one CapacityReport per second on a long-lived stream;
+// the handler decodes each report, applies it to the engine's
+// per-node capacity table via the SchedAPI.CapacitySink seam,
+// and replies with a single ReportCapacityAck on stream close.
+//
+// Wire error mapping:
+//
+//   - codes.OK + nil on clean shutdown (vmmd cancels after
+//     CloseAndRecv completes, or sends CloseAndRecv naturally
+//     when its loop exits)
+//   - codes.Canceled when vmmd cancels mid-stream
+//   - codes.Unavailable for any other unexpected drain failure
+//     (non-EOF / non-Canceled Recv error, or a sink-side failure)
+//   - codes.InvalidArgument if a report's node_id is empty —
+//     a programming bug in vmmd; the handler must NOT silently
+//     drop empty-id reports because that would let a future
+//     publisher regression poison the cache silently.
+//
+// Observability note: same shape as StreamWarmHints — the single
+// Observe call times the entire stream lifetime, not per-event.
+// Long-lived streams skew the latency histogram toward
+// minute-scale buckets; the next metric-review pass should split
+// this into a per-event observation (or a separate events-counter).
+// The shape is consistent with StreamAppLogs and StreamWarmHints;
+// fixing all three together is a follow-up ADR.
+//
+// Additive per ADR-016: new RPC + new messages append at the end.
+func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) error {
+	const op = "ReportCapacity"
+	start := time.Now()
+	var sendErr error
+	defer func() {
+		s.ops.Observe(op, time.Since(start), sendErr)
+	}()
+	table := s.engine.CapacitySink()
+	if table == nil {
+		// Pre-axis-5 fixture (no engine-side table). Block
+		// until ctx cancel so the gRPC trailer carries codes.OK
+		// + nil. A real vmmd in production never sees this
+		// path because production always wires the table.
+		<-stream.Context().Done()
+		return nil
+	}
+	for {
+		msg, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			// vmmd closed the send side cleanly; reply with
+			// the typed ack.
+			return stream.SendAndClose(&scheddpb.ReportCapacityAck{})
+		}
+		if err != nil {
+			sendErr = err
+			return mapStreamErr(err)
+		}
+		// ADR-016: empty node_id is a programming bug.
+		// Surface as codes.InvalidArgument so vmmd's publisher
+		// logs + reconnects instead of silently dropping.
+		if msg.GetNodeId() == "" {
+			sendErr = status.Error(codes.InvalidArgument, "capacity report missing node_id")
+			return sendErr
+		}
+		// Apply to the table. The sink closure handles the
+		// empty-nodeid no-op as a defensive fallback (the
+		// explicit check above is the load-bearing gate).
+		if err := table(sched.CapacityReport{
+			NodeID:        msg.GetNodeId(),
+			SampledAt:     time.UnixMilli(msg.GetSampledAtUnixMs()),
+			LiveCount:     msg.GetLiveCount(),
+			LeasedCount:   msg.GetLeasedCount(),
+			UsedMB:        msg.GetUsedMb(),
+			RAMHeadroomMB: msg.GetRamHeadroomMb(),
+			VCPUBusy:      msg.GetVcpuBusy(),
+		}); err != nil {
+			sendErr = err
 			return status.Error(codes.Unavailable, err.Error())
 		}
 	}
-	return nil
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the

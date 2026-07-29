@@ -13,7 +13,7 @@
 | Date (UTC) | 2026-07-21T__:__:__Z |
 | Operator | <name> |
 | Box | <EX44 id / public IP> |
-| Wildcard domain | `*.apps.<zone>` (e.g. `*.apps.example.com`) |
+| Wildcard domain | `*.apps.<zone>` (e.g. `*.apps.gregale.dev`) |
 | Cert issuer | Let's Encrypt (prod) |
 | Cert `notBefore` | <ISO-8601> |
 | Cert `notAfter` | <ISO-8601> |
@@ -27,7 +27,7 @@ Paste the raw command output under "Result".)
 
 | # | Check | Expected | Result |
 |---|-------|----------|--------|
-| 1 | Cert subject + issuer (TLS 1.3, `apps.example.com`) | `subject=CN = *.apps.example.com`, `issuer=O = Let's Encrypt` | |
+| 1 | Cert subject + issuer (TLS 1.3, `apps.gregale.dev`) | `subject=CN = *.apps.gregale.dev`, `issuer=O = Let's Encrypt` | |
 | 2 | TLS 1.2 rejected | `handshake failure` | |
 | 3 | Customer HTTPS | `200` after wake | |
 | 4 | :80 → :443 redirect | `308` | |
@@ -50,13 +50,13 @@ listening addr=:80" within the window, plus the wildcard mint INFO>
 ```
 $ sudo bash deploy/scripts/hetzner-zone-setup.sh \
       --zone example.com \
-      --apps-domain apps.example.com \
-      --edge-host edge.example.com \
+      --apps-domain apps.gregale.dev \
+      --edge-host edge.gregale.dev \
       --host-ip <EX44_IP>
 
 <paste the full script output here; expect three lines:
-   A     apps.example.com  -> <IP>
-   CNAME edge.example.com  -> apps.example.com.
+   A     apps.gregale.dev  -> <IP>
+   CNAME edge.gregale.dev  -> apps.gregale.dev.
    TXT   _faas-verify      -> "faas-domain-ok=1">
 ```
 

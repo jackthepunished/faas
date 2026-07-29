@@ -153,7 +153,7 @@ covers ~90% of what codegen would, with zero rework risk during M8.
   signal. Add `example:` blocks to the response shapes — SDK codegen
   reads them and ships nicer stubs.
 - **External docs site.** `docs/faas_ux_spec.md:81` references
-  `https://docs.DOMAIN/...` for the rendered HTML home. When that
+  `https://docs.gregale.dev/...` for the rendered HTML home. When that
   lands, point a Redoc/Starlight build at `/v1/openapi.json` instead
   of maintaining a separate HTML description.
 

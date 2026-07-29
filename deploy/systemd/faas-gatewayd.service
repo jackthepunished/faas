@@ -1,6 +1,6 @@
 [Unit]
 Description=onebox-faas gatewayd — edge proxy (the only public listener, spec §4.1)
-Documentation=https://docs.DOMAIN/ops/gatewayd
+Documentation=https://docs.gregale.dev/ops/gatewayd
 # gatewayd depends on apid (routing cache needs apps/domains rows + the
 # custom_domains table before /readyz returns true) and schedd (Wake gRPC).
 After=faas-cp.slice network-online.target faas-apid.service faas-schedd.service

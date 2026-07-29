@@ -43,7 +43,7 @@ func newTestHetznerFactory(_ *testing.T, h *fakeHetzner) DNSProviderFactory {
 func validTLSConfig() TLSConfig {
 	return TLSConfig{
 		Disabled:                false,
-		WildcardCertDomain:      "apps.example.com",
+		WildcardCertDomain:      "apps.gregale.dev",
 		HetznerDNSAPITokenPath:  "/dev/null", // not read by the factory path
 		HetznerZone:             "example.com",
 		StorageDir:              "", // caller fills per test

@@ -284,7 +284,7 @@ func TestSecrets_AppOwnershipBoundary(t *testing.T) {
 	teardown := withTestRecipient(t)
 	defer teardown()
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 
 	mustNamed := func(label string) (state.Account, string) {
 		t.Helper()
@@ -338,7 +338,7 @@ func TestSecrets_RecipientMissing_503(t *testing.T) {
 	// When apid starts without a host.age.pub (misconfigured box), PUTs
 	// MUST be rejected with 503 — never silently accept-and-drop plaintext.
 	store := state.NewMemStore()
-	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "example.com", noopNotifier{})
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{})
 	acct, _, key := mustAccount(t, store, api.PlanHobby)
 	env := testEnv{h: srv.handler(), store: store, key: key, acct: acct}
 	createApp(t, env, "rcp-app")
