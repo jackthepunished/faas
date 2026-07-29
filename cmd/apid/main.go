@@ -567,7 +567,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
 	if sock := resolveAdvisorySock(deps.getenv); sock != "" {
-		advisorySrv, advisoryLis, err = runAdvisoryServer(sock, srv.store, srv.audit, srv.notif, log)
+		advisorySrv, advisoryLis, err = runAdvisoryServer(sock, srv.store, srv.audit, srv.notif, log, srv.ops)
 		if err != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory listen %q: %w", sock, err)
@@ -750,12 +750,16 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 // Returns the server (caller calls Serve) and the listener. Errors
 // here are fatal — without the advisory listener vmmd has no way to
 // forward fanotify batches and the audit loop is silently broken.
-func runAdvisoryServer(sock string, store state.Store, audit *auditor, notif Notifier, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+func runAdvisoryServer(sock string, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
 	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
 	if err != nil {
 		return nil, nil, fmt.Errorf("advisory listen: %w", err)
 	}
 	srv := grpc.NewServer()
-	registerAdvisoryReceiver(srv, store, audit, notif, log)
+	// Mega-PR B: pass ops so the receiver can increment
+	// apid_stateless_advisory_events_total on each landed advisory.
+	// The accessor is nil-receiver safe so the metric stays zero
+	// when ops is nil (test path).
+	registerAdvisoryReceiver(srv, store, audit, notif, log, ops)
 	return srv, lis, nil
 }
