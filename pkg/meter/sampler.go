@@ -175,6 +175,26 @@ type RolledRow struct {
 	// Zero when no source is wired or the source has no
 	// data this tick.
 	NetTxBytes int64
+	// NetRxBytes (ADR-048) is the per-minute byte delta
+	// on root-side vethHost.tx_bytes (root→guest =
+	// ingress) the sampler appends to usage_minutes.
+	// net_rx_bytes. Source: vmmd netstats.Cache TX path
+	// → schedd instancestats.Poller → scheddgrpc.
+	// InstanceStatsRow.IngressTxBytes → meterd
+	// scheddIngressAdapter. Zero when no source is wired
+	// or the source has no data this tick.
+	NetRxBytes int64
+	// ColdBootCount (ADR-048) is the per-minute count of
+	// WAKE_RESTORE→WAKE_COLD_BOOT transitions observed
+	// for this instance. The sampler detects the
+	// transition by comparing LastWakeMethod on
+	// scheddgrpc.InstanceStatsRow across two consecutive
+	// ticks for the same (instance, minute) — only the
+	// transition counts; a redelivered tick within the
+	// same minute is a no-op. Zero when no source is
+	// wired or the instance is in WAKE_RESTORE steady-
+	// state for the whole minute.
+	ColdBootCount int32
 }
 
 // SampleAndRoll walks every app's live instances and appends one minute of
@@ -245,7 +265,13 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 				row.TXBytes = int64(txBytes)
 				row.NetTxBytes = int64(netTxBytes)
 			}
-			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec, row.TXBytes, row.NetTxBytes); err != nil {
+			// ADR-048 (extend metering telemetry): ingress bytes
+			// and WakeMethod transitions are wired by tasks A.3a
+			// and A.3b. Until then, the sampler passes 0 for both
+			// new columns (the additive-merge contract makes this
+			// safe — a redelivered AppendUsage with 0/0 is a no-op
+			// for the columns, matching the established pattern).
+			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec, row.TXBytes, row.NetTxBytes, row.NetRxBytes, int32(row.ColdBootCount)); err != nil {
 				return out, err
 			}
 			out = append(out, row)

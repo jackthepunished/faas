@@ -99,6 +99,8 @@ func TestInvoiceShadow24h_Sandbox(t *testing.T) {
 			0,
 			0,
 			0,
+			0,
+			0,
 		); err != nil {
 			t.Fatalf("AppendUsage minute %d: %v", i, err)
 		}

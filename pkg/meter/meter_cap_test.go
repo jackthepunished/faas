@@ -53,7 +53,7 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 		mbSeconds -= u.MBSeconds
 	}
 	if mbSeconds > 0 {
-		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0); err != nil {
+		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
 			t.Fatalf("append usage: %v", err)
 		}
 	}
@@ -112,7 +112,7 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 
 	// 500 cents of overage (5 GB-h). Below the 10_000 cap.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 
 	// Exactly 500 cents of derived overage.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
-	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append usage: %v", err)
 	}
 

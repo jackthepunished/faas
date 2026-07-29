@@ -871,6 +871,19 @@ type Usage struct {
 	// AppendUsage. ADR-046. Informational — not billed. Unit
 	// = interface bytes (includes Ethernet/IP framing).
 	NetTxBytes int64
+	// NetRxBytes is the cumulative byte delta on root-side
+	// vethHost.tx_bytes (root→guest = ingress) for this app
+	// in this month. Source: vmmd pkg/fcvm/netstats.Cache TX
+	// path → vmmd.Stats → schedd instancestats.Poller → meterd
+	// Sampler.SampleAndRoll → AppendUsage. ADR-048.
+	// Informational — not billed. Unit = interface bytes.
+	NetRxBytes int64
+	// ColdBootCount is the per-month sum of WAKE_RESTORE→
+	// WAKE_COLD_BOOT transitions observed across this app's
+	// instances. Source: scheddgrpc.InstanceStatsRow.
+	// LastWakeMethod, sampled by meterd Sampler.
+	// ADR-048. Informational — not billed.
+	ColdBootCount int64
 }
 
 // Invoice is one persisted invoice from a billing provider (issue #259,

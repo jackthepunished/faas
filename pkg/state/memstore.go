@@ -309,6 +309,21 @@ type usageMinute struct {
 	// (instance_id, minute). Unit = interface bytes (incl.
 	// framing).
 	NetTxBytes int64
+	// NetRxBytes is the cumulative byte delta on root-side
+	// vethHost.tx_bytes (root→guest = ingress) for this
+	// instance in this minute. Source: vmmd pkg/fcvm/netstats
+	// TX cache → schedd instancestats.Poller → meterd Sampler.
+	// ADR-048. Informational — not billed. Additive on conflict
+	// (instance_id, minute). Unit = interface bytes.
+	NetRxBytes int64
+	// ColdBootCount is the per-minute count of
+	// WAKE_RESTORE→WAKE_COLD_BOOT transitions observed for this
+	// instance. Source: scheddgrpc.InstanceStatsRow.LastWakeMethod,
+	// sampled by meterd Sampler. ADR-048. Informational — not
+	// billed. Additive on conflict (idempotent — only the
+	// transition counts; a redelivered tick within the same
+	// minute is a no-op).
+	ColdBootCount int32
 }
 
 // NewMemStore returns an empty in-memory store with the synthetic
@@ -3649,7 +3664,7 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 // migrations/00055_usage_minutes_cpu.sql, and
 // migrations/00065_usage_minutes_egress.sql for the production
 // rationale.
-func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error {
+func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := minute.UTC().Truncate(time.Minute)
@@ -3657,9 +3672,10 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 		if m.usage[i].InstanceID == instanceID && m.usage[i].Minute.Equal(key) {
 			// Idempotent for mb_seconds / requests (first write wins,
 			// so a restart-driven redelivery cannot inflate billing).
-			// cpu_usec / tx_bytes / net_tx_bytes are additive: the
-			// schedd / meterd accumulators can call AppendUsage many
-			// times per minute, and we sum the deltas.
+			// cpu_usec / tx_bytes / net_tx_bytes / net_rx_bytes /
+			// cold_boot_count are additive: the schedd / meterd
+			// accumulators can call AppendUsage many times per
+			// minute, and we sum the deltas.
 			if m.usage[i].MBSeconds == 0 && m.usage[i].Requests == 0 {
 				m.usage[i].MBSeconds = mbSeconds
 				m.usage[i].Requests = requests
@@ -3667,6 +3683,8 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 			m.usage[i].CPUUsec += cpuUsec
 			m.usage[i].TXBytes += txBytes
 			m.usage[i].NetTxBytes += netTxBytes
+			m.usage[i].NetRxBytes += netRxBytes
+			m.usage[i].ColdBootCount += coldBootCount
 			m.recomputeMonthLocked(accountID, appID, key)
 			return nil
 		}
@@ -3675,6 +3693,7 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 		AccountID: accountID, AppID: appID, InstanceID: instanceID,
 		Minute: key, MBSeconds: mbSeconds, Requests: requests,
 		CPUUsec: cpuUsec, TXBytes: txBytes, NetTxBytes: netTxBytes,
+		NetRxBytes: netRxBytes, ColdBootCount: coldBootCount,
 	})
 	m.recomputeMonthLocked(accountID, appID, key)
 	return nil
@@ -4429,7 +4448,8 @@ type appHourKey struct {
 // stays bounded (one minute × max_concurrency(plan) × apps).
 func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Time) {
 	month := time.Date(minute.Year(), minute.Month(), 1, 0, 0, 0, 0, time.UTC)
-	var mbSec, req, cpuUsec, txBytes, netTxBytes int64
+	var mbSec, req, cpuUsec, txBytes, netTxBytes, netRxBytes int64
+	var coldBoots int32
 	for _, u := range m.usage {
 		if u.AccountID != accountID || u.AppID != appID {
 			continue
@@ -4442,6 +4462,8 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 		cpuUsec += u.CPUUsec
 		txBytes += u.TXBytes
 		netTxBytes += u.NetTxBytes
+		netRxBytes += u.NetRxBytes
+		coldBoots += u.ColdBootCount
 	}
 	// Drop the existing row for this (account, app, month) if any, then append.
 	for i := range m.usageByMonth {
@@ -4456,6 +4478,7 @@ func (m *MemStore) recomputeMonthLocked(accountID, appID string, minute time.Tim
 		AccountID: accountID, AppID: appID, Month: month,
 		MBSeconds: mbSec, Requests: req, CPUUsec: cpuUsec,
 		TXBytes: txBytes, NetTxBytes: netTxBytes,
+		NetRxBytes: netRxBytes, ColdBootCount: int64(coldBoots),
 	})
 }
 

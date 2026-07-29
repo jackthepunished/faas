@@ -1332,15 +1332,23 @@ type Store interface {
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first
 	// write of mb_seconds / requests wins, a redelivered minute is
-	// a no-op for those columns. cpu_usec, tx_bytes, and net_tx_bytes
-	// are ADDITIVE on (instance_id, minute): the schedd / meterd
-	// accumulators can call AppendUsage many times within the same
-	// minute; the columns are the sum of all per-tick deltas. The
-	// additive merge is documented at
-	// migrations/00055_usage_minutes_cpu.sql (cpu_usec) and
-	// migrations/00065_usage_minutes_egress.sql (tx_bytes,
-	// net_tx_bytes, ADR-046).
-	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes int64) error
+	// a no-op for those columns. cpu_usec, tx_bytes, net_tx_bytes,
+	// net_rx_bytes, and cold_boot_count are ADDITIVE on
+	// (instance_id, minute): the schedd / meterd accumulators can
+	// call AppendUsage many times within the same minute; the
+	// columns are the sum of all per-tick deltas. The additive
+	// merge is documented at migrations/00055_usage_minutes_cpu.sql
+	// (cpu_usec), migrations/00065_usage_minutes_egress.sql
+	// (tx_bytes, net_tx_bytes, ADR-046), and
+	// migrations/00067_extend_metering_telemetry.sql (net_rx_bytes,
+	// cold_boot_count, ADR-048).
+	//
+	// builder_seconds / builder_kind are NOT accepted here — they
+	// are written via AppendBuilderUsage (keyed by build_id) because
+	// the per-build billing grain differs from the per-instance
+	// usage_minutes grain and mixing them would lose the
+	// build-id idempotency that webhook redelivery requires.
+	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error
 	UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error)
 	// ListInvoicesForAccount returns the account's invoices, newest
 	// first, ordered by (period_end DESC, id DESC) for deterministic

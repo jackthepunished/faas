@@ -83,7 +83,7 @@ func TestConsumeInvoice_HappyPath(t *testing.T) {
 		// past minute so UsageByAccount's "since" window picks it up.
 		// The reducer passes inv.PeriodStart = zero time, so all rows
 		// land in the window.
-		time.Now().UTC(), 9_000, 0, 0, 0, 0); err != nil {
+		time.Now().UTC(), 9_000, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("usage: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestConsumeInvoice_IdempotentReplay(t *testing.T) {
 	}
 	e.store.SeedInvoiceForTest(inv)
 	if err := e.store.AppendUsage(context.Background(), target.ID, "app-1", "inst-1",
-		time.Now().UTC(), 9_000, 0, 0, 0, 0); err != nil {
+		time.Now().UTC(), 9_000, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("usage: %v", err)
 	}
 

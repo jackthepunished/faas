@@ -276,10 +276,10 @@ func TestPg_UsageByAccount_AggregatesByMonth(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 	minute := time.Now().UTC().Truncate(time.Minute).Add(-1 * time.Minute)
-	if err := s.AppendUsage(ctx, acctID, app.ID, ins.ID, minute, 1024, 5, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, app.ID, ins.ID, minute, 1024, 5, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("AppendUsage: %v", err)
 	}
-	if err := s.AppendUsage(ctx, acctID, app.ID, ins.ID, minute.Add(time.Minute), 2048, 7, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, app.ID, ins.ID, minute.Add(time.Minute), 2048, 7, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("AppendUsage: %v", err)
 	}
 	rows, err := s.UsageByAccount(ctx, acctID, time.Time{})
