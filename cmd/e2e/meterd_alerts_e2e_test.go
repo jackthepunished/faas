@@ -52,6 +52,7 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -319,11 +320,14 @@ func TestMeterdAlertEvaluator_FiresAndDedupes(t *testing.T) {
 	// path which sums across all four sources for source='any'.
 	for i := 0; i < 5; i++ {
 		src := []string{"cron", "queue", "delayed_task", "async_invoke", ""}[i%5]
-		// invocations column is `state` (not `status`) — the row
-		// column follows pkg/state.InvocationState (terminal-failed).
+		// invocations.id is uuid-typed; invocations.state (not
+		// 'status') carries the lifecycle column. The id is a fresh
+		// UUID — not derived from rule.ID — because the table has no
+		// rule_id column and a UUID primary key is the canonical
+		// insert shape.
 		if _, err := pool.Exec(ctx,
 			`insert into invocations (id, account_id, app_id, source, state, created_at) values ($1, $2, $3, $4, 'failed', now())`,
-			fmt.Sprintf("inv-%s-%d", rule.ID, i), acct.ID, app.ID, src); err != nil {
+			uuid.NewString(), acct.ID, app.ID, src); err != nil {
 			t.Fatalf("seed invocation %d: %v", i, err)
 		}
 	}
