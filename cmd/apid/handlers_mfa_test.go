@@ -38,7 +38,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/auth"
+	"github.com/onebox-faas/faas/pkg/authcode"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -355,8 +355,8 @@ func TestMFAEnroll_ReturnsSecretAndQR(t *testing.T) {
 	if len(out.QRCodePNG) == 0 {
 		t.Errorf("QRCodePNG empty")
 	}
-	if len(out.RecoveryCodes) != auth.RecoveryCodeCount {
-		t.Errorf("RecoveryCodes count = %d, want %d", len(out.RecoveryCodes), auth.RecoveryCodeCount)
+	if len(out.RecoveryCodes) != authcode.RecoveryCodeCount {
+		t.Errorf("RecoveryCodes count = %d, want %d", len(out.RecoveryCodes), authcode.RecoveryCodeCount)
 	}
 }
 
@@ -525,8 +525,8 @@ func TestMFARecover_ConsumesCodeAndReissuesCookie(t *testing.T) {
 		t.Fatalf("AccountByID: %v", err)
 	}
 	hashes := after.MFARecoveryCodesHash
-	if len(hashes) != auth.RecoveryCodeCount-1 {
-		t.Errorf("RecoveryCodes remaining = %d, want %d", len(hashes), auth.RecoveryCodeCount-1)
+	if len(hashes) != authcode.RecoveryCodeCount-1 {
+		t.Errorf("RecoveryCodes remaining = %d, want %d", len(hashes), authcode.RecoveryCodeCount-1)
 	}
 }
 
@@ -543,8 +543,8 @@ func TestMFARecover_RejectsBadCode(t *testing.T) {
 
 	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
 	hashes := after.MFARecoveryCodesHash
-	if len(hashes) != auth.RecoveryCodeCount {
-		t.Errorf("RecoveryCodes after bad burn = %d, want %d (unchanged)", len(hashes), auth.RecoveryCodeCount)
+	if len(hashes) != authcode.RecoveryCodeCount {
+		t.Errorf("RecoveryCodes after bad burn = %d, want %d (unchanged)", len(hashes), authcode.RecoveryCodeCount)
 	}
 }
 
@@ -693,8 +693,8 @@ func TestFlipMFARequiredIfUnenrolled(t *testing.T) {
 func TestMFARecover_RefusesToBurnLastCode(t *testing.T) {
 	e := setupWithMFA(t, api.PlanPro, false, false)
 	recovCodes, _, _ := e.generateEnrolledAccount(t)
-	if len(recovCodes) != auth.RecoveryCodeCount {
-		t.Fatalf("setup: recovery code count = %d, want %d", len(recovCodes), auth.RecoveryCodeCount)
+	if len(recovCodes) != authcode.RecoveryCodeCount {
+		t.Fatalf("setup: recovery code count = %d, want %d", len(recovCodes), authcode.RecoveryCodeCount)
 	}
 	ctx := context.Background()
 
@@ -703,7 +703,7 @@ func TestMFARecover_RefusesToBurnLastCode(t *testing.T) {
 	// cookie (the reissue flow at /recover / /confirm keeps it
 	// cleared, so we re-mint only when we need a fresh session —
 	// the do() helper carries the existing cookie unchanged).
-	for i := 0; i < auth.RecoveryCodeCount-1; i++ {
+	for i := 0; i < authcode.RecoveryCodeCount-1; i++ {
 		rec := e.do(t, http.MethodPost, "/v1/account/mfa/recover",
 			api.MFARecoverRequest{Code: recovCodes[i]})
 		if rec.Code != http.StatusOK {
@@ -717,7 +717,7 @@ func TestMFARecover_RefusesToBurnLastCode(t *testing.T) {
 	}
 
 	// Drive /recover with the LAST remaining code (recovCodes[last]).
-	lastCode := recovCodes[auth.RecoveryCodeCount-1]
+	lastCode := recovCodes[authcode.RecoveryCodeCount-1]
 	rec := e.do(t, http.MethodPost, "/v1/account/mfa/recover",
 		api.MFARecoverRequest{Code: lastCode})
 	if rec.Code != http.StatusConflict {
@@ -807,9 +807,9 @@ func TestMFARecover_ConcurrentBurnOneCode(t *testing.T) {
 	// double-burn.
 	ctx := context.Background()
 	after, _ := e.store.AccountByID(ctx, e.acct.ID)
-	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
+	if got, want := len(after.MFARecoveryCodesHash), authcode.RecoveryCodeCount-1; got != want {
 		t.Errorf("codes after concurrent burn = %d, want %d (double-burn would have left %d)",
-			got, want, auth.RecoveryCodeCount-2)
+			got, want, authcode.RecoveryCodeCount-2)
 	}
 }
 
@@ -836,7 +836,7 @@ func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
 		t.Fatalf("setup: recovery code count = %d, want >= 2", len(recovCodes))
 	}
 	code := recovCodes[0]
-	presented := auth.HashRecoveryCode(code)
+	presented := authcode.HashRecoveryCode(code)
 
 	type result struct {
 		matched  bool
@@ -887,9 +887,9 @@ func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
 	}
 
 	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
-	if got, want := len(after.MFARecoveryCodesHash), auth.RecoveryCodeCount-1; got != want {
+	if got, want := len(after.MFARecoveryCodesHash), authcode.RecoveryCodeCount-1; got != want {
 		t.Errorf("codes after %d-way concurrent burn = %d, want %d (double-burn would have left %d)",
-			concurrency, got, want, auth.RecoveryCodeCount-2)
+			concurrency, got, want, authcode.RecoveryCodeCount-2)
 	}
 }
 
@@ -913,8 +913,8 @@ func TestMFAConfirm_AuditLand(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode /enroll: %v", err)
 	}
-	if len(out.RecoveryCodes) != auth.RecoveryCodeCount {
-		t.Fatalf("recovery code count = %d, want %d", len(out.RecoveryCodes), auth.RecoveryCodeCount)
+	if len(out.RecoveryCodes) != authcode.RecoveryCodeCount {
+		t.Fatalf("recovery code count = %d, want %d", len(out.RecoveryCodes), authcode.RecoveryCodeCount)
 	}
 }
 
@@ -931,15 +931,15 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 	ctx := context.Background()
 
 	// Burn down to 1 code by driving /recover until 1 is left.
-	for i := 0; i < auth.RecoveryCodeCount-1; i++ {
+	for i := 0; i < authcode.RecoveryCodeCount-1; i++ {
 		rec := e.do(t, http.MethodPost, "/v1/account/mfa/recover",
 			api.MFARecoverRequest{Code: recovCodes[i]})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("burn #%d: status %d", i, rec.Code)
 		}
 	}
-	lastCode := recovCodes[auth.RecoveryCodeCount-1]
-	presented := auth.HashRecoveryCode(lastCode)
+	lastCode := recovCodes[authcode.RecoveryCodeCount-1]
+	presented := authcode.HashRecoveryCode(lastCode)
 
 	// Drive the store primitive directly to bypass the
 	// handler's lastCode refusal: the customer is calling
@@ -1056,8 +1056,8 @@ func TestMFARecover_MailerErrorDoesNotFailBurn(t *testing.T) {
 	// leave the customer with a "code appears burned but isn't"
 	// half-state.
 	after, _ := e.store.AccountByID(context.Background(), e.acct.ID)
-	if got := len(after.MFARecoveryCodesHash); got != auth.RecoveryCodeCount-1 {
-		t.Errorf("recovery code count = %d, want %d (burn must commit even if mailer flakes)", got, auth.RecoveryCodeCount-1)
+	if got := len(after.MFARecoveryCodesHash); got != authcode.RecoveryCodeCount-1 {
+		t.Errorf("recovery code count = %d, want %d (burn must commit even if mailer flakes)", got, authcode.RecoveryCodeCount-1)
 	}
 }
 

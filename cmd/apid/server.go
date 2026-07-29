@@ -8,11 +8,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -159,6 +159,17 @@ type server struct {
 	// stub that returns codes.Unimplemented so the SSE handler
 	// degrades gracefully when the daemon is unreachable.
 	schedd scheddClient
+	// authMw is the pkg/auth.Middleware that backs the
+	// s.requireMFA + s.requireScope facade methods
+	// (cmd/apid/auth_facade.go). Constructed in
+	// newServerWithDeps from s.store + s.audit + s.log +
+	// s.apiAuthLimiter. Nil is tolerated for unit tests that
+	// don't exercise the auth chain (the facade is a wrapper
+	// around nil-Middleware methods, which is fine — those
+	// tests don't call s.requireMFA/Scope either).
+	//
+	// ADR-044.
+	authMw *authmw.Middleware
 	// appLogsHeartbeat and appLogsBackstop bound the serveAppLogs
 	// receive pump. Defaults are 15s heartbeat and 10m backstop
 	// (set by newServerWithDeps); whitebox tests shorten these
@@ -166,29 +177,7 @@ type server struct {
 	// wait the production interval. Issue #254.
 	appLogsHeartbeat time.Duration
 	appLogsBackstop  time.Duration
-	// touchDebounce coalesces per-key last_used_at updates (PR #232
-	// review #7). Without this, every successful bearer auth would
-	// spawn a goroutine issuing an UPDATE api_keys SET last_used_at =
-	// now(). Hot keys (gateway pinned under one key) would amplify
-	// into WAL+lock pressure. keyTouchWindow below is the
-	// minimum interval — recent touches within the window drop.
-	// Reads are lock-free via sync.Map.Load; the Store path is
-	// LoadOrStore so the first writer wins. A periodic janitor
-	// (pkg/grace) evicts old entries to bound memory.
-	touchDebounce sync.Map // map[string]time.Time
-	// sessionTouch is the IAM-3 (ADR-039) per-sid debounce map for
-	// last_seen_at UPDATEs. Distinct from touchDebounce (which
-	// gates per-key api_keys.last_used_at). Same sync.Map idiom;
-	// memory bounded by fresh sids in the 5-min window. Read by
-	// requireSessionCookie in the cookie branch of s.auth.
-	sessionTouch sessionTouchDebounce
 }
-
-// keyTouchWindow is the minimum interval between per-key last_used_at
-// stamps. PR #232 review pinned this at 30s — observability doesn't need
-// sub-second resolution, and a long-enough window keeps WAL amplification
-// bounded even under sustained 1k RPS on one key.
-const keyTouchWindow = 30 * time.Second
 
 // anonymousAccountLabel is the literal value of the `account_id`
 // label that the per-request accounting chain assigns to unauthenticated
@@ -208,23 +197,6 @@ const keyTouchWindow = 30 * time.Second
 // `acct := anonymousAccountLabel` and golangci-lint's goconst rule
 // would otherwise flag the duplication.
 const anonymousAccountLabel = "anonymous"
-
-// shouldTouchKey reports whether the key's last_used_at is stale enough
-// to warrant an UPDATE. Atomic-ish via sync.Map.LoadOrStore so two
-// concurrent first-time callers don't both schedule a touch; the
-// second caller observes the freshly-stored timestamp and skips.
-func (s *server) shouldTouchKey(keyID string, now time.Time) bool {
-	last, loaded := s.touchDebounce.LoadOrStore(keyID, now)
-	if !loaded {
-		return true // first touch wins
-	}
-	if now.Sub(last.(time.Time)) < keyTouchWindow {
-		return false // recent touch — drop
-	}
-	// stale entry; CAS to refresh.
-	s.touchDebounce.Store(keyID, now)
-	return true
-}
 
 // WithOpsMetrics attaches the daemon-wide Prometheus registry. The
 // handler-level observe call in observeHandler hits ops; the chain
@@ -496,6 +468,21 @@ func newServerWithDeps(
 		schedd:           stubScheddClient{},
 		appLogsHeartbeat: 15 * time.Second,
 		appLogsBackstop:  10 * time.Minute,
+		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
+		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
+		// nil-safe so the auth.mfa_gate_hit audit row fires when the
+		// auditor is wired; nil in tests disables the row. The Limiter
+		// is the shared apiAuthLimiter that backs s.authLimited (the
+		// API surface-level per-IP bucket per spec §11 10/min/IP).
+		// ADR-044.
+		authMw: authmw.New(
+			storeAsAuthenticator(store),
+			sessions,
+			storeAsSessionLookup(store),
+			auditorAsAuthAuditor(newAuditor(store, log, nil)),
+			log,
+			apiAuthLimiter,
+		),
 	}
 }
 
@@ -1241,25 +1228,20 @@ type principal struct {
 	Key  *state.APIKey
 }
 
-type ctxKey int
-
-const principalCtxKey ctxKey = iota
-
 // principalFrom returns the principal stashed in r.Context() by s.auth.
 // Returns ok=false if s.auth did not run (e.g. tests that wire a
-// handler directly to httptest).
+// handler directly to httptest). Bridges to pkg/auth so that both
+// cmd/apid's observeWrap and pkg/auth.RequireScope read the same
+// stamped value — without the bridge, the two surfaces would each
+// look at their own (separate) ctx key and requireScope would
+// 500/CodeCapacity on every apid route (PR-1 pkg/auth extraction,
+// ADR-044).
 func principalFrom(r *http.Request) (principal, bool) {
-	v := r.Context().Value(principalCtxKey)
-	if v == nil {
+	acct, key, ok := authmw.AccountFromContext(r)
+	if !ok {
 		return principal{}, false
 	}
-	p, ok := v.(principal)
-	return p, ok
-}
-
-// withPrincipal returns a context carrying the principal.
-func withPrincipal(ctx context.Context, p principal) context.Context {
-	return context.WithValue(ctx, principalCtxKey, p)
+	return principal{Acct: acct, Key: key}, true
 }
 
 // principalHasScope reports whether the principal carries at least one
@@ -1310,122 +1292,11 @@ func principalHasScope(p principal, allowed []string) bool {
 // Account out of the principal; the requireScope wrapper reads the
 // scopes. Session-cookie auth produces a principal with Key == nil
 // (treated as implicit admin by the scope check). See ADR-034.
-func (s *server) auth(next accountHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tok := bearerToken(r)
-		if api.ValidAPIKeyFormat(tok) {
-			acct, key, err := s.store.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
-			if err == nil {
-				if !acct.Active() {
-					if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
-						api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,
-							"Account suspended", "resolve billing to continue: https://DOMAIN/billing"))
-						return
-					}
-				}
-				*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
-				// TouchKeyLastUsed is observability, not auth — a slow or
-				// failing PG must not block the user's request. Detached
-				// context so a request that cancels client-side (tab close,
-				// SSE disconnect) still stamps the key; bounded timeout
-				// so a hung pool is reclaimed in 2 s. No pkg/grace.Recover:
-				// a panic in a 5-line goroutine implies a code bug worth
-				// surfacing in the daemon logs. Pass r.Context() to satisfy
-				// contextcheck even though the goroutine's detached ctx
-				// ignores it. Per-key debounce (keyTouchWindow,
-				// server.touchDebounce) keeps hot keys from amplifying
-				// into 1k+ UPDATEs/sec under sustained load (PR #232
-				// review #7).
-				if s.shouldTouchKey(key.ID, time.Now()) {
-					//nolint:contextcheck // see touchKeyLastUsed — detached is load-bearing
-					go func(parent context.Context, id string) {
-						s.touchKeyLastUsed(parent, id)
-					}(r.Context(), key.ID)
-				}
-				next(w, r, acct)
-				return
-			}
-		}
-
-		// Session cookie authentication (faas_sid) for Web Dashboard
-		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
-			if env, err := s.sessions.Verify(c.Value); err == nil {
-				// IAM-3 (ADR-039) cross-validate the AEAD-bound
-				// sid against the live sessions row. Empty sid ==
-				// pre-rollout cookie (revoked). Missing/revoked row
-				// == the migration's kill switch. Account-mismatch
-				// is defensive (AEAD should bind).
-				sess, handled, sessCheckErr := requireSessionCookie(
-					w, r, env, s.store, s.audit, s.log, &s.sessionTouch,
-				)
-				if sessCheckErr != nil {
-					// Err from requireSessionCookie is reserved
-					// for unexpected lookup failures; today it
-					// never returns one (the helper funnels
-					// state.ErrNotFound to a 401). Treat as fail-
-					// closed.
-					if s.log != nil {
-						s.log.Warn("session cross-check error",
-							"path", r.URL.Path, "error", sessCheckErr.Error())
-					}
-					clearSessionCookie(w, r)
-					api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
-						api.CodeSessionExpired, "Session expired",
-						"session validation failed; sign in again"))
-					return
-				}
-				if handled {
-					// 401 already written.
-					return
-				}
-				// sess carries the validated row. Stamp it onto
-				// the request context here so the four
-				// /v1/auth/sessions* handlers can read its id
-				// without re-querying. Each r.WithContext re-reads
-				// r.Context() so the chain accumulates (session →
-				// principal → mfa-pending) without losing prior
-				// stamps. contextcheck fires on the r.Context()
-				// re-reads but the seam is documented (withSession
-				// is the public function; r.Context() is the
-				// inherited parent).
-				//nolint:contextcheck // documented seam: r.Context() is the inherited parent; withSession/withPrincipal are the wrappers.
-				r = r.WithContext(withSession(r.Context(), sess))
-				//nolint:contextcheck // see above.
-				if acct, err := s.store.AccountByID(r.Context(), env.AccountID); err == nil {
-					if !acct.Active() {
-						if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
-							api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,
-								"Account suspended", "resolve billing to continue: https://DOMAIN/billing"))
-							return
-						}
-					}
-					// Key stays nil; session cookie = implicit admin.
-					// Pointer-mutation (`*r = ...`) is load-bearing —
-					// observeWrap is the outermost middleware in the
-					// chain and reads the principal via principalFrom(r);
-					// a non-mutating rebind would be invisible to
-					// observeWrap and the request-failure counter would
-					// lose the account_id label (PR #332 / issue #278).
-					*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil}))
-					// Stamp the mfa-pending flag for requireMFA. The
-					// bearer branch above deliberately does NOT
-					// stamp this — API keys bypass MFA per the
-					// IAM-2 design decision 3. The flag is the
-					// session-envelope's MfaPending, which the
-					// login handlers set via
-					// IssueWithMFAFlag(mfaEnrollRequired(acct)).
-					//nolint:contextcheck // withMFAPending is the documented seam; same shape as withPrincipal above.
-					*r = *r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
-					next(w, r, acct)
-					return
-				}
-			}
-		}
-
-		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
-			"Unauthorized", "provide a valid API key as a Bearer token or sign in via session cookie"))
-	}
-}
+// auth is the cmd/apid-side facade. The body lives in
+// pkg/auth (cmd/apid/auth_facade.go::auth is the bridge).
+// Behaviour matches the pre-extraction shape because pkg/auth lifts
+// the bearer + cookie branch + debounce + detached-touch machinery
+// verbatim. ADR-046.
 
 // requireScope returns a middleware that enforces the API-key scope
 // vocabulary on the route. The principal must have at least one of the
@@ -1441,70 +1312,10 @@ func (s *server) auth(next accountHandler) http.HandlerFunc {
 // api.ScopesUsageReadSurface) — admin is in every set, so a session
 // cookie or admin key always satisfies. See ADR-034 rev2.
 
-// touchKeyLastUsed bumps last_used_at on the given api_key after a
-// successful bearer auth. Observability only — never auth. Detached
-// context + 2 s timeout means a slow or hung PG cannot block the user's
-// request, and a canceled client (tab close, SSE disconnect) still
-// leaves a stamp. An error is logged at WARN; the next successful
-// request will overwrite a stale value anyway. Accepts a parent ctx
-// (unused — the goroutine detaches) so it matches contextcheck's
-// "function takes ctx" guidance; the touch never respects its parent
-// because it MUST outlive the request.
-//
-//nolint:contextcheck // detached-context is the load-bearing behavior for fire-and-forget observability
-func (s *server) touchKeyLastUsed(_ context.Context, keyID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := s.store.TouchKeyLastUsed(ctx, keyID); err != nil {
-		s.log.Warn("api_key last_used_at touch failed", "key_id", keyID, "error", err.Error())
-	}
-}
-
-// requireScope(allowed ...string) accepts the route's allowed scope set.
-// The HTTP method is implicit in the closure below — handlers chain
-// requireScope before calling the real handler, so method is no longer
-// a separate parameter. Routes pick the named shape that matches the
-// HTTP verb (api.ScopesDeployWriteSurface for POST/PATCH/DELETE,
-// api.ScopesReadSurface for GET, etc.) — admin is in every set, so a
-// session cookie or admin key always satisfies.
-//
-// Pick the named shape that matches the route
-// (api.ScopesAdminOnly / api.ScopesReadSurface /
-// api.ScopesDeployWriteSurface / api.ScopesSecretsWriteSurface /
-// api.ScopesUsageReadSurface) — admin is in every set, so a session
-// cookie or admin key always satisfies. See ADR-034 rev2.
-func (s *server) requireScope(allowed ...string) func(accountHandler) accountHandler {
-	return func(next accountHandler) accountHandler {
-		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
-			p, ok := principalFrom(r)
-			if !ok {
-				// requireScope must run AFTER s.auth. If the principal is
-				// missing, the route wiring is broken — fail closed.
-				api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeCapacity,
-					"auth-context missing", "requireScope must be wrapped inside s.auth / s.authLimited"))
-				return
-			}
-			if !principalHasScope(p, allowed) {
-				api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
-					"Insufficient scope", "this endpoint requires one of: "+strings.Join(allowed, ",")))
-				return
-			}
-			next(w, r, acct)
-		}
-	}
-}
-
-// isAccountScopedPath returns true for the paths that must remain
-// reachable while an account is in the deletion grace window. Keep
-// this list short and explicit — every entry is a deliberate
-// exception to the spec §11 "inactive account = 402" rule.
-func isAccountScopedPath(p string) bool {
-	switch p {
-	case "/v1/account", "/v1/account/export", "/v1/account/restore":
-		return true
-	}
-	return false
-}
+// requireScope is the cmd/apid-side facade. The body lives in
+// pkg/auth (cmd/apid/auth_facade.go::requireScope is the bridge).
+// Behaviour matches the pre-extraction shape because pkg/auth lifts
+// the predicate principalHasScope and the audit path verbatim. ADR-044.
 
 // authLimited wraps an accountHandler in s.auth + AuthLimit (spec §11:
 // 10 failed auth attempts per IP per minute). The /v1/* API-key surface
@@ -1521,17 +1332,11 @@ func isAccountScopedPath(p string) bool {
 // route. Tests inject a fresh limiter via apiAuthLimiter so each test
 // gets an isolated bucket; the nil-fallback keeps the daemon booting
 // in dev environments that bypass newServerWithDeps.
-func (s *server) authLimited(next accountHandler) http.HandlerFunc {
-	h := s.auth(next)
-	cfg := middleware.AuthLimitConfig{
-		CountStatuses: []int{http.StatusUnauthorized},
-		Log:           s.log,
-	}
-	if s.apiAuthLimiter == nil {
-		s.apiAuthLimiter = middleware.NewLimiter(cfg)
-	}
-	return middleware.AuthLimitWithLimiter(cfg, s.apiAuthLimiter)(h).ServeHTTP
-}
+// authLimited is the cmd/apid-side facade. The body lives in
+// pkg/auth (cmd/apid/auth_facade.go::authLimited is the bridge).
+// Behaviour matches the pre-extraction shape — pkg/auth.RequireLimited
+// wraps RequireSession in pkg/middleware.AuthLimitWithLimiter with the
+// shared s.apiAuthLimiter bucket (spec §11 "10/min/IP"). ADR-046.
 
 // idempotent replays a stored response for a repeated Idempotency-Key, or runs
 // the handler and stores its response (spec §4.2: kept 24 h). Without the header
@@ -1609,11 +1414,9 @@ func ctx(r *http.Request) context.Context { return r.Context() }
 // loadApp resolves a slug to an account-scoped App, collapsing cross-account
 // lookups to 404 per the handler convention. Returns the resolved app or
 // writes the error and returns false.
-func (s *server) loadApp(w http.ResponseWriter, r *http.Request, acct state.Account, slug string) (state.App, bool) {
-	app, err := s.store.AppBySlug(ctx(r), slug)
-	if err != nil || app.AccountID != acct.ID {
-		s.notFound(w, "no such app")
-		return state.App{}, false
-	}
-	return app, true
-}
+// loadApp is the cmd/apid-side facade. The body lives in
+// pkg/auth (cmd/apid/auth_facade.go::loadApp is the bridge).
+// Behaviour matches the pre-extraction shape — pkg/auth.LoadApp
+// does the IDOR-safe slug→App lookup with the ownership predicate
+// (app.AccountID == acct.ID) and the 404 "no such app" response on
+// a cross-account or missing row. ADR-046.

@@ -81,7 +81,7 @@ func (s *server) logout(w http.ResponseWriter, r *http.Request, acct state.Accou
 			api.CodeCapacity, "Session revoke failed", err.Error()))
 		return
 	}
-	clearSessionCookie(w, r)
+	s.clearSessionCookie(w, r)
 	if s.audit != nil {
 		s.audit.Emit(r.Context(), "auth.session.revoke", &acct.ID, map[string]any{
 			"sid":    current.ID,
@@ -157,7 +157,7 @@ func (s *server) revokeSession(w http.ResponseWriter, r *http.Request, acct stat
 	// the logout handler — same "log out this device" path).
 	current, hasCurrent := sessionFrom(r)
 	if hasCurrent && current.ID == id {
-		clearSessionCookie(w, r)
+		s.clearSessionCookie(w, r)
 	}
 	if s.audit != nil {
 		s.audit.Emit(r.Context(), "auth.session.revoke", &acct.ID, map[string]any{

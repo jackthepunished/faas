@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -521,7 +522,8 @@ func TestRequireSessionCookie_DefendsAccountMismatch(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/auth/sessions", nil)
-	_, handled, err := requireSessionCookie(rec, req, env, store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), &sessionTouchDebounce{})
+	mw := authmw.New(storeAsAuthenticator(store), mgr, storeAsSessionLookup(store), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), middleware.NewLimiter(middleware.AuthLimitConfig{}))
+	_, handled, err := mw.RequireSessionCookie(rec, req, env)
 	if err != nil {
 		t.Fatalf("requireSessionCookie returned err (should be silent handled=true): %v", err)
 	}
