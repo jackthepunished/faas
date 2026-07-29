@@ -1796,6 +1796,149 @@ func assertMemHeartbeatAdvanced(t *testing.T, m *MemStore, ctx context.Context, 
 	return after.LastHeartbeatAt.After(before)
 }
 
+func TestMem_ComputeNodes_AppendComputeNodeHeartbeat_RoundTrip(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	node := state_computeNodeFixture("hb-history-node", true)
+	created, err := m.CreateComputeNode(ctx, node)
+	if err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	// Append five rows in known order; assert ListComputeNodeHeartbeats
+	// returns them newest-first.
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		receivedAt := base.Add(time.Duration(i) * 30 * time.Second)
+		if err := m.AppendComputeNodeHeartbeat(ctx, created.ID, receivedAt, receivedAt, "heartbeat_tick"); err != nil {
+			t.Fatalf("AppendComputeNodeHeartbeat #%d: %v", i, err)
+		}
+	}
+	rows, err := m.ListComputeNodeHeartbeats(ctx, created.ID, time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("ListComputeNodeHeartbeats: %v", err)
+	}
+	if len(rows) != 5 {
+		t.Fatalf("got %d rows, want 5", len(rows))
+	}
+	// Newest first.
+	for i := 0; i < len(rows)-1; i++ {
+		if !rows[i].ReceivedAt.After(rows[i+1].ReceivedAt) {
+			t.Errorf("rows not newest-first: row[%d].ReceivedAt = %v, row[%d].ReceivedAt = %v",
+				i, rows[i].ReceivedAt, i+1, rows[i+1].ReceivedAt)
+		}
+	}
+}
+
+func TestMem_ComputeNodes_AppendComputeNodeHeartbeat_DuplicateIsConflict(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	node := state_computeNodeFixture("hb-dup-node", true)
+	created, err := m.CreateComputeNode(ctx, node)
+	if err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	at := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	if err := m.AppendComputeNodeHeartbeat(ctx, created.ID, at, at, "heartbeat_tick"); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	err = m.AppendComputeNodeHeartbeat(ctx, created.ID, at, at, "heartbeat_tick")
+	if err == nil {
+		t.Fatalf("duplicate (node_id, received_at) must surface as ErrConflict")
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("duplicate = %v, want ErrConflict", err)
+	}
+}
+
+func TestMem_ComputeNodes_AppendComputeNodeHeartbeat_UnknownNodeIsNotFound(t *testing.T) {
+	m := NewMemStore()
+	err := m.AppendComputeNodeHeartbeat(context.Background(), "no-such-id",
+		time.Now(), time.Now(), "heartbeat_tick")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AppendComputeNodeHeartbeat(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMem_ComputeNodes_ListComputeNodeHeartbeats_FiltersSince(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	node := state_computeNodeFixture("hb-since-node", true)
+	created, err := m.CreateComputeNode(ctx, node)
+	if err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 6; i++ {
+		receivedAt := base.Add(time.Duration(i) * 30 * time.Second)
+		if err := m.AppendComputeNodeHeartbeat(ctx, created.ID, receivedAt, receivedAt, "heartbeat_tick"); err != nil {
+			t.Fatalf("append #%d: %v", i, err)
+		}
+	}
+	since := base.Add(60 * time.Second)
+	rows, err := m.ListComputeNodeHeartbeats(ctx, created.ID, since, 100)
+	if err != nil {
+		t.Fatalf("ListComputeNodeHeartbeats: %v", err)
+	}
+	// ReceivedAt >= base+60s means rows 2..5 inclusive = 4 rows.
+	if len(rows) != 4 {
+		t.Errorf("since-filter row count = %d, want 4", len(rows))
+	}
+	for _, r := range rows {
+		if r.ReceivedAt.Before(since) {
+			t.Errorf("row ReceivedAt=%v below since=%v", r.ReceivedAt, since)
+		}
+	}
+}
+
+func TestMem_ComputeNodes_ListComputeNodeHeartbeats_LimitZeroDefaults200(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	node := state_computeNodeFixture("hb-limit-node", true)
+	created, err := m.CreateComputeNode(ctx, node)
+	if err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	// Append 250 rows; assert limit=0 returns ≤ 200 (the documented default).
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 250; i++ {
+		receivedAt := base.Add(time.Duration(i) * time.Second)
+		if err := m.AppendComputeNodeHeartbeat(ctx, created.ID, receivedAt, receivedAt, "heartbeat_tick"); err != nil {
+			t.Fatalf("append #%d: %v", i, err)
+		}
+	}
+	rows, err := m.ListComputeNodeHeartbeats(ctx, created.ID, time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("ListComputeNodeHeartbeats: %v", err)
+	}
+	if len(rows) != 200 {
+		t.Errorf("limit=0 row count = %d, want 200 (default)", len(rows))
+	}
+}
+
+func TestMem_ComputeNodes_DeleteComputeNode_CascadesHeartbeats(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	node := state_computeNodeFixture("hb-cascade-node", true)
+	created, err := m.CreateComputeNode(ctx, node)
+	if err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	if err := m.AppendComputeNodeHeartbeat(ctx, created.ID,
+		time.Now(), time.Now(), "heartbeat_tick"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := m.DeleteComputeNode(ctx, created.ID); err != nil {
+		t.Fatalf("DeleteComputeNode: %v", err)
+	}
+	rows, err := m.ListComputeNodeHeartbeats(ctx, created.ID, time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("ListComputeNodeHeartbeats: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("after cascade, row count = %d, want 0", len(rows))
+	}
+}
+
 func TestMem_ComputeNodes_CreateComputeNode_AutoFillsIDAndTimestamps(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

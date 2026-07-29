@@ -331,3 +331,37 @@ returning id;
 -- Best-effort, fire-and-forget. Allowed on revoked rows (observability
 -- signal only; not authorization). pgx interface returns nothing.
 update sessions set last_seen_at = now() where id = $1;
+
+-- name: InsertComputeNodeHeartbeat :exec
+-- CP-1 (operator observability): append one row to the heartbeat
+-- history. The schedd Heartbeat.Tick goroutine is the only writer.
+-- We deliberately do NOT use ON CONFLICT DO NOTHING — a duplicate
+-- (node_id, received_at) is observable as a SQLSTATE 23505 unique-
+-- violation, which the writer logs as a warning. A silently-deduped
+-- stamp would mask a future bug where the scheduler tick fires twice.
+-- received_at and last_heartbeat_at are passed by the caller; the
+-- column default now() is intentionally NOT used so the writer
+-- controls the wall-clock pair (the property test depends on
+-- caller-supplied timestamps for deterministic gap classification).
+insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source)
+values ($1, $2, $3, $4);
+
+-- name: ListComputeNodeHeartbeats :many
+-- CP-1: read heartbeat history for one node, newest first. The
+-- $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
+-- zero value, mapped to SQL NULL by sqlc) means "no lower bound,
+-- return most-recent N"; passing a populated timestamptz means
+-- "history since t". The composite index
+-- compute_node_heartbeats_node_at_idx (node_id, received_at desc)
+-- matches this read shape.
+--
+-- The endpoint passes a hard-cap limit (default 200, max 2000). The
+-- composite index is enough for the routine 30s × 60 nodes × 24h
+-- steady-state workload; a 7-day retention sweep is a follow-on.
+select id, node_id, received_at, last_heartbeat_at, source
+from compute_node_heartbeats
+where node_id = $1
+  and ($2::timestamptz is null or received_at >= $2)
+order by received_at desc
+limit $3;
+

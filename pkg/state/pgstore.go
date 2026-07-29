@@ -4210,6 +4210,92 @@ func (s *PgStore) HeartbeatComputeNode(ctx context.Context, nodeID string) error
 	return nil
 }
 
+// AppendComputeNodeHeartbeat appends one row to the append-only
+// heartbeat history (CP-1, migration 00065). The parent
+// compute_node row is checked first so a known-missing node returns
+// ErrNotFound (matching the MemStore branch); the INSERT itself
+// raises a unique-violation SQLSTATE 23505 on (node_id, received_at)
+// collision, which we surface as ErrConflict so the writer can log
+// it as a warning rather than silently dedup. The FK on delete
+// cascade is automatic — see migration 00065.
+//
+// Why raw SQL and not the sqlc-generated method: the generated
+// method uses pgtype.UUID for the node_id parameter, which would
+// force every caller to thread UUID values through pgtype — the
+// rest of the compute-node surface (HeartbeatComputeNode,
+// MarkComputeNodeInactive, etc.) takes string ids. The raw SQL
+// path is consistent with that surface.
+func (s *PgStore) AppendComputeNodeHeartbeat(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string) error {
+	// Parent existence check first. A hot tick that races a
+	// concurrent admin DELETE will reach this point and bail with
+	// ErrNotFound rather than racing the FK insert.
+	var parentExists bool
+	if err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from compute_nodes where id = $1)`, nodeID,
+	).Scan(&parentExists); err != nil {
+		return fmt.Errorf("state: append compute_node_heartbeat: parent check: %w", err)
+	}
+	if !parentExists {
+		return ErrNotFound
+	}
+	if _, err := s.pool.Exec(ctx, `
+		insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source)
+		values ($1, $2, $3, $4)
+	`, nodeID, receivedAt, lastHeartbeatAt, source); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+		return fmt.Errorf("state: append compute_node_heartbeat: %w", err)
+	}
+	return nil
+}
+
+// ListComputeNodeHeartbeats returns up to limit rows for the
+// given node, newest first. since.IsZero() ⇒ no lower bound;
+// the SQL `$2::timestamptz is null or received_at >= $2` predicate
+// collapses both cases into a single query (the MemStore
+// implementation mirrors the same shape in Go). The composite
+// index compute_node_heartbeats_node_at_idx (node_id, received_at
+// desc) matches this read. An empty result set is NOT an error —
+// a fresh node has no history rows, the endpoint surfaces that
+// as { "heartbeats": [] }.
+func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	var sinceArg interface{}
+	if !since.IsZero() {
+		sinceArg = since.UTC()
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, node_id, received_at, last_heartbeat_at, source
+		from compute_node_heartbeats
+		where node_id = $1
+		  and ($2::timestamptz is null or received_at >= $2)
+		order by received_at desc
+		limit $3
+	`, nodeID, sinceArg, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list compute_node_heartbeats: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ComputeNodeHeartbeat, 0, limit)
+	for rows.Next() {
+		var h ComputeNodeHeartbeat
+		var nodeUUID string
+		if err := rows.Scan(&h.ID, &nodeUUID, &h.ReceivedAt, &h.LastHeartbeatAt, &h.Source); err != nil {
+			return nil, fmt.Errorf("state: scan compute_node_heartbeat: %w", err)
+		}
+		h.NodeID = nodeUUID
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate compute_node_heartbeats: %w", err)
+	}
+	return out, nil
+}
+
 // MarkComputeNodeInactive flips active=false on the row (PR #114,
 // schedd heartbeat path). Idempotent: the UPDATE matches regardless
 // of current value, so re-flipping an inactive row is a no-op. We

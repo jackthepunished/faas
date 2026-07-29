@@ -804,6 +804,29 @@ type ComputeNode struct {
 	CreatedAt          time.Time
 }
 
+// ComputeNodeHeartbeat is one row in the append-only
+// compute_node_heartbeats table (CP-1, migration 00065). The
+// schedd Heartbeat.Tick goroutine writes one row per successful
+// ping; the operator's GET /v1/compute-nodes/{name}/heartbeats
+// endpoint reads from this table.
+//
+// Source is the enum-shaped stamp trigger:
+//   - "heartbeat_tick"  — the routine stamp path (every successful
+//     ping; this is the dominant row).
+//   - "deactivation"   — the watchdog's last contact attempt before
+//     flipping active=false (the deactivation event row).
+//   - "reactivation"   — the recovery path (a previously drained
+//     node whose ping succeeded again).
+//
+// The CHECK constraint on the column keeps the set Go-shaped.
+type ComputeNodeHeartbeat struct {
+	ID              int64
+	NodeID          string
+	ReceivedAt      time.Time
+	LastHeartbeatAt time.Time
+	Source          string
+}
+
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
 // gateway accumulates these in memory and hands them to schedd every 15 s.
 type InstanceTouch struct {

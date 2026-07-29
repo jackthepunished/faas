@@ -237,6 +237,14 @@ type MemStore struct {
 	// CreateComputeNode to exercise the single-box path. Production
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
+	// computeNodeHeartbeats is the append-only history (CP-1,
+	// migration 00065). Mirrors the same wire shape as the SQL
+	// table; rows are append-only, never mutated, and dropped with
+	// the parent computeNode on hard-delete (mimicking the FK's
+	// ON DELETE CASCADE). The cached map is keyed by node-id for
+	// the read path; ListComputeNodeHeartbeats iterates the
+	// per-node slice in received_at-desc order.
+	computeNodeHeartbeats map[string][]ComputeNodeHeartbeat
 	// sessions is the IAM-3 (ADR-039) in-memory mirror of the
 	// `sessions` table — one row per dashboard login, keyed by
 	// uuid. Revocation authority is RevokedAt != nil; LastSeenAt
@@ -371,6 +379,10 @@ func NewMemStore() *MemStore {
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
+		// computeNodeHeartbeats is the CP-1 history mirror. Empty here;
+		// rows accumulate via AppendComputeNodeHeartbeat as the schedd
+		// Heartbeat.Tick goroutine (or test setup) drives them.
+		computeNodeHeartbeats: map[string][]ComputeNodeHeartbeat{},
 		// sessions is empty here; populated by CreateSession at each
 		// dashboard login (handlers_auth*.go + handlers_mfa reissue).
 		sessions: map[string]Session{},
@@ -3481,7 +3493,73 @@ func (m *MemStore) DeleteComputeNode(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	delete(m.computeNodes, id)
+	// CP-1: cascade the heartbeat history. Mirrors the FK ON DELETE
+	// CASCADE on compute_node_heartbeats.node_id; the endpoint
+	// resolves the parent by name first, so a missing history rows
+	// after a hard-delete is the expected shape.
+	delete(m.computeNodeHeartbeats, id)
 	return nil
+}
+
+// AppendComputeNodeHeartbeat appends one row to the per-node
+// history. The CP-1 routine path is schedd's Heartbeat.Tick; the
+// deactivation/reactivation sources are stamped on the rarer
+// deactivation/reactivation paths (gated by the same operations that
+// call MarkComputeNodeInactive / SetComputeNodeActive). The unique
+// (node_id, received_at) constraint is OBSERVED, not folded; a
+// duplicate-timestamp stamp returns ErrConflict so the writer can
+// log a warning rather than silently dedup.
+func (m *MemStore) AppendComputeNodeHeartbeat(_ context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.computeNodes[nodeID]; !ok {
+		return ErrNotFound
+	}
+	for _, prev := range m.computeNodeHeartbeats[nodeID] {
+		if prev.ReceivedAt.Equal(receivedAt) {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+	}
+	row := ComputeNodeHeartbeat{
+		ID:              int64(len(m.computeNodeHeartbeats[nodeID]) + 1),
+		NodeID:          nodeID,
+		ReceivedAt:      receivedAt,
+		LastHeartbeatAt: lastHeartbeatAt,
+		Source:          source,
+	}
+	m.computeNodeHeartbeats[nodeID] = append(m.computeNodeHeartbeats[nodeID], row)
+	return nil
+}
+
+// ListComputeNodeHeartbeats returns up to limit rows for the
+// given node, newest first. since.IsZero() ⇒ no lower bound;
+// otherwise restrict to rows whose received_at >= since. The
+// implementation iterates in insertion order (cheap for the
+// routine test scale) and reverses the slice for the wire shape;
+// the SQL PgStore impl uses the (node_id, received_at desc)
+// composite index for the same read.
+func (m *MemStore) ListComputeNodeHeartbeats(_ context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.computeNodeHeartbeats[nodeID]
+	if limit <= 0 {
+		limit = 200
+	}
+	out := make([]ComputeNodeHeartbeat, 0, len(rows))
+	// Iterate in reverse (newest-first) so the wire shape is
+	// stable without a sort. The endpoint's reader expects
+	// received_at DESC.
+	for i := len(rows) - 1; i >= 0; i-- {
+		row := rows[i]
+		if !since.IsZero() && row.ReceivedAt.Before(since) {
+			continue
+		}
+		out = append(out, row)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // AppendEvent (commit 4) fixes two pre-existing bugs that the audit-log

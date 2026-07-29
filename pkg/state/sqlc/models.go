@@ -25,12 +25,59 @@ type Account struct {
 	MfaSecretEncrypted     []byte
 	MfaRecoveryCodesHash   [][]byte
 	MfaRequired            bool
+	OverageCapCents        pgtype.Int8
+}
+
+type AccountCredit struct {
+	ID             pgtype.UUID
+	AccountID      pgtype.UUID
+	CentsRemaining int64
+	Reason         string
+	CreatedAt      pgtype.Timestamptz
+	ExpiresAt      pgtype.Timestamptz
 }
 
 type AccountPassword struct {
 	AccountID pgtype.UUID
 	Hash      string
 	UpdatedAt pgtype.Timestamptz
+}
+
+type AlertDelivery struct {
+	ID             pgtype.UUID
+	RuleID         pgtype.UUID
+	AccountID      pgtype.UUID
+	AppID          pgtype.UUID
+	IdempotencyKey string
+	Payload        []byte
+	Status         string
+	AttemptCount   int32
+	LastStatusCode pgtype.Int4
+	LastError      pgtype.Text
+	ObservedValue  float64
+	FiredAt        pgtype.Timestamptz
+	DeliveredAt    pgtype.Timestamptz
+}
+
+type AlertRule struct {
+	ID                  pgtype.UUID
+	AccountID           pgtype.UUID
+	AppID               pgtype.UUID
+	Name                string
+	Enabled             bool
+	Metric              string
+	Comparison          string
+	Threshold           float64
+	WindowSpec          string
+	FailureSource       pgtype.Text
+	WebhookUrl          string
+	WebhookSecretSealed []byte
+	CooldownMinutes     int32
+	State               string
+	LastFiredAt         pgtype.Timestamptz
+	LastEvaluatedAt     pgtype.Timestamptz
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
 }
 
 type ApiKey struct {
@@ -63,7 +110,19 @@ type App struct {
 	// Per-instance RPS target. When live_request_count / live_instance_count exceeds this, schedd admits another instance (up to plan max_concurrency). Hobby/Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app).
 	AutoscaleTargetRps pgtype.Int4
 	// Per-instance CPU% target (1..100). Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app). CPU target is unbounded above 100 inside the DB; the apid handler enforces [1, 100] via 422.
-	AutoscaleTargetCpuPct pgtype.Int4
+	AutoscaleTargetCpuPct  pgtype.Int4
+	GithubInstallBindingID pgtype.Text
+	GithubInstallAccountID pgtype.UUID
+	GithubInstallLinkedAt  pgtype.Timestamptz
+}
+
+type AppEnv struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Key       string
+	Value     string
+	CreatedAt pgtype.Timestamptz
+	UpdatedAt pgtype.Timestamptz
 }
 
 type AppSecret struct {
@@ -88,6 +147,23 @@ type Build struct {
 	EnqueuedAt   pgtype.Timestamptz
 }
 
+type BuildProvenance struct {
+	ID              pgtype.UUID
+	BuildID         pgtype.UUID
+	BuildkitVersion pgtype.Text
+	RailpackVersion pgtype.Text
+	BaseDigest      pgtype.Text
+	SourceSha256    string
+	SourceUrl       pgtype.Text
+	CommitSha       pgtype.Text
+	Plan            pgtype.Text
+	RunnerDigest    pgtype.Text
+	BuilderNodeID   pgtype.Text
+	StartedAt       pgtype.Timestamptz
+	FinishedAt      pgtype.Timestamptz
+	SbomStorageKey  pgtype.Text
+}
+
 type CliAuthCode struct {
 	TokenHash  []byte
 	AccountID  pgtype.UUID
@@ -108,6 +184,25 @@ type ComputeNode struct {
 	Active             bool
 	LastHeartbeatAt    pgtype.Timestamptz
 	CreatedAt          pgtype.Timestamptz
+}
+
+type ComputeNodeHeartbeat struct {
+	ID              int64
+	NodeID          pgtype.UUID
+	ReceivedAt      pgtype.Timestamptz
+	LastHeartbeatAt pgtype.Timestamptz
+	Source          string
+}
+
+type CreditLedger struct {
+	ID                pgtype.UUID
+	AccountID         pgtype.UUID
+	CreditID          pgtype.UUID
+	DeltaCents        int64
+	Reason            string
+	Actor             string
+	CreatedAt         pgtype.Timestamptz
+	ProviderInvoiceID pgtype.Text
 }
 
 type Cron struct {
@@ -145,6 +240,8 @@ type Deployment struct {
 	LogPath     pgtype.Text
 	ErrorCode   pgtype.Text
 	RootfsKey   string
+	SourceUrl   pgtype.Text
+	CommitSha   pgtype.Text
 }
 
 type DeploymentLog struct {
@@ -164,273 +261,6 @@ type Event struct {
 	Data    []byte
 }
 
-type FaasInspect2UsageMinute struct {
-	Minute pgtype.Timestamptz
-}
-
-type FaasInspectUsageMinute struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	InstanceID pgtype.UUID
-	Minute     pgtype.Timestamptz
-	MbSeconds  pgtype.Int8
-	Requests   pgtype.Int4
-}
-
-type FaasInspectUsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	Requests  int64
-}
-
-type FaasTestCheckUsageMinute struct {
-	AccountID pgtype.Text
-	AppID     pgtype.Text
-	Minute    pgtype.Timestamp
-	MbSeconds pgtype.Int8
-}
-
-type FaasTestCheckUsageMonthly struct {
-	AccountID pgtype.Text
-	AppID     pgtype.Text
-	Month     pgtype.Interval
-	MbSeconds int64
-}
-
-type FaasTestFf43e5ba178f23a3Account struct {
-	ID                     pgtype.UUID
-	Email                  interface{}
-	Plan                   string
-	Status                 string
-	StripeCustomerID       pgtype.Text
-	CreatedAt              pgtype.Timestamptz
-	DeletionRequestedAt    pgtype.Timestamptz
-	StripeSubscriptionItem pgtype.Text
-}
-
-type FaasTestFf43e5ba178f23a3ApiKey struct {
-	ID         pgtype.UUID
-	AccountID  pgtype.UUID
-	KeySha256  []byte
-	Label      pgtype.Text
-	LastUsedAt pgtype.Timestamptz
-	CreatedAt  pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3App struct {
-	ID                     pgtype.UUID
-	AccountID              pgtype.UUID
-	Slug                   string
-	Type                   string
-	Runtime                pgtype.Text
-	RamMb                  int32
-	IdleTimeoutS           pgtype.Int4
-	MaxConcurrency         int32
-	Status                 string
-	CreatedAt              pgtype.Timestamptz
-	Manifest               []byte
-	GithubInstallID        pgtype.Int8
-	GithubRepoFullName     pgtype.Text
-	GithubProductionBranch pgtype.Text
-	MinInstances           int32
-}
-
-type FaasTestFf43e5ba178f23a3AppSecret struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	Key        string
-	Ciphertext []byte
-	CreatedAt  pgtype.Timestamptz
-	UpdatedAt  pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3Build struct {
-	ID           pgtype.UUID
-	DeploymentID pgtype.UUID
-	Kind         string
-	SourceBytes  int64
-	Status       string
-	FailureClass pgtype.Text
-	LogPath      pgtype.Text
-	StartedAt    pgtype.Timestamptz
-	FinishedAt   pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3Cron struct {
-	ID          pgtype.UUID
-	AppID       pgtype.UUID
-	Schedule    string
-	Path        string
-	Enabled     bool
-	LastFiredAt pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3CustomDomain struct {
-	Domain         interface{}
-	AppID          pgtype.UUID
-	VerifiedAt     pgtype.Timestamptz
-	ChallengeToken string
-	AppIDRedirect  pgtype.UUID
-}
-
-type FaasTestFf43e5ba178f23a3Deployment struct {
-	ID          pgtype.UUID
-	AppID       pgtype.UUID
-	BuildID     pgtype.UUID
-	ImageDigest string
-	RootfsPath  pgtype.Text
-	RootfsBytes pgtype.Int8
-	Status      string
-	Error       pgtype.Text
-	CreatedAt   pgtype.Timestamptz
-	Kind        string
-	SourcePath  pgtype.Text
-	SourceBytes pgtype.Int8
-	Handler     pgtype.Text
-	LogPath     pgtype.Text
-}
-
-type FaasTestFf43e5ba178f23a3DeploymentLog struct {
-	DeploymentID pgtype.UUID
-	Seq          int64
-	Stream       string
-	Line         string
-	WrittenAt    pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3Event struct {
-	ID      int64
-	At      pgtype.Timestamptz
-	Actor   string
-	Kind    string
-	Subject pgtype.UUID
-	Data    []byte
-}
-
-type FaasTestFf43e5ba178f23a3GooseDbVersion struct {
-	ID        int32
-	VersionID int64
-	IsApplied bool
-	Tstamp    pgtype.Timestamp
-}
-
-type FaasTestFf43e5ba178f23a3IdempotencyKey struct {
-	Key            string
-	AccountID      pgtype.UUID
-	ResponseStatus int32
-	ResponseBody   []byte
-	CreatedAt      pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3Instance struct {
-	ID            pgtype.UUID
-	AppID         pgtype.UUID
-	DeploymentID  pgtype.UUID
-	State         string
-	Netns         pgtype.Text
-	GuestUid      pgtype.Int4
-	HostIp        *netip.Addr
-	RamMb         int32
-	StartedAt     pgtype.Timestamptz
-	LastRequestAt pgtype.Timestamptz
-	ParkedAt      pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3LoginToken struct {
-	TokenHash  []byte
-	AccountID  pgtype.UUID
-	ExpiresAt  pgtype.Timestamptz
-	ConsumedAt pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3Snapshot struct {
-	ID           pgtype.UUID
-	DeploymentID pgtype.UUID
-	FcVersion    string
-	MemBytes     int64
-	DiskBytes    int64
-	Path         string
-	Stale        bool
-	CreatedAt    pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3StripePushDedupe struct {
-	AccountID pgtype.UUID
-	Hour      pgtype.Timestamptz
-	PushedAt  pgtype.Timestamptz
-}
-
-type FaasTestFf43e5ba178f23a3UsageMinute struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	InstanceID pgtype.UUID
-	Minute     pgtype.Timestamptz
-	MbSeconds  int64
-	Requests   int32
-}
-
-type FaasTestFf43e5ba178f23a3UsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	Requests  int64
-}
-
-type FaasTestGooseUsageMinute struct {
-	AccountID pgtype.Text
-	AppID     pgtype.Text
-	Minute    pgtype.Timestamp
-	MbSeconds pgtype.Int8
-}
-
-type FaasTestGooseUsageMonthly struct {
-	AccountID pgtype.Text
-	AppID     pgtype.Text
-	Month     pgtype.Interval
-	MbSeconds int64
-}
-
-type FaasTestM1UsageMinute struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	InstanceID pgtype.UUID
-	Minute     pgtype.Timestamptz
-	MbSeconds  pgtype.Int8
-	Requests   pgtype.Int4
-}
-
-type FaasTestM1UsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	Requests  int64
-}
-
-type FaasTestM2UsageMinute struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	InstanceID pgtype.UUID
-	Minute     pgtype.Timestamptz
-	MbSeconds  pgtype.Int8
-	Requests   pgtype.Int4
-}
-
-type FaasTestM2UsageMonthly struct {
-	AccountID pgtype.UUID
-	AppID     pgtype.UUID
-	Month     pgtype.Interval
-	MbSeconds int64
-	Requests  int64
-}
-
-type FaasTestM3T struct {
-	X pgtype.Timestamptz
-}
-
 type GdprRequest struct {
 	ID           pgtype.UUID
 	AccountID    pgtype.UUID
@@ -438,6 +268,16 @@ type GdprRequest struct {
 	Action       string
 	RequestedAt  pgtype.Timestamptz
 	CompletedAt  pgtype.Timestamptz
+}
+
+type GithubInstallation struct {
+	AccountID          pgtype.UUID
+	InstallationID     int64
+	DefaultBranch      string
+	SealedInstallToken []byte
+	TokenExpiresAt     pgtype.Timestamptz
+	SealedAt           pgtype.Timestamptz
+	AuditGithubLogin   string
 }
 
 type GooseDbVersion struct {
@@ -589,6 +429,8 @@ type UsageMinute struct {
 	Minute     pgtype.Timestamptz
 	MbSeconds  int64
 	Requests   int32
+	// Cumulative host cgroup CPU-µs consumed by the instance during this minute. Source: vmmd cpustats.Cache (cpu.stat usage_usec delta) → schedd instancestats.Poller → meterd Sampler. Measurement only — billing is on plan RAM. issue #279 / PR-B.
+	CpuUsec int64
 }
 
 type UsageMonthly struct {
@@ -596,5 +438,6 @@ type UsageMonthly struct {
 	AppID     pgtype.UUID
 	Month     pgtype.Interval
 	MbSeconds int64
+	CpuUsec   int64
 	Requests  int64
 }

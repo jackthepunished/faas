@@ -57,6 +57,17 @@ type Querier interface {
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)
+	// CP-1 (operator observability): append one row to the heartbeat
+	// history. The schedd Heartbeat.Tick goroutine is the only writer.
+	// We deliberately do NOT use ON CONFLICT DO NOTHING — a duplicate
+	// (node_id, received_at) is observable as a SQLSTATE 23505 unique-
+	// violation, which the writer logs as a warning. A silently-deduped
+	// stamp would mask a future bug where the scheduler tick fires twice.
+	// received_at and last_heartbeat_at are passed by the caller; the
+	// column default now() is intentionally NOT used so the writer
+	// controls the wall-clock pair (the property test depends on
+	// caller-supplied timestamps for deterministic gap classification).
+	InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg InsertComputeNodeHeartbeatParams) error
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
@@ -64,6 +75,18 @@ type Querier interface {
 	// /v1/keys listing. See ADR-034 rev2.
 	ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAPIKeysRow, error)
 	ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAppsRow, error)
+	// CP-1: read heartbeat history for one node, newest first. The
+	// $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
+	// zero value, mapped to SQL NULL by sqlc) means "no lower bound,
+	// return most-recent N"; passing a populated timestamptz means
+	// "history since t". The composite index
+	// compute_node_heartbeats_node_at_idx (node_id, received_at desc)
+	// matches this read shape.
+	//
+	// The endpoint passes a hard-cap limit (default 200, max 2000). The
+	// composite index is enough for the routine 30s × 60 nodes × 24h
+	// steady-state workload; a 7-day retention sweep is a follow-on.
+	ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ComputeNodeHeartbeat, error)
 	ListCronsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListCronsForAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)
@@ -111,7 +134,7 @@ type Querier interface {
 	UpdateCron(ctx context.Context, db DBTX, arg UpdateCronParams) (UpdateCronRow, error)
 	UpdateDeploymentStatus(ctx context.Context, db DBTX, arg UpdateDeploymentStatusParams) error
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
-	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageMonthly, error)
+	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
 }
 
 var _ Querier = (*Queries)(nil)
