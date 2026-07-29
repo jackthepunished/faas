@@ -49,11 +49,26 @@ type Config struct {
 	TLSKeyPath  string `toml:"tls_key_path"`
 	TLSCAPath   string `toml:"tls_ca_path"`
 
-	// GatewaySynthSocket is the unix-domain socket schedd dials to
-	// fire synthetic cron requests through gatewayd (spec §4.4, M7).
+	// GatewaySynthSocket is the legacy unix-domain socket schedd dials
+	// to fire synthetic cron requests through gatewayd (spec §4.4, M7).
 	// Mode 0660 group `faas` (ADR-015). Defaults to
-	// /run/faas/gatewayd-internal.sock.
+	// /run/faas/gatewayd-internal.sock. Deprecated: multi-box schedd
+	// uses GatewaySynthTarget (a wire.ParseTarget-style URL). Setting
+	// GatewaySynthSocket alone keeps the legacy one-box behaviour;
+	// setting GatewaySynthTarget takes precedence.
 	GatewaySynthSocket string `toml:"gateway_synth_socket"`
+
+	// GatewaySynthTarget is the wire.ParseTarget-style URL schedd
+	// uses to dial gatewayd's internal listener (placement scheduler
+	// PR, ADR-025 axis 3, Q8). Accepts unix://|tcp://|dns://; the
+	// default "unix:///run/faas/gatewayd-internal.sock" preserves the
+	// one-box behaviour. Multi-box operators set this to
+	// tcp://<gatewayd-overlay-ip>:9090 (or https://... when the
+	// tailnet ACL isn't enough on its own). Empty GatewaySynthTarget
+	// falls back to the legacy GatewaySynthSocket for backwards
+	// compatibility — existing tests + the e2e harness rely on the
+	// legacy field name.
+	GatewaySynthTarget string `toml:"gateway_synth_target"`
 
 	// OwnerUser owns the socket file (looked up by name). Defaults to
 	// faas-schedd. Only consulted when the resolved listen target is
@@ -171,6 +186,13 @@ func LoadConfig(path string) (*Config, error) {
 		SocketPath:         "/run/faas/schedd.sock",
 		VMMDSocket:         "/run/faas/vmmd.sock",
 		GatewaySynthSocket: "/run/faas/gatewayd-internal.sock",
+		// Default GatewaySynthTarget to the legacy unix-socket
+		// path so one-box deploys pick up the new field without a
+		// TOML edit. Multi-box operators override via the
+		// gateway_synth_target TOML key or FAAS_GATEWAY_SYNTH_TARGET
+		// env (env path is wired in cmd/schedd/main.go via the
+		// fallback "unix://" + GatewaySynthSocket concatenation).
+		GatewaySynthTarget: "unix:///run/faas/gatewayd-internal.sock",
 		OwnerUser:          "faas-schedd",
 		// Issue #169 / #172: default to gatewayd's loopback
 		// control listener. Empty disables the trigger (the

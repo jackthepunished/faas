@@ -4125,10 +4125,10 @@ type SnapshotSize struct {
 // is safe: pkg/api has no outbound dependency on pkg/state, so no cycle.
 
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
-	n := ComputeNode{}
+	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.Active,
-		&n.LastHeartbeatAt, &n.CreatedAt); err != nil {
+		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
 	return n, nil
@@ -4137,7 +4137,8 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where active = true
 		 order by name
@@ -4165,7 +4166,8 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 order by name
 	`)
@@ -4187,7 +4189,8 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where id = $1
 	`, id)
@@ -4201,7 +4204,8 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       region, zone
 		  from compute_nodes
 		 where name = $1
 	`, name)

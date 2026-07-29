@@ -14,10 +14,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// strPtr is a tiny helper for table rows that need region/zone
+// pointers (placement.go tie-break orders on these; nil must sort the
+// same as "" so pre-00067 rows don't bias the result).
+func strPtr(s string) *string { return &s }
+
 // node is a tiny constructor for test fixtures; keeps the table-driven
 // cases readable (the alternative — full struct literals — is verbose
 // for 5 scenarios). Sets Active=true and a default ceiling; individual
-// cases override as needed.
+// cases override as needed. Region/Zone are nil so callers opt in
+// explicitly (pre-00067 shape).
 func node(id, name string, usedMB int64, ceilingMB int) state.ComputeNode {
 	return state.ComputeNode{
 		ID: id, Name: name, TargetURL: "unix:///run/faas/" + name + ".sock",
@@ -95,6 +101,148 @@ func TestChoosePlacement_Table(t *testing.T) {
 			usedMB:  map[string]int64{},
 			r:       Request{RAMMB: req},
 			wantErr: true,
+		},
+		{
+			// Sticky-warm hint honored when the preferred node has
+			// headroom (ADR-009 snapshot/page-cache benefit). Even
+			// though b has strictly more free RAM, the hint pins a.
+			name: "sticky-warm hint honored when preferred has headroom",
+			nodes: []state.ComputeNode{
+				node("a-id", "a", 30, 100), // a: 70 headroom, hint target
+				node("b-id", "b", 0, 100),  // b: 100 headroom, least-loaded
+			},
+			usedMB: map[string]int64{"a-id": 30, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredNodeID: "a-id"},
+			wantID: "a-id",
+		},
+		{
+			// Affinity is bias, not a gate: when the hint target is
+			// saturated, fall through to the least-loaded node. This
+			// preserves the headroom invariant (ADR-005: cold-boot
+			// always works; the chooser must not place into a node
+			// that can't fit the request).
+			name: "sticky-warm hint ignored when preferred is saturated",
+			nodes: []state.ComputeNode{
+				node("a-id", "a", 90, 100), // a: 10 headroom, hint target, but 10+48=58 > 10 → no fit
+				node("b-id", "b", 0, 100),  // b: 100 headroom, least-loaded
+			},
+			usedMB: map[string]int64{"a-id": 90, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredNodeID: "a-id"},
+			wantID: "b-id",
+		},
+		{
+			// Hint targets a node that doesn't exist (or was
+			// de-registered since the hint was set). Falls through
+			// to least-loaded — silently choosing a non-existent
+			// node would be worse than ignoring the hint.
+			name: "sticky-warm hint for missing node falls through",
+			nodes: []state.ComputeNode{
+				node("a-id", "a", 80, 100), // a: 20 headroom, does not fit 48
+				node("b-id", "b", 0, 100),  // b: 100 headroom
+			},
+			usedMB: map[string]int64{"a-id": 80, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredNodeID: "ghost-id"},
+			wantID: "b-id",
+		},
+		{
+			// Cold-boot path (ADR-005): no hint → least-loaded wins.
+			// This is the single-box install case before any
+			// WarmAffinity.RecordWake call has landed.
+			name: "cold-boot path with no hint returns least-loaded",
+			nodes: []state.ComputeNode{
+				node("a-id", "a", 80, 100), // a: 20 headroom, does not fit 48
+				node("b-id", "b", 0, 100),
+			},
+			usedMB: map[string]int64{"a-id": 80, "b-id": 0},
+			r:      Request{RAMMB: req}, // no PreferredNodeID
+			wantID: "b-id",
+		},
+		{
+			// Per-row ceiling respected: nodes[].AdmissionCeilingMB is
+			// the per-node ceiling (not the global RAMAdmissionCeilingMB).
+			// Here node a's ceiling is 80 (smaller than b's 100), and the
+			// request is 50 billable. Both have zero used, but a fits
+			// exactly (0+50=50 ≤ 80) while b is preferred on headroom.
+			// Tie-break on (region, name): b wins on headroom 100 vs 80.
+			name: "per-row ceiling respected (ceiling < RAMAdmissionCeilingMB)",
+			nodes: []state.ComputeNode{
+				node("a-id", "a", 0, 80),
+				node("b-id", "b", 0, 100),
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: 50},
+			wantID: "b-id", // 100 headroom > 80 headroom
+		},
+		{
+			// Per-row ceiling refuses a request the global ceiling
+			// would have allowed. a's ceiling is 80; billable is 90.
+			// The global ceiling (api.RAMAdmissionCeilingMB = 47600)
+			// would have allowed this, but the per-row ceiling is
+			// the source of truth — operators set per-row ceilings
+			// to fence smaller boxes inside a heterogeneous fleet.
+			name: "per-row ceiling refuses over-ceiling request",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 80, Active: true},
+				node("b-id", "b", 0, 100),
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: 90}, // 98 billable; a refuses (98 > 80)
+			wantID: "b-id",
+		},
+		{
+			// Tie-break on (region, name) when headroom is equal. a
+			// and b both have 100 headroom; tie-break sorts by region
+			// ascending — a is in "eu-fra", b is in "us-east". The
+			// chooser must prefer a.
+			name: "tie-break on region when headroom equal",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req},
+			wantID: "a-id",
+		},
+		{
+			// Tie-break on zone when region is equal. Both in
+			// "eu-fra"; zone a-1 sorts before zone a-2.
+			name: "tie-break on zone when region equal",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-2")},
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req},
+			wantID: "b-id",
+		},
+		{
+			// Pre-00067 rows have nil region/zone. nil and "" must
+			// sort identically so a fleet mid-rollout doesn't bias
+			// toward the post-migration rows.
+			name: "nil region sorts as empty string",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true}, // nil region
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("z-region")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req},
+			wantID: "a-id", // "" < "z-region"
+		},
+		{
+			// Sticky-warm hint AND equal headroom tie-break:
+			// least-loaded path (hint missing) still respects
+			// region/name ordering. a and b both fit with equal
+			// headroom; b's region "us-east" sorts after a's
+			// "eu-fra", so a wins even though b is alphabetically
+			// later.
+			name: "region tie-break beats name tie-break",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req},
+			wantID: "a-id",
 		},
 	}
 	for _, tc := range cases {

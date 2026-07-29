@@ -89,6 +89,22 @@ type Request struct {
 	// (used by PR #113's pre-multi-node tests; production callers in
 	// PR #113 always pass a non-empty value).
 	NodeID string
+	// PreferredNodeID is the sticky-warm affinity hint (placement
+	// scheduler PR, ADR-025). The Engine populates this from
+	// pkg/sched.WarmAffinity.LastWarmNode(AppID) before calling the
+	// chooser; an empty value means "no hint, fall through to
+	// least-loaded RAM headroom". The chooser honors this only when
+	// the preferred node still has headroom — affinity is bias, never
+	// a gate (ADR-005: cold boot must always work).
+	PreferredNodeID string
+	// NodeCeilingMB is the per-node RAM admission ceiling from
+	// compute_nodes.admission_ceiling_mb for the chosen node. The
+	// chooser already verified the request fits; the ledger uses this
+	// instead of the legacy global api.RAMAdmissionCeilingMB so a
+	// node with a smaller ceiling enforces that smaller cap. Zero or
+	// negative falls back to api.RAMAdmissionCeilingMB (safe for
+	// un-registered nodes and pre-multi-node test seams).
+	NodeCeilingMB int
 }
 
 func (r Request) admissionMB() int { return api.BillableRAMMB(r.RAMMB) }
@@ -132,11 +148,15 @@ func (l *NodeLedger) Admit(r Request) error {
 
 	// Per-node RAM headroom (invariant §6.2-2 re-stated per-node).
 	// The reservation is admitted iff the chosen node still has room
-	// below its admission_ceiling_mb. An empty NodeID (legacy test
-	// seam) routes through the synthetic default-global bucket whose
-	// ceiling is api.RAMAdmissionCeilingMB; production always passes
-	// a non-empty NodeID (the Engine resolves it via ChoosePlacement).
-	ceiling := l.ceilingForNode_locked(r.NodeID, limits)
+	// below its admission_ceiling_mb. The Engine reads the row
+	// ceiling from compute_nodes and threads it into the Request;
+	// r.NodeCeilingMB > 0 means a real row ceiling; ≤ 0 falls back
+	// to the global api.RAMAdmissionCeilingMB (the legacy single-box
+	// posture, and the safe default for un-registered nodes).
+	ceiling := r.NodeCeilingMB
+	if ceiling <= 0 {
+		ceiling = l.ceilingForNode_locked(r.NodeID, limits)
+	}
 	node := l.resident[r.NodeID]
 	if node == nil {
 		node = &nodeReservation{}
@@ -170,21 +190,25 @@ func (l *NodeLedger) Admit(r Request) error {
 // ceilingForNode_locked resolves the per-node admission ceiling.
 // Empty nodeID (legacy test seam) falls back to the global
 // api.RAMAdmissionCeilingMB; the production path always passes a
-// real NodeID. A future operator surface can override per-node
-// ceilings (e.g. via compute_nodes.admission_ceiling_mb rows) by
-// changing this resolver.
+// real NodeID plus a non-zero NodeCeilingMB on the Request (the
+// Engine threads the row value from compute_nodes.admission_ceiling_mb
+// at placement time). Per-row ceilings from migrations/00024 let
+// operators tune a node's cap below the legacy 47,600 MB global
+// without changing api.RAMAdmissionCeilingMB — the chooser already
+// verified headroom at placement time, this is the load-bearing
+// enforcement that survives a stale hint.
 func (l *NodeLedger) ceilingForNode_locked(nodeID string, _ api.Limits) int {
 	if nodeID == "" {
 		return api.RAMAdmissionCeilingMB
 	}
-	// The Engine reads the ceiling from the compute_nodes row at
-	// placement time and threads it into the request via NodeID.
-	// Today the per-node ceiling is constant on the synthetic
-	// default-local row (47600); future slices can plumb a
-	// per-request ceiling through Request if operator overrides
-	// diverge. Defaulting to RAMAdmissionCeilingMB here keeps the
-	// invariant intact for any operator-registered node whose
-	// admission_ceiling_mb equals the legacy global value.
+	// Future slice: a per-node map populated by an admin RPC can
+	// override the row ceiling without re-routing every call site
+	// through the Request struct. For now the Engine passes the
+	// ceiling on the Request itself (see admitAndDispatch in
+	// pkg/sched/engine.go), so this resolver returns the row value
+	// indirectly via the caller. The global constant stays as the
+	// safe fallback for un-registered nodes and pre-multi-node
+	// test seams.
 	return api.RAMAdmissionCeilingMB
 }
 
