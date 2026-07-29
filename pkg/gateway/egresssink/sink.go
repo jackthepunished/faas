@@ -119,6 +119,12 @@ func NewEgressSinkWithClock(now func() time.Time) *EgressSink {
 // eviction sweep runs alongside (see maybeSweep) so a long-idle
 // instance row eventually disappears without an explicit
 // "instance parked" signal from vmmd or schedd.
+//
+// Contract: n is int64 but the bucket storage is uint64. The
+// n <= 0 guard above is the load-bearing piece — a negative n
+// would silently wrap on the uint64 conversion inside this
+// function and corrupt the running total. Callers MUST keep that
+// guard upstream (or call this function with n >= 0 only).
 func (s *EgressSink) RecordResponseBytes(instanceID string, n int64) {
 	if instanceID == "" || n <= 0 {
 		return

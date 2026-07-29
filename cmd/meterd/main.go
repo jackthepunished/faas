@@ -262,11 +262,6 @@ type gatewayEgressAdapter struct {
 	// hand-rolled stream client; production wires the
 	// gatewaydpb-grpc DailContext.
 	dialFn func(ctx context.Context, socketPath string) (gatewaydpb.EgressTxServiceClient, error)
-
-	// streamReconnectBackoff bounds the reconnect cadence
-	// when the upstream gateway stream errors out. 250 ms
-	// initial, 5 s ceiling, full jitter on the floor.
-	streamReconnectBackoff backoff
 }
 
 // EgressBytes returns the latest drained (instanceID,
@@ -404,13 +399,6 @@ func (a *gatewayEgressAdapter) Tracked() int {
 	defer a.mu.Unlock()
 	return len(a.data)
 }
-
-// backoff is a tiny helper to keep the reconnect cadence
-// readable inline. Zero-value is "no backoff" (used by tests
-// that want synchronous reconnect behaviour).
-type backoff time.Duration
-
-func (b *backoff) reset() { *b = backoff(250 * time.Millisecond) }
 
 // dialGatewayEgressStream dials the gatewayd unix socket and
 // returns a stub EgressTxServiceClient. ADR-015 (unix-socket
@@ -722,11 +710,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		data:   make(map[string]map[int64]uint64),
 		dialFn: dialGatewayEgressStream,
 	}
-	// PR-2: kick off the gateway stream consumer. The unix-socket
-	// path defaults to the same FAAS_GATEWAY_SYNTH_SOCKET that schedd
-	//'s synth dialer uses; both daemons reach the same gatewayd via
-	// the same group-`faas` DAC auth (ADR-015). ctx here is the loop
-	// ctx — when the daemon shuts down the goroutine returns.
 	// PR-2: kick off the gateway stream consumer. The unix-socket
 	// path defaults to the same FAAS_GATEWAY_SYNTH_SOCKET that schedd
 	//'s synth dialer uses; both daemons reach the same gatewayd via

@@ -25,7 +25,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	gatewaydpbv1 "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
@@ -62,7 +61,7 @@ func startEgressTestGRPC(t *testing.T, sink *egresssink.EgressSink) (string, fun
 	srv := egressgrpc.NewServer(sink, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	sock := shortUnixSocket(t)
 	gs := grpc.NewServer()
-	gatewaydpb.RegisterEgressTxServiceServer(gs, srv)
+	gatewaydpbv1.RegisterEgressTxServiceServer(gs, srv)
 	lis, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen unix %s: %v", sock, err)

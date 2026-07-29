@@ -35,11 +35,13 @@
 //     from the ReverseProxy. Canonical persisted metric is
 //     usage_minutes.tx_bytes; this counter is the §12
 //     FaasTenantEgressSpike real-time operator view — "rate > 1GiB/min
-//     sustained 5m on a single (app, plan) pair". Wire-side mirror at
-//     pkg/wire.OpsMetrics.ObserveResponseBytes with the same name and
-//     same label set; both increment in lockstep from
-//     Handler.recordEgress so the operator view reconciles with the
-//     cross-daemon contract.)
+//     sustained 5m on a single (app, plan) pair". Lives on the
+//     gatewayd-local registry (the daemon's /metrics scrape); the
+//     cross-daemon contract is not duplicated here because gatewayd
+//     does not construct pkg/wire.OpsMetrics today. If a future
+//     daemon ever needs to surface this counter alongside its
+//     own, instantiate it via a fresh CounterVec — do NOT bring
+//     back a wire-side mirror without a real consumer.)
 //   - gateway_wake_locality_total{outcome}          counter (PR scale-out
 //     readiness; outcome ∈ {local_snapshot, local_coldboot} today;
 //     remote_* outcomes slot in transparently when the second compute
@@ -204,12 +206,11 @@ func NewMetrics() *Metrics {
 		}, []string{"app", "plan"}),
 		// ADR-046 PR-2 producer observability. Counter is
 		// registered on the gatewayd-local registry (this
-		// daemon scrapes /metrics via the control listener);
-		// the wire-side `gateway_response_bytes_total` lives
-		// on pkg/wire.OpsMetrics and is the cross-daemon
-		// contract — both increment in lockstep from
-		// Handler.recordEgress so the operator view and the
-		// SQL persistence stay reconcilable.
+		// daemon scrapes /metrics via the control listener).
+		// The cross-daemon pkg/wire.OpsMetrics mirror was
+		// removed in the PR-2 review pass — there was no
+		// production caller, and dual registries with no
+		// cross-daemon consumer is dead counter surface.
 		responseBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_response_bytes_total",
 			Help: "Per-(app, plan) HTTP response body bytes observed by the gateway (ADR-046 PR-2). One Add per observed byte, called once per proxied response after the ReverseProxy returns. Canonical persisted metric is usage_minutes.tx_bytes; this counter is the real-time operator view for §12 anomaly detection.",
@@ -360,10 +361,9 @@ func (m *Metrics) ObserveRequest(appID, plan, code string) {
 // ObserveResponseBytes increments the per-(app, plan) egress byte
 // counter for ADR-046 PR-2. Nil-receiver safe (mirrors the rest of
 // the Observe* family). Called from Handler.recordEgress on the
-// 2xx/3xx path only. Wire-side mirror lives at
-// pkg/wire.OpsMetrics.ObserveResponseBytes; both increment in
-// lockstep so the operator view (this counter) and the cross-daemon
-// metric (wire) reconcile.
+// 2xx/3xx path only. The counter lives on the gatewayd-local
+// registry; the cross-daemon pkg/wire mirror was removed (review
+// pass: no production caller existed).
 func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
 	if m == nil || appID == "" || plan == "" || n <= 0 {
 		return

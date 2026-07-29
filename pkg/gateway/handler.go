@@ -238,6 +238,10 @@ func (h *Handler) WithForwarding(fn func(nodeID string) http.Handler) *Handler {
 // cmd/gatewayd/main.go. nil-safe: passing nil clears the sink;
 // ServeHTTP short-circuits the record path the moment it sees
 // h.egressSink == nil, so unit tests don't have to install one.
+//
+// Mutates the receiver in place; the returned *Handler is the same
+// pointer, provided for fluent chaining. Discarding the return
+// value (statement-form `h.WithEgressSink(...)`) is correct.
 func (h *Handler) WithEgressSink(sink *egresssink.EgressSink) *Handler {
 	h.egressSink = sink
 	return h
@@ -632,8 +636,6 @@ func (h *Handler) preInstantiateApp(appID string) {
 	h.metrics.PreInstantiateApp(appID)
 }
 
-// statusRecorder is a thin ResponseWriter wrapper that records the HTTP status
-// that was written so metrics can label without buffering headers/body.
 // statusRecorder is a thin ResponseWriter wrapper that records the HTTP status
 // that was written so metrics can label without buffering headers/body.
 //

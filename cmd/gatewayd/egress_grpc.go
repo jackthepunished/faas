@@ -126,11 +126,31 @@ func (l *egressGRPCListener) start() error {
 // stop tears down the gRPC server + removes the socket file.
 // The returned error is informational; the daemon continues
 // shutdown even on cleanup failures.
+//
+// ctx bounds the graceful shutdown window: GracefulStop blocks
+// until in-flight RPCs drain, which can be slow under load; if
+// ctx fires first we escalate to Stop() (immediate connection
+// close) so the daemon doesn't outlive its shutdown deadline.
+// The deferred caller at runWithDeps wraps this with a 5-second
+// timeout — without the ctx race, that 5s grace was silently
+// violated under load (GracefulStop would block forever).
 func (l *egressGRPCListener) stop(ctx context.Context) error {
 	if l == nil || l.server == nil {
 		return nil
 	}
-	l.server.GracefulStop()
+	done := make(chan struct{})
+	go func() {
+		l.server.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Graceful shutdown completed within ctx.
+	case <-ctx.Done():
+		// Deadline blew past; force-close so the daemon doesn't
+		// hold the process open. gRPC's Stop returns immediately.
+		l.server.Stop()
+	}
 	if l.socketPath != "" {
 		_ = os.Remove(l.socketPath)
 	}
