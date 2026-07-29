@@ -94,3 +94,65 @@ This decoupling directly unlocks horizontal scaling of the compute layer:
 - **CA-only verification (chain with no hostname pinning):**
   - Rejected. The first iteration of `loadClientTLSConfig` did chain-only verification by suppressing stdlib's hostname check (`InsecureSkipVerify=true`) and re-running chain validation in a custom `VerifyPeerCertificate` hook. That posture was strictly weaker than letting stdlib's default verifier run, and CodeQL alert #58 flagged the literal `= true` regardless of any rationale. The current design (issue #95, slice 1) relies on stdlib's `verifyServerCertificate` (handshake_client.go / handshake_client_tls13.go), which performs chain trust against the operator's `RootCAs`, RFC 6125 SAN matching, and EKU enforcement in a single pass during the handshake. grpc-go's `tlsCreds.ClientHandshake` populates `ServerName` from the dial `:authority` before `tls.Client` is called, so no caller-side plumbing is required.
   - **Operational consequence:** distributed deployments must issue per-daemon SANs (`schedd.faas`, `vmmd.faas`, …) on every leaf certificate. The local-dev PKI continues to issue SANs for `127.0.0.1`, `::1`, and `localhost`, so single-box tests stay correct. A future slice that adds a production-ready dev PKI for distributed setups should make this automatic.
+
+---
+
+## 4. Live capacity reporting (axis 5)
+
+### 4.1 Decision
+
+`vmmd` pushes a `CapacityReport` (live_count, leased_count, used_mb, ram_headroom_mb, vcpu_busy) to `schedd` every 1 s on a client-streaming gRPC RPC (`Schedd.ReportCapacity`). `schedd` updates a per-node in-memory cache that the placement chooser reads before falling back to the legacy store-derived sum.
+
+This slice is the load-bearing fix for issue #297 / ADR-025 v1.1 acceptance #1: the chooser must read live RAM headroom, live instance count, and vCPU availability from each compute node, not the stale seeded values written at `vmmd` registration and not the stale sum-of-plan-MBs derived from `instances.ram_mb + 8`.
+
+### 4.2 Wire shape
+
+Client-streaming (`vmmd` is the gRPC client). Proto additive per ADR-016:
+
+```proto
+rpc ReportCapacity(stream CapacityReport) returns (ReportCapacityAck);
+
+message CapacityReport {
+  string node_id             = 1;  // compute_nodes.id (uuid)
+  int64  sampled_at_unix_ms  = 2;  // informational; chooser uses staleness, not absolute time
+  int32  live_count          = 3;  // Manager.LiveCount()
+  int32  leased_count        = 4;  // Manager.LeasedCount()
+  int32  used_mb             = 5;  // Σ(memory.current / 1 MiB) across live instances
+  int32  ram_headroom_mb     = 6;  // cfg.ComputeNode.MemMB - used_mb, clamped at 0
+  int32  vcpu_busy           = 7;  // v1: live_count * 2 (conservative placeholder)
+}
+
+message ReportCapacityAck {}
+```
+
+Server-streaming was rejected because it forces ack frames per tick and inverts producer/consumer semantics. Reusing the existing 200 ms `instancestats` poller was rejected because freshness ties to the poller's lifecycle and the wording "vmmd reports" calls for a producer on `vmmd`.
+
+### 4.3 Trust model
+
+The reverse direction (vmmd→schedd) is new for this codebase. The existing schedd→vmmd `Heartbeat` RPC is pull-only (vmmd.proto:63-70, sched.heartbeat.go:16-19) with a documented rejection rationale ("schedd is the admission authority and shouldn't trust inbound traffic from a box it may have already drained"). We accept the new direction for capacity *because* capacity is bias, not authority:
+
+- The chooser reads capacity as one input to `ChoosePlacement`, never as the only input. The per-node `AdmissionCeilingMB` check inside `ChoosePlacement` (placement.go:104-107) and the per-node ceiling inside `NodeLedger.Admit` (admission.go:165-169) are the load-bearing enforcement; capacity reports inform, never gate.
+- The ledger floor rule (PR-2's `applyLiveCapacityMB`) caps trust: a vmmd report's `used_mb` is taken as `max(report.used_mb, ledger.ResidentRAMForNode)`. A hostile vmmd lying *down* (claiming less residency than it has) cannot shrink the live accounting and force schedd to over-admit. A hostile vmmd lying *up* (claiming more residency than it has) can only make schedd under-admit on that node — safe, non-load-bearing.
+
+This mirrors the existing trust pattern in the inverse direction: `UpdateEgressAllowlist` (vmmd.proto:72-87) is schedd→vmmd push, and the egress_drift subscriber treats a failed push as best-effort. Capacity is vmmd→schedd push, and the chooser treats a fresh report as bias and a stale/missing one as a no-op. The two directions share the same shape (push) and differ in the consequence of a bad payload (under-admit vs. policy leak), but both are bounded by an in-process invariant the receiving daemon enforces unilaterally.
+
+### 4.4 Backwards compatibility
+
+Single-box default-local path is unchanged:
+
+- `compute_nodes` schema is untouched; no new migration.
+- Empty `nodeCapacityTable` causes `choosePlacementLocked` to fall back to `store.ComputeNodeUsedMB` (legacy behaviour).
+- `vmmd`'s publisher only starts when `[compute_node].name` is set (multi-node path). The default-local vmmd skips the loop entirely.
+- The ledger floor rule is monotone: if `applyLiveCapacityMB` returns a smaller number than `store.ComputeNodeUsedMB` did for the same ledger resident, the ledger wins (the floor is canonical). The chooser never admits more than before; this slice can only reduce over-admission on a node whose live residency exceeds the stale sum.
+
+### 4.5 Future work
+
+- `node_signature` field on `CapacityReport`: per-host cryptographic stamp so schedd can authenticate the report's source without trusting UDS DAC. Defer until cross-host mTLS (issue #95 slice 2) ships; the floor rule is sufficient until then.
+- `compute_node_capacity_reports` audit table: ops visibility into drop counters, freshness histograms, per-node staleness alerts.
+- Per-node vCPU budget (replacing the box-wide `api.VCPUSlots` today). Capacity reports already carry `vcpu_busy`; the chooser ignores it today, and a future slice will read it.
+
+### 4.6 Rejected alternatives
+
+- **Server-streaming RPC**: forced ack frames per tick, inverted semantics. Rejected in favor of client-streaming.
+- **Heartbeat piggyback**: change `Heartbeat` from unary to server-streaming and push capacity in the same stream. Rejected because the reverse-direction rationale (vmmd.proto:63-70) is load-bearing for the production trust model. Adding a capacity payload blurs the "presence-only" contract and creates two producers on one RPC.
+- **Schedd-side only, no new RPC**: extend `pkg/sched/instancestats.Poller` to also write into `nodeCapacityTable`. Rejected because freshness ties to the poller's lifecycle (which runs only on schedd) and the wording "vmmd reports" calls for a producer on vmmd. The new RPC is the right shape; Option C remains a valid fallback if the publisher ever proves too heavy.

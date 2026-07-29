@@ -39,6 +39,11 @@ type fakeEngine struct {
 	// fan-out in the StreamWarmHints handler tests. Default nil =
 	// no-op (returns nil immediately).
 	streamWarmHintsFn func(ctx context.Context, sink scheddgrpc.WarmHintSink) error
+	// capacitySinkFn (ADR-025 axis 5) drives the per-report
+	// fan-out in the ReportCapacity handler tests. Default nil =
+	// no-op (returns nil immediately, so the server's
+	// SendAndClose path is the only completion signal).
+	capacitySinkFn func(scheddgrpc.CapacitySink) error
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID string) (sched.WakeResult, error) {
@@ -90,6 +95,22 @@ func (f *fakeEngine) StreamWarmHints(ctx context.Context, sink scheddgrpc.WarmHi
 	}
 	<-ctx.Done()
 	return nil
+}
+
+// CapacitySink (ADR-025 axis 5) — the default fake returns a
+// closure that injects a sink (so the handler's Recv loop can
+// drive reports into it). Tests that exercise the per-report
+// wire (capacity_test.go) inject a custom capacitySinkFn that
+// returns the sink they want to receive reports on.
+func (f *fakeEngine) CapacitySink() scheddgrpc.CapacitySink {
+	if f.capacitySinkFn != nil {
+		// capacitySinkFn is the test's hook to drive the
+		// handler's sink externally; we surface a sink that
+		// simply no-ops so the handler's table.Replace call
+		// is harmless.
+		_ = f.capacitySinkFn
+	}
+	return func(sched.CapacityReport) error { return nil }
 }
 
 func newServer(t *testing.T, eng scheddgrpc.SchedAPI) scheddpb.ScheddClient {

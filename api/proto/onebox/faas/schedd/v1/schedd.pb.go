@@ -1088,6 +1088,184 @@ func (x *StreamWarmHintsResponse) GetWrittenAt() *timestamppb.Timestamp {
 	return nil
 }
 
+// CapacityReport (ADR-025 axis 5) is one sample of vmmd's live
+// capacity state, pushed at ~1 s cadence on the ReportCapacity
+// stream. The fields are the live numbers the placement chooser
+// consults before falling back to the store's stale aggregate.
+//
+// node_id is the compute_nodes.id UUID the publisher stamped at
+// startup from registerComputeNode's return value (not the
+// operator-friendly name). Empty node_id is rejected at the
+// schedd handler with codes.InvalidArgument; vmmd's publisher
+// must always carry a real id.
+//
+// sampled_at_unix_ms is informational — the chooser uses a
+// "since this daemon received the report" freshness budget
+// (CapacityFreshness = 5 s), not absolute time, so a clock skew
+// of tens of ms between hosts is invisible.
+//
+// live_count is Σ instances currently running on this node
+// (pkg/fcvm.Manager.LiveCount). vmmd is the source of truth here —
+// schedd's PG-derived sum is up to one snapshot-restore behind.
+//
+// leased_count is Σ leases currently checked out
+// (pkg/fcvm.Manager.LeasedCount). Mirrors live_count for the
+// wake-path; informs a future capacity-aware reaper (issue #379
+// follow-up).
+//
+// used_mb is Σ(memory.current / 1 MiB) across every live instance
+// on this node, sourced from pkg/fcvm/leakcheck.ResidentBytes()
+// (matches what vmmdgrpc.Stats reports). The chooser consults
+// this with a ledger-floor rule (max(used_mb, ledger.ResidentRAM)).
+//
+// ram_headroom_mb is cfg.ComputeNode.MemMB - used_mb, clamped at
+// 0. The chooser does NOT consume this directly — it recomputes
+// headroom as ceiling - max(used_mb, ledger). The field is kept
+// for the dashboard and a future capacity-aware reaper.
+//
+// vcpu_busy is v1's conservative placeholder: live_count * 2
+// (matches the plan vCPU default). Per-cgroup-weight summation is
+// the v1.1 upgrade. The chooser ignores vcpu_busy today (vCPU
+// budget is box-wide via api.VCPUSlots); the field exists so the
+// wire is forward-compatible with a future per-node vCPU slice.
+//
+// Wire is additive: new fields go at the end.
+//
+// Additive per ADR-016.
+type CapacityReport struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	NodeId          string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	SampledAtUnixMs int64                  `protobuf:"varint,2,opt,name=sampled_at_unix_ms,json=sampledAtUnixMs,proto3" json:"sampled_at_unix_ms,omitempty"`
+	LiveCount       int32                  `protobuf:"varint,3,opt,name=live_count,json=liveCount,proto3" json:"live_count,omitempty"`
+	LeasedCount     int32                  `protobuf:"varint,4,opt,name=leased_count,json=leasedCount,proto3" json:"leased_count,omitempty"`
+	UsedMb          int32                  `protobuf:"varint,5,opt,name=used_mb,json=usedMb,proto3" json:"used_mb,omitempty"`
+	RamHeadroomMb   int32                  `protobuf:"varint,6,opt,name=ram_headroom_mb,json=ramHeadroomMb,proto3" json:"ram_headroom_mb,omitempty"`
+	VcpuBusy        int32                  `protobuf:"varint,7,opt,name=vcpu_busy,json=vcpuBusy,proto3" json:"vcpu_busy,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *CapacityReport) Reset() {
+	*x = CapacityReport{}
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CapacityReport) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CapacityReport) ProtoMessage() {}
+
+func (x *CapacityReport) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CapacityReport.ProtoReflect.Descriptor instead.
+func (*CapacityReport) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *CapacityReport) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *CapacityReport) GetSampledAtUnixMs() int64 {
+	if x != nil {
+		return x.SampledAtUnixMs
+	}
+	return 0
+}
+
+func (x *CapacityReport) GetLiveCount() int32 {
+	if x != nil {
+		return x.LiveCount
+	}
+	return 0
+}
+
+func (x *CapacityReport) GetLeasedCount() int32 {
+	if x != nil {
+		return x.LeasedCount
+	}
+	return 0
+}
+
+func (x *CapacityReport) GetUsedMb() int32 {
+	if x != nil {
+		return x.UsedMb
+	}
+	return 0
+}
+
+func (x *CapacityReport) GetRamHeadroomMb() int32 {
+	if x != nil {
+		return x.RamHeadroomMb
+	}
+	return 0
+}
+
+func (x *CapacityReport) GetVcpuBusy() int32 {
+	if x != nil {
+		return x.VcpuBusy
+	}
+	return 0
+}
+
+// ReportCapacityAck is the typed "I consumed all your messages"
+// signal vmmd sees after CloseAndRecv completes. Empty for v1;
+// future slices may carry capacity-aware reaper hints (issue
+// #379) — adding a field is ADR-016-additive.
+//
+// Additive per ADR-016.
+type ReportCapacityAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReportCapacityAck) Reset() {
+	*x = ReportCapacityAck{}
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReportCapacityAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReportCapacityAck) ProtoMessage() {}
+
+func (x *ReportCapacityAck) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_schedd_v1_schedd_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReportCapacityAck.ProtoReflect.Descriptor instead.
+func (*ReportCapacityAck) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP(), []int{17}
+}
+
 var File_onebox_faas_schedd_v1_schedd_proto protoreflect.FileDescriptor
 
 const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
@@ -1156,11 +1334,21 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x129\n" +
 	"\n" +
-	"written_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt*2\n" +
+	"written_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt\"\xf6\x01\n" +
+	"\x0eCapacityReport\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12+\n" +
+	"\x12sampled_at_unix_ms\x18\x02 \x01(\x03R\x0fsampledAtUnixMs\x12\x1d\n" +
+	"\n" +
+	"live_count\x18\x03 \x01(\x05R\tliveCount\x12!\n" +
+	"\fleased_count\x18\x04 \x01(\x05R\vleasedCount\x12\x17\n" +
+	"\aused_mb\x18\x05 \x01(\x05R\x06usedMb\x12&\n" +
+	"\x0fram_headroom_mb\x18\x06 \x01(\x05R\rramHeadroomMb\x12\x1b\n" +
+	"\tvcpu_busy\x18\a \x01(\x05R\bvcpuBusy\"\x13\n" +
+	"\x11ReportCapacityAck*2\n" +
 	"\n" +
 	"WakeMethod\x12\x12\n" +
 	"\x0eWAKE_COLD_BOOT\x10\x00\x12\x10\n" +
-	"\fWAKE_RESTORE\x10\x012\xf7\x05\n" +
+	"\fWAKE_RESTORE\x10\x012\xdc\x06\n" +
 	"\x06Schedd\x12O\n" +
 	"\x04Wake\x12\".onebox.faas.schedd.v1.WakeRequest\x1a#.onebox.faas.schedd.v1.WakeResponse\x12j\n" +
 	"\rAdmitInstance\x12+.onebox.faas.schedd.v1.AdmitInstanceRequest\x1a,.onebox.faas.schedd.v1.AdmitInstanceResponse\x12m\n" +
@@ -1168,7 +1356,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\fParkInstance\x12*.onebox.faas.schedd.v1.ParkInstanceRequest\x1a+.onebox.faas.schedd.v1.ParkInstanceResponse\x12v\n" +
 	"\x11ListInstanceStats\x12/.onebox.faas.schedd.v1.ListInstanceStatsRequest\x1a0.onebox.faas.schedd.v1.ListInstanceStatsResponse\x12l\n" +
 	"\rStreamAppLogs\x12+.onebox.faas.schedd.v1.StreamAppLogsRequest\x1a,.onebox.faas.schedd.v1.StreamAppLogsResponse0\x01\x12r\n" +
-	"\x0fStreamWarmHints\x12-.onebox.faas.schedd.v1.StreamWarmHintsRequest\x1a..onebox.faas.schedd.v1.StreamWarmHintsResponse0\x01BFZDgithub.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpbb\x06proto3"
+	"\x0fStreamWarmHints\x12-.onebox.faas.schedd.v1.StreamWarmHintsRequest\x1a..onebox.faas.schedd.v1.StreamWarmHintsResponse0\x01\x12c\n" +
+	"\x0eReportCapacity\x12%.onebox.faas.schedd.v1.CapacityReport\x1a(.onebox.faas.schedd.v1.ReportCapacityAck(\x01BFZDgithub.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpbb\x06proto3"
 
 var (
 	file_onebox_faas_schedd_v1_schedd_proto_rawDescOnce sync.Once
@@ -1183,7 +1372,7 @@ func file_onebox_faas_schedd_v1_schedd_proto_rawDescGZIP() []byte {
 }
 
 var file_onebox_faas_schedd_v1_schedd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_onebox_faas_schedd_v1_schedd_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_onebox_faas_schedd_v1_schedd_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_onebox_faas_schedd_v1_schedd_proto_goTypes = []any{
 	(WakeMethod)(0),                   // 0: onebox.faas.schedd.v1.WakeMethod
 	(*WakeRequest)(nil),               // 1: onebox.faas.schedd.v1.WakeRequest
@@ -1202,18 +1391,20 @@ var file_onebox_faas_schedd_v1_schedd_proto_goTypes = []any{
 	(*StreamAppLogsResponse)(nil),     // 14: onebox.faas.schedd.v1.StreamAppLogsResponse
 	(*StreamWarmHintsRequest)(nil),    // 15: onebox.faas.schedd.v1.StreamWarmHintsRequest
 	(*StreamWarmHintsResponse)(nil),   // 16: onebox.faas.schedd.v1.StreamWarmHintsResponse
-	(*structpb.Struct)(nil),           // 17: google.protobuf.Struct
-	(*timestamppb.Timestamp)(nil),     // 18: google.protobuf.Timestamp
+	(*CapacityReport)(nil),            // 17: onebox.faas.schedd.v1.CapacityReport
+	(*ReportCapacityAck)(nil),         // 18: onebox.faas.schedd.v1.ReportCapacityAck
+	(*structpb.Struct)(nil),           // 19: google.protobuf.Struct
+	(*timestamppb.Timestamp)(nil),     // 20: google.protobuf.Timestamp
 }
 var file_onebox_faas_schedd_v1_schedd_proto_depIdxs = []int32{
 	0,  // 0: onebox.faas.schedd.v1.WakeResponse.method:type_name -> onebox.faas.schedd.v1.WakeMethod
-	17, // 1: onebox.faas.schedd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
+	19, // 1: onebox.faas.schedd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
 	0,  // 2: onebox.faas.schedd.v1.AdmitInstanceResponse.method:type_name -> onebox.faas.schedd.v1.WakeMethod
-	17, // 3: onebox.faas.schedd.v1.AdmitInstanceResponse.problem:type_name -> google.protobuf.Struct
+	19, // 3: onebox.faas.schedd.v1.AdmitInstanceResponse.problem:type_name -> google.protobuf.Struct
 	5,  // 4: onebox.faas.schedd.v1.ReportActivityRequest.touches:type_name -> onebox.faas.schedd.v1.Touch
 	10, // 5: onebox.faas.schedd.v1.ListInstanceStatsResponse.rows:type_name -> onebox.faas.schedd.v1.InstanceStatsRow
-	18, // 6: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
-	18, // 7: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
+	20, // 6: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
+	20, // 7: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
 	1,  // 8: onebox.faas.schedd.v1.Schedd.Wake:input_type -> onebox.faas.schedd.v1.WakeRequest
 	3,  // 9: onebox.faas.schedd.v1.Schedd.AdmitInstance:input_type -> onebox.faas.schedd.v1.AdmitInstanceRequest
 	6,  // 10: onebox.faas.schedd.v1.Schedd.ReportActivity:input_type -> onebox.faas.schedd.v1.ReportActivityRequest
@@ -1221,15 +1412,17 @@ var file_onebox_faas_schedd_v1_schedd_proto_depIdxs = []int32{
 	11, // 12: onebox.faas.schedd.v1.Schedd.ListInstanceStats:input_type -> onebox.faas.schedd.v1.ListInstanceStatsRequest
 	13, // 13: onebox.faas.schedd.v1.Schedd.StreamAppLogs:input_type -> onebox.faas.schedd.v1.StreamAppLogsRequest
 	15, // 14: onebox.faas.schedd.v1.Schedd.StreamWarmHints:input_type -> onebox.faas.schedd.v1.StreamWarmHintsRequest
-	2,  // 15: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
-	4,  // 16: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
-	7,  // 17: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
-	9,  // 18: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
-	12, // 19: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
-	14, // 20: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
-	16, // 21: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
-	15, // [15:22] is the sub-list for method output_type
-	8,  // [8:15] is the sub-list for method input_type
+	17, // 15: onebox.faas.schedd.v1.Schedd.ReportCapacity:input_type -> onebox.faas.schedd.v1.CapacityReport
+	2,  // 16: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
+	4,  // 17: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
+	7,  // 18: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
+	9,  // 19: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
+	12, // 20: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
+	14, // 21: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
+	16, // 22: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
+	18, // 23: onebox.faas.schedd.v1.Schedd.ReportCapacity:output_type -> onebox.faas.schedd.v1.ReportCapacityAck
+	16, // [16:24] is the sub-list for method output_type
+	8,  // [8:16] is the sub-list for method input_type
 	8,  // [8:8] is the sub-list for extension type_name
 	8,  // [8:8] is the sub-list for extension extendee
 	0,  // [0:8] is the sub-list for field type_name
@@ -1246,7 +1439,7 @@ func file_onebox_faas_schedd_v1_schedd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_schedd_v1_schedd_proto_rawDesc), len(file_onebox_faas_schedd_v1_schedd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
