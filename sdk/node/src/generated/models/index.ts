@@ -97,6 +97,8 @@ export type { SessionListResponse } from './SessionListResponse.js';
 export type { SessionsRevokeAllResponse } from './SessionsRevokeAllResponse.js';
 export type { SetPasswordRequest } from './SetPasswordRequest.js';
 export type { Slug } from './Slug.js';
+export type { StorageUsageListResponse } from './StorageUsageListResponse.js';
+export type { StorageUsageResponse } from './StorageUsageResponse.js';
 export type { UpdateAlertRuleRequest } from './UpdateAlertRuleRequest.js';
 export type { UpdateAppRequest } from './UpdateAppRequest.js';
 export type { UpdateCronRequest } from './UpdateCronRequest.js';

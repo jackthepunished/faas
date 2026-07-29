@@ -148,6 +148,8 @@ from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_password_request import SetPasswordRequest
+from .storage_usage_list_response import StorageUsageListResponse
+from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
@@ -310,6 +312,8 @@ __all__ = (
     "SessionListResponse",
     "SessionsRevokeAllResponse",
     "SetPasswordRequest",
+    "StorageUsageListResponse",
+    "StorageUsageResponse",
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
