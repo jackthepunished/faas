@@ -278,6 +278,15 @@ func dataSeverity(data json.RawMessage) (string, bool) {
 // auditEventResponse converts one state.Event row into the wire shape.
 // Subject is rendered as a string (uuid canonical form) — the wire
 // contract is string-typed so JSON consumers never see Go's uuid type.
+//
+// Mega-PR B: hoists data.severity onto the top-level Severity
+// field for stateless.advisory rows (and the receiver's `info`
+// empty-batch fallback). dataSeverity is the existing per-row
+// helper; the omitempty tag on AuditEventResponse.Severity means
+// non-stateless kinds and pre-PR-427 rows render with no Severity
+// field at all (backwards-compatible wire). Pre-PR-427 rows are
+// the load-bearing case: customers with audit data already in
+// the table must not see a wire-shape change for those rows.
 func auditEventResponse(e state.Event) api.AuditEventResponse {
 	resp := api.AuditEventResponse{
 		ID:    strconv.FormatInt(e.ID, 10),
@@ -288,6 +297,9 @@ func auditEventResponse(e state.Event) api.AuditEventResponse {
 	}
 	if e.Subject != nil {
 		resp.Subject = e.Subject.String()
+	}
+	if sev, ok := dataSeverity(e.Data); ok {
+		resp.Severity = sev
 	}
 	return resp
 }
