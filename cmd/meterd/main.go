@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,7 +37,10 @@ import (
 
 	"filippo.io/age"
 
+	"google.golang.org/grpc"
+
 	"github.com/jackc/pgx/v5/pgxpool"
+	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/audit"
@@ -203,34 +207,236 @@ func (a *scheddEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bo
 	return 0, row.NetTxBytes, true
 }
 
-// gatewayEgressAdapter (ADR-046, step 8) is the meterd-side
-// source for usage_minutes.tx_bytes (gateway HTTP response
-// bytes). Production wires this against the gatewayd's
-// EgressTxService gRPC stream (PR-2, gateway side); the
-// adapter maintains a per-instance ring buffer and the
-// Drain method returns the per-(instance, minute) delta.
+// gatewayEgressAdapter (ADR-046, step 8; PR-2 = stream consumer)
+// is the meterd-side source for usage_minutes.tx_bytes
+// (gateway HTTP response bytes). Production wires the gatewayd
+// gRPC stream
+// (onebox.faas.gatewayd.v1.EgressTxService.StreamBytes on
+// FAAS_GATEWAY_SYNTH_SOCKET) into a background goroutine that
+// feeds a per-(instance, minute) byte snapshot. Sample-time
+// reads (EgressBytes) look up the snapshot under the read lock
+// and return (txBytes, 0, true) when the gateway reported any
+// rows for this instance in the current minute.
 //
-// In PR-1 (no gateway stream yet), this adapter returns
-// 0 for tx_bytes unconditionally — the schema layer is
-// landed without the gateway-side producer, and the
-// append-time semantics are correct (tx_bytes stays at 0).
-// PR-2 wires the gRPC client.
+// Storage layout:
+//
+//	snapshot[instanceID][minuteUnix] = bytes
+//
+// minuteUnix is the truncated minute the gateway observed the
+// bytes over; the meterd sampler reads only the bucket whose
+// key matches the floor(now) tick. Past-minute buckets are
+// retained for the duration of one sampler tick so a transient
+// scheduler delay (slow Postgres) doesn't lose attribution — a
+// future drain-eviction pass on meterd's resetToCurrentMinute
+// helper below disposes of them.
+//
+// Push vs pull:
+//
+//	The gateway stream pushes frames on a 1 Hz cadence
+//	(pkg/gateway/egressgrpc.StreamCadence). Pulling per sample
+//	would either burn an extra round trip per instance-per-tick
+//	(~max_concurrency × 1/min × 2 daemons) or coalesce and lose
+//	per-minute fidelity. The push channel lets the gateway
+//	accumulate and the dialer read on its own cadence
+//	(1/min/sample) without per-tick chatter.
+//
+// Reconnect:
+//
+//	The stream goroutine reconnects with backoff on disconnect
+//	(gatewayd restart, transient sock churn). Worst-case
+//	behaviour during the gap is ok=false on every EgressBytes
+//	read → AppendUsage writes 0 to tx_bytes for that minute,
+//	which surfaces as a one-minute gap in the FaasTxBytesStall
+//	alert (operational, not a customer-visible bill increase).
 type gatewayEgressAdapter struct {
-	// reserved for PR-2 — populated with the gRPC stream
-	// client + ring buffer drainer.
+	// now is the clock injection seam for tests; production
+	// uses time.Now. Replacing it doesn't restart the stream
+	// goroutine — it's read on every EgressBytes call only.
+	now func() time.Time
+
+	mu   sync.Mutex
+	data map[string]map[int64]uint64 // instanceID → minuteUnix → bytes
+
+	// dialFn is the unix-socket dialer for the gateway
+	// stream. Tests substitute a fake dialer that returns a
+	// hand-rolled stream client; production wires the
+	// gatewaydpb-grpc DailContext.
+	dialFn func(ctx context.Context, socketPath string) (gatewaydpb.EgressTxServiceClient, error)
+
+	// streamReconnectBackoff bounds the reconnect cadence
+	// when the upstream gateway stream errors out. 250 ms
+	// initial, 5 s ceiling, full jitter on the floor.
+	streamReconnectBackoff backoff
 }
 
+// EgressBytes returns the latest drained (instanceID,
+// currentMinute) byte count from the gateway stream. ok is
+// true when the gateway reported any bytes in the current
+// minute. The 0/0/false fallback for "stream not yet open,
+// or gateway hasn't drained anything yet" is intentional —
+// the sampler falls through to its no-source branch and
+// writes 0 to BOTH egress columns, mirroring the PR-1
+// contract.
+//
+// netTxBytes is always 0 on this path — scheddEgressAdapter
+// owns the net_tx_bytes column. The aggregator picks the
+// right value per column.
 func (a *gatewayEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bool) {
-	// PR-1: tx_bytes is always 0 (no gateway stream wired).
-	// netTxBytes is also 0 here — scheddEgressAdapter owns
-	// that column. ok=true would be misleading (we have no
-	// row); return ok=false so the sampler falls through to
-	// its no-source branch and writes 0 to BOTH egress
-	// columns. PR-2 re-implements this method to read the
-	// gateway ring buffer and return (tx, 0, true) when a
-	// row is present.
-	_ = instanceID
-	return 0, 0, false
+	if a == nil || instanceID == "" {
+		return 0, 0, false
+	}
+	minute := a.now().UTC().Truncate(time.Minute).Unix()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows, ok := a.data[instanceID]
+	if !ok {
+		return 0, 0, false
+	}
+	n, ok := rows[minute]
+	if !ok {
+		return 0, 0, false
+	}
+	return n, 0, true
+}
+
+// startStream dials FAAS_GATEWAY_SYNTH_SOCKET and runs the
+// StreamBytes receive loop until ctx cancels. Reconnects with
+// backoff on transient errors; each received frame updates
+// the snapshot in place. Tests inject a fake dialFn + a fake
+// now() to drive this path deterministically.
+//
+// Lifecycle:
+//
+//	Caller starts the goroutine exactly once at boot. The
+//	stream is a long-lived connection — terminating it is
+//	done by ctx cancellation. The lifecycle matches
+//	egressAggregator's usage: start at daemon boot, terminate
+//	by process shutdown.
+func (a *gatewayEgressAdapter) startStream(ctx context.Context, socketPath string, log *slog.Logger) {
+	if a.dialFn == nil || socketPath == "" {
+		if log != nil {
+			log.Warn("gatewayEgressAdapter: no dialFn or socket path; tx_bytes will stay 0")
+		}
+		return
+	}
+	go func() {
+		backoff := 250 * time.Millisecond
+		const backoffMax = 5 * time.Second
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			client, err := a.dialFn(ctx, socketPath)
+			if err != nil {
+				if log != nil {
+					log.Warn("gatewayEgressAdapter: dial failed; backing off", "err", err, "backoff", backoff)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				if backoff > backoffMax {
+					backoff = backoffMax
+				}
+				continue
+			}
+			backoff = 250 * time.Millisecond
+			a.consumeStream(ctx, client, log)
+		}
+	}()
+}
+
+// consumeStream runs one stream-receive iteration: open the
+// server-streaming RPC, fold every frame into the snapshot,
+// return when the upstream closes or the ctx cancels.
+func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client gatewaydpb.EgressTxServiceClient, log *slog.Logger) {
+	stream, err := client.StreamBytes(ctx, &gatewaydpb.StreamBytesRequest{})
+	if err != nil {
+		if log != nil {
+			log.Warn("gatewayEgressAdapter: stream open failed", "err", err)
+		}
+		return
+	}
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			if err != io.EOF && log != nil {
+				log.Debug("gatewayEgressAdapter: stream recv ended", "err", err)
+			}
+			return
+		}
+		a.recordFrame(frame)
+	}
+}
+
+// recordFrame folds one BytesFrame into the snapshot. Called
+// exclusively from consumeStream under the assumption that the
+// producer (gatewayd) sends strictly minute-aligned timestamps
+// (it does — pkg/gateway/egresssink truncates on intake). A
+// non-truncated minute from a future gateway-side change would
+// be treated as its own bucket (different minuteUnix) and
+// coexist with the truncated bucket; that's the documented
+// "no implicit re-bucketing" contract.
+func (a *gatewayEgressAdapter) recordFrame(frame *gatewaydpb.BytesFrame) {
+	if frame == nil || frame.InstanceId == "" || frame.Minute == nil {
+		return
+	}
+	minuteUnix := frame.Minute.AsTime().UTC().Truncate(time.Minute).Unix()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows, ok := a.data[frame.InstanceId]
+	if !ok {
+		rows = make(map[int64]uint64, 4)
+		a.data[frame.InstanceId] = rows
+	}
+	rows[minuteUnix] = frame.Bytes
+}
+
+// Tracked returns the number of distinct instances the adapter
+// currently holds rows for. Test seam; not on the hot path.
+func (a *gatewayEgressAdapter) Tracked() int {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.data)
+}
+
+// backoff is a tiny helper to keep the reconnect cadence
+// readable inline. Zero-value is "no backoff" (used by tests
+// that want synchronous reconnect behaviour).
+type backoff time.Duration
+
+func (b *backoff) reset() { *b = backoff(250 * time.Millisecond) }
+
+// dialGatewayEgressStream dials the gatewayd unix socket and
+// returns a stub EgressTxServiceClient. ADR-015 (unix-socket
+// DAC auth, group `faas`) is the only authentication on this
+// path; the socket mode 0660 + group ownership IS the auth
+// posture, no TLS handshake happens on this socket. The dialer
+// is overridable via gwEgress.dialFn for tests.
+//
+// grpc.WithContextDialer lets us dial a unix socket without
+// touching the DNS resolver; a fresh *grpc.ClientConn per dial
+// is the canonical "long-lived streaming RPC" shape (gRPC's
+// stream stays alive across the lifetime of the conn, and a
+// dropped conn signals a stream close which the goroutine
+// handler reconnects on).
+func dialGatewayEgressStream(ctx context.Context, socketPath string) (gatewaydpb.EgressTxServiceClient, error) {
+	conn, err := grpc.NewClient(
+		"unix:///"+socketPath,
+		grpc.WithContextDialer(func(_ context.Context, _ string) (net.Conn, error) {
+			return net.Dial("unix", socketPath)
+		}),
+		grpc.WithInsecure(), //nolint:staticcheck // ADR-015: unix-socket DAC is the auth; TLS handshake is skipped by design on local sockets.
+	)
+	if err != nil {
+		return nil, fmt.Errorf("meterd: dial gatewayd socket %s: %w", socketPath, err)
+	}
+	return gatewaydpb.NewEgressTxServiceClient(conn), nil
 }
 
 // egressAggregator combines scheddEgressAdapter (net_tx_bytes)
@@ -246,12 +452,30 @@ type egressAggregator struct {
 }
 
 func (a *egressAggregator) EgressBytes(instanceID string) (uint64, uint64, bool) {
-	// PR-1: both adapters return ok=false. Aggregator
-	// also returns ok=false so the sampler writes 0 to
-	// both columns. PR-2 swaps the bodies for real
-	// adapter calls.
-	_ = instanceID
-	return 0, 0, false
+	if a == nil || instanceID == "" {
+		return 0, 0, false
+	}
+	// Per-column reads. Either adapter may report "no row" for
+	// this instance; the aggregator returns the union — the
+	// sampler treats nonzero bytes as a real observation even if
+	// only one column produced a value, because tx_bytes and
+	// net_tx_bytes are independent (gateway HTTP response vs
+	// root-side veth rx) and "no gateway traffic but veth rx
+	// present" is a perfectly valid per-minute state.
+	var (
+		txBytes, netTxBytes uint64
+		okSchedd, okGw      bool
+	)
+	if a.schedd != nil {
+		_, netTxBytes, okSchedd = a.schedd.EgressBytes(instanceID)
+	}
+	if a.gw != nil {
+		txBytes, _, okGw = a.gw.EgressBytes(instanceID)
+	}
+	if !okSchedd && !okGw {
+		return 0, 0, false
+	}
+	return txBytes, netTxBytes, true
 }
 
 func main() {
@@ -493,7 +717,33 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// future test harness can omit the egress wire without
 	// touching the constructor.
 	scheddEgress := &scheddEgressAdapter{cpu: cpu}
-	gwEgress := &gatewayEgressAdapter{}
+	gwEgress := &gatewayEgressAdapter{
+		now:    deps.now,
+		data:   make(map[string]map[int64]uint64),
+		dialFn: dialGatewayEgressStream,
+	}
+	// PR-2: kick off the gateway stream consumer. The unix-socket
+	// path defaults to the same FAAS_GATEWAY_SYNTH_SOCKET that schedd
+	//'s synth dialer uses; both daemons reach the same gatewayd via
+	// the same group-`faas` DAC auth (ADR-015). ctx here is the loop
+	// ctx — when the daemon shuts down the goroutine returns.
+	// PR-2: kick off the gateway stream consumer. The unix-socket
+	// path defaults to the same FAAS_GATEWAY_SYNTH_SOCKET that schedd
+	//'s synth dialer uses; both daemons reach the same gatewayd via
+	// the same group-`faas` DAC auth (ADR-015). ctx here is the loop
+	// ctx — when the daemon shuts down the goroutine returns.
+	envOr := func(key, fallback string) string {
+		if v, ok := os.LookupEnv(key); ok && v != "" {
+			return v
+		}
+		return fallback
+	}
+	// FAAS_GATEWAY_EGRESS_SOCKET is the ADR-046 PR-2 producer
+	// channel (separate from FAAS_GATEWAY_SYNTH_SOCKET, which
+	// stays HTTP-shaped for cron dispatch). Both share the same
+	// group-`faas` DAC auth (ADR-015).
+	gwSocketPath := envOr("FAAS_GATEWAY_EGRESS_SOCKET", "/run/faas/gatewayd-egress.sock")
+	gwEgress.startStream(ctx, gwSocketPath, log)
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and
 	// hand it to the loop. The evaluator is nil-coerced below when

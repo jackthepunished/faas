@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 )
 
 // App is the routing target for a hostname.
@@ -97,6 +98,13 @@ type Handler struct {
 	// constraint implicitly by being keys in the routing cache — see
 	// WithAppsSuffix docs.
 	appsSuffix string
+	// egressSink records per-instance HTTP response body bytes for
+	// ADR-046 (per-instance egress metering, telemetry only).
+	// Set via WithEgressSink from cmd/gatewayd/main.go; nil in
+	// unit tests that don't exercise the egress counter.
+	// Recording happens in observe() after the proxy returns —
+	// see the proxyByNode call site in ServeHTTP.
+	egressSink *egresssink.EgressSink
 	// proxyFor builds the reverse proxy for an upstream address; overridable in
 	// tests.
 	proxyFor func(addr string) http.Handler
@@ -221,6 +229,17 @@ func (h *Handler) WithAccountLimiter(l *Limiter) *Handler {
 // addr-based proxy path (used by tests and the e2e harness).
 func (h *Handler) WithForwarding(fn func(nodeID string) http.Handler) *Handler {
 	h.proxyByNode = fn
+	return h
+}
+
+// WithEgressSink installs the per-instance HTTP response byte ring
+// buffer (pkg/gateway/egresssink). ADR-046 (per-instance egress
+// metering, telemetry only) wires this once at gatewayd boot from
+// cmd/gatewayd/main.go. nil-safe: passing nil clears the sink;
+// ServeHTTP short-circuits the record path the moment it sees
+// h.egressSink == nil, so unit tests don't have to install one.
+func (h *Handler) WithEgressSink(sink *egresssink.EgressSink) *Handler {
+	h.egressSink = sink
 	return h
 }
 
@@ -429,6 +448,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.proxyFor(target.NodeID).ServeHTTP(w, r)
 	}
 	h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)
+	// ADR-046 (per-instance egress metering, telemetry only):
+	// record the response body bytes that egressed the gateway on
+	// this instance. Gated on 2xx/3xx because 4xx/5xx the
+	// ReverseProxy never actually wrote the response body to the
+	// wire (it short-circuited on the upstream reject) — billing
+	// bytes that didn't egress would be wrong on both ends of the
+	// financial model. nil-safe for unit tests.
+	h.recordEgress(rec, target, app)
 	if cold && h.metrics != nil {
 		// Wake latency is "request-received to first upstream byte". The
 		// wake-timing RoundTripper stamps the inbound request's recorder at
@@ -556,6 +583,42 @@ func (p *preInstantiateApps) seen(appID string) bool {
 	return loaded
 }
 
+// recordEgress attributes response body bytes to the (instanceID,
+// minute) bucket in h.egressSink. Called after the proxy ServeHTTP
+// returns so the recorder has observed every body chunk that hit
+// the wire. The 2xx/3xx gate mirrors what the gateway actually
+// delivered to the caller: 4xx/5xx responses never reach the body
+// stage on the ReverseProxy path (it short-circuits to the error
+// branch), so trying to count their bytes would over-attribute.
+//
+// The InstanceID guard means tests that exercise only fakeBackend
+// (where pick-instance is empty) skip the recording without
+// crashing. The sink is nil-safe itself (RecordResponseBytes
+// no-ops on a nil/empty instance id and <= 0 bytes), but the early
+// return here skips the function-call overhead on the hot path.
+//
+// Also increments the gateway_response_bytes_total counter for the
+// (app.id, app.plan) tuple. The plan label uses the same string
+// cast as the rest of handler.observe; if it changes, audit the
+// §12 dashboard panels to keep the join on plan stable.
+func (h *Handler) recordEgress(rec *statusRecorder, target Target, app App) {
+	if h == nil || rec == nil {
+		return
+	}
+	if rec.status < 200 || rec.status >= 400 {
+		return
+	}
+	if rec.Bytes <= 0 {
+		return
+	}
+	if h.egressSink != nil && target.InstanceID != "" {
+		h.egressSink.RecordResponseBytes(target.InstanceID, rec.Bytes)
+	}
+	if h.metrics != nil && app.ID != "" {
+		h.metrics.ObserveResponseBytes(app.ID, string(app.Plan), rec.Bytes)
+	}
+}
+
 // preInstantiateApp records appID once and delegates to
 // Metrics.PreInstantiateApp. Safe on a nil h (test seam) and a nil
 // Metrics (also nil-safe inside the method).
@@ -571,10 +634,20 @@ func (h *Handler) preInstantiateApp(appID string) {
 
 // statusRecorder is a thin ResponseWriter wrapper that records the HTTP status
 // that was written so metrics can label without buffering headers/body.
+// statusRecorder is a thin ResponseWriter wrapper that records the HTTP status
+// that was written so metrics can label without buffering headers/body.
+//
+// Bytes is the cumulative response body length observed via Write. Streaming
+// responses (no Content-Length, Write called multiple times) accumulate the
+// sum — the ADR-046 telemetry path doesn't need per-chunk fidelity, only the
+// total. Negative or zero-byte callers (HEAD, 304 Not Modified, error paths
+// without a body) leave Bytes at zero, which the post-proxy recording site
+// treats as "no traffic to meter" (see recordEgress in ServeHTTP).
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
+	Bytes       int64
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
@@ -591,7 +664,18 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.status = http.StatusOK
 		s.wroteHeader = true
 	}
-	return s.ResponseWriter.Write(b)
+	n, err := s.ResponseWriter.Write(b)
+	// bytes only advance when the underlying Write actually consumes
+	// the buffer — a partial write (err != nil, n<len(b)) still counts
+	// what made it to the wire, because that's what egressed. The
+	// !s.hasBodyWrite guard prevents double-counting in the rare case
+	// where the embedded ResponseWriter is itself wrapped; we don't
+	// currently wrap a second layer so it's a no-op in practice but
+	// cheap insurance for the future.
+	if n > 0 {
+		s.Bytes += int64(n)
+	}
+	return n, err
 }
 
 // ensureCapacity (issue #168) is the per-app fan-out admission primitive.

@@ -1,0 +1,96 @@
+// gatewayd egress producer service (ADR-046 PR-2). One streaming
+// RPC: `StreamBytes` server-streaming from gatewayd to meterd.
+// Each chunk is one (instance_id, minute, bytes) drained from the
+// in-memory per-instance ring buffer
+// (pkg/gateway/egresssink.EgressSink). The meterd side reads,
+// keys on (instance_id, minute), folds into the egress aggregator
+// (cmd/meterd/main.go:gatewayEgressAdapter), and the next sample
+// tick appends to usage_minutes.tx_bytes.
+//
+// Why a separate proto rather than reusing pkg/gateway/vmmd's
+// existing v1 surface:
+//
+//   wire-stable enum isolation (spec §14): touching the
+//   existing vmmd/schedd packages to add an ADR-046-specific RPC
+//   would have inflated their envelope, and a follow-up slice
+//   that swaps an existing field's type would have required a
+//   version bump across every consumer. Mirroring the existing
+//   onebox.faas.{schedd,vmmd,githubd}.v1 convention
+//   (api/proto/onebox/faas/<daemon>/v1/<svc>.proto) keeps the
+//   egress surface additive and independently versionable.
+//
+// Why a single StreamBytes RPC rather than two (one for the
+// current-minute tail, one for replay):
+//
+//   The drain shape — (instance_id, truncated_minute, bytes) —
+//   is the same shape whether the row is current or historical.
+//   Splitting into "current" vs "replay" would force meterd to
+//   reconcile two streams on every reconnect; a single monotonic
+//   stream (one chunk per drained bucket) lets the consumer
+//   treat a re-subscribe as a fresh pull from minute 0. The
+//   ring buffer's drain-eviction policy keeps the per-instance
+//   window bounded at BucketsToKeep minutes (3) so a missed
+//   reconnect never accumulates an unbounded backlog.
+
+syntax = "proto3";
+
+package onebox.faas.gatewayd.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1;gatewaydpb";
+
+// EgressTxService is the gRPC service gatewayd exposes for the
+// egress-producer channel (ADR-046 PR-2). Served on the same
+// unix socket as cmd/gatewayd/synth.go's SynthServer
+// (FAAS_GATEWAY_SYNTH_SOCKET, default /run/faas/gatewayd-
+// internal.sock); the unix-socket DAC auth (ADR-015) is the
+// only authentication for v1 — only meterd is in the `faas`
+// group, so the socket IS the auth. Multiple service definitions
+// on a single *grpc.Server is the gRPC-native shape; the synth
+// service stays co-resident, the egress service comes up
+// alongside, and operators see one process on the box.
+service EgressTxService {
+  // StreamBytes (ADR-046 PR-2 producer channel) emits one
+  // egress frame per drained (instance_id, minute) bucket.
+  // The server pushes frames as fast as the underlying
+  // EgressSink.DrainRecords produces them; the client (meterd)
+  // reads at its own cadence (one minute-by-minute accumulation
+  // per SampleAndRoll tick). Server-side backpressure is gRPC's
+  // natural flow control — the gateway never blocks; the meterd
+  // dialer pulls at its own rate. Empty stream = nothing to
+  // drain this turn (the ring buffer has no observed bytes);
+  // the client MUST tolerate empty returns. End-of-stream is
+  // driven by ctx cancellation (server side) or by
+  // deadline-exceeded (client side); there is no
+  // "complete" marker because the drain is naturally lossy
+  // (an instance that parks between two drains loses its
+  // last-partial bucket, by design — see egressSink eviction
+  // comment).
+  rpc StreamBytes(StreamBytesRequest) returns (stream BytesFrame);
+}
+
+// StreamBytesRequest is intentionally empty. The server starts
+// streaming whatever is currently queued in the per-instance
+// ring buffer and continues as new frames arrive. A future
+// iteration could add a `since_minute_unix` filter to gate the
+// initial replay to "drain only from this minute forward"; the
+// current request shape mirrors Vmmd.LogsRequest (intentionally
+// empty, room to grow without a wire version bump) so the
+// surface can stay stable across the next ADR-046 slice.
+message StreamBytesRequest {}
+
+// BytesFrame is one (instance, minute, bytes) row. instance_id
+// is the compute_node-relative instances.id UUID
+// (commands.com/drivers agree on this shape — see vmmd.Logs
+// for the canonical reference). minute is the truncated minute
+// the bytes accrued over; bytes is the cumulative number of
+// observed HTTP response body bytes in that minute on that
+// instance. Order: server emits frames in (instance_id, minute)
+// lex order; the client MUST NOT depend on it being strict
+// because future drain-eviction changes could reorder.
+message BytesFrame {
+  string instance_id = 1;
+  google.protobuf.Timestamp minute = 2;
+  uint64 bytes = 3;
+}

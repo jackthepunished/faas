@@ -17,6 +17,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -522,6 +525,229 @@ func (r *meterRec) Calls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls
+}
+
+// TestGatewayEgressAdapter_EgressBytes — exercise the
+// recordFrame → EgressBytes round-trip on the meterd-side
+// push-consumer (ADR-046 PR-2). PR-1 left this as a stub
+// returning ok=false; PR-2 replaces it with a real minute-bucketed
+// accumulator. Contract pinned by this test:
+//
+//  1. EgressBytes looks up by current-minute bucket; the
+//     adapter's `now` injection is the "what is current"
+//     source of truth.
+//  2. recordFrame without an instance id, with nil Minute, or
+//     with empty InstanceId is a silent no-op (mirrors the
+//     producer's upstream guards).
+//  3. After the clock advances past the frame's minute, the
+//     historical bucket is no longer current → EgressBytes
+//     returns ok=false for that instance until a new frame in
+//     the new minute arrives.
+//  4. netTxBytes is always 0 on this path (the schedd adapter
+//     owns that column; the aggregator combines).
+//  5. Looking up an instance the adapter never saw returns
+//     ok=false with zero bytes.
+func TestGatewayEgressAdapter_EgressBytes(t *testing.T) {
+	t.Parallel()
+
+	// Anchor is mid-minute so the truncation boundary is
+	// observable: anchor.Truncate(Minute) = 12:00, anchor+30s is
+	// still in the 12:00 bucket.
+	anchor := time.Date(2026, 7, 29, 12, 0, 30, 0, time.UTC)
+	a := &gatewayEgressAdapter{
+		now:  func() time.Time { return anchor },
+		data: make(map[string]map[int64]uint64),
+	}
+
+	// 1. recordFrame(nil) is a no-op.
+	a.recordFrame(nil)
+	if _, _, ok := a.EgressBytes("inst-1"); ok {
+		t.Fatalf("EgressBytes(inst-1) ok=true after a nil recordFrame; want false")
+	}
+
+	// 2. recordFrame with empty InstanceId is a no-op.
+	a.recordFrame(&gatewaydpb.BytesFrame{InstanceId: "", Minute: timestamppb.New(anchor), Bytes: 4096})
+	if _, _, ok := a.EgressBytes(""); ok {
+		t.Fatalf("EgressBytes(\"\") ok=true after empty-id record; want false (receiver also gates on empty)")
+	}
+
+	// 3. recordFrame with nil Minute is a no-op (the bucket
+	//    key is derived from frame.Minute.AsTime()).
+	a.recordFrame(&gatewaydpb.BytesFrame{InstanceId: "inst-1", Minute: nil, Bytes: 4096})
+	if _, _, ok := a.EgressBytes("inst-1"); ok {
+		t.Fatalf("EgressBytes(inst-1) ok=true after nil-Minute record; want false (no bucket was keyed)")
+	}
+
+	// 4. Happy path: a frame stamped at the anchor (truncated
+	//    to 12:00) is readable while the clock stays in 12:00.
+	a.recordFrame(&gatewaydpb.BytesFrame{
+		InstanceId: "inst-1",
+		Minute:     timestamppb.New(anchor),
+		Bytes:      4096,
+	})
+
+	got, netTx, ok := a.EgressBytes("inst-1")
+	if !ok {
+		t.Fatalf("EgressBytes(inst-1) ok=false after a positive recordFrame; want true")
+	}
+	if got != 4096 {
+		t.Errorf("EgressBytes(inst-1) = %d, want 4096", got)
+	}
+	if netTx != 0 {
+		t.Errorf("EgressBytes(inst-1) netTx = %d, want 0 (adapter never populates netTx; schedd adapter owns that column)", netTx)
+	}
+
+	// 5. Cross-minute: a frame stamped one minute past the anchor
+	//    goes into its own bucket. While the clock is still in
+	//    the anchor minute, the anchor bucket is the one read.
+	nextMinute := anchor.Add(time.Minute)
+	a.recordFrame(&gatewaydpb.BytesFrame{
+		InstanceId: "inst-1",
+		Minute:     timestamppb.New(nextMinute),
+		Bytes:      8192,
+	})
+
+	got, _, ok = a.EgressBytes("inst-1")
+	if !ok {
+		t.Fatalf("EgressBytes(inst-1) ok=false after cross-minute frame; want true")
+	}
+	if got != 4096 {
+		t.Errorf("EgressBytes(inst-1) at anchor minute = %d, want 4096 (cross-minute frame must not overwrite anchor bucket)", got)
+	}
+
+	// 6. After the clock advances past the anchor minute, the
+	//    anchor bucket is no longer "current" — EgressBytes
+	//    returns ok=false even though the row is still in the
+	//    map. This is the producer/consumer re-anchor contract:
+	//    the meterd sampler reads the live minute only.
+	a.now = func() time.Time { return nextMinute.Add(30 * time.Second) }
+	if _, _, ok := a.EgressBytes("inst-1"); ok {
+		t.Errorf("EgressBytes(inst-1) ok=true after clock advance into nextMinute; want false (anchor bucket is stale)")
+	}
+
+	// 7. A fresh frame in the new minute restores ok=true with
+	//    that minute's bytes.
+	a.recordFrame(&gatewaydpb.BytesFrame{
+		InstanceId: "inst-1",
+		Minute:     timestamppb.New(a.now()),
+		Bytes:      16384,
+	})
+	got, _, ok = a.EgressBytes("inst-1")
+	if !ok {
+		t.Fatalf("EgressBytes(inst-1) ok=false after fresh frame in current minute; want true")
+	}
+	if got != 16384 {
+		t.Errorf("EgressBytes(inst-1) in nextMinute = %d, want 16384", got)
+	}
+
+	// 8. Ghost instance: never recorded → ok=false.
+	if _, _, ok := a.EgressBytes("inst-ghost"); ok {
+		t.Errorf("EgressBytes(inst-ghost) ok=true; want false (no frame ever recorded)")
+	}
+
+	// 9. nil receiver is safe (defends the test-injected seams).
+	var nilA *gatewayEgressAdapter
+	if _, _, ok := nilA.EgressBytes("inst-1"); ok {
+		t.Errorf("EgressBytes on nil receiver ok=true; want false")
+	}
+	if got := nilA.Tracked(); got != 0 {
+		t.Errorf("Tracked on nil receiver = %d, want 0", got)
+	}
+}
+
+// TestGatewayEgressAdapter_Concurrent — race-safe concurrent
+// recordFrame + EgressBytes. 8 producers × 200 frames × 1 byte
+// = 1600 expected (last-writer-wins per bucket, since the
+// adapter replaces the per-(instance, minute) total on each
+// frame rather than summing). The adapter must hold the
+// (instance, minute) invariant under -race: every concurrent
+// recordFrame lands in exactly one bucket (no torn writes), and
+// EgressBytes reads the bucket monotonically.
+//
+// All frames are stamped against the same minute (anchor) so
+// the last frame wins the (inst-1, 12:00) bucket.
+func TestGatewayEgressAdapter_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	anchor := time.Date(2026, 7, 29, 12, 0, 30, 0, time.UTC)
+	a := &gatewayEgressAdapter{
+		now:  func() time.Time { return anchor },
+		data: make(map[string]map[int64]uint64),
+	}
+
+	const (
+		producers   = 8
+		framesEach  = 200
+		bytesPerFrm = uint64(1)
+	)
+
+	var wg sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := 0; f < framesEach; f++ {
+				a.recordFrame(&gatewaydpb.BytesFrame{
+					InstanceId: "inst-1",
+					Minute:     timestamppb.New(anchor),
+					Bytes:      bytesPerFrm,
+				})
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Per-bucket replacement semantics: the final write wins;
+	// we expect exactly bytesPerFrm (1), not the sum.
+	got, _, ok := a.EgressBytes("inst-1")
+	if !ok {
+		t.Fatalf("EgressBytes(inst-1) ok=false after concurrent writes; want true")
+	}
+	if got != bytesPerFrm {
+		t.Errorf("EgressBytes(inst-1) = %d, want %d (last-write-wins per (instance, minute) bucket)",
+			got, bytesPerFrm)
+	}
+	if tracked := a.Tracked(); tracked != 1 {
+		t.Errorf("Tracked() = %d, want 1 (single instance, single minute)", tracked)
+	}
+}
+
+// TestGatewayEgressAdapter_Tracked — exercise the
+// per-instance cardinality seam. Distinct instance ids each
+// open their own row in the data map; cross-recordFrames for the
+// same instance don't bump Tracked.
+func TestGatewayEgressAdapter_Tracked(t *testing.T) {
+	t.Parallel()
+
+	anchor := time.Date(2026, 7, 29, 12, 0, 30, 0, time.UTC)
+	a := &gatewayEgressAdapter{
+		now:  func() time.Time { return anchor },
+		data: make(map[string]map[int64]uint64),
+	}
+
+	if got := a.Tracked(); got != 0 {
+		t.Fatalf("fresh adapter Tracked() = %d, want 0", got)
+	}
+
+	// Two distinct instances, multiple frames each.
+	for i := 0; i < 5; i++ {
+		a.recordFrame(&gatewaydpb.BytesFrame{
+			InstanceId: "inst-A",
+			Minute:     timestamppb.New(anchor),
+			Bytes:      uint64(100 + i),
+		})
+	}
+	for i := 0; i < 3; i++ {
+		a.recordFrame(&gatewaydpb.BytesFrame{
+			InstanceId: "inst-B",
+			Minute:     timestamppb.New(anchor),
+			Bytes:      uint64(200 + i),
+		})
+	}
+
+	if got := a.Tracked(); got != 2 {
+		t.Errorf("Tracked() = %d, want 2 (inst-A + inst-B)", got)
+	}
 }
 
 // TestRun_MetricsAddr_StripePushLabels — the §14 M7 dashboard

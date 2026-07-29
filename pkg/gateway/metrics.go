@@ -30,6 +30,16 @@
 //     boot and a missing wire-incrementation is visible as a frozen zero.
 //     ADR-024 H3.b is the still-open follow-up to bridge the certmagic zap
 //     logger into this counter)
+//   - gateway_response_bytes_total{app, plan}      counter (ADR-046 PR-2;
+//     per-(app, plan) HTTP response body bytes the gateway observed
+//     from the ReverseProxy. Canonical persisted metric is
+//     usage_minutes.tx_bytes; this counter is the §12
+//     FaasTenantEgressSpike real-time operator view — "rate > 1GiB/min
+//     sustained 5m on a single (app, plan) pair". Wire-side mirror at
+//     pkg/wire.OpsMetrics.ObserveResponseBytes with the same name and
+//     same label set; both increment in lockstep from
+//     Handler.recordEgress so the operator view reconciles with the
+//     cross-daemon contract.)
 //   - gateway_wake_locality_total{outcome}          counter (PR scale-out
 //     readiness; outcome ∈ {local_snapshot, local_coldboot} today;
 //     remote_* outcomes slot in transparently when the second compute
@@ -66,6 +76,15 @@ type Metrics struct {
 	wakeQueueWait prometheus.Histogram
 	queueDepth    *prometheus.GaugeVec
 	rateLimited   *prometheus.CounterVec
+	// responseBytes: ADR-046 PR-2 producer observability.
+	// Counter labelled by app (UUID, bounded by per-plan app
+	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
+	// canonical persisted metric is usage_minutes.tx_bytes;
+	// this counter is the real-time operator view (egress
+	// per app), and backs the §12 FaasTenantEgressSpike alert
+	// ("rate > 1GiB/min sustained for 5m on a single app").
+	// See ObserveResponseBytes below.
+	responseBytes *prometheus.CounterVec
 	// accountRateLimited backs the per-account throttling introduced by
 	// ADR-040 (issue #292). Labels: account_id, plan. Pre-instantiates
 	// the four plan rows under the `__other__` placeholder so the §12
@@ -182,6 +201,18 @@ func NewMetrics() *Metrics {
 		rateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_rate_limited_total",
 			Help: "Requests rejected by the per-app rate limiter.",
+		}, []string{"app", "plan"}),
+		// ADR-046 PR-2 producer observability. Counter is
+		// registered on the gatewayd-local registry (this
+		// daemon scrapes /metrics via the control listener);
+		// the wire-side `gateway_response_bytes_total` lives
+		// on pkg/wire.OpsMetrics and is the cross-daemon
+		// contract — both increment in lockstep from
+		// Handler.recordEgress so the operator view and the
+		// SQL persistence stay reconcilable.
+		responseBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_response_bytes_total",
+			Help: "Per-(app, plan) HTTP response body bytes observed by the gateway (ADR-046 PR-2). One Add per observed byte, called once per proxied response after the ReverseProxy returns. Canonical persisted metric is usage_minutes.tx_bytes; this counter is the real-time operator view for §12 anomaly detection.",
 		}, []string{"app", "plan"}),
 		// ADR-040 / issue #292. account_id label has cardinality O(active
 		// accounts × 4 plans). The bounded admission lives in the
@@ -307,7 +338,7 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive, m.responseBytes)
 	return m
 }
 
@@ -324,6 +355,20 @@ func (m *Metrics) Handler() http.Handler {
 // status class as a 3-digit string ("200", "404", "503"...).
 func (m *Metrics) ObserveRequest(appID, plan, code string) {
 	m.requests.WithLabelValues(appID, plan, code).Inc()
+}
+
+// ObserveResponseBytes increments the per-(app, plan) egress byte
+// counter for ADR-046 PR-2. Nil-receiver safe (mirrors the rest of
+// the Observe* family). Called from Handler.recordEgress on the
+// 2xx/3xx path only. Wire-side mirror lives at
+// pkg/wire.OpsMetrics.ObserveResponseBytes; both increment in
+// lockstep so the operator view (this counter) and the cross-daemon
+// metric (wire) reconcile.
+func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
+	if m == nil || appID == "" || plan == "" || n <= 0 {
+		return
+	}
+	m.responseBytes.WithLabelValues(appID, plan).Add(float64(n))
 }
 
 // ObserveRequestDuration records the full request duration (received →

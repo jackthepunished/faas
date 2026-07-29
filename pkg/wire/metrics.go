@@ -488,6 +488,20 @@ type OpsMetrics struct {
 	// usage_minutes.net_tx_bytes (the canonical source per
 	// ADR-046 §1); this counter is the failure-channel.
 	egressSourceErrors prometheus.Counter
+	// gatewayResponseBytes: per-(app, plan) HTTP response
+	// body byte counter (ADR-046 PR-2). Mirrors the
+	// apidLogsEmittedTotal shape (CounterVec with closed
+	// label set); the (app, plan) tuple is bounded by
+	// per-plan app quotas — Free=1, Hobby=5, Pro=25,
+	// Scale=100 ≈ 524 series worst case across all plans,
+	// inside Prometheus' guideline. The metric name
+	// (gateway_response_bytes_total) matches the §12
+	// conventions and the single-registry pattern (memory
+	// wire-opsmetrics-single-registry). The canonical
+	// persistence path is usage_minutes.tx_bytes; this
+	// counter is the real-time operator view. See
+	// ObserveResponseBytes accessor below.
+	gatewayResponseBytes *prometheus.CounterVec
 	// provenanceWrites: ADR-038 / Tier 3 / issue #197 B3.1
 	// observability. Counter labelled by code ∈ {ok, error} so the
 	// dashboard surfaces the populator success rate alongside the
@@ -865,6 +879,26 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_logs_emitted_total",
 		Help: "Per-app SSE log frames emitted to clients (issue #254, Move 4). One Increment per `event: log` frame written to the SSE response body in cmd/apid/handlers_ext.go::writeAppLogEvent. The series is registered on every daemon so the struct is a single-registry; only apid's production path increments. Use this rate with apid_ops_total{op=\"app_logs\"} to break out per-app log throughput — that op label is already on every streamAppLogs handler entry.",
 	}, []string{"app"})
+	// gateway_response_bytes_total — ADR-046 producer
+	// observability (PR-2). Counter labelled by app (apps.id UUID)
+	// and plan (Free|Hobby|Pro|Scale — closed set, bounded) so a
+	// dashboard panel can sum across apps for a "noisy tenant"
+	// view while still slicing by plan. The metric is the
+	// per-(app,plan) ATTEMPTED egress byte counter; the canonical
+	// "what actually metered to usage_minutes.tx_bytes" surface
+	// is the SQL view on the database, this counter is the
+	// real-time operator view for anomaly detection. Cardinality:
+	// bounded at the per-plan app quota (Free=1/Hobby=5/Pro=25/
+	// Scale=100) × 4 plans ≈ 524 series worst case. Registered
+	// on every daemon (single-registry pattern, memory
+	// wire-opsmetrics-single-registry); only gatewayd's production
+	// path increments via ObserveResponseBytes. The label `app`
+	// matches the apid_logs_emitted_total convention so the
+	// dashboard joins align on the same key.
+	gatewayResponseBytes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_response_bytes_total",
+		Help: "Per-(app, plan) HTTP response body bytes observed by the gateway (ADR-046 PR-2). One Increment per observed byte, called once per proxied response after the ReverseProxy returns. The counter is the operator-side real-time view of egress attribution per app; the canonical persisted metric is usage_minutes.tx_bytes (drained from the per-instance ring buffer). Both increment together: this one for the dashboard, the table column for persistence + downstream billing telemetry. Plan ∈ {Free, Hobby, Pro, Scale} — bounded. App ∈ UUIDs bounded by per-plan quotas. Alert source: rate > 1GiB/min sustained for 5m on a single (app, plan) pair (FaasTenantEgressSpike, spec §12).",
+	}, []string{"app", "plan"})
 	// egressSourceErrors: per-instance sysfs read failures
 	// (ADR-046, step 7). The network poller in cmd/vmmd reads
 	// /sys/class/net/<vethHost>/statistics/rx_bytes for every
@@ -910,6 +944,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginAuditWriteFailures,
 		topTenantRPS,
 		apidLogsEmittedTotal,
+		gatewayResponseBytes,
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
 	}
@@ -1164,6 +1199,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		provenanceWrites:              provenanceWrites,
 		imageScanVulns:                imageScanVulns,
 		apidLogsEmittedTotal:          apidLogsEmittedTotal,
+		gatewayResponseBytes:          gatewayResponseBytes,
 		egressSourceErrors:            egressSourceErrors,
 	}
 }
@@ -1767,6 +1803,36 @@ func (m *OpsMetrics) EgressSourceErrors() prometheus.Counter {
 		return nil
 	}
 	return m.egressSourceErrors
+}
+
+// ObserveResponseBytes increments the gateway_response_bytes_total
+// counter for the (app, plan) tuple by the given byte count. Called
+// from cmd/gatewayd/main.go::recordEgress (PR-2) once per proxied
+// HTTP response, after the ReverseProxy returns and the body bytes
+// are known. The (app, plan) tuple must be non-empty; an empty
+// app id (the test-only fakeBackend path) returns silently so the
+// call site doesn't have to nil-check.
+//
+// Cardinality stays bounded: app is a UUID, plan ∈ {Free, Hobby,
+// Pro, Scale}. Worst-case series count ≈ 524 across all plans,
+// well inside Prometheus' guideline. The accessor is safe on a
+// nil receiver — same convention as the rest of the Observe*
+// family.
+func (m *OpsMetrics) ObserveResponseBytes(app, plan string, n int64) {
+	if m == nil || m.gatewayResponseBytes == nil || app == "" || plan == "" || n <= 0 {
+		return
+	}
+	m.gatewayResponseBytes.WithLabelValues(app, plan).Add(float64(n))
+}
+
+// GatewayResponseBytesSeries returns the underlying CounterVec for
+// callers that need to iterate the closed label set (admin/debug
+// endpoints). nil-safe.
+func (m *OpsMetrics) GatewayResponseBytesSeries() *prometheus.CounterVec {
+	if m == nil {
+		return nil
+	}
+	return m.gatewayResponseBytes
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor
