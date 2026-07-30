@@ -220,8 +220,38 @@ type App struct {
 	// silently skipped.
 	AutoscaleTargetCPUPct int
 	Status                AppStatus
-	Manifest              AppManifest
-	CreatedAt             time.Time
+	// ProjectID is the parent project for apps that came from a
+	// multi-workload repo (ADR-050). Empty for standalone apps; the
+	// apps.project_id column is nullable. ON DELETE SET NULL so a
+	// project's hard delete (Phase 5) orphans the app rather than
+	// cascading it.
+	ProjectID string
+	// RootDir is the build context relative to the repo root
+	// ("" = repo root). Defaults to '' so standalone apps keep the
+	// pre-projects deploy contract bit-for-bit.
+	RootDir string
+	// WorkloadName is the workload's name within the project
+	// (unique under (project_id, workload_name) per migration 00073).
+	// Empty for standalone apps.
+	WorkloadName string
+	// WorkloadClass is the per-app shape classification. Phase 1
+	// (ADR-050) stamps the value as a scan hint from the repo; Phase
+	// 4 (ADR-051) re-derives the authoritative class via the probe
+	// boot. The schema CHECK (apps_workload_class_chk) admits
+	// http|graphql|grpc|job|worker only; the Go zero-value is "" and
+	// is intentionally NOT in that set — code that persists an App
+	// must set WorkloadClassHTTP (or another canonical value)
+	// explicitly before CreateApp.
+	WorkloadClass WorkloadClass
+	// StartCommand overrides the OCI image's CMD when present.
+	// Phase 3 writes it from compose/Procfile declarations; Phase
+	// 1 carries the column through but the apid handler does not
+	// yet set it. Nullable text in SQL; the empty-string-means-NULL
+	// convention is enforced by `nullString` on writes and `coalesce`
+	// on reads (same shape as Runtime).
+	StartCommand string
+	Manifest     AppManifest
+	CreatedAt    time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1277,3 +1307,144 @@ type AppEnv struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// ProjectScanSource is the discoverer that produced the project's
+// current scan (ADR-050 §3, docs/repo_decomposition_implementation.md
+// §2). The stable set is closed by projects_scan_source_chk on the
+// projects table. 'single' is the backfill label for projects that
+// existed before repo decomposition; every other value comes from
+// pkg/reposcan in Phase 2+. Phase 5's reconciler enforces monotonic
+// upgrade ('single' → 'convention' allowed; 'compose' never reverts).
+//
+// The Go zero-value (ScanSource("")) is NOT in the schema CHECK set;
+// code that persists a Project must set a canonical value (the
+// backfill uses 'single'; the apid createProject transaction sets
+// the scanner tier from the reposcan result; the rebuild path
+// stamps 'unknown' when nothing has scanned yet).
+type ProjectScanSource string
+
+const (
+	ProjectScanSourceCompose    ProjectScanSource = "compose"
+	ProjectScanSourceProcfile   ProjectScanSource = "procfile"
+	ProjectScanSourceK8s        ProjectScanSource = "k8s"
+	ProjectScanSourceRender     ProjectScanSource = "render"
+	ProjectScanSourceFly        ProjectScanSource = "fly"
+	ProjectScanSourceServerless ProjectScanSource = "serverless"
+	ProjectScanSourceWorkspace  ProjectScanSource = "workspace"
+	ProjectScanSourceConvention ProjectScanSource = "convention"
+	ProjectScanSourceSingle     ProjectScanSource = "single"
+	ProjectScanSourceUnknown    ProjectScanSource = "unknown"
+)
+
+// scanSourceRank is the monotonic-upgrade total ordering. Higher rank
+// wins; the Store.SetProjectScanSource path rejects a downgrade from
+// a higher to a lower rank. The ordering closely tracks the tier
+// table in docs/repo_decomposition_implementation.md §3:
+//
+//   - compose / k8s / render / fly / serverless are the "strong"
+//     declarative sources (Tier 1); they cross-rank (a customer who
+//     started on render and moved to compose doesn't "lose" data).
+//   - procfile / workspace sit one tier below (they enumerate but
+//     do not classify).
+//   - convention (Tier 3) is the directory-shape guess.
+//   - single (backfill label) is below convention.
+//   - unknown is the floor.
+//
+// tierRank collapses onto this table once at init time.
+type scanSourceRank int
+
+const (
+	scanSourceRankUnknown    scanSourceRank = 0
+	scanSourceRankSingle     scanSourceRank = 1
+	scanSourceRankConvention scanSourceRank = 2
+	scanSourceRankWorkspace  scanSourceRank = 4
+	scanSourceRankProcfile   scanSourceRank = 6
+	scanSourceRankServerless scanSourceRank = 8
+	scanSourceRankFly        scanSourceRank = 8
+	scanSourceRankRender     scanSourceRank = 8
+	scanSourceRankK8s        scanSourceRank = 8
+	scanSourceRankCompose    scanSourceRank = 8
+)
+
+func tierRank(s ProjectScanSource) scanSourceRank {
+	switch s {
+	case ProjectScanSourceCompose:
+		return scanSourceRankCompose
+	case ProjectScanSourceK8s:
+		return scanSourceRankK8s
+	case ProjectScanSourceRender:
+		return scanSourceRankRender
+	case ProjectScanSourceFly:
+		return scanSourceRankFly
+	case ProjectScanSourceServerless:
+		return scanSourceRankServerless
+	case ProjectScanSourceProcfile:
+		return scanSourceRankProcfile
+	case ProjectScanSourceWorkspace:
+		return scanSourceRankWorkspace
+	case ProjectScanSourceConvention:
+		return scanSourceRankConvention
+	case ProjectScanSourceSingle:
+		return scanSourceRankSingle
+	default:
+		return scanSourceRankUnknown
+	}
+}
+
+// WorkloadClass is the per-app shape classification (ADR-050 §3).
+// Phase 1 stamps the value as a scan hint from the repo; Phase 4
+// (ADR-051) re-derives the authoritative class via the probe boot.
+// Every state column carries a CHECK (CLAUDE.md), so the
+// apps_workload_class_chk constraint mirrors this set.
+//
+// The Go zero-value WorkloadClass("") is NOT a valid DB CHECK value;
+// code that persists an App must set WorkloadClassHTTP (or another
+// canonical value) explicitly before CreateApp. Test fixtures that
+// rely on zero values pass through MemStore but would trip the
+// PgStore CHECK — see the comment on WorkloadClassHTTP.
+type WorkloadClass string
+
+const (
+	WorkloadClassHTTP    WorkloadClass = "http"
+	WorkloadClassGraphQL WorkloadClass = "graphql"
+	WorkloadClassGRPC    WorkloadClass = "grpc"
+	WorkloadClassJob     WorkloadClass = "job"
+	WorkloadClassWorker  WorkloadClass = "worker"
+)
+
+// Project groups apps that share one (account, install_id, repo)
+// binding (ADR-050 / impl plan §2). Phase 1 lands the read +
+// monotonic-upgrade seams; the apid createProject transactional
+// endpoint and the push-dispatch path are Phase 3 / Phase 5.
+//
+// Members: apps.project_id references this row. Standalone apps
+// keep project_id NULL.
+type Project struct {
+	ID               string
+	AccountID        string
+	Slug             string
+	RepoFullName     string // empty for standalone (non-bound) projects
+	ProductionBranch string // empty until BindAppRepo runs
+	InstallID        int64  // 0 until BindAppRepo runs
+	ScanSource       ProjectScanSource
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// IsZero reports whether this is an unset Project (Go zero value).
+// store-layer scans can return such a value via the concrete-type
+// `Project{}` initializer that the pgx `Scan` into a value receiver
+// produces on no-rows errors; callers should prefer ErrNotFound over
+// IsZero, but IsZero is useful as a defensive guard on pagination
+// cursors and test fixtures.
+func (p Project) IsZero() bool {
+	return p.ID == "" && p.AccountID == "" && p.Slug == ""
+}
+
+// ErrScanSourceDowngrade is returned by SetProjectScanSource when
+// the caller asks to move from a stronger scan tier to a weaker
+// one. The corresponding sentinel in MemStore's state package.
+//
+// AllowUpward re-classifies an error via errors.Is like the other
+// shared sentinels (ErrNotFound, ErrConflict, ErrQuotaExceeded).
+var ErrScanSourceDowngrade = errors.New("state: scan_source downgrade rejected")

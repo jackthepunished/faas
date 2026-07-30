@@ -535,6 +535,47 @@ type Store interface {
 	// column in place; returns ErrNotFound when the app is gone.
 	SetAppMinInstances(ctx context.Context, appID string, min int) error
 	DeleteApp(ctx context.Context, id string) error
+
+	// Projects (ADR-050, Phase 1).
+	//
+	// CreateProject persists a new project row. Returns ErrConflict
+	// when (account_id, slug) collides (the projects_account_slug_uniq
+	// constraint). Implementations are responsible for stamping
+	// CreatedAt/UpdatedAt and assigning a non-empty ID.
+	//
+	// ProjectByID returns ErrNotFound when no project matches id.
+	//
+	// ProjectBySlug is the dashboard lookup; returns ErrNotFound when
+	// no project matches (account_id, slug).
+	//
+	// ProjectByRepo is the push-dispatch lookup Phase 5 wires through.
+	// Returns ErrNotFound when no project owns (install_id,
+	// repo_full_name) — installID=0 and repoFullName="" return
+	// ErrNotFound, consistent with the partial-unique WHERE clause.
+	//
+	// ListProjectsForAccount returns every project under the account
+	// (sorted by created_at desc) for the dashboard list view.
+	//
+	// AppsForProject returns the project's member apps in
+	// slug-ascending order, filtered to status <> 'deleted'. Cross-
+	// account reads return ErrNotFound, mirroring the AppsByAccount
+	// precedent so handlers can 404 cleanly without checking which
+	// store is in use.
+	//
+	// SetProjectScanSource updates scan_source monotonically upward
+	// (single → convention is the minimum baseline; compose never
+	// reverts to convention). On a downgrade returns
+	// ErrScanSourceDowngrade. Returns ErrNotFound when the project
+	// row is gone. Phase 5's reconciler is the only intended caller
+	// in Phase 1.
+	CreateProject(ctx context.Context, p Project) (Project, error)
+	ProjectByID(ctx context.Context, projectID string) (Project, error)
+	ProjectBySlug(ctx context.Context, accountID, slug string) (Project, error)
+	ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error)
+	ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error)
+	AppsForProject(ctx context.Context, accountID, projectID string) ([]App, error)
+	SetProjectScanSource(ctx context.Context, projectID string, src ProjectScanSource) (Project, error)
+
 	// RecordGitHubBinding persists the (app → installation_id, repo,
 	// branch) tuple after the /oauth/callback handler verified the
 	// installation against api.github.com. Idempotent: re-binding the

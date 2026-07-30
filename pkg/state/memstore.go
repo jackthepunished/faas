@@ -256,6 +256,24 @@ type MemStore struct {
 	// authorization). MemStore's m.mu mirrors the SQL `for update`
 	// semantics the PgStore uses.
 	sessions map[string]Session
+	// projects is the ADR-050 Phase 1 in-memory mirror of the
+	// `projects` table. Keyed by project id. The two secondary
+	// indexes mirror the (account_id, slug) and (install_id,
+	// repo_full_name) partial uniques from migration 00073 so
+	// ProjectBySlug / ProjectByRepo are O(1) lookups the same way
+	// PgStore's btrees are.
+	projects              map[string]Project
+	projectsByAccountSlug map[string]map[string]string // account_id → slug → id
+	projectsByInstallRepo map[installRepoKey]string    // install_id, repo_full_name → id
+}
+
+// installRepoKey mirrors the projects_install_repo_uniq partial index
+// (install_id, repo_full_name) from migration 00073. Standalone
+// projects (install_id == nil, repo_full_name == "") never enter this
+// map; the indexed lookups are bound-only.
+type installRepoKey struct {
+	InstallID    int64
+	RepoFullName string
 }
 
 // secretKey mirrors the app_secrets PRIMARY KEY (app_id, key). The
@@ -432,7 +450,10 @@ func NewMemStore() *MemStore {
 		computeNodeHeartbeats: map[string][]ComputeNodeHeartbeat{},
 		// sessions is empty here; populated by CreateSession at each
 		// dashboard login (handlers_auth*.go + handlers_mfa reissue).
-		sessions: map[string]Session{},
+		sessions:              map[string]Session{},
+		projects:              map[string]Project{},
+		projectsByAccountSlug: map[string]map[string]string{},
+		projectsByInstallRepo: map[installRepoKey]string{},
 	}
 	// Auto-seed default-local. Done after the struct literal so the
 	// seeded row carries a real id and created_at timestamp. Mirrors
@@ -909,6 +930,185 @@ func (m *MemStore) TouchKeyLastUsed(_ context.Context, keyID string) error {
 	k.LastUsedAt = time.Now()
 	m.keys[keyID] = k
 	return nil
+}
+
+// --- Projects (ADR-050, Phase 1) -------------------------------------------
+//
+// MemStore mirrors the pgstore contract exactly: the same error sentinels
+// (ErrNotFound, ErrConflict), the same monotonic-upgrade semantics in
+// SetProjectScanSource. The two secondary indexes
+// (projectsByAccountSlug, projectsByInstallRepo) keep the read paths
+// O(1) — the SQL btrees are the same shape.
+
+func (m *MemStore) CreateProject(_ context.Context, p Project) (Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.accounts[p.AccountID]; !ok {
+		return Project{}, ErrNotFound
+	}
+	if p.ScanSource == "" {
+		p.ScanSource = ProjectScanSourceUnknown
+	}
+	// (account_id, slug) uniqueness — mirrors projects_account_slug_uniq.
+	if bySlug, ok := m.projectsByAccountSlug[p.AccountID]; ok {
+		if _, taken := bySlug[p.Slug]; taken {
+			return Project{}, ErrConflict
+		}
+	}
+	// (install_id, repo_full_name) uniqueness — mirrors
+	// projects_install_repo_uniq. Standalone projects
+	// (InstallID == 0 or empty RepoFullName) skip this check entirely.
+	if p.InstallID != 0 && p.RepoFullName != "" {
+		key := installRepoKey{InstallID: p.InstallID, RepoFullName: p.RepoFullName}
+		if _, taken := m.projectsByInstallRepo[key]; taken {
+			return Project{}, ErrConflict
+		}
+	}
+	if p.ID == "" {
+		p.ID = newID()
+	}
+	now := time.Now()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	m.projects[p.ID] = p
+	if m.projectsByAccountSlug[p.AccountID] == nil {
+		m.projectsByAccountSlug[p.AccountID] = map[string]string{}
+	}
+	m.projectsByAccountSlug[p.AccountID][p.Slug] = p.ID
+	if p.InstallID != 0 && p.RepoFullName != "" {
+		m.projectsByInstallRepo[installRepoKey{InstallID: p.InstallID, RepoFullName: p.RepoFullName}] = p.ID
+	}
+	return p, nil
+}
+
+func (m *MemStore) ProjectByID(_ context.Context, projectID string) (Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.projects[projectID]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	return p, nil
+}
+
+func (m *MemStore) ProjectBySlug(_ context.Context, accountID, slug string) (Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bySlug, ok := m.projectsByAccountSlug[accountID]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	id, ok := bySlug[slug]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	p, ok := m.projects[id]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	return p, nil
+}
+
+// ProjectByRepo looks up by (install_id, repo_full_name). The
+// accountID filter is optional — passing "" matches the first hit
+// across accounts (mirrors the SQL `($3 = ”)` clause in pgstore).
+// This is the push-dispatch lookup Phase 5 wires to githubd.
+func (m *MemStore) ProjectByRepo(_ context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.projectsByInstallRepo[installRepoKey{InstallID: installID, RepoFullName: repoFullName}]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	p, ok := m.projects[id]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	if accountID != "" && p.AccountID != accountID {
+		return Project{}, ErrNotFound
+	}
+	return p, nil
+}
+
+func (m *MemStore) ListProjectsForAccount(_ context.Context, accountID string) ([]Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Project, 0)
+	for _, p := range m.projects {
+		if p.AccountID != accountID {
+			continue
+		}
+		out = append(out, p)
+	}
+	// Stable order: created_at desc (matches SQL).
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].CreatedAt.After(out[i].CreatedAt) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
+// AppsForProject returns live apps currently bound to projectID. The
+// account scope is enforced before the slice walk so a project owned
+// by a different account returns ErrNotFound (404 path, not an empty
+// list that would leak membership).
+func (m *MemStore) AppsForProject(_ context.Context, accountID, projectID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	proj, ok := m.projects[projectID]
+	if !ok {
+		return []App{}, ErrNotFound
+	}
+	if proj.AccountID != accountID {
+		return []App{}, ErrNotFound
+	}
+	out := make([]App, 0)
+	for _, a := range m.apps {
+		if a.ProjectID == "" || a.ProjectID != projectID {
+			continue
+		}
+		if a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	// Order: workload_name asc, created_at asc (matches the SQL).
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].WorkloadName < out[i].WorkloadName ||
+				(out[j].WorkloadName == out[i].WorkloadName && out[j].CreatedAt.Before(out[i].CreatedAt)) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
+// SetProjectScanSource updates scan_source monotonically upward. Same
+// tier is a no-op (touches updated_at so observers see the activity).
+// Weaker tier returns ErrScanSourceDowngrade.
+func (m *MemStore) SetProjectScanSource(_ context.Context, projectID string, src ProjectScanSource) (Project, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if src == "" {
+		src = ProjectScanSourceUnknown
+	}
+	p, ok := m.projects[projectID]
+	if !ok {
+		return Project{}, ErrNotFound
+	}
+	if tierRank(src) < tierRank(p.ScanSource) {
+		return Project{}, ErrScanSourceDowngrade
+	}
+	p.ScanSource = src
+	p.UpdatedAt = time.Now()
+	m.projects[projectID] = p
+	return p, nil
 }
 
 // --- Apps -------------------------------------------------------------------

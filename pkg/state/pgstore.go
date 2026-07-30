@@ -650,12 +650,10 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	row := s.pool.QueryRow(ctx,
-		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
-		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
 	return scanApp(row)
 }
@@ -717,12 +715,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	row := tx.QueryRow(ctx,
-		`insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
-		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		 returning ` + appsSelectColumns
+	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
 	created, err := scanApp(row)
 	if err != nil {
@@ -735,29 +731,20 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 }
 
 func (s *PgStore) AppByID(ctx context.Context, id string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
-		 from apps where id = $1`, id)
+	sel := `select ` + appsSelectColumns + ` from apps where id = $1`
+	row := s.pool.QueryRow(ctx, sel, id)
 	return scanApp(row)
 }
 
 func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
-		 from apps where slug = $1 and status <> 'deleted'`, slug)
+	sel := `select ` + appsSelectColumns + ` from apps where slug = $1 and status <> 'deleted'`
+	row := s.pool.QueryRow(ctx, sel, slug)
 	return scanApp(row)
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
-	rows, err := s.pool.Query(ctx,
-		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
-		 from apps where account_id = $1 and status <> 'deleted' order by created_at desc`, accountID)
+	sel := `select ` + appsSelectColumns + ` from apps where account_id = $1 and status <> 'deleted' order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -766,11 +753,8 @@ func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error)
 }
 
 func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
-	rows, err := s.pool.Query(ctx,
-		`select id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		        max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		        coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)
-		 from apps where status <> 'deleted' order by created_at desc`)
+	sel := `select ` + appsSelectColumns + ` from apps where status <> 'deleted' order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -791,8 +775,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 	if p.Manifest != nil {
 		manifestBytes, _ = json.Marshal(*p.Manifest)
 	}
-	row := s.pool.QueryRow(ctx,
-		`update apps set
+	upd := `update apps set
 		   ram_mb          = coalesce($2, ram_mb),
 		   idle_timeout_s  = case when $3 then $4 else idle_timeout_s end,
 		   max_concurrency = coalesce($5, max_concurrency),
@@ -803,9 +786,8 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
 		 where id = $1
-		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, upd,
 		id,
 		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
@@ -843,12 +825,10 @@ func (s *PgStore) SetAppMinInstances(ctx context.Context, appID string, min int)
 // Both PgStore and MemStore share the same error contract so the apid
 // handler can branch on errors.Is without checking the concrete type.
 func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug string) (App, error) {
-	row := s.pool.QueryRow(ctx,
-		`update apps set slug = $3
+	upd := `update apps set slug = $3
 		 where account_id = $1 and slug = $2 and status <> 'deleted'
-		 returning id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
-		           max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
-		           coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0)`,
+		 returning ` + appsSelectColumns
+	row := s.pool.QueryRow(ctx, upd,
 		accountID, oldSlug, newSlug)
 	return scanApp(row)
 }
@@ -856,6 +836,211 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 func (s *PgStore) DeleteApp(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `update apps set status = 'deleted' where id = $1`, id)
 	return err
+}
+
+// --- Projects (ADR-050, Phase 1) ----------------------------------
+//
+// Phase 1 lands the storage seam: a project row + 7 methods. The
+// patterns below mirror the existing App methods (RETURNING-id style,
+// scanApp helper, ErrConflict/ErrNotFound mapErr translation). The
+// monotonic-upgrade check in SetProjectScanSource is enforced by a
+// rank comparison in pure SQL — Phase 5 reconcile calls it; Phase 1
+// only exercises the no-op path and the upgrade path through tests.
+
+func scanProject(row pgx.Row) (Project, error) {
+	var (
+		p          Project
+		scanSource string
+	)
+	if err := row.Scan(
+		&p.ID, &p.AccountID, &p.Slug, &p.RepoFullName, &p.ProductionBranch,
+		&p.InstallID, &scanSource, &p.CreatedAt, &p.UpdatedAt,
+	); err != nil {
+		return Project{}, mapErr(err)
+	}
+	p.ScanSource = ProjectScanSource(scanSource)
+	return p, nil
+}
+
+func scanProjects(rows pgx.Rows) ([]Project, error) {
+	var out []Project
+	for rows.Next() {
+		p, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// CreateProject inserts a new project row. The accounts FK is enforced
+// by Postgres; an unknown accountID surfaces as ErrFKViolation via
+// mapErr → 23503. The (account_id, slug) unique projects_account_slug_uniq
+// surfaces as ErrConflict via 23505. scan_source defaults to 'unknown'
+// at the DB level when the caller passes the empty string.
+func (s *PgStore) CreateProject(ctx context.Context, p Project) (Project, error) {
+	if p.ScanSource == "" {
+		p.ScanSource = ProjectScanSourceUnknown
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into projects
+		    (account_id, slug, repo_full_name, production_branch, install_id, scan_source)
+		values ($1, $2, $3, $4, $5, $6)
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id,0),
+		          scan_source, created_at, updated_at
+	`,
+		p.AccountID, p.Slug, nullString(p.RepoFullName), nullString(p.ProductionBranch),
+		p.InstallID, string(p.ScanSource),
+	)
+	proj, err := scanProject(row)
+	if err != nil {
+		// FK violation on account_id means the owning account row is
+		// gone. Surface as ErrNotFound so handlers can branch on a
+		// single sentinel instead of distinguishing 23503 from
+		// pgx.ErrNoRows. The pgErr.ConstraintName preserves the
+		// diagnosis for operator logs.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ForeignKeyViolation {
+			return Project{}, fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+		}
+		return Project{}, mapErr(err)
+	}
+	return proj, nil
+}
+
+func (s *PgStore) ProjectByID(ctx context.Context, projectID string) (Project, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		       created_at, updated_at
+		  from projects
+		 where id = $1
+	`, projectID)
+	return scanProject(row)
+}
+
+func (s *PgStore) ProjectBySlug(ctx context.Context, accountID, slug string) (Project, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		       created_at, updated_at
+		  from projects
+		 where account_id = $1 and slug = $2
+	`, accountID, slug)
+	return scanProject(row)
+}
+
+// ProjectByRepo is the push-dispatch lookup. install_id is non-null on
+// bound projects only; we surface ErrNotFound when the row is gone
+// rather than swallowing it as an empty result. The account_id filter
+// is only applied when a non-empty accountID is supplied — passing ""
+// (the cross-account push dispatch, or a test that hasn't bound an
+// account yet) skips the account predicate so the uuid→text coercion
+// in `account_id = ”` doesn't trip on an empty string.
+func (s *PgStore) ProjectByRepo(ctx context.Context, accountID string, installID int64, repoFullName string) (Project, error) {
+	if accountID == "" {
+		row := s.pool.QueryRow(ctx, `
+			select id, account_id, slug, coalesce(repo_full_name,''),
+			       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+			       created_at, updated_at
+			  from projects
+			 where install_id = $1 and repo_full_name = $2
+			 limit 1
+		`, installID, repoFullName)
+		return scanProject(row)
+	}
+	row := s.pool.QueryRow(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		       created_at, updated_at
+		  from projects
+		 where install_id = $1 and repo_full_name = $2
+		   and account_id = $3
+		 limit 1
+	`, installID, repoFullName, accountID)
+	return scanProject(row)
+}
+
+func (s *PgStore) ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, account_id, slug, coalesce(repo_full_name,''),
+		       coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		       created_at, updated_at
+		  from projects
+		 where account_id = $1
+		 order by created_at desc
+	`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanProjects(rows)
+}
+
+// AppsForProject returns live apps currently bound to projectID. The
+// account scope is enforced at the SQL level: a project_id owned by
+// a different account returns ErrNotFound (not an empty slice) so
+// handlers can 404 cleanly without leaking membership.
+func (s *PgStore) AppsForProject(ctx context.Context, accountID, projectID string) ([]App, error) {
+	// Project ownership check first: returns ErrNotFound cleanly.
+	proj, err := s.ProjectByID(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if proj.AccountID != accountID {
+		return nil, ErrNotFound
+	}
+	sel := `select ` + appsSelectColumns + `
+		   from apps
+		  where project_id = $1 and status <> 'deleted'
+		  order by workload_name asc, created_at asc`
+	rows, err := s.pool.Query(ctx, sel, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// SetProjectScanSource updates scan_source monotonically upward. The
+// rank lookup delegates to the SQL function pg_tier_rank added in
+// migration 00073 — that function is the single source of truth for
+// the rank table, mirrored in Go by tierRank in pkg/state/types.go.
+// If requested_rank <= stored_rank, the UPDATE zero-rows-affects and
+// we return ErrScanSourceDowngrade.
+func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, src ProjectScanSource) (Project, error) {
+	if src == "" {
+		src = ProjectScanSourceUnknown
+	}
+	// First round-trip: probe the existing row to learn its current
+	// scan_source. We need this to distinguish downgrade (existing
+	// rank > requested rank) from row-gone (no row at all) without
+	// relying on a single UPDATE+RETURNING where the WHERE double-
+	// duties both predicates. Splitting it gives us two clean signals:
+	// pgx.ErrNoRows on the SELECT means row-gone; a non-empty result
+	// lets us compare ranks directly.
+	existing, getErr := s.ProjectByID(ctx, projectID)
+	if getErr != nil {
+		return Project{}, getErr
+	}
+	if tierRank(existing.ScanSource) > tierRank(src) {
+		return Project{}, ErrScanSourceDowngrade
+	}
+	// Second round-trip: apply the upgrade (or same-tier no-op). The
+	// CASE preserves updated_at on same-tier writes so the timestamp
+	// moves only when scan_source actually changes.
+	row := s.pool.QueryRow(ctx, `
+		update projects
+		   set scan_source = $2,
+		       updated_at  = case when scan_source <> $2 then now() else updated_at end
+		 where id = $1
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id, 0), scan_source,
+		          created_at, updated_at
+	`, projectID, string(src))
+	return scanProject(row)
 }
 
 // RecordGitHubBinding writes the (install_id, repo_full_name,
@@ -5988,45 +6173,66 @@ func scanAccount(row pgx.Row) (Account, error) {
 
 func scanApp(row pgx.Row) (App, error) {
 	a := App{}
-	var typeStr, statusStr string
-	var manifestBytes []byte
-	var allowlistText string
-	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
-		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
-		return App{}, mapErr(err)
-	}
-	a.Type = AppType(typeStr)
-	a.Status = AppStatus(statusStr)
-	if len(manifestBytes) > 0 {
-		_ = json.Unmarshal(manifestBytes, &a.Manifest)
-	}
-	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
-	return a, nil
+	err := scanAppInto(&a, row)
+	return a, err
 }
 
 func scanApps(rows pgx.Rows) ([]App, error) {
 	var out []App
 	for rows.Next() {
 		a := App{}
-		var typeStr, statusStr string
-		var manifestBytes []byte
-		var allowlistText string
-		if err := rows.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
-			&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
-			&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct); err != nil {
+		if err := scanAppInto(&a, rows); err != nil {
 			return nil, err
 		}
-		a.Type = AppType(typeStr)
-		a.Status = AppStatus(statusStr)
-		if len(manifestBytes) > 0 {
-			_ = json.Unmarshal(manifestBytes, &a.Manifest)
-		}
-		a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
 		out = append(out, a)
 	}
 	return out, rows.Err()
 }
+
+// scanAppInto decodes the apps projection (appsSelectColumns) into a.
+// Single source of truth for the 19-column scanApp shape — every
+// SELECT/RETURNING that reads an App row uses this helper so adding
+// a column only touches the const + the App struct + this function.
+func scanAppInto(a *App, row pgx.Row) error {
+	var typeStr, statusStr string
+	var manifestBytes []byte
+	var allowlistText string
+	var workloadClassStr string
+	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
+		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
+		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand); err != nil {
+		return mapErr(err)
+	}
+	a.Type = AppType(typeStr)
+	a.Status = AppStatus(statusStr)
+	a.WorkloadClass = WorkloadClass(workloadClassStr)
+	if len(manifestBytes) > 0 {
+		_ = json.Unmarshal(manifestBytes, &a.Manifest)
+	}
+	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	return nil
+}
+
+// appsSelectColumns is the projection every app SELECT/RETURNING
+// must use. Listed in the same order as scanAppInto — scanAppInto
+// reads columns positionally, so the order is load-bearing. The 5
+// trailing columns (project_id, root_dir, workload_name, workload_class,
+// start_command) are the ADR-050 Phase 1 additions. Keep this const
+// and the App struct aligned: adding a column touches both.
+const appsSelectColumns = `
+	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
+	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
+	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
+	workload_class, coalesce(start_command, '')`
+
+// Compile-time anchor: the const is interpolated only inside SQL raw-string
+// literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
+// checker doesn't trace. This blank reference keeps the const bound to a
+// Go-level use so deleting it (or a future SQL rewrite that drops all
+// nine callers) trips the linter instead of rotting silently.
+var _ = appsSelectColumns
 
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
