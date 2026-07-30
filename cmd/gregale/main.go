@@ -1,4 +1,4 @@
-// Command gregale is the customer-facing CLI and the primary interface to the
+// Command faas is the customer-facing CLI and the primary interface to the
 // platform (UX spec §3). Everything the platform does is possible from here.
 //
 // M0 ships the dispatcher, version, and help skeleton; individual commands
@@ -13,10 +13,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-const usage = `gregale — deploy apps and functions that scale to zero.
+const usage = `faas — deploy apps and functions that scale to zero.
 
 Usage:
-  gregale <command> [flags]
+  faas <command> [flags]
 
 Commands:
   login        Authenticate this machine (--token for CI)
@@ -27,9 +27,9 @@ Commands:
   deployments  List deployments (--limit N | --before C | --all)
   deployment   Get one deployment (<id>)
   apps         List your apps
-  apps ls      Alias for 'gregale apps'
+  apps ls      Alias for 'faas apps'
   apps -q      Delete an app
-  app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
+  app          Get/update one app (faas app <slug> [scale|rename <new>|--ram N|…])
   ps           Show live instances + state for an app
   status       Personal SLO numbers (availability, wake p95, build success)
   env          Pull/push .env <-> sealed secrets (--app <slug>)
@@ -44,22 +44,23 @@ Commands:
   sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   secrets      Manage env secrets on an app (--app <slug>)
   account      Self-service: export your data, delete account, restore
-  usage        Show this month's usage (gregale usage [--month YYYY-MM])
-  usage summary  Account-wide usage roll-up (gregale usage summary [--month YYYY-MM])
-  metrics      Per-app request / latency / cold-boot metrics (gregale metrics <slug> [--range 5m])
+  usage        Show this month's usage (faas usage [--month YYYY-MM])
+  usage summary  Account-wide usage roll-up (faas usage summary [--month YYYY-MM])
+  billing      Manage billing (faas billing portal)
+  metrics      Per-app request / latency / cold-boot metrics (faas metrics <slug> [--range 5m])
   logs         Tail app or deployment logs (--follow)
   version      Print the CLI version
   connect      Connect a third-party service (github)
   open         Open the app's URL (or its dashboard page) in your browser
 
-Run 'gregale <command> --help' for command details.
+Run 'faas <command> --help' for command details.
 
 Global flags:
   --json         Machine-readable output on every command. Slices emit
                  NDJSON (one JSON object per line, jq -c '.'); scalars
                  emit indented JSON; errors print raw RFC 7807 to stderr.
                  Equivalent env: FAAS_JSON=1. Negate with --json=false.
-Docs: https://docs.gregale.dev
+Docs: https://docs.DOMAIN
 `
 
 func main() {
@@ -77,14 +78,14 @@ func run(args []string) int {
 	}
 	switch args[0] {
 	case "version", "--version", "-v":
-		// `gregale version --help` prints usage + docs link; bare
-		// `gregale version foo` still prints the version string (POSIX
+		// `faas version --help` prints usage + docs link; bare
+		// `faas version foo` still prints the version string (POSIX
 		// convention — git does the same).
 		if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
-			PrintUsage(os.Stderr, "usage: gregale version", "version")
+			PrintUsage(os.Stderr, "usage: faas version", "version")
 			return 0
 		}
-		fmt.Printf("gregale %s\n", wire.Version)
+		fmt.Printf("faas %s\n", wire.Version)
 		return 0
 	case "help", "--help", "-h":
 		fmt.Print(usage)
@@ -93,13 +94,13 @@ func run(args []string) int {
 		return cmdLogin(args[1:])
 	case "logout":
 		if len(args) > 1 {
-			PrintUsage(os.Stderr, "usage: gregale logout", "auth")
+			PrintUsage(os.Stderr, "usage: faas logout", "auth")
 			return 1
 		}
 		return cmdLogout()
 	case "whoami":
 		if len(args) > 1 {
-			PrintUsage(os.Stderr, "usage: gregale whoami", "auth")
+			PrintUsage(os.Stderr, "usage: faas whoami", "auth")
 			return 1
 		}
 		return cmdWhoami()
@@ -112,25 +113,25 @@ func run(args []string) int {
 	case "open":
 		return cmdOpen(args[1:])
 	case dispatchApps:
-		// `gregale apps ls` is an alias for the default list action.
+		// `faas apps ls` is an alias for the default list action.
 		if len(args) > 1 && args[1] == "ls" {
 			return cmdApps()
 		}
-		// `gregale apps -q <slug>` is the delete path.
+		// `faas apps -q <slug>` is the delete path.
 		if len(args) > 1 && (args[1] == "-q" || args[1] == "--quiet") {
 			return cmdAppsRm(args[2:])
 		}
 		return cmdApps()
 	case dispatchDeployments:
-		// `gregale deployments [--limit N|--before C|--all]` — list.
+		// `faas deployments [--limit N|--before C|--all]` — list.
 		// Place before appSlugFallback so the singular never shadows it.
 		return cmdDeployments(args[1:])
 	case dispatchDeployment:
-		// `gregale deployment <id>` — get one. Must come before appSlugFallback
+		// `faas deployment <id>` — get one. Must come before appSlugFallback
 		// so the singular is never misread as an app slug.
 		return cmdDeployment(args[1:])
 	case dispatchBuild:
-		// `gregale build provenance <id>` — ADR-038 / Tier 3 / issue
+		// `faas build provenance <id>` — ADR-038 / Tier 3 / issue
 		// #197 B3.10-read half. The parent dispatch is in
 		// commands_builds.go::cmdBuild; future build-surface
 		// subcommands (`logs`, `sbom`) land there without
@@ -170,12 +171,17 @@ func run(args []string) int {
 	case "account":
 		return cmdAccount(args[1:])
 	case "usage":
-		// cmdUsage dispatches: bare `gregale usage` → per-app rows;
-		// `gregale usage summary [--month X]` → account roll-up.
+		// cmdUsage dispatches: bare `faas usage` → per-app rows;
+		// `faas usage summary [--month X]` → account roll-up.
 		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
+	case "billing":
+		// Issue #253: dashboard's "Open Stripe billing portal"
+		// button has a CLI twin. Subcommands live in
+		// commands_billing.go.
+		return cmdBilling(args[1:])
 	case "admin":
 		return cmdAdmin(args[1:])
 	case "logs":
@@ -197,7 +203,7 @@ func run(args []string) int {
 	case "queue":
 		return cmdQueueDispatch(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
+		fmt.Fprintf(os.Stderr, "faas: unknown command %q\nRun 'faas help' for usage.\n", args[0])
 		return 1
 	}
 }

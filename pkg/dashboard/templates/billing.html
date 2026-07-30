@@ -34,13 +34,45 @@
       <h1>Plan: {{.Data.Plan}}</h1>
       <table>
         <tr><th>Max app memory (RAM MB)</th><td>{{.Data.RAMMB}}</td></tr>
+        <tr><th>Max concurrent instances</th><td>{{.Data.MaxConcurrency}}</td></tr>
         <tr><th>Included GB-hours / month</th><td>{{.Data.Included}}</td></tr>
         <tr><th>Max deployed apps</th><td>{{.Data.AppsCap}}</td></tr>
         <tr><th>App layer cap (MB)</th><td>{{.Data.AppLayer}}</td></tr>
         <tr><th>Idle reaper (sec)</th><td>{{.Data.IdleSec}}</td></tr>
       </table>
-      <p>Stripe customer portal redirects ship in the post-M7.5 add-on. Today, change plan via the CLI: <code>faas plan &lt;plan&gt;</code>.</p>
-      <p>See <a href="/dashboard/pricing">plan comparison</a> or your <a href="/dashboard/invoices">invoice history</a>.</p>
+
+      <h2>Current month usage</h2>
+      <table>
+        <tr><th>GB-hours used</th><td>{{printf "%.2f" .Data.UsedGBHours}} / {{.Data.Included}}</td></tr>
+        <tr><th>% of included quota</th><td>{{printf "%.0f" .Data.UsedPct}}%</td></tr>
+        <tr><th>Egress this month (GB)</th><td>{{printf "%.2f" .Data.UsedEgressGB}}</td></tr>
+      </table>
+      <p><a href="/dashboard/usage">Detailed usage</a> for the per-app breakdown.</p>
+
+      {{if .Data.HasPaidPlan}}
+        <h2>Manage billing</h2>
+        {{if .Data.PortalURL}}
+          <p><a class="btn" href="{{.Data.PortalURL}}" rel="noopener">Open Stripe billing portal</a></p>
+          <p>Update card, view invoices, download receipts. The portal is hosted by Stripe; no card data touches this server.</p>
+        {{else}}
+          <p>Stripe portal is not configured on this box. Use the CLI: <code>faas billing portal</code>.</p>
+        {{end}}
+
+        <h2>Last invoice</h2>
+        {{if .Data.LastInvoiceDate}}
+          <table>
+            <tr><th>Period end</th><td>{{.Data.LastInvoiceDate}}</td></tr>
+            <tr><th>Status</th><td>{{.Data.LastInvoiceStatus}}</td></tr>
+            <tr><th>Total</th><td>{{.Data.LastInvoiceTotalFormatted}} {{.Data.LastInvoiceCurrency}}</td></tr>
+          </table>
+          <p>See <a href="/dashboard/invoices">invoice history</a> for older entries.</p>
+        {{else}}
+          <p>No invoices yet. Invoices appear after your first provider-side billing cycle.</p>
+        {{end}}
+      {{else}}
+        <h2>Upgrade</h2>
+        <p>You're on the Free plan. To unlock paid features, see <a href="/dashboard/pricing">plan comparison</a> or change plan via the CLI: <code>faas plan &lt;plan&gt;</code>.</p>
+      {{end}}
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

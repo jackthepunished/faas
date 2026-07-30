@@ -282,7 +282,23 @@ type UsageData struct {
 	UsedEgressGB float64
 }
 
-// BillingData is the /dashboard/billing page payload.
+// BillingData is the /dashboard/billing page payload (issue #253).
+//
+// HasPaidPlan gates the "Manage billing" + "Last invoice" sections so a
+// Free-tier account never sees a Stripe portal link. PortalURL is the
+// operator-configured FAAS_BILLING_PORTAL_URL template (already substituted
+// with the account's ID by the handler), same shape as the changePlan
+// 402 path. Empty URL means the box has no portal configured; the
+// template renders a CLI fallback instead of a broken link.
+//
+// Current-month usage is informational only (mirrors /dashboard/usage);
+// the billable floor is included GB-hours, not raw mb_seconds.
+//
+// LastInvoiceDate / LastInvoiceStatus / LastInvoiceTotalFormatted are
+// sourced from the most recent row in state.Invoices (LIMIT 1). The
+// fields are pre-formatted at the handler edge so the template is a
+// pure renderer. Currency is the provider's three-letter code (USD /
+// EUR / etc.); empty when no invoice exists.
 type BillingData struct {
 	Plan     string
 	RAMMB    int
@@ -290,6 +306,27 @@ type BillingData struct {
 	AppsCap  int
 	AppLayer int
 	IdleSec  int
+
+	// MaxConcurrency is sourced from api.MustLimitsFor(acct.Plan);
+	// distinct from the live HealthyCount on the Apps page so the
+	// customer can see the per-app ceiling without leaving the
+	// billing surface.
+	MaxConcurrency int
+
+	// Current-month usage (informational; not billed here).
+	UsedGBHours  float64
+	UsedPct      float64
+	UsedEgressGB float64 // mirrors renderUsage; informational (eth framing caveat)
+
+	// Last invoice (empty fields for free or no-invoice accounts).
+	LastInvoiceDate           string
+	LastInvoiceStatus         string
+	LastInvoiceTotalFormatted string
+	LastInvoiceCurrency       string
+
+	// Stripe billing portal link; empty for free accounts.
+	HasPaidPlan bool
+	PortalURL   string
 }
 
 // PricingData is the /dashboard/pricing page payload (issue #259).

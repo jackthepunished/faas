@@ -1098,6 +1098,20 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// GetBillingPortal returns the operator-configured Stripe billing
+// portal URL for the authenticated account (issue #253). Empty string
+// means the box has FAAS_BILLING_PORTAL_URL unset — the CLI prints a
+// friendly hint instead of opening the browser to "". The endpoint
+// is authenticated via the standard Bearer / API-key chain (same
+// surface as usage reads).
+func (c *Client) GetBillingPortal(ctx context.Context) (string, error) {
+	var out BillingPortalResponse
+	if err := c.do(ctx, "GET", "/v1/billing/portal", nil, &out); err != nil {
+		return "", err
+	}
+	return out.URL, nil
+}
+
 // ListInvoices returns a single page of the authenticated account's
 // invoices (issue #259). month is "YYYY-MM" or "" for all months;
 // before is the RFC3339Nano cursor for the next page ("" for first

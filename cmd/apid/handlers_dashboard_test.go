@@ -180,6 +180,129 @@ func TestDashboardHandler_OtherPages(t *testing.T) {
 	}
 }
 
+// TestDashboardHandler_Billing_PaidPlan is the issue #253 dashboard
+// integration pin. Seeds an account that:
+//   - has StripeSubscriptionItem set (so HasPaidPlan = true)
+//   - has a previously issued invoice (so the "Last invoice" section renders)
+//   - has current-month usage (so the "GB-hours used" panel renders)
+//   - the server is wired with FAAS_BILLING_PORTAL_URL
+//
+// Then asserts the rendered HTML contains all four acceptance items
+// in one body: the portal anchor with the substituted account_id,
+// the "Last invoice" table with the formatted total, the current-month
+// usage line, and the "Manage billing" heading.
+//
+// A parallel test, TestDashboardHandler_Billing_FreePlan, asserts the
+// inverse: a Free plan must NOT render the portal section even when
+// a portal URL is configured. This is the issue #253 acceptance #5.
+func TestDashboardHandler_Billing_PaidPlan(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(t.Context(), "hobby@example.com", "hobby")
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := store.UpdateAccountStripeSubscriptionItem(t.Context(), acct.ID, "si_test"); err != nil {
+		t.Fatalf("stripe item: %v", err)
+	}
+	store.SeedInvoiceForTest(state.Invoice{
+		AccountID:         acct.ID,
+		ProviderInvoiceID: "in_test_001",
+		Provider:          "stripe",
+		Status:            "paid",
+		TotalCents:        1240,
+		Currency:          "eur",
+		PeriodStart:       time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:         time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
+	})
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	cookie, err := mgr.Issue(acct.ID)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil,
+		15*60_000_000_000, "")
+	srv.WithBillingPortalURL(billingPortalURL)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard/billing", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	srv.handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Plan: hobby",
+		"Manage billing",
+		"Open Stripe billing portal",
+		// The {account_id} placeholder must be substituted; if a
+		// future refactor breaks the template helper, this fails
+		// before the click goes out.
+		"https://billing.example.com/portal?account=" + acct.ID,
+		"Last invoice",
+		"2026-07-31",
+		"€12.40",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("paid-plan body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// The literal unsubstituted template MUST NOT appear — that's the
+	// classic unencoded-template bug we'd otherwise ship a clickable
+	// link with `{account_id}` in it.
+	if strings.Contains(body, "{account_id}") {
+		t.Errorf("body leaked unsubstituted {account_id} template placeholder\n--- body ---\n%s", body)
+	}
+}
+
+func TestDashboardHandler_Billing_FreePlan(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(t.Context(), "free@example.com", "free")
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	cookie, err := mgr.Issue(acct.ID)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil,
+		15*60_000_000_000, "")
+	// Inject a portal URL even though the account is Free; the
+	// dashboard must still gate on HasPaidPlan (issue #253
+	// acceptance #5).
+	srv.WithBillingPortalURL(billingPortalURL)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard/billing", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	srv.handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Plan: free") {
+		t.Errorf("body missing Plan: free marker\n--- body ---\n%s", body)
+	}
+	for _, banned := range []string{
+		"Manage billing",
+		"Open Stripe billing portal",
+		"Last invoice",
+	} {
+		if strings.Contains(body, banned) {
+			t.Errorf("Free-plan body should NOT contain %q\n--- body ---\n%s", banned, body)
+		}
+	}
+}
+
 // TestDashboardAccountDPA_RendersMarkdown confirms the new
 // session-authed DPA route (PR follow-up) renders the configured
 // template inside the dashboard chrome. Sets a tmp DPA file via

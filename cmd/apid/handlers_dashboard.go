@@ -49,7 +49,7 @@ const dashboardAccountPath = "/dashboard/account"
 //	GET /dashboard/apps              → apps list
 //	GET /dashboard/apps/{slug}       → app detail
 //	GET /dashboard/usage             → usage meter
-//	GET /dashboard/billing           → plan + portal placeholder
+//	GET /dashboard/billing           → plan + usage + last invoice + portal link (issue #253)
 //	GET /dashboard/account           → account + keys + GitHub connect
 //
 // The sessionAuth middleware (server.go) runs first; the account is
@@ -444,23 +444,101 @@ func (s *server) renderUsage(w http.ResponseWriter, r *http.Request, log *slog.L
 	}
 }
 
-// renderBilling renders /dashboard/billing — the plan card + a
-// placeholder for the Stripe customer portal (post-M7.5 add-on).
+// renderBilling renders /dashboard/billing — the plan card + current-month
+// usage + last invoice + Stripe billing portal link (issue #253).
+//
+// The page is intentionally lenient about failures: every read failures
+// (UsageByMonth, ListInvoicesForAccount, CountDeployedApps) only logs +
+// falls back to an empty value. The customer must always see something
+// useful on /dashboard/billing — a Postgres blip on the read path must
+// not collapse the page to a 500. The dashboard render itself is the
+// only fatal path (renderProblem 500 RFC 7807).
+//
+// HasPaidPlan is sourced from acct.StripeSubscriptionItem (the durable
+// "this account has a paid subscription" signal, written by the
+// invoice.payment_succeeded webhook) OR acct.Plan != free (catches
+// admin-elevated accounts that have not yet completed a Stripe
+// checkout; the portal link still works because the operator can
+// attach the customer to a subscription through the portal itself).
+// Both legs are gated so a Free account never sees a portal link.
 func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	ctx := r.Context()
 	limits := api.MustLimitsFor(acct.Plan)
-	view, _ := AccountFrom(r.Context())
-	appCount, err := s.store.CountDeployedApps(r.Context(), acct.ID)
+
+	// Current-month usage (reuses UsageByMonth + renderUsage's shape).
+	// Failure is non-fatal: log + fall through with 0 mbSec so the page
+	// still renders.
+	month := time.Now().UTC()
+	rows, err := s.store.UsageByMonth(ctx, acct.ID, month)
+	if err != nil {
+		log.Warn("dashboard renderBilling: usage by month", "account_id", acct.ID, "err", err)
+		rows = nil
+	}
+	var mbSec int64
+	var egressBytes int64
+	for _, u := range rows {
+		mbSec += u.MBSeconds
+		// Same framing caveat as renderUsage:counts both egress columns
+		// so the page can surface a single GB number. Informational only.
+		egressBytes += u.TXBytes + u.NetTxBytes
+	}
+	used := float64(mbSec) / 3_600_000.0
+	usedEgressGB := float64(egressBytes) / (1024 * 1024 * 1024)
+	pct := 0.0
+	if limits.IncludedGBHours > 0 {
+		pct = used / float64(limits.IncludedGBHours) * 100
+	}
+
+	// Last invoice (LIMIT 1). Failure is non-fatal: log + render the
+	// "No invoices yet" empty state from the template.
+	lastInvoice, err := s.store.ListInvoicesForAccount(ctx, acct.ID, nil, time.Time{}, 1)
+	if err != nil {
+		log.Warn("dashboard renderBilling: list invoices", "account_id", acct.ID, "err", err)
+		lastInvoice = nil
+	}
+	var lastInvDate, lastInvStatus, lastInvTotal, lastInvCcy string
+	if len(lastInvoice) > 0 {
+		li := lastInvoice[0]
+		// Go's time layout uses "02" for day-of-month, NOT a literal
+		// day value — "2006-01-31" renders 2026-07-127 because "31" is
+		// the day count for the reference time (Jan 31). The first
+		// row's PeriodEnd is already a month-end, so the day is
+		// always ≤ 31 — using "2006-01-02" fixes the off-by-one and
+		// also correctly handles shorter months.
+		lastInvDate = li.PeriodEnd.UTC().Format("2006-01-02")
+		lastInvStatus = li.Status
+		lastInvTotal = formatCentsEuros(li.TotalCents)
+		// Stripe stores currency as lowercase ISO 4217 ("eur");
+		// display it as "EUR" to match the receipt the customer
+		// sees in their portal.
+		lastInvCcy = strings.ToUpper(li.Currency)
+	}
+
+	hasPaidPlan := acct.StripeSubscriptionItem != "" || acct.Plan != api.PlanFree
+
+	view, _ := AccountFrom(ctx)
+	appCount, err := s.store.CountDeployedApps(ctx, acct.ID)
 	if err != nil {
 		log.Warn("dashboard renderBilling: count deployed apps", "account_id", acct.ID, "err", err)
 		appCount = 0
 	}
 	page := dashboard.Page{Title: "Billing", Body: "billing", Account: dashboardAccountView(view, appCount), Data: dashboard.BillingData{
-		Plan:     string(acct.Plan),
-		RAMMB:    limits.RAMMB,
-		Included: int64(limits.IncludedGBHours),
-		AppsCap:  limits.DeployedApps,
-		AppLayer: limits.AppLayerMaxMB,
-		IdleSec:  limits.IdleTimeoutS,
+		Plan:                      string(acct.Plan),
+		RAMMB:                     limits.RAMMB,
+		Included:                  int64(limits.IncludedGBHours),
+		AppsCap:                   limits.DeployedApps,
+		AppLayer:                  limits.AppLayerMaxMB,
+		IdleSec:                   limits.IdleTimeoutS,
+		MaxConcurrency:            limits.MaxConcurrency,
+		UsedGBHours:               used,
+		UsedPct:                   pct,
+		UsedEgressGB:              usedEgressGB,
+		LastInvoiceDate:           lastInvDate,
+		LastInvoiceStatus:         lastInvStatus,
+		LastInvoiceTotalFormatted: lastInvTotal,
+		LastInvoiceCurrency:       lastInvCcy,
+		HasPaidPlan:               hasPaidPlan,
+		PortalURL:                 s.billingPortalURLFor(acct),
 	}}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)

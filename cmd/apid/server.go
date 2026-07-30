@@ -710,6 +710,15 @@ func (s *server) handler() http.Handler {
 	// session-cookie routes (IAM-2 / issue #186).
 	mux.HandleFunc("GET /v1/invoices", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.listInvoices))))
 
+	// Billing portal link (issue #253). Read-only — the URL itself
+	// does not mutate anything; the customer-facing mutations live
+	// inside the Stripe-hosted portal that the URL points to. Same
+	// access tier as usage/invoices (usage:read scope) but NO MFA
+	// gate: viewing a portal link is a read, and the mutations gated
+	// by the portal itself happen after the customer authenticates
+	// to Stripe with 2FA on their side.
+	mux.HandleFunc("GET /v1/billing/portal", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.getBillingPortal)))
+
 	// Credit consumption reducer (issue #279 PR-C). Admin-only +
 	// MFA-gated — operator action that mutates money (spec §11). The
 	// `idempotent` middleware replays a prior 200 on duplicate
