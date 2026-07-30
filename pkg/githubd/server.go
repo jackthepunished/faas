@@ -139,7 +139,7 @@ func (s *Server) Start(ctx context.Context) (func(context.Context) error, <-chan
 	if err != nil {
 		return nil, nil, fmt.Errorf("githubd: listen %q: %w", listenTarget, err)
 	}
-	gsrv := grpc.NewServer()
+	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
 	s.GRPCServer.Register(gsrv)
 
 	// HTTP loopback listener for /webhooks/github.

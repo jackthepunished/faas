@@ -41,3 +41,16 @@
     name: faas
     state: present
     system: true
+
+# Tier 1 control-plane mTLS (ADR-052). vmmd on a multi-box
+# compute node is one of the daemons that runs gregale pki
+# init; the operator-side bootstrap lays out
+# /etc/faas/tls/vmmd/{server,schedd-client,apid-client}.crt.
+# Failing this stat-assert surfaces a missing bootstrap before
+# vmmd attempts to start and refuses to bind with a confusing
+# TLS handshake error.
+- name: vmmd_service — assert /etc/faas/tls/vmmd/server.crt exists (Tier 1)
+  ansible.builtin.stat:
+    path: /etc/faas/tls/vmmd/server.crt
+  register: faas_pki_vmmd_server_stat
+  failed_when: not faas_pki_vmmd_server_stat.stat.exists

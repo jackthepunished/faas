@@ -22,18 +22,28 @@
 
 Currently, `pkg/scheddgrpc` dials a hardcoded UNIX path:
 ```go
-// Current dialer code
+// Pre-slice-1 dialer code (now superseded)
 conn, err := grpc.Dial("unix://" + socketPath, grpc.WithInsecure())
 ```
 
-We will extend dialing to parse a target address URL scheme (`unix://`, `tcp://`, `dns://`):
+Slice 1 (landed) extended dialing to parse a target address URL scheme
+(`unix://`, `tcp://`, `dns://`) and shipped the real surface in
+`pkg/wire/grpc.go`:
+
 ```go
-// Proposed Dial helper in pkg/wire/grpc.go
-func Dial(target string, creds *tls.Config) (*grpc.ClientConn, error) {
-    var opts []grpc.DialOption
-    if creds != nil {
-        opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(creds)))
-    } else {
+// Real dial helper — see pkg/wire/grpc.go for the full implementation.
+func DialContext(ctx context.Context, target string, tlsCfg *tls.Config, opts ...grpc.DialOption) (*grpc.ClientConn, error)
+func Listen(ctx context.Context, target string, tlsCfg *tls.Config) (net.Listener, error)
+func LoadClientTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error)
+func LoadServerTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error)
+```
+
+TCP/DNS targets require a non-nil `tlsCfg`; the loader returns a
+`*tls.Config` populated with the operator's CA pool and the standard
+stdlib verifier (chain trust, RFC 6125 SAN matching, EKU enforcement —
+all in a single handshake pass). See ADR-052 §Handler-layer peer binding
+for the per-service `compute_node.id` CN-binding that runs *after* the
+handshake, and §Reference call sites for the per-daemon TLS threading.
         opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
     }
     return grpc.Dial(target, opts...)

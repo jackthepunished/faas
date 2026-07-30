@@ -182,3 +182,39 @@
       or faas_sign_pub_stat.stat.mode != "0444"
       or faas_sign_pub_stat.stat.pw_name != "root"
       or faas_sign_pub_stat.stat.gr_name != "root"
+
+# Tier 1 control-plane mTLS (ADR-052). The local-dev PKI
+# bootstrap lays out /etc/faas/tls/{ca,<daemon>/} with 0400
+# private keys and 0444 public certs; this stat-assert proves
+# the bootstrap ran on a control-plane node (compute nodes run
+# `gregale pki init` via their own vmmd_service role and are
+# checked there). Failing the play here surfaces a misconfigured
+# bootstrap before the daemons attempt to load the certs and
+# start with a confusing TLS handshake failure.
+- name: control_plane_service — assert /etc/faas/tls/ca/ca.crt exists (Tier 1)
+  ansible.builtin.stat:
+    path: /etc/faas/tls/ca/ca.crt
+  register: faas_pki_ca_cert_stat
+  failed_when: not faas_pki_ca_cert_stat.stat.exists
+
+- name: control_plane_service — assert /etc/faas/tls/ca/ca.key mode is 0400 root:root (Tier 1)
+  ansible.builtin.stat:
+    path: /etc/faas/tls/ca/ca.key
+  register: faas_pki_ca_key_stat
+  failed_when:
+    - >-
+      not faas_pki_ca_key_stat.stat.exists
+      or faas_pki_ca_key_stat.stat.mode != "0400"
+      or faas_pki_ca_key_stat.stat.pw_name != "root"
+      or faas_pki_ca_key_stat.stat.gr_name != "root"
+
+- name: control_plane_service — assert per-daemon leaves exist (Tier 1)
+  ansible.builtin.stat:
+    path: "/etc/faas/tls/{{ item }}/server.crt"
+  loop:
+    - schedd
+    - apid
+    - meterd
+    - gatewayd
+  register: faas_pki_leaf_stat
+  failed_when: not faas_pki_leaf_stat.stat.exists

@@ -332,7 +332,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
 	// loop entirely.
 	netCache := netstats.NewWithDefaults()
-	gsrv := grpc.NewServer()
+	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
 	impl := vmmdgrpc.NewWithCPUAndNet(mgr, ops, fcVersion, log, cpuCache, netCache)
 	impl.Register(gsrv)
 

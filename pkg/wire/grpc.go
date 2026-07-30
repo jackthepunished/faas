@@ -232,6 +232,16 @@ func DialContext(ctx context.Context, target string, tlsCfg *tls.Config, opts ..
 // package comment for the auth model. Errors before binding are returned
 // without any side effect; binding failures are returned with the listener
 // already closed.
+//
+// For tcp/dns targets, the returned net.Listener is a raw TCP
+// listener (not tls.NewListener) — gRPC's server transport does the
+// TLS handshake itself when constructed with ServerCreds(tlsCfg).
+// This is the load-bearing piece of the handler-layer peer binding
+// story (ADR-052 §Handler-layer peer binding): the server transport
+// populates peer.AuthInfo with credentials.TLSInfo when it does the
+// handshake itself, and pkg/wire.PeerCN then sees the peer CN. A
+// tls.NewListener wrap would hide the handshake from gRPC's
+// transport, leaving peer.AuthInfo=nil and breaking PeerCN.
 func Listen(ctx context.Context, target string, tlsCfg *tls.Config) (net.Listener, error) {
 	return ListenAs(ctx, target, tlsCfg, "")
 }
@@ -275,14 +285,64 @@ func ListenAs(ctx context.Context, target string, tlsCfg *tls.Config, daemonUser
 		return nil, fmt.Errorf("wire: dns scheme is not a bind target")
 	}
 
-	if tlsCfg != nil {
-		tlsLis := tls.NewListener(lis, tlsCfg)
-		// tls.NewListener owns the underlying listener; on a tls.NewListener
-		// Close, it closes the underlying conn too. No defer-close needed
-		// for the success path. The error path closes lis explicitly above.
-		return tlsLis, nil
-	}
+	// For tcp targets, the returned listener is raw TCP — gRPC's
+	// server transport does the TLS handshake itself when constructed
+	// with ServerCreds(tlsCfg) (see Listen's package comment). This
+	// is what populates peer.AuthInfo with credentials.TLSInfo so
+	// pkg/wire.PeerCN can read the CN at the handler layer. A
+	// tls.NewListener wrap would hide the handshake from gRPC's
+	// transport and break the handler-layer peer binding (ADR-052).
+	//
+	// Unix sockets skip the TLS wrap: the daemon that dials the
+	// socket is in the `faas` group (ADR-015), DAC is the auth, and
+	// tlsCfg==nil is the only accepted state.
 	return lis, nil
+}
+
+// ServerCreds returns the grpc.ServerOption that pairs with the
+// *tls.Config passed to Listen (or ListenAs). gRPC's server transport
+// only populates peer.AuthInfo with credentials.TLSInfo when it has
+// been told — via grpc.Creds — that the listener is TLS-wrapped. The
+// tls.NewListener in Listen handles the wire-level handshake, but
+// without this option the server-side peer.Peer carries AuthInfo=nil
+// and pkg/wire.PeerCN fails every handler-layer CN lookup.
+//
+// Production callers should pass the result to grpc.NewServer:
+//
+//	lis, _ := wire.Listen(ctx, target, tlsCfg)
+//	srv := grpc.NewServer(wire.ServerCreds(tlsCfg))
+//	srv.Serve(lis)
+//
+// tlsCfg==nil returns nil — unix-socket listeners don't need this
+// option, and the daemons that dial those sockets rely on the
+// default insecure transport on the server side. Callers should
+// still pass the option through (grpc.NewServer ignores nil opts
+// after we filter it; passing nil explicitly would panic in older
+// grpc-go versions, so this helper exists to give callers a
+// nil-tolerant entry point).
+func ServerCreds(tlsCfg *tls.Config) grpc.ServerOption {
+	if tlsCfg == nil {
+		return nil
+	}
+	return grpc.Creds(credentials.NewTLS(tlsCfg))
+}
+
+// ServerCredsOrEmpty returns ServerCreds(tlsCfg) when tlsCfg is non-nil
+// and an empty []grpc.ServerOption otherwise. The wrapper exists so
+// callers can splat the result directly into grpc.NewServer without
+// nil-checks:
+//
+//	srv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
+//
+// grpc.NewServer(nil) panics in grpc-go v1.82+, so we materialise
+// the empty-slice branch here. Production callers always pass a
+// real *tls.Config on the multi-box path; single-box unix listeners
+// pass nil and the empty-slice branch keeps the test path working.
+func ServerCredsOrEmpty(tlsCfg *tls.Config) []grpc.ServerOption {
+	if tlsCfg == nil {
+		return nil
+	}
+	return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 }
 
 // listenUnix binds a UNIX socket at path with the documented DAC model.
