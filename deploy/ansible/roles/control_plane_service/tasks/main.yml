@@ -210,11 +210,24 @@
 
 - name: control_plane_service — assert per-daemon leaves exist (Tier 1)
   ansible.builtin.stat:
-    path: "/etc/faas/tls/{{ item }}/server.crt"
-  loop:
-    - schedd
-    - apid
-    - meterd
-    - gatewayd
+    path: "/etc/faas/tls/{{ item.0 }}/{{ item.1 }}"
+  loop: "{{ faas_pki_leaves | zip(faas_pki_leaf_files) | map('list') }}"
+  vars:
+    # Each control-plane daemon has its own net.Listener / leaf
+    # filename under /etc/faas/tls/<daemon>/. gatewayd uses
+    # "egress.crt" because the gatewayd server leaf is the egress
+    # listener (the public TLS listener uses certmagic, not the
+    # control-plane PKI). The other three listen on gRPC servers
+    # named "server".
+    faas_pki_leaves:
+      - schedd
+      - apid
+      - meterd
+      - gatewayd
+    faas_pki_leaf_files:
+      - server.crt
+      - server.crt
+      - server.crt
+      - egress.crt
   register: faas_pki_leaf_stat
   failed_when: not faas_pki_leaf_stat.stat.exists

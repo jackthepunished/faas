@@ -287,7 +287,7 @@ func ListenAs(ctx context.Context, target string, tlsCfg *tls.Config, daemonUser
 
 	// For tcp targets, the returned listener is raw TCP — gRPC's
 	// server transport does the TLS handshake itself when constructed
-	// with ServerCreds(tlsCfg) (see Listen's package comment). This
+	// with ServerCredsOrEmpty(tlsCfg) (see Listen's package comment). This
 	// is what populates peer.AuthInfo with credentials.TLSInfo so
 	// pkg/wire.PeerCN can read the CN at the handler layer. A
 	// tls.NewListener wrap would hide the handshake from gRPC's
@@ -299,45 +299,34 @@ func ListenAs(ctx context.Context, target string, tlsCfg *tls.Config, daemonUser
 	return lis, nil
 }
 
-// ServerCreds returns the grpc.ServerOption that pairs with the
-// *tls.Config passed to Listen (or ListenAs). gRPC's server transport
-// only populates peer.AuthInfo with credentials.TLSInfo when it has
-// been told — via grpc.Creds — that the listener is TLS-wrapped. The
-// tls.NewListener in Listen handles the wire-level handshake, but
-// without this option the server-side peer.Peer carries AuthInfo=nil
-// and pkg/wire.PeerCN fails every handler-layer CN lookup.
+// ServerCredsOrEmpty returns the []grpc.ServerOption that pairs with
+// the *tls.Config passed to Listen (or ListenAs). gRPC's server
+// transport only populates peer.AuthInfo with credentials.TLSInfo
+// when it has been told — via grpc.Creds — that the listener is
+// TLS-wrapped. The tls.NewListener in Listen handles the wire-level
+// handshake, but without this option the server-side peer.Peer
+// carries AuthInfo=nil and pkg/wire.PeerCN fails every handler-layer
+// CN lookup.
 //
-// Production callers should pass the result to grpc.NewServer:
+// The wrapper exists so callers can splat the result directly into
+// grpc.NewServer without nil-checks:
 //
 //	lis, _ := wire.Listen(ctx, target, tlsCfg)
-//	srv := grpc.NewServer(wire.ServerCreds(tlsCfg))
+//	srv := grpc.NewServer(wire.ServerCredsOrEmpty(tlsCfg)...)
 //	srv.Serve(lis)
 //
-// tlsCfg==nil returns nil — unix-socket listeners don't need this
-// option, and the daemons that dial those sockets rely on the
-// default insecure transport on the server side. Callers should
-// still pass the option through (grpc.NewServer ignores nil opts
-// after we filter it; passing nil explicitly would panic in older
-// grpc-go versions, so this helper exists to give callers a
-// nil-tolerant entry point).
-func ServerCreds(tlsCfg *tls.Config) grpc.ServerOption {
-	if tlsCfg == nil {
-		return nil
-	}
-	return grpc.Creds(credentials.NewTLS(tlsCfg))
-}
-
-// ServerCredsOrEmpty returns ServerCreds(tlsCfg) when tlsCfg is non-nil
-// and an empty []grpc.ServerOption otherwise. The wrapper exists so
-// callers can splat the result directly into grpc.NewServer without
-// nil-checks:
+// tlsCfg==nil returns nil (a typed-nil []grpc.ServerOption); grpc.NewServer
+// is happy with `...` of a nil slice and the empty-result branch keeps
+// the single-box unix-socket path working. Production multi-box
+// callers always pass a real *tls.Config.
 //
-//	srv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
-//
-// grpc.NewServer(nil) panics in grpc-go v1.82+, so we materialise
-// the empty-slice branch here. Production callers always pass a
-// real *tls.Config on the multi-box path; single-box unix listeners
-// pass nil and the empty-slice branch keeps the test path working.
+// Why only the slice form: a singular `ServerCreds(tlsCfg)
+// grpc.ServerOption` helper would need to return a typed-nil
+// grpc.ServerOption when tlsCfg is nil, and `grpc.NewServer(typedNil)`
+// panics in grpc-go v1.82+ (the typed-nil is not the same as a
+// missing variadic argument). The slice form sidesteps the footgun
+// entirely because `grpc.NewServer(opts...)` is variadic — the caller
+// never has to handle a singular option's nil-ness themselves.
 func ServerCredsOrEmpty(tlsCfg *tls.Config) []grpc.ServerOption {
 	if tlsCfg == nil {
 		return nil

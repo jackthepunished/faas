@@ -49,8 +49,12 @@
 # Failing this stat-assert surfaces a missing bootstrap before
 # vmmd attempts to start and refuses to bind with a confusing
 # TLS handshake error.
-- name: vmmd_service — assert /etc/faas/tls/vmmd/server.crt exists (Tier 1)
+- name: vmmd_service — assert vmmd PKI leaves exist (Tier 1)
   ansible.builtin.stat:
-    path: /etc/faas/tls/vmmd/server.crt
-  register: faas_pki_vmmd_server_stat
-  failed_when: not faas_pki_vmmd_server_stat.stat.exists
+    path: "/etc/faas/tls/vmmd/{{ item }}.crt"
+  loop:
+    - server
+    - schedd-client
+    - apid-client
+  register: faas_pki_vmmd_leaf_stat
+  failed_when: not faas_pki_vmmd_leaf_stat.stat.exists

@@ -787,6 +787,15 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 // here are fatal — without the advisory listener vmmd has no way to
 // forward fanotify batches and the audit loop is silently broken.
 func runAdvisoryServer(target string, tlsCfg *tls.Config, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
+	// Guard: a tcp/dns target without TLS would silently build an
+	// insecure server (wire.Listen returns raw TCP, ServerCredsOrEmpty
+	// yields zero opts). Refuse; the operator must set the
+	// FAAS_APID_ADVISORY_TLS_{CERT,KEY,CA}_PATH env trio. ADR-052.
+	if !isUnixSocketPath(target) && tlsCfg == nil {
+		return nil, nil, fmt.Errorf(
+			"advisory: target %q is non-unix but %s is empty (set FAAS_APID_ADVISORY_TLS_CERT_PATH / KEY_PATH / CA_PATH or point the target at a unix socket for single-box mode)",
+			target, "FAAS_APID_ADVISORY_TLS_*_PATH")
+	}
 	var lis net.Listener
 	var err error
 	if isUnixSocketPath(target) {

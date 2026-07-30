@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -384,9 +385,20 @@ func writeLeaf(certPath string, keyPEM, certPEM []byte) error {
 }
 
 // loadExistingLeaf returns the parsed cert at certPath if both cert
-// and key exist with valid mode. Returns (nil, nil) when the cert is
-// missing — caller treats that as "issue a fresh leaf". Returns a
-// non-nil error only on real problems (bad perms, parse failure).
+// and key exist with valid mode and the cert↔key pair matches.
+// Returns (nil, nil) when the cert is missing — caller treats that
+// as "issue a fresh leaf". Returns a non-nil error only on real
+// problems (bad perms, parse failure, cert↔key mismatch).
+//
+// The pair check is the load-bearing detection of a misconfigured
+// install: a leaf whose cert was rotated but whose key was left
+// dangling from a previous rotate. Without the pair check, the
+// loader would happily return the cert, EnsureLeaf would skip the
+// re-issue (ErrLeafNotExpiringSoon), and the operator would discover
+// the mismatch at the first TLS handshake with an opaque "private
+// key does not match public key" error weeks later. The pair-roundtrip
+// uses the standard library's tls.X509KeyPair so we don't reinvent
+// the parsing.
 func loadExistingLeaf(certPath, keyPath string) (*x509.Certificate, error) {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
@@ -398,6 +410,17 @@ func loadExistingLeaf(certPath, keyPath string) (*x509.Certificate, error) {
 	if err := enforceCertMode(certPath); err != nil {
 		return nil, err
 	}
+	// Read the key BEFORE enforceKeyMode so a missing key surfaces as
+	// the clear "is missing" error rather than enforceKeyMode's
+	// "stat ... no such file or directory" diagnostic. The pair-mismatch
+	// detection depends on the key bytes anyway.
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("pki: cert %q exists but key %q is missing (rotate stale): %w", certPath, keyPath, err)
+		}
+		return nil, fmt.Errorf("pki: read key %q: %w", keyPath, err)
+	}
 	if err := enforceKeyMode(keyPath); err != nil {
 		return nil, err
 	}
@@ -408,6 +431,12 @@ func loadExistingLeaf(certPath, keyPath string) (*x509.Certificate, error) {
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("pki: parse cert %q: %w", certPath, err)
+	}
+	// cert↔key pair validation. The stdlib's tls.X509KeyPair round-trip
+	// is the canonical check; stdlib matches the public key in the
+	// cert against the private key and returns an error on mismatch.
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return nil, fmt.Errorf("pki: cert↔key pair mismatch for %q: %w", certPath, err)
 	}
 	return cert, nil
 }

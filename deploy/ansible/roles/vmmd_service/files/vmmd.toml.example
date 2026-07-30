@@ -38,3 +38,23 @@
 # tls_cert_path = "/etc/faas/tls/vmmd.crt"
 # tls_key_path = "/etc/faas/tls/vmmd.key"
 # tls_ca_path = "/etc/faas/tls/ca.pem"
+
+# schedd_client_cert_path / schedd_client_key_path / schedd_client_ca_path:
+# client mTLS material vmmd uses to dial schedd for ReportCapacity
+# (ADR-052 / issue #95 slice 2). All three empty => no TLS (single-box
+# unix socket). All three set => mTLS-over-TCP to a remote schedd;
+# the leaf is /etc/faas/tls/vmmd/schedd-client.{crt,key} (EKU
+# ClientAuth only). Partial cluster => startup error.
+# Defaults: ""
+# schedd_client_cert_path = "/etc/faas/tls/vmmd/schedd-client.crt"
+# schedd_client_key_path = "/etc/faas/tls/vmmd/schedd-client.key"
+# schedd_client_ca_path = "/etc/faas/tls/ca/ca.crt"
+
+# advisory_client_cert_path / advisory_client_key_path / advisory_client_ca_path:
+# client mTLS material vmmd uses to dial apid's advisory listener
+# (ADR-052). Leaf is /etc/faas/tls/vmmd/apid-client.{crt,key}. Same
+# partial-cluster contract as schedd_client_*.
+# Defaults: ""
+# advisory_client_cert_path = "/etc/faas/tls/vmmd/apid-client.crt"
+# advisory_client_key_path = "/etc/faas/tls/vmmd/apid-client.key"
+# advisory_client_ca_path = "/etc/faas/tls/ca/ca.crt"

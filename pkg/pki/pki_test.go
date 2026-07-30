@@ -1,8 +1,12 @@
 package pki
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -412,5 +416,111 @@ func TestCARootPathStable(t *testing.T) {
 	}
 	if got, want := keyPath, filepath.Join("/etc/faas/tls", "ca", "ca.key"); got != want {
 		t.Errorf("CARoot key = %q, want %q", got, want)
+	}
+}
+
+// TestEnsureLeafRejectsCertKeyMismatch guards the load-bearing pair
+// validation in loadExistingLeaf. Without the pair check, a leaf
+// whose cert was rotated but whose key was left dangling from a
+// previous rotate would slip past the loader and fail at the first
+// TLS handshake with an opaque "private key does not match public
+// key" error. The pair check surfaces the mismatch at the next
+// `gregale pki status` instead.
+//
+// The test installs a valid leaf, then replaces the key on disk with
+// a freshly generated one (different private key, same cert on top)
+// so the cert↔key pair no longer matches. The next EnsureLeaf must
+// fail rather than return ErrLeafNotExpiringSoon.
+func TestEnsureLeafRejectsCertKeyMismatch(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	role := Role{
+		CommonName: "schedd.faas",
+		Kind:       KindServer,
+		Directory:  "schedd",
+		Filename:   "server",
+		AltNames:   ProductionSANs("schedd.faas"),
+	}
+	if err := EnsureLeaf(root, role, caCert, caKey, false); err != nil {
+		t.Fatalf("first EnsureLeaf: %v", err)
+	}
+	_, keyPath := LeafPaths(root, role)
+
+	// Replace the key with a freshly generated one — same cert,
+	// different private key. Catches a previous rotate that left
+	// the key file dangling.
+	freshKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate fresh key: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(freshKey)
+	if err != nil {
+		t.Fatalf("marshal fresh key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	// Remove first — the existing key was written 0o400 by EnsureLeaf,
+	// and os.WriteFile doesn't truncate a read-only file owned by us
+	// on POSIX (no owner-w bit). Removing and re-writing mirrors what
+	// writeLeaf does internally (removeIfExists → WriteFile).
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatalf("remove stale key: %v", err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o400); err != nil {
+		t.Fatalf("write fresh key: %v", err)
+	}
+
+	// Next EnsureLeaf must fail with a pair-mismatch error rather
+	// than returning ErrLeafNotExpiringSoon (which would silently
+	// skip the re-issue).
+	err = EnsureLeaf(root, role, caCert, caKey, false)
+	if err == nil {
+		t.Fatal("EnsureLeaf accepted cert↔key pair mismatch")
+	}
+	if errors.Is(err, ErrLeafNotExpiringSoon) {
+		t.Errorf("EnsureLeaf returned ErrLeafNotExpiringSoon on a mismatched pair — loader did not validate the pair")
+	}
+	if !strings.Contains(err.Error(), "cert↔key pair mismatch") {
+		t.Errorf("EnsureLeaf error = %v, want to mention 'cert↔key pair mismatch'", err)
+	}
+}
+
+// TestEnsureLeafRejectsMissingKeyWithCert is the second pair-mismatch
+// path: a cert exists but the key file is missing (typically a
+// half-finished rotate). The loader should refuse rather than return
+// the cert as valid.
+func TestEnsureLeafRejectsMissingKeyWithCert(t *testing.T) {
+	root := t.TempDir()
+	caCert, caKey, err := EnsureCA(root, false)
+	if err != nil {
+		t.Fatalf("EnsureCA: %v", err)
+	}
+	role := Role{
+		CommonName: "schedd.faas",
+		Kind:       KindServer,
+		Directory:  "schedd",
+		Filename:   "server",
+		AltNames:   ProductionSANs("schedd.faas"),
+	}
+	if err := EnsureLeaf(root, role, caCert, caKey, false); err != nil {
+		t.Fatalf("first EnsureLeaf: %v", err)
+	}
+	certPath, keyPath := LeafPaths(root, role)
+	// Remove the key — leave the cert dangling.
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatalf("remove key: %v", err)
+	}
+	// The cert is still on disk from the first EnsureLeaf, so
+	// loadExistingLeaf's cert-missing branch does NOT short-circuit.
+	_ = certPath
+
+	err = EnsureLeaf(root, role, caCert, caKey, false)
+	if err == nil {
+		t.Fatal("EnsureLeaf accepted a cert without a key")
+	}
+	if !strings.Contains(err.Error(), "is missing") {
+		t.Errorf("EnsureLeaf error = %v, want to mention 'is missing'", err)
 	}
 }
