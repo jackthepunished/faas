@@ -11,9 +11,13 @@ import (
 // here is a candidate; each member subdirectory is a workload iff
 // it carries a Dockerfile or a language marker.
 //
-// Order matters for output stability only — when two convention
-// dirs both match (e.g. a `services/foo` AND an `apps/foo`),
-// the first one wins. (Real-world monorepos usually pick one.)
+// When two convention dirs both match (e.g. a `services/foo` AND
+// an `apps/foo`), BOTH are emitted as separate seeds. They have
+// different `rootDir` values, so mergeByKey treats them as two
+// distinct workloads — the (RootDir, Name) merge key is what
+// keeps them separate. The order here matters only for the
+// iteration order of `fs.ReadDir` results, which Go standardises
+// to alphabetical regardless.
 var conventionDirs = []string{"services", "apps", "packages", "cmd"}
 
 // detectConventionImpl walks each present convention dir and emits

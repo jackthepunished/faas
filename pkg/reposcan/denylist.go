@@ -17,7 +17,7 @@ import "strings"
 // (pkg/api/limits.go's stateless_only_violation, ADR-046,
 // docs/storage.md) is held forward one cycle: a customer now
 // learns the carve-out at the confirm table, not at runtime.
-// datastoreDenylist is the canonical image-name → env-hint map.
+//
 // Map keys are literal OCI image basenames (postgres, redis, …)
 // — these are NOT magic strings repeated elsewhere in the package,
 // they ARE the spec. Lifting them to named constants would obscure

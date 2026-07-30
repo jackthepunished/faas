@@ -51,7 +51,8 @@ func detectServerless(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 	}
 	var d serverlessDoc
 	if err := yaml.Unmarshal(body, &d); err != nil {
-		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, wrapSkipErr(err)
+		// Warn-and-skip: malformed serverless.yml is recoverable.
+		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, nil //nolint:nilerr
 	}
 	var seeds []workloadSeed
 	names := make([]string, 0, len(d.Functions))

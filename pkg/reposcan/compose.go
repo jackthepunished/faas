@@ -98,13 +98,18 @@ func detectCompose(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 	// at https://docs.docker.com/compose/compose-file/16-merging/).
 	var c composeDoc
 	if err := yaml.Unmarshal(body, &c); err != nil {
-		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, wrapSkipErr(err)
+		// Warn-and-skip: malformed compose is recoverable —
+		// the operator sees the parse error in warnings, the
+		// rest of the scan continues.
+		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, nil //nolint:nilerr
 	}
 	if len(c.Services) == 0 {
 		// Try the wrapped form.
 		var r composeRoot
 		if err := yaml.Unmarshal(body, &r); err != nil || len(r.Compose.Services) == 0 {
-			return nil, nil, nil, wrapSkipErr(err)
+			// Same warn-and-skip semantics; the wrapped form
+			// also failed to find any services — quiet skip.
+			return nil, nil, nil, nil //nolint:nilerr
 		}
 		c = r.Compose
 	}

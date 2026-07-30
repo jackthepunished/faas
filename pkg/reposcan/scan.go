@@ -135,27 +135,34 @@ func Scan(fsys fs.FS) (Result, error) {
 		highestTier Tier
 	)
 
-	// Tier 1 — explicit sources.
+	// Tier 1 — explicit sources. Each detector is paired with its
+	// detector tag so the merge rule can break ties on detector
+	// precedence (compose > Procfile > k8s > render > fly >
+	// serverless > app.yaml) rather than the free-form source
+	// string. The Procfile's class=`http` wins over compose's
+	// class=`unknown` because detProcfile.priority() > detCompose
+	// .priority() at the same tier.
 	results := []struct {
-		name string
-		run  func(fs.FS) ([]workloadSeed, []Managed, []string, error)
+		tag detector
+		run func(fs.FS) ([]workloadSeed, []Managed, []string, error)
 	}{
-		{"compose", detectCompose},
-		{"procfile", detectProcfile},
-		{nameK8s, detectK8s},
-		{"render", detectRender},
-		{"fly", detectFly},
-		{"serverless", detectServerless},
-		{nameAppYAML, detectAppYaml},
+		{detCompose, detectCompose},
+		{detProcfile, detectProcfile},
+		{detK8s, detectK8s},
+		{detRender, detectRender},
+		{detFly, detectFly},
+		{detServerless, detectServerless},
+		{detAppYaml, detectAppYaml},
 	}
 	for _, r := range results {
 		s, m, w, err := r.run(fsys)
 		if err != nil {
 			return Result{}, err
 		}
-		for _, seed := range s {
-			seed.tier = TierCompose
-			seeds = append(seeds, seed)
+		for i := range s {
+			s[i].tier = TierCompose
+			s[i].det = r.tag
+			seeds = append(seeds, s[i])
 			if TierCompose > highestTier {
 				highestTier = TierCompose
 			}

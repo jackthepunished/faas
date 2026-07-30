@@ -196,25 +196,32 @@ func TestScan_NoComposeFixture_NoPathsOutsideRoot(t *testing.T) {
 }
 
 // TestScan_RootsOnly — a bare fixtures/compose_k8s/ fixture
-// with no ./services/. This is the §4 case where the compose
-// contents are at root and k8s contents are at root/k8s/.
-// The fixture's `api` workload has build.context=./api; the
-// RootDir must normalize to that path (NOT empty root) so
-// merge-by-(RootDir, Name) doesn't confuse it with a Tier-4
-// "app" floor.
+// with no ./services/. The compose contents are at root and
+// k8s contents are at root/k8s/. The fixture's `api` workload
+// has build.context=./api; the RootDir MUST normalize to "api"
+// (NOT empty root) so merge-by-(RootDir, Name) doesn't confuse
+// it with a Tier-4 "app" floor. The `worker` workload has
+// build.context=./worker; RootDir="worker". The `nightly`
+// CronJob has no build context declaration; its RootDir is "".
 func TestScan_RootsOnly(t *testing.T) {
 	t.Parallel()
 	r, err := Scan(composeK8sFixture(t))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	if len(r.Workloads) == 0 {
-		t.Fatalf("Workloads empty")
+	want := map[string]string{
+		"api":     "api",
+		"worker":  "worker",
+		"nightly": "",
 	}
-	if r.Workloads[0].RootDir != "" && r.Workloads[0].Name == "api" {
-		// ok (build.context normalized) — log so future
-		// regressions surface in test output.
-		t.Logf("api RootDir=%q (expected relative to repo root)", r.Workloads[0].RootDir)
+	got := map[string]string{}
+	for _, w := range r.Workloads {
+		got[w.Name] = w.RootDir
+	}
+	for name, wantRd := range want {
+		if gotRD := got[name]; gotRD != wantRd {
+			t.Errorf("%s RootDir = %q, want %q", name, gotRD, wantRd)
+		}
 	}
 }
 

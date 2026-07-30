@@ -37,7 +37,8 @@ func detectFly(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 	}
 	var d flyDoc
 	if err := toml.Unmarshal(body, &d); err != nil {
-		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, wrapSkipErr(err)
+		// Warn-and-skip: malformed fly.toml is recoverable.
+		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, nil //nolint:nilerr
 	}
 	appName := d.App
 	if appName == "" {

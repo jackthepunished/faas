@@ -38,7 +38,8 @@ func detectRender(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 	}
 	var d renderDoc
 	if err := yaml.Unmarshal(body, &d); err != nil {
-		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, wrapSkipErr(err)
+		// Warn-and-skip: malformed render.yaml is recoverable.
+		return nil, nil, []string{"reposcan: parse " + src + ": " + err.Error()}, nil //nolint:nilerr
 	}
 	var seeds []workloadSeed
 	for _, s := range d.Services {

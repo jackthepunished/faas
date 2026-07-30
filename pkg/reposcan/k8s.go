@@ -72,14 +72,12 @@ func detectK8s(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 		managed  []Managed
 		warnings []string
 	)
-	dirs := make(map[string]bool, 4)
 	for _, d := range k8sRootDirs {
 		// Stat the directory; if present, walk it.
 		info, err := fs.Stat(fsys, d)
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		dirs[d] = true
 		err = fs.WalkDir(fsys, d, func(p string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -130,7 +128,6 @@ func detectK8s(fsys fs.FS) ([]workloadSeed, []Managed, []string, error) {
 			return nil, nil, nil, err
 		}
 	}
-	_ = dirs // kept for future debug
 	// Deterministic order to keep the merge input stable.
 	sort.SliceStable(seeds, func(i, j int) bool { return seeds[i].name < seeds[j].name })
 	return seeds, managed, warnings, nil

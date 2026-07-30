@@ -7,26 +7,29 @@ import "sort"
 // plan §3.227-231:
 //
 //   - Identity fields (Name, RootDir, Tier, Source, Dockerfile) come
-//     from the highest-tier seed. The merge result's Tier is the
-//     highest tier that contributed.
+//     from the highest-priority seed. Priority is (tier desc,
+//     detector.priority desc, source asc, rootDir asc) — the
+//     detector tag is the load-bearing tiebreak for two seeds at
+//     the same tier (e.g. compose + Procfile both naming `web`).
 //   - Per-field-fillable fields (Class, Command, Schedule, Ports,
-//     EnvKeys) are filled by the highest NON-EMPTY tier that has
-//     them. The canonical example: a Procfile `web` (TierCompose)
-//     can fill the class field of a compose `web` (also TierCompose)
-//     when compose didn't set it. The merge treats a "tier" as
-//     the seed's `tier` value: the seed that arrives first (in
-//     tier-descending order) is the highest-tier contributor for
-//     each non-empty field.
+//     EnvKeys) are filled by the first non-empty under the same
+//     priority order. The canonical example: a Procfile `web`
+//     (TierCompose, detProcfile) fills the class field of a
+//     compose `web` (TierCompose, detCompose) when compose didn't
+//     set it.
 //
-// Determinism: maps are not safe under -race. Sort seeds by
-// (tier desc, source asc, rootDir asc) before iterating so the
-// merge is reproducible.
+// Determinism: maps are not safe under -race. Sort seeds by the
+// priority key above before iterating so the merge is
+// reproducible regardless of slice ordering.
 func mergeByKey(seeds []workloadSeed) []Workload {
 	sorted := make([]workloadSeed, len(seeds))
 	copy(sorted, seeds)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if sorted[i].tier != sorted[j].tier {
 			return sorted[i].tier > sorted[j].tier
+		}
+		if sorted[i].det.priority() != sorted[j].det.priority() {
+			return sorted[i].det.priority() > sorted[j].det.priority()
 		}
 		if sorted[i].rootDir != sorted[j].rootDir {
 			return sorted[i].rootDir < sorted[j].rootDir

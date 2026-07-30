@@ -199,3 +199,38 @@ func TestDetectWorkspaces_PnpmMonorepo_AlreadyCovered(t *testing.T) {
 		t.Errorf("pnpm members = %v, want {api, web}", names)
 	}
 }
+
+// TestDetectWorkspaces_RejectsDotDotEscape — a malicious
+// pnpm-workspace.yaml entry that contains `..` is rejected by
+// fs.ValidPath after the path.Join normalisation. The dangerous
+// value is "packages/../escape": leading ".." check passes (the
+// path starts with "p"), but path.Join collapses it to "escape"
+// before fs.ReadDir ever runs. The fix is an explicit
+// fs.ValidPath gate around the add() body.
+//
+// Without the fix, this fixture would emit a workload named
+// "escape" sourced from inside the (hypothetical) tarball's
+// "escape/" subtree — a path the scanner is not supposed to
+// reach.
+func TestDetectWorkspaces_RejectsDotDotEscape(t *testing.T) {
+	t.Parallel()
+	fsys := fstest.MapFS{
+		"pnpm-workspace.yaml": &fstest.MapFile{Data: []byte(`packages:
+  - "packages/legal"
+  - "packages/../escape"
+`)},
+		"packages/legal/Dockerfile": &fstest.MapFile{Data: []byte("FROM scratch")},
+		"escape/Dockerfile":         &fstest.MapFile{Data: []byte("FROM scratch")},
+	}
+	seeds, _, err := detectWorkspaces(fsys)
+	if err != nil {
+		t.Fatalf("detectWorkspaces: %v", err)
+	}
+	names := make([]string, len(seeds))
+	for i, s := range seeds {
+		names[i] = s.name
+	}
+	if !equalSet(names, []string{"legal"}) {
+		t.Errorf("dot-dot escape = %v, want only {legal} (escape must be rejected)", names)
+	}
+}

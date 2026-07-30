@@ -137,24 +137,43 @@ func TestFSSafety_Scan_NoEscapePossible(t *testing.T) {
 	}
 }
 
-// TestFSSafety_ErrorsIsPlumbing — verifies that the errors.Is
-// tripwire for ErrNotExist/ErrInvalid is intact in fsys_safety.go.
-// If a future refactor changes that helper, fs.ValidPath
-// differences will surface here first.
-func TestFSSafety_ErrorsIsPlumbing(t *testing.T) {
+// TestFSSafety_ReadValidFile_RejectsDirectory — readValidFile
+// must propagate ErrInvalid (via errors.Is) when handed a
+// directory path. The fsys_safety.go helper classifies the
+// ErrInvalid case as "next candidate" only inside
+// readFirstValidFile — readValidFile surfaces it. If a future
+// refactor stops surfacing it, the silent-skip path in
+// detectCompose would skip a directory-shaped file and miss
+// the actual fsys content.
+func TestFSSafety_ReadValidFile_RejectsDirectory(t *testing.T) {
 	t.Parallel()
 	fsys := fstest.MapFS{
 		"subdir": &fstest.MapFile{Mode: 0o755 | fs.ModeDir},
 	}
-	// Calling ReadFile on a directory returns ErrInvalid, not
-	// ErrNotExist. Our helper discriminates between them so an
-	// I/O error on a real directory doesn't masquerade as a
-	// missing-file skip.
-	_, err := fs.ReadFile(fsys, "subdir")
+	_, err := readValidFile(fsys, "subdir")
 	if err == nil {
-		t.Fatalf("ReadFile on a directory returned nil err")
+		t.Fatalf("readValidFile(/) returned nil err")
 	}
 	if !errors.Is(err, fs.ErrInvalid) {
-		t.Logf("Note: ReadFile on dir returned %v (not ErrInvalid) — still OK", err)
+		t.Errorf("readValidFile returned %v; want errors.Is fs.ErrInvalid", err)
+	}
+}
+
+// TestFSSafety_ReadFirstValidFile_SkipsDirectory — confirms
+// readFirstValidFile classifies the directory case as "next
+// candidate" (NOT a propagated error). Then the equivalent
+// non-dir file is read successfully.
+func TestFSSafety_ReadFirstValidFile_SkipsDirectory(t *testing.T) {
+	t.Parallel()
+	fsys := fstest.MapFS{
+		"subdir":   &fstest.MapFile{Mode: 0o755 | fs.ModeDir},
+		"goodfile": &fstest.MapFile{Data: []byte("hi")},
+	}
+	body, src, err := readFirstValidFile(fsys, []string{"subdir", "goodfile"})
+	if err != nil {
+		t.Errorf("readFirstValidFile: %v", err)
+	}
+	if string(body) != "hi" || src != "goodfile" {
+		t.Errorf("readFirstValidFile = (%s, %q)", src, body)
 	}
 }

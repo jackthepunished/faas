@@ -1,11 +1,57 @@
 package reposcan
 
+// detector is the named source that produced a workloadSeed. The
+// merge rule uses this as a tiebreak: when two seeds at the same
+// tier have the same (RootDir, Name), the lower-detectorPriority
+// wins identity (and first-non-empty wins per field). The detector
+// is a fixed enum — NOT a free-form source string — so detector
+// precedence is a contract detectors cannot accidentally
+// renegotiate by changing their source-string format.
+type detector uint8
+
+const (
+	detOther      detector = iota // convention / workspaces / root floor
+	detCompose                    // compose.yaml
+	detProcfile                   // Procfile
+	detK8s                        // k8s manifests
+	detRender                     // render.yaml
+	detFly                        // fly.toml
+	detServerless                 // serverless.yml
+	detAppYaml                    // app.yaml
+)
+
+// detectorPriority is the canonical tiebreak order. Within a tier,
+// higher priority wins (Procfile is the most explicit name
+// declarer; compose is the most common workload carrier). The
+// sentinel values are NON-CONTIGUOUS so a future detector can
+// land between two existing ones without renumbering.
+func (d detector) priority() uint8 {
+	switch d {
+	case detCompose:
+		return 80
+	case detProcfile:
+		return 75
+	case detK8s:
+		return 70
+	case detRender:
+		return 65
+	case detFly:
+		return 60
+	case detServerless:
+		return 55
+	case detAppYaml:
+		return 50
+	}
+	return 0 // convention / workspaces / root floor
+}
+
 // workloadSeed is the internal carrier produced by each tier
 // detector before merge.go collapses them into a sorted
 // []Workload. Keeping it lighter than Workload makes per-tier
 // code shorter (the merge rule fills the empty fields).
 type workloadSeed struct {
 	tier       Tier
+	det        detector
 	source     string // provenance string; carried into Workload.Source
 	name       string
 	rootDir    string

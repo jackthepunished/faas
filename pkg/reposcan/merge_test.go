@@ -10,13 +10,20 @@ import (
 // compose+Procfile composition: a Procfile supplies class=http for
 // `web:`, and a compose.yaml supplies the same (RootDir="",
 // Name="web") workload with ports + command. The merge rule
-// carries BOTH: the highest-tier seeds win identity, and the
+// carries BOTH: the highest-priority seeds win identity, and the
 // first-non-empty wins per field.
+//
+// With the detector-tiebreak fix (PR-review HIGH #1), compose has
+// higher priority than Procfile at the same tier, so compose's
+// fields (command, ports, envKeys) win identity and the merged
+// command is the 4-token list. The Procfile's class=http still
+// fills the empty slot because compose didn't set one.
 func TestMerge_ComposeFillsProcfileClass(t *testing.T) {
 	t.Parallel()
 	seeds := []workloadSeed{
 		{
 			tier:    TierCompose,
+			det:     detCompose,
 			source:  "compose.yaml: web",
 			name:    "web",
 			ports:   []int{8080},
@@ -25,6 +32,7 @@ func TestMerge_ComposeFillsProcfileClass(t *testing.T) {
 		},
 		{
 			tier:    TierCompose,
+			det:     detProcfile,
 			source:  "Procfile: web",
 			name:    "web",
 			class:   ClassHTTP,
@@ -48,12 +56,13 @@ func TestMerge_ComposeFillsProcfileClass(t *testing.T) {
 	if len(w.Ports) != 1 || w.Ports[0] != 8080 {
 		t.Errorf("ports = %v, want [8080] (from compose)", w.Ports)
 	}
-	// Command: first non-empty wins per field — Procfile's
-	// "bundle exec rails s -p 3000" was first to land because
-	// iteration order is arbitrary; we accept either. The
-	// determinism test below pins a specific order.
-	if len(w.Command) == 0 {
-		t.Errorf("command empty; want non-empty")
+	// Detector-priority tiebreak: compose has higher detector
+	// priority than Procfile, so compose's command wins identity.
+	// The Procfile's "bundle exec rails s -p 3000" is a single
+	// string; compose's is the 4-token list. The merged command
+	// is compose's.
+	if len(w.Command) != 4 || w.Command[0] != "bundle" {
+		t.Errorf("command = %v; want compose's 4-token form", w.Command)
 	}
 }
 
@@ -154,5 +163,93 @@ func TestMerge_SortIsDeterministic(t *testing.T) {
 	sort.Strings(got)
 	if !equalSet(got, []string{"alpha", "mu", "zeta"}) {
 		t.Errorf("Scan() sorted names = %v, want {alpha,mu,zeta}", got)
+	}
+}
+
+// TestMerge_ShuffledInputDeterministic — the load-bearing
+// determinism test PR-review HIGH #1 demanded. Two seeds at the
+// same tier with the same (RootDir, Name) and conflicting field
+// values must produce the SAME merged Workload regardless of
+// input order. Before the detector-tiebreak fix, the merge sort
+// used (source lex) as the secondary key, which is not a contract
+// any detector is held to. With the fix, the secondary key is
+// detector.priority(), which IS a contract.
+func TestMerge_ShuffledInputDeterministic(t *testing.T) {
+	t.Parallel()
+	seed := func() []workloadSeed {
+		return []workloadSeed{
+			{
+				tier:    TierCompose,
+				det:     detCompose,
+				source:  "compose.yaml: web",
+				name:    "web",
+				command: []string{"bundle", "exec", "rails", "s"},
+			},
+			{
+				tier:    TierCompose,
+				det:     detProcfile,
+				source:  "Procfile: web",
+				name:    "web",
+				class:   ClassHTTP,
+				command: []string{"bundle exec rails s -p 3000"},
+			},
+		}
+	}
+	// Forward order.
+	out1 := mergeByKey(seed())
+	// Reverse order.
+	s2 := seed()
+	for i, j := 0, len(s2)-1; i < j; i, j = i+1, j-1 {
+		s2[i], s2[j] = s2[j], s2[i]
+	}
+	out2 := mergeByKey(s2)
+	// Interleaved: compose, Procfile, compose, Procfile — doubling.
+	s3 := append(seed(), seed()...)
+	out3 := mergeByKey(s3)
+	if len(out1) != 1 || len(out2) != 1 || len(out3) != 1 {
+		t.Fatalf("len(out) = (%d, %d, %d), want 1", len(out1), len(out2), len(out3))
+	}
+	if out1[0].Class != out2[0].Class || out2[0].Class != out3[0].Class {
+		t.Errorf("Class drift: %q %q %q", out1[0].Class, out2[0].Class, out3[0].Class)
+	}
+	if len(out1[0].Command) != len(out2[0].Command) || len(out2[0].Command) != len(out3[0].Command) {
+		t.Errorf("Command len drift: %v %v %v", out1[0].Command, out2[0].Command, out3[0].Command)
+	}
+}
+
+// TestMerge_ProcfileWinsClassWhenHigherPriority — pins the
+// detector precedence: Procfile (priority=75) outranks
+// compose (priority=80)... wait, no. Compose outranks Procfile
+// in priority. So compose's fields win identity, and the
+// Procfile's class fills the empty field. The Procfile's command
+// would NOT win because compose's command is non-empty.
+func TestMerge_ProcfileFillsComposeEmptyClass(t *testing.T) {
+	t.Parallel()
+	seeds := []workloadSeed{
+		{
+			tier:    TierCompose,
+			det:     detCompose,
+			source:  "compose.yaml: web",
+			name:    "web",
+			command: []string{"bundle", "exec", "rails", "s"},
+			// class left empty — Procfile will fill it.
+		},
+		{
+			tier:   TierCompose,
+			det:    detProcfile,
+			source: "Procfile: web",
+			name:   "web",
+			class:  ClassHTTP,
+		},
+	}
+	out := mergeByKey(seeds)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if out[0].Class != ClassHTTP {
+		t.Errorf("Class = %q, want http (from Procfile, fills compose's empty slot)", out[0].Class)
+	}
+	if len(out[0].Command) != 4 {
+		t.Errorf("Command = %v, want compose's 4-token form", out[0].Command)
 	}
 }

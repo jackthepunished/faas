@@ -45,6 +45,14 @@ func detectWorkspacesImpl(fsys fs.FS) ([]workloadSeed, []string, error) {
 		}
 		// Strip trailing slash.
 		member = strings.TrimRight(member, "/")
+		// fs.ValidPath is the load-bearing rejection — a path like
+		// "packages/../escape" passes the leading ".." check above,
+		// but path.Join normalises it to "escape" before fs.ReadDir
+		// or fs.Stat ever sees it. fs.ValidPath rejects *after*
+		// normalisation, so the guard runs on the final value.
+		if !fs.ValidPath(member) {
+			return
+		}
 		// Skip the literal "*" form (un-expandable glob).
 		if strings.HasSuffix(member, "/*") {
 			dir := strings.TrimSuffix(member, "/*")
@@ -56,7 +64,14 @@ func detectWorkspacesImpl(fsys fs.FS) ([]workloadSeed, []string, error) {
 				if !e.IsDir() {
 					continue
 				}
-				add(path.Join(dir, e.Name()), src)
+				// path.Join normalises, so a directory entry named
+				// ".." would produce a parent-escape; re-validate
+				// before the recursive call.
+				joined := path.Join(dir, e.Name())
+				if !fs.ValidPath(joined) {
+					continue
+				}
+				add(joined, src)
 			}
 			return
 		}
