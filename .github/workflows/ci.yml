@@ -766,7 +766,11 @@ jobs:
           mkdir -p coverage
           # -covermode=atomic is required for accurate concurrency coverage;
           # standard idiom for any package exercising goroutines.
-          go test -race -count=1 -coverprofile=coverage/cover.out -covermode=atomic ./...
+          # -timeout=15m: ./cmd/e2e under -race + coverage races the 10m Go
+          # default ceiling (memory cmd-e2e-coverage-timeout-edge.md). The
+          # dedicated `e2e` job is the canonical gate; this profile only
+          # needs to land the .out file for Codecov + the pkg/state gate.
+          go test -race -count=1 -timeout=15m -coverprofile=coverage/cover.out -covermode=atomic ./...
 
       - name: pkg/state coverage gate
         # Re-runs the focused profile and fails the job if the package

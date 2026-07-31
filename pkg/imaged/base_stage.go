@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -274,3 +277,134 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 	}
 	return nil
 }
+
+// RuntimeBaseRef pairs a runtime id with its default OCI ref and the
+// env-var name an operator may use to override that ref with a digest-
+// pinned value. Used by DefaultRuntimeBaseRefs to drive imaged's
+// startup auto-stage loop (Tier 1 PR 2, ADR-052).
+type RuntimeBaseRef struct {
+	// Runtime is the apps.runtime constant the function deploy stores
+	// in the database (e.g. "node24"). It is also the base key's path
+	// component: sched.BaseKeyForArch(runtime, arch) →
+	// "base/runner-<runtime>-<arch>.ext4".
+	Runtime string
+	// Ref is the default OCI ref for the runtime base. The `:latest`
+	// default is correct for dev (a fresh box auto-pulls whatever the
+	// registry currently serves); production must override via
+	// EnvOverride because a deploy keyed to today's `:latest` will
+	// silently resolve to tomorrow's image on the next cold-boot.
+	Ref string
+	// EnvOverride is the operator-facing env-var name (e.g.
+	// "FAAS_DEPLOY_BASE_REF_NODE24"). When the env var is set the
+	// override MUST be digest-pinned (oci.ParseReference.Digest != "")
+	// — a tag-only override aborts imaged's startup loop with a
+	// fail-loud error, the same posture the deploy-base-ref gate uses
+	// in cmd/imaged/main.go.
+	EnvOverride string
+}
+
+// DefaultRuntimeBaseRefs is the canonical runtime → OCI-base mapping
+// for every supported function runtime. The table is the Tier 1 PR 2
+// analog of the older FAAS_BUILDER_BASE_REF knob: a single seeded map
+// replaces the per-runtime staging recipe. Adding a new runtime means
+// adding a row here, mirroring the matrix pins at
+// pkg/imaged/handler_test.go (TestBaseRefFor_Runtimes /
+// TestBuildFunctionLayer_Runtimes / TestMissingRunnerFailsLoud).
+//
+// go124-alpine shares the go124 runner shim but is on a different
+// base image (musl vs glibc). It gets its own row because the OCI
+// ref is distinct (BaseRefGo124Alpine) and the staged ext4 sits under
+// its own key (`base/runner-go124-alpine-<arch>.ext4`), even though
+// the build/run path at function-deploy time reuses go124's runner
+// binary.
+var DefaultRuntimeBaseRefs = []RuntimeBaseRef{
+	{Runtime: RuntimeNode22, Ref: BaseRefNode22, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE22"},
+	{Runtime: RuntimePython312, Ref: BaseRefPython312, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON312"},
+	{Runtime: RuntimeGo124, Ref: BaseRefGo124, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124"},
+	{Runtime: RuntimeGo124Alpine, Ref: BaseRefGo124Alpine, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124_ALPINE"},
+	{Runtime: RuntimeNode24, Ref: BaseRefNode24, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE24"},
+	{Runtime: RuntimePython313, Ref: BaseRefPython313, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON313"},
+}
+
+// EnsureBasesResult reports what EnsureBases did for a single runtime
+// row. Used by the imaged-ready log line so the §12 dashboard sees a
+// per-runtime summary at startup (skip vs rebuild, observed digest).
+type EnsureBasesResult struct {
+	// Runtime is the apps.runtime constant the row belongs to.
+	Runtime string
+	// Ref is the OCI ref that was actually staged (defaults from the
+	// table, overridden via EnvOverride when set).
+	Ref string
+	// ConfigDigest is the OCI config digest the staged ext4 was built
+	// from (empty only when the row was rejected pre-stage, e.g. a
+	// non-digest EnvOverride).
+	ConfigDigest string
+	// Skipped is true when the digest sidecar matched and the
+	// existing artifact was left untouched.
+	Skipped bool
+}
+
+// EnsureBases iterates DefaultRuntimeBaseRefs and stages every runtime
+// base at imaged startup, mirroring the builder-base auto-stage that
+// pre-dates this PR. The first non-skip, non-EnvOverride-validate
+// failure aborts the loop — half-staged fleet is worse than refuse,
+// because a partial staging of N-1 runtimes would silently omit one
+// runtime on the customer's first wake.
+//
+// Per-row idempotency and digest-pin handling is identical to the
+// builder-base path: the digest sidecar short-circuits rebuilds when
+// the OCI ref is unchanged (digest match → Skipped=true), and an
+// operator EnvOverride set to a tag-only ref (no `Digest` in
+// oci.ParseReference) fails loud before any layer is pulled.
+//
+// The legacy pre-PR operator recipe ("docker build + mkfs.ext4 + scp
+// to /srv/fc/base/runner-<rt>.ext4") is preserved by docs/runtimes/*.md
+// for boxes that haven't upgraded imaged yet — the auto-stage path is
+// strictly additive.
+func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBaseRef, envLookup func(string) string) ([]EnsureBasesResult, error) {
+	if arch == "" {
+		return nil, errors.New("imaged: EnsureBases: empty arch")
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	if envLookup == nil {
+		envLookup = os.Getenv
+	}
+	out := make([]EnsureBasesResult, 0, len(refs))
+	for _, row := range refs {
+		ref := row.Ref
+		if v := strings.TrimSpace(envLookup(row.EnvOverride)); v != "" {
+			// Operator wants this runtime pinned. Reject tag-only
+			// overrides before any byte is pulled — a deploy keyed
+			// to a today-stable digest would silently resolve to
+			// whatever `:v2` or `:latest` the registry serves
+			// tomorrow, and a cold-boot in two weeks would rebuild
+			// the fleet base against the new bytes. This is the
+			// same posture the deploy-base-ref gate uses
+			// (cmd/imaged/main.go).
+			parsed, perr := oci.ParseReference(v)
+			if perr != nil || parsed.Digest == "" {
+				return nil, fmt.Errorf("imaged: %s=%q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", row.EnvOverride, v)
+			}
+			ref = v
+		}
+		baseKey := sched.BaseKeyForArch(row.Runtime, arch)
+		digestKey := sched.BaseDigestKeyForArch(row.Runtime, arch)
+		outImage := sched.BaseKeyForArch(row.Runtime, arch) // LocalStorageBackend joins under FAAS_STORAGE_ROOT
+		res, err := h.EnsureBaseExt4(ctx, ref, baseKey, digestKey, outImage)
+		if err != nil {
+			return nil, fmt.Errorf("imaged: stage runtime base %s (%s → %s): %w", row.Runtime, ref, baseKey, err)
+		}
+		out = append(out, EnsureBasesResult{
+			Runtime:      row.Runtime,
+			Ref:          ref,
+			ConfigDigest: res.ConfigDigest,
+			Skipped:      res.Skipped,
+		})
+	}
+	return out, nil
+}
+
+// envLookup nil-falls-back to os.Getenv; the test seam is a map
+// literal (TestEnsureBases_OperatorOverride_*).

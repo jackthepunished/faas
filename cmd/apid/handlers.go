@@ -98,9 +98,9 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if typ != state.AppTypeApp && typ != state.AppTypeFunction {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Invalid type", "type must be app or function")
 	}
-	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" && req.Runtime != "go124" && req.Runtime != "go124-alpine" {
+	if typ == state.AppTypeFunction && req.Runtime != "node22" && req.Runtime != "python312" && req.Runtime != "go124" && req.Runtime != "go124-alpine" && req.Runtime != "node24" && req.Runtime != "python313" {
 		return state.App{}, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-			"Invalid runtime", "functions require runtime node22, python312, go124, or go124-alpine")
+			"Invalid runtime", "functions require runtime node22, python312, go124, go124-alpine, node24, or python313")
 	}
 	ram := req.RAMMB
 	if ram == 0 {

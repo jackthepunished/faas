@@ -8,7 +8,7 @@
 export type CreateAppRequest = {
   slug: string;
   type?: 'app' | 'function';
-  runtime?: 'node22' | 'python312' | 'go124';
+  runtime?: 'node22' | 'python312' | 'go124' | 'go124-alpine' | 'node24' | 'python313';
   ram_mb?: number;
   max_concurrency?: number;
   idle_timeout_s?: number;

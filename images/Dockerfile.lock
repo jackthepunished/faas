@@ -64,6 +64,26 @@
       "platform": "linux/amd64",
       "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
       "pinned_in_dockerfile": "FROM golang:1.24-alpine@sha256:REPLACE_ME_AT_MERGE_TIME"
+    },
+    {
+      "dockerfile": "images/runner-node24.Dockerfile",
+      "instruction": "FROM",
+      "alias": "node:24-bookworm-slim",
+      "resolved_repo": "docker.io/library/node",
+      "resolved_tag": "24-bookworm-slim",
+      "platform": "linux/amd64",
+      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
+      "pinned_in_dockerfile": "FROM node:24-bookworm-slim@sha256:REPLACE_ME_AT_MERGE_TIME"
+    },
+    {
+      "dockerfile": "images/runner-python313.Dockerfile",
+      "instruction": "FROM",
+      "alias": "python:3.13-slim-bookworm",
+      "resolved_repo": "docker.io/library/python",
+      "resolved_tag": "3.13-slim-bookworm",
+      "platform": "linux/amd64",
+      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
+      "pinned_in_dockerfile": "FROM python:3.13-slim-bookworm@sha256:REPLACE_ME_AT_MERGE_TIME"
     }
   ]
 }

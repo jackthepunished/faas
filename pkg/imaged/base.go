@@ -23,19 +23,26 @@ const (
 	BaseRefPython312   = "ghcr.io/onebox-faas/runner-python312:latest"
 	BaseRefGo124       = "ghcr.io/onebox-faas/runner-go124:latest"
 	BaseRefGo124Alpine = "ghcr.io/onebox-faas/runner-go124-alpine:latest"
+	BaseRefNode24      = "ghcr.io/onebox-faas/runner-node24:latest"
+	BaseRefPython313   = "ghcr.io/onebox-faas/runner-python313:latest"
 	BaseRefMinimal     = "ghcr.io/onebox-faas/base-minimal:latest"
 	BaseRefBuilder     = "ghcr.io/onebox-faas/builder-base:latest"
 
 	// Runtime names are the values stored on state.App.Runtime. They map
-	// 1:1 to the runner shims in guest/runners/{node22,python312,go124}.
+	// 1:1 to the runner shims in
+	// guest/runners/{node22,python312,go124,node24,python313}.
 	// go124-alpine reuses the go124 runner shim against a musl base
 	// (images/runner-go124-alpine.Dockerfile); libc only differs.
-	// Naming them as constants keeps the baseRefFor switch and the
-	// production callers (cmd/imaged's deploy path) in lockstep.
+	// node24 uses /app/node24.js (versioned); python313 stays on the
+	// version-neutral /app/handler.py. Naming them as constants keeps
+	// the baseRefFor switch and the production callers (cmd/imaged's
+	// deploy path) in lockstep.
 	RuntimeNode22      = "node22"
 	RuntimePython312   = "python312"
 	RuntimeGo124       = "go124"
 	RuntimeGo124Alpine = "go124-alpine"
+	RuntimeNode24      = "node24"
+	RuntimePython313   = "python313"
 )
 
 // StatefulBaseImageDenylist is the Wave 0 / year-one set of OCI image
@@ -214,6 +221,10 @@ func baseRefFor(runtime string) string {
 		return BaseRefGo124
 	case RuntimeGo124Alpine:
 		return BaseRefGo124Alpine
+	case RuntimeNode24:
+		return BaseRefNode24
+	case RuntimePython313:
+		return BaseRefPython313
 	default:
 		return BaseRefMinimal
 	}

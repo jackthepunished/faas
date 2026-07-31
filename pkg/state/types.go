@@ -183,7 +183,7 @@ type App struct {
 	AccountID      string
 	Slug           string
 	Type           AppType
-	Runtime        string // node22|python312|go124|go124-alpine for functions
+	Runtime        string // node22|python312|go124|go124-alpine|node24|python313 for functions
 	RAMMB          int
 	IdleTimeoutS   int // 0 => plan default
 	MaxConcurrency int

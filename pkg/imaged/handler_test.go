@@ -1097,6 +1097,8 @@ func TestBaseRefFor_Runtimes(t *testing.T) {
 		{"python312 → python312 base", RuntimePython312, BaseRefPython312},
 		{"go124 → go124 base (PR #201 row)", RuntimeGo124, BaseRefGo124},
 		{"go124-alpine → go124-alpine base (Tier 2 PR row)", RuntimeGo124Alpine, BaseRefGo124Alpine},
+		{"node24 → node24 base (Tier 1 PR 1 row)", RuntimeNode24, BaseRefNode24},
+		{"python313 → python313 base (Tier 1 PR 1 row)", RuntimePython313, BaseRefPython313},
 		{"empty runtime → minimal base", "", BaseRefMinimal},
 		{"unknown runtime → minimal base", "ruby33", BaseRefMinimal},
 	}
@@ -1125,6 +1127,8 @@ func TestRunnerPathFor_Runtimes(t *testing.T) {
 		{"python312 → python312Path", func(h *Handler) { h.WithFunctionRunnerPython312("/runners/python312") }, RuntimePython312, "/runners/python312"},
 		{"go124 → go124Path (PR #201 row)", func(h *Handler) { h.WithFunctionRunnerGo124("/runners/go124") }, RuntimeGo124, "/runners/go124"},
 		{"go124-alpine → go124AlpinePath (Tier 2 PR row)", func(h *Handler) { h.WithFunctionRunnerGo124Alpine("/runners/go124-alpine") }, RuntimeGo124Alpine, "/runners/go124-alpine"},
+		{"node24 → node24Path (Tier 1 PR 1 row)", func(h *Handler) { h.WithFunctionRunnerNode24("/runners/node24") }, RuntimeNode24, "/runners/node24"},
+		{"python313 → python313Path (Tier 1 PR 1 row)", func(h *Handler) { h.WithFunctionRunnerPython313("/runners/python313") }, RuntimePython313, "/runners/python313"},
 		{"empty runtime → \"\"", func(h *Handler) {}, "", ""},
 		{"unknown runtime → \"\"", func(h *Handler) {}, "ruby33", ""},
 	}
@@ -1155,6 +1159,8 @@ func TestRuntimeToEnvSuffix_Runtimes(t *testing.T) {
 		{"python312 → PYTHON312", RuntimePython312, "PYTHON312"},
 		{"go124 → GO124 (PR #201 row)", RuntimeGo124, "GO124"},
 		{"go124-alpine → GO124_ALPINE (Tier 2 PR row)", RuntimeGo124Alpine, "GO124_ALPINE"},
+		{"node24 → NODE24 (Tier 1 PR 1 row)", RuntimeNode24, "NODE24"},
+		{"python313 → PYTHON313 (Tier 1 PR 1 row)", RuntimePython313, "PYTHON313"},
 		{"unknown runtime → unchanged", "ruby33", "ruby33"},
 	}
 	for _, tc := range cases {
@@ -1220,6 +1226,27 @@ func TestBuildFunctionLayer_Runtimes(t *testing.T) {
 			runnerPath:  "/runners/go124-alpine",
 			handlerPath: "/app/handler",
 			wire:        func(h *Handler) { h.WithFunctionRunnerGo124Alpine("/runners/go124-alpine") },
+		},
+		{
+			// Tier 1 PR 1 row: node24 mirrors node22 with a
+			// versioned handler filename. The runner shim is the
+			// same `node` binary; the underlying Node version is
+			// bound by images/runner-node24.Dockerfile (PR 2).
+			name:        "node24",
+			runtime:     RuntimeNode24,
+			runnerPath:  "/runners/node24",
+			handlerPath: "/app/node24.js",
+			wire:        func(h *Handler) { h.WithFunctionRunnerNode24("/runners/node24") },
+		},
+		{
+			// Tier 1 PR 1 row: python313 stays version-neutral on
+			// the handler filename, matching python312's /app/handler.py.
+			// Only --runtime differs in argv.
+			name:        "python313",
+			runtime:     RuntimePython313,
+			runnerPath:  "/runners/python313",
+			handlerPath: "/app/handler.py",
+			wire:        func(h *Handler) { h.WithFunctionRunnerPython313("/runners/python313") },
 		},
 	}
 	for _, tc := range cases {
@@ -1298,6 +1325,8 @@ func TestBuildFunctionLayer_MissingRunnerFailsLoud(t *testing.T) {
 		{"python312", RuntimePython312, "FAAS_FUNCTION_RUNNER_PYTHON312"},
 		{"go124 (PR #201 row)", RuntimeGo124, "FAAS_FUNCTION_RUNNER_GO124"},
 		{"go124-alpine (Tier 2 PR row)", RuntimeGo124Alpine, "FAAS_FUNCTION_RUNNER_GO124_ALPINE"},
+		{"node24 (Tier 1 PR 1 row)", RuntimeNode24, "FAAS_FUNCTION_RUNNER_NODE24"},
+		{"python313 (Tier 1 PR 1 row)", RuntimePython313, "FAAS_FUNCTION_RUNNER_PYTHON313"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

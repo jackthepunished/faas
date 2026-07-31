@@ -38,6 +38,14 @@ const (
 	// (commands2.go) so goconst stops flagging them.
 	svcGithub = "github"
 
+	// defaultTemplateHandler is the `handler.handler` value the
+	// function-* templates force into `--handler` (the wire field
+	// carries the customer's tarball stem, not the in-VM filename;
+	// imaged's function-layer manifest rewrites it to /app/node*.js
+	// or /app/handler.py at deploy time). Reused across node22,
+	// node24, python312, python313 so goconst doesn't trip.
+	defaultTemplateHandler = "handler.handler"
+
 	// appSlugFallback is the placeholder slug sanitizeSlugForURL
 	// returns when the input is entirely garbage (all stripped).
 	// Lifted out of the literal so goconst stops flagging the
@@ -262,7 +270,7 @@ func cmdDeployTarball(args []string) int {
 	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
 	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
-	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine)")
+	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
 	if err := fs.Parse(args); err != nil {
@@ -296,11 +304,29 @@ func cmdDeployTarball(args []string) int {
 		}
 		switch *templateName {
 		case "function-node":
+			// Default Node runtime is node22 (per docs/runtimes/go124.md
+			// tier-1 stance: no default-flip in the same PR that adds a
+			// new runtime). Use function-node24 for the Node 24 variant.
 			*runtime = "node22"
-			*handler = "handler.handler"
+			*handler = defaultTemplateHandler
+		case "function-node24":
+			// Tier 1 PR 1 row: parallel to function-node, runtime is
+			// node24 (Node 24 LTS). The handler filename
+			// convention is the same; imaged's function-layer
+			// manifest sets `--handler /app/node24.js`.
+			*runtime = "node24"
+			*handler = defaultTemplateHandler
 		case "function-python":
+			// Default Python runtime is python312 (no default-flip in
+			// Tier 1; python313 stays opt-in via function-python313).
 			*runtime = "python312"
-			*handler = "handler.handler"
+			*handler = defaultTemplateHandler
+		case "function-python313":
+			// Tier 1 PR 1 row: parallel to function-python, runtime
+			// is python313. Handler filename is identical
+			// (/app/handler.py in the microVM, version-neutral).
+			*runtime = "python313"
+			*handler = defaultTemplateHandler
 		case "function-go":
 			// The customer's handler is a static Go binary; the
 			// --handler wire field is vestigial for go124 (the imaged

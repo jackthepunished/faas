@@ -10,6 +10,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/storage"
 )
 
@@ -432,3 +433,230 @@ func (b *brokenManifestPuller) PullManifest(_ context.Context, _ string) (oci.Ma
 func (b *brokenManifestPuller) PullBlob(_ context.Context, _, _ string) (io.ReadCloser, error) {
 	return nil, b.manifestErr
 }
+
+// TestEnsureBases_AllRowsStage walks DefaultRuntimeBaseRefs end-to-end:
+// every row produces a StorageKey distinct from every other row, the
+// digest sidecar matches, and the per-row summary's Skipped=false on
+// the first run. The matrix here is the Tier 1 PR 2 lock-step pin —
+// if a future runtime is added to DefaultRuntimeBaseRefs without
+// matching it here, TestDefaultRuntimeBaseRefs_HasExpectedRuntimes
+// (below) catches the drift at unit-test speed. Pinned by ADR-052.
+func TestEnsureBases_AllRowsStage(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+
+	results, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	if err != nil {
+		t.Fatalf("EnsureBases: %v", err)
+	}
+	if len(results) != len(DefaultRuntimeBaseRefs) {
+		t.Fatalf("results = %d rows, want %d", len(results), len(DefaultRuntimeBaseRefs))
+	}
+	keysSeen := map[string]bool{}
+	for i, r := range results {
+		if r.Runtime != DefaultRuntimeBaseRefs[i].Runtime {
+			t.Errorf("row %d runtime = %q, want %q", i, r.Runtime, DefaultRuntimeBaseRefs[i].Runtime)
+		}
+		if r.ConfigDigest == "" {
+			t.Errorf("row %d (%s) ConfigDigest empty", i, r.Runtime)
+		}
+		if r.Skipped {
+			t.Errorf("row %d (%s) Skipped=true on first run, want false", i, r.Runtime)
+		}
+		baseKey := sched.BaseKeyForArch(r.Runtime, "amd64")
+		if _, err := hs.be.Get(context.Background(), baseKey); err != nil {
+			t.Errorf("ext4 missing at %s for runtime %s: %v", baseKey, r.Runtime, err)
+		}
+		if keysSeen[baseKey] {
+			t.Errorf("duplicate baseKey across rows: %s", baseKey)
+		}
+		keysSeen[baseKey] = true
+		digestKey := sched.BaseDigestKeyForArch(r.Runtime, "amd64")
+		if _, err := hs.be.Get(context.Background(), digestKey); err != nil {
+			t.Errorf("digest sidecar missing at %s for runtime %s: %v", digestKey, r.Runtime, err)
+		}
+		// digestsSeen is intentionally NOT checked here — in this
+		// fake-driven test, every row's puller returns the same
+		// fixture manifest, so the config digest is identical across
+		// rows. In production, distinct image refs produce distinct
+		// OCI config digests; the per-row StorageKey's distinctness
+		// (above) is the load-bearing property, not config digest.
+	}
+}
+
+// TestEnsureBases_OperatorOverride_DigestPinnedWins — when an operator
+// sets FAAS_DEPLOY_BASE_REF_<RUNTIME> to a digest-pinned ref, that
+// ref is used (not the default). The test exercises the env-lookup
+// seam with a hard-coded map; the nil-fallback to os.Getenv is the
+// production wiring.
+func TestEnsureBases_OperatorOverride_DigestPinnedWins(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+	const overrideRuntime = RuntimeNode24
+	const overrideRef = "ghcr.io/onebox-faas/runner-node24@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	env := map[string]string{"FAAS_DEPLOY_BASE_REF_NODE24": overrideRef}
+	lookup := func(k string) string { return env[k] }
+	refs := DefaultRuntimeBaseRefs
+	results, err := hs.h.EnsureBases(context.Background(), "amd64", refs, lookup)
+	if err != nil {
+		t.Fatalf("EnsureBases: %v", err)
+	}
+	var saw bool
+	for _, r := range results {
+		if r.Runtime == overrideRuntime {
+			saw = true
+			if r.Ref != overrideRef {
+				t.Errorf("Ref = %q, want override %q", r.Ref, overrideRef)
+			}
+		} else {
+			if r.Ref == overrideRef {
+				t.Errorf("override %q leaked into row %s", overrideRef, r.Runtime)
+			}
+		}
+	}
+	if !saw {
+		t.Fatalf("override row %s missing from results", overrideRuntime)
+	}
+}
+
+// TestEnsureBases_OperatorOverride_TagOnlyFailsLoud — a tag-only
+// override (`node24:latest`, no digest) aborts imaged startup before
+// any layer is pulled. The same posture cmd/imaged applies to
+// FAAS_DEPLOY_BASE_REF (deploy-time base ref). Pinned by ADR-052.
+func TestEnsureBases_OperatorOverride_TagOnlyFailsLoud(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+	env := map[string]string{"FAAS_DEPLOY_BASE_REF_NODE24": "ghcr.io/onebox-faas/runner-node24:latest"}
+	lookup := func(k string) string { return env[k] }
+	_, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, lookup)
+	if err == nil {
+		t.Fatal("tag-only EnvOverride should fail-loud before any byte is pulled")
+	}
+	if !strings.Contains(err.Error(), "digest-pinned") {
+		t.Errorf("error %q must mention 'digest-pinned'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "FAAS_DEPLOY_BASE_REF_NODE24") {
+		t.Errorf("error %q must name the operator-facing env var", err.Error())
+	}
+}
+
+// TestEnsureBases_SkipsOnDigestMatch — second call returns Skipped=true
+// for every row when the digest sidecar matches. Inherits the same
+// idempotency contract as EnsureBaseExt4's skip path.
+func TestEnsureBases_SkipsOnDigestMatch(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+	first, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	if err != nil {
+		t.Fatalf("first EnsureBases: %v", err)
+	}
+	second, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	if err != nil {
+		t.Fatalf("second EnsureBases: %v", err)
+	}
+	for i, r := range second {
+		if !r.Skipped {
+			t.Errorf("row %d (%s) Skipped=false on second run, want true (digest match)", i, r.Runtime)
+		}
+	}
+	if len(first) != len(second) {
+		t.Errorf("first/second row counts mismatch: %d vs %d", len(first), len(second))
+	}
+}
+
+// TestEnsureBases_FailsLoudOnPullError — a broken puller aborts the loop;
+// no partial-staged fleet. The test asserts the err path bubble-up
+// preserves the underlying registry error so the operator can
+// diagnose without grepping the source.
+func TestEnsureBases_FailsLoudOnPullError(t *testing.T) {
+	bad := &brokenManifestPuller{manifestErr: errors.New("connection refused")}
+	be, _ := storage.NewLocalStorageBackend(t.TempDir())
+	h := &Handler{
+		oci:     bad,
+		builder: &fakeBuilder{},
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
+	}
+	_, err := h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	if err == nil {
+		t.Fatal("EnsureBases must fail on a broken puller")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error %q must preserve 'connection refused' from registry", err.Error())
+	}
+	if !strings.Contains(err.Error(), "stage runtime base") {
+		t.Errorf("error %q must annotate which runtime row failed (got %q)", err.Error(), err.Error())
+	}
+}
+
+// TestEnsureBases_EmptyArchRejected — boundary check.
+func TestEnsureBases_EmptyArchRejected(t *testing.T) {
+	be, _ := storage.NewLocalStorageBackend(t.TempDir())
+	h := &Handler{
+		oci:      &minimalManifestPuller{},
+		builder:  &fakeBuilder{},
+		log:      silentLogger(),
+		storage:  be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) { return map[string]int{}, nil },
+	}
+	if _, err := h.EnsureBases(context.Background(), "", DefaultRuntimeBaseRefs, nil); err == nil {
+		t.Error("empty arch should error")
+	}
+}
+
+// TestEnsureBases_NilRefsIsNoOp — convenience: passing nil refs
+// returns (nil, nil) so cmd/imaged can guard an "env-disabled" mode
+// without a separate nil check. (DefaultRuntimeBaseRefs is never
+// nil in production; the path is here for test seam only.)
+func TestEnsureBases_NilRefsIsNoOp(t *testing.T) {
+	be, _ := storage.NewLocalStorageBackend(t.TempDir())
+	h := &Handler{
+		oci:      &minimalManifestPuller{},
+		builder:  &fakeBuilder{},
+		log:      silentLogger(),
+		storage:  be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) { return map[string]int{}, nil },
+	}
+	if r, err := h.EnsureBases(context.Background(), "amd64", nil, nil); err != nil || r != nil {
+		t.Errorf("nil refs → (%v, %v), want (nil, nil)", r, err)
+	}
+}
+
+// TestDefaultRuntimeBaseRefs_HasExpectedRuntimes — the per-runtime
+// set in DefaultRuntimeBaseRefs must match the supported runtime enum
+// (apps.runtime CHECK after migrations/00075). A drift here means a
+// runtime was added but its base isn't auto-staged, or a removed
+// runtime's row wasn't deleted; either trips Tier 1 PR 2's load-bearing
+// promise of "every runtime base auto-stages on imaged startup".
+func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
+	want := []string{
+		RuntimeNode22, RuntimeNode24,
+		RuntimePython312, RuntimePython313,
+		RuntimeGo124, RuntimeGo124Alpine,
+	}
+	if len(DefaultRuntimeBaseRefs) != len(want) {
+		t.Fatalf("DefaultRuntimeBaseRefs = %d rows, want %d", len(DefaultRuntimeBaseRefs), len(want))
+	}
+	seen := map[string]bool{}
+	for i, r := range DefaultRuntimeBaseRefs {
+		seen[r.Runtime] = true
+		if r.Ref == "" {
+			t.Errorf("row %d (%s) Ref empty", i, r.Runtime)
+		}
+		if r.EnvOverride == "" {
+			t.Errorf("row %d (%s) EnvOverride empty", i, r.Runtime)
+		}
+	}
+	for _, rt := range want {
+		if !seen[rt] {
+			t.Errorf("runtime %s missing from DefaultRuntimeBaseRefs; check that migrations/00075 + pkg/imaged/base.go + base_stage.go are in lockstep", rt)
+		}
+	}
+}
+
+// schedBaseKeyForArch is removed; tests use pkg/sched.BaseKeyForArch
+// / BaseDigestKeyForArch directly so the key format is sourced from
+// the same constant the production code reads.
