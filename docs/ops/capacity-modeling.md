@@ -144,12 +144,14 @@ ledger honours the per-row value (`pkg/sched/admission.go:156-159`).
 `PerNodeVCPUSlots` lands:
 
 ```
-Σ vCPU used ≤ VCPUSlots = 160   (cluster-wide today)
+max(Σ vCPU used over all nodes) ≤ VCPUSlots = 160   (cluster-wide today)
 ```
 
 A heterogeneous fleet shares the same 160-slot pool. The
 `NodeLedger.UsedVCPU()` aggregate returns the global sum
-(`admission.go:333-337`).
+(`admission.go:333-337`). A node holding more than its share
+cannot escape the global budget because the cap is on the sum,
+not per-node.
 
 ### Per-app concurrency stays global
 

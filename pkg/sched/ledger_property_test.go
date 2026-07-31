@@ -213,10 +213,24 @@ func checkLedgerInvariantsForNodes(t *testing.T, l *NodeLedger, step int, fleet 
 	// Cluster total Σ(ram_mb + 8) is bounded by Σ(node.AdmissionCeilingMB)
 	// on a multi-node fleet — NOT by api.RAMAdmissionCeilingMB. The
 	// single-node property test pins the legacy posture; the
-	// multi-node property test pins the cluster-sum posture via
-	// per-node checks above, so this global assertion stays as a
-	// safety net rather than the load-bearing check.
-	if len(fleet) == 0 && residentRAM > api.RAMAdmissionCeilingMB { // §6.2-2
+	// multi-node property test pins the cluster-sum posture. The
+	// per-node check above is the load-bearing assertion (it
+	// catches the actual bug); this cluster-sum check is a
+	// cheap defence-in-depth sanity net for any regression
+	// that bypasses the per-node ceiling while still
+	// admitting — e.g. a refactor that splits the ceiling
+	// check across two functions and one branch is missed.
+	if len(fleet) > 0 {
+		var clusterCeiling int
+		for _, n := range fleet {
+			clusterCeiling += n.admissionCeilingMB
+		}
+		if residentRAM > clusterCeiling { // §6.2-2 cluster-sum
+			t.Fatalf("step %d: cluster residentRAM=%d breached Σ(node.AdmissionCeilingMB)=%d",
+				step, residentRAM, clusterCeiling)
+		}
+	}
+	if len(fleet) == 0 && residentRAM > api.RAMAdmissionCeilingMB { // §6.2-2 single-node
 		t.Fatalf("step %d: residentRAM=%d breached admission ceiling %d",
 			step, residentRAM, api.RAMAdmissionCeilingMB)
 	}
@@ -291,19 +305,23 @@ var propFleet = [][]propNode{
 func FuzzLedgerInvariantsMultiNode(f *testing.F) {
 	// Seeds cover the canonical fleet shapes plus a churn pattern
 	// and a burst that pushes toward the per-node ceiling. The
-	// first byte encodes the fleet index (mask 0x03); the
-	// remaining bytes are operations against that fleet.
+	// first byte's HIGH bits encode the fleet index (mask 0xC0;
+	// shifted right 6); the LOW bits of subsequent bytes are
+	// operations against that fleet. High-bit encoding avoids
+	// colliding with applyOp's bit 0-1 (action) and bit 2-3
+	// (app) — the first byte's low bits are reserved for fleet
+	// index, not actions, so we strip it before the op loop.
 	f.Add([]byte{0x00, 0x00, 0x04, 0x08, 0x0c})                         // N=1, mirror FuzzLedgerInvariants seed
-	f.Add([]byte{0x04, 0x00, 0x04, 0x08, 0x0c})                         // N=2
-	f.Add([]byte{0x08, 0x00, 0x04, 0x08, 0x0c})                         // N=4
-	f.Add([]byte{0x04, 0x00, 0x40, 0x80, 0x00, 0x40, 0x80})             // N=2 churn
-	f.Add([]byte{0x08, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70}) // N=4 fan-out
+	f.Add([]byte{0x40, 0x00, 0x04, 0x08, 0x0c})                         // N=2
+	f.Add([]byte{0x80, 0x00, 0x04, 0x08, 0x0c})                         // N=4
+	f.Add([]byte{0x40, 0x00, 0x40, 0x80, 0x00, 0x40, 0x80})             // N=2 churn
+	f.Add([]byte{0x80, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70}) // N=4 fan-out
 
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		if len(ops) == 0 {
 			return
 		}
-		fleetIdx := int(ops[0]&0x03) % len(propFleet)
+		fleetIdx := (int(ops[0]>>6) & 0x03) % len(propFleet)
 		fleet := propFleet[fleetIdx]
 		ops = ops[1:]
 		l := NewNodeLedger()
@@ -362,99 +380,15 @@ func applyOpMultiNode(l *NodeLedger, b byte, fleet []propNode) {
 }
 
 // TestNodeLedger_PerNodeCeiling_AdmitRefusesOverflowingNode pins
-// the per-node ceiling's independence from the global
-// api.RAMAdmissionCeilingMB constant (issue #297 acceptance item 5).
+// the per-node ceiling's enforcement at the smaller end: a
+// compute node with a sub-global constant ceiling refuses
+// admission once the ceiling is reached (issue #297 acceptance
+// item 5, scenario 2).
 //
-// Two scenarios:
-//
-//  1. Two nodes at 23,800 MB each (cluster ceiling = 47,600 MB,
-//     matching the global constant). Fill node 0 to its ceiling,
-//     verify node 1 still admits. A future refactor that mistakenly
-//     folds the global 47,600 MB cap into the per-node Admit
-//     would fail here — node 0 admits up to 23,800 MB, the
-//     cluster sum is 23,800 MB (well under 47,600 MB), and the
-//     fold collapses the math in a way that doesn't surface.
-//
-//  2. A single node at 12,000 MB ceiling (smaller than the
-//     global constant). Verify a 12,000 MB+1 admission is refused
-//     even though the cluster total is well under 47,600 MB. This
-//     pins the per-node ceiling's non-triviality: a node with a
-//     smaller ceiling enforces that smaller cap, regardless of
-//     how much cluster-wide headroom remains.
-//
-// Together, these two assertions pin the property that the
-// per-node ceiling is enforced independently of the global
-// api.RAMAdmissionCeilingMB constant.
+// The complementary "two nodes admit independently" property
+// (scenario 1 — per-node ceilings don't cross-talk) is pinned by
+// TestNodeLedger_PerNodeCeiling_TwoNodesAdmitIndependently below.
 func TestNodeLedger_PerNodeCeiling_AdmitRefusesOverflowingNode(t *testing.T) {
-	t.Run("two_nodes_at_half_global_ceiling", func(t *testing.T) {
-		// Scenario 1: two nodes, each at half the global ceiling.
-		// Cluster ceiling matches the global constant. We use
-		// distinct appIDs per node so the per-app concurrency
-		// cap (scale=20) doesn't trip the per-node ceiling at
-		// half the global constant — the assertion is about
-		// the per-node ceiling's independence, not the
-		// per-app cap.
-		//
-		// We don't need to fill node-0 to its ceiling. What
-		// matters is that the per-node resident is bounded by
-		// the per-node ceiling (NOT the global constant) AND
-		// a different node admits cleanly even when one node
-		// is partially full. The invariant: per-node ceilings
-		// are enforced independently per node.
-		const halfCeiling = 23_800
-		scaleLimits := api.MustLimitsFor(api.PlanScale)
-		l := NewNodeLedger()
-
-		// Fill node-0 up to its per-app concurrency cap (20
-		// for scale); each admit is 1,032 MB billable, so the
-		// per-node resident reaches ~20,640 MB < 23,800 MB.
-		// That exercises the per-node ceiling's path without
-		// overflowing it; the assertion below verifies it.
-		for i := 0; i < scaleLimits.MaxConcurrency; i++ {
-			err := l.Admit(Request{
-				Instance:       fmt.Sprintf("node0-%d", i),
-				AppID:          "node0-app", // distinct appID so per-app cap is freshly applied
-				Plan:           api.PlanScale,
-				RAMMB:          scaleLimits.RAMMB,
-				VCPU:           1, // 1 vCPU each so the global vCPU cap doesn't bite at 20 instances
-				MaxConcurrency: scaleLimits.MaxConcurrency,
-				NodeID:         "node-0",
-				NodeCeilingMB:  halfCeiling,
-			})
-			if err != nil {
-				t.Fatalf("node-0 admit %d refused (err=%v) before per-node ceiling — fixture is wrong", i, err)
-			}
-		}
-		got0 := l.ResidentRAMForNode("node-0")
-		if got0 > halfCeiling {
-			t.Fatalf("node-0 residentRAM=%d breached per-node ceiling %d", got0, halfCeiling)
-		}
-
-		// Now admit on node-1; the cluster is well under the
-		// global 47,600 MB cap (we filled half of one node),
-		// and node-1 has its own 23,800 MB ceiling that's
-		// untouched. The per-node ceiling check inside Admit
-		// must admit normally — a future refactor that
-		// mistakenly folds the global 47,600 MB cap into
-		// the per-node Admit would refuse this.
-		err := l.Admit(Request{
-			Instance:       "node1-0",
-			AppID:          "node1-app", // distinct appID so per-app cap is freshly applied
-			Plan:           api.PlanScale,
-			RAMMB:          scaleLimits.RAMMB,
-			VCPU:           1,
-			MaxConcurrency: scaleLimits.MaxConcurrency,
-			NodeID:         "node-1",
-			NodeCeilingMB:  halfCeiling,
-		})
-		if err != nil {
-			t.Fatalf("node-1 admission refused (err=%v) — per-node ceiling wrongly collides with global constant", err)
-		}
-		if got := l.ResidentRAMForNode("node-1"); got == 0 {
-			t.Fatalf("node-1 residentRAM=0 after successful admit — bookkeeping drift")
-		}
-	})
-
 	t.Run("single_node_ceiling_below_global_constant", func(t *testing.T) {
 		// Scenario 2: a smaller compute node (e.g. a 24 GB box
 		// carrying a 12,000 MB ceiling) refuses admission at
@@ -507,4 +441,68 @@ func TestNodeLedger_PerNodeCeiling_AdmitRefusesOverflowingNode(t *testing.T) {
 			t.Fatalf("expected per-node ceiling refusal; got %v — per-node ceiling not enforced", lastErr)
 		}
 	})
+}
+
+// TestNodeLedger_PerNodeCeiling_TwoNodesAdmitIndependently pins
+// the per-node ceiling's independence from the global
+// api.RAMAdmissionCeilingMB constant (issue #297 acceptance item 5,
+// scenario 1). The two nodes' ceilings sum to the global
+// constant; filling node-0 must not starve node-1, and a
+// future refactor that mistakenly folds the global constant
+// into the per-node Admit (refusing at 47,600 MB instead of
+// the per-row value) would fail here.
+func TestNodeLedger_PerNodeCeiling_TwoNodesAdmitIndependently(t *testing.T) {
+	const halfCeiling = 23_800
+	scaleLimits := api.MustLimitsFor(api.PlanScale)
+	l := NewNodeLedger()
+
+	// Fill node-0 to its per-app concurrency cap (20 for scale);
+	// each admit is 1,032 MB billable, so the per-node resident
+	// reaches ~20,640 MB < 23,800 MB. That exercises the per-node
+	// ceiling's path without overflowing it; the assertion below
+	// verifies the ceiling wasn't crossed.
+	for i := 0; i < scaleLimits.MaxConcurrency; i++ {
+		err := l.Admit(Request{
+			Instance:       fmt.Sprintf("node0-%d", i),
+			AppID:          "node0-app", // distinct appID so per-app cap is freshly applied
+			Plan:           api.PlanScale,
+			RAMMB:          scaleLimits.RAMMB,
+			VCPU:           1, // 1 vCPU each so the global vCPU cap doesn't bite at 20 instances
+			MaxConcurrency: scaleLimits.MaxConcurrency,
+			NodeID:         "node-0",
+			NodeCeilingMB:  halfCeiling,
+		})
+		if err != nil {
+			t.Fatalf("node-0 admit %d refused (err=%v) before per-node ceiling — fixture is wrong", i, err)
+		}
+	}
+	got0 := l.ResidentRAMForNode("node-0")
+	if got0 > halfCeiling {
+		t.Fatalf("node-0 residentRAM=%d breached per-node ceiling %d", got0, halfCeiling)
+	}
+
+	// Now admit on node-1; node-1 has its own 23,800 MB ceiling
+	// that's untouched. The per-node ceiling check inside Admit
+	// must admit normally — a future refactor that mistakenly
+	// folds the global 47,600 MB cap into the per-node Admit
+	// would refuse this on the cluster-sum ground (we'd already
+	// be at 20,640 MB cluster-wide, which is well under 47,600 MB
+	// anyway, but a tighter fold against the cluster sum would
+	// surface here).
+	err := l.Admit(Request{
+		Instance:       "node1-0",
+		AppID:          "node1-app", // distinct appID so per-app cap is freshly applied
+		Plan:           api.PlanScale,
+		RAMMB:          scaleLimits.RAMMB,
+		VCPU:           1,
+		MaxConcurrency: scaleLimits.MaxConcurrency,
+		NodeID:         "node-1",
+		NodeCeilingMB:  halfCeiling,
+	})
+	if err != nil {
+		t.Fatalf("node-1 admission refused (err=%v) — per-node ceiling wrongly collides with global constant", err)
+	}
+	if got := l.ResidentRAMForNode("node-1"); got == 0 {
+		t.Fatalf("node-1 residentRAM=0 after successful admit — bookkeeping drift")
+	}
 }
