@@ -31,10 +31,12 @@ import (
 //   - HMAC-SHA256 keyed by a server-side secret is collision- and
 //     pre-image-resistant in the same way SHA-256 is, but the rainbow
 //     table attack requires the secret to be present. A box-level
-//     secret loaded from host.age (PR #237 precedent) at startup,
-//     never written to the events table, never logged, gives us the
-//     lookup-stability we need for the audit-row join key WITHOUT
-//     the rainbow-table weakness.
+//     secret persisted to /var/lib/faas/audit-hmac.key (mode 0600
+//     root:root) by cmd/apid/main.go loadOrGenerateAuditHMACKey, or
+//     supplied via FAAS_AUDIT_HMAC_KEY env var, never written to the
+//     events table, never logged, gives us the lookup-stability we
+//     need for the audit-row join key WITHOUT the rainbow-table
+//     weakness.
 //   - CodeQL go/weak-sensitive-data-hashing (alert #121) flagged the
 //     SHA-256 form. The HMAC form is the right fix; dismissing the
 //     alert was incorrect.
@@ -83,10 +85,15 @@ var (
 )
 
 // SetHMACSecret wires the per-daemon HMAC key into the package.
-// Called from cmd/apid/main.go at startup, AFTER the host.age
-// identity has been loaded and a domain-separated audit-HMAC key
-// has been derived (HKDF over the identity, info="audit-email-hmac"
-// to keep this domain distinct from any other HMAC use).
+// Called from cmd/apid/main.go at startup with the key loaded by
+// loadOrGenerateAuditHMACKey (env > file > generate). The
+// audit-HMAC key is INDEPENDENT of host.age — rotating host.age
+// does NOT change the audit-HMAC key, and `events.data.email_hash`
+// values are stable across host.age rotations. The HKDF-over-
+// host.age derivation that the previous version of this comment
+// described was never implemented; the actual key material is a
+// freshly-generated 32-byte random key persisted to
+// /var/lib/faas/audit-hmac.key (mode 0600 root:root).
 //
 // A nil or empty key logs a Warn and leaves HashEmail running on a
 // zero-key fallback. The zero-key fallback is functionally

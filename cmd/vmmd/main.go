@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"filippo.io/age"
@@ -207,6 +208,7 @@ type runDeps struct {
 	// (LoadHostKey returns ErrHostKeyNotFound → GenerateAndSaveHostKey)
 	// and restart (LoadHostKey returns id) paths without touching disk.
 	loadHostKey    func(path string) (*age.X25519Identity, error)
+	loadHostKeys   func(dir string) ([]*age.X25519Identity, error)
 	genAndSaveKey  func(path string) (*age.X25519Identity, error)
 	writeRecipient func(path string, id *age.X25519Identity) error
 	// popCounters: PR-E egress-deny poll seam. nil → netns.PopCounters
@@ -278,6 +280,7 @@ func defaultDeps() runDeps {
 		openStore:          state.NewPgStore,
 		detectOverlayIP:    defaultDetectOverlayIP,
 		loadHostKey:        secretbox.LoadHostKey,
+		loadHostKeys:       secretbox.LoadHostKeys,
 		genAndSaveKey:      secretbox.GenerateAndSaveHostKey,
 		writeRecipient:     secretbox.WriteRecipientFile,
 		popCounters:        netns.PopCounters,
@@ -336,6 +339,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if deps.loadHostKey == nil {
 		deps.loadHostKey = secretbox.LoadHostKey
 	}
+	if deps.loadHostKeys == nil {
+		deps.loadHostKeys = secretbox.LoadHostKeys
+	}
 	if deps.genAndSaveKey == nil {
 		deps.genAndSaveKey = secretbox.GenerateAndSaveHostKey
 	}
@@ -381,6 +387,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	)
 	if err != nil {
 		return err
+	}
+
+	// Issue #316 / ADR-057: load BOTH the current AND previous
+	// host.age identities (during the 30-day rotation overlap
+	// window) so the Manager can unseal envelopes sealed under
+	// either key. The first-boot / restart single-identity path
+	// above already wrote host.age.pub from the current identity,
+	// so the apid-side sealing endpoint keeps working unchanged.
+	hostIdentities, err := loadHostIdentities(deps, filepath.Dir(keyPath))
+	if err != nil {
+		return fmt.Errorf("vmmd: load host identities (%s): %w", filepath.Dir(keyPath), err)
 	}
 
 	// Issue #98 / ADR-028: vmmd self-registers in compute_nodes
@@ -462,7 +479,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log,
 		cbm,
 	)
-	mgr.SetHostIdentity(hostID)
+	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's
 	// own WithStorage wiring at line 223 above; the VMM uses
@@ -799,4 +816,30 @@ func loadOrGenerateHostIdentity(deps runDeps, keyPath, pubPath string) (*age.X25
 		return nil, keyPath, pubPath, fmt.Errorf("vmmd: write recipient (%s): %w", pubPath, err)
 	}
 	return id, keyPath, pubPath, nil
+}
+
+// loadHostIdentities loads the multi-identity unseal set for the
+// Manager (issue #316 / ADR-057). During the 30-day rotation
+// overlap window the operator renames host.age → host.age.previous
+// and drops a new host.age; this helper returns the slice
+// [current, previous] so the Manager can pass it to
+// secretbox.OpenMulti and unseal envelopes sealed under either
+// key. Outside the overlap window the slice has length 1 (just
+// the current identity) — same shape as SetHostIdentity(id)
+// modulo a slice allocation.
+//
+// The dir is the parent of the canonical host.age file
+// (e.g. /etc/faas/secrets for the production install). vmmd
+// derives the dir from the FAAS_HOST_KEY_PATH the boot-time
+// loadOrGenerateHostIdentity call already validated, so this
+// helper does not need a separate env-var lookup.
+func loadHostIdentities(deps runDeps, dir string) ([]*age.X25519Identity, error) {
+	ids, err := deps.loadHostKeys(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("vmmd: loadHostKeys(%q) returned empty slice", dir)
+	}
+	return ids, nil
 }

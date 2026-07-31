@@ -55,6 +55,14 @@ Environment=FAAS_STATUSPAGE_PATH=/etc/faas/statuspage/index.html
 # handlers 503 CodeCapacity and every mfa_pending session locks
 # the customer out indefinitely.
 LoadCredential=faas_host_age_identity:/etc/faas/secrets/host.age
+# Rotation overlap (issue #316 / ADR-057): the previous host.age
+# is named host.age.previous during the 30-day overlap window
+# after `gregale host-age rotate --commit`. apid loads BOTH
+# identities via secretbox.LoadHostKeys(dir) so MFA envelopes
+# sealed under either key unseal during the overlap. systemd
+# materialises whatever's on disk; this LoadCredential is a
+# no-op pre-rotation.
+LoadCredential=faas_host_age_identity_previous:/etc/faas/secrets/host.age.previous
 Environment=FAAS_HOST_AGE_IDENTITY_PATH=%d/faas_host_age_identity
 
 # Hardening baseline.
