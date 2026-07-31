@@ -110,7 +110,7 @@ jobs:
             root@${{ env.CP_HOST }} "mkdir -p /opt/faas/bin/deploy-tmp"
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             bin/apid bin/schedd bin/gatewayd bin/imaged bin/meterd \
-            bin/githubd bin/gregale bin/migrate \
+            bin/githubd bin/vmmd bin/gregale bin/migrate \
             root@${{ env.CP_HOST }}:/opt/faas/bin/deploy-tmp/
 
       - name: Install binaries, run migrations & restart services
