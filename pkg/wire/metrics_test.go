@@ -160,6 +160,44 @@ func TestOpsMetrics_NewObserversNilSafe(t *testing.T) {
 	m.ObserveImagedOCIPull("blob", "ok", time.Second)
 }
 
+// TestOpsMetrics_PgBackupLastPushed (issue #250) — the
+// pg_backup_last_pushed_seconds gauge must:
+//   - be registered under the per-daemon prefix,
+//   - surface in /metrics from boot pre-instantiated to 0,
+//   - accept Set() calls without panicking,
+//   - return nil from the accessor on a nil receiver (nil-safe).
+//
+// The PgBackupStale alert rule (deploy/ansible/roles/prometheus/files/pg_backup.rules.yml)
+// queries `time() - pg_backup_last_pushed_seconds > 86400`; without
+// the gauge series from boot, a freshly-booted box looks identical
+// to one with no basebackup root — both return NaN to the alert,
+// and the alert is silently skipped. The pre-instantiated-to-0
+// pattern (mirror of alertEvaluatorEnabled, line ~771) closes the
+// gap.
+func TestOpsMetrics_PgBackupLastPushed(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	body := render(t, m)
+	want := `apid_pg_backup_last_pushed_seconds 0`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing line %q in:\n%s", want, body)
+	}
+	// Set must not panic; the gauge accepts arbitrary float64 values
+	// (apid's sampler writes time.Since(newest).Seconds()).
+	m.PgBackupLastPushed().Set(3600)
+	body = render(t, m)
+	if !strings.Contains(body, `apid_pg_backup_last_pushed_seconds 3600`) {
+		t.Errorf("gauge did not surface Set value:\n%s", body)
+	}
+}
+
+// TestOpsMetrics_PgBackupLastPushedNilSafe — nil-receiver accessor.
+func TestOpsMetrics_PgBackupLastPushedNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if g := m.PgBackupLastPushed(); g != nil {
+		t.Errorf("nil receiver returned non-nil gauge: %v", g)
+	}
+}
+
 // TestOpsMetrics_EgressDenyRegistryPreinstantiated (PR-E) — every
 // catalog (cidr, family) tuple must surface in /metrics from boot
 // with value 0, mirroring the OCI-pull and build histogram

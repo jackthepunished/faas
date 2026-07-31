@@ -139,6 +139,19 @@ backup-restore-drill: ## Run the M8 restore drill end-to-end (must run on EX44 a
 lint-drill: ## Static lint of the restore drill script + record template shape (spec §14 M8)
 	bash deploy/scripts/faas-m8-restore-drill_test.sh
 
+.PHONY: backup-push-pg
+backup-push-pg: ## Push the latest basebackup to Hetzner Storage Box (issue #250)
+	@sudo systemctl start faas-pg-basebackup-push.service
+	@sudo journalctl -u faas-pg-basebackup-push.service -n 50 --no-pager
+
+.PHONY: backup-restore-verify
+backup-restore-verify: ## T-7 throwaway restore verify on Hetzner Storage Box basebackup (issue #250)
+	sudo bash deploy/scripts/pg-restore-verify.sh
+
+.PHONY: lint-pg-restore-verify
+lint-pg-restore-verify: ## Static lint of the off-host restore-verify script (issue #250)
+	bash deploy/scripts/pg-restore-verify_test.sh
+
 .PHONY: metal-lima
 metal-lima: ## Run metal tests locally on an M3+ Mac via Lima nested KVM (see deploy/lima/README.md)
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false

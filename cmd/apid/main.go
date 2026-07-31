@@ -222,6 +222,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// the daemon's lifetime; stops cleanly on ctx cancel.
 		topNSampler := newTopNSampler(srv.ops, log)
 		go topNSampler.run(ctx)
+		// Issue #250: pgBackupPushedSampler drives the
+		// apid_pg_backup_last_pushed_seconds gauge from the mtime
+		// of the newest tarball in /var/lib/pgsql/basebackup/.
+		// 60s tick (matches the PgBackupStale alert's `for: 5m`
+		// window — at least 5 fresh ticks per evaluation).
+		pgBackupPushedSampler := newPgBackupPushedSampler(srv.ops, log)
+		go pgBackupPushedSampler.run(ctx)
 		// Webhook replay-dedupe sweep (issue #294). The
 		// webhook_deliveries table is written by all three ingresses
 		// (GitHub via gatewayd, Stripe + Paddle via apid); the TTL

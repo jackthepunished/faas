@@ -377,6 +377,104 @@ else
   fi
 fi
 
+# ─── 11d. Hetzner Storage Box secrets (issue #250 / off-host pg backup) ────
+# The Hetzner Storage Box holds nightly pg_basebackup copies + the
+# continuous WAL archive. rclone authenticates to its SFTP endpoint
+# via a sealed-at-rest config under /etc/faas/secrets/storage-box/:
+#
+#   * rclone.conf  — the `[hertznerbox]` remote (SFTP user, host, key
+#     file path). 0400 root:root. Read by `rclone --config=...` in the
+#     postgres + faas-pg-basebackup-push units via systemd LoadCredential=.
+#   * box-age-key  — the local age identity used to seal the rclone.conf
+#     on the operator laptop before shipping to the box. 0400 root:root.
+#
+# Sealing flow (operator laptop):
+#   $ age -r host.age.pub -o rclone.conf.age rclone.conf
+#   $ age-keygen -o box-age.key         # 1.1.0+ age identity
+#   $ scp rclone.conf.age host:$(hostname).rclone.conf.age
+#   $ scp box-age.key      host:$(hostname).box-age.key
+#
+# The bootstrap step below (a) creates the 0700 root:root staging dir
+# if missing, (b) decrypts the .age envelopes to plaintext under it
+# with mode 0400 root:root, and (c) drift-repairs perms without ever
+# re-rotating (rotation invalidates the rclone session + would let
+# a future bootstrap silently strand every nightly push).
+#
+# This mirrors the 11b (host.age) and 11c (cosign sign-keypair)
+# precedent: refuse silent rotation, only repair perms.
+SB_DIR="${SECRETS_DIR}/storage-box"
+RCLONE_CONF_SRC="/root/rclone.conf.age"
+RCLONE_CONF="${SB_DIR}/rclone.conf"
+BOX_AGE_SRC="/root/box-age.key"
+BOX_AGE="${SB_DIR}/box-age-key"
+
+mkdir -p "${SB_DIR}"
+chown root:root "${SB_DIR}"
+chmod 0700 "${SB_DIR}"
+
+# rclone.conf
+# Mode is 0440 root:postgres — the postgres user (User= on the
+# systemd postgresql.service) must read this file via its
+# `archive_command` (issue #250). LoadCredential= surfaces the
+# plaintext under $CREDENTIALS_DIRECTORY at unit activation; the
+# postgres user traverses the dir via the unit's group membership.
+# This mirrors the cosign sign-keypair precedent (sign.key is
+# 0440 root:faas so faas-imaged can read it via group access).
+if [[ ! -f "${RCLONE_CONF}" ]]; then
+  if [[ -f "${RCLONE_CONF_SRC}" && -x "${FAAS_BIN}/gregale" ]]; then
+    "${FAAS_BIN}/gregale" backup unseal-rclone \
+      --age-identity "${BOX_AGE}" \
+      --in "${RCLONE_CONF_SRC}" \
+      --out "${RCLONE_CONF}"
+    chown root:postgres "${RCLONE_CONF}"
+    chmod 0440 "${RCLONE_CONF}"
+    ok "rclone.conf written to ${RCLONE_CONF} (0440 root:postgres)"
+    # Shred the .age envelope on disk so it can't be replayed against a
+    # future host.age-key compromise. The plaintext under /etc/faas/
+    # secrets/storage-box/ is what units actually consume.
+    shred -u "${RCLONE_CONF_SRC}"
+    ok "shredded staging ${RCLONE_CONF_SRC}"
+  elif [[ ! -f "${BOX_AGE}" ]]; then
+    warn "no rclone.conf at ${RCLONE_CONF} and no age envelope at ${RCLONE_CONF_SRC}"
+    warn "off-host pg backup will be DISABLED until you scp the .age envelope and re-run"
+    warn "(see docs/runbooks/PostgresBackup.md §Preconditions — issue #250)"
+  else
+    warn "rclone.conf missing at ${RCLONE_CONF}; skip unseal (no ${RCLONE_CONF_SRC})"
+  fi
+else
+  RC_MODE=$(stat -c '%a' "${RCLONE_CONF}")
+  RC_OWNER=$(stat -c '%U:%G' "${RCLONE_CONF}")
+  if [[ "${RC_MODE}" != "440" || "${RC_OWNER}" != "root:postgres" ]]; then
+    chown root:postgres "${RCLONE_CONF}"
+    chmod 0440 "${RCLONE_CONF}"
+    ok "rclone.conf perms repaired (was ${RC_MODE} ${RC_OWNER}, now 0440 root:postgres)"
+  else
+    ok "rclone.conf already present with correct perms (refusing to rotate)"
+  fi
+fi
+
+# box-age-key (the local age identity). Same drift-repair branch.
+if [[ ! -f "${BOX_AGE}" ]]; then
+  if [[ -f "${BOX_AGE_SRC}" ]]; then
+    install -m 0400 -o root -g root "${BOX_AGE_SRC}" "${BOX_AGE}"
+    shred -u "${BOX_AGE_SRC}"
+    ok "box-age-key written to ${BOX_AGE} (0400 root:root)"
+  else
+    warn "no box-age-key at ${BOX_AGE} and no plaintext at ${BOX_AGE_SRC}"
+    warn "off-host pg backup will be DISABLED until the operator provides it"
+  fi
+else
+  BA_MODE=$(stat -c '%a' "${BOX_AGE}")
+  BA_OWNER=$(stat -c '%U:%G' "${BOX_AGE}")
+  if [[ "${BA_MODE}" != "400" || "${BA_OWNER}" != "root:root" ]]; then
+    chown root:root "${BOX_AGE}"
+    chmod 0400 "${BOX_AGE}"
+    ok "box-age-key perms repaired (was ${BA_MODE} ${BA_OWNER}, now 0400 root:root)"
+  else
+    ok "box-age-key already present with correct perms (refusing to rotate)"
+  fi
+fi
+
 # ─── 12. Generate deploy SSH key ─────────────────────────────────────────────
 mkdir -p "$(dirname "${DEPLOY_KEY_PATH}")"
 # Defensive ownership on the directory regardless of which branch runs
