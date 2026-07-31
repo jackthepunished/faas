@@ -172,17 +172,19 @@ func TestLoadHostKey_RejectsInsecurePerms(t *testing.T) {
 	// path (vmmd writes 0o400 on first boot), but pinning a
 	// standalone accept case here keeps the contract + the
 	// rejection table in one place.
-	t.Run("accept_0o400", func(t *testing.T) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "host.age")
-		if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-		if err := os.Chmod(path, 0o400); err != nil {
-			t.Fatalf("chmod: %v", err)
-		}
-		if _, err := LoadHostKey(path); err != nil {
-			t.Errorf("mode 0o400 rejected: %v", err)
+	t.Run("accept_0o400_and_0o440", func(t *testing.T) {
+		for _, mode := range []os.FileMode{0o400, 0o440} {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "host.age")
+			if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			if _, err := LoadHostKey(path); err != nil {
+				t.Errorf("mode %#o rejected: %v", mode, err)
+			}
 		}
 	})
 }
