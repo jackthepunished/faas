@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00075 (compute_node_keys table, ADR-053
+// Migration-apply tests for 00076 (compute_node_keys table, ADR-053
 // Tier 1 Phase 2 — node_signature).
 //
 // Pins the Phase 2 acceptance gate verbatim:
@@ -87,7 +87,7 @@ func insertComputeNode(ctx context.Context, t *testing.T, pool *pgxpool.Pool, na
 	return id
 }
 
-func Test00075_ComputeNodeKeys_TableShape(t *testing.T) {
+func Test00076_ComputeNodeKeys_TableShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -131,7 +131,7 @@ func Test00075_ComputeNodeKeys_TableShape(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_PrimaryKeyEnforced(t *testing.T) {
+func Test00076_ComputeNodeKeys_PrimaryKeyEnforced(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -161,7 +161,7 @@ func Test00075_ComputeNodeKeys_PrimaryKeyEnforced(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_KeyIdShapeCheck(t *testing.T) {
+func Test00076_ComputeNodeKeys_KeyIdShapeCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -187,7 +187,7 @@ func Test00075_ComputeNodeKeys_KeyIdShapeCheck(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_PemShapeCheck(t *testing.T) {
+func Test00076_ComputeNodeKeys_PemShapeCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -211,7 +211,7 @@ func Test00075_ComputeNodeKeys_PemShapeCheck(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_PgNotifyOnChange(t *testing.T) {
+func Test00076_ComputeNodeKeys_PgNotifyOnChange(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -270,7 +270,7 @@ func Test00075_ComputeNodeKeys_PgNotifyOnChange(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_CascadeOnComputeNodeDelete(t *testing.T) {
+func Test00076_ComputeNodeKeys_CascadeOnComputeNodeDelete(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -299,7 +299,7 @@ func Test00075_ComputeNodeKeys_CascadeOnComputeNodeDelete(t *testing.T) {
 	}
 }
 
-func Test00075_ComputeNodeKeys_Replay(t *testing.T) {
+func Test00076_ComputeNodeKeys_Replay(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()

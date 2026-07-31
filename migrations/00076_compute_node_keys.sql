@@ -1,9 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00075_compute_node_keys.sql
+-- filename: 00076_compute_node_keys.sql
 --
--- 00075_compute_node_keys.sql — ADR-053, Tier 1 Phase 2.
+-- 00076_compute_node_keys.sql — ADR-053, Tier 1 Phase 2.
 --
 -- The compute_node_keys table holds one row per (compute_node,
 -- signing-key-generation). vmmd registers its own row on startup

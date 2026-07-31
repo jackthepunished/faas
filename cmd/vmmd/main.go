@@ -99,9 +99,15 @@ var errNodeKeyInsecure = errors.New("vmmd: node.key mode permits group/other acc
 // compute_node_keys table by an out-of-band install step; the
 // registry listens for `compute_node_changed` pg_notify and
 // picks up the row within its next refresh tick (migration
-// 00075).
+// 00076).
 func loadNodeSigningKey() (*ecdsa.PrivateKey, string, error) {
 	path := envOr("FAAS_VMMD_NODE_KEY_PATH", defaultNodeKeyPath)
+	//nolint:forbidigo // vetted daemon-id path (/etc/faas/secrets/vmmd/node.key); the
+	// openCustomerFile guard is for customer-supplied CLI paths. Here the
+	// path is constructed from the FAAS_VMMD_NODE_KEY_PATH env var with a
+	// fixed default, then stat'd on the same fd to bind the mode check to
+	// the body read (F4 TOCTOU pin) — os.ReadFile would discard the fd and
+	// re-introduce the swap window.
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -113,7 +119,7 @@ func loadNodeSigningKey() (*ecdsa.PrivateKey, string, error) {
 		}
 		return nil, "", fmt.Errorf("vmmd: open node key %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// Mode 0400 strict, read via the open fd so the inode
 	// can't be swapped between the mode check and the body
 	// read. vmmd is root, so group/other bits are an

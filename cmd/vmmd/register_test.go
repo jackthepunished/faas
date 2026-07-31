@@ -189,7 +189,7 @@ func TestRegisterComputeNodeKey_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("parsed type = %T, want *ecdsa.PublicKey", parsed)
 	}
-	if parsedECDSA.X.Cmp(priv.PublicKey.X) != 0 || parsedECDSA.Y.Cmp(priv.PublicKey.Y) != 0 {
+	if parsedECDSA.X.Cmp(priv.X) != 0 || parsedECDSA.Y.Cmp(priv.Y) != 0 {
 		t.Error("parsed public key does not match the one we registered")
 	}
 }
