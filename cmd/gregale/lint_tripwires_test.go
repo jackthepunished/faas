@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -187,6 +189,126 @@ func TestLintTripwire_NoGlyphLiteralOutsideOutput(t *testing.T) {
 
 	if len(violations) > 0 {
 		t.Fatalf("found leading ✓/✗/→ string literal outside output.go — gate every customer-facing line through PrintOK/PrintFail/PrintProgress/PrintWarn so it strips in pipes and under NO_COLOR:\n  %s\n\n(mid-string `→` is allowed; this rule matches leading prefix only. Add `// lint:allow-glyph` above the line and document the reason if you genuinely need an exception.)",
+			strings.Join(violations, "\n  "))
+	}
+}
+
+// TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire closes bug 2
+// (PR #439): the wire `x-faas-wake` header is the published customer
+// contract (docs/cold-wake.md, docs/faas_ux_spec.md, docs/STATUS.md) —
+// the Gregale rename kept the `x-faas-` prefix on purpose so downstream
+// tooling and SDKs that depend on the header name don't break. PR #439
+// silently renamed the CLI's probe from `x-faas-wake` to
+// `x-gregale-wake`, breaking the cold-wake affordance for `gregale
+// open` while every test stubbed the renamed literal and made the
+// suite self-confirming.
+//
+// The fix routes both the producer (pkg/gateway) and the consumer
+// (cmd/gregale) through pkg/wire.WakeHeader. This tripwire fails fast
+// if any future PR reintroduces a literal `"x-faas-wake"` or
+// `"x-gregale-wake"` anywhere outside the documented canonical home
+// (pkg/wire/wake.go). The header constant is the only sanctioned
+// spelling.
+//
+// Excludes:
+//   - pkg/wire/wake.go: the canonical home; the literal IS the contract.
+//   - cmd/gregale/output.go and any *_test.go already excluded by the
+//     per-directory walker.
+//
+// Scope note: the walker descends every directory rooted under the
+// repo root passed via `--repo-root` (or the test's current working
+// directory when unset). The CLI packaging this test enforces only
+// has visibility into the local . tree, so we walk the package root
+// directly. The intent is "no literal in production code that travels
+// over the wire"; docs and tests are out of scope (docs are sourced
+// to spec §6 / cold-wake.md, tests are gated by the suite's own
+// asserts).
+func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
+	fset := token.NewFileSet()
+
+	// Walk the whole repo except pkg/wire itself. Each package is
+	// parsed in its own directory; pkgs is a map keyed by directory
+	// relative to the walker root.
+	type pkgFiles struct {
+		root string
+		files map[string]*ast.File
+	}
+	pkgs := map[string]*pkgFiles{}
+
+	walkErr := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			// Skip vendor, generated, and test fixture subtrees.
+			name := d.Name()
+			if name == "vendor" || name == "node_modules" || name == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		// Skip the canonical home — the literal IS the contract.
+		if strings.HasSuffix(path, "pkg/wire/wake.go") {
+			return nil
+		}
+		// Skip *_test.go (tests legitimately assert or stub the wire
+		// header literal — they are the contract tests, not the
+		// production code).
+		if strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		// Skip generated protobuf stubs.
+		if strings.HasSuffix(path, ".pb.go") {
+			return nil
+		}
+		pf, ferr := parser.ParseFile(fset, path, nil, parser.AllErrors)
+		if ferr != nil {
+			// Generated or unsupported files (e.g. build-tag-only)
+			// may fail to parse. Don't fail the tripwire on those —
+			// just skip them so a single unparseable file doesn't
+			// mask the rule.
+			return nil
+		}
+		dir := filepath.Dir(path)
+		bucket, ok := pkgs[dir]
+		if !ok {
+			bucket = &pkgFiles{root: dir, files: map[string]*ast.File{}}
+			pkgs[dir] = bucket
+		}
+		bucket.files[path] = pf
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk repo: %v", walkErr)
+	}
+
+	forbidden := []string{`"x-faas-wake"`, `"x-gregale-wake"`, `"X-Faas-Wake"`, `"X-Gregale-Wake"`}
+
+	var violations []string
+	for _, bucket := range pkgs {
+		for _, file := range bucket.files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				for _, forbid := range forbidden {
+					if lit.Value == forbid {
+						pos := fset.Position(lit.Pos())
+						violations = append(violations, pos.String()+": "+lit.Value)
+						return true
+					}
+				}
+				return true
+			})
+		}
+	}
+
+	if len(violations) > 0 {
+		t.Fatalf("found literal x-faas-wake / x-gregale-wake string outside pkg/wire/wake.go — these headers are the published customer contract and must be sourced from pkg/wire.WakeHeader (see docs/cold-wake.md):\n  %s\n\nIf a legacy gateway test legitimately needs the literal, move it to a *_test.go file (excluded) or convert it to wire.WakeHeader.",
 			strings.Join(violations, "\n  "))
 	}
 }

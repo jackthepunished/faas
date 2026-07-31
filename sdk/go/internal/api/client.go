@@ -646,8 +646,13 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 }
 
 // Usage.
-func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, error) {
-	var out UsageResponse
+//
+// GetUsage returns per-app usage rows for the given month — the wire
+// shape is an ARRAY of UsageResponse objects, not a single struct.
+// Mirrors the canonical Go SDK in pkg/api/client.go. See memory:
+// getusage-wire-shape-mismatch for the history of the array contract.
+func (c *Client) GetUsage(ctx context.Context, month string) ([]UsageResponse, error) {
+	var out []UsageResponse
 	return out, c.do(ctx, "GET", "/v1/usage?month="+month, nil, &out)
 }
 

@@ -779,9 +779,12 @@ func TestCmdDeploy_JSON_SkipsStream(t *testing.T) {
 func TestCmdUsage_JSON_IndentedScalar(t *testing.T) {
 	resetJSONOutput()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(api.UsageResponse{
+		// The wire shape is an ARRAY of UsageResponse objects — the
+		// OpenAPI spec, server handler, and cross-language SDKs all
+		// agree. See memory: getusage-wire-shape-mismatch.
+		_ = json.NewEncoder(w).Encode([]api.UsageResponse{{
 			AppID: "my-app", Requests: 42, MBSeconds: 123456, IncludedGBHours: 5,
-		})
+		}})
 	}))
 	defer srv.Close()
 
@@ -801,12 +804,15 @@ func TestCmdUsage_JSON_IndentedScalar(t *testing.T) {
 	if !strings.Contains(out, "\n  ") {
 		t.Fatalf("expected indented JSON, got %q", out)
 	}
-	var u api.UsageResponse
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &u); err != nil {
+	var rows []api.UsageResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rows); err != nil {
 		t.Fatalf("not valid JSON: %v\n%s", err, out)
 	}
-	if u.Requests != 42 {
-		t.Errorf("requests = %d, want 42", u.Requests)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Requests != 42 {
+		t.Errorf("requests = %d, want 42", rows[0].Requests)
 	}
 }
 

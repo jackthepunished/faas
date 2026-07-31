@@ -263,9 +263,9 @@ func TestCmdUsage_NoPositional_DispatchesToList(t *testing.T) {
 		gotPath = r.URL.Path
 		switch r.URL.Path {
 		case "/v1/usage":
-			_ = json.NewEncoder(w).Encode(api.UsageResponse{
+			_ = json.NewEncoder(w).Encode([]api.UsageResponse{{
 				AppID: "a1", Requests: 1, MBSeconds: 1, IncludedGBHours: 5,
-			})
+			}})
 		case "/v1/usage/summary":
 			t.Errorf("dispatcher reached /v1/usage/summary for bare `gregale usage`; want /v1/usage")
 		default:
@@ -300,9 +300,9 @@ func TestCmdUsage_FlagLeading_DispatchesToList(t *testing.T) {
 		gotQuery = r.URL.RawQuery
 		switch r.URL.Path {
 		case "/v1/usage":
-			_ = json.NewEncoder(w).Encode(api.UsageResponse{
+			_ = json.NewEncoder(w).Encode([]api.UsageResponse{{
 				AppID: "a1", Requests: 1, MBSeconds: 1, IncludedGBHours: 5,
-			})
+			}})
 		default:
 			http.Error(w, "no", 404)
 		}
@@ -399,24 +399,28 @@ func TestCmdUsageList_HumanEgressColumn(t *testing.T) {
 		{
 			name: "zero egress omits column",
 			tx:   0, net: 0,
-			wantSub: []string{"App a1 —", "1 requests", "0.000 GB-hours"},
-			wantNot: []string{"egress"},
+			wantSub: []string{"a1 —", "1 · 0.000", "included 5", "App — requests"},
+			// The header row says "egress" once; the row should NOT
+			// contain a per-row egress column. The combined marker
+			// "egress X.XXX GB" only appears when a row has a
+			// non-zero egress cell.
+			wantNot: []string{"egress 0.000 GB"},
 		},
 		{
 			// 1.5 GiB tx + 2.0 GiB net → 3.5 GiB egress, 1.50 / 2.00 split.
 			// Conversion: float64(bytes) / (1024*1024*1024).
 			name: "non-zero egress prints column",
 			tx:   1610612736, net: 2147483648,
-			wantSub: []string{"App a1 —", "1 requests", "egress 3.500 GB", "tx 1.50", "net 2.00"},
+			wantSub: []string{"a1 —", "1 · 0.000", "included 5", "egress 3.500 GB", "tx 1.50", "net 2.00"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(api.UsageResponse{
+				_ = json.NewEncoder(w).Encode([]api.UsageResponse{{
 					AppID: "a1", Requests: 1, MBSeconds: 1, IncludedGBHours: 5,
 					TXBytes: tc.tx, NetTxBytes: tc.net,
-				})
+				}})
 			}))
 			defer srv.Close()
 

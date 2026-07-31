@@ -18,7 +18,7 @@ import (
 //  2. The OS keychain (macOS Keychain / Linux libsecret via D-Bus /
 //     Windows wincred, UX §2.2). The canonical store — gated by the
 //     OS user unlock, never backed up by default.
-//  3. This plaintext file (~/.config/faas/token at 0o600) — a
+//  3. This plaintext file (~/.config/gregale/token at 0o600) — a
 //     fallback for headless hosts with no D-Bus session (CI runners,
 //     SSH-only servers, Docker images). A WARN line is printed when
 //     the keychain is unavailable so the operator sees the degraded
@@ -27,6 +27,12 @@ import (
 // saveToken migrates the legacy plaintext file to the keychain
 // one-shot: on the first successful keychain Set, the old file is
 // removed if present. Issue #293 closes gap G5 (impl spec §17).
+//
+// Pre-rename (PR #439, 3bc9796c) the keychain service was "faas-cli"
+// and the file path was ~/.config/faas/token. saveToken / loadToken
+// also look up the legacy names first and migrate forward on the
+// first successful Set — otherwise every existing user gets logged
+// out at the upgrade.
 
 const defaultAPIBase = "https://api.gregale.dev"
 
@@ -37,6 +43,12 @@ const defaultAPIBase = "https://api.gregale.dev"
 const (
 	keyringService = "gregale-cli"
 	keyringAccount = "default"
+
+	// legacyKeyringService is the pre-#439 keychain service. We
+	// consult it on loadToken (a one-shot fallback) and remove it
+	// on saveToken (forward migration). The legacy KeychainAccount
+	// is the same `default` — only the service identifier changed.
+	legacyKeyringService = "faas-cli"
 )
 
 // keyringStub is the OS-keychain surface we need. The production
@@ -116,6 +128,18 @@ func tokenPath() (string, error) {
 	return filepath.Join(dir, "gregale", "token"), nil
 }
 
+// legacyTokenPath returns the pre-#439 plaintext-file fallback path:
+// the same config dir as tokenPath, but the "faas" subdirectory
+// instead of "gregale". Used by loadToken and saveToken for the
+// one-shot migration of pre-rename installs.
+func legacyTokenPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "faas", "token"), nil
+}
+
 // loadToken returns the token from $FAAS_TOKEN, the OS keychain, or
 // the plaintext-file fallback — in that priority order. A non-empty
 // env var always wins (CI). When the keychain returns ErrNotFound
@@ -123,6 +147,12 @@ func tokenPath() (string, error) {
 // entry yet is indistinguishable from "no user logged in"). Any
 // other keychain error triggers a one-shot WARN and the same file
 // fallback.
+//
+// Pre-#439 legacy lookup is silently chained AFTER the new keychain
+// + new file: a pre-#439 install never wrote to the new keychain
+// service, so the new lookup is always ErrNotFound and the legacy
+// probe runs cheaply. The new saveToken migrates the legacy entry
+// forward on the first successful Set — see saveToken below.
 func loadToken() string {
 	if v := os.Getenv("FAAS_TOKEN"); v != "" {
 		return strings.TrimSpace(v)
@@ -144,9 +174,41 @@ func loadToken() string {
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
+		// No new file — fall through to the legacy keychain / file
+		// paths before giving up. A pre-#439 install has neither the
+		// new keychain service nor the new file, so this loop is the
+		// load path for everyone who hasn't re-logged-in after the
+		// rename.
+		if v := loadLegacyToken(); v != "" {
+			return v
+		}
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// loadLegacyToken probes the pre-#439 keychain service and the
+// pre-#439 plaintext file in turn. Silent on ErrNotFound (the
+// expected case for a fresh install); other keychain errors get
+// a WARN.
+func loadLegacyToken() string {
+	if kr := effectiveKeyring(); kr != nil {
+		v, err := kr.Get(legacyKeyringService, keyringAccount)
+		switch {
+		case err == nil:
+			return strings.TrimSpace(v)
+		case errors.Is(err, keyring.ErrNotFound):
+			// fall through to legacy file
+		default:
+			PrintWarn(os.Stderr, "Legacy keychain lookup failed (%v).", err)
+		}
+	}
+	if p, err := legacyTokenPath(); err == nil {
+		if b, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
 }
 
 // saveToken persists the token to the OS keychain, falling back to
@@ -154,6 +216,12 @@ func loadToken() string {
 // the first successful keychain Set the legacy plaintext file (if
 // any) is removed — a one-shot migration so customers do not keep a
 // redundant plaintext copy on disk after the upgrade. Issue #293.
+//
+// Additionally, when the new keychain Set succeeds the legacy
+// keychain service entry (pre-#439 "faas-cli") and the legacy
+// plaintext file (pre-#439 ~/.config/faas/token) are removed — see
+// PR #439. The new store is the source of truth; the legacy store
+// is erased, not republished.
 func saveToken(token string) error {
 	token = strings.TrimSpace(token)
 
@@ -172,6 +240,24 @@ func saveToken(token string) error {
 				// nothing to migrate
 			default:
 				PrintWarn(os.Stderr, "Could not remove legacy plaintext token file: %v", rerr)
+			}
+		}
+		// One-shot migration: pre-#439 legacy keychain service
+		// entry. Delete is best-effort — ErrNotFound is silent,
+		// any other failure is a WARN (the new save already
+		// succeeded).
+		if err := kr.Delete(legacyKeyringService, keyringAccount); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			PrintWarn(os.Stderr, "Could not remove legacy keychain entry: %v", err)
+		}
+		// One-shot migration: pre-#439 legacy plaintext file.
+		if lp, lperr := legacyTokenPath(); lperr == nil {
+			switch lerr := os.Remove(lp); {
+			case lerr == nil:
+				PrintProgress(os.Stdout, "Removed legacy keychain service and plaintext token file.")
+			case errors.Is(lerr, os.ErrNotExist):
+				// nothing to migrate
+			default:
+				PrintWarn(os.Stderr, "Could not remove legacy plaintext token file: %v", lerr)
 			}
 		}
 		return nil
@@ -196,11 +282,20 @@ func saveToken(token string) error {
 // deleteToken clears the token from both stores (keychain + legacy
 // file). Best-effort: a stuck keychain must not block logout, and a
 // missing file is not an error. Used by `gregale logout`.
+//
+// Also clears the pre-#439 legacy keychain service and the
+// pre-#439 legacy plaintext file so a logout is symmetric: it
+// removes both the new and the legacy copies regardless of which
+// store the user upgraded from.
 func deleteToken() {
 	if err := effectiveKeyring().Delete(keyringService, keyringAccount); err != nil && !errors.Is(err, keyring.ErrNotFound) {
 		PrintWarn(os.Stderr, "Could not remove token from OS keychain: %v", err)
 	}
+	_ = effectiveKeyring().Delete(legacyKeyringService, keyringAccount)
 	if p, err := tokenPath(); err == nil {
 		_ = os.Remove(p)
+	}
+	if lp, err := legacyTokenPath(); err == nil {
+		_ = os.Remove(lp)
 	}
 }
