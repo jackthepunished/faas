@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 )
 
 // LocalStorageBackend is the reference StorageBackend. It is rooted at
@@ -20,28 +19,31 @@ import (
 // is composed via PrefixRouter (pkg/storage/router.go).
 //
 // Concurrency: Put is safe for concurrent calls on distinct keys;
-// concurrent Put on the same key is serialised by the atomic temp-name
-// suffix but the last-rename wins (matches today's imaged semantics).
-// Get is safe for concurrent calls. Delete is safe for concurrent
-// calls; a Delete racing a Put observes either "no key" or "old key"
-// — never a torn file, because Put uses temp+rename atomically.
+// concurrent Put on the same key is serialised by os.CreateTemp's
+// random suffix but the last-rename wins (matches today's imaged
+// semantics). Get is safe for concurrent calls. Delete is safe for
+// concurrent calls; a Delete racing a Put observes either "no key"
+// or "old key" — never a torn file, because Put uses temp+rename
+// atomically.
 //
-// Atomicity: Put writes to a sibling temp file with a process-unique
-// suffix and os.Rename's to the final name. The rename is atomic on
-// the same filesystem (ext4 in /srv/fc). A crash mid-write leaves the
-// temp file behind; the next Put for the same key overwrites it after
-// best-effort cleanup (see Put body).
+// Atomicity: Put writes to a sibling temp file inside the same
+// directory as the final destination (os.CreateTemp(filepath.Dir(full),
+// ...) — same idiom as pkg/builderd/cache.go:175 Cache.Store and
+// pkg/builderd/cache.go:242 Cache.writeSidecar) and os.Rename's to
+// the final name. The rename is atomic on the same filesystem
+// (ext4 in /srv/fc) and the temp file is reachable under the same
+// ReadWritePaths whitelist as the final file — load-bearing under
+// systemd's ProtectSystem=strict where the root path is read-only
+// but child directories are whitelisted (see
+// deploy/ansible/.../faas-imaged.service:40). A crash mid-write
+// leaves the temp file behind; the next Put for the same key
+// overwrites it after best-effort cleanup (see Put body).
 //
 // All errors wrap the underlying cause with %w plus a storage-tagged
 // operation context so callers can match on errors.Is without losing
 // the upstream signal.
 type LocalStorageBackend struct {
 	root string // absolute, validated by NewLocalStorageBackend
-	// tmpSeq is a monotonic counter used to build unique temp suffixes
-	// inside a single process. The PID already differentiates processes,
-	// but the suffix also benefits from being short and unpredictable
-	// when combined with os.CreateTemp's own randomness.
-	tmpSeq atomic.Uint64
 }
 
 // NewLocalStorageBackend validates root, resolves it to an absolute
@@ -107,17 +109,36 @@ func (l *LocalStorageBackend) Put(ctx context.Context, key string, r io.Reader) 
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	dir := filepath.Dir(full)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("storage: put %q: mkdir: %w", key, err)
 	}
-	// Build a process-unique temp suffix so concurrent Put calls don't
-	// collide on the temp name. The atomic counter is in addition to
-	// os.CreateTemp's randomness; together they make collisions
-	// practically impossible.
-	suffix := fmt.Sprintf(".tmp.%d.%d", os.Getpid(), l.tmpSeq.Add(1))
-	tmp := full + suffix
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	// Create the atomic-rename temp file in the SAME directory as the
+	// final destination, not in the parent of `dir`. This matters
+	// under systemd's ProtectSystem=strict + ReadWritePaths=<subdir>
+	// (deploy/ansible/.../faas-imaged.service:40): the root path is
+	// read-only even for root inside the unit's mount namespace, so a
+	// temp file at <root>/foo.tmp would fail with EROFS. The temp
+	// must be a sibling of the final file inside the whitelisted
+	// subdir. Same idiom as pkg/builderd/cache.go:175 (Cache.Store)
+	// and pkg/builderd/cache.go:242 (Cache.writeSidecar).
+	f, err := os.CreateTemp(dir, ".faas-tmp-*")
 	if err != nil {
+		return fmt.Errorf("storage: put %q: open tmp: %w", key, err)
+	}
+	tmp := f.Name()
+	// CreateTemp returns a 0600 file; we want 0644 to match the prior
+	// contract and the published-file mode. Close and reopen with the
+	// correct mode + truncate (the CreateTemp handle is fresh but a
+	// O_TRUNC round-trip is the documented pattern from the builderd
+	// sibling).
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("storage: put %q: close tmp: %w", key, err)
+	}
+	f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("storage: put %q: open tmp: %w", key, err)
 	}
 	closed := false

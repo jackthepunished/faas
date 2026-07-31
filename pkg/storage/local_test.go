@@ -352,6 +352,87 @@ func newTestBackend(t *testing.T) *LocalStorageBackend {
 	return be
 }
 
+// TestLocalBackendTempFileInDestinationDir is the regression for the
+// 2026-07-31 cd-controlplane failure: LocalStorageBackend.Put wrote
+// its atomic-rename temp file at `<full> + ".tmp.<pid>.<n>"`, which
+// for a nested key like "base/foo" landed at `<root>/foo.tmp.<pid>.<n>`
+// — one directory above the final destination. Under systemd's
+// ProtectSystem=strict + ReadWritePaths=/srv/fc/base, the parent
+// /srv/fc/ is read-only and the temp file creation fails with EROFS,
+// crash-looping imaged on every deploy.
+//
+// We simulate that shape: root is writable only inside a subdir, and
+// we assert Put succeeds because the temp file lands in the subdir,
+// not at the root. We skip the test when running as root because
+// chmod 0555 doesn't restrict root — the test would pass for the
+// wrong reason. The CI runner and the prod operator-side deploy
+// script both run as unprivileged users, so the skip is local-only.
+func TestLocalBackendTempFileInDestinationDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod-based path restriction does not apply to root; manual verify on the box")
+	}
+	root := t.TempDir()
+	// The subdir must exist BEFORE we lock the root down: once
+	// the parent is 0555, mkdir is denied. This is the equivalent
+	// of the EX44's /srv/fc/base existing at install time, with
+	// /srv/fc itself locked down by ProtectSystem=strict.
+	sub := filepath.Join(root, "base")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	// Lock down the root so new files cannot be created at <root>/…
+	// (subdir's own mode is unaffected; the chmod is on `root` only).
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatalf("chmod root 0555: %v", err)
+	}
+	// Sanity check: the root is now read-only for this process.
+	if err := os.WriteFile(filepath.Join(root, "probe"), []byte("x"), 0o644); err == nil {
+		t.Fatalf("root not locked down: write at <root>/probe succeeded (this test is meaningless on this filesystem)")
+	}
+	be, err := NewLocalStorageBackend(root)
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	// Put for "<subdir>/foo" must succeed: the temp file lives
+	// alongside the final destination in the writable subdir.
+	if err := be.Put(context.Background(), "base/foo", strings.NewReader("payload")); err != nil {
+		t.Fatalf("Put base/foo: %v", err)
+	}
+	// The final file lives at root/base/foo and has the right content.
+	got := mustReadAll(t, be, "base/foo")
+	if got != "payload" {
+		t.Fatalf("Put then Get: got %q, want %q", got, "payload")
+	}
+	// No stray .faas-tmp-* file should be left behind — Put's atomic
+	// rename must have moved it to the final name.
+	entries, err := os.ReadDir(sub)
+	if err != nil {
+		t.Fatalf("readdir sub: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".faas-tmp-") {
+			t.Fatalf("stale temp file left behind: %s", e.Name())
+		}
+	}
+	// And the root itself must remain pristine — no temp file ever
+	// landed at <root>/.faas-tmp-*, which was the production bug.
+	// We have to relax the perms back so os.ReadDir can list the
+	// dir; t.TempDir's cleanup chowns it for us at test end.
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Logf("chmod root 0755 (relax for readdir): %v", err)
+	}
+	rootEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("readdir root: %v", err)
+	}
+	for _, e := range rootEntries {
+		if e.Name() == "base" {
+			continue
+		}
+		t.Fatalf("unexpected entry at root: %s (production bug shape: temp file lands at root)", e.Name())
+	}
+}
+
 // mustReadAll is a test helper that opens the key and returns its
 // full content as a string. It fails the test on any error other
 // than success — used by tests that want a one-liner content check.

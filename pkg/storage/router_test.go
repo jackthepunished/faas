@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -323,7 +324,7 @@ func TestPrefixRouterMidSegmentEscape(t *testing.T) {
 		t.Fatalf("apps backend received a mid-segment write — escape!")
 	}
 	// dispatch-level check: confirm the apps backend is NOT selected.
-	b, rem, err := router.dispatch("appsfoo/x")
+	b, rem, _, err := router.dispatch("appsfoo/x")
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -560,4 +561,103 @@ func mustLister(t *testing.T, prefix string, snap, base, kernel, layers *LocalSt
 		t.Fatalf("unknown prefix %q", prefix)
 		return nil
 	}
+}
+
+// TestPrefixRouterErrorWrapPrefixMatchesKey is the regression for
+// the 2026-07-31 imaged crash-loop on the EX44: the wrapped error
+// from PrefixRouter.Put/Get/Delete used to re-derive the matched
+// route prefix via a second map walk, whose iteration order Go
+// does not guarantee. With the same LocalStorageBackend registered
+// for multiple routes (the production wiring has /srv/fc as the
+// canonical backend for snap/, base/, kernel/, layers/), the wrap
+// prefix alternated between routes on each restart, which made the
+// underlying EROFS root-cause harder to read from the logs.
+//
+// The fix: dispatch returns the matched prefix at call time, and
+// Put/Get/Delete close over that exact value. This test forces an
+// error from the underlying backend and asserts the wrap prefix is
+// the longest match for the key — every iteration, regardless of
+// map-walk order.
+//
+// Run with -count=50 to surface any lingering map-iteration
+// non-determinism; before the fix this would fail at least once
+// across the iterations on a stock Go runtime.
+func TestPrefixRouterErrorWrapPrefixMatchesKey(t *testing.T) {
+	for _, tc := range []struct {
+		key        string
+		wantRoute  string
+		wantRemain string
+	}{
+		{"base/runner-builder-amd64.ext4", "base/", "runner-builder-amd64.ext4"},
+		{"snap/dep/mem", "snap/", "dep/mem"},
+		{"kernel/vmlinux-6.1.128", "kernel/", "vmlinux-6.1.128"},
+		{"layers/slug-1.dep.ext4", "layers/", "slug-1.dep.ext4"},
+	} {
+		for i := 0; i < 50; i++ {
+			failing := &failingPutBackend{err: errors.New("synthetic failure")}
+			// Two routes share the same failing backend — the
+			// pre-fix code would alternate the wrap prefix between
+			// "base/" and "snap/" depending on map-iteration order.
+			router, err := NewPrefixRouter(map[string]StorageBackend{
+				"base/":   failing,
+				"snap/":   failing,
+				"kernel/": failing,
+				"layers/": failing,
+			}, failing)
+			if err != nil {
+				t.Fatalf("NewPrefixRouter: %v", err)
+			}
+
+			err = router.Put(context.Background(), tc.key, strings.NewReader("x"))
+			if err == nil {
+				t.Fatalf("iter %d Put %q: expected error from failing backend", i, tc.key)
+			}
+			// The wrap must be `storage: put "<full key>"` — the full
+			// key, not the strip-then-rebuild shape that lost the
+			// matched prefix.
+			wantSub := fmt.Sprintf(`storage: put %q: synthetic failure`, tc.wantRoute+tc.wantRemain)
+			if !strings.Contains(err.Error(), wantSub) {
+				t.Fatalf("iter %d Put %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, wantSub)
+			}
+
+			// Same check for Get + Delete so the determinism
+			// guarantee covers the full router surface.
+			if _, err := router.Get(context.Background(), tc.key); err == nil {
+				t.Fatalf("iter %d Get %q: expected error from failing backend", i, tc.key)
+			} else if want := fmt.Sprintf(`storage: get %q: synthetic failure`, tc.wantRoute+tc.wantRemain); !strings.Contains(err.Error(), want) {
+				t.Fatalf("iter %d Get %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, want)
+			}
+			if err := router.Delete(context.Background(), tc.key); err == nil {
+				t.Fatalf("iter %d Delete %q: expected error from failing backend", i, tc.key)
+			} else if want := fmt.Sprintf(`storage: delete %q: synthetic failure`, tc.wantRoute+tc.wantRemain); !strings.Contains(err.Error(), want) {
+				t.Fatalf("iter %d Delete %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, want)
+			}
+		}
+	}
+}
+
+// failingPutBackend is a test-only StorageBackend that forces every
+// operation to return err. Used to exercise PrefixRouter's error-
+// wrap path without depending on a particular filesystem failure
+// mode (the production bug was an EROFS on a temp file under
+// ProtectSystem=strict; reproducing that on a developer machine
+// would need root + a custom unit, so we synthesise the failure
+// instead).
+type failingPutBackend struct {
+	err error
+}
+
+func (f *failingPutBackend) Put(_ context.Context, _ string, _ io.Reader) error {
+	return f.err
+}
+
+func (f *failingPutBackend) Get(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, f.err
+}
+
+func (f *failingPutBackend) Delete(_ context.Context, _ string) error {
+	return f.err
 }
