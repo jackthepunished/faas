@@ -113,6 +113,42 @@ jobs:
             bin/githubd bin/vmmd bin/gregale bin/migrate \
             root@${{ env.CP_HOST }}:/opt/faas/bin/deploy-tmp/
 
+      # Install faas-vmmd.service systemd unit. Pre-PR #495 the unit
+      # shipped only via the vmmd_service ansible role, which is in
+      # site.yml but never re-run on boxes bootstrapped before that role
+      # landed. Without /etc/systemd/system/faas-vmmd.service on the
+      # box, (a) imaged's `After=faas-vmmd.service` directive waits for a
+      # unit that doesn't exist (PR #492) and (b) the FAAS_SERVICES
+      # restart loop's `systemctl restart faas-vmmd.service` 404s (run
+      # 30666277403, 2026-07-31). The unit file is bundled from
+      # deploy/etc/faas-vmmd.service, kept byte-identical to
+      # deploy/ansible/roles/vmmd_service/files/faas-vmmd.service so
+      # ansible and the cd-controlplane workflow stay in lockstep.
+      # `systemctl enable` is idempotent (creates the [Install] symlink
+      # once) so subsequent deploys are no-ops.
+      - name: Install faas-vmmd.service unit
+        run: |
+          set -euo pipefail
+          UNIT_SRC="deploy/etc/faas-vmmd.service"
+          UNIT_DST="/etc/systemd/system/faas-vmmd.service"
+          TMP_DST="/etc/systemd/system/faas-vmmd.service.deploy-tmp"
+          UNIT_SHA=$(sha256sum "${UNIT_SRC}" | awk '{print $1}')
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${UNIT_SRC}" "root@${{ env.CP_HOST }}:${TMP_DST}"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            root@${{ env.CP_HOST }} "set -euo pipefail
+              install -m 0644 -o root -g root '${TMP_DST}' '${UNIT_DST}'
+              rm -f '${TMP_DST}'
+              REMOTE_SHA=\$(sha256sum '${UNIT_DST}' | awk '{print \$1}')
+              if [ \"\${REMOTE_SHA}\" != \"${UNIT_SHA}\" ]; then
+                echo '::error::installed faas-vmmd.service sha256 mismatch: local=${UNIT_SHA} remote=\${REMOTE_SHA}'
+                exit 1
+              fi
+              systemctl daemon-reload
+              systemctl enable faas-vmmd.service
+              echo '→ installed ${UNIT_DST} (sha256=${UNIT_SHA})'
+              systemctl show faas-vmmd.service -p FragmentPath,LoadState,UnitFileState --value"
+
       - name: Install binaries, run migrations & restart services
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
