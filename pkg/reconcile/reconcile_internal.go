@@ -1,0 +1,106 @@
+// Internal reconcile implementation. The exported entry point
+// lives in reconcile.go (Reconcile) and delegates here. Splits
+// the "public surface contract" from the "implementation"
+// so reviewers can read the entry point without scrolling 200
+// lines of code.
+
+package reconcile
+
+import (
+	"context"
+
+	"github.com/onebox-faas/faas/pkg/reposcan"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// reconcile is the orchestrator. Order of operations:
+//
+//  1. Three guards (runGuards). Tripped guards set Result
+//     partially (WasIgnored, Alerts) and short-circuit the
+//     rest of the function. The scan-source-downgrade guard
+//     errors out so the caller can 4xx.
+//  2. emitReconcileStarted (one audit row for the entire pass).
+//  3. Resolve the existing app set (AppsForProject). Failure
+//     here is a caller-visible error.
+//  4. workloadDiff → []Action.
+//  5. applyActions (quota pre-check, updates, removes, creates).
+//  6. Upgrade SetProjectScanSource if the scan tier trumps the
+//     stored project.ScanSource AND tierRank is strictly greater
+//     (same-tier is a no-op per the store).
+//
+// The function is the package's only public-method-shaped
+// surface; everything else is package-private.
+func (s *Service) reconcile(
+	ctx context.Context,
+	project state.Project,
+	scan reposcan.Result,
+	commitSHA string,
+	branch string,
+) (Result, error) {
+	var out Result
+
+	// 1. Guards.
+	outcome := s.runGuards(ctx, project, scan, commitSHA, branch)
+	if outcome.err != nil {
+		// scan-source-downgrade: visible to the caller as an
+		// error AND recorded as an alert.
+		out.Alerts = append(out.Alerts, *outcome.alert)
+		return out, outcome.err
+	}
+	if outcome.alert != nil {
+		// neverEmpty or productionBranchOnly.
+		out.Alerts = append(out.Alerts, *outcome.alert)
+		if outcome.alert.Kind == AlertKindFeatureBranch {
+			out.WasIgnored = true
+		}
+		return out, nil
+	}
+
+	// 2. Audit "started".
+	s.emitReconcileStarted(ctx, project, scan, commitSHA, branch)
+
+	// 3. Existing membership.
+	existing, err := s.Store.AppsForProject(ctx, project.AccountID, project.ID)
+	if err != nil {
+		return out, err
+	}
+
+	// 4. Diff.
+	actions := workloadDiff(scan, project, existing)
+
+	// 5. Apply. applyActions may emit a quota_blocked alert and
+	// return out with no error; it returns a real error only on
+	// store failures (FK, conflict, etc.).
+	applied, err := s.applyActions(ctx, project, actions, commitSHA)
+	if err != nil {
+		return out, err
+	}
+	out.Added = applied.Added
+	out.Changed = applied.Changed
+	out.Removed = applied.Removed
+	out.Alerts = append(out.Alerts, applied.Alerts...)
+
+	// 6. ScanSource upgrade (strictly greater; same-tier is a
+	// no-op per the store). The audit row is emitted ONLY on a
+	// real upgrade via emitScanSourceChanged.
+	desired := deriveScanSource(scan.Workloads)
+	if tierRank(desired) > tierRank(project.ScanSource) {
+		prev := project.ScanSource
+		updated, err := s.Store.SetProjectScanSource(ctx, project.ID, desired)
+		if err != nil {
+			// A downgrade rejection at this point is a
+			// concurrent-spec violation — surface to the
+			// caller. The guards already passed so this is
+			// unexpected.
+			return out, err
+		}
+		s.emitScanSourceChanged(ctx, updated, string(prev), string(desired), commitSHA)
+	}
+
+	return out, nil
+}
+
+// reposcan import guard — keep the package imported so future
+// phases (PR-H path-filtered fan-out) can call helpers in
+// pkg/reposcan directly from the reconcile layer.
+var _ = reposcan.Result{}

@@ -1,0 +1,510 @@
+// Unit tests for pkg/reconcile. Table-driven where the input
+// shape is stable; individual TestXxx functions where the audit
+// chronology matters more than the input shape. The fakeStore
+// (fakes_test.go) is the substrate; the fakeAuditor is a real
+// pkg/audit.Auditor backed by the fakeStore so AppendEvent
+// calls land in the recorded-event slice.
+//
+// Each test:
+//   1. Seeds an Account + Project via the fakeStore's MemStore
+//      (using the project's ProductionBranch + ScanSource as the
+//      test case distinguishes).
+//   2. Builds a reposcan.Result (no fs.FS — the diff is the unit
+//      under test, not the parsers).
+//   3. Calls Service.Reconcile.
+//   4. Asserts on Result + the recorded event slice.
+
+package reconcile
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
+	"github.com/onebox-faas/faas/pkg/reposcan"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// ---------- helpers ----------
+
+// seedProject inserts an account + a project with the given
+// productionBranch + scanSource. Returns the project.
+func seedProject(t *testing.T, store *fakeStore, scanSource state.ProjectScanSource, prodBranch string) (state.Account, state.Project) {
+	t.Helper()
+	acct := store.putAccount("acct-1")
+	proj, err := store.CreateProject(context.Background(), state.Project{
+		AccountID:        acct.ID,
+		Slug:             "demo",
+		RepoFullName:     "octocat/demo",
+		ProductionBranch: prodBranch,
+		ScanSource:       scanSource,
+	})
+	if err != nil {
+		t.Fatalf("seedProject: %v", err)
+	}
+	return acct, proj
+}
+
+// seedApp inserts an app with the given (rootDir, workloadName)
+// pair into the project via MemStore.CreateApp. The store stamps
+// id, created_at, and status='active'. The test reads the App
+// back from AppsForProject so the WorkloadName-based merge key
+// captures the canonical values.
+func seedApp(t *testing.T, store *fakeStore, project state.Project, rootDir, workloadName, startCmd string) state.App {
+	t.Helper()
+	a := state.App{
+		AccountID:     project.AccountID,
+		ProjectID:     project.ID,
+		Slug:          slugify(workloadName),
+		RootDir:       rootDir,
+		WorkloadName:  workloadName,
+		WorkloadClass: state.WorkloadClassHTTP,
+		StartCommand:  startCmd,
+		Status:        state.AppActive,
+	}
+	added, err := store.CreateApp(context.Background(), a)
+	if err != nil {
+		t.Fatalf("seedApp: %v", err)
+	}
+	return added
+}
+
+// appScanResult builds a 3-workload Result sorted by name.
+func threeWorkloads(t *testing.T, rootDir string) reposcan.Result {
+	t.Helper()
+	return reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: rootDir, Class: reposcan.ClassHTTP, Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+			{Name: "worker", RootDir: rootDir, Class: reposcan.ClassWorker, Source: "compose.yaml: worker", Tier: reposcan.TierCompose},
+			{Name: "web", RootDir: rootDir, Class: reposcan.ClassHTTP, Source: "compose.yaml: web", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+}
+
+// extractAppIDs returns the IDs from a Result.Added / Changed slice.
+func extractAppIDs(apps []state.App) []string {
+	out := make([]string, 0, len(apps))
+	for _, a := range apps {
+		out = append(out, a.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// extractKinds returns the sorted kind list from the recorded
+// audit events. The unit tests don't pin the per-event payload
+// shape (that's covered by the audit-row content tests); the
+// order + kinds are the load-bearing assertions.
+func extractKinds(events []fakeEvent) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		out = append(out, e.Kind)
+	}
+	return out
+}
+
+// findEvent returns the first recorded event whose kind matches.
+// Returns ok=false if no event matches.
+func findEvent(events []fakeEvent, kind string) (fakeEvent, bool) {
+	for _, e := range events {
+		if e.Kind == kind {
+			return e, true
+		}
+	}
+	return fakeEvent{}, false
+}
+
+// freshService wires a fakeStore + fakeAuditor into a Service.
+// scan is the reposcan entry used by the test (default: nil →
+// the real reposcan.Scan is never called because the unit tests
+// pass the scan Result directly).
+func freshService(store *fakeStore, aud *audit.Auditor) *Service {
+	s := NewService(store, aud, nil)
+	// The unit tests pass scan Result directly; the Scan func on
+	// Service is unused. Keep the default for safety.
+	return s
+}
+
+// ---------- audit helper re-import for the test signature ----------
+// (audit.Auditor is used in the helper signatures above; the
+//  import resolves through the import block below.)
+
+// ---------- tests ----------
+
+func TestReconcile_ThreeWorkloads_NoDiff(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+	seedApp(t, store, proj, "", "worker", "")
+	seedApp(t, store, proj, "", "web", "")
+
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Added) != 0 || len(out.Changed) != 0 || len(out.Removed) != 0 {
+		t.Errorf("expected zero actions, got added=%d changed=%d removed=%d",
+			len(out.Added), len(out.Changed), len(out.Removed))
+	}
+	if out.WasIgnored {
+		t.Errorf("WasIgnored should be false")
+	}
+	// Only the started audit row should fire on a no-op pass.
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 1 || kinds[0] != KindReconcileStarted {
+		t.Errorf("expected 1 event (started), got %v", kinds)
+	}
+}
+
+func TestReconcile_ThreeWorkloads_AddOne(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+	seedApp(t, store, proj, "", "worker", "")
+
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Added) != 1 {
+		t.Fatalf("expected 1 create, got %d", len(out.Added))
+	}
+	if out.Added[0].WorkloadName != "web" {
+		t.Errorf("expected create=workload_name=web, got %q", out.Added[0].WorkloadName)
+	}
+	// Audit: started + 1 added.
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 2 || kinds[0] != KindReconcileStarted || kinds[1] != KindWorkloadAdded {
+		t.Errorf("expected [started, added], got %v", kinds)
+	}
+}
+
+func TestReconcile_ThreeWorkloads_RemoveOne(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+	seedApp(t, store, proj, "", "worker", "")
+	seedApp(t, store, proj, "", "extrasvc", "")
+
+	// Only api + worker survive.
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "", Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+			{Name: "worker", RootDir: "", Source: "compose.yaml: worker", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Removed) != 1 {
+		t.Fatalf("expected 1 remove, got %d", len(out.Removed))
+	}
+	// Audit: started + 1 removed (the audit row fires BEFORE the
+	// cascade, so the chronology is [started, removed]).
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 2 || kinds[0] != KindReconcileStarted || kinds[1] != KindWorkloadRemoved {
+		t.Errorf("expected [started, removed], got %v", kinds)
+	}
+}
+
+func TestReconcile_ThreeWorkloads_ChangeRootDir(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	// Existing app has rootDir="apps/api" and the scan also has
+	// rootDir="apps/api" but start_command differs. The diff key
+	// (rootDir, name) collides, so the diff produces an update
+	// (not a remove+create).
+	seedApp(t, store, proj, "apps/api", "api", "")
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "apps/api", Command: []string{"python", "app.py"}, Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Changed) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(out.Changed))
+	}
+	if out.Changed[0].StartCommand != "python app.py" {
+		t.Errorf("expected start_command=python app.py, got %q", out.Changed[0].StartCommand)
+	}
+	// Audit row payload should include "start_command" in fields_changed.
+	ev, ok := findEvent(store.snapshotEvents(), KindWorkloadChanged)
+	if !ok {
+		t.Fatalf("missing workload.changed audit row")
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("audit payload unparseable: %v", err)
+	}
+	fields, ok := data["fields_changed"].([]any)
+	if !ok {
+		t.Fatalf("fields_changed missing or wrong type: %v", data["fields_changed"])
+	}
+	if len(fields) != 1 || fields[0] != "start_command" {
+		t.Errorf("expected fields_changed=[start_command], got %v", fields)
+	}
+}
+
+func TestReconcile_ScanSourceDowngrade(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	// Project's stored scan_source is Compose; the scan produces
+	// only Convention-level seeds (no compose file). The guard
+	// computes "convention" and compares against Compose via
+	// tierRank. Compose(8) > Convention(2) → downgrade.
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "apps/api", Source: "convention: apps/api", Tier: reposcan.TierConvention},
+		},
+		Tier: reposcan.TierConvention,
+	}
+	svc := freshService(store, aud)
+	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err == nil {
+		t.Fatalf("expected downgrade rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "scan_source") {
+		t.Errorf("expected scan_source-related error, got %v", err)
+	}
+	// Audit: alert only.
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 1 || kinds[0] != KindReconcileAlert {
+		t.Errorf("expected [alert], got %v", kinds)
+	}
+}
+
+func TestReconcile_FeatureBranch_NoDiff(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+
+	svc := freshService(store, aud)
+	// branch="feature/x" != project.ProductionBranch="main".
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "feature/x")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !out.WasIgnored {
+		t.Errorf("WasIgnored should be true")
+	}
+	if len(out.Added) != 0 || len(out.Changed) != 0 || len(out.Removed) != 0 {
+		t.Errorf("expected zero actions, got added=%d changed=%d removed=%d",
+			len(out.Added), len(out.Changed), len(out.Removed))
+	}
+	// Audit: alert only.
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 1 || kinds[0] != KindReconcileAlert {
+		t.Errorf("expected [alert], got %v", kinds)
+	}
+}
+
+func TestReconcile_ZeroWorkloads_AlertEmitted(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+
+	svc := freshService(store, aud)
+	scan := reposcan.Result{Workloads: nil, Tier: 0}
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindNoWorkloads {
+		t.Errorf("expected no_workloads alert, got %v", out.Alerts)
+	}
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 1 || kinds[0] != KindReconcileAlert {
+		t.Errorf("expected [alert], got %v", kinds)
+	}
+}
+
+func TestReconcile_AuditOrdering_RemovedBeforeCascade(t *testing.T) {
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+	seedApp(t, store, proj, "", "toRemove", "")
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "", Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	_, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Chronology: started, removed. The cascade SQL fires AFTER
+	// the audit row.
+	events := store.snapshotEvents()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Kind != KindReconcileStarted {
+		t.Errorf("events[0] should be started, got %s", events[0].Kind)
+	}
+	if events[1].Kind != KindWorkloadRemoved {
+		t.Errorf("events[1] should be removed, got %s", events[1].Kind)
+	}
+}
+
+func TestReconcile_OverQuota_CreatesSkipped(t *testing.T) {
+	store := newFakeStore()
+	// Free plan has deployed_apps cap = 1.
+	store.accountPlan = api.PlanFree
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "api", "")
+
+	// Attempt 3 creates. Free cap = 1. proj = 1 existing + 3 = 4.
+	// projected > cap → skipped.
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, threeWorkloads(t, ""), "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Added) != 0 {
+		t.Errorf("expected zero creates on over-quota, got %d", len(out.Added))
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindQuotaBlocked {
+		t.Errorf("expected quota_blocked alert, got %v", out.Alerts)
+	}
+	// Audit: started + quota_blocked.
+	kinds := extractKinds(store.snapshotEvents())
+	if len(kinds) != 2 || kinds[0] != KindReconcileStarted || kinds[1] != KindReconcileQuotaBlocked {
+		t.Errorf("expected [started, quota_blocked], got %v", kinds)
+	}
+}
+
+func TestReconcile_DeriveScanSource_MirrorsApid(t *testing.T) {
+	// Pin the priority list. If the cmd/apid list ever changes,
+	// this test breaks and the reviewer has to update both
+	// copies. The failure mode is intentional: silent divergence
+	// is worse than a noisy merge conflict.
+	cases := []struct {
+		name      string
+		workloads []reposcan.Workload
+		want      state.ProjectScanSource
+	}{
+		{
+			name: "compose wins over convention",
+			workloads: []reposcan.Workload{
+				{Name: "web", Source: "convention: apps/web"},
+				{Name: "api", Source: "compose.yaml: api"},
+			},
+			want: state.ProjectScanSourceCompose,
+		},
+		{
+			name: "compose wins over k8s when both present (priority list)",
+			workloads: []reposcan.Workload{
+				{Name: "api", Source: "compose.yaml: api"},
+				{Name: "web", Source: "k8s/deployment.yaml: web"},
+			},
+			want: state.ProjectScanSourceCompose,
+		},
+		{
+			name: "single workload with root-floor source",
+			workloads: []reposcan.Workload{
+				{Name: "app", Source: "root-floor"},
+			},
+			want: state.ProjectScanSourceSingle,
+		},
+		{
+			name:      "empty workload list",
+			workloads: nil,
+			want:      state.ProjectScanSourceUnknown,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveScanSource(tc.workloads)
+			if got != tc.want {
+				t.Errorf("deriveScanSource(%v) = %q, want %q", tc.workloads, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcile_StartCommand_Flattened(t *testing.T) {
+	// resolveStartCommand joins []string with " " — pinned by the
+	// unit test so a future refactor doesn't change the wire
+	// shape.
+	cases := []struct {
+		w    reposcan.Workload
+		want string
+	}{
+		{reposcan.Workload{Command: []string{"python", "app.py"}}, "python app.py"},
+		{reposcan.Workload{Command: nil}, ""},
+		{reposcan.Workload{Command: []string{}}, ""},
+	}
+	for _, tc := range cases {
+		got := resolveStartCommand(tc.w)
+		if got != tc.want {
+			t.Errorf("resolveStartCommand(%v) = %q, want %q", tc.w, got, tc.want)
+		}
+	}
+}
+
+func TestReconcile_AppliedIDs_IsolatesAddsFromChanged(t *testing.T) {
+	// Regression for #428-style drift: a "changed" must NEVER
+	// also appear in "added". The diff's creates and updates are
+	// disjoint by construction; this test pins the invariant.
+	store := newFakeStore()
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	// Seed the existing api app at the SAME rootDir as the scan
+	// so the diff key (rootDir, name) collides → update path.
+	seedApp(t, store, proj, "apps/api", "api", "")
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "apps/api", Command: []string{"python", "app.py"}, Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+			{Name: "worker", RootDir: "apps/worker", Source: "compose.yaml: worker", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-1", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	added := extractAppIDs(out.Added)
+	changed := extractAppIDs(out.Changed)
+	if len(added) != 1 {
+		t.Errorf("expected 1 add, got %d", len(added))
+	}
+	if len(changed) != 1 {
+		t.Errorf("expected 1 change, got %d", len(changed))
+	}
+	for _, c := range changed {
+		for _, a := range added {
+			if c == a {
+				t.Errorf("changed %s also in added", c)
+			}
+		}
+	}
+}
