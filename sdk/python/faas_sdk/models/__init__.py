@@ -32,6 +32,8 @@ from .app_response_type import AppResponseType
 from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
 from .app_secret_response import AppSecretResponse
+from .apply_response import ApplyResponse
+from .apply_response_apps_item import ApplyResponseAppsItem
 from .apps_metrics_response import AppsMetricsResponse
 from .apps_metrics_response_apps_type_0 import AppsMetricsResponseAppsType0
 from .apps_metrics_response_range import AppsMetricsResponseRange
@@ -127,8 +129,17 @@ from .password_login_response_plan import PasswordLoginResponsePlan
 from .password_reset_confirm import PasswordResetConfirm
 from .password_reset_request import PasswordResetRequest
 from .password_signup_request import PasswordSignupRequest
+from .plan_cron import PlanCron
+from .plan_managed import PlanManaged
+from .plan_response import PlanResponse
+from .plan_response_scan_source import PlanResponseScanSource
+from .plan_workload import PlanWorkload
+from .plan_workload_class import PlanWorkloadClass
+from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
 from .problem import Problem
+from .project_apply_request import ProjectApplyRequest
+from .project_scan_request import ProjectScanRequest
 from .put_app_env_request import PutAppEnvRequest
 from .put_app_secret_request import PutAppSecretRequest
 from .queue_dead_letter_message import QueueDeadLetterMessage
@@ -143,6 +154,7 @@ from .queue_send_request_payload import QueueSendRequestPayload
 from .queue_send_response import QueueSendResponse
 from .queue_state_response import QueueStateResponse
 from .queue_state_response_plan import QueueStateResponsePlan
+from .quota_block import QuotaBlock
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
@@ -188,6 +200,8 @@ __all__ = (
     "APIKeyResponseScopesItem",
     "AppEnvListResponse",
     "AppEnvResponse",
+    "ApplyResponse",
+    "ApplyResponseAppsItem",
     "AppManifest",
     "AppManifestEnv",
     "AppMetricsResponse",
@@ -293,8 +307,17 @@ __all__ = (
     "PasswordResetConfirm",
     "PasswordResetRequest",
     "PasswordSignupRequest",
+    "PlanCron",
+    "PlanManaged",
+    "PlanResponse",
+    "PlanResponseScanSource",
+    "PlanWorkload",
+    "PlanWorkloadClass",
+    "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
     "Problem",
+    "ProjectApplyRequest",
+    "ProjectScanRequest",
     "PutAppEnvRequest",
     "PutAppSecretRequest",
     "QueueDeadLetterMessage",
@@ -309,6 +332,7 @@ __all__ = (
     "QueueSendResponse",
     "QueueStateResponse",
     "QueueStateResponsePlan",
+    "QuotaBlock",
     "RenameAppRequest",
     "RepoResponse",
     "RotateAlertRuleSecretResponse",

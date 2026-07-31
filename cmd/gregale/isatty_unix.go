@@ -61,16 +61,6 @@ func stdinIsTTY() bool {
 	return v
 }
 
-// termIsTerminal is the unconditional cross-fd probe. Used by the
-// Phase 3 helpers that need to check an arbitrary *os.File (e.g. a
-// redirected stdin in a test). Returns false on error.
-func termIsTerminal(f *os.File) bool {
-	if f == nil {
-		return false
-	}
-	return term.IsTerminal(int(f.Fd()))
-}
-
 // isStdinTTYCache holds the once-computed stdin TTY result. Same
 // shape as the stdout cache above.
 var (

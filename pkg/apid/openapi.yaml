@@ -109,6 +109,12 @@ tags:
       and §11 ownership proof.
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
+  - name: projects
+    description: |
+      Multi-workload repo decomposition (ADR-050). /v1/projects/scan is
+      the dry-run that returns the PlanResponse (can_apply, plan_token);
+      /v1/projects is the transactional apply that creates the project,
+      its apps, and its crons in one Tx.
 
 security:
   - bearerAuth: []

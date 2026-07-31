@@ -198,7 +198,7 @@ func (s *server) scanService(
 		return nil, state.Project{}, nil, nil, api.ErrInternal(
 			fmt.Sprintf("count apps: %v", appCountErr))
 	}
-	observedCrons := countAccountCrons(s, requestCtx{r.Context()}, acct.ID)
+	observedCrons := countAccountCrons(r.Context(), s, acct.ID)
 
 	canApply := true
 	notAllowed := false
@@ -348,7 +348,9 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 			}
 		case "install_id":
 			b, _ := io.ReadAll(io.LimitReader(part, 32))
-			fmt.Sscanf(string(b), "%d", &installID)
+			//nolint:errcheck // empty input → installID stays 0; the
+			// apply handler treats 0 as "no install binding" (issue #313).
+			_, _ = fmt.Sscanf(string(b), "%d", &installID)
 		case "only":
 			b, _ := io.ReadAll(io.LimitReader(part, 1024))
 			for _, s := range strings.Split(string(b), ",") {
@@ -404,6 +406,9 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 // the whole thing into memory. The cap is enforced by the
 // MaxBytesReader above so this can't pin apid.
 func hashFileSHA256(path string) (string, error) {
+	//nolint:forbidigo // path is the daemon-spooled tarball from
+	// FAAS_SCAN_SPOOL_ROOT (set by scanService); not customer input.
+	// The lint tripwire for customer-path os.Open is in cmd/gregale.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -439,14 +444,14 @@ func mintPlanToken(accountID, slug, hashHex string) (string, error) {
 // runs OUTSIDE the apply Tx so it needs its own count to render
 // can_apply accurately. The store's count inside the Tx is the
 // authoritative one — if the two disagree, the store wins on commit.
-func countAccountCrons(s *server, c ctxLike, accountID string) int {
-	apps, err := s.store.ListApps(c.asCtx(), accountID)
+func countAccountCrons(ctx context.Context, s *server, accountID string) int {
+	apps, err := s.store.ListApps(ctx, accountID)
 	if err != nil {
 		return 0
 	}
 	var total int
 	for _, a := range apps {
-		cs, err := s.store.ListCronsForApp(c.asCtx(), a.ID)
+		cs, err := s.store.ListCronsForApp(ctx, a.ID)
 		if err != nil {
 			continue
 		}
@@ -454,19 +459,6 @@ func countAccountCrons(s *server, c ctxLike, accountID string) int {
 	}
 	return total
 }
-
-// ctxLike is the minimal context surface the scan service needs.
-// Both *http.Request and our test stubs satisfy it; using a real
-// context.Context here would force handlers to plumb a context
-// everywhere we want to defer cancellation.
-type ctxLike interface {
-	asCtx() context.Context
-}
-
-// requestCtx wraps an http.Request's context so it satisfies ctxLike.
-type requestCtx struct{ c context.Context }
-
-func (r requestCtx) asCtx() context.Context { return r.c }
 
 // deriveScanSource picks the project scan_source from the workloads
 // that survived --only. The rule mirrors the impl plan: if any

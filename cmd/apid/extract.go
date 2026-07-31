@@ -18,6 +18,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,6 +103,10 @@ func extractTarGzToDir(src string, lim extractLimits) (string, *api.Problem) {
 }
 
 func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
+	//nolint:forbidigo // src is a daemon-spooled path under FAAS_SCAN_SPOOL_ROOT
+	// (set by scanService above); not a customer-supplied path. The
+	// lint tripwire that catches customer-path os.Open calls lives in
+	// cmd/gregale; this path is not reachable from a customer file.
 	f, err := os.Open(src)
 	if err != nil {
 		return api.NewProblem(http.StatusBadRequest, api.CodeSourceInvalid,
@@ -128,7 +133,7 @@ func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 	)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -150,7 +155,7 @@ func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 		// so a tarball can carry directory entries (Railpack-style
 		// archives do).
 		switch hdr.Typeflag {
-		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
+		case tar.TypeReg, tar.TypeDir:
 			// allowed
 		default:
 			return api.ErrSourceInvalid(

@@ -196,7 +196,7 @@ func TestCmdScan_RendersTable(t *testing.T) {
 	apiAt := strings.Index(out, "api")
 	nightlyAt := strings.Index(out, "nightly")
 	workerAt := strings.Index(out, "worker")
-	if !(apiAt < nightlyAt && nightlyAt < workerAt) {
+	if apiAt >= nightlyAt || nightlyAt >= workerAt {
 		t.Errorf("workloads not sorted by name asc: api=%d nightly=%d worker=%d", apiAt, nightlyAt, workerAt)
 	}
 }

@@ -239,6 +239,11 @@ func splitCSV(s string) []string {
 // sections: Workloads (sorted by name asc) and Managed (stateful
 // services we won't provision). Cron rows appear under Workloads with
 // a "(cron: <schedule>)" suffix.
+//
+//nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
+// Fprintf at the tab stop is no different from a panic mid-row for the
+// operator — both surface as malformed output and the CLI exits non-zero
+// on the JSON-parse path below (mirrors commands_builds.go:166).
 func printPlanText(w io.Writer, plan api.PlanResponse) int {
 	fmt.Fprintf(w, "Project: %s\n", plan.ProjectSlug)
 	fmt.Fprintf(w, "Scan source: %s   tier: %s\n", plan.ScanSource, plan.Tier)
@@ -292,6 +297,8 @@ func printPlanText(w io.Writer, plan api.PlanResponse) int {
 // input — git does the same.
 func confirmPlan(w io.Writer, r io.Reader, plan api.PlanResponse) bool {
 	printPlanText(w, plan)
+	//nolint:errcheck // same rationale as printPlanText; a failed Fprintln
+	// at the prompt is no different from the read below failing.
 	fmt.Fprintln(w, "\nApply this plan? [y/N] ")
 	scanner := bufio.NewScanner(r)
 	if !scanner.Scan() {
