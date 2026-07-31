@@ -112,6 +112,25 @@ service Vmmd {
   // when the instance is not alive on this vmmd (nil ring).
   rpc Logs(LogsRequest) returns (stream LogsResponse);
 
+  // ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
+  // peer of ForwardHTTP. Same semantics as ForwardHTTP but the
+  // request body is sent as a stream of chunks (the first frame
+  // carries the init envelope; subsequent frames carry body bytes),
+  // and the response is returned as a stream of chunks (the first
+  // frame carries status + headers; subsequent frames carry body
+  // bytes). The bidirectional streaming lets gatewayd push the
+  // request body incrementally and pull the response body
+  // incrementally — the vmmd-side bridge script no longer needs to
+  // buffer the entire response body before sending it back.
+  //
+  // The init-level `stream` field on ForwardHTTPRequestInit lifts
+  // ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
+  // envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
+  // caps are on the gateway side via http.MaxBytesWriter). The
+  // legacy unary ForwardHTTP stays as the deprecated path for one
+  // release cycle to keep a rolling deploy green; PR-D removes it.
+  rpc ForwardHTTPStream(stream ForwardHTTPStreamRequest) returns (stream ForwardHTTPStreamResponse);
+
   // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
   // lets imaged compose the per-runtime base ext4 from a shared
   // debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -705,3 +724,84 @@ message UmountParentExt4Request {
 // itself — e.g. EBUSY when a child re-stage is still walking
 // the parent).
 message UmountParentExt4Response {}
+
+// ForwardHTTPStreamRequest (issue #471 PR-B + PR-C) is one frame
+// on the client→server stream. The first frame MUST carry the
+// `init` field with the full request envelope (instance, method,
+// URI, headers, port). Subsequent frames carry raw request body
+// bytes in `body_chunk`. Half-close on the client side signals
+// end-of-body.
+//
+// Header order is preserved exactly as the caller wrote it; vmmd
+// does not deduplicate. The `stream` field on the init envelope
+// is the truth signal — the server lifts
+// ForwardMaxBodyBytes → ForwardStreamMaxBodyBytes (25 MiB → 100 MiB)
+// and forwardResponseTimeout → ForwardStreamResponseTimeout (60 s
+// → 900 s) when set. Setting both fields explicitly avoids a
+// second round-trip on the streaming path.
+message ForwardHTTPStreamRequest {
+  oneof frame {
+    ForwardHTTPRequestInit init = 1;
+    bytes body_chunk = 2;
+  }
+}
+
+// ForwardHTTPRequestInit is the first frame of ForwardHTTPStreamRequest.
+// It reuses the Header envelope from the unary ForwardHTTPRequest so
+// gatewayd can build a single init frame and pass it to both RPCs
+// without a copy. The init frame is the only place `stream` is
+// honoured; subsequent frames are pure body bytes.
+message ForwardHTTPRequestInit {
+  // The compute_node-relative instance id (instances.id, scoped to a
+  // node). vmmd resolves the netns from this. Empty → InvalidArgument.
+  string instance = 1;
+  // HTTP method: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH.
+  string method = 2;
+  // Request-target — path?query, e.g. "/api/v1/items?id=42".
+  string request_uri = 3;
+  // Headers, in order. Each entry is one header line. Multi-valued
+  // headers are repeated (HTTP/1.1 allows). The gateway MUST drop
+  // hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
+  // sending — see pkg/gateway/forwardproxy.go's stripHopByHop.
+  repeated Header headers = 4;
+  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
+  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
+  // zero — legacy gateway clients keep working. Additive per ADR-016.
+  uint32 port = 5;
+  // stream is the truth signal: when true, vmmd lifts its body and
+  // timeout caps to the streaming envelopes
+  // (ForwardStreamMaxBodyBytes / ForwardStreamResponseTimeout).
+  // Lives on the init frame so a single message carries both
+  // "what to bridge" and "how to bound it" — no second RPC.
+  bool stream = 6;
+}
+
+// ForwardHTTPStreamResponse is one frame on the server→client
+// stream. The first frame carries the response init envelope
+// (status, headers, termination_kind). Subsequent frames carry
+// raw response body bytes. The server half-closes the stream
+// when the upstream bridge script exits; the client EOF on the
+// stream is the clean-shutdown signal.
+message ForwardHTTPStreamResponse {
+  oneof frame {
+    ForwardHTTPResponseInit init = 1;
+    bytes body_chunk = 2;
+  }
+}
+
+// ForwardHTTPResponseInit is the first frame of
+// ForwardHTTPStreamResponse. status is the upstream HTTP status
+// code; headers are the upstream response headers. Content-Length
+// is NOT echoed — the body is chunked and the client counts bytes
+// as they arrive. Error is the gRPC-status-equivalent message
+// (empty on success); non-empty means the server is signalling
+// a failure before the body even started.
+message ForwardHTTPResponseInit {
+  int32 status = 1;
+  repeated Header headers = 2;
+  // Non-empty on failure: e.g. "could not dial guest: timeout".
+  // The client surfaces this as a 502 with the upstream message
+  // in the X-Faas-Forward-Error header (operator-only; not
+  // customer-visible).
+  string error = 3;
+}

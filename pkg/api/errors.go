@@ -306,6 +306,16 @@ const (
 	// without conflating them in telemetry.
 	CodePlanStreamingNotAllowed = "plan_streaming_not_allowed"
 
+	// Issue #471 PR-B (the meat) — emitted when an active stream
+	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
+	// Free: 25 MB). 413 + this code so the client sees a distinct
+	// error from the plan-gate (403 plan_streaming_not_allowed) and
+	// can retry with a smaller payload. Distinct from the cap-exceeded
+	// path on the proxy buffer (which currently surfaces as a 502
+	// from stdlib net/http); PR-B wraps the streaming response
+	// writer in a custom MaxBytesWriter that emits this code instead.
+	CodeStreamingNotAvailable = "streaming_not_available"
+
 	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
 	// shape as MinInstances: a single plan-locked feature with two
 	// failure modes that warrant distinct codes so the CLI can render
