@@ -599,7 +599,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
 		}
-		advisorySrv, advisoryLis, err = runAdvisoryServer(sock, advisoryTLS, srv.store, srv.audit, srv.notif, log, srv.ops)
+		advisorySrv, advisoryLis, err = runAdvisoryServer(ctx, sock, advisoryTLS, srv.store, srv.audit, srv.notif, log, srv.ops)
 		if err != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory listen %q: %w", sock, err)
@@ -786,7 +786,7 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 // Returns the server (caller calls Serve) and the listener. Errors
 // here are fatal — without the advisory listener vmmd has no way to
 // forward fanotify batches and the audit loop is silently broken.
-func runAdvisoryServer(target string, tlsCfg *tls.Config, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
+func runAdvisoryServer(ctx context.Context, target string, tlsCfg *tls.Config, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
 	// Guard: a tcp/dns target without TLS would silently build an
 	// insecure server (wire.Listen returns raw TCP, ServerCredsOrEmpty
 	// yields zero opts). Refuse; the operator must set the
@@ -801,7 +801,7 @@ func runAdvisoryServer(target string, tlsCfg *tls.Config, store state.Store, aud
 	if isUnixSocketPath(target) {
 		lis, err = wire.ListenOrRecreateByName(target, "faas-apid")
 	} else {
-		lis, err = wire.Listen(context.Background(), target, tlsCfg)
+		lis, err = wire.Listen(ctx, target, tlsCfg)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("advisory listen: %w", err)

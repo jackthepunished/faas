@@ -128,7 +128,13 @@ func isUnixSocketPath(target string) bool {
 // server in a goroutine. Unix sockets get the 0660 + group `faas`
 // chmod after bind (ADR-015). TCP targets skip the chmod and
 // rely on the TLS handshake for auth.
-func (l *egressGRPCListener) start() error {
+//
+// ctx bounds the wire.Listen call on the TCP branch — unix sockets
+// don't need it (net.Listen is synchronous and never blocks past
+// the bind). The ctx isn't propagated to the running server because
+// the caller owns the shutdown ctx via stop(ctx); the runWithDeps
+// shutdown path uses a separate, deadline-bounded context for that.
+func (l *egressGRPCListener) start(ctx context.Context) error {
 	if l == nil || l.socketPath == "" || l.server == nil {
 		return nil
 	}
@@ -153,7 +159,7 @@ func (l *egressGRPCListener) start() error {
 		// raw TCP — gRPC's transport will do the TLS handshake
 		// via ServerCreds passed to grpc.NewServer above
 		// (ADR-052 §Handler-layer peer binding).
-		lis, err = wire.Listen(context.Background(), l.socketPath, nil)
+		lis, err = wire.Listen(ctx, l.socketPath, nil)
 		if err != nil {
 			return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
 		}

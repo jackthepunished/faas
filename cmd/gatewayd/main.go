@@ -511,7 +511,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// AppendUsage writes 0 to tx_bytes for that minute. Once the
 	// socket becomes bindable (deploy-time /run/faas exists), the
 	// next daemon restart picks up the stream automatically.
-	if err := deps.egressGRPC.start(); err != nil {
+	if err := deps.egressGRPC.start(ctx); err != nil {
 		log.Warn("gatewayd egress listen failed; tx_bytes will stay 0 until restart",
 			"socket", egressGRPCSocket, "err", err)
 		deps.egressGRPC = nil

@@ -318,7 +318,7 @@ func generateLeaf(role Role, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) 
 		return nil, nil, err
 	}
 	now := time.Now()
-	eku := []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	var eku []x509.ExtKeyUsage
 	if role.Kind == KindServer {
 		// ServerAuth only.
 		eku = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}

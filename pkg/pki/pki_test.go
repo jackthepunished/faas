@@ -113,7 +113,7 @@ func TestEnsureLeafSkipsFreshLeaf(t *testing.T) {
 		t.Fatalf("first EnsureLeaf: %v", err)
 	}
 	err = EnsureLeaf(root, role, caCert, caKey, false)
-	if err != ErrLeafNotExpiringSoon {
+	if !errors.Is(err, ErrLeafNotExpiringSoon) {
 		t.Errorf("second EnsureLeaf: got %v, want ErrLeafNotExpiringSoon", err)
 	}
 }

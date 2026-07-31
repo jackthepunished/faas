@@ -230,29 +230,34 @@ func reportLeafStatusAll(w io.Writer, rootDir string) {
 // reportOneStatus prints one line: <label>  <mode>  <serial>  <expires_at>  <CN>  <SANs>  <path>.
 // Missing files print "<label>  missing  <path>" and return without
 // error so the operator can see the full picture before running init.
+//
+// The Fprintf calls below cannot fail meaningfully (w is typically os.Stdout
+// or a *bytes.Buffer the operator reads later); we discard the error
+// explicitly so errcheck is happy and the code reads as a printf, not a
+// status-report path that pretends to bubble I/O errors back to the operator.
 func reportOneStatus(w io.Writer, label, certPath string) {
 	info, err := os.Stat(certPath)
 	if err != nil {
-		fmt.Fprintf(w, "%s  missing  %s\n", label, certPath)
+		_, _ = fmt.Fprintf(w, "%s  missing  %s\n", label, certPath)
 		return
 	}
 	data, err := os.ReadFile(certPath)
 	if err != nil {
-		fmt.Fprintf(w, "%s  mode %#o  read error: %v  %s\n", label, info.Mode().Perm(), err, certPath)
+		_, _ = fmt.Fprintf(w, "%s  mode %#o  read error: %v  %s\n", label, info.Mode().Perm(), err, certPath)
 		return
 	}
 	block, _ := pem.Decode(data)
 	if block == nil {
-		fmt.Fprintf(w, "%s  mode %#o  not PEM  %s\n", label, info.Mode().Perm(), certPath)
+		_, _ = fmt.Fprintf(w, "%s  mode %#o  not PEM  %s\n", label, info.Mode().Perm(), certPath)
 		return
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		fmt.Fprintf(w, "%s  mode %#o  parse error: %v  %s\n", label, info.Mode().Perm(), err, certPath)
+		_, _ = fmt.Fprintf(w, "%s  mode %#o  parse error: %v  %s\n", label, info.Mode().Perm(), err, certPath)
 		return
 	}
 	sans := formatSANs(cert.DNSNames, cert.IPAddresses)
-	fmt.Fprintf(w, "%s  %#o  serial=%s  expires=%s  CN=%s  SANs=[%s]  %s\n",
+	_, _ = fmt.Fprintf(w, "%s  %#o  serial=%s  expires=%s  CN=%s  SANs=[%s]  %s\n",
 		label, info.Mode().Perm(),
 		cert.SerialNumber.String(),
 		cert.NotAfter.Format(time.RFC3339),
