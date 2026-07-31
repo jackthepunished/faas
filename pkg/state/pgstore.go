@@ -6737,20 +6737,24 @@ var ErrInvalidArgument = errors.New("state: invalid argument")
 
 // checkViolationMappedToInvalid lists the constraint names whose
 // CHECK violations surface as ErrInvalidArgument at the Store
-// contract. The list is intentionally narrow: the canonical
-// tripwire tests
-// (TestPgStore_InstancesStateCheck_RejectsBogusState +
-// TestPgStore_InstancesStateCheck_RejectsInjection) pin the
-// inverse — instances_state_check MUST bubble the raw SQLSTATE
-// 23514 so a future regression that widens the CHECK to text is
-// visible. Adding a constraint here should match a Store contract
-// change (PR-B's SetAppWorkloadClass + the apps.egress_allowlist
-// path in pkg/netns + scan_source_tier on Project). Don't add
-// `instances_state_check` here — its raw error is the point.
+// contract. The list is intentionally narrow — most CHECK violations
+// bubble the raw *pgconn.PgError so tripwire tests like
+// TestPgStore_InstancesStateCheck_RejectsBogusState,
+// TestPgStore_InstancesStateCheck_RejectsInjection, and
+// TestPgStore_UpdateApp_SlashZeroRejected can substring-match
+// "23514" and a future widening of the CHECK (e.g. to text) is
+// visible at the test boundary.
+//
+// The two entries below map to ErrInvalidArgument because their
+// Store-layer callers (PR-B's SetAppWorkloadClass +
+// SetProjectScanSource) explicitly validate the input upstream
+// — a CHECK hit is a contract violation between the Store and the
+// schema, not a transient DB error. Don't add
+// `instances_state_check` or `apps_egress_allowlist_cidr` here —
+// their raw errors are load-bearing for the tripwires above.
 var checkViolationMappedToInvalid = map[string]struct{}{
-	"apps_workload_class_chk":    {}, // PR-B SetAppWorkloadClass
-	"apps_egress_allowlist_cidr": {}, // pkg/netns policy validation
-	"scan_source_tier_chk":       {}, // SetProjectScanSource tier enum
+	"apps_workload_class_chk": {}, // SetAppWorkloadClass (PR-B)
+	"scan_source_tier_chk":    {}, // SetProjectScanSource tier enum
 }
 
 func mapErr(err error) error {
