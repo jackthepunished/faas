@@ -97,6 +97,21 @@ func (f *fakeVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusReq
 	panic("SeccompStatus: not stubbed")
 }
 
+// MountParentExt4ReadOnly (ADR-053) — gateway forwardproxy tests
+// never drive the parent-mount staging path; imaged owns those
+// RPCs. Returns empty + nil so the vmmdpb.VmmdClient interface
+// is satisfied; any accidental caller would surface as imaged's
+// "empty mountpoint" check rather than a NotFound from vmmd.
+func (f *fakeVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountParentExt4ReadOnlyRequest, ...grpc.CallOption) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
+	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
+}
+
+// UmountParentExt4 (ADR-053) — gateway forwardproxy tests never
+// drive the parent umount path. Returns nil.
+func (f *fakeVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {
+	return &vmmdpb.UmountParentExt4Response{}, nil
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

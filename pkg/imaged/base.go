@@ -27,6 +27,17 @@ const (
 	BaseRefPython313   = "ghcr.io/onebox-faas/runner-python313:latest"
 	BaseRefMinimal     = "ghcr.io/onebox-faas/base-minimal:latest"
 	BaseRefBuilder     = "ghcr.io/onebox-faas/builder-base:latest"
+	// BaseRefDebianParent (ADR-053) is the staging-only parent
+	// runtime — its ext4 carries the shared debian:12-slim userland
+	// (~150 MB of libc/openssl/ca-certs/busybox) that the four
+	// node/python runtime bases used to duplicate. The Dockerfile
+	// (images/base-debian-parent.Dockerfile) is `FROM debian:12-slim`
+	// DIRECTLY — not scratch + COPY — so the first OCI layer in the
+	// parent's manifest is the literal debian:12-slim rootfs layer
+	// and `oci.LayersAboveBase(parent.DiffIDs, child.DiffIDs)`
+	// succeeds (the chain-composability invariant documented in
+	// ADR-053).
+	BaseRefDebianParent = "ghcr.io/onebox-faas/base-debian-parent:latest"
 
 	// Runtime names are the values stored on state.App.Runtime. They map
 	// 1:1 to the runner shims in
@@ -37,12 +48,13 @@ const (
 	// version-neutral /app/handler.py. Naming them as constants keeps
 	// the baseRefFor switch and the production callers (cmd/imaged's
 	// deploy path) in lockstep.
-	RuntimeNode22      = "node22"
-	RuntimePython312   = "python312"
-	RuntimeGo124       = "go124"
-	RuntimeGo124Alpine = "go124-alpine"
-	RuntimeNode24      = "node24"
-	RuntimePython313   = "python313"
+	RuntimeNode22       = "node22"
+	RuntimePython312    = "python312"
+	RuntimeGo124        = "go124"
+	RuntimeGo124Alpine  = "go124-alpine"
+	RuntimeNode24       = "node24"
+	RuntimePython313    = "python313"
+	RuntimeDebianParent = "base-debian-parent" // ADR-053: shared parent runtime id
 )
 
 // StatefulBaseImageDenylist is the Wave 0 / year-one set of OCI image
@@ -225,6 +237,11 @@ func baseRefFor(runtime string) string {
 		return BaseRefNode24
 	case RuntimePython313:
 		return BaseRefPython313
+	case RuntimeDebianParent:
+		// ADR-053: parent runtime resolves to its own ref, never
+		// BaseRefMinimal (which is `FROM scratch + COPY`, not on
+		// the debian chain).
+		return BaseRefDebianParent
 	default:
 		return BaseRefMinimal
 	}

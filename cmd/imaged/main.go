@@ -206,7 +206,16 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// "scan-critical" failure rather than the supply-chain
 		// installation gap it actually is.
 		WithGrypeRun(makeGrypeRunner(os.Getenv("FAAS_GRYPE_BIN"))).
-		WithSyftRun(makeSyftRunner(os.Getenv("FAAS_SYFT_BIN")))
+		WithSyftRun(makeSyftRunner(os.Getenv("FAAS_SYFT_BIN"))).
+		// ADR-053: imaged asks vmmd to loopback-mount the parent
+		// ext4 read-only for the parent-ref staging path. The
+		// client is constructed eagerly but the gRPC conn is lazy
+		// (first MountParentExt4ReadOnly call dials) so a vmmd
+		// restart doesn't delay imaged startup. Default target
+		// matches /run/faas/vmmd.sock (ADR-015); operators can
+		// override with FAAS_VMM_SOCK for dev (e.g. a bufconn
+		// test on a Mac).
+		WithVMMClient(imaged.NewVMMClient(envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock), log))
 
 	// F3: function runner wiring. cmd/imaged refuses to come up if either
 	// env var is set but the path doesn't exist on disk — silent omission
@@ -277,7 +286,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	arch := imaged.BuilderArch()
 	baseKey := sched.BaseKeyForArch("builder", arch)
 	digestKey := sched.BaseDigestKeyForArch("builder", arch)
-	baseRes, err := h.EnsureBaseExt4(ctx, baseRef, baseKey, digestKey, basePath)
+	baseRes, err := h.EnsureBaseExt4(ctx, baseRef, baseKey, digestKey, basePath, "", "")
 	if err != nil {
 		return fmt.Errorf("imaged: stage builder base %s → %s: %w", baseRef, basePath, err)
 	}
@@ -355,6 +364,15 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 			_ = msrv.Shutdown(shutdownCtx)
 		}()
 	}
+
+	// ADR-053: release the vmmd gRPC conn on shutdown so SIGTERM
+	// doesn't leak the dial. Idempotent on a nil receiver; the
+	// VMMClient's Close is also nil-safe.
+	defer func() {
+		if err := h.CloseVMMClient(); err != nil {
+			log.Warn("imaged: close vmm client", "err", err)
+		}
+	}()
 
 	return loop.Run(ctx)
 }

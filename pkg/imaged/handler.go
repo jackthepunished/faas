@@ -42,6 +42,13 @@ type LayerBuilder interface {
 	// so cold-boot can pass it as drive0. The base pipeline is the inverse
 	// of Build: no app manifest injection, no plan cap, every layer applied.
 	BuildBase(ctx context.Context, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error)
+	// BuildBaseFromStaging (ADR-053) mkfs-es an already-populated
+	// staging dir into the canonical base ext4. The imaged
+	// parent-ref branch cp -a's the parent's tree into a fresh
+	// MkdirBaseStaging dir, applies ONLY the runtime delta OCI
+	// layers via ApplyLayerGz, and hands the dir here — mkfs +
+	// publish, no layer apply inside Build.
+	BuildBaseFromStaging(ctx context.Context, staging string, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error)
 }
 
 // Handler is the imaged orchestrator. It owns the transition walk that
@@ -127,6 +134,16 @@ type Handler struct {
 	// still succeeds (the SBOM is observational, not a deployment
 	// precondition — schema §4.2).
 	syftRun func(ctx context.Context, dir string) ([]byte, error)
+	// vmmClient (ADR-053) is the imaged-side gRPC client to vmmd
+	// used by the parent-ref staging branch of EnsureBaseExt4. vmmd
+	// owns the loopback mount; imaged is not root (User=faas-imaged
+	// + NoNewPrivileges=yes per spec §11) and cannot mount on its
+	// own. Wired via WithVMMClient at daemon startup. Nil-safe:
+	// the legacy "apply all layers" path stays operational without
+	// a client wired; only the parent-ref branch fails loud.
+	// Interface (not concrete *VMMClient) so tests can inject a
+	// fakeVMMClient (defined in vmmclient.go) without dialing.
+	vmmClient VMMClientIface
 }
 
 // New returns a Handler. The OCI puller is injected so tests can substitute
@@ -251,6 +268,36 @@ func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (map[str
 func (h *Handler) WithSyftRun(fn func(ctx context.Context, dir string) ([]byte, error)) *Handler {
 	h.syftRun = fn
 	return h
+}
+
+// WithVMMClient wires the vmmd gRPC client used by the
+// ADR-053 parent-ref staging branch of EnsureBaseExt4. The
+// client is nil-safe: the legacy "apply all layers" path
+// (RuntimeGo124, RuntimeGo124Alpine, RuntimeDebianParent
+// itself, builder-base) stays operational without a client
+// wired; only the parent-ref branch (RuntimeNode22/24 +
+// RuntimePython312/313) fails loud when the client is nil
+// and the parent ext4 isn't staged.
+//
+// Production cmd/imaged constructs the client against
+// FAAS_VMM_SOCK (default unix:///run/faas/vmmd.sock,
+// ADR-015) and calls this once at startup. The client is
+// reused across staging cycles; cmd/imaged also calls
+// h.vmmClient.Close() on SIGTERM so the dial doesn't leak.
+func (h *Handler) WithVMMClient(c VMMClientIface) *Handler {
+	h.vmmClient = c
+	return h
+}
+
+// CloseVMMClient closes the vmmd gRPC client wired at startup.
+// Exposed (rather than a method on VMMClient only) so cmd/imaged
+// can call h.CloseVMMClient() on SIGTERM without exposing the
+// unexported vmmClient field. Idempotent on a nil receiver.
+func (h *Handler) CloseVMMClient() error {
+	if h == nil || h.vmmClient == nil {
+		return nil
+	}
+	return h.vmmClient.Close()
 }
 
 // runGrype dispatches to the injected grypeRun or falls back to

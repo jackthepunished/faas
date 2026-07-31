@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,6 +84,125 @@ func TestBuildBase_LegacyOutImage(t *testing.T) {
 	}
 	if !containsString(run.argv, out) {
 		t.Errorf("argv %v must contain %q (legacy path)", run.argv, out)
+	}
+}
+
+// TestBuildBaseFromStaging_MkfsFromExistingDir (ADR-053) is the parent-ref
+// staging seam: caller pre-populates the staging dir (cp -a from a vmmd
+// loopback mount of the parent ext4 + delta layer apply) and BuildBaseFromStaging
+// mkfs-es it without touching in.Layers. Pins that (a) the staging dir is
+// used as mkfs's -d source verbatim, (b) the produced ext4 is published at
+// StorageKey, (c) the staging dir is NOT auto-removed (caller owns the
+// cleanup after publishing), and (d) the layered-apply code path is NOT
+// invoked when Layers is empty.
+func TestBuildBaseFromStaging_MkfsFromExistingDir(t *testing.T) {
+	be := newTestStorage(t)
+	run := &mkfsFakeRunner{fill: []byte("FAKE-BASE-FROM-STAGING")}
+	b := NewBuilder(run)
+
+	staging, err := MkdirBaseStaging()
+	if err != nil {
+		t.Fatalf("MkdirBaseStaging: %v", err)
+	}
+	// Caller-owned cleanup (matches the contract documented on
+	// BuildBaseFromStaging).
+	t.Cleanup(func() { _ = os.RemoveAll(staging) })
+
+	// Seed the staging tree as if imaged's parent-ref path had
+	// already cp -a'd the parent + applied delta layers.
+	if err := os.WriteFile(filepath.Join(staging, "lib"), []byte("parent-content"), 0o644); err != nil {
+		t.Fatalf("seed staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "usr"), []byte("delta-content"), 0o644); err != nil {
+		t.Fatalf("seed staging: %v", err)
+	}
+
+	res, err := b.BuildBaseFromStaging(context.Background(), staging, BaseBuildInput{
+		Storage:    be,
+		StorageKey: "base/runner-node24.ext4",
+	})
+	if err != nil {
+		t.Fatalf("BuildBaseFromStaging: %v", err)
+	}
+	if res.ImageKey != "base/runner-node24.ext4" {
+		t.Errorf("ImageKey = %q, want %q", res.ImageKey, "base/runner-node24.ext4")
+	}
+	if res.SizeBytes == 0 {
+		t.Error("SizeBytes = 0, want > 0")
+	}
+	if len(run.argv) == 0 || run.argv[0] != "mkfs.ext4" {
+		t.Fatalf("Run argv[0] = %v, want mkfs.ext4", run.argv)
+	}
+	if !containsString(run.argv, "-d") {
+		t.Errorf("argv %v must use -d (mkfs with source dir)", run.argv)
+	}
+	if !containsString(run.argv, staging) {
+		t.Errorf("argv %v must contain the pre-populated staging dir %q", run.argv, staging)
+	}
+	// Staging dir must still exist — BuildBaseFromStaging does not own
+	// its cleanup (the contract documented on the function).
+	if _, err := os.Stat(staging); err != nil {
+		t.Errorf("staging dir was removed by BuildBaseFromStaging: %v", err)
+	}
+	// The published ext4 must be at the requested key.
+	rc, err := be.Get(context.Background(), "base/runner-node24.ext4")
+	if err != nil {
+		t.Fatalf("ext4 not at key: %v", err)
+	}
+	body, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !bytes.Equal(body, []byte("FAKE-BASE-FROM-STAGING")) {
+		t.Errorf("ext4 body = %q, want %q", body, "FAKE-BASE-FROM-STAGING")
+	}
+}
+
+// TestBuildBaseFromStaging_RejectsEmptyStaging covers the boundary: the
+// caller must pass a non-empty staging path; an empty path or a
+// non-existent path is a configuration error.
+func TestBuildBaseFromStaging_RejectsEmptyStaging(t *testing.T) {
+	be := newTestStorage(t)
+	b := NewBuilder(&mkfsFakeRunner{fill: []byte("x")})
+	if _, err := b.BuildBaseFromStaging(context.Background(), "", BaseBuildInput{
+		Storage: be, StorageKey: "base/runtime.ext4",
+	}); err == nil {
+		t.Error("empty staging dir should error")
+	}
+	if _, err := b.BuildBaseFromStaging(context.Background(), "/nonexistent/never-exists-12345",
+		BaseBuildInput{Storage: be, StorageKey: "base/runtime.ext4"},
+	); err == nil {
+		t.Error("missing staging dir should error")
+	}
+}
+
+// TestMkdirBaseStaging_ReturnedDirIsUsable pins that the exported
+// helper returns a writable, empty, OS-allocated temp dir that the
+// caller can populate + later hand to BuildBaseFromStaging. This is
+// the load-bearing seam between imaged's parent-ref staging and
+// rootfs's mkfs.
+func TestMkdirBaseStaging_ReturnedDirIsUsable(t *testing.T) {
+	d, err := MkdirBaseStaging()
+	if err != nil {
+		t.Fatalf("MkdirBaseStaging: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+
+	if d == "" {
+		t.Fatal("MkdirBaseStaging returned empty path")
+	}
+	info, err := os.Stat(d)
+	if err != nil {
+		t.Fatalf("stat returned dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("returned path %q is not a directory", d)
+	}
+	// Empty on creation — BuildBaseFromStaging is the one that mkfs-es it.
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("returned dir has %d initial entries, want 0", len(entries))
 	}
 }
 

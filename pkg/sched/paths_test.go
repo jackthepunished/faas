@@ -86,3 +86,38 @@ func TestBaseAndDigestKeyMatchPerArch(t *testing.T) {
 		}
 	}
 }
+
+// TestIsParentBaseKey: the gRPC allow-list for MountParentExt4ReadOnly.
+// Must accept the canonical parent key for this arch + the sibling
+// arch (heterogenous cluster case), and reject everything else.
+func TestIsParentBaseKey(t *testing.T) {
+	want := BaseKeyForArch(ParentBaseRuntime, runtime.GOARCH)
+	if !IsParentBaseKey(want) {
+		t.Errorf("IsParentBaseKey(%q) = false, want true (host arch parent key)", want)
+	}
+	// Sibling arch.
+	otherArch := "arm64"
+	if runtime.GOARCH == "arm64" {
+		otherArch = "amd64"
+	}
+	sibling := BaseKeyForArch(ParentBaseRuntime, otherArch)
+	if !IsParentBaseKey(sibling) {
+		t.Errorf("IsParentBaseKey(%q) = false, want true (sibling arch parent key)", sibling)
+	}
+	for _, bad := range []string{
+		"",
+		"base/runner-node22-amd64.ext4",
+		"base/runner-python312-amd64.ext4",
+		"base/base-debian-parent-amd64",               // missing .ext4
+		"base/debian-parent-amd64.ext4",               // dropped "runner-" prefix
+		"base/runner-base-debian-parent-riscv64.ext4", // unsupported arch
+		"layers/foo.ext4",
+		"base/base-amd64.ext4",
+		"kernel/vmlinux-amd64",
+		"snapshots/app-foo/mem.bin",
+	} {
+		if IsParentBaseKey(bad) {
+			t.Errorf("IsParentBaseKey(%q) = true, want false (non-parent key)", bad)
+		}
+	}
+}

@@ -125,6 +125,22 @@ func (f *fakeVMM) InstancePID(instance string) (int, bool) { return 0, false }
 // will surface as a NotFound from vmmd's handler.
 func (f *fakeVMM) LogRing(_ string) *logbuf.Ring { return nil }
 
+// MountParentExt4 (ADR-053) — the sched test rig never drives
+// the parent-mount staging path; imaged owns those gRPC calls.
+// Returns "" + nil so the VmmdAPI contract is satisfied and any
+// accidental invocation would surface as imaged's
+// "empty mountpoint" check rather than a NotFound from vmmd.
+func (f *fakeVMM) MountParentExt4(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
+// UmountParentExt4 (ADR-053) — sched doesn't drive the parent
+// umount path. Returns nil; imaged's defer-on-error pattern is
+// idempotent on this no-op success.
+func (f *fakeVMM) UmountParentExt4(_ context.Context, _ string) error {
+	return nil
+}
+
 // newClient stands up a vmmdgrpc.Server on bufconn and returns a sched.VMMClient
 // dialed to it.
 func newClient(t *testing.T, fake *fakeVMM) *sched.VMMClient {

@@ -16,7 +16,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-const usage = `gregale — deploy apps and functions that scale to zero.
+// docsURL is the canonical link printed at the bottom of the usage string.
+// Computed (not a const) so the tripwire that bans DOMAIN-shaped literals
+// in source keeps working; the only host that surfaces in the binary is
+// wire.DocsHost.
+var docsURL = "https://" + wire.DocsHost
+
+var usage = `gregale — deploy apps and functions that scale to zero.
 
 Usage:
   gregale <command> [flags]
@@ -68,7 +74,7 @@ Global flags:
                  NDJSON (one JSON object per line, jq -c '.'); scalars
                  emit indented JSON; errors print raw RFC 7807 to stderr.
                  Equivalent env: FAAS_JSON=1. Negate with --json=false.
-Docs: https://docs.gregale.dev
+Docs: ` + docsURL + `
 `
 
 func main() {

@@ -8,9 +8,11 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -96,6 +98,27 @@ type Config struct {
 	// Default empty; FAAS_VMMD_DBURL env var overrides for the
 	// containerised deployments that prefer env-only config.
 	DBURL string `toml:"db_url"`
+
+	// ParentMountCap bounds the registry size for the ADR-053
+	// parent-mount loopback table (cmd/vmmd/main.go wires
+	// pkg/vmmdmount.Registry). Default 16 matches the worst-case
+	// staging parallelism on a one-box fleet (a rebuild + the
+	// four child runtimes + headroom); operators can dial it up
+	// on boxes that drive larger fleet-wide rebuilds.
+	ParentMountCap int `toml:"parent_mount_cap"`
+
+	// ParentMountMaxAge is the orphan-sweep threshold. Anything
+	// older when the sweep tick fires is force-umounted. Default
+	// 30 min — a normal mkfs.ext4 -d over a ~280 MB debian userland
+	// takes seconds; a hung imaged child surfaces long before
+	// the sweep kicks in.
+	ParentMountMaxAge time.Duration `toml:"parent_mount_max_age"`
+
+	// ParentSweepInterval is the cadence of the orphan sweep
+	// goroutine. Default 30 s; tight enough to keep the worst-case
+	// "hung imaged + orphan mount" window bounded without burning
+	// CPU on idle fleets.
+	ParentSweepInterval time.Duration `toml:"parent_sweep_interval"`
 }
 
 // ComputeNodeConfig is the [compute_node] TOML section. Field naming
@@ -169,6 +192,15 @@ func LoadConfig(path string) (*Config, error) {
 		// fixtures working until operators migrate.
 		KernelPath: "/srv/fc/base/vmlinux-6.1",
 		OwnerUser:  "faas-vmmd",
+		// Parent-mount registry defaults — see ADR-053 / field docs.
+		// Cap=DefaultCap (16), MaxAge=ParentMountMaxAge (30m),
+		// Sweep=ParentSweepInterval (30s). Operators dial these
+		// for larger fleets; the constants live in pkg/vmmdmount
+		// so any other consumer (e.g. a hypothetical test helper)
+		// shares the same baseline.
+		ParentMountCap:      vmmdmount.DefaultCap,
+		ParentMountMaxAge:   vmmdmount.ParentMountMaxAge,
+		ParentSweepInterval: 30 * time.Second,
 		ComputeNode: ComputeNodeConfig{
 			// Defaults match the synthetic default-local row seeded
 			// by migration 00024 so single-box dev (no overlay)
