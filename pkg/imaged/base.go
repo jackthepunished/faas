@@ -1,6 +1,8 @@
 package imaged
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/oci"
@@ -245,4 +247,45 @@ func baseRefFor(runtime string) string {
 	default:
 		return BaseRefMinimal
 	}
+}
+
+// resolveDeployBaseRef returns the OCI base ref to use when staging an
+// image-deploy for the given runtime. Per-runtime env vars
+// (FAAS_DEPLOY_BASE_REF_<RUNTIME>) take precedence over the const
+// default in baseRefFor. Falls through to baseRefFor for runtimes
+// not in DefaultRuntimeBaseRefs (the "" / BaseRefMinimal case for
+// customer-uploaded images).
+//
+// Companion to baseRefFor (which is the pure const switch, pinned by
+// TestBaseRefFor_Runtimes): wraps the const lookup with the same
+// per-runtime env-override + digest-pin posture that EnsureBases
+// (startup auto-stage, pkg/imaged/base_stage.go) uses. This keeps
+// the Runtime → Ref → EnvOverride mapping in one place
+// (DefaultRuntimeBaseRefs) and covers both the startup-stage and
+// deploy-time paths with a single env var each, set via the
+// cd-controlplane.yml writer loop.
+//
+// envLookup nil-falls-back to os.Getenv; the test seam is a map
+// literal (TestResolveDeployBaseRef_*).
+func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string, error) {
+	if envLookup == nil {
+		envLookup = os.Getenv
+	}
+	for _, row := range DefaultRuntimeBaseRefs {
+		if row.Runtime != runtime {
+			continue
+		}
+		v := strings.TrimSpace(envLookup(row.EnvOverride))
+		if v == "" {
+			return row.Ref, nil
+		}
+		parsed, perr := oci.ParseReference(v)
+		if perr != nil || parsed.Digest == "" {
+			return "", fmt.Errorf("imaged: %s=%q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", row.EnvOverride, v)
+		}
+		return v, nil
+	}
+	// Runtime not in the table (e.g. customer-uploaded image with
+	// runtime="") — fall through to baseRefFor's default (BaseRefMinimal).
+	return baseRefFor(runtime), nil
 }

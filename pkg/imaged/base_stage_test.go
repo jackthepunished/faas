@@ -1054,3 +1054,83 @@ func TestEnsureBaseExt4_WithoutParentRef_AppliesAllLayers(t *testing.T) {
 		_ = rc.Close()
 	}
 }
+
+// TestResolveParentRef_HonorsEnvOverride is the regression for run
+// 30661487390 (2026-07-31). Before the fix, EnsureBases hardcoded
+// row.ParentRef in the parent branch — bypassing
+// FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT entirely. An operator who set
+// that env var to a mirror.gcr.io digest would see the parent row
+// honor it but every child row's parent manifest pull still ask for
+// the unreachable ghcr.io/onebox-faas/base-debian-parent:latest.
+//
+// The fix routes the parent lookup through the same env-override
+// path the parent row uses itself, via the envOverrideByRef map
+// built once per EnsureBases call. resolveParentRef is the
+// extracted helper. This test pins the four cases the field
+// needs to handle: empty parentRef (legacy row), env override
+// present + digest-pinned (override applied), env override
+// missing (const kept), env override set to a tag-only ref
+// (fail-loud, same posture as the row-level override gate).
+func TestResolveParentRef_HonorsEnvOverride(t *testing.T) {
+	const parentRef = "ghcr.io/onebox-faas/base-debian-parent:latest"
+	const overrideRef = "mirror.gcr.io/library/debian@sha256:81d93757457f988523814ae0009837ae893f38d3fe123f2c37896f118b4c7804"
+	envOverrideByRef := map[string]string{
+		parentRef: "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT",
+	}
+	envLookup := func(key string) string {
+		if key == "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT" {
+			return overrideRef
+		}
+		return ""
+	}
+	t.Run("empty parentRef returns empty", func(t *testing.T) {
+		got, err := resolveParentRef("", envOverrideByRef, envLookup)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("env override present returns override", func(t *testing.T) {
+		got, err := resolveParentRef(parentRef, envOverrideByRef, envLookup)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != overrideRef {
+			t.Errorf("got %q, want %q (env override must propagate to child parent ref)", got, overrideRef)
+		}
+	})
+	t.Run("env override missing returns const", func(t *testing.T) {
+		got, err := resolveParentRef(parentRef, envOverrideByRef, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != parentRef {
+			t.Errorf("got %q, want %q (missing env must not clobber const)", got, parentRef)
+		}
+	})
+	t.Run("env override tag-only ref fails loud", func(t *testing.T) {
+		tagOnly := func(string) string { return "mirror.gcr.io/library/debian:12-slim" }
+		_, err := resolveParentRef(parentRef, envOverrideByRef, tagOnly)
+		if err == nil {
+			t.Fatal("expected error for tag-only env override, got nil")
+		}
+		if !strings.Contains(err.Error(), "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT") {
+			t.Errorf("error should name the env var; got %v", err)
+		}
+	})
+	t.Run("parent ref not in envOverrideByRef returns the const", func(t *testing.T) {
+		// Defensive: a child row whose parent isn't a row in the
+		// table (shouldn't happen, but the slice is operator-
+		// configurable so don't crash on misses). The const
+		// passes through.
+		got, err := resolveParentRef("ghcr.io/onebox-faas/some-other:latest", envOverrideByRef, envLookup)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "ghcr.io/onebox-faas/some-other:latest" {
+			t.Errorf("got %q, want const passthrough", got)
+		}
+	})
+}

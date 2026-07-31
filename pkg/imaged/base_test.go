@@ -143,3 +143,101 @@ func TestStatefulBaseImageDenylist_AllKeysHaveHint(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveDeployBaseRef_PerRuntimeEnvOverride is the regression for
+// the function-deploy side of the EX44 crash loop (run 30661487390 +
+// 30659586727 + 30656504195 — every BaseRef* const in pkg/imaged/base.go
+// points at the unreachable ghcr.io/onebox-faas/... private namespace).
+//
+// baseRefFor (the pure const switch) returns the unreachable const for
+// every runtime. Without resolveDeployBaseRef, the only operator
+// override was FAAS_DEPLOY_BASE_REF (single global, wired at
+// cmd/imaged/main.go:255) — wrong granularity for the box, which needs
+// per-runtime digests. The helper walks DefaultRuntimeBaseRefs and
+// applies the SAME per-runtime env-override + digest-pin posture that
+// EnsureBases uses for the startup auto-stage path.
+//
+// Companion to TestResolveParentRef_HonorsEnvOverride in
+// base_stage_test.go (startup path). Together they pin the full set
+// of per-runtime env-override consumers.
+func TestResolveDeployBaseRef_PerRuntimeEnvOverride(t *testing.T) {
+	const overrideRef = "mirror.gcr.io/library/node@sha256:81d93757457f988523814ae0009837ae893f38d3fe123f2c37896f118b4c7804"
+	const parentRef = "mirror.gcr.io/library/debian@sha256:81d93757457f988523814ae0009837ae893f38d3fe123f2c37896f118b4c7804"
+	envLookup := func(key string) string {
+		switch key {
+		case "FAAS_DEPLOY_BASE_REF_NODE22":
+			return overrideRef
+		case "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT":
+			return parentRef
+		}
+		return ""
+	}
+	t.Run("env override present returns override", func(t *testing.T) {
+		got, err := resolveDeployBaseRef(RuntimeNode22, envLookup)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != overrideRef {
+			t.Errorf("got %q, want %q (env override must propagate to deploy-time base ref)", got, overrideRef)
+		}
+	})
+	t.Run("env override missing returns const", func(t *testing.T) {
+		got, err := resolveDeployBaseRef(RuntimeNode22, func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BaseRefNode22 {
+			t.Errorf("got %q, want %q (missing env must not clobber const)", got, BaseRefNode22)
+		}
+	})
+	t.Run("env override tag-only ref fails loud", func(t *testing.T) {
+		tagOnly := func(string) string { return "mirror.gcr.io/library/node:22-bookworm-slim" }
+		_, err := resolveDeployBaseRef(RuntimeNode22, tagOnly)
+		if err == nil {
+			t.Fatal("expected error for tag-only env override, got nil")
+		}
+		if !strings.Contains(err.Error(), "FAAS_DEPLOY_BASE_REF_NODE22") {
+			t.Errorf("error should name the env var; got %v", err)
+		}
+	})
+	t.Run("runtime not in table falls through to baseRefFor", func(t *testing.T) {
+		// Customer-uploaded image with an unrecognised runtime —
+		// must NOT crash, must NOT return empty. The baseRefFor
+		// default (BaseRefMinimal) is the correct fallback.
+		got, err := resolveDeployBaseRef("ruby33", func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BaseRefMinimal {
+			t.Errorf("got %q, want %q (fallback to baseRefFor default)", got, BaseRefMinimal)
+		}
+	})
+	t.Run("base-debian-parent runtime overrides correctly", func(t *testing.T) {
+		// The parent runtime also lives in DefaultRuntimeBaseRefs,
+		// so its env override must propagate too. Covers the
+		// edge case where a customer runs the parent runtime
+		// directly (debug / e2e tests).
+		got, err := resolveDeployBaseRef(RuntimeDebianParent, envLookup)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != parentRef {
+			t.Errorf("got %q, want %q (parent runtime env override)", got, parentRef)
+		}
+	})
+	t.Run("nil envLookup falls back to os.Getenv without panic", func(t *testing.T) {
+		// Defensive: nil envLookup must not crash. With os.Getenv
+		// reading the empty test environment, the helper returns
+		// the const for any runtime in the table.
+		// (Set FAAS_DEPLOY_BASE_REF_NODE22 to mirror.gcr.io
+		// upstream if a future fixture wants to exercise the
+		// non-empty branch through os.Getenv.)
+		got, err := resolveDeployBaseRef(RuntimeNode22, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BaseRefNode22 {
+			t.Errorf("got %q, want %q (nil envLookup should read os.Getenv)", got, BaseRefNode22)
+		}
+	})
+}
