@@ -833,22 +833,48 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 	if p.Manifest != nil {
 		manifestBytes, _ = json.Marshal(*p.Manifest)
 	}
+	// Issue #462 / ADR-058 / PR-A: the scaling policy is the jsonb
+	// column `apps.scaling_policy`. The store writes the jsonb
+	// AND keeps the legacy `min_instances` column in sync so the
+	// reaper + the SDK see the same floor without a fan-out read.
+	// The sync is unconditional when the policy is set: the
+	// legacy column is the projection of the policy's
+	// MinInstances (Hobby+ writes 1; Free stays 0).
+	scalingPolicyBytes := []byte(nil)
+	keepMinInstancesInSync := false
+	if p.SetScalingPolicy && p.ScalingPolicy != nil {
+		scalingPolicyBytes, _ = json.Marshal(*p.ScalingPolicy)
+		keepMinInstancesInSync = true
+	}
 	upd := `update apps set
 		   ram_mb          = coalesce($2, ram_mb),
 		   idle_timeout_s  = case when $3 then $4 else idle_timeout_s end,
 		   max_concurrency = coalesce($5, max_concurrency),
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
-		   min_instances   = case when $9 then $10 else min_instances end,
+		   min_instances   = case
+		                        when $25 then $26
+		                        when $9  then $10
+		                        else min_instances
+		                      end,
 		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
 		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
 		   root_dir       = case when $19 then $20 else root_dir end,
 		   workload_name  = case when $21 then $22 else workload_name end,
-		   start_command  = case when $23 then $24::text else start_command end
+		   start_command  = case when $23 then $24::text else start_command end,
+		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
 		 where id = $1
 		 returning ` + appsSelectColumns
+	// `policyMinInstances` is the value to push into the legacy
+	// column when the policy is set. The two SET sources race on
+	// the same column; the policy-comes-first CASE preserves the
+	// policy author as the canonical writer at PR-A.
+	var policyMinInstances int
+	if p.ScalingPolicy != nil {
+		policyMinInstances = p.ScalingPolicy.MinInstances
+	}
 	row := s.pool.QueryRow(ctx, upd,
 		id,
 		p.RAMMB, p.SetIdleTimeout, intOrZero(p.IdleTimeoutS),
@@ -861,7 +887,9 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled),
 		p.RootDir != nil, p.RootDir,
 		p.WorkloadName != nil, p.WorkloadName,
-		p.StartCommand != nil, nullString(derefString(p.StartCommand)))
+		p.StartCommand != nil, nullString(derefString(p.StartCommand)),
+		keepMinInstancesInSync, policyMinInstances,
+		p.SetScalingPolicy, scalingPolicyBytes)
 	return scanApp(row)
 }
 
@@ -6568,11 +6596,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var manifestBytes []byte
 	var allowlistText string
 	var workloadClassStr string
+	var scalingPolicyBytes []byte
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled); err != nil {
+		&a.StreamingEnabled, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6582,6 +6611,19 @@ func scanAppInto(a *App, row pgx.Row) error {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
 	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	// scaling_policy: an empty jsonb ('{}'::jsonb, the column
+	// default) round-trips as a non-nil zero-length slice. The
+	// non-empty path is the customer-authored shape from
+	// `pkg/state.ScalingPolicy.MarshalJSON`. Empty path = legacy
+	// row, project as the zero-value struct + nil pointer so the
+	// apid read-back falls through to the min_instances /
+	// max_concurrency projection.
+	if len(scalingPolicyBytes) > 0 {
+		p := &ScalingPolicy{}
+		if err := json.Unmarshal(scalingPolicyBytes, p); err == nil {
+			a.ScalingPolicy = p
+		}
+	}
 	return nil
 }
 
@@ -6589,14 +6631,17 @@ func scanAppInto(a *App, row pgx.Row) error {
 // must use. Listed in the same order as scanAppInto — scanAppInto
 // reads columns positionally, so the order is load-bearing. The 5
 // trailing columns (project_id, root_dir, workload_name, workload_class,
-// start_command) are the ADR-050 Phase 1 additions. Keep this const
+// start_command) are the ADR-050 Phase 1 additions. The 3 trailing
+// columns (scaling_policy, last_scale_out_at, last_scale_in_at) are
+// the issue #462 / ADR-058 PR-A additions. Keep this const
 // and the App struct aligned: adding a column touches both.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, ''), streaming_enabled`
+	workload_class, coalesce(start_command, ''), streaming_enabled,
+	scaling_policy, last_scale_out_at, last_scale_in_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

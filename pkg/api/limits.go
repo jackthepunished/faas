@@ -106,11 +106,23 @@ type Limits struct {
 	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
 	// MinInstancesAllowed toggles the per-app cold-wake floor (ux_spec
-	// §6.5). Free + Hobby keep the default scale-to-zero behaviour
-	// because `min_instances = N` keeps N × RAMMB resident at all times,
-	// which is the cost shape of the always-on tier. Pro + Scale opt in.
-	// apid's updateApp handler gates the PATCH body on this flag.
+	// §6.5). Free keeps the default scale-to-zero behaviour because
+	// `min_instances = N` keeps N × RAMMB resident at all times, which
+	// is the cost shape of the always-on tier. Hobby + Pro + Scale opt
+	// in (issue #462 / ADR-058 PR-A tier-up: Hobby unlocked at PR-A
+	// because the bill auto-counts via pkg/meter/sampler.go:238-239 and
+	// the max_concurrency cap is bounded). apid's updateApp handler
+	// gates the PATCH body on this flag.
 	MinInstancesAllowed bool
+
+	// MaxInstancesAllowed (issue #462 / ADR-058) toggles the per-app
+	// ceiling on live instances. Mirrors MinInstancesAllowed: Hobby+
+	// unlock, Free stays off. The customer-authored `max_instances`
+	// is bounded above by the plan's MaxConcurrency (already a
+	// hard cap on the wake path); the gate here is the plan-tier
+	// lock, not the value-lock. The accessor
+	// `Plan.MaxInstancesAllowed()` reads this field.
+	MaxInstancesAllowed bool
 
 	// ScaleUpTargetRPSAllowed toggles `autoscale_target_rps` per plan
 	// (issue #169 / #172). Hobby + Pro + Scale opt in; Free does not
@@ -368,6 +380,19 @@ var planLimits = map[Plan]Limits{
 		// a min_instances floor" is unbounded on Hobby.
 		ScaleUpTargetRPSAllowed: false,
 		ScaleUpTargetCPUAllowed: false,
+		// Scaling policy (issue #462 / ADR-058, PR-A tier-up):
+		// Hobby now unlocks `MinInstancesAllowed` (warm-floor
+		// charge is bounded — Hobby's MaxConcurrency is 2 and
+		// the bill auto-counts via pkg/meter/sampler.go:238-239).
+		// MaxInstancesAllowed follows the same Hobby+ gate.
+		// Hobby still does NOT unlock `ScaleUpTargetRPSAllowed`
+		// nor `ScaleUpTargetCPUAllowed` — those remain Pro+ on
+		// the existing cost-shape rationale. The doc copy on
+		// the dashboard's "Plan" page names "Hobby+ unlocks
+		// warm floor" so a Hobby customer opting in knows what
+		// they're paying for.
+		MinInstancesAllowed: true,
+		MaxInstancesAllowed: true,
 		// Cron: Hobby gets a small per-app budget (5) and a per-account
 		// budget that absorbs ~2 Hobby-tier apps (10). Tracks the
 		// Hobby apps cap (5) with headroom for the cron-example
@@ -419,6 +444,7 @@ var planLimits = map[Plan]Limits{
 		EnvVarsMax:          64,
 		EnvValueMaxBytes:    16 * 1024,
 		MinInstancesAllowed: true,
+		MaxInstancesAllowed: true,
 		// 256 KB = 0.1 % of Pro's 250 MB tarball.
 		MaxQueueDepth:               25,
 		MaxDelayedTasksPerApp:       50,
@@ -489,6 +515,7 @@ var planLimits = map[Plan]Limits{
 		EnvVarsMax:          256,
 		EnvValueMaxBytes:    32 * 1024,
 		MinInstancesAllowed: true,
+		MaxInstancesAllowed: true,
 		// Soft ceiling: the binding constraint on Scale is the per-payload
 		// byte cap (1 MiB), not the row count.
 		MaxQueueDepth:               100,
@@ -649,6 +676,39 @@ const (
 	// is already over by the time the trigger fires.
 	ScaleUpDecisionIntervalSeconds = 1
 	ScaleUpWindowSeconds           = 5
+
+	// Scaling policy cooldowns (issue #462 / ADR-058). The
+	// customer-facing knobs are `scale_out_cooldown_s` /
+	// `scale_in_cooldown_s` on the wire; the floor / ceiling
+	// constants below are the admission time clamp apid uses to
+	// validate the PATCH. The floors prevent a self-DoS via
+	// `cooldown_s: 0` (the engine would otherwise admit every
+	// request inside the same tick). The ceilings bound the
+	// customer against accidentally making the engine inert
+	// (24 h ceiling on scale-in is the maximum a customer
+	// reasonably wants to dampen oscillation — anything longer
+	// is a "stuck running" footgun).
+	//
+	// MinScaleOutCooldownS = 1 (1 s floor — the engine's tick is
+	//   1 s, so 0 would always be honored as "now" and 1 is the
+	//   smallest strictly-positive value).
+	//
+	// MaxScaleOutCooldownS = 3600 (1 h ceiling — any longer makes
+	//   a legitimate burst unresponsive; 1 h is the practical
+	//   upper bound for a "shock absorber" knob).
+	//
+	// MinScaleInCooldownS = 5 (5 s floor — matches the reaper's
+	//   5 s floor on `ReapIdle`, so a manually-tuned scale-in
+	//   cooldown cannot be tighter than the reaper's idle window).
+	//
+	// MaxScaleInCooldownS = 86400 (1 day ceiling — the customer
+	//   who wants a "never scale-in" knob uses max_instances = 0
+	//   via the legacy code path; values >= 1 day are degenerate
+	//   but legal and the engine clamps to today+1d internally).
+	MinScaleOutCooldownS = 1
+	MaxScaleOutCooldownS = 3600
+	MinScaleInCooldownS  = 5
+	MaxScaleInCooldownS  = 86400
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -868,16 +928,37 @@ func (p Plan) RequiresStripeUpgradeTo(next Plan) bool {
 }
 
 // MinInstancesAllowed reports whether the plan may set the per-app
-// cold-wake floor (ux_spec §6.5). Pro + Scale opt in; Free + Hobby
-// stay scale-to-zero by default. apid's updateApp handler gates
+// cold-wake floor (ux_spec §6.5). Hobby + Pro + Scale opt in; Free
+// stays scale-to-zero by default. apid's updateApp handler gates
 // `req.MinInstances` on this; the CLI surfaces the rejection with
-// CodePlanMinInstancesNotAllowed.
+// CodePlanMinInstancesNotAllowed. PR-A history (issue #462 / ADR-058):
+// Hobby unlocked at PR-A. The pre-#462 contract was Pro + Scale only;
+// the tier-up landed because the bill auto-counts via
+// pkg/meter/sampler.go:238-239 and Hobby's MaxConcurrency is bounded
+// (2) so the worst-case residency cost is 2 × RAMMB + 16 MB overhead.
 func (p Plan) MinInstancesAllowed() bool {
 	l, ok := LimitsFor(p)
 	if !ok {
 		return false
 	}
 	return l.MinInstancesAllowed
+}
+
+// MaxInstancesAllowed (issue #462 / ADR-058) reports whether the
+// plan may set a per-app live-instances ceiling. Mirrors the
+// MinInstancesAllowed tier-up: Hobby + Pro + Scale opt in; Free
+// stays off. The value the customer passes is bounded above by
+// the plan's MaxConcurrency (which is the existing hard cap on the
+// wake path), so the gate here is the plan-tier lock, not the
+// value-lock. apid's updateApp handler gates
+// `req.ScalingPolicy.MaxInstances` on this; the CLI surfaces the
+// rejection with CodePlanMaxInstancesNotAllowed.
+func (p Plan) MaxInstancesAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.MaxInstancesAllowed
 }
 
 // EgressAllowlistAllowed reports whether the plan may set a per-app

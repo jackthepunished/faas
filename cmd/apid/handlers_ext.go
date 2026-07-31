@@ -222,6 +222,97 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
 		}
 	}
+	// Issue #462 / ADR-058: per-app scaling policy (PR-A persists
+	// + Hobby+ tier-up; PR-C wires the engine; PR-D carves out the
+	// worker-class branch). The DTO uses value semantics so the
+	// wire form allows `{}` (zero-value policy = "scale to zero,
+	// the v1 contract"). The Set bit distinguishes "don't touch
+	// the jsonb column" (nil pointer) from "explicit zero policy"
+	// (non-nil with all-zero fields). The worker-class carve-out
+	// runs separately in updateApp after loadApp surfaces the
+	// per-app WorkloadClass.
+	if req.ScalingPolicy != nil {
+		sp := req.ScalingPolicy
+		// Strict UnmarshalJSON: a typo on the wire (e.g. `min_instance`
+		// vs `min_instances`) must surface as 422 validation_failed
+		// rather than silently dropping the field. The unknown-field
+		// check runs FIRST so a malformed shape doesn't drown in
+		// downstream cooldown / bounds errors.
+		if sp.HasUnknownFields() {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeValidation,
+				"Invalid scaling policy",
+				fmt.Sprintf("unknown field(s): %s", strings.Join(sp.UnknownFields(), ", ")))
+		}
+		sp.ClearUnknownFields()
+		// Plan gates first (403 supersedes 422): a Free customer
+		// patching a valid policy still sees the plan error.
+		if sp.MinInstances > 0 && !acct.Plan.MinInstancesAllowed() {
+			return api.ErrPlanMinInstancesNotAllowed(acct.Plan)
+		}
+		if sp.MaxInstances > 0 && !acct.Plan.MaxInstancesAllowed() {
+			return api.ErrPlanMaxInstancesNotAllowed(acct.Plan)
+		}
+		// Bounds on min_instances: still in [0, plan.MaxConcurrency].
+		// 0 is the explicit "scale to zero" form below the engine
+		// floor (1) — the engine applies the floor at wake time, so
+		// the apid gate only rejects the negative / over-cap cases.
+		if sp.MinInstances < 0 || sp.MinInstances > limits.MaxConcurrency {
+			return api.ErrInvalidMinInstances(sp.MinInstances, limits.MaxConcurrency)
+		}
+		// Bounds on max_instances: must be in [MinInstances, plan.MaxConcurrency].
+		// 0 means "use plan max_concurrency"; the engine reads the
+		// resolved value at wake time. The bounds check uses the
+		// customer-authored min_instances — if the customer
+		// PATCHed min_instances=0, max_instances=0 is also valid
+		// (the engine resolves to plan max_concurrency).
+		if sp.MaxInstances < 0 {
+			return api.ErrInvalidMaxInstances(sp.MaxInstances, sp.MinInstances, limits.MaxConcurrency)
+		}
+		if sp.MaxInstances > 0 && sp.MaxInstances > limits.MaxConcurrency {
+			return api.ErrInvalidMaxInstances(sp.MaxInstances, sp.MinInstances, limits.MaxConcurrency)
+		}
+		if sp.MaxInstances > 0 && sp.MaxInstances < sp.MinInstances {
+			return api.ErrInvalidMaxInstances(sp.MaxInstances, sp.MinInstances, limits.MaxConcurrency)
+		}
+		// Cooldown floors + ceilings. The plan allows a customer
+		// to opt for a tighter cooldown (e.g. 5 s on Hobby) than
+		// the engine default, but the floors prevent self-DoS via
+		// `cooldown_s: 0`.
+		if sp.ScaleOutCooldownS < api.MinScaleOutCooldownS ||
+			sp.ScaleOutCooldownS > api.MaxScaleOutCooldownS {
+			return api.ErrInvalidCooldown("scale_out_cooldown_s",
+				sp.ScaleOutCooldownS, api.MinScaleOutCooldownS, api.MaxScaleOutCooldownS)
+		}
+		if sp.ScaleInCooldownS < api.MinScaleInCooldownS ||
+			sp.ScaleInCooldownS > api.MaxScaleInCooldownS {
+			return api.ErrInvalidCooldown("scale_in_cooldown_s",
+				sp.ScaleInCooldownS, api.MinScaleInCooldownS, api.MaxScaleInCooldownS)
+		}
+		// Target metric surface: closed set. Empty Metric is the
+		// "engine-derives from autoscale_target_rps" path (legacy
+		// compat). The metric surface is the only field that
+		// triggers the workload-class gate, but the actual reject
+		// runs in updateApp after loadApp — the validator here
+		// only checks the value shape.
+		if sp.Target != nil {
+			switch sp.Target.Metric {
+			case "", "rps", "concurrent_requests", "p99_latency_ms":
+				// ok
+			default:
+				return api.NewProblem(http.StatusUnprocessableEntity,
+					api.CodeValidation,
+					"Invalid scaling policy",
+					fmt.Sprintf("target.metric=%q is not in the closed set (rps, concurrent_requests, p99_latency_ms).", sp.Target.Metric))
+			}
+			if sp.Target.Value < 0 {
+				return api.NewProblem(http.StatusUnprocessableEntity,
+					api.CodeValidation,
+					"Invalid scaling policy",
+					fmt.Sprintf("target.value must be >= 0; got %v.", sp.Target.Value))
+			}
+		}
+	}
 	return nil
 }
 
@@ -261,6 +352,21 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	}
 	if prob := api.ValidateAppConfig(limits, ram, mc); prob != nil {
 		api.WriteProblem(w, prob)
+		return
+	}
+	// Issue #462 / ADR-058 / PR-D carve-out at the customer side:
+	// a worker-class app cannot use `target.metric =
+	// concurrent_requests` because the signal source
+	// (pkg/vmmd/activity.ActivityTracker) counts in-flight HTTP
+	// requests — a worker has none, so the metric is forever 0 and
+	// the engine would never admit. The apid gate rejects the PATCH
+	// at 422 with `scaling_target_incompatible_with_workload_class`
+	// so the customer sees the misconfiguration immediately. PR-D
+	// closes the engine-side bypass.
+	if req.ScalingPolicy != nil && req.ScalingPolicy.Target != nil &&
+		req.ScalingPolicy.Target.Metric == "concurrent_requests" &&
+		app.WorkloadClass == state.WorkloadClassWorker {
+		api.WriteProblem(w, api.ErrScalingTargetIncompatibleWithWorkloadClass("concurrent_requests"))
 		return
 	}
 	if prob := validateUpdateApp(&req, acct, limits); prob != nil {
@@ -310,6 +416,16 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// store is a plain column write.
 		StreamingEnabled:    req.StreamingEnabled,
 		SetStreamingEnabled: req.StreamingEnabled != nil,
+		// Issue #462 / ADR-058: per-app scaling policy. The
+		// setter bit on UpdateAppParams distinguishes "don't
+		// touch" (nil pointer) from "explicit zero policy"
+		// (non-nil with all-zero fields = "scale to zero"). The
+		// store layer writes the jsonb column `apps.scaling_policy`
+		// and keeps the legacy `min_instances` column in sync so
+		// legacy readers (the reaper + the SDK) see the same
+		// floor.
+		ScalingPolicy:    policyPtrFromReq(&req),
+		SetScalingPolicy: req.ScalingPolicy != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -2311,4 +2427,39 @@ func (s *server) resolveSbomPath(r *http.Request, buildID string, acct state.Acc
 		return "", api.ErrBuildSBOMUnavailable()
 	}
 	return filepath.Join(s.sbomRoot, clean), nil
+}
+
+// policyPtrFromReq converts the wire DTO `*api.ScalingPolicy` to the
+// state-layer `*state.ScalingPolicy`. Returns nil when the DTO is
+// nil (the "don't touch the column" case — UpdateAppParams.Set bit
+// is the canonical signal). The conversion is a struct-by-struct
+// copy because the two types must NOT alias (the wire DTO has
+// pointer-to-Target for the omitempty semantics; the state type
+// has a value Target to keep the jsonb round-trip symmetric).
+//
+// `req.SetScalingPolicy` (the boolean bit on UpdateAppRequest) is
+// the load-bearing signal: `req.ScalingPolicy == nil` with
+// Set=false means "don't touch the column"; `req.ScalingPolicy ==
+// nil` with Set=true means "explicit zero policy" (which is the
+// canonical "scale to zero" form). The handler's caller contract
+// pins Set=true whenever a non-nil policy is supplied; the
+// validateUpdateApp gate ensures the in-memory state is consistent.
+func policyPtrFromReq(req *api.UpdateAppRequest) *state.ScalingPolicy {
+	if req == nil || req.ScalingPolicy == nil {
+		return nil
+	}
+	sp := req.ScalingPolicy
+	out := &state.ScalingPolicy{
+		MinInstances:      sp.MinInstances,
+		MaxInstances:      sp.MaxInstances,
+		ScaleOutCooldownS: sp.ScaleOutCooldownS,
+		ScaleInCooldownS:  sp.ScaleInCooldownS,
+	}
+	if sp.Target != nil {
+		out.Target = state.ScalingTarget{
+			Metric: sp.Target.Metric,
+			Value:  sp.Target.Value,
+		}
+	}
+	return out
 }

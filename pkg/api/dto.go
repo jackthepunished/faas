@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -92,6 +93,30 @@ type UpdateAppRequest struct {
 	RootDir      *string `json:"-"`
 	WorkloadName *string `json:"-"`
 	StartCommand *string `json:""`
+	// ScalingPolicy is the per-app autoscaling configuration
+	// (issue #462 / ADR-058). nil pointer = "don't touch the
+	// jsonb column"; non-nil with the Set bit set = "replace the
+	// jsonb column with this shape". The DTO uses value semantics
+	// (not pointer-to-int) so the wire form can omit fields
+	// ("scale_out_cooldown_s: 0" = "set to the engine default")
+	// without a three-state "unset / zero / explicit" dance.
+	// SetScalingPolicy (parallel to SetMinInstances above)
+	// distinguishes "don't touch" (nil pointer) from "explicit
+	// zero policy" (non-nil struct with zero fields = "scale to
+	// zero, the v1 contract"). Plan-gated upstream:
+	//   MinInstances > 0   → Hobby+ (was Pro/Scale, PR-A
+	//                              tier-up)
+	//   MaxInstances > 0   → Hobby+ (new gate at PR-A)
+	//   Target.Metric != "" → Hobby+ (PR-A ships the DTO; PR-C
+	//                              wires the engine)
+	//   Worker-class concurrent_requests → 422
+	//                              (scaling_target_incompatible_with_
+	//                              workload_class, PR-D carve-out)
+	// Cooldowns clamped to package constants
+	// (`MinScaleOutCooldownS` / `MaxScaleOutCooldownS` /
+	// `MinScaleInCooldownS` / `MaxScaleInCooldownS`).
+	ScalingPolicy    *ScalingPolicy `json:"scaling_policy,omitempty"`
+	SetScalingPolicy bool           `json:"-"`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -100,6 +125,126 @@ type UpdateAppRequest struct {
 // live app already holds NewSlug.
 type RenameAppRequest struct {
 	NewSlug string `json:"new_slug"`
+}
+
+// ScalingPolicy is the per-app autoscaling configuration wire shape
+// (issue #462 / ADR-058). Mirrors the on-disk jsonb column
+// `apps.scaling_policy` and the in-memory `state.ScalingPolicy`.
+// Empty values map to the engine default (the apid gate is what
+// enforces the floor / ceiling, not the encoder).
+//
+// Field semantics:
+//
+//   MinInstances: per-app cold-wake floor. 0 = scale to zero (the
+//     pre-#462 default). Hobby+ unlocked at PR-A time (was Pro/Scale).
+//   MaxInstances: per-app ceiling on live instances. Must be in
+//     [MinInstances, plan.MaxConcurrency]. Hobby+ unlocked at PR-A
+//     time. 0 = "use plan max_concurrency".
+//   Target: the per-instance signal the engine watches for the
+//     scale-up trigger. Closed metric set: "rps" |
+//     "concurrent_requests" | "p99_latency_ms". Empty Metric =
+//     "disabled" (the engine falls back to the legacy
+//     autoscale_target_rps / autoscale_target_cpu_pct columns).
+//   ScaleOutCooldownS: minimum seconds between two scale-out
+//     events. Floor 1 (no `0` traps); ceiling 3600 (1 h).
+//   ScaleInCooldownS: minimum seconds between two scale-in events.
+//     Floor 5 (longer than the scale-out floor to dampen
+//     oscillation); ceiling 86400 (1 day).
+//
+// The DTO uses value semantics (no inner pointer fields) so the
+// wire allows `{...}` (zero-value policy) for the "scale to zero"
+// semantics. The handler rejects the JSON `null` value via strict
+// UnmarshalJSON.
+type ScalingPolicy struct {
+	MinInstances      int                `json:"min_instances,omitempty"`
+	MaxInstances      int                `json:"max_instances,omitempty"`
+	Target            *ScalingTarget     `json:"target,omitempty"`
+	ScaleOutCooldownS int                `json:"scale_out_cooldown_s,omitempty"`
+	ScaleInCooldownS  int                `json:"scale_in_cooldown_s,omitempty"`
+	// unknownFields is the set of unknown JSON keys encountered
+	// during a strict Unmarshal. Stored as a one-shot value so
+	// the validator can surface a single error without
+	// re-implementing the duck-typed reject. Cleared on the next
+	// successful unmarshal.
+	unknownFields []string `json:"-"`
+}
+
+// ScalingTarget is the (metric, value) pair the engine watches for
+// the scale-up trigger. The metric surface is closed. The unset
+// state (nil pointer) is the legacy "engine falls back to
+// autoscale_target_rps / autoscale_target_cpu_pct" path.
+type ScalingTarget struct {
+	Metric string  `json:"metric,omitempty"`
+	Value  float64 `json:"value,omitempty"`
+}
+
+// UnmarshalJSON implements a strict decoder for ScalingPolicy:
+// unknown fields are rejected with a synthetic CodeValidation
+// problem so the wire surface stays self-documenting. Mirrors the
+// EgressAllowlist DTO shape (handler-side strict surface).
+func (s *ScalingPolicy) UnmarshalJSON(data []byte) error {
+	// Hot path: pass through to the default unmarshal + a parallel
+	// peek for unknown keys. The peek + decode pair is required
+	// because the standard json package does not surface
+	// "unknown field" without DisallowUnknownFields, which would
+	// require re-implementing the field-by-field scan.
+	allowed := map[string]struct{}{
+		"min_instances":        {},
+		"max_instances":        {},
+		"target":               {},
+		"scale_out_cooldown_s": {},
+		"scale_in_cooldown_s":  {},
+	}
+	// Detect unknown fields by walking the raw object.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("scaling_policy: %w", err)
+	}
+	unknown := make([]string, 0)
+	for k := range raw {
+		if _, ok := allowed[k]; !ok {
+			unknown = append(unknown, k)
+		}
+	}
+	sort.Strings(unknown)
+	// Now decode with the stdlib into the typed shape.
+	type alias ScalingPolicy
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return fmt.Errorf("scaling_policy: %w", err)
+	}
+	// The alias trick loses the unknown fields; carry them on the
+	// receiver so the validator can attach them to the *Problem.
+	s.unknownFields = unknown
+	*s = ScalingPolicy(a)
+	// Re-attach after the copy because `*s = ScalingPolicy(a)`
+	// overwrites the receiver's unknown-field list with the alias's
+	// zero value. The unknown list is captured locally in
+	// `unknown`; copying it back preserves the validator's view.
+	s.unknownFields = unknown
+	return nil
+}
+
+// HasUnknownFields reports whether the most recent UnmarshalJSON
+// encountered any unknown fields. Cleared by a successful
+// Validator pass that consumes the list.
+func (s *ScalingPolicy) HasUnknownFields() bool {
+	return len(s.unknownFields) > 0
+}
+
+// UnknownFields returns the sorted list of unknown-field names seen
+// during the most recent UnmarshalJSON. Empty after a clean
+// decode.
+func (s *ScalingPolicy) UnknownFields() []string {
+	return s.unknownFields
+}
+
+// ClearUnknownFields drops the stored unknown-fields list. Called
+// by the validator after the *Problem is built, so a successful
+// Validate → PATCH flow doesn't leak the previous decode's list
+// into a subsequent re-validation.
+func (s *ScalingPolicy) ClearUnknownFields() {
+	s.unknownFields = nil
 }
 
 // AppResponse is an app as returned by the API.
@@ -152,6 +297,38 @@ type AppResponse struct {
 	// dashboards can show "streaming on / off" alongside the
 	// egress-allowlist flag.
 	StreamingEnabled bool `json:"streaming_enabled"`
+	// ScalingPolicy is the per-app autoscaling configuration (issue
+	// #462 / ADR-058). The struct is the wire DTO for the on-disk
+	// jsonb column `apps.scaling_policy`; the in-memory state type
+	// (`state.ScalingPolicy`) is the canonical source. Materialised
+	// as `null` for legacy rows (applies the empty-policy
+	// projection = "use min_instances / max_concurrency from the
+	// existing columns"). Dashboards branch on `null` to render the
+	// "default scale-to-zero" pill. The full nested shape mirrors
+	// the issue-body example:
+	//
+	//   {"min_instances": 0,
+	//    "max_instances": 5,
+	//    "target": {"metric": "concurrent_requests", "value": 1.0},
+	//    "scale_out_cooldown_s": 5,
+	//    "scale_in_cooldown_s": 60}
+	//
+	// Plan-gated upstream: Hobby+ unlocks MinInstancesAllowed at
+	// PR-A time (was Pro/Scale); MaxInstancesAllowed tier-up is
+	// a Hobby+ gate at the same time. Worker-class apps reject
+	// `target.metric = concurrent_requests` with 422
+	// `scaling_target_incompatible_with_workload_class` (PR-D
+	// carve-out).
+	ScalingPolicy *ScalingPolicy `json:"scaling_policy,omitempty"`
+	// LastScaleOutAt / LastScaleInAt are the wall-clock timestamps
+	// schedd stamps on the wake-gate admit / reaper park branches
+	// (issue #462 / ADR-058). Used by the cooldown helper to
+	// short-circuit requests inside the cooldown window. Surfaced
+	// on GET so dashboards can render "warm-up in progress" +
+	// "recently scaled" copy. RFC 3339 string form; nil on a
+	// never-scaled app.
+	LastScaleOutAt *time.Time `json:"last_scale_out_at,omitempty"`
+	LastScaleInAt  *time.Time `json:"last_scale_in_at,omitempty"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

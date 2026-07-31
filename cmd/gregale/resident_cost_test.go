@@ -18,10 +18,19 @@ func TestResidentGBHoursPerMonth(t *testing.T) {
 		min   int
 		want  float64
 	}{
-		// Free / Hobby: min must be 0 (api rejects); helper returns 0.
+		// Free: min must be 0 (api rejects any positive value at
+		// PR-A); helper returns 0 regardless.
 		{"Free min=0", api.PlanFree, 128, 0, 0},
 		{"Free min=1 clamps to 0", api.PlanFree, 128, 1, 0},
-		{"Hobby min=1 clamps to 0", api.PlanHobby, 256, 1, 0},
+
+		// Issue #462 / ADR-058 / PR-A: Hobby now unlocks min_instances
+		// (the Hobby+ tier-up). Hobby RAM is 256 MB; the supported
+		// floor is the same as Pro 1x256. Pre-#462 this case clamped
+		// to 0 (Hobby rejected min>0); the PR-A tier-up means Hobby
+		// customers can opt into a warm floor, and the bill
+		// auto-counts via pkg/meter/sampler.go:238-239.
+		// Hobby 1x256: (256+8) × 1 × 30 / 1024 = 7920/1024 = 7.734375
+		{"Hobby min=1 bills", api.PlanHobby, 256, 1, 7.734375},
 
 		// Pro 512 MB: (512+8) × 1 × 30 / 1024 = 15600/1024 = 15.234375
 		{"Pro 1x512", api.PlanPro, 512, 1, 15.234375},
