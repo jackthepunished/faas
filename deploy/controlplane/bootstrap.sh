@@ -124,15 +124,8 @@ su - postgres -c "psql -d faas -c 'CREATE EXTENSION IF NOT EXISTS citext;'"
 
 # Ensure peer auth works for the service users → faas DB.
 PG_HBA=$(su - postgres -c "psql -tAc 'SHOW hba_file'")
-if ! grep -q 'faas-apid' "${PG_HBA}"; then
-  cat >> "${PG_HBA}" <<'EOF'
-# FaaS service users → faas database via peer auth (user maps below).
-local   faas   faas           peer
-local   faas   faas-apid      peer  map=faas_map
-local   faas   faas-schedd    peer  map=faas_map
-local   faas   faas-imaged    peer  map=faas_map
-local   faas   faas-meterd    peer  map=faas_map
-EOF
+if ! grep -q 'faas_map' "${PG_HBA}"; then
+  sed -i '/local   all             all                                     peer/i # FaaS service users\nlocal   faas   all      peer  map=faas_map\n' "${PG_HBA}"
   ok "pg_hba.conf updated"
 fi
 
@@ -201,7 +194,7 @@ done
 cd "${FAAS_SRC}"
 make build
 mkdir -p "${FAAS_BIN}"
-install -m 0755 bin/* "${FAAS_BIN}/"
+find bin -maxdepth 1 -type f -exec install -m 0755 {} "${FAAS_BIN}/" \;
 # Also build the migrate tool
 go build -o bin/migrate ./cmd/migrate
 install -m 0755 bin/migrate "${FAAS_BIN}/"
@@ -209,10 +202,10 @@ ok "Binaries in ${FAAS_BIN}"
 
 # ─── 9. Drop configs ─────────────────────────────────────────────────────────
 step "Installing configs"
-DO_CONFIG_SRC="${FAAS_SRC}/deploy/digitalocean"
+CP_CONFIG_SRC="${FAAS_SRC}/deploy/controlplane"
 
 # TOML configs — sed-replace __DROPLET_IP__
-for f in "${DO_CONFIG_SRC}/config/"*.toml; do
+for f in "${CP_CONFIG_SRC}/config/"*.toml; do
   base=$(basename "$f")
   sed "s/__DROPLET_IP__/${DROPLET_IP}/g" "$f" > "${CONFIG_DIR}/${base}"
   chown root:faas "${CONFIG_DIR}/${base}"
@@ -247,7 +240,7 @@ fi
 ok "session key written to ${SESS_KEY_PATH} (0400 root:root)"
 sed -e "s/__DROPLET_IP__/${DROPLET_IP}/g" \
     -e "s|__DEV_TOKEN__|${DEV_TOKEN}|g" \
-    "${DO_CONFIG_SRC}/sealed.env.example" > "${SEALED_ENV}"
+    "${CP_CONFIG_SRC}/sealed.env.example" > "${SEALED_ENV}"
 chown root:faas "${SEALED_ENV}"
 chmod 0640 "${SEALED_ENV}"
 ok "sealed.env created (dev token generated; session key is in /etc/faas/secrets/session.key)"
@@ -275,7 +268,7 @@ ok "Dev credentials written to ${CRED_FILE}"
 
 # ─── 10. Systemd units ───────────────────────────────────────────────────────
 step "Installing systemd units"
-for f in "${DO_CONFIG_SRC}/systemd/"*.{service,slice}; do
+for f in "${CP_CONFIG_SRC}/systemd/"*.{service,slice}; do
   [[ -f "$f" ]] || continue
   cp "$f" /etc/systemd/system/
   ok "$(basename "$f")"

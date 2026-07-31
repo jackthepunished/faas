@@ -1,9 +1,6 @@
-# Deploy to DigitalOcean — FaaS Control Plane
+# Deploy FaaS Control Plane (Standalone Host)
 
-Deploys the non-KVM parts of the platform on a DigitalOcean Droplet for
-development and testing. `vmmd` and `builderd` are **not deployed** (no
-`/dev/kvm` on DO Droplets) — VM lifecycle operations return errors, which is
-expected.
+Deploys the non-KVM parts of the platform on a standalone Cloud VM (GCP, DigitalOcean, Hetzner Cloud, etc.) for development, testing, and staging. `vmmd` and `builderd` are **not deployed** (no `/dev/kvm` on standard non-nested VMs) — VM lifecycle operations return errors, which is expected.
 
 ## What runs
 
@@ -15,31 +12,31 @@ expected.
 | `imaged` | (event-driven) | OCI pull + ext4 layer builder |
 | `meterd` | (timer loops) | Metering, quota, billing |
 | `githubd` | `127.0.0.1:8083` + socket | GitHub App OAuth, webhooks |
-| Postgres 15 | Unix socket | Database |
+| Postgres 15/16 | Unix socket | Database |
 
 ## Quick start
 
-### 1. Create a Droplet
+### 1. Create a VM / Droplet
 
 - **Image:** Ubuntu 24.04 LTS
-- **Plan:** Regular 4 GB / 2 vCPU ($24/mo) — the control plane is lightweight
+- **Plan:** 4 GB RAM / 2 vCPU — the control plane is lightweight
 - **Region:** Pick closest to you
 - **Auth:** Your SSH key
 
 ### 2. Bootstrap
 
-SSH into the Droplet and run:
+SSH into the server and run:
 
 ```bash
-# Option A: From the repo (if you've cloned it on the Droplet)
-sudo bash deploy/digitalocean/bootstrap.sh
+# Option A: From the repo (if you've cloned it on the host)
+sudo bash deploy/controlplane/bootstrap.sh
 
 # Option B: One-liner from GitHub
-curl -sSf https://raw.githubusercontent.com/poyrazK/faas/main/deploy/digitalocean/bootstrap.sh | sudo bash
+curl -sSf https://raw.githubusercontent.com/poyrazK/faas/main/deploy/controlplane/bootstrap.sh | sudo bash
 ```
 
 The script:
-- Installs Postgres 15, Go, system deps
+- Installs Postgres, Go, system deps
 - Creates system users (`faas`, `faas-apid`, `faas-schedd`, …)
 - Clones the repo to `/opt/faas/src`, builds all binaries to `/opt/faas/bin`
 - Drops TOML configs + `sealed.env` to `/etc/faas/`
@@ -51,38 +48,34 @@ The script:
 ### 3. Verify
 
 ```bash
-# From the Droplet
+# From the host
 curl http://127.0.0.1:8080/healthz                              # gatewayd → apid
 curl http://127.0.0.1:9090/healthz                              # gatewayd control
-# awk strips the trailing "  # generated <ts>" comment so the bare token
-# is what reaches the Authorization header.
 TOKEN=$(awk -F= '/^FAAS_DEV_TOKEN=/{print $2; exit}' /root/faas-dev-credentials.txt | awk '{print $1}')
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/account
 
 # From your laptop
-curl http://<DROPLET_IP>:8080/status                            # status page
-open http://<DROPLET_IP>:8080/dashboard/                        # dashboard UI
+curl http://<HOST_IP>:8080/status                               # status page
+open http://<HOST_IP>:8080/dashboard/                           # dashboard UI
 ```
 
 ### 4. Set up GitHub Actions CD
 
 After `bootstrap.sh` finishes, it has written a deploy SSH key to
-`/opt/faas/.ssh/deploy_ed25519` on the Droplet — it is **never printed to
-stdout** (which systemd-journal and agent logs both capture). Retrieve it with
-`scp`:
+`/opt/faas/.ssh/deploy_ed25519` on the host — it is **never printed to
+stdout** (which systemd-journal and agent logs both capture). Retrieve it:
 
 ```bash
 # From your laptop
-scp root@<DROPLET_IP>:/opt/faas/.ssh/deploy_ed25519 ./do_ssh_key
-# Paste the contents into the GitHub DO_SSH_KEY secret (next step).
+scp root@<HOST_IP>:/opt/faas/.ssh/deploy_ed25519 ./cp_ssh_key
 ```
 
 Add these to your GitHub repo (Settings → Secrets and variables → Actions):
 
 | Secret | Value |
 |--------|-------|
-| `DO_SSH_KEY` | The ed25519 private key you just scp'd |
-| `DO_HOST` | Droplet public IP address |
+| `CP_SSH_KEY` (or `DO_SSH_KEY`) | The ed25519 private key you just scp'd |
+| `CP_HOST` (or `DO_HOST`) | Control Plane host public IPv4 address |
 
 Now every push to `main` that passes CI will auto-deploy to the Droplet.
 
