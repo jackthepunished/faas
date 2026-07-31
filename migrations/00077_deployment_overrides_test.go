@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00076 (deploy-time overrides on deployments,
+// Migration-apply test for 00077 (deploy-time overrides on deployments,
 // issue #460 / ADR-053). Pins the override columns:
 //
-//  1. The migration set applies cleanly through 00076.
+//  1. The migration set applies cleanly through 00077.
 //  2. Each override column accepts the canonical shape (text[] for
 //     entrypoint/cmd, jsonb for env/env_secrets/healthcheck, int for
 //     port) and round-trips.
@@ -12,10 +12,10 @@
 //  4. Replay-safe: ADD COLUMN IF NOT EXISTS makes a second MigrateUp
 //     no-op (PR #377 / ADR-041).
 //
-// Slot note: HEAD is at 00075 (Node 24 / Python 3.13 widening), so 00076
+// Slot note: HEAD is at 00076 (compute-node keys, sibling PR), so 00077
 // is the next free slot at PR creation time. The migration is slot-
 // agnostic — only the filename and the test function name carry the
-// literal slot. If a sibling PR grabs 00076 first, renumber per
+// literal slot. If a sibling PR grabs 00077 first, renumber per
 // `migrations/README.md` and update this test's filename + ApplyUp
 // range.
 //
@@ -32,7 +32,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00076_DeploymentOverrides(t *testing.T) {
+func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -43,10 +43,10 @@ func TestMigrations_00076_DeploymentOverrides(t *testing.T) {
 	// "deployment overrides" and makes the source obvious to a
 	// reader scanning the test fixtures.
 
-	// (1) Apply through 00076. A regression that drops a slot between
-	// 1 and 76 surfaces here before the per-assertion pins.
+	// (1) Apply through 00077. A regression that drops a slot between
+	// 1 and 77 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 76)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 77)", err)
 	}
 
 	// (2) Seed an account + app. The literal UUIDs are fixed across

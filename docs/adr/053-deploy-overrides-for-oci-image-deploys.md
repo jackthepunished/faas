@@ -81,7 +81,7 @@ whole request 400s. This is the only correct behaviour; customers
 who specified an override expect it to apply.
 
 **3. Six new columns on `deployments` (NOT on `apps`).**
-Migration `00076_deployment_overrides.sql` adds, replay-safe
+Migration `00077_deployment_overrides.sql` adds, replay-safe
 (`ADD COLUMN IF NOT EXISTS`):
 ```
 override_entrypoint   text[]
@@ -190,7 +190,7 @@ a label, until the cardinality argument is made.
   harness at `pkg/e2etest/harness.go:75-122`. PR A ships the API
   round-trip subtest (POST overrides → GET deployment → assert echo);
   PR B/C add the boot-effect subtests.
-- `migrations/00076_deployment_overrides.sql` is replay-safe via
+- `migrations/00077_deployment_overrides.sql` is replay-safe via
   `ADD COLUMN IF NOT EXISTS` — `TestNewMigrationsAreReplaySafe`
   (PR #377 / ADR-041) passes without further work. The migration has
   no DOWN-block complication: the columns are nullable, so a DOWN
