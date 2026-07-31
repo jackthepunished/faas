@@ -2,6 +2,7 @@ package secretbox
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -307,7 +308,227 @@ func TestOpenMulti_EmptyInputs(t *testing.T) {
 	}
 }
 
-// TestOpenBytesMulti_RoundTrip is the byte-channel counterpart of
+// TestOpenMulti_NilElementInSlice pins the nil-element defence
+// (PR #487 review finding #3). age.Decrypt panics on a nil
+// *age.X25519Identity (x25519.go:158 Unwrap dereferences), so
+// OpenMulti must filter silent nils before widening to the
+// []age.Identity interface slice. The widening is "one-sided"
+// in the sense that the nil-filter must happen BEFORE the
+// []age.Identity conversion — the test covers both the
+// "all-nil slice" guard and the "mixed nil + valid" path
+// (the latter must NOT panic and must succeed via the valid
+// identity).
+func TestOpenMulti_NilElementInSlice(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	blob, err := Seal(id.Recipient(), Envelope{"K": "v"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	// All-nil slice: must return an error (not panic).
+	if _, err := OpenMulti([]*age.X25519Identity{nil, nil, nil}, blob); err == nil {
+		t.Error("OpenMulti(all-nil identities): expected error, got nil")
+	}
+
+	// Mixed nil + valid: must succeed via the valid identity, NOT panic.
+	got, err := OpenMulti([]*age.X25519Identity{nil, id, nil}, blob)
+	if err != nil {
+		t.Fatalf("OpenMulti(mixed nil + valid): %v", err)
+	}
+	if got["K"] != "v" {
+		t.Errorf("decryption mismatch: got %q, want \"v\"", got["K"])
+	}
+
+	// Trailing-nil: must succeed via the leading valid identity.
+	got, err = OpenMulti([]*age.X25519Identity{id, nil}, blob)
+	if err != nil {
+		t.Fatalf("OpenMulti([id, nil]): %v", err)
+	}
+	if got["K"] != "v" {
+		t.Errorf("decryption mismatch: got %q, want \"v\"", got["K"])
+	}
+}
+
+// TestOpenBytesMulti_NilElementInSlice mirrors the byte-channel
+// counterpart of TestOpenMulti_NilElementInSlice.
+func TestOpenBytesMulti_NilElementInSlice(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	blob, err := SealBytes(id.Recipient(), "alert_rule_secret", []byte("plaintext"), 256)
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+
+	if _, _, err := OpenBytesMulti([]*age.X25519Identity{nil, nil, nil}, blob); err == nil {
+		t.Error("OpenBytesMulti(all-nil identities): expected error, got nil")
+	}
+
+	gotNS, gotPlain, err := OpenBytesMulti([]*age.X25519Identity{nil, id, nil}, blob)
+	if err != nil {
+		t.Fatalf("OpenBytesMulti(mixed nil + valid): %v", err)
+	}
+	if gotNS != "alert_rule_secret" {
+		t.Errorf("namespace: got %q, want \"alert_rule_secret\"", gotNS)
+	}
+	if string(gotPlain) != "plaintext" {
+		t.Errorf("plaintext: got %q, want \"plaintext\"", gotPlain)
+	}
+}
+
+// TestOpenMulti_RotateEndToEnd pins the full rotation round-trip
+// (PR #487 review finding #15). Mirrors what `gregale host-age
+// rotate --commit` does on disk:
+//
+//  1. Init a fresh dir with host.age (identity A).
+//  2. Seal an envelope under A — this is the "pre-rotation customer
+//     secret" the box needs to keep reading for 30 days.
+//  3. Move host.age → host.age.previous (still identity A).
+//  4. Generate a fresh identity B, write as host.age.
+//  5. LoadHostKeys(dir) returns [B, A].
+//  6. OpenMulti([B, A], pre-rotation-blob) succeeds via fallback to A.
+//  7. OpenMulti([B, A], new-blob-sealed-under-B) succeeds.
+//  8. After prune-previous (host.age.previous removed), OpenMulti
+//     returns the all-nil-previous → still 1-element [B] case and
+//     unseals the B-sealed blob; the A-sealed blob now fails.
+//  9. LoadHostKeys(dir) returns just [B] post-prune.
+//
+// This is the contract that closes the gap the runbook promises:
+// "rotate does not strand pre-rotation sealed secrets."
+func TestOpenMulti_RotateEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+
+	// (1) Seed host.age as identity A.
+	idA, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age"))
+	if err != nil {
+		t.Fatalf("seed host.age: %v", err)
+	}
+
+	// (2) Pre-rotation seal under A.
+	preBlob, err := Seal(idA.Recipient(), Envelope{"STRIPE_KEY": "sk_live_old"})
+	if err != nil {
+		t.Fatalf("seal under A: %v", err)
+	}
+
+	// (3) Move host.age → host.age.previous.
+	if err := os.Rename(filepath.Join(dir, "host.age"), filepath.Join(dir, "host.age.previous")); err != nil {
+		t.Fatalf("rename current → previous: %v", err)
+	}
+
+	// (4) Generate identity B, save as the new current.
+	idB, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age"))
+	if err != nil {
+		t.Fatalf("seed new host.age: %v", err)
+	}
+	if idA.Recipient().String() == idB.Recipient().String() {
+		t.Fatal("rotation produced identical recipient — RNG broken?")
+	}
+
+	// (5) LoadHostKeys returns [B, A].
+	loaded, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("LoadHostKeys len=%d, want 2 (current + previous)", len(loaded))
+	}
+	if loaded[0].Recipient().String() != idB.Recipient().String() {
+		t.Errorf("loaded[0] is the OLD identity, want new current")
+	}
+	if loaded[1].Recipient().String() != idA.Recipient().String() {
+		t.Errorf("loaded[1] is the NEW identity, want previous (identity A)")
+	}
+
+	// (6) OpenMulti falls back to A — pre-rotation envelope survives.
+	got, err := OpenMulti(loaded, preBlob)
+	if err != nil {
+		t.Fatalf("OpenMulti of pre-rotation blob via [B,A]: %v", err)
+	}
+	if got["STRIPE_KEY"] != "sk_live_old" {
+		t.Errorf("pre-rotation unseal: got %q, want \"sk_live_old\"", got["STRIPE_KEY"])
+	}
+
+	// (7) A new envelope sealed under B (post-rotation write) opens too.
+	postBlob, err := Seal(idB.Recipient(), Envelope{"STRIPE_KEY": "sk_live_new"})
+	if err != nil {
+		t.Fatalf("seal under B: %v", err)
+	}
+	got, err = OpenMulti(loaded, postBlob)
+	if err != nil {
+		t.Fatalf("OpenMulti of post-rotation blob via [B,A]: %v", err)
+	}
+	if got["STRIPE_KEY"] != "sk_live_new" {
+		t.Errorf("post-rotation unseal: got %q, want \"sk_live_new\"", got["STRIPE_KEY"])
+	}
+
+	// Sanity: B alone cannot unseal the A-sealed blob (recipient binding is real).
+	if _, err := OpenMulti([]*age.X25519Identity{idB}, preBlob); err == nil {
+		t.Error("OpenMulti[B] of A-sealed blob succeeded — recipient binding broken")
+	}
+
+	// (8) Prune-previous: remove .previous.
+	if err := os.Remove(filepath.Join(dir, "host.age.previous")); err != nil {
+		t.Fatalf("remove .previous: %v", err)
+	}
+
+	// (9) LoadHostKeys now returns just [B].
+	loadedAfterPrune, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys post-prune: %v", err)
+	}
+	if len(loadedAfterPrune) != 1 {
+		t.Fatalf("LoadHostKeys post-prune len=%d, want 1", len(loadedAfterPrune))
+	}
+	if loadedAfterPrune[0].Recipient().String() != idB.Recipient().String() {
+		t.Errorf("post-prune current identity mismatch")
+	}
+
+	// Post-prune: B-sealed blob still works; A-sealed blob now fails.
+	if _, err := OpenMulti(loadedAfterPrune, postBlob); err != nil {
+		t.Errorf("post-prune unseal of B-sealed blob failed: %v", err)
+	}
+	if _, err := OpenMulti(loadedAfterPrune, preBlob); err == nil {
+		t.Error("post-prune unseal of A-sealed blob succeeded — overlap should be over")
+	}
+}
+
+// TestOpenBytesMulti_RotateEndToEnd is the byte-channel counterpart
+// of TestOpenMulti_RotateEndToEnd — the alert evaluator webhook
+// secret path that drove the original ADR-057 motivation.
+func TestOpenBytesMulti_RotateEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+
+	idA, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age"))
+	if err != nil {
+		t.Fatalf("seed host.age: %v", err)
+	}
+	preBlob, err := SealBytes(idA.Recipient(), "alert_rule_secret", []byte("https://hooks.old/path"), 256)
+	if err != nil {
+		t.Fatalf("SealBytes under A: %v", err)
+	}
+
+	if err := os.Rename(filepath.Join(dir, "host.age"), filepath.Join(dir, "host.age.previous")); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if _, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age")); err != nil {
+		t.Fatalf("seed new host.age: %v", err)
+	}
+
+	loaded, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys: %v", err)
+	}
+	gotNS, gotPlain, err := OpenBytesMulti(loaded, preBlob)
+	if err != nil {
+		t.Fatalf("OpenBytesMulti fallback to A: %v", err)
+	}
+	if gotNS != "alert_rule_secret" {
+		t.Errorf("namespace mismatch: got %q", gotNS)
+	}
+	if string(gotPlain) != "https://hooks.old/path" {
+		t.Errorf("plaintext mismatch: got %q", gotPlain)
+	}
+}
+
+// TestOpenMulti_RoundTrip is the byte-channel counterpart of
 // TestOpenMulti_CurrentAndPrevious. Confirms the alert evaluator
 // (pkg/alerts/evaluator.go) can keep unsealing webhook secrets
 // sealed under the previous host.age across a rotate.

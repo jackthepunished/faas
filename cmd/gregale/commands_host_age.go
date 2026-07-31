@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -71,6 +72,40 @@ const (
 // shorter overlap is required (e.g. a confirmed compromise with no
 // time for a gradual handover); --force skips the check entirely.
 const defaultMinOverlapDays = 30
+
+// Sentinel errors for the host-age CLI. Wrapped by the helpers
+// below so the test file can use errors.Is for the load-bearing
+// contract assertions (replacing strings.Contains which would
+// silently keep passing through an i18n rewrite or a copy-edit).
+var (
+	// ErrInitRequiresRoot is returned by hostAgeInit when the caller
+	// is not root. host.age is 0400 root:root (spec §11); a non-root
+	// write would produce a file the daemons can't load.
+	ErrInitRequiresRoot = errors.New("host-age: init requires root (host.age is 0400 root:root)")
+
+	// ErrInitRefuseOverwrite is returned by hostAgeInit when
+	// host.age already exists and --force is not set. Silent
+	// overwrite strands every SealedSecret ever sealed under the
+	// old key.
+	ErrInitRefuseOverwrite = errors.New("host-age: refusing to overwrite existing host.age (use --force for emergency re-init)")
+
+	// ErrRotateNoCurrent is returned by hostAgeRotate when host.age
+	// does not exist on disk (operator skipped init or wiped the
+	// secret dir). The error message points the operator at init.
+	ErrRotateNoCurrent = errors.New("host-age: rotate requires an existing host.age (run 'gregale host-age init' first)")
+
+	// ErrPruneMissingPrevious is returned by hostAgePrunePrevious
+	// when host.age.previous does not exist. Surfaces as a clear
+	// "already pruned or no rotation in progress" rather than a
+	// silent no-op.
+	ErrPruneMissingPrevious = errors.New("host-age: no host.age.previous found (already pruned, or no rotation in progress)")
+
+	// ErrPruneTooRecent is returned by hostAgePrunePrevious when
+	// .previous is younger than the min-overlap-days window. --force
+	// or --min-overlap-days are the documented escape hatches;
+	// --promote flips the roles instead.
+	ErrPruneTooRecent = errors.New("host-age: refusing to prune .previous younger than the configured min-overlap window")
+)
 
 // cmdHostAge is the parent dispatcher. With zero args it prints
 // usage; with init/rotate/status/prune-previous it fans to the
@@ -170,10 +205,13 @@ func cmdHostAgeInit(args []string) int {
 }
 
 func hostAgeInit(dir string, force bool) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("%w (run with sudo or as the root user)", ErrInitRequiresRoot)
+	}
 	paths := hostAgePaths(dir)
 	if !force {
 		if _, err := os.Stat(paths.current); err == nil {
-			return fmt.Errorf("refusing to overwrite existing %s (use --force for emergency re-init)", paths.current)
+			return fmt.Errorf("%w: %s", ErrInitRefuseOverwrite, paths.current)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %s: %w", paths.current, err)
 		}
@@ -222,34 +260,50 @@ func cmdHostAgeRotate(args []string) int {
 		PrintUsage(os.Stderr, "usage: gregale host-age rotate [flags]", "host-age")
 		return 1
 	}
-	if err := hostAgeRotate(f.dir, f.force); err != nil {
+	newRecipient, prevRecipient, err := hostAgeRotate(f.dir, f.force)
+	if err != nil {
 		return printErr("rotate failed", err)
 	}
-	PrintOK(osStdout, "Rotated host.age → host.age.previous; new current written.\n  Next: systemctl restart faas-apid faas-vmmd faas-meterd faas-githubd\n  Next: gregale host-age status (verify all daemons on the new fingerprint after restart)\n  Next: 30-day overlap window starts now; run 'gregale host-age prune-previous' after that")
+	PrintOK(osStdout, "Rotated host.age → host.age.previous; new current written.\n  New recipient:     %s\n  Previous (now .previous): %s\n  Next: chown root:root %s/host.age %s/host.age.previous && chmod 0400 both (if not already root)\n  Next: systemctl restart faas-vmmd first (it owns host.age.pub), then faas-apid faas-meterd faas-githubd\n  Next: gregale host-age status (verify all daemons on the new fingerprint after restart)\n  Next: 30-day overlap window starts now; run 'gregale host-age prune-previous' after that",
+		newRecipient, prevRecipient, f.dir, f.dir)
 	return 0
 }
 
-func hostAgeRotate(dir string, force bool) error {
+// hostAgeRotate returns (newRecipient, previousRecipient, error).
+// Returning the recipients lets the CLI surface them on stdout
+// without re-reading the files (issue #316 / ADR-057 — the
+// operator-facing runbook step 2 promises "the output is the new
+// recipient string"; this helper is the source of truth for that
+// claim).
+//
+// On the "no current" error path the returned recipients are both
+// empty strings; the caller prints the error and bails before
+// reaching the PrintOK line so the empty strings are never visible.
+func hostAgeRotate(dir string, force bool) (newRecipient, prevRecipient string, err error) {
 	paths := hostAgePaths(dir)
 
 	if !force {
 		if _, err := os.Stat(paths.current); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				// No current to rotate FROM — point the operator at init.
-				return fmt.Errorf("no current host.age at %s (run 'gregale host-age init' first)", paths.current)
+				return "", "", fmt.Errorf("%w: missing %s", ErrRotateNoCurrent, paths.current)
 			}
-			return fmt.Errorf("stat %s: %w", paths.current, err)
+			return "", "", fmt.Errorf("stat %s: %w", paths.current, err)
 		}
 	}
 
 	// Step 1: generate the new key in memory (NOT on disk yet).
-	newID, err := secretbox.GenerateAndSaveHostKey(paths.current + ".new")
+	newID, err := secretbox.GenerateAndSaveHostKey(filepath.Join(dir, "host.age.new"))
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	// GenerateAndSaveHostKey already wrote host.age.new with 0400.
 	// Capture the path so we can rename it after the .previous swap.
-	newPath := paths.current + ".new"
+	newPath := filepath.Join(dir, "host.age.new")
+	// Capture the recipient NOW so we can surface it on stdout
+	// regardless of which rename fails — the recipient is the
+	// material the operator needs to record in the rotation log.
+	newRecipient = secretbox.RecipientString(newID)
 
 	// Step 2: rename current → .previous (if current exists).
 	// We use os.Rename so the swap is atomic on the same
@@ -261,7 +315,15 @@ func hostAgeRotate(dir string, force bool) error {
 	// key — no customer-visible blast radius.
 	if _, err := os.Stat(paths.current); err == nil {
 		if err := os.Rename(paths.current, paths.previous); err != nil {
-			return fmt.Errorf("rename current → previous: %w (host.age.new left on disk for manual recovery)", err)
+			return newRecipient, "", fmt.Errorf("rename current → previous: %w (host.age.new left on disk for manual recovery)", err)
+		}
+		// Capture the previous recipient from the just-renamed
+		// .previous file. We re-read it (rather than tracking the
+		// in-memory identity) because the file is the source of
+		// truth — if the rename succeeded but the previous file
+		// was already corrupted on disk, the operator sees that.
+		if prevID, loadErr := secretbox.LoadHostKey(paths.previous); loadErr == nil {
+			prevRecipient = secretbox.RecipientString(prevID)
 		}
 	}
 
@@ -272,14 +334,14 @@ func hostAgeRotate(dir string, force bool) error {
 		// fails, the operator has host.age.new + an old
 		// host.age.previous to manually reconcile.
 		if rbErr := os.Rename(paths.previous, paths.current); rbErr != nil {
-			return fmt.Errorf("rename .new → current: %w (rollback also failed: %v; manual recovery required: mv %s %s)",
-				err, rbErr, paths.previous, paths.current)
+			return newRecipient, prevRecipient,
+				fmt.Errorf("rename .new → current: %w (rollback also failed: %v; manual recovery required: mv %s %s)",
+					err, rbErr, paths.previous, paths.current)
 		}
-		return fmt.Errorf("rename .new → current: %w (rolled back; old identity still active)", err)
+		return newRecipient, prevRecipient, fmt.Errorf("rename .new → current: %w (rolled back; old identity still active)", err)
 	}
 
-	_ = newID // Same as init: status surfaces the recipient, not the rotate path.
-	return nil
+	return newRecipient, prevRecipient, nil
 }
 
 // cmdHostAgeStatus prints mode + fingerprint + mtime for both
@@ -401,7 +463,7 @@ func hostAgePrunePrevious(dir string, minOverlapDays int, force, promote bool) e
 	info, err := os.Stat(paths.previous)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("no host.age.previous at %s (already pruned, or no rotation in progress)", paths.previous)
+			return fmt.Errorf("%w: missing %s", ErrPruneMissingPrevious, paths.previous)
 		}
 		return fmt.Errorf("stat %s: %w", paths.previous, err)
 	}
@@ -418,8 +480,8 @@ func hostAgePrunePrevious(dir string, minOverlapDays int, force, promote bool) e
 	if !force {
 		ageDays := int(time.Since(info.ModTime()).Hours() / 24)
 		if ageDays < minOverlapDays {
-			return fmt.Errorf("refusing: host.age.previous is only %d days old (min %d). Use --force to prune anyway, --min-overlap-days=%d to shorten the window, or --promote to make .previous the new current.",
-				ageDays, minOverlapDays, ageDays)
+			return fmt.Errorf("%w: .previous is %d days old (min %d); use --force, --min-overlap-days=%d, or --promote",
+				ErrPruneTooRecent, ageDays, minOverlapDays, ageDays)
 		}
 	}
 

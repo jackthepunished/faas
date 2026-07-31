@@ -26,9 +26,9 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +72,16 @@ func TestHostAgeFlagDefaults(t *testing.T) {
 // commands_backup_test.go::TestUnsealRclone_RefuseOverwrite — a
 // silent overwrite of an existing identity strands every SealedSecret
 // ever written under the old key.
+//
+// Skipped when not running as root: hostAgeInit refuses non-root
+// callers (issue #316 / spec §11 — host.age is 0400 root:root, and
+// a non-root write would produce a file the daemons can't load).
+// CI runs as a non-root user; only the explicit root-only smoke
+// runs under sudo.
 func TestHostAgeInit_RefuseExisting(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if _, err := secretbox.GenerateAndSaveHostKey(filepath.Join(dir, "host.age")); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -81,8 +90,35 @@ func TestHostAgeInit_RefuseExisting(t *testing.T) {
 	if err == nil {
 		t.Fatal("init should refuse when host.age already exists")
 	}
-	if !strings.Contains(err.Error(), "refusing to overwrite") {
-		t.Errorf("err=%q, want 'refusing to overwrite' substring", err.Error())
+	if !errors.Is(err, ErrInitRefuseOverwrite) {
+		t.Errorf("err=%v, want errors.Is(ErrInitRefuseOverwrite)", err)
+	}
+}
+
+// TestHostAgeInit_RefuseNonRoot pins the root-only guard. Spec §11
+// mandates host.age is 0400 root:root; a non-root `init` would
+// produce a file owned by the calling user that vmmd/apid/meterd/
+// githubd cannot load (LoadCredential= copies the file as the unit
+// user, but the on-disk source must be root:root or chown — the
+// daemons explicitly refuse anything that isn't 0:0).
+//
+// The guard is independent of the refuse-overwrite guard above; both
+// must fire under their respective conditions.
+func TestHostAgeInit_RefuseNonRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("hostAgeInit_RefuseNonRoot only meaningful as non-root; CI runs as non-root by default")
+	}
+	dir := t.TempDir()
+	err := hostAgeInit(dir, false)
+	if err == nil {
+		t.Fatal("init must refuse when not running as root")
+	}
+	if !errors.Is(err, ErrInitRequiresRoot) {
+		t.Errorf("err=%v, want errors.Is(ErrInitRequiresRoot) (point operator at sudo)", err)
+	}
+	// No host.age should have been written.
+	if _, statErr := os.Stat(filepath.Join(dir, "host.age")); !os.IsNotExist(statErr) {
+		t.Errorf("host.age must not exist after refused init: stat err = %v", statErr)
 	}
 }
 
@@ -91,7 +127,12 @@ func TestHostAgeInit_RefuseExisting(t *testing.T) {
 // (via secretbox.LoadHostKey) reads it back. The atomic-write
 // property is implicitly exercised by every test in this file
 // that reads back what hostAgeInit wrote.
+//
+// Skipped when not running as root — see TestHostAgeInit_RefuseNonRoot.
 func TestHostAgeInit_HappyPath(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if err := hostAgeInit(dir, false); err != nil {
 		t.Fatalf("init: %v", err)
@@ -115,6 +156,9 @@ func TestHostAgeInit_HappyPath(t *testing.T) {
 // (current first, previous second) — the load-bearing detail
 // for the multi-recipient unseal fallback.
 func TestHostAgeRotate_HappyPath(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if err := hostAgeInit(dir, false); err != nil {
 		t.Fatalf("init: %v", err)
@@ -126,7 +170,8 @@ func TestHostAgeRotate_HappyPath(t *testing.T) {
 		t.Fatalf("load pre: %v", err)
 	}
 
-	if err := hostAgeRotate(dir, false); err != nil {
+	_, _, err = hostAgeRotate(dir, false)
+	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
@@ -170,12 +215,12 @@ func TestHostAgeRotate_HappyPath(t *testing.T) {
 // without a .previous file and zero audit trail).
 func TestHostAgeRotate_NoCurrent(t *testing.T) {
 	dir := t.TempDir()
-	err := hostAgeRotate(dir, false)
+	_, _, err := hostAgeRotate(dir, false)
 	if err == nil {
 		t.Fatal("rotate with no current must fail")
 	}
-	if !strings.Contains(err.Error(), "init") {
-		t.Errorf("err=%q, want substring 'init' (point operator at init)", err.Error())
+	if !errors.Is(err, ErrRotateNoCurrent) {
+		t.Errorf("err=%v, want errors.Is(ErrRotateNoCurrent) (point operator at init)", err)
 	}
 }
 
@@ -189,11 +234,14 @@ func TestHostAgeRotate_NoCurrent(t *testing.T) {
 // test with a JSON-shape assertion; for now the line-oriented
 // shape is the contract (same as reportSignKeyStatus).
 func TestHostAgeStatus_PrintsBothFingerprints(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if err := hostAgeInit(dir, false); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if err := hostAgeRotate(dir, false); err != nil {
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
@@ -232,11 +280,14 @@ func TestHostAgeStatus_PrintsMissing(t *testing.T) {
 // PR #483's TestUnsealRclone_RefuseOverwrite — small file-system
 // state plus a clear pass/fail boundary.
 func TestHostAgePrunePrevious_RefuseTooRecent(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if err := hostAgeInit(dir, false); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if err := hostAgeRotate(dir, false); err != nil {
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
@@ -251,8 +302,8 @@ func TestHostAgePrunePrevious_RefuseTooRecent(t *testing.T) {
 	if err == nil {
 		t.Fatal("prune-previous should refuse when .previous is <30 days old")
 	}
-	if !strings.Contains(err.Error(), "min") {
-		t.Errorf("err=%q, want substring 'min' (the refusal surfaces the min-overlap-days threshold)", err.Error())
+	if !errors.Is(err, ErrPruneTooRecent) {
+		t.Errorf("err=%v, want errors.Is(ErrPruneTooRecent) (the refusal surfaces the min-overlap-days threshold)", err)
 	}
 	if _, statErr := os.Stat(prevPath); statErr != nil {
 		t.Errorf(".previous must remain after refused prune: stat err = %v", statErr)
@@ -280,8 +331,8 @@ func TestHostAgePrunePrevious_Missing(t *testing.T) {
 	if err == nil {
 		t.Fatal("prune-previous with no .previous must fail")
 	}
-	if !strings.Contains(err.Error(), "already pruned") {
-		t.Errorf("err=%q, want substring 'already pruned'", err.Error())
+	if !errors.Is(err, ErrPruneMissingPrevious) {
+		t.Errorf("err=%v, want errors.Is(ErrPruneMissingPrevious)", err)
 	}
 }
 
@@ -293,11 +344,14 @@ func TestHostAgePrunePrevious_Missing(t *testing.T) {
 // protecting against a silent overwrite that would strand
 // freshly-sealed envelopes under the new current).
 func TestHostAgePrunePrevious_PromoteFlow(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("hostAgeInit requires root (writes 0400 host.age; spec §11)")
+	}
 	dir := t.TempDir()
 	if err := hostAgeInit(dir, false); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if err := hostAgeRotate(dir, false); err != nil {
+	if _, _, err := hostAgeRotate(dir, false); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 

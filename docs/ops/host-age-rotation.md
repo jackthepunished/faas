@@ -135,8 +135,13 @@ This performs three operations in one shell:
 The output is the new recipient string:
 
 ```
-host.age rotated. New recipient: age1qz3p...
-Previous fingerprint (now host.age.previous): age1abc...
+✓ Rotated host.age → host.age.previous; new current written.
+  New recipient:                age1qz3p...
+  Previous (now .previous):     age1abc...
+  Next: chown root:root /etc/faas/secrets/host.age /etc/faas/secrets/host.age.previous && chmod 0400 both
+  Next: systemctl restart faas-vmmd first (it owns host.age.pub), then faas-apid faas-meterd faas-githubd
+  Next: gregale host-age status (verify all daemons on the new fingerprint after restart)
+  Next: 30-day overlap window starts now; run 'gregale host-age prune-previous' after that
 ```
 
 **The new recipient is what every NEW envelope will be sealed
@@ -151,7 +156,7 @@ sudo ls -la /etc/faas/secrets/
 # expect:
 # host.age             0400 root:root  (new)
 # host.age.previous    0400 root:root  (old)
-# host.age.pub         0444 root:faas  (unchanged, still the old recipient)
+# host.age.pub         0444 root:faas  (still the OLD recipient — see step 4)
 ```
 
 ```sh
@@ -161,17 +166,44 @@ sudo gregale host-age status
 Output should show two fingerprints (current + previous), their
 respective `mtime`, and a 30-day countdown annotation.
 
-### 4. Bounce the daemons
+### 4. Bounce the daemons — vmmd FIRST, then the rest
+
+The bounce order is load-bearing. **vmmd writes
+`/etc/faas/secrets/host.age.pub` from its in-memory identity at
+boot** (`pkg/secretbox/hostkey.go:172-181 WriteRecipientFile`); if
+apid restarts first it reads the OLD recipient and seals new
+envelopes against the OLD key — the daemons won't be able to
+unseal them until vmmd comes up and rewrites the file.
 
 ```sh
-sudo systemctl restart faas-apid faas-vmmd faas-meterd faas-githubd
+# 1. vmmd FIRST — it picks up host.age, writes the new host.age.pub.
+sudo systemctl restart faas-vmmd
+
+# 2. apid SECOND — it reads the new host.age.pub as its sealing key.
+sudo systemctl restart faas-apid
+
+# 3. meterd + githubd — unseal-only; they read host.age via LoadHostKeys
+#    and don't care which order they bounce in, so long as vmmd and
+#    apid are already on the new identity.
+sudo systemctl restart faas-meterd faas-githubd
 ```
 
 daemons don't watch the file — systemd restart re-reads via
-`LoadCredential=faas_host_age_identity` (apid) or the
-FAAS_HOST_AGE_KEY / FAAS_HOST_AGE_IDENTITY_PATH env var (the
-other three). Without the bounce, daemons still hold the
+`LoadCredential=faas_host_age_identity` (apid) and the
+`FAAS_HOST_AGE_IDENTITY_PATH` env var + LoadHostKeys(dir) for the
+other three. Without the bounce, daemons still hold the
 **pre-rotation** identity and the rotation does nothing.
+
+After vmmd's restart, `host.age.pub` now points at the NEW
+recipient:
+
+```sh
+sudo ls -la /etc/faas/secrets/
+# expect:
+# host.age.pub         0444 root:faas  (now the NEW recipient)
+# host.age             0400 root:root  (new)
+# host.age.previous    0400 root:root  (old)
+```
 
 Wait for the daemons to come up clean:
 
@@ -236,10 +268,19 @@ Up until `gregale host-age prune-previous`, the previous key is
 still on disk as `host.age.previous`. Rollback is:
 
 ```sh
-sudo systemctl stop faas-apid faas-vmmd faas-meterd faas-githubd
+# Stop all four daemons.
+sudo systemctl stop faas-vmmd faas-apid faas-meterd faas-githubd
+
+# Restore the previous key as the new current.
 sudo mv /etc/faas/secrets/host.age.previous /etc/faas/secrets/host.age
 sudo chmod 0400 /etc/faas/secrets/host.age
-sudo systemctl start faas-apid faas-vmmd faas-meterd faas-githubd
+
+# Restart in the same order as step 4: vmmd first (it owns
+# host.age.pub), then apid (it reads host.age.pub as its sealing
+# key), then meterd + githubd.
+sudo systemctl start faas-vmmd
+sudo systemctl start faas-apid
+sudo systemctl start faas-meterd faas-githubd
 ```
 
 This restores the pre-rotation state exactly: every daemon
