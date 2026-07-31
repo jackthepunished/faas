@@ -92,9 +92,20 @@ end;
 $$ language plpgsql;
 
 drop trigger if exists egress_policy_changed_trg on egress_policy;
+-- Per-row (NOT statement-level): the function body reads new.id,
+-- new.public_iface, new.masquerade_cidr, new.changed_at via PL/pgSQL
+-- NEW — those are only bound per-row. A statement-level trigger fires
+-- once per INSERT/UPDATE statement but does NOT see NEW/OLD row
+-- variables; using it here would emit an all-empty payload (the
+-- function would still run, but new.* would all be NULL, and
+-- json_build_object would skip them). The single-row shape (the
+-- egress_policy_singleton CHECK constraint caps the table at one
+-- row) makes per-row and statement-level firing functionally
+-- identical here, but per-row is the only one that's CORRECT for
+-- the payload contract.
 create trigger egress_policy_changed_trg
     after insert or update on egress_policy
-    for each statement execute function egress_policy_notify();
+    for each row execute function egress_policy_notify();
 
 -- +goose StatementEnd
 
