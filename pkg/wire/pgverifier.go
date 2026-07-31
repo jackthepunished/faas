@@ -76,9 +76,9 @@ func NewPGNodeVerifier(loader NodeLoader, log *slog.Logger) *PGNodeVerifier {
 //
 // The snapshot is keyed by CN (== compute_nodes.name), so the
 // mismatch path can't have an associated id — the wrap is the CN
-// alone. If a future policy adds an id-based check (e.g. "this CN
-// must match a specific compute_nodes.id"), the id is already
-// plumbed: use nodeVerifierWithCNID to surface it.
+// alone. The id is retained in case a future id-discriminating
+// policy wants to surface it; today, LookupCN only consumes the
+// boolean hit/miss.
 func (v *PGNodeVerifier) LookupCN(cn string) error {
 	if v == nil {
 		return nil
@@ -89,7 +89,7 @@ func (v *PGNodeVerifier) LookupCN(cn string) error {
 	if !ok {
 		return nodeVerifierWithCN(ErrNodeVerifierCNMismatch, cn)
 	}
-	_ = id // retained for an id-discriminating policy; see nodeVerifierWithCNID
+	_ = id // retained for an id-discriminating policy; today unused
 	return nil
 }
 

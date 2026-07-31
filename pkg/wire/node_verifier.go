@@ -126,27 +126,15 @@ var _ NodeVerifier = (*AllowAllNodeVerifier)(nil)
 // call site is the verifier's LookupCN method, and those methods
 // already produce an error in the canonical ErrNodeVerifierCNMismatch
 // shape.
+//
+// Future id-based policies ("this CN must match a specific
+// compute_nodes.id") would carry the id through here. The id is
+// already in the PGNodeVerifier snapshot; the helper just needs an
+// id-aware sibling at that time — adding one now without a caller
+// would trip the `unused` linter.
 func nodeVerifierWithCN(err error, cn string) error {
 	if err == nil {
 		return nil
 	}
 	return fmt.Errorf("%w: cn=%q", err, cn)
-}
-
-// nodeVerifierWithCNID is the production-side variant of
-// nodeVerifierWithCN. PGNodeVerifier carries (name, id) pairs in its
-// snapshot, so a future id-based policy (e.g. "this CN must match
-// specific id=...") can surface the id alongside the cn. The
-// snapshot is keyed by CN, so the lookup-mismatch path can't have
-// an id — that path uses nodeVerifierWithCN; the id-surfacing case
-// is reserved for an id-discriminating policy that wraps a hit
-// with a separate rejection.
-func nodeVerifierWithCNID(err error, cn, id string) error {
-	if err == nil {
-		return nil
-	}
-	if id == "" {
-		return nodeVerifierWithCN(err, cn)
-	}
-	return fmt.Errorf("%w: cn=%q id=%q", err, cn, id)
 }
