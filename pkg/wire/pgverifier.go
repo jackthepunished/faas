@@ -73,6 +73,12 @@ func NewPGNodeVerifier(loader NodeLoader, log *slog.Logger) *PGNodeVerifier {
 // LookupCN implements NodeVerifier. RLock-guarded read on the
 // snapshot; nil-receiver returns nil (AllowAll) so legacy callers
 // that pass a nil verifier don't crash.
+//
+// The snapshot is keyed by CN (== compute_nodes.name), so the
+// mismatch path can't have an associated id — the wrap is the CN
+// alone. If a future policy adds an id-based check (e.g. "this CN
+// must match a specific compute_nodes.id"), the id is already
+// plumbed: use nodeVerifierWithCNID to surface it.
 func (v *PGNodeVerifier) LookupCN(cn string) error {
 	if v == nil {
 		return nil
@@ -83,7 +89,7 @@ func (v *PGNodeVerifier) LookupCN(cn string) error {
 	if !ok {
 		return nodeVerifierWithCN(ErrNodeVerifierCNMismatch, cn)
 	}
-	_ = id // id is retained for diagnostics; future API can surface it via errors.As
+	_ = id // retained for an id-discriminating policy; see nodeVerifierWithCNID
 	return nil
 }
 
@@ -144,8 +150,27 @@ func (v *PGNodeVerifier) Size() int {
 // other notification source) and refreshes the snapshot on every
 // delivery. Every notify triggers Refresh; the loop survives
 // transient loader failures because Refresh keeps the last-known-good
-// snapshot. nil receiver is tolerated (no-op drain; identical shape
-// to pkg/sched.NodeKeyRegistry.Run).
+// snapshot. nil receiver is tolerated (no-op drain on ctx; identical
+// shape to pkg/sched.NodeKeyRegistry.Run).
+//
+// Panic-recovery: none. The reference drain loops (see
+// pkg/sched.NodeKeyRegistry.Run and cmd/vmmd/egress_watcher.go::Run)
+// don't recover either — a panic in the loader propagates and the
+// daemon dies loudly, which is the right posture for a verifier.
+// Adding recover() to swallow-and-retry would hide a sustained
+// loader bug and leave the daemon with a stale snapshot under
+// silently-misbehaving code.
+//
+// Return-value contract:
+//   - ctx.Done() returns ctx.Err() (caller treats as benign shutdown).
+//   - channel close (notify<ok==false) returns nil. db.Subscribe uses
+//     channel-close as a reconnect signal, so the production
+//     cmd/schedd + cmd/vmmd drain loop (see subscribeWithReconnect)
+//     treats nil as "open a fresh Subscribe and dial again on transient
+//     errors". A non-nil error here would force the loop to log a
+//     spurious warning on every reconnect tick.
+//   - loader-failure Refresh results are swallowed (Refresh already
+//     logs at Warn and the snapshot stays on last-known-good).
 func (v *PGNodeVerifier) Run(ctx context.Context, ch <-chan db.Notification) error {
 	if v == nil {
 		<-ctx.Done()
@@ -157,11 +182,15 @@ func (v *PGNodeVerifier) Run(ctx context.Context, ch <-chan db.Notification) err
 			return ctx.Err()
 		case _, ok := <-ch:
 			if !ok {
+				// Channel close is a reconnect signal from
+				// db.Subscribe; production drain loops interpret
+				// nil as "open a fresh Subscribe". See the
+				// package doc above for the full contract.
 				return nil
 			}
 			if _, err := v.Refresh(ctx); err != nil {
 				// Refresh already logs at Warn; the loop survives
-				// last-known-good.
+				// on last-known-good.
 				_ = err
 			}
 		}

@@ -161,27 +161,43 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 
-	// ADR-056: handshake-layer NodeVerifier. Schedd is always
-	// multi-box-aware (no NodeName gate — the synth `default-local`
-	// row is seeded by migration 00024). Construct the PG-backed
-	// verifier and refresh once at startup so the first mTLS
-	// handshake after listen sees a populated snapshot. The drain
-	// loop runs as a goroutine for the lifetime of the daemon and
-	// drives Refresh on every compute_node_changed notification.
-	nodeVerifier := wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log)
-	if _, err := nodeVerifier.Refresh(ctx); err != nil {
-		return fmt.Errorf("schedd: node verifier startup refresh: %w", err)
+	// ADR-056: handshake-layer NodeVerifier. Gated on cfg.NodeName
+	// (the multi-box gate, mirroring vmmd's cfg.ComputeNode.NodeName
+	// at cmd/vmmd/main.go:394). When the gate is open, schedd is
+	// part of a multi-box deployment and the verifier sits in
+	// front of every mTLS leg (server-side on the gatewayd-facing
+	// surface, client-side on the vmmd dial). Empty NodeName =
+	// single-box dev / pre-slice-3 schedd keeps the verifier off
+	// entirely; stdlib chain + RFC 6125 SAN + EKU alone run.
+	//
+	// Refresh + Run only run when the gate is open. The factory
+	// variants accept a nil verifier and degrade to the stdlib
+	// trust path, so the closed-gate wiring reuses the same
+	// LoadServerTLSWithVerifier / LoadVMMTLSWithVerifier call
+	// sites as the open-gate wiring — a single code path.
+	var nodeVerifier *wire.PGNodeVerifier
+	if cfg.NodeName != "" {
+		nodeVerifier = wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log)
+		if _, err := nodeVerifier.Refresh(ctx); err != nil {
+			return fmt.Errorf("schedd: node verifier startup refresh: %w", err)
+		}
+		// Last-known-good posture: the drain loop survives
+		// transient Postgres blips because Refresh keeps the
+		// previous snapshot on loader failure. A de-sync to "allow
+		// nothing" would brick the cluster's mTLS legs (every
+		// handshake would fail), so the contract is "best effort
+		// refresh on every notify; never brick".
+		go func() {
+			ch, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyComputeNodeChanged}, log)
+			if err != nil {
+				log.Error("schedd: node verifier LISTEN failed", "err", err)
+				return
+			}
+			if err := nodeVerifier.Run(ctx, ch); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("schedd: node verifier exited", "err", err)
+			}
+		}()
 	}
-	go func() {
-		ch, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyComputeNodeChanged}, log)
-		if err != nil {
-			log.Error("schedd: node verifier LISTEN failed", "err", err)
-			return
-		}
-		if err := nodeVerifier.Run(ctx, ch); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("schedd: node verifier exited", "err", err)
-		}
-	}()
 
 	// Snapshots load only on the Firecracker version that made them (ADR-005);
 	// detect it so the engine restores compatible snapshots and cold boots the

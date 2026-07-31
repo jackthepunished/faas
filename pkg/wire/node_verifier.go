@@ -37,13 +37,6 @@ import (
 // on the listener side.
 var ErrNodeVerifierCNMismatch = errors.New("wire: peer CN not in compute_node registry")
 
-// ErrNilNodeVerifierPool is returned by daemon-side wiring when
-// runNodeVerifier is called with a nil pool. Reaching this branch
-// is a programming error (the caller is supposed to gate on
-// cfg.ComputeNode.NodeName != ""), so the error is loud and
-// distinguishable from load-time failures.
-var ErrNilNodeVerifierPool = errors.New("wire: node verifier started with nil pool")
-
 // NodeVerifier is the handshake-layer CN-binding seam. The stdlib TLS
 // verifier (chain/SAN/EKU) runs first in the same pass; this hook is
 // invoked AFTER stdlib trust succeeds, so the verifier augments
@@ -123,10 +116,37 @@ var _ NodeVerifier = (*AllowAllNodeVerifier)(nil)
 
 // nodeVerifierWithCN wraps an error with the rejected CN for
 // diagnostics. Wrapping is via %w so errors.Is matches
-// ErrNodeVerifierCNMismatch across calls.
+// ErrNodeVerifierCNMismatch across calls (closed from the stdlib
+// trust path; the wrap carries only the CN because the snapshot is
+// keyed by CN, so the lookup-mismatch path has no id to surface).
+//
+// A nil err short-circuits to nil so callers can compose the helper
+// at the rejection site without an explicit guard. The helper is
+// package-private: there is no plan to expose it because every
+// call site is the verifier's LookupCN method, and those methods
+// already produce an error in the canonical ErrNodeVerifierCNMismatch
+// shape.
 func nodeVerifierWithCN(err error, cn string) error {
 	if err == nil {
 		return nil
 	}
 	return fmt.Errorf("%w: cn=%q", err, cn)
+}
+
+// nodeVerifierWithCNID is the production-side variant of
+// nodeVerifierWithCN. PGNodeVerifier carries (name, id) pairs in its
+// snapshot, so a future id-based policy (e.g. "this CN must match
+// specific id=...") can surface the id alongside the cn. The
+// snapshot is keyed by CN, so the lookup-mismatch path can't have
+// an id — that path uses nodeVerifierWithCN; the id-surfacing case
+// is reserved for an id-discriminating policy that wraps a hit
+// with a separate rejection.
+func nodeVerifierWithCNID(err error, cn, id string) error {
+	if err == nil {
+		return nil
+	}
+	if id == "" {
+		return nodeVerifierWithCN(err, cn)
+	}
+	return fmt.Errorf("%w: cn=%q id=%q", err, cn, id)
 }

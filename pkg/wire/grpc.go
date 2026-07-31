@@ -395,11 +395,8 @@ func LoadServerTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath 
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		return nil, nil
-	}
-	if hook := VerifyCNClosure(v); hook != nil {
-		cfg.VerifyPeerCertificate = hook
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -415,18 +412,20 @@ func LoadServerTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath 
 // their current behaviour. A nil/empty all-paths input returns the
 // LoadServerTLSConfig nil contract — the production caller (cmd/schedd)
 // already handles "no TLS at all" as a legitimate single-box state.
+//
+// This is the TEST-HELPER / unprefixed shape — production daemons
+// with role-distinguished clusters (schedd's `tls_*` vs vmmd's
+// `vmmd_tls_*`) call LoadServerTLSConfigWithPrefixAndVerifier so the
+// missing-field error names an operator-actionable TOML key. The
+// unprefixed variant is kept for symmetry with LoadServerTLSConfig and
+// for tests that don't model a role prefix.
 func LoadServerTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
 	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, "")
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		// All-paths-empty: honour LoadServerTLSConfig's nil
-		// contract. The verifier is irrelevant without TLS.
-		return nil, nil
-	}
-	if hook := VerifyCNClosure(v); hook != nil {
-		cfg.VerifyPeerCertificate = hook
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -481,11 +480,8 @@ func LoadClientTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath 
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		return nil, nil
-	}
-	if hook := VerifyCNClosure(v); hook != nil {
-		cfg.VerifyPeerCertificate = hook
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -500,18 +496,37 @@ func LoadClientTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath 
 // installed): single-box clients continue to work. All-paths-empty
 // input returns LoadClientTLSConfig's nil contract — the production
 // caller decides whether to fall back to insecure (unix sockets).
+//
+// This is the TEST-HELPER / unprefixed shape — production daemons
+// call LoadClientTLSConfigWithPrefixAndVerifier so the
+// missing-field error names an operator-actionable TOML key.
 func LoadClientTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
 	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, "")
 	if err != nil {
 		return nil, err
 	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// setVerifyHook installs the hook returned by VerifyCNClosure on cfg
+// when (and only when) the closure is non-nil. A nil cfg keeps the
+// Load*TLSConfig nil contract (no TLS, no hook); a nil v degrades to
+// the existing Load*TLSConfig behaviour (no hook installed). The
+// helper is package-private so the only canonical installation point
+// is the *WithVerifier factory family — a side-channel
+// SetVerifier(cfg, v) helper would let callers splice the hook onto
+// a *tls.Config built elsewhere and bypass the production wiring.
+func setVerifyHook(cfg *tls.Config, v NodeVerifier) error {
 	if cfg == nil {
-		return nil, nil
+		return nil
 	}
 	if hook := VerifyCNClosure(v); hook != nil {
 		cfg.VerifyPeerCertificate = hook
 	}
-	return cfg, nil
+	return nil
 }
 
 func loadClientTLSConfig(certPath, keyPath, caPath, prefix string) (*tls.Config, error) {

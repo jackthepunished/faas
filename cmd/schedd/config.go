@@ -143,6 +143,24 @@ type Config struct {
 	// ReapIdle / SelectEvictions paths are NOT capped — they
 	// already drain at their own cadences.
 	ReaperAggressiveParkCap int `toml:"reaper_aggressive_park_cap"`
+
+	// NodeName is the multi-box gate (ADR-056, mirrored from vmmd's
+	// [compute_node].name). When set, schedd constructs the
+	// handshake-layer NodeVerifier and surfaces a populated
+	// compute_nodes snapshot to every mTLS leg on listen. Empty
+	// (one-box dev / pre-slice-3 schedd) keeps the verifier off
+	// entirely — stdlib chain + RFC 6125 SAN + EKU alone run. The
+	// synthetic `default-local` row seeded by migration 00024 is
+	// always present, so the verifier, when wired, finds at least
+	// one entry to bind against.
+	//
+	// The field is intentionally not backed by [compute_node] TOML
+	// subsection for schedd: schedd is the control-plane trust
+	// anchor across every compute node, not a self-registrant.
+	// Operators set node_name = "schedd-<box>" through this field
+	// and the [compute_nodes] row is provisioned by `faas node
+	// register` (out of scope for ADR-056).
+	NodeName string `toml:"node_name"`
 }
 
 // ResolveListenTarget returns the gRPC target schedd should bind.
