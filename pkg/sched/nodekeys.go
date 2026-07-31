@@ -40,6 +40,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/onebox-faas/faas/pkg/db"
 )
 
 // NodeKeyLookup is the production-style accessor exported for
@@ -188,6 +190,49 @@ func (r *NodeKeyRegistry) Refresh(ctx context.Context) (int, error) {
 			"keys", n, "rows_loaded", len(rows))
 	}
 	return n, nil
+}
+
+// Run drains an already-opened 'compute_node_changed' channel
+// until ctx is cancelled or the channel closes. Each notify
+// triggers a Refresh; the production channel covers both
+// compute_nodes AND compute_node_keys writes (migration 00075's
+// trigger fires on either table), so a single subscription
+// refreshes both lifecycles.
+//
+// Returns ctx.Err() on cancellation; closes on nil-channel
+// return cleanly. The handler's nil-safe NodeKeyRegistry
+// accessor means a missing subscription is operationally safe
+// (the registry stays at its initial-Refresh snapshot); the
+// subtle failure mode is "vmmd registers a new key but
+// schedd's listener is wedged" — the canary is the
+// schedd_capacity_signature_rejected_total counter (F7) which
+// spikes if the live registry doesn't accept a freshly-issued
+// signature.
+//
+// nil receiver is tolerated (no-op drain).
+func (r *NodeKeyRegistry) Run(ctx context.Context, ch <-chan db.Notification) error {
+	if r == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case _, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			// Refresh on every notify. Errors keep the
+			// last-known-good map (Refresh's contract); the
+			// loop survives a transient loader failure.
+			if _, err := r.Refresh(ctx); err != nil {
+				// Refresh already logs at Warn; the loop
+				// continues so the next notify retries.
+				_ = err
+			}
+		}
+	}
 }
 
 // parsePublicKeyPEM parses a PEM-encoded SubjectPublicKeyInfo

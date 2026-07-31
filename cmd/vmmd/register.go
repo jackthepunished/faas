@@ -29,6 +29,9 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +39,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -130,3 +134,98 @@ func defaultDetectOverlayIP(ctx context.Context) (string, error) {
 	}
 	return ip, nil
 }
+
+// registerComputeNodeKey writes the public half of vmmd's signing
+// key into compute_node_keys (migration 00075 / ADR-053) so
+// schedd's NodeKeyRegistry can verify node_signature on every
+// CapacityReport.
+//
+// The row is keyed by (compute_node_id, key_id); both vmmd and
+// schedd compute key_id the same way (SHA-256(SPKI) hex, lowercase)
+// via pkg/sched.KeyIDForPublicKey. ON CONFLICT DO NOTHING means a
+// re-register (vmmd restart, key rotation mid-flight) is
+// idempotent — a future runbook (issue #316) will own the rotation
+// ceremony; this function is the per-startup no-op-on-repeat.
+//
+// nil nodeKey is the pre-slice-3 mode (no node.key on disk; legacy
+// schedd accepts unsigned reports). The function returns nil
+// without writing so a vmmd boot that hasn't yet received a signing
+// key from the bootstrap step doesn't fail-closed against a
+// condition that is, by design, supposed to be a soft no-op on
+// the wire. The pre-slice-3 schedd already accepts an empty
+// node_signature field (ADR-016 additive wire), so this is not a
+// silent semantic change.
+//
+// The PEM body is a SubjectPublicKeyInfo (RFC 7468 §13) wrapped in
+// a PUBLIC KEY block — the same shape the schedd-side
+// parsePublicKeyPEM accepts in pkg/sched/nodekeys.go. Reusing the
+// PEM wire rather than passing raw DER keeps the migration 00075
+// schema (`public_key_pem text`) unchanged and gives an operator
+// reading the table a copy-paste-able verification artifact.
+//
+// Fail-closed: if the upsert fails (Postgres down, schema drift),
+// the function surfaces the error so vmmd exits rather than
+// serving unsigned reports against a registry that won't accept
+// them. The capacity publisher below this block in main.go will
+// already be wired with the signing key — a successful start but a
+// missing compute_node_keys row is exactly the silent-degrade case
+// the F7 counter (`capacity_signature_rejected_total`) is supposed
+// to surface, and failing here turns the counter into a tripwire
+// instead of a silent signal.
+func registerComputeNodeKey(ctx context.Context, st state.Store, nodeID string, nodeKey *ecdsa.PrivateKey, nodeKeyID string, log *slog.Logger) error {
+	if nodeKey == nil {
+		// Pre-slice-3 mode. Log so an operator looking at the
+		// startup sequence can correlate this with the
+		// "capacity reports unsigned" line emitted at the
+		// call site.
+		log.Info("vmmd: skipping compute_node_keys upsert (no node.key); pre-slice-3 mode")
+		return nil
+	}
+	if nodeID == "" {
+		// registerComputeNode was called with an empty name,
+		// so there's no compute_nodes.id to attach the key
+		// to. Match that path's silent-skip posture: legacy
+		// single-box dev never writes a row, never serves a
+		// signed report.
+		log.Info("vmmd: skipping compute_node_keys upsert (no compute_nodes.id; default-local only)")
+		return nil
+	}
+
+	pemBytes, err := publicKeyPEM(&nodeKey.PublicKey)
+	if err != nil {
+		return fmt.Errorf("vmmd: marshal node public key: %w", err)
+	}
+
+	if err := st.UpsertNodeKey(ctx, nodeID, nodeKeyID, string(pemBytes)); err != nil {
+		return fmt.Errorf("vmmd: upsert compute_node_keys (node=%q, key_id=%s): %w", nodeID, nodeKeyID, err)
+	}
+	log.Info("vmmd: compute_node_keys row upserted",
+		"node_id", nodeID, "key_id", nodeKeyID)
+	return nil
+}
+
+// publicKeyPEM encodes an ECDSA public key as a SubjectPublicKeyInfo
+// PEM block. The block type is "PUBLIC KEY" (RFC 7468 §13), the
+// only type parsePublicKeyPEM accepts; DER is the PKIX form
+// (RFC 5480) produced by x509.MarshalPKIXPublicKey.
+//
+// Centralised so registerComputeNodeKey and the test helper both
+// call the same marshaller — and so a future curve change (ADR-053
+// permits none today; the F4 test pins P-256) has exactly one site
+// to update.
+func publicKeyPEM(pub *ecdsa.PublicKey) ([]byte, error) {
+	if pub == nil {
+		return nil, errors.New("nil public key")
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("marshal PKIX: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
+// Compile-time guard: registerComputeNodeKey depends on
+// sched.KeyIDForPublicKey existing; pin it via an unused-import
+// reference so a future refactor that drops the helper surfaces
+// at build time rather than silently producing an empty key_id.
+var _ = sched.KeyIDForPublicKey

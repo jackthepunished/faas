@@ -20,6 +20,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -403,6 +404,190 @@ func TestLocalCacheBackend_DeterministicBucketing(t *testing.T) {
 			t.Errorf("bucket %q contains non-hex char %q", bucket, c)
 		}
 	}
+}
+
+// sizeReader is an io.Reader that exposes its byte count via
+// Size(). Mirrors the shape of bytes.Reader, strings.Reader,
+// and bytes.Buffer so the cache's SizeReader sniff picks it up.
+type sizeReader struct {
+	off int64
+	buf []byte
+}
+
+func (s *sizeReader) Read(p []byte) (int, error) {
+	if s.off >= int64(len(s.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.buf[s.off:])
+	s.off += int64(n)
+	return n, nil
+}
+
+func (s *sizeReader) Size() int64 { return int64(len(s.buf)) }
+
+// TestLocalCacheBackend_Put_RejectsOversizedBlob pins the hard
+// pre-check: a blob whose caller-known size exceeds maxBytes is
+// rejected before any read. The parent never sees the bytes,
+// the cache stays untouched, and the typed error is observable
+// by callers that want to distinguish "too big" from "parent
+// failed".
+func TestLocalCacheBackend_Put_RejectsOversizedBlob(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 16)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	// 32-byte blob into a 16-byte cache. The SizeReader sniff
+	// triggers the pre-check before the parent is even called.
+	src := &sizeReader{buf: make([]byte, 32)}
+	err = cache.Put(context.Background(), "snap/abc", src)
+	if err == nil {
+		t.Fatal("Put on 32-byte blob into 16-byte cache succeeded; want error")
+	}
+	if !strings.Contains(err.Error(), "exceeds maxBytes") {
+		t.Errorf("err = %q, want contains 'exceeds maxBytes'", err)
+	}
+	if parent.puts.Load() != 0 {
+		t.Errorf("parent.puts = %d, want 0 (oversized blob must not reach parent)", parent.puts.Load())
+	}
+}
+
+// TestLocalCacheBackend_Put_RejectsOversizedStreamedBlob pins
+// the post-parent size check: a stream that doesn't expose Size
+// (and therefore can't be pre-checked) is rejected after the
+// parent has accepted the bytes. The parent has the canonical
+// copy; the cache is not poisoned with an oversized blob we
+// can't guarantee eviction for. (A SizeReader, by contrast,
+// hits the pre-check and never reaches the parent.)
+func TestLocalCacheBackend_Put_RejectsOversizedStreamedBlob(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 16)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	// 32-byte stream wrapped to hide Size() so the pre-check
+	// can't fire; the TeeReader fills the buffer; the
+	// post-parent check fires.
+	blob := []byte(strings.Repeat("x", 32))
+	err = cache.Put(context.Background(), "snap/abc", noSizeReader{Reader: bytes.NewReader(blob)})
+	if err == nil {
+		t.Fatal("Put on 32-byte stream into 16-byte cache succeeded; want error")
+	}
+	if !strings.Contains(err.Error(), "exceeds maxBytes") {
+		t.Errorf("err = %q, want contains 'exceeds maxBytes'", err)
+	}
+	if parent.puts.Load() != 1 {
+		t.Errorf("parent.puts = %d, want 1 (parent should still see the bytes)", parent.puts.Load())
+	}
+}
+
+// noSizeReader wraps an io.Reader to hide Size(). Used to
+// exercise the post-parent size check path that the pre-check
+// would otherwise short-circuit.
+type noSizeReader struct{ io.Reader }
+
+// TestLocalCacheBackend_Put_StreamsToParent pins the streaming
+// Put path: a large blob is piped to the parent via TeeReader
+// without a 2x transient allocation. The parent sees the
+// streamed bytes; the cache mirrors the same bytes back via
+// a subsequent Get.
+func TestLocalCacheBackend_Put_StreamsToParent(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	ctx := context.Background()
+	payload := strings.Repeat("stream-blob-", 1024)
+	if err := cache.Put(ctx, "snap/abc", strings.NewReader(payload)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if parent.puts.Load() != 1 {
+		t.Errorf("parent.puts = %d, want 1", parent.puts.Load())
+	}
+	// Round-trip through the cache hit-path.
+	got, err := readAll(ctx, cache, "snap/abc")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != payload {
+		t.Errorf("Get round-tripped %d bytes, want %d", len(got), len(payload))
+	}
+	if parent.gets.Load() != 0 {
+		t.Errorf("parent.gets = %d, want 0 (cache should serve)", parent.gets.Load())
+	}
+}
+
+// TestLocalCacheBackend_GetsDoNotTouchMtime pins the LRU
+// contract: a cache hit MUST NOT bump the file's mtime. The
+// cache eviction is mtime-driven; touching mtime on every
+// read would make all entries look freshly-written and
+// silently defeat eviction (the cache would grow to maxBytes
+// and never evict, no matter how old the original Put was).
+//
+// The test seeds two blobs with distinct, OLD mtimes, then
+// reads both repeatedly. A bug that re-introduces the Chtimes
+// call would move both mtimes to "now", making the next
+// Put-driving-eviction step observe a flat mtime ordering
+// instead of the intended old-first ordering.
+func TestLocalCacheBackend_GetsDoNotTouchMtime(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	ctx := context.Background()
+	for _, k := range []string{"snap/a", "snap/b"} {
+		if err := cache.Put(ctx, k, strings.NewReader("data-"+k)); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+		// Set mtime to a known old value.
+		path := hashCachePath(t, filepath.Join(tmp, "cache"), k)
+		past := time.Now().Add(-1 * time.Hour)
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatalf("Chtimes %q: %v", k, err)
+		}
+	}
+	// Read both repeatedly. Each Get must not bump the mtime.
+	// The pre-Gets mtime is the baseline; the post-Gets mtime
+	// must be at-or-before that baseline (we compare UnixNano
+	// to defeat clock-resolution coarseness).
+	beforeA := mtimeOf(t, hashCachePath(t, filepath.Join(tmp, "cache"), "snap/a"))
+	beforeB := mtimeOf(t, hashCachePath(t, filepath.Join(tmp, "cache"), "snap/b"))
+	for i := 0; i < 5; i++ {
+		if _, err := readAll(ctx, cache, "snap/a"); err != nil {
+			t.Fatalf("Get a: %v", err)
+		}
+		if _, err := readAll(ctx, cache, "snap/b"); err != nil {
+			t.Fatalf("Get b: %v", err)
+		}
+	}
+	afterA := mtimeOf(t, hashCachePath(t, filepath.Join(tmp, "cache"), "snap/a"))
+	afterB := mtimeOf(t, hashCachePath(t, filepath.Join(tmp, "cache"), "snap/b"))
+	// Allow equal mtime (no change) but reject any forward bump.
+	// The bug being prevented is mtime advancing toward "now" on
+	// every read; a regression that re-introduces Chtimes would
+	// push afterA → afterNow, the literal exact-current time.
+	if afterA.After(beforeA) {
+		t.Errorf("snap/a mtime advanced on read: before=%s, after=%s", beforeA, afterA)
+	}
+	if afterB.After(beforeB) {
+		t.Errorf("snap/b mtime advanced on read: before=%s, after=%s", beforeB, afterB)
+	}
+}
+
+// mtimeOf returns the file's mtime or fatals. Test helper.
+func mtimeOf(t *testing.T, path string) time.Time {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %q: %v", path, err)
+	}
+	return st.ModTime()
 }
 
 // readAll pulls a blob through the cache, returning the contents

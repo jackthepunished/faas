@@ -537,6 +537,16 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 					"capacity report signature rejected: %v", verr)
 				s.log.Warn("schedd: capacity signature rejected; closing stream",
 					"node_id", report.NodeID, "err", verr)
+				// ADR-053 §3: one increment per rejected stream
+				// (the handler closes the stream on the first
+				// bad frame, so per-frame increment would
+				// over-count). The operator's "which node?"
+				// question is answered by the audit log
+				// stream-rejection event, not by the metric
+				// label — the counter is unlabelled.
+				if c := s.ops.CapacitySignatureRejected(); c != nil {
+					c.Inc()
+				}
 				return sendErr
 			}
 		}

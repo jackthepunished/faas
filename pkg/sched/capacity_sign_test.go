@@ -359,3 +359,44 @@ func TestSignNodeReport_RejectsNilKey(t *testing.T) {
 		t.Error("SignNodeReport on nil key succeeded; want error")
 	}
 }
+
+// TestSignNodeReport_RejectsNegativeFields pins the
+// CanonicalPayload precondition: every numeric field must be
+// ≥ 0. A negative value silently wraps to a huge uint on the
+// wire, producing a signature that won't verify against any
+// honest reconstruction. SignNodeReport must reject up front
+// so the publisher cannot mint a self-inconsistent report.
+//
+// Tests SampledAt pre-epoch + each of the five int32 fields.
+// A regression that drops the validator would slip a
+// silently-broken signature into the wire and break every
+// downstream verification — but only in the field, not in
+// unit tests. This test pins the contract at the boundary.
+func TestSignNodeReport_RejectsNegativeFields(t *testing.T) {
+	t.Parallel()
+	priv, _ := generateTestP256(t)
+	base := sampleReport("node-1")
+
+	cases := []struct {
+		name string
+		mut  func(*CapacityReport)
+	}{
+		{"pre-epoch SampledAt", func(r *CapacityReport) { r.SampledAt = time.UnixMilli(-1) }},
+		{"negative LiveCount", func(r *CapacityReport) { r.LiveCount = -1 }},
+		{"negative LeasedCount", func(r *CapacityReport) { r.LeasedCount = -1 }},
+		{"negative UsedMB", func(r *CapacityReport) { r.UsedMB = -1 }},
+		{"negative RAMHeadroomMB", func(r *CapacityReport) { r.RAMHeadroomMB = -1 }},
+		{"negative VCPUBusy", func(r *CapacityReport) { r.VCPUBusy = -1 }},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := base
+			tc.mut(&r)
+			if _, err := SignNodeReport(priv, r); err == nil {
+				t.Errorf("SignNodeReport(%s) succeeded; want error", tc.name)
+			}
+		})
+	}
+}

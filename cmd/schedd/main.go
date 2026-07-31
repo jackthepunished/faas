@@ -66,6 +66,16 @@ type runDeps struct {
 	// existing app_changed consumer stays as the logging-only
 	// fallback. Tests inject a fake channel.
 	subscribeEgressDrift func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
+	// for the 'compute_node_changed' pg_notify consumer that
+	// refreshes the in-memory NodeKeyRegistry on every relevant
+	// INSERT/UPDATE/DELETE (migration 00075's trigger fires on
+	// both compute_nodes AND compute_node_keys). nil = the
+	// subscriber is not started; the initial Refresh at startup
+	// still runs so a slice-3 schedd with no vmmd registered
+	// yet has a coherent (empty) state. Tests inject a fake
+	// channel.
+	subscribeNodeKeyChanges func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// heartbeatInterval overrides sched.DefaultHeartbeatInterval for
 	// tests that want a sub-second cadence. Zero falls back to the
 	// production default (30s).
@@ -102,6 +112,16 @@ func defaultDeps() runDeps {
 		// callers are safe.
 		subscribeEgressDrift: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
+		},
+		// Production wires db.Subscribe on the
+		// 'compute_node_changed' channel. Migration 00075's
+		// trigger fires on both compute_nodes AND
+		// compute_node_keys writes, so a single subscription
+		// covers both lifecycles. The registry's Run method
+		// reruns Refresh on every notify (idempotent on the
+		// ReplaceAll map swap).
+		subscribeNodeKeyChanges: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyComputeNodeChanged})
 		},
 	}
 }
@@ -223,6 +243,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("schedd: init engine: %w", err)
 	}
 	engine.WithOpsMetrics(ops)
+
+	// ADR-053 — slice-3 signature verification. Construct the
+	// in-memory (key_id → *ecdsa.PublicKey) registry, load the
+	// initial snapshot from compute_node_keys (migration 00075),
+	// then subscribe to the 'compute_node_changed' pg_notify
+	// channel so a vmmd registering (or rotating) its key
+	// lands on the next listener tick. The handler
+	// (pkg/scheddgrpc.Server.ReportCapacity) reads
+	// engine.NodeKeyRegistry() — the engine's accessor is
+	// nil-safe so pre-slice-3 fixtures keep working, but
+	// production always wires a non-nil registry here.
+	//
+	// The initial Refresh is best-effort: a transient loader
+	// failure is logged at Warn and the daemon keeps running
+	// with the empty registry. The first successful
+	// 'compute_node_changed' notify populates the map; until
+	// then the handler rejects every report with
+	// ErrUnknownNodeKey, which is the safer default (silent
+	// unsigned-accept is the failure mode slice-3 closes).
+	keys := sched.NewNodeKeyRegistry(pgNodeKeyLoader{pool: pool}, log)
+	engine.WithNodeKeyRegistry(keys)
+	if n, err := keys.Refresh(ctx); err != nil {
+		log.Warn("schedd: initial node key registry refresh failed; first notify will populate",
+			"err", err)
+	} else {
+		log.Info("schedd: node key registry loaded", "keys", n)
+	}
+	if deps.subscribeNodeKeyChanges != nil {
+		go subscribeWithReconnect(ctx, "node keys", log,
+			deps.subscribeNodeKeyChanges, pool, keys.Run)
+	}
 
 	// ADR-038 / Tier 3 phase 3: load the build-attestation
 	// verification pub key at startup. Defaults to

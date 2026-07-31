@@ -241,6 +241,15 @@ type MemStore struct {
 	// CreateComputeNode to exercise the single-box path. Production
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
+	// computeNodeKeys is the in-memory mirror of compute_node_keys
+	// (migration 00075, ADR-053). Keyed by (nodeID, keyID) tuple
+	// joined by a NUL so the composite key stays string-typed for
+	// map lookup; the value is the canonical public_key_pem string.
+	// Tests that don't pre-seed this map have empty key registries
+	// — same as a fresh Postgres cluster with no vmmd registered
+	// yet. The pkg/sched.NodeKeyRegistry's Refresh path treats
+	// both as "no rows, return empty map".
+	computeNodeKeys map[string]string
 	// computeNodeHeartbeats is the append-only history (CP-1,
 	// migration 00065). Mirrors the same wire shape as the SQL
 	// table; rows are append-only, never mutated, and dropped with
@@ -444,6 +453,14 @@ func NewMemStore() *MemStore {
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
+		// computeNodeKeys is the in-memory mirror of
+		// compute_node_keys (migration 00075). Empty by default
+		// — vmmd's self-registration populates it via
+		// UpsertNodeKey. Tests that exercise the slice-3
+		// signature path inject rows by calling the method
+		// directly; tests that don't care about slice-3 see
+		// an empty map (same as a fresh Postgres cluster).
+		computeNodeKeys: map[string]string{},
 		// computeNodeHeartbeats is the CP-1 history mirror. Empty here;
 		// rows accumulate via AppendComputeNodeHeartbeat as the schedd
 		// Heartbeat.Tick goroutine (or test setup) drives them.
@@ -3699,6 +3716,44 @@ func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (Compu
 	n.Active = true
 	m.computeNodes[n.ID] = n
 	return n, nil
+}
+
+// UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
+// in the in-memory mirror of compute_node_keys (migration 00075,
+// ADR-053). Mirrors PgStore.UpsertNodeKey's ON CONFLICT DO NOTHING
+// semantics: a re-insert of the same (nodeID, keyID) is a no-op
+// (the existing public_key_pem is preserved). See
+// PgStore.UpsertNodeKey for the write-once rationale.
+func (m *MemStore) UpsertNodeKey(_ context.Context, nodeID string, keyID string, publicKeyPEM string) error {
+	if nodeID == "" || keyID == "" {
+		return fmt.Errorf("state: memstore: UpsertNodeKey requires nodeID and keyID (got %q, %q)", nodeID, keyID)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	composite := nodeID + "\x00" + keyID
+	if _, ok := m.computeNodeKeys[composite]; ok {
+		return nil
+	}
+	m.computeNodeKeys[composite] = publicKeyPEM
+	return nil
+}
+
+// LookupNodeKey returns the PEM for the (computeNodeID, keyID)
+// row in the in-memory mirror of compute_node_keys. Returns
+// ("", false) when no row exists. Test convenience for the
+// cmd/vmmd registerComputeNodeKey coverage — production code
+// goes through sched.NodeKeyRegistry.Refresh, which loads via
+// the pg-side query, not this accessor. Keeping it MemStore-only
+// (not on the Store interface) avoids pulling a test-only seam
+// onto the production interface.
+func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID string) (string, bool) {
+	if computeNodeID == "" || keyID == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pem, ok := m.computeNodeKeys[computeNodeID+"\x00"+keyID]
+	return pem, ok
 }
 
 // SetComputeNodeActive flips active on a row by id (issue #98 /

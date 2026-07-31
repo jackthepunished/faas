@@ -29,8 +29,14 @@ package scheddgrpc_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -39,8 +45,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 // capturingEngine is a SchedAPI whose CapacitySink drives
@@ -343,5 +354,145 @@ func TestReportCapacity_MultipleNodesCoexist(t *testing.T) {
 	}
 	if !seen["node-b"] {
 		t.Errorf("node-b missing; second Replace was lost")
+	}
+}
+
+// signedEngine wraps fakeEngine to expose a populated
+// NodeKeyRegistry. The default fakeEngine returns nil to disable
+// signature verification (pre-slice-3 mode). For slice-3 tests
+// (ADR-053), a separate wrapper concrete type is needed because
+// the fakeEngine's NodeKeyRegistry() is method-defined on the
+// type, not a settable field.
+type signedEngine struct {
+	*fakeEngine
+	keys *sched.NodeKeyRegistry
+}
+
+func (s *signedEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return s.keys }
+
+// stubKeyLoader is a NodeKeyLoader backed by an in-memory slice.
+// The handler-side test doesn't actually exercise Refresh — the
+// registry is pre-populated via ReplaceAll — but the loader
+// field is required by NewNodeKeyRegistry.
+type stubKeyLoader struct {
+	rows []sched.NodeKeyRow
+}
+
+func (s *stubKeyLoader) LoadNodeKeys(_ context.Context) ([]sched.NodeKeyRow, error) {
+	return s.rows, nil
+}
+
+// TestReportCapacity_BadSignatureIncrementsCounter pins the
+// ADR-053 §3 observability contract: a rejected CapacityReport
+// stream (codes.Unauthenticated) increments the
+// schedd_capacity_signature_rejected_total counter exactly once.
+// A regression that drops the increment silently hides hostile
+// publishers behind a "the wire said no" log line.
+func TestReportCapacity_BadSignatureIncrementsCounter(t *testing.T) {
+	// Pre-construct a real P-256 key so the registry holds a
+	// valid key_id; the report we send below carries a different
+	// key_id (empty), so VerifyNodeSignature returns
+	// ErrUnknownNodeKey.
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	registeredKeyID, err := sched.KeyIDForPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("KeyIDForPublicKey: %v", err)
+	}
+
+	// PEM-encode the public key so the registry's loader path
+	// can parse it (we bypass the loader by calling ReplaceAll
+	// directly with the parsed key, but the constructor still
+	// needs a non-nil loader).
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	loader := &stubKeyLoader{rows: []sched.NodeKeyRow{
+		{KeyID: registeredKeyID, PublicKeyPEM: string(pemBytes)},
+	}}
+	keys := sched.NewNodeKeyRegistry(loader, nil)
+	if n := keys.ReplaceAll(loader.rows); n != 1 {
+		t.Fatalf("ReplaceAll: %d, want 1", n)
+	}
+
+	// Build the engine. We need both a populated registry AND
+	// a witness for the sink so the test can assert no report
+	// reached the table (the handler must close before the
+	// sink is invoked).
+	var (
+		mu       sync.Mutex
+		received []sched.CapacityReport
+	)
+	eng := &signedEngine{
+		fakeEngine: &fakeEngine{},
+		keys:       keys,
+	}
+
+	// Build the server with a fresh OpsMetrics so the test can
+	// read the counter without polluting other tests.
+	ops := wire.NewOpsMetrics("schedd_test")
+	srv := grpc.NewServer()
+	scheddgrpc.New(eng, ops, nil).Register(srv)
+	lis := bufconn.Listen(1024 * 1024)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() { srv.Stop(); _ = lis.Close() })
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	cli := scheddpb.NewScheddClient(conn)
+
+	// Send a report with an empty NodeKeyID — VerifyNodeSignature
+	// returns ErrUnknownNodeKey (the report's key_id doesn't
+	// resolve in the registry). The handler must reject with
+	// codes.Unauthenticated and increment the counter.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := cli.ReportCapacity(ctx)
+	if err != nil {
+		t.Fatalf("ReportCapacity: %v", err)
+	}
+	if err := stream.Send(&scheddpb.CapacityReport{
+		NodeId:          "node-1",
+		SampledAtUnixMs: time.Unix(1730000000, 0).UnixMilli(),
+		UsedMb:          1024,
+		NodeKeyId:       "", // empty → ErrUnknownNodeKey
+		NodeSignature:   []byte{0xde, 0xad, 0xbe, 0xef},
+	}); err != nil {
+		t.Logf("Send returned (acceptable if trailer arrived first): %v", err)
+	}
+	_, err = stream.CloseAndRecv()
+	if err == nil {
+		t.Fatal("CloseAndRecv = nil after bad signature; want Unauthenticated")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("err = %v; want gRPC status error", err)
+	}
+	if st.Code() != codes.Unauthenticated {
+		t.Errorf("code = %v, want Unauthenticated", st.Code())
+	}
+
+	// Counter must have incremented exactly once. The handler
+	// closes on the first bad frame, so per-stream increment
+	// matches per-call increment here.
+	if got := testutil.ToFloat64(ops.CapacitySignatureRejected()); got != 1 {
+		t.Errorf("capacity_signature_rejected_total = %v, want 1", got)
+	}
+
+	// Defensive: no report reached the sink. The handler must
+	// have closed before the table.Replace call.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 0 {
+		t.Errorf("received %d reports; handler must have rejected before sink", len(received))
 	}
 }

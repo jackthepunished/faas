@@ -4608,6 +4608,37 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 	return n, nil
 }
 
+// UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
+// in compute_node_keys (migration 00075, ADR-053). vmmd's
+// self-registration calls this on startup once it has loaded its
+// node signing key (cmd/vmmd/main.go::loadNodeSigningKey) and
+// computed the key_id (the SHA-256 hex of the SubjectPublicKeyInfo).
+//
+// ON CONFLICT is a no-op (DO NOTHING) because key material is
+// write-once — re-applying public_key_pem on conflict would
+// silently overwrite a rotation that produced a different key
+// (the PK is (compute_node_id, key_id), so a rotated key on the
+// same node has a different key_id and lands as a fresh row).
+// Re-stamping public_key_pem on the same key_id would be a
+// defensive no-op anyway (the bytes are deterministic) but we
+// keep the explicit semantics to flag the omit-intent at review
+// time. Migration 00075's CHECK constraints
+// (compute_node_keys_key_id_shape, compute_node_keys_pem_shape)
+// reject malformed shapes at INSERT — a vmmd that mints a
+// non-64-hex-char key_id or a non-PEM block fails loud at the
+// persist step rather than corrupting the registry.
+func (s *PgStore) UpsertNodeKey(ctx context.Context, nodeID string, keyID string, publicKeyPEM string) error {
+	_, err := s.pool.Exec(ctx, `
+		insert into compute_node_keys (compute_node_id, key_id, public_key_pem)
+		values ($1, $2, $3)
+		on conflict (compute_node_id, key_id) do nothing
+	`, nodeID, keyID, publicKeyPEM)
+	if err != nil {
+		return fmt.Errorf("state: upsert compute_node_keys (node=%q, key=%s): %w", nodeID, keyID, err)
+	}
+	return nil
+}
+
 // SetComputeNodeActive flips active on a row by id (issue #98 /
 // ADR-028). The watchdog uses this to mark a row drained when
 // last_heartbeat_at ages past 90s, and the heartbeat goroutine uses it

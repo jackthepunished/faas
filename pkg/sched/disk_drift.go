@@ -254,7 +254,17 @@ func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
 			"snap_dir", root, "err", err)
 		return 0, nil
 	}
+	return d.scanDiskForDrift(ctx, root, diskDirs, expected, rows, false)
+}
 
+// scanDiskForDrift is the shared os.ReadDir-based sweep. Both
+// the inline Tick path (no storage wired) and the storage-aware
+// path's fallback (registry transient failure) call this so the
+// drift-counting logic exists in one place. The fallback flag
+// flips the "discrepancies observed" log suffix to "(fallback)"
+// so an operator investigating a transient registry outage can
+// tell which leg of the dispatch produced the count.
+func (d *DiskDrift) scanDiskForDrift(ctx context.Context, root string, diskDirs []os.DirEntry, expected map[string]state.SnapshotForGC, rows []state.SnapshotForGC, fallback bool) (int, error) {
 	drift := 0
 	seen := make(map[string]struct{}, len(diskDirs))
 
@@ -296,7 +306,11 @@ func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
 	}
 
 	if drift > 0 {
-		d.log.Warn("disk-drift: discrepancies observed",
+		suffix := "discrepancies observed"
+		if fallback {
+			suffix = "discrepancies observed (fallback)"
+		}
+		d.log.Warn("disk-drift: "+suffix,
 			"drift", drift, "rows", len(rows), "snap_dir", root)
 	}
 	return drift, nil
@@ -378,11 +392,12 @@ func (d *DiskDrift) tickWithStorage(ctx context.Context, expected map[string]sta
 	return drift, nil
 }
 
-// tickOnDiskFallback runs the original os.ReadDir-based sweep so a
-// transient backend failure doesn't silence the drift detector. The
-// body mirrors the inline Tick body before the storage-aware
-// refactor; the duplication is intentional — extracting it further
-// would force a callback-typed helper that obscures the diff.
+// tickOnDiskFallback runs the read-through on-disk sweep so a
+// transient backend failure doesn't silence the drift detector.
+// The body delegates to scanDiskForDrift so the drift-counting
+// logic lives in one place; the only thing this fallback adds
+// is the per-row os.ReadDir error path (and the "(fallback)"
+// log suffix in the discrepancies emission).
 func (d *DiskDrift) tickOnDiskFallback(ctx context.Context, expected map[string]state.SnapshotForGC, rows []state.SnapshotForGC) (int, error) {
 	root := SnapDir()
 	diskDirs, err := os.ReadDir(root)
@@ -396,34 +411,7 @@ func (d *DiskDrift) tickOnDiskFallback(ctx context.Context, expected map[string]
 			"snap_dir", root, "err", err)
 		return 0, nil
 	}
-	drift := 0
-	seen := make(map[string]struct{}, len(diskDirs))
-	for depID, row := range expected {
-		if err := ctx.Err(); err != nil {
-			d.log.Warn("disk-drift: tick timed out",
-				"err", err, "drift", drift, "rows_processed", len(seen))
-			return drift, nil
-		}
-		seen[depID] = struct{}{}
-		drift += d.checkDepDir(depID, row)
-	}
-	for _, entry := range diskDirs {
-		if !entry.IsDir() {
-			drift += d.recordDrift("orphan-file-under-snap-dir",
-				filepath.Join(root, entry.Name()))
-			continue
-		}
-		if _, ok := seen[entry.Name()]; ok {
-			continue
-		}
-		drift += d.recordDrift("orphan-dep-dir",
-			filepath.Join(root, entry.Name()))
-	}
-	if drift > 0 {
-		d.log.Warn("disk-drift: discrepancies observed (fallback)",
-			"drift", drift, "rows", len(rows), "snap_dir", root)
-	}
-	return drift, nil
+	return d.scanDiskForDrift(ctx, root, diskDirs, expected, rows, true)
 }
 
 // parseSnapKey splits a snap/<depID>/<file> key into its parts.

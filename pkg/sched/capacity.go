@@ -102,12 +102,12 @@ var ErrEmptySignature = errors.New("sched: empty node_signature on slice-3 sched
 // ECDSA-P-256-with-SHA-256 is computed over. ADR-053 §2:
 //
 //	"faas.capacity.v1" || node_id (UTF-8)
-//	  || sampled_at_unix_ms (big-endian int64)
-//	  || live_count (big-endian int32)
-//	  || leased_count (big-endian int32)
-//	  || used_mb (big-endian int32)
-//	  || ram_headroom_mb (big-endian int32)
-//	  || vcpu_busy (big-endian int32)
+//	  || sampled_at_unix_ms (big-endian int64, must be ≥ 0)
+//	  || live_count (big-endian uint32)
+//	  || leased_count (big-endian uint32)
+//	  || used_mb (big-endian uint32)
+//	  || ram_headroom_mb (big-endian uint32)
+//	  || vcpu_busy (big-endian uint32)
 //
 // The domain separator is a fixed prefix; the ints are
 // fixed-width big-endian. Total length is
@@ -117,8 +117,14 @@ var ErrEmptySignature = errors.New("sched: empty node_signature on slice-3 sched
 // bytes. Pure function; used by both Sign (vmmd publisher) and
 // Verify (schedd handler). The single source of truth for what
 // gets signed.
+//
+// Precondition: every numeric field must be ≥ 0. A negative
+// value silently wraps to a huge uint on the wire, producing a
+// signature that won't verify against any honest reconstruction.
+// SignNodeReport rejects negative inputs up front so the
+// publisher cannot mint a self-inconsistent report.
 func (r CapacityReport) CanonicalPayload() []byte {
-	// 18 (domain) + len(node_id) + 8 (int64) + 5*4 (int32s)
+	// 16 (domain) + len(node_id) + 8 (int64) + 5*4 (int32s)
 	buf := make([]byte, 0, len(capacityPayloadDomain)+len(r.NodeID)+8+20)
 	buf = append(buf, []byte(capacityPayloadDomain)...)
 	buf = append(buf, []byte(r.NodeID)...)
@@ -150,17 +156,29 @@ func (r CapacityReport) HashCanonicalPayload() []byte {
 // signature over r.CanonicalPayload(). The signature is computed
 // against the SHA-256 digest of the payload (not double-hashed —
 // mirror of pkg/cosign's verifyDigest contract). Returned errors
-// reflect crypto/rand failures (rare).
+// reflect crypto/rand failures (rare) and pre-flight validation
+// failures (negative numeric fields).
 //
 // Used by the vmmd publisher (cmd/vmmd/capacity_publisher.go);
 // not used on the schedd side. Production wires this once at
 // startup with the loaded node signing key.
+//
+// Pre-flight validation: SampledAt must be ≥ unix epoch and
+// every int32 field must be ≥ 0. CanonicalPayload encodes
+// these as unsigned big-endian (the wire contract is unsigned),
+// so a negative value would silently wrap and produce a
+// signature that doesn't verify against any honest
+// reconstruction. Rejecting at sign-time keeps the publisher
+// from minting a self-inconsistent report.
 func SignNodeReport(priv *ecdsa.PrivateKey, r CapacityReport) ([]byte, error) {
 	if priv == nil {
 		return nil, errors.New("sched: SignNodeReport: nil private key")
 	}
 	if priv.Curve != ecdsaP256() {
 		return nil, fmt.Errorf("sched: SignNodeReport: want P-256 curve, got %s", priv.Curve.Params().Name)
+	}
+	if err := validateReportNonNegative(r); err != nil {
+		return nil, fmt.Errorf("sched: SignNodeReport: %w", err)
 	}
 	digest := r.HashCanonicalPayload()
 	rInt, sInt, err := ecdsaSignDeterministic(priv, digest)
@@ -176,6 +194,31 @@ func SignNodeReport(priv *ecdsa.PrivateKey, r CapacityReport) ([]byte, error) {
 	copy(out[32-len(rb):32], rb)
 	copy(out[64-len(sb):64], sb)
 	return out, nil
+}
+
+// validateReportNonNegative enforces the CanonicalPayload
+// precondition (all numeric fields ≥ 0). The function is
+// named for the precondition, not the wire encoding, so
+// readers see the contract without reading the encoder.
+func validateReportNonNegative(r CapacityReport) error {
+	if r.SampledAt.UnixMilli() < 0 {
+		return fmt.Errorf("SampledAt before unix epoch: %s", r.SampledAt)
+	}
+	for _, c := range []struct {
+		name  string
+		value int32
+	}{
+		{"LiveCount", r.LiveCount},
+		{"LeasedCount", r.LeasedCount},
+		{"UsedMB", r.UsedMB},
+		{"RAMHeadroomMB", r.RAMHeadroomMB},
+		{"VCPUBusy", r.VCPUBusy},
+	} {
+		if c.value < 0 {
+			return fmt.Errorf("%s is negative: %d", c.name, c.value)
+		}
+	}
+	return nil
 }
 
 // KeyIDForPublicKey returns the canonical key_id for a public
