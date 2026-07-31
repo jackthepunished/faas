@@ -673,6 +673,11 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if maxConcurrency <= 0 {
 		maxConcurrency = 1
 	}
+	// ramMB is NOT NULL with CHECK (ram_mb > 0) (migrations/00001_init.sql:36).
+	// Callers that leave it at the Go int zero (no plan resolution / no
+	// explicit mem cap set) would trip the CHECK if passed as-is; coerce
+	// <= 0 to 128 — the Free plan minimum from pkg/api/limits.go:242 —
+	// the smallest legal value the column accepts.
 	ramMB := app.RAMMB
 	if ramMB <= 0 {
 		ramMB = 128
@@ -748,8 +753,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	if maxConcurrency <= 0 {
 		maxConcurrency = 1
 	}
-	// Coerce RAMMB <= 0 to 128 (Free plan minimum) so the NOT NULL CHECK
-	// (ram_mb > 0) is satisfied.
+	// Coerce RAMMB <= 0 to 128 (Free plan minimum, pkg/api/limits.go:242)
+	// so the NOT NULL CHECK (ram_mb > 0) is satisfied (matches CreateApp).
 	ramMB := app.RAMMB
 	if ramMB <= 0 {
 		ramMB = 128
@@ -949,8 +954,14 @@ func (s *PgStore) DeleteApp(ctx context.Context, id string) error {
 // (not_null) the same way as SetAppWorkloadClass.
 func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, error) {
 	var a App
+	// The apps table does NOT have an updated_at column (appsSelectColumns
+	// at pgstore.go:6531 doesn't include it; no migration adds it). The
+	// earlier PR-E code touched updated_at = now() here, which trips
+	// SQLSTATE 42703 on every soft-delete. The deleted row is filtered
+	// out of every list/read by status <> 'deleted', so the deletion
+	// timestamp is implicit — no separate column needed.
 	row := s.pool.QueryRow(ctx, `
-		update apps set status = 'deleted', updated_at = now()
+		update apps set status = 'deleted'
 		where id = $1
 		returning `+appsSelectColumns, id)
 	if err := scanAppInto(&a, row); err != nil {
@@ -1316,6 +1327,13 @@ func (s *PgStore) ApplyProjectPlan(
 		if maxConcurrency <= 0 {
 			maxConcurrency = 1
 		}
+		// Coerce RAMMB <= 0 to 128 (Free plan minimum) so the NOT NULL
+		// CHECK (ram_mb > 0) is satisfied (matches CreateApp /
+		// CreateAppIfUnderQuota).
+		ramMB := a.RAMMB
+		if ramMB <= 0 {
+			ramMB = 128
+		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
@@ -1324,7 +1342,7 @@ func (s *PgStore) ApplyProjectPlan(
 		        $11, $12, $13, $14, $15)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
-			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, maxConcurrency,
+			project.AccountID, a.Slug, string(a.Type), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),

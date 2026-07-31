@@ -89,8 +89,10 @@ func TestPg_UpdateApp_WorkloadFields_Widen(t *testing.T) {
 	}
 
 	// UpdateApp on a missing app must return ErrNotFound, same shape
-	// as the other UpdateApp tests.
-	if _, err := s.UpdateApp(ctx, "missing-id", state.UpdateAppParams{
+	// as the other UpdateApp tests. The apps.id column is UUID, so the
+	// missing-id must be syntactically valid (otherwise pgx trips the
+	// cast at SQLSTATE 22P02 before the not-found check can fire).
+	if _, err := s.UpdateApp(ctx, "00000000-0000-0000-0000-000000000000", state.UpdateAppParams{
 		RootDir: &rootDir,
 	}); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("missing app update: got %v, want ErrNotFound", err)
