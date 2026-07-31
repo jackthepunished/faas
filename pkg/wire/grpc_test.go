@@ -245,7 +245,7 @@ func TestMTLSRoundTrip(t *testing.T) {
 	addr := lis.Addr().String()
 	healthServer := healthsvc.NewServer()
 	healthServer.SetServingStatus("", healthgrpc.HealthCheckResponse_SERVING)
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(ServerCredsOrEmpty(serverTLS)...)
 	healthgrpc.RegisterHealthServer(srv, healthServer)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(func() { srv.Stop() })

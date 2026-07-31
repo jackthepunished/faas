@@ -37,6 +37,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"time"
 
@@ -112,6 +113,7 @@ func runCapacityPublish(
 	nodeID string,
 	cfg ComputeNodeConfig,
 	scheddTarget string,
+	scheddClientTLS *tls.Config,
 	tick time.Duration,
 	resident residentBytesFn,
 	log *slog.Logger,
@@ -127,9 +129,10 @@ func runCapacityPublish(
 		tick = CapacityInterval
 	}
 	streamer := prodStreamer{
-		scheddTarget: scheddTarget,
-		nodeID:       nodeID,
-		log:          log,
+		scheddTarget:    scheddTarget,
+		nodeID:          nodeID,
+		scheddClientTLS: scheddClientTLS,
+		log:             log,
 	}
 	runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
 }
@@ -231,9 +234,10 @@ type capacityStreamer interface {
 // over a unix (or tcp+TLS) target and opens the client-
 // streaming ReportCapacity RPC.
 type prodStreamer struct {
-	scheddTarget string
-	nodeID       string
-	log          *slog.Logger
+	scheddTarget    string
+	nodeID          string
+	scheddClientTLS *tls.Config
+	log             *slog.Logger
 }
 
 // Open dials schedd and opens a client-streaming ReportCapacity
@@ -246,7 +250,7 @@ func (p prodStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityC
 	// Lazy dial: gRPC's blocking dial happens at first RPC;
 	// we want stream-open failures to surface inside the
 	// outer reconnect loop's backoff, not at boot.
-	conn, err := wire.DialContext(ctx, p.scheddTarget, nil)
+	conn, err := wire.DialContext(ctx, p.scheddTarget, p.scheddClientTLS)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -32,3 +32,14 @@ hetzner_zone = "gregale.dev"
 
 # CertMagic storage. ansible role creates this dir root:faas 0700.
 storage_dir = "/var/lib/faas/certs"
+
+# Multi-box control-plane mTLS (ADR-052). gatewayd's egress gRPC
+# listener (the ADR-046 PR-2 producer channel that streams tx_bytes
+# to meterd) supports mTLS-over-TCP when meterd lives on a remote
+# compute node. All three paths empty => no TLS, single-box unix
+# socket; all three set => mTLS. Partial cluster is rejected at
+# startup with the egress_tls_* field names. The leaf is
+# /etc/faas/tls/gatewayd/egress.{crt,key} (EKU ServerAuth only).
+# egress_tls_cert_path = "/etc/faas/tls/gatewayd/egress.crt"
+# egress_tls_key_path = "/etc/faas/tls/gatewayd/egress.key"
+# egress_tls_ca_path = "/etc/faas/tls/ca/ca.crt"

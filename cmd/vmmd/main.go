@@ -84,6 +84,12 @@ type runDeps struct {
 	// (single-box dev default). Tests inject a fake target to drive
 	// the seam without a real schedd.
 	scheddTarget string
+	// scheddClientTLS: ADR-052 — mTLS config the capacity publisher
+	// uses to dial schedd. nil → no TLS (single-box unix socket);
+	// loaded from cfg.ScheddClientTLS in main.go and passed through.
+	// Tests inject a stub to assert the seam forwards the right
+	// *tls.Config to wire.DialContext.
+	scheddClientTLS *tls.Config
 	// capacityInterval: ADR-025 axis 5 — override for the publisher's
 	// tick cadence. nil → CapacityInterval (1 s). Tests inject
 	// sub-second cadence so the loop has observable ticks in a unit
@@ -101,7 +107,7 @@ type runDeps struct {
 	// *fcvm.Manager so the production wiring still passes `mgr` (which
 	// satisfies the interface) and tests can inject a stub without
 	// booting a real Manager.
-	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
+	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, scheddClientTLS *tls.Config, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
 }
 
 func defaultDeps() runDeps {
@@ -314,6 +320,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)
 	}
+	scheddClientTLS, err := cfg.LoadScheddClientTLS()
+	if err != nil {
+		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
+	}
+	deps.scheddClientTLS = scheddClientTLS
 	lis, err := deps.listen(ctx, listenTarget, serverTLS, cfg.OwnerUser)
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
@@ -332,7 +343,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
 	// loop entirely.
 	netCache := netstats.NewWithDefaults()
-	gsrv := grpc.NewServer()
+	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
 	impl := vmmdgrpc.NewWithCPUAndNet(mgr, ops, fcVersion, log, cpuCache, netCache)
 	impl.Register(gsrv)
 
@@ -422,9 +433,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			resident = leakcheckResidentBytes
 		}
 		if deps.startCapacityPublish != nil {
-			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, interval, resident, log)
+			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, log)
 		} else {
-			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, interval, resident, log)
+			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, log)
 		}
 		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())
 	}

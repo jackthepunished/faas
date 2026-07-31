@@ -16,3 +16,21 @@
 # log_level: slog level (debug, info, warn, error).
 # Default: info
 # log_level = "info"
+
+# Multi-box control-plane mTLS (ADR-052). The advisory gRPC listener
+# (apid's inbound channel for vmmd fanotify batches) and the githubd
+# client (apid's outbound dial for webhook dispatch) read TLS material
+# from env vars, not TOML — there's no apid.toml cluster for them
+# today. Single-box deployments leave the env unset and the daemons
+# dial over the unix socket. Multi-box deployments stamp:
+#
+#   FAAS_APID_ADVISORY_TLS_CERT_PATH = /etc/faas/tls/apid/advisory.crt
+#   FAAS_APID_ADVISORY_TLS_KEY_PATH  = /etc/faas/tls/apid/advisory.key
+#   FAAS_APID_ADVISORY_TLS_CA_PATH   = /etc/faas/tls/ca/ca.crt
+#   FAAS_GITHUBD_TLS_CERT_PATH       = /etc/faas/tls/apid/githubd-client.crt
+#   FAAS_GITHUBD_TLS_KEY_PATH        = /etc/faas/tls/apid/githubd-client.key
+#   FAAS_GITHUBD_TLS_CA_PATH         = /etc/faas/tls/ca/ca.crt
+#
+# Partial cluster is rejected at startup with the exact env-var
+# name(s) missing. See cmd/gregale/commands_pki.go for the operator
+# CLI that issues /etc/faas/tls/<daemon>/<role>.{crt,key}.

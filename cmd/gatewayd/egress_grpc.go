@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,7 @@ import (
 	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 const (
@@ -70,51 +72,100 @@ func egressGRPCSocketPath() string {
 type egressGRPCListener struct {
 	socketPath string
 	server     *grpc.Server
+	listener   net.Listener
 	sink       *egresssink.EgressSink
 	log        *slog.Logger
 }
 
 // newEgressGRPCListener constructs (but does not start) the
-// gRPC listener. socketPath is the unix-domain bind target.
-// Empty path = noop listener (Start/Stop are both no-ops).
-func newEgressGRPCListener(socketPath string, srv *egressgrpc.Server, log *slog.Logger) *egressGRPCListener {
-	if socketPath == "" {
+// gRPC listener. target is the bind target (unix:///path or
+// tcp://host:port for multi-box). tlsCfg is the server-side
+// mTLS material for tcp targets; nil for unix-socket (single-box)
+// targets. Empty target = noop listener (Start/Stop are both
+// no-ops).
+func newEgressGRPCListener(target string, tlsCfg *tls.Config, srv *egressgrpc.Server, log *slog.Logger) *egressGRPCListener {
+	if target == "" {
 		return &egressGRPCListener{log: log}
 	}
-	gs := grpc.NewServer(
-		grpc.MaxRecvMsgSize(1<<20), // 1 MiB; one frame is small
-		grpc.MaxSendMsgSize(1<<20), // matches above
-		grpc.ConnectionTimeout(5*time.Second),
-	)
+	// Build a single varargs ServerOption list so the unix/
+	// multi-box branches share the same limits + dial timeout.
+	// Multi-box tcp targets need ServerCredsOrEmpty so gRPC's
+	// transport does the TLS handshake — this is what populates
+	// peer.AuthInfo with credentials.TLSInfo for the
+	// handler-layer CN binding (ADR-052).
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(1 << 20), // 1 MiB; one frame is small
+		grpc.MaxSendMsgSize(1 << 20), // matches above
+		grpc.ConnectionTimeout(5 * time.Second),
+	}
+	if !isUnixSocketPath(target) {
+		opts = append(opts, wire.ServerCredsOrEmpty(tlsCfg)...)
+	}
+	gs := grpc.NewServer(opts...)
 	gatewaydpb.RegisterEgressTxServiceServer(gs, srv)
 	return &egressGRPCListener{
-		socketPath: socketPath,
+		socketPath: target,
 		server:     gs,
 		sink:       nil, // reserved for a future /debug endpoint
 		log:        log,
 	}
 }
 
-// start binds the unix socket and starts the gRPC server in a
-// goroutine. The 0660 chmod follows the synth server pattern —
-// once the listener is bound, the socket's permissions become
-// the auth posture.
-func (l *egressGRPCListener) start() error {
+// isUnixSocketPath detects unix:// scheme OR a bare filesystem
+// path. Used by the egress listener to decide whether to require
+// a non-nil tlsCfg.
+func isUnixSocketPath(target string) bool {
+	if len(target) >= 7 && target[:7] == "unix://" {
+		return true
+	}
+	if len(target) > 0 && target[0] == '/' {
+		return true
+	}
+	return false
+}
+
+// start binds the unix socket (or tcp port) and starts the gRPC
+// server in a goroutine. Unix sockets get the 0660 + group `faas`
+// chmod after bind (ADR-015). TCP targets skip the chmod and
+// rely on the TLS handshake for auth.
+//
+// ctx bounds the wire.Listen call on the TCP branch — unix sockets
+// don't need it (net.Listen is synchronous and never blocks past
+// the bind). The ctx isn't propagated to the running server because
+// the caller owns the shutdown ctx via stop(ctx); the runWithDeps
+// shutdown path uses a separate, deadline-bounded context for that.
+func (l *egressGRPCListener) start(ctx context.Context) error {
 	if l == nil || l.socketPath == "" || l.server == nil {
 		return nil
 	}
-	if err := os.Remove(l.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("gatewayd egress: remove stale socket: %w", err)
+	var lis net.Listener
+	var err error
+	if isUnixSocketPath(l.socketPath) {
+		if err := os.Remove(l.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("gatewayd egress: remove stale socket: %w", err)
+		}
+		lis, err = net.Listen("unix", l.socketPath)
+		if err != nil {
+			return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
+		}
+		if err := os.Chmod(l.socketPath, egressGRPCSocketMode); err != nil {
+			_ = lis.Close()
+			return fmt.Errorf("gatewayd egress: chmod: %w", err)
+		}
+		l.listener = lis
+		l.log.Info("gatewayd egress: listening", "socket", l.socketPath)
+	} else {
+		// TCP/DNS target. Use wire.Listen so the listener is
+		// raw TCP — gRPC's transport will do the TLS handshake
+		// via ServerCreds passed to grpc.NewServer above
+		// (ADR-052 §Handler-layer peer binding).
+		lis, err = wire.Listen(ctx, l.socketPath, nil)
+		if err != nil {
+			return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
+		}
+		l.listener = lis
+		l.log.Info("gatewayd egress: listening", "addr", l.socketPath)
 	}
-	lis, err := net.Listen("unix", l.socketPath)
-	if err != nil {
-		return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
-	}
-	if err := os.Chmod(l.socketPath, egressGRPCSocketMode); err != nil {
-		_ = lis.Close()
-		return fmt.Errorf("gatewayd egress: chmod: %w", err)
-	}
-	l.log.Info("gatewayd egress: listening", "socket", l.socketPath)
 	go func() {
 		if err := l.server.Serve(lis); err != nil {
 			l.log.Warn("gatewayd egress: serve", "err", err)
@@ -151,7 +202,7 @@ func (l *egressGRPCListener) stop(ctx context.Context) error {
 		// hold the process open. gRPC's Stop returns immediately.
 		l.server.Stop()
 	}
-	if l.socketPath != "" {
+	if l.socketPath != "" && isUnixSocketPath(l.socketPath) {
 		_ = os.Remove(l.socketPath)
 	}
 	return nil

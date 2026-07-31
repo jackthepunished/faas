@@ -162,7 +162,7 @@ func TestRunCapacityPublish_EmptyTargetReturnsImmediately(t *testing.T) {
 	go func() {
 		defer close(done)
 		runCapacityPublish(context.Background(), nil, "node-1",
-			ComputeNodeConfig{MemMB: 1000}, "", 1*time.Second, noResident, logger)
+			ComputeNodeConfig{MemMB: 1000}, "", nil, 1*time.Second, noResident, logger)
 	}()
 	select {
 	case <-done:
@@ -187,7 +187,7 @@ func TestRunCapacityPublish_CtxCancelExitsPromptly(t *testing.T) {
 		// must surface the cancel promptly without
 		// blocking on the dialer's full timeout.
 		runCapacityPublish(ctx, nil, "node-1",
-			ComputeNodeConfig{MemMB: 1000}, "unix:///nonexistent.sock",
+			ComputeNodeConfig{MemMB: 1000}, "unix:///nonexistent.sock", nil,
 			1*time.Second, noResident, logger)
 	}()
 	// Give the publisher a tick to enter the dial path.

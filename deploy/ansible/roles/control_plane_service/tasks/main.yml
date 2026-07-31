@@ -182,3 +182,52 @@
       or faas_sign_pub_stat.stat.mode != "0444"
       or faas_sign_pub_stat.stat.pw_name != "root"
       or faas_sign_pub_stat.stat.gr_name != "root"
+
+# Tier 1 control-plane mTLS (ADR-052). The local-dev PKI
+# bootstrap lays out /etc/faas/tls/{ca,<daemon>/} with 0400
+# private keys and 0444 public certs; this stat-assert proves
+# the bootstrap ran on a control-plane node (compute nodes run
+# `gregale pki init` via their own vmmd_service role and are
+# checked there). Failing the play here surfaces a misconfigured
+# bootstrap before the daemons attempt to load the certs and
+# start with a confusing TLS handshake failure.
+- name: control_plane_service — assert /etc/faas/tls/ca/ca.crt exists (Tier 1)
+  ansible.builtin.stat:
+    path: /etc/faas/tls/ca/ca.crt
+  register: faas_pki_ca_cert_stat
+  failed_when: not faas_pki_ca_cert_stat.stat.exists
+
+- name: control_plane_service — assert /etc/faas/tls/ca/ca.key mode is 0400 root:root (Tier 1)
+  ansible.builtin.stat:
+    path: /etc/faas/tls/ca/ca.key
+  register: faas_pki_ca_key_stat
+  failed_when:
+    - >-
+      not faas_pki_ca_key_stat.stat.exists
+      or faas_pki_ca_key_stat.stat.mode != "0400"
+      or faas_pki_ca_key_stat.stat.pw_name != "root"
+      or faas_pki_ca_key_stat.stat.gr_name != "root"
+
+- name: control_plane_service — assert per-daemon leaves exist (Tier 1)
+  ansible.builtin.stat:
+    path: "/etc/faas/tls/{{ item.0 }}/{{ item.1 }}"
+  loop: "{{ faas_pki_leaves | zip(faas_pki_leaf_files) | map('list') }}"
+  vars:
+    # Each control-plane daemon has its own net.Listener / leaf
+    # filename under /etc/faas/tls/<daemon>/. gatewayd uses
+    # "egress.crt" because the gatewayd server leaf is the egress
+    # listener (the public TLS listener uses certmagic, not the
+    # control-plane PKI). The other three listen on gRPC servers
+    # named "server".
+    faas_pki_leaves:
+      - schedd
+      - apid
+      - meterd
+      - gatewayd
+    faas_pki_leaf_files:
+      - server.crt
+      - server.crt
+      - server.crt
+      - egress.crt
+  register: faas_pki_leaf_stat
+  failed_when: not faas_pki_leaf_stat.stat.exists

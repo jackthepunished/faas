@@ -39,7 +39,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
@@ -257,14 +256,24 @@ type gatewayEgressAdapter struct {
 	// goroutine — it's read on every EgressBytes call only.
 	now func() time.Time
 
+	// tlsCfg is the mTLS config the dialFn uses when the
+	// gatewayd egress listener lives on a remote compute node
+	// (ADR-052). Nil on the single-box default-local path —
+	// the unix socket dial skips the TLS handshake by design
+	// (ADR-015: group-`faas` DAC is the auth posture).
+	tlsCfg *tls.Config
+
 	mu   sync.Mutex
 	data map[string]map[int64]uint64 // instanceID → minuteUnix → bytes
 
 	// dialFn is the unix-socket dialer for the gateway
 	// stream. Tests substitute a fake dialer that returns a
 	// hand-rolled stream client; production wires the
-	// gatewaydpb-grpc DailContext.
-	dialFn func(ctx context.Context, socketPath string) (gatewaydpb.EgressTxServiceClient, error)
+	// gatewaydpb-grpc DailContext. tlsCfg is nil on the
+	// single-box default-local path; mTLS-wrapped remote
+	// gatewayd deployments pass the loaded *tls.Config here
+	// (ADR-052).
+	dialFn func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (gatewaydpb.EgressTxServiceClient, error)
 }
 
 // EgressBytes returns the latest drained (instanceID,
@@ -324,7 +333,7 @@ func (a *gatewayEgressAdapter) startStream(ctx context.Context, socketPath strin
 			if ctx.Err() != nil {
 				return
 			}
-			client, err := a.dialFn(ctx, socketPath)
+			client, err := a.dialFn(ctx, socketPath, a.tlsCfg)
 			if err != nil {
 				if log != nil {
 					log.Warn("gatewayEgressAdapter: dial failed; backing off", "err", err, "backoff", backoff)
@@ -403,29 +412,24 @@ func (a *gatewayEgressAdapter) Tracked() int {
 	return len(a.data)
 }
 
-// dialGatewayEgressStream dials the gatewayd unix socket and
-// returns a stub EgressTxServiceClient. ADR-015 (unix-socket
-// DAC auth, group `faas`) is the only authentication on this
-// path; the socket mode 0660 + group ownership IS the auth
-// posture, no TLS handshake happens on this socket. The dialer
-// is overridable via gwEgress.dialFn for tests.
+// dialGatewayEgressStream dials the gatewayd egress listener and
+// returns a stub EgressTxServiceClient. Single-box deployments
+// pass a unix socket path + nil tlsCfg; the unix-socket DAC auth
+// (ADR-015, group `faas`, mode 0660) is the only authentication
+// on that path. Multi-box deployments pass a tcp/dns target +
+// a non-nil tlsCfg loaded via cfg.LoadGatewayEgressTLS(); the
+// stdlib verifier handles chain + SAN + EKU in a single pass
+// (ADR-052). The dialer is overridable via gwEgress.dialFn for
+// tests.
 //
-// grpc.WithContextDialer lets us dial a unix socket without
-// touching the DNS resolver; a fresh *grpc.ClientConn per dial
-// is the canonical "long-lived streaming RPC" shape (gRPC's
-// stream stays alive across the lifetime of the conn, and a
-// dropped conn signals a stream close which the goroutine
-// handler reconnects on).
-func dialGatewayEgressStream(ctx context.Context, socketPath string) (gatewaydpb.EgressTxServiceClient, error) {
-	conn, err := grpc.NewClient(
-		"unix:///"+socketPath,
-		grpc.WithContextDialer(func(_ context.Context, _ string) (net.Conn, error) {
-			return net.Dial("unix", socketPath)
-		}),
-		grpc.WithInsecure(), //nolint:staticcheck // ADR-015: unix-socket DAC is the auth; TLS handshake is skipped by design on local sockets.
-	)
+// A fresh *grpc.ClientConn per dial is the canonical "long-lived
+// streaming RPC" shape (gRPC's stream stays alive across the
+// lifetime of the conn, and a dropped conn signals a stream close
+// which the goroutine handler reconnects on).
+func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Config) (gatewaydpb.EgressTxServiceClient, error) {
+	conn, err := wire.DialContext(ctx, target, tlsCfg)
 	if err != nil {
-		return nil, fmt.Errorf("meterd: dial gatewayd socket %s: %w", socketPath, err)
+		return nil, fmt.Errorf("meterd: dial gatewayd egress %s: %w", target, err)
 	}
 	return gatewaydpb.NewEgressTxServiceClient(conn), nil
 }
@@ -601,7 +605,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if deps.dialSchedd == nil {
 			return fmt.Errorf("meterd: nil dialSchedd and nil parker (refusing to start unbounded)")
 		}
-		c, err := deps.dialSchedd(ctx, scheddAddr, nil)
+		// ADR-052: load the mTLS config meterd uses to dial schedd.
+		// Single-box deployments keep all three paths empty and
+		// LoadScheddTLS returns (nil, nil); multi-box deployments
+		// pass tcp:// or dns:// + a TLS cluster.
+		scheddTLS, err := cfg.LoadScheddTLS()
+		if err != nil {
+			return fmt.Errorf("meterd: load schedd TLS: %w", err)
+		}
+		c, err := deps.dialSchedd(ctx, scheddAddr, scheddTLS)
 		if err != nil {
 			return fmt.Errorf("meterd: dial schedd %q: %w", scheddAddr, err)
 		}
@@ -715,8 +727,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// future test harness can omit the egress wire without
 	// touching the constructor.
 	scheddEgress := &scheddEgressAdapter{cpu: cpu}
+	// Load the mTLS config for the gatewayd egress dial (ADR-052).
+	// Single-box deployments keep all three paths empty and
+	// LoadGatewayEgressTLS returns (nil, nil); multi-box deployments
+	// point gateway_egress_target at tcp:// or dns:// + a TLS cluster.
+	gwEgressTLS, err := cfg.LoadGatewayEgressTLS()
+	if err != nil {
+		return fmt.Errorf("meterd: load gateway egress TLS: %w", err)
+	}
 	gwEgress := &gatewayEgressAdapter{
 		now:    deps.now,
+		tlsCfg: gwEgressTLS,
 		data:   make(map[string]map[int64]uint64),
 		dialFn: dialGatewayEgressStream,
 	}
@@ -734,8 +755,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// FAAS_GATEWAY_EGRESS_SOCKET is the ADR-046 PR-2 producer
 	// channel (separate from FAAS_GATEWAY_SYNTH_SOCKET, which
 	// stays HTTP-shaped for cron dispatch). Both share the same
-	// group-`faas` DAC auth (ADR-015).
-	gwSocketPath := envOr("FAAS_GATEWAY_EGRESS_SOCKET", "/run/faas/gatewayd-egress.sock")
+	// group-`faas` DAC auth (ADR-015). The env var wins over
+	// cfg.GatewayEgressSocket so the e2e harness can dial a
+	// per-test socket without rewriting the unit file.
+	gwSocketPath := envOr("FAAS_GATEWAY_EGRESS_SOCKET", cfg.GatewayEgressSocket)
+	if gwSocketPath == "" {
+		gwSocketPath = "/run/faas/gatewayd-egress.sock"
+	}
 	gwEgress.startStream(ctx, gwSocketPath, log)
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and

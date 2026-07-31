@@ -47,6 +47,24 @@ type Config struct {
 	TLSKeyPath  string `toml:"tls_key_path"`
 	TLSCAPath   string `toml:"tls_ca_path"`
 
+	// ScheddClientTLS is the client mTLS material vmmd uses to dial
+	// schedd for the capacity publisher (ADR-052 / issue #95 slice 2).
+	// Empty cluster => no TLS, single-box default; full cluster => mTLS
+	// to remote schedd. Partial cluster => startup error. The leaf is
+	// vmmd's per-role client cert (CommonName "vmmd.faas", EKU
+	// ClientAuth only — issued by `gregale pki init` as
+	// /etc/faas/tls/vmmd/schedd-client.{crt,key}).
+	ScheddClientCertPath string `toml:"schedd_client_cert_path"`
+	ScheddClientKeyPath  string `toml:"schedd_client_key_path"`
+	ScheddClientCAPath   string `toml:"schedd_client_ca_path"`
+
+	// AdvisoryClientTLS is the client mTLS material vmmd uses to
+	// dial apid's advisory listener (ADR-052). Same contract as
+	// ScheddClientTLS; the leaf is /etc/faas/tls/vmmd/apid-client.{crt,key}.
+	AdvisoryClientCertPath string `toml:"advisory_client_cert_path"`
+	AdvisoryClientKeyPath  string `toml:"advisory_client_key_path"`
+	AdvisoryClientCAPath   string `toml:"advisory_client_ca_path"`
+
 	// KernelKey is the StorageBackend key for the Firecracker kernel
 	// artifact vmmd loads on cold boot (issue #96 / ADR-025 axis 2 / PR
 	// #116). The local backend's Get resolves it to the same file the
@@ -108,6 +126,20 @@ func (c *Config) ResolveListenTarget() string {
 // which fields are missing.
 func (c *Config) LoadServerTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
+}
+
+// LoadScheddClientTLS returns the client mTLS config vmmd uses to
+// dial schedd for the capacity publisher (ADR-052). Empty cluster
+// returns (nil, nil); partial cluster is rejected.
+func (c *Config) LoadScheddClientTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("schedd_client_", c.ScheddClientCertPath, c.ScheddClientKeyPath, c.ScheddClientCAPath)
+}
+
+// LoadAdvisoryClientTLS returns the client mTLS config vmmd uses to
+// dial apid's advisory listener (ADR-052). Empty cluster returns
+// (nil, nil); partial cluster is rejected.
+func (c *Config) LoadAdvisoryClientTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("advisory_client_", c.AdvisoryClientCertPath, c.AdvisoryClientKeyPath, c.AdvisoryClientCAPath)
 }
 
 // LoadConfig reads a TOML file at path and returns the parsed Config with

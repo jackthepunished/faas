@@ -220,6 +220,12 @@ type runDeps struct {
 	// is dialed so the consumer goroutine shares the existing
 	// /run/faas/schedd.sock connection (no second dial).
 	warmHints *warmHintConsumer
+	// egressTLS is the server mTLS config the egress gRPC listener
+	// uses when meterd dials it from a remote compute node (ADR-052).
+	// nil in tests; production wires it in run() from
+	// cfg.LoadEgressTLS() so the [egress_tls_*] TOML keys apply
+	// before the listener binds.
+	egressTLS *tls.Config
 }
 
 func defaultDeps() runDeps {
@@ -403,6 +409,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
+	// ADR-052: load the server mTLS material the egress gRPC
+	// listener uses when meterd dials it from a remote compute
+	// node. Empty cluster returns (nil, nil); partial cluster is
+	// rejected with the egress_tls_* field names.
+	deps.egressTLS, err = cfg.LoadEgressTLS()
+	if err != nil {
+		return fmt.Errorf("gatewayd: load egress TLS: %w", err)
+	}
 	// PR scale-out readiness: thread *gateway.Metrics into the node
 	// cache so the WatchEvictions heartbeat goroutine has a sink for
 	// gateway_compute_node_changed_subscriber_alive. deps.metrics is
@@ -479,8 +493,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	egressSink := egresssink.NewEgressSink()
 	handler.WithEgressSink(egressSink)
 	egressGRPCSocket := egressGRPCSocketPath()
+	// Reject the silent-no-TLS path: a non-unix target without TLS
+	// would build an insecure server (ADR-052). deps.egressTLS is
+	// loaded in run() — see TomlTLSLoad order below.
+	if !isUnixSocketPath(egressGRPCSocket) && deps.egressTLS == nil {
+		return fmt.Errorf("gatewayd: egress target %q is non-unix but egress_tls_* is empty (set egress_tls_cert_path / key_path / ca_path or point the target at a unix socket for single-box mode)", egressGRPCSocket)
+	}
 	egressGRPCSrv := egressgrpc.NewServer(egressSink, log)
-	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, egressGRPCSrv, log)
+	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, deps.egressTLS, egressGRPCSrv, log)
 	// Best-effort start, mirroring the synth listener pattern
 	// (runWithDeps internal RPC). If the unix socket can't bind
 	// (e.g. /run/faas doesn't exist on a dev/test box), log + continue
@@ -491,7 +511,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// AppendUsage writes 0 to tx_bytes for that minute. Once the
 	// socket becomes bindable (deploy-time /run/faas exists), the
 	// next daemon restart picks up the stream automatically.
-	if err := deps.egressGRPC.start(); err != nil {
+	if err := deps.egressGRPC.start(ctx); err != nil {
 		log.Warn("gatewayd egress listen failed; tx_bytes will stay 0 until restart",
 			"socket", egressGRPCSocket, "err", err)
 		deps.egressGRPC = nil
