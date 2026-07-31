@@ -202,8 +202,8 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 // typed at_capacity=true outcome (issue #168).
 type atCapScheduler struct{}
 
-func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
-	return "", "", "", 0, true, nil
+func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+	return "", "", "", 0, true, 0, nil
 }
 
 // TestPGBackend_AdmitForwardsWakeMethod (PR scale-out readiness) — the
@@ -272,8 +272,8 @@ type controllableScheduler struct {
 	rawMethod int32
 }
 
-func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
-	return "i-test", "n-test", "w-test", c.rawMethod, false, nil
+func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+	return "i-test", "n-test", "w-test", c.rawMethod, false, 0, nil
 }
 
 func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
@@ -291,5 +291,55 @@ func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
 	}
 	if n := router.resolveCalls(); n != 2 {
 		t.Errorf("router resolve calls = %d, want 2 (cache flushed)", n)
+	}
+}
+
+// TestPGBackend_AdmitCarriesOverridePort pins issue #460 / ADR-053
+// (PR-C) on the gateway's caching surface: when the FakeScheduler
+// returns port=9090, the cached Target must carry that port so the
+// forwarder can stamp it onto ForwardHTTPRequest. A regression that
+// drops Target.Port would force the forwarder to dial :8080 against
+// a guest bound on :9090 — silent 503s.
+func TestPGBackend_AdmitCarriesOverridePort(t *testing.T) {
+	sched := gateway.NewFakeScheduler("n-1").
+		WithInstanceID("i-1").
+		WithWakeID("w-1").
+		WithPort(9090)
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+	if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	tgt, ok := b.Pick("app-1")
+	if !ok {
+		t.Fatal("Pick post-admit = empty; want i-1")
+	}
+	if tgt.Port != 9090 {
+		t.Errorf("Target.Port = %d, want 9090", tgt.Port)
+	}
+	if tgt.NodeID != "n-1" || tgt.InstanceID != "i-1" {
+		t.Errorf("Target identity = %+v, want n-1 / i-1", tgt)
+	}
+}
+
+// TestPGBackend_AdmitPortZeroIsZero pins the no-override boundary:
+// when the FakeScheduler doesn't set a port, the cached Target must
+// carry port=0 so vmmd's buildBridgeScript defaults to 8080 at the
+// wire boundary. Asserting this prevents a future "always default to
+// 8080 in the sched wrapper" regression from leaking non-zero ports
+// onto legacy callers.
+func TestPGBackend_AdmitPortZeroIsZero(t *testing.T) {
+	sched := gateway.NewFakeScheduler("n-1").WithInstanceID("i-1")
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
+
+	if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	tgt, ok := b.Pick("app-1")
+	if !ok {
+		t.Fatal("Pick post-admit = empty; want i-1")
+	}
+	if tgt.Port != 0 {
+		t.Errorf("Target.Port = %d, want 0 (legacy 8080 default at vmmd)", tgt.Port)
 	}
 }

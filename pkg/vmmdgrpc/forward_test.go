@@ -11,8 +11,10 @@ package vmmdgrpc_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
@@ -185,6 +187,68 @@ func TestHeartbeat_Ok(t *testing.T) {
 // test the parser directly.
 func parseBridgeOutputForTest(raw []byte) (*vmmdpb.ForwardHTTPResponse, error) {
 	return vmmdgrpc.ParseBridgeOutputForTest(raw)
+}
+
+// TestBuildBridgeScript_ResolvesDialPort pins issue #460 / ADR-053
+// (PR-C): the bridge script must dial the per-deployment override
+// port when set, fall back to netns.AppPort (8080) when zero, and
+// rewrite the Host header in both cases. The Host rewrite matters
+// because customer apps that pin Host (e.g. vhost routers) must see
+// the inner identity, not the overlay hostname.
+//
+// We assert on the rendered script — no nsenter, no root — using the
+// stable strings emitted by buildBridgeScript:
+//   - `exec 3<>/dev/tcp/<netns.GuestIP>/<dialPort>\n`
+//   - `printf 'Host: %s\r\n' '<netns.GuestIP>:<dialPort>' >&3`
+func TestBuildBridgeScript_ResolvesDialPort(t *testing.T) {
+	const (
+		guestIP = "10.0.0.2"
+	)
+	tests := []struct {
+		name        string
+		wirePort    uint32
+		wantDial    string
+		wantHost    string
+		description string
+	}{
+		{
+			name:        "zero port → 8080 default (ADR-009 + portnorm)",
+			wirePort:    0,
+			wantDial:    fmt.Sprintf("exec 3<>/dev/tcp/%s/8080", guestIP),
+			wantHost:    fmt.Sprintf("'Host: %%s\\r\\n' '%s:8080'", guestIP),
+			description: "legacy callers leave Port==0; buildBridgeScript defaults to netns.AppPort",
+		},
+		{
+			name:        "explicit 9090 override",
+			wirePort:    9090,
+			wantDial:    fmt.Sprintf("exec 3<>/dev/tcp/%s/9090", guestIP),
+			wantHost:    fmt.Sprintf("'Host: %%s\\r\\n' '%s:9090'", guestIP),
+			description: "PR-C payload: vmmd forwarder dials the customer's override port",
+		},
+		{
+			name:        "explicit 3000 override",
+			wirePort:    3000,
+			wantDial:    fmt.Sprintf("exec 3<>/dev/tcp/%s/3000", guestIP),
+			wantHost:    fmt.Sprintf("'Host: %%s\\r\\n' '%s:3000'", guestIP),
+			description: "non-8080 override sanity check — Host header ports the same value",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &vmmdpb.ForwardHTTPRequest{
+				Method:     "GET",
+				RequestUri: "/",
+				Port:       tt.wirePort,
+			}
+			script := vmmdgrpc.BuildBridgeScriptForTest("/tmp/body", req, 30*time.Second, 30*time.Second)
+			if !strings.Contains(script, tt.wantDial) {
+				t.Errorf("script missing dial line %q\n--- script ---\n%s", tt.wantDial, script)
+			}
+			if !strings.Contains(script, tt.wantHost) {
+				t.Errorf("script missing Host rewrite %q\n--- script ---\n%s", tt.wantHost, script)
+			}
+		})
+	}
 }
 
 // bufconnTestRig is the minimal scaffolding a ForwardHTTP test

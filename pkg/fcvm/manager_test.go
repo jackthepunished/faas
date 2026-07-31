@@ -544,6 +544,15 @@ func req(id string) ColdBootRequest {
 	return ColdBootRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128, Plan: api.PlanHobby}
 }
 
+// reqWithPort mirrors req() but stamps a per-deployment override port
+// (issue #460 / ADR-053, PR-C). Used by the port-propagation test that
+// exercises ColdBoot → WakeRequest → Instance.Port.
+func reqWithPort(id string, port int) ColdBootRequest {
+	r := req(id)
+	r.Port = port
+	return r
+}
+
 func newTestManager(run Runner, vmm VMM) *Manager {
 	return NewManager(run, vmm, Paths{Kernel: "/srv/fc/base/vmlinux-6.1"}, testFCVersion, nil, nil)
 }
@@ -586,6 +595,30 @@ func TestColdBootSuccessTracksInstance(t *testing.T) {
 	}
 	if !run.ran("netns add fc-i1") {
 		t.Error("network setup did not run")
+	}
+}
+
+// TestColdBootSuccessStampsInstancePort pins issue #460 / ADR-053
+// (PR-C): when ColdBootRequest carries a per-deployment override
+// port, the live Instance must carry that port so the vmmdgrpc
+// forwarder (or any other server-side reader that walks m.live) can
+// resolve the per-instance dial port without a second lookup. A
+// regression that drops the propagation forces the forwarder to
+// re-resolve from the deployment row on every request — breaking
+// the "in-memory cache" invariant vmmdgrpc.forward.go relies on.
+func TestColdBootSuccessStampsInstancePort(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), reqWithPort("i1", 9090))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.Port != 9090 {
+		t.Errorf("Instance.Port = %d, want 9090 (inst=%+v)", inst.Port, inst)
+	}
+	if m.LiveCount() != 1 {
+		t.Errorf("LiveCount = %d, want 1 (the live map should hold the stamped instance)", m.LiveCount())
 	}
 }
 

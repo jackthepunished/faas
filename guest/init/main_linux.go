@@ -153,7 +153,21 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	argv := m.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = m.EffectiveWorkingDir()
-	cmd.Env = BuildEnvWithSecrets(os.Environ(), m, secrets, apiEnv)
+	env := BuildEnvWithSecrets(os.Environ(), m, secrets, apiEnv)
+	// Issue #460 / ADR-053 (PR-C): stamp PORT=<m.EffectivePort()>
+	// onto the exec'd env so the runner shim can bind the
+	// per-deployment override port. Appended AFTER
+	// BuildEnvWithSecrets so a customer-set PORT in manifest env,
+	// apiEnv, or sealed secrets cannot accidentally override the
+	// platform contract — guest-init is the canonical source of
+	// truth for the override port. Unconditional: m.Port == 0
+	// still injects PORT=8080, which is harmless for runners that
+	// already bind :8080 and matches the vmmd wire-level default.
+	// StampOverridePortEnv is the pure helper the unit test pins;
+	// keeping the live edit here means the precedence assertion
+	// tests the exact code path the production execve uses.
+	env = StampOverridePortEnv(env, m.EffectivePort())
+	cmd.Env = env
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if uid := lookupUID(m.EffectiveUser()); uid > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{

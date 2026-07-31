@@ -429,6 +429,12 @@ type WakeResult struct {
 	// inspects error codes. Always false on Wake (the existing fast
 	// path is the only short-circuit there).
 	AtCapacity bool
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
+	// override port copied from dep.OverridePort. 0 = legacy 8080.
+	// On the Phase-1 fast path this comes from a LiveDeployment
+	// lookup so the gateway sees the same value AdmitInstance would
+	// have produced; on the admit path it comes from bootInput.spec.
+	Port int
 }
 
 // Wake ensures a running instance for appID and returns its address (spec §4.3
@@ -477,6 +483,38 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {
+		// PR-C (issue #460 / ADR-053): resolve the live deployment so
+		// the response's Port field is consistent with what
+		// AdmitInstance would have produced. The instance row
+		// carries no port (port is a deployment-level concept); the
+		// live dep row carries dep.OverridePort.
+		//
+		// Why a LiveDeployment read is acceptable here: Wake is the
+		// legacy fast path used by meterd's per-minute sampler + cron
+		// firings, NOT the customer hot path. Production customer
+		// requests go through AdmitInstance (cmd/gatewayd/main.go),
+		// which has the live deployment already loaded. So this read
+		// adds one cheap PG roundtrip (~1ms, single-row lookup with
+		// the existing (app_id, status) partial index) per minute per
+		// active app — well below any customer-facing budget.
+		//
+		// A read failure here logs (slog) and falls through with
+		// Port=0 — the vmmd wire boundary defaults to 8080 in that
+		// case, so a transient PG hiccup never widens the failure
+		// surface beyond the legacy behaviour.
+		//
+		// If Wake ever becomes customer-facing, denormalise port onto
+		// the instances row at admit time and read it back alongside
+		// the existing fields — that costs a migration + an extra
+		// column on state.Instance + the RunningInstanceForApp query,
+		// which is overkill for synth traffic.
+		var port int
+		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
+			port = dep.OverridePort
+		} else {
+			e.log.Warn("sched: wake: live deployment lookup for port failed; falling through with 0",
+				"app", appID, "err", depErr)
+		}
 		release()
 		// Surface the existing row's wake_id so a Phase-1 fast-path
 		// response carries x-faas-wake-id just like a cold-wake
@@ -484,7 +522,7 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 		// brought the instance up; an operator tailing a warm request
 		// can still pin it back to the schedd slog line that stamped
 		// it (gaps analysis 2026-07-23 review finding #1).
-		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID}, nil
+		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port}, nil
 	} else if !errors.Is(err, state.ErrNotFound) {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: running lookup: %w", err)
@@ -721,6 +759,13 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// effect on the next wake. Live instances keep their
 		// old netns — same contract as RAMMB and MaxConcurrency.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
+		// Issue #460 / ADR-053 (PR-C): per-deployment override
+		// port the customer's app binds inside the guest. 0 =
+		// legacy 8080 (vmmd's wire-level default). The host's
+		// waitReady + DNAT stay fixed on 8080 (ADR-009 +
+		// guest/init/portnorm_linux.go); only vmmd's ForwardHTTP
+		// bridge uses this port to dial the guest.
+		Port: dep.OverridePort,
 	}
 
 	// Capture the boot inputs we need across the unlocked window. These
@@ -939,7 +984,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
-	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID}, nil
+	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port}, nil
 }
 
 // bootInput is the immutable bundle of values needed across the

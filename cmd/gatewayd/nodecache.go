@@ -144,7 +144,7 @@ func newNodeCache(store *state.PgStore, vmmdTLS *tls.Config, log *slog.Logger, m
 // Forwarding returns the per-node http.Handler factory. cmd/gatewayd
 // installs it on the gateway.Handler via WithForwarding so every
 // request dispatches through the cache.
-func (n *nodeCache) Forwarding() func(nodeID string) http.Handler {
+func (n *nodeCache) Forwarding() func(gateway.Target) http.Handler {
 	return gateway.ForwardingReverseProxy(n.cache, n.log)
 }
 

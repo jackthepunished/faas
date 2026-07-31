@@ -144,7 +144,7 @@ type Scheduler interface {
 	//     app_concurrency_reached outcome is NEVER lifted to an error —
 	//     it surfaces as atCapacity=true so the gateway can treat it
 	//     as a no-op. method is 0.
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, err error)
+	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -155,8 +155,8 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, error) {
-	return "", "", "", 0, false, ErrSchedulerUnconfigured
+func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+	return "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
 // FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd
@@ -182,6 +182,11 @@ type FakeScheduler struct {
 
 	// nextID is the per-call instance id counter when instanceID override is unset.
 	nextID atomic.Uint64
+
+	// port (PR-C, issue #460 / ADR-053) is the per-deployment
+	// override port the fake scheduler returns. 0 = legacy 8080
+	// (vmmd wire boundary default). Set via WithPort.
+	port int
 
 	// admitsByApp tracks per-app AdmitInstance call counts; useful for the
 	// wake-coalesce + multi-instance tests.
@@ -249,6 +254,15 @@ func (f *FakeScheduler) WithErr(err error) *FakeScheduler {
 	return f
 }
 
+// WithPort (PR-C, issue #460 / ADR-053) sets the per-deployment
+// override port the fake scheduler reports on AdmitInstance. 0
+// (the default) preserves the legacy wire shape — vmmd's bridge
+// defaults 0 to netns.AppPort (8080) at the server boundary.
+func (f *FakeScheduler) WithPort(p int) *FakeScheduler {
+	f.port = p
+	return f
+}
+
 // Calls returns the number of AdmitInstance() calls made (test assertion hook).
 func (f *FakeScheduler) Calls() int {
 	return int(f.totalCalls.Load())
@@ -261,7 +275,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, int32, bool, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, int32, bool, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond
@@ -270,13 +284,17 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	instanceOverride := f.instanceID
 	wakeOverride := f.wakeID
 	method := f.method
+	// PR-C (issue #460 / ADR-053): per-deployment override port.
+	// Defaults to 0 (legacy 8080 at the wire boundary); tests that
+	// need a non-default port set WithPort.
+	port := f.port
 	f.mu.Unlock()
 
 	if latency > 0 {
 		select {
 		case <-time.After(latency):
 		case <-ctx.Done():
-			return "", "", "", 0, false, ctx.Err()
+			return "", "", "", 0, false, 0, ctx.Err()
 		}
 	}
 
@@ -304,7 +322,7 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	default:
 		rawMethod = WireWakeColdBoot
 	}
-	return instanceID, nodeID, wakeID, rawMethod, false, err
+	return instanceID, nodeID, wakeID, rawMethod, false, port, err
 }
 
 // itoa renders a uint64 as a base-10 string without importing strconv into

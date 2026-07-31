@@ -231,10 +231,10 @@ func TestHandler_LookupMissStill404sBeforeProxy(t *testing.T) {
 }
 
 func TestHandler_WithForwardingIdempotent(t *testing.T) {
-	first := func(string) http.Handler {
+	first := func(Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
 	}
-	second := func(string) http.Handler {
+	second := func(Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	}
 	b := &fakeBackend{app: App{ID: "app-1", Plan: api.PlanScale}, host: "app.example.com", running: true}
@@ -242,7 +242,7 @@ func TestHandler_WithForwardingIdempotent(t *testing.T) {
 	h.WithForwarding(first)
 	h.WithForwarding(second)
 
-	if got := h.proxyByNode("anything"); got == nil {
+	if got := h.proxyByNode(Target{NodeID: "anything"}); got == nil {
 		t.Fatal("proxyByNode nil after install")
 	}
 }

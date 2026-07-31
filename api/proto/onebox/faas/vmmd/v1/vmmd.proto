@@ -221,6 +221,13 @@ message AppSpec {
   // = no env.json file written (manifest env still flows in via
   // /etc/faas/app.json, the legacy path).
   repeated APIEnvEntry api_env = 9;
+  // port (issue #460 / ADR-053, PR-C) is the per-deployment override
+  // port the customer's app binds inside the guest. Defaults to
+  // netns.AppPort (8080) when zero — wire legacy. The host's
+  // waitReady + DNAT stay fixed on 8080 (ADR-009 +
+  // guest/init/portnorm_linux.go); vmmd's ForwardHTTP bridge uses
+  // this port to dial the guest. Additive per ADR-016.
+  uint32 port         = 10;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -523,6 +530,13 @@ message ForwardHTTPRequest {
   // Request body. Capped at ForwardMaxBodyBytes. vmmd treats an empty
   // body as zero-length, not missing.
   bytes  body         = 5;
+  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
+  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
+  // zero — legacy gateway clients keep working. New gateway clients
+  // always set this explicitly from the per-app Target cached at
+  // admit time. The dial target is the inner guest IP, never the
+  // host IP, so this is purely a guest port. Additive per ADR-016.
+  uint32 port         = 6;
 }
 
 // Header is one (name, value) HTTP header line. Both fields are

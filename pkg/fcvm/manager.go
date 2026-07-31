@@ -195,6 +195,16 @@ type Instance struct {
 	// is schedd-owned and recorded at Wake time.
 	Plan api.Plan
 
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
+	// override port copied from WakeRequest.Port. The vmmdgrpc
+	// forwarder reads this to resolve the per-instance guest dial
+	// port (server-side default to netns.AppPort when 0). 0 on
+	// instances that pre-date PR-C and on legacy callers that
+	// never set the wire field; the wire-level default at the
+	// buildBridgeScript boundary keeps those legacy instances
+	// dial-able on 8080.
+	Port int
+
 	// Characterization (ADR-051 Phase 4 / PR-D) is the
 	// CharacterizationReport the host received via
 	// WaitCharacterizationReport during this cold boot. Empty on
@@ -608,6 +618,14 @@ type WakeRequest struct {
 	// and copies build artifacts (build-done.json + /build/out/*) into this host
 	// directory. App VMs leave it empty.
 	ExportDir string
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment override
+	// port the customer's app binds inside the guest. 0 = legacy 8080
+	// (netns.AppPort default). The host's waitReady + DNAT stay fixed
+	// on 8080 (ADR-009 + guest/init/portnorm_linux.go); vmmd's
+	// forwarder uses this port to dial the guest. Stamped onto the
+	// live Instance so vmmdgrpc forwarder callers can resolve
+	// LiveFor(instance).Port without a second request lookup.
+	Port int
 	// SealedEnvEntries are the per-key ciphertext rows from `app_secrets`
 	// the caller wants loaded into the guest's env (spec §11/G2). Each entry is
 	// sealed independently by apid via pkg/secretbox.SealOne against the host
@@ -698,6 +716,17 @@ type ColdBootRequest struct {
 	APIEnvEntries []APIEnvEntry
 	// EgressAllowlist (ADR-031) — same shape as WakeRequest.
 	EgressAllowlist []string
+	// Port (issue #460 / ADR-053, PR-C) — the per-deployment override
+	// port forwarded verbatim to WakeRequest.Port. Production wiring
+	// uses WakeRequest directly via the vmmdgrpc adapters
+	// (pkg/vmmdgrpc/proto.go), so this field is currently exercised
+	// only by unit tests (TestColdBootSuccessStampsInstancePort). Kept
+	// for symmetry so the cold-boot public surface stays a complete
+	// mirror of WakeRequest — a future caller that wants to invoke
+	// ColdBoot without going through WakeRequest shouldn't have to
+	// drop a field. Removing the field would silently break the
+	// port-stamping test.
+	Port int
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -712,6 +741,7 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		APIEnvEntries:   req.APIEnvEntries,
 		EgressAllowlist: req.EgressAllowlist,
 		Plan:            req.Plan,
+		Port:            req.Port,
 	})
 }
 
@@ -901,7 +931,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Characterization: report}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, Characterization: report}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and

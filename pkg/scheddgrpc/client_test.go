@@ -53,7 +53,7 @@ func TestClientWake_ReturnsNodeID(t *testing.T) {
 			return sched.WakeResult{InstanceID: "i-1", NodeID: "node-test-1", Method: vmmdpb.WakeMethod_WAKE_RESTORE}, nil
 		},
 	})
-	instanceID, nodeID, wakeID, err := c.Wake(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, _, err := c.Wake(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestClientWake_CapacityLiftsToProblem(t *testing.T) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
-	_, _, _, err := c.Wake(context.Background(), "app-1")
+	_, _, _, _, err := c.Wake(context.Background(), "app-1")
 	if err == nil {
 		t.Fatal("expected capacity denial")
 	}
@@ -91,6 +91,31 @@ func TestClientWake_CapacityLiftsToProblem(t *testing.T) {
 	}
 	if prob.Status != 503 {
 		t.Errorf("problem status = %d, want 503", prob.Status)
+	}
+}
+
+// TestClientWake_PropagatesPort pins issue #460 / ADR-053 (PR-C): the
+// per-deployment override port the engine computed must surface in
+// Client.Wake's return tuple so gatewayd callers can stamp it onto
+// ForwardHTTPRequest. The fake stub here mirrors the engine contract:
+// WakeResult.Port populated → Client.Wake's 5-tuple last value matches.
+func TestClientWake_PropagatesPort(t *testing.T) {
+	c := newClient(t, &fakeEngine{
+		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+			return sched.WakeResult{
+				InstanceID: "i-1",
+				NodeID:     "node-test-1",
+				Method:     vmmdpb.WakeMethod_WAKE_RESTORE,
+				Port:       9090,
+			}, nil
+		},
+	})
+	_, _, _, port, err := c.Wake(context.Background(), "app-1")
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if port != 9090 {
+		t.Errorf("port = %d, want 9090", port)
 	}
 }
 
@@ -149,7 +174,7 @@ func TestClientAdmitInstance_AdmitsNewInstance(t *testing.T) {
 			}, nil
 		},
 	})
-	instanceID, nodeID, wakeID, method, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("AdmitInstance: %v", err)
 	}
@@ -184,7 +209,7 @@ func TestClientAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 			return sched.WakeResult{AtCapacity: true}, nil
 		},
 	})
-	instanceID, nodeID, wakeID, method, atCapacity, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("AdmitInstance: at_capacity must NOT be lifted to an error; got %v", err)
 	}
@@ -215,7 +240,7 @@ func TestClientAdmitInstance_LiftsError(t *testing.T) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
-	_, _, _, _, _, err := c.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, _, err := c.AdmitInstance(context.Background(), "app-1")
 	if err == nil {
 		t.Fatal("expected capacity denial on AdmitInstance")
 	}
@@ -225,6 +250,32 @@ func TestClientAdmitInstance_LiftsError(t *testing.T) {
 	}
 	if prob.Status != 503 {
 		t.Errorf("problem status = %d, want 503", prob.Status)
+	}
+}
+
+// TestClientAdmitInstance_PropagatesPort pins issue #460 / ADR-053
+// (PR-C) on the production path: Client.AdmitInstance is what the
+// gateway actually calls, and its 7-tuple return carries the
+// override port as the last value. A regression that drops Port
+// would silently force the gateway to dial :8080 against any
+// deployment that set --port.
+func TestClientAdmitInstance_PropagatesPort(t *testing.T) {
+	c := newClient(t, &fakeEngine{
+		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+			return sched.WakeResult{
+				InstanceID: "i-1",
+				NodeID:     "node-test-1",
+				Method:     vmmdpb.WakeMethod_WAKE_COLD_BOOT,
+				Port:       9090,
+			}, nil
+		},
+	})
+	_, _, _, _, _, port, err := c.AdmitInstance(context.Background(), "app-1")
+	if err != nil {
+		t.Fatalf("AdmitInstance: %v", err)
+	}
+	if port != 9090 {
+		t.Errorf("port = %d, want 9090", port)
 	}
 }
 

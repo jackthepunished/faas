@@ -10,7 +10,7 @@ import (
 
 func TestFakeSchedulerAdmitInstance(t *testing.T) {
 	s := NewFakeScheduler("node-fake-1").WithInstanceID("i-7").WithWakeID("w-9")
-	instanceID, nodeID, wakeID, method, atCap, err := s.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, wakeID, method, atCap, port, err := s.AdmitInstance(context.Background(), "app-1")
 	if err != nil {
 		t.Fatalf("AdmitInstance err = %v", err)
 	}
@@ -30,6 +30,11 @@ func TestFakeSchedulerAdmitInstance(t *testing.T) {
 	if method != 0 {
 		t.Errorf("method = %d, want 0 (cold boot default)", method)
 	}
+	// Default FakeScheduler port is 0 (legacy 8080 default at the
+	// server boundary — vmmd buildBridgeScript).
+	if port != 0 {
+		t.Errorf("port = %d, want 0 (legacy default)", port)
+	}
 	if got := s.Calls(); got != 1 {
 		t.Errorf("Calls = %d, want 1", got)
 	}
@@ -42,7 +47,7 @@ func TestFakeSchedulerMintsFreshInstanceID(t *testing.T) {
 	s := NewFakeScheduler("node-fake-1")
 	ids := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		id, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1")
+		id, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1")
 		if err != nil {
 			t.Fatalf("AdmitInstance: %v", err)
 		}
@@ -56,14 +61,14 @@ func TestFakeSchedulerMintsFreshInstanceID(t *testing.T) {
 func TestFakeSchedulerWithErr(t *testing.T) {
 	want := errors.New("boom")
 	s := NewFakeScheduler("node-fake-1").WithErr(want)
-	_, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, _, err := s.AdmitInstance(context.Background(), "app-1")
 	if !errors.Is(err, want) {
 		t.Errorf("err = %v, want %v", err, want)
 	}
 }
 
 func TestNoopSchedulerReturnsUnconfigured(t *testing.T) {
-	_, _, _, _, _, err := NoopScheduler{}.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, _, err := NoopScheduler{}.AdmitInstance(context.Background(), "app-1")
 	if !errors.Is(err, ErrSchedulerUnconfigured) {
 		t.Errorf("err = %v, want ErrSchedulerUnconfigured", err)
 	}

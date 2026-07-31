@@ -541,6 +541,159 @@ func TestEngineWake_NoSecrets_EmptySealedEnv(t *testing.T) {
 	}
 }
 
+// TestEngineWake_ForwardsOverridePort pins issue #460 / ADR-053 (PR-C):
+// when a Deployment carries OverridePort=9090, the engine must stamp
+// Port onto both the cold-boot AppSpec (vmmd cold-boot branch) and
+// the restore AppSpec (snapshot branch). The restoration path is the
+// harder one — it could regress "Port lives on disk with the
+// snapshot" silently, so it gets its own assertion next to lastColdBoot.
+//
+// The expected result: fakeVMM.lastColdBootSpec.Port captures 9090 for
+// the cold-boot case, lastRestoreSpec.Port captures 9090 for the
+// restore case. WakeResult.Port surfaces the same value so the
+// scheddgrpc response can hand it to the gateway.
+func TestEngineWake_ForwardsOverridePort(t *testing.T) {
+	t.Run("cold-boot", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
+		// Stamp the per-deployment override port directly. CreateDeployment
+		// accepts a fully-populated Deployment, so the simplest thing is to
+		// create a second deployment that supersedes the seed with the
+		// override port set, then LiveDeployment reads it back.
+		if _, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID:        app.ID,
+			Kind:         state.DeploymentKindImage,
+			ImageDigest:  "sha256:abc",
+			Status:       state.DeployLive,
+			OverridePort: 9090,
+		}); err != nil {
+			t.Fatalf("CreateDeployment override-port: %v", err)
+		}
+		vmm := &fakeVMM{}
+		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+		res, err := e.Wake(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("Wake: %v", err)
+		}
+		if vmm.lastColdBootSpec.Port != 9090 {
+			t.Errorf("cold-boot Port = %d, want 9090 (spec=%+v)",
+				vmm.lastColdBootSpec.Port, vmm.lastColdBootSpec)
+		}
+		if res.Port != 9090 {
+			t.Errorf("WakeResult.Port = %d, want 9090", res.Port)
+		}
+		// The seed deployment that had no override port must not leak
+		// into the Wake dispatch — LiveDeployment picks the most
+		// recent DeployLive row, which is the 9090 one we just created.
+		_ = dep
+	})
+
+	t.Run("restore-from-snapshot", func(t *testing.T) {
+		store := state.NewMemStore()
+		acct, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+		if _, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID:        app.ID,
+			Kind:         state.DeploymentKindImage,
+			ImageDigest:  "sha256:abc",
+			Status:       state.DeployLive,
+			OverridePort: 9090,
+		}); err != nil {
+			t.Fatalf("CreateDeployment override-port: %v", err)
+		}
+		liveDep, err := store.LiveDeployment(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("LiveDeployment: %v", err)
+		}
+		if _, err := store.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: liveDep.ID,
+			FCVersion:    "1.10.0",
+			MemBytes:     1,
+			StorageKey:   SnapshotMemKey(liveDep.ID),
+		}); err != nil {
+			t.Fatalf("CreateSnapshot: %v", err)
+		}
+		vmm := &fakeVMM{}
+		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+		res, err := e.Wake(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("Wake: %v", err)
+		}
+		if vmm.lastRestoreSpec.Port != 9090 {
+			t.Errorf("restore Port = %d, want 9090 (spec=%+v)",
+				vmm.lastRestoreSpec.Port, vmm.lastRestoreSpec)
+		}
+		if res.Port != 9090 {
+			t.Errorf("WakeResult.Port = %d, want 9090", res.Port)
+		}
+		// Anchor: the seed flow used seedApp unchanged.
+		_ = acct
+	})
+
+	// Issue #460 / ADR-053 PR-C Phase-1 fast path: when an instance
+	// is already RUNNING, Wake short-circuits under appMu and returns
+	// the existing row. The port must still reach the wire, sourced
+	// from a LiveDeployment read inside the same critical section.
+	// The fast path is the synth-loop hot path (meterd's per-minute
+	// sampler + cron firings), not the customer hot path — but it
+	// must remain truthful so any future caller that consumes
+	// WakeResponse.port on a warm instance sees the same value
+	// AdmitInstance would have produced.
+	t.Run("fast-path-warm", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+		if _, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID:        app.ID,
+			Kind:         state.DeploymentKindImage,
+			ImageDigest:  "sha256:abc",
+			Status:       state.DeployLive,
+			OverridePort: 9090,
+		}); err != nil {
+			t.Fatalf("CreateDeployment override-port: %v", err)
+		}
+		vmm := &fakeVMM{}
+		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+		// Cold-wake first to materialise a RUNNING row.
+		if _, err := e.Wake(context.Background(), app.ID); err != nil {
+			t.Fatalf("first Wake: %v", err)
+		}
+		// Second Wake hits the Phase-1 fast path.
+		res, err := e.Wake(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("second Wake (fast path): %v", err)
+		}
+		if res.Port != 9090 {
+			t.Errorf("fast-path WakeResult.Port = %d, want 9090 "+
+				"(LiveDeployment read must populate Port even on warm path)", res.Port)
+		}
+	})
+}
+
+// TestEngineWake_OverridePortZeroIsZero pins the no-override boundary:
+// when no deployment carries an override port, the wire fields must be
+// zero (the legacy signal) so vmmd's server-side buildBridgeScript
+// defaults to netns.AppPort. A regression that always stamped 8080
+// would break compatibility with callers that hand-build Wake frames
+// for legacy tests.
+func TestEngineWake_OverridePortZeroIsZero(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.Wake(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if vmm.lastColdBootSpec.Port != 0 {
+		t.Errorf("cold-boot Port = %d, want 0", vmm.lastColdBootSpec.Port)
+	}
+	if res.Port != 0 {
+		t.Errorf("WakeResult.Port = %d, want 0", res.Port)
+	}
+}
+
 func TestEngineWake_StaleFcVersionColdBoots(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)

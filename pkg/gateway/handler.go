@@ -37,6 +37,13 @@ type Target struct {
 	InstanceID string
 	WakeID     string
 	AddedAt    time.Time
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
+	// override port copied from AdmitInstanceResponse.port. 0
+	// = legacy 8080 (vmmd wire-boundary default). The forwarder
+	// reads this to populate ForwardHTTPRequest.port; vmmd's
+	// buildBridgeScript resolves 0 to netns.AppPort (8080) for
+	// legacy cached targets that pre-date the field.
+	Port int
 }
 
 // Backend is the seam between the edge and the rest of the platform (in
@@ -116,7 +123,15 @@ type Handler struct {
 	// the per-node vmmd client cache. nil = legacy addr-based path
 	// (default for tests and the e2e harness; production wires
 	// ForwardingReverseProxy in cmd/gatewayd/main.go).
-	proxyByNode func(nodeID string) http.Handler
+	//
+	// PR-C (issue #460 / ADR-053): the callback receives the full
+	// Target (not just the node id) so the forwarder can stamp
+	// ForwardHTTPRequest.port with the per-deployment override port
+	// the gateway cached at admit time. Legacy callers that still
+	// expect the node-id-only shape must update to func(Target)
+	// http.Handler — the wire defaulting at vmmd keeps pre-PR-C
+	// targets (Port=0) reaching 8080.
+	proxyByNode func(t Target) http.Handler
 	// topNSample is the per-request bump for the gateway-side
 	// top-N sampler (cmd/gatewayd/topn.go, issue #300). Set via
 	// SetTopNSample from cmd/gatewayd/main.go. nil in unit
@@ -228,7 +243,7 @@ func (h *Handler) WithAccountLimiter(l *Limiter) *Handler {
 // request dispatches through fn(nodeID) where nodeID is the value
 // Backend.Pick returned. nil-safe: pass nil to revert to the legacy
 // addr-based proxy path (used by tests and the e2e harness).
-func (h *Handler) WithForwarding(fn func(nodeID string) http.Handler) *Handler {
+func (h *Handler) WithForwarding(fn func(t Target) http.Handler) *Handler {
 	h.proxyByNode = fn
 	return h
 }
@@ -464,7 +479,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// bridges the HTTP bytes through the instance netns via the
 		// ForwardHTTP RPC. target stays in scope for the metrics
 		// labels and observe() last-seen hook below.
-		h.proxyByNode(target.NodeID).ServeHTTP(w, r)
+		//
+		// PR-C (issue #460 / ADR-053): the callback receives the
+		// full Target so the forwarder can stamp
+		// ForwardHTTPRequest.port with the per-deployment override
+		// port cached at admit time.
+		h.proxyByNode(target).ServeHTTP(w, r)
 	} else {
 		// Legacy addr-based path. Target.NodeID is treated as a
 		// host:port by defaultProxy — preserved for tests and the

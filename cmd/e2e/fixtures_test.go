@@ -62,6 +62,43 @@ http.createServer((req, res) => {
 	return buildTarGz(t, files)
 }
 
+// NodeFixturePort returns the bytes of a minimal Node 22 source tarball
+// whose index.js reads the `PORT` env var (issue #460 / ADR-053, PR-C).
+// The platform contract is that guest-init always stamps PORT
+// (EffectivePort() resolves to 8080 when the override is unset, and
+// to the override value otherwise), so the fixture mirrors that by
+// reading the env var with no source-level fallback — if guest-init
+// ever drops the stamp, the runner would bind :0 and the
+// TestDeployOverridePortMetal content assertion would catch the
+// regression. Callers wanting a hardcoded :3000 bind should keep
+// using NodeFixture (the legacy fixture that pre-dates PR-C).
+func NodeFixturePort(t *testing.T) []byte {
+	t.Helper()
+	const pkgJSON = `{
+  "name": "faas-fixture-node-port",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {"node": "22"},
+  "scripts": {"start": "node index.js"},
+  "dependencies": {}
+}
+`
+	const indexJS = `const http = require('http');
+const port = process.env.PORT;
+http.createServer((req, res) => {
+  res.writeHead(200, {'content-type': 'text/plain'});
+  res.end('hello from faas (override-port:' + port + ')\n');
+}).listen(parseInt(port, 10), () => console.log('node fixture listening on :' + port));
+`
+	files := map[string]string{
+		"package.json":     pkgJSON,
+		"index.js":         indexJS,
+		".faas-fixture":    "node22\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
 // PythonFixture returns the bytes of a minimal Python 3.12 source tarball
 // with Flask as the single dep. Railpack auto-detects from requirements.txt
 // and uses uvicorn+gunicorn under the hood; we don't pin that here because

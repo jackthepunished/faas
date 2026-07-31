@@ -243,6 +243,13 @@ type AppSpec struct {
 	SealedEnv       []fcvm.SealedEnvEntry
 	APIEnv          []fcvm.APIEnvEntry // issue #395 / ADR-045: plaintext per-app env
 	EgressAllowlist []string           // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
+	// Port (issue #460 / ADR-053 §Decision 1, PR-C) is the per-deployment
+	// override port the customer's app binds inside the guest. 0 = legacy
+	// 8080 (netns.AppPort default at the vmmd wire boundary). The host's
+	// waitReady + DNAT stay fixed on 8080 (ADR-009 +
+	// guest/init/portnorm_linux.go); only vmmd's ForwardHTTP bridge uses
+	// this port to dial the guest.
+	Port int
 }
 
 // SnapshotRef points at the snapshot to restore from and the Firecracker
@@ -608,6 +615,7 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 		SealedEnv:       sealed,
 		ApiEnv:          apiEnv,
 		EgressAllowlist: a.EgressAllowlist,
+		Port:            uint32(a.Port),
 	}
 }
 
