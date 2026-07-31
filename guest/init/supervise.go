@@ -41,6 +41,18 @@ func (s *Supervisor) LastExitCode() int {
 	return int(s.lastExitCode.Load())
 }
 
+// TrackCommand records the *exec.Cmd the supervisor most-recently
+// forked, swapped atomically on every restart. Read by
+// characterize_linux.go's AppPID() callback via LastAppPID.
+// Invariant: callers call TrackCommand exactly once per fork
+// (runAppWithEnv at guest/init/main_linux.go) — the same scope
+// that calls cmd.Run(). A forked-but-not-tracked cmd means
+// LastAppPID returns -1 and the characterize probe's bind-wait
+// times out (correctly classified as `job`).
+func (s *Supervisor) TrackCommand(cmd *exec.Cmd) {
+	s.lastCmd.Store(cmd)
+}
+
 // LastAppPID returns the PID of the most-recently-forked customer
 // app, or -1 if the supervisor hasn't forked yet.
 func (s *Supervisor) LastAppPID() int {

@@ -165,7 +165,7 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	// The supervisor's Run() loop captures the cmd at every
 	// restart; runAppWithEnv executes once per restart.
 	if sup != nil {
-		sup.trackCommand(cmd)
+		sup.TrackCommand(cmd)
 	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("run %v: %w", argv, err)
