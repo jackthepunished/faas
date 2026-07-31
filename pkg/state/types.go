@@ -333,11 +333,14 @@ type ScalingPolicy struct {
 	// the plan's `MaxConcurrency`. 0 = "use plan max_concurrency".
 	MaxInstances int
 	// Target is the per-instance signal the engine watches for the
-	// scale-up trigger. `Metric == ""` means "engine-derives from
+	// scale-up trigger. nil = "engine-derives from
 	// autoscale_target_rps / autoscale_target_cpu_pct" (legacy
-	// compat). PR-A only persists the shape; PR-B wires the
+	// compat, also the empty-policy projection). A non-nil zero-
+	// value struct is legal and round-trips (e.g. `{metric: "rps",
+	// value: 0}` — the engine reads Metric rather than Value for
+	// "disabled"). PR-A only persists the shape; PR-B wires the
 	// `concurrent_requests` metric, PR-C the engine cooldown.
-	Target ScalingTarget
+	Target *ScalingTarget
 	// ScaleOutCooldownS is the minimum number of seconds between
 	// two scale-out events for the same app. Floor = 1 s (no
 	// `0` traps); ceiling = 3600 s (1 h). Default = 0 means
@@ -366,25 +369,20 @@ type ScalingTarget struct {
 // round-trips, and the one the wire DTO mirrors. Empty fields render
 // as `0` (the convention is "value zero = use default"; the apid
 // gate is what enforces the floor / ceiling, not the encoder).
+// Target uses an inline struct so the nil-pointer case emits `null`
+// (mirrors the DTO's `*ScalingTarget`).
 func (p ScalingPolicy) MarshalJSON() ([]byte, error) {
-	type targetShape struct {
-		Metric string  `json:"metric,omitempty"`
-		Value  float64 `json:"value,omitempty"`
-	}
 	type policyShape struct {
-		MinInstances       int          `json:"min_instances,omitempty"`
-		MaxInstances       int          `json:"max_instances,omitempty"`
-		Target             targetShape  `json:"target,omitempty"`
-		ScaleOutCooldownS  int          `json:"scale_out_cooldown_s,omitempty"`
-		ScaleInCooldownS   int          `json:"scale_in_cooldown_s,omitempty"`
+		MinInstances      int            `json:"min_instances,omitempty"`
+		MaxInstances      int            `json:"max_instances,omitempty"`
+		Target            *ScalingTarget `json:"target,omitempty"`
+		ScaleOutCooldownS int            `json:"scale_out_cooldown_s,omitempty"`
+		ScaleInCooldownS  int            `json:"scale_in_cooldown_s,omitempty"`
 	}
-	return json.Marshal(policyShape{
-		MinInstances:      p.MinInstances,
-		MaxInstances:      p.MaxInstances,
-		Target:            targetShape(p.Target),
-		ScaleOutCooldownS: p.ScaleOutCooldownS,
-		ScaleInCooldownS:  p.ScaleInCooldownS,
-	})
+	// The struct conversion pins the jsonb encoder's tag set to the
+	// policyShape local — adding a json tag here does not silently
+	// change how the canonical state.ScalingPolicy serialises.
+	return json.Marshal(policyShape(p))
 }
 
 // UnmarshalJSON decodes the jsonb shape into the policy. Unknown
@@ -393,16 +391,12 @@ func (p ScalingPolicy) MarshalJSON() ([]byte, error) {
 // legacy` union is what the production read paths project back into
 // the in-memory struct.
 func (p *ScalingPolicy) UnmarshalJSON(data []byte) error {
-	type targetShape struct {
-		Metric string  `json:"metric,omitempty"`
-		Value  float64 `json:"value,omitempty"`
-	}
 	type policyShape struct {
-		MinInstances      int         `json:"min_instances,omitempty"`
-		MaxInstances      int         `json:"max_instances,omitempty"`
-		Target            targetShape `json:"target,omitempty"`
-		ScaleOutCooldownS int         `json:"scale_out_cooldown_s,omitempty"`
-		ScaleInCooldownS  int         `json:"scale_in_cooldown_s,omitempty"`
+		MinInstances      int            `json:"min_instances,omitempty"`
+		MaxInstances      int            `json:"max_instances,omitempty"`
+		Target            *ScalingTarget `json:"target,omitempty"`
+		ScaleOutCooldownS int            `json:"scale_out_cooldown_s,omitempty"`
+		ScaleInCooldownS  int            `json:"scale_in_cooldown_s,omitempty"`
 	}
 	var raw policyShape
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -410,7 +404,7 @@ func (p *ScalingPolicy) UnmarshalJSON(data []byte) error {
 	}
 	p.MinInstances = raw.MinInstances
 	p.MaxInstances = raw.MaxInstances
-	p.Target = ScalingTarget(raw.Target)
+	p.Target = raw.Target
 	p.ScaleOutCooldownS = raw.ScaleOutCooldownS
 	p.ScaleInCooldownS = raw.ScaleInCooldownS
 	return nil

@@ -3841,6 +3841,7 @@ components:
     ScalingPolicy:
       description: "Per-app autoscaling configuration (issue #462 / ADR-058). Mirrors the on-disk jsonb column `apps.scaling_policy`. Empty values map to the engine default (the apid gate is load-bearing for the floor / ceiling, not the encoder). PR-A persists the DTO; PR-C wires the engine; PR-D carves out the worker-class branch."
       type: object
+      additionalProperties: false
       properties:
         min_instances:
           description: "Per-app cold-wake floor. 0 = scale to zero (default). Hobby+ unlocked at PR-A (was Pro/Scale pre-#462). Free → 403 plan_min_instances_not_allowed."
@@ -3873,6 +3874,7 @@ components:
     ScalingTarget:
       description: "(metric, value) pair the engine watches for the scale-up trigger. The metric surface is closed; the unset state (null) is the legacy 'engine falls back to autoscale_target_rps' path."
       type: object
+      additionalProperties: false
       properties:
         metric:
           type: string

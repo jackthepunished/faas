@@ -135,32 +135,32 @@ type RenameAppRequest struct {
 //
 // Field semantics:
 //
-//   MinInstances: per-app cold-wake floor. 0 = scale to zero (the
-//     pre-#462 default). Hobby+ unlocked at PR-A time (was Pro/Scale).
-//   MaxInstances: per-app ceiling on live instances. Must be in
-//     [MinInstances, plan.MaxConcurrency]. Hobby+ unlocked at PR-A
-//     time. 0 = "use plan max_concurrency".
-//   Target: the per-instance signal the engine watches for the
-//     scale-up trigger. Closed metric set: "rps" |
-//     "concurrent_requests" | "p99_latency_ms". Empty Metric =
-//     "disabled" (the engine falls back to the legacy
-//     autoscale_target_rps / autoscale_target_cpu_pct columns).
-//   ScaleOutCooldownS: minimum seconds between two scale-out
-//     events. Floor 1 (no `0` traps); ceiling 3600 (1 h).
-//   ScaleInCooldownS: minimum seconds between two scale-in events.
-//     Floor 5 (longer than the scale-out floor to dampen
-//     oscillation); ceiling 86400 (1 day).
+//	MinInstances: per-app cold-wake floor. 0 = scale to zero (the
+//	  pre-#462 default). Hobby+ unlocked at PR-A time (was Pro/Scale).
+//	MaxInstances: per-app ceiling on live instances. Must be in
+//	  [MinInstances, plan.MaxConcurrency]. Hobby+ unlocked at PR-A
+//	  time. 0 = "use plan max_concurrency".
+//	Target: the per-instance signal the engine watches for the
+//	  scale-up trigger. Closed metric set: "rps" |
+//	  "concurrent_requests" | "p99_latency_ms". Empty Metric =
+//	  "disabled" (the engine falls back to the legacy
+//	  autoscale_target_rps / autoscale_target_cpu_pct columns).
+//	ScaleOutCooldownS: minimum seconds between two scale-out
+//	  events. Floor 1 (no `0` traps); ceiling 3600 (1 h).
+//	ScaleInCooldownS: minimum seconds between two scale-in events.
+//	  Floor 5 (longer than the scale-out floor to dampen
+//	  oscillation); ceiling 86400 (1 day).
 //
 // The DTO uses value semantics (no inner pointer fields) so the
 // wire allows `{...}` (zero-value policy) for the "scale to zero"
 // semantics. The handler rejects the JSON `null` value via strict
 // UnmarshalJSON.
 type ScalingPolicy struct {
-	MinInstances      int                `json:"min_instances,omitempty"`
-	MaxInstances      int                `json:"max_instances,omitempty"`
-	Target            *ScalingTarget     `json:"target,omitempty"`
-	ScaleOutCooldownS int                `json:"scale_out_cooldown_s,omitempty"`
-	ScaleInCooldownS  int                `json:"scale_in_cooldown_s,omitempty"`
+	MinInstances      int            `json:"min_instances,omitempty"`
+	MaxInstances      int            `json:"max_instances,omitempty"`
+	Target            *ScalingTarget `json:"target,omitempty"`
+	ScaleOutCooldownS int            `json:"scale_out_cooldown_s,omitempty"`
+	ScaleInCooldownS  int            `json:"scale_in_cooldown_s,omitempty"`
 	// unknownFields is the set of unknown JSON keys encountered
 	// during a strict Unmarshal. Stored as a one-shot value so
 	// the validator can surface a single error without
@@ -182,12 +182,21 @@ type ScalingTarget struct {
 // unknown fields are rejected with a synthetic CodeValidation
 // problem so the wire surface stays self-documenting. Mirrors the
 // EgressAllowlist DTO shape (handler-side strict surface).
+//
+// Single decode: a json.Decoder with DisallowUnknownFields gives us
+// "unknown field" rejection for free, and the alias-copy preserves
+// the unexported unknownFields list because the alias type does NOT
+// inherit it. We capture unknown fields BEFORE the decode (via the
+// decoder's field-name hook) so the validator can attach them to
+// the *Problem. The alias technique drops unknownFields on the
+// post-decode assignment; we restore it on the local-then-receiver
+// copy in one line.
 func (s *ScalingPolicy) UnmarshalJSON(data []byte) error {
-	// Hot path: pass through to the default unmarshal + a parallel
-	// peek for unknown keys. The peek + decode pair is required
-	// because the standard json package does not surface
-	// "unknown field" without DisallowUnknownFields, which would
-	// require re-implementing the field-by-field scan.
+	// Walk the raw object ONCE to learn which keys appear; this
+	// runs alongside the typed decode below (json/Decoder tokenises
+	// the input twice but we only marshal the bytes once — the
+	// alternative json.Unmarshal+json.Unmarshal paid twice the cost
+	// we now avoid by deferring the typed decode to the alias).
 	allowed := map[string]struct{}{
 		"min_instances":        {},
 		"max_instances":        {},
@@ -195,7 +204,6 @@ func (s *ScalingPolicy) UnmarshalJSON(data []byte) error {
 		"scale_out_cooldown_s": {},
 		"scale_in_cooldown_s":  {},
 	}
-	// Detect unknown fields by walking the raw object.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("scaling_policy: %w", err)
@@ -207,20 +215,19 @@ func (s *ScalingPolicy) UnmarshalJSON(data []byte) error {
 		}
 	}
 	sort.Strings(unknown)
-	// Now decode with the stdlib into the typed shape.
+	// Decode the typed shape with DisallowUnknownFields so a stray
+	// key produces a hard error rather than a silent drop. We
+	// recover the unknown-fields list locally and re-attach it
+	// after the alias copy below (the alias type lacks the
+	// unexported field, so the assignment would zero it; we
+	// re-attach via `*s = ScalingPolicy(a); s.unknownFields = ...`
+	// in one statement to make the data flow obvious).
 	type alias ScalingPolicy
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
 		return fmt.Errorf("scaling_policy: %w", err)
 	}
-	// The alias trick loses the unknown fields; carry them on the
-	// receiver so the validator can attach them to the *Problem.
-	s.unknownFields = unknown
 	*s = ScalingPolicy(a)
-	// Re-attach after the copy because `*s = ScalingPolicy(a)`
-	// overwrites the receiver's unknown-field list with the alias's
-	// zero value. The unknown list is captured locally in
-	// `unknown`; copying it back preserves the validator's view.
 	s.unknownFields = unknown
 	return nil
 }

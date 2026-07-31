@@ -334,19 +334,19 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		// The state layer is the canonical source; the DTO carries
 		// the same shape so the dashboard / CLI surface one
 		// consistent struct.
-		ScalingPolicy: statePolicyToDTO(a.ScalingPolicy),
+		ScalingPolicy:  statePolicyToDTO(a.ScalingPolicy),
 		LastScaleOutAt: a.LastScaleOutAt,
 		LastScaleInAt:  a.LastScaleInAt,
 	}
 }
 
 // statePolicyToDTO converts the state-layer `*state.ScalingPolicy`
-// to the wire DTO `*api.ScalingPolicy`. The conversion is a direct
-// field-by-field copy because the two types must NOT alias (the
-// state layer uses value-target for the jsonb round-trip; the DTO
-// uses pointer-target for the omitempty semantics). Returns nil
-// when the input is nil so legacy rows project as a JSON `null`
-// (the pre-#462 contract).
+// to the wire DTO `*api.ScalingPolicy`. Returns nil when the input
+// is nil so legacy rows project as a JSON `null` (the pre-#462
+// contract). Target is pointer-to-pointer so a customer-authored
+// `Target: {metric: "rps", value: 0}` round-trips through the read
+// path with the metric intact (the pre-fix path dropped Target when
+// Value==0, which the DTO upgrade to pointer-Target preserves).
 func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
 	if p == nil {
 		return nil
@@ -357,7 +357,7 @@ func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
 		ScaleOutCooldownS: p.ScaleOutCooldownS,
 		ScaleInCooldownS:  p.ScaleInCooldownS,
 	}
-	if p.Target.Metric != "" || p.Target.Value != 0 {
+	if p.Target != nil {
 		out.Target = &api.ScalingTarget{
 			Metric: p.Target.Metric,
 			Value:  p.Target.Value,

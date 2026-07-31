@@ -65,7 +65,7 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request, acct state.Accou
 //
 // Returns *api.Problem instead of error to mirror cmd/apid/handlers.go
 // buildApp, the established helper signature in this package.
-func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api.Limits) *api.Problem {
+func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api.Limits, app state.App) *api.Problem {
 	if req.MinInstances == nil {
 		// fall through to the egress allowlist branch
 	} else {
@@ -245,6 +245,18 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				fmt.Sprintf("unknown field(s): %s", strings.Join(sp.UnknownFields(), ", ")))
 		}
 		sp.ClearUnknownFields()
+		// Worker-class carve-out (PR-D): live here in the validator
+		// (rather than at the call site in updateApp) so an
+		// unknown-field error surfaces before the workload-class
+		// error when the wire body has both. The signal source
+		// (`pkg/vmmd/activity.ActivityTracker`) counts in-flight
+		// HTTP requests; a worker has none, so the metric is
+		// forever 0 and the engine would never admit. PR-D closes
+		// the engine-side bypass.
+		if sp.Target != nil && sp.Target.Metric == "concurrent_requests" &&
+			app.WorkloadClass == state.WorkloadClassWorker {
+			return api.ErrScalingTargetIncompatibleWithWorkloadClass("concurrent_requests")
+		}
 		// Plan gates first (403 supersedes 422): a Free customer
 		// patching a valid policy still sees the plan error.
 		if sp.MinInstances > 0 && !acct.Plan.MinInstancesAllowed() {
@@ -354,22 +366,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
-	// Issue #462 / ADR-058 / PR-D carve-out at the customer side:
-	// a worker-class app cannot use `target.metric =
-	// concurrent_requests` because the signal source
-	// (pkg/vmmd/activity.ActivityTracker) counts in-flight HTTP
-	// requests — a worker has none, so the metric is forever 0 and
-	// the engine would never admit. The apid gate rejects the PATCH
-	// at 422 with `scaling_target_incompatible_with_workload_class`
-	// so the customer sees the misconfiguration immediately. PR-D
-	// closes the engine-side bypass.
-	if req.ScalingPolicy != nil && req.ScalingPolicy.Target != nil &&
-		req.ScalingPolicy.Target.Metric == "concurrent_requests" &&
-		app.WorkloadClass == state.WorkloadClassWorker {
-		api.WriteProblem(w, api.ErrScalingTargetIncompatibleWithWorkloadClass("concurrent_requests"))
-		return
-	}
-	if prob := validateUpdateApp(&req, acct, limits); prob != nil {
+	// Issue #462 / ADR-058 / PR-D carve-out (worker-class vs
+	// `target.metric = concurrent_requests`) lives inside
+	// validateUpdateApp below, where it runs AFTER the unknown-
+	// fields check so a malformed wire body surfaces the wire-shape
+	// error rather than the workload-class error. The signal source
+	// is `pkg/vmmd/activity.ActivityTracker` (PR-B) which counts
+	// in-flight HTTP requests; a worker has none, so the metric is
+	// forever 0 and the engine would never admit.
+	if prob := validateUpdateApp(&req, acct, limits, app); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -2433,9 +2438,8 @@ func (s *server) resolveSbomPath(r *http.Request, buildID string, acct state.Acc
 // state-layer `*state.ScalingPolicy`. Returns nil when the DTO is
 // nil (the "don't touch the column" case — UpdateAppParams.Set bit
 // is the canonical signal). The conversion is a struct-by-struct
-// copy because the two types must NOT alias (the wire DTO has
-// pointer-to-Target for the omitempty semantics; the state type
-// has a value Target to keep the jsonb round-trip symmetric).
+// copy because the two types must NOT alias. With the pointer-
+// Target shape on both sides the inner field copies 1:1.
 //
 // `req.SetScalingPolicy` (the boolean bit on UpdateAppRequest) is
 // the load-bearing signal: `req.ScalingPolicy == nil` with
@@ -2456,7 +2460,7 @@ func policyPtrFromReq(req *api.UpdateAppRequest) *state.ScalingPolicy {
 		ScaleInCooldownS:  sp.ScaleInCooldownS,
 	}
 	if sp.Target != nil {
-		out.Target = state.ScalingTarget{
+		out.Target = &state.ScalingTarget{
 			Metric: sp.Target.Metric,
 			Value:  sp.Target.Value,
 		}

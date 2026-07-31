@@ -347,9 +347,9 @@ const (
 	//     "worker-class apps cannot use concurrent_requests as the
 	//     scale-up target metric". PR-A closes the customer side;
 	//     PR-D carves out the engine side.
-	CodePlanMaxInstancesNotAllowed               = "plan_max_instances_not_allowed"
-	CodeInvalidMaxInstances                      = "invalid_max_instances"
-	CodeInvalidCooldown                          = "invalid_cooldown"
+	CodePlanMaxInstancesNotAllowed                 = "plan_max_instances_not_allowed"
+	CodeInvalidMaxInstances                        = "invalid_max_instances"
+	CodeInvalidCooldown                            = "invalid_cooldown"
 	CodeScalingTargetIncompatibleWithWorkloadClass = "scaling_target_incompatible_with_workload_class"
 
 	// Account self-service (spec §17 G6, ADR-021). The

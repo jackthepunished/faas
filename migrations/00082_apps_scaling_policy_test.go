@@ -220,14 +220,27 @@ func TestMigrations_00082_AppsScalingPolicy(t *testing.T) {
 }
 
 // isCheckViolation is the duck-typed check for a Postgres 23514
-// (check_violation) SQLSTATE. Avoids importing pgconn directly so the
-// test stays a single, readable fixture. The substring check is
-// sufficient for a migration test — every 23514 message carries
-// the literal "check" string somewhere in the wrapped pq error.
+// (check_violation) SQLSTATE. Avoids importing pgconn directly so
+// the test stays a single, readable fixture. We pin BOTH the
+// SQLSTATE code AND the human-readable marker (`check_violation`
+// or `check constraint`) so a future pgx upgrade that rephrases
+// the literal substring still trips the test via the SQLSTATE
+// match. The order matters: SQLSTATE first (stable across all pgx
+// versions), literal substring as a fallback.
 func isCheckViolation(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "23514") || strings.Contains(msg, "check")
+	// SQLSTATE 23514 is "check_violation" — emitted by every pgx
+	// release since the driver was written. The literal SQLSTATE
+	// is the durable anchor.
+	if strings.Contains(msg, "SQLSTATE 23514") || strings.Contains(msg, "23514") {
+		return true
+	}
+	// Fallback: when SQLSTATE is omitted (older pq wrapper) check
+	// the human-readable form. The literal phrase "check
+	// constraint" is part of the pgx error formatter and is
+	// stable across the supported releases.
+	return strings.Contains(msg, "check constraint")
 }
