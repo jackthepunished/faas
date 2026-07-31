@@ -1,15 +1,53 @@
-# postgres_backup — install the nightly pg_basebackup timer (spec §14 M8).
+# postgres_backup — install the nightly pg_basebackup timer (spec §14 M8)
+# + the off-host push timer (issue #250).
 #
 # Runs AFTER the `postgres` role so:
 #   * the cluster is up (postgresql.service exists),
 #   * the `faas` system user + DB exist (the role reads them),
 #   * `/var/lib/pgsql/archive` exists (postgres role:158-165),
 #   * WAL archiving is wired (wal_level=replica, archive_mode=on,
-#     archive_command='cp %p /var/lib/pgsql/archive/%f').
+#     archive_command wired — issue #250 rewrites the cp-only baseline
+#     to rclone to Hetzner Storage Box).
 #
 # This role does NOT change PG config — the producer only consumes the
-# existing GUCs. It only drops two systemd units into /etc/systemd/system/
-# and enables the timer. Re-running is a no-op on a converged box.
+# existing GUCs. It drops four systemd units into /etc/systemd/system/
+# and enables both timers. Re-running is a no-op on a converged box.
+#
+# Off-host push wiring (issue #250):
+#   * rclone installed via apt (matches the postgres-15 install
+#     pattern; we don't vendor binaries).
+#   * /etc/faas/secrets/storage-box/{rclone.conf,box-age-key} are
+#     sealed-at-rest via host.age (PR #371 cosign precedent) and
+#     decrypted into a tmpfs staging dir at ansible-run time. systemd
+#     `LoadCredential=` surfaces the plaintext file inside the push
+#     unit's $CREDENTIALS_DIRECTORY; rclone reads `%d/faas_storage_box_rclone`.
+#   * Fail-closed asserts on mode + owner + group for every secret
+#     file (mirrors the canonical `stat` + `failed_when` block in
+#     control_plane_service/tasks/main.yml:108-209).
+#   * HETZNER_STORAGE_BOX_USER / HETZNER_STORAGE_BOX_HOST env vars
+#     are read from /etc/faas/sealed.env (operator-provisioned
+#     secret surface — see deploy/controlplane/sealed.env.example).
+
+- name: postgres_backup — fail-closed on missing Hetzner Storage Box env
+  ansible.builtin.assert:
+    that:
+      - hetzner_storage_box_user is defined and hetzner_storage_box_user != ''
+      - hetzner_storage_box_host is defined and hetzner_storage_box_host != ''
+      - hetzner_storage_box_basebackup_path is defined and hetzner_storage_box_basebackup_path != ''
+      - hetzner_storage_box_wal_path is defined and hetzner_storage_box_wal_path != ''
+    fail_msg: >-
+      HETZNER_STORAGE_BOX_USER + HETZNER_STORAGE_BOX_HOST env vars
+      must be set in the operator shell (issue #250). The role
+      refuses to deploy off-host backup without an endpoint; source
+      /etc/faas/sealed.env before re-running.
+
+- name: postgres_backup — install rclone
+  ansible.builtin.apt:
+    name:
+      - rclone
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
 
 - name: postgres_backup — create basebackup root
   ansible.builtin.file:
@@ -38,14 +76,52 @@
     mode: "0644"
   notify: daemon-reload postgres_backup
 
+# Issue #250: off-host push wiring. The new units ride on the
+# postgres_backup role so both timers live on the same host, both
+# touch the same basebackup tree, and both run on the 03:00/03:30
+# UTC cadence (matches Postgres' WAL-archive flush window).
+- name: postgres_backup — create storage-box secret dir (0700 root:root)
+  ansible.builtin.file:
+    path: /etc/faas/secrets/storage-box
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  failed_when: false  # chroot/CI may not have /etc/faas/secrets
+
+- name: postgres_backup — drop basebackup-push.service
+  ansible.builtin.copy:
+    src: faas-pg-basebackup-push.service
+    dest: /etc/systemd/system/faas-pg-basebackup-push.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload postgres_backup
+
+- name: postgres_backup — drop basebackup-push.timer
+  ansible.builtin.copy:
+    src: faas-pg-basebackup-push.timer
+    dest: /etc/systemd/system/faas-pg-basebackup-push.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload postgres_backup
+
 - name: postgres_backup — daemon-reload
   ansible.builtin.systemd:
     daemon_reload: true
   failed_when: false  # chroot/CI lacks systemd
 
-- name: postgres_backup — enable + start the timer
+- name: postgres_backup — enable + start the local basebackup timer
   ansible.builtin.systemd:
     name: faas-pg-basebackup.timer
+    enabled: true
+    state: started
+  failed_when: false  # chroot/CI lacks systemd
+
+- name: postgres_backup — enable + start the off-host push timer
+  ansible.builtin.systemd:
+    name: faas-pg-basebackup-push.timer
     enabled: true
     state: started
   failed_when: false  # chroot/CI lacks systemd
@@ -65,3 +141,35 @@
       - pg_bb_root.stat.mode in ["0750", "0700"]
     fail_msg: "/var/lib/pgsql/basebackup must be 0750 or tighter (spec §11)"
   when: pg_bb_root.stat.exists
+
+# Issue #250 — fail-closed asserts on the storage-box secret files.
+# Mirrors control_plane_service/tasks/main.yml:108-209. The pattern
+# is `stat` + `failed_when` full-arity on mode + owner + group.
+#
+# Skipped in chroot/CI (no /etc/faas/secrets/storage-box/ yet). On a
+# real EX44 the bootstrap.sh step that decrypts host.age-sealed
+# secrets into the staging dir is required before this role passes.
+- name: postgres_backup — stat storage-box secrets
+  ansible.builtin.stat:
+    path: "/etc/faas/secrets/storage-box/{{ item }}"
+  loop:
+    - rclone.conf
+    - box-age-key
+  register: pg_sb_stat
+  failed_when: false
+
+- name: postgres_backup — assert storage-box secrets are 0400 root:root
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.mode == "0400"
+      - item.stat.pw_name == "root"
+      - item.stat.gr_name == "root"
+    fail_msg: >-
+      /etc/faas/secrets/storage-box/{{ item.item }} must be 0400
+      root:root (issue #250, spec §11). Re-run bootstrap.sh's storage-box
+      unseal step to repopulate from the host.age-sealed form.
+  loop: "{{ pg_sb_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stat.exists

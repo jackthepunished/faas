@@ -1,0 +1,23 @@
+[Unit]
+Description=Nightly onebox-faas Postgres base backup push (issue #250)
+
+[Timer]
+# 03:30 UTC — 30 min after the local 03:00 UTC basebackup (spec §14
+# M8). The slack gives pg_basebackup time to finish on a busy
+# cluster; on a quiet box it's harmless because rclone is no-op when
+# the source tree is empty.
+#
+# Persistent=true so a paused host catches up on next boot — the
+# timer stamp + rclone sync semantics mean the Storage Box converges
+# to the local state regardless of skipped runs.
+#
+# RandomizedDelaySec spreads load across a fleet; on a one-box
+# install it's harmless.
+OnCalendar=*-*-*T03:30:00Z
+Persistent=true
+RandomizedDelaySec=900
+AccuracySec=60s
+Unit=faas-pg-basebackup-push.service
+
+[Install]
+WantedBy=timers.target
