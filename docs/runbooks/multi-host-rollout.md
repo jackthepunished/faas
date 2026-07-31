@@ -46,13 +46,22 @@ horizontal-scale variant, not active-passive).
 >   copy of every app's per-app layer today, which defeats
 >   the §4.6 two-drive storage economics at fleet scale.
 > - **Tier 1 Phase 4 (per-host egress policy templating)** —
->   ✗ NOT shipped. Compute nodes on different NICs (e.g.
->   `ens5` on Hetzner) must use the upstream
->   `policy_nftables.conf` unmodified. **The "Ansible
->   inventory delta" step below gates `public_iface: eth0`
->   until Phase 4 lands** — setting it to anything other
->   than `eth0` will silently mismatch the per-host egress
->   policy.
+>   ✓ shipped in ADR-055. The static
+>   `policy_nftables.conf` is now a Jinja2 template
+>   (`policy_nftables.conf.j2`) that substitutes
+>   `{{ public_iface }}` and `{{ masquerade_cidr }}` at the
+>   two substitution sites. A Hetzner compute node on
+>   `ens5` sets `host_vars[fsn-2].public_iface: ens5` and
+>   the rendered `/etc/nftables.conf` carries that value
+>   through the forward-chain allow and postrouting
+>   MASQUERADE. The Go render at
+>   `pkg/netns.HostPolicy.Render()` is the source of truth;
+>   `make egress-render-cross-check` byte-compares the Go
+>   and Jinja2 surfaces for every supported pair. The
+>   runtime `pg_notify` watcher
+>   (`cmd/vmmd/egress_watcher.go`, migration 00077) keeps
+>   `/etc/nftables.conf` live-reloadable without a
+>   `make bootstrap` rerun.
 > - **#250 (off-host Postgres backup)** — ✗ NOT shipped.
 >   Multi-host without off-host PG backup means a CP-host
 >   loss is unrecoverable. The runbook is staging-only on
@@ -131,22 +140,35 @@ Add `host_vars/faas-fsn-2.yml` with the per-node overrides:
 
 ```yaml
 ---
-# Pre-Phase-4: public_iface MUST stay "eth0" — policy_nftables.conf
-# is hardcoded to that NIC name; a different NIC silently produces
-# an egress-denied box. Tier 1 Phase 4 (per-host templating) unblocks
-# per-host values; until then, this stays at eth0.
-public_iface: eth0
+# Per-host egress policy (ADR-055, Tier 1 Phase 4). public_iface is
+# substituted into the Jinja2 template
+# deploy/ansible/roles/nftables/files/policy_nftables.conf.j2 at the
+# forward-chain allow and the postrouting MASQUERADE. A Hetzner
+# compute node on a different NIC name (e.g. ens5) overrides here;
+# the rendered /etc/nftables.conf carries the new value through
+# both substitution sites (pkg/netns.HostPolicy.Render() is the
+# Go source of truth; `make egress-render-cross-check` byte-compares
+# the two surfaces). The default-local node on faas-fsn-1 keeps
+# eth0.
+public_iface: ens5
 
+# Per-host masquerade CIDR. Every compute node's bridged tenant VMs
+# fall in this RFC1918 slice (10.100.x.y, x.y ≥ 0.2; the bridge IP
+# .1 is reserved by pkg/fcvm/alloc.go). Distinct from fsn-1's CIDR
+# so the overlay routes don't collide across the cluster.
+#
 # Pre-Phase-3: every compute node must hold a local copy of every
-# app's per-app layer. The masquerade_cidr here is the node-local
-# RFC1918 slice that pkg/netns will NAT behind. Distinct from
-# fsn-1's CIDR so the overlay routes don't collide.
+# app's per-app layer — the OCI snapshot backend that fixes the
+# per-host layer duplication lands in Tier 1 Phase 3.
 masquerade_cidr: 10.101.0.0/16
 ```
 
-> **⚠️ Do NOT set `public_iface` to anything other than `eth0`
-> until Tier 1 Phase 4 ships.** The pre-conditions callout above
-> explains why.
+> **Note:** the inventory delta is now per-host for both fields.
+> The runtime watcher (`cmd/vmmd/egress_watcher.go`, channel
+> `egress_policy_changed`) keeps `/etc/nftables.conf` in sync with
+> the audit row, so an operator-side UPSERT on `egress_policy`
+> also hot-reloads the live ruleset without re-running
+> `make bootstrap`.
 
 ### 2. `make bootstrap` on the new node
 
@@ -320,10 +342,13 @@ If the cut-over fails irrecoverably:
   expected-CN map. The handler-layer peer binding (ADR-052) is
   the load-bearing enforcement that survives a forged leaf.
 - **Capacity reports never land** — check the
-  `egress_policy_changed` watcher on fsn-2. Without Phase 4's
-  templating, the upstream `policy_nftables.conf` rules the
-  schedd↔vmmd gRPC port (7070) out — the new node can't talk
-  to the control plane.
+  `egress_policy_changed` watcher on fsn-2
+  (`journalctl -u faas-vmmd` for the watcher logs; the
+  watcher re-renders with the host's compile-time defaults
+  on every notification). If `host_vars[fsn-2].public_iface`
+  was set to a value not present on the new node's NICs,
+  `nft -c -f` will fail the syntax check and the watcher
+  leaves the staging file on disk for inspection.
 - **Page the on-call.** A multi-host rollout that fails is page-
   severity on the staging cluster, near-page on production
   (because the rollback above restores single-box state in
@@ -337,9 +362,6 @@ If the cut-over fails irrecoverably:
 - **Tier 1 Phase 3 (`OCIRegistryStorageBackend` end-to-end)** —
   closes the "Snapshot locality" gap. Without it, every compute
   node holds a local copy of every app's per-app layer.
-- **Tier 1 Phase 4 (per-host egress templating)** — closes the
-  "Egress policy per host" gap. Until it lands, the inventory
-  delta pins `public_iface: eth0`.
 - **#250 (off-host Postgres backup)** — required before the
   runbook is production-safe.
 - **#316 (`host.age` rotation runbook)** — per-node signing-key

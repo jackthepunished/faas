@@ -497,6 +497,71 @@ func TestHostPolicyMasqueradeSubstitutesCIDRAndIface(t *testing.T) {
 	}
 }
 
+// TestHostPolicyRenderSubstitutesPublicIface (ADR-055) pins the
+// single-field substitution of PublicIface. The combined-fields
+// test above varies both fields at once; this one varies only
+// PublicIface so a regression that hard-codes `eth0` while
+// accidentally still substituting MasqueradeCIDR (or vice versa)
+// surfaces directly. The test asserts three substitution sites:
+//   - the forward chain's broad allow (`iifname "br-tenants"
+//     oifname "<iface>" accept`);
+//   - the postrouting chain's MASQUERADE rule (`ip saddr <cidr>
+//     oifname "<iface>" masquerade`);
+//   - the absence of `oifname "eth0"` once the field is varied.
+//
+// Per-host rendering (ADR-055) requires this test to pass for
+// every `host_vars[<compute_node>].public_iface` value the EX44
+// fleet uses (currently `eth0`, `ens5`).
+func TestHostPolicyRenderSubstitutesPublicIface(t *testing.T) {
+	p := DefaultHostPolicy
+	p.PublicIface = "ens5"
+	out := p.Render()
+	// Forward chain's broad allow must pick up the new iface.
+	wantFwd := `iifname "br-tenants" oifname "ens5" accept`
+	if !strings.Contains(out, wantFwd) {
+		t.Errorf("forward chain did not pick up PublicIface substitution; want %q in:\n%s", wantFwd, out)
+	}
+	// Postrouting MASQUERADE rule must also pick up the new iface.
+	wantMasq := fmt.Sprintf(`ip saddr %s oifname "ens5" masquerade`, p.MasqueradeCIDR)
+	if !strings.Contains(out, wantMasq) {
+		t.Errorf("postrouting chain did not pick up PublicIface substitution; want %q in:\n%s", wantMasq, out)
+	}
+	// Anti-regression: the production default must not appear in the
+	// rendered output once the field is varied. Scoped to `oifname
+	// "eth0"` (the IFACE token) so an unrelated `eth0` substring
+	// elsewhere doesn't false-positive.
+	if strings.Contains(out, `oifname "eth0"`) {
+		t.Errorf("rendered output retained the default PublicIface when test varied it:\n%s", out)
+	}
+}
+
+// TestHostPolicyRenderSubstitutesMasqueradeCIDR (ADR-055) pins the
+// single-field substitution of MasqueradeCIDR. Mirror of the
+// PublicIface test above: vary only MasqueradeCIDR so a regression
+// that hard-codes `10.100.0.0/16` while accidentally still
+// substituting PublicIface (or vice versa) surfaces directly.
+//
+// Per-host rendering (ADR-055) requires this test to pass for
+// every `host_vars[<compute_node>].masquerade_cidr` value the
+// fleet uses (currently `10.100.0.0/16`, `10.101.0.0/16`).
+func TestHostPolicyRenderSubstitutesMasqueradeCIDR(t *testing.T) {
+	p := DefaultHostPolicy
+	p.MasqueradeCIDR = "10.101.0.0/16"
+	out := p.Render()
+	// Postrouting chain's MASQUERADE rule must pick up the new CIDR.
+	wantMasq := fmt.Sprintf(`ip saddr 10.101.0.0/16 oifname %q masquerade`, p.PublicIface)
+	if !strings.Contains(out, wantMasq) {
+		t.Errorf("postrouting chain did not pick up MasqueradeCIDR substitution; want %q in:\n%s", wantMasq, out)
+	}
+	// Anti-regression: the production default must not appear in the
+	// rendered output once the field is varied. Scoped to the literal
+	// CIDR string so an unrelated `10.100.0.0/16` substring elsewhere
+	// (e.g. a comment) doesn't false-positive.
+	if strings.Contains(out, "ip saddr 10.100.0.0/16") {
+		t.Errorf("rendered output retained the default MasqueradeCIDR when test varied it:\n%s", out)
+	}
+}
+
 // TestHostPolicyRenderNftSyntaxCheck is the local equivalent of the
 // ansible role's `nft -c -f /etc/nftables.conf` step. CI gates this via
 // `make egress-check` (regenerates + byte-compares the artifact), but on

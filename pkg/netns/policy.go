@@ -30,6 +30,20 @@ import (
 // Fields map 1:1 to spec §11 + §7 concepts. The export is on this type (not a
 // package-level constructor) so tests can vary individual fields and assert
 // the substitution behavior.
+//
+// Per-host rendering (ADR-055). The fields `PublicIface` and
+// `MasqueradeCIDR` are the per-host substitution points. Default values
+// live on `DefaultHostPolicy` (the EX44 default-local node shape: `eth0`
+// + `10.100.0.0/16`). A Hetzner compute node on a different NIC name
+// (e.g. `ens5`) overrides via `host_vars[<compute_node>].public_iface`
+// in `deploy/ansible/roles/nftables/`. The Jinja2 template at
+// `policy_nftables.conf.j2` mirrors these substitutions site-for-site;
+// the Go render is the source of truth, and `make egress-render-cross-check`
+// byte-compares the two for the default values. The two single-field
+// tests in policy_test.go (TestHostPolicyRenderSubstitutesPublicIface
+// and TestHostPolicyRenderSubstitutesMasqueradeCIDR) pin each
+// substitution individually so the per-host rendering can't regress
+// to a hard-coded default.
 type HostPolicy struct {
 	// BridgeName is the root-ns bridge that all per-instance veth host-sides
 	// enslave to (set up by pkg/fcvm/manager.go via the TenantBridge constant
