@@ -314,11 +314,22 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 	// chunks. The first error (client disconnect, send
 	// failure) wins; the receiver goroutine below surfaces
 	// it via sendErr so the bidi close is clean.
+	//
+	// Cancellation: when r.Context() is cancelled (client
+	// disconnect, gateway-side deadline), the goroutine exits
+	// promptly via the inner ctxReader.Read returning
+	// ctx.Err(). Without this, a client that uploads 1 byte
+	// per second and then disconnects would leave the
+	// goroutine blocked on r.Body.Read until the gateway's
+	// http.Server.ReadTimeout fires — that's a goroutine
+	// leak visible in production dashboards. (Issue #471
+	// review F3 fix.)
 	bodyErrCh := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 8*1024)
+		cr := &ctxReader{r: r.Body, ctx: r.Context()}
 		for {
-			n, err := r.Body.Read(buf)
+			n, err := cr.Read(buf)
 			if n > 0 {
 				if serr := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
 					Frame: &vmmdpb.ForwardHTTPStreamRequest_BodyChunk{
@@ -329,7 +340,7 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 					return
 				}
 			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				bodyErrCh <- nil
 				_ = stream.CloseSend()
 				return
@@ -384,11 +395,17 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 		}
 		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
 			if _, werr := w.Write(chunk); werr != nil {
-				// Client disconnect mid-stream. Stop
-				// reading frames; the body goroutine
-				// will exit when its next Send fails.
+				// Client disconnect mid-stream. The
+				// receiver stops reading frames. The
+				// body-copy goroutine is cancelled via
+				// the ctxReader (F3 fix) so it exits
+				// within the stream-teardown window;
+				// drain bodyErrCh so the handler
+				// doesn't return while the goroutine
+				// is still unwinding.
 				log.Debug("gateway: forwarder stream client write failed",
 					"node", t.NodeID, "err", werr.Error())
+				<-bodyErrCh
 				return
 			}
 		}
@@ -398,6 +415,43 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 	// distinguish a clean bidi close from a client-disconnect
 	// (which surfaces as a Send error).
 	<-bodyErrCh
+}
+
+// ctxReader is a context-aware io.Reader wrapper used by
+// fwdStreamOnce's body-copy goroutine. It returns ctx.Err()
+// when the underlying context is cancelled (client disconnect,
+// gateway deadline, server shutdown) so the goroutine exits
+// promptly instead of staying blocked on r.Body.Read. The
+// base reader is used unchanged on the data path — the context
+// check is a non-blocking select race against the Read result.
+//
+// Issue #471 review F3: the body goroutine previously sat on
+// r.Body.Read until the gateway's http.Server.ReadTimeout fired
+// (up to 30 s). With ctxReader, the goroutine exits within the
+// gRPC client's normal stream-teardown latency (<1 s in
+// practice) on any context cancellation, so a client that
+// disconnects mid-upload doesn't pin the goroutine.
+type ctxReader struct {
+	r   io.Reader
+	ctx context.Context
+}
+
+func (cr *ctxReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := cr.r.Read(p)
+		ch <- result{n, err}
+	}()
+	select {
+	case <-cr.ctx.Done():
+		return 0, cr.ctx.Err()
+	case r := <-ch:
+		return r.n, r.err
+	}
 }
 
 // NodeClientCache is the production implementation of NodeClientLookup.

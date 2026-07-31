@@ -37,6 +37,7 @@
 package vmmdgrpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -45,6 +46,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -218,28 +220,65 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		return status.Errorf(codes.Internal, "pipe: %v", err)
 	}
 	defer func() { _ = stdinR.Close() }()
+	// stdinW.Close is idempotent and a no-op after the first close
+	// (the body goroutine below closes it once the gRPC stream
+	// signals end-of-body; the deferred close here is the
+	// belt-and-suspenders for the cmd.Start error path and any
+	// early returns). The defer also drains any pending writes
+	// from the body goroutine before closing.
+	defer func() { _ = stdinW.Close() }()
 
 	// 3. Spawn the bridge. Bridge stdout pipes to the server
-	//    goroutine below; stderr is captured for the Unavailable
-	//    surfacing path on bridge failure.
+	//    goroutine below via an os.Pipe (NOT a buffer) so the
+	//    server can stream the response body chunks out the
+	//    gRPC bidi stream as the bridge writes them — the
+	//    buffering path defeats the streaming purpose. Stderr
+	//    is captured for the Unavailable surfacing path on
+	//    bridge failure.
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return status.Errorf(codes.Internal, "stdout pipe: %v", err)
+	}
+	defer func() { _ = stdoutR.Close() }()
+
 	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netnsName, "sh", "-c",
 		buildStreamingBridgeScript(reqInit, respTimeout))
 	cmd.Stdin = stdinR
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	cmd.Stdout = stdoutW
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
-		_ = stdinW.Close()
+		_ = stdoutW.Close()
 		return status.Errorf(codes.Unavailable, "bridge start: %v", err)
 	}
+	// The bridge owns the write end of stdout; the reader
+	// goroutine below owns the read end. Closing stdoutW
+	// after cmd.Wait ensures the pipe reader sees EOF.
+	stdoutReaderClosed := false
+	defer func() {
+		if !stdoutReaderClosed {
+			_ = stdoutR.Close()
+		}
+	}()
 
 	// Body-copy goroutine: copies client body_chunks → bridge
 	// stdin. Errors are aggregated; the first one cancels the
-	// bidi stream via the cancelErr closure capture.
+	// bidi stream via the cancelErr closure capture. The
+	// goroutine owns the stdinW writer and closes it on exit —
+	// this is the EOF signal that lets the bridge script's
+	// stdin read loop return and the process exit. Closing it
+	// before reporting via bodyErrCh would race the server's
+	// post-loop read; closing AFTER the channel send is safe
+	// because the channel is buffered (size 1) and the server
+	// only reads from bodyErrCh after the goroutine has
+	// returned. (Issue #471 review F1 fix.)
 	bodyErrCh := make(chan error, 1)
 	go func() {
 		var written int64
+		// close stdinW exactly once at exit, regardless of
+		// which branch returned.
+		defer func() { _ = stdinW.Close() }()
 		for {
 			f, err := stream.Recv()
 			if errors.Is(err, io.EOF) {
@@ -267,11 +306,127 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		}
 	}()
 
-	// Wait for the bridge to exit (it exits when stdin EOFs OR
-	// when the timeout fires inside the script).
+	// 4. Stdout reader goroutine: reads headers from the bridge
+	//    stdout pipe, parses them via parseBridgeOutput, sends
+	//    the init frame on the gRPC stream, then streams the
+	//    body bytes as ForwardHTTPStreamResponse_BodyChunk
+	//    frames. The body stream is chunked-decoded on the fly
+	//    via httputil.NewChunkedReader when the parsed
+	//    Transfer-Encoding header indicates chunked encoding
+	//    (issue #471 review F2 fix; the prior buffered +
+	//    bytes.Buffer path forwarded raw chunked-encoded bytes
+	//    including chunk-size lines to the client).
+	//
+	//    The reader owns the read end of stdoutR; the bridge
+	//    process owns the write end. The reader sees EOF when
+	//    the bridge closes its stdout (i.e. when the bridge
+	//    process exits after `cat <&3` returns).
+	streamErrCh := make(chan error, 1)
+	go func() {
+		defer close(streamErrCh)
+		br := bufio.NewReader(stdoutR)
+		// Read until the header/body separator (\n\n). Cap
+		// the header read at 64 KiB so a malformed guest
+		// that never sends the separator can't OOM the
+		// server; in practice, HTTP/1.1 headers are <8 KiB.
+		var headBuf bytes.Buffer
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil && line == "" {
+				streamErrCh <- status.Errorf(codes.Internal, "read bridge headers: %v", err)
+				return
+			}
+			headBuf.WriteString(line)
+			if line == "\n" {
+				break
+			}
+			if headBuf.Len() > 64*1024 {
+				streamErrCh <- status.Error(codes.ResourceExhausted, "bridge headers exceed 64 KiB")
+				return
+			}
+		}
+		resp, err := parseBridgeOutput(headBuf.Bytes())
+		if err != nil {
+			streamErrCh <- status.Errorf(codes.Internal, "parse bridge headers: %v", err)
+			return
+		}
+
+		// Send the init frame first (status + headers, no body yet).
+		if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
+			Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{
+					Status:  resp.GetStatus(),
+					Headers: resp.GetHeaders(),
+				},
+			},
+		}); err != nil {
+			streamErrCh <- status.Errorf(codes.Internal, "send init: %v", err)
+			return
+		}
+
+		// Wrap the body stream in a chunked decoder if the
+		// guest emitted Transfer-Encoding: chunked. The
+		// decoder consumes the chunked framing (size-line,
+		// body bytes, CRLF terminator per chunk) and emits
+		// the decoded payload as the next Read result;
+		// io.EOF signals end-of-body.
+		var bodySrc io.Reader = br
+		if responseIsChunked(resp.GetHeaders()) {
+			bodySrc = httputil.NewChunkedReader(br)
+		}
+
+		// Stream the body in 8 KiB chunks. The chunk size
+		// matches the bridge's per-read `cat <&3` granularity
+		// at the byte level — chunks emerge from the bridge
+		// as they arrive, the gateway's statusRecorder.Write
+		// triggers maybeFlush on the 256 KiB / 200 ms
+		// boundary, and the per-flush tx_bytes increments
+		// attribute every egress byte to
+		// (instance_id, current minute).
+		buf := make([]byte, 8*1024)
+		for {
+			n, rerr := bodySrc.Read(buf)
+			if n > 0 {
+				if serr := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
+					Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{
+						BodyChunk: append([]byte(nil), buf[:n]...),
+					},
+				}); serr != nil {
+					streamErrCh <- status.Errorf(codes.Internal, "send body chunk: %v", serr)
+					return
+				}
+			}
+			if errors.Is(rerr, io.EOF) {
+				streamErrCh <- nil
+				return
+			}
+			if rerr != nil {
+				streamErrCh <- status.Errorf(codes.Internal, "read body: %v", rerr)
+				return
+			}
+		}
+	}()
+
+	// Drain the body-copy goroutine BEFORE waiting on the bridge.
+	// The bridge's stdin read loop only returns EOF when stdinW
+	// is closed, and the goroutine closes stdinW on exit (above).
+	// Reading from bodyErrCh first forces that sequence:
+	//   1. stream.Recv returns io.EOF on the body goroutine
+	//   2. body goroutine sends nil to bodyErrCh + closes stdinW
+	//   3. bridge stdin read returns EOF → bridge exits
+	//   4. cmd.Wait returns promptly
+	// (Issue #471 review F1 fix; the prior ordering
+	// cmd.Wait → stdinW.Close deadlocked every well-formed
+	// streaming request until the 900 s exec.CommandContext
+	// killed the bridge.)
+	bodyErr := <-bodyErrCh
 	bridgeErr := cmd.Wait()
-	closeErr := stdinW.Close() // signal EOF to the bridge
-	bodyErr := <-bodyErrCh     // collect the body-copy status
+	// Close stdoutW now that the bridge has exited; the reader
+	// goroutine will see EOF and exit cleanly.
+	_ = stdoutW.Close()
+	streamErr := <-streamErrCh
+	stdoutReaderClosed = true
+	_ = stdoutR.Close()
 
 	if bridgeErr != nil {
 		var exitErr *exec.ExitError
@@ -287,49 +442,11 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		}
 		return status.Errorf(codes.Unavailable, "bridge exec: %v", bridgeErr)
 	}
-	if closeErr != nil {
-		s.log.Debug("vmmd: streaming bridge stdin close", "err", closeErr.Error())
-	}
 	if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {
 		return status.Errorf(codes.InvalidArgument, "body stream: %v", bodyErr)
 	}
-
-	// 4. Parse the bridge output into init (status+headers) +
-	//    body bytes, then emit them as ForwardHTTPStreamResponse
-	//    frames. The script's output shape is unchanged
-	//    ("<status>\n<headers>\n\n<body bytes>") so parseBridgeOutput
-	//    is reused.
-	resp, err := parseBridgeOutput(stdout.Bytes())
-	if err != nil {
-		return status.Errorf(codes.Internal, "parse bridge: %v", err)
-	}
-
-	// Send the init frame first (status + headers, no body yet).
-	if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
-		Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
-			Init: &vmmdpb.ForwardHTTPResponseInit{
-				Status:  resp.GetStatus(),
-				Headers: resp.GetHeaders(),
-			},
-		},
-	}); err != nil {
-		return status.Errorf(codes.Internal, "send init: %v", err)
-	}
-
-	// Send the body as one chunk (the streaming wire shape doesn't
-	// restrict chunking — the gateway-side forwardproxy will
-	// forward each chunk to the client's statusRecorder.Write
-	// which triggers maybeFlush). Splitting into smaller pieces
-	// here is a future optimization (the bridge could pipe
-	// arbitrary-size chunks via tee; today the body is one slurp).
-	if len(resp.GetBody()) > 0 {
-		if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
-			Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{
-				BodyChunk: resp.GetBody(),
-			},
-		}); err != nil {
-			return status.Errorf(codes.Internal, "send body: %v", err)
-		}
+	if streamErr != nil {
+		return streamErr
 	}
 	return nil
 }
@@ -472,21 +589,38 @@ func buildBridgeScript(reqPath string, req *vmmdpb.ForwardHTTPRequest, dialTimeo
 //     stdin and chunked-encodes it to fd 3; EOF on stdin
 //     terminates the body read and the bridge continues to
 //     read the response.
-//   - Response read uses read -t N to bound the per-line read
-//     latency on a streaming upstream that may sit idle for
-//     many seconds between chunks. The legacy `cat <&3` slurp
-//     blocks until the guest closes the connection — fine for
-//     buffered responses, fatal for streaming because the
-//     guest keeps the connection open until the response
-//     completes.
+//   - Response: status line + headers are written to stdout
+//     (terminated by a blank line, mirroring the unary
+//     bridge's parseBridgeOutput contract); the body bytes
+//     are then streamed to stdout via a single `cat <&3` —
+//     raw from the wire, including chunked framing if the
+//     guest emitted `Transfer-Encoding: chunked`. The Go-side
+//     ForwardHTTPStream server reads the body stream
+//     incrementally via a pipe (NOT a buffer) and applies
+//     `httputil.NewChunkedReader` when the parsed
+//     Transfer-Encoding header indicates chunked encoding.
+//     This is what lets the bridge stay shell-simple while
+//     the wire-level decoding happens in Go (where binary
+//     data + per-byte framing is straightforward).
 //   - Host header rewrite + port-resolution logic mirror the
 //     legacy script (the same per-deployment override port,
 //     the same inner-IP Host).
 //
-// The output shape is unchanged ("<status>\n<headers>\n\n<body
-// bytes>") so parseBridgeOutput keeps working; the streaming
-// shape on the gRPC side is purely a server-side framing
-// translation layer on top of the same wire bytes.
+// The bridge's request path still uses the chunked-encoding
+// pattern (`read -r -t 1 -n 8192 CHUNK` → `<hex-len>\r\n<body>\r\n`)
+// because the gateway already emits Transfer-Encoding: chunked
+// to the guest; the unary bridge took the same shape.
+// respTimeout is reserved for a future per-line read deadline
+// inside the cat loop (today, `cat <&3` is the simpler
+// streaming primitive and the total budget is enforced by
+// exec.CommandContext on the Go side).
+//
+// (Issue #471 review F2 fix: the prior body loop
+// `while IFS= read -r -t N -n 8192 CHUNK <&3` emitted raw
+// chunked-encoded bytes — including chunk-size lines and
+// CRLF separators — as the body, which the gateway then
+// forwarded verbatim to the client. The Go-side pipe +
+// httputil.NewChunkedReader is the correct fix.)
 func buildStreamingBridgeScript(req *vmmdpb.ForwardHTTPRequestInit, respTimeout time.Duration) string {
 	dialPort := req.GetPort()
 	if dialPort == 0 {
@@ -524,11 +658,7 @@ func buildStreamingBridgeScript(req *vmmdpb.ForwardHTTPRequestInit, respTimeout 
 	fmt.Fprintf(&b, "  printf '\\r\\n' >&3\n")
 	fmt.Fprintf(&b, "done\n")
 	fmt.Fprintf(&b, "printf '0\\r\\n\\r\\n' >&3\n")
-	// Response: status line, headers (until blank line), then
-	// body in a streaming read with timeout. The timeout
-	// bounds idle latency on a streaming upstream that sits
-	// between chunks; total budget is enforced by
-	// exec.CommandContext on the Go side.
+	// Response status + headers (terminated by a blank line).
 	fmt.Fprintf(&b, "read -r STATUS <&3 || true\n")
 	fmt.Fprintf(&b, "printf '%%s\\n' \"$STATUS\"\n")
 	fmt.Fprintf(&b, "while IFS= read -r -t %d LINE <&3; do\n",
@@ -537,16 +667,44 @@ func buildStreamingBridgeScript(req *vmmdpb.ForwardHTTPRequestInit, respTimeout 
 	fmt.Fprintf(&b, "  printf '%%s\\n' \"$LINE\"\n")
 	fmt.Fprintf(&b, "done\n")
 	fmt.Fprintf(&b, "printf '\\n'\n")
-	// Streaming body read: pull 8 KiB at a time and write each
-	// chunk verbatim to stdout so parseBridgeOutput captures
-	// the trailing body slice as one chunk. The read's `-t`
-	// bounds per-call idle latency; on EOF (guest closed
-	// connection), the loop exits and the script ends.
-	fmt.Fprintf(&b, "while IFS= read -r -t %d -n 8192 CHUNK <&3; do\n",
-		int(respTimeout.Seconds()))
-	fmt.Fprintf(&b, "  printf '%%s' \"$CHUNK\"\n")
-	fmt.Fprintf(&b, "done\n")
+	// Body stream: copy raw bytes from fd 3 to stdout. The Go
+	// side reads stdout via a pipe (NOT a buffer) and applies
+	// chunked decoding if the parsed Transfer-Encoding header
+	// indicates chunked encoding. `cat <&3` is the simplest
+	// streaming primitive available in the minimal guest base
+	// image (POSIX-required, ships in busybox + dash); it
+	// exits when the guest closes the connection (the
+	// end-of-body signal for both Content-Length and
+	// chunked-encoded responses).
+	fmt.Fprintf(&b, "cat <&3\n")
 	return b.String()
+}
+
+// responseIsChunked reports whether the guest's response carries
+// a chunked Transfer-Encoding coding (issue #471 PR-B + PR-C /
+// ADR-047, F2 review fix). Per RFC 7230 §3.3.1, the
+// Transfer-Encoding header value is a comma-separated list of
+// codings and tokens are case-insensitive. A "chunked" coding
+// anywhere in the list means the body stream needs to be
+// decoded via httputil.NewChunkedReader before forwarding to
+// the client — otherwise chunk-size lines and CRLF separators
+// leak into the response body.
+//
+// The helper accepts the parsed header slice returned by
+// parseBridgeOutput; nil/empty headers yield false (no chunked
+// decoding, pass-through).
+func responseIsChunked(headers []*vmmdpb.Header) bool {
+	for _, h := range headers {
+		if !strings.EqualFold(h.GetName(), "Transfer-Encoding") {
+			continue
+		}
+		for _, tok := range strings.Split(h.GetValue(), ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "chunked") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parseBridgeOutput splits "<status>\n<header lines>\n\n<body bytes>"
