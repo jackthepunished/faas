@@ -1117,26 +1117,32 @@ func (s *PgStore) ApplyProjectPlan(
 	//    short-circuits with NotAllowed; paid plans compare against
 	//    the current count. We join through apps so deleted apps'
 	//    crons don't poison the cap (mirrors CreateCronIfUnderQuota).
-	if len(crons) > 0 && limits.CronLimitPerAccount == 0 {
-		return Project{}, nil, nil, &QuotaError{
-			Kind:       QuotaErrorKindCrons,
-			NotAllowed: true,
+	//    Skipped entirely when len(crons) == 0 — a Free account with
+	//    pre-existing crons (from a prior plan downgrade) must still
+	//    be able to apply a cron-less project. PR #454 review F2
+	//    finding: the cap check must not block zero-cron applies.
+	if len(crons) > 0 {
+		if limits.CronLimitPerAccount == 0 {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:       QuotaErrorKindCrons,
+				NotAllowed: true,
+			}
 		}
-	}
-	var observedCrons int
-	if err := tx.QueryRow(ctx,
-		`select count(*) from crons c
-		 join apps a on a.id = c.app_id
-		 where a.account_id = $1 and a.status <> 'deleted'`,
-		project.AccountID,
-	).Scan(&observedCrons); err != nil {
-		return Project{}, nil, nil, fmt.Errorf("state: count crons for account %s: %w", project.AccountID, err)
-	}
-	if observedCrons+len(crons) > limits.CronLimitPerAccount {
-		return Project{}, nil, nil, &QuotaError{
-			Kind:     QuotaErrorKindCrons,
-			Limit:    limits.CronLimitPerAccount,
-			Observed: observedCrons + len(crons),
+		var observedCrons int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from crons c
+			 join apps a on a.id = c.app_id
+			 where a.account_id = $1 and a.status <> 'deleted'`,
+			project.AccountID,
+		).Scan(&observedCrons); err != nil {
+			return Project{}, nil, nil, fmt.Errorf("state: count crons for account %s: %w", project.AccountID, err)
+		}
+		if observedCrons+len(crons) > limits.CronLimitPerAccount {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:     QuotaErrorKindCrons,
+				Limit:    limits.CronLimitPerAccount,
+				Observed: observedCrons + len(crons),
+			}
 		}
 	}
 

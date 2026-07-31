@@ -1153,27 +1153,33 @@ func (m *MemStore) ApplyProjectPlan(
 		}
 	}
 
-	// 4. Free-plan cron guard + cron quota check.
-	if len(crons) > 0 && limits.CronLimitPerAccount == 0 {
-		return Project{}, nil, nil, &QuotaError{
-			Kind:       QuotaErrorKindCrons,
-			NotAllowed: true,
-		}
-	}
-	observedCrons := 0
-	for _, c := range m.crons {
-		for _, a := range m.apps {
-			if c.AppID == a.ID && a.AccountID == project.AccountID && a.Status != AppDeleted {
-				observedCrons++
-				break
+	// 4. Free-plan cron guard + cron quota check. Skipped entirely
+	//    when the apply is zero-cron — a Free account with
+	//    pre-existing crons (from a prior plan downgrade) must still
+	//    be able to apply a cron-less project. Same shape as
+	//    PgStore.ApplyProjectPlan step 3 (pgstore.go:1116).
+	if len(crons) > 0 {
+		if limits.CronLimitPerAccount == 0 {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:       QuotaErrorKindCrons,
+				NotAllowed: true,
 			}
 		}
-	}
-	if observedCrons+len(crons) > limits.CronLimitPerAccount {
-		return Project{}, nil, nil, &QuotaError{
-			Kind:     QuotaErrorKindCrons,
-			Limit:    limits.CronLimitPerAccount,
-			Observed: observedCrons + len(crons),
+		observedCrons := 0
+		for _, c := range m.crons {
+			for _, a := range m.apps {
+				if c.AppID == a.ID && a.AccountID == project.AccountID && a.Status != AppDeleted {
+					observedCrons++
+					break
+				}
+			}
+		}
+		if observedCrons+len(crons) > limits.CronLimitPerAccount {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:     QuotaErrorKindCrons,
+				Limit:    limits.CronLimitPerAccount,
+				Observed: observedCrons + len(crons),
+			}
 		}
 	}
 

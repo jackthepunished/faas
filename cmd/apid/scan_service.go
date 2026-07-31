@@ -67,26 +67,26 @@ type scanPlanRequest struct {
 // the apply service. Marshaled to JSON for both the /scan and
 // /apply responses so the CLI can pass --json through verbatim.
 type scanPlanResponse struct {
-	ProjectSlug  string                 `json:"project_slug"`
-	RepoFullName string                 `json:"repo_full_name,omitempty"`
+	ProjectSlug  string                  `json:"project_slug"`
+	RepoFullName string                  `json:"repo_full_name,omitempty"`
 	ScanSource   state.ProjectScanSource `json:"scan_source"`
-	Tier         string                 `json:"tier"`
-	Workloads    []reposcan.Workload    `json:"workloads"`
+	Tier         string                  `json:"tier"`
+	Workloads    []reposcan.Workload     `json:"workloads"`
 	Managed      []reposcan.Managed      `json:"managed"`
 	Crons        []planCron              `json:"crons"`
 	// CronNames parallels Crons: when /apply runs, the apply handler
 	// uses CronNames[i] to look up the freshly inserted app_id from
 	// insertedApps (matched by Slug == WorkloadName). Not exposed
 	// on /scan responses because the scan handler doesn't need it.
-	CronNames    []string               `json:"-"`
-	Warnings     []string               `json:"warnings,omitempty"`
-	ObservedApps int                    `json:"observed_apps"`
-	ObservedCrons int                   `json:"observed_crons"`
-	LimitApps    int                    `json:"limit_apps"`
-	LimitCrons   int                    `json:"limit_crons"`
-	CanApply     bool                   `json:"can_apply"`
-	NotAllowed   bool                   `json:"crons_not_allowed,omitempty"`
-	PlanToken    string                 `json:"plan_token"`
+	CronNames     []string `json:"-"`
+	Warnings      []string `json:"warnings,omitempty"`
+	ObservedApps  int      `json:"observed_apps"`
+	ObservedCrons int      `json:"observed_crons"`
+	LimitApps     int      `json:"limit_apps"`
+	LimitCrons    int      `json:"limit_crons"`
+	CanApply      bool     `json:"can_apply"`
+	NotAllowed    bool     `json:"crons_not_allowed,omitempty"`
+	PlanToken     string   `json:"plan_token"`
 }
 
 // planCron is the cron shape returned by the scan service. We keep
@@ -214,19 +214,19 @@ func (s *server) scanService(
 	}
 
 	resp := &scanPlanResponse{
-		ProjectSlug:  req.ProjectSlug,
-		ScanSource:   deriveScanSource(filteredW),
-		Tier:         result.Tier.String(),
-		Workloads:    filteredW,
-		Managed:      filteredMc,
-		Crons:        crons,
-		Warnings:     result.Warnings,
-		ObservedApps: observedApps + len(filteredW),
+		ProjectSlug:   req.ProjectSlug,
+		ScanSource:    deriveScanSource(filteredW),
+		Tier:          result.Tier.String(),
+		Workloads:     filteredW,
+		Managed:       filteredMc,
+		Crons:         crons,
+		Warnings:      result.Warnings,
+		ObservedApps:  observedApps + len(filteredW),
 		ObservedCrons: observedCrons + len(crons),
-		LimitApps:    limits.DeployedApps,
-		LimitCrons:   limits.CronLimitPerAccount,
-		CanApply:     canApply,
-		NotAllowed:   notAllowed,
+		LimitApps:     limits.DeployedApps,
+		LimitCrons:    limits.CronLimitPerAccount,
+		CanApply:      canApply,
+		NotAllowed:    notAllowed,
 	}
 
 	// Mint a fresh plan_token unless one was supplied (apply path

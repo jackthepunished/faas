@@ -138,10 +138,10 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 	}
 
 	s.audit.Emit(r.Context(), "project.created", &acct.ID, map[string]any{
-		"project_id": insertedProject.ID,
-		"slug":       insertedProject.Slug,
+		"project_id":  insertedProject.ID,
+		"slug":        insertedProject.Slug,
 		"scan_source": string(insertedProject.ScanSource),
-		"app_count":  len(insertedApps),
+		"app_count":   len(insertedApps),
 	})
 
 	writeJSON(w, http.StatusOK, out)
@@ -161,7 +161,7 @@ type appSummary struct {
 //
 //   - apps:    403 plan_limit_apps        (with limit + observed)
 //   - crons:   402 plan_crons_not_allowed (NotAllowed=true)
-//              403 plan_cron_quota        (Limit > 0 but exceeded)
+//     403 plan_cron_quota        (Limit > 0 but exceeded)
 //
 // Both already have helper constructors in pkg/api/errors.go; this
 // function just translates the state's Kind enum into the helper call

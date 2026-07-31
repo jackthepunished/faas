@@ -1320,9 +1320,9 @@ type PlanCron struct {
 // 402/403 quota response so the CLI can render "X/Y apps" without
 // a second request.
 type QuotaBlock struct {
-	Limit   int64  `json:"limit,omitempty"`
-	Observed int64 `json:"observed,omitempty"`
-	DocsURL string `json:"docs_url,omitempty"`
+	Limit    int64  `json:"limit,omitempty"`
+	Observed int64  `json:"observed,omitempty"`
+	DocsURL  string `json:"docs_url,omitempty"`
 }
 
 // PlanResponse is the dry-run response from POST /v1/projects/scan.
@@ -1330,21 +1330,21 @@ type QuotaBlock struct {
 // DTO is the wire shape, the in-process struct is the
 // handler-internal carrier.
 type PlanResponse struct {
-	ProjectSlug    string         `json:"project_slug"`
-	RepoFullName   string         `json:"repo_full_name,omitempty"`
-	ScanSource     string         `json:"scan_source"`
-	Tier           string         `json:"tier"`
-	Workloads      []PlanWorkload `json:"workloads"`
-	Managed        []PlanManaged  `json:"managed"`
-	Crons          []PlanCron     `json:"crons"`
-	Warnings       []string       `json:"warnings,omitempty"`
-	ObservedApps   int            `json:"observed_apps"`
-	ObservedCrons  int            `json:"observed_crons"`
-	LimitApps      int            `json:"limit_apps"`
-	LimitCrons     int            `json:"limit_crons"`
-	CanApply       bool           `json:"can_apply"`
-	CronsNotAllowed bool          `json:"crons_not_allowed,omitempty"`
-	PlanToken      string         `json:"plan_token"`
+	ProjectSlug     string         `json:"project_slug"`
+	RepoFullName    string         `json:"repo_full_name,omitempty"`
+	ScanSource      string         `json:"scan_source"`
+	Tier            string         `json:"tier"`
+	Workloads       []PlanWorkload `json:"workloads"`
+	Managed         []PlanManaged  `json:"managed"`
+	Crons           []PlanCron     `json:"crons"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	ObservedApps    int            `json:"observed_apps"`
+	ObservedCrons   int            `json:"observed_crons"`
+	LimitApps       int            `json:"limit_apps"`
+	LimitCrons      int            `json:"limit_crons"`
+	CanApply        bool           `json:"can_apply"`
+	CronsNotAllowed bool           `json:"crons_not_allowed,omitempty"`
+	PlanToken       string         `json:"plan_token"`
 }
 
 // ApplyResponse is the success body for POST /v1/projects. Carries
