@@ -182,6 +182,19 @@ type Engine struct {
 	// table keep their existing single-box behaviour.
 	capacityTable *nodeCapacityTable
 
+	// nodeKeys is the in-memory (key_id → *ecdsa.PublicKey)
+	// registry the ReportCapacity handler consults to verify
+	// the report's node_signature (ADR-053). Populated by the
+	// 'compute_node_changed' pg_notify listener at startup;
+	// refreshed on every node key INSERT/UPDATE/DELETE.
+	//
+	// nil means "signature verification disabled" — pre-slice-3
+	// schedd accepts every report as in axis 5. Slice-3 schedd
+	// always returns a non-nil registry; the production wiring
+	// sets it inside cmd/schedd/main.go's NewEngine caller via
+	// WithNodeKeyRegistry (or any future wiring seam).
+	nodeKeys *NodeKeyRegistry
+
 	// defaultLocalNodeID is the resolved UUID of the 'default-local'
 	// compute_node (issue #97 / ADR-025 axis 3). Looked up once at
 	// construction via ComputeNodeByName so the router can resolve
@@ -321,7 +334,38 @@ func (e *Engine) CapacityTable() *nodeCapacityTable { return e.capacityTable }
 //
 // nil table (pre-axis-5 fixture) returns a no-op sink.
 func (e *Engine) CapacitySink() CapacitySink {
+	if e == nil || e.capacityTable == nil {
+		return func(CapacityReport) error { return nil }
+	}
 	return e.capacityTable.CapacitySink()
+}
+
+// WithNodeKeyRegistry wires the ADR-053 signature-verification
+// registry onto the engine. Called once at startup after
+// NewEngine returns; the listener for 'compute_node_changed'
+// fires Refresh on every notify. A nil registry disables
+// signature verification (pre-slice-3 mode).
+//
+// Returns the engine so it composes with the NewEngine call:
+// `e, err := NewEngine(...).WithNodeKeyRegistry(reg)`.
+func (e *Engine) WithNodeKeyRegistry(reg *NodeKeyRegistry) *Engine {
+	if e == nil {
+		return e
+	}
+	e.nodeKeys = reg
+	return e
+}
+
+// NodeKeyRegistry returns the engine's signature-verification
+// registry. nil means "verification disabled" — the handler
+// accepts every report as in pre-slice-3.
+//
+// Implements scheddgrpc.SchedAPI.
+func (e *Engine) NodeKeyRegistry() *NodeKeyRegistry {
+	if e == nil {
+		return nil
+	}
+	return e.nodeKeys
 }
 
 // WakeResult is what the gateway needs back from a wake: which instance

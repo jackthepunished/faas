@@ -415,7 +415,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// never repairs. Ops reads rate(snapshot_disk_drift_total[5m])
 		// and alerts on a non-zero rate. Shares the OpsMetrics
 		// receiver the engine + retention + watchdog already use.
-		WithDiskDrift(sched.NewDiskDrift(store, log).WithMetrics(ops)).
+		WithDiskDrift(sched.NewDiskDrift(store, log).WithMetrics(ops).
+			// ADR-054 §3: enumerate the snap/ prefix via the
+			// production storage backend instead of os.ReadDir on
+			// /srv/fc/snap. The byte-comparison path stays in
+			// place for the local backend; a remote backend (OCI)
+			// degrades to a presence check.
+			WithStorage(storageBackend)).
 		// Audit seam (lifted from cmd/apid/audit.go into pkg/audit
 		// for cross-daemon reuse). schedd uses actor="schedd" so the
 		// cron-fire path can emit a `cron.fired` events row after

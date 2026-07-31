@@ -346,3 +346,218 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// fakeOCIBackend is the stub OCI backend for the multi-prefix
+// router test. It's a full StorageBackend so it satisfies the
+// router's signature, and LocalArtifactLister so the router can
+// aggregate its keys into the router-level List. The tracker
+// counters let the test assert which backend received which key.
+type fakeOCIBackend struct {
+	blobs   map[string][]byte
+	puts    int
+	gets    int
+	deletes int
+}
+
+func newFakeOCI() *fakeOCIBackend {
+	return &fakeOCIBackend{blobs: map[string][]byte{}}
+}
+
+func (f *fakeOCIBackend) Put(_ context.Context, key string, r io.Reader) error {
+	f.puts++
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.blobs[key] = data
+	return nil
+}
+
+func (f *fakeOCIBackend) Get(_ context.Context, key string) (io.ReadCloser, error) {
+	f.gets++
+	data, ok := f.blobs[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (f *fakeOCIBackend) Delete(_ context.Context, key string) error {
+	f.deletes++
+	delete(f.blobs, key)
+	return nil
+}
+
+func (f *fakeOCIBackend) List(_ context.Context, prefix string) ([]string, error) {
+	out := make([]string, 0, len(f.blobs))
+	for k := range f.blobs {
+		if prefix == "" || strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// TestPrefixRouterLocalPlusOCI pins the ADR-054 routing semantics
+// end-to-end: a single PrefixRouter carries the canonical local
+// routes (snap/, base/, kernel/, layers/) AND a sibling OCI route
+// (apps/). Every Put/Get/Delete routes by prefix; List aggregates
+// keys from both backends. The fake OCI backend tracks per-op
+// counters so the test asserts which backend actually received
+// each request.
+func TestPrefixRouterLocalPlusOCI(t *testing.T) {
+	snap := newTestBackend(t)
+	base := newTestBackend(t)
+	kernel := newTestBackend(t)
+	layers := newTestBackend(t)
+	oci := newFakeOCI()
+
+	router, err := NewPrefixRouter(map[string]StorageBackend{
+		"snap/":   snap,
+		"base/":   base,
+		"kernel/": kernel,
+		"layers/": layers,
+		"apps/":   oci,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+	ctx := context.Background()
+
+	// --- Puts: each prefix lands in its declared backend ---
+	puts := []struct {
+		key, blob string
+	}{
+		{"snap/d-1/mem", "mem-data"},
+		{"snap/d-1/vmstate", "vmstate-data"},
+		{"base/base.ext4", "base-blob"},
+		{"kernel/v1.0", "kernel-blob"},
+		{"layers/l-1.ext4", "layer-blob"},
+		{"apps/acme/d-1.ext4", "oci-blob"},
+	}
+	for _, p := range puts {
+		if err := router.Put(ctx, p.key, strings.NewReader(p.blob)); err != nil {
+			t.Fatalf("Put %q: %v", p.key, err)
+		}
+	}
+
+	// OCI must have received exactly the apps/ key, nothing else.
+	if oci.puts != 1 {
+		t.Errorf("oci.puts = %d, want 1", oci.puts)
+	}
+	if got, err := readTestBackend(ctx, oci, "acme/d-1.ext4"); err != nil {
+		t.Errorf("read OCI apps/acme/d-1.ext4: %v", err)
+	} else if got != "oci-blob" {
+		t.Errorf("OCI apps/acme/d-1.ext4 = %q, want %q", got, "oci-blob")
+	}
+
+	// Local backends each received exactly their own key. The
+	// router strips the route prefix before forwarding to the
+	// LocalStorageBackend, so we read using the stripped key
+	// directly from the backend (which mirrors what the
+	// underlying fs layout looks like).
+	for _, want := range []struct{ prefix, strippedKey, blob string }{
+		{"snap", "d-1/mem", "mem-data"},
+		{"snap", "d-1/vmstate", "vmstate-data"},
+		{"base", "base.ext4", "base-blob"},
+		{"kernel", "v1.0", "kernel-blob"},
+		{"layers", "l-1.ext4", "layer-blob"},
+	} {
+		got, err := readTestBackend(ctx, mustLister(t, want.prefix, snap, base, kernel, layers), want.strippedKey)
+		if err != nil {
+			t.Errorf("read %s %s: %v", want.prefix, want.strippedKey, err)
+			continue
+		}
+		if got != want.blob {
+			t.Errorf("%s %s = %q, want %q", want.prefix, want.strippedKey, got, want.blob)
+		}
+	}
+
+	// --- Get: same routing for reads ---
+	// Snapshot the counter after the List call above so we can
+	// assert the delta from a single Get. List walks every backend
+	// to aggregate keys, so it's expected to have bumped the
+	// per-backend counters; we only care about the Get path here.
+	beforeGets := oci.gets
+	got, err := router.Get(ctx, "apps/acme/d-1.ext4")
+	if err != nil {
+		t.Fatalf("Get apps/acme/d-1.ext4: %v", err)
+	}
+	if delta := oci.gets - beforeGets; delta != 1 {
+		t.Errorf("after Get: oci.gets delta = %d, want 1", delta)
+	}
+	data, err := io.ReadAll(got)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(data) != "oci-blob" {
+		t.Errorf("apps/acme/d-1.ext4 = %q, want %q", string(data), "oci-blob")
+	}
+	_ = got.Close()
+
+	// --- List: aggregates local + OCI keys ---
+	keys, err := router.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	sort.Strings(keys)
+	want := []string{
+		"apps/acme/d-1.ext4",
+		"base/base.ext4",
+		"kernel/v1.0",
+		"layers/l-1.ext4",
+		"snap/d-1/mem",
+		"snap/d-1/vmstate",
+	}
+	if !equalStrings(keys, want) {
+		t.Errorf("List = %v, want %v", keys, want)
+	}
+
+	// --- Delete: propagates to the right backend ---
+	if err := router.Delete(ctx, "apps/acme/d-1.ext4"); err != nil {
+		t.Fatalf("Delete apps/...: %v", err)
+	}
+	if oci.deletes != 1 {
+		t.Errorf("oci.deletes = %d, want 1", oci.deletes)
+	}
+	if _, err := router.Get(ctx, "apps/acme/d-1.ext4"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("after Delete, Get = %v, want ErrNotFound", err)
+	}
+}
+
+// readTestBackend pulls a blob out of the named test backend.
+// Used by TestPrefixRouterLocalPlusOCI to verify per-backend
+// round-trips without exposing internal counters.
+func readTestBackend(ctx context.Context, be StorageBackend, key string) (string, error) {
+	rc, err := be.Get(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// mustLister picks the right LocalStorageBackend for a prefix
+// assertion. Keeps TestPrefixRouterLocalPlusOCI's per-prefix
+// round-trip loop readable.
+func mustLister(t *testing.T, prefix string, snap, base, kernel, layers *LocalStorageBackend) StorageBackend {
+	t.Helper()
+	switch prefix {
+	case "snap":
+		return snap
+	case "base":
+		return base
+	case "kernel":
+		return kernel
+	case "layers":
+		return layers
+	default:
+		t.Fatalf("unknown prefix %q", prefix)
+		return nil
+	}
+}

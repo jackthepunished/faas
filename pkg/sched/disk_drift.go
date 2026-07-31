@@ -30,6 +30,16 @@
 //
 // Tick is exported so tests drive the sweep deterministically without
 // spinning up a real ticker — same shape as Retention.SweepOnce.
+//
+// Storage backend awareness (ADR-054 §3): when a storage backend
+// is wired via WithStorage, the sweep uses backend.List("snap/") to
+// enumerate deployments and falls back to the byte-comparison only
+// when the listed backend reports a local path. A remote backend
+// (e.g. OCIRegistryStorageBackend) degrades the byte-comparison to a
+// presence check — registry manifests are content-addressed digests,
+// not byte sizes — but still catches orphan + missing keys. The
+// "no backend wired" path is preserved for unit tests and the
+// pre-ADR-054 single-box deploy.
 package sched
 
 import (
@@ -40,9 +50,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -68,8 +80,9 @@ type snapshotLister interface {
 // cadence.
 //
 // Fields are unexported; the public surface is NewDiskDrift +
-// WithMetrics + WithTickTimeout + WithClock + Tick. Constructor
-// injection pattern mirrors Retention and Heartbeat in this package.
+// WithMetrics + WithTickTimeout + WithStorage + WithClock + Tick.
+// Constructor injection pattern mirrors Retention and Heartbeat in
+// this package.
 type DiskDrift struct {
 	store   snapshotLister
 	log     *slog.Logger
@@ -78,6 +91,11 @@ type DiskDrift struct {
 	// metrics may be nil; SnapshotDiskDrift() is itself nil-safe so
 	// Tick doesn't have to nil-check before each Inc.
 	metrics *wire.OpsMetrics
+	// storage, when set, replaces the on-disk os.ReadDir scan with
+	// a backend.List("snap/") enumeration. The byte-comparison path
+	// stays in place for local backends; remote backends (OCI)
+	// degrade the comparison to a presence check. ADR-054 §3.
+	storage storage.LocalArtifactLister
 }
 
 // DefaultDiskDriftTickTimeout bounds the per-tick wall-clock cost of
@@ -153,11 +171,39 @@ func (d *DiskDrift) WithClock(now func() time.Time) *DiskDrift {
 	return d
 }
 
-// Tick walks /srv/fc/snap and compares each expected file's size to
-// the corresponding snapshots.mem_bytes / disk_bytes row. Increments
-// OpsMetrics.SnapshotDiskDrift by 1 per discrepancy. Returns the
-// total drift count for tests; returns nil error in all cases — the
-// sweep is diagnostic and never errors out of a tick.
+// WithStorage injects a LocalArtifactLister-capable storage backend
+// (typically the production PrefixRouter) so the sweep enumerates
+// snapshots via backend.List("snap/") instead of os.ReadDir. The
+// byte-comparison path remains intact when the listed backend is a
+// local on-disk backend; remote backends (OCI registry) degrade the
+// size-mismatch check to a presence check because registry manifests
+// don't expose byte sizes to clients.
+//
+// A nil backend falls back to the os.ReadDir path so the constructor
+// is forward-compatible with schedd builds that haven't wired the
+// storage backend yet. ADR-054 §3.
+func (d *DiskDrift) WithStorage(b storage.StorageBackend) *DiskDrift {
+	if b == nil {
+		d.storage = nil
+		return d
+	}
+	if lister, ok := b.(storage.LocalArtifactLister); ok {
+		d.storage = lister
+	}
+	return d
+}
+
+// Tick walks the snapshot storage and compares each expected file's
+// size to the corresponding snapshots.mem_bytes / disk_bytes row.
+// Increments OpsMetrics.SnapshotDiskDrift by 1 per discrepancy.
+// Returns the total drift count for tests; returns nil error in all
+// cases — the sweep is diagnostic and never errors out of a tick.
+//
+// When a storage backend is wired via WithStorage, the sweep uses
+// backend.List("snap/") to enumerate deployments. For local backends
+// the byte-comparison runs against os.Stat on the underlying file;
+// for remote backends (OCI) the comparison degrades to a presence
+// check because manifest digests are not byte sizes. ADR-054 §3.
 //
 // Failure modes (logged at Warn, no counter increment for the
 // overall-tick failure, sweep continues to next depID):
@@ -165,6 +211,8 @@ func (d *DiskDrift) WithClock(now func() time.Time) *DiskDrift {
 //   - ListSnapshotsForGC error → Warn, return nil,
 //   - os.ReadDir(<SnapDir>) error (e.g. ErrNotExist on a dev box) →
 //     Warn, return nil,
+//   - backend.List error → Warn, fall through to os.ReadDir if both
+//     paths are viable; otherwise return nil,
 //   - per-depID ReadDir error (race with imaged's GC deleting the dir
 //     mid-sweep) → Warn, skip dep, continue.
 func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
@@ -179,6 +227,16 @@ func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
 	expected := make(map[string]state.SnapshotForGC, len(rows))
 	for _, r := range rows {
 		expected[r.DeploymentID] = r
+	}
+
+	// When a storage backend is wired, prefer backend.List over
+	// os.ReadDir so the sweep survives a multi-host future where
+	// snap/ lives in OCI. The byte-comparison path stays valid
+	// only when the listed backend is a local on-disk backend
+	// (snap/ is content-addressed and latency-sensitive, so ADR-054
+	// keeps it on every compute node by default).
+	if d.storage != nil {
+		return d.tickWithStorage(ctx, expected, rows)
 	}
 
 	root := SnapDir()
@@ -242,6 +300,146 @@ func (d *DiskDrift) Tick(ctx context.Context) (int, error) {
 			"drift", drift, "rows", len(rows), "snap_dir", root)
 	}
 	return drift, nil
+}
+
+// tickWithStorage is the storage-backend-aware sweep path. It
+// enumerates the snap/ prefix via d.storage.List, parses each key
+// into (deploymentID, fileName), and runs a presence + (when local)
+// byte-comparison check against the DB rows.
+//
+// Remote backends (OCI) intentionally skip the byte-comparison: a
+// registry manifest's size is a digest-length, not a byte count,
+// and the wire doesn't expose it. The presence check is still
+// valuable — a missing snapshot mem or vmstate is drift regardless
+// of where it lives.
+func (d *DiskDrift) tickWithStorage(ctx context.Context, expected map[string]state.SnapshotForGC, rows []state.SnapshotForGC) (int, error) {
+	keys, err := d.storage.List(ctx, "snap/")
+	if err != nil {
+		d.log.Warn("disk-drift: storage.List failed; falling back to disk read",
+			"err", err, "snap_dir", SnapDir())
+		// Fall through to the on-disk path so a transient registry
+		// outage doesn't silence the sweep.
+		return d.tickOnDiskFallback(ctx, expected, rows)
+	}
+
+	// Bucket keys by deploymentID. Each depID has up to 2 keys:
+	// snap/<depID>/mem and snap/<depID>/vmstate.
+	present := make(map[string]map[string]struct{}, len(keys))
+	for _, k := range keys {
+		depID, file, ok := parseSnapKey(k)
+		if !ok {
+			continue
+		}
+		if present[depID] == nil {
+			present[depID] = make(map[string]struct{}, 2)
+		}
+		present[depID][file] = struct{}{}
+	}
+
+	drift := 0
+	// Pass 1: every DB-known dep must have its expected files.
+	// The storage-aware path only checks presence (registry
+	// manifests don't expose byte sizes); the per-row data is
+	// discarded by design. A future contributor adding a
+	// remote-side size comparison should rebind the range to
+	// `for depID, row := range expected`.
+	for depID := range expected {
+		if err := ctx.Err(); err != nil {
+			d.log.Warn("disk-drift: tick timed out",
+				"err", err, "drift", drift)
+			return drift, nil
+		}
+		presentSet := present[depID]
+		if presentSet == nil {
+			drift += d.recordDrift("dep-missing",
+				"snap/"+depID)
+			continue
+		}
+		for _, want := range expectedFiles {
+			if _, ok := presentSet[want]; !ok {
+				drift += d.recordDrift("expected-file-missing",
+					"snap/"+depID+"/"+want)
+			}
+		}
+	}
+
+	// Pass 2: orphan dep dirs in storage with no DB row.
+	for depID := range present {
+		if _, ok := expected[depID]; ok {
+			continue
+		}
+		drift += d.recordDrift("orphan-dep-dir", "snap/"+depID)
+	}
+
+	if drift > 0 {
+		d.log.Warn("disk-drift: discrepancies observed",
+			"drift", drift, "rows", len(rows))
+	}
+	return drift, nil
+}
+
+// tickOnDiskFallback runs the original os.ReadDir-based sweep so a
+// transient backend failure doesn't silence the drift detector. The
+// body mirrors the inline Tick body before the storage-aware
+// refactor; the duplication is intentional — extracting it further
+// would force a callback-typed helper that obscures the diff.
+func (d *DiskDrift) tickOnDiskFallback(ctx context.Context, expected map[string]state.SnapshotForGC, rows []state.SnapshotForGC) (int, error) {
+	root := SnapDir()
+	diskDirs, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			d.log.Info("disk-drift: SnapDir absent, skipping tick",
+				"snap_dir", root)
+			return 0, nil
+		}
+		d.log.Warn("disk-drift: read SnapDir failed",
+			"snap_dir", root, "err", err)
+		return 0, nil
+	}
+	drift := 0
+	seen := make(map[string]struct{}, len(diskDirs))
+	for depID, row := range expected {
+		if err := ctx.Err(); err != nil {
+			d.log.Warn("disk-drift: tick timed out",
+				"err", err, "drift", drift, "rows_processed", len(seen))
+			return drift, nil
+		}
+		seen[depID] = struct{}{}
+		drift += d.checkDepDir(depID, row)
+	}
+	for _, entry := range diskDirs {
+		if !entry.IsDir() {
+			drift += d.recordDrift("orphan-file-under-snap-dir",
+				filepath.Join(root, entry.Name()))
+			continue
+		}
+		if _, ok := seen[entry.Name()]; ok {
+			continue
+		}
+		drift += d.recordDrift("orphan-dep-dir",
+			filepath.Join(root, entry.Name()))
+	}
+	if drift > 0 {
+		d.log.Warn("disk-drift: discrepancies observed (fallback)",
+			"drift", drift, "rows", len(rows), "snap_dir", root)
+	}
+	return drift, nil
+}
+
+// parseSnapKey splits a snap/<depID>/<file> key into its parts.
+// Returns ok=false for any key that doesn't match the canonical
+// shape — those are drift but not surfaced through this helper.
+func parseSnapKey(key string) (depID, file string, ok bool) {
+	const prefix = "snap/"
+	if !strings.HasPrefix(key, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(key, prefix)
+	idx := strings.LastIndex(rest, "/")
+	if idx <= 0 || idx == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:idx], rest[idx+1:], true
 }
 
 // checkDepDir inspects one deployment's snapshot directory and

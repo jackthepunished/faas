@@ -60,9 +60,177 @@
 package sched
 
 import (
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
+
+// capacityPayloadDomain is the domain separator that prevents a
+// tier-3 cosign signature on an ext4 layer (ADR-038) from being
+// replayed as a CapacityReport signature. Mirrors sigstore's
+// Type Hints. ADR-053 §2.
+//
+// Pinned constant: any change here is a wire-incompatible break
+// of every node_signature that's been emitted under the old
+// separator. Bumping this constant is a coordinated key rotation.
+const capacityPayloadDomain = "faas.capacity.v1"
+
+// ErrSignatureMismatch is the typed error VerifyNodeSignature
+// returns when the signature bytes are valid ECDSA-P-256 (64-byte
+// raw r||s) but the verification fails. Callers map this to
+// codes.Unauthenticated on the wire.
+var ErrSignatureMismatch = errors.New("sched: capacity signature mismatch")
+
+// ErrUnknownNodeKey is the typed error returned when the report's
+// node_key_id does not resolve in the nodeKeyRegistry. Distinct
+// from ErrSignatureMismatch so a stale-registry scenario is
+// observable in logs (registry is missing the row, not the
+// signature is wrong).
+var ErrUnknownNodeKey = errors.New("sched: unknown node_key_id")
+
+// ErrEmptySignature is the typed error returned when the report
+// arrives with an empty node_signature field on a slice-3 schedd.
+// Pre-slice-3 schedd returns nil (the field is additive); the
+// slice-3 handler returns this and rejects the stream.
+var ErrEmptySignature = errors.New("sched: empty node_signature on slice-3 schedd")
+
+// CanonicalPayload builds the byte slice that
+// ECDSA-P-256-with-SHA-256 is computed over. ADR-053 §2:
+//
+//	"faas.capacity.v1" || node_id (UTF-8)
+//	  || sampled_at_unix_ms (big-endian int64)
+//	  || live_count (big-endian int32)
+//	  || leased_count (big-endian int32)
+//	  || used_mb (big-endian int32)
+//	  || ram_headroom_mb (big-endian int32)
+//	  || vcpu_busy (big-endian int32)
+//
+// The domain separator is a fixed prefix; the ints are
+// fixed-width big-endian. Total length is
+//
+//	16 + len(node_id) + 8 + 5*4 = 44 + len(node_id)
+//
+// bytes. Pure function; used by both Sign (vmmd publisher) and
+// Verify (schedd handler). The single source of truth for what
+// gets signed.
+func (r CapacityReport) CanonicalPayload() []byte {
+	// 18 (domain) + len(node_id) + 8 (int64) + 5*4 (int32s)
+	buf := make([]byte, 0, len(capacityPayloadDomain)+len(r.NodeID)+8+20)
+	buf = append(buf, []byte(capacityPayloadDomain)...)
+	buf = append(buf, []byte(r.NodeID)...)
+	var scratch [8]byte
+	binary.BigEndian.PutUint64(scratch[:], uint64(r.SampledAt.UnixMilli()))
+	buf = append(buf, scratch[:]...)
+	binary.BigEndian.PutUint32(scratch[:4], uint32(r.LiveCount))
+	buf = append(buf, scratch[:4]...)
+	binary.BigEndian.PutUint32(scratch[:4], uint32(r.LeasedCount))
+	buf = append(buf, scratch[:4]...)
+	binary.BigEndian.PutUint32(scratch[:4], uint32(r.UsedMB))
+	buf = append(buf, scratch[:4]...)
+	binary.BigEndian.PutUint32(scratch[:4], uint32(r.RAMHeadroomMB))
+	buf = append(buf, scratch[:4]...)
+	binary.BigEndian.PutUint32(scratch[:4], uint32(r.VCPUBusy))
+	buf = append(buf, scratch[:4]...)
+	return buf
+}
+
+// HashCanonicalPayload returns sha256(CanonicalPayload). Exposed
+// for tests that want to assert the digest shape directly without
+// running ECDSA.
+func (r CapacityReport) HashCanonicalPayload() []byte {
+	h := sha256.Sum256(r.CanonicalPayload())
+	return h[:]
+}
+
+// SignNodeReport produces a 64-byte raw (r||s) ECDSA P-256
+// signature over r.CanonicalPayload(). The signature is computed
+// against the SHA-256 digest of the payload (not double-hashed —
+// mirror of pkg/cosign's verifyDigest contract). Returned errors
+// reflect crypto/rand failures (rare).
+//
+// Used by the vmmd publisher (cmd/vmmd/capacity_publisher.go);
+// not used on the schedd side. Production wires this once at
+// startup with the loaded node signing key.
+func SignNodeReport(priv *ecdsa.PrivateKey, r CapacityReport) ([]byte, error) {
+	if priv == nil {
+		return nil, errors.New("sched: SignNodeReport: nil private key")
+	}
+	if priv.Curve != ecdsaP256() {
+		return nil, fmt.Errorf("sched: SignNodeReport: want P-256 curve, got %s", priv.Curve.Params().Name)
+	}
+	digest := r.HashCanonicalPayload()
+	rInt, sInt, err := ecdsaSignDeterministic(priv, digest)
+	if err != nil {
+		return nil, fmt.Errorf("sched: SignNodeReport: %w", err)
+	}
+	out := make([]byte, 64)
+	rb := rInt.Bytes()
+	sb := sInt.Bytes()
+	if len(rb) > 32 || len(sb) > 32 {
+		return nil, fmt.Errorf("sched: SignNodeReport: oversized r/s (%d/%d)", len(rb), len(sb))
+	}
+	copy(out[32-len(rb):32], rb)
+	copy(out[64-len(sb):64], sb)
+	return out, nil
+}
+
+// KeyIDForPublicKey returns the canonical key_id for a public
+// key: the SHA-256 hex of the SubjectPublicKeyInfo. The schedd
+// nodeKeyRegistry is keyed by this value; the wire's
+// CapacityReport.node_key_id carries the same value so a report
+// is routable to its registered key.
+//
+// The encoding is the standard "sha256:<lowercase-hex>" stripped
+// of its prefix — 64 hex chars. The migration's CHECK constraint
+// pins the same shape (compute_node_keys_key_id_shape).
+func KeyIDForPublicKey(pub *ecdsa.PublicKey) (string, error) {
+	if pub == nil {
+		return "", errors.New("sched: KeyIDForPublicKey: nil public key")
+	}
+	der, err := marshalPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("sched: KeyIDForPublicKey: %w", err)
+	}
+	h := sha256.Sum256(der)
+	return hexEncode(h[:]), nil
+}
+
+// VerifyNodeSignature checks the report's node_signature against
+// the public key registered under node_key_id in keys. Returns
+// nil on success, or one of:
+//
+//   - ErrUnknownNodeKey: keys is nil or doesn't carry node_key_id
+//   - ErrEmptySignature: sig is empty (slice-3 strict)
+//   - ErrSignatureMismatch: signature didn't verify
+//
+// The function does NOT verify the timestamp — that's the
+// freshness budget on the table (CapacityFreshness = 5 s).
+// node_signature already binds sampled_at_unix_ms into the
+// payload, so a replayed-old report fails verification anyway.
+func VerifyNodeSignature(r CapacityReport, sig []byte, keys nodeKeyLookup) error {
+	if len(sig) == 0 {
+		return ErrEmptySignature
+	}
+	if keys == nil {
+		return ErrUnknownNodeKey
+	}
+	pub, ok := keys.PublicKey(r.NodeKeyID)
+	if !ok {
+		return ErrUnknownNodeKey
+	}
+	if pub.Curve != ecdsaP256() {
+		return ErrSignatureMismatch
+	}
+	digest := r.HashCanonicalPayload()
+	if !verifyDigestRaw(pub, digest, sig) {
+		return ErrSignatureMismatch
+	}
+	return nil
+}
 
 // CapacityFreshness is the staleness budget a chooser applies
 // before trusting a vmmd report. Reports older than this fall
@@ -86,6 +254,12 @@ const CapacityFreshness = 5 * time.Second
 // lastSeen stamp (set in Replace) for the freshness budget,
 // not the proto's sampled_at_unix_ms, so clock skew between
 // hosts is invisible.
+//
+// NodeSignature + NodeKeyID (ADR-053) are populated by the
+// publisher when the proto's optional fields are non-empty.
+// The chooser does not consume them (signature verification
+// happens at the gRPC handler boundary; the table caches
+// already-trusted numbers).
 type CapacityReport struct {
 	NodeID        string
 	SampledAt     time.Time
@@ -94,6 +268,8 @@ type CapacityReport struct {
 	UsedMB        int32
 	RAMHeadroomMB int32
 	VCPUBusy      int32
+	NodeSignature []byte
+	NodeKeyID     string
 }
 
 // CapacitySink is the per-event callback the ReportCapacity

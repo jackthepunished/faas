@@ -41,6 +41,7 @@ func (noopEngine) StreamWarmHints(context.Context, WarmHintSink) error          
 func (noopEngine) CapacitySink() CapacitySink {
 	return func(sched.CapacityReport) error { return nil }
 }
+func (noopEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
 
 // TestServerNew_NilOpsUsesDefault confirms the
 // "ops == nil → wire.NewOpsMetrics(\"schedd\")" fallback

@@ -87,6 +87,15 @@ func (c *capturingEngine) CapacitySink() scheddgrpc.CapacitySink {
 	}
 }
 
+// NodeKeyRegistry returns nil to disable signature verification
+// (pre-slice-3 mode). The RoundTrip test sends unsigned reports
+// via plain CapacityReport proto messages — the wire field is
+// additive and the handler skips verification when the
+// registry is nil. The TestReportCapacity_Slice3StrictMode test
+// (added in Task #39) wraps this engine with a populated
+// registry.
+func (c *capturingEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
+
 // TestReportCapacity_RoundTrip drives two reports through the
 // wire and asserts the handler applies them to the table via
 // the SchedAPI.CapacitySink seam. The seam is the only surface

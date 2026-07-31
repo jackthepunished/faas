@@ -12,7 +12,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +41,107 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 )
+
+// ellipticP256 returns the P-256 curve. Mirrors
+// sched.ecdsaP256 without importing the unexported name from
+// pkg/sched — we just need a stable pointer for the curve
+// equality check inside loadNodeSigningKey.
+func ellipticP256() elliptic.Curve { return elliptic.P256() }
+
+// defaultNodeKeyPath is the canonical location for the slice-3
+// node signing key (ADR-053). Mirrors DefaultSignKeyPath from
+// pkg/cosign but lives under the vmmd-specific secrets dir so a
+// future signer split (e.g. per-daemon keys) doesn't collide.
+// Mode 0400 root:root on the install (PR-#237 stat-assert).
+const defaultNodeKeyPath = "/etc/faas/secrets/vmmd/node.key"
+
+// errNodeKeyInsecure is returned by loadNodeSigningKey when the
+// node.key file's mode permits any group/other access. Inserting
+// a node key whose file is readable by the faas-imaged or faas-
+// schedd user is a §11 G2 violation: the canonical install is
+// 0400 root:root (vmmd is the only root daemon, so the file is
+// only readable because vmmd runs as root). Anything looser
+// (group read, world read, any write/exec/setuid) is a PKI
+// tamper signal and the daemon refuses to start.
+var errNodeKeyInsecure = errors.New("vmmd: node.key mode permits group/other access")
+
+// loadNodeSigningKey loads the per-node ECDSA P-256 signing key
+// vmmd uses to stamp every CapacityReport with node_signature
+// (ADR-053).
+//
+// Returns (nil, "", nil) when the file is missing — single-box
+// dev default falls through to pre-slice-3 mode (unsigned
+// reports). The wire field is additive per ADR-016, so legacy
+// schedd silently accepts the empty signature.
+//
+// On a non-empty file: the file must be mode 0400 root:root
+// (mode 0440 owner+group read is NOT accepted here — vmmd is
+// the only root daemon, so the canonical install is owner-only
+// to keep the post-restart file-mode stat-assert simple). The
+// PEM type must be PRIVATE KEY (PKCS#8) and the curve must be
+// P-256. The key_id is computed once as SHA-256(SPKI) hex so the
+// hot path stays cheap and the schedd-side registry can bind
+// signatures to the leaf's identity without re-running the PEM
+// parse on every report.
+//
+// The matching public key is registered in schedd's
+// compute_node_keys table by an out-of-band install step; the
+// registry listens for `compute_node_changed` pg_notify and
+// picks up the row within its next refresh tick (migration
+// 00075).
+func loadNodeSigningKey() (*ecdsa.PrivateKey, string, error) {
+	path := envOr("FAAS_VMMD_NODE_KEY_PATH", defaultNodeKeyPath)
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Pre-slice-3 mode: no node key on disk. The
+			// publisher emits unsigned reports; legacy
+			// schedd accepts, slice-3 schedd (with a
+			// configured registry) rejects the stream.
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("vmmd: stat node key %q: %w", path, err)
+	}
+	// Mode 0400 strict. vmmd is root, so group/other bits are
+	// an unambiguous tamper signal. Anything looser →
+	// errNodeKeyInsecure (fail-loud, not fail-open).
+	if perm := info.Mode().Perm(); perm != 0o400 {
+		return nil, "", fmt.Errorf("vmmd: node.key %q mode %#o: %w",
+			path, perm, errNodeKeyInsecure)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("vmmd: read node key %q: %w", path, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, "", fmt.Errorf("vmmd: node key %q is not PEM-encoded", path)
+	}
+	// PKCS#8 form. The image builder (cmd/faas-pki) emits
+	// "PRIVATE KEY" (PKCS#8), not "EC PRIVATE KEY" (SEC1),
+	// so the matching PEM type is required.
+	if block.Type != "PRIVATE KEY" {
+		return nil, "", fmt.Errorf("vmmd: node key %q PEM type %q, want PRIVATE KEY",
+			path, block.Type)
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("vmmd: parse node key %q: %w", path, err)
+	}
+	priv, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, "", fmt.Errorf("vmmd: node key %q is not ECDSA (got %T)", path, key)
+	}
+	if priv.Curve != ellipticP256() {
+		return nil, "", fmt.Errorf("vmmd: node key %q curve %s, want P-256",
+			path, priv.Curve.Params().Name)
+	}
+	keyID, err := sched.KeyIDForPublicKey(&priv.PublicKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("vmmd: compute key_id for %q: %w", path, err)
+	}
+	return priv, keyID, nil
+}
 
 const metricsPath = "/metrics"
 
@@ -107,7 +212,7 @@ type runDeps struct {
 	// *fcvm.Manager so the production wiring still passes `mgr` (which
 	// satisfies the interface) and tests can inject a stub without
 	// booting a real Manager.
-	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, scheddClientTLS *tls.Config, tick time.Duration, resident func() (map[string]int64, bool), log *slog.Logger)
+	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, scheddClientTLS *tls.Config, tick time.Duration, resident func() (map[string]int64, bool), nodeKey *ecdsa.PrivateKey, nodeKeyID string, log *slog.Logger)
 }
 
 func defaultDeps() runDeps {
@@ -432,10 +537,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if resident == nil {
 			resident = leakcheckResidentBytes
 		}
-		if deps.startCapacityPublish != nil {
-			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, log)
+		// Slice-3 (ADR-053): load the node signing key from
+		// disk. The key file is at /etc/faas/secrets/vmmd/node.key
+		// (mode 0400, mirror of the mTLS leaf's posture). When
+		// the file is missing (single-box / pre-slice-3 dev
+		// default), we fall through to nil + "" and the
+		// publisher emits unsigned reports — additive, so
+		// pre-slice-3 schedd still accepts. The key_id is the
+		// SHA-256 hex of the leaf's SPKI; we compute it once
+		// at startup so the hot path stays cheap.
+		nodeKey, nodeKeyID, keyErr := loadNodeSigningKey()
+		if keyErr != nil {
+			return fmt.Errorf("vmmd: load node signing key: %w", keyErr)
+		}
+		if nodeKey != nil {
+			log.Info("vmmd: capacity reports will be signed", "key_id", nodeKeyID)
 		} else {
-			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, log)
+			log.Info("vmmd: capacity reports unsigned (no node.key); pre-slice-3 mode")
+		}
+		if deps.startCapacityPublish != nil {
+			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log)
+		} else {
+			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log)
 		}
 		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())
 	}
