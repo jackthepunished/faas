@@ -499,6 +499,16 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 	//   - `://DOMAIN"`         string-terminated generic catch-all
 	//   - `docs.DOMAIN`        matches the issue's literal spelling + `apps.DOMAIN` style
 	//   - `.DOMAIN`            suffix-bearing catch-all (covers `apps.DOMAIN`)
+	//
+	// Overlap note: `https://docs/DOMAIN` is a strict superset of
+	// `https://DOMAIN`, and `://DOMAIN/` is a strict superset of
+	// `://DOMAIN`. The redundant entries are kept on purpose — the
+	// exact entries document the pre-rename literal form a future
+	// regression could re-introduce. Walker's `strings.Contains`
+	// short-circuits per match, so the overlap has no runtime cost.
+	// Don't delete the "redundant" entries without also deleting the
+	// comment lines above; one without the other is a confusing
+	// intermediate state.
 	forbidden := []string{
 		"https://docs/DOMAIN",
 		"https://DOMAIN",

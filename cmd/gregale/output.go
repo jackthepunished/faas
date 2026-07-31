@@ -23,6 +23,8 @@ import (
 	"io"
 	"os"
 	"sync/atomic"
+
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // stdoutIsTTY is defined per-platform: isatty_unix.go calls
@@ -109,7 +111,11 @@ var testOnlyTTY *bool
 // Used by PrintUsage so every `usage:` line carries a stable, namespaced
 // link to the docs site. Mirrors how the systemd unit files use
 // `https://docs.gregale.dev/ops/<daemon>` — same host, same convention.
-const docsURLBase = "https://docs.gregale.dev/cli/"
+// The host is sourced from pkg/wire.DocsHost (issue #420) so the
+// tripwire TestLintTripwire_NoLiteralDocsDomainEverywhere
+// (cmd/gregale/lint_tripwires_test.go) sees only one canonical home
+// for the literal.
+const docsURLBase = "https://" + wire.DocsHost + "/cli/"
 
 // RenderTitle emits the title row of an APIError render. When Enabled()
 // the leading `✗ ` glyph prefixes the title; otherwise the row is just

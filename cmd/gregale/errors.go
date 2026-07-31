@@ -7,6 +7,12 @@ import "github.com/onebox-faas/faas/pkg/api"
 // is the single point of override (an env-var override is a follow-up).
 // Issue #420 — keeps the synthesized row aligned with the live
 // Problem.DocsURL the server emits (pkg/wire.DocsHost).
+//
+// History: until PR #458 the prefix used `docs.gregale.example`, the
+// IANA-reserved example TLD (RFC 2606). Reserved and unreachable,
+// so a stray lookup failed fast and was obviously wrong. The host
+// was renamed to gregale.dev in PR #458 to match the live docs site
+// — the example domain is no longer used here.
 const docsURLPrefix = "https://docs.gregale.dev/errors"
 
 // errorDocsURL is the per-stable-Code docs URL table. Codes live in
