@@ -55,7 +55,10 @@ func TestPg_SoftDeleteAppCascade_UpdatesStatus(t *testing.T) {
 // must map the no-rows result to ErrNotFound.
 func TestPg_SoftDeleteAppCascade_NotFound(t *testing.T) {
 	s, ctx := pgStore(t)
-	if _, err := s.SoftDeleteAppCascade(ctx, "missing-id"); !errors.Is(err, state.ErrNotFound) {
+	// apps.id is UUID; the cast must succeed so the no-rows check
+	// fires (SQLSTATE 22P02 would short-circuit at parse time).
+	const missingID = "00000000-0000-0000-0000-000000000000"
+	if _, err := s.SoftDeleteAppCascade(ctx, missingID); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("missing id: got %v, want ErrNotFound", err)
 	}
 }

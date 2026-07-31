@@ -759,17 +759,25 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	if ramMB <= 0 {
 		ramMB = 128
 	}
-	// project_id (migration 00074, nullable) + workload_name
-	// (NOT NULL DEFAULT ''). The reconcile path passes a project-bound
-	// App and AppsForProject filters by project_id; the unique index
-	// apps_project_workload_uniq (project_id, workload_name) WHERE
-	// project_id IS NOT NULL means every project-bound insert must
-	// carry both columns.
+	// Coerce Type=="" to AppTypeApp so the NOT NULL CHECK
+	// (type IN ('app','function')) is satisfied (matches CreateApp).
+	appType := app.Type
+	if appType == "" {
+		appType = AppTypeApp
+	}
+	// project_id + workload_name are added by migration 00074. The
+	// reconcile path passes project-bound Apps and AppsForProject
+	// filters by project_id; the unique index apps_project_workload_uniq
+	// (project_id, workload_name) WHERE project_id IS NOT NULL means
+	// every project-bound insert must carry both columns or it
+	// collides with the prior row. project_id is nullable (empty →
+	// NULL via nullString); workload_name is NOT NULL DEFAULT '' so
+	// the empty string stays as '' (matches the v1 default).
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1334,6 +1342,12 @@ func (s *PgStore) ApplyProjectPlan(
 		if ramMB <= 0 {
 			ramMB = 128
 		}
+		// Coerce Type=="" to AppTypeApp so the NOT NULL CHECK
+		// (type IN ('app','function')) is satisfied (matches CreateApp).
+		appType := a.Type
+		if appType == "" {
+			appType = AppTypeApp
+		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
@@ -1342,7 +1356,7 @@ func (s *PgStore) ApplyProjectPlan(
 		        $11, $12, $13, $14, $15)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
-			project.AccountID, a.Slug, string(a.Type), runtime, ramMB, idle, maxConcurrency,
+			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
