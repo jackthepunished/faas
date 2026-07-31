@@ -1120,6 +1120,24 @@ type UpdateAppParams struct {
 	SetStreamingEnabled bool
 	Status              *AppStatus
 	Manifest            *AppManifest
+	// RootDir is the workload's repo-relative build context (Phase 5
+	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
+	// update; the apid handler leaves it nil on customer-initiated
+	// PATCH. Empty string = default ('' in DB). No Set* flag: the
+	// "nil vs explicit empty" distinction is irrelevant for a column
+	// whose canonical "unset" is the empty string.
+	RootDir *string
+	// WorkloadName is the per-app workload identity (e.g. the
+	// compose service name). Mirrors apps.workload_name. Same
+	// semantics as RootDir: nil = leave alone, empty string = reset
+	// to default. Reconcile writes this on every update.
+	WorkloadName *string
+	// StartCommand is the customer-supplied override for the image's
+	// entrypoint (e.g. compose `command:`). apps.start_command is
+	// NULL-able; the nullString helper treats the empty string as
+	// NULL on the wire. Reconcile writes this on every update; the
+	// apid handler leaves it nil.
+	StartCommand *string
 }
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

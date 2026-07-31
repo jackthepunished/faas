@@ -566,7 +566,24 @@ type Store interface {
 	// ErrNotFound when the app is gone so a redelivered characterize
 	// event returns cleanly.
 	SetAppWorkloadClass(ctx context.Context, appID string, class WorkloadClass, source string) (App, error)
+	// DeleteApp is the legacy soft-delete entry point used by the apid
+	// deleteApp handler. New code (Phase 5 pkg/reconcile) should call
+	// SoftDeleteAppCascade directly so it can read the returned App
+	// for the workload.removed audit row.
 	DeleteApp(ctx context.Context, id string) error
+	// SoftDeleteAppCascade marks an app deleted (status='deleted') and
+	// returns the freshly-deleted App row. Per Phase 5 user decision
+	// the cascade is *status-only*: child rows (app_envs, crons,
+	// custom_domains, deployments, instances, invocations) survive
+	// for slug-reuse and the GDPR-style hard cascade still lives in
+	// DeleteAccount. The name preserves intent for future readers —
+	// "Cascade" is a verb (propagate the delete signal) not a
+	// guarantee about child row destruction.
+	//
+	// Returns ErrNotFound when the app id is unknown. Reconciled
+	// removes that race with a concurrent re-create rely on the
+	// updated_at timestamp: the later caller wins.
+	SoftDeleteAppCascade(ctx context.Context, id string) (App, error)
 
 	// Projects (ADR-050, Phase 1).
 	//
