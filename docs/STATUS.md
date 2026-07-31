@@ -155,11 +155,17 @@ The sampling/quota shapes are in `cmd/meterd` and
 `pkg/billing/stripe`, the dunning state machine is
 `pkg/state.MarkAccountDeletionPending` (ADR-021), GB-h = plan RAM
 + 8 MB per running second is in `pkg/meter`. Functions:
-`guest/runners/{node22,python312,go124}` (handler
-contract per spec §4.9; `go124` is a new runtime — apps deploy
-with a static binary emitted by Railpack's go plan, functions
-reuse the per-request subprocess model). Cron: `pkg/sched/cron.go`, single-flight
-per scheduled fire, loop-tested in `cron_loop_test.go`. Cron caps (per-app
+`guest/runners/{node22,node24,python312,python313,go124}` (handler
+contract per spec §4.9; `go124` apps deploy with a static binary
+emitted by Railpack's go plan, functions reuse the per-request
+subprocess model. `node24` and `python313` are the Tier 1 runtime
+additions — additive on top of `node22` / `python312` with the
+same envelope contract; handler paths `/app/node24.js` and
+`/app/handler.py` respectively. See `docs/runtimes/{node24,
+python313}.md` for the per-runtime detail and ADR-052 for the
+canonical procedure to add a runtime. PR #373 (cron limits), PR
+#423 (Move 4 — async-invoke) etc. Cron: `pkg/sched/cron.go`,
+single-flight per scheduled fire, loop-tested in `cron_loop_test.go`. Cron caps (per-app
 and per-account, Free gated to 402) live in `pkg/api/limits.go` and are
 enforced by `apid`'s `createCron` under an apps `FOR UPDATE` row lock
 (mirrors `CreateAppIfUnderQuota`); store-side check at

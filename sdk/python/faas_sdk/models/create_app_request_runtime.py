@@ -1,11 +1,14 @@
 from typing import Literal
 
-CreateAppRequestRuntime = Literal["go124", "node22", "python312"]
+CreateAppRequestRuntime = Literal["go124", "go124-alpine", "node22", "node24", "python312", "python313"]
 
 CREATE_APP_REQUEST_RUNTIME_VALUES: set[CreateAppRequestRuntime] = {
     "go124",
+    "go124-alpine",
     "node22",
+    "node24",
     "python312",
+    "python313",
 }
 
 

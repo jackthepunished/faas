@@ -28,9 +28,10 @@ build: guest-runners ## Build every daemon + function runners into ./bin
 # must be built for the guest architecture (linux/amd64, CGO off). Each
 # shim is tiny (<1 MB); imaged stitches the matching one into the per-app
 # ext4 when the deploy's runtime matches (cmd/imaged wires
-# FAAS_FUNCTION_RUNNER_NODE22 / FAAS_FUNCTION_RUNNER_PYTHON312 to the
-# resulting paths). Build matrix matches guest/init.
-GUEST_RUNNERS := node22 python312 go124
+# FAAS_FUNCTION_RUNNER_<RUNTIME_UPPER> — NODE22 / PYTHON312 / GO124 /
+# GO124_ALPINE / NODE24 / PYTHON313 — to the resulting paths). Build matrix
+# matches guest/init.
+GUEST_RUNNERS := node22 python312 go124 node24 python313
 .PHONY: guest-runners
 guest-runners: ## Build function-runner shims into ./bin/runners/<runtime>/faas-runner
 	@mkdir -p $(BINDIR)/runners

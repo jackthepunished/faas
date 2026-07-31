@@ -270,9 +270,11 @@ provision:
 
       # Build function-runner shims (per-runtime). These live at
       # /usr/local/bin/faas-runner inside the per-app ext4 (drive1); the
-      # M8 PR wires them via FAAS_FUNCTION_RUNNER_NODE22 / _PYTHON312.
-      # Same build matrix as guest-init (linux/arm64, CGO off, trimpath).
-      for rt in node22 python312; do
+      # M8 PR wires them via FAAS_FUNCTION_RUNNER_<RUNTIME_UPPER>. The
+      # set here mirrors cmd/imaged/main.go's runtime matrix (node22,
+      # python312, go124, node24, python313). Same build matrix as
+      # guest-init (linux/arm64, CGO off, trimpath).
+      for rt in node22 python312 go124 node24 python313; do
         GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
           go build -trimpath -o "/tmp/faas-runner-${rt}" "${REPO}/guest/runners/${rt}"
         install -m0755 "/tmp/faas-runner-${rt}" "/usr/local/bin/faas-runner-${rt}"
@@ -325,8 +327,16 @@ provision:
       # /srv/fc/base/base.ext4 (no runtime) by default and .ext4 for
       # node22. Symlink both to the same v6-base so a single staged image
       # services every cold-boot path.
+      # Symlink order matches DefaultRuntimeBaseRefs (pkg/imaged/base_stage.go)
+      # so a future "missing in Lima but present in imaged" drift is
+      # obvious on the diff. runner-go124-alpine is intentionally absent
+      # here — that base is x86_64-only and not part of the arm64 dev path.
       install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/base.ext4
       install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/runner-node22.ext4
+      install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/runner-python312.ext4
+      install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/runner-go124.ext4
+      install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/runner-node24.ext4
+      install -m 0644 -o faas-vmmd -g faas "$V6_BASE" /srv/fc/base/runner-python313.ext4
 
       # Writable layer upper — the guest's overlay writes here. Small is fine.
       mkdir -p "${LWORK}/etc" "${LWORK}/etc/faas" "${LWORK}/tmp"

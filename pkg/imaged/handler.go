@@ -81,6 +81,16 @@ type Handler struct {
 	// (alpine/musl vs bookworm/glibc). The function layer's argv is
 	// identical to go124.
 	functionRunnerGo124AlpinePath string
+	// functionRunnerNode24Path mirrors functionRunnerNode22Path for the
+	// node24 runtime (FAAS_FUNCTION_RUNNER_NODE24). Same `node`
+	// interpreter as node22; the underlying version is bound by the OCI
+	// base image (images/runner-node24.Dockerfile, PR 2 of Tier 1), not
+	// by the runner binary. The handler path is /app/node24.js.
+	functionRunnerNode24Path string
+	// functionRunnerPython313Path mirrors functionRunnerPython312Path
+	// for the python313 runtime (FAAS_FUNCTION_RUNNER_PYTHON313).
+	// Handler path stays /app/handler.py (version-neutral on the wire).
+	functionRunnerPython313Path string
 	// deployBaseRefOverride replaces the per-runtime base ref during
 	// aboveBaseLayers. See WithDeployBaseRef — test-only seam.
 	deployBaseRefOverride string
@@ -164,6 +174,25 @@ func (h *Handler) WithFunctionRunnerGo124(p string) *Handler {
 // FAAS_FUNCTION_RUNNER_GO124_ALPINE.
 func (h *Handler) WithFunctionRunnerGo124Alpine(p string) *Handler {
 	h.functionRunnerGo124AlpinePath = p
+	return h
+}
+
+// WithFunctionRunnerNode24 mirrors WithFunctionRunnerNode22 for the
+// node24 runtime. Wired from cmd/imaged via FAAS_FUNCTION_RUNNER_NODE24.
+// The runner binary is built from guest/runners/node24 and is identical
+// in shape to the node22 shim; only --runtime and --handler defaults
+// differ (TestNode24RunnerHandlerDefault pins the /app/node24.js path).
+func (h *Handler) WithFunctionRunnerNode24(p string) *Handler {
+	h.functionRunnerNode24Path = p
+	return h
+}
+
+// WithFunctionRunnerPython313 mirrors WithFunctionRunnerPython312 for
+// the python313 runtime. Wired from cmd/imaged via
+// FAAS_FUNCTION_RUNNER_PYTHON313. Handler path stays /app/handler.py
+// (TestPython313RunnerHandlerDefault pins it).
+func (h *Handler) WithFunctionRunnerPython313(p string) *Handler {
+	h.functionRunnerPython313Path = p
 	return h
 }
 
@@ -648,7 +677,7 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// doesn't carry the runtime — keeps older clients working.
 		runtime = dep.Handler
 	}
-	if runtime != RuntimeNode22 && runtime != RuntimePython312 && runtime != RuntimeGo124 && runtime != RuntimeGo124Alpine {
+	if runtime != RuntimeNode22 && runtime != RuntimePython312 && runtime != RuntimeGo124 && runtime != RuntimeGo124Alpine && runtime != RuntimeNode24 && runtime != RuntimePython313 {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "unsupported runtime: "+runtime)
 		return fmt.Errorf("imaged: unsupported function runtime %q", runtime)
 	}
@@ -687,6 +716,28 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 	// matches the default above. Adding `case RuntimeNode22 { ... }`
 	// for symmetry would silently diverge from the runner default.
 	if runtime == RuntimePython312 {
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/handler.py",
+		}
+	}
+	if runtime == RuntimeNode24 {
+		// Versioned node handler path. The runner's `--handler` default
+		// (guest/runners/node24/main.go:54) is `/app/node24.js`, pinned
+		// by TestNode24RunnerHandlerDefault; the manifest mirrors it
+		// verbatim so the round-trip works without an override.
+		manifest.Entrypoint = []string{
+			"/usr/local/bin/faas-runner",
+			"--runtime", runtime,
+			"--handler", "/app/node24.js",
+		}
+	}
+	if runtime == RuntimePython313 {
+		// Version-neutral Python handler. Like python312, the handler
+		// filename carries no version — the version is bound by the
+		// OCI base (images/runner-python313.Dockerfile). Pinned by
+		// TestPython313RunnerHandlerDefault.
 		manifest.Entrypoint = []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
@@ -781,6 +832,10 @@ func (h *Handler) runnerPathFor(runtime string) string {
 		return h.functionRunnerGo124Path
 	case RuntimeGo124Alpine:
 		return h.functionRunnerGo124AlpinePath
+	case RuntimeNode24:
+		return h.functionRunnerNode24Path
+	case RuntimePython313:
+		return h.functionRunnerPython313Path
 	}
 	return ""
 }
@@ -798,6 +853,10 @@ func runtimeToEnvSuffix(runtime string) string {
 		return "GO124"
 	case RuntimeGo124Alpine:
 		return "GO124_ALPINE"
+	case RuntimeNode24:
+		return "NODE24"
+	case RuntimePython313:
+		return "PYTHON313"
 	}
 	return runtime
 }

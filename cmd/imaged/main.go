@@ -220,6 +220,8 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		{"FAAS_FUNCTION_RUNNER_PYTHON312", imaged.RuntimePython312, func(p string) { h.WithFunctionRunnerPython312(p) }},
 		{"FAAS_FUNCTION_RUNNER_GO124", imaged.RuntimeGo124, func(p string) { h.WithFunctionRunnerGo124(p) }},
 		{"FAAS_FUNCTION_RUNNER_GO124_ALPINE", imaged.RuntimeGo124Alpine, func(p string) { h.WithFunctionRunnerGo124Alpine(p) }},
+		{"FAAS_FUNCTION_RUNNER_NODE24", imaged.RuntimeNode24, func(p string) { h.WithFunctionRunnerNode24(p) }},
+		{"FAAS_FUNCTION_RUNNER_PYTHON313", imaged.RuntimePython313, func(p string) { h.WithFunctionRunnerPython313(p) }},
 	} {
 		p := os.Getenv(kw.envKey)
 		if p == "" {
@@ -280,6 +282,17 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("imaged: stage builder base %s → %s: %w", baseRef, basePath, err)
 	}
 
+	// PR 2 of Tier 1: auto-stage every runtime base so the operator
+	// recipe ("docker build + mkfs.ext4 + scp to /srv/fc/base/...") is
+	// replaced by a single seeded table at imaged startup. Mirrors the
+	// builder-base loop above; failure aborts imaged — a partial fleet
+	// (some runtimes staged, others skipped mid-loop) silently breaks
+	// the first wake of the missing runtime, so we fail closed instead.
+	baseLoop, err := h.EnsureBases(ctx, arch, imaged.DefaultRuntimeBaseRefs, os.Getenv)
+	if err != nil {
+		return fmt.Errorf("imaged: stage runtime bases: %w", err)
+	}
+
 	loop := imaged.NewLoop(imaged.LoopConfig{
 		Handler:   h,
 		Store:     store,
@@ -303,6 +316,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		"builder_base_ref", baseRef,
 		"builder_base_digest", baseRes.ConfigDigest,
 		"builder_base_skipped", baseRes.Skipped,
+		"runtime_bases", baseLoop,
 	)
 
 	// Optional /metrics listener (this PR). Mirrors cmd/apid/main.go

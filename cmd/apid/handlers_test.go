@@ -100,6 +100,61 @@ func TestCreateApp_FunctionGo124BadRuntime(t *testing.T) {
 	}
 }
 
+// TestCreateApp_FunctionNode24Runtime is the positive pin for the
+// node24 runtime (Node 24 LTS, added in migrations/00075 + PR 1 Layer 4).
+// Mirrors TestCreateApp_FunctionGo124Runtime above: the apid-side
+// allow-list in cmd/apid/handlers.go and the DB CHECK widening must
+// stay in lockstep; if either regresses this test fires.
+func TestCreateApp_FunctionNode24Runtime(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/apps",
+		api.CreateAppRequest{Slug: "fn-node24-rt", Type: "function", Runtime: "node24"}, nil)
+	if rec.Code != 201 {
+		t.Fatalf("function with runtime=node24: %d %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Runtime != "node24" {
+		t.Errorf("runtime round-trip = %q, want node24", out.Runtime)
+	}
+}
+
+// TestCreateApp_FunctionPython313Runtime is the positive pin for the
+// python313 runtime (Python 3.13 default for RHEL/Fedora, added in
+// migrations/00075). Python handlers stay version-neutral on the
+// wire — `/app/handler.py` — but the runtime id distinguishes the
+// function base.
+func TestCreateApp_FunctionPython313Runtime(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/apps",
+		api.CreateAppRequest{Slug: "fn-py313-rt", Type: "function", Runtime: "python313"}, nil)
+	if rec.Code != 201 {
+		t.Fatalf("function with runtime=python313: %d %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Runtime != "python313" {
+		t.Errorf("runtime round-trip = %q, want python313", out.Runtime)
+	}
+}
+
+// TestCreateApp_FunctionNode24BadRuntime is the negative pin for the
+// widening: a runtime that LOOKS like node24 but is misspelled must
+// still be rejected with 400. The allow-list is exhaustive over the
+// six runtime ids, not "node*".
+func TestCreateApp_FunctionNode24BadRuntime(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/apps",
+		api.CreateAppRequest{Slug: "fn-node24-bad", Type: "function", Runtime: "node24beta"}, nil)
+	if rec.Code != 400 {
+		t.Errorf("function with runtime=node24beta: %d %s, want 400", rec.Code, rec.Body)
+	}
+}
+
 func TestCreateApp_AppliesDefaults(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	rec := e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "defaults-app"}, nil)

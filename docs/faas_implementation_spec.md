@@ -66,7 +66,7 @@ One physical host runs everything. Every box below is a systemd unit; every arro
 
 **Deploy path:** `apid` accepts source (≤ 100 MB) or OCI reference → `builderd` runs the build in an ephemeral builder microVM → OCI image → `imaged` converts it to a per-app **app layer** over a shared read-only base (two-drive scheme, §4.6) + injects `guest-init` → boots once, waits ready, pauses, snapshots → app state = `PARKED`. First deploy of an app is also its first snapshot.
 
-**Two workload models, one data plane (ADR-003):** an *App* is any HTTP server listening on `:8080` in its microVM. A *Function* is an App whose rootfs we generate from a platform runner image (node22 / python312) wrapping the customer's handler file behind the same `:8080` contract. Functions get zero new infrastructure: same lifecycle, same snapshots, same metering, same routing. Cron triggers are synthetic requests fired by `schedd`.
+**Two workload models, one data plane (ADR-003):** an *App* is any HTTP server listening on `:8080` in its microVM. A *Function* is an App whose rootfs we generate from a platform runner image (node22 / node24 / python312 / python313 / go124 / go124-alpine) wrapping the customer's handler file behind the same `:8080` contract. Functions get zero new infrastructure: same lifecycle, same snapshots, same metering, same routing. Cron triggers are synthetic requests fired by `schedd`.
 
 ---
 
@@ -116,7 +116,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 - Auth: API keys (`fp_live_…`, SHA-256 stored), per-user; sessions for the dashboard later. Every key scoped to an account.
 - Resources (all JSON; full endpoint table in Appendix A): accounts, apps, deployments, builds, instances (read-only), usage, plans, custom_domains.
 - Deploy inputs (three, ADR-004): `POST /v1/apps/{app}/deployments` with (a) tarball upload `source` (≤ 100 MB Free/Hobby, ≤ 250 MB Pro/Scale — reject larger with `413` and a docs link), (b) `dockerfile: true` flag if tarball root has one, or (c) `image: registry.gregale.dev/...@sha256:...` reference.
-- Function deploys: `type: function`, `runtime: node22 | python312`, tarball contains `handler.{js,py}` (+ optional `package.json` / `requirements.txt`). apid rewrites this into an App deployment using the runner scaffold (§4.9) and the same pipeline runs.
+- Function deploys: `type: function`, `runtime: node22 | node24 | python312 | python313 | go124 | go124-alpine`, tarball contains `handler.{js,py}` (+ optional `package.json` / `requirements.txt`). apid rewrites this into an App deployment using the runner scaffold (§4.9) and the same pipeline runs.
 - Validation enforces plan quotas *before* work happens: deployed-sandbox count, RAM size ≤ plan cap, concurrency setting ≤ plan cap.
 - Idempotency: `Idempotency-Key` header on all POSTs, stored 24 h.
 - Never talks to vmmd/builderd directly — writes rows, notifies via `pg_notify`; owners poll/listen.
@@ -160,9 +160,9 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 
 **Owns:** OCI → bootable rootfs conversion, base images, kernels, snapshot GC.
 
-- **Two-drive scheme (protects the 130 MB fleet target):** drive0 = shared, read-only, content-addressed **base rootfs** (`base-minimal`, `runner-node22`, `runner-python312` — counted once, in the 60 GB reserve); drive1 = per-app **app layer** ext4 containing only the OCI layers above the base (deps + code + `/etc/faas/app.json`). guest-init assembles them with overlayfs at boot. A flattened single-drive rootfs would duplicate ~150+ MB of base per app and silently destroy the financial model's disk math — do not "simplify" to it.
+- **Two-drive scheme (protects the 130 MB fleet target):** drive0 = shared, read-only, content-addressed **base rootfs** (`base-minimal`, `runner-node22`, `runner-node24`, `runner-python312`, `runner-python313`, `runner-go124`, `runner-go124-alpine` — counted once, in the 60 GB reserve); drive1 = per-app **app layer** ext4 containing only the OCI layers above the base (deps + code + `/etc/faas/app.json`). guest-init assembles them with overlayfs at boot. A flattened single-drive rootfs would duplicate ~150+ MB of base per app and silently destroy the financial model's disk math — do not "simplify" to it.
 - App-layer build: diff OCI layers above the matched base → `mkfs.ext4 -d <dir> layer.ext4 <padded size>`, ≤ plan app-layer cap: Free 256 MB, Hobby 512 MB, Pro 1 GB, Scale 2 GB. Content over cap fails the deploy with a clear error naming the cap and observed size. `guest-init` is injected into the app layer.
-- Base images: `runner-node22`, `runner-python312`, `builder-base` — built in CI from Dockerfiles in `images/`, content-addressed, staged to `/srv/fc/base/`.
+- Base images: `runner-node22`, `runner-node24`, `runner-python312`, `runner-python313`, `runner-go124`, `runner-go124-alpine`, `builder-base` — built in CI from Dockerfiles in `images/`, content-addressed, auto-staged to `/srv/fc/base/` by `imaged` (`pkg/imaged/base_stage.go::EnsureBases`, Tier 1 PR 2; the builder base auto-stage predated this PR). Operator-side digest pin per runtime via `FAAS_DEPLOY_BASE_REF_<RUNTIME>` env var.
 - Snapshot GC: keep current + previous deployment's snapshots per app; delete orphans nightly; enforce the 452 GB budget with account-level fairness (biggest-over-quota first). Emits `snapshot_fleet_avg_mb` and `snapshot_fleet_p95_mb` — **the** business metrics.
 
 ### 4.7 `meterd` — metering and billing
@@ -194,11 +194,11 @@ Resume path (post-restore, triggered by host signal via vsock): re-seed `/dev/ur
 
 ### 4.9 Function runners
 
-`runner-node22`, `runner-python312`: a 15-line HTTP host on `:8080` that loads the customer handler and adapts request/response.
+`runner-node22`, `runner-node24`, `runner-python312`, `runner-python313`, `runner-go124`, `runner-go124-alpine`: a 15-line HTTP host on `:8080` that loads the customer handler and adapts request/response.
 
 Contract (identical across languages): handler receives `{method, path, headers, query, body_b64}`; returns `{status, headers, body_b64}` or a plain body. Node: `export default async function handler(req)`. Python: `def handler(request) -> Response | dict | str`.
 Streaming, websockets: not in v1 for functions (fine for Apps — gatewayd proxies them transparently).
-Adding a runtime = adding one runner image + one detection rule. Target: launch with these two; Go runner at M7 if demanded.
+Adding a runtime is a 7-layer procedure (migrations, schema, apid handler whitelist, openapi enums, runner shim, imaged handler surfaces, base Dockerfile + auto-stage wiring) — see ADR-052 for the canonical touch-list. The worked example for `node24` and `python313` is Tier 1 PR 1 + PR 2.
 
 ---
 
@@ -229,7 +229,7 @@ create table apps (
   account_id uuid not null references accounts(id),
   slug text unique not null,                    -- {slug}.apps.gregale.dev
   type text not null default 'app',             -- app|function
-  runtime text,                                 -- node22|python312 when function
+  runtime text,                                 -- node22|node24|python312|python313|go124|go124-alpine when function
   ram_mb int not null,                          -- ≤ plan cap
   idle_timeout_s int,
   max_concurrency int not null default 1,       -- ≤ plan cap
@@ -629,7 +629,7 @@ Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are
 | **M4** | gatewayd + schedd: routing, wake-blocking, idle reaper, admission | `curl` to a parked app returns 200 with wake; 1,000 rps to hot app adds < 2 ms p50; RAM admission refuses correctly at synthetic 85 % |
 | **M5** | apid + Postgres + deploy pipeline with **prebuilt images only**; CLI (`faas deploy --image`) | end-to-end: `faas deploy` → parked → first request wakes; quotas enforced (plan matrix table-test) |
 | **M6** | builderd + Railpack/Dockerfile in builder VMs | `faas deploy` a bare Node and Python repo (no config) → live; OOM bomb build kills only its VM (tenant latency unaffected — measured); cache makes 2nd build ≥ 2× faster |
-| **M7** | meterd + Stripe: usage, quotas, overage, dunning; functions runtime (runner-node22, runner-python312); cron | invoice shadow equals hand-computed GB-h for a scripted 24 h scenario (< 0.1 % delta); function hello-world p95 wake < 1 s; Free-tier hard stop verified; **egress metering (ADR-046):** scripted guest egress produces a `net_tx_bytes` row whose sum equals the kernel `vethHost.rx_bytes` delta within 0 bytes, `GET /v1/usage` reflects `tx_bytes` and `net_tx_bytes`, and `billing.Provider.PushUsageRecord` is **not** called for the new columns |
+| **M7** | meterd + Stripe: usage, quotas, overage, dunning; functions runtime (runner-node22, runner-node24, runner-python312, runner-python313, runner-go124, runner-go124-alpine); cron | invoice shadow equals hand-computed GB-h for a scripted 24 h scenario (< 0.1 % delta); function hello-world p95 wake < 1 s; Free-tier hard stop verified; **egress metering (ADR-046):** scripted guest egress produces a `net_tx_bytes` row whose sum equals the kernel `vethHost.rx_bytes` delta within 0 bytes, `GET /v1/usage` reflects `tx_bytes` and `net_tx_bytes`, and `billing.Provider.PushUsageRecord` is **not** called for the new columns |
 | **M7.5** | Git-deploy + thin dashboard (see `ux_spec.md` §5, §4; ADR-011/012): `githubd`/module, GitHub App, OAuth + repo picker, apps/usage/billing dashboard | push to `main` auto-deploys via the normal pipeline; commit status written back; dashboard connect-repo → live URL end-to-end; least-privilege scopes verified |
 | **M8** | Hardening + ops: §11 checklist, backups + **timed restore drill**, status page, docs site, Gate-A runbook (2nd box active-passive); UX: cold-wake transparency surfaces (`ux_spec.md` §6), account export/delete (G6) | restore drill: PG + one app back serving on a clean VM < 30 min, documented as executed; security checklist signed off item-by-item; SLO dashboard live; first-time user reaches live URL < 5 min via CLI **and** GitHub connect |
 
@@ -641,7 +641,7 @@ Post-M8 = private beta (founding doc roadmap M2–M3: hand-held first ten custom
 faas/
   cmd/{apid,gatewayd,schedd,vmmd,builderd,imaged,meterd,faas}/   one main.go each (faas = CLI)
   pkg/{api,state,fcvm,netns,oci,rootfs,meter,stripex,wire}/
-  guest/{init,runners/node22,runners/python312}/
+  guest/{init,runners/{node22,node24,python312,python313,go124}}/
   images/                      Dockerfiles for base/runner/builder images
   deploy/{ansible,systemd,nftables}/
   migrations/

@@ -1,0 +1,4 @@
+# Functions don't pull Flask — the runner invokes `handler(event, ctx)`
+# directly without an HTTP server. Same empty requirements file as
+# function-python (python312) — the runtime id is bound by the OCI
+# base image, not by the handler deps.

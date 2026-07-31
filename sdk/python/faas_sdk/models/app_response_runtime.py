@@ -1,11 +1,14 @@
 from typing import Literal
 
-AppResponseRuntime = Literal["go124", "node22", "python312"]
+AppResponseRuntime = Literal["go124", "go124-alpine", "node22", "node24", "python312", "python313"]
 
 APP_RESPONSE_RUNTIME_VALUES: set[AppResponseRuntime] = {
     "go124",
+    "go124-alpine",
     "node22",
+    "node24",
     "python312",
+    "python313",
 }
 
 
