@@ -23,9 +23,16 @@ func TestMigrations_00070_SnapshotStorageDaily(t *testing.T) {
 		t.Fatalf("db.MigrateUp: %v", err)
 	}
 
-	// Columns + types + NOT NULL. Note: 00070's CREATE TABLE uses
-	// `public.snapshot_storage_daily` explicitly, so the table
-	// lives in `public` regardless of search_path.
+	// Columns + types + NOT NULL. 00070 uses search_path-relative
+	// identifiers (no `public.` prefix), so the column lookup
+	// queries `current_schema()` rather than a hardcoded schema —
+	// the table lives in `public` for prod connections and in
+	// `faas_test_<hex>` for pgtest-isolated test schemas. The
+	// schema scoping closes the 40P01 deadlock on pg_class when N
+	// parallel test packages each try CREATE TABLE
+	// public.snapshot_storage_daily against the same cluster (CI
+	// run 30645758787 TestPg_ClaimCliAuthCode_BindsAccountID
+	// alongside migration 00068).
 	wantCols := map[string]string{
 		"account_id":     "uuid",
 		"app_id":         "uuid",
@@ -37,7 +44,7 @@ func TestMigrations_00070_SnapshotStorageDaily(t *testing.T) {
 	rows, err := pool.Query(ctx,
 		`select column_name, data_type
 		   from information_schema.columns
-		  where table_schema = 'public'
+		  where table_schema = current_schema()
 		    and table_name = 'snapshot_storage_daily'`)
 	if err != nil {
 		t.Fatalf("query columns: %v", err)
@@ -65,14 +72,16 @@ func TestMigrations_00070_SnapshotStorageDaily(t *testing.T) {
 		}
 	}
 
-	// Index exists (lives in public because 00070 uses
-	// `public.snapshot_storage_daily` explicitly). Schema-agnostic
-	// — pgtest.Open uses a per-test schema so the indexdef always
-	// carries the literal schema name. Pin only the suffix.
+	// Index exists (lives in current_schema() because 00070 uses
+	// search_path-relative identifiers). Schema-agnostic — pgtest
+	// always lands the table at current_schema()=front-of-search_path,
+	// so pin only the suffix of the indexdef (carries the schema
+	// name in raw form and we don't want to teach this test the
+	// prefix on every locale change).
 	var indexDef string
 	err = pool.QueryRow(ctx,
 		`select indexdef from pg_indexes
-		  where schemaname = 'public'
+		  where schemaname = current_schema()
 		    and tablename = 'snapshot_storage_daily'
 		    and indexname = 'snapshot_storage_daily_account_day_idx'`).
 		Scan(&indexDef)

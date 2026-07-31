@@ -358,10 +358,15 @@ type usageMinute struct {
 }
 
 // builderUsageRow is the per-build grain (ADR-048 §4) backing
-// AppendBuilderUsage. Mirrors public.builder_usage created by
+// AppendBuilderUsage. Mirrors builder_usage created by
 // migrations/00068_builder_usage.sql. PK is BuildID; first write
 // wins, a redelivered webhook / meterd restart is a no-op. The
 // meterd rollup cron sums Seconds into usage_daily.builder_seconds.
+// The table is search_path-relative; production search_path=public
+// puts it in the public schema, pgtest-isolated tests put it in a
+// faas_test_<hex> schema (the schema scoping closes the 40P01
+// deadlock on pg_class when N parallel test packages race CREATE
+// TABLE on the same cluster).
 type builderUsageRow struct {
 	BuildID    string
 	AccountID  string
