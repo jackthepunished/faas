@@ -34,13 +34,15 @@ func phase3PlanProject(plan api.Plan) (state.Project, []state.App, []state.Cron,
 	limits := api.MustLimitsFor(plan)
 	apps := []state.App{
 		{
-			Slug:          "phase3-api",
-			WorkloadName:  "api",
-			RootDir:       "services/api",
-			Type:          state.AppTypeFunction,
-			Runtime:       "nodejs22",
-			RAMMB:         256,
-			WorkloadClass: state.WorkloadClassHTTP,
+			Slug:           "phase3-api",
+			WorkloadName:   "api",
+			RootDir:        "services/api",
+			Type:           state.AppTypeFunction,
+			Runtime:        "node22",
+			RAMMB:          256,
+			MaxConcurrency: 5,
+			IdleTimeoutS:   60,
+			WorkloadClass:  state.WorkloadClassHTTP,
 		},
 	}
 	crons := []state.Cron{
