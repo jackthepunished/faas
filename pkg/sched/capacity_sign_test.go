@@ -304,7 +304,7 @@ func TestVerifyNodeSignature_EmptySignature(t *testing.T) {
 	keys := &stubKeyLookup{keys: map[string]*ecdsa.PublicKey{
 		keyID: nil, // populated elsewhere; the empty-sig check fires first
 	}}
-	if err := VerifyNodeSignature(r, nil, keys); err != ErrEmptySignature {
+	if err := VerifyNodeSignature(r, nil, keys); !errors.Is(err, ErrEmptySignature) {
 		t.Errorf("empty sig: err = %v, want ErrEmptySignature", err)
 	}
 }
