@@ -1,7 +1,7 @@
 # ADR-051 · Characterization boot: observed workload classification + in-guest port normalization
 
-- **Status:** proposed
-- **Date:** 2026-07-29
+- **Status:** accepted
+- **Date:** 2026-07-31
 - **Decision:** Classify a workload by **observing its first cold boot**, not by
   parsing its source and not by booting a second throwaway VM. The first cold
   boot of a new deployment runs in **characterizing mode**: guest-init (already
