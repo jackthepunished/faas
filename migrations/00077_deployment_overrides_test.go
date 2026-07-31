@@ -36,12 +36,13 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs use the `d` prefix in the 4th group (e.g. `0d00076`)
-	// because the readable `000076` form is a coincidental collision
-	// with the migration slot number and could shadow another
-	// migration's pin in a future test. The `d` flag stands for
-	// "deployment overrides" and makes the source obvious to a
-	// reader scanning the test fixtures.
+	// Seed UUIDs carry the slot number in the last group (`...000076`,
+	// `...000176`, `...000276`, `...000376`) so a reader scanning the
+	// test fixtures can pin each row to this migration without grepping
+	// the file name. The first three are zero-padded to keep all four
+	// IDs the same length and easy to scan side-by-side. The literal
+	// slot value MUST stay in sync with the filename; renumber per
+	// `migrations/README.md` if a sibling PR grabs 00077 first.
 
 	// (1) Apply through 00077. A regression that drops a slot between
 	// 1 and 77 surfaces here before the per-assertion pins.
@@ -53,7 +54,7 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-0000d000076',
+		values ('00000000-0000-0000-0000-000000000076',
 		        'deploy-overrides-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -61,8 +62,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-0000d000176',
-		        '00000000-0000-0000-0000-0000d000076',
+		values ('00000000-0000-0000-0000-000000000176',
+		        '00000000-0000-0000-0000-000000000076',
 		        'overrides-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -87,8 +88,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 			override_env_secrets, override_port, override_healthcheck,
 			created_at
 		) values (
-			'00000000-0000-0000-0000-0000d000276',
-			'00000000-0000-0000-0000-0000d000176',
+			'00000000-0000-0000-0000-000000000276',
+			'00000000-0000-0000-0000-000000000176',
 			'sha256:0000000000000000000000000000000000000000000000000000000000000001',
 			'image', 'pending',
 			ARRAY['/usr/bin/node','/srv/app.js'],
@@ -111,7 +112,7 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		select override_entrypoint, override_cmd, override_port,
 		       override_env, override_env_secrets, override_healthcheck
 		from deployments
-		where id = '00000000-0000-0000-0000-0000d000276'
+		where id = '00000000-0000-0000-0000-000000000276'
 	`).Scan(&gotEntrypoint, &gotCmd, &gotPort,
 		&gotEnvRaw, &gotEnvSecretsRaw, &gotHealthcheckRaw); err != nil {
 		t.Fatalf("read back deployment overrides: %v", err)
@@ -153,8 +154,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		insert into deployments (
 			id, app_id, image_digest, kind, status, created_at
 		) values (
-			'00000000-0000-0000-0000-0000d000376',
-			'00000000-0000-0000-0000-0000d000176',
+			'00000000-0000-0000-0000-000000000376',
+			'00000000-0000-0000-0000-000000000176',
 			'sha256:0000000000000000000000000000000000000000000000000000000000000002',
 			'image', 'pending', now()
 		)
@@ -171,7 +172,7 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		select override_entrypoint, override_cmd, override_port,
 		       override_env, override_env_secrets, override_healthcheck
 		from deployments
-		where id = '00000000-0000-0000-0000-0000d000376'
+		where id = '00000000-0000-0000-0000-000000000376'
 	`).Scan(&nullEntrypoint, &nullCmd, &nullPort,
 		&nullEnv, &nullSecs, &nullHC); err != nil {
 		t.Fatalf("read back null-override deployment: %v", err)
