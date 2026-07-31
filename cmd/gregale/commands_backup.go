@@ -180,11 +180,16 @@ func unsealRclone(f *unsealRcloneFlags) error {
 	}()
 
 	if _, err := io.Copy(tmp, plaintextR); err != nil {
-		tmp.Close()
+		// Best-effort close: the tmp file is unlinked by the
+		// deferred os.Remove above; a stuck close on the error path
+		// would only delay that cleanup. The error we surface is
+		// the io.Copy error, not a close error — pinning the close
+		// would mask the real failure.
+		_ = tmp.Close()
 		return fmt.Errorf("write plaintext: %w", err)
 	}
 	if err := tmp.Chmod(0o440); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("chmod 0440: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
