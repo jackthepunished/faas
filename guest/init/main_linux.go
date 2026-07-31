@@ -477,33 +477,11 @@ func runCharacterizationForSup(sup *Supervisor, manifest api.AppManifest) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	// Channel signals when sup.Run() returns. Filling our own
-	// pipe keeps WaitForExit() independent of supervisor internals.
-	done := make(chan struct{})
-	go func() {
-		// The supervisor's Run() returns BEFORE the kickoff goroutine
-		// yields in practice — by the time we launch WaitForExit
-		// below the supervisor may already be done. The channel
-		// captures both cases. We close the gate the moment
-		// lastExitCode settles (the supervisor's trackExit fires
-		// synchronously before Run returns).
-		// We can't poll every tick fast enough; instead we set a
-		// 50 ms ticker. This is the in-guest equivalent of the
-		// "polling the awaitable" pattern.
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if sup.LastExitCode() != -1 {
-					return
-				}
-			}
-		}
-	}()
-	defer close(done)
+	// Exit-code visibility is exposed via WaitForExit below, which
+	// polls sup.LastExitCode synchronously. The supervisor's trackExit
+	// fires synchronously inside Run() before it returns, so the polling
+	// loop unblocks as soon as the app exits — no separate gate goroutine
+	// or `done` channel is needed here.
 
 	args := RunArgs{
 		Manifest: manifest,

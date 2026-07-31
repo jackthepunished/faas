@@ -303,6 +303,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	log.Info("schedd: build attestation verifier ready", "pub", signPubPath)
 	engine.WithVerifier(verifier)
+	// ADR-051 PR-D review finding #6: app.characterized audit row
+	// emission on the cold-boot wake path. Shares the same
+	// `audit.New(store, log, ops, "schedd")` instance Loop.WithAudit
+	// uses — the Auditor is stateless and idempotent across callers
+	// (pkg/audit/audit.go). Best-effort per ADR-035: never blocks
+	// the RUNNING transition.
+	engine.WithAudit(audit.New(store, log, ops, "schedd"))
 
 	// Rebuild admission accounting from any instances still live from a prior
 	// run before we start admitting new wakes.

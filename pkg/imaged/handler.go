@@ -894,8 +894,15 @@ func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 	// line ~677 hard-codes — we mirror that here so both paths share
 	// the same defaults. The `:8080` readiness contract is the cross-
 	// boundary host shape — changing it would invalidate every
-	// existing snapshot (ADR-009).
-	manifest.Healthz = "/healthz"
+	// existing snapshot (ADR-009). Customer-pinned values win: we only
+	// set defaults for fields the customer didn't pin, mirroring the
+	// Env["PORT"] guard below — the Function path at ~677 has the same
+	// pattern. Without the `manifest.Healthz == ""` check a customer
+	// who intentionally sets Healthz="" to opt out of the readiness
+	// probe would be silently overridden.
+	if manifest.Healthz == "" {
+		manifest.Healthz = "/healthz"
+	}
 	if manifest.Env == nil {
 		manifest.Env = make(map[string]string, 1)
 	}

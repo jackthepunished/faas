@@ -30,6 +30,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -137,6 +138,15 @@ type Engine struct {
 	// production path (cmd/schedd/main.go) fails to start if the
 	// verifier is nil — see WithVerifier's doc.
 	verifier LayerVerifier
+
+	// audit is the IAM-4 seam for cold-boot characterization events
+	// (ADR-051 PR-D review finding #6: "app.characterized audit
+	// emission"). Distinct from pkg/sched/loop.go::Loop.audit, which
+	// serves the cron-fired path; the wake-path emit lives here so
+	// it sits next to the SetAppWorkloadClass call it accompanies.
+	// nil opts out (no row written); production cmd/schedd wires the
+	// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
+	audit *audit.Auditor
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
@@ -306,6 +316,18 @@ func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 // benign for the unit-test surface.
 func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
 	e.verifier = v
+	return e
+}
+
+// WithAudit attaches the IAM-4 audit seam for the cold-boot
+// characterization path (ADR-051 PR-D review finding #6).
+// Distinct from pkg/sched/loop.go::Loop.WithAudit, which serves
+// the cron-fired path; this setter scopes audit emission to the
+// wake path. nil opts out (no row written) so pre-PR-D fixtures
+// keep their existing behaviour. Production cmd/schedd wires the
+// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
+func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
+	e.audit = a
 	return e
 }
 
@@ -877,6 +899,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	if out.Characterization.ObservedClass != "" {
 		if _, err := e.store.SetAppWorkloadClass(ctx, bootInput.appID, state.WorkloadClass(out.Characterization.ObservedClass), "observed"); err != nil {
 			e.log.Warn("wake: SetAppWorkloadClass", "app", bootInput.appID, "err", err)
+		}
+		// PR-D review finding #6: emit an `app.characterized` audit
+		// row so an operator tailing events can pin the observed
+		// class back to the boot that surfaced it. Carries the
+		// guest's class hint, the observed port, exit code, and
+		// the chosen portnorm rung — enough to reconstruct "why is
+		// this app now classed http" from the event log alone
+		// (no vmmd slog archaeology). Best-effort per ADR-035:
+		// audit.Emit never returns an error and never blocks the
+		// RUNNING transition. nil auditor (pre-PR-D fixtures) is
+		// tolerated via the nil check.
+		if e.audit != nil {
+			e.audit.Emit(ctx, "app.characterized", nil, map[string]any{
+				"app_id":          bootInput.appID,
+				"wake_id":         bootInput.wakeID,
+				"observed_class":  out.Characterization.ObservedClass,
+				"observed_port":   out.Characterization.ObservedPort,
+				"exit_code":       out.Characterization.ExitCode,
+				"listening_addrs": out.Characterization.ListeningAddrs,
+				"port_norm_mode":  out.Characterization.PortNormalizationMode,
+				"log_tail_chars":  len(out.Characterization.LogTail),
+			})
 		}
 	}
 

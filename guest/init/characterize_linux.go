@@ -40,7 +40,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -466,5 +465,3 @@ func setSockTimeout(fd int, opt int, d time.Duration) {
 }
 
 // truncateLog lives in characterize_common.go (build-tag-free).
-
-var _ atomic.Bool // types-only reference, satisfies unused-import lints
