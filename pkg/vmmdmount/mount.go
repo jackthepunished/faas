@@ -139,16 +139,16 @@ func NewRegistry(cap int) *Registry {
 // acquisition. Returns:
 //
 //   - (true,  nil)         — entry was found and the umount
-//                            syscall + source cleanup succeeded.
+//     syscall + source cleanup succeeded.
 //   - (false, nil)         — entry was not found (idempotent
-//                            defer-after-error path; imaged's
-//                            UmountParentExt4 wrapper absorbs this).
+//     defer-after-error path; imaged's
+//     UmountParentExt4 wrapper absorbs this).
 //   - (false, err)         — entry was found but umount failed
-//                            (e.g. EBUSY); entry is KEPT in the
-//                            map so the next sweep can retry.
-//                            The caller MUST surface the error —
-//                            silently dropping a real umount
-//                            failure would leak the loopback mount.
+//     (e.g. EBUSY); entry is KEPT in the
+//     map so the next sweep can retry.
+//     The caller MUST surface the error —
+//     silently dropping a real umount
+//     failure would leak the loopback mount.
 //
 // This is the single critical section for the umount lifecycle:
 // a concurrent sweep tick + a deferred UmountExt4 from imaged

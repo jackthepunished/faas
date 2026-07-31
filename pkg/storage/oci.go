@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/oci"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // OCIRegistryStorageBackend is the remote-distribution driver for the
@@ -178,7 +179,7 @@ func WithTimeout(d time.Duration) Option {
 func NewOCIRegistryStorageBackend(opts ...Option) (*OCIRegistryStorageBackend, error) {
 	o := &OCIRegistryStorageBackend{
 		prefix:  defaultRepoPrefix,
-		ua:      "faas-storage/1 (+https://DOMAIN)",
+		ua:      "faas-storage/1 (+https://" + wire.PlatformHost + ")",
 		timeout: 60 * time.Second,
 	}
 	for _, opt := range opts {

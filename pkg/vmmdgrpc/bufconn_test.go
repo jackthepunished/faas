@@ -772,11 +772,11 @@ func TestMountParentExt4ReadOnly_RejectsNonParentKey(t *testing.T) {
 	}
 	cli, _ := newServer(t, f)
 	for _, badKey := range []string{
-		"base/runner-node22-amd64.ext4",        // per-app base
-		"base/runner-python312-amd64.ext4",     // per-app base
-		"layers/foo.ext4",                      // per-deployment layer
-		"snapshots/app-foo/mem.bin",            // snapshot blob
-		"kernel/vmlinux-amd64",                 // kernel artifact
+		"base/runner-node22-amd64.ext4",               // per-app base
+		"base/runner-python312-amd64.ext4",            // per-app base
+		"layers/foo.ext4",                             // per-deployment layer
+		"snapshots/app-foo/mem.bin",                   // snapshot blob
+		"kernel/vmlinux-amd64",                        // kernel artifact
 		"base/runner-base-debian-parent-riscv64.ext4", // unsupported arch
 	} {
 		_, err := cli.MountParentExt4ReadOnly(context.Background(),

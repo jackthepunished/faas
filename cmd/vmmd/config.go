@@ -183,9 +183,9 @@ func LoadConfig(path string) (*Config, error) {
 		// for larger fleets; the constants live in pkg/vmmdmount
 		// so any other consumer (e.g. a hypothetical test helper)
 		// shares the same baseline.
-		ParentMountCap:       vmmdmount.DefaultCap,
-		ParentMountMaxAge:    vmmdmount.ParentMountMaxAge,
-		ParentSweepInterval:  30 * time.Second,
+		ParentMountCap:      vmmdmount.DefaultCap,
+		ParentMountMaxAge:   vmmdmount.ParentMountMaxAge,
+		ParentSweepInterval: 30 * time.Second,
 		ComputeNode: ComputeNodeConfig{
 			// Defaults match the synthetic default-local row seeded
 			// by migration 00024 so single-box dev (no overlay)

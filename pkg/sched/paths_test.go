@@ -108,8 +108,8 @@ func TestIsParentBaseKey(t *testing.T) {
 		"",
 		"base/runner-node22-amd64.ext4",
 		"base/runner-python312-amd64.ext4",
-		"base/base-debian-parent-amd64",         // missing .ext4
-		"base/debian-parent-amd64.ext4",          // dropped "runner-" prefix
+		"base/base-debian-parent-amd64",               // missing .ext4
+		"base/debian-parent-amd64.ext4",               // dropped "runner-" prefix
 		"base/runner-base-debian-parent-riscv64.ext4", // unsupported arch
 		"layers/foo.ext4",
 		"base/base-amd64.ext4",

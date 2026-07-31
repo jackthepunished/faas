@@ -237,7 +237,7 @@ func (s *Server) PauseAndSnapshot(ctx context.Context, req *vmmdpb.PauseAndSnaps
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing paths",
 			"storage_key is required; at least one of vmstate_storage_key or vmstate_path must be set").
-			WithDocs("https://docs/DOMAIN/vmmd#pause")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#pause")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -472,7 +472,7 @@ func (s *Server) UpdateEgressAllowlist(ctx context.Context, req *vmmdpb.UpdateEg
 	if req.GetAppId() == "" {
 		return nil, grpcerr.ToStatus(toProblem(api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing app_id", "app_id is required").
-			WithDocs("https://docs/DOMAIN/vmmd#update-egress-allowlist")))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#update-egress-allowlist")))
 	}
 	allowlist, err := toEgressAllowlist(req.GetEgressAllowlist())
 	if err != nil {
@@ -511,13 +511,13 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 	if req.GetInstance() == "" {
 		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
-			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#seccomp"))
 	}
 	pid, ok := s.vmm.InstancePID(req.GetInstance())
 	if !ok {
 		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.NotFound),
 			api.CodeNotFound, "Instance not alive", fmt.Sprintf("instance %q is not alive on this vmmd", req.GetInstance())).
-			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#seccomp"))
 	}
 
 	mode, filterLen, err := readSeccompStatus(pid)
@@ -554,16 +554,16 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 // SIGTERM + 30-minute orphan sweep.
 //
 // Validation chain:
-//   1. Empty storage_key → InvalidArgument.
-//   2. Non-parent storage_key → InvalidArgument (allow-list —
-//      a misbehaving caller or a leaked token from another
-//      `faas`-group member cannot read arbitrary storage bytes
-//      through vmmd's loopback mount; the allow-list is the
-//      host-arch + sibling-arch set from sched.IsParentBaseKey).
-//   3. vmm.MountParentExt4 returns vmmdmount.ErrNotFound →
-//      NotFound (the storage backend has no such key — the
-//      load-bearing wire code for imaged's pre-staging checks).
-//   4. Any other error → Internal.
+//  1. Empty storage_key → InvalidArgument.
+//  2. Non-parent storage_key → InvalidArgument (allow-list —
+//     a misbehaving caller or a leaked token from another
+//     `faas`-group member cannot read arbitrary storage bytes
+//     through vmmd's loopback mount; the allow-list is the
+//     host-arch + sibling-arch set from sched.IsParentBaseKey).
+//  3. vmm.MountParentExt4 returns vmmdmount.ErrNotFound →
+//     NotFound (the storage backend has no such key — the
+//     load-bearing wire code for imaged's pre-staging checks).
+//  4. Any other error → Internal.
 //
 // imaged's defer-after-error pattern relies on UmountParentExt4
 // being idempotent so the parent is always released — see
@@ -574,7 +574,7 @@ func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountP
 	if req.GetStorageKey() == "" {
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing storage_key", "storage_key is required").
-			WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#mount-parent-ext4")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -586,7 +586,7 @@ func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountP
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"storage_key not in allow-list",
 			"only the canonical parent base ext4 key may be mounted").
-			WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#mount-parent-ext4")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -601,7 +601,7 @@ func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountP
 			p := api.NewProblem(int(codes.NotFound), api.CodeNotFound,
 				"storage_key not found",
 				"no artifact under that key in the configured storage backend").
-				WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+				WithDocs("https://" + wire.DocsHost + "/vmmd#mount-parent-ext4")
 			s.ops.Observe(op, time.Since(start), p)
 			return nil, grpcerr.ToStatus(p)
 		}
@@ -623,7 +623,7 @@ func (s *Server) UmountParentExt4(ctx context.Context, req *vmmdpb.UmountParentE
 	if req.GetMountpoint() == "" {
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing mountpoint", "mountpoint is required").
-			WithDocs("https://docs/DOMAIN/vmmd#umount-parent-ext4")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#umount-parent-ext4")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}

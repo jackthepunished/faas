@@ -362,7 +362,7 @@ func newTwoLayerPuller(t *testing.T) *minimalManifestPuller {
 // BuildBase calls rather than writing to disk.
 type callCountingBuilder struct {
 	calls            int
-	fromStagingCalls int // ADR-053: BuildBaseFromStaging invocations
+	fromStagingCalls int      // ADR-053: BuildBaseFromStaging invocations
 	fromStagingArgs  []string // ADR-053 §4.6: the staging path passed to BuildBaseFromStaging
 }
 

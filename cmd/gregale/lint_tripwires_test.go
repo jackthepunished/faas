@@ -395,3 +395,199 @@ var header = "x-faas-wake"
 		t.Fatal("self-test: walker did not detect the seeded x-faas-wake literal — the tripwire may be silently broken")
 	}
 }
+
+// TestLintTripwire_NoLiteralDocsDomainEverywhere closes issue #420:
+// every customer-facing or third-party-readable URL the platform
+// emits used to carry a `DOMAIN` placeholder literal
+// (`https://docs/DOMAIN/...`, `https://DOMAIN/billing`,
+// `+https://DOMAIN`, `apps.DOMAIN`, etc.). PR #439 + PR #455 swept
+// the CLI help block + apid REST; this tripwire makes sure no future
+// PR reintroduces one anywhere outside the canonical home
+// (pkg/wire/docs.go).
+//
+// Why a repo-wide walk rather than a per-package scan: the
+// placeholders surface in pkg/vmmdgrpc (gRPC envelope), pkg/auth/
+// middleware (apid REST 402 Detail), pkg/oci + pkg/storage
+// (User-Agent to OCI registries), and cmd/gregale (synthesized docs
+// row). A per-package tripwire would miss whichever of these
+// packets the next regression lands in.
+//
+// Excludes:
+//   - pkg/wire/docs.go: the canonical home; the literals
+//     `docs.gregale.dev` and `gregale.dev` ARE the contract.
+//   - any *_test.go: tests legitimately stub the URL or pin the
+//     wire shape (pkg/grpcerr/grpcerr_test.go round-trip assertions).
+//   - generated *.pb.go stubs.
+//
+// Scope: the walker descends from the nearest enclosing `go.mod`
+// directory. `go test ./cmd/gregale/...` chdirs into cmd/gregale
+// before running, so the walker explicitly locates the repo root via
+// go.mod — otherwise it would silently scope to just cmd/gregale
+// and miss regressions in the daemons.
+func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
+	fset := token.NewFileSet()
+
+	// Locate the repo root (the directory containing go.mod).
+	root, err := findRepoRoot(".")
+	if err != nil {
+		t.Fatalf("locate repo root: %v", err)
+	}
+
+	// Walk the whole repo except the canonical homes + generated
+	// stubs + tests. Each package is parsed in its own directory;
+	// pkgs is a map keyed by directory relative to the walker root.
+	pkgs := map[string]map[string]*ast.File{}
+
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" || name == "node_modules" || name == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		// Skip the canonical homes — the constants DocsHost and
+		// PlatformHost are the contract, the way pkg/wire/wake.go
+		// owns x-faas-wake.
+		if strings.HasSuffix(path, "pkg/wire/docs.go") || strings.HasSuffix(path, "pkg/wire/wake.go") {
+			return nil
+		}
+		// Skip *_test.go (tests legitimately assert or stub the
+		// wire URL literal — they are the contract tests, not the
+		// production code).
+		if strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		// Skip generated protobuf stubs.
+		if strings.HasSuffix(path, ".pb.go") {
+			return nil
+		}
+		pf, ferr := parser.ParseFile(fset, path, nil, parser.AllErrors)
+		if ferr != nil {
+			// Generated or unsupported files may fail to parse;
+			// skip them so a single unparseable file doesn't mask
+			// the rule. nilerr lint fires on `return nil` here; the
+			// skip is deliberate.
+			return nil //nolint:nilerr // intentional skip on parse failure; see comment above
+		}
+		dir := filepath.Dir(path)
+		bucket, ok := pkgs[dir]
+		if !ok {
+			bucket = map[string]*ast.File{}
+			pkgs[dir] = bucket
+		}
+		bucket[path] = pf
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk repo: %v", walkErr)
+	}
+
+	// Strict forbidden list (per user direction). Each entry is a
+	// substring the walker matches against every string literal in
+	// every visited .go file. The forms are exhaustive of every
+	// DOMAIN-shaped spelling the survey found on main:
+	//   - `https://docs/DOMAIN` matches `WithDocs("https://docs/DOMAIN/vmmd#...")` in pkg/vmmdgrpc
+	//   - `https://DOMAIN`     matches `https://DOMAIN/billing` in pkg/auth/middleware
+	//   - `://DOMAIN/`         path-bearing generic catch-all
+	//   - `://DOMAIN"`         string-terminated generic catch-all
+	//   - `docs.DOMAIN`        matches the issue's literal spelling + `apps.DOMAIN` style
+	//   - `.DOMAIN`            suffix-bearing catch-all (covers `apps.DOMAIN`)
+	//
+	// Overlap note: `https://docs/DOMAIN` is a strict superset of
+	// `https://DOMAIN`, and `://DOMAIN/` is a strict superset of
+	// `://DOMAIN`. The redundant entries are kept on purpose — the
+	// exact entries document the pre-rename literal form a future
+	// regression could re-introduce. Walker's `strings.Contains`
+	// short-circuits per match, so the overlap has no runtime cost.
+	// Don't delete the "redundant" entries without also deleting the
+	// comment lines above; one without the other is a confusing
+	// intermediate state.
+	forbidden := []string{
+		"https://docs/DOMAIN",
+		"https://DOMAIN",
+		"://DOMAIN/",
+		"://DOMAIN\"",
+		"docs.DOMAIN",
+		".DOMAIN",
+	}
+
+	var violations []string
+	for _, files := range pkgs {
+		for _, file := range files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				for _, forbid := range forbidden {
+					if strings.Contains(lit.Value, forbid) {
+						pos := fset.Position(lit.Pos())
+						violations = append(violations, pos.String()+": "+lit.Value)
+						return true
+					}
+				}
+				return true
+			})
+		}
+	}
+
+	if len(violations) > 0 {
+		t.Fatalf("found DOMAIN-shaped placeholder string outside pkg/wire/docs.go — these literals leak unsubstituted placeholders to customers (issue #420) and must be sourced from pkg/wire.DocsHost / pkg/wire.PlatformHost:\n  %s\n\nIf a test legitimately needs the literal, move it to a *_test.go file (excluded) or convert it to a wire.DocsHost / wire.PlatformHost reference.",
+			strings.Join(violations, "\n  "))
+	}
+}
+
+// TestLintTripwire_NoLiteralDocsDomainSelfTest exercises the
+// placeholder walker by injecting a forbidden literal into a
+// synthetic production-style file under a temp directory and
+// asserting the tripwire flags it. Without this, the AST walker is
+// silently blind to itself — a future refactor that breaks the
+// walker's substring match would land without anyone noticing
+// because the live walker never finds a violation on a clean tree.
+func TestLintTripwire_NoLiteralDocsDomainSelfTest(t *testing.T) {
+	// Build a small Go file that contains a forbidden substring in a
+	// string context the walker will recognise.
+	tmp := t.TempDir()
+	src := `package tripwiretest
+
+// Synthetic production-like file carrying the forbidden placeholder
+// literal. Exists only to exercise the AST walker.
+var url = "https://docs/DOMAIN/vmmd#create"
+`
+	srcPath := filepath.Join(tmp, "tripwire.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	pf, err := parser.ParseFile(fset, srcPath, nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	forbidden := []string{"https://docs/DOMAIN"}
+	var found string
+	ast.Inspect(pf, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		for _, forbid := range forbidden {
+			if strings.Contains(lit.Value, forbid) {
+				found = fset.Position(lit.Pos()).String()
+				return false
+			}
+		}
+		return true
+	})
+	if found == "" {
+		t.Fatal("self-test: walker did not detect the seeded DOMAIN placeholder literal — the tripwire may be silently broken")
+	}
+}
