@@ -704,6 +704,22 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 		envLookup = os.Getenv
 	}
 	out := make([]EnsureBasesResult, 0, len(refs))
+	// envOverrideByRef maps a parent DefaultRef → the env var name that
+	// overrides it. Built once per EnsureBases call so the parent-ref
+	// branch (ADR-053) can route through the same env-override path
+	// the parent row uses itself, instead of hardcoding the
+	// BaseRefDebianParent const. Without this, an operator who sets
+	// FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT to a mirror.gcr.io digest
+	// would see the parent row honor it (the parent's own loop
+	// iteration reads the env var) but every child row's parent
+	// lookup still ask for the unreachable ghcr.io/onebox-faas/ const
+	// (run 30661487390, 2026-07-31).
+	envOverrideByRef := make(map[string]string, len(refs))
+	for _, r := range refs {
+		if r.EnvOverride != "" {
+			envOverrideByRef[r.Ref] = r.EnvOverride
+		}
+	}
 	for _, row := range refs {
 		ref := row.Ref
 		if v := strings.TrimSpace(envLookup(row.EnvOverride)); v != "" {
@@ -731,9 +747,20 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 		// block) and runs the legacy "apply ALL layers" path —
 		// staged first because DefaultRuntimeBaseRefs[0] is the
 		// parent.
-		parentRef := row.ParentRef
+		//
+		// Resolve parentRef through the same env-override path the
+		// parent row uses itself (look up the parent's
+		// EnvOverride by Ref, then envLookup it). Without this,
+		// FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT set on the box is
+		// ignored by every child row's parent manifest pull — the
+		// child would ask for the const default which is the
+		// unreachable ghcr.io/onebox-faas/base-debian-parent:latest.
+		parentRef, err := resolveParentRef(row.ParentRef, envOverrideByRef, envLookup)
+		if err != nil {
+			return nil, err
+		}
 		parentBaseKey := ""
-		if parentRef != "" {
+		if row.ParentRef != "" {
 			parentBaseKey = sched.BaseKeyForArch(RuntimeDebianParent, arch)
 		}
 		res, err := h.EnsureBaseExt4(ctx, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey)
@@ -752,3 +779,40 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 
 // envLookup nil-falls-back to os.Getenv; the test seam is a map
 // literal (TestEnsureBases_OperatorOverride_*).
+
+// resolveParentRef looks up the operator env-override for the given
+// parent DefaultRef. If the parent row's EnvOverride is set in the
+// env (and the value is a digest-pinned ref), the override is
+// returned; otherwise the input parentRef is returned unchanged.
+//
+// Why this exists: when a child runtime row declares
+// `ParentRef: BaseRefDebianParent`, the parent branch used to
+// hardcode the const default — bypassing
+// FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT entirely. An operator who set
+// that env var to a mirror.gcr.io digest would see the parent row
+// honor it (the parent's own loop iteration reads the env var) but
+// every child row's parent manifest pull still asked for the
+// unreachable ghcr.io/onebox-faas/base-debian-parent:latest. Run
+// 30661487390 (2026-07-31) hit this — the writer in
+// cd-controlplane.yml seeded FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT
+// but imaged still 403'd on the child. The fix routes the parent
+// lookup through the same env-override path the parent row uses
+// itself, via envOverrideByRef (built once per EnsureBases call).
+func resolveParentRef(parentRef string, envOverrideByRef map[string]string, envLookup func(string) string) (string, error) {
+	if parentRef == "" {
+		return "", nil
+	}
+	parentEnv, ok := envOverrideByRef[parentRef]
+	if !ok {
+		return parentRef, nil
+	}
+	pv := strings.TrimSpace(envLookup(parentEnv))
+	if pv == "" {
+		return parentRef, nil
+	}
+	parsed, perr := oci.ParseReference(pv)
+	if perr != nil || parsed.Digest == "" {
+		return "", fmt.Errorf("imaged: parent %s=%q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", parentEnv, pv)
+	}
+	return pv, nil
+}
