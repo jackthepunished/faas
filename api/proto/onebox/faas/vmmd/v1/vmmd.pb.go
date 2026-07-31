@@ -153,9 +153,20 @@ type AppSpec struct {
 	// waitReady + DNAT stay fixed on 8080 (ADR-009 +
 	// guest/init/portnorm_linux.go); vmmd's ForwardHTTP bridge uses
 	// this port to dial the guest. Additive per ADR-016.
-	Port          uint32 `protobuf:"varint,10,opt,name=port,proto3" json:"port,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Port uint32 `protobuf:"varint,10,opt,name=port,proto3" json:"port,omitempty"`
+	// healthcheck_path (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. When empty,
+	// vmmd's waitReady keeps the legacy TCP-accept on :8080 (zero
+	// regression risk for pre-PR-D callers). When non-empty, vmmd
+	// issues an HTTP GET <healthcheck_path> against <HostIP>:8080
+	// and accepts 2xx as ready; non-2xx retries every 200ms until
+	// readyTimeout (default 30s). The host's probe target stays
+	// :8080 — ADR-009 + portnorm re-expose the customer bind on
+	// :8080 inside the guest, so the path is the customer's choice
+	// and the port is the host's choice. Additive per ADR-016.
+	HealthcheckPath string `protobuf:"bytes,11,opt,name=healthcheck_path,json=healthcheckPath,proto3" json:"healthcheck_path,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AppSpec) Reset() {
@@ -256,6 +267,13 @@ func (x *AppSpec) GetPort() uint32 {
 		return x.Port
 	}
 	return 0
+}
+
+func (x *AppSpec) GetHealthcheckPath() string {
+	if x != nil {
+		return x.HealthcheckPath
+	}
+	return ""
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -2336,7 +2354,7 @@ var File_onebox_faas_vmmd_v1_vmmd_proto protoreflect.FileDescriptor
 
 const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\n" +
-	"\x1eonebox/faas/vmmd/v1/vmmd.proto\x12\x13onebox.faas.vmmd.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/wrappers.proto\"\xf6\x02\n" +
+	"\x1eonebox/faas/vmmd/v1/vmmd.proto\x12\x13onebox.faas.vmmd.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/wrappers.proto\"\xa1\x03\n" +
 	"\aAppSpec\x12\x19\n" +
 	"\bbase_key\x18\x01 \x01(\tR\abaseKey\x12\x1b\n" +
 	"\tlayer_key\x18\x02 \x01(\tR\blayerKey\x12\x1d\n" +
@@ -2352,7 +2370,8 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x06app_id\x18\b \x01(\tR\x05appId\x129\n" +
 	"\aapi_env\x18\t \x03(\v2 .onebox.faas.vmmd.v1.APIEnvEntryR\x06apiEnv\x12\x12\n" +
 	"\x04port\x18\n" +
-	" \x01(\rR\x04port\"@\n" +
+	" \x01(\rR\x04port\x12)\n" +
+	"\x10healthcheck_path\x18\v \x01(\tR\x0fhealthcheckPath\"@\n" +
 	"\fSealedSecret\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x1e\n" +
 	"\n" +

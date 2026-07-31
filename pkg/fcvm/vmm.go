@@ -50,7 +50,13 @@ type JailerVMM struct {
 	mu      sync.Mutex
 	proc    map[string]*exec.Cmd // instance -> running jailer process
 	clients map[string]*http.Client
-	recs    map[string]*instanceRecord // instance -> per-process bookkeeping (M6 builder VMs)
+	// hcClient (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-VMM *http.Client the waitReady HTTP probe reuses across
+	// its 200ms-cadence loop. Lazily created by healthcheckClient
+	// under mu; nil = first probe. 2s per-probe timeout bounds
+	// the probe within the readyTimeout deadline.
+	hcClient *http.Client
+	recs     map[string]*instanceRecord // instance -> per-process bookkeeping (M6 builder VMs)
 	// rings is the per-instance log ring buffer (issue #254 / Move 4).
 	// Created in Boot/Restore before startJailer so cmd.Stdout can be wired
 	// to the ring's writer; closed in Kill/DestroyWithExport so the byte
@@ -251,7 +257,11 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	spec.KernelKey = kernelSrc
 	spec.BaseKey = baseSrc
 	spec.LayerKey = layerSrc
-	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot))
+	// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment override
+	// readiness probe path. Empty keeps the legacy TCP-accept on :8080
+	// (pre-PR-D default). Non-empty → waitReady does HTTP GET
+	// <HealthcheckPath> against <HostIP>:8080 and accepts 2xx as ready.
+	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.HealthcheckPath)
 }
 
 // Boot provisions the chroot, starts the jailed firecracker with a full config,
@@ -261,9 +271,17 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 // keys in ColdBootSpec into host paths first, then delegates here. Boot
 // is kept for tests that already have resolved paths in hand.
 //
+// healthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+// per-deployment override readiness probe path. Empty keeps the legacy
+// TCP-accept on :8080 (pre-PR-D default). Non-empty → waitReady does
+// HTTP GET <healthcheckPath> against <HostIP>:8080 and accepts 2xx as
+// ready. The BootColdBoot wrapper threads ColdBootSpec.HealthcheckPath
+// into this parameter; tests that already have resolved paths in hand
+// can pass "" to keep the legacy probe.
+//
 // Move 4 (issue #254): registerRing is called BEFORE startJailer so
 // cmd.Stdout can be wired to the ring's writer in startJailer.
-func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig) (err error) {
+func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheckPath string) (err error) {
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
 		return err
@@ -302,7 +320,7 @@ func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig) (err error)
 	// see VMConfig). Firecracker attaches it pre-start; the UDS at
 	// vsockUDSSock is created by the time startJailer returns. No
 	// post-start PUT needed.
-	if err = v.waitReady(ctx, l); err != nil {
+	if err = v.waitReady(ctx, l, healthcheckPath); err != nil {
 		return fmt.Errorf("vmm: readiness: %w", err)
 	}
 	return nil
@@ -311,6 +329,12 @@ func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig) (err error)
 // Restore starts a bare jailed firecracker and loads a snapshot into it, resuming
 // the guest (spec §4.4, mem_backend File). The netns/tap already exist (the
 // Manager set them up); the restored net device references tap0 by name.
+//
+// spec.HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+// per-deployment override readiness probe path. Empty keeps the legacy
+// TCP-accept on :8080 (pre-PR-D default). Non-empty → waitReady does
+// HTTP GET <path> against <HostIP>:8080 and accepts 2xx as ready. The
+// Manager threads WakeRequest.HealthcheckPath into this field at bringUp.
 func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err error) {
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
@@ -461,7 +485,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err = v.TriggerResumeHook(ctx, l, time.Now().UnixNano()); err != nil {
 		return fmt.Errorf("vmm: resume hook: %w", err)
 	}
-	if err = v.waitReady(ctx, l); err != nil {
+	if err = v.waitReady(ctx, l, spec.HealthcheckPath); err != nil {
 		return fmt.Errorf("vmm: readiness after restore: %w", err)
 	}
 	return nil
@@ -1319,24 +1343,122 @@ func (v *JailerVMM) ownChrootRoot(root string, l Lease) error {
 	return nil
 }
 
-// waitReady polls the guest's routable identity for a :8080 accept.
-func (v *JailerVMM) waitReady(ctx context.Context, l Lease) error {
+// waitReady probes the guest's routable identity for readiness.
+//
+// Legacy path (healthcheckPath == ""): bare TCP accept on :8080 — the
+// pre-PR-D contract. The accept proves the customer app bound *something*
+// on the inner port the portnorm ladder re-exposes on :8080 (ADR-009).
+//
+// PR-D path (healthcheckPath != "", issue #460 / ADR-053 / ADR-057):
+// HTTP GET <healthcheckPath> against <HostIP>:8080; 2xx = ready, non-2xx
+// or err = retry until readyTimeout (default 30s). The host probe target
+// is always :8080 — ADR-009 + portnorm re-expose the customer bind on
+// :8080 inside the guest, so the path is the customer's choice and the
+// port is the host's choice. Wake must always work (ADR-005): a
+// transient customer-app 500 must not wedge a wake, so we retry instead
+// of fast-failing. 200ms backoff matches the legacy TCP cadence.
+//
+// The HTTP client is a per-VMM cached instance with a 2s per-probe
+// timeout (bounded by the readyTimeout deadline). On a successful 2xx
+// the body is discarded immediately — the probe is "alive enough to
+// answer", not "shape-conformant".
+func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath string) error {
 	deadline := time.Now().Add(v.readyTimeout)
 	addr := net.JoinHostPort(l.HostIP.String(), "8080")
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+
+	// Legacy TCP-accept — pre-PR-D contract. Byte-identical to the
+	// pre-PR-D loop.
+	if healthcheckPath == "" {
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("guest %s not ready after %s", l.Instance, v.readyTimeout)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return nil
+	}
+
+	// PR-D HTTP GET probe. Reuse the cached client across probes —
+	// the 200ms cadence would otherwise allocate a Transport on
+	// every iteration. The host loop is bounded by ctx.Done() and
+	// the deadline.
+	client := v.healthcheckClient()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("guest %s not ready after %s", l.Instance, v.readyTimeout)
+			return fmt.Errorf("guest %s not ready (healthcheck %s) after %s", l.Instance, healthcheckPath, v.readyTimeout)
 		}
-		time.Sleep(10 * time.Millisecond)
+		if ok, err := healthcheckProbe(ctx, client, addr, healthcheckPath); err == nil && ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
+}
+
+// healthcheckProbe issues a single GET against
+// `http://<addr><healthcheckPath>` via client. Returns (true, nil)
+// on a 2xx response, (false, nil) on any non-2xx, transport error,
+// or context cancel — the caller decides what to do with a
+// "not-yet-2xx" answer (the waitReady loop treats it as a retry
+// trigger). Extracted so unit tests can drive the probe against a
+// httptest.Server on an ephemeral port instead of contending for
+// the literal `:8080` the production loop pins.
+//
+// addr must be the output of net.JoinHostPort (host:port, no
+// scheme); healthcheckPath must start with `/` (DTO validator
+// guarantees this in production).
+func healthcheckProbe(ctx context.Context, client *http.Client, addr, healthcheckPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+healthcheckPath, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Transport error (connection refused, dial timeout,
+		// EOF) — the waitReady loop treats (false, nil) as
+		// "retry until deadline". Surfacing err here would
+		// abort the loop on the first transient transport
+		// hiccup, contradicting ADR-005's "wake must always
+		// work" stance (a guest that hasn't bound its port
+		// yet looks identical to a guest whose netns blew
+		// away mid-probe — both must be retried).
+		return false, nil //nolint:nilerr
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode/100 == 2, nil
+}
+
+// healthcheckClient returns the per-VMM *http.Client used by the
+// PR-D waitReady HTTP probe. A single client with a 2s per-probe
+// timeout is reused across probes (the 200ms loop cadence would
+// otherwise allocate a Transport on every iteration). Nil-safe:
+// returns a fresh client when the receiver or the cache is nil.
+func (v *JailerVMM) healthcheckClient() *http.Client {
+	if v == nil {
+		return &http.Client{Timeout: 2 * time.Second}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.hcClient == nil {
+		v.hcClient = &http.Client{Timeout: 2 * time.Second}
+	}
+	return v.hcClient
 }
 
 // VsockCharacterizationHostPort is the AF_VSOCK port the host's

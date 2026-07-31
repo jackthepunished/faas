@@ -46,7 +46,11 @@ type Runner interface {
 type VMM interface {
 	// Boot spawns jailer→firecracker with cfg and returns once the guest passes
 	// readiness. It must clean up its own chroot/process if it returns an error.
-	Boot(ctx context.Context, l Lease, cfg VMConfig) error
+	// healthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. Empty keeps the legacy
+	// TCP-accept on :8080 (pre-PR-D default). Non-empty → waitReady does
+	// HTTP GET <path> against <HostIP>:8080 and accepts 2xx as ready.
+	Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheckPath string) error
 	// BootColdBoot is the cold-boot entry point (issue #96 / ADR-025 axis 2
 	// / PR #116): it materializes the StorageBackend keys in spec through
 	// the configured backend into vmmd-allocated tmp paths, then delegates
@@ -55,6 +59,9 @@ type VMM interface {
 	BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec) error
 	// Restore loads a snapshot into a fresh jailed firecracker and resumes it,
 	// returning once the guest is ready. On error it cleans up its own process.
+	// spec.HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. Empty keeps the legacy
+	// TCP-accept on :8080; non-empty → waitReady does HTTP GET <path>.
 	Restore(ctx context.Context, l Lease, spec RestoreSpec) error
 	// TriggerResumeHook dials the guest's vsock UDS and asks it to run its
 	// post-restore side effects (re-seed entropy + step clock, guest/init/resume.go).
@@ -204,6 +211,16 @@ type Instance struct {
 	// buildBridgeScript boundary keeps those legacy instances
 	// dial-able on 8080.
 	Port int
+
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path copied from
+	// WakeRequest.HealthcheckPath. "" = legacy TCP-accept on :8080
+	// (pre-PR-D default). Non-empty → vmmd's waitReady does HTTP GET
+	// <HealthcheckPath> against <HostIP>:8080 and accepts 2xx as
+	// ready. Stamped onto the live Instance so server-side readers
+	// can resolve Instance.HealthcheckPath without a second request
+	// lookup (PR-C mirror).
+	HealthcheckPath string
 
 	// Characterization (ADR-051 Phase 4 / PR-D) is the
 	// CharacterizationReport the host received via
@@ -626,6 +643,17 @@ type WakeRequest struct {
 	// live Instance so vmmdgrpc forwarder callers can resolve
 	// LiveFor(instance).Port without a second request lookup.
 	Port int
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. "" = legacy
+	// TCP-accept on :8080 (pre-PR-D default). Non-empty → vmmd's
+	// waitReady does HTTP GET <HealthcheckPath> against <HostIP>:8080
+	// and accepts 2xx as ready. The host probe target is always :8080
+	// — ADR-009 + portnorm re-expose the customer bind on :8080 inside
+	// the guest, so the path is the customer's choice and the port is
+	// the host's choice. Stamped onto the live Instance so server-side
+	// readers can resolve LiveFor(instance).HealthcheckPath without a
+	// second request lookup.
+	HealthcheckPath string
 	// SealedEnvEntries are the per-key ciphertext rows from `app_secrets`
 	// the caller wants loaded into the guest's env (spec §11/G2). Each entry is
 	// sealed independently by apid via pkg/secretbox.SealOne against the host
@@ -727,6 +755,16 @@ type ColdBootRequest struct {
 	// drop a field. Removing the field would silently break the
 	// port-stamping test.
 	Port int
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) — the
+	// per-deployment override readiness probe path forwarded verbatim
+	// to WakeRequest.HealthcheckPath. Production wiring uses
+	// WakeRequest directly via the vmmdgrpc adapters
+	// (pkg/vmmdgrpc/proto.go), so this field is currently exercised
+	// only by unit tests. Kept for symmetry so the cold-boot public
+	// surface stays a complete mirror of WakeRequest — a future caller
+	// that wants to invoke ColdBoot without going through WakeRequest
+	// shouldn't have to drop a field.
+	HealthcheckPath string
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -742,6 +780,10 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		EgressAllowlist: req.EgressAllowlist,
 		Plan:            req.Plan,
 		Port:            req.Port,
+		// ADR-057 / PR-D: forward the per-deployment override
+		// readiness probe path so Wake stamps it onto the live
+		// Instance. Empty = legacy TCP-accept on :8080.
+		HealthcheckPath: req.HealthcheckPath,
 	})
 }
 
@@ -931,7 +973,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, Characterization: report}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, Characterization: report}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
@@ -1005,6 +1047,12 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// from the lease's slot so the guest's listener is reachable at a
 			// globally unique guest_cid.
 			VsockDevice: NewVsockDevice(lease.Slot),
+			// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+			// override readiness probe path. Empty keeps the legacy
+			// TCP-accept on :8080 (pre-PR-D default). Non-empty →
+			// waitReady does HTTP GET <HealthcheckPath> against
+			// <HostIP>:8080 and accepts 2xx as ready.
+			HealthcheckPath: req.HealthcheckPath,
 		}
 		if rErr := m.vmm.Restore(ctx, lease, rs); rErr == nil {
 			return WakeRestore, nil
@@ -1039,6 +1087,12 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		VcpuCount:  req.VcpuCount,
 		MemSizeMiB: req.MemSizeMiB,
 		Tap:        nc.Tap,
+		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+		// override readiness probe path. Empty keeps the legacy
+		// TCP-accept on :8080 (pre-PR-D default). Non-empty →
+		// waitReady does HTTP GET <HealthcheckPath> against
+		// <HostIP>:8080 and accepts 2xx as ready.
+		HealthcheckPath: req.HealthcheckPath,
 	}
 	if err := m.vmm.BootColdBoot(ctx, lease, spec); err != nil {
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)

@@ -73,6 +73,16 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// this port to dial the guest. 0 = legacy 8080 default
 		// at the buildBridgeScript boundary.
 		Port: int(app.GetPort()),
+		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+		// override readiness probe path. "" = legacy TCP-accept
+		// on :8080 (pre-PR-D default). Non-empty → vmmd's
+		// waitReady does HTTP GET <HealthcheckPath> against
+		// <HostIP>:8080 and accepts 2xx as ready. The host
+		// probe target is always :8080 — ADR-009 + portnorm
+		// re-expose the customer bind on :8080 inside the guest,
+		// so the path is the customer's choice and the port is
+		// the host's choice.
+		HealthcheckPath: app.GetHealthcheckPath(),
 	}
 	if snap != nil {
 		// #96 / ADR-025 axis 2 (slice 3) — mem_path is gone from the
@@ -147,6 +157,11 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// rationale. Cold-boot mirrors the port so deploy's
 		// first boot primes the same per-deployment override.
 		Port: int(app.GetPort()),
+		// Issue #460 / ADR-053, ADR-057 / PR-D: see
+		// toWakeRequest. Cold-boot mirrors the healthcheck
+		// path so deploy's first boot primes the same probe
+		// semantics on the freshly-deployed app.
+		HealthcheckPath: app.GetHealthcheckPath(),
 	}, nil
 }
 
