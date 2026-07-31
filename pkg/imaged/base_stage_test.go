@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -750,3 +752,244 @@ func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 // schedBaseKeyForArch is removed; tests use pkg/sched.BaseKeyForArch
 // / BaseDigestKeyForArch directly so the key format is sourced from
 // the same constant the production code reads.
+
+// =================================================================
+// ADR-053: parent-ref staging tests
+// =================================================================
+//
+// These tests exercise the parent-ref branch of EnsureBaseExt4
+// (mount → cp -a → umount → pull delta → ApplyLayerGz → mkfs).
+// They use a parentPuller that returns one manifest for the
+// parent ref and a different, longer manifest for the runtime
+// ref, with the parent's DiffIDs as a strict prefix of the
+// runtime's. The fakeVMMClient provides a real tmpdir so cp
+// -a has something to read.
+
+// parentRuntimePuller implements oci.ManifestPuller for the
+// parent-ref tests. Two registries keyed by ref string: the
+// parent ref → 1-layer manifest; the runtime ref → 2-layer
+// manifest whose first DiffID matches the parent's. This is
+// the OCI-chain composability invariant (ADR-053).
+type parentRuntimePuller struct {
+	parentCfg   string
+	parentLayer string
+	runtimeCfg  string
+	runtimeLy1  string // matches parentLayer (delta prefix invariant)
+	runtimeLy2  string
+	layers      map[string][]byte // gzipped tarball bytes keyed by digest
+}
+
+func (p *parentRuntimePuller) PullDigest(_ context.Context, ref string) (string, error) {
+	return ref, nil
+}
+func (p *parentRuntimePuller) PullImageConfig(_ context.Context, _ string) (oci.ImageConfig, error) {
+	return oci.ImageConfig{}, nil
+}
+func (p *parentRuntimePuller) PullLayers(_ context.Context, _ string) (oci.PullLayersResult, error) {
+	return oci.PullLayersResult{}, nil
+}
+func (p *parentRuntimePuller) PullManifest(_ context.Context, ref string) (oci.Manifest, error) {
+	switch ref {
+	case BaseRefDebianParent:
+		return oci.Manifest{
+			Config: oci.Descriptor{Digest: p.parentCfg},
+			Layers: []oci.Descriptor{{Digest: p.parentLayer}},
+		}, nil
+	default:
+		return oci.Manifest{
+			Config: oci.Descriptor{Digest: p.runtimeCfg},
+			Layers: []oci.Descriptor{{Digest: p.runtimeLy1}, {Digest: p.runtimeLy2}},
+		}, nil
+	}
+}
+func (p *parentRuntimePuller) PullBlob(_ context.Context, _ string, digest string) (io.ReadCloser, error) {
+	b, ok := p.layers[digest]
+	if !ok {
+		return nil, errors.New("parentRuntimePuller: no such digest " + digest)
+	}
+	return io.NopCloser(strings.NewReader(string(b))), nil
+}
+
+// newParentRuntimePuller builds the two-manifest puller with
+// stable synthetic digests. The delta is exactly 1 layer
+// (the runtime's second layer; the first matches the
+// parent's DiffID, satisfying oci.LayersAboveBase).
+func newParentRuntimePuller(t *testing.T) *parentRuntimePuller {
+	t.Helper()
+	parentLy := "sha256:parent-layer-aaaaaaaaaaaaaaaa"
+	parentCfg := "sha256:parent-config-bbbbbbbbbbbbbbbb"
+	runtimeLy1 := parentLy
+	runtimeLy2 := "sha256:runtime-layer-ccccccccccccccccc"
+	runtimeCfg := "sha256:runtime-config-ddddddddddddddddd"
+	// OCI config JSON blobs — pullConfig reads them via
+	// PullBlob(repo, manifest.Config.Digest) and decodes
+	// rootfs.diff_ids. The parent's DiffID list is exactly the
+	// prefix of the runtime's, satisfying
+	// oci.LayersAboveBase.
+	parentCfgBlob := []byte(`{"rootfs":{"type":"layers","diff_ids":["` + parentLy + `"]}}`)
+	runtimeCfgBlob := []byte(`{"rootfs":{"type":"layers","diff_ids":["` + runtimeLy1 + `","` + runtimeLy2 + `"]}}`)
+	return &parentRuntimePuller{
+		parentCfg:   parentCfg,
+		parentLayer: parentLy,
+		runtimeCfg:  runtimeCfg,
+		runtimeLy1:  runtimeLy1,
+		runtimeLy2:  runtimeLy2,
+		layers: map[string][]byte{
+			parentLy:   gzTar(t, map[string]string{"lib/libc.so.6": "fake libc"}),
+			runtimeLy2: gzTar(t, map[string]string{"usr/local/bin/node": "fake node"}),
+			parentCfg:  parentCfgBlob,
+			runtimeCfg: runtimeCfgBlob,
+		},
+	}
+}
+
+// newParentHarness builds a Handler wired with the parent-ref
+// puller, a real tmpdir-backed fakeVMMClient (so cp -a has
+// something to read), and a callCountingBuilder so tests can
+// assert BuildBaseFromStaging was the actual mkfs call.
+type parentHarness struct {
+	h   *Handler
+	be  storage.StorageBackend
+	fvm *fakeVMMClient
+	cb  *callCountingBuilder
+}
+
+func newParentHarness(t *testing.T) *parentHarness {
+	t.Helper()
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	mp := newParentRuntimePuller(t)
+	cb := &callCountingBuilder{}
+	// Real tmpdir for the fake mountpoint so cp -a succeeds.
+	mountDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(mountDir, "lib"), []byte("placeholder"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	fvm := &fakeVMMClient{mountHook: func(_ string) (string, error) {
+		return mountDir, nil
+	}}
+	h := &Handler{
+		oci:     mp,
+		builder: cb,
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
+		vmmClient: fvm,
+	}
+	return &parentHarness{h: h, be: be, fvm: fvm, cb: cb}
+}
+
+// TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly — happy
+// path for the ADR-053 staging branch. The runtime has 2
+// DiffIDs, the parent has 1 (matching the runtime's first).
+// After staging:
+//   - BuildBaseFromStaging called once (the parent-ref mkfs)
+//   - BuildBase NOT called (delta applied in-place, not via
+//     BuildBase's "apply ALL layers" loop)
+//   - fvm.MountParentExt4ReadOnly invoked exactly once with
+//     the parent base key
+//   - the base ext4 was published under the runtime baseKey
+func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
+	hs := newParentHarness(t)
+	const baseKey = "base/runner-node22-amd64.ext4"
+	const digKey = "base/runner-node22-amd64.ext4.digest"
+	res, err := hs.h.EnsureBaseExt4(context.Background(),
+		BaseRefNode22, baseKey, digKey, "", BaseRefDebianParent, "base/runner-base-debian-parent-amd64.ext4")
+	if err != nil {
+		t.Fatalf("EnsureBaseExt4: %v", err)
+	}
+	if res.Skipped {
+		t.Error("Skipped=true on first run, want false")
+	}
+	if res.ConfigDigest == "" {
+		t.Error("ConfigDigest empty")
+	}
+	if hs.cb.calls != 0 {
+		t.Errorf("BuildBase called %d times, want 0 (parent-ref path uses BuildBaseFromStaging)", hs.cb.calls)
+	}
+	if hs.cb.fromStagingCalls != 1 {
+		t.Errorf("BuildBaseFromStaging called %d times, want 1", hs.cb.fromStagingCalls)
+	}
+	if len(hs.fvm.mountedKeys) != 1 {
+		t.Fatalf("MountParentExt4ReadOnly called %d times, want 1", len(hs.fvm.mountedKeys))
+	}
+	if hs.fvm.mountedKeys[0] != "base/runner-base-debian-parent-amd64.ext4" {
+		t.Errorf("mounted with key %q, want base/runner-base-debian-parent-amd64.ext4", hs.fvm.mountedKeys[0])
+	}
+	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
+		t.Errorf("base ext4 not published at %s: %v", baseKey, err)
+	} else {
+		_ = rc.Close()
+	}
+	if rc, err := hs.be.Get(context.Background(), digKey); err != nil {
+		t.Errorf("digest sidecar not published at %s: %v", digKey, err)
+	} else {
+		_ = rc.Close()
+	}
+}
+
+// TestEnsureBaseExt4_WithParentRef_RejectsNilVMMClient —
+// the parent-ref branch must fail loud when h.vmmClient is
+// nil. The legacy path stays operational without a client
+// wired; only the parent-ref branch fails loud so a misconfig
+// surfaces here rather than at the cold-boot wake.
+func TestEnsureBaseExt4_WithParentRef_RejectsNilVMMClient(t *testing.T) {
+	be, _ := storage.NewLocalStorageBackend(t.TempDir())
+	mp := newParentRuntimePuller(t)
+	h := &Handler{
+		oci:     mp,
+		builder: &callCountingBuilder{},
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
+		// vmmClient intentionally nil
+	}
+	_, err := h.EnsureBaseExt4(context.Background(),
+		BaseRefNode22, "k", "k.digest", "", BaseRefDebianParent, "base/runner-base-debian-parent-amd64.ext4")
+	if err == nil {
+		t.Fatal("expected error when vmmClient is nil")
+	}
+	if !strings.Contains(err.Error(), "VMMClient") || !strings.Contains(err.Error(), "ADR-053") {
+		t.Errorf("error %q must mention VMMClient + ADR-053", err.Error())
+	}
+}
+
+// TestEnsureBaseExt4_WithoutParentRef_AppliesAllLayers —
+// the legacy "apply ALL layers" path stays operational when
+// parentRef is empty. Confirms the dispatcher in
+// EnsureBaseExt4 doesn't accidentally route a parent-less
+// row through the parent-ref branch (a regression here
+// would break every legacy runtime + builder-base).
+func TestEnsureBaseExt4_WithoutParentRef_AppliesAllLayers(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+	// Use an empty parentRef — the legacy path. The vmmClient
+	// stays nil (no client wired) and that's fine.
+	const baseKey = "base/runner-go124-amd64.ext4"
+	const digKey = "base/runner-go124-amd64.ext4.digest"
+	res, err := hs.h.EnsureBaseExt4(context.Background(),
+		BaseRefGo124, baseKey, digKey, "", "", "")
+	if err != nil {
+		t.Fatalf("EnsureBaseExt4: %v", err)
+	}
+	if res.Skipped {
+		t.Error("Skipped=true on first run, want false")
+	}
+	if hs.h.builder.(*callCountingBuilder).calls != 1 {
+		t.Errorf("BuildBase called %d times, want 1 (legacy path)", hs.h.builder.(*callCountingBuilder).calls)
+	}
+	if hs.h.builder.(*callCountingBuilder).fromStagingCalls != 0 {
+		t.Errorf("BuildBaseFromStaging called %d times, want 0 (legacy path)", hs.h.builder.(*callCountingBuilder).fromStagingCalls)
+	}
+	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
+		t.Errorf("base ext4 not published at %s: %v", baseKey, err)
+	} else {
+		_ = rc.Close()
+	}
+}

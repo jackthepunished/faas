@@ -106,6 +106,21 @@ func (s *stubVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusReq
 	return &vmmdpb.SeccompStatusResponse{}, nil
 }
 
+// MountParentExt4ReadOnly (ADR-053) — gateway never drives the
+// parent-mount staging path; imaged owns that RPC. Returns
+// empty + nil so the vmmdpb.VmmdClient interface is satisfied.
+// Any accidental caller would surface as imaged's
+// "empty mountpoint" check rather than a NotFound from vmmd.
+func (s *stubVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountParentExt4ReadOnlyRequest, ...grpc.CallOption) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
+	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
+}
+
+// UmountParentExt4 (ADR-053) — gateway never drives the parent
+// umount path. Returns nil.
+func (s *stubVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {
+	return &vmmdpb.UmountParentExt4Response{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

@@ -398,7 +398,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 	}
 	rc, err := m.storage.Get(ctx, storageKey)
 	if err != nil {
-		return "", fmt.Errorf("%w: %s: %v", vmmdmount.ErrNotFound, storageKey, err)
+		return "", fmt.Errorf("%w: %s: %w", vmmdmount.ErrNotFound, storageKey, err)
 	}
 	defer func() { _ = rc.Close() }()
 

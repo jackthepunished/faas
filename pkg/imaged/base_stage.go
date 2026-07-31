@@ -365,35 +365,32 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		h.log.Warn("imaged: parent umount (early release) failed", "mountpoint", mountpoint, "err", err)
 	}
 
-	// Apply the delta layers on top of the parent's tree. Pre-
-	// allocate readers + closers so a partial pull on layer N
-	// still closes layers 0..N-1 (mirrors the legacy path's
-	// closer-defer pattern).
-	readers := make([]io.Reader, 0, len(delta))
+	// Apply the delta layers on top of the parent's tree. Each
+	// layer is streamed via rootfs.ApplyLayerGz directly — the
+	// legacy path collects readers into a slice and hands them to
+	// BuildBase, but the parent-ref path applies layers in-place
+	// on the staging dir (BuildBaseFromStaging doesn't read
+	// BaseBuildInput.Layers — see pkg/rootfs/build_base.go).
 	closers := make([]io.ReadCloser, 0, len(delta))
-	for _, diffID := range delta {
-		desc, ok := blobByDiff[diffID]
-		if !ok {
-			for _, c := range closers {
-				_ = c.Close()
-			}
-			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref missing blob for diff %s", diffID)
-		}
-		rc, err := mp.PullBlob(ctx, ociRef.Registry+"/"+ociRef.Repository, desc.Digest)
-		if err != nil {
-			for _, c := range closers {
-				_ = c.Close()
-			}
-			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref pull blob %s: %w", desc.Digest, err)
-		}
-		closers = append(closers, rc)
-		readers = append(readers, rc)
-	}
 	defer func() {
 		for _, c := range closers {
 			_ = c.Close()
 		}
 	}()
+	for _, diffID := range delta {
+		desc, ok := blobByDiff[diffID]
+		if !ok {
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref missing blob for diff %s", diffID)
+		}
+		rc, err := mp.PullBlob(ctx, ociRef.Registry+"/"+ociRef.Repository, desc.Digest)
+		if err != nil {
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref pull blob %s: %w", desc.Digest, err)
+		}
+		closers = append(closers, rc)
+		if err := rootfs.ApplyLayerGz(staging, rc); err != nil {
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref apply delta layer %s: %w", desc.Digest, err)
+		}
+	}
 
 	res, err := h.builder.BuildBaseFromStaging(ctx, staging, rootfs.BaseBuildInput{
 		Storage:    be,
