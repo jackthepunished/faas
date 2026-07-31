@@ -97,6 +97,18 @@ func (s *stubVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.Call
 	return nil, status.Error(codes.Unimplemented, "gateway stub does not stream logs")
 }
 
+// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047). The
+// gateway hot path uses this on the streaming response path;
+// the unit-test handler suite doesn't drive the streaming
+// codepath today (the streaming e2e lives in cmd/e2e with
+// //go:build metal). Returning Unimplemented keeps any
+// accidental test firing the codepath honest: the test
+// either flips the stub to drive a fake bidi stream or the
+// caller fixes itself to use the unary ForwardHTTP.
+func (s *stubVmmdClient) ForwardHTTPStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
+	return nil, status.Error(codes.Unimplemented, "gateway stub does not stream HTTP")
+}
+
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go drives the
 // dial directly. Returns a "not implemented" envelope so the

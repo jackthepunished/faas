@@ -1186,3 +1186,124 @@ func TestServeHTTP_StreamingFallback_FiresOnPerAppFlag(t *testing.T) {
 		}
 	})
 }
+
+// TestStatusRecorder_FlushTriggers is the PR-B / ADR-047 unit
+// tripwire: the per-flush hook must fire on the (256 KiB / 200 ms)
+// triggers and once on the residual capture. The cumulative byte
+// count passed to onFlush must monotonically increase and the
+// delta between successive onFlush calls must sum to the total
+// Bytes observed. Buffered path (nil flusher) is a no-op so the
+// PR-A test suite keeps its character.
+func TestStatusRecorder_FlushTriggers(t *testing.T) {
+	t.Run("nil-flusher-buffered-path-noop", func(t *testing.T) {
+		rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+		var hookCalls atomic.Int32
+		rec.installFlushHook(nil, func(int64) { hookCalls.Add(1) }, 256*1024, 200*time.Millisecond, time.Second)
+		_, _ = rec.Write([]byte("hello"))
+		_, _ = rec.Write([]byte(" world"))
+		if rec.Bytes != int64(len("hello world")) {
+			t.Errorf("Bytes = %d, want %d", rec.Bytes, len("hello world"))
+		}
+		if hookCalls.Load() != 0 {
+			t.Errorf("nil-flusher path fired onFlush %d times, want 0", hookCalls.Load())
+		}
+	})
+	t.Run("byte-threshold-triggers-flush", func(t *testing.T) {
+		rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+		var hookBytes []int64
+		// 4 KiB threshold; 8 KiB total written in 1 KiB chunks.
+		// lastFlushAt pre-set so periodic-time trigger doesn't fire.
+		base := time.Now()
+		rec.installFlushHook(nopFlusher{},
+			func(c int64) { hookBytes = append(hookBytes, c) },
+			4*1024, 200*time.Millisecond, time.Second)
+		rec.firstFlush = false
+		rec.lastFlushAt = base // suppress periodic trigger; only byte threshold counts
+		// Write 8 KiB in 1 KiB chunks.
+		for i := 0; i < 8; i++ {
+			_, _ = rec.Write(make([]byte, 1024))
+		}
+		// Periodic flush should have fired once on the byte
+		// threshold (when bytesDelta crossed 4 KiB at the
+		// 5th Write).
+		if len(hookBytes) < 1 {
+			t.Fatalf("onFlush fired %d times, want ≥ 1 (byte threshold should have triggered)", len(hookBytes))
+		}
+		// The last hook call must be cumulative = 8192.
+		last := hookBytes[len(hookBytes)-1]
+		if last != 8192 {
+			t.Errorf("last onFlush cumulative = %d, want 8192", last)
+		}
+		// Sum of deltas between successive hook calls must
+		// equal 8192 (every byte observed by Write must be
+		// accounted for via onFlush).
+		var sum int64
+		prev := int64(0)
+		for _, b := range hookBytes {
+			sum += b - prev
+			prev = b
+		}
+		if sum != 8192 {
+			t.Errorf("sum of onFlush deltas = %d, want 8192 (every observed byte must be accounted for exactly once)", sum)
+		}
+	})
+	t.Run("residual-capture-finalFlush-fires", func(t *testing.T) {
+		rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+		base := time.Now()
+		rec.installFlushHook(nopFlusher{},
+			nil, // onFlush irrelevant for the periodic gate; we test finalFlush directly
+			4*1024, 200*time.Millisecond, time.Second)
+		rec.firstFlush = false
+		// lastFlushedBytes set so any periodic-trigger eval
+		// computes delta = current - lastFlushedBytes, which
+		// is the contract the Handler hook relies on.
+		rec.lastFlushedBytes = 0
+		rec.lastFlushAt = base
+		var hookBytes []int64
+		rec.onFlush = func(c int64) { hookBytes = append(hookBytes, c) }
+		// Write 100 bytes (well below the 4 KiB threshold).
+		_, _ = rec.Write(make([]byte, 100))
+		// Periodic flush should NOT have fired.
+		if len(hookBytes) != 0 {
+			t.Fatalf("periodic flush fired %d times under threshold, want 0", len(hookBytes))
+		}
+		// Now finalFlush (residual capture) must fire exactly
+		// once with cumulative 100 (the cumulative bytes
+		// observed by the recorder so far). The Handler's
+		// onFlush closure subtracts lastReported against
+		// this cumulative to compute the delta.
+		rec.finalFlush()
+		if len(hookBytes) != 1 {
+			t.Fatalf("finalFlush fired %d times, want 1", len(hookBytes))
+		}
+		if hookBytes[0] != 100 {
+			t.Errorf("finalFlush cumulative = %d, want 100", hookBytes[0])
+		}
+	})
+	t.Run("first-flush-fires-on-first-write", func(t *testing.T) {
+		rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+		rec.installFlushHook(nopFlusher{},
+			nil, // installFlushHook nil-hooks are a no-op; we set onFlush below
+			1024*1024, 200*time.Millisecond, time.Second)
+		// installFlushHook sets firstFlush=true.
+		var hookCount atomic.Int32
+		rec.onFlush = func(int64) { hookCount.Add(1) }
+		// First write triggers first-flush path (uncoditionally).
+		_, _ = rec.Write([]byte("first"))
+		if hookCount.Load() != 1 {
+			t.Errorf("first-flush hook fired %d times, want 1", hookCount.Load())
+		}
+		if rec.firstFlush {
+			t.Error("firstFlush flag stayed true after first flush")
+		}
+	})
+}
+
+// nopFlusher is the unit-test stand-in for http.Flusher. The
+// httptest.NewRecorder doesn't implement Flusher (it predates
+// the streaming work); the recorder's Write path doesn't need
+// a real flush target because the test asserts the hook
+// callback fired, not the bytes made it to the wire.
+type nopFlusher struct{}
+
+func (nopFlusher) Flush() {}

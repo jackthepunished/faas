@@ -311,6 +311,171 @@ func (h *Handler) streamingFallbackLog(appID, contentType string) {
 		"app", appID, "content_type", contentType)
 }
 
+// isAcceptJSON reports whether the request's Accept header opts the
+// request into the buffered path regardless of the per-app
+// streaming_enabled flag (spec §4.1, ADR-047). The check is case-
+// insensitive on the prefix and tolerates parameters like
+// "application/json; charset=utf-8". Anything else (no header,
+// wildcard "*/*", "text/event-stream", etc.) leaves the per-app
+// flag as the source of truth. Returns false for empty string — a
+// client that sets Accept: "" is treated the same as not setting
+// the header at all.
+func isAcceptJSON(accept string) bool {
+	if accept == "" {
+		return false
+	}
+	// Header may carry multiple comma-separated values; the
+	// per-request opt-out fires when ANY of them is
+	// application/json. The plan-of-record is "if you set
+	// application/json at all, you're opting in to buffered".
+	for _, raw := range strings.Split(accept, ",") {
+		mt := strings.TrimSpace(strings.ToLower(raw))
+		// Strip parameters (e.g. "; charset=utf-8").
+		if i := strings.IndexByte(mt, ';'); i >= 0 {
+			mt = mt[:i]
+		}
+		mt = strings.TrimSpace(mt)
+		if mt == "application/json" {
+			return true
+		}
+	}
+	return false
+}
+
+// setupStreamingWriter arms the per-request Flusher path. The
+// returned writer chains: MaxBytesWriter → statusRecorder →
+// original. Cap-exceeded writes emit a 413 problem+json via the
+// supplied onCap callback and disable further writes. The recorder
+// receives a per-flush onFlush closure that:
+//   - computes delta = cumulativeBytes - lastReported
+//   - attributes the delta to the egress sink
+//     (target.InstanceID, current minute)
+//   - increments the per-(app, plan) response bytes counter
+//   - tracks lastReported in a closure-local int64 (no field on
+//     the recorder — the recorder stays a value type that can
+//     still be embedded inside statusRecorder or copied
+//     accidentally without losing accounting state)
+//
+// The flush window (256 KiB / 200 ms) comes from
+// api.StreamingFlushBytesDefault / api.StreamingFlushIntervalDefault
+// — keeping them in pkg/api/limits.go means the operator can
+// later add a per-cluster override without touching this file.
+// writeTimeout is the per-flush deadline installed on the first
+// flush via http.ResponseController.SetWriteDeadline; the
+// subsequent flushes re-install the deadline relative to "now" so
+// the total wall time the connection can stay open is
+// flushInterval × N (with N bounded by the upstream duration).
+//
+// Returns the OUTER writer (the cap-wrapped recorder). The
+// Handler then calls proxy.ServeHTTP(w, r) with this writer;
+// every Write hits the cap check, the recorder's maybeFlush,
+// and the recorder's flush (which calls onFlush).
+func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorder, app App, target Target, writeTimeout time.Duration) http.ResponseWriter {
+	var lastReported int64
+	onFlush := func(cumulative int64) {
+		delta := cumulative - lastReported
+		lastReported = cumulative
+		if delta <= 0 {
+			return
+		}
+		if h.egressSink != nil && target.InstanceID != "" {
+			h.egressSink.RecordResponseBytes(target.InstanceID, delta)
+		}
+		if h.metrics != nil && app.ID != "" {
+			h.metrics.ObserveResponseBytes(app.ID, string(app.Plan), delta)
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveStreamFlush(app.ID, string(app.Plan))
+		}
+	}
+
+	flusher, _ := w.(http.Flusher)
+	if flusher == nil {
+		// The wrapped writer isn't an http.Flusher. The buffered
+		// path stays; we still install the onFlush hook so the
+		// recorder tracks Bytes for the once-per-response
+		// recordEgress call. (This branch is reachable in unit
+		// tests where httptest.NewRecorder doesn't implement
+		// Flusher; production uses http.ResponseWriter from
+		// net/http.Server which always does.)
+		rec.installFlushHook(nil, onFlush, 0, 0, 0)
+		return w
+	}
+	rec.installFlushHook(flusher, onFlush, api.StreamingFlushBytesDefault, api.StreamingFlushIntervalDefault, writeTimeout)
+
+	// Wrap with MaxBytesWriter so a streaming app that exceeds
+	// its plan's response body cap (Free 25 MB, Hobby 100 MB,
+	// etc.) gets a 413 problem+json instead of a stdlib-default
+	// 502. The onCap callback fires once per request — the
+	// MaxBytesWriter goroutine detects the cap, signals the
+	// response goroutine via the closed channel, the response
+	// goroutine writes the 413 problem+json and disables
+	// further writes via the capWriter.disabled flag.
+	cap := app.Plan.MaxResponseBodyBytes()
+	return &capWriter{
+		ResponseWriter: rec,
+		cap:            cap,
+		onCap: func() {
+			api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, api.CodeStreamingNotAvailable,
+				"streaming response exceeded plan cap",
+				fmt.Sprintf("app %s on plan %s is capped at %d bytes per response", app.ID, app.Plan, cap)))
+		},
+		disabled: &atomic.Bool{},
+	}
+}
+
+// capWriter is a thin http.ResponseWriter wrapper that enforces
+// a per-response body byte cap. On cap-exceeded Write returns an
+// error and fires onCap (which writes a problem+json to the
+// ORIGINAL writer before this wrapper was installed, so the
+// problem lands on the wire even though the wrapped Write is
+// blocked). After onCap fires, the disabled flag prevents
+// subsequent Writes from consuming bytes.
+//
+// This is a separate type from http.MaxBytesWriter because the
+// stdlib one writes a 502 directly to the underlying writer with
+// no opportunity to inject our 413 problem+json shape.
+type capWriter struct {
+	http.ResponseWriter
+	cap      int64
+	written  int64
+	onCap    func()
+	disabled *atomic.Bool
+}
+
+func (c *capWriter) Write(b []byte) (int, error) {
+	if c.disabled.Load() {
+		return 0, http.ErrHandlerTimeout
+	}
+	if c.written+int64(len(b)) > c.cap {
+		// Fire once; idempotent under concurrent writes thanks
+		// to disabled CAS.
+		if c.disabled.CompareAndSwap(false, true) && c.onCap != nil {
+			c.onCap()
+		}
+		return 0, http.ErrHandlerTimeout
+	}
+	n, err := c.ResponseWriter.Write(b)
+	if n > 0 {
+		c.written += int64(n)
+	}
+	return n, err
+}
+
+// Flush is forwarded so a streaming upstream calling Flush
+// directly on the cap-wrapped writer still triggers the
+// recorder's flush logic. The cap check happens in Write, not
+// Flush, so a Flush that hasn't been preceded by a new Write is
+// a no-op for the cap.
+func (c *capWriter) Flush() {
+	if c.disabled.Load() {
+		return
+	}
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // WithEgressSink installs the per-instance HTTP response byte ring
 // buffer (pkg/gateway/egresssink). ADR-046 (per-instance egress
 // metering, telemetry only) wires this once at gatewayd boot from
@@ -535,6 +700,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-faas-wake-id", wakeID)
 	}
 
+	// Streaming decision (PR-B / ADR-047). Three-way AND: the operator
+	// must have opted the process in (h.streamingEnabled, set via
+	// FAAS_GATEWAY_STREAMING), the per-app apps.streaming_enabled flag
+	// must be true (set on build / PATCH / plan default), and the
+	// per-request Accept header must not opt out. The
+	// Accept: application/json override is the customer-visible
+	// contract from spec §4.1 — a client can force the buffered
+	// path for one request without a per-app PATCH.
+	//
+	// Placement: AFTER Backend.Pick so the per-flush onFlush hook
+	// has target.InstanceID to attribute egress bytes. BEFORE the
+	// proxy runs so the wrapped ResponseWriter (which is both an
+	// http.ResponseWriter and an http.Flusher via embed) is in
+	// place when the upstream first calls Write. The wrap is
+	// nil-safe in the sense that when the gate is false, w stays
+	// the original ResponseWriter and the recorder is never
+	// installed — the buffered path is a strict pass-through.
+	streaming := h.streamingEnabled && app.StreamingEnabled &&
+		!isAcceptJSON(r.Header.Get("Accept"))
+	if streaming {
+		writeTimeout := app.Plan.ResponseWriteTimeout()
+		w = h.setupStreamingWriter(w, rec, app, target, writeTimeout)
+		// Internal header stamp (PR-B + PR-C / ADR-047). The
+		// forwarder (pkg/gateway/forwardproxy.go) reads this to
+		// switch to the bidi ForwardHTTPStream RPC and lift the
+		// per-request cap/timeout on the vmmd side. Not exposed
+		// to the client (the request stays on the inbound HTTP
+		// path); the forwarder strips x-faas-* headers before
+		// bridging so the guest never sees it.
+		r.Header.Set("x-faas-stream", "true")
+	}
+
 	wakeStart := time.Now()
 	if h.proxyByNode != nil {
 		// Issue #98 / ADR-028: Target.NodeID is the compute_node.id;
@@ -572,6 +769,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.streamingFallbackLog(app.ID, rec.ContentType)
 	}
 	h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)
+	// PR-B residual capture. On the streaming path the per-flush
+	// deltas already attributed every byte that hit the wire; the
+	// one outstanding delta is the trailing slice between the
+	// last periodic flush and the upstream finishing. finalFlush
+	// fires one more onFlush with rec.Bytes (the cumulative
+	// count) which the hook subtracts against its lastReported.
+	// The buffered path short-circuits via nil-safe flusher ==
+	// nil. The streaming flag is set by setupStreamingWriter
+	// alongside flusher, so checking streaming here would be
+	// equivalent to checking flusher != nil; we use flusher
+	// directly to keep the helper self-contained.
+	if rec.flusher != nil {
+		rec.finalFlush()
+	}
 	// ADR-046 (per-instance egress metering, telemetry only):
 	// record the response body bytes that egressed the gateway on
 	// this instance. Gated on 2xx/3xx because 4xx/5xx the
@@ -715,6 +926,14 @@ func (p *preInstantiateApps) seen(appID string) bool {
 // stage on the ReverseProxy path (it short-circuits to the error
 // branch), so trying to count their bytes would over-attribute.
 //
+// PR-B streaming path: when the recorder is armed with a flusher
+// (rec.flusher != nil, set by setupStreamingWriter), the per-flush
+// onFlush hook has ALREADY recorded every byte in deltas plus the
+// residual from finalFlush(). Calling recordEgress again would
+// double-count (rec.Bytes + sum(deltas) = 2 × total). The streaming
+// gate short-circuits the function; the buffered path remains
+// unchanged.
+//
 // The InstanceID guard means tests that exercise only fakeBackend
 // (where pick-instance is empty) skip the recording without
 // crashing. The sink is nil-safe itself (RecordResponseBytes
@@ -727,6 +946,12 @@ func (p *preInstantiateApps) seen(appID string) bool {
 // §12 dashboard panels to keep the join on plan stable.
 func (h *Handler) recordEgress(rec *statusRecorder, target Target, app App) {
 	if h == nil || rec == nil {
+		return
+	}
+	// PR-B streaming path: per-flush + residual already covered
+	// the byte accounting; suppress the once-per-response call to
+	// avoid double-counting.
+	if rec.flusher != nil {
 		return
 	}
 	if rec.status < 200 || rec.status >= 400 {
@@ -851,12 +1076,78 @@ func (h *Handler) preInstantiateApp(appID string) {
 // at WriteHeader time so the post-proxy site can decide whether the
 // response was an SSE stream (text/event-stream) that got buffered on
 // the way out. The field is read once after proxy.ServeHTTP returns.
+//
+// PR-B (issue #471) extends the recorder with optional streaming
+// fields. The semantics: when `flusher` is nil, the recorder is a
+// strict pass-through (today's buffered path) and `Write` ignores
+// the onFlush hook + flush triggers. When `flusher` is non-nil
+// (installed by Handler.setupStreamingWriter), `Write` calls
+// maybeFlush() after the underlying write; maybeFlush triggers
+// a flush when bytes-since-last-flush ≥ flushBytes
+// (StreamingFlushBytesDefault, 256 KiB) OR
+// time-since-last-flush ≥ flushInterval (StreamingFlushIntervalDefault,
+// 200 ms) AND bytes-since-last-flush > 0. The first flush after
+// WriteHeader unconditionally fires (to set the per-flush write
+// deadline via http.ResponseController) and is the onFlush hook's
+// caller-side gate for the per-flush tx_bytes increment.
+//
+// `streaming` is the boolean the gateway sets when it has decided
+// to take the streaming path (operator flag + per-app flag +
+// Accept opt-out). The handler reads it once at the post-proxy
+// branch to decide whether to call finalFlush (the residual
+// capture) and whether to skip the once-per-response recordEgress
+// (the per-flush deltas already account for everything on the
+// streaming path).
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
 	Bytes       int64
 	ContentType string
+
+	// Streaming fields (PR-B, nil → buffered path). Install via
+	// installFlushHook; the fields stay zero otherwise.
+	flusher          http.Flusher
+	onFlush          func(cumulativeBytes int64)
+	lastFlushAt      time.Time
+	lastFlushedBytes int64
+	flushBytes       int64
+	flushInterval    time.Duration
+	// firstFlush gates the one-shot write-deadline install that
+	// happens on the first flush after WriteHeader. True until the
+	// first flush fires.
+	firstFlush bool
+	// writeDeadline is the per-flush deadline installed via
+	// http.ResponseController.SetWriteDeadline on the first flush
+	// (and re-installed on every subsequent flush to keep the
+	// deadline sliding forward — the plan enforces "no more than
+	// this many seconds of blocking write per flush window").
+	writeDeadline time.Duration
+	// streaming is the Handle ctx-side flag: true when the gateway
+	// took the streaming path on this request. Read by the post-
+	// proxy site to decide whether to call finalFlush (residual
+	// capture) and whether to skip the once-per-response
+	// recordEgress call (the per-flush deltas already account for
+	// everything on the streaming path).
+	streaming bool
+}
+
+// installFlushHook arms the recorder for streaming. After install,
+// every Write triggers maybeFlush, and every flush fires onFlush.
+// The hook is nil-safe: a nil flusher or nil onFlush silently
+// no-ops on the flush attempt (the recorder still tracks Bytes
+// for the buffered path).
+func (s *statusRecorder) installFlushHook(flusher http.Flusher, onFlush func(int64), flushBytes int64, flushInterval, writeDeadline time.Duration) {
+	if flusher == nil {
+		return
+	}
+	s.flusher = flusher
+	s.onFlush = onFlush
+	s.flushBytes = flushBytes
+	s.flushInterval = flushInterval
+	s.writeDeadline = writeDeadline
+	s.firstFlush = true
+	s.streaming = true
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
@@ -894,7 +1185,88 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	if n > 0 {
 		s.Bytes += int64(n)
 	}
+	if s.flusher != nil {
+		s.maybeFlush()
+	}
 	return n, err
+}
+
+// Flush is the http.Flusher pass-through. The ReverseProxy doesn't
+// call it directly today (the buffered path), but a streaming
+// upstream that wants to push bytes between Writes can call it
+// and the same onFlush hook fires. Used by Handler.finalFlush too.
+// Nil-safe: returns instantly if the recorder is on the buffered
+// path (no flusher installed).
+func (s *statusRecorder) Flush() {
+	if s.flusher == nil {
+		return
+	}
+	s.doFlush()
+}
+
+// maybeFlush checks the periodic-flush triggers and calls doFlush
+// when any are met. Cheap when no trigger fires: a bytes-delta
+// subtract + a time.Since + a comparison.
+func (s *statusRecorder) maybeFlush() {
+	if s.firstFlush {
+		s.doFlush()
+		return
+	}
+	bytesDelta := s.Bytes - s.lastFlushedBytes
+	if bytesDelta >= s.flushBytes {
+		s.doFlush()
+		return
+	}
+	if bytesDelta > 0 && time.Since(s.lastFlushAt) >= s.flushInterval {
+		s.doFlush()
+		return
+	}
+}
+
+// doFlush is the single point that fires onFlush + pushes bytes
+// to the wire. Called from maybeFlush (periodic triggers), Flush
+// (explicit upstream call), and finalFlush (residual capture).
+func (s *statusRecorder) doFlush() {
+	if s.firstFlush && s.writeDeadline > 0 {
+		// Install the per-flush write deadline on the very first
+		// flush. http.ResponseController is the post-Go-1.20 way
+		// to set a write deadline on a ResponseWriter without
+		// touching the underlying net/http internals; if the
+		// controller is unavailable (e.g. the wrapped writer
+		// predates Go 1.20), the deadline is silently skipped and
+		// the http.Server.WriteTimeout safety net applies. We
+		// don't error-out because production is on Go 1.23 per
+		// CLAUDE.md, but the nil-check keeps the unit tests on
+		// older httptest.NewRecorder paths honest.
+		if rc := http.NewResponseController(s.ResponseWriter); rc != nil {
+			_ = rc.SetWriteDeadline(time.Now().Add(s.writeDeadline))
+		}
+		s.firstFlush = false
+	}
+	if s.onFlush != nil {
+		s.onFlush(s.Bytes)
+	}
+	s.flusher.Flush()
+	s.lastFlushAt = time.Now()
+	s.lastFlushedBytes = s.Bytes
+}
+
+// finalFlush is the residual capture. The post-proxy site calls
+// this after the proxy returns on the streaming path. It fires
+// onFlush one more time with the final Bytes (cumulative) so the
+// per-flush tx_bytes deltas cover the trailing bytes between the
+// last periodic flush and the upstream finishing. Nil-safe: no-op
+// on the buffered path.
+//
+// The two-phase accounting (per-flush + residual) is documented
+// in ADR-047; the contract is that the sum of every per-flush
+// delta after proxy.ServeHTTP returns equals total egress bytes
+// for the request.
+func (s *statusRecorder) finalFlush() {
+	if s.flusher == nil {
+		return
+	}
+	s.doFlush()
 }
 
 // ensureCapacity (issue #168) is the per-app fan-out admission primitive.

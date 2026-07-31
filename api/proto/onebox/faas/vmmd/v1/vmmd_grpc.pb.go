@@ -33,6 +33,7 @@ const (
 	Vmmd_UpdateEgressAllowlist_FullMethodName   = "/onebox.faas.vmmd.v1.Vmmd/UpdateEgressAllowlist"
 	Vmmd_SeccompStatus_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
 	Vmmd_Logs_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Logs"
+	Vmmd_ForwardHTTPStream_FullMethodName       = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTPStream"
 	Vmmd_MountParentExt4ReadOnly_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/MountParentExt4ReadOnly"
 	Vmmd_UmountParentExt4_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/UmountParentExt4"
 )
@@ -129,6 +130,24 @@ type VmmdClient interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogsResponse], error)
+	// ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
+	// peer of ForwardHTTP. Same semantics as ForwardHTTP but the
+	// request body is sent as a stream of chunks (the first frame
+	// carries the init envelope; subsequent frames carry body bytes),
+	// and the response is returned as a stream of chunks (the first
+	// frame carries status + headers; subsequent frames carry body
+	// bytes). The bidirectional streaming lets gatewayd push the
+	// request body incrementally and pull the response body
+	// incrementally — the vmmd-side bridge script no longer needs to
+	// buffer the entire response body before sending it back.
+	//
+	// The init-level `stream` field on ForwardHTTPRequestInit lifts
+	// ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
+	// envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
+	// caps are on the gateway side via http.MaxBytesWriter). The
+	// legacy unary ForwardHTTP stays as the deprecated path for one
+	// release cycle to keep a rolling deploy green; PR-D removes it.
+	ForwardHTTPStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse], error)
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -297,6 +316,19 @@ func (c *vmmdClient) Logs(ctx context.Context, in *LogsRequest, opts ...grpc.Cal
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_LogsClient = grpc.ServerStreamingClient[LogsResponse]
 
+func (c *vmmdClient) ForwardHTTPStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Vmmd_ServiceDesc.Streams[1], Vmmd_ForwardHTTPStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Vmmd_ForwardHTTPStreamClient = grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]
+
 func (c *vmmdClient) MountParentExt4ReadOnly(ctx context.Context, in *MountParentExt4ReadOnlyRequest, opts ...grpc.CallOption) (*MountParentExt4ReadOnlyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MountParentExt4ReadOnlyResponse)
@@ -409,6 +441,24 @@ type VmmdServer interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error
+	// ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
+	// peer of ForwardHTTP. Same semantics as ForwardHTTP but the
+	// request body is sent as a stream of chunks (the first frame
+	// carries the init envelope; subsequent frames carry body bytes),
+	// and the response is returned as a stream of chunks (the first
+	// frame carries status + headers; subsequent frames carry body
+	// bytes). The bidirectional streaming lets gatewayd push the
+	// request body incrementally and pull the response body
+	// incrementally — the vmmd-side bridge script no longer needs to
+	// buffer the entire response body before sending it back.
+	//
+	// The init-level `stream` field on ForwardHTTPRequestInit lifts
+	// ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
+	// envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
+	// caps are on the gateway side via http.MaxBytesWriter). The
+	// legacy unary ForwardHTTP stays as the deprecated path for one
+	// release cycle to keep a rolling deploy green; PR-D removes it.
+	ForwardHTTPStream(grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]) error
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -490,6 +540,9 @@ func (UnimplementedVmmdServer) SeccompStatus(context.Context, *SeccompStatusRequ
 }
 func (UnimplementedVmmdServer) Logs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error {
 	return status.Error(codes.Unimplemented, "method Logs not implemented")
+}
+func (UnimplementedVmmdServer) ForwardHTTPStream(grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]) error {
+	return status.Error(codes.Unimplemented, "method ForwardHTTPStream not implemented")
 }
 func (UnimplementedVmmdServer) MountParentExt4ReadOnly(context.Context, *MountParentExt4ReadOnlyRequest) (*MountParentExt4ReadOnlyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MountParentExt4ReadOnly not implemented")
@@ -709,6 +762,13 @@ func _Vmmd_Logs_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_LogsServer = grpc.ServerStreamingServer[LogsResponse]
 
+func _Vmmd_ForwardHTTPStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(VmmdServer).ForwardHTTPStream(&grpc.GenericServerStream[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Vmmd_ForwardHTTPStreamServer = grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]
+
 func _Vmmd_MountParentExt4ReadOnly_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MountParentExt4ReadOnlyRequest)
 	if err := dec(in); err != nil {
@@ -806,6 +866,12 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "Logs",
 			Handler:       _Vmmd_Logs_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "ForwardHTTPStream",
+			Handler:       _Vmmd_ForwardHTTPStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "onebox/faas/vmmd/v1/vmmd.proto",
