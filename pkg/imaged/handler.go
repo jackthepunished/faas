@@ -866,6 +866,16 @@ func runtimeToEnvSuffix(runtime string) string {
 // unchanged. Validation is left to AppManifest.Validate so it can emit
 // consistent error codes. Per-deploy overrides apply on top of this in
 // handleDeployment.
+//
+// ADR-051 Phase 4 (characterization boot): the App path must default
+// Port + Healthz and inject PORT=8080 into Env so the in-guest probe
+// (guest/init/{characterize,portnorm}_linux.go) sees a known listening
+// port and the app listens on :8080. Without these defaults the port
+// normalization ladder in portnorm_linux.go must fall through to the
+// userspace forwarder on every first wake, which the architecture
+// avoids (ADR-051 §"Consequences"). Customer-pinned values in
+// cfg.Port / cfg.Env["PORT"] survive this seeding (last-write-wins
+// is the customer's call).
 func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 	manifest := api.AppManifest{
 		WorkingDir: cfg.WorkingDir,
@@ -878,6 +888,19 @@ func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 		// manifest.Entrypoint. Pinned by
 		// TestManifestFromImageConfig_AppModeCmd in handler_test.go.
 		manifest.Entrypoint = slices.Clone(cfg.Cmd)
+	}
+	// Pin: containerised config wins (file-system contract is the
+	// customer's); null is the unset case the function-path code at
+	// line ~677 hard-codes — we mirror that here so both paths share
+	// the same defaults. The `:8080` readiness contract is the cross-
+	// boundary host shape — changing it would invalidate every
+	// existing snapshot (ADR-009).
+	manifest.Healthz = "/healthz"
+	if manifest.Env == nil {
+		manifest.Env = make(map[string]string, 1)
+	}
+	if _, set := manifest.Env["PORT"]; !set {
+		manifest.Env["PORT"] = "8080"
 	}
 	return manifest
 }

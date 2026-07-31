@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -120,14 +121,27 @@ func boot() error {
 		slog.Default().Warn("env.json could not be loaded; proceeding without api env", "err_kind", errorKind(apiErr))
 	}
 
-	sup := Supervisor{
-		Max:   MaxRestarts,
-		Start: func() error { return runAppWithEnv(manifest, secrets, apiEnv) },
-		OnCrash: func(attempt int, err error) {
-			fmt.Fprintf(os.Stderr, "guest-init: app crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
-		},
+	// ADR-051 Phase 4: Supervisor holds atomic.Pointer (Run is a
+	// pointer receiver, see supervise.go). We assign the struct
+	// fields one at a time so the Start closure can refer to
+	// `supRef` — referencing `&sup` from inside its own struct
+	// literal would trip Go's "undefined: sup" before the
+	// assignment. The wiring below is the canonical fix.
+	supRef := &Supervisor{Max: MaxRestarts}
+	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef) }
+	supRef.OnCrash = func(attempt int, err error) {
+		fmt.Fprintf(os.Stderr, "guest-init: app crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
 	}
-	return sup.Run()
+	// ADR-051 Phase 4: characterize the workload by observing the
+	// first cold boot. Runs in parallel with sup.Run() so the
+	// PID-fd walk finds the customer's listener without blocking
+	// the boot. The host (pkg/fcvm/vmm.go::WaitCharacterization
+	// Report in PR-D) gates the RUNNING transition on the report
+	// arriving; a timeout here falls back to scan-hint class (never
+	// fails the deploy — that's worse than today's opaque "guest
+	// not ready after 30s" path).
+	go runCharacterizationForSup(supRef, manifest)
+	return supRef.Run()
 }
 
 // runAppWithEnv is the secrets+apiEnv-aware entrypoint — same execve
@@ -135,7 +149,7 @@ func boot() error {
 // Empty/nil secrets AND empty/nil apiEnv short-circuits to the bare
 // BuildEnv path; nil in one of them short-circuits to the other layer's
 // 3-arg shape via BuildEnvWithSecrets's nil-tolerant map reads.
-func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string) error {
+func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Supervisor) error {
 	argv := m.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = m.EffectiveWorkingDir()
@@ -145,6 +159,13 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string) error {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid)},
 		}
+	}
+	// ADR-051 Phase 4: expose the forked cmd to the supervisor so
+	// runCharacterizationForSup can read the PID via LastAppPID().
+	// The supervisor's Run() loop captures the cmd at every
+	// restart; runAppWithEnv executes once per restart.
+	if sup != nil {
+		sup.trackCommand(cmd)
 	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("run %v: %w", argv, err)
@@ -431,4 +452,78 @@ func lookupUID(user string) int {
 		return api.DefaultAppUID
 	}
 	return api.DefaultAppUID
+}
+
+// runCharacterizationForSup is the boot-side glue between the
+// characterize_linux.go probe and the supervisor. It owns the
+// "what PID is the customer app" lifecycle and the "what was the
+// last exit code" visibility that runCharacterization needs:
+//
+//   - `AppPID()` is polled by waitForBind every 50 ms until the
+//     supervisor's lastCmd pointer is non-nil. If the supervisor
+//     finishes without ever forking (e.g. a test-only stub Start),
+//     AppPID returns -1 forever and the probe times out at the
+//     bind-dealine → classified `job`.
+//   - `WaitForExit()` blocks until the supervisor's Run returns.
+//     We bridge by polling the supervisor's lastExitCode via
+//     reflection-free access (every 50 ms) and surfacing it as
+//     the report's ExitCode.
+//
+// Returns when runCharacterization returns (duration: ~10s
+// deadline or earlier on bind+probe). Errors are warn-logged;
+// the platform contract is "no signal" not "won't boot".
+func runCharacterizationForSup(sup *Supervisor, manifest api.AppManifest) {
+	log := slog.Default()
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	// Channel signals when sup.Run() returns. Filling our own
+	// pipe keeps WaitForExit() independent of supervisor internals.
+	done := make(chan struct{})
+	go func() {
+		// The supervisor's Run() returns BEFORE the kickoff goroutine
+		// yields in practice — by the time we launch WaitForExit
+		// below the supervisor may already be done. The channel
+		// captures both cases. We close the gate the moment
+		// lastExitCode settles (the supervisor's trackExit fires
+		// synchronously before Run returns).
+		// We can't poll every tick fast enough; instead we set a
+		// 50 ms ticker. This is the in-guest equivalent of the
+		// "polling the awaitable" pattern.
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if sup.LastExitCode() != -1 {
+					return
+				}
+			}
+		}
+	}()
+	defer close(done)
+
+	args := RunArgs{
+		Manifest: manifest,
+		AppPID:   func() int { return sup.LastAppPID() },
+		WaitForExit: func() (int, error) {
+			// Block until the supervisor's exit code stabilises.
+			for sup.LastExitCode() == -1 {
+				time.Sleep(50 * time.Millisecond)
+			}
+			return sup.LastExitCode(), nil
+		},
+		RingBufferTail: func() string {
+			// Empty until the supervisor's stdout/stderr capture
+			// (PR-C doesn't add it; customer deploy-row log surfacing
+			// ships in a follow-up). The wire field stays empty
+			// for v1, the platform contract of "no signal not
+			// won't boot" is preserved.
+			return ""
+		},
+		Log: log,
+	}
+	runCharacterization(context.Background(), args)
 }
