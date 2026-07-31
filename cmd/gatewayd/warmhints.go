@@ -139,7 +139,12 @@ func (g *warmHintConsumer) Run(ctx context.Context) {
 
 // drain pulls events from stream until ctx cancels or the stream
 // errors. Each event updates the cache. Returns nil on ctx
-// cancel or io.EOF; the underlying gRPC error otherwise.
+// cancel; io.EOF when the stream closes cleanly outside of a
+// cancel; the underlying gRPC error otherwise. A stream error that
+// races ctx cancel (e.g. io.EOF delivered in the same goroutine
+// cycle as ctx.Done) is folded into nil — caller wants the cancel
+// path to win so Run() exits instead of treating a stale EOF as a
+// transient blip and reconnecting.
 func (g *warmHintConsumer) drain(ctx context.Context, stream scheddgrpc.WarmHintStream) error {
 	for {
 		select {
@@ -149,6 +154,18 @@ func (g *warmHintConsumer) drain(ctx context.Context, stream scheddgrpc.WarmHint
 		}
 		ev, err := stream.Recv()
 		if err != nil {
+			if ctx.Err() != nil {
+				// ctx wins — return nil so Run() exits cleanly
+				// instead of reconnecting on a stream teardown
+				// that was triggered by the cancel.
+				//
+				// nolint:nilerr // Mirrors the bearer() fallback
+				// at oci.go:1197-1203: a stream teardown that
+				// races ctx cancel folds into the clean-shutdown
+				// path; returning the underlying error would
+				// trigger a spurious reconnect.
+				return nil
+			}
 			return err
 		}
 		// Drop malformed events silently — schedd is the only

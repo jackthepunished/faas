@@ -1312,19 +1312,10 @@ func manipulateCacheForTest(be *OCIRegistryStorageBackend, scope string, mut fun
 // wake against a near-expiry token would fan out 8 refresh round trips.
 func TestOCIRefreshSingleFlight(t *testing.T) {
 	var refreshHits int32
-	started := make(chan struct{}, 1) // signals when the first POST arrives
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			atomic.AddInt32(&refreshHits, 1)
-			// Non-blocking signal: first writer wins, others see a
-			// full channel and move on. We want every goroutine to
-			// enter the cache-miss path BEFORE the first refresh
-			// returns, otherwise the test would race.
-			select {
-			case started <- struct{}{}:
-			default:
-			}
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"token":"refreshed","refresh_token":"rt-2","expires_in":3600}`)
 			return
@@ -1364,18 +1355,29 @@ func TestOCIRefreshSingleFlight(t *testing.T) {
 	})
 
 	const concurrent = 8
+	// ready is a release barrier — every goroutine blocks on
+	// <-ready until the main goroutine closes it, so all 8 hit
+	// the cache-miss check in bearer() simultaneously. Without
+	// the barrier the first goroutine can finish its refresh POST
+	// before the others even reach bearer(), each then spawns
+	// its own refresh, and the test fails with "refresh hits = 2,
+	// want 1". The in-process HTTP client round-trips in µs, so
+	// a fast CI runner fires this race ~1 in 10 — observed on CI
+	// run 30647001244 (PR #467 coverage job 91210737805).
+	ready := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := 0; i < concurrent; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-ready
 			_, _ = be.fetchTags(ctx, "apps")
 		}()
 	}
+	close(ready)
 	wg.Wait()
 
 	if got := atomic.LoadInt32(&refreshHits); got != 1 {
 		t.Errorf("refresh hits = %d, want 1 (single-flight must coalesce)", got)
 	}
-	_ = started // referenced only to keep the channel alive in the closure
 }
