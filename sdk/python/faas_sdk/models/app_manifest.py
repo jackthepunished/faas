@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.app_manifest_env import AppManifestEnv
+    from ..models.app_manifest_env_secrets import AppManifestEnvSecrets
 
 
 T = TypeVar("T", bound="AppManifest")
@@ -18,12 +19,17 @@ T = TypeVar("T", bound="AppManifest")
 @_attrs_define
 class AppManifest:
     """App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source
-    flag (§ux 6.3).
+    flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs ("secret:NAME" strings) resolved by the
+    host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are NEVER sealed
+    ciphertext — only refs.
 
     """
 
     entrypoint: list[str]
     env: AppManifestEnv | Unset = UNSET
+    env_secrets: AppManifestEnvSecrets | Unset = UNSET
+    """Env override via sealed-secret refs. Each value is "secret:NAME"; the host resolver looks up NAME against
+    the app_secrets table at wake."""
     working_dir: None | str | Unset = UNSET
     port: int | None | Unset = UNSET
     healthz: None | str | Unset = UNSET
@@ -36,6 +42,10 @@ class AppManifest:
         env: dict[str, Any] | Unset = UNSET
         if not isinstance(self.env, Unset):
             env = self.env.to_dict()
+
+        env_secrets: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.env_secrets, Unset):
+            env_secrets = self.env_secrets.to_dict()
 
         working_dir: None | str | Unset
         if isinstance(self.working_dir, Unset):
@@ -70,6 +80,8 @@ class AppManifest:
         )
         if env is not UNSET:
             field_dict["env"] = env
+        if env_secrets is not UNSET:
+            field_dict["env_secrets"] = env_secrets
         if working_dir is not UNSET:
             field_dict["working_dir"] = working_dir
         if port is not UNSET:
@@ -84,6 +96,7 @@ class AppManifest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.app_manifest_env import AppManifestEnv
+        from ..models.app_manifest_env_secrets import AppManifestEnvSecrets
 
         d = dict(src_dict)
         entrypoint = cast(list[str], d.pop("entrypoint"))
@@ -94,6 +107,13 @@ class AppManifest:
             env = UNSET
         else:
             env = AppManifestEnv.from_dict(_env)
+
+        _env_secrets = d.pop("env_secrets", UNSET)
+        env_secrets: AppManifestEnvSecrets | Unset
+        if isinstance(_env_secrets, Unset):
+            env_secrets = UNSET
+        else:
+            env_secrets = AppManifestEnvSecrets.from_dict(_env_secrets)
 
         def _parse_working_dir(data: object) -> None | str | Unset:
             if data is None:
@@ -134,6 +154,7 @@ class AppManifest:
         app_manifest = cls(
             entrypoint=entrypoint,
             env=env,
+            env_secrets=env_secrets,
             working_dir=working_dir,
             port=port,
             healthz=healthz,

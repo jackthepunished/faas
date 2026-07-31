@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -689,11 +691,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// local backend's Get maps the same keys to the same files the
 	// legacy *_path fields used, so single-box behaviour is
 	// preserved. See pkg/sched/paths.go baseKey / layerKey.
+	//
+	// PR-B (issue #460 / ADR-053 §Decision 1): env_secrets override
+	// filtering happens here, on the wake path. dep.OverrideEnvSecrets
+	// (a jsonb blob) is the per-deployment allowlist; pre-PR-B
+	// deployments without override columns get the legacy "stage
+	// everything for the app" behaviour so tarball/dockerfile paths
+	// keep working unchanged.
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	if err != nil {
+		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		SealedEnv:  sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -1113,11 +1126,20 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	// local backend's Get maps the same keys to the same files the
 	// legacy *_path fields used, so single-box behaviour is
 	// preserved. See pkg/sched/paths.go baseKey / layerKey.
+	//
+	// PR-B (issue #460 / ADR-053 §Decision 1): env_secrets override
+	// filtering — see Wake builder for the full contract. ColdBoot /
+	// Prime shares the wake path; the dep row is the same one Wake
+	// loaded (so no extra DB read).
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	if err != nil {
+		return fmt.Errorf("sched: prime: load sealed env: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		SealedEnv:  sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -1486,28 +1508,110 @@ func (e *Engine) resolveAppForDeploy(ctx context.Context, appID string) (state.A
 	return app, acct, limits, nil
 }
 
-// loadSealedEnv reads the per-app sealed env rows and flattens them into
-// the fcvm shape Manager.Wake consumes. A read failure here is non-fatal:
-// it logs and returns nil (an empty SealedEnv). That preserves the
-// "wake succeeds even if PG has a hiccup" property — the app comes up
-// without secrets rather than failing entirely. vmmd never sees a stale
-// ciphertext, so there's nothing to leak; the worst case is a missing
-// secret, which customer support can spot from the next failed deploy.
+// loadSealedEnvFor returns the sealed env entries to stage at wake for the
+// given deployment.
+//
+// Issue #460 / ADR-053 §Decision 1: when the deployment's OverrideEnvSecrets
+// is non-empty, the result is filtered to ONLY those keys (the override is a
+// positive allowlist — "secret:DB_URL" resolves to the app_secrets row whose
+// Key == "DB_URL"). When OverrideEnvSecrets is empty (legacy behaviour for
+// source-tarball / dockerfile deploys that pre-date the override surface),
+// the entire app_secrets set for the app is returned.
+//
+// Missing-secret posture (mirrors ADR-053 §Decision 2 "fail-loud"): an
+// override entry referencing a NAME that has no row in app_secrets is
+// reported as a loud error — schedd aborts the wake so the deployment row
+// transitions to failed. The shape was already validated at apid-create time
+// (CreateDeploymentOverrides.Validate at pkg/api/dto.go using
+// api.SecretRefNameRe); the existence check is the wake-side equivalent.
+// Customers who specify an env_secrets override expect those keys to land in
+// the guest — silently dropping them surfaces as a confusing "env var
+// missing" without ever telling the customer why.
+//
+// When ANY override entry is missing its row, ALL missing keys are reported
+// in a single error — non-deterministic, but bounded: a customer with three
+// missing secrets sees all three in one wake failure, not three sequential
+// "fix one, retry, see the next" deploys.
+//
+// Behaviour change vs. the pre-PR-B loadSealedEnv: a ListAppSecrets error
+// (PG hiccup, replication lag, role separation dropping the connection)
+// now aborts the wake instead of being silently logged-and-swallowed. This
+// is intentional — a wake that comes up without the sealed env the customer
+// configured is exactly the "silent drop" ADR-053 §Decision 2 forbids.
+//
+// Ciphertext + key only — VALUES never appear here or in logs.
 //
 // We carry AccountID explicitly so a cross-account (accountID, appID) pair
 // returns ErrNotFound (consistent with apid's 404 contract).
-func (e *Engine) loadSealedEnv(ctx context.Context, accountID, appID string) []fcvm.SealedEnvEntry {
+func (e *Engine) loadSealedEnvFor(ctx context.Context, accountID, appID string, overrideEnvSecrets map[string]string) ([]fcvm.SealedEnvEntry, error) {
 	rows, err := e.store.ListAppSecrets(ctx, accountID, appID)
 	if err != nil {
-		e.log.Warn("load sealed env", "app", appID, "err", err)
-		return nil
+		return nil, fmt.Errorf("load sealed env (account=%s app=%s): %w", accountID, appID, err)
 	}
-	if len(rows) == 0 {
-		return nil
+	if len(overrideEnvSecrets) == 0 {
+		// Legacy path: stage everything for the app. Preserved for
+		// pre-PR-A deployments without override columns populated AND for
+		// tarball/dockerfile deploys that don't use the override surface.
+		out := make([]fcvm.SealedEnvEntry, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
+		}
+		return out, nil
 	}
-	out := make([]fcvm.SealedEnvEntry, 0, len(rows))
+	// Filtered path: build a Key→row index, then iterate the override's
+	// requested env_keys in declaration order (so the staged
+	// /etc/faas/secrets.env is stable and easy to diff in support tickets).
+	// Each requested env_key MUST resolve; missing keys are accumulated and
+	// reported as one error rather than one-at-a-time so support tickets see
+	// the full set.
+	index := make(map[string]state.AppSecret, len(rows))
 	for _, r := range rows {
-		out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
+		index[r.Key] = r
+	}
+	var missing []string
+	out := make([]fcvm.SealedEnvEntry, 0, len(overrideEnvSecrets))
+	for envKey, ref := range overrideEnvSecrets {
+		row, ok := index[envKey]
+		if !ok {
+			missing = append(missing, fmt.Sprintf("%q (-> %q)", envKey, ref))
+			continue
+		}
+		out = append(out, fcvm.SealedEnvEntry{Key: row.Key, Ciphertext: row.Ciphertext})
+	}
+	if len(missing) > 0 {
+		// Sort for determinism — Go map iteration is randomised, so without
+		// this a customer with three missing keys would see them in
+		// different orders on different wakes.
+		sort.Strings(missing)
+		return nil, fmt.Errorf("env_secrets: missing app_secrets rows for %s on (%s, %s); set the secret first via faas secrets set",
+			strings.Join(missing, ", "), accountID, appID)
+	}
+	return out, nil
+}
+
+// envSecretsFromDep unmarshals dep.OverrideEnvSecrets (jsonb column) into a
+// map[string]string. Pre-PR-B deployments store nil here (the column didn't
+// exist); an empty result preserves the legacy "stage everything for the
+// app" behaviour. A malformed column is treated as no override rather than
+// fail-the-wake, because the apid path validates the shape at INSERT time —
+// a tampered column would need a direct DB write, which the spec gates
+// behind DB role separation (CLAUDE.md security rules).
+//
+// Returned map is owned by the caller; mutating it does not affect the
+// deployment row.
+func envSecretsFromDep(dep state.Deployment) map[string]string {
+	if len(dep.OverrideEnvSecrets) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	if err := json.Unmarshal(dep.OverrideEnvSecrets, &out); err != nil {
+		// Defensive: apid validates shape at INSERT. Treat malformed as
+		// no-override so a corrupted row doesn't compound with a missing
+		// secrets row to surface as a confusing wake failure.
+		return nil
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

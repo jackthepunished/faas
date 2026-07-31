@@ -3749,7 +3749,7 @@ components:
         new_slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', minLength: 3, maxLength: 40, example: "hello-world-v2" }
 
     AppManifest:
-      description: "App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source flag (§ux 6.3)."
+      description: "App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs (\"secret:NAME\" strings) resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are NEVER sealed ciphertext — only refs."
       type: object
       required: [entrypoint]
       properties:
@@ -3760,6 +3760,10 @@ components:
         env:
           type: object
           additionalProperties: { type: string }
+        env_secrets:
+          type: object
+          additionalProperties: { type: string }
+          description: "Env override via sealed-secret refs. Each value is \"secret:NAME\"; the host resolver looks up NAME against the app_secrets table at wake."
         working_dir: { type: [string, "null"] }
         port: { type: [integer, "null"], minimum: 0, maximum: 65535 }
         healthz: { type: [string, "null"] }

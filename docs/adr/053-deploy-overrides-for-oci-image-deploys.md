@@ -241,3 +241,51 @@ a label, until the cardinality argument is made.
   The field list is frozen in this ADR. Each future field requires a
   follow-up ADR that explicitly extends this one — the same review
   gate that ADR-045 §Decision 1 imposed on `app_envs` scope widening.
+
+## PR-B status (issue #460 — layered rollout)
+
+PR A (merged 2026-07-31) shipped the contract + persistence half.
+PR B (this ADR's runtime-effect half) ships layered on top:
+
+- **`pkg/api/appmanifest.go`** gains `EnvSecrets map[string]string`
+  with `Validate()` rejecting refs that don't start with
+  `pkg/api.SecretRefPrefix` or whose NAME doesn't match
+  `pkg/api.SecretRefNameRe` — same grammar as the apid validator.
+- **`pkg/imaged/apply_overrides.go`** is a pure-function helper
+  (no I/O, no DB) called once at `buildImageLayer` (handler.go:546)
+  and once at `buildFunctionLayer` (handler.go:788). Layers the six
+  override columns onto the OCI-derived `api.AppManifest` between
+  `manifestFromImageConfig` and `manifest.Validate`. `snapshot-boot`
+  fans out through these two paths, so layering once at the leaves
+  covers both image and function deploys.
+- **`pkg/sched/engine.go::loadSealedEnvFor`** replaces
+  `loadSealedEnv`. Accepts the deployment's override map; when
+  present, filters the loaded `app_secrets` set to ONLY the
+  override's allowlist keys. When absent, preserves the legacy
+  "stage everything for the app" behaviour (source-tarball /
+  dockerfile deploys without override columns).
+- **Missing-secret posture (load-bearing mirror of §Decision 2):**
+  `loadSealedEnvFor` returns an error when an override references
+  a NAME with no row in `app_secrets` — schedd aborts the wake and
+  the deployment row transitions to failed. Logging carries the
+  requested env_key and the `secret:NAME` ref string, never the
+  plaintext value.
+- **`pkg/api/dto.go::SecretRefPrefix` + `SecretRefNameRe`** are
+  exported so pkg/sched reuses the same grammar (one source of truth
+  between apid and schedd).
+
+**Runtime-effect scope after PR-B:**
+- `entrypoint` — yes (`guest/init/main_linux.go:139`)
+- `cmd` — yes (argv = entrypoint + cmd, same exec line)
+- `env` — yes (`guest/init/app.go:55`)
+- `env_secrets` — yes (filtered set written to `/etc/faas/secrets.env`)
+- `port` — written into the manifest, but `waitReady` is still a
+  bare TCP accept on `:8080` — runtime-effect deferred to PR C.
+- `healthcheck` — written into `manifest.Healthz`, but
+  `waitReady` does not issue an HTTP probe — deferred to a follow-up
+  ADR (this ADR §Decision 6 + §Decision 7 unchanged).
+
+PR C (port + healthcheck plumbing through `pkg/netns/config.go`,
+`pkg/fcvm.Lease`, `pkg/fcvm/vmm.waitReady`, `pkg/vmmdgrpc`,
+`pkg/scheddgrpc`, and the five `guest/runners/*` runners that all
+hardcode `:8080`) is the remaining work to close issue #460 entirely.
