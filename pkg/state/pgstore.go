@@ -841,7 +841,12 @@ func (s *PgStore) SetAppWorkloadClass(ctx context.Context, appID string, class W
 		 returning `+appsSelectColumns,
 		appID, string(class))
 	if err := scanAppInto(&a, row); err != nil {
-		return App{}, err
+		// Funnel through mapErr so a CHECK violation on
+		// apps_workload_class_chk (SQLSTATE 23514) surfaces as
+		// ErrInvalidArgument instead of a raw pgx error. The empty
+		// class guard above covers the Go-side validation; this
+		// covers the schema-side defence-in-depth.
+		return App{}, mapErr(err)
 	}
 	return a, nil
 }
@@ -6738,8 +6743,21 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
-		return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case pgerrcode.UniqueViolation:
+			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+		case pgerrcode.CheckViolation:
+			// CHECK constraint violations (e.g. apps_workload_class_chk,
+			// apps_egress_allowlist_cidr, scan_source_tier_chk) surface
+			// as ErrInvalidArgument at the Store contract — the caller
+			// already validated user input upstream, so a CHECK hit is
+			// a contract violation between the Store and the schema,
+			// not a transient DB error. The constraint name is appended
+			// so an operator tailing logs can pinpoint the offending
+			// check.
+			return fmt.Errorf("%w: %s", ErrInvalidArgument, pgErr.ConstraintName)
+		}
 	}
 	return err
 }
