@@ -27,6 +27,9 @@ class UpdateAppRequest:
     autoscale_target_cpu_pct: int | None | Unset = UNSET
     """Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values
     outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct."""
+    streaming_enabled: bool | None | Unset = UNSET
+    """Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403
+    plan_streaming_not_allowed."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +73,12 @@ class UpdateAppRequest:
         else:
             autoscale_target_cpu_pct = self.autoscale_target_cpu_pct
 
+        streaming_enabled: bool | None | Unset
+        if isinstance(self.streaming_enabled, Unset):
+            streaming_enabled = UNSET
+        else:
+            streaming_enabled = self.streaming_enabled
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -87,6 +96,8 @@ class UpdateAppRequest:
             field_dict["autoscale_target_rps"] = autoscale_target_rps
         if autoscale_target_cpu_pct is not UNSET:
             field_dict["autoscale_target_cpu_pct"] = autoscale_target_cpu_pct
+        if streaming_enabled is not UNSET:
+            field_dict["streaming_enabled"] = streaming_enabled
 
         return field_dict
 
@@ -150,6 +161,15 @@ class UpdateAppRequest:
 
         autoscale_target_cpu_pct = _parse_autoscale_target_cpu_pct(d.pop("autoscale_target_cpu_pct", UNSET))
 
+        def _parse_streaming_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        streaming_enabled = _parse_streaming_enabled(d.pop("streaming_enabled", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -158,6 +178,7 @@ class UpdateAppRequest:
             egress_allowlist=egress_allowlist,
             autoscale_target_rps=autoscale_target_rps,
             autoscale_target_cpu_pct=autoscale_target_cpu_pct,
+            streaming_enabled=streaming_enabled,
         )
 
         update_app_request.additional_properties = d
