@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
 	"time"
@@ -1258,7 +1259,20 @@ func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
 	}
 	baseRef := h.deployBaseRefOverride
 	if baseRef == "" {
-		baseRef = baseRefFor(runtime)
+		// Per-runtime env var (FAAS_DEPLOY_BASE_REF_<RUNTIME>) takes
+		// precedence over the legacy single-string global
+		// FAAS_DEPLOY_BASE_REF (wired at cmd/imaged/main.go:255).
+		// Matches the posture of EnsureBases (startup auto-stage):
+		// per-runtime is the canonical operator surface, the single
+		// global is the test-harness / legacy knob. Unknown runtimes
+		// fall through to baseRefFor's default (BaseRefMinimal for
+		// the "" / customer-uploaded-image case). Same
+		// digest-pin validation as the row-level override gate.
+		resolved, err := resolveDeployBaseRef(runtime, os.Getenv)
+		if err != nil {
+			return aboveBaseStream{}, nil, err
+		}
+		baseRef = resolved
 	}
 	baseRepo := repoWithHost(baseRef)
 	if baseRepo == "" {
