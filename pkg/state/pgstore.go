@@ -1195,7 +1195,7 @@ func (s *PgStore) ApplyProjectPlan(
 		        $11, $12, $13, $14, $15)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
-			insertedProject.ID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
+			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
