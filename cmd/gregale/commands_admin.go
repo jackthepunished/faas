@@ -36,7 +36,7 @@ import (
 // the account uuid + cents positionals.
 func cmdAdmin(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: gregale admin <credit> [args]")
+		fmt.Fprintln(os.Stderr, "usage: gregale admin <credit>")
 		fmt.Fprintln(os.Stderr, "  gregale admin credit --reason <text> <account_uuid> <cents>")
 		return 2
 	}
