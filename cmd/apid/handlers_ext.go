@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1475,17 +1476,75 @@ func (s *server) lookupAccountByPaddleID(ctx context.Context, paddleID string) (
 // --- response helpers ------------------------------------------------------
 
 func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
-	return api.DeploymentResponse{
-		ID:          d.ID,
-		AppID:       d.AppID,
-		BuildID:     d.BuildID,
-		ImageDigest: d.ImageDigest,
-		Kind:        string(d.Kind),
-		Status:      string(d.Status),
-		Error:       d.Error,
-		ErrorCode:   d.ErrorCode,
-		CreatedAt:   d.CreatedAt.UTC().Format(time.RFC3339),
+	// Issue #460 / ADR-053: echo the override_* columns on the
+	// response. Env values are NEVER echoed (override_env_keys
+	// carries only the key set). Env-secret refs ARE echoed
+	// verbatim because "secret:NAME" is non-secret by design — the
+	// customer needs to see which secret they bound to which env
+	// var to debug a misconfigured deploy.
+	hasOverrides := len(d.OverrideEntrypoint) > 0 ||
+		len(d.OverrideCmd) > 0 ||
+		len(d.OverrideEnv) > 0 ||
+		len(d.OverrideEnvSecrets) > 0 ||
+		d.OverridePort != 0 ||
+		len(d.OverrideHealthcheck) > 0
+	resp := api.DeploymentResponse{
+		ID:           d.ID,
+		AppID:        d.AppID,
+		BuildID:      d.BuildID,
+		ImageDigest:  d.ImageDigest,
+		Kind:         string(d.Kind),
+		Status:       string(d.Status),
+		Error:        d.Error,
+		ErrorCode:    d.ErrorCode,
+		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
+		HasOverrides: hasOverrides,
 	}
+	if len(d.OverrideEntrypoint) > 0 {
+		resp.OverrideEntrypoint = d.OverrideEntrypoint
+	}
+	if len(d.OverrideCmd) > 0 {
+		resp.OverrideCmd = d.OverrideCmd
+	}
+	if len(d.OverrideEnv) > 0 {
+		// Decode the jsonb map to surface the KEYS only. Values are
+		// never echoed (ADR-053 §Decision 4). Stable order: sorted
+		// alphabetically so two deploys with the same key set hash
+		// to the same JSON body.
+		var env map[string]string
+		if err := json.Unmarshal(d.OverrideEnv, &env); err == nil {
+			keys := make([]string, 0, len(env))
+			for k := range env {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			resp.OverrideEnvKeys = keys
+		}
+	}
+	if len(d.OverrideEnvSecrets) > 0 {
+		// Decode the jsonb map to surface keys + refs. Refs are
+		// non-secret; both keys and refs are safe to echo.
+		var refs map[string]string
+		if err := json.Unmarshal(d.OverrideEnvSecrets, &refs); err == nil {
+			keys := make([]string, 0, len(refs))
+			for k := range refs {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			resp.OverrideEnvSecretKeys = keys
+			resp.OverrideEnvSecretRefs = refs
+		}
+	}
+	if d.OverridePort != 0 {
+		resp.OverridePort = d.OverridePort
+	}
+	if len(d.OverrideHealthcheck) > 0 {
+		var hc api.DeploymentHealthcheck
+		if err := json.Unmarshal(d.OverrideHealthcheck, &hc); err == nil {
+			resp.OverrideHealthcheck = &hc
+		}
+	}
+	return resp
 }
 
 // buildProvenanceResponse renders a state.BuildProvenance as the

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -243,6 +244,170 @@ func TestCreateDeployment_ImageBadDigest(t *testing.T) {
 		api.CreateDeploymentRequest{Image: "r/x@sha256:short"}, nil)
 	if rec.Code != 400 {
 		t.Errorf("image with short digest should 400, got %d %s", rec.Code, rec.Body)
+	}
+}
+
+// TestCreateDeployment_Overrides_HappyPath pins the wire round-trip
+// for the Fargate-shaped deploy override object (issue #460 /
+// ADR-053). The handler must:
+//   - accept a CreateDeploymentRequest with the optional `overrides`
+//     field and decode it into the typed shape;
+//   - validate the override against the plan's EnvVarsMax +
+//     EnvValueMaxBytes caps;
+//   - persist the six override_* columns on the deployments row;
+//   - echo the override shape on the DeploymentResponse, NEVER
+//     including the plaintext env values (only the key set on
+//     override_env_keys).
+func TestCreateDeployment_Overrides_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "dep-app"}, nil)
+
+	digest := "sha256:" + repeat("a", 64)
+	overrides := &api.CreateDeploymentOverrides{
+		Entrypoint: []string{"/usr/bin/node", "/srv/app.js"},
+		Cmd:        []string{"--port", "9090"},
+		Env: map[string]string{
+			"LOG_LEVEL":   "debug",
+			"PORT_SECRET": "should-not-be-echoed",
+		},
+		EnvSecrets: map[string]string{
+			"DB_URL": "secret:DB_URL",
+		},
+		Port: 9090,
+		Healthcheck: &api.DeploymentHealthcheck{
+			Path:      "/healthz",
+			IntervalS: 5,
+			TimeoutS:  2,
+			Retries:   3,
+		},
+	}
+	rec := e.do(t, "POST", "/v1/apps/dep-app/deployments",
+		api.CreateDeploymentRequest{Image: "r/x@" + digest, Overrides: overrides}, nil)
+	if rec.Code != 202 {
+		t.Fatalf("POST deploy: %d %s", rec.Code, rec.Body)
+	}
+	var resp api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	if !resp.HasOverrides {
+		t.Errorf("response HasOverrides = false, want true")
+	}
+	if got := resp.OverridePort; got != 9090 {
+		t.Errorf("OverridePort = %d, want 9090", got)
+	}
+	wantEntrypoint := []string{"/usr/bin/node", "/srv/app.js"}
+	if !reflect.DeepEqual(resp.OverrideEntrypoint, wantEntrypoint) {
+		t.Errorf("OverrideEntrypoint = %v, want %v", resp.OverrideEntrypoint, wantEntrypoint)
+	}
+	if got := resp.OverrideCmd; !reflect.DeepEqual(got, []string{"--port", "9090"}) {
+		t.Errorf("OverrideCmd = %v, want [--port 9090]", got)
+	}
+	// Env keys echoed, values NEVER. Sorted alphabetically (handler
+	// contract — see cmd/apid/handlers_ext.go::deploymentResponse).
+	wantEnvKeys := []string{"LOG_LEVEL", "PORT_SECRET"}
+	if !reflect.DeepEqual(resp.OverrideEnvKeys, wantEnvKeys) {
+		t.Errorf("OverrideEnvKeys = %v, want %v", resp.OverrideEnvKeys, wantEnvKeys)
+	}
+	if strings.Contains(rec.Body.String(), "should-not-be-echoed") {
+		t.Errorf("response body leaked env value 'should-not-be-echoed'; raw body = %s", rec.Body.String())
+	}
+	// Env-secret refs are echoed verbatim (refs are non-secret by
+	// design — the customer needs to see which secret they bound).
+	if got := resp.OverrideEnvSecretRefs["DB_URL"]; got != "secret:DB_URL" {
+		t.Errorf("OverrideEnvSecretRefs[DB_URL] = %q, want secret:DB_URL", got)
+	}
+	if resp.OverrideHealthcheck == nil || resp.OverrideHealthcheck.Path != "/healthz" {
+		t.Errorf("OverrideHealthcheck = %+v, want path=/healthz", resp.OverrideHealthcheck)
+	}
+}
+
+// TestCreateDeployment_Overrides_RejectsInvalid pins the validation
+// 400 path: a malformed override never silently drops — the whole
+// request 400s with a code=validation_failed Problem (ADR-053
+// §Decision 2).
+func TestCreateDeployment_Overrides_RejectsInvalid(t *testing.T) {
+	e := setup(t, api.PlanFree) // Free caps env at 8 entries / 4 KiB per value
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "dep-app"}, nil)
+
+	digest := "sha256:" + repeat("a", 64)
+	cases := []struct {
+		name       string
+		overrides  *api.CreateDeploymentOverrides
+		wantInBody string
+	}{
+		{
+			name: "port-out-of-range",
+			overrides: &api.CreateDeploymentOverrides{
+				Port: 70000,
+			},
+			wantInBody: "port 70000 out of range",
+		},
+		{
+			name: "env-secrets-ref-missing-prefix",
+			overrides: &api.CreateDeploymentOverrides{
+				EnvSecrets: map[string]string{"DB_URL": "DB_URL"},
+			},
+			wantInBody: `must start with \"secret:\"`,
+		},
+		{
+			name: "healthcheck-path-must-start-with-slash",
+			overrides: &api.CreateDeploymentOverrides{
+				Healthcheck: &api.DeploymentHealthcheck{Path: "healthz"},
+			},
+			wantInBody: `must start with \"/\"`,
+		},
+		{
+			name: "env-key-violates-grammar",
+			overrides: &api.CreateDeploymentOverrides{
+				Env: map[string]string{"lower_case": "v"},
+			},
+			wantInBody: "Invalid env var key",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := e.do(t, "POST", "/v1/apps/dep-app/deployments",
+				api.CreateDeploymentRequest{Image: "r/x@" + digest, Overrides: tc.overrides}, nil)
+			if rec.Code != 400 {
+				t.Fatalf("expected 400, got %d %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantInBody) {
+				t.Errorf("body = %s, want it to contain %q", rec.Body, tc.wantInBody)
+			}
+		})
+	}
+}
+
+// TestCreateDeployment_Overrides_NoOverrideIsUnchanged pins the
+// backward-compat path: a CreateDeploymentRequest without the
+// `overrides` field is byte-for-byte the same as before issue #460
+// landed (no behaviour change, no echo fields on the response).
+func TestCreateDeployment_Overrides_NoOverrideIsUnchanged(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "dep-app"}, nil)
+
+	digest := "sha256:" + repeat("a", 64)
+	rec := e.do(t, "POST", "/v1/apps/dep-app/deployments",
+		api.CreateDeploymentRequest{Image: "r/x@" + digest}, nil)
+	if rec.Code != 202 {
+		t.Fatalf("POST deploy: %d %s", rec.Code, rec.Body)
+	}
+	var resp api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	if resp.HasOverrides {
+		t.Errorf("response HasOverrides = true; want false when no override sent")
+	}
+	if len(resp.OverrideEntrypoint) > 0 {
+		t.Errorf("OverrideEntrypoint = %v, want empty", resp.OverrideEntrypoint)
+	}
+	if resp.OverridePort != 0 {
+		t.Errorf("OverridePort = %d, want 0", resp.OverridePort)
+	}
+	if resp.OverrideHealthcheck != nil {
+		t.Errorf("OverrideHealthcheck = %+v, want nil", resp.OverrideHealthcheck)
 	}
 }
 

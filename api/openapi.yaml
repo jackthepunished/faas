@@ -3768,7 +3768,7 @@ components:
     # ─── Deployments ──────────────────────────────────────────────────────
 
     DeploymentResponse:
-      description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps."
+      description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design."
       type: object
       required: [id, app_id, image_digest, kind, status, created_at]
       properties:
@@ -3781,6 +3781,33 @@ components:
         error: { type: [string, "null"] }
         error_code: { type: [string, "null"] }
         created_at: { type: string, format: date-time }
+        has_overrides: { type: boolean, description: "True when this deployment carries a non-null override_* column set." }
+        override_entrypoint:
+          type: array
+          items: { type: string }
+          description: "Entrypoint override echoed verbatim from the create request. nil when no override was supplied."
+        override_cmd:
+          type: array
+          items: { type: string }
+          description: "Cmd override echoed verbatim from the create request."
+        override_env_keys:
+          type: array
+          items: { type: string }
+          description: "Sorted set of env-var keys set by the env override. VALUES ARE NEVER ECHOED (ADR-053 §Decision 4)."
+        override_env_secret_keys:
+          type: array
+          items: { type: string }
+          description: "Sorted set of env-var keys set by the env_secrets override. The parallel refs are echoed in `override_env_secret_refs` because the ref shape is non-secret by design."
+        override_env_secret_refs:
+          type: object
+          additionalProperties: { type: string }
+          description: "Verbatim `secret:NAME` ref map; the customer needs to see which secret they bound to which env var to debug a misconfigured deploy."
+        override_port: { type: integer, minimum: 0, maximum: 65535, description: "Listen-port override; 0 = absent (fall back to image default)." }
+        override_healthcheck:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentHealthcheck'
+            - type: 'null'
+          description: "Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept."
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."
@@ -3940,12 +3967,88 @@ components:
         new_balance: { type: integer, minimum: 0 }
 
     CreateDeploymentRequest:
-      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload."
+      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1)."
       type: object
       properties:
         image:
           type: string
           description: 'registry.gregale.dev/...@sha256:... — digest-pinned OCI reference.'
+        overrides:
+          oneOf:
+            - $ref: '#/components/schemas/CreateDeploymentOverrides'
+            - type: 'null'
+          description: "Deploy-time overrides (entrypoint, cmd, env, env_secrets, port, healthcheck). nil/omitted = deploy the image as-is."
+
+    CreateDeploymentOverrides:
+      description: |
+        Fargate-shaped deploy-time override object on `POST /v1/apps/{slug}/deployments`
+        (issue #460 / ADR-053). Field list is FROZEN — six fields, no more. Any extra
+        field on this object 400s the request. ADR-053 §Decision 1 documents the freeze;
+        the handler enforces it via `DisallowUnknownFields` on the JSON decoder.
+
+        - `entrypoint` replaces the OCI image's ENTRYPOINT/CMD argv at exec time.
+        - `cmd` is appended to `entrypoint` (mirrors the OCI runtime contract).
+        - `env` is plaintext; env-var keys must match `^[A-Z][A-Z0-9_]*$`; per-value
+          byte cap = plan `EnvValueMaxBytes`.
+        - `env_secrets` carries `secret:NAME` REFS — the runtime resolver (PR-B)
+          strips the prefix and looks up `NAME` against the existing `app_secrets`
+          table. The ref name must match `^[A-Z][A-Z0-9_]*$`.
+        - `env` + `env_secrets` share the plan `EnvVarsMax` quota — no bypass by
+          mixing the two surfaces.
+        - `port` is per-deployment (1..65535; 0 = absent / fall back to image default).
+        - `healthcheck` is the readiness-probe shape; the actual HTTP probe ships
+          in a follow-up ADR.
+      type: object
+      properties:
+        entrypoint:
+          type: array
+          items: { type: string, minLength: 1 }
+          minItems: 1
+          description: "Replaces the OCI image's ENTRYPOINT/CMD argv. Each element must be non-empty."
+        cmd:
+          type: array
+          items: { type: string, minLength: 1 }
+          minItems: 1
+          description: "Appended to entrypoint at exec time (OCI runtime contract). Each element must be non-empty."
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: "Plaintext env map applied at boot. Keys: `^[A-Z][A-Z0-9_]*$`. Per-value byte cap = plan EnvValueMaxBytes."
+        env_secrets:
+          type: object
+          additionalProperties:
+            type: string
+            pattern: '^secret:[A-Z][A-Z0-9_]*$'
+          description: "Sealed-secret-ref env map. Each VALUE is `secret:NAME`; the runtime resolver looks up `NAME` against `app_secrets` at wake. Counts against the shared `EnvVarsMax` cap with `env`."
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: "Listen port; 0 = absent / fall back to image default (today 8080)."
+        healthcheck:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentHealthcheck'
+            - type: 'null'
+          description: "Readiness-probe shape. Persisted today; the HTTP probe variant ships in a follow-up ADR."
+
+    DeploymentHealthcheck:
+      description: |
+        Readiness-probe shape on the deploy-time override object (issue #460 /
+        ADR-053). Today the probe stays a bare TCP accept — `path`, `interval_s`,
+        `timeout_s`, `retries` are persisted but not yet exercised by `vmm.waitReady`.
+
+        Validation rules (enforced in `pkg/api/dto.go::CreateDeploymentOverrides.Validate`):
+        - `path` must start with `/`.
+        - `interval_s`, `timeout_s`, `retries` must be `>= 0`.
+        - Missing fields default to 0 (interpreted as "use image default" by the
+          future probe implementation).
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, pattern: '^/', description: "Path the probe requests from the guest; must start with `/` (e.g. `/healthz`)." }
+        interval_s: { type: integer, minimum: 0, description: "Probe interval in seconds; 0 = use image default." }
+        timeout_s:  { type: integer, minimum: 0, description: "Probe timeout in seconds; 0 = use image default." }
+        retries:    { type: integer, minimum: 0, description: "Consecutive failures before the instance is considered unhealthy; 0 = use image default." }
 
     # ─── Instances ────────────────────────────────────────────────────────
 

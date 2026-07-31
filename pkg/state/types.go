@@ -380,6 +380,22 @@ type Deployment struct {
 	// migrations/00021 column add).
 	ErrorCode string
 	CreatedAt time.Time
+	// Override columns (issue #460 / ADR-053). Six optional fields
+	// that layer on top of the OCI image config when the customer
+	// redeploys the same digest-pinned image with a different
+	// entrypoint/cmd/env/port/healthcheck. PR-A persists the
+	// shape; PR-B injects the merged manifest into the app-layer
+	// ext4 at imaged time; PR-C threads the port through the
+	// host-side wake path. Env / EnvSecrets are json.RawMessage
+	// because the DB columns are jsonb and the handler marshals
+	// the validated map before INSERT (mirrors how RootfsKey
+	// carries the canonical storage handle).
+	OverrideEntrypoint   []string          `json:"override_entrypoint,omitempty"`
+	OverrideCmd          []string          `json:"override_cmd,omitempty"`
+	OverrideEnv          json.RawMessage   `json:"override_env,omitempty"`
+	OverrideEnvSecrets   json.RawMessage   `json:"override_env_secrets,omitempty"`
+	OverridePort         int               `json:"override_port,omitempty"`
+	OverrideHealthcheck  json.RawMessage   `json:"override_healthcheck,omitempty"`
 }
 
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes

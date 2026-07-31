@@ -63,6 +63,9 @@ from .create_custom_domain_request import CreateCustomDomainRequest
 from .create_deployment_files_body import CreateDeploymentFilesBody
 from .create_deployment_files_body_kind import CreateDeploymentFilesBodyKind
 from .create_deployment_files_body_runtime import CreateDeploymentFilesBodyRuntime
+from .create_deployment_overrides import CreateDeploymentOverrides
+from .create_deployment_overrides_env import CreateDeploymentOverridesEnv
+from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
 from .create_deployment_request import CreateDeploymentRequest
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
@@ -75,8 +78,10 @@ from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
+from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
 from .deployment_response import DeploymentResponse
+from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .gdpr_audit_export_response import GdprAuditExportResponse
 from .gdpr_audit_export_response_action import GdprAuditExportResponseAction
 from .gdpr_audit_export_response_data import GdprAuditExportResponseData
@@ -241,6 +246,9 @@ __all__ = (
     "CreateDeploymentFilesBody",
     "CreateDeploymentFilesBodyKind",
     "CreateDeploymentFilesBodyRuntime",
+    "CreateDeploymentOverrides",
+    "CreateDeploymentOverridesEnv",
+    "CreateDeploymentOverridesEnvSecrets",
     "CreateDeploymentRequest",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
@@ -253,8 +261,10 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
+    "DeploymentHealthcheck",
     "DeploymentListResponse",
     "DeploymentResponse",
+    "DeploymentResponseOverrideEnvSecretRefs",
     "GdprAuditExportResponse",
     "GdprAuditExportResponseAction",
     "GdprAuditExportResponseData",
