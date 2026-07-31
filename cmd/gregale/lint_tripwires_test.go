@@ -277,8 +277,9 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 			// Generated or unsupported files (e.g. build-tag-only)
 			// may fail to parse. Don't fail the tripwire on those —
 			// just skip them so a single unparseable file doesn't
-			// mask the rule.
-			return nil
+			// mask the rule. nilerr lint fires on `return nil` here;
+			// the skip is deliberate.
+			return nil //nolint:nilerr // intentional skip on parse failure; see comment above
 		}
 		dir := filepath.Dir(path)
 		bucket, ok := pkgs[dir]

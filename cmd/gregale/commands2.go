@@ -844,10 +844,10 @@ func cmdUsageList(args []string) int {
 		return jsonOut(writeNDJSON(rows))
 	}
 	if len(rows) == 0 {
-		fmt.Fprintf(osStdout, "No usage recorded for %s.\n", *month)
+		_, _ = fmt.Fprintf(osStdout, "No usage recorded for %s.\n", *month)
 		return 0
 	}
-	fmt.Fprintf(osStdout, "App — requests · GB-hours (included GB-h) · egress\n")
+	_, _ = fmt.Fprintf(osStdout, "App — requests · GB-hours (included GB-h) · egress\n")
 	for _, u := range rows {
 		// ADR-046: tx_bytes (HTTP response bytes, gateway-side) and
 		// net_tx_bytes (root-side vethHost interface bytes, includes
