@@ -1440,6 +1440,15 @@ func healthcheckProbe(ctx context.Context, client *http.Client, addr, healthchec
 		// away mid-probe — both must be retried).
 		return false, nil //nolint:nilerr
 	}
+	// Drain the body (capped) before close so the cached
+	// transport's keep-alive can reuse the connection. Without
+	// this, every probe opens a fresh TCP socket and TIME_WAIT
+	// accumulates under sustained probing. The 64 KiB cap is a
+	// safety net — production customers' healthcheck responses
+	// are status-only — but bounded drain is required so a
+	// misbehaving runner that streams a 1 GB body can't OOM
+	// the host.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
 	return resp.StatusCode/100 == 2, nil
 }

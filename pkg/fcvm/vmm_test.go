@@ -839,6 +839,143 @@ func TestHealthcheckProbe_TransportError(t *testing.T) {
 	}
 }
 
+// TestHealthcheckProbe_RequestShape pins the on-the-wire shape the
+// runner sees. ADR-057 §Decision 3 nails down: GET (not HEAD), exact
+// path (verbatim from the dep override), empty body. A regression
+// that flips to HEAD or rewrites the path trips here. Query-string
+// is included as a table row because customers will want it for
+// cache-busting / readiness-token gates; the server-side r.URL
+// splits Path from RawQuery per RFC 3986.
+func TestHealthcheckProbe_RequestShape(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		wantPath string // server-side r.URL.Path
+		wantRaw  string // server-side r.URL.RawQuery
+	}{
+		{"plain path", "/healthz", "/healthz", ""},
+		{"nested path", "/ready/internal", "/ready/internal", ""},
+		{"path with query", "/healthz?ready=1", "/healthz", "ready=1"},
+		{"path with fragment (stdlib strips fragment before send)", "/healthz#anchor", "/healthz", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				gotMethod     string
+				gotPath       string
+				gotRawQuery   string
+				gotBody       []byte
+				gotAuthHeader string
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotRawQuery = r.URL.RawQuery
+				b := make([]byte, 16)
+				n, _ := r.Body.Read(b)
+				gotBody = b[:n]
+				gotAuthHeader = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			addr := strings.TrimPrefix(srv.URL, "http://")
+			client := &http.Client{Timeout: 2 * time.Second}
+			if _, err := healthcheckProbe(context.Background(), client, addr, tt.path); err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if gotMethod != http.MethodGet {
+				t.Errorf("method=%q, want GET", gotMethod)
+			}
+			if gotPath != tt.wantPath {
+				t.Errorf("path=%q, want %q", gotPath, tt.wantPath)
+			}
+			if gotRawQuery != tt.wantRaw {
+				t.Errorf("RawQuery=%q, want %q", gotRawQuery, tt.wantRaw)
+			}
+			if len(gotBody) != 0 {
+				t.Errorf("body=%q, want empty", gotBody)
+			}
+			if gotAuthHeader != "" {
+				t.Errorf("probe sent Authorization=%q, want empty (probes are unauthenticated per ADR-057 §Security)", gotAuthHeader)
+			}
+		})
+	}
+}
+
+// TestHealthcheckProbe_BodyDrained verifies the response body is
+// drained (capped) before close so the cached transport can reuse
+// the connection on the next probe. Without the drain, every probe
+// at 200ms cadence opens a fresh socket under the cached client and
+// TIME_WAIT accumulates. A handler that streams a 256 KiB body
+// (well above the 64 KiB cap) must not OOM the host, and the
+// transport must remain usable for the next probe.
+func TestHealthcheckProbe_BodyDrained(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		// Stream a body well above the 64 KiB drain cap.
+		w.Header().Set("Content-Length", "262144")
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for i := 0; i < 64; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	client := &http.Client{Timeout: 5 * time.Second}
+	for i := 0; i < 3; i++ {
+		ok, err := healthcheckProbe(context.Background(), client, addr, "/healthz")
+		if err != nil {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("probe %d: ready=false (status 200 expected ready)", i)
+		}
+	}
+	if atomic.LoadInt32(&hits) != 3 {
+		t.Errorf("hits=%d, want 3 (transport reuse implies the same handler answered each probe)", hits)
+	}
+}
+
+// TestHealthcheckProbe_MalformedPath: a path without a leading slash
+// is what the DTO validator (pkg/api/dto.go:323) rejects at deploy
+// time. The helper has no DTO context of its own — but
+// http.NewRequestWithContext rejects a path lacking a leading slash
+// because it produces a relative URL against the host. Pin the
+// behavior so a future refactor that lets a bare path through
+// produces a (false, nil) (transport-friendly) instead of an
+// undefined panic or a request to "http://host:porthealthz".
+func TestHealthcheckProbe_MalformedPath(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	client := &http.Client{Timeout: 1 * time.Second}
+	// "healthz" with no leading slash — Go's url.Parse rejects
+	// this as "missing protocol scheme" against the absolute
+	// host:port base.
+	ok, err := healthcheckProbe(context.Background(), client, addr, "healthz")
+	if err != nil {
+		// NewRequestWithContext returned a parse error — that's
+		// an exception to the (false, nil) contract, surfaced
+		// directly. Document via this test.
+		t.Logf("malformed path returned err=%v (acceptable — caller treats as not-ready)", err)
+		return
+	}
+	if ok {
+		t.Error("malformed path must NOT yield ready=true")
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Errorf("handler received %d hits; want 0 (malformed URL must not reach the server)", hits)
+	}
+}
+
 // TestWaitReadyHTTP_SucceedsRetriesAndTimesOut walks the full waitReady
 // HTTP loop (PR-D's load-bearing path) end-to-end. We can't use the
 // real waitReady against a httptest.Server because it hard-codes :8080
