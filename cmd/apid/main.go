@@ -494,6 +494,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// FAAS_HOST_AGE_IDENTITY_PATH is required only when MFA is
 	// in use — without it, /enroll still works (recipient-only)
 	// but /confirm /verify /disable /recover all 503.
+	//
+	// Issue #316 / ADR-057: we also load host.age.previous via
+	// LoadHostKeys(dir) and wire the slice through SetMFAIdentities
+	// so the 30-day rotation overlap window unseals envelopes
+	// sealed under the previous key. The single-identity SetMFAIdentity
+	// stays wired for backward compat with the existing tests.
 	if identityPath := deps.getenv("FAAS_HOST_AGE_IDENTITY_PATH"); identityPath != "" {
 		ident, err := secretbox.LoadHostKey(identityPath)
 		if err != nil {
@@ -502,6 +508,26 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		SetMFARecipient(func() *age.X25519Recipient { return ident.Recipient() })
 		SetMFAIdentity(func() *age.X25519Identity { return ident })
 		log.Info("host age identity loaded for MFA", "path", identityPath)
+
+		// Rotation-overlap wiring: load the multi-identity slice from
+		// the same directory. If LoadHostKeys fails (e.g. .previous
+		// mode tripwire fired mid-deploy) we keep the single-identity
+		// path wired and log a Warn — the box is still unsealing
+		// envelopes under the current key, just not the previous one.
+		// A hard error would lock every MFA customer out, which is
+		// worse than the operator-visible degraded-mode log line.
+		identities, loadErr := secretbox.LoadHostKeys(filepath.Dir(identityPath))
+		if loadErr != nil {
+			log.Warn("apid: LoadHostKeys (rotation overlap) failed; MFA unseal will work only for envelopes sealed under the current host.age",
+				"dir", filepath.Dir(identityPath), "err", loadErr.Error())
+		} else {
+			SetMFAIdentities(func() []*age.X25519Identity { return identities })
+			if len(identities) > 1 {
+				log.Info("apid: rotation overlap active — MFA unseal falls back across current + previous host.age",
+					"current", identities[0].Recipient().String(),
+					"previous", identities[1].Recipient().String())
+			}
+		}
 	} else {
 		log.Warn("FAAS_HOST_AGE_IDENTITY_PATH unset — MFA /confirm, /verify, /disable, /recover will return 503")
 	}

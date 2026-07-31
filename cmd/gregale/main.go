@@ -38,6 +38,7 @@ Commands:
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
   domains      Manage custom domains
   env          Pull/push .env <-> sealed secrets (--app <slug>)
+  host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   invoices     List issued invoices
   keys         Manage API keys
@@ -180,6 +181,14 @@ func run(args []string) int {
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:
 		return cmdSignKeys(args[1:])
+	case dispatchHostAge:
+		// Operator-side host.age rotation (issue #316 / ADR-057).
+		// Same operator-only surface as sign-keys / pki: every
+		// leaf is a local fs operation against /etc/faas/secrets/.
+		// Sibling — never reuse the `keys` namespace (that's the
+		// customer API-key manager in commands2.go::cmdKeys which
+		// hits apid via authedClient()).
+		return cmdHostAge(args[1:])
 	case dispatchPKI:
 		// Operator-side local-dev PKI bootstrap (ADR-052). Issues
 		// /etc/faas/tls/{ca,<daemon>/} material for multi-box mTLS.

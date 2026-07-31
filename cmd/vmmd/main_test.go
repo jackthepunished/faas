@@ -33,6 +33,11 @@ import (
 // to. Every existing runDeps{} user calls this helper. The ADR-021
 // host-key lifecycle tests below exercise the real secretbox path
 // against a temp dir.
+//
+// Issue #316 / ADR-057 also stubs LoadHostKeys (multi-identity) so
+// the rotation-overlap wiring in run() doesn't read /etc/faas/secrets
+// from the test process. Returning a 1-element slice matches the
+// pre-rotation state — the tests don't exercise the overlap window.
 func nopHostKeyDeps(t *testing.T) (loadHostKey func(string) (*age.X25519Identity, error), writeRecipient func(string, *age.X25519Identity) error) {
 	t.Helper()
 	id, err := age.GenerateX25519Identity()
@@ -41,6 +46,20 @@ func nopHostKeyDeps(t *testing.T) (loadHostKey func(string) (*age.X25519Identity
 	}
 	return func(string) (*age.X25519Identity, error) { return id, nil },
 		func(string, *age.X25519Identity) error { return nil }
+}
+
+// nopHostKeysDep returns a loadHostKeys stub that mirrors
+// nopHostKeyDeps' 1-element slice (issue #316 / ADR-057). Tests
+// that wire a runDeps{} need this in addition to nopHostKeyDeps.
+func nopHostKeysDep(t *testing.T) func(string) ([]*age.X25519Identity, error) {
+	t.Helper()
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("nopHostKeysDep: GenerateX25519Identity: %v", err)
+	}
+	return func(string) ([]*age.X25519Identity, error) {
+		return []*age.X25519Identity{id}, nil
+	}
 }
 
 // shortDir mirrors the helper in pkg/wire's test (kept private here so this
@@ -88,6 +107,7 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 			return net.Listen("unix", t.Address)
 		},
 		loadHostKey:    load,
+		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
 	}
 
@@ -124,6 +144,7 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 		detectFC:       func(context.Context) (string, error) { return "1.7.0", nil },
 		listen:         func(context.Context, string, *tls.Config, string) (net.Listener, error) { return nil, wantErr },
 		loadHostKey:    load,
+		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
 	}
 	err := runWithDeps(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), deps)
@@ -157,6 +178,7 @@ func TestRun_FCDetectFailureIsWarning(t *testing.T) {
 			return net.Listen("unix", t.Address)
 		},
 		loadHostKey:    load,
+		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
 	}
 

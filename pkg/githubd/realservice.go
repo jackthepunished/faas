@@ -88,8 +88,20 @@ type RealService struct {
 	Store     BindingsStore
 	Installs  StoreInstalls
 	Recipient *age.X25519Recipient
-	Identity  *age.X25519Identity
-	Audit     AuditEvent
+	// Identities is the multi-identity unseal slice for rotation
+	// overlap (issue #316 / ADR-057). Pre-rotation: length 1
+	// (just the current). During the 30-day overlap window:
+	// length 2 ([current, previous]). Loaded by the githubd
+	// boot path via secretbox.LoadHostKeys(dir). SetIdentity
+	// (deprecated) keeps the 1-element-slice shape for backward
+	// compat with existing callers/tests.
+	Identities []*age.X25519Identity
+	// Identity is the single-identity unseal accessor. Same
+	// rotation-overlap caveat as Identities — call sites that
+	// need the multi-recipient fallback should pass
+	// service.Identities to secretbox.OpenMulti directly.
+	Identity *age.X25519Identity
+	Audit    AuditEvent
 
 	// bindingsCache is keyed by accountID → appID → state.GitHubBinding.
 	// Demoted from source-of-truth to read-through cache by PR-B.
@@ -511,13 +523,24 @@ func (s *RealService) ensureInstallToken(ctx context.Context, accountID string) 
 	// Step 1: try to rehydrate from durable. This is what
 	// a freshly-restarted process does — TokenCache is empty,
 	// so the durable row is the source of truth.
-	if s.Installs != nil && s.Identity != nil {
+	//
+	// Prefer s.Identities (multi-identity slice) over s.Identity
+	// (single) so the rotation-overlap window unseals envelopes
+	// sealed under either the current or previous host.age.
+	// s.Identities is the canonical accessor; s.Identity is the
+	// backward-compat seam for callers that haven't been migrated
+	// yet (issue #316 / ADR-057).
+	identities := s.Identities
+	if identities == nil && s.Identity != nil {
+		identities = []*age.X25519Identity{s.Identity}
+	}
+	if s.Installs != nil && len(identities) > 0 {
 		inst, ierr := s.Installs.ForAccount(ctx, accountID)
 		switch {
 		case ierr == nil:
 			now := time.Now()
 			if inst.TokenExpiresAt.After(now.Add(tokenRefreshSkew)) {
-				env, oerr := secretbox.Open(s.Identity, inst.SealedToken)
+				env, oerr := secretbox.OpenMulti(identities, inst.SealedToken)
 				if oerr != nil {
 					return 0, "", fmt.Errorf("githubd: unseal install token: %w", oerr)
 				}

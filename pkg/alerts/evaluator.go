@@ -96,10 +96,16 @@ type Ops interface {
 // intentionally small so a future PR can add per-rule filtering or
 // per-account parallelism without reshaping the public surface.
 type Evaluator struct {
-	store      Store
-	promQL     appmetrics.PromQL // nil = Prometheus unreachable; degraded path
-	audit      *audit.Auditor
-	identity   func() *age.X25519Identity // nil = meterd can't unseal; skip with warn
+	store    Store
+	promQL   appmetrics.PromQL // nil = Prometheus unreachable; degraded path
+	audit    *audit.Auditor
+	identity func() *age.X25519Identity // nil = meterd can't unseal; skip with warn
+	// identities is the rotation-overlap accessor (issue #316 /
+	// ADR-057). Multi-identity slice from secretbox.LoadHostKeys:
+	// pre-rotation length 1, during the 30-day overlap length 2.
+	// identity stays wired for backward compat — openBytes call
+	// below prefers identities when non-empty.
+	identities func() []*age.X25519Identity
 	dispatch   Dispatcher
 	dispatchMu *sync.Mutex // serialises the concurrency-unsafe Dispatcher
 	newSigner  func(secret []byte) *webhookout.Signer
@@ -111,10 +117,17 @@ type Evaluator struct {
 // EvaluatorOptions is the constructor input. Every field has a
 // non-zero default except store (the only required dependency).
 type EvaluatorOptions struct {
-	Store      Store
-	PromQL     appmetrics.PromQL
-	Audit      *audit.Auditor
-	Identity   func() *age.X25519Identity
+	Store    Store
+	PromQL   appmetrics.PromQL
+	Audit    *audit.Auditor
+	Identity func() *age.X25519Identity
+	// Identities is the rotation-overlap accessor (issue #316 /
+	// ADR-057): multi-identity slice from secretbox.LoadHostKeys(dir).
+	// Pre-rotation: length 1 (just the current). During the 30-day
+	// overlap window: length 2 ([current, previous]). nil means
+	// "not wired" — the evaluator falls back to Identity for
+	// backward compat.
+	Identities func() []*age.X25519Identity
 	Dispatcher Dispatcher
 	NewSigner  func(secret []byte) *webhookout.Signer
 	Now        func() time.Time
@@ -144,6 +157,7 @@ func NewEvaluator(o EvaluatorOptions) *Evaluator {
 		promQL:     o.PromQL,
 		audit:      o.Audit,
 		identity:   o.Identity,
+		identities: o.Identities,
 		dispatch:   o.Dispatcher,
 		dispatchMu: &sync.Mutex{},
 		newSigner:  o.NewSigner,
@@ -356,20 +370,38 @@ func (e *Evaluator) evalRule(ctx context.Context, rule state.AlertRule, now time
 	// Unseal the webhook secret. A nil identity or a namespace
 	// mismatch is a hard skip — we never dispatch without a valid
 	// signature, and we never re-open a future-namespace blob.
-	if e.identity == nil {
+	//
+	// Prefer the rotation-aware identities slice (issue #316 /
+	// ADR-057) over the single identity accessor when both are
+	// wired. The fallback to identity preserves the pre-rotation
+	// contract for callers that haven't migrated to LoadHostKeys.
+	if e.identity == nil && e.identities == nil {
 		e.log.Warn("alerts: no host age identity; skipping dispatch",
 			"rule", rule.ID, "name", rule.Name)
 		stats.SkippedNoIdentity++
 		return
 	}
-	ident := e.identity()
-	if ident == nil {
+	var openIdents []*age.X25519Identity
+	if e.identities != nil {
+		openIdents = e.identities()
+	}
+	if len(openIdents) == 0 && e.identity != nil {
+		// identity is a loader closure (issue #316); invoke it to
+		// surface the actual identity, not the closure pointer.
+		// A loader that returns nil means "no identity at boot" —
+		// the canonical degraded mode (FAAS_HOST_AGE_IDENTITY_PATH
+		// unset). Skip rather than dispatch a half-built envelope.
+		if single := e.identity(); single != nil {
+			openIdents = []*age.X25519Identity{single}
+		}
+	}
+	if len(openIdents) == 0 {
 		e.log.Warn("alerts: identity loader returned nil; skipping dispatch",
 			"rule", rule.ID, "name", rule.Name)
 		stats.SkippedNoIdentity++
 		return
 	}
-	ns, plaintext, err := secretbox.OpenBytes(ident, rule.WebhookSecretSealed)
+	ns, plaintext, err := secretbox.OpenBytesMulti(openIdents, rule.WebhookSecretSealed)
 	if err != nil {
 		e.log.Warn("alerts: open webhook secret; skipping dispatch",
 			"rule", rule.ID, "err", err)

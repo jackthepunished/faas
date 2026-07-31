@@ -217,6 +217,134 @@ func TestOpenBytes_EmptyBlob_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestOpenMulti_CurrentAndPrevious is the load-bearing test for
+// the rotation-overlap plumbing (issue #316 / ADR-057). We seal
+// against identity A, then unseal with a slice that contains a
+// DIFFERENT identity B in slot 0 AND A in slot 1 — both orderings
+// must succeed because age.Decrypt falls back across the slice.
+//
+// This pins the contract: after `gregale host-age rotate --commit`,
+// envelopes sealed under the PREVIOUS host.age are still unsealable
+// without operator intervention, until prune-previous is invoked.
+func TestOpenMulti_CurrentAndPrevious(t *testing.T) {
+	prevID := mustGenHostKey(t, "prev.age")
+	currID := mustGenHostKey(t, "curr.age")
+
+	blob, err := Seal(prevID.Recipient(), Envelope{"API_KEY": "secret-value"})
+	if err != nil {
+		t.Fatalf("Seal under prevID: %v", err)
+	}
+
+	// Order 1: current first, previous second — matches LoadHostKeys output.
+	env, err := OpenMulti([]*age.X25519Identity{currID, prevID}, blob)
+	if err != nil {
+		t.Fatalf("OpenMulti [curr,prev]: %v", err)
+	}
+	if env["API_KEY"] != "secret-value" {
+		t.Errorf("decrypted value mismatch: got %q", env["API_KEY"])
+	}
+
+	// Order 2: previous first — must also work because the fallback
+	// is across the slice, not position-dependent.
+	env, err = OpenMulti([]*age.X25519Identity{prevID, currID}, blob)
+	if err != nil {
+		t.Fatalf("OpenMulti [prev,curr]: %v", err)
+	}
+	if env["API_KEY"] != "secret-value" {
+		t.Errorf("decrypted value mismatch (order 2): got %q", env["API_KEY"])
+	}
+}
+
+// TestOpenMulti_SingleIdentity mirrors Open's behaviour for the
+// single-identity case. The 1-element-slice path is a hot path
+// (every unseal during the rotation overlap actually hits it
+// when the envelope was sealed under the current key — the
+// fallback only fires for the previous-keyed envelopes).
+func TestOpenMulti_SingleIdentity(t *testing.T) {
+	id := mustGenHostKey(t, "host.age")
+	blob, err := Seal(id.Recipient(), Envelope{"K": "v"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	got, err := OpenMulti([]*age.X25519Identity{id}, blob)
+	if err != nil {
+		t.Fatalf("OpenMulti: %v", err)
+	}
+	if got["K"] != "v" {
+		t.Errorf("got %q, want \"v\"", got["K"])
+	}
+}
+
+// TestOpenMulti_AllWrong confirms the multi-identity contract still
+// fails loudly when no supplied identity matches. Pin the
+// non-nil error shape so a regression to "silently return zero
+// Envelope" is caught loudly.
+func TestOpenMulti_AllWrong(t *testing.T) {
+	a := mustGenHostKey(t, "a.age")
+	b := mustGenHostKey(t, "b.age")
+	blob, err := Seal(a.Recipient(), Envelope{"K": "v"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	// b + an unrelated c — neither matches the seal under a.
+	c := mustGenHostKey(t, "c.age")
+	if _, err := OpenMulti([]*age.X25519Identity{b, c}, blob); err == nil {
+		t.Fatal("OpenMulti with all-wrong identities succeeded")
+	}
+}
+
+// TestOpenMulti_EmptyInputs pins the precondition errors. An empty
+// slice or empty blob must surface before age is called.
+func TestOpenMulti_EmptyInputs(t *testing.T) {
+	if _, err := OpenMulti(nil, []byte("anything")); err == nil {
+		t.Error("OpenMulti(nil identities): expected error")
+	}
+	if _, err := OpenMulti([]*age.X25519Identity{}, []byte("anything")); err == nil {
+		t.Error("OpenMulti(empty slice): expected error")
+	}
+	if _, err := OpenMulti([]*age.X25519Identity{(*age.X25519Identity)(nil)}, nil); err == nil {
+		t.Error("OpenMulti(empty blob): expected error")
+	}
+}
+
+// TestOpenBytesMulti_RoundTrip is the byte-channel counterpart of
+// TestOpenMulti_CurrentAndPrevious. Confirms the alert evaluator
+// (pkg/alerts/evaluator.go) can keep unsealing webhook secrets
+// sealed under the previous host.age across a rotate.
+func TestOpenBytesMulti_RoundTrip(t *testing.T) {
+	prevID := mustGenHostKey(t, "prev.age")
+	currID := mustGenHostKey(t, "curr.age")
+	const ns = "alert_rule_secret"
+	const plaintext = "https://hooks.example.com/path"
+
+	blob, err := SealBytes(prevID.Recipient(), ns, []byte(plaintext), 256)
+	if err != nil {
+		t.Fatalf("SealBytes under prevID: %v", err)
+	}
+
+	gotNS, gotPlain, err := OpenBytesMulti([]*age.X25519Identity{currID, prevID}, blob)
+	if err != nil {
+		t.Fatalf("OpenBytesMulti: %v", err)
+	}
+	if gotNS != ns {
+		t.Errorf("namespace: got %q, want %q", gotNS, ns)
+	}
+	if string(gotPlain) != plaintext {
+		t.Errorf("plaintext: got %q, want %q", gotPlain, plaintext)
+	}
+}
+
+// TestOpenBytesMulti_EmptyInputs mirrors TestOpenMulti_EmptyInputs
+// for the byte channel.
+func TestOpenBytesMulti_EmptyInputs(t *testing.T) {
+	if _, _, err := OpenBytesMulti(nil, []byte("anything")); err == nil {
+		t.Error("OpenBytesMulti(nil identities): expected error")
+	}
+	if _, _, err := OpenBytesMulti([]*age.X25519Identity{}, []byte("anything")); err == nil {
+		t.Error("OpenBytesMulti(empty slice): expected error")
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 // envelopesEqual compares two Envelopes without relying on map ordering.
