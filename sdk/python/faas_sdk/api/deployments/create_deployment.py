@@ -116,7 +116,12 @@ def sync_detailed(
         slug (str):
         idempotency_key (str | Unset):
         body (CreateDeploymentRequest): Two content-types accepted (see operation description):
-            prebuilt OCI image reference, or multipart source upload.
+            prebuilt OCI image reference, or multipart source upload. The optional `overrides` object
+            (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a
+            different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the
+            image. The override field list is FROZEN — six fields, no more — and any extra field on
+            the override object 400s the request (the handler's decoder rejects unknown keys; see
+            ADR-053 §Decision 1).
         body (CreateDeploymentFilesBody):
 
     Raises:
@@ -158,7 +163,12 @@ def sync(
         slug (str):
         idempotency_key (str | Unset):
         body (CreateDeploymentRequest): Two content-types accepted (see operation description):
-            prebuilt OCI image reference, or multipart source upload.
+            prebuilt OCI image reference, or multipart source upload. The optional `overrides` object
+            (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a
+            different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the
+            image. The override field list is FROZEN — six fields, no more — and any extra field on
+            the override object 400s the request (the handler's decoder rejects unknown keys; see
+            ADR-053 §Decision 1).
         body (CreateDeploymentFilesBody):
 
     Raises:
@@ -195,7 +205,12 @@ async def asyncio_detailed(
         slug (str):
         idempotency_key (str | Unset):
         body (CreateDeploymentRequest): Two content-types accepted (see operation description):
-            prebuilt OCI image reference, or multipart source upload.
+            prebuilt OCI image reference, or multipart source upload. The optional `overrides` object
+            (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a
+            different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the
+            image. The override field list is FROZEN — six fields, no more — and any extra field on
+            the override object 400s the request (the handler's decoder rejects unknown keys; see
+            ADR-053 §Decision 1).
         body (CreateDeploymentFilesBody):
 
     Raises:
@@ -235,7 +250,12 @@ async def asyncio(
         slug (str):
         idempotency_key (str | Unset):
         body (CreateDeploymentRequest): Two content-types accepted (see operation description):
-            prebuilt OCI image reference, or multipart source upload.
+            prebuilt OCI image reference, or multipart source upload. The optional `overrides` object
+            (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a
+            different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the
+            image. The override field list is FROZEN — six fields, no more — and any extra field on
+            the override object 400s the request (the handler's decoder rejects unknown keys; see
+            ADR-053 §Decision 1).
         body (CreateDeploymentFilesBody):
 
     Raises:

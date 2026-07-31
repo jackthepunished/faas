@@ -41,6 +41,7 @@ export type { CreateAlertRuleRequest } from './models/CreateAlertRuleRequest.js'
 export type { CreateAppRequest } from './models/CreateAppRequest.js';
 export type { CreateCronRequest } from './models/CreateCronRequest.js';
 export type { CreateCustomDomainRequest } from './models/CreateCustomDomainRequest.js';
+export type { CreateDeploymentOverrides } from './models/CreateDeploymentOverrides.js';
 export type { CreateDeploymentRequest } from './models/CreateDeploymentRequest.js';
 export type { CreateKeyRequest } from './models/CreateKeyRequest.js';
 export type { CronResponse } from './models/CronResponse.js';
@@ -49,6 +50,7 @@ export type { DailyUsageListResponse } from './models/DailyUsageListResponse.js'
 export type { DailyUsageResponse } from './models/DailyUsageResponse.js';
 export type { DelayedTaskRequest } from './models/DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './models/DelayedTaskResponse.js';
+export type { DeploymentHealthcheck } from './models/DeploymentHealthcheck.js';
 export type { DeploymentListResponse } from './models/DeploymentListResponse.js';
 export type { DeploymentResponse } from './models/DeploymentResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';

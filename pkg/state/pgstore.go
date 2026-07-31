@@ -1754,16 +1754,26 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	// TestPgStore_InstancesStateCheck_RejectsInjection got "got 13 and 15"
 	// before this fix). Both columns are nullable; empty string on the
 	// write side mirrors the rest of the read-side coalesce shape.
+	//
+	// Issue #460 / ADR-053: include the six override_* columns. Empty
+	// text[] is signalled by the caller passing a nil []string — pgx
+	// marshals nil to NULL which the column accepts (nullable).
+	// jsonb columns accept NULL too; the handler marshals an empty
+	// map to "{}" rather than NULL so a downstream consumer never
+	// has to branch on "is the jsonb column populated but the JSON
+	// string empty?".
 	row := tx.QueryRow(ctx,
-		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha, status)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
-		 returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		           coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		           status, coalesce(error,''), coalesce(error_code,''), created_at,
-		           coalesce(source_url,''), coalesce(commit_sha,'')`,
+		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
+		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          status)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
+		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
-		nullString(d.SourceURL), nullString(d.CommitSHA))
+		nullString(d.SourceURL), nullString(d.CommitSHA),
+		d.OverrideEntrypoint, d.OverrideCmd,
+		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
+		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck))
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -1776,42 +1786,28 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 
 func (s *PgStore) DeploymentByID(ctx context.Context, id string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where id = $1`, id)
 	return scanDeploymentWithRootfs(row)
 }
 
 func (s *PgStore) LatestDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumns+`
 		 from deployments where app_id = $1 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
 }
 
 func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
 	return scanDeploymentWithRootfs(row)
 }
 
 func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumns+`
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
@@ -1845,18 +1841,12 @@ func (s *PgStore) ListDeploymentsForApp(ctx context.Context, appID string, limit
 	)
 	if limit > 0 {
 		rows, err = s.pool.Query(ctx,
-			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at,
-			        coalesce(source_url,''), coalesce(commit_sha,'')
+			`select `+deploymentSelectColumns+`
 			 from deployments where app_id = $1 order by created_at desc limit $2 offset $3`,
 			appID, limit, offset)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at,
-			        coalesce(source_url,''), coalesce(commit_sha,'')
+			`select `+deploymentSelectColumns+`
 			 from deployments where app_id = $1 order by created_at desc offset $2`,
 			appID, offset)
 	}
@@ -1883,19 +1873,13 @@ func (s *PgStore) ListDeploymentsForAccount(ctx context.Context, accountID strin
 	)
 	if before.IsZero() {
 		rows, err = s.pool.Query(ctx,
-			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
-			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
-			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
+			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 order by d.created_at desc limit $2`,
 			accountID, limit)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
-			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
-			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
+			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 and d.created_at < $2
 			 order by d.created_at desc limit $3`,
@@ -1994,11 +1978,7 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 		`update deployments
 		    set status = 'failed', error = $2, error_code = $3
 		  where id = $1
-		  returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		            coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		            coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		            status, coalesce(error,''), coalesce(error_code,''), created_at,
-		            coalesce(source_url,''), coalesce(commit_sha,'')`,
+		  returning `+deploymentSelectColumnsWithRootfs,
 		id, nullString(message), nullString(code))
 	return scanDeploymentWithRootfs(row)
 }
@@ -6499,13 +6479,98 @@ const appsSelectColumns = `
 // nine callers) trips the linter instead of rotting silently.
 var _ = appsSelectColumns
 
+// deploymentSelectColumns is the canonical SELECT projection for a
+// deployment row. Used by every read path that needs the full
+// deployment state without the rootfs triple (CreateDeployment
+// RETURNING, LatestDeployment, LatestSupersededDeployment, and the
+// non-rootfs variants of ListDeploymentsForApp / ListDeploymentsForAccount).
+// The order is load-bearing — pgx scans scanDeployment positionally,
+// and the scan order matches the SELECT list.
+//
+// Issue #460 / ADR-053: the trailing 6 columns are the override shape.
+// Coalesce rules:
+//   - text[] columns: coalesce with ARRAY[]::text[] so the read
+//     destination is always a non-nil []string (mirrors the pre-PR
+//     convention used for non-override reads).
+//   - jsonb columns: NO coalesce — pgx scans into json.RawMessage which
+//     can be nil for a NULL column (pre-override rows + a refresh
+//     that didn't write env/env_secrets/healthcheck).
+//   - int port: coalesce to 0 so the absence sentinel reads as 0
+//     (mirrors nullableOverridePort on the write side).
+//
+// Adding a new column touches: this const + scanDeployment +
+// scanDeployments + the INSERT in CreateDeployment. Keep them
+// aligned; the gofmt/golangci-lint gate catches the constant binding
+// but not column-order drift.
+const deploymentSelectColumns = `
+	id, app_id, coalesce(build_id::text,''), image_digest, kind,
+	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
+	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	coalesce(source_url,''), coalesce(commit_sha,''),
+	coalesce(override_entrypoint, ARRAY[]::text[]),
+	coalesce(override_cmd, ARRAY[]::text[]),
+	override_env, override_env_secrets,
+	coalesce(override_port, 0), override_healthcheck`
+
+// deploymentSelectColumnsWithRootfs is the variant used by read paths
+// that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
+// — the three columns land between the source columns and the
+// status/error columns. Used by DeploymentByID, LiveDeployment,
+// SetDeploymentFailed.
+//
+// The order is the same as deploymentSelectColumns but with the
+// rootfs triple inserted at the canonical position. Keep this and
+// scanDeploymentWithRootfs in lockstep.
+const deploymentSelectColumnsWithRootfs = `
+	id, app_id, coalesce(build_id::text,''), image_digest, kind,
+	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
+	coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
+	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	coalesce(source_url,''), coalesce(commit_sha,''),
+	coalesce(override_entrypoint, ARRAY[]::text[]),
+	coalesce(override_cmd, ARRAY[]::text[]),
+	override_env, override_env_secrets,
+	coalesce(override_port, 0), override_healthcheck`
+
+// Compile-time anchors for the deployment column constants. See the
+// appsSelectColumns comment above for rationale.
+var _ = deploymentSelectColumns
+var _ = deploymentSelectColumnsWithRootfs
+
+// deploymentSelectColumnsQualified is the d.alias-prefixed variant of
+// deploymentSelectColumns for SELECTs that JOIN with another table
+// (e.g. ListDeploymentsForAccount joins deployments d with apps a on
+// a.id = d.app_id). The qualifications resolve the id / app_id
+// ambiguity that arises when both tables carry the same column name.
+// Column order matches deploymentSelectColumns exactly so the
+// scanDeployments helper stays in lockstep across all read paths.
+const deploymentSelectColumnsQualified = `
+	d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
+	coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
+	d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+	coalesce(d.source_url,''), coalesce(d.commit_sha,''),
+	coalesce(d.override_entrypoint, ARRAY[]::text[]),
+	coalesce(d.override_cmd, ARRAY[]::text[]),
+	d.override_env, d.override_env_secrets,
+	coalesce(d.override_port, 0), d.override_healthcheck`
+
+var _ = deploymentSelectColumnsQualified
+
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
 	var kind, statusStr string
+	// Issue #460 / ADR-053: six override columns scanned here so the
+	// SELECT projections in DeploymentByID / LatestDeployment / etc.
+	// match. The scan order matches the column order in the SELECT
+	// list — keep them in lockstep or pgx's positional Scan returns
+	// the wrong field into the wrong destination.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-		&d.SourceURL, &d.CommitSHA); err != nil {
+		&d.SourceURL, &d.CommitSHA,
+		&d.OverrideEntrypoint, &d.OverrideCmd,
+		&d.OverrideEnv, &d.OverrideEnvSecrets,
+		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
@@ -6528,7 +6593,10 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&rootfsPath, &rootfsKey, &d.RootfsBytes,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-		&d.SourceURL, &d.CommitSHA); err != nil {
+		&d.SourceURL, &d.CommitSHA,
+		&d.OverrideEntrypoint, &d.OverrideCmd,
+		&d.OverrideEnv, &d.OverrideEnvSecrets,
+		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
@@ -6546,7 +6614,10 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-			&d.SourceURL, &d.CommitSHA); err != nil {
+			&d.SourceURL, &d.CommitSHA,
+			&d.OverrideEntrypoint, &d.OverrideCmd,
+			&d.OverrideEnv, &d.OverrideEnvSecrets,
+			&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
@@ -6811,6 +6882,35 @@ func nullAppStatus(p *AppStatus) any {
 		return nil
 	}
 	return string(*p)
+}
+
+// nullJSONRaw returns nil for an empty json.RawMessage so the DB column
+// is NULL rather than the byte string "{}" or "null". Used by the
+// CreateDeployment INSERT for the override_*_env / override_healthcheck
+// jsonb columns (issue #460 / ADR-053) — a deployment that didn't
+// carry an override writes NULL, not an empty object.
+//
+// json.RawMessage IS []byte, so the non-empty branch is a direct
+// return — no conversion needed. The redirection to `any` here
+// gates the value through pgx's encode path; the slice type is
+// preserved on the wire so pgx sends the raw bytes.
+func nullJSONRaw(b json.RawMessage) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// nullableOverridePort returns nil when port is 0 (the "absent" sentinel
+// for CreateDeploymentOverrides.Port) so the column reads NULL on a
+// round-trip; otherwise the int value. Mirrors nullableInt's zero-to-NULL
+// rule but keeps the override-intent explicit at the call site so a
+// future reader can grep for it.
+func nullableOverridePort(p int) any {
+	if p == 0 {
+		return nil
+	}
+	return p
 }
 
 // cidrPrefixesToArray renders a Go []netip.Prefix as a pgx driver value

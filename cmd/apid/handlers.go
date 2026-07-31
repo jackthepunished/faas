@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -135,13 +136,18 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		return
 	}
 	ct := r.Header.Get("Content-Type")
+	// Lookup the plan limits once. Both branches need them:
+	//   - multipart: cap upload size at SourceTarballMaxMB
+	//   - JSON:     validate override env byte + count caps
+	// Hoisting avoids a second MustLimitsFor call in the override
+	// branch (issue #460 / ADR-053).
+	limits := api.MustLimitsFor(acct.Plan)
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		// Cap upload size at the plan's SourceTarballMaxMB before any
 		// multipart parsing — MaxBytesReader returns a *MaxBytesError on
 		// overflow, which r.MultipartReader surfaces as a parse error that
 		// createDeploymentMultipart already maps to 413. The pre-Check
 		// in deploy_inputs.go only fires when ContentLength is known.
-		limits := api.MustLimitsFor(acct.Plan)
 		max := int64(limits.SourceTarballMaxMB) * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, max)
 		s.createDeploymentMultipart(w, r, acct, app)
@@ -157,6 +163,21 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 			"Image required", "image: deploys require a digest-pinned reference, e.g. registry.gregale.dev/app@sha256:..."))
 		return
 	}
+	// Issue #460 / ADR-053: validate the override object AFTER the
+	// image digest check (digest first — a missing image is a more
+	// fundamental request shape error than a malformed override).
+	// A failed override validation 400s the whole request — the
+	// override is NEVER silently dropped (ADR-053 §Decision 2).
+	// Plan tier comes from the authenticated account (limits already
+	// hoisted above the multipart branch).
+	var overrides *api.CreateDeploymentOverrides
+	if req.Overrides != nil {
+		if p := req.Overrides.Validate(limits); p != nil {
+			api.WriteProblem(w, p)
+			return
+		}
+		overrides = req.Overrides
+	}
 	// PR-B: the prior-deployment supersede is folded into
 	// store.CreateDeployment's tx (pkg/state/pgstore.go). apid no longer
 	// holds a "supersede then create" two-step — the in-tx ordering
@@ -166,9 +187,39 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// supersede-notify can carry its id; this keeps the return shape
 	// 2-tuple and backward-compatible with pre-PR-B call sites.
 	prev, _ := s.store.LatestDeployment(ctx(r), app.ID)
-	d, err := s.store.CreateDeployment(ctx(r), state.Deployment{
+	dep := state.Deployment{
 		AppID: app.ID, ImageDigest: req.Image, Kind: state.DeploymentKindImage, Status: state.DeployPending,
-	})
+	}
+	if overrides != nil {
+		// Convert the validated override into the DB shape. The
+		// json.RawMessage columns carry the marshalled map; nil
+		// means "no override" (the store writes NULL).
+		if len(overrides.Entrypoint) > 0 {
+			dep.OverrideEntrypoint = overrides.Entrypoint
+		}
+		if len(overrides.Cmd) > 0 {
+			dep.OverrideCmd = overrides.Cmd
+		}
+		if len(overrides.Env) > 0 {
+			if b, err := json.Marshal(overrides.Env); err == nil {
+				dep.OverrideEnv = b
+			}
+		}
+		if len(overrides.EnvSecrets) > 0 {
+			if b, err := json.Marshal(overrides.EnvSecrets); err == nil {
+				dep.OverrideEnvSecrets = b
+			}
+		}
+		if overrides.Port != 0 {
+			dep.OverridePort = overrides.Port
+		}
+		if overrides.Healthcheck != nil {
+			if b, err := json.Marshal(overrides.Healthcheck); err == nil {
+				dep.OverrideHealthcheck = b
+			}
+		}
+	}
+	d, err := s.store.CreateDeployment(ctx(r), dep)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
@@ -212,11 +263,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// pre-PR-#340 layout). Empty when this is the first deploy
 	// on the app — dashboards can distinguish "first deploy"
 	// from "supersede" without inspecting app history.
+	//
+	// Issue #460 / ADR-053: data.has_overrides is the audit-side
+	// mirror of the HasOverrides response field. Set true when the
+	// deployment carried any override_* column. The override values
+	// themselves are NEVER in the audit payload — only the boolean
+	// (ADR-053 §Decision 4 + ADR-045 §Decision 6 mirror: env values
+	// never cross the audit sink).
+	hasOverrides := req.Overrides != nil
 	s.audit.Emit(ctx(r), "app.deployed", &acct.ID, map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": d.ID,
 		"ref":           req.Image,
 		"supersedes":    prev.ID,
+		"has_overrides": hasOverrides,
 	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
