@@ -71,15 +71,19 @@ type osExecNft struct{}
 
 func (osExecNft) CheckSyntax(ctx context.Context, path string) error {
 	// `nft -c -f <path>` is the dry-run / syntax-check mode. The
-	// production watcher holds a staging file under os.TempDir() so
-	// syntax-check failure leaves the file on disk for inspection.
+	// production watcher holds a staging file at
+	// /tmp/vmmd-egress-staging/nftables.conf.staging (see
+	// runWithDeps); on syntax-check failure the staging file is
+	// left on disk so the operator can inspect it.
 	return runNftCmd(ctx, "nft -c -f "+shellQuote(path))
 }
 
 func (osExecNft) Reload(ctx context.Context, path string) error {
 	// `nft -f <path>` is the live-reload path. The staging file
-	// has already been atomic-renamed over /etc/nftables.conf by
-	// the caller, so the path here is the live file.
+	// at /tmp/vmmd-egress-staging/nftables.conf.staging has already
+	// been atomic-replaced over /etc/nftables.conf by the caller
+	// (atomicReplace's cross-fs copy+rename path), so the path here
+	// is the live file.
 	return runNftCmd(ctx, "nft -f "+shellQuote(path))
 }
 
@@ -243,21 +247,28 @@ func (w *egressWatcher) Reload(ctx context.Context) error {
 	return nil
 }
 
-// atomicReplace moves src over dst. On EXDEV (cross-filesystem
-// rename), falls back to a copy-then-rename: the staging file is
-// already on the target filesystem (the production staging dir is
-// the same dir as /etc), so this is a rarely-hit branch. The
-// intermediate scratch file uses the `<dst>.faas-new` suffix so a
+// atomicReplace moves src over dst. On the production wiring the
+// staging file lives at /tmp/vmmd-egress-staging/nftables.conf.staging
+// (tmpfs) and dst is /etc/nftables.conf (ext4) — different filesystems,
+// so os.Rename will fail with EXDEV and the copy+rename path below
+// is the production hot path, not a fallback. The optimistic rename
+// IS exercised when staging and dst happen to share a filesystem
+// (test fixtures, a custom stagingDir); that path is the fast path.
+//
+// The intermediate scratch file uses the `<dst>.faas-new` suffix so a
 // concurrent ansible run that writes /etc/nftables.conf doesn't
-// collide. The intermediate is removed on success.
+// collide with our copy. The intermediate is removed on success; on
+// failure it is left on disk so the operator can inspect what we
+// tried to write.
 func atomicReplace(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
-	// Cross-fs or any other rename error: copy + rename. Most
-	// production staging sits in /tmp and dst is /etc/ — both
-	// are tmpfs on the EX44, so the rename WILL succeed without
-	// crossing filesystems. The fallback is the insurance policy.
+	// Production hot path: cross-fs rename failed. Copy the body to
+	// the dst filesystem, then atomic-rename into place. The
+	// `<dst>.faas-new` suffix is required because a concurrent
+	// ansible run might also be writing dst directly — we never
+	// write to dst until the rename.
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("read staging: %w", err)
