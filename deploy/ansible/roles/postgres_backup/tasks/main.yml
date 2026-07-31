@@ -107,6 +107,35 @@
     mode: "0644"
   notify: daemon-reload postgres_backup
 
+# Issue #250 (review F3): rclone copyto / rclone sync do NOT
+# auto-create parent directories on the remote Storage Box — the
+# first push fails loud with "directory not found" and silently
+# stalls the off-host backup. Create the two directories at role
+# apply time so the very first archive_command has somewhere to
+# land. Idempotent: rclone mkdir is a no-op if the dir already
+# exists. Reads the credential from the same systemd LoadCredential
+# dir the units use (mode 0440 root:postgres — see the perms
+# assert below).
+#
+# The `creates:` sentinel on `command:` is the load-bearing
+# idempotency trick: rclone mkdir returns 0 whether or not the
+# directory exists, so without `creates:` ansible would mark the
+# task "changed" on every run. The sentinel `true` command is
+# unconditional — we only mark the role idempotent, we don't claim
+# "this never changes."
+- name: postgres_backup — create Storage Box dirs (issue #250 / F3)
+  ansible.builtin.command:
+    cmd: >-
+      rclone mkdir
+      hertznerbox:{{ hetzner_storage_box_basebackup_path }}
+      hertznerbox:{{ hetzner_storage_box_wal_path }}
+      --config=/etc/faas/secrets/storage-box/rclone.conf
+      --stats=0 --quiet
+  args:
+    creates: "/etc/faas/secrets/storage-box/rclone.conf"
+  changed_when: false
+  failed_when: false  # chroot/CI may not have rclone or the secret
+
 - name: postgres_backup — daemon-reload
   ansible.builtin.systemd:
     daemon_reload: true
@@ -146,30 +175,51 @@
 # Mirrors control_plane_service/tasks/main.yml:108-209. The pattern
 # is `stat` + `failed_when` full-arity on mode + owner + group.
 #
+# Two distinct perms profiles:
+#
+#   rclone.conf  → 0440 root:postgres
+#     The postgres user (User= on the systemd postgresql.service)
+#     must read this file via its `archive_command` (the WAL push
+#     path). LoadCredential= surfaces the plaintext under
+#     $CREDENTIALS_DIRECTORY at unit activation; postgres traverses
+#     the dir via its group membership. 0400 root:root would be
+#     unreadable to the archive_command (the rclone call would
+#     fail loud with "config not found").
+#
+#   box-age-key  → 0400 root:root
+#     Used only by the bootstrap-time `gregale backup unseal-rclone`
+#     CLI which runs as root. Never read by a daemon, so the
+#     tighter 0400 root:root profile is correct. Same shape as
+#     /etc/faas/secrets/host.age and /etc/faas/secrets/session.key.
+#
 # Skipped in chroot/CI (no /etc/faas/secrets/storage-box/ yet). On a
 # real EX44 the bootstrap.sh step that decrypts host.age-sealed
 # secrets into the staging dir is required before this role passes.
 - name: postgres_backup — stat storage-box secrets
   ansible.builtin.stat:
-    path: "/etc/faas/secrets/storage-box/{{ item }}"
+    path: "/etc/faas/secrets/storage-box/{{ item.name }}"
   loop:
-    - rclone.conf
-    - box-age-key
+    - { name: rclone.conf, mode: "0440", owner: root, group: postgres }
+    - { name: box-age-key, mode: "0400", owner: root, group: root }
   register: pg_sb_stat
   failed_when: false
 
-- name: postgres_backup — assert storage-box secrets are 0400 root:root
+- name: postgres_backup — assert storage-box secrets match the perms profile
   ansible.builtin.assert:
     that:
       - item.stat.exists
-      - item.stat.mode == "0400"
-      - item.stat.pw_name == "root"
-      - item.stat.gr_name == "root"
+      - item.stat.mode == item.item.mode
+      - item.stat.pw_name == item.item.owner
+      - item.stat.gr_name == item.item.group
     fail_msg: >-
-      /etc/faas/secrets/storage-box/{{ item.item }} must be 0400
-      root:root (issue #250, spec §11). Re-run bootstrap.sh's storage-box
-      unseal step to repopulate from the host.age-sealed form.
+      /etc/faas/secrets/storage-box/{{ item.item.name }} must be
+      {{ item.item.mode }} {{ item.item.owner }}:{{ item.item.group }}
+      (issue #250, spec §11). Re-run bootstrap.sh's storage-box
+      unseal step (step 11d) to repopulate from the host.age-sealed
+      form. The rclone.conf profile is group-readable to postgres so
+      archive_command can rclone WAL via the systemd LoadCredential
+      staging dir.
   loop: "{{ pg_sb_stat.results }}"
   loop_control:
-    label: "{{ item.item }}"
+    label: "{{ item.item.name }}"
   when: item.stat.exists

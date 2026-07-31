@@ -130,4 +130,4 @@ be considered healthy.
 - `deploy/ansible/roles/postgres_backup/tasks/main.yml` — installer.
 - `deploy/systemd/faas-pg-basebackup-push.{service,timer}` — push unit pair.
 - `pkg/wire/metrics.go` — `pg_backup_last_pushed_seconds` gauge.
-- ADR-050 (TBD) — design rationale.
+- ADR-056 — design rationale.

@@ -34,7 +34,6 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -52,6 +51,13 @@ const pgBackupPushedInterval = 60 * time.Second
 //
 // var (not const) so the unit test can swap to a t.TempDir path;
 // the production wiring never reassigns it.
+//
+// TODO(F9-followup): source this from a FAAS_PG_BASEBACKUP_ROOT env
+// var matching the systemd unit's Environment=PG_BB_ROOT, with the
+// hardcoded path as the default. Today the hardcoded path is fine
+// (canonical install) but a Lima/metal test running against a
+// non-canonical root would have to swap the package-level var in a
+// test-only file. See review F9 + issue #250 follow-up.
 var pgBackupPushedRoot = "/var/lib/pgsql/basebackup"
 
 // pgBackupPushedSampler stamps the pg_backup_last_pushed_seconds
@@ -66,13 +72,6 @@ var pgBackupPushedRoot = "/var/lib/pgsql/basebackup"
 type pgBackupPushedSampler struct {
 	ops *wire.OpsMetrics
 	log *slog.Logger
-
-	// mu guards prevNewest because Tick writes + reads it on a
-	// single goroutine today; the lock is forward-compatible with
-	// a future per-tick "delta since last tick" feature without
-	// having to refactor the type.
-	mu         sync.Mutex
-	prevNewest time.Time
 }
 
 // newPgBackupPushedSampler constructs a sampler; the caller owns the
@@ -95,9 +94,6 @@ func newPgBackupPushedSampler(ops *wire.OpsMetrics, log *slog.Logger) *pgBackupP
 //  3. Stamp the gauge with time.Since(newest).Seconds(), or 0 if
 //     the directory is empty (matches the gauge's pre-instantiated
 //     default so a fresh box doesn't look like a stale-push).
-//
-// The lock around prevNewest is unnecessary today (single-goroutine
-// writer) but mirrors topNSampler for symmetry.
 func (s *pgBackupPushedSampler) run(ctx context.Context) {
 	if s.ops == nil {
 		// Defensive: the sampler is started from bgBefore AFTER
@@ -126,6 +122,14 @@ func (s *pgBackupPushedSampler) run(ctx context.Context) {
 
 // tick drives one sampler iteration. Extracted so the boot-time
 // immediate emit (run) and the recurring tick share the same path.
+//
+// TODO(F8-followup): the unit test for tick() currently constructs a
+// nil-ops sampler (returning the empty gauge) and asserts the path
+// through newestEntryMtime; the real wire.PgBackupLastPushed() path
+// is uncovered. Future work: add a test that constructs an OpsMetrics
+// via wire.NewOpsMetrics(), swaps pgBackupPushedRoot to a t.TempDir,
+// stamps a fake mtime, and asserts the gauge reads time.Since(stamp).
+// See review F8 + issue #250 follow-up.
 func (s *pgBackupPushedSampler) tick() {
 	gauge := s.ops.PgBackupLastPushed()
 	if gauge == nil {
@@ -136,9 +140,6 @@ func (s *pgBackupPushedSampler) tick() {
 		// Empty dir or stat failure — keep the gauge at 0 so the
 		// alert doesn't false-fire on a fresh install.
 		gauge.Set(0)
-		s.mu.Lock()
-		s.prevNewest = time.Time{}
-		s.mu.Unlock()
 		return
 	}
 	ageSeconds := time.Since(newest).Seconds()
@@ -149,9 +150,6 @@ func (s *pgBackupPushedSampler) tick() {
 		ageSeconds = 0
 	}
 	gauge.Set(ageSeconds)
-	s.mu.Lock()
-	s.prevNewest = newest
-	s.mu.Unlock()
 }
 
 // newestEntryMtime returns the maximum mtime of entries directly

@@ -30,6 +30,14 @@
 #
 # Run as root on the EX44. Refuses to run if not Linux + not root.
 # M8 docs: docs/runbooks/PostgresBackup.md (acceptance matrix).
+#
+# TODO(F4-followup): script body assumes Linux + x86_64 (pg_isready,
+# stat -c '%Y', `/proc/self/loginuid`, etc.). The bash lint
+# (`make lint-pg-restore-verify`) is portable but execution is gated
+# on Linux + root + an EX44-style pg layout. A future patch should
+# either (a) ship a sibling aarch64 variant for the Lima/metal arm64
+# guest, or (b) gate the script behind //go:build metal and rerun the
+# bash via `make metal-lima`. See review F4 + issue #250 follow-up.
 
 set -euo pipefail
 
