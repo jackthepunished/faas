@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -87,6 +88,27 @@ type Config struct {
 	EgressTLSCertPath string `toml:"egress_tls_cert_path"`
 	EgressTLSKeyPath  string `toml:"egress_tls_key_path"`
 	EgressTLSCAPath   string `toml:"egress_tls_ca_path"`
+
+	// StreamingEnabled (issue #471 / ADR-047) gates the per-app
+	// streaming response path. When false (the default), gatewayd
+	// buffers responses per the legacy v1 contract even when the
+	// per-app flag is true; an app that emits
+	// text/event-stream will be buffered end-to-end with a
+	// once-per-process deprecation log so a noisy Free-tier app
+	// doesn't spam logs. PR-B activates the Flusher path when this
+	// is true; PR-A only tests the buffered-fallback AC
+	// (#streaming_not_available). Overridable via FAAS_GATEWAY_STREAMING
+	// so the e2e harness and metal tests can flip it without a TOML
+	// round-trip. Production default is false — operators opt in
+	// per-cluster after PR-B ships.
+	StreamingEnabled bool `toml:"streaming_enabled"`
+	// ResponseWriteTimeout is the http.Server.WriteTimeout override
+	// (spec §4.1: 300 s; issue #471 raises it to 900 s for paid
+	// plans). When 0, gatewayd uses api.ResponseWriteTimeout() which
+	// already reads the per-plan cap from pkg/api/limits.go. Set this
+	// to override per-cluster (e.g. a staging cluster that wants a
+	// tighter envelope than production).
+	ResponseWriteTimeout time.Duration `toml:"response_write_timeout"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived

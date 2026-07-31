@@ -1435,6 +1435,13 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetAutoscaleTargetCPUPct {
 		a.AutoscaleTargetCPUPct = derefInt(p.AutoscaleTargetCPUPct)
 	}
+	// Issue #471: per-app streaming flag. Same Set-bit convention as
+	// the autoscale targets — SetStreamingEnabled distinguishes "don't
+	// touch" from "explicit false" (opt out of streaming). Apid
+	// already gated the plan; the store is a plain column write.
+	if p.SetStreamingEnabled {
+		a.StreamingEnabled = derefBool(p.StreamingEnabled)
+	}
 	m.apps[id] = a
 	return a, nil
 }
@@ -4992,6 +4999,18 @@ func (m *MemStore) PutIdempotent(_ context.Context, accountID, key string, statu
 func derefInt(p *int) int {
 	if p == nil {
 		return 0
+	}
+	return *p
+}
+
+// derefBool is the boolean counterpart to derefInt, used by pgstore
+// when building the SQL UPDATE args list. A nil pointer (the "don't
+// touch the column" sentinel from UpdateAppParams.SetStreamingEnabled)
+// reads as false here, which is harmless because pgstore's case-when
+// guard only consults this value when SetStreamingEnabled is true.
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
 	}
 	return *p
 }

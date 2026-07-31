@@ -1037,3 +1037,64 @@ func TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit(t *testing.T) {
 		t.Errorf("local_snapshot count = %d, want 0 (PlanPro default is cold boot)", gotSnap)
 	}
 }
+
+// TestStreamingFallbackLog_DedupPerKey pins the buffered-fallback
+// deprecation log behaviour (issue #471 / ADR-047 PR-A). The helper
+// must emit exactly one log line per (appID, contentType) pair —
+// repeat calls within the same process are silent. Different
+// content-types on the same app get separate entries (so the
+// "missed" SSE-on-app-A and the "missed" SSE+json-on-app-A are
+// distinguishable in dashboards). A nil-log handler must be a
+// no-op (the test seam in Handler.NewHandlerWith accepts a nil
+// logger; the deprecation path must not panic).
+func TestStreamingFallbackLog_DedupPerKey(t *testing.T) {
+	t.Run("dedup-on-same-key", func(t *testing.T) {
+		h := &Handler{}
+		var lines atomic.Int32
+		h.log = slog.New(slog.NewJSONHandler(testCountingWriter{on: &lines}, nil))
+
+		h.streamingFallbackLog("app-A", "text/event-stream")
+		h.streamingFallbackLog("app-A", "text/event-stream")
+		h.streamingFallbackLog("app-A", "text/event-stream")
+
+		if got := lines.Load(); got != 1 {
+			t.Errorf("log lines = %d, want 1 (sync.Map dedup must short-circuit repeats)", got)
+		}
+	})
+
+	t.Run("distinct-content-types-distinct-entries", func(t *testing.T) {
+		h := &Handler{}
+		var lines atomic.Int32
+		h.log = slog.New(slog.NewJSONHandler(testCountingWriter{on: &lines}, nil))
+
+		h.streamingFallbackLog("app-A", "text/event-stream")
+		h.streamingFallbackLog("app-A", "application/x-ndjson")
+		// Same content-type on the same app → dedup, no new line.
+		h.streamingFallbackLog("app-A", "text/event-stream")
+		// Different app → distinct entry.
+		h.streamingFallbackLog("app-B", "text/event-stream")
+
+		if got := lines.Load(); got != 3 {
+			t.Errorf("log lines = %d, want 3 (one per app×content-type pair)", got)
+		}
+	})
+
+	t.Run("nil-log-handler-is-silent", func(t *testing.T) {
+		h := &Handler{}
+		// Deliberately leave h.log nil — must not panic on the
+		// buffered path. The streamingFallbackLog short-circuit
+		// at the top is the load-bearing guard.
+		h.streamingFallbackLog("app-A", "text/event-stream")
+	})
+}
+
+// testCountingWriter is a single-purpose io.Writer that bumps an
+// atomic counter on every Write. The sliding scope of the streaming
+// fallback test means a one-off helper is cheaper than the
+// prometheus-based counterValue pattern used elsewhere in this file.
+type testCountingWriter struct{ on *atomic.Int32 }
+
+func (w testCountingWriter) Write(p []byte) (int, error) {
+	w.on.Add(1)
+	return len(p), nil
+}

@@ -21,6 +21,12 @@ type CreateAppRequest struct {
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
+	// StreamingEnabled (issue #471) lets a customer opt out of
+	// streaming at creation time. nil → plan default (Free off,
+	// Hobby+ on). Explicit false on a Hobby/Pro/Scale plan = opt out
+	// (a synchronous JSON API that wants Content-Length). Explicit
+	// true on Free = rejected by apid with 403 plan_streaming_not_allowed.
+	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -65,6 +71,17 @@ type UpdateAppRequest struct {
 	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
+	// StreamingEnabled (issue #471) toggles the per-app streaming
+	// response path through gatewayd. When true (or unset on a plan
+	// where the default is true), gatewayd streams the response body
+	// from the guest through to the client with a periodic 200 ms /
+	// 256 KiB tx_bytes flush; when false, the legacy buffered path
+	// runs (spec §4.1: 25 MB / 300 s). Plan-gated upstream: Free
+	// returns 403 plan_streaming_not_allowed. Hobby/Pro/Scale may
+	// PATCH true → false to opt out (e.g. a synchronous JSON API
+	// that wants Content-Length). Pointer distinguishes "don't
+	// touch" (nil) from "explicit false" (*bool=false).
+	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -117,6 +134,14 @@ type AppResponse struct {
 	// current target. Plan-gated upstream.
 	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
 	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
+	// StreamingEnabled (issue #471) reflects the per-app flag stored
+	// on the apps row. False on Free (the plan default and the only
+	// legal state on Free — apid rejects PATCH true with 403
+	// plan_streaming_not_allowed). True on Hobby/Pro/Scale by default
+	// unless the customer explicitly opted out via PATCH. Surfaced so
+	// dashboards can show "streaming on / off" alongside the
+	// egress-allowlist flag.
+	StreamingEnabled bool `json:"streaming_enabled"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

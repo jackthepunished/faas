@@ -206,6 +206,20 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				fmt.Sprintf("autoscale_target_cpu_pct must be 0 (disable) or in [1, 100]; got %d", *req.AutoscaleTargetCPUPct))
 		}
 	}
+	// Issue #471 / ADR-047: per-app streaming flag. Plan gate runs
+	// first (403 supersedes 422) so a Free customer PATCHing
+	// true surfaces the gate error, not a bounds error. The plan
+	// default is applied at create time (cmd/apid/handlers.go::
+	// buildApp), so a Hobby customer PATCHing nil is a no-op (the
+	// Set bit is unset in updateApp's UpdateAppParams call below).
+	if req.StreamingEnabled != nil && *req.StreamingEnabled {
+		if !acct.Plan.StreamingResponseAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanStreamingNotAllowed,
+				"Streaming responses are not allowed on this plan",
+				"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
+		}
+	}
 	return nil
 }
 
@@ -288,6 +302,12 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		SetAutoscaleTargetRPS:    req.AutoscaleTargetRPS != nil,
 		AutoscaleTargetCPUPct:    req.AutoscaleTargetCPUPct,
 		SetAutoscaleTargetCPUPct: req.AutoscaleTargetCPUPct != nil,
+		// Issue #471 / ADR-047: per-app streaming flag. Set bit
+		// distinguishes "unset" from "explicit false" (opt out of
+		// streaming). Apid validation already gated the plan; the
+		// store is a plain column write.
+		StreamingEnabled:    req.StreamingEnabled,
+		SetStreamingEnabled: req.StreamingEnabled != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -327,6 +347,13 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.AutoscaleTargetCPUPct != nil {
 		oldApp["autoscale_target_cpu_pct"] = app.AutoscaleTargetCPUPct
 		newApp["autoscale_target_cpu_pct"] = updated.AutoscaleTargetCPUPct
+	}
+	if req.StreamingEnabled != nil {
+		// Issue #471 / ADR-047: record what the customer altered on
+		// the streaming flag. Same shape as the autoscale entries
+		// above — only fields the caller touched appear in the audit.
+		oldApp["streaming_enabled"] = app.StreamingEnabled
+		newApp["streaming_enabled"] = updated.StreamingEnabled
 	}
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)

@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -88,6 +89,19 @@ var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 // deployments are unaffected.
 var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 
+// streamingEnabledFromEnv is the per-process opt-in for the
+// streaming response path (issue #471 / ADR-047). PR-A wires the
+// flag end-to-end but the actual Flusher path ships in PR-B; while
+// PR-A's buffered-fallback AC #4 needs the flag to flow into the
+// Handler, the runtime behaviour is unchanged (every request still
+// buffers). Production default is false — operators opt in per-cluster
+// after PR-B ships; the e2e harness sets it to true via the
+// FAAS_GATEWAY_STREAMING env var.
+func streamingEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", "false")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
 // surface from Wake-only to two methods so the synthetic HTTP envelope
@@ -121,6 +135,14 @@ type runDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
+	// streamingEnabled (issue #471 / ADR-047) is the per-process
+	// opt-in for the streaming response path. Production passes
+	// envOr(TOML) || env("FAAS_GATEWAY_STREAMING"); tests leave it
+	// false. PR-A wires the flag into the Handler but the actual
+	// Flusher path ships in PR-B; PR-A only uses the flag to emit
+	// the buffered-fallback deprecation log when an SSE-emitting app
+	// lands on the legacy buffered path.
+	streamingEnabled bool
 	// synth is the internal unix-socket RPC server schedd dials for cron
 	// dispatch (spec §4.4, M7). nil in tests; production wires it after
 	// the schedd client is dialed.
@@ -432,6 +454,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	deps.pgStore = pgStore
+	// Issue #471 / ADR-047 (PR-A): merge the per-process streaming
+	// opt-in from TOML + env. Either source flips the bit. Production
+	// default is false (no streaming — the legacy buffered path).
+	// Tests override by setting one of the two knobs.
+	deps.streamingEnabled = cfg.StreamingEnabled || streamingEnabledFromEnv()
 	// Issue #254 / Move 4 PR-2: pkg/auth.Middleware construction.
 	// AppLogsHandler (cmd/gatewayd/app_logs.go) shares the auth chain
 	// with cmd/apid via ADR-046 — same bearer / session / MFA / scope
@@ -489,6 +516,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
 	handler.SetWakeGateHook()
+	// Issue #471 / ADR-047: per-process streaming opt-in. PR-A wires
+	// the flag end-to-end but the actual Flusher path ships in PR-B;
+	// while PR-A the Handler still buffers every response (so
+	// behaviour is unchanged). The buffered-fallback AC #4 needs the
+	// flag to flow into the Handler so a misconfigured SSE-emitting
+	// app surfaces the once-per-process deprecation log instead of a
+	// silent buffered blob. The flag here is the merged
+	// (cfg.StreamingEnabled || env(FAAS_GATEWAY_STREAMING)) — run()
+	// populates deps.streamingEnabled; tests inject the bit directly.
+	handler.WithStreamingEnabled(deps.streamingEnabled)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
 	// producer channel. The sink is shared between Handler.recordEgress
 	// (writer) and egressgrpc.Server (drainer-on-cadence reader).

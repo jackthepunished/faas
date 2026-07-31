@@ -223,6 +223,34 @@ type Limits struct {
 	// (Pro: 16; Scale: 64). apid's updateApp rejects with 400
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
+
+	// StreamingEnabled (issue #471) gates the per-app streaming
+	// response path through gatewayd (Flusher + periodic 200 ms /
+	// 256 KiB tx_bytes flush; ADR-047). Free defaults off — the
+	// buffered path is the v1 contract and Free is the abuse-floor
+	// tier where an unbounded stream would let one app monopolise
+	// gatewayd. Hobby/Pro/Scale default on; apid's updateApp handler
+	// rejects Free PATCH with 403 plan_streaming_not_allowed (issue
+	// #471 AC #3). The plan-level default is applied at CreateApp
+	// time via buildApp so a Hobby customer's brand-new app is
+	// streaming-ready without an extra PATCH round-trip.
+	StreamingEnabled bool
+	// MaxResponseBodyBytes is the per-response body cap (spec §4.1
+	// for the legacy 25 MB bound; issue #471 raises the cap for
+	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
+	// "fall back to api.MaxResponseBodyBytesDefault" so an unknown
+	// plan fails closed rather than silently inheriting Free's cap.
+	// gatewayd wraps the response writer in http.MaxBytesWriter at
+	// this number; PR-A leaves the writer unused on the buffered
+	// path and PR-B activates it on the streaming path.
+	MaxResponseBodyBytes int64
+	// ResponseWriteTimeoutSeconds is the total-response-write window
+	// for streaming responses (spec §4.1: 300 s; issue #471 raises
+	// it to 900 s for Hobby+ so 30 s LLM streams + slow client reads
+	// fit). The http.Server-level WriteTimeout is the safety net;
+	// the per-flush deadline is enforced via http.ResponseController.
+	// 0 means "fall back to api.ResponseWriteTimeoutDefault".
+	ResponseWriteTimeoutSeconds int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -297,6 +325,12 @@ var planLimits = map[Plan]Limits{
 		CPUWeight:   2,
 		CPUQuotaUS:  100_000,
 		CPUPeriodUS: 100_000,
+		// Streaming (issue #471 / ADR-047): Free is the abuse-floor
+		// tier — buffered path stays the contract, default off, no
+		// cap lift (spec §4.1 baseline 25 MB / 300 s).
+		StreamingEnabled:            false,
+		MaxResponseBodyBytes:        MaxResponseBodyBytesDefault,
+		ResponseWriteTimeoutSeconds: ResponseWriteTimeoutDefault,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -358,6 +392,13 @@ var planLimits = map[Plan]Limits{
 		CPUWeight:   4,
 		CPUQuotaUS:  200_000,
 		CPUPeriodUS: 200_000,
+		// Streaming (issue #471 / ADR-047): Hobby is the first paid
+		// tier — streaming is opt-in by default (the LLM use case is
+		// the Hobby customer's entry point). Cap lifts to 100 MB / 900 s
+		// to cover a 30–120 s chat completion plus headroom.
+		StreamingEnabled:            true,
+		MaxResponseBodyBytes:        100 * 1024 * 1024,
+		ResponseWriteTimeoutSeconds: 900,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -419,6 +460,15 @@ var planLimits = map[Plan]Limits{
 		CPUWeight:   8,
 		CPUQuotaUS:  500_000,
 		CPUPeriodUS: 500_000,
+		// Streaming (issue #471 / ADR-047): Pro is paid-tier streaming
+		// — same cap as Hobby. 100 MB / 900 s covers LLM chat
+		// completions and JSON/CSV exports; SaaS-scale apps don't
+		// need a higher cap because gatewayd's per-instance egress
+		// bandwidth ceiling (250 Mbit for Scale) is the binding
+		// constraint long before 100 MB matters.
+		StreamingEnabled:            true,
+		MaxResponseBodyBytes:        100 * 1024 * 1024,
+		ResponseWriteTimeoutSeconds: 900,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -485,6 +535,16 @@ var planLimits = map[Plan]Limits{
 		CPUWeight:   16,
 		CPUQuotaUS:  1_000_000,
 		CPUPeriodUS: 1_000_000,
+		// Streaming (issue #471 / ADR-047): Scale is paid-tier
+		// streaming — same cap as Hobby/Pro. 100 MB / 900 s is
+		// already the LLM-token-stream ceiling; Scale customers who
+		// need >100 MB are rare (large JSON exports are dwarfed by
+		// the per-instance egress bandwidth cap of 250 Mbit/s). A
+		// future PR can lift this if telemetry shows Scale customers
+		// tripping the cap.
+		StreamingEnabled:            true,
+		MaxResponseBodyBytes:        100 * 1024 * 1024,
+		ResponseWriteTimeoutSeconds: 900,
 	},
 }
 
@@ -549,6 +609,21 @@ const (
 	MaxRequestBodyBytes = 25 * 1024 * 1024 // 25 MB either direction
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
+
+	// Streaming response caps (issue #471 / ADR-047). Free stays on the
+	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
+	// tier can't pin a long stream against the box. Hobby/Pro/Scale
+	// raise the cap to 100 MB / 900 s so LLM token streams (typical
+	// 30–120 s chat completions) and large JSON/CSV exports have
+	// headroom. Limits.MaxResponseBodyBytes /
+	// Limits.ResponseWriteTimeoutSeconds override these defaults per
+	// plan; 0 in those fields falls back to the *Default constants
+	// below so a missing plan row fails closed to the spec baseline
+	// rather than inheriting a paid tier's relaxed cap.
+	MaxResponseBodyBytesDefault   int64 = 25 * 1024 * 1024 // 25 MB (spec §4.1)
+	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
+	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
+	StreamingFlushIntervalDefault       = 200 * time.Millisecond
 
 	// OCI puller (spec §17 G1, ADR-021). Per-pull HTTP timeout for the
 	// registry client. cmd/imaged passes this to oci.WithTimeout; the
@@ -833,6 +908,71 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// StreamingEnabled reports whether the plan defaults the per-app
+// streaming_enabled column to true (issue #471 / ADR-047). Hobby/Pro/
+// Scale opt in; Free stays off (spec §4.1 baseline; Free is the
+// abuse-floor tier where an unbounded stream would let one app pin
+// gatewayd). The plan-level default is applied at CreateApp time in
+// cmd/apid/handlers.go::buildApp; an existing app may still flip the
+// flag via PATCH (gated by StreamingResponseAllowed so Free stays off
+// even when an admin backfills the column). Unknown plans fail closed
+// (return false) — same contract as MinInstancesAllowed /
+// EgressAllowlistAllowed.
+func (p Plan) StreamingEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.StreamingEnabled
+}
+
+// StreamingResponseAllowed reports whether the plan permits a customer
+// to set apps.streaming_enabled=true via PATCH. Hobby+ opt in; Free
+// returns false so apid's updateApp handler can surface 403
+// plan_streaming_not_allowed (issue #471 AC #3). Same fail-closed
+// contract as StreamingEnabled above.
+func (p Plan) StreamingResponseAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.StreamingEnabled
+}
+
+// MaxResponseBodyBytes returns the per-response body cap in bytes for
+// this plan, falling back to MaxResponseBodyBytesDefault (spec §4.1's
+// 25 MB) when the plan row's field is unset. The unknown-plan case
+// falls back the same way; the buffer ceiling is conservative and
+// fail-closed. Used by gatewayd to wrap the response writer in
+// http.MaxBytesWriter at this number (PR-B activates it on the
+// streaming path; PR-A's buffered path stays under the cap naturally).
+func (p Plan) MaxResponseBodyBytes() int64 {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return MaxResponseBodyBytesDefault
+	}
+	if l.MaxResponseBodyBytes <= 0 {
+		return MaxResponseBodyBytesDefault
+	}
+	return l.MaxResponseBodyBytes
+}
+
+// ResponseWriteTimeout returns the per-response write timeout for this
+// plan, falling back to ResponseWriteTimeoutDefault (spec §4.1's 300 s)
+// when the plan row's field is unset. Same fail-closed shape as
+// MaxResponseBodyBytes. Used by gatewayd to configure http.Server
+// .WriteTimeout so a single response cannot pin the listener.
+func (p Plan) ResponseWriteTimeout() time.Duration {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return time.Duration(ResponseWriteTimeoutDefault) * time.Second
+	}
+	if l.ResponseWriteTimeoutSeconds <= 0 {
+		return time.Duration(ResponseWriteTimeoutDefault) * time.Second
+	}
+	return time.Duration(l.ResponseWriteTimeoutSeconds) * time.Second
 }
 
 // CronLimitPerApp returns the per-app cron cap for the plan (spec §4.4).
