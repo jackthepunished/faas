@@ -135,17 +135,26 @@ func (b *Builder) BuildBaseFromStaging(ctx context.Context, staging string, in B
 // path) and BuildBaseFromStaging (ADR-053 parent-ref path): measure,
 // mkfs, publish. Extracted so both paths share the same padding +
 // signing + storage Put semantics.
+//
+// Sizing uses BasePaddedSizeMB (small-file-ratio-aware) rather than
+// PaddedSizeMB because base images — particularly the Debian 12-slim
+// parent (ADR-053) — are dominated by tiny files like
+// /usr/share/zoneinfo/*. The 10 % slack PaddedSizeMB adds is far too
+// tight for that shape; the previous formula left imaged's
+// base-debian-parent staging ENOSPC-failing inside mkfs.ext4 -d (EX44
+// run 30656504195, 2026-07-31). InspectStaging walks the tree once;
+// the cost is dwarfed by the mkfs that follows.
 func (b *Builder) buildBaseFromStaging(ctx context.Context, staging string, in BaseBuildInput) (BaseBuildResult, error) {
-	content, err := DirSize(staging)
+	stats, err := InspectStaging(staging)
 	if err != nil {
 		return BaseBuildResult{}, err
 	}
 
-	if err := b.publishBaseExt4(ctx, in, staging, PaddedSizeMB(content)); err != nil {
+	if err := b.publishBaseExt4(ctx, in, staging, BasePaddedSizeMB(stats.ContentBytes, stats.SmallRatio)); err != nil {
 		return BaseBuildResult{}, err
 	}
 
-	res := BaseBuildResult{SizeBytes: content}
+	res := BaseBuildResult{SizeBytes: stats.ContentBytes}
 	if in.OutImage != "" {
 		res.ImagePath = in.OutImage
 	} else {
