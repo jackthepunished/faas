@@ -350,7 +350,7 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 	wroteHeader := false
 	for {
 		frame, err := stream.Recv()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

@@ -217,7 +217,7 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 	if err != nil {
 		return status.Errorf(codes.Internal, "pipe: %v", err)
 	}
-	defer stdinR.Close()
+	defer func() { _ = stdinR.Close() }()
 
 	// 3. Spawn the bridge. Bridge stdout pipes to the server
 	//    goroutine below; stderr is captured for the Unavailable
@@ -242,7 +242,7 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		var written int64
 		for {
 			f, err := stream.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				bodyErrCh <- nil
 				return
 			}
