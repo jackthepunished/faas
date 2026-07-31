@@ -332,11 +332,14 @@ func hostAgeRotate(dir string, force bool) (newRecipient, prevRecipient string, 
 		// Try to roll back the .previous rename so the box stays
 		// on the pre-rotate identity. Best-effort: if rollback
 		// fails, the operator has host.age.new + an old
-		// host.age.previous to manually reconcile.
+		// host.age.previous to manually reconcile. rbErr is a
+		// SIBLING failure (the rollback), not a causal parent of
+		// err; errorlint forbids %v on error values, so we
+		// stringify rbErr explicitly via err.Error().
 		if rbErr := os.Rename(paths.previous, paths.current); rbErr != nil {
 			return newRecipient, prevRecipient,
-				fmt.Errorf("rename .new → current: %w (rollback also failed: %v; manual recovery required: mv %s %s)",
-					err, rbErr, paths.previous, paths.current)
+				fmt.Errorf("rename .new → current: %w (rollback also failed: %s; manual recovery required: mv %s %s)",
+					err, rbErr.Error(), paths.previous, paths.current)
 		}
 		return newRecipient, prevRecipient, fmt.Errorf("rename .new → current: %w (rolled back; old identity still active)", err)
 	}
