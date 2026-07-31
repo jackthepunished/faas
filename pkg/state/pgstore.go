@@ -715,11 +715,11 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
+		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err

@@ -3,6 +3,7 @@ package state_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -961,6 +962,83 @@ func TestPg_CreateAppIfUnderQuota_ConcurrentAcrossAccounts(t *testing.T) {
 	} else if got != 1 {
 		t.Errorf("count(B) = %d, want 1", got)
 
+	}
+}
+
+// TestPg_CreateAppIfUnderQuota_WritesStreamingEnabled pins the
+// INSERT-time write of streaming_enabled on the quota-enforced
+// create path (PR #481 / issue #471). The handler-side
+// buildApp defaults the column from the plan (Hobby/Pro/Scale →
+// true; Free → false) and the e2e test asserts the round-trip
+// value matches. Pre-fix, CreateAppIfUnderQuota's INSERT omitted
+// the column entirely and the migration DEFAULT (false) silently
+// won — Hobby created apps came back with streaming_enabled=false
+// and the e2e test failed on CI.
+//
+// The mirror of this is the bare CreateApp path (already passes
+// the column; the column projection in appsSelectColumns covers
+// it). The test covers three shapes so a future column-default
+// flip is caught at the integration layer:
+//
+//   - Hobby + streaming=true   → round-trip stays true
+//   - Free  + streaming=false  → round-trip stays false
+//   - Free  + streaming=true   → round-trip stays true (callers
+//     must enforce the plan gate; the store is the writer of
+//     truth, not the gatekeeper)
+func TestPg_CreateAppIfUnderQuota_WritesStreamingEnabled(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	cases := []struct {
+		name        string
+		plan        api.Plan
+		wantWritten bool
+	}{
+		{name: "HobbyDefaultsToTrueWhenSet", plan: api.PlanHobby, wantWritten: true},
+		{name: "FreeExplicitlyFalse", plan: api.PlanFree, wantWritten: false},
+		{name: "FreeExplicitlyTrueDespitePlanGate", plan: api.PlanFree, wantWritten: true},
+	}
+	for i, tc := range cases {
+		i, tc := i, tc
+		t.Run(tc.name, func(t *testing.T) {
+			email := fmt.Sprintf("streaming-insert-%d-%d@example.com", i, time.Now().UnixNano())
+			acct, err := s.CreateAccount(ctx, email, tc.plan)
+			if err != nil {
+				t.Fatalf("CreateAccount(%s): %v", tc.plan, err)
+			}
+			limits := api.MustLimitsFor(acct.Plan)
+
+			want := tc.wantWritten
+			app := state.App{
+				AccountID:        acct.ID,
+				Slug:             "stream-" + tc.name,
+				Type:             state.AppTypeApp,
+				RAMMB:            256,
+				MaxConcurrency:   1,
+				IdleTimeoutS:     60,
+				Status:           state.AppActive,
+				StreamingEnabled: want,
+			}
+			created, err := s.CreateAppIfUnderQuota(ctx, app, limits)
+			if err != nil {
+				t.Fatalf("CreateAppIfUnderQuota: %v", err)
+			}
+			if created.StreamingEnabled != want {
+				t.Errorf("RETURNING streaming_enabled = %v, want %v (insert dropped the column)",
+					created.StreamingEnabled, want)
+			}
+
+			// Read back via the slug lookup (the same path the
+			// apid GET /v1/apps/{slug} uses) — verifies the row
+			// was actually written, not just the RETURNING decode.
+			fetched, err := s.AppBySlug(ctx, created.Slug)
+			if err != nil {
+				t.Fatalf("AppBySlug: %v", err)
+			}
+			if fetched.StreamingEnabled != want {
+				t.Errorf("AppBySlug streaming_enabled = %v, want %v (round-trip regression)",
+					fetched.StreamingEnabled, want)
+			}
+		})
 	}
 }
 

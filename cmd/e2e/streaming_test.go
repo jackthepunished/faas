@@ -131,12 +131,12 @@ func TestE2E_Streaming_HobbyPlanDefaultsAndPersists(t *testing.T) {
 	if err := json.Unmarshal(createBody, &created); err != nil {
 		t.Fatalf("decode created: %v (raw=%s)", err, createBody)
 	}
-	// Diagnostic dump — the CI flake on PR #481 surfaced as
-	// "StreamingEnabled=false" with no clear root cause; the raw
-	// body pinches the search to either buildApp, the SELECT, or
-	// the JSON marshal layer. Cheap (one extra format on every run)
-	// and only useful when the assertion trips.
-	t.Logf("create response raw=%s planDefault(Hobby)=%v", createBody, api.PlanHobby.StreamingEnabled())
+	// The diagnostic t.Logf that previously dumped the raw body +
+	// planDefault(Hobby) lived here during the PR #481 e2e CI flake
+	// investigation. It was diagnostic-only — every run printed it
+	// even when the test passed. Now that CreateAppIfUnderQuota
+	// writes streaming_enabled (the actual bug), the log line is
+	// dead weight; remove it.
 	if !created.StreamingEnabled {
 		t.Errorf("Hobby create: StreamingEnabled=false; want true (plan default)")
 	}
