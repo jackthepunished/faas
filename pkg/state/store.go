@@ -17,13 +17,35 @@ var ErrNotFound = errors.New("state: not found")
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
 // api.ErrPlanLimitApps without re-running the count.
+// QuotaErrorKind names the cap that tripped. "apps" is the
+// Limits.DeployedApps cap; "crons" is Limits.CronLimitPerAccount.
+// "apps" is the zero value so existing call sites that build a
+// QuotaError without a Kind keep behaving the same.
+type QuotaErrorKind string
+
+const (
+	QuotaErrorKindApps   QuotaErrorKind = "apps"
+	QuotaErrorKindCrons  QuotaErrorKind = "crons"
+	QuotaErrorKindMemory                = "memory" // reserved for ADR-046 follow-on
+)
+
 type QuotaError struct {
-	Limit    int // limits.DeployedApps at the time of the call
-	Observed int // count(*) of live apps observed inside the same critical section
+	Kind       QuotaErrorKind // "apps" | "crons" | "memory"
+	Limit      int            // caps at the time of the call
+	Observed   int            // count(*) observed inside the same critical section
+	NotAllowed bool           // true when the plan tier forbids the entity entirely (e.g. Free cron)
 }
 
 func (e *QuotaError) Error() string {
-	return fmt.Sprintf("state: deployed-app quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+	switch e.Kind {
+	case QuotaErrorKindCrons:
+		if e.NotAllowed {
+			return "state: crons not allowed on this plan"
+		}
+		return fmt.Sprintf("state: cron quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+	default:
+		return fmt.Sprintf("state: deployed-app quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+	}
 }
 
 // Is allows errors.Is(err, ErrQuotaExceeded) to match any *QuotaError.
@@ -575,6 +597,32 @@ type Store interface {
 	ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error)
 	AppsForProject(ctx context.Context, accountID, projectID string) ([]App, error)
 	SetProjectScanSource(ctx context.Context, projectID string, src ProjectScanSource) (Project, error)
+
+	// ApplyProjectPlan persists a project + its member apps + crons
+	// in a single transaction. Quota is checked inside the locked
+	// critical section; an over-quota call returns *QuotaError with
+	// Kind set ("apps" or "crons") and zero rows inserted. The
+	// returned slice ordering matches the input — apps[i] pairs with
+	// the plan's selected workloads[i]. Crons reference the freshly
+	// inserted app IDs through crons[i].WorkloadName lookup.
+	//
+	// The Cron input is the bare fields the apply handler resolved
+	// from reposcan; this method writes crons directly without
+	// re-running CreateCronIfUnderQuota (the account-level cap is
+	// enforced here, in the same Tx). Returns:
+	//   - (Project, []App, []Cron, nil) on success
+	//   - (Project{}, nil, nil, ErrConflict) on slug or
+	//     (project_id, workload_name) collision
+	//   - (Project{}, nil, nil, ErrNotFound) when project.AccountID
+	//     does not resolve
+	//   - (Project{}, nil, nil, *QuotaError) over-quota
+	ApplyProjectPlan(
+		ctx context.Context,
+		project Project,
+		apps []App,
+		crons []Cron,
+		limits api.Limits,
+	) (Project, []App, []Cron, error)
 
 	// RecordGitHubBinding persists the (app → installation_id, repo,
 	// branch) tuple after the /oauth/callback handler verified the

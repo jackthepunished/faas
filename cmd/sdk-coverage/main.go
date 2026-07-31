@@ -194,6 +194,16 @@ var methodRouteMap = map[string]string{
 	"GET /v1/audit-events":      "ListAuditEvents",
 	"GET /v1/audit-events/{id}": "GetAuditEvent",
 
+	// ADR-050 Phase 3 — repo decomposition. The two routes take
+	// multipart bodies so the SDK verb is named after the action
+	// (scan / apply) rather than the resource noun. The auto-
+	// derivation would produce "PostProjects" for both, which is
+	// indistinguishable in the SDK. Apply must hit POST /v1/projects
+	// (not /v1/projects/scan) — the SDK enforces this in
+	// ApplyProjectPlan via url.QueryEscape(plan_token).
+	"POST /v1/projects/scan": "ScanProject",
+	"POST /v1/projects":      "ApplyProjectPlan",
+
 	// Issue #273 / ADR-042 — per-app metrics. The auto-derivation
 	// would produce GetAppsSlugMetrics (Swagger-style); the SDK
 	// names it GetAppMetrics to match the existing per-app methods

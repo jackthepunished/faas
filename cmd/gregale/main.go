@@ -114,6 +114,12 @@ func run(args []string) int {
 		return cmdWhoami()
 	case "deploy":
 		return cmdDeployTarball(args[1:])
+	case "scan":
+		// Phase 3 (repo decomposition) — dry-run entry point. Prints
+		// the plan as a table or --json, never writes. The
+		// transactional apply path lives in cmdDeployTarball when
+		// --yes/--json/--only/--project-slug are set.
+		return cmdScan(args[1:])
 	case "init":
 		return cmdInit(args[1:])
 	case "connect":

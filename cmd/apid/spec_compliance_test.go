@@ -83,6 +83,7 @@ var routeExclude = map[string]bool{
 // they cross the apid/CLI boundary — but they belong to non-public surfaces
 // (CLI device-code, public status page).
 var dtoExclude = map[string]bool{
+	"ApplyResponseApp":             true, // inline {slug,id} row in ApplyResponse.apis schema
 	"CliAuthCodeResponse":          true, // POST /v1/cli-auth/code (anonymous)
 	"CliAuthExchangeRequest":       true, // POST /v1/cli-auth/exchange
 	"CliAuthExchangeResponse":      true, // POST /v1/cli-auth/exchange

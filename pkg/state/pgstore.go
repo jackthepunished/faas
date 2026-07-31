@@ -1043,6 +1043,204 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 	return scanProject(row)
 }
 
+// ApplyProjectPlan persists a project + its member apps + crons in
+// one transaction. The critical section sits behind a
+// `SELECT … FOR UPDATE` on the parent accounts row so two concurrent
+// applies on the same account serialise; an over-quota call returns
+// *QuotaError with Kind set and zero rows inserted. Per ADR-050 §3
+// and repo_decomposition_implementation.md §3 (lines 268-276):
+// quota is evaluated before any write, the limit problem carries
+// limit + observed + docs URL, and nothing is created on a tripped
+// cap.
+//
+// The Cron input carries AppID already resolved against the just-
+// inserted apps — the apply handler runs in two passes: first it
+// collects the workload → app_id map by inserting each app and
+// reading RETURNING, then it inserts crons referencing those IDs.
+// Persisting crons by AppID (not by name) avoids re-running the
+// lookup inside the Tx and keeps the input shape identical to what
+// CreateCronIfUnderQuota produces.
+//
+// Errors:
+//   - *QuotaError: Kind="apps" or "crons"; "crons"+NotAllowed=true
+//     when the plan tier has CronLimitPerAccount==0 (Free plan).
+//   - ErrConflict: projects_account_slug_uniq 23505, or
+//     apps_project_workload_uniq 23505 inside the apply batch.
+//   - ErrNotFound: accounts row gone (23503 on project insert).
+func (s *PgStore) ApplyProjectPlan(
+	ctx context.Context,
+	project Project,
+	apps []App,
+	crons []Cron,
+	limits api.Limits,
+) (Project, []App, []Cron, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent accounts row. SELECT 1 + FOR UPDATE keeps the
+	//    lock acquisition in one round-trip; the FOR UPDATE blocks any
+	//    concurrent CreateAppIfUnderQuota or ApplyProjectPlan on the
+	//    same account until COMMIT/ROLLBACK. apps_account_idx
+	//    (account_id, status) is not relevant here — accounts_pkey is.
+	var locked int
+	if err := tx.QueryRow(ctx,
+		`select 1 from accounts where id = $1 for update`, project.AccountID,
+	).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Project{}, nil, nil, ErrNotFound
+		}
+		return Project{}, nil, nil, fmt.Errorf("state: lock account %s: %w", project.AccountID, err)
+	}
+
+	// 2. Authoritative deployed-app count under the lock. Same predicate
+	//    as CreateAppIfUnderQuota so the MemStore mirror matches.
+	var observedApps int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from apps where account_id = $1
+		 and status in ('active','evicted_cold')`,
+		project.AccountID,
+	).Scan(&observedApps); err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: count apps for account %s: %w", project.AccountID, err)
+	}
+	if observedApps+len(apps) > limits.DeployedApps {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:     QuotaErrorKindApps,
+			Limit:    limits.DeployedApps,
+			Observed: observedApps + len(apps),
+		}
+	}
+
+	// 3. Cron quota pre-check. Free plan (CronLimitPerAccount==0)
+	//    short-circuits with NotAllowed; paid plans compare against
+	//    the current count. We join through apps so deleted apps'
+	//    crons don't poison the cap (mirrors CreateCronIfUnderQuota).
+	//    Skipped entirely when len(crons) == 0 — a Free account with
+	//    pre-existing crons (from a prior plan downgrade) must still
+	//    be able to apply a cron-less project. PR #454 review F2
+	//    finding: the cap check must not block zero-cron applies.
+	if len(crons) > 0 {
+		if limits.CronLimitPerAccount == 0 {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:       QuotaErrorKindCrons,
+				NotAllowed: true,
+			}
+		}
+		var observedCrons int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from crons c
+			 join apps a on a.id = c.app_id
+			 where a.account_id = $1 and a.status <> 'deleted'`,
+			project.AccountID,
+		).Scan(&observedCrons); err != nil {
+			return Project{}, nil, nil, fmt.Errorf("state: count crons for account %s: %w", project.AccountID, err)
+		}
+		if observedCrons+len(crons) > limits.CronLimitPerAccount {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:     QuotaErrorKindCrons,
+				Limit:    limits.CronLimitPerAccount,
+				Observed: observedCrons + len(crons),
+			}
+		}
+	}
+
+	// 4. Insert the project. 23503 (FK violation on account_id) maps
+	//    to ErrNotFound (same shape as CreateProject); 23505
+	//    (account_slug unique) maps to ErrConflict via mapErr.
+	scanSrc := project.ScanSource
+	if scanSrc == "" {
+		scanSrc = ProjectScanSourceUnknown
+	}
+	projRow := tx.QueryRow(ctx, `
+		insert into projects
+		    (account_id, slug, repo_full_name, production_branch, install_id, scan_source)
+		values ($1, $2, $3, $4, $5, $6)
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id,0),
+		          scan_source, created_at, updated_at
+	`,
+		project.AccountID, project.Slug, nullString(project.RepoFullName),
+		nullString(project.ProductionBranch), project.InstallID, string(scanSrc),
+	)
+	insertedProject, err := scanProject(projRow)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ForeignKeyViolation {
+			return Project{}, nil, nil, fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+		}
+		return Project{}, nil, nil, mapErr(err)
+	}
+
+	// 5. Insert apps one at a time, inside the same Tx, populating
+	//    the workload fields. Reuse appsSelectColumns so the column
+	//    list stays in one place (scanAppInto is the matching
+	//    positional reader). 23505 on apps_project_workload_uniq maps
+	//    to ErrConflict — handlers must dedupe workload_name upstream.
+	insertedApps := make([]App, 0, len(apps))
+	for _, a := range apps {
+		manifest := a.Manifest
+		if manifest.Entrypoint == nil && manifest.Env == nil {
+			manifest = AppManifest{}
+		}
+		manifestBytes, _ := json.Marshal(manifest)
+		runtime := nullString(a.Runtime)
+		idle := nullableInt(a.IdleTimeoutS)
+		insertAppSQL := `insert into apps
+		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
+		     status, manifest, min_instances, egress_allowlist,
+		     project_id, root_dir, workload_name, workload_class, start_command)
+		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
+		        $11, $12, $13, $14, $15)
+		returning ` + appsSelectColumns
+		row := tx.QueryRow(ctx, insertAppSQL,
+			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
+			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
+			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
+			nullString(a.StartCommand),
+		)
+		app, err := scanApp(row)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+				return Project{}, nil, nil, ErrConflict
+			}
+			return Project{}, nil, nil, err
+		}
+		insertedApps = append(insertedApps, app)
+	}
+
+	// 6. Insert crons attached to the freshly inserted apps. AppID is
+	//    set by the caller; an empty AppID is treated as "deferred"
+	//    so the apply handler can resolve the workload-name → ID map
+	//    from the returned insertedApps and re-insert via CreateCron.
+	//    The cron quota check (step 3) already ran so a deferred cron
+	//    cannot bypass it; the worst case on a name-resolution bug is
+	//    a missing cron row + a 500 the handler can retry.
+	insertedCrons := make([]Cron, 0, len(crons))
+	for _, c := range crons {
+		if c.AppID == "" {
+			continue // deferred to the handler
+		}
+		row := tx.QueryRow(ctx,
+			`insert into crons (app_id, schedule, path, enabled) values ($1, $2, $3, $4)
+			 returning id, app_id, schedule, path, enabled, created_at`,
+			c.AppID, c.Schedule, c.Path, c.Enabled,
+		)
+		var out Cron
+		if err := row.Scan(&out.ID, &out.AppID, &out.Schedule, &out.Path, &out.Enabled, &out.CreatedAt); err != nil {
+			return Project{}, nil, nil, mapErr(err)
+		}
+		insertedCrons = append(insertedCrons, out)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: commit apply project plan: %w", err)
+	}
+	return insertedProject, insertedApps, insertedCrons, nil
+}
+
 // RecordGitHubBinding writes the (install_id, repo_full_name,
 // production_branch) tuple onto the apps row. Idempotent: re-binding
 // the same app overwrites the prior values. The migration's unique

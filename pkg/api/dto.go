@@ -1257,3 +1257,107 @@ type AppsMetricsResponse struct {
 	AsOf   string                        `json:"as_of"`
 	Apps   map[string]AppMetricsResponse `json:"apps"`
 }
+
+// ProjectScanRequest is the multipart body for POST /v1/projects/scan.
+// Defined as a DTO (rather than an inline handler struct) so the
+// schema-parity AST gate can assert field-for-field equivalence with
+// the OpenAPI spec.
+type ProjectScanRequest struct {
+	Source           string `json:"source"`            // tar.gz binary blob
+	ProjectSlug      string `json:"project_slug"`      // kebab slug
+	ProductionBranch string `json:"production_branch"` // default "main"
+	InstallID        int64  `json:"install_id"`        // GitHub install id (--repo); 0 for unbound
+	Only             string `json:"only"`              // CSV of workload names
+}
+
+// ProjectApplyRequest is the multipart body for POST /v1/projects.
+// Shape mirrors ProjectScanRequest — the handler re-runs the scan
+// and re-checks the plan token internally.
+type ProjectApplyRequest struct {
+	Source           string `json:"source"`
+	ProjectSlug      string `json:"project_slug"`
+	ProductionBranch string `json:"production_branch"`
+	InstallID        int64  `json:"install_id"`
+	Only             string `json:"only"`
+}
+
+// PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).
+// Field names match the OpenAPI schema verbatim — the spec-check
+// AST gate enforces the field-for-field mapping.
+type PlanWorkload struct {
+	Name       string   `json:"name"`
+	RootDir    string   `json:"root_dir"`
+	Dockerfile string   `json:"dockerfile,omitempty"`
+	Command    []string `json:"command"`
+	Class      string   `json:"class,omitempty"`
+	Schedule   string   `json:"schedule,omitempty"`
+	Ports      []int    `json:"ports"`
+	EnvKeys    []string `json:"env_keys,omitempty"`
+	Source     string   `json:"source,omitempty"`
+	Tier       string   `json:"tier,omitempty"`
+}
+
+// PlanManaged mirrors reposcan.Managed.
+type PlanManaged struct {
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	EnvHint string `json:"env_hint"`
+	Source  string `json:"source"`
+	Image   string `json:"image"`
+}
+
+// PlanCron is the per-cron line in the scan response. Carries the
+// workload name (NOT the AppID — that's resolved at apply time).
+type PlanCron struct {
+	WorkloadName string `json:"workload_name"`
+	Schedule     string `json:"schedule"`
+	Path         string `json:"path"`
+	Enabled      bool   `json:"enabled"`
+}
+
+// QuotaBlock is the limit + observed extension on a plan-quota
+// problem. Mirrors api.Problem.WithLimit — emitted alongside any
+// 402/403 quota response so the CLI can render "X/Y apps" without
+// a second request.
+type QuotaBlock struct {
+	Limit    int64  `json:"limit,omitempty"`
+	Observed int64  `json:"observed,omitempty"`
+	DocsURL  string `json:"docs_url,omitempty"`
+}
+
+// PlanResponse is the dry-run response from POST /v1/projects/scan.
+// Fields mirror scanPlanResponse in cmd/apid/scan_service.go; the
+// DTO is the wire shape, the in-process struct is the
+// handler-internal carrier.
+type PlanResponse struct {
+	ProjectSlug     string         `json:"project_slug"`
+	RepoFullName    string         `json:"repo_full_name,omitempty"`
+	ScanSource      string         `json:"scan_source"`
+	Tier            string         `json:"tier"`
+	Workloads       []PlanWorkload `json:"workloads"`
+	Managed         []PlanManaged  `json:"managed"`
+	Crons           []PlanCron     `json:"crons"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	ObservedApps    int            `json:"observed_apps"`
+	ObservedCrons   int            `json:"observed_crons"`
+	LimitApps       int            `json:"limit_apps"`
+	LimitCrons      int            `json:"limit_crons"`
+	CanApply        bool           `json:"can_apply"`
+	CronsNotAllowed bool           `json:"crons_not_allowed,omitempty"`
+	PlanToken       string         `json:"plan_token"`
+}
+
+// ApplyResponse is the success body for POST /v1/projects. Carries
+// the inserted project_id + per-app IDs so the CLI's --yes flow
+// can render "applied: <slug> → <app_id>".
+type ApplyResponse struct {
+	PlanResponse
+	ProjectID string             `json:"project_id"`
+	Apps      []ApplyResponseApp `json:"apps"`
+}
+
+// ApplyResponseApp is the per-app line in the apply response.
+type ApplyResponseApp struct {
+	Slug string `json:"slug"`
+	ID   string `json:"id"`
+}
