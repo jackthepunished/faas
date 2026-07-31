@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00077 (deploy-time overrides on deployments,
+// Migration-apply test for 00079 (deploy-time overrides on deployments,
 // issue #460 / ADR-053). Pins the override columns:
 //
-//  1. The migration set applies cleanly through 00077.
+//  1. The migration set applies cleanly through 00079.
 //  2. Each override column accepts the canonical shape (text[] for
 //     entrypoint/cmd, jsonb for env/env_secrets/healthcheck, int for
 //     port) and round-trips.
@@ -12,10 +12,10 @@
 //  4. Replay-safe: ADD COLUMN IF NOT EXISTS makes a second MigrateUp
 //     no-op (PR #377 / ADR-041).
 //
-// Slot note: HEAD is at 00076 (compute-node keys, sibling PR), so 00077
-// is the next free slot at PR creation time. The migration is slot-
-// agnostic — only the filename and the test function name carry the
-// literal slot. If a sibling PR grabs 00077 first, renumber per
+// Slot note: HEAD is at 00078 (egress policy notify, sibling PR), so
+// 00079 is the next free slot at PR creation time. The migration is
+// slot-agnostic — only the filename and the test function name carry
+// the literal slot. If a sibling PR grabs 00079 first, renumber per
 // `migrations/README.md` and update this test's filename + ApplyUp
 // range.
 //
@@ -32,29 +32,29 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
+func TestMigrations_00079_DeploymentOverrides(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000076`,
-	// `...000176`, `...000276`, `...000376`) so a reader scanning the
+	// Seed UUIDs carry the slot number in the last group (`...000079`,
+	// `...000179`, `...000279`, `...000379`) so a reader scanning the
 	// test fixtures can pin each row to this migration without grepping
 	// the file name. The first three are zero-padded to keep all four
 	// IDs the same length and easy to scan side-by-side. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00077 first.
+	// `migrations/README.md` if a sibling PR grabs 00079 first.
 
-	// (1) Apply through 00077. A regression that drops a slot between
-	// 1 and 77 surfaces here before the per-assertion pins.
+	// (1) Apply through 00079. A regression that drops a slot between
+	// 1 and 79 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 77)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 79)", err)
 	}
 
 	// (2) Seed an account + app. The literal UUIDs are fixed across
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000076',
+		values ('00000000-0000-0000-0000-000000000079',
 		        'deploy-overrides-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -62,8 +62,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000176',
-		        '00000000-0000-0000-0000-000000000076',
+		values ('00000000-0000-0000-0000-000000000179',
+		        '00000000-0000-0000-0000-000000000079',
 		        'overrides-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -88,8 +88,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 			override_env_secrets, override_port, override_healthcheck,
 			created_at
 		) values (
-			'00000000-0000-0000-0000-000000000276',
-			'00000000-0000-0000-0000-000000000176',
+			'00000000-0000-0000-0000-000000000279',
+			'00000000-0000-0000-0000-000000000179',
 			'sha256:0000000000000000000000000000000000000000000000000000000000000001',
 			'image', 'pending',
 			ARRAY['/usr/bin/node','/srv/app.js'],
@@ -112,7 +112,7 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		select override_entrypoint, override_cmd, override_port,
 		       override_env, override_env_secrets, override_healthcheck
 		from deployments
-		where id = '00000000-0000-0000-0000-000000000276'
+		where id = '00000000-0000-0000-0000-000000000279'
 	`).Scan(&gotEntrypoint, &gotCmd, &gotPort,
 		&gotEnvRaw, &gotEnvSecretsRaw, &gotHealthcheckRaw); err != nil {
 		t.Fatalf("read back deployment overrides: %v", err)
@@ -154,8 +154,8 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		insert into deployments (
 			id, app_id, image_digest, kind, status, created_at
 		) values (
-			'00000000-0000-0000-0000-000000000376',
-			'00000000-0000-0000-0000-000000000176',
+			'00000000-0000-0000-0000-000000000379',
+			'00000000-0000-0000-0000-000000000179',
 			'sha256:0000000000000000000000000000000000000000000000000000000000000002',
 			'image', 'pending', now()
 		)
@@ -172,7 +172,7 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		select override_entrypoint, override_cmd, override_port,
 		       override_env, override_env_secrets, override_healthcheck
 		from deployments
-		where id = '00000000-0000-0000-0000-000000000376'
+		where id = '00000000-0000-0000-0000-000000000379'
 	`).Scan(&nullEntrypoint, &nullCmd, &nullPort,
 		&nullEnv, &nullSecs, &nullHC); err != nil {
 		t.Fatalf("read back null-override deployment: %v", err)

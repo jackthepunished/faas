@@ -1,4 +1,4 @@
--- filename: 00077_deployment_overrides.sql
+-- filename: 00079_deployment_overrides.sql
 -- +goose Up
 -- Add deploy-time override columns to `deployments` (issue #460 /
 -- ADR-053). Customers redeploy the same digest-pinned OCI image with a
