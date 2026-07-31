@@ -62,6 +62,27 @@ horizontal-scale variant, not active-passive).
 >   (`cmd/vmmd/egress_watcher.go`, migration 00078) keeps
 >   `/etc/nftables.conf` live-reloadable without a
 >   `make bootstrap` rerun.
+> - **Tier 1 Phase 5 (`pkg/wire.NodeVerifier`)** —
+>   ✓ shipped in ADR-056. Every cross-box mTLS leg
+>   (vmmd↔schedd, schedd→vmmd, gatewayd→vmmd) now installs
+>   a `tls.Config.VerifyPeerCertificate` hook that augments
+>   stdlib chain/SAN/EKU trust with a leaf-CN →
+>   `compute_nodes.name` lookup. The verifier runs
+>   `after` stdlib trust succeeds, so stdlib chain failures
+>   still reject first (CodeQL #58 invariant: never touch
+>   `InsecureSkipVerify`). A peer presenting a leaf-CN
+>   that is not in the `compute_nodes` registry is
+>   rejected at handshake — BEFORE any RPC dispatch.
+>   Single-box dev mode (no `compute_nodes` row) skips the
+>   verifier entirely; multi-box vmmd wires it gated on
+>   `cfg.ComputeNode.NodeName != ""` (same gate as the
+>   egress watcher). The wire factory variants
+>   `wire.LoadServerTLSConfigWithVerifier` /
+>   `wire.LoadClientTLSConfigWithVerifier` /
+>   `*WithPrefixAndVerifier` are additive — the originals
+>   stay byte-for-byte unchanged so single-box CI keeps
+>   working. Defense-in-depth alongside `wire.PeerCN`
+>   (ADR-052).
 > - **#250 (off-host Postgres backup)** — ✗ NOT shipped.
 >   Multi-host without off-host PG backup means a CP-host
 >   loss is unrecoverable. The runbook is staging-only on

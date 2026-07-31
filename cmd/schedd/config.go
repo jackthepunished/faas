@@ -143,6 +143,24 @@ type Config struct {
 	// ReapIdle / SelectEvictions paths are NOT capped — they
 	// already drain at their own cadences.
 	ReaperAggressiveParkCap int `toml:"reaper_aggressive_park_cap"`
+
+	// NodeName is the multi-box gate (ADR-056, mirrored from vmmd's
+	// [compute_node].name). When set, schedd constructs the
+	// handshake-layer NodeVerifier and surfaces a populated
+	// compute_nodes snapshot to every mTLS leg on listen. Empty
+	// (one-box dev / pre-slice-3 schedd) keeps the verifier off
+	// entirely — stdlib chain + RFC 6125 SAN + EKU alone run. The
+	// synthetic `default-local` row seeded by migration 00024 is
+	// always present, so the verifier, when wired, finds at least
+	// one entry to bind against.
+	//
+	// The field is intentionally not backed by [compute_node] TOML
+	// subsection for schedd: schedd is the control-plane trust
+	// anchor across every compute node, not a self-registrant.
+	// Operators set node_name = "schedd-<box>" through this field
+	// and the [compute_nodes] row is provisioned by `faas node
+	// register` (out of scope for ADR-056).
+	NodeName string `toml:"node_name"`
 }
 
 // ResolveListenTarget returns the gRPC target schedd should bind.
@@ -170,6 +188,13 @@ func (c *Config) LoadServerTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
 }
 
+// LoadServerTLSWithVerifier is the ADR-056 variant of LoadServerTLS.
+// Schedd is the control-plane trust anchor, so it wires the
+// verifier unconditionally when the multi-box gate is open.
+func (c *Config) LoadServerTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithVerifier(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v)
+}
+
 // LoadVMMTLS returns the client mTLS config schedd uses to dial vmmd.
 // Empty cluster returns (nil, nil) — single-box default. Partial
 // cluster is rejected with the vmmd_tls_* field names (not the
@@ -177,6 +202,12 @@ func (c *Config) LoadServerTLS() (*tls.Config, error) {
 // key.
 func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath)
+}
+
+// LoadVMMTLSWithVerifier is the ADR-056 variant of LoadVMMTLS.
+// Mirrors the prefix semantics (vmmd_ for error naming).
+func (c *Config) LoadVMMTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefixAndVerifier("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath, v)
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing file

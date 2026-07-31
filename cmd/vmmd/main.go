@@ -512,11 +512,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
 		"host_key_path", keyPath, "recipient_path", pubPath,
 		"recipient", hostID.Recipient().String())
-	serverTLS, err := cfg.LoadServerTLS()
+	// ADR-056: handshake-layer NodeVerifier. Single-box vmmd
+	// (cfg.ComputeNode.NodeName == "") does NOT construct a
+	// verifier — stdlib trust alone runs. Multi-box vmmd
+	// constructs a PG-backed verifier, refreshes once at
+	// startup, and pumps compute_node_changed notifications into
+	// a drain goroutine for the lifetime of the daemon.
+	var nodeVerifier *wire.PGNodeVerifier
+	if nodeID != "" {
+		nodeVerifier = wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log)
+		// Drive a synchronous startup Refresh so the first
+		// handshake after listen sees a populated snapshot.
+		if _, rerr := nodeVerifier.Refresh(ctx); rerr != nil {
+			return fmt.Errorf("vmmd: node verifier startup refresh: %w", rerr)
+		}
+		go func() {
+			ch, lerr := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyComputeNodeChanged}, log)
+			if lerr != nil {
+				log.Error("vmmd: node verifier LISTEN failed", "err", lerr)
+				return
+			}
+			if rerr := nodeVerifier.Run(ctx, ch); rerr != nil && !errors.Is(rerr, context.Canceled) {
+				log.Error("vmmd: node verifier exited", "err", rerr)
+			}
+		}()
+	}
+
+	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)
 	}
-	scheddClientTLS, err := cfg.LoadScheddClientTLS()
+	scheddClientTLS, err := cfg.LoadScheddClientTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
 	}
