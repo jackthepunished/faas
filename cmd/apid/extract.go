@@ -132,6 +132,14 @@ func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 		firstSet bool
 	)
 	for {
+		// codeql[go/path-injection] false-positive: escapesArchiveRoot
+		// (line ~150) rejects every ".." and absolute hdr.Name before
+		// the value reaches any filesystem operation below. The
+		// post-Join filepath.IsLocal check at line ~207 is the
+		// belt-and-braces runtime guard. `dst` is a daemon-owned 0o700
+		// scratch dir, never customer-controllable. CodeQL's taint
+		// engine does not trace escapesArchiveRoot as a sanitizer
+		// (same precedent as pkg/rootfs/layer.go:35).
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
