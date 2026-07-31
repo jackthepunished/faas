@@ -158,6 +158,12 @@ func (g *warmHintConsumer) drain(ctx context.Context, stream scheddgrpc.WarmHint
 				// ctx wins — return nil so Run() exits cleanly
 				// instead of reconnecting on a stream teardown
 				// that was triggered by the cancel.
+				//
+				// nolint:nilerr // Mirrors the bearer() fallback
+				// at oci.go:1197-1203: a stream teardown that
+				// races ctx cancel folds into the clean-shutdown
+				// path; returning the underlying error would
+				// trigger a spurious reconnect.
 				return nil
 			}
 			return err
