@@ -1,7 +1,9 @@
 # ADR-025 · Decoupled Control Plane and Compute Nodes
 
-- **Status:** proposed
-- **Date:** 2026-07-21
+- **Status:** accepted v1.1 (2026-07-31). v1.1 adds the §6.4 failure-mode catalogue (spec §6.4); v1.0 was the original three-axis decoupling.
+
+> **⚠️ Status flips do not authorise a real cutover.** The first second-EX44 box is gated by the [Tier 2 pre-requisites](#tier-2-pre-requisites) below and the runbook `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297 — **TBD**, not yet written).
+- **Date:** 2026-07-21 (proposed); 2026-07-31 (accepted v1.1)
 - **Decision:** Evolve the FaaS architecture from a strict single-box loopback deployment to a decoupled, location-transparent topology. Specifically:
   - Transition the internal service-to-service gRPC boundaries (e.g. `schedd` ➔ `vmmd`, `builderd` ➔ `vmmd`) from hardcoded UNIX domain sockets to support standard TCP/IP networking secured via **Mutual TLS (mTLS)**.
   - Abstract local filesystem writes for rootfs layers and VM snapshot storage behind a unified storage interface (`StorageBackend`). Support local disk storage for single-box mode, and an OCI registry or object-storage-backed driver for distributed deployments.
@@ -13,6 +15,17 @@
   - **Security (mTLS):** Moving gRPC communication over TCP introduces a network boundary. Services MUST enforce certificate verification via mutual TLS (mTLS) to prevent unauthorized control-plane calls.
   - **Shared Registry/Storage:** Introducing a remote storage driver eliminates the local disk dependency. Compute nodes pull required app and base layers on-demand, making compute nodes stateless and easily scalable.
   - **Config Additions:** `schedd` and `vmmd` gain standard gRPC server/client parameters (such as `listen_network`, `cert_file`, `key_file`, `ca_file`).
+
+## Tier 2 pre-requisites
+
+The following are still un-shipped at v1.1 time and gate the load-bearing failure modes in [spec §6.4](https://github.com/poyrazK/faas/blob/main/docs/faas_implementation_spec.md#6.4-failure-mode-catalogue-adr-025-v11-adr-028-v11-adr-029-v11). When each ships, retire the corresponding bullet from this list and from the [Tier 2 plan](https://github.com/poyrazK/faas/issues/297) cross-references.
+
+- **Tier 1 Phase 2** (`node_signature` on `CapacityReport`) — blocks the "CapacityReport trust" row in §6.4. Mitigates the case where a remote vmmd forges a report to bias placement.
+- **Tier 1 Phase 3** (`OCIRegistryStorageBackend` end-to-end) — blocks the "Snapshot locality" row in §6.4. Mitigates the case where a compute node cold-boots without the per-app layer.
+- **Tier 1 Phase 4** (per-host egress policy templating) — blocks the "Egress policy per host" row in §6.4. Mitigates the case where one host's `policy_nftables.conf` references another host's `MasqueradeCIDR`.
+- **#250** (off-host Postgres backup) — gates production safety. Phase D runbook (`docs/runbooks/multi-host-rollout.md`, not yet written) inherits this. Multi-host without off-host PG backup means a CP-host loss is unrecoverable.
+
+**PR #425** (closed-not-merged 2026-07-29) was the prior attempt at this status flip; it lacked the callout above. This v1.1 supersedes it.
 
 ---
 
