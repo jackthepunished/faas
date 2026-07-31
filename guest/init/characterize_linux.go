@@ -77,6 +77,20 @@ var vsockCharacterizationBackoff = []time.Duration{
 	500 * time.Millisecond,
 }
 
+// Wire-stable class hint literals (ADR-051 §"Consequences").
+// The host re-derives the authoritative class from the observed
+// signals; these are the guest's best-guess sentinels. Centralised
+// here so a future class addition doesn't drift across the three
+// return sites in runL7Probes + probeHTTP. Mirrors the string
+// literals in pkg/api.CharacterizationReport.ObservedClass (the
+// wire doc) — keep both in sync.
+const (
+	classHTTP    = "http"
+	classJob     = "job"
+	classGraphQL = "graphql"
+	classGRPC    = "grpc"
+)
+
 // CharacterizationResult is what runCharacterization returns to the
 // caller. The caller (boot()) uses it ONLY to decide whether to log
 // a degradation (the platform never fails a deploy on a probe
@@ -175,9 +189,6 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 	if addr == "" {
 		addr = fmt.Sprintf("127.0.0.1:%d", res.Port)
 	}
-	if args.RingBufferTail != nil {
-		// pulled in by the supervisor's crash-loop hook
-	}
 	r := api.CharacterizationReport{
 		ObservedClass:         res.ObservedClass,
 		ObservedPort:          res.Port,
@@ -244,6 +255,9 @@ func probeListeningLinux(pid int) (int, string, bool) {
 // unmounted post-pivot — defensive, shouldn't happen here).
 func ownedSocketInodes(pid int) map[uint64]struct{} {
 	dir := fmt.Sprintf("/proc/%d/fd", pid)
+	//nolint:forbidigo // /proc/<pid>/fd is a vetted kernel path inside the
+	// guest; the customer-path guard (openCustomerFile) is for host daemons
+	// reading customer bytes — this reads in-guest kernel state only.
 	f, err := os.Open(dir)
 	if err != nil {
 		return nil
@@ -285,7 +299,7 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) string {
 	if port <= 0 {
 		// No bind → can't probe. Engine interprets "no bind, exit 0"
 		// as `job`. We surface that hint, host re-derives.
-		return "job"
+		return classJob
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -306,7 +320,7 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) string {
 	for collected < len(probes) {
 		select {
 		case <-probeCtx.Done():
-			return "http"
+			return classHTTP
 		case r := <-resCh:
 			collected++
 			if r != "" {
@@ -314,7 +328,7 @@ func runL7Probes(ctx context.Context, _ RunArgs, port int) string {
 			}
 		}
 	}
-	return "http"
+	return classHTTP
 }
 
 func probeGraphQL(port int) func() string {
@@ -337,7 +351,7 @@ func probeGraphQL(port int) func() string {
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if bytes.Contains(raw, []byte("__schema")) {
-			return "graphql"
+			return classGraphQL
 		}
 		return ""
 	}
@@ -365,7 +379,7 @@ func probeGRPC(port int) func() string {
 		n, _ := c.Read(buf)
 		if n > 0 && bytes.Contains(buf[:n], []byte("content-type")) {
 			// Probably gRPC reflection; the engine re-derives.
-			return "grpc"
+			return classGRPC
 		}
 		return ""
 	}
@@ -383,11 +397,11 @@ func probeHTTP(port int) func() string {
 		}
 		defer func() { _ = c.Close() }()
 		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
-		fmt.Fprintf(c, "GET /openapi.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+		_, _ = fmt.Fprintf(c, "GET /openapi.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
 		buf := make([]byte, 1024)
 		n, _ := c.Read(buf)
 		if n > 0 && bytes.HasPrefix(buf[:n], []byte("HTTP/1.")) && bytes.Contains(buf[:n], []byte(" 2")) {
-			return "http"
+			return classHTTP
 		}
 		return ""
 	}

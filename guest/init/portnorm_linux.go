@@ -38,7 +38,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -48,51 +47,16 @@ import (
 
 // PortNormMode + the ladder constants live in portnorm_common.go
 // so the unit test can pin them on every platform; this file only
-// holds the linux-only runtime helpers (kernel capability probe,
-// iptables rule install, userspace forwarder).
-
-// natAvailable reports whether the guest kernel has netfilter NAT
-// compiled in. We don't require functional conntrack — the only rule
-// we install is `-t nat -A OUTPUT -p tcp --dport 8080 -j REDIRECT
-// --to-ports <observed>`, which only needs the nat table to exist.
-// The probe is a no-op iptables list; reading /proc/net/ip_tables_names
-// is the cheaper predicate but is newer-than-most-guests.
-func natAvailable() bool {
-	// Cheaper path: the sysctl-removed kernels (CONFIG_NETFILTER=y
-	// but no nat) report an empty /proc/net/ip_tables_names. If the
-	// file exists and lists "nat", we can install rules.
-	if data, err := readProcNetIPTableNames(); err == nil && containsNat(data) {
-		return true
-	}
-	// Fallback: try a benign rule-add + remove. If either succeeds
-	// we have netfilter NAT; otherwise the kernel rejects with
-	// EOPNOTSUPP or ENOENT.
-	c := exec.Command("iptables", "-t", "nat", "-L", "-n")
-	if err := c.Run(); err == nil {
-		return true
-	}
-	return false
-}
-
-// readProcNetIPTableNames reads /proc/net/ip_tables_names. Returns
-// the raw bytes (one table name per line) or an error if the file is
-// missing (modern kernels removed it when nothing is registered).
-func readProcNetIPTableNames() ([]byte, error) {
-	//nolint:forbidigo // Probed kernel-info file: /proc/net/ip_tables_names
-	// is a kernel-managed pseudo-file the guest-init probes for netfilter
-	// NAT compilation. The path is hard-coded, no customer input can
-	// influence it, the openCustomerFile lint gate targets paths that
-	// come in via the manifest or webhook.
-	f, err := os.Open("/proc/net/ip_tables_names")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	return io.ReadAll(f)
-}
-
-// containsNat lives in characterize_common.go (build-tag-free) so
-// the unit test exercises it on every platform.
+// holds the linux-only runtime helpers (iptables rule install +
+// userspace forwarder). The earlier NAT-availability probe
+// (`natAvailable` + `readProcNetIPTableNames`) was removed in the
+// PR-D review follow-up: installDNAT surfaces the same failure
+// as an error return, and the platform contract is "fall through
+// to forwarder on nat failure" — a kernel-capability probe would
+// only race the actual install attempt. The helpers can be
+// reintroduced in a follow-up if we need to surface the
+// absence-of-NAT metric on the `guest_port_normalization_total`
+// series (ADR-051 §"Consequences").
 
 // installDNAT installs `iptables -t nat -A OUTPUT -p tcp --dport 8080
 // -j REDIRECT --to-ports <observed>`. Idempotency: a duplicate rule
