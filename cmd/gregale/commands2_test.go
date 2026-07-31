@@ -20,6 +20,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // constSlug lifts "hello" out of the test bodies so goconst stops flagging
@@ -362,9 +363,10 @@ func TestCmdOpen_DashboardFlagHitsDashboardPage(t *testing.T) {
 	}
 }
 
-// wakeStub is a test double for the public gateway that returns
-// x-gregale-wake: cold for the first N requests, then drops the header
-// to simulate the app warming up. Used to drive cmdOpen's probe loop.
+// wakeStub is a test double for the public gateway that returns the
+// cold-wake header (see pkg/wire.WakeHeader) for the first N requests,
+// then drops the header to simulate the app warming up. Used to drive
+// cmdOpen's probe loop.
 type wakeStub struct {
 	calls  int32
 	coldN  int    // first coldN requests return cold; rest are warm
@@ -377,7 +379,7 @@ func (w *wakeStub) ServeHTTP(rw http.ResponseWriter, _ *http.Request) {
 	}
 	n := atomic.AddInt32(&w.calls, 1)
 	if int(n) <= w.coldN {
-		rw.Header().Set("x-gregale-wake", "cold")
+		rw.Header().Set(wire.WakeHeader, wire.ColdWakeValue)
 	}
 	_, _ = rw.Write([]byte("ok"))
 }

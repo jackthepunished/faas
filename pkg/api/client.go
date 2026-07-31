@@ -1019,8 +1019,16 @@ func (c *Client) DeleteAppsSlugEnvKey(ctx context.Context, slug, key string) err
 }
 
 // Usage.
-func (c *Client) GetUsage(ctx context.Context, month string) (UsageResponse, error) {
-	var out UsageResponse
+//
+// GetUsage returns per-app usage rows for the given month — the wire
+// shape is an ARRAY of UsageResponse objects, not a single struct.
+// The OpenAPI spec (api/openapi.yaml GET /v1/usage), the server handler
+// (cmd/apid/handlers_ext.go getUsage), the cross-language fixture
+// (sdk/fakeapid/main.go), and the Node/Python SDKs all agree. This
+// Go SDK is the sole outlier — see memory: getusage-wire-shape-mismatch.
+// Empty month falls back to the server's default (current month).
+func (c *Client) GetUsage(ctx context.Context, month string) ([]UsageResponse, error) {
+	var out []UsageResponse
 	return out, c.do(ctx, "GET", "/v1/usage?month="+month, nil, &out)
 }
 

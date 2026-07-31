@@ -811,6 +811,12 @@ func cmdUsage(args []string) int {
 
 // cmdUsageList: GET /v1/usage?month=YYYY-MM. Defaults to the current
 // month. Per-app rows (UsageResponse — AppID, MBSeconds, Requests).
+//
+// The wire shape is an ARRAY of UsageResponse objects — the OpenAPI
+// spec, the server handler, the cross-language fixture, and the
+// Node/Python SDKs all agree. See memory: getusage-wire-shape-mismatch.
+// An empty month is a valid response (no traffic yet) and renders
+// just the header row.
 func cmdUsageList(args []string) int {
 	fs := flag.NewFlagSet("usage-list", flag.ContinueOnError)
 	month := fs.String("month", "", "month (YYYY-MM); default: current month")
@@ -824,29 +830,42 @@ func cmdUsageList(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	u, err := client.GetUsage(context.Background(), *month)
+	rows, err := client.GetUsage(context.Background(), *month)
 	if err != nil {
 		return printErr("Request failed", err)
 	}
 	if jsonOutput {
-		return jsonOut(writeJSON(u))
+		// NDJSON matches every other per-resource list (apps, instances,
+		// crons, domains, keys, secrets, deployments). One object per line
+		// is jq-friendly and streams. The prior single-array writeJSON
+		// shape was tied to the broken single-struct decode that PR #439
+		// didn't fix — switching to NDJSON aligns with the rest of the
+		// CLI and removes that vestigial coupling.
+		return jsonOut(writeNDJSON(rows))
 	}
-	// ADR-046: tx_bytes (HTTP response bytes, gateway-side) and
-	// net_tx_bytes (root-side vethHost interface bytes, includes
-	// framing) are informational, NOT billed. Surfaced as a
-	// trailing column so a customer can spot egress anomalies
-	// without grepping --json. Only printed when at least one
-	// counter is non-zero — most months most apps are 0 and the
-	// trailing column is noise.
-	if u.TXBytes > 0 || u.NetTxBytes > 0 {
-		_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d) · egress %.3f GB (tx %.2f / net %.2f)\n",
-			u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours,
-			u.TotalEgressGB(),
-			float64(u.TXBytes)/(1024*1024*1024),
-			float64(u.NetTxBytes)/(1024*1024*1024))
+	if len(rows) == 0 {
+		_, _ = fmt.Fprintf(osStdout, "No usage recorded for %s.\n", *month)
 		return 0
 	}
-	_, _ = fmt.Fprintf(osStdout, "App %s — %d requests · %.3f GB-hours (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
+	_, _ = fmt.Fprintf(osStdout, "App — requests · GB-hours (included GB-h) · egress\n")
+	for _, u := range rows {
+		// ADR-046: tx_bytes (HTTP response bytes, gateway-side) and
+		// net_tx_bytes (root-side vethHost interface bytes, includes
+		// framing) are informational, NOT billed. Surfaced as a
+		// trailing column so a customer can spot egress anomalies
+		// without grepping --json. Only printed when at least one
+		// counter is non-zero — most months most apps are 0 and the
+		// trailing column is noise.
+		if u.TXBytes > 0 || u.NetTxBytes > 0 {
+			_, _ = fmt.Fprintf(osStdout, "%s — %d · %.3f (included %d) · egress %.3f GB (tx %.2f / net %.2f)\n",
+				u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours,
+				u.TotalEgressGB(),
+				float64(u.TXBytes)/(1024*1024*1024),
+				float64(u.NetTxBytes)/(1024*1024*1024))
+			continue
+		}
+		_, _ = fmt.Fprintf(osStdout, "%s — %d · %.3f (included %d)\n", u.AppID, u.Requests, float64(u.MBSeconds)/3.6e6, u.IncludedGBHours)
+	}
 	return 0
 }
 
@@ -1045,10 +1064,11 @@ func cmdOpen(args []string) int {
 		target = dashboardAppURL(apiBase(), slug)
 	} else {
 		// Cold-wake transparency (UX §6.4, issue #65 D1). Probe with
-		// a 2 s deadline; if the response carries `x-gregale-wake: cold`,
-		// print the cold-start line immediately, then wait up to 8 s
-		// total for the app to warm before opening — the user would
-		// otherwise see a 502 from the gateway. Probe errors collapse
+		// a 2 s deadline; if the response carries the cold-wake header
+		// (see pkg/wire.WakeHeader), print the cold-start line
+		// immediately, then wait up to 8 s total for the app to warm
+		// before opening — the user would otherwise see a 502 from the
+		// gateway. Probe errors collapse
 		// to "Opening." (don't block on a flaky probe).
 		state, err := probeWakeState(target, 2*time.Second)
 		switch {
