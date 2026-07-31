@@ -238,8 +238,7 @@ func KeyIDForPublicKey(pub *ecdsa.PublicKey) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sched: KeyIDForPublicKey: %w", err)
 	}
-	h := sha256.Sum256(der)
-	return hexEncode(h[:]), nil
+	return hexEncode(sha256Hex(der)), nil
 }
 
 // VerifyNodeSignature checks the report's node_signature against

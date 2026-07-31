@@ -400,7 +400,7 @@ func TestLocalCacheBackend_DeterministicBucketing(t *testing.T) {
 		t.Errorf("bucket = %q (len %d), want 2-char hex", bucket, len(bucket))
 	}
 	for _, c := range bucket {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if c < '0' || (c > '9' && c < 'a') || c > 'f' {
 			t.Errorf("bucket %q contains non-hex char %q", bucket, c)
 		}
 	}

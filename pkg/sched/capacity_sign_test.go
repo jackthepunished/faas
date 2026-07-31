@@ -32,6 +32,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 )
@@ -206,7 +207,7 @@ func TestVerifyNodeSignature_TamperedPayload(t *testing.T) {
 	keys := &stubKeyLookup{keys: map[string]*ecdsa.PublicKey{
 		keyID: &priv.PublicKey,
 	}}
-	if err := VerifyNodeSignature(tampered, sig, keys); err != ErrSignatureMismatch {
+	if err := VerifyNodeSignature(tampered, sig, keys); !errors.Is(err, ErrSignatureMismatch) {
 		t.Errorf("tampered payload: err = %v, want ErrSignatureMismatch", err)
 	}
 }
@@ -235,7 +236,7 @@ func TestVerifyNodeSignature_ReplayedTimestamp(t *testing.T) {
 	keys := &stubKeyLookup{keys: map[string]*ecdsa.PublicKey{
 		keyID: &priv.PublicKey,
 	}}
-	if err := VerifyNodeSignature(replayed, sig, keys); err != ErrSignatureMismatch {
+	if err := VerifyNodeSignature(replayed, sig, keys); !errors.Is(err, ErrSignatureMismatch) {
 		t.Errorf("replayed timestamp: err = %v, want ErrSignatureMismatch", err)
 	}
 }
@@ -262,7 +263,7 @@ func TestVerifyNodeSignature_WrongKey(t *testing.T) {
 	keys := &stubKeyLookup{keys: map[string]*ecdsa.PublicKey{
 		otherKeyID: &wrongPriv.PublicKey,
 	}}
-	if err := VerifyNodeSignature(report, sig, keys); err != ErrUnknownNodeKey {
+	if err := VerifyNodeSignature(report, sig, keys); !errors.Is(err, ErrUnknownNodeKey) {
 		t.Errorf("wrong key: err = %v, want ErrUnknownNodeKey", err)
 	}
 }
@@ -285,7 +286,7 @@ func TestVerifyNodeSignature_UnknownKeyID(t *testing.T) {
 	report.NodeKeyID = keyID
 
 	keys := &stubKeyLookup{keys: map[string]*ecdsa.PublicKey{}}
-	if err := VerifyNodeSignature(report, sig, keys); err != ErrUnknownNodeKey {
+	if err := VerifyNodeSignature(report, sig, keys); !errors.Is(err, ErrUnknownNodeKey) {
 		t.Errorf("unknown key: err = %v, want ErrUnknownNodeKey", err)
 	}
 }
@@ -326,7 +327,7 @@ func TestVerifyNodeSignature_NilRegistry(t *testing.T) {
 	report.NodeSignature = sig
 	report.NodeKeyID = keyID
 
-	if err := VerifyNodeSignature(report, sig, nil); err != ErrUnknownNodeKey {
+	if err := VerifyNodeSignature(report, sig, nil); !errors.Is(err, ErrUnknownNodeKey) {
 		t.Errorf("nil registry: err = %v, want ErrUnknownNodeKey", err)
 	}
 }
