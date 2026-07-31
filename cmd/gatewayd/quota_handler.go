@@ -45,6 +45,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -97,20 +98,63 @@ func internalQuotaHandler(h *gateway.Handler, logger *slog.Logger) http.HandlerF
 			// unknown, or the bucket has never been Allow'd. The
 			// dashboard renders "—" on this case; the JSON shape is
 			// still well-formed so the browser JS doesn't crash.
+			//
+			// Body built via json.Marshal so user-supplied
+			// app_id/planStr are escaped (U+0022 / U+005C / control
+			// bytes per RFC 8259 §7). The string-concat shape that
+			// lived here through PR #314 was flagging CodeQL
+			// go/reflected-xss (alert #146) — the endpoint is
+			// loopback-only per assertLoopbackBind so the alert was
+			// a FP for the live wire, but the concat was a real
+			// defense-in-depth gap for any future caller that
+			// renders the response as HTML. Marshal closes both.
 			w.Header().Set("X-Faas-Quota-State", "noop")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"app_id":"` + appID + `","plan":"` + planStr +
-				`","limit":0,"remaining":0,"reset_seconds":0,"ok":false}`))
+			_, _ = w.Write(marshalQuotaSnapshot(quotaSnapshotJSON{
+				AppID:        appID,
+				Plan:         planStr,
+				Limit:        0,
+				Remaining:    0,
+				ResetSeconds: 0,
+				OK:           false,
+			}))
 			return
 		}
 		w.Header().Set("X-Faas-Quota-State", "ok")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"app_id":"` + appID + `","plan":"` + planStr +
-			`","limit":` + itoa(snap.Limit) +
-			`,"remaining":` + itoa(snap.Remaining) +
-			`,"reset_seconds":` + itoa(snap.ResetSeconds) +
-			`,"ok":true}`))
+		_, _ = w.Write(marshalQuotaSnapshot(quotaSnapshotJSON{
+			AppID:        appID,
+			Plan:         planStr,
+			Limit:        snap.Limit,
+			Remaining:    snap.Remaining,
+			ResetSeconds: snap.ResetSeconds,
+			OK:           true,
+		}))
 	}
+}
+
+// quotaSnapshotJSON is the wire shape returned by /v1/internal/quota.
+// Field order is fixed so the JSON output matches the legacy
+// string-concat shape (the dashboard JS parses both shapes; reordering
+// would break the existing field name bindings in the dashboard).
+type quotaSnapshotJSON struct {
+	AppID        string `json:"app_id"`
+	Plan         string `json:"plan"`
+	Limit        int    `json:"limit"`
+	Remaining    int    `json:"remaining"`
+	ResetSeconds int    `json:"reset_seconds"`
+	OK           bool   `json:"ok"`
+}
+
+// marshalQuotaSnapshot is the JSON encoder for the /v1/internal/quota
+// response body. Uses encoding/json so user-supplied plan/app_id
+// values are escaped per RFC 8259 §7 — patch for CodeQL alert #146
+// (go/reflected-xss). The compiler can prove the return is a
+// non-error []byte (no Marshaler implementations on the struct
+// fields), so the error is intentionally dropped.
+func marshalQuotaSnapshot(s quotaSnapshotJSON) []byte {
+	b, _ := json.Marshal(s)
+	return b
 }
 
 func writeProblemQuota(w http.ResponseWriter, status int, code, detail string) {
@@ -136,31 +180,4 @@ func quotaParsePlan(s string) api.Plan {
 		return api.PlanScale
 	}
 	return api.Plan("")
-}
-
-// itoa is the gatewayd-local int-to-string helper. There is one in
-// pkg/gateway/handler.go already (used by the response-header writers);
-// we can't import it without exposing it across packages. Keep this
-// private duplication — the change is small enough that drift is
-// caught by gofmt + the test that renders the JSON.
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }
