@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -346,7 +347,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// M7.5: githubd socket path (ADR-012). Empty = stub client (every
 	// method returns api.Problem{Code:"githubd_not_ready"}), which is
 	// fine until githubd is actually deployed on this host.
-	githubd := newGithubdClient(ctx, deps.getenv("FAAS_GITHUBD_SOCKET"), nil, log)
+	//
+	// ADR-052: multi-box deployments dial githubd over tcp:// +
+	// mTLS. Load the client TLS config from env so the same
+	// per-daemon TOML surface (or env-var analogue) works whether
+	// the githubd lives on the same host (unix socket) or a
+	// remote box (tcp/dns + leaf cert). Empty TLS cluster returns
+	// (nil, nil) and the unix path keeps working.
+	githubdTLS, err := wire.LoadClientTLSConfig(
+		deps.getenv("FAAS_GITHUBD_TLS_CERT_PATH"),
+		deps.getenv("FAAS_GITHUBD_TLS_KEY_PATH"),
+		deps.getenv("FAAS_GITHUBD_TLS_CA_PATH"),
+	)
+	if err != nil {
+		return fmt.Errorf("apid: githubd TLS: %w", err)
+	}
+	githubd := newGithubdClient(ctx, deps.getenv("FAAS_GITHUBD_SOCKET"), githubdTLS, log)
 	// M7.5: dashboard session manager. Loads the 32-byte key from
 	// FAAS_SESSION_KEY (hex-encoded); empty in dev = ephemeral key +
 	// warning so the daemon still boots for local testing. Production
@@ -564,10 +580,26 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// guest-init. Empty FAAS_APID_ADVISORY_SOCK disables (matches the
 	// metricsAddr explicit-empty pattern so the e2e harness can stamp
 	// empty and avoid the bind race).
+	//
+	// ADR-052: when the target is tcp:// or dns:// (multi-box path),
+	// the operator must also set FAAS_APID_ADVISORY_TLS_{CERT,KEY,CA}_PATH
+	// to a per-daemon leaf. Single-box deployments leave the TLS
+	// cluster unset and continue to use the unix socket; the
+	// LoadServerTLSConfig helper returns (nil, nil) when all three
+	// paths are empty.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
 	if sock := resolveAdvisorySock(deps.getenv); sock != "" {
-		advisorySrv, advisoryLis, err = runAdvisoryServer(sock, srv.store, srv.audit, srv.notif, log, srv.ops)
+		advisoryTLS, tlsErr := wire.LoadServerTLSConfig(
+			deps.getenv("FAAS_APID_ADVISORY_TLS_CERT_PATH"),
+			deps.getenv("FAAS_APID_ADVISORY_TLS_KEY_PATH"),
+			deps.getenv("FAAS_APID_ADVISORY_TLS_CA_PATH"),
+		)
+		if tlsErr != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
+		}
+		advisorySrv, advisoryLis, err = runAdvisoryServer(ctx, sock, advisoryTLS, srv.store, srv.audit, srv.notif, log, srv.ops)
 		if err != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory listen %q: %w", sock, err)
@@ -742,24 +774,55 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 
 // runAdvisoryServer binds the AdvisoryService gRPC server onto a
 // fresh /run/faas/apid.sock (or wherever FAAS_APID_ADVISORY_SOCK
-// points). The owner is the apid daemon user (lookup via
+// points). Single-box deployments point sock at a unix:// path;
+// the owner is the apid daemon user (lookup via
 // pkg/wire.ListenOrRecreateByName), the group is `faas` so vmmd can
 // dial without root, and the mode is 0660 — the standing repo
-// convention (pkg/wire.DefaultSocketMode).
+// convention (pkg/wire.DefaultSocketMode). Multi-box deployments
+// pass a tcp:// or dns:// target + a non-nil tlsCfg loaded via
+// wire.LoadServerTLSConfig (ADR-052). Empty sock disables the
+// listener entirely (matches the e2e harness path).
 //
 // Returns the server (caller calls Serve) and the listener. Errors
 // here are fatal — without the advisory listener vmmd has no way to
 // forward fanotify batches and the audit loop is silently broken.
-func runAdvisoryServer(sock string, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
-	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+func runAdvisoryServer(ctx context.Context, target string, tlsCfg *tls.Config, store state.Store, audit *auditor, notif Notifier, log *slog.Logger, ops *wire.OpsMetrics) (*grpc.Server, net.Listener, error) {
+	// Guard: a tcp/dns target without TLS would silently build an
+	// insecure server (wire.Listen returns raw TCP, ServerCredsOrEmpty
+	// yields zero opts). Refuse; the operator must set the
+	// FAAS_APID_ADVISORY_TLS_{CERT,KEY,CA}_PATH env trio. ADR-052.
+	if !isUnixSocketPath(target) && tlsCfg == nil {
+		return nil, nil, fmt.Errorf(
+			"advisory: target %q is non-unix but %s is empty (set FAAS_APID_ADVISORY_TLS_CERT_PATH / KEY_PATH / CA_PATH or point the target at a unix socket for single-box mode)",
+			target, "FAAS_APID_ADVISORY_TLS_*_PATH")
+	}
+	var lis net.Listener
+	var err error
+	if isUnixSocketPath(target) {
+		lis, err = wire.ListenOrRecreateByName(target, "faas-apid")
+	} else {
+		lis, err = wire.Listen(ctx, target, tlsCfg)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("advisory listen: %w", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(wire.ServerCredsOrEmpty(tlsCfg)...)
 	// Mega-PR B: pass ops so the receiver can increment
 	// apid_stateless_advisory_events_total on each landed advisory.
 	// The accessor is nil-receiver safe so the metric stays zero
 	// when ops is nil (test path).
 	registerAdvisoryReceiver(srv, store, audit, notif, log, ops)
 	return srv, lis, nil
+}
+
+// isUnixSocketPath detects the legacy single-box dial target by
+// checking for the unix:// scheme OR a bare absolute filesystem
+// path (the historical FAAS_APID_ADVISORY_SOCK default). Anything
+// else — host:port, dns://authority, tcp://host:port — is treated
+// as a multi-box dial target that requires a non-nil tlsCfg.
+func isUnixSocketPath(target string) bool {
+	if strings.HasPrefix(target, "unix://") || strings.HasPrefix(target, "/") {
+		return true
+	}
+	return false
 }

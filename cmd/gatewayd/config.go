@@ -76,6 +76,17 @@ type Config struct {
 	VMMDPingTLSCertPath string `toml:"vmmd_tls_cert_path"`
 	VMMDPingTLSKeyPath  string `toml:"vmmd_tls_key_path"`
 	VMMDPingTLSCAPath   string `toml:"vmmd_tls_ca_path"`
+
+	// EgressTLSCertPath / Key / CA configure the mTLS material the
+	// egress gRPC listener uses when meterd dials it from a remote
+	// compute node (ADR-052 / issue #95 slice 2). All three empty
+	// => no TLS, single-box unix socket; all three set => mTLS-over-
+	// TCP. Partial cluster => startup error naming the missing fields.
+	// Leaf is /etc/faas/tls/gatewayd/egress.{crt,key} (EKU ServerAuth
+	// only).
+	EgressTLSCertPath string `toml:"egress_tls_cert_path"`
+	EgressTLSKeyPath  string `toml:"egress_tls_key_path"`
+	EgressTLSCAPath   string `toml:"egress_tls_ca_path"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived
@@ -161,4 +172,13 @@ func (c *Config) resolveTLSConfig(allowlist gateway.OnDemandAllowlist) gateway.T
 // is start-up fatal rather than a runtime fault (spec §11).
 func (c *Config) LoadVMMDPingTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("vmmd_", c.VMMDPingTLSCertPath, c.VMMDPingTLSKeyPath, c.VMMDPingTLSCAPath)
+}
+
+// LoadEgressTLS returns the server mTLS config the egress gRPC
+// listener uses when meterd dials it from a remote compute node
+// (ADR-052). Empty cluster returns (nil, nil); partial cluster is
+// rejected with the egress_tls_* field names so an operator can map
+// the error straight to a TOML key.
+func (c *Config) LoadEgressTLS() (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithPrefix("egress_", c.EgressTLSCertPath, c.EgressTLSKeyPath, c.EgressTLSCAPath)
 }

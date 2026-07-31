@@ -5,11 +5,13 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"os"
 
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Config is the on-disk representation of meterd's TOML config.
@@ -23,14 +25,52 @@ type Config struct {
 	MetricsAddr string `toml:"metrics_addr"`
 	// Meter is the pkg/meter timer cadence + behavior block.
 	Meter *meter.Config `toml:"meter"`
+
+	// ScheddTLS is the client mTLS material meterd uses to dial schedd
+	// (ADR-052 / issue #95 slice 2). All three paths empty => no TLS,
+	// single-box default; all three set => mTLS to remote schedd. Partial
+	// cluster => startup error naming the missing fields.
+	ScheddTLSCertPath string `toml:"schedd_tls_cert_path"`
+	ScheddTLSKeyPath  string `toml:"schedd_tls_key_path"`
+	ScheddTLSCAPath   string `toml:"schedd_tls_ca_path"`
+
+	// GatewayEgressSocket is the gatewayd egress dial target meterd
+	// dials to read tx_bytes (ADR-046). Defaults to
+	// /run/faas/gatewayd-egress.sock; multi-box deployments override
+	// with tcp:// or dns:// plus the gateway_egress_tls_* cluster.
+	GatewayEgressSocket string `toml:"gateway_egress_socket"`
+
+	// GatewayEgressTLSCertPath / Key / CA configure the mTLS material
+	// meterd uses to dial gatewayd's egress listener when it lives on a
+	// remote compute node (ADR-052). All three empty => no TLS (single-box
+	// path uses the unix socket above); partial cluster => startup error.
+	// Field names are prefixed with gateway_egress_ so an operator can map
+	// the error straight to a TOML key.
+	GatewayEgressTLSCertPath string `toml:"gateway_egress_tls_cert_path"`
+	GatewayEgressTLSKeyPath  string `toml:"gateway_egress_tls_key_path"`
+	GatewayEgressTLSCAPath   string `toml:"gateway_egress_tls_ca_path"`
+}
+
+// LoadScheddTLS returns the client mTLS config meterd uses to dial
+// schedd. Empty cluster returns (nil, nil); partial cluster is rejected.
+func (c *Config) LoadScheddTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("schedd_", c.ScheddTLSCertPath, c.ScheddTLSKeyPath, c.ScheddTLSCAPath)
+}
+
+// LoadGatewayEgressTLS returns the client mTLS config meterd uses to
+// dial gatewayd's egress listener. Empty cluster returns (nil, nil);
+// partial cluster is rejected.
+func (c *Config) LoadGatewayEgressTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("gateway_egress_", c.GatewayEgressTLSCertPath, c.GatewayEgressTLSKeyPath, c.GatewayEgressTLSCAPath)
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
-		SocketPath: "/run/faas/schedd.sock",
-		Meter:      &meter.Config{},
+		SocketPath:          "/run/faas/schedd.sock",
+		GatewayEgressSocket: "/run/faas/gatewayd-egress.sock",
+		Meter:               &meter.Config{},
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

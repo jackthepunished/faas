@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# deploy.sh — manual redeploy on the Droplet.
-# Usage: sudo bash deploy/digitalocean/deploy.sh
+# deploy.sh — manual redeploy on the Control Plane host.
+# Usage: sudo bash deploy/controlplane/deploy.sh
 #
 # Pulls latest source, rebuilds, runs migrations, restarts services.
 
@@ -19,7 +19,7 @@ ok "Source updated"
 
 step "Building daemons"
 make build
-cp bin/* "${FAAS_BIN}/"
+find bin -maxdepth 1 -type f -exec install -m 0755 {} "${FAAS_BIN}/" \;
 go build -o "${FAAS_BIN}/migrate" ./cmd/migrate
 ok "Binaries updated"
 

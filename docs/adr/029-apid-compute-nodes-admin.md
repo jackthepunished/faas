@@ -1,7 +1,7 @@
 # ADR-029 · apid Compute-Nodes Admin Surface
 
-- **Status:** proposed
-- **Date:** 2026-07-22
+- **Status:** accepted v1.1 (2026-07-31). The CRUD surface is live; v1.1 adds the §6.4 audit-trail cross-reference — admin actions remain un-emitted into `events` (deferred to a v1.2 follow-up; see Consequences). The §6.4 failure-mode catalogue (spec §6.4) lists the per-error-mode contract for the admin surface (default-local hard-delete protection, typo'd `target_url`, admin-allowlist rotation, the 47600 MB literal backfill anti-goal).
+- **Date:** 2026-07-22 (proposed); 2026-07-31 (accepted v1.1)
 - **Issue:** #98
 - **Decision:** Add operator-facing CRUD on `compute_nodes` to apid:
   `GET /v1/compute-nodes`, `POST /v1/compute-nodes`, `DELETE

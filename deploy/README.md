@@ -28,8 +28,7 @@ make test               # cross-platform unit tests
   via the `nftables` ansible role.
 - `scripts/` — ops helpers (`leakcheck.sh` for the shell-side check,
   restore drill planned for M8).
-- `digitalocean/` — production deploy path: bootstrap.sh for first-time
-  droplet setup, deploy.sh for re-runs, and `sealed.env.example` for
-  the operator-supplied env file. See
-  [`digitalocean/README.md`](digitalocean/README.md) for the OAuth
-  sign-in env vars (issue #419 / ADR-046).
+- `controlplane/` — standalone Control Plane deploy path (GCP, DO, Hetzner Cloud, etc.):
+  bootstrap.sh for first-time host setup, deploy.sh for re-runs, and `sealed.env.example`
+  for the operator-supplied env file. See [`controlplane/README.md`](controlplane/README.md)
+  for the OAuth sign-in env vars (issue #419 / ADR-046).

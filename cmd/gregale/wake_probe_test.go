@@ -6,11 +6,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 func TestProbeWakeState_Cold(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("x-gregale-wake", "cold")
+		w.Header().Set(wire.WakeHeader, wire.ColdWakeValue)
 		_, _ = w.Write([]byte("ok"))
 	}))
 	defer srv.Close()
@@ -72,10 +74,10 @@ func TestProbeWakeState_5xx(t *testing.T) {
 }
 
 func TestProbeWakeState_HeaderValueExactMatch(t *testing.T) {
-	// Wire contract per pkg/gateway/handler_test.go is exactly "cold".
+	// Wire contract per pkg/gateway/handler.go is exactly "cold".
 	// A misspelled or capitalized value must NOT count as cold.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("x-gregale-wake", "Cold") // capital C
+		w.Header().Set(wire.WakeHeader, "Cold") // capital C
 		_, _ = w.Write([]byte("ok"))
 	}))
 	defer srv.Close()

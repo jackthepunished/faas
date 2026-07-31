@@ -166,6 +166,12 @@ func run(args []string) int {
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:
 		return cmdSignKeys(args[1:])
+	case dispatchPKI:
+		// Operator-side local-dev PKI bootstrap (ADR-052). Issues
+		// /etc/faas/tls/{ca,<daemon>/} material for multi-box mTLS.
+		// Distinct from sign-keys because the trust root is the CA,
+		// not the per-box cosign keypair.
+		return cmdPKI(args[1:])
 	case "secrets":
 		return cmdSecrets(args[1:])
 	case "account":

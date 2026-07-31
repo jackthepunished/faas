@@ -15,6 +15,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // App is the routing target for a hostname.
@@ -428,7 +429,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if cold {
 		// Cold-wake transparency (UX spec §6): let developers see the penalty.
-		w.Header().Set("x-faas-wake", "cold")
+		w.Header().Set(wire.WakeHeader, wire.ColdWakeValue)
 	}
 	if wakeID != "" {
 		// Per-wake correlation handle (gaps analysis 2026-07-23). Sits

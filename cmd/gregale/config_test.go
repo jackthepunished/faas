@@ -112,7 +112,10 @@ func setupHermeticTokensEnv(t *testing.T) string {
 }
 
 // writeLegacyToken pre-creates the plaintext-file fallback with the
-// given value (used by migration tests).
+// given value (used by #293-era migration tests — pre-keychain
+// installs that still wrote a file at the CURRENT path). For
+// pre-#439 (pre-rename) seeding use writePreRenamePlaintextToken
+// below.
 func writeLegacyToken(t *testing.T, value string) string {
 	t.Helper()
 	p, err := tokenPath()
@@ -126,6 +129,38 @@ func writeLegacyToken(t *testing.T, value string) string {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	return p
+}
+
+// writePreRenamePlaintextToken writes the token to the PRE-#439
+// path (the "faas" subdirectory under os.UserConfigDir). The
+// existing writeLegacyToken writes the CURRENT path (post-#439,
+// "gregale"); this sibling seeds the pre-rename state for the
+// legacy-migration tests. The PR #439 rename flipped the path
+// without forward-migrating, so any customer who logged in before
+// the rename has a file at the OLD path.
+func writePreRenamePlaintextToken(t *testing.T, value string) string {
+	t.Helper()
+	p, err := legacyTokenPath()
+	if err != nil {
+		t.Fatalf("legacyTokenPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(p, []byte(value+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return p
+}
+
+// writePreRenameKeychainEntry seeds the pre-#439 keychain service
+// ("faas-cli") so migration tests can exercise the legacy-keychain
+// branch. Mirrors the withEntry helper for the new service.
+func writePreRenameKeychainEntry(t *testing.T, f *fakeKeyring, value string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data[f.storeKey(legacyKeyringService, keyringAccount)] = value
 }
 
 // ----- Save-side tests -----
@@ -387,3 +422,116 @@ func TestKeyringStub_IsWired(t *testing.T) {
 // mustTokenPath is defined in cli_login_test.go (one helper per
 // package is enough — keeping the definition there preserves the
 // existing import surface for cmd/gregale/*_test.go).
+
+// --- Pre-#439 rename migration --------------------------------------------
+//
+// PR #439 (commit 3bc9796c, "feat(cli): rename binary faas -> gregale")
+// flipped keyringService from "faas-cli" to "gregale-cli" and the
+// plaintext-file path from ~/.config/faas/token to
+// ~/.config/gregale/token without forward-migrating. A customer who
+// logged in before the upgrade is logged out at the next launch. The
+// tests below pin the one-shot migration: loadToken consults the
+// legacy stores in turn, and saveToken erases them once the new
+// store has the value.
+
+// TestLoadToken_PreRenameKeychain_LegacyServiceIsRead covers the
+// case where a pre-#439 customer has the secret only in the legacy
+// keychain service ("faas-cli"). loadToken must read it so the
+// current command sees the secret without forcing a re-login.
+func TestLoadToken_PreRenameKeychain_LegacyServiceIsRead(t *testing.T) {
+	setupHermeticTokensEnv(t)
+	f := setFakeKeyring(t)
+	writePreRenameKeychainEntry(t, f, "from-pre-rename-kc")
+
+	if got := loadToken(); got != "from-pre-rename-kc" {
+		t.Errorf("loadToken = %q, want from-pre-rename-kc", got)
+	}
+}
+
+// TestLoadToken_PreRenameFile_LegacyFileIsRead covers the case
+// where a pre-#439 customer has the secret only in the legacy
+// plaintext file (~/.config/faas/token). loadToken must read it.
+func TestLoadToken_PreRenameFile_LegacyFileIsRead(t *testing.T) {
+	setupHermeticTokensEnv(t)
+	setFakeKeyring(t) // empty
+	p := writePreRenamePlaintextToken(t, "from-pre-rename-file")
+
+	if got := loadToken(); got != "from-pre-rename-file" {
+		t.Errorf("loadToken = %q, want from-pre-rename-file", got)
+	}
+	// The legacy file is read but NOT removed on load — removal is
+	// saveToken's job (mirrors the existing #293 pattern: read
+	// eagerly, write migrates).
+	if _, err := os.Stat(p); err != nil {
+		t.Errorf("legacy file should still exist after load; Stat err=%v", err)
+	}
+}
+
+// TestLoadToken_PreRename_PreferNewOverLegacy pins the priority:
+// when BOTH the new and legacy stores are populated, the new store
+// wins. A post-rename customer must not be served the legacy
+// value (e.g. an ex-coworker's account on the same machine).
+func TestLoadToken_PreRename_PreferNewOverLegacy(t *testing.T) {
+	setupHermeticTokensEnv(t)
+	setFakeKeyring(t,
+		withEntry(keyringService, keyringAccount, "new-kc"),
+		withEntry(legacyKeyringService, keyringAccount, "old-kc"),
+	)
+	writePreRenamePlaintextToken(t, "old-file")
+
+	if got := loadToken(); got != "new-kc" {
+		t.Errorf("loadToken = %q, want new-kc (new keychain wins over legacy)", got)
+	}
+}
+
+// TestSaveToken_PreRename_MigratesKeychainAndFile covers the
+// forward-migration on the first successful keychain Set. Both
+// the legacy keychain service entry AND the legacy plaintext file
+// are removed once the new keychain has the new value.
+func TestSaveToken_PreRename_MigratesKeychainAndFile(t *testing.T) {
+	setupHermeticTokensEnv(t)
+	f := setFakeKeyring(t)
+	writePreRenameKeychainEntry(t, f, "legacy-kc")
+	legacyFile := writePreRenamePlaintextToken(t, "legacy-file")
+
+	if err := saveToken("new-kc-value"); err != nil {
+		t.Fatalf("saveToken: %v", err)
+	}
+	if got, _ := f.Get(legacyKeyringService, keyringAccount); got != "" {
+		t.Errorf("legacy keychain entry = %q, want removed (ErrNotFound)", got)
+	}
+	if _, err := os.Stat(legacyFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy plaintext file should be removed; Stat err=%v", err)
+	}
+	if got, _ := f.Get(keyringService, keyringAccount); got != "new-kc-value" {
+		t.Errorf("new keychain entry = %q, want new-kc-value", got)
+	}
+}
+
+// TestDeleteToken_ClearsLegacyKeychainAndFile pins the symmetric
+// logout path: gregale logout must remove BOTH the new and legacy
+// stores, regardless of which one the user originally logged in
+// with. A pre-#439 customer who runs logout should not have the
+// old entry survive.
+func TestDeleteToken_ClearsLegacyKeychainAndFile(t *testing.T) {
+	setupHermeticTokensEnv(t)
+	f := setFakeKeyring(t)
+	writePreRenameKeychainEntry(t, f, "legacy-kc")
+	legacyFile := writePreRenamePlaintextToken(t, "legacy-file")
+	if err := saveToken("new-kc-value"); err != nil {
+		t.Fatalf("saveToken: %v", err)
+	}
+	// After save, the new store is populated. Logout must clear
+	// both stores.
+	deleteToken()
+
+	if _, err := f.Get(keyringService, keyringAccount); !errors.Is(err, keyring.ErrNotFound) {
+		t.Errorf("new keychain entry should be removed")
+	}
+	if _, err := f.Get(legacyKeyringService, keyringAccount); !errors.Is(err, keyring.ErrNotFound) {
+		t.Errorf("legacy keychain entry should be removed")
+	}
+	if _, err := os.Stat(legacyFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy plaintext file should be removed; Stat err=%v", err)
+	}
+}

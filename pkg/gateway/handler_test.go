@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
@@ -201,8 +202,8 @@ func TestColdWakeReturns200AndHeader(t *testing.T) {
 	if rec.Body.String() != "hello from app" {
 		t.Errorf("body = %q", rec.Body.String())
 	}
-	if rec.Header().Get("x-faas-wake") != "cold" {
-		t.Error("first request after park should carry x-faas-wake: cold (UX §6)")
+	if rec.Header().Get(wire.WakeHeader) != wire.ColdWakeValue {
+		t.Error("first request after park should carry the cold-wake header (UX §6)")
 	}
 	// Per-wake stable ID flows from schedd's Wake() through the gateway
 	// handler onto the response. fakeBackend's Wake returns the literal
@@ -229,7 +230,7 @@ func TestHotPathDoesNotWakeOrTagCold(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if rec.Header().Get("x-faas-wake") != "" {
+	if rec.Header().Get(wire.WakeHeader) != "" {
 		t.Error("warm request must not carry the cold header")
 	}
 	if got := rec.Header().Get("x-faas-wake-id"); got != "" {
