@@ -742,11 +742,29 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10)
+// Coerce MaxConcurrency <= 0 to 1 so the NOT NULL CHECK (>= 1) is
+	// satisfied (matches the CreateApp / ApplyProjectPlan paths).
+	maxConcurrency := app.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
+	// Coerce RAMMB <= 0 to 128 (Free plan minimum) so the NOT NULL CHECK
+	// (ram_mb > 0) is satisfied.
+	ramMB := app.RAMMB
+	if ramMB <= 0 {
+		ramMB = 128
+	}
+	// project_id (migration 00074, nullable) + workload_name
+	// (NOT NULL DEFAULT ''). The reconcile path passes a project-bound
+	// App and AppsForProject filters by project_id; the unique index
+	// apps_project_workload_uniq (project_id, workload_name) WHERE
+	// project_id IS NOT NULL means every project-bound insert must
+	// carry both columns.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled)
+		app.AccountID, app.Slug, string(app.Type), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1290,10 +1308,14 @@ func (s *PgStore) ApplyProjectPlan(
 		manifestBytes, _ := json.Marshal(manifest)
 		runtime := nullString(a.Runtime)
 		idle := nullableInt(a.IdleTimeoutS)
-		// Same rationale as CreateApp: pass nil for MaxConcurrency=0
-		// so DEFAULT 1 fires (CHECK >= 1) and the autoscale trigger
-		// sees NULL = disabled.
-		maxConcurrency := nullableInt(a.MaxConcurrency)
+		// Same rationale as CreateApp: coerce MaxConcurrency <= 0
+		// to 1 so the NOT NULL CHECK (>= 1) is satisfied. Autoscale
+		// "disabled" is autoscale_target_rps / autoscale_target_cpu_pct,
+		// not max_concurrency.
+		maxConcurrency := a.MaxConcurrency
+		if maxConcurrency <= 0 {
+			maxConcurrency = 1
+		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
