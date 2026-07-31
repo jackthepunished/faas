@@ -815,6 +815,37 @@ func (s *PgStore) SetAppMinInstances(ctx context.Context, appID string, min int)
 	return nil
 }
 
+// SetAppWorkloadClass overwrites apps.workload_class (ADR-050 §3,
+// ADR-051). Single round-trip UPDATE … RETURNING; the RETURNING
+// projection matches appsSelectColumns so scanAppInto can decode it.
+// SQLSTATE 23514 (apps_workload_class_chk) maps to ErrInvalidArgument
+// via mapErr; SQLSTATE 23502 (not_null) is unreachable because the
+// column carries a DEFAULT in the migration.
+//
+// The `source` argument is caller metadata only — the store does NOT
+// log or persist it. The engine/reconcile caller writes an audit row
+// carrying {app_id, observed_class, source} with the same value
+// (ADR-035 best-effort).
+//
+// Returns the fresh App row so the cold-boot path in pkg/sched
+// (PR-D) can pass it on to SetInstanceRuntime without a second read.
+// Returns ErrNotFound when the app is gone.
+func (s *PgStore) SetAppWorkloadClass(ctx context.Context, appID string, class WorkloadClass, source string) (App, error) {
+	_ = source // metadata only — see comment above
+	if class == "" {
+		return App{}, ErrInvalidArgument
+	}
+	var a App
+	row := s.pool.QueryRow(ctx,
+		`update apps set workload_class = $2 where id = $1
+		 returning `+appsSelectColumns,
+		appID, string(class))
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, err
+	}
+	return a, nil
+}
+
 // RenameApp changes an app's slug atomically (issue #63). The UPDATE
 // is scoped to (account_id, oldSlug, status<>'deleted') so a wrong
 // accountID or unknown slug returns ErrNotFound via mapErr → pgx.ErrNoRows.

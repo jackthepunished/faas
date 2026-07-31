@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -3630,5 +3631,122 @@ func TestMem_ApplyProjectPlan_FreePlanDowngradeKeepsExistingCrons(t *testing.T) 
 	}
 	if cronCount != 1 {
 		t.Errorf("legacy cron count = %d, want 1 (zero-cron apply must not prune)", cronCount)
+	}
+}
+
+// --- SetAppWorkloadClass (ADR-051 Phase 4 PR-B parity) ----------------
+
+// memSeedClassApp creates one Pro-plan app for the SetAppWorkloadClass
+// parity tests. Mirrors the pgtest-injection style of seedAppForClass
+// in pgstore_set_workload_class_test.go so the two suites can be
+// read side-by-side.
+func memSeedClassApp(t *testing.T, ctx context.Context, m *MemStore, email string) App {
+	t.Helper()
+	acc, err := m.CreateAccount(ctx, email, api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	limits := api.MustLimitsFor(api.PlanPro)
+	a, err := m.CreateAppIfUnderQuota(ctx, App{
+		AccountID:      acc.ID,
+		Slug:           "class-mem-" + email,
+		Type:           AppTypeFunction,
+		Runtime:        "node22",
+		RAMMB:          256,
+		MaxConcurrency: 5,
+		IdleTimeoutS:   60,
+		Status:         AppActive,
+		WorkloadClass:  WorkloadClassHTTP,
+	}, limits)
+	if err != nil {
+		t.Fatalf("CreateAppIfUnderQuota: %v", err)
+	}
+	return a
+}
+
+func TestMemStore_SetAppWorkloadClass_RoundTrip(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "rt@x.test")
+
+	cases := []WorkloadClass{
+		WorkloadClassHTTP, WorkloadClassGraphQL, WorkloadClassGRPC,
+		WorkloadClassJob, WorkloadClassWorker,
+	}
+	for _, want := range cases {
+		got, err := m.SetAppWorkloadClass(ctx, a.ID, want, "scan_hint")
+		if err != nil {
+			t.Fatalf("SetAppWorkloadClass(%s) = %v, want nil", want, err)
+		}
+		if got.WorkloadClass != want {
+			t.Errorf("SetAppWorkloadClass(%s) round-trip = %q, want %q",
+				want, got.WorkloadClass, want)
+		}
+		if got.ID != a.ID {
+			t.Errorf("returned ID=%q, want %q", got.ID, a.ID)
+		}
+	}
+}
+
+func TestMemStore_SetAppWorkloadClass_EmptyClass_FastFail(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "empty@x.test")
+
+	_, err := m.SetAppWorkloadClass(ctx, a.ID, WorkloadClass(""), "manual")
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("SetAppWorkloadClass(\"\") = %v, want ErrInvalidArgument", err)
+	}
+	// Read-back must NOT have mutated the row.
+	got, err := m.AppByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.WorkloadClass != a.WorkloadClass {
+		t.Errorf("empty-class update mutated WorkloadClass = %q, want original %q",
+			got.WorkloadClass, a.WorkloadClass)
+	}
+}
+
+func TestMemStore_SetAppWorkloadClass_AppMissing(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	_, err := m.SetAppWorkloadClass(ctx,
+		"00000000-0000-0000-0000-000000000000", WorkloadClassHTTP, "observed")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetAppWorkloadClass on missing app = %v, want ErrNotFound", err)
+	}
+}
+
+// Parallel Sets on the same row in MemStore must converge (the PgStore
+// suite proves the SQL path; this proves the mutex path). Last-writer-
+// wins is fine — anything else indicates a torn write inside the lock.
+func TestMemStore_SetAppWorkloadClass_ParallelSameRow(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "par@x.test")
+
+	var wg sync.WaitGroup
+	const N = 8
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := m.SetAppWorkloadClass(ctx, a.ID, WorkloadClassWorker, "observed"); err != nil {
+				t.Errorf("parallel Set %d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := m.AppByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.WorkloadClass != WorkloadClassWorker {
+		t.Errorf("final WorkloadClass = %q, want worker", got.WorkloadClass)
 	}
 }
