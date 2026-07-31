@@ -412,7 +412,7 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 
 **Operator runbook pointers:**
 
-- Per-component verification scripts live in `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297) and `docs/runbooks/gate-a.md` (G.1, Gate-A active-passive adoption).
+- Per-component verification scripts live in `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297 — **TBD**, not yet written) and `docs/runbooks/gate-a.md` (G.1, Gate-A active-passive adoption).
 - Admin surface row-by-row CRUD: `apid GET/POST/DELETE /v1/compute-nodes` (ADR-029 v1.1).
 - Cross-box gRPC dial: `pkg/wire.DialContext` (ADR-025 axis 1).
 
