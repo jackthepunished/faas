@@ -604,6 +604,15 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
 
+	// Projects (ADR-050, Phase 3). Two routes — /scan is dry-run
+	// (no writes), / is the transactional apply. Both are deploy-
+	// write scoped; / is wrapped in s.idempotent so retries are
+	// safe. The middleware order is the same as POST /v1/crons so
+	// a Free plan customer gets the same 402/403 surfaces for
+	// over-quota on /apply.
+	mux.HandleFunc("POST /v1/projects/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.scanProject))))
+	mux.HandleFunc("POST /v1/projects", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.applyProject)))))
+
 	// Alert rules (ADR-045 / issue #396 PR 3).
 	// CRUD surface under /v1/apps/{slug}/alerts. The rotate-secret
 	// action verb is the literal `/rotate-secret` segment (Go 1.22+

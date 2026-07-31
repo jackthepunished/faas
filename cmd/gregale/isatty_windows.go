@@ -13,6 +13,8 @@
 // `golang.org/x/term.IsTerminal`, which already does this dance).
 package main
 
+import "os"
+
 // stdoutIsTTY always reports false on Windows. See file header.
 // Defined here (with a `//go:build windows` tag) so it shadows the
 // unix implementation in isatty_unix.go on a Windows build.
@@ -20,5 +22,22 @@ func stdoutIsTTY() bool {
 	if testOnlyTTY != nil {
 		return *testOnlyTTY
 	}
+	return false
+}
+
+// stdinIsTTY mirrors stdoutIsTTY on windows — always false. Same
+// justification: gregale.exe is not a supported runtime, so the
+// prompt path always falls back to the `--yes` / non-TTY shape.
+func stdinIsTTY() bool {
+	if testOnlyTTY != nil {
+		return *testOnlyTTY
+	}
+	return false
+}
+
+// termIsTerminal is the unconditional cross-fd probe. Always false
+// on windows — the same logic as stdinIsTTY / stdoutIsTTY. Mirrors
+// the unix implementation in isatty_unix.go.
+func termIsTerminal(_ *os.File) bool {
 	return false
 }

@@ -44,9 +44,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -517,6 +519,104 @@ func (c *Client) RenameApp(ctx context.Context, oldSlug, newSlug string) (AppRes
 // DeleteApp removes an app.
 func (c *Client) DeleteApp(ctx context.Context, slug string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug, nil, nil)
+}
+
+// ScanProject ships a source tarball to the dry-run endpoint. The
+// response carries the discovered workloads, managed services,
+// derived scan_source, and a plan_token that ApplyProjectPlan can
+// echo back on the same multipart body to skip the second extract
+// in the interactive flow. No writes — POST /v1/projects/scan.
+func (c *Client) ScanProject(
+	ctx context.Context,
+	source io.Reader, sourceName, projectSlug, productionBranch string,
+	installID int64, only []string,
+) (PlanResponse, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only); err != nil {
+		return PlanResponse{}, fmt.Errorf("build multipart: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/projects/scan", &b)
+	if err != nil {
+		return PlanResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	var out PlanResponse
+	return out, c.doReq(c.uploadHTTP(), req, &out)
+}
+
+// ApplyProjectPlan ships the same multipart body as ScanProject
+// plus a plan_token query parameter to /v1/projects. The token is
+// optional — pass "" to force a fresh extract + scan + quota check
+// on the server. On over-quota the response carries the matching
+// 402/403 RFC 7807 problem with zero rows inserted.
+func (c *Client) ApplyProjectPlan(
+	ctx context.Context,
+	planToken string,
+	source io.Reader, sourceName, projectSlug, productionBranch string,
+	installID int64, only []string,
+) (ApplyResponse, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	if err := writeProjectMultipartFields(w, source, sourceName, projectSlug, productionBranch, installID, only); err != nil {
+		return ApplyResponse{}, fmt.Errorf("build multipart: %w", err)
+	}
+	endpoint := c.baseURL + "/v1/projects"
+	if planToken != "" {
+		endpoint += "?plan_token=" + url.QueryEscape(planToken)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, &b)
+	if err != nil {
+		return ApplyResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Idempotency-Key", newUUIDv4())
+	var out ApplyResponse
+	return out, c.doReq(c.uploadHTTP(), req, &out)
+}
+
+// writeProjectMultipartFields serializes the multipart body shared
+// by ScanProject + ApplyProjectPlan. The fields exactly mirror the
+// OpenAPI ProjectScanRequest schema (the spec-compliance AST gate
+// enforces the field-for-field mapping).
+func writeProjectMultipartFields(
+	w *multipart.Writer, source io.Reader, sourceName, projectSlug,
+	productionBranch string, installID int64, only []string,
+) error {
+	fw, err := w.CreateFormFile("source", sourceName)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(fw, source); err != nil {
+		return err
+	}
+	if projectSlug != "" {
+		if err := w.WriteField("project_slug", projectSlug); err != nil {
+			return err
+		}
+	}
+	if productionBranch != "" {
+		if err := w.WriteField("production_branch", productionBranch); err != nil {
+			return err
+		}
+	}
+	if installID > 0 {
+		if err := w.WriteField("install_id", fmt.Sprintf("%d", installID)); err != nil {
+			return err
+		}
+	}
+	if len(only) > 0 {
+		if err := w.WriteField("only", strings.Join(only, ",")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ChangePlan changes the account's subscription tier.

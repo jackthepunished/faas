@@ -265,6 +265,15 @@ func cmdDeployTarball(args []string) int {
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
+	// Phase 3 (repo decomposition) — one-key provision flags. Presence
+	// of --only or --project-slug short-circuits the existing CreateApp
+	// + DeployTarball path and routes through ScanProject →
+	// ApplyProjectPlan. --yes / --json are absorbed by the global
+	// json_flag.go layer and live alongside the others so a single
+	// `gregale deploy --tarball X --yes --json --project-slug S` works.
+	yes := fs.Bool("yes", false, "skip the apply confirmation prompt")
+	deployOnly := fs.String("only", "", "comma-separated workload names to apply (triggers one-key provision)")
+	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -280,6 +289,13 @@ func cmdDeployTarball(args []string) int {
 	if *repo != "" {
 		if err := validateRepoSlug(*repo); err != nil {
 			return printErr("Invalid --repo", err)
+		}
+		// Phase 3 guard: --repo is the dashboard browser flow; the
+		// one-key provision surface takes --tarball/--path, not
+		// --repo. Mixing them is almost always a mistake.
+		if *deployOnly != "" || *projectSlug != "" {
+			PrintFail(os.Stderr, "--repo cannot be combined with --only or --project-slug")
+			return 1
 		}
 		return cmdDeployRepo(slug, *repo)
 	}
@@ -367,6 +383,65 @@ func cmdDeployTarball(args []string) int {
 		return printErr("Not logged in", err)
 	}
 	ctx := context.Background()
+
+	// Phase 3 (repo decomposition) one-key provision path. Triggered
+	// by --only or --project-slug on a --tarball / --template / zero-config
+	// pack. The plan is fetched via ScanProject, the apply is
+	// transactional on the server (rollback on over-quota per
+	// ADR-050), and the confirm prompt is gated on TTY + --yes.
+	if *deployOnly != "" || *projectSlug != "" {
+		// Make sure the tarball resolves the same way it does for
+		// the legacy path: --template materialises, zero-config packs
+		// $PWD. The block above already populated *tarball in those
+		// cases; if it's still empty, we have no source.
+		if *tarball == "" {
+			return printErr("One-key provision requires --tarball, --template, or a TTY cwd",
+				errors.New("no source resolved"))
+		}
+		openTarball, err := openCustomerFile(*tarball)
+		if err != nil {
+			return printErr("Could not open tarball", err)
+		}
+		defer func() { _ = openTarball.Close() }()
+		prodBranch := "main"
+		plan, err := client.ScanProject(ctx, openTarball, filepath.Base(*tarball),
+			*projectSlug, prodBranch, 0, splitCSV(*deployOnly))
+		if err != nil {
+			return printErr("Scan failed", err)
+		}
+		if !plan.CanApply {
+			if jsonOutput {
+				return jsonOut(writeJSONProblem(planProblem(plan)))
+			}
+			printPlanText(osStdout, plan)
+			return printErr("Plan is not applicable on this plan", errors.New("over-quota or unsupported configuration"))
+		}
+		if !*yes && !jsonOutput && stdoutIsTTY() && stdinIsTTY() {
+			if !confirmPlan(osStdout, os.Stdin, plan) {
+				return printErr("Aborted by user", errors.New("user declined at the confirm prompt"))
+			}
+		}
+		// Re-open because the previous reader consumed the body.
+		// openCustomerFile is the same helper used in the scan call
+		// above; it's the documented path for any CLI-supplied tarball
+		// (Lstat + symlink-follow guard).
+		openTarball2, err := openCustomerFile(*tarball)
+		if err != nil {
+			return printErr("Could not reopen tarball", err)
+		}
+		defer func() { _ = openTarball2.Close() }()
+		apply, err := client.ApplyProjectPlan(ctx, plan.PlanToken, openTarball2, filepath.Base(*tarball),
+			*projectSlug, prodBranch, 0, splitCSV(*deployOnly))
+		if err != nil {
+			return printErr("Apply failed", err)
+		}
+		if jsonOutput {
+			return jsonOut(writeJSON(apply))
+		}
+		PrintOK(osStdout, "Created project %s with %d app(s) and %d cron(s)",
+			apply.ProjectID, len(apply.Apps), len(plan.Crons))
+		return 0
+	}
 
 	if _, err := client.CreateApp(ctx, api.CreateAppRequest{Slug: slug}); err != nil {
 		var ae *APIError

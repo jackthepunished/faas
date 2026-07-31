@@ -1111,6 +1111,126 @@ func (m *MemStore) SetProjectScanSource(_ context.Context, projectID string, src
 	return p, nil
 }
 
+// ApplyProjectPlan — Phase 3 transactional seam. Mirrors the
+// CreateAppIfUnderQuota critical section but inlines the count +
+// insert for project + apps + crons inside one Tx so the apid
+// "one keypress" path either lands the whole set or nothing.
+func (m *MemStore) ApplyProjectPlan(
+	_ context.Context,
+	project Project,
+	apps []App,
+	crons []Cron,
+	limits api.Limits,
+) (Project, []App, []Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 1. Account exists.
+	if _, ok := m.accounts[project.AccountID]; !ok {
+		return Project{}, nil, nil, ErrNotFound
+	}
+
+	// 2. Project slug collision guard.
+	for _, p := range m.projects {
+		if p.AccountID == project.AccountID && p.Slug == project.Slug {
+			return Project{}, nil, nil, ErrConflict
+		}
+	}
+
+	// 3. Count current deployed apps (mirror CreateAppIfUnderQuota).
+	observedApps := 0
+	for _, a := range m.apps {
+		if a.AccountID == project.AccountID && a.Status != AppDeleted &&
+			(a.Status == AppActive || a.Status == AppEvictedCold) {
+			observedApps++
+		}
+	}
+	if observedApps+len(apps) > limits.DeployedApps {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:     QuotaErrorKindApps,
+			Limit:    limits.DeployedApps,
+			Observed: observedApps + len(apps),
+		}
+	}
+
+	// 4. Free-plan cron guard + cron quota check.
+	if len(crons) > 0 && limits.CronLimitPerAccount == 0 {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:       QuotaErrorKindCrons,
+			NotAllowed: true,
+		}
+	}
+	observedCrons := 0
+	for _, c := range m.crons {
+		for _, a := range m.apps {
+			if c.AppID == a.ID && a.AccountID == project.AccountID && a.Status != AppDeleted {
+				observedCrons++
+				break
+			}
+		}
+	}
+	if observedCrons+len(crons) > limits.CronLimitPerAccount {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:     QuotaErrorKindCrons,
+			Limit:    limits.CronLimitPerAccount,
+			Observed: observedCrons + len(crons),
+		}
+	}
+
+	// 5. Insert project.
+	if project.ID == "" {
+		project.ID = uuid.NewString()
+	}
+	now := time.Now()
+	if project.CreatedAt.IsZero() {
+		project.CreatedAt = now
+	}
+	project.UpdatedAt = now
+	if project.ScanSource == "" {
+		project.ScanSource = ProjectScanSourceUnknown
+	}
+	m.projects[project.ID] = project
+
+	// 6. Insert apps. The apply handler resolves crons[i].AppID
+	// against the just-inserted apps — callers see the same Cron
+	// shape CreateCronIfUnderQuota produces (AppID populated, ID
+	// empty). We persist whatever AppID is set; overwriting here
+	// would force callers to learn the apply internal sequencing.
+	insertedApps := make([]App, 0, len(apps))
+	for _, a := range apps {
+		if a.ID == "" {
+			a.ID = uuid.NewString()
+		}
+		a.AccountID = project.AccountID
+		a.ProjectID = project.ID
+		if a.Status == "" {
+			a.Status = AppActive
+		}
+		a.CreatedAt = now
+		m.apps[a.ID] = a
+		insertedApps = append(insertedApps, a)
+	}
+
+	// 7. Insert crons (AppID is the caller's responsibility to set
+	// against the freshly inserted apps). Empty AppID is treated
+	// as "deferred" — the apply handler resolves the workload-name
+	// → ID map from the returned insertedApps and re-inserts via
+	// CreateCron. Quota is already enforced in step 6 so a deferred
+	// cron cannot bypass it.
+	insertedCrons := make([]Cron, 0, len(crons))
+	for _, c := range crons {
+		if c.AppID == "" {
+			continue
+		}
+		c.ID = uuid.NewString()
+		c.CreatedAt = now
+		m.crons[c.ID] = c
+		insertedCrons = append(insertedCrons, c)
+	}
+
+	return project, insertedApps, insertedCrons, nil
+}
+
 // --- Apps -------------------------------------------------------------------
 
 func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
