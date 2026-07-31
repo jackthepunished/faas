@@ -164,3 +164,80 @@ func TestBuildEnv_FourLayerPrecedence(t *testing.T) {
 		t.Errorf("BuildEnv 4-layer precedence = %v, want %v", got, want)
 	}
 }
+
+// TestStampOverridePortEnv_AppendsLast pins issue #460 / ADR-053
+// (PR-C): the platform contract for the per-deployment override port
+// must reach the runner as PORT=<port>, appended AFTER BuildEnv so
+// a customer-set PORT in manifest env, apiEnv, or sealed secrets
+// cannot accidentally override the contract. The helper is the
+// thin shell around the production runAppWithEnv's append — both
+// paths share the same line, so this test pins the production
+// behavior without launching the customer's process.
+func TestStampOverridePortEnv_AppendsLast(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      []string
+		port     int
+		wantLast string
+	}{
+		{
+			name:     "zero port → PORT=0 (the 0→8080 resolution lives in m.EffectivePort(), not here)",
+			env:      []string{"PATH=/usr/bin", "HOME=/root"},
+			port:     0,
+			wantLast: "PORT=0",
+		},
+		{
+			name:     "explicit 9090",
+			env:      []string{"PATH=/usr/bin"},
+			port:     9090,
+			wantLast: "PORT=9090",
+		},
+		{
+			name:     "explicit 3000",
+			env:      nil,
+			port:     3000,
+			wantLast: "PORT=3000",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StampOverridePortEnv(tt.env, tt.port)
+			if len(got) != len(tt.env)+1 {
+				t.Fatalf("StampOverridePortEnv len = %d, want %d", len(got), len(tt.env)+1)
+			}
+			// Appended LAST (defense against any layer that earlier
+			// injected a PORT key — this helper is the platform
+			// contract).
+			if got[len(got)-1] != tt.wantLast {
+				t.Errorf("last env = %q, want %q", got[len(got)-1], tt.wantLast)
+			}
+			// Earlier entries preserved.
+			for i, e := range tt.env {
+				if got[i] != e {
+					t.Errorf("entry %d = %q, want %q", i, got[i], e)
+				}
+			}
+		})
+	}
+}
+
+// TestStampOverridePortEnv_AppendsAfterManifestPort pins the
+// precedence invariant: even when BuildEnv put PORT=9090 (from a
+// customer image's manifest env), StampOverridePortEnv appends the
+// resolved platform port LAST, so the platform contract is the
+// final entry on the wire. Execve semantics treat the slice as a
+// bag of KEY=VALUE pairs (last-write-wins per key); the appended
+// position is the strongest guarantee the platform has against a
+// later layer accidentally re-introducing a PORT key.
+func TestStampOverridePortEnv_AppendsAfterManifestPort(t *testing.T) {
+	m := api.AppManifest{Env: map[string]string{"PORT": "9090"}}
+	merged := BuildEnv([]string{"PATH=/usr/bin"}, m)
+	// Customer wrote 9090 via manifest env. Platform contract is
+	// EffectivePort()=8080 here (Port=0 falls back). The helper
+	// appends "PORT=8080" AFTER the merged slice, so the last
+	// entry on the wire is the platform value.
+	out := StampOverridePortEnv(merged, 8080)
+	if out[len(out)-1] != "PORT=8080" {
+		t.Errorf("last PORT = %q, want PORT=8080 (platform contract)", out[len(out)-1])
+	}
+}

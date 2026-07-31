@@ -66,6 +66,13 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// new callers must always populate this.
 		Plan:      api.Plan(req.GetPlan()),
 		AccountID: req.GetAccountId(),
+		// Issue #460 / ADR-053 (PR-C): per-deployment override
+		// port copied from app.GetPort(). The host's waitReady +
+		// DNAT stay fixed on 8080 (ADR-009 +
+		// guest/init/portnorm_linux.go); vmmd's forwarder uses
+		// this port to dial the guest. 0 = legacy 8080 default
+		// at the buildBridgeScript boundary.
+		Port: int(app.GetPort()),
 	}
 	if snap != nil {
 		// #96 / ADR-025 axis 2 (slice 3) — mem_path is gone from the
@@ -136,6 +143,10 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// and the throttle counter labels are populated.
 		Plan:      api.Plan(req.GetPlan()),
 		AccountID: req.GetAccountId(),
+		// Issue #460 / ADR-053 (PR-C): see toWakeRequest for
+		// rationale. Cold-boot mirrors the port so deploy's
+		// first boot primes the same per-deployment override.
+		Port: int(app.GetPort()),
 	}, nil
 }
 

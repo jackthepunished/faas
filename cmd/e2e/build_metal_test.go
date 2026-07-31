@@ -413,6 +413,61 @@ func postMultipartDeployment(t *testing.T, h *e2etest.Harness, key, slug string,
 	return raw, resp.StatusCode
 }
 
+// postMultipartDeploymentWithOverrides is the issue #460 / ADR-053
+// (PR-C) variant of postMultipartDeployment. It stamps an optional
+// `overrides` JSON form-field onto the multipart body so the test
+// can pin per-deployment Overrides.Port (and any future field from
+// the same struct). Nil overrides = behaves exactly like the
+// non-overrides helper above.
+//
+// Kept in this file next to postMultipartDeployment so the multipart
+// shape stays in one place; apid's createDeployment handler parses
+// the `overrides` field as JSON into pkg/api.CreateDeploymentOverrides.
+func postMultipartDeploymentWithOverrides(t *testing.T, h *e2etest.Harness, key, slug string, sourceTar []byte, isDockerfile bool, ov *api.CreateDeploymentOverrides) ([]byte, int) {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	srcPart, err := mw.CreateFormFile("source", "src.tar.gz")
+	if err != nil {
+		t.Fatalf("multipart CreateFormFile: %v", err)
+	}
+	if _, err := srcPart.Write(sourceTar); err != nil {
+		t.Fatalf("multipart Write source: %v", err)
+	}
+	if isDockerfile {
+		if err := mw.WriteField("dockerfile", "1"); err != nil {
+			t.Fatalf("multipart WriteField dockerfile: %v", err)
+		}
+	}
+	if ov != nil {
+		ovJSON, mErr := json.Marshal(ov)
+		if mErr != nil {
+			t.Fatalf("marshal overrides: %v", mErr)
+		}
+		if err := mw.WriteField("overrides", string(ovJSON)); err != nil {
+			t.Fatalf("multipart WriteField overrides: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("multipart Close: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("%s/v1/apps/%s/deployments", h.APIDURL, slug), &body)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := h.HTTPClient().Do(req)
+	if err != nil {
+		t.Fatalf("deploy POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	return raw, resp.StatusCode
+}
+
 // parseQueuedDeployment extracts the deployment ID and build ID from a
 // CreateDeploymentResponse. apid writes both into the JSON body when
 // the deploy is queued (kind=tarball/dockerfile), but the response type

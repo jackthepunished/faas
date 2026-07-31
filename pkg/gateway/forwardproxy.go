@@ -113,13 +113,19 @@ func safeLogField(s string) string {
 // when the inbound request is cancelled (client disconnect). nil
 // means "no special cancellation"; we still wire the inbound ctx to
 // the bridge call so the standard http.Server cancellation works.
-func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(nodeID string) http.Handler {
+//
+// PR-C (issue #460 / ADR-053): the returned closure receives the
+// full Target so the per-deployment override port (Target.Port) can
+// be stamped onto ForwardHTTPRequest.port. vmmd's bridge resolves
+// port=0 to netns.AppPort (8080) so legacy cached targets keep
+// working bit-for-bit.
+func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return func(nodeID string) http.Handler {
+	return func(t Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fwdOnce(w, r, nodes, log, nodeID)
+			fwdOnce(w, r, nodes, log, t)
 		})
 	}
 }
@@ -129,16 +135,16 @@ func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(nodeI
 // is the only panic-safety net — if a future maintainer adds a step
 // that panics on a malformed request, we still observe the request
 // via slog instead of crashing the listener.
-func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, nodeID string) {
+func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Error("gateway: forwarder panic",
-				"node", nodeID, "err", fmt.Sprintf("%v", rec))
+				"node", t.NodeID, "err", fmt.Sprintf("%v", rec))
 			http.Error(w, "internal error", http.StatusInternalServerError)
 		}
 	}()
 
-	if nodeID == "" {
+	if t.NodeID == "" {
 		// Defensive: an empty node id would mean the routing cache
 		// evicted between Target() and the proxy call. Surface 503 so
 		// the client retries; this should not happen because the
@@ -149,7 +155,7 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 		return
 	}
 
-	cli, closer, ok := nodes.ClientFor(r.Context(), nodeID)
+	cli, closer, ok := nodes.ClientFor(r.Context(), t.NodeID)
 	if !ok {
 		http.Error(w, "node unavailable", http.StatusServiceUnavailable)
 		return
@@ -161,7 +167,7 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 		// Body read failure = a client that disconnected before we
 		// finished buffering. Distinct from the bridge failing because
 		// the bridge hasn't started yet.
-		log.Warn("gateway: body read failed", "node", nodeID, "err", err.Error())
+		log.Warn("gateway: body read failed", "node", t.NodeID, "err", err.Error())
 		http.Error(w, "body read failed", http.StatusBadRequest)
 		return
 	}
@@ -171,6 +177,10 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 		Method:     r.Method,
 		RequestUri: r.URL.RequestURI(),
 		Body:       body,
+		// PR-C (issue #460 / ADR-053): per-deployment override
+		// port the gateway cached at admit time. 0 = legacy 8080
+		// (vmmd's wire boundary defaults 0 to netns.AppPort).
+		Port: uint32(t.Port),
 	}
 	// Sanitised copy for log statements: the wire value keeps the raw
 	// header (vmmd validates UUID shape), the log value strips CR/LF
@@ -197,7 +207,7 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 		// evict the cached target and let the next request re-wake.
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 			log.Warn("gateway: forwarder Unavailable; surfacing 503",
-				"node", nodeID, "instance", logInstance)
+				"node", t.NodeID, "instance", logInstance)
 			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -208,7 +218,7 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 			return
 		}
 		log.Error("gateway: forwarder RPC failed",
-			"node", nodeID, "instance", logInstance,
+			"node", t.NodeID, "instance", logInstance,
 			"err", err.Error())
 		http.Error(w, "forwarder RPC failed", http.StatusBadGateway)
 		return

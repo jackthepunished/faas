@@ -320,7 +320,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// path. Synth traffic is operational (cron, per-minute
 			// sampler), not customer traffic, and would skew the
 			// "what fraction of admissions were local" reading.
-			_, _, _, _, _, err := sched.AdmitInstance(ctx, appID)
+			_, _, _, _, _, _, err := sched.AdmitInstance(ctx, appID)
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -334,7 +334,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// Invocation so schedd can StampInstanceInvocation —
 		// without it the meter's per-instance count lands on 0.
 		invoke: func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
-			instanceID, _, _, err := sched.Wake(ctx, appID)
+			instanceID, _, _, _, err := sched.Wake(ctx, appID)
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}

@@ -83,12 +83,12 @@ func (c *Client) Close() error {
 // Admission denials arrive as an *api.Problem so gateway.writeWakeError
 // maps them straight to the right RFC 7807 status. Satisfies
 // gateway.Scheduler.
-func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, err error) {
+func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error) {
 	resp, err := c.cli.Wake(ctx, &scheddpb.WakeRequest{AppId: appID})
 	if err != nil {
-		return "", "", "", liftErr(err)
+		return "", "", "", 0, liftErr(err)
 	}
-	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), nil
+	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int(resp.GetPort()), nil
 }
 
 // AdmitInstance (issue #168) is the schedule scale-out RPC. Distinct
@@ -113,12 +113,12 @@ func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wa
 //   - err: non-nil only on real admission failures (RAM headroom,
 //     chooser, store). The benign app_concurrency_reached outcome is
 //     never lifted to an error.
-func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, err error) {
+func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error) {
 	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID})
 	if err != nil {
-		return "", "", "", 0, false, liftErr(err)
+		return "", "", "", 0, false, 0, liftErr(err)
 	}
-	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int32(resp.GetMethod()), resp.GetAtCapacity(), nil
+	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int32(resp.GetMethod()), resp.GetAtCapacity(), int(resp.GetPort()), nil
 }
 
 // ReportActivity flushes a batch of last_request_at touches to schedd. Returns
