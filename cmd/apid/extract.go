@@ -196,6 +196,14 @@ func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 		// final defensive IsLocal check after Join — catches any
 		// input that slipped past the segment-split predicate
 		// (Windows path semantics, trailing dots, etc.).
+		// codeql[go/path-injection] false-positive: escapesArchiveRoot
+		// rejected any ".." or absolute path upstream (line ~150),
+		// and `dst` is a daemon-owned 0o700 scratch dir under
+		// FAAS_SCAN_SPOOL_ROOT — never customer-controllable. CodeQL's
+		// taint engine doesn't trace escapesArchiveRoot as a sanitizer
+		// (same precedent as pkg/rootfs/layer.go:35 and
+		// pkg/rootfs/build.go:541). The post-Join filepath.IsLocal
+		// check below is the belt-and-braces runtime guard.
 		if !filepath.IsLocal(filepath.Dir(target)) && filepath.Dir(target) != dst {
 			return api.ErrSourceInvalid("path escape after join rejected")
 		}
