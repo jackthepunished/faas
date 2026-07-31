@@ -188,10 +188,18 @@ func (c *VMMClient) dial(ctx context.Context) (vmmdpb.VmmdClient, error) {
 // keep pkg/imaged KVM/loop-free per spec §Conventions.
 //
 // The fake records the storage keys it was asked to mount and
-// exposes a hook so tests can assert the parent-ref branch
-// invoked vmmd exactly once per row, with the expected key.
+// the mountpoints it was asked to release, and exposes hooks so
+// tests can assert the parent-ref branch invoked vmmd exactly
+// once per row, with the expected key, and ALWAYS paired a
+// release with the mount (review finding — defer-after-error
+// idempotency).
 type fakeVMMClient struct {
 	mountedKeys []string
+	// umountCalls records every UmountParentExt4 invocation so
+	// tests can assert the parent mount is always released, even
+	// on the success path (the §4.6 staging composition is a
+	// defer'd umount).
+	umountCalls int
 	// mountHook lets tests inject an error or a custom mountpoint
 	// path; default returns ("/tmp/faas-parent-fake-<n>", nil).
 	mountHook func(storageKey string) (string, error)
@@ -208,6 +216,7 @@ func (f *fakeVMMClient) MountParentExt4ReadOnly(_ context.Context, storageKey st
 }
 
 func (f *fakeVMMClient) UmountParentExt4(_ context.Context, mountpoint string) error {
+	f.umountCalls++
 	if f.umountHook != nil {
 		return f.umountHook(mountpoint)
 	}

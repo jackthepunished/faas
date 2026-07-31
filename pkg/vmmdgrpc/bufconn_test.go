@@ -19,6 +19,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -736,6 +737,8 @@ func TestMountParentExt4ReadOnly_RejectsEmptyStorageKey(t *testing.T) {
 // through to the Internal branch and bury the diagnosis in the
 // log.
 func TestMountParentExt4ReadOnly_SurfacesUnknownStorageKey(t *testing.T) {
+	// Use the canonical parent key so the allow-list accepts it
+	// and the storage-miss path is exercised.
 	f := &fakeVMM{
 		mountParentFn: func(_ context.Context, _ string) (string, error) {
 			return "", errNotFoundForMount
@@ -743,17 +746,51 @@ func TestMountParentExt4ReadOnly_SurfacesUnknownStorageKey(t *testing.T) {
 	}
 	cli, _ := newServer(t, f)
 	_, err := cli.MountParentExt4ReadOnly(context.Background(),
-		&vmmdpb.MountParentExt4ReadOnlyRequest{StorageKey: "base/never-staged.ext4"})
+		&vmmdpb.MountParentExt4ReadOnlyRequest{StorageKey: "base/runner-base-debian-parent-amd64.ext4"})
 	if err == nil {
 		t.Fatal("expected NotFound error, got nil")
 	}
-	// The fake returns a plain stringErr; toProblem lifts to
-	// Internal (the documented gRPC path for unknown errors).
-	// The load-bearing assertion is that the handler does NOT
-	// return InvalidArgument (the empty-key case) — the wire
-	// code must distinguish "key is wrong" from "key is missing".
-	if code := status.Code(err); code == codes.InvalidArgument {
-		t.Errorf("code = InvalidArgument, want a non-InvalidArgument code so the diagnosis differs from the empty-key branch")
+	if code := status.Code(err); code != codes.NotFound {
+		t.Errorf("code = %v, want codes.NotFound (the load-bearing wire mapping for vmmdmount.ErrNotFound)", code)
+	}
+}
+
+// TestMountParentExt4ReadOnly_RejectsNonParentKey pins the
+// allow-list: non-parent keys (a per-app base key, an arbitrary
+// blob, a layer key) MUST be rejected with InvalidArgument
+// BEFORE the VmmdAPI hook runs. The fake's mountParentFn is
+// left nil; if the handler reaches it, the test panics — the
+// load-bearing assertion is that no fake call happens for a
+// rejected key.
+func TestMountParentExt4ReadOnly_RejectsNonParentKey(t *testing.T) {
+	called := false
+	f := &fakeVMM{
+		mountParentFn: func(_ context.Context, _ string) (string, error) {
+			called = true
+			return "/srv/fc/parent/faas-parent-mnt-x", nil
+		},
+	}
+	cli, _ := newServer(t, f)
+	for _, badKey := range []string{
+		"base/runner-node22-amd64.ext4",        // per-app base
+		"base/runner-python312-amd64.ext4",     // per-app base
+		"layers/foo.ext4",                      // per-deployment layer
+		"snapshots/app-foo/mem.bin",            // snapshot blob
+		"kernel/vmlinux-amd64",                 // kernel artifact
+		"base/runner-base-debian-parent-riscv64.ext4", // unsupported arch
+	} {
+		_, err := cli.MountParentExt4ReadOnly(context.Background(),
+			&vmmdpb.MountParentExt4ReadOnlyRequest{StorageKey: badKey})
+		if err == nil {
+			t.Errorf("key %q: expected InvalidArgument, got nil", badKey)
+			continue
+		}
+		if code := status.Code(err); code != codes.InvalidArgument {
+			t.Errorf("key %q: code = %v, want codes.InvalidArgument", badKey, code)
+		}
+	}
+	if called {
+		t.Error("VmmdAPI.MountParentExt4 was called for a rejected key; the allow-list ran BEFORE the hook")
 	}
 }
 
@@ -829,4 +866,12 @@ func TestUmountParentExt4_PropagatesInternalError(t *testing.T) {
 // NotFound branch — distinct from the bufconn_test-internal
 // errNotLive so a future refactor that flips the wrong variable
 // trips here rather than at every other NotFound assertion.
-var errNotFoundForMount = stringErr("vmmdmount: not found")
+//
+// Wraps vmmdmount.ErrNotFound via fmt.Errorf %w so the
+// handler's errors.Is(err, vmmdmount.ErrNotFound) check
+// (review finding mapping #58) lifts to codes.NotFound. The
+// pre-PR #465 review assertion ("not InvalidArgument") would
+// pass via the default Internal mapping too; the wrap here
+// pins the post-PR #465 contract that NotFound is the
+// load-bearing code.
+var errNotFoundForMount = fmt.Errorf("fake vmm: %w", vmmdmount.ErrNotFound)

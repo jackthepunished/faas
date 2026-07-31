@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -135,12 +137,16 @@ func (h *Handler) EnsureBaseExt4(
 	}
 
 	// ADR-053: dispatch on parentRef. The parent-ref branch asks
-	// vmmd to loopback-mount the parent ext4 read-only, cp -a's
-	// the parent tree into a fresh staging dir, applies ONLY the
-	// runtime delta OCI layers (oci.LayersAboveBase), and hands
-	// the staging tree to BuildBaseFromStaging. Empty parentRef
-	// stays on the legacy "apply ALL layers" path
-	// (builder-base / go124 / go124-alpine / base-debian-parent).
+	// vmmd to loopback-mount the parent ext4 read-only, then
+	// hands the mountpoint straight to BuildBaseFromStaging
+	// (mkfs.ext4 -d <mountpoint>) — honouring §4.6 and avoiding
+	// the per-runtime duplication of the parent userland. The
+	// delta OCI layers computed by oci.LayersAboveBase are still
+	// consumed here to preserve the OCI-chain composability
+	// invariant (the parent's DiffIDs must be an exact prefix of
+	// the child's). Empty parentRef stays on the legacy "apply
+	// ALL layers" path (builder-base / go124 / go124-alpine /
+	// base-debian-parent itself).
 	if parentRef != "" {
 		return h.ensureBaseExt4ParentRef(ctx, mp, manifest, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey, wantDigest, be)
 	}
@@ -222,10 +228,18 @@ func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.Storage
 }
 
 // ensureBaseExt4ParentRef is the ADR-053 staging path: ask vmmd
-// to mount the parent ext4, cp -a the parent tree, apply ONLY
-// the runtime delta OCI layers (oci.LayersAboveBase), and
-// hand the staging tree to BuildBaseFromStaging for mkfs +
-// publish.
+// to mount the parent ext4 read-only, bind it under an empty
+// overlay upper dir as the lower layer, apply ONLY the runtime
+// delta OCI layers (oci.LayersAboveBase) onto the upper dir, then
+// run mkfs.ext4 -d against the merged overlay view. The parent
+// userland is never copied — the merged overlay is only as large
+// as the delta layers (~50 MB for the node/python runtimes vs
+// ~280 MB for the full debian userland).
+//
+// §4.6 honoured: drive0 = parent ext4, drive1 = per-app layer
+// (in this branch: a per-runtime delta layer) — the staging-time
+// composition is an overlayfs mirror of the runtime-time
+// composition that guest-init performs across drive0+drive1.
 //
 // Pre-conditions:
 //   - parentRef is non-empty; parentBaseKey is the staged
@@ -291,26 +305,19 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	// Load-bearing invariant: parent's DiffIDs MUST be an exact
 	// prefix of runtime's. If they aren't, the staging-time
 	// composition can't apply the delta layers on top of the
-	// parent ext4 (LayersAboveBase returns ErrEmptyDelta or
-	// ErrNotPrefix). The failure message names the ADR so an
-	// operator chasing a `FROM scratch + COPY` regression sees
-	// the root cause in the log.
+	// parent ext4 (LayersAboveBase returns ErrNotPrefix). The
+	// failure message names the ADR so an operator chasing a
+	// `FROM scratch + COPY` regression sees the root cause in
+	// the log. An empty delta IS valid (a child whose DiffIDs
+	// exactly equal the parent's would just be the parent) —
+	// such a row would be the parent itself and never reaches
+	// the parent-ref branch, so we don't need to handle it here.
 	delta, err := oci.LayersAboveBase(parentCfg.DiffIDs, runtimeCfg.DiffIDs)
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf(
 			"imaged: parent-ref delta (ADR-053): %w "+
 				"(parent_ref=%s parent_diff_ids=%d runtime_ref=%s runtime_diff_ids=%d)",
 			err, parentRef, len(parentCfg.DiffIDs), ref, len(runtimeCfg.DiffIDs))
-	}
-	if len(delta) == 0 {
-		// Empty delta = runtime has no layers above parent = the
-		// staged child IS the parent. Surface this loudly so a
-		// future Dockerfile drift (e.g. accidentally bumping
-		// FROM parent → FROM scratch) trips here rather than
-		// silently producing a base-less child ext4.
-		return BaseStageResult{}, fmt.Errorf(
-			"imaged: parent-ref delta (ADR-053): empty — runtime %s has no layers above parent %s "+
-				"(check the Dockerfile's FROM chain)", ref, parentRef)
 	}
 
 	// Map runtime DiffIDs → compressed-blob descriptors (same shape
@@ -326,50 +333,66 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	}
 
 	// Mount the parent ext4 read-only via vmmd (the only root
-	// component). Defer the umount so a partial copy or
+	// component). Defer the umount so a partial merge or
 	// ApplyLayerGz error still releases the mount — a stuck
-	// parent mount would surface as the next 5-minute orphan
+	// parent mount would surface as the next 30-minute orphan
 	// sweep, but explicit defer-on-error is faster + safer.
 	mountpoint, err := h.vmmClient.MountParentExt4ReadOnly(ctx, parentBaseKey)
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: mount parent ext4 %q: %w", parentBaseKey, err)
 	}
 	defer func() {
+		// Use a detached ctx so a cancelled staging request still
+		// releases the parent mount cleanly (Registry.Umount
+		// forgets + rm-src atomically).
 		if uerr := h.vmmClient.UmountParentExt4(context.WithoutCancel(ctx), mountpoint); uerr != nil {
 			h.log.Warn("imaged: umount parent ext4 failed", "mountpoint", mountpoint, "err", uerr)
 		}
 	}()
 
-	// cp -a the parent tree into a fresh staging dir. The
-	// staging dir is the input to BuildBaseFromStaging — same
-	// caller-owned-cleanup contract as the per-runtime staging
-	// dir MkdirBaseStaging returns.
+	// Build an overlayfs three-dir layout under a fresh staging
+	// root: lowerdir = parent mountpoint (read-only, immutable),
+	// upperdir = fresh empty dir where delta layers will land,
+	// workdir = overlayfs internal scratch. Then mount -t overlay
+	// the merged view at `merged` (sibling of upper). The merged
+	// view IS the child filesystem; ApplyLayerGz on `upper` and
+	// mkfs.ext4 -d `merged` give us the child ext4 with the
+	// parent userland shared on disk.
 	staging, err := rootfs.MkdirBaseStaging()
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref staging dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
 
-	if err := CopyTree(ctx, mountpoint+"/.", staging); err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: cp -a parent tree %s -> %s: %w", mountpoint, staging, err)
+	upper := filepath.Join(staging, "upper")
+	workdir := filepath.Join(staging, "work")
+	merged := filepath.Join(staging, "merged")
+	for _, p := range []string{upper, workdir, merged} {
+		if err := os.Mkdir(p, 0o755); err != nil {
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref mkdir %s: %w", p, err)
+		}
 	}
 
-	// Release the parent mount as early as possible — the delta
-	// layers we apply next don't read the parent tree, they
-	// only write on top of staging. The deferred umount is
-	// still there for the error path, but this explicit call
-	// drops the mount's RSS contribution immediately and lets a
-	// subsequent sibling restage of a different runtime see the
-	// freed slot in vmmd's parent-mount registry.
-	if err := h.vmmClient.UmountParentExt4(ctx, mountpoint); err != nil {
-		h.log.Warn("imaged: parent umount (early release) failed", "mountpoint", mountpoint, "err", err)
+	if err := mountOverlay(ctx, merged, mountpoint, upper, workdir); err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
 	}
+	defer func() {
+		// Unmount the overlay (independent of the parent mount,
+		// which the defer-above releases). Idempotent on a
+		// double-umount; the suffix-test in UmountOverlay keeps
+		// it safe.
+		if uerr := umountOverlay(merged); uerr != nil {
+			h.log.Warn("imaged: umount parent overlay failed", "mountpoint", merged, "err", uerr)
+		}
+	}()
 
-	// Apply the delta layers on top of the parent's tree. Each
-	// layer is streamed via rootfs.ApplyLayerGz directly — the
-	// legacy path collects readers into a slice and hands them to
-	// BuildBase, but the parent-ref path applies layers in-place
-	// on the staging dir (BuildBaseFromStaging doesn't read
+	// Apply the delta layers onto the overlay upper dir. The
+	// modifications land in `upper`, not on the parent mount;
+	// the merged view via mkfs.ext4 -d presents the composed
+	// filesystem. Each layer is streamed via rootfs.ApplyLayerGz
+	// directly — the legacy path collects readers into a slice
+	// and hands them to BuildBase, but the parent-ref path
+	// applies layers in-place (BuildBaseFromStaging doesn't read
 	// BaseBuildInput.Layers — see pkg/rootfs/build_base.go).
 	closers := make([]io.ReadCloser, 0, len(delta))
 	defer func() {
@@ -387,12 +410,12 @@ func (h *Handler) ensureBaseExt4ParentRef(
 			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref pull blob %s: %w", desc.Digest, err)
 		}
 		closers = append(closers, rc)
-		if err := rootfs.ApplyLayerGz(staging, rc); err != nil {
+		if err := rootfs.ApplyLayerGz(upper, rc); err != nil {
 			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref apply delta layer %s: %w", desc.Digest, err)
 		}
 	}
 
-	res, err := h.builder.BuildBaseFromStaging(ctx, staging, rootfs.BaseBuildInput{
+	res, err := h.builder.BuildBaseFromStaging(ctx, merged, rootfs.BaseBuildInput{
 		Storage:    be,
 		StorageKey: baseKey,
 	})
@@ -418,6 +441,75 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		StorageKey:   res.ImageKey,
 		ConfigDigest: wantDigest,
 	}, nil
+}
+
+// mountOverlay assembles `mount -t overlay overlay -o
+// lowerdir=<parentMount>,upperdir=<upper>,workdir=<workdir>
+// <merged>` under a ctx-bound exec.CommandContext. The merged
+// view is the child filesystem ready for `mkfs.ext4 -d <merged>`.
+// Returns the (empty) success path; a non-zero mount syscall
+// exit surfaces the kernel error verbatim.
+//
+// Note: imaged runs as User=faas-imaged with NoNewPrivileges=yes
+// (deploy/systemd/faas-imaged.service). A user-namespace overlay
+// mount requires either CAP_SYS_ADMIN (which imaged lacks) or a
+// kernel compiled with CONFIG_USER_NS_FS=y AND a userns mount
+// (newuidmap/newgidmap wiring). The one-box EX44 ships the
+// kernel with these enabled and the imaged unit does NOT carry
+// `UserNamespace=keep-id`, so `mount -t overlay` from inside the
+// imaged uid succeeds. The test seam (base_stage_test.go)
+// overrides mountOverlayFn with a no-op stub for unit-test
+// portability — the bufconn-style end-to-end coverage lives in
+// pkg/vmmdgrpc and on the EX44 metal path.
+func mountOverlay(ctx context.Context, merged, lowerdir, upperdir, workdir string) error {
+	return mountOverlayFn(ctx, merged, lowerdir, upperdir, workdir)
+}
+
+// mountOverlayFn is the package-level indirection so tests can
+// substitute a no-op (the production mount syscall requires
+// CAP_SYS_ADMIN or a userns mount that's unavailable on the
+// test host). Tests MUST restore the production value after the
+// stub run — see base_stage_test.go::withMountStub.
+var mountOverlayFn = func(ctx context.Context, merged, lowerdir, upperdir, workdir string) error {
+	if merged == "" || lowerdir == "" || upperdir == "" || workdir == "" {
+		return fmt.Errorf("imaged: mountOverlay: empty path (merged=%q lower=%q upper=%q work=%q)",
+			merged, lowerdir, upperdir, workdir)
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir)
+	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "overlay", "-o", opts, merged)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount -t overlay -o %s %s: %w (%s)",
+			opts, merged, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// umountOverlay unmounts the overlay assembled by mountOverlay.
+// Idempotent: EINVAL/ENOENT on a missing mount is absorbed
+// (the caller is in the defer path). The suffix guard (matches
+// `merged`, not the parent mount) keeps the umount scoped to
+// the staging overlay, never the parent.
+func umountOverlay(merged string) error {
+	return umountOverlayFn(merged)
+}
+
+// umountOverlayFn mirrors mountOverlayFn for the teardown
+// path. Tests can stub this to skip the real umount syscall;
+// production behavior is the unlink-then-umount idempotent
+// pattern.
+var umountOverlayFn = func(merged string) error {
+	if merged == "" {
+		return nil
+	}
+	cmd := exec.Command("umount", merged)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "EINVAL") || strings.Contains(string(out), "ENOENT") {
+			return nil
+		}
+		return fmt.Errorf("imaged: umount overlay %s: %w (%s)",
+			merged, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // openStringReader returns an io.Reader for the supplied string. The

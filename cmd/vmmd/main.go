@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 )
@@ -274,6 +275,41 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the same backend (the production PrefixRouter rooted at
 	// /srv/fc).
 	mgr.WithStorage(storageBackend)
+
+	// ADR-053: parent-base loopback registry. Constructed AFTER
+	// WithStorage so Manager.MountParentExt4's storage.Get has a
+	// backend to read from. The cap + max-age + sweep cadence come
+	// from cfg (defaults via pkg/vmmdmount). Without this wiring
+	// every production MountParentExt4ReadOnly RPC short-circuits
+	// to vmmdmount.ErrNotFound (Manager.parentMounts nil guard) —
+	// see review blocker #1.
+	parentReg := vmmdmount.NewRegistry(cfg.ParentMountCap)
+	mgr.SetParentMountRegistry(parentReg)
+	log.Info("vmmd: parent-mount registry wired",
+		"cap", cfg.ParentMountCap,
+		"max_age", cfg.ParentMountMaxAge.String(),
+		"sweep_interval", cfg.ParentSweepInterval.String())
+
+	// Orphan sweep — schedule via a context-bound goroutine that
+	// exits cleanly on ctx.Done. Mirrors the schedd watchdog tick
+	// pattern (1s tick + KillStuck), adapted to the configurable
+	// sweep interval. A tick that fires during shutdown exits
+	// harmlessly because Registry.SweepOrphans is safe on a
+	// partially-drained map.
+	sweepCtx, sweepCancel := context.WithCancel(ctx)
+	defer sweepCancel()
+	go runParentMountSweep(sweepCtx, parentReg, cfg.ParentSweepInterval, log)
+	// Shutdown sweep — registered as a defer BEFORE the gRPC
+	// GracefulStop so a late RPC still gets serviced and the
+	// registry is empty when vmmd exits. Defers run LIFO, so
+	// this fires AFTER gsrv.GracefulStop + httpSrv.Shutdown —
+	// correct order (no late caller waiting on a mountpoint
+	// while we sweep it).
+	defer func() {
+		if n := parentReg.SweepAll(log); n > 0 {
+			log.Info("vmmd: shutdown parent-mount sweep", "n", n)
+		}
+	}()
 
 	// Ops + listener. Resolve the listen target (issue #95): unix://
 	// default, tcp/dns optional; tcp targets require a complete mTLS

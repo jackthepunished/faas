@@ -134,30 +134,39 @@ type VmmdClient interface {
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
 	// NoNewPrivileges=yes per spec §11), so it cannot mount the parent
 	// ext4 itself; vmmd is the only root component and runs the
-	// `mount -o loop,ro` on imaged's behalf. The returned mountpoint
-	// is an absolute host path into a tmpfs mount dir owned by vmmd
-	// — the caller (imaged) is expected to `cp -a <mp>/. <staging>`
-	// and immediately call UmountParentExt4. The mount is read-only
-	// (-o ro) so a child re-stage cannot corrupt the parent. vmmd
-	// tracks the mount in an in-memory registry and sweeps orphans
-	// every 5 minutes + at SIGTERM. Storage_key is the canonical
-	// StorageBackend key (issue #96 / ADR-025 axis 2), e.g.
-	// "base/runner-base-debian-parent-amd64.ext4". Empty storage_key
-	// → InvalidArgument. Unknown storage_key (Get returns
-	// ErrNotFound) → NotFound. vmmd writes the bytes through its
-	// own configured StorageBackend — there is no precedent for
-	// imaged→vmmd dialing; CLAUDE.md is amended (ADR-053) to call
-	// this out as a deliberate exception to "components talk via
-	// Postgres rows + pg_notify, or gRPC on unix sockets in
-	// /run/faas/".
+	// `mount -o loop,ro,nodev,nosuid,noexec` on imaged's behalf. The
+	// returned mountpoint is an absolute host path under
+	// /srv/fc/parent/faas-parent-mnt-<id>/ — shared between vmmd and
+	// imaged because BOTH daemons carry systemd `PrivateTmp=yes`
+	// (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's /tmp is
+	// its own tmpfs, invisible to imaged's mount namespace. The caller
+	// (imaged) §4.6-honours the contract by `mkfs.ext4 -d <mountpoint>`
+	// directly through the read-only loopback mount — no `cp -a`, no
+	// separate staging tree — and immediately calls UmountParentExt4.
+	// The mount is read-only so a child re-stage cannot corrupt the
+	// parent; vmmd tracks the mount in an in-memory registry and
+	// sweeps orphans every ParentMountMaxAge (default 30 min) + at
+	// SIGTERM. Storage_key is the canonical StorageBackend key
+	// (issue #96 / ADR-025 axis 2), e.g.
+	// "base/runner-base-debian-parent-amd64.ext4". Storage_key MUST be
+	// in the parent-base allow-list (sched.IsParentBaseKey — host arch
+	// + sibling for heterogenous clusters); anything else is rejected
+	// with InvalidArgument. Empty storage_key → InvalidArgument.
+	// Unknown storage_key (Get returns ErrNotFound) → NotFound. vmmd
+	// writes the bytes through its own configured StorageBackend —
+	// there is no precedent for imaged→vmmd dialing; CLAUDE.md is
+	// amended (ADR-053) to call this out as a deliberate exception to
+	// "components talk via Postgres rows + pg_notify, or gRPC on unix
+	// sockets in /run/faas/".
 	MountParentExt4ReadOnly(ctx context.Context, in *MountParentExt4ReadOnlyRequest, opts ...grpc.CallOption) (*MountParentExt4ReadOnlyResponse, error)
 	// UmountParentExt4 (ADR-053) releases a mount vmmd previously
 	// returned from MountParentExt4ReadOnly. Idempotent on an
 	// unknown mountpoint — imaged's call-on-error-defer pattern
-	// (cp -a errored → umount anyway) is safe. The mountpoint path
-	// is validated to live under vmmd's parent-mnt scratch dir to
-	// refuse unmounting an unrelated filesystem (defence in depth
-	// against a caller that hands back a path vmmd never issued).
+	// (mkfs.ext4 errored → umount anyway) is safe. The mountpoint
+	// path is validated to live under /srv/fc/parent/faas-parent-mnt-*
+	// (vmmdmount.MountRoot) to refuse unmounting an unrelated
+	// filesystem (defence in depth against a caller that hands back
+	// a path vmmd never issued).
 	UmountParentExt4(ctx context.Context, in *UmountParentExt4Request, opts ...grpc.CallOption) (*UmountParentExt4Response, error)
 }
 
@@ -405,30 +414,39 @@ type VmmdServer interface {
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
 	// NoNewPrivileges=yes per spec §11), so it cannot mount the parent
 	// ext4 itself; vmmd is the only root component and runs the
-	// `mount -o loop,ro` on imaged's behalf. The returned mountpoint
-	// is an absolute host path into a tmpfs mount dir owned by vmmd
-	// — the caller (imaged) is expected to `cp -a <mp>/. <staging>`
-	// and immediately call UmountParentExt4. The mount is read-only
-	// (-o ro) so a child re-stage cannot corrupt the parent. vmmd
-	// tracks the mount in an in-memory registry and sweeps orphans
-	// every 5 minutes + at SIGTERM. Storage_key is the canonical
-	// StorageBackend key (issue #96 / ADR-025 axis 2), e.g.
-	// "base/runner-base-debian-parent-amd64.ext4". Empty storage_key
-	// → InvalidArgument. Unknown storage_key (Get returns
-	// ErrNotFound) → NotFound. vmmd writes the bytes through its
-	// own configured StorageBackend — there is no precedent for
-	// imaged→vmmd dialing; CLAUDE.md is amended (ADR-053) to call
-	// this out as a deliberate exception to "components talk via
-	// Postgres rows + pg_notify, or gRPC on unix sockets in
-	// /run/faas/".
+	// `mount -o loop,ro,nodev,nosuid,noexec` on imaged's behalf. The
+	// returned mountpoint is an absolute host path under
+	// /srv/fc/parent/faas-parent-mnt-<id>/ — shared between vmmd and
+	// imaged because BOTH daemons carry systemd `PrivateTmp=yes`
+	// (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's /tmp is
+	// its own tmpfs, invisible to imaged's mount namespace. The caller
+	// (imaged) §4.6-honours the contract by `mkfs.ext4 -d <mountpoint>`
+	// directly through the read-only loopback mount — no `cp -a`, no
+	// separate staging tree — and immediately calls UmountParentExt4.
+	// The mount is read-only so a child re-stage cannot corrupt the
+	// parent; vmmd tracks the mount in an in-memory registry and
+	// sweeps orphans every ParentMountMaxAge (default 30 min) + at
+	// SIGTERM. Storage_key is the canonical StorageBackend key
+	// (issue #96 / ADR-025 axis 2), e.g.
+	// "base/runner-base-debian-parent-amd64.ext4". Storage_key MUST be
+	// in the parent-base allow-list (sched.IsParentBaseKey — host arch
+	// + sibling for heterogenous clusters); anything else is rejected
+	// with InvalidArgument. Empty storage_key → InvalidArgument.
+	// Unknown storage_key (Get returns ErrNotFound) → NotFound. vmmd
+	// writes the bytes through its own configured StorageBackend —
+	// there is no precedent for imaged→vmmd dialing; CLAUDE.md is
+	// amended (ADR-053) to call this out as a deliberate exception to
+	// "components talk via Postgres rows + pg_notify, or gRPC on unix
+	// sockets in /run/faas/".
 	MountParentExt4ReadOnly(context.Context, *MountParentExt4ReadOnlyRequest) (*MountParentExt4ReadOnlyResponse, error)
 	// UmountParentExt4 (ADR-053) releases a mount vmmd previously
 	// returned from MountParentExt4ReadOnly. Idempotent on an
 	// unknown mountpoint — imaged's call-on-error-defer pattern
-	// (cp -a errored → umount anyway) is safe. The mountpoint path
-	// is validated to live under vmmd's parent-mnt scratch dir to
-	// refuse unmounting an unrelated filesystem (defence in depth
-	// against a caller that hands back a path vmmd never issued).
+	// (mkfs.ext4 errored → umount anyway) is safe. The mountpoint
+	// path is validated to live under /srv/fc/parent/faas-parent-mnt-*
+	// (vmmdmount.MountRoot) to refuse unmounting an unrelated
+	// filesystem (defence in depth against a caller that hands back
+	// a path vmmd never issued).
 	UmountParentExt4(context.Context, *UmountParentExt4Request) (*UmountParentExt4Response, error)
 	mustEmbedUnimplementedVmmdServer()
 }

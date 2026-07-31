@@ -11,6 +11,7 @@ package vmmdgrpc
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
+	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -542,16 +545,29 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 // that lets imaged compose the per-runtime base ext4 from a
 // shared debian:12-slim parent. The handler validates the
 // storage key against the configured StorageBackend, stages
-// the bytes into a tmpfs scratch, loopback-mounts read-only,
-// and registers the mountpoint in the parent-mnt registry for
-// sweep-at-SIGTERM + 5-minute orphan sweep. The actual mount
-// syscall lives in pkg/vmmdgrpc/mount.go to keep this handler
-// ≤50 lines (spec §Conventions).
+// the bytes into /srv/fc/parent/faas-parent-src-* (cmd/vmmd
+// bootstraps the directory with mode 0750 root:faas so the
+// imaged-side MkdirBaseStaging-style operations can read
+// through the resulting loopback mount), loopback-mounts
+// read-only under /srv/fc/parent/faas-parent-mnt-*, and
+// registers the mountpoint in vmmdmount.Registry for sweep-on-
+// SIGTERM + 30-minute orphan sweep.
 //
-// Empty storage_key → InvalidArgument; unknown storage_key →
-// NotFound; storage.Get error → Internal. imaged's defer-after-
-// error pattern relies on UmountParentExt4 being idempotent so
-// the parent is always released — see MountParentRegistry.
+// Validation chain:
+//   1. Empty storage_key → InvalidArgument.
+//   2. Non-parent storage_key → InvalidArgument (allow-list —
+//      a misbehaving caller or a leaked token from another
+//      `faas`-group member cannot read arbitrary storage bytes
+//      through vmmd's loopback mount; the allow-list is the
+//      host-arch + sibling-arch set from sched.IsParentBaseKey).
+//   3. vmm.MountParentExt4 returns vmmdmount.ErrNotFound →
+//      NotFound (the storage backend has no such key — the
+//      load-bearing wire code for imaged's pre-staging checks).
+//   4. Any other error → Internal.
+//
+// imaged's defer-after-error pattern relies on UmountParentExt4
+// being idempotent so the parent is always released — see
+// MountParentRegistry.
 func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountParentExt4ReadOnlyRequest) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
 	const op = "MountParentExt4ReadOnly"
 	start := time.Now()
@@ -562,9 +578,33 @@ func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountP
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
+	// Allow-list check (review finding #4): only the canonical
+	// parent-base storage keys may be loopback-mounted. The set
+	// is per-arch (host + sibling for heterogenous clusters);
+	// see sched.IsParentBaseKey.
+	if !sched.IsParentBaseKey(req.GetStorageKey()) {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"storage_key not in allow-list",
+			"only the canonical parent base ext4 key may be mounted").
+			WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
 	mp, err := s.vmm.MountParentExt4(ctx, req.GetStorageKey())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
+		// Storage-miss → NotFound (load-bearing mapping for
+		// imaged's pre-staging checks). Anything else falls
+		// through to the default Internal mapping via
+		// toProblem.
+		if errors.Is(err, vmmdmount.ErrNotFound) {
+			p := api.NewProblem(int(codes.NotFound), api.CodeNotFound,
+				"storage_key not found",
+				"no artifact under that key in the configured storage backend").
+				WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+			s.ops.Observe(op, time.Since(start), p)
+			return nil, grpcerr.ToStatus(p)
+		}
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	return &vmmdpb.MountParentExt4ReadOnlyResponse{Mountpoint: mp}, nil

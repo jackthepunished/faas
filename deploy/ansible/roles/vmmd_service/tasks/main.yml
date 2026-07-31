@@ -42,6 +42,23 @@
     state: present
     system: true
 
+# ADR-053: parent-base loopback mount scratch dir. vmmd owns the
+# loopback mounts (cmd/vmmd/main.go wires pkg/vmmdmount.Registry)
+# and imaged reads through them, so the directory must be writable
+# by vmmd and traversable by imaged. /srv/fc is already in
+# imaged's ReadWritePaths= (deploy/systemd/faas-imaged.service); the
+# 0750 root:faas mode lets the faas-imaged uid traverse the parent
+# to reach the mountpoint subdirs. Both daemons carry
+# PrivateTmp=yes so /srv/fc is the only cross-namespace shared path
+# that survives systemd's per-daemon tmpfs isolation.
+- name: vmmd_service — ensure /srv/fc/parent exists (ADR-053 mount scratch)
+  ansible.builtin.file:
+    path: /srv/fc/parent
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
 # Tier 1 control-plane mTLS (ADR-052). vmmd on a multi-box
 # compute node is one of the daemons that runs gregale pki
 # init; the operator-side bootstrap lays out

@@ -2095,8 +2095,9 @@ func (x *LogsResponse) GetWrittenAt() *timestamppb.Timestamp {
 // key of the parent base ext4 (issue #96 / ADR-025 axis 2). vmmd
 // resolves the bytes via the same configured StorageBackend the rest
 // of vmmd uses (snapshot publishes, vmstate publishes); staging into
-// a tmpfs scratch + loopback mount happens after the bytes are in
-// hand. Empty → InvalidArgument. Unknown → NotFound.
+// /srv/fc/parent/ + loopback mount happens after the bytes are in
+// hand. Empty → InvalidArgument. Non-parent key (allow-list reject)
+// → InvalidArgument. Unknown → NotFound.
 type MountParentExt4ReadOnlyRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	StorageKey    string                 `protobuf:"bytes,1,opt,name=storage_key,json=storageKey,proto3" json:"storage_key,omitempty"`
@@ -2142,12 +2143,14 @@ func (x *MountParentExt4ReadOnlyRequest) GetStorageKey() string {
 }
 
 // MountParentExt4ReadOnlyResponse returns the absolute host path of
-// the read-only loopback mountpoint. The caller (imaged) treats this
-// as a regular directory tree: `cp -a <mountpoint>/. <staging>`
-// copies the parent tree, then calls UmountParentExt4 to release.
-// The mountpoint lives under vmmd's parent-mnt scratch dir
-// (/tmp/faas-parent-mnt-XXXXXX on Linux; macOS dev skips because
-// vmmd doesn't run there).
+// the read-only loopback mountpoint under
+// /srv/fc/parent/faas-parent-mnt-<id>/. The caller (imaged) §4.6-
+// honours the contract: pass the path straight to `mkfs.ext4 -d
+// <mountpoint>` (no `cp -a`, no separate staging tree) — the parent
+// userland is shared via the read-only loopback mount, the delta
+// layers land on an overlayfs upper dir, and mkfs packs the merged
+// view into the child ext4 without ever copying the parent.
+// Then call UmountParentExt4 to release the parent mount.
 type MountParentExt4ReadOnlyResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Mountpoint    string                 `protobuf:"bytes,1,opt,name=mountpoint,proto3" json:"mountpoint,omitempty"`

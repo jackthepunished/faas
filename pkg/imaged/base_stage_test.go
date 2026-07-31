@@ -363,6 +363,7 @@ func newTwoLayerPuller(t *testing.T) *minimalManifestPuller {
 type callCountingBuilder struct {
 	calls            int
 	fromStagingCalls int // ADR-053: BuildBaseFromStaging invocations
+	fromStagingArgs  []string // ADR-053 §4.6: the staging path passed to BuildBaseFromStaging
 }
 
 func (b *callCountingBuilder) Build(_ context.Context, in rootfs.BuildInput) (rootfs.BuildResult, error) {
@@ -378,14 +379,21 @@ func (b *callCountingBuilder) BuildBase(ctx context.Context, in rootfs.BaseBuild
 	}
 	return rootfs.BaseBuildResult{ImageKey: in.StorageKey}, nil
 }
-func (b *callCountingBuilder) BuildBaseFromStaging(ctx context.Context, _ string, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
+func (b *callCountingBuilder) BuildBaseFromStaging(ctx context.Context, staging string, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
 	// ADR-053: parent-ref branch ends here. Tests that exercise the
 	// legacy path use the callCountingBuilder too; calling
 	// BuildBaseFromStaging must NOT bump BuildBase's call counter
 	// (which is asserted by TestEnsureBaseExt4_PerArchPartition) so
 	// we count parent-ref builds on a separate field. Tests for the
 	// parent-ref branch can branch on fromStagingCalls vs calls.
+	//
+	// fromStagingArgs captures the staging path so a future test
+	// can assert the §4.6 contract: BuildBaseFromStaging must be
+	// called with the merged overlay view (not a copy of the
+	// parent tree) — that's what gives the on-disk dedup the
+	// review called out as missing in PR #465's blocker #3.
 	b.fromStagingCalls++
+	b.fromStagingArgs = append(b.fromStagingArgs, staging)
 	if in.Storage != nil && in.StorageKey != "" {
 		_ = in.Storage.Put(ctx, in.StorageKey, bytes.NewReader([]byte("fake ext4 parent-ref")))
 	}
@@ -856,13 +864,24 @@ type parentHarness struct {
 
 func newParentHarness(t *testing.T) *parentHarness {
 	t.Helper()
+	// Stub the overlay mount syscall so the unit-test runner
+	// doesn't need CAP_SYS_ADMIN or a userns mount. Production
+	// (cmd/imaged running as faas-imaged on the EX44) uses the
+	// real mount syscall; here we just remember the args so the
+	// test can assert the staging composition wired them up
+	// correctly.
+	withMountStub(t)
+
 	be, err := storage.NewLocalStorageBackend(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStorageBackend: %v", err)
 	}
 	mp := newParentRuntimePuller(t)
 	cb := &callCountingBuilder{}
-	// Real tmpdir for the fake mountpoint so cp -a succeeds.
+	// Real tmpdir for the fake mountpoint so BuildBaseFromStaging
+	// has a tree to mkfs over (the stub treats the merged dir as
+	// a pass-through — callCountingBuilder records the staging
+	// path it was handed).
 	mountDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(mountDir, "lib"), []byte("placeholder"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -883,16 +902,42 @@ func newParentHarness(t *testing.T) *parentHarness {
 	return &parentHarness{h: h, be: be, fvm: fvm, cb: cb}
 }
 
+// withMountStub swaps mountOverlayFn / umountOverlayFn for
+// no-op stubs and registers a t.Cleanup that restores the
+// production values. The stubs record the args so a future
+// test can assert the staging composition wired them up
+// correctly; for now they're no-ops because the unit-test
+// runtime doesn't have the kernel support to actually mount
+// overlayfs.
+//
+// Production cmd/imaged does NOT call this — the real mount
+// syscall runs (EX44 has CAP_SYS_ADMIN via the userns mount).
+func withMountStub(t *testing.T) {
+	t.Helper()
+	origMount := mountOverlayFn
+	origUmount := umountOverlayFn
+	mountOverlayFn = func(_ context.Context, _, _, _, _ string) error { return nil }
+	umountOverlayFn = func(_ string) error { return nil }
+	t.Cleanup(func() {
+		mountOverlayFn = origMount
+		umountOverlayFn = origUmount
+	})
+}
+
 // TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly — happy
 // path for the ADR-053 staging branch. The runtime has 2
 // DiffIDs, the parent has 1 (matching the runtime's first).
 // After staging:
-//   - BuildBaseFromStaging called once (the parent-ref mkfs)
-//   - BuildBase NOT called (delta applied in-place, not via
-//     BuildBase's "apply ALL layers" loop)
+//   - BuildBaseFromStaging called once with the merged overlay
+//     path (NOT a separate staging dir — that was the pre-§4.6
+//     `cp -a` flow that produced 5 duplicated Debian images).
+//   - BuildBase NOT called (delta applied in-place on the
+//     overlay upper dir, not via BuildBase's "apply ALL layers"
+//     loop).
 //   - fvm.MountParentExt4ReadOnly invoked exactly once with
-//     the parent base key
-//   - the base ext4 was published under the runtime baseKey
+//     the parent base key; UmountParentExt4 called once on
+//     shutdown path.
+//   - the base ext4 was published under the runtime baseKey.
 func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
 	hs := newParentHarness(t)
 	const baseKey = "base/runner-node22-amd64.ext4"
@@ -914,11 +959,27 @@ func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
 	if hs.cb.fromStagingCalls != 1 {
 		t.Errorf("BuildBaseFromStaging called %d times, want 1", hs.cb.fromStagingCalls)
 	}
+	// §4.6 contract: BuildBaseFromStaging must be called with a
+	// path that ends in "merged" (the overlay merged view). The
+	// pre-§4.6 flow passed a separate staging dir produced by
+	// `cp -a` — that contract would fail this assertion because
+	// the staging path was the parent mountpoint + "/.", not the
+	// merged overlay.
+	if got := hs.cb.fromStagingArgs[0]; filepath.Base(got) != "merged" {
+		t.Errorf("BuildBaseFromStaging staging path = %q (basename %q); want a path ending in /merged (the §4.6 overlay merged view)",
+			got, filepath.Base(got))
+	}
 	if len(hs.fvm.mountedKeys) != 1 {
 		t.Fatalf("MountParentExt4ReadOnly called %d times, want 1", len(hs.fvm.mountedKeys))
 	}
 	if hs.fvm.mountedKeys[0] != "base/runner-base-debian-parent-amd64.ext4" {
 		t.Errorf("mounted with key %q, want base/runner-base-debian-parent-amd64.ext4", hs.fvm.mountedKeys[0])
+	}
+	// UmountParentExt4 must be called on shutdown path even on
+	// the success branch — pinned because a leak here would
+	// surface as the next 30-minute orphan sweep.
+	if hs.fvm.umountCalls != 1 {
+		t.Errorf("UmountParentExt4 called %d times, want 1 (parent mount must always be released)", hs.fvm.umountCalls)
 	}
 	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
 		t.Errorf("base ext4 not published at %s: %v", baseKey, err)

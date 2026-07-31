@@ -1,27 +1,38 @@
 // Package vmmdmount — loopback mount/umount for the ADR-053
 // parent-base staging path. vmmd is the only root component (spec
-// §11) and runs `mount -o loop,ro` on imaged's behalf; imaged
-// (User=faas-imaged + NoNewPrivileges=yes) cannot do this itself.
+// §11) and runs `mount -o loop,ro,nodev,nosuid,noexec` on imaged's
+// behalf; imaged (User=faas-imaged + NoNewPrivileges=yes) cannot
+// do this itself.
 //
 // Architecture:
 //
 //   - MountParentExt4ReadOnly: looks up storageKey via the configured
-//     StorageBackend, stages the bytes into /tmp/faas-parent-src-*,
-//     mkdir's /tmp/faas-parent-mnt-*, mounts -o loop,ro, and
+//     StorageBackend, stages the bytes into
+//     /srv/fc/parent/faas-parent-src-*, mkdir's
+//     /srv/fc/parent/faas-parent-mnt-*, mounts -o loop,ro, and
 //     registers the (mountpoint -> storageKey, mountedAt) pair in
 //     Registry. Returns the mountpoint path; caller reads via
-//     `cp -a` and calls UmountParentExt4.
+//     `mkfs.ext4 -d <mountpoint>` (§4.6 — no cp -a) and calls
+//     UmountParentExt4.
 //   - UmountParentExt4: looks up the mountpoint in the registry,
-//     runs `umount`, removes the registry entry, and rmdir's the
-//     mountpoint. Idempotent on unknown mountpoints so imaged's
-//     defer-after-error pattern is safe.
+//     runs `umount`, removes the registry entry, deletes the staged
+//     source bytes, and rmdir's the mountpoint. Idempotent on
+//     unknown mountpoints so imaged's defer-after-error pattern is
+//     safe.
 //
-// Sweep: Registry.SweepOrphans walks every entry older than 5
-// minutes and force-umounts it. Called from cmd/vmmd's main
-// goroutine on SIGTERM (sync sweep) and on a 5-minute background
-// ticker (orphan sweep). The 5-minute window is generous — a
-// normal cp -a of ~280 MB takes ~10s; a hung imaged child would
-// surface long before the sweep kicks in.
+// MountRoot is /srv/fc/parent/ because both vmmd and imaged run
+// under systemd PrivateTmp=yes (deploy/systemd/faas-{vmmd,imaged}.service)
+// — vmmd's /tmp is its own tmpfs, invisible to imaged's mount
+// namespace. /srv/fc/parent/ is shared (mkdir 0750 root:faas at
+// box bootstrap; imaged's ReadWritePaths already covers /srv/fc).
+//
+// Sweep: Registry.SweepOrphans walks every entry older than
+// ParentMountMaxAge (default 30 min) and force-umounts it. Called
+// from cmd/vmmd's main goroutine on SIGTERM (sync sweep via
+// SweepAll) and on a configurable background ticker (orphan
+// sweep). The 30-minute default is generous — a normal mkfs.ext4
+// -d over ~280 MB of debian userland takes seconds; a hung imaged
+// child would surface long before the sweep kicks in.
 //
 // Why a separate package: pkg/vmmdgrpc imports pkg/fcvm, so
 // pkg/fcvm cannot import pkg/vmmdgrpc without a cycle. Manager
@@ -48,11 +59,36 @@ import (
 // reads back to construct the source path under the same parent.
 const ParentMountPrefix = "faas-parent-"
 
+// MountRoot is the parent directory every parent mount lives
+// under. /srv/fc/parent/ is created at box bootstrap with owner
+// root, group faas, mode 0750; imaged's ReadWritePaths already
+// covers /srv/fc, so the directory is readable for the
+// daemon traversal that mkfs.ext4 -d performs via the read-only
+// loopback mount. Keeping the path off /tmp is load-bearing —
+// both vmmd and imaged carry PrivateTmp=yes in their systemd
+// units (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's
+// /tmp is its own tmpfs invisible to imaged's namespace.
+const MountRoot = "/srv/fc/parent"
+
+// DefaultCap is the registry cap used when NewRegistry is called
+// with cap<=0. 16 matches the worst-case staging parallelism on
+// a one-box fleet (a rebuild + the four child runtimes + headroom).
+const DefaultCap = 16
+
 // ParentMountMaxAge is the orphan-sweep threshold. Anything older
-// than this when SweepOrphans runs is force-umounted. 5 minutes
-// matches the normal-cp window with generous headroom for slow
-// disks / cold caches.
-const ParentMountMaxAge = 5 * time.Minute
+// than this when SweepOrphans runs is force-umounted. The default
+// is generous (30 min) — a normal mkfs.ext4 -d over a ~280 MB
+// debian userland takes seconds; a hung imaged child would surface
+// long before the sweep kicks in. cmd/vmmd overrides this via
+// FAAS_VMMD_PARENT_MAX_AGE when operators need to tune.
+const ParentMountMaxAge = 30 * time.Minute
+
+// parentMountOpts is the mount-option string passed to `mount -o`.
+// nodev,nosuid,noexec hardens the loopback mount against any
+// binary inside the parent ext4 executing or opening device nodes
+// — defense in depth; the mount is short-lived and read-only, so
+// the options cost nothing in the staging hot path.
+const parentMountOpts = "loop,ro,nodev,nosuid,noexec"
 
 // ErrUnknownMountpoint is the typed sentinel UmountParentExt4 returns
 // when the mountpoint isn't in the registry. The gRPC handler lifts
@@ -88,14 +124,73 @@ type MountEntry struct {
 // NewRegistry builds an empty registry. cap is the soft cap on
 // concurrent mounts — when a Mount would exceed it, the oldest
 // entry is force-umounted to make room (load-shedding, not
-// back-pressure). Production default cap=16 matches the fleet-wide
-// imaging parallelism of an idle box; bumped to 64 on builds under
-// load.
+// back-pressure). Production default cap=DefaultCap (16) matches
+// the fleet-wide imaging parallelism of an idle box; bumped to
+// 64 on builds under load.
 func NewRegistry(cap int) *Registry {
 	if cap <= 0 {
-		cap = 16
+		cap = DefaultCap
 	}
 	return &Registry{entries: make(map[string]MountEntry), cap: cap}
+}
+
+// Umount atomically looks up + umounts + forgets + removes the
+// staged source for `mountpoint` under a single mutex
+// acquisition. Returns:
+//
+//   - (true,  nil)         — entry was found and the umount
+//                            syscall + source cleanup succeeded.
+//   - (false, nil)         — entry was not found (idempotent
+//                            defer-after-error path; imaged's
+//                            UmountParentExt4 wrapper absorbs this).
+//   - (false, err)         — entry was found but umount failed
+//                            (e.g. EBUSY); entry is KEPT in the
+//                            map so the next sweep can retry.
+//                            The caller MUST surface the error —
+//                            silently dropping a real umount
+//                            failure would leak the loopback mount.
+//
+// This is the single critical section for the umount lifecycle:
+// a concurrent sweep tick + a deferred UmountExt4 from imaged
+// used to race (manager's umount + forget held no lock, so the
+// sweep could umount the same mountpoint first). Now both paths
+// funnel through Umount and the registry stays consistent.
+func (r *Registry) Umount(mountpoint string) (found bool, err error) {
+	r.mu.Lock()
+	entry, ok := r.entries[mountpoint]
+	if !ok {
+		r.mu.Unlock()
+		return false, nil
+	}
+	delete(r.entries, mountpoint)
+	r.mu.Unlock()
+
+	if uerr := UmountExt4(mountpoint); uerr != nil {
+		// Restore the entry so a retry has a chance — the next
+		// sweep tick (or a future explicit Umount call) will
+		// pick it up. We restore under the lock to keep the map
+		// consistent with the disk state.
+		if !errors.Is(uerr, ErrUnknownMountpoint) {
+			r.mu.Lock()
+			if _, stillMissing := r.entries[mountpoint]; stillMissing {
+				r.entries[mountpoint] = entry
+			}
+			r.mu.Unlock()
+			return false, uerr
+		}
+		// ErrUnknownMountpoint means the kernel has nothing at
+		// the path — entry was already forgotten, no restore
+		// needed.
+	}
+	if entry.SrcPath != "" {
+		if rerr := os.Remove(entry.SrcPath); rerr != nil && !os.IsNotExist(rerr) {
+			// Source file removal failure is non-fatal — the
+			// next sweep (or a manual umount) will retry. Log
+			// via the returned error so the manager can decide.
+			return true, fmt.Errorf("vmmdmount: registry.Umount: rm src %s: %w", entry.SrcPath, rerr)
+		}
+	}
+	return true, nil
 }
 
 // RegisterOrEvict records (mountpoint, storageKey) under mu, and if
@@ -151,11 +246,12 @@ func (r *Registry) Forget(mountpoint string) {
 }
 
 // SweepOrphans walks every entry older than ParentMountMaxAge and
-// force-umounts it. Returns the count swept. Safe on an empty
-// registry (returns 0). The mutex is held only for the lookup; the
-// umount syscall is invoked outside the lock so a slow umount
-// (EBUSY when a child re-stage is mid-cp) does not block new
-// Mounts.
+// force-umounts it via the atomic Registry.Umount (which also
+// removes the staged source file). Returns the count swept. Safe
+// on an empty registry (returns 0). Entries whose umount fails
+// are kept in the map so the next sweep tick retries — this
+// matches the deferred Umount path (Registry.Umount itself
+// restores on real umount errors).
 func (r *Registry) SweepOrphans(log *slog.Logger) int {
 	r.mu.Lock()
 	var stale []string
@@ -169,22 +265,21 @@ func (r *Registry) SweepOrphans(log *slog.Logger) int {
 
 	swept := 0
 	for _, mp := range stale {
-		if err := UmountExt4(mp); err != nil {
-			if log != nil {
-				log.Warn("vmmd: orphan parent umount failed", "mountpoint", mp, "err", err)
-			}
-			// Leave the entry in place — the next sweep will retry.
-			continue
+		found, err := r.Umount(mp)
+		if err != nil && log != nil {
+			log.Warn("vmmd: orphan parent umount failed", "mountpoint", mp, "err", err)
 		}
-		r.Forget(mp)
-		swept++
+		if found && err == nil {
+			swept++
+		}
 	}
 	return swept
 }
 
 // SweepAll force-umounts every live entry. Called from cmd/vmmd's
-// SIGTERM handler so the box doesn't leave dangling mounts. Returns
-// the count swept. Empty registry is a no-op.
+// SIGTERM handler so the box doesn't leave dangling mounts or
+// source files in /srv/fc/parent/. Returns the count swept.
+// Empty registry is a no-op.
 func (r *Registry) SweepAll(log *slog.Logger) int {
 	r.mu.Lock()
 	mps := make([]string, 0, len(r.entries))
@@ -195,32 +290,33 @@ func (r *Registry) SweepAll(log *slog.Logger) int {
 
 	swept := 0
 	for _, mp := range mps {
-		if err := UmountExt4(mp); err != nil {
-			if log != nil {
-				log.Warn("vmmd: shutdown parent umount failed", "mountpoint", mp, "err", err)
-			}
-			continue
+		found, err := r.Umount(mp)
+		if err != nil && log != nil {
+			log.Warn("vmmd: shutdown parent umount failed", "mountpoint", mp, "err", err)
 		}
-		r.Forget(mp)
-		swept++
+		if found && err == nil {
+			swept++
+		}
 	}
 	return swept
 }
 
 // MountExt4ReadOnly loopback-mounts `src` (a path on disk) at a
-// fresh mountpoint, both created via os.MkdirTemp under os.TempDir().
-// The caller (Manager.MountParentExt4) is responsible for (a)
-// populating `src` with the StorageBackend bytes, and (b) registering
-// the returned mountpoint in the registry so SweepOrphans can find
-// it.
+// fresh mountpoint under MountRoot (/srv/fc/parent). The caller
+// (Manager.MountParentExt4) is responsible for (a) populating
+// `src` with the StorageBackend bytes via MkdirSrcTemp (which
+// also writes under MountRoot), and (b) registering the returned
+// mountpoint in the registry so SweepOrphans can find it.
 //
 // src is NOT removed by this function — the caller owns the staged
 // bytes' lifecycle. The mountpoint IS removed on umount, but the
 // mountpoint itself is left in place on Mount error so the caller
 // can surface the path in the error log without re-creating it.
 //
-// Mount options: -o loop,ro. Read-only so a child re-stage cannot
-// corrupt the parent.
+// Mount options: -o loop,ro,nodev,nosuid,noexec. Read-only so a
+// child re-stage cannot corrupt the parent; nodev+nosuid+noexec
+// harden against any binary inside the parent ext4 executing or
+// opening device nodes via the loopback mount.
 func MountExt4ReadOnly(ctx context.Context, src string) (mountpoint string, err error) {
 	if src == "" {
 		return "", errors.New("vmmdmount: MountExt4ReadOnly: empty src")
@@ -228,12 +324,13 @@ func MountExt4ReadOnly(ctx context.Context, src string) (mountpoint string, err 
 	if _, err := os.Stat(src); err != nil {
 		return "", fmt.Errorf("vmmdmount: MountExt4ReadOnly: stat src: %w", err)
 	}
-	mp, err := os.MkdirTemp("", ParentMountPrefix+"mnt-")
+	mp, err := os.MkdirTemp(MountRoot, ParentMountPrefix+"mnt-")
 	if err != nil {
 		return "", fmt.Errorf("vmmdmount: MountExt4ReadOnly: mkdir mountpoint: %w", err)
 	}
 	// On any error path, rmdir the freshly-created mountpoint so a
-	// failed Mount doesn't leave /tmp/faas-parent-mnt-* orphans.
+	// failed Mount doesn't leave /srv/fc/parent/faas-parent-mnt-*
+	// orphans.
 	success := false
 	defer func() {
 		if !success {
@@ -244,12 +341,36 @@ func MountExt4ReadOnly(ctx context.Context, src string) (mountpoint string, err 
 	// exec.CommandContext binds the mount to ctx — a cancelled ctx
 	// kills the mount syscall. The mount itself is fast (loopback +
 	// read-only ext4 metadata read), so the ctx is a paranoia belt.
-	cmd := exec.CommandContext(ctx, "mount", "-o", "loop,ro", src, mp)
+	cmd := exec.CommandContext(ctx, "mount", "-o", parentMountOpts, src, mp)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("vmmdmount: MountExt4ReadOnly: mount loop ro: %w (%s)", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("vmmdmount: MountExt4ReadOnly: mount %s: %w (%s)", parentMountOpts, err, strings.TrimSpace(string(out)))
 	}
 	success = true
 	return mp, nil
+}
+
+// MkdirSrcTemp creates a fresh tmp file path under MountRoot for
+// staging StorageBackend bytes prior to MountExt4ReadOnly. The
+// caller is responsible for writing the bytes and passing the
+// returned path to MountExt4ReadOnly; the registry.Umount lifecycle
+// (or an explicit UmountExt4 in the error path) cleans up.
+//
+// Living under MountRoot (not /tmp) is load-bearing — both daemons
+// run PrivateTmp=yes (deploy/systemd/faas-{vmmd,imaged}.service)
+// and vmmd's /tmp is invisible to imaged's mount namespace. The
+// scratch file's owner is vmmd's uid; imaged reads through the
+// resulting loopback mount, never the source path directly.
+func MkdirSrcTemp() (string, error) {
+	f, err := os.CreateTemp(MountRoot, ParentMountPrefix+"src-")
+	if err != nil {
+		return "", fmt.Errorf("vmmdmount: MkdirSrcTemp: %w", err)
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("vmmdmount: MkdirSrcTemp: close: %w", err)
+	}
+	return name, nil
 }
 
 // UmountExt4 unmounts mountpoint and removes the (now-empty) dir.
@@ -261,7 +382,7 @@ func UmountExt4(mountpoint string) error {
 	if mountpoint == "" {
 		return ErrUnknownMountpoint
 	}
-	if !strings.HasPrefix(mountpoint, filepath.Join(os.TempDir(), ParentMountPrefix)) {
+	if !strings.HasPrefix(mountpoint, filepath.Join(MountRoot, ParentMountPrefix)) {
 		// Defence in depth: refuse to umount a path vmmd didn't
 		// issue. A caller that hands back a path under / or
 		// /home/foo would otherwise silently run umount on
@@ -279,9 +400,10 @@ func UmountExt4(mountpoint string) error {
 		return fmt.Errorf("vmmdmount: umount %s: %w (%s)", mountpoint, err, strings.TrimSpace(string(out)))
 	}
 	// rmdir only — the mountpoint should be empty after a successful
-	// umount (imaged's cp -a writes to staging, not the mountpoint).
-	// If rmdir fails (e.g. a debug process left a file), the next
-	// sweep will retry; not a fatal error.
+	// umount (mkfs.ext4 -d reads through the mount but writes to
+	// the new ext4 outside the scratch tree). If rmdir fails
+	// (e.g. a debug process left a file), the next sweep will
+	// retry; not a fatal error.
 	_ = os.Remove(mountpoint)
 	return nil
 }
