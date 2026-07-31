@@ -12,8 +12,12 @@
 //  4. The CHECK constraints on the last_*_at columns reject a future
 //     timestamp (the "bad client clocks" guard from the migration
 //     comment).
-//  5. Replay-safe: ADD COLUMN IF NOT EXISTS makes a second MigrateUp
-//     no-op (PR #377 / ADR-041).
+//  5. Replay-safe: ADD COLUMN IF NOT EXISTS (for the three columns)
+//     + DO-block-guarded ADD CONSTRAINT (for the two CHECKs) makes
+//     a second MigrateUp no-op (PR #377 / ADR-041). `ADD CONSTRAINT
+//     IF NOT EXISTS` is NOT supported by Postgres — the DO-block
+//     guard mirrors the codebase's existing convention (see
+//     migrations/00074_projects_and_workloads.sql:86-104).
 //
 // Slot note: 00081 is the slot-reservation no-op (the slot reservation
 // is kept so the cross-PR migration-gate stays contiguous; renumber

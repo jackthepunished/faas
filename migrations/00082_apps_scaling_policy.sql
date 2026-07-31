@@ -47,12 +47,34 @@ ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS last_scale_out_at timestamptz;
 ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS last_scale_in_at timestamptz;
-ALTER TABLE apps
-    ADD CONSTRAINT IF NOT EXISTS apps_last_scale_out_at_le_now_chk
-    CHECK (last_scale_out_at IS NULL OR last_scale_out_at <= now());
-ALTER TABLE apps
-    ADD CONSTRAINT IF NOT EXISTS apps_last_scale_in_at_le_now_chk
-    CHECK (last_scale_in_at IS NULL OR last_scale_in_at <= now());
+-- Replay-safe CHECK constraints via DO-block guards. `ADD CONSTRAINT
+-- IF NOT EXISTS` is NOT supported by Postgres — Postgres has `IF NOT
+-- EXISTS` for ADD COLUMN but not for ADD CONSTRAINT. The DO-block
+-- pattern matches the codebase's existing convention (see
+-- migrations/00074_projects_and_workloads.sql:86-104, the
+-- apps_workload_class_chk precedent). A second MigrateUp against a
+-- schema already holding the constraints is a clean no-op.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'apps_last_scale_out_at_le_now_chk'
+          AND conrelid = 'apps'::regclass
+    ) THEN
+        ALTER TABLE apps
+            ADD CONSTRAINT apps_last_scale_out_at_le_now_chk
+            CHECK (last_scale_out_at IS NULL OR last_scale_out_at <= now());
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'apps_last_scale_in_at_le_now_chk'
+          AND conrelid = 'apps'::regclass
+    ) THEN
+        ALTER TABLE apps
+            ADD CONSTRAINT apps_last_scale_in_at_le_now_chk
+            CHECK (last_scale_in_at IS NULL OR last_scale_in_at <= now());
+    END IF;
+END$$;
 -- +goose StatementEnd
 
 -- +goose Down
@@ -60,7 +82,9 @@ ALTER TABLE apps
 -- a non-default scaling_policy loses the customer-authored policy
 -- on downgrade; apid's appResponse falls back to the empty-policy
 -- projection from min_instances / max_concurrency, which is the
--- correct degraded behaviour (matches the pre-PR contract).
+-- correct degraded behaviour (matches the pre-PR contract). DROP
+-- CONSTRAINT IF EXISTS is supported by Postgres (the IF EXISTS form
+-- is valid on DROP even though it isn't on ADD).
 -- +goose StatementBegin
 ALTER TABLE apps
     DROP CONSTRAINT IF EXISTS apps_last_scale_out_at_le_now_chk;

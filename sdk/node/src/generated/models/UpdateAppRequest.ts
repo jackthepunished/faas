@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ScalingPolicy } from './ScalingPolicy.js';
 /**
  * Partial update — every field is optional; omitted fields are unchanged.
  */
@@ -26,5 +27,9 @@ export type UpdateAppRequest = {
    * Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403 plan_streaming_not_allowed.
    */
   streaming_enabled?: boolean | null;
+  /**
+   * Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column.
+   */
+  scaling_policy?: (null | ScalingPolicy);
 };
 

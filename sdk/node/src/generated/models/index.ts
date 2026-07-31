@@ -102,6 +102,8 @@ export type { RateLimitPlain } from './RateLimitPlain.js';
 export type { RenameAppRequest } from './RenameAppRequest.js';
 export type { RepoResponse } from './RepoResponse.js';
 export type { RotateAlertRuleSecretResponse } from './RotateAlertRuleSecretResponse.js';
+export type { ScalingPolicy } from './ScalingPolicy.js';
+export type { ScalingTarget } from './ScalingTarget.js';
 export type { SecretKey } from './SecretKey.js';
 export type { SessionInfo } from './SessionInfo.js';
 export type { SessionListResponse } from './SessionListResponse.js';
