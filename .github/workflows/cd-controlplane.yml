@@ -351,7 +351,7 @@ jobs:
 
           echo "2. Verifying Control API healthz endpoint..."
           STATUS=$(curl -sf -o /dev/null -w '%{http_code}' \
-            "http://${{ env.CP_HOST }}:8081/healthz" || echo 000)
+            "http://${{ env.CP_HOST }}:8080/healthz" || echo 000)
           echo "Control API /healthz status code: $STATUS"
           if [[ "$STATUS" != "200" ]]; then
             echo "::error::Control API health check failed with status $STATUS"
