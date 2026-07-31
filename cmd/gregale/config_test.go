@@ -112,7 +112,10 @@ func setupHermeticTokensEnv(t *testing.T) string {
 }
 
 // writeLegacyToken pre-creates the plaintext-file fallback with the
-// given value (used by migration tests).
+// given value (used by #293-era migration tests — pre-keychain
+// installs that still wrote a file at the CURRENT path). For
+// pre-#439 (pre-rename) seeding use writePreRenamePlaintextToken
+// below.
 func writeLegacyToken(t *testing.T, value string) string {
 	t.Helper()
 	p, err := tokenPath()
@@ -470,7 +473,7 @@ func TestLoadToken_PreRenameFile_LegacyFileIsRead(t *testing.T) {
 // value (e.g. an ex-coworker's account on the same machine).
 func TestLoadToken_PreRename_PreferNewOverLegacy(t *testing.T) {
 	setupHermeticTokensEnv(t)
-	f := setFakeKeyring(t,
+	setFakeKeyring(t,
 		withEntry(keyringService, keyringAccount, "new-kc"),
 		withEntry(legacyKeyringService, keyringAccount, "old-kc"),
 	)
@@ -479,7 +482,6 @@ func TestLoadToken_PreRename_PreferNewOverLegacy(t *testing.T) {
 	if got := loadToken(); got != "new-kc" {
 		t.Errorf("loadToken = %q, want new-kc (new keychain wins over legacy)", got)
 	}
-	_ = f
 }
 
 // TestSaveToken_PreRename_MigratesKeychainAndFile covers the

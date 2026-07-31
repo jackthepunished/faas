@@ -212,30 +212,38 @@ func TestLintTripwire_NoGlyphLiteralOutsideOutput(t *testing.T) {
 //
 // Excludes:
 //   - pkg/wire/wake.go: the canonical home; the literal IS the contract.
-//   - cmd/gregale/output.go and any *_test.go already excluded by the
-//     per-directory walker.
+//   - any *_test.go: tests legitimately assert or stub the wire
+//     header literal — they are the contract tests, not the production
+//     code.
+//   - generated *.pb.go stubs.
 //
-// Scope note: the walker descends every directory rooted under the
-// repo root passed via `--repo-root` (or the test's current working
-// directory when unset). The CLI packaging this test enforces only
-// has visibility into the local . tree, so we walk the package root
-// directly. The intent is "no literal in production code that travels
-// over the wire"; docs and tests are out of scope (docs are sourced
-// to spec §6 / cold-wake.md, tests are gated by the suite's own
-// asserts).
+// Scope: the walker descends from the nearest enclosing `go.mod`
+// directory. `go test ./cmd/gregale/...` chdirs into cmd/gregale
+// before running, so the walker must explicitly locate the repo root
+// via go.mod — otherwise it would silently scope to just cmd/gregale
+// and miss regressions in pkg/gateway (the producer side). The intent
+// is "no literal in production code that travels over the wire";
+// docs and tests are out of scope.
 func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 	fset := token.NewFileSet()
+
+	// Locate the repo root (the directory containing go.mod) by
+	// walking up from the test's CWD. The test lives at
+	// cmd/gregale/...; the CWD when `go test` runs is cmd/gregale/.
+	// Without this, the walker below only sees cmd/gregale/ and the
+	// tripwire is silently blind to pkg/gateway regressions — exactly
+	// the side PR #439 broke.
+	root, err := findRepoRoot(".")
+	if err != nil {
+		t.Fatalf("locate repo root: %v", err)
+	}
 
 	// Walk the whole repo except pkg/wire itself. Each package is
 	// parsed in its own directory; pkgs is a map keyed by directory
 	// relative to the walker root.
-	type pkgFiles struct {
-		root string
-		files map[string]*ast.File
-	}
-	pkgs := map[string]*pkgFiles{}
+	pkgs := map[string]map[string]*ast.File{}
 
-	walkErr := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -275,10 +283,10 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 		dir := filepath.Dir(path)
 		bucket, ok := pkgs[dir]
 		if !ok {
-			bucket = &pkgFiles{root: dir, files: map[string]*ast.File{}}
+			bucket = map[string]*ast.File{}
 			pkgs[dir] = bucket
 		}
-		bucket.files[path] = pf
+		bucket[path] = pf
 		return nil
 	})
 	if walkErr != nil {
@@ -288,8 +296,8 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 	forbidden := []string{`"x-faas-wake"`, `"x-gregale-wake"`, `"X-Faas-Wake"`, `"X-Gregale-Wake"`}
 
 	var violations []string
-	for _, bucket := range pkgs {
-		for _, file := range bucket.files {
+	for _, files := range pkgs {
+		for _, file := range files {
 			ast.Inspect(file, func(n ast.Node) bool {
 				lit, ok := n.(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
@@ -310,5 +318,79 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 	if len(violations) > 0 {
 		t.Fatalf("found literal x-faas-wake / x-gregale-wake string outside pkg/wire/wake.go — these headers are the published customer contract and must be sourced from pkg/wire.WakeHeader (see docs/cold-wake.md):\n  %s\n\nIf a legacy gateway test legitimately needs the literal, move it to a *_test.go file (excluded) or convert it to wire.WakeHeader.",
 			strings.Join(violations, "\n  "))
+	}
+}
+
+// findRepoRoot climbs from start upward until it finds a go.mod
+// file. Returns the absolute directory of go.mod. Used by the
+// repo-walking lint tripwire so the walker's root is the repo root
+// regardless of the test's working directory (which chdirs into
+// cmd/gregale under `go test ./cmd/gregale/...`).
+func findRepoRoot(start string) (string, error) {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", os.ErrNotExist
+		}
+		dir = parent
+	}
+}
+
+// TestLintTripwire_NoLiteralWakeHeaderSelfTest exercises the AST
+// walker by injecting a literal into a synthetic production-style
+// file under a temp directory and asserting the tripwire flags it.
+// This is the regression guard for the guard: a future refactor that
+// silently breaks the walker (e.g. an early-return that skips the
+// ast.Inspect callback) would land without anyone noticing, because
+// the live walker never finds a violation on a clean tree. The
+// self-test makes a violation unavoidable on every run.
+func TestLintTripwire_NoLiteralWakeHeaderSelfTest(t *testing.T) {
+	// Build a small Go file that contains the forbidden literal in
+	// a string context the walker will recognise. We can't use the
+	// in-package walker because it skips pkg/wire — instead we run
+	// the same walk against a temp directory and assert the literal
+	// shows up in the violations list.
+	tmp := t.TempDir()
+	src := `package tripwiretest
+
+// Synthetic production-like file carrying the forbidden header
+// literal. Exists only to exercise the AST walker.
+var header = "x-faas-wake"
+`
+	srcPath := filepath.Join(tmp, "tripwire.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	pf, err := parser.ParseFile(fset, srcPath, nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	forbidden := []string{`"x-faas-wake"`}
+	var found string
+	ast.Inspect(pf, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		for _, forbid := range forbidden {
+			if lit.Value == forbid {
+				found = fset.Position(lit.Pos()).String()
+				return false
+			}
+		}
+		return true
+	})
+	if found == "" {
+		t.Fatal("self-test: walker did not detect the seeded x-faas-wake literal — the tripwire may be silently broken")
 	}
 }

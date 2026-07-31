@@ -776,12 +776,15 @@ func TestCmdDeploy_JSON_SkipsStream(t *testing.T) {
 	}
 }
 
-func TestCmdUsage_JSON_IndentedScalar(t *testing.T) {
+func TestCmdUsage_JSON_NDJSONList(t *testing.T) {
 	resetJSONOutput()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// The wire shape is an ARRAY of UsageResponse objects — the
 		// OpenAPI spec, server handler, and cross-language SDKs all
-		// agree. See memory: getusage-wire-shape-mismatch.
+		// agree. See memory: getusage-wire-shape-mismatch. The CLI
+		// emits NDJSON (one object per line, no indent) to match the
+		// rest of the list-style commands (apps, instances, crons,
+		// domains, keys, secrets, deployments).
 		_ = json.NewEncoder(w).Encode([]api.UsageResponse{{
 			AppID: "my-app", Requests: 42, MBSeconds: 123456, IncludedGBHours: 5,
 		}})
@@ -801,12 +804,20 @@ func TestCmdUsage_JSON_IndentedScalar(t *testing.T) {
 		t.Fatalf("cmdUsage JSON = %d, want 0", code)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "\n  ") {
-		t.Fatalf("expected indented JSON, got %q", out)
+	if strings.Contains(out, "\n  ") {
+		t.Errorf("NDJSON must not be indented; got %q", out)
 	}
+	dec := json.NewDecoder(strings.NewReader(out))
 	var rows []api.UsageResponse
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rows); err != nil {
-		t.Fatalf("not valid JSON: %v\n%s", err, out)
+	for {
+		var row api.UsageResponse
+		if err := dec.Decode(&row); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("NDJSON decode: %v\noutput: %s", err, out)
+		}
+		rows = append(rows, row)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))

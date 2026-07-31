@@ -245,15 +245,20 @@ func saveToken(token string) error {
 		// One-shot migration: pre-#439 legacy keychain service
 		// entry. Delete is best-effort — ErrNotFound is silent,
 		// any other failure is a WARN (the new save already
-		// succeeded).
-		if err := kr.Delete(legacyKeyringService, keyringAccount); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		// succeeded). Print a separate progress line so a customer
+		// who only had the plaintext file (no keychain entry) sees
+		// an accurate "what just happened" rather than a misleading
+		// combined message.
+		if err := kr.Delete(legacyKeyringService, keyringAccount); err == nil {
+			PrintProgress(os.Stdout, "Removed legacy keychain entry (\"faas-cli\").")
+		} else if !errors.Is(err, keyring.ErrNotFound) {
 			PrintWarn(os.Stderr, "Could not remove legacy keychain entry: %v", err)
 		}
 		// One-shot migration: pre-#439 legacy plaintext file.
 		if lp, lperr := legacyTokenPath(); lperr == nil {
 			switch lerr := os.Remove(lp); {
 			case lerr == nil:
-				PrintProgress(os.Stdout, "Removed legacy keychain service and plaintext token file.")
+				PrintProgress(os.Stdout, "Removed legacy plaintext token file.")
 			case errors.Is(lerr, os.ErrNotExist):
 				// nothing to migrate
 			default:

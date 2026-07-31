@@ -835,7 +835,13 @@ func cmdUsageList(args []string) int {
 		return printErr("Request failed", err)
 	}
 	if jsonOutput {
-		return jsonOut(writeJSON(rows))
+		// NDJSON matches every other per-resource list (apps, instances,
+		// crons, domains, keys, secrets, deployments). One object per line
+		// is jq-friendly and streams. The prior single-array writeJSON
+		// shape was tied to the broken single-struct decode that PR #439
+		// didn't fix — switching to NDJSON aligns with the rest of the
+		// CLI and removes that vestigial coupling.
+		return jsonOut(writeNDJSON(rows))
 	}
 	if len(rows) == 0 {
 		fmt.Fprintf(osStdout, "No usage recorded for %s.\n", *month)
