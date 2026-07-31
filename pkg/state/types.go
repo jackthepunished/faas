@@ -1109,7 +1109,7 @@ type UpdateAppParams struct {
 	// semantics as AutoscaleTargetRPS. Pro/Scale only.
 	AutoscaleTargetCPUPct    *int
 	SetAutoscaleTargetCPUPct bool
-// StreamingEnabled (issue #471) toggles the per-app response
+	// StreamingEnabled (issue #471) toggles the per-app response
 	// streaming path. SetStreamingEnabled distinguishes "unset"
 	// (don't touch) from "explicit false" (opt out of streaming).
 	// Plan-gated upstream (apid returns 403 plan_streaming_not_allowed

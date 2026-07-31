@@ -650,21 +650,21 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-// type: NOT NULL CHECK (type IN ('app','function')) with DEFAULT 'app'.
-// DEFAULT is bypassed because we pass the column explicitly; empty Go
-// string would trip the CHECK. Coerce "" to AppTypeApp so the
-// default's value is preserved whenever the caller hasn't picked.
-// maxConcurrency: NOT NULL DEFAULT 1 CHECK (>= 1). Coerce <= 0 to 1.
-// ramMB: NOT NULL CHECK (ram_mb > 0). Coerce <= 0 to 128 (Free plan
-// minimum, pkg/api/limits.go:242) — the smallest legal value the
-// column accepts.
-// project_id + workload_name (migration 00074). project_id is nullable
-// (empty → NULL via nullString); workload_name is NOT NULL DEFAULT ''
-// so empty stays as ''. Together with the unique index
-// apps_project_workload_uniq (project_id, workload_name) WHERE
-// project_id IS NOT NULL, a project-bound insert must carry both
-// columns and a non-project insert lands with (NULL, '') which the
-// index filters out.
+	// type: NOT NULL CHECK (type IN ('app','function')) with DEFAULT 'app'.
+	// DEFAULT is bypassed because we pass the column explicitly; empty Go
+	// string would trip the CHECK. Coerce "" to AppTypeApp so the
+	// default's value is preserved whenever the caller hasn't picked.
+	// maxConcurrency: NOT NULL DEFAULT 1 CHECK (>= 1). Coerce <= 0 to 1.
+	// ramMB: NOT NULL CHECK (ram_mb > 0). Coerce <= 0 to 128 (Free plan
+	// minimum, pkg/api/limits.go:242) — the smallest legal value the
+	// column accepts.
+	// project_id + workload_name (migration 00074). project_id is nullable
+	// (empty → NULL via nullString); workload_name is NOT NULL DEFAULT ''
+	// so empty stays as ''. Together with the unique index
+	// apps_project_workload_uniq (project_id, workload_name) WHERE
+	// project_id IS NOT NULL, a project-bound insert must carry both
+	// columns and a non-project insert lands with (NULL, '') which the
+	// index filters out.
 	appType := app.Type
 	if appType == "" {
 		appType = AppTypeApp
@@ -747,7 +747,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-// Coerce MaxConcurrency <= 0 to 1 so the NOT NULL CHECK (>= 1) is
+	// Coerce MaxConcurrency <= 0 to 1 so the NOT NULL CHECK (>= 1) is
 	// satisfied (matches the CreateApp / ApplyProjectPlan paths).
 	maxConcurrency := app.MaxConcurrency
 	if maxConcurrency <= 0 {

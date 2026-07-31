@@ -71,7 +71,7 @@ type UpdateAppRequest struct {
 	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
-// StreamingEnabled (issue #471) toggles the per-app streaming
+	// StreamingEnabled (issue #471) toggles the per-app streaming
 	// response path through gatewayd. When true (or unset on a plan
 	// where the default is true), gatewayd streams the response body
 	// from the guest through to the client with a periodic 200 ms /
