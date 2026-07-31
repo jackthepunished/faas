@@ -943,11 +943,13 @@ func (p Plan) StreamingResponseAllowed() bool {
 
 // MaxResponseBodyBytes returns the per-response body cap in bytes for
 // this plan, falling back to MaxResponseBodyBytesDefault (spec §4.1's
-// 25 MB) when the plan row's field is unset. The unknown-plan case
-// falls back the same way; the buffer ceiling is conservative and
-// fail-closed. Used by gatewayd to wrap the response writer in
-// http.MaxBytesWriter at this number (PR-B activates it on the
-// streaming path; PR-A's buffered path stays under the cap naturally).
+// 25 MB) when the plan row's field is unset or the plan is unknown.
+// The default is the strict spec baseline (a guest cannot exceed it);
+// when limits are missing the cap clamps to that baseline rather
+// than dropping to a permissive ceiling. Used by gatewayd to wrap
+// the response writer in http.MaxBytesWriter at this number (PR-B
+// activates it on the streaming path; PR-A's buffered path stays
+// under the cap naturally).
 func (p Plan) MaxResponseBodyBytes() int64 {
 	l, ok := LimitsFor(p)
 	if !ok {

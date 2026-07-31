@@ -108,6 +108,10 @@ type Config struct {
 	// already reads the per-plan cap from pkg/api/limits.go. Set this
 	// to override per-cluster (e.g. a staging cluster that wants a
 	// tighter envelope than production).
+	//
+	// TOML accepts Go's time.Duration string syntax via
+	// BurntSushi/toml — e.g. "300s", "15m", "1h30m". Plain integer
+	// nanoseconds are NOT accepted (a bare `900` parses as 900 ns).
 	ResponseWriteTimeout time.Duration `toml:"response_write_timeout"`
 }
 

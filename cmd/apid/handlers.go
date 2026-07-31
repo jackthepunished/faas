@@ -119,8 +119,10 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// Hobby customer's brand-new app is streaming-ready without an
 	// extra PATCH round-trip. Free defaults to false (the only
 	// legal value on Free; apid rejects PATCH true with 403
-	// plan_streaming_not_allowed).
-	streaming := limits.StreamingEnabled
+	// plan_streaming_not_allowed). The Plan accessor keeps the
+	// fail-closed contract (pkg/api/limits.go) — Free's accessor
+	// returns false just like LimitsFor(false) would.
+	streaming := acct.Plan.StreamingEnabled()
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled
 	}

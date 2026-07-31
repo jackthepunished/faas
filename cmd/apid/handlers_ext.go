@@ -206,12 +206,14 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				fmt.Sprintf("autoscale_target_cpu_pct must be 0 (disable) or in [1, 100]; got %d", *req.AutoscaleTargetCPUPct))
 		}
 	}
-	// Issue #471 / ADR-047: per-app streaming flag. Plan gate runs
-	// first (403 supersedes 422) so a Free customer PATCHing
-	// true surfaces the gate error, not a bounds error. The plan
-	// default is applied at create time (cmd/apid/handlers.go::
-	// buildApp), so a Hobby customer PATCHing nil is a no-op (the
-	// Set bit is unset in updateApp's UpdateAppParams call below).
+	// Issue #471 / ADR-047: per-app streaming flag. The plan gate
+	// runs after the bounds checks above so a Free customer
+	// PATCHing true receives a 403 plan_streaming_not_allowed
+	// (the action is forbidden for this account), not a 422
+	// bounds error. The plan default is applied at create time
+	// (cmd/apid/handlers.go::buildApp), so a Hobby customer
+	// PATCHing nil is a no-op (the Set bit is unset in updateApp's
+	// UpdateAppParams call below).
 	if req.StreamingEnabled != nil && *req.StreamingEnabled {
 		if !acct.Plan.StreamingResponseAllowed() {
 			return api.NewProblem(http.StatusForbidden,

@@ -80,6 +80,9 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 // the app) and filters out deleted apps. AccountID is plumbed through to the
 // gateway.App so the per-account rate limiter (ADR-040 / issue #292) can key
 // the throttle on app.AccountID — production joins always populate it.
+// StreamingEnabled (issue #471 / ADR-047) is plumbed through so ServeHTTP
+// can decide between the buffered and streamed response path without
+// re-reading the apps row from Postgres on every request.
 func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, error) {
 	if app.Status == state.AppDeleted {
 		return gateway.App{}, false, nil
@@ -88,7 +91,7 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 	if err != nil {
 		return gateway.App{}, false, err
 	}
-	return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan}, true, nil
+	return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled}, true, nil
 }
 
 // appsSuffix normalizes a bare apps domain ("apps.gregale.dev") into the

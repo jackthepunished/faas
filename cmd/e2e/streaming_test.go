@@ -1,7 +1,11 @@
-// streaming_test.go — issue #471 PR-A acceptance for the buffered
-// fallback path (AC #4). PR-A wires the per-app streaming flag, plan
-// default, env flag, and the buffered-fallback deprecation log; the
-// real Flusher path ships in PR-B. This test exercises three pins:
+// streaming_test.go — issue #471 PR-A acceptance for the *flag +
+// plan-gate* surface (AC #4 splits cleanly: the e2e pin below
+// covers the apid side; the gateway-side buffered-fallback log line
+// is pinned in pkg/gateway/handler_test.go in-process — see note
+// below). PR-A wires the per-app streaming flag, plan default, env
+// flag, and the buffered-fallback deprecation log; the real Flusher
+// path ships in PR-B. This test exercises three pins, all on the
+// apid + Postgres surface:
 //
 //  1. Plan-gate: a Free-plan customer cannot enable streaming.
 //     PATCH /v1/apps/{slug} with streaming_enabled=true returns
@@ -15,16 +19,17 @@
 //  3. Persistence: a Hobby customer can enable streaming explicitly
 //     via PATCH and the row reflects the new value.
 //
-// The actual buffered-fallback deprecation log (the once-per-process
-// slog.Warn emitted when an SSE-emitting app lands on the legacy
-// buffered path) is exercised in pkg/gateway/handler_test.go via a
-// unit test that drives the streamingFallbackLog helper directly —
-// no e2e harness needed: the helper is a sync.Map dedup + a log
-// emission, both of which are easier to assert in-process than
-// across a subprocess boundary. The end-to-end "real SSE response
-// reaching gatewayd" path is a PR-B metal test (the e2e harness
-// without a deployed app can't synthesize a successful 200 with
-// an SSE Content-Type).
+// What this test does NOT cover (deliberately): the buffered-fallback
+// deprecation log itself. That log line is emitted inside gatewayd's
+// statusRecorder post-proxy branch when an SSE response arrives on
+// the legacy buffered path; it is a sync.Map dedup + a slog.Warn
+// with no Postgres involvement. Asserting it here would mean
+// standing up gatewayd in the harness, deploying an SSE-emitting app,
+// and tailing slog — far more surface than the unit test in
+// pkg/gateway/handler_test.go already covers. The end-to-end "real
+// SSE response reaching gatewayd and being buffered" path is a
+// PR-B metal test (the e2e harness without a deployed app can't
+// synthesize a successful 200 with an SSE Content-Type).
 //
 // Build tag: (none). CI-safe. Requires Postgres (skip via
 // FAAS_SKIP_PG_TESTS) and a buildable ./cmd/apid.

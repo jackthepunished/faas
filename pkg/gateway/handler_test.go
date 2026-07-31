@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1097,4 +1098,91 @@ type testCountingWriter struct{ on *atomic.Int32 }
 func (w testCountingWriter) Write(p []byte) (int, error) {
 	w.on.Add(1)
 	return len(p), nil
+}
+
+// TestServeHTTP_StreamingFallback_FiresOnPerAppFlag pins the
+// ServeHTTP-level buffered-fallback contract (issue #471 / ADR-047
+// PR-A, AC #4). The post-proxy branch must fire the deprecation log
+// when the per-app App.StreamingEnabled is true AND the upstream
+// emitted a text/event-stream response, regardless of the operator
+// opt-in (h.streamingEnabled). The wiring lives in pgRouter.toApp;
+// the test drives a fakeBackend with streamingEnabled=on and an
+// SSE-emitting upstream so the full proxy path — including the
+// statusRecorder.ContentType capture added in PR-A — is exercised.
+//
+// Three sub-tests cover the matrix:
+//   - per-app on + SSE → 1 streaming-fallback log line
+//   - per-app on + non-SSE → 0 streaming-fallback log lines (the
+//     customer's app is streaming-flagged but the upstream didn't
+//     emit SSE; nothing to deprecate)
+//   - per-app off + SSE → 0 streaming-fallback log lines (the
+//     customer opted out of streaming via PATCH; the legacy
+//     buffered path is the contract)
+func TestServeHTTP_StreamingFallback_FiresOnPerAppFlag(t *testing.T) {
+	const sseBody = "data: hello\n\n"
+	// streamingFallbackMarker is the slog.NewJSONHandler msg-key
+	// the deprecation log emits ("gateway: streaming fallback
+	// ..."). Counting bytes / lines emitted by the JSON handler
+	// would also count unrelated request-time log lines (e.g. the
+	// wake-timing warn at handler.go:573), so we buffer the output
+	// and match the marker substring instead.
+	const streamingFallbackMarker = "streaming fallback"
+
+	sseUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sseBody)
+	}))
+	t.Cleanup(sseUpstream.Close)
+
+	plainUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(plainUpstream.Close)
+
+	run := func(t *testing.T, upstream string, streamingEnabled bool) int {
+		t.Helper()
+		h, b, _ := newTestHandler(t)
+		b.mu.Lock()
+		b.upstream = upstream
+		b.running = true
+		b.app.StreamingEnabled = streamingEnabled
+		if len(b.targets) == 0 {
+			b.targets = append(b.targets, Target{
+				NodeID:     upstream,
+				InstanceID: "i-fake",
+				WakeID:     "",
+			})
+		}
+		b.mu.Unlock()
+
+		var buf bytes.Buffer
+		h.log = slog.New(slog.NewJSONHandler(&buf, nil))
+
+		req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		return strings.Count(buf.String(), streamingFallbackMarker)
+	}
+
+	t.Run("per-app-on + SSE → 1 line", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), true); got != 1 {
+			t.Errorf("streaming-fallback lines = %d, want 1 (per-app streaming + SSE response must trip the deprecation)", got)
+		}
+	})
+
+	t.Run("per-app-on + non-SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, plainUpstream.Listener.Addr().String(), true); got != 0 {
+			t.Errorf("streaming-fallback lines = %d, want 0 (upstream didn't emit SSE; nothing to deprecate)", got)
+		}
+	})
+
+	t.Run("per-app-off + SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), false); got != 0 {
+			t.Errorf("streaming-fallback lines = %d, want 0 (customer opted out of streaming; legacy buffered path is the contract)", got)
+		}
+	})
 }

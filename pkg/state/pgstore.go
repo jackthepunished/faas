@@ -790,14 +790,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, upd,
 		id,
-		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
+		p.RAMMB, p.SetIdleTimeout, intOrZero(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
 		p.Manifest != nil, manifestBytes,
-		p.SetMinInstances, derefInt(p.MinInstances),
+		p.SetMinInstances, intOrZero(p.MinInstances),
 		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
-		p.SetAutoscaleTargetRPS, derefInt(p.AutoscaleTargetRPS),
-		p.SetAutoscaleTargetCPUPct, derefInt(p.AutoscaleTargetCPUPct),
-		p.SetStreamingEnabled, derefBool(p.StreamingEnabled))
+		p.SetAutoscaleTargetRPS, intOrZero(p.AutoscaleTargetRPS),
+		p.SetAutoscaleTargetCPUPct, intOrZero(p.AutoscaleTargetCPUPct),
+		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled))
 	return scanApp(row)
 }
 
@@ -6473,7 +6473,7 @@ const appsSelectColumns = `
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, ''), coalesce(streaming_enabled, false)`
+	workload_class, coalesce(start_command, ''), streaming_enabled`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

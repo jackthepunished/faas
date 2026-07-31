@@ -23,6 +23,15 @@ type App struct {
 	ID        string
 	AccountID string // joined in pgRouter.toApp; empty only in fakeBackend unit tests (ADR-040)
 	Plan      api.Plan
+	// StreamingEnabled is the per-app streaming flag (issue #471 /
+	// ADR-047). Plumbed through pgRouter.toApp from the apps row so
+	// ServeHTTP can decide between the buffered and streamed
+	// response path WITHOUT re-reading the database. PR-A uses the
+	// flag only for the once-per-process buffered-fallback
+	// deprecation log; PR-B activates the actual Flusher path.
+	// Default-false in fakeBackend unit tests (the in-memory
+	// backend doesn't populate the column).
+	StreamingEnabled bool
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -525,16 +534,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// e2e harness without a vmmd overlay.
 		h.proxyFor(target.NodeID).ServeHTTP(w, r)
 	}
-	// Issue #471 / ADR-047 PR-A buffered-fallback AC. When the
-	// per-app streaming flag is set on a plan that did NOT unlock
-	// streaming (Free — apid's plan-gate should reject PATCH true
-	// upstream, but a misconfiguration could land us here) AND the
-	// upstream actually emitted a streaming response
-	// (Content-Type: text/event-stream), log a once-per-process
-	// deprecation line so operators see the fallback instead of a
-	// silent buffered blob. PR-B replaces this with the real Flusher
-	// path; PR-A keeps the log to make AC #4 observable.
-	if h.streamingEnabled && strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
+	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
+	// per-app streaming_enabled flag (ap.StreamingEnabled,
+	// propagated through pgRouter.toApp) is the load-bearing
+	// signal for the fallback log — the customer asked for
+	// streaming, apid's plan-gate (CodePlanStreamingNotAllowed)
+	// should already have rejected the request on a non-paid
+	// plan, but a misconfiguration could land a Free app with
+	// streaming_enabled=true here. h.streamingEnabled (the
+	// operator opt-in) is a separate question: PR-A emits the
+	// log when the per-app flag is set AND the upstream emitted
+	// SSE, regardless of the operator's toggle, because the
+	// per-app flag is the customer-visible contract. PR-B
+	// replaces this with the real Flusher path; PR-A keeps the
+	// log to make AC #4 observable.
+	if app.StreamingEnabled && strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
 		h.streamingFallbackLog(app.ID, rec.ContentType)
 	}
 	h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)
