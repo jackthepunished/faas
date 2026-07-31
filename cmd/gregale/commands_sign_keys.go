@@ -70,11 +70,20 @@ func cmdSignKeys(args []string) int {
 
 // sharedFlags builds the common --sign-key / --verify-key flag set.
 // Both init and rotate use the same surface; status only needs the
-// paths (no --force). force defaults to false everywhere except in
-// cmdSignKeysRotate, which sets defaultForce = true so a bare
-// `gregale sign-keys rotate` does NOT silently overwrite (the operator
-// must explicitly pass --force=false to override — kept for the
-// paranoid operator).
+// paths (no --force).
+//
+// force defaults: init=false (refuse overwrite by default; an operator
+// who re-runs `init` mid-deploy is almost certainly making a mistake),
+// rotate=true (a bare `gregale sign-keys rotate` MUST overwrite —
+// that's the whole point of the subcommand; running rotate without
+// overwrite is a no-op, see cmdSignKeysRotate body for the rotation
+// flow).
+//
+// The rotate-true default was the source of a long-standing doc bug
+// (PR #449 follow-up): the previous comment claimed "does NOT
+// silently overwrite" while the code passed defaultForce = true. The
+// contradiction has been in this file since PR #322. The asymmetry
+// is load-bearing — TestSignKeyFlagDefaults pins it.
 type signKeyFlags struct {
 	signKey string
 	verify  string

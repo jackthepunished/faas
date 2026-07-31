@@ -238,3 +238,37 @@ func TestAdminCredit_IdempotentOnRetry(t *testing.T) {
 		t.Errorf("different reason produced the same key %q; hash is not input-sensitive", keys[3])
 	}
 }
+
+// TestAdminUsage_DoesNotAdvertiseRefund pins the fix for the
+// "advertised but not dispatched" bug filed in PR #449's "Out of
+// scope" list. The server has no refund endpoint — cmd/apid/server.go
+// only mounts POST /v1/admin/accounts/{id}/credits. Help text that
+// advertises `refund` is a customer-facing broken promise: running
+// `gregale admin refund ...` exits 2 with "unknown admin
+// subcommand". The test asserts the no-arg usage line neither lists
+// nor implies `refund`. Pin the contract so a future PR that lands
+// Provider.Refund re-adds the dispatcher and the help line together
+// — not just the help line, which is the silent regression.
+//
+// Uses the captureStderr helper from commands5_test.go — same
+// package, same redirect-to-tempfile pattern as the env/symlink
+// tests at lines 563-590.
+func TestAdminUsage_DoesNotAdvertiseRefund(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	t.Setenv("FAAS_API", "")
+
+	stderr, restore := captureStderr(t)
+	defer restore()
+	if code := cmdAdmin([]string{}); code != 2 {
+		t.Errorf("cmdAdmin([]) exit = %d, want 2 (operator error)", code)
+	}
+	out := stderr.String()
+	if strings.Contains(out, "refund") {
+		t.Fatalf("cmdAdmin usage advertises `refund` but no /v1/admin/accounts/.../refunds endpoint exists — remove the word from the usage line and re-add it in the PR that lands Provider.Refund:\n  %s", out)
+	}
+	if !strings.Contains(out, "credit") {
+		t.Fatalf("cmdAdmin usage missing `credit` entry — sanity check, the only known subcommand:\n  %s", out)
+	}
+}
