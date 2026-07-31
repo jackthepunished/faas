@@ -31,9 +31,19 @@ import (
 //	FAAS_STORAGE_BACKEND          "local" (default) | "oci"
 //	FAAS_STORAGE_ROOT             local-only — root dir (e.g. /srv/fc)
 //	FAAS_APPS_ROOT                local-only — apps prefix (may equal ROOT)
-//	FAAS_STORAGE_LOCAL_PREFIXES   local+oci — comma-separated prefix list
+//	FAAS_STORAGE_LOCAL_PREFIXES   oci-only — comma-separated prefix list
 //	                                routed to the local backend (default
-//	                                "snap/,base/,kernel/,layers/")
+//	                                "snap/,base/,kernel/,layers/"). The
+//	                                local-only backend IGNORES this — every
+//	                                key falls through to FAAS_STORAGE_ROOT
+//	                                with the full prefix preserved (the
+//	                                prefix list exists to tell the OCI
+//	                                backend what NOT to ship to the
+//	                                registry; in a local-only deployment
+//	                                there's nothing to keep apart, and
+//	                                honouring it as routes strips prefixes
+//	                                and crashes imaged — see env.go:155
+//	                                and the 2026-07-31 incident).
 //	FAAS_STORAGE_CACHE_DIR        local+oci — optional. When set, wrap
 //	                                the resulting backend in a read-through
 //	                                LocalCacheBackend rooted at this dir.
@@ -168,27 +178,30 @@ func localBackendFromEnv() (StorageBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: FAAS_APPS_ROOT=%q: %w", appsRoot, err)
 	}
-	// FAAS_STORAGE_LOCAL_PREFIXES is honoured even in the
-	// "local" backend so an operator can route, say,
-	// `apps/` to a different on-disk path than the rest.
-	// In the default config the apps prefix is the only
-	// non-fc prefix; custom layouts build the same router
-	// shape via PrefixRouter.
-	_ = envOr // silence unused if prefixes end up empty in tests
-	prefixes, err := parseLocalPrefixes(os.Getenv("FAAS_STORAGE_LOCAL_PREFIXES"))
-	if err != nil {
-		return nil, err
-	}
-	routes := map[string]StorageBackend{"apps/": appsBackend}
-	for _, p := range prefixes {
-		// Skip prefixes that overlap the apps route to
-		// keep the router's longest-match rule deterministic.
-		if p == "apps/" {
-			continue
-		}
-		routes[p] = fcBackend
-	}
-	router, err := NewPrefixRouter(routes, fcBackend)
+	// Local-only backend: register ONLY the apps/ prefix as a route.
+	// The local-prefix set (snap/, base/, kernel/, layers/) is a list
+	// of *subdirs of fcBackend's root* — registering them as routes
+	// would strip the prefix and make fcBackend.Put land files at the
+	// root of /srv/fc/ rather than in the matching subdir. That also
+	// crashed imaged under ProtectSystem=strict + ReadWritePaths= on
+	// the subdirs: the LocalStorageBackend's atomic-rename temp file
+	// would land at /srv/fc/<tmp>, which is NOT whitelisted. Falling
+	// through to fcBackend with the full key preserves the subdir
+	// (file at /srv/fc/base/<key>) and keeps the temp at
+	// /srv/fc/base/<tmp> — both inside the whitelisted subdir.
+	//
+	// FAAS_STORAGE_LOCAL_PREFIXES is ignored in the local backend —
+	// it's an OCI-side knob that says "don't ship these to the
+	// registry"; in a local-only deployment there's nothing to keep
+	// apart. Honouring it here as routes would re-introduce the bug.
+	//
+	// CI run 30650464753 (2026-07-31) repro: deploy of PR #467 fell
+	// into the rollback path because this bug pre-dates the PR. Fix
+	// lives here in the router wiring, not in LocalStorageBackend.Put.
+	router, err := NewPrefixRouter(
+		map[string]StorageBackend{"apps/": appsBackend},
+		fcBackend,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("storage: prefix router: %w", err)
 	}

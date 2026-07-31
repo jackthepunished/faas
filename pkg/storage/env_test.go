@@ -91,14 +91,22 @@ func TestParseLocalPrefixes_AllEmpty(t *testing.T) {
 	}
 }
 
-// TestBackendFromEnv_LocalRespectsCustomPrefixes: when
-// FAAS_STORAGE_LOCAL_PREFIXES is set, the router carries those
-// prefixes in addition to the apps prefix (no overlap with apps).
-func TestBackendFromEnv_LocalRespectsCustomPrefixes(t *testing.T) {
+// TestBackendFromEnv_LocalIgnoresLocalPrefixes: the local-only
+// backend IGNORES FAAS_STORAGE_LOCAL_PREFIXES. The local-prefix
+// list is an OCI-side knob (snap/, base/, kernel/, layers/ are the
+// prefixes NOT shipped to the registry); in a local-only deployment
+// there's nothing to keep apart, and honouring them as routes
+// strips prefixes and crashes imaged under ProtectSystem=strict
+// (CI run 30650464753, 2026-07-31). The local router must always
+// register apps/ as the only route and let everything else fall
+// through to FAAS_STORAGE_ROOT.
+func TestBackendFromEnv_LocalIgnoresLocalPrefixes(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FAAS_STORAGE_BACKEND", "local")
 	t.Setenv("FAAS_STORAGE_ROOT", filepath.Join(tmp, "fc"))
 	t.Setenv("FAAS_APPS_ROOT", filepath.Join(tmp, "apps"))
+	// Even with a custom prefix list, the local backend keeps the
+	// router shape minimal — just apps/.
 	t.Setenv("FAAS_STORAGE_LOCAL_PREFIXES", "snap/,base/,kernel/")
 	be, err := BackendFromEnv()
 	if err != nil {
@@ -108,25 +116,37 @@ func TestBackendFromEnv_LocalRespectsCustomPrefixes(t *testing.T) {
 	if !ok {
 		t.Fatalf("backend type = %T, want *PrefixRouter", be)
 	}
-	// apps/ + snap/ + base/ + kernel/ = 4 routes; the
-	// layers/ default is suppressed by the override.
-	if len(router.routes) != 4 {
-		t.Errorf("routes = %d, want 4 (apps + snap + base + kernel); got %v",
+	// Only apps/ is a route. snap/, base/, kernel/ fall through to
+	// fcBackend with their full prefix preserved (so a Put for
+	// "base/runner-builder-amd64.ext4" lands at
+	// /srv/fc/base/runner-builder-amd64.ext4, not
+	// /srv/fc/runner-builder-amd64.ext4).
+	if len(router.routes) != 1 {
+		t.Errorf("routes = %d, want 1 (apps only); got %v",
 			len(router.routes), router.routes)
+	}
+	if _, ok := router.routes["apps/"]; !ok {
+		t.Errorf("apps/ route missing; routes = %v", router.routes)
+	}
+	if router.fallback == nil {
+		t.Error("fallback is nil; want FAAS_STORAGE_ROOT backend")
 	}
 }
 
-// TestBackendFromEnv_LocalEmptyPrefixesRejected: an override
-// that parses to zero prefixes is rejected at startup.
-func TestBackendFromEnv_LocalEmptyPrefixesRejected(t *testing.T) {
+// TestBackendFromEnv_LocalEmptyPrefixesAccepted: the local backend
+// accepts an empty/all-whitespace FAAS_STORAGE_LOCAL_PREFIXES value
+// because it doesn't parse it. (The OCI backend still rejects empty
+// lists — see TestBackendFromEnv_OCIRequiresRegistry for the
+// equivalent there.) A custom-prefix override that would be invalid
+// for OCI is silently OK for local; that's the desired asymmetry.
+func TestBackendFromEnv_LocalEmptyPrefixesAccepted(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FAAS_STORAGE_BACKEND", "local")
 	t.Setenv("FAAS_STORAGE_ROOT", filepath.Join(tmp, "fc"))
 	t.Setenv("FAAS_APPS_ROOT", filepath.Join(tmp, "apps"))
 	t.Setenv("FAAS_STORAGE_LOCAL_PREFIXES", " , , ")
-	_, err := BackendFromEnv()
-	if err == nil {
-		t.Fatal("BackendFromEnv accepted empty prefixes list; want error")
+	if _, err := BackendFromEnv(); err != nil {
+		t.Fatalf("BackendFromEnv rejected empty prefixes list; want accept (local-only ignores it): %v", err)
 	}
 }
 
@@ -178,6 +198,45 @@ func TestBackendFromEnv_LocalCoalesced(t *testing.T) {
 	}
 	if _, ok := be.(*LocalStorageBackend); !ok {
 		t.Errorf("backend type = %T, want *LocalStorageBackend (coalesced)", be)
+	}
+}
+
+// TestBackendFromEnv_LocalPutLandsInSubdir is the end-to-end
+// regression for the 2026-07-31 imaged crash-loop on the EX44 (CI
+// run 30650464753). The local-only backend must Put a key like
+// "base/runner-builder-amd64.ext4" into the FAAS_STORAGE_ROOT's
+// base/ subdir — NOT into the root. Pre-fix the local backend
+// registered "base/" as a PrefixRouter route → fcBackend, which
+// stripped the prefix and made fcBackend.Put land the file at
+// <root>/runner-builder-amd64.ext4 instead of
+// <root>/base/runner-builder-amd64.ext4. The temp file followed the
+// same wrong path: /srv/fc/.faas-tmp-<rand> instead of
+// /srv/fc/base/.faas-tmp-<rand>, and EROFS'd under ProtectSystem=strict.
+func TestBackendFromEnv_LocalPutLandsInSubdir(t *testing.T) {
+	tmp := t.TempDir()
+	fcRoot := filepath.Join(tmp, "fc")
+	appsRoot := filepath.Join(tmp, "apps")
+	t.Setenv("FAAS_STORAGE_BACKEND", "local")
+	t.Setenv("FAAS_STORAGE_ROOT", fcRoot)
+	t.Setenv("FAAS_APPS_ROOT", appsRoot)
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	// Put for "base/runner-builder-amd64.ext4" must land at
+	// <fcRoot>/base/runner-builder-amd64.ext4, not at
+	// <fcRoot>/runner-builder-amd64.ext4.
+	if err := be.Put(t.Context(), "base/runner-builder-amd64.ext4", strings.NewReader("payload")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	want := filepath.Join(fcRoot, "base", "runner-builder-amd64.ext4")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("file at %s: %v (this is the 2026-07-31 bug shape — file landed at the wrong path)", want, err)
+	}
+	// Belt-and-braces: no file at the root with the basename only.
+	wrongPath := filepath.Join(fcRoot, "runner-builder-amd64.ext4")
+	if _, err := os.Stat(wrongPath); err == nil {
+		t.Errorf("file at %s — pre-fix bug shape; router stripped the base/ prefix", wrongPath)
 	}
 }
 
