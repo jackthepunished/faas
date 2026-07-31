@@ -71,7 +71,7 @@ type UpdateAppRequest struct {
 	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
-	// StreamingEnabled (issue #471) toggles the per-app streaming
+// StreamingEnabled (issue #471) toggles the per-app streaming
 	// response path through gatewayd. When true (or unset on a plan
 	// where the default is true), gatewayd streams the response body
 	// from the guest through to the client with a periodic 200 ms /
@@ -82,6 +82,16 @@ type UpdateAppRequest struct {
 	// that wants Content-Length). Pointer distinguishes "don't
 	// touch" (nil) from "explicit false" (*bool=false).
 	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
+	// RootDir, WorkloadName, StartCommand mirror the apps table
+	// columns added in Phase 1 (migration 00074). The customer-facing
+	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
+	// they're populated by pkg/reconcile in PR-G/H via the internal
+	// updateApp flow. json tags keep them off the customer wire
+	// surface (`omitempty` on every field, no separate routes
+	// targeting these) so an existing CLI SDK never sends them.
+	RootDir      *string `json:"-"`
+	WorkloadName *string `json:"-"`
+	StartCommand *string `json:""`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).

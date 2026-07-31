@@ -91,17 +91,30 @@ func TestMemStoreCoverageAppQuotaAndUpdates(t *testing.T) {
 		t.Fatalf("quota slug conflict = %v", err)
 	}
 	egress := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
+	rootDir := "services/api"
+	workloadName := "api"
+	startCmd := "node server.js"
 	updated, err := m.UpdateApp(ctx, app.ID, UpdateAppParams{
 		RAMMB: &[]int{1024}[0], SetIdleTimeout: true, IdleTimeoutS: new(int),
 		SetMinInstances: true, MinInstances: new(int), EgressAllowlist: &egress, SetEgressAllowlist: true,
 		SetAutoscaleTargetRPS: true, AutoscaleTargetRPS: new(int), SetAutoscaleTargetCPUPct: true, AutoscaleTargetCPUPct: new(int),
 		Manifest: &AppManifest{Port: 8080},
+		// Phase 5 widening (PR-E): reconcile populates these on
+		// update. Coverage tripwire ensures both stores mirror the
+		// same fields.
+		RootDir: &rootDir, WorkloadName: &workloadName, StartCommand: &startCmd,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.RAMMB != 1024 || updated.Manifest.Port != 8080 || len(updated.EgressAllowlist) != 1 {
 		t.Fatalf("updated app = %+v", updated)
+	}
+	// Phase 5 widening: pin the round-trip on every widened field so
+	// a regression in pgstore/memstore parity trips the coverage gate
+	// immediately.
+	if updated.RootDir != rootDir || updated.WorkloadName != workloadName || updated.StartCommand != startCmd {
+		t.Fatalf("updated workload fields = %+v", updated)
 	}
 	if _, err := m.UpdateApp(ctx, "missing", UpdateAppParams{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing app update = %v", err)

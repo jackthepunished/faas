@@ -785,7 +785,10 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
-		   streaming_enabled = case when $17 then $18 else streaming_enabled end
+		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
+		   root_dir       = case when $19 then $20 else root_dir end,
+		   workload_name  = case when $21 then $22 else workload_name end,
+		   start_command  = case when $23 then $24::text else start_command end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, upd,
@@ -797,8 +800,21 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
 		p.SetAutoscaleTargetRPS, intOrZero(p.AutoscaleTargetRPS),
 		p.SetAutoscaleTargetCPUPct, intOrZero(p.AutoscaleTargetCPUPct),
-		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled))
+		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled),
+		p.RootDir != nil, p.RootDir,
+		p.WorkloadName != nil, p.WorkloadName,
+		p.StartCommand != nil, nullString(derefString(p.StartCommand)))
 	return scanApp(row)
+}
+
+// derefString returns the dereferenced value of a *string, or "" if
+// nil. Mirrors derefInt at this file's helper section; both are safe
+// to call with a nil pointer because the CASE guards the read site.
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // SetAppMinInstances stamps the per-app floor (ux_spec §6.5). Plan-tier
@@ -872,8 +888,30 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 }
 
 func (s *PgStore) DeleteApp(ctx context.Context, id string) error {
-	_, err := s.pool.Exec(ctx, `update apps set status = 'deleted' where id = $1`, id)
+	// Legacy thin wrapper retained for the apid deleteApp handler
+	// (Phase 5 pkg/reconcile calls SoftDeleteAppCascade directly).
+	_, err := s.SoftDeleteAppCascade(ctx, id)
 	return err
+}
+
+// SoftDeleteAppCascade marks the app deleted (status='deleted') and
+// returns the freshly-deleted App row. Per Phase 5 user decision the
+// cascade is status-only — child rows survive for slug-reuse (an app
+// deleted then recreated under the same slug keeps its envs and
+// secrets; cf. memstore_test.go:309-312). GDPR-style hard cascade
+// still lives in DeleteAccount. Returns ErrNotFound when no row
+// matches; the subsequent mapErr funnel wraps SQLSTATE 23502
+// (not_null) the same way as SetAppWorkloadClass.
+func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, error) {
+	var a App
+	row := s.pool.QueryRow(ctx, `
+		update apps set status = 'deleted', updated_at = now()
+		where id = $1
+		returning `+appsSelectColumns, id)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
 }
 
 // --- Projects (ADR-050, Phase 1) ----------------------------------

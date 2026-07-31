@@ -1442,6 +1442,20 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetStreamingEnabled {
 		a.StreamingEnabled = boolOrFalse(p.StreamingEnabled)
 	}
+	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
+	// these to stamp a fresh workload identity on a changed app. The
+	// apid handler never sets them (customers don't touch root_dir
+	// / workload_name / start_command via PATCH today). nil = leave
+	// alone; non-nil pointer = copy verbatim.
+	if p.RootDir != nil {
+		a.RootDir = *p.RootDir
+	}
+	if p.WorkloadName != nil {
+		a.WorkloadName = *p.WorkloadName
+	}
+	if p.StartCommand != nil {
+		a.StartCommand = *p.StartCommand
+	}
 	m.apps[id] = a
 	return a, nil
 }
@@ -1512,16 +1526,25 @@ func (m *MemStore) SetAppWorkloadClass(_ context.Context, appID string, class Wo
 	return a, nil
 }
 
-func (m *MemStore) DeleteApp(_ context.Context, id string) error {
+func (m *MemStore) DeleteApp(ctx context.Context, id string) error {
+	// Legacy thin wrapper retained for the apid deleteApp handler.
+	_, err := m.SoftDeleteAppCascade(ctx, id)
+	return err
+}
+
+// SoftDeleteAppCascade marks the app deleted (status=AppDeleted) and
+// returns the freshly-deleted App row. Memstore parity with
+// PgStore.SoftDeleteAppCascade — status-only, child rows survive.
+func (m *MemStore) SoftDeleteAppCascade(_ context.Context, id string) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.apps[id]
 	if !ok {
-		return ErrNotFound
+		return App{}, ErrNotFound
 	}
 	a.Status = AppDeleted
 	m.apps[id] = a
-	return nil
+	return a, nil
 }
 
 // RecordGitHubBinding persists the (app → installation_id, repo,
