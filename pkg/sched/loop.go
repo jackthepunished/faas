@@ -738,6 +738,11 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// value is always >= 0 here.
 				MinInstances: a.MinInstances,
 				OpenConns:    open,
+				// ADR-051 PR-D: workload class drives the
+				// reaper-exempt carve-out. Workers skip
+				// ReapIdle + ReapAggressive; RAM pressure
+				// (SelectEvictions) still wins.
+				WorkloadClass: a.WorkloadClass,
 			})
 		}
 	}

@@ -42,6 +42,9 @@ func containsNat(data []byte) bool {
 // platform with a temp-file fixture — the linux-only thing is the
 // path passed in.
 func scanListeningFile(path string, owned map[uint64]struct{}) (int, string, bool) {
+	//nolint:forbidigo // /proc/net/tcp{,6} is a vetted kernel path inside the
+	// guest; the customer-path guard (openCustomerFile) is for host daemons
+	// reading customer bytes — this reads in-guest kernel state only.
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, "", false

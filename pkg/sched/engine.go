@@ -865,6 +865,21 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)
 	}
+
+	// ADR-051 Phase 4 / PR-D: persist the workload class the
+	// characterize probe observed on the cold boot. On restore we
+	// inherit from the apps row (no observation here — the warm
+	// path runs the same scan-hint class the original cold boot
+	// committed). On cold-boot timeouts the report is empty and we
+	// keep the scan-hint class (no row mutation). Best-effort:
+	// SetAppWorkloadClass failure doesn't block the RUNNING
+	// transition — the class is metadata, not the boot path.
+	if out.Characterization.ObservedClass != "" {
+		if _, err := e.store.SetAppWorkloadClass(ctx, bootInput.appID, state.WorkloadClass(out.Characterization.ObservedClass), "observed"); err != nil {
+			e.log.Warn("wake: SetAppWorkloadClass", "app", bootInput.appID, "err", err)
+		}
+	}
+
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
 	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID}, nil

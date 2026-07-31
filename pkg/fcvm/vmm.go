@@ -1339,6 +1339,141 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease) error {
 	}
 }
 
+// VsockCharacterizationHostPort is the AF_VSOCK port the host's
+// characterization listener accepts on. Must match
+// guest/init/characterize_linux.go::VsockCharacterizationPort (1026).
+// Distinct from VsockResumePort (1024) and VsockStatelessAdvisoryPort
+// (1025) so a host-side prefix collision is impossible.
+const VsockCharacterizationHostPort = 1026
+
+// VsockCharacterizationMsgType is the wire-format discriminator for
+// a guest→host characterization report. Matches
+// guest/init/characterize_linux.go::VsockCharacterizationMsgType (=3).
+const VsockCharacterizationMsgType uint32 = 3
+
+// VsockCharacterizationMaxBody caps the JSON body at 32 KiB.
+// The typical report is <2 KiB; 32 KiB accommodates a long log_tail
+// plus listening_addrs for a polyglot app. Matches the guest's
+// VsockCharacterizationMaxBody.
+const VsockCharacterizationMaxBody = 32 * 1024
+
+// WaitCharacterizationReport accepts the FIRST guest-initiated
+// AF_VSOCK STREAM connection on VsockCharacterizationHostPort and
+// reads [4B BE msg_type][4B BE body_len][N B JSON], writes a 1-byte
+// ack (0=ok), and returns the parsed report.
+//
+// Wire direction: GUEST INITIATES — guest dials host CID 2 at
+// port 1026 (mirror of VsockResumePort which is host-accept). The
+// guest retries with backoff (100/250/500 ms, 3 retries); the host
+// must accept any of them. We open the listener ONCE, accept ONE
+// connection, and let the deadline elapse if no guest arrives.
+//
+// Caller (pkg/sched/engine.go in PR-D) gates the RUNNING transition
+// on the report arriving. On timeout, the engine falls back to the
+// scan-hint class (never fails the deploy — that would regress vs
+// today's opaque `:8080` accept failure).
+//
+// Defense-in-depth mirrors TriggerResumeHook: nil receiver, empty
+// instance, unconfigured chroot root are all explicit errors. A
+// refactor that passes an uninitialised VMM would otherwise dial a
+// malformed UDS path and return a cryptic ENOENT.
+func (v *JailerVMM) WaitCharacterizationReport(ctx context.Context, l Lease, deadline time.Duration) (api.CharacterizationReport, error) {
+	var zero api.CharacterizationReport
+	if v == nil {
+		return zero, fmt.Errorf("vmm: WaitCharacterizationReport: nil receiver")
+	}
+	if l.Instance == "" {
+		return zero, fmt.Errorf("vmm: WaitCharacterizationReport: empty instance")
+	}
+	if v.chrootBase == "" {
+		return zero, fmt.Errorf("vmm: WaitCharacterizationReport: chrootBase not configured")
+	}
+	sock := v.vsockUDSSock(l.Instance)
+
+	dialDeadline := time.Now().Add(deadline)
+	var conn net.Conn
+	var lastErr error
+	for time.Now().Before(dialDeadline) {
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		var err error
+		conn, err = net.DialTimeout("unix", sock, 200*time.Millisecond)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(resumeHookDialStep):
+		}
+	}
+	if conn == nil {
+		return zero, fmt.Errorf("vmm: dial vsock uds %s: %w", sock, lastErr)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Step 1: FC CONNECT-port handshake. Same shape as
+	// TriggerResumeHook — the guest's listen_resume_linux.go's UDS
+	// and the characterization UDS are the same socket; the port
+	// arg tells FC which guest-side listener to deliver to.
+	connectCmd := fmt.Sprintf("CONNECT %d\n", VsockCharacterizationHostPort)
+	if _, err := conn.Write([]byte(connectCmd)); err != nil {
+		return zero, fmt.Errorf("vmm: write CONNECT %d: %w", VsockCharacterizationHostPort, err)
+	}
+	connectAck, err := readConnectAck(conn)
+	if err != nil {
+		return zero, fmt.Errorf("vmm: read CONNECT ack: %w", err)
+	}
+	if connectAck != "OK" {
+		return zero, fmt.Errorf("vmm: CONNECT rejected: %q", connectAck)
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(deadline))
+
+	// Step 2: read the framed JSON. 4-byte BE msg type discriminator +
+	// 4-byte BE body length + N bytes JSON. We validate msg_type =
+	// VsockCharacterizationMsgType; a wrong type means a misrouted
+	// frame (the guest dialed the right port but the wrong listener,
+	// or the host reused the UDS for something else).
+	var hdr [8]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return zero, fmt.Errorf("vmm: read characterization frame header: %w", err)
+	}
+	msgType := binary.BigEndian.Uint32(hdr[0:4])
+	bodyLen := binary.BigEndian.Uint32(hdr[4:8])
+	if msgType != VsockCharacterizationMsgType {
+		return zero, fmt.Errorf("vmm: wrong msg_type %d (want %d)", msgType, VsockCharacterizationMsgType)
+	}
+	if bodyLen == 0 || int(bodyLen) > VsockCharacterizationMaxBody {
+		return zero, fmt.Errorf("vmm: characterization body length %d out of range (max %d)", bodyLen, VsockCharacterizationMaxBody)
+	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return zero, fmt.Errorf("vmm: read characterization body: %w", err)
+	}
+
+	// Step 3: parse the report. The guest's emit-side encodes via
+	// pkg/api.CharacterizationReport (json tags are wire-stable).
+	var report api.CharacterizationReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return zero, fmt.Errorf("vmm: unmarshal characterization report: %w", err)
+	}
+
+	// Step 4: 1-byte ack. 0 = ok. The guest retries on !=0 or
+	// short read; we send 0 unconditionally (any failure here would
+	// have already returned).
+	if _, err := conn.Write([]byte{0}); err != nil {
+		// Ack write failure doesn't undo the parsed report; the
+		// guest will retry but we already have what we need.
+		// Surface as a soft warning via the return tuple: caller
+		// (engine.go) decides if it matters.
+		return report, fmt.Errorf("vmm: write ack: %w", err)
+	}
+	return report, nil
+}
+
 // fcClient returns an HTTP client bound to the instance's Firecracker API socket.
 // Clients are cached per instance because http.Transport's connection pool is
 // the expensive part; rebuilding per request would re-resolve the socket every

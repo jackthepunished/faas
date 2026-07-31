@@ -50,12 +50,6 @@ func (s *Supervisor) LastAppPID() int {
 	return -1
 }
 
-// trackCommand is called inside Start's exec.Cmd setup to record the
-// running pid for characterize_linux.go's AppPID() callback.
-func (s *Supervisor) trackCommand(cmd *exec.Cmd) {
-	s.lastCmd.Store(cmd)
-}
-
 // trackExit is called when Start returns; -1 indicates non-ExitError.
 func (s *Supervisor) trackExit(code int) {
 	s.lastExitCode.Store(int64(code))
