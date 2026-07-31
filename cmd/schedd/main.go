@@ -161,6 +161,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 
+	// ADR-056: handshake-layer NodeVerifier. Schedd is always
+	// multi-box-aware (no NodeName gate — the synth `default-local`
+	// row is seeded by migration 00024). Construct the PG-backed
+	// verifier and refresh once at startup so the first mTLS
+	// handshake after listen sees a populated snapshot. The drain
+	// loop runs as a goroutine for the lifetime of the daemon and
+	// drives Refresh on every compute_node_changed notification.
+	nodeVerifier := wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log)
+	if _, err := nodeVerifier.Refresh(ctx); err != nil {
+		return fmt.Errorf("schedd: node verifier startup refresh: %w", err)
+	}
+	go func() {
+		ch, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyComputeNodeChanged}, log)
+		if err != nil {
+			log.Error("schedd: node verifier LISTEN failed", "err", err)
+			return
+		}
+		if err := nodeVerifier.Run(ctx, ch); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("schedd: node verifier exited", "err", err)
+		}
+	}()
+
 	// Snapshots load only on the Firecracker version that made them (ADR-005);
 	// detect it so the engine restores compatible snapshots and cold boots the
 	// rest.
@@ -172,7 +194,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the vmmd_tls_* cluster; nil TLS on
 	// a unix target keeps single-box behaviour unchanged.
-	vmmTLS, err := cfg.LoadVMMTLS()
+	vmmTLS, err := cfg.LoadVMMTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("schedd: load vmmd TLS: %w", err)
 	}
@@ -312,7 +334,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// gRPC surface for gatewayd (ADR-018): unix socket by default;
 	// tcp requires the tls_* cluster and is issue #95.
-	serverTLS, err := cfg.LoadServerTLS()
+	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("schedd: load server TLS: %w", err)
 	}

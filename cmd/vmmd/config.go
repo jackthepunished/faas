@@ -128,11 +128,26 @@ func (c *Config) LoadServerTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
 }
 
+// LoadServerTLSWithVerifier is the ADR-056 variant of LoadServerTLS
+// that attaches a wire.NodeVerifier to the server's TLS config. A
+// nil verifier is the single-box / pre-slice-3 case (no verifier
+// installed; stdlib trust alone runs).
+func (c *Config) LoadServerTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithVerifier(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v)
+}
+
 // LoadScheddClientTLS returns the client mTLS config vmmd uses to
 // dial schedd for the capacity publisher (ADR-052). Empty cluster
 // returns (nil, nil); partial cluster is rejected.
 func (c *Config) LoadScheddClientTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("schedd_client_", c.ScheddClientCertPath, c.ScheddClientKeyPath, c.ScheddClientCAPath)
+}
+
+// LoadScheddClientTLSWithVerifier is the ADR-056 variant of
+// LoadScheddClientTLS. Same contract: nil verifier → no hook
+// installed; prefix ("schedd_client_") names missing fields.
+func (c *Config) LoadScheddClientTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefixAndVerifier("schedd_client_", c.ScheddClientCertPath, c.ScheddClientKeyPath, c.ScheddClientCAPath, v)
 }
 
 // LoadAdvisoryClientTLS returns the client mTLS config vmmd uses to

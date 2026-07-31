@@ -170,6 +170,13 @@ func (c *Config) LoadServerTLS() (*tls.Config, error) {
 	return wire.LoadServerTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
 }
 
+// LoadServerTLSWithVerifier is the ADR-056 variant of LoadServerTLS.
+// Schedd is the control-plane trust anchor, so it wires the
+// verifier unconditionally when the multi-box gate is open.
+func (c *Config) LoadServerTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithVerifier(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v)
+}
+
 // LoadVMMTLS returns the client mTLS config schedd uses to dial vmmd.
 // Empty cluster returns (nil, nil) — single-box default. Partial
 // cluster is rejected with the vmmd_tls_* field names (not the
@@ -177,6 +184,12 @@ func (c *Config) LoadServerTLS() (*tls.Config, error) {
 // key.
 func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath)
+}
+
+// LoadVMMTLSWithVerifier is the ADR-056 variant of LoadVMMTLS.
+// Mirrors the prefix semantics (vmmd_ for error naming).
+func (c *Config) LoadVMMTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefixAndVerifier("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath, v)
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing file

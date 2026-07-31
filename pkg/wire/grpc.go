@@ -387,6 +387,50 @@ func LoadServerTLSConfigWithPrefix(prefix, certPath, keyPath, caPath string) (*t
 	return loadServerTLSConfig(certPath, keyPath, caPath, prefix)
 }
 
+// LoadServerTLSConfigWithPrefixAndVerifier combines the role-distinguished
+// error naming of LoadServerTLSConfigWithPrefix with the handshake-layer
+// NodeVerifier hook of LoadServerTLSConfigWithVerifier (ADR-056).
+func LoadServerTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, nil
+	}
+	if hook := VerifyCNClosure(v); hook != nil {
+		cfg.VerifyPeerCertificate = hook
+	}
+	return cfg, nil
+}
+
+// LoadServerTLSConfigWithVerifier is the LoadServerTLSConfig variant
+// that installs a VerifyPeerCertificate hook augmenting stdlib trust
+// (chain / RFC 6125 SAN / EKU) with the supplied NodeVerifier
+// (ADR-056). The hook runs AFTER stdlib trust succeeds —
+// InsecureSkipVerify stays false, so CodeQL #58 doesn't fire.
+//
+// v==nil degrades to the existing LoadServerTLSConfig (no hook
+// installed): single-box dev paths and pre-slice-3 schedd keep
+// their current behaviour. A nil/empty all-paths input returns the
+// LoadServerTLSConfig nil contract — the production caller (cmd/schedd)
+// already handles "no TLS at all" as a legitimate single-box state.
+func LoadServerTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, "")
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		// All-paths-empty: honour LoadServerTLSConfig's nil
+		// contract. The verifier is irrelevant without TLS.
+		return nil, nil
+	}
+	if hook := VerifyCNClosure(v); hook != nil {
+		cfg.VerifyPeerCertificate = hook
+	}
+	return cfg, nil
+}
+
 func loadServerTLSConfig(certPath, keyPath, caPath, prefix string) (*tls.Config, error) {
 	if certPath == "" && keyPath == "" && caPath == "" {
 		return nil, nil
@@ -426,6 +470,48 @@ func LoadClientTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) 
 // LoadClientTLSConfigWithPrefix is the role-distinguished variant.
 func LoadClientTLSConfigWithPrefix(prefix, certPath, keyPath, caPath string) (*tls.Config, error) {
 	return loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+}
+
+// LoadClientTLSConfigWithPrefixAndVerifier combines the
+// role-distinguished error naming of LoadClientTLSConfigWithPrefix
+// with the handshake-layer NodeVerifier hook of
+// LoadClientTLSConfigWithVerifier (ADR-056).
+func LoadClientTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, nil
+	}
+	if hook := VerifyCNClosure(v); hook != nil {
+		cfg.VerifyPeerCertificate = hook
+	}
+	return cfg, nil
+}
+
+// LoadClientTLSConfigWithVerifier is the client-side mirror of
+// LoadServerTLSConfigWithVerifier (ADR-056). Same contract: the
+// stdlib chain/SAN/EKU check runs first; the verifier's
+// VerifyPeerCertificate hook augments it AFTER stdlib trust succeeds.
+// InsecureSkipVerify stays false (CodeQL #58 invariant).
+//
+// v==nil degrades to the existing LoadClientTLSConfig (no hook
+// installed): single-box clients continue to work. All-paths-empty
+// input returns LoadClientTLSConfig's nil contract — the production
+// caller decides whether to fall back to insecure (unix sockets).
+func LoadClientTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, "")
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, nil
+	}
+	if hook := VerifyCNClosure(v); hook != nil {
+		cfg.VerifyPeerCertificate = hook
+	}
+	return cfg, nil
 }
 
 func loadClientTLSConfig(certPath, keyPath, caPath, prefix string) (*tls.Config, error) {
