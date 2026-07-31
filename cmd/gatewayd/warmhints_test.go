@@ -93,13 +93,21 @@ func TestWarmHintConsumer_DrainsAndUpdatesCache(t *testing.T) {
 func TestWarmHintConsumer_DrainCtxCancelStops(t *testing.T) {
 	cache := gateway.NewWarmHintCache()
 	g := newTestConsumer(cache)
-	// Never-emitting stream with no tailErr — drain blocks on
-	// Recv. ctx cancel unblocks it.
-	stream := &fakeWarmHintStream{events: nil}
+	// Never-emitting stream with no tailErr — drain is asked to
+	// exit via ctx cancel. Cancel ctx BEFORE starting drain so
+	// the first loop iteration's select catches ctx.Done() and
+	// returns nil deterministically. Without pre-cancel the test
+	// races: drain's first Recv returns EOF immediately (fake
+	// has no events), drain returns EOF, and the test sees "drain
+	// returned EOF on ctx cancel" — exactly the 2026-07-31 flake
+	// on CI run 30647001244. The pre-cancel pattern mirrors
+	// real gRPC, where the daemon's ctx is already cancelled by
+	// the time drain sees the call.
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := &fakeWarmHintStream{events: nil}
 	done := make(chan error, 1)
 	go func() { done <- drainForTest(g, ctx, stream) }()
-	cancel()
 
 	select {
 	case err := <-done:
