@@ -26,6 +26,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -107,16 +109,23 @@ type planCron struct {
 //	  → mint plan_token
 //
 // `apply` is true for POST /v1/projects, false for POST /v1/projects/scan.
-// When apply=true, the function ALSO builds the state.Project / []state.App
-// / []state.Cron inputs ready for store.ApplyProjectPlan (caller invokes
-// the store). When apply=false, the caller renders the response as JSON.
+// When apply=true, the function ALSO creates the projects row + runs
+// pkg/reconcile.Service, returning the reconcile Result via the
+// third/fourth slots. When apply=false, the caller renders the
+// response as JSON.
 //
-// Returns (response, project, apps, crons, problem). project/apps/crons
-// are valid only when problem == nil and apply==true.
+// Returns (response, project, added, changed, problem). project/added/
+// changed are valid only when problem == nil and apply==true.
+//
+// added is the post-insert state.App slice for newly-created apps;
+// changed is the post-update slice for workloads whose RootDir /
+// WorkloadName / StartCommand drifted. The handler uses these two
+// slices to fire kind=created vs kind=updated NotifyAppChanged
+// notifications and to stamp cron AppID from the slug→ID map.
 func (s *server) scanService(
 	w http.ResponseWriter, r *http.Request, acct state.Account,
 	planToken string, apply bool,
-) (*scanPlanResponse, state.Project, []state.App, []state.Cron, *api.Problem) {
+) (*scanPlanResponse, state.Project, []state.App, []state.App, *api.Problem) {
 	limits := api.MustLimitsFor(acct.Plan)
 	req, prob := parseScanMultipart(r, acct, limits)
 	if prob != nil {
@@ -215,7 +224,7 @@ func (s *server) scanService(
 
 	resp := &scanPlanResponse{
 		ProjectSlug:   req.ProjectSlug,
-		ScanSource:    deriveScanSource(filteredW),
+		ScanSource:    reconcile.DeriveScanSource(filteredW),
 		Tier:          result.Tier.String(),
 		Workloads:     filteredW,
 		Managed:       filteredMc,
@@ -246,14 +255,20 @@ func (s *server) scanService(
 		return resp, state.Project{}, nil, nil, nil
 	}
 
-	// Apply path: translate filteredW + crons into state rows.
-	// Crons carry WorkloadName; the caller (handler) resolves
-	// WorkloadName -> AppID once the ApplyProjectPlan Tx returns.
+	// Apply path (PR-G, repo decomposition Phase 5): route every
+
+	// Apply path (PR-G, repo decomposition Phase 5): route every
+	// workload-mutating action through pkg/reconcile.Service. The
+	// scan-service no longer builds state.App rows directly; the
+	// reconcile package owns the diff/apply contract and emits the
+	// audit rows. Pre-PR-G this branch built stateApps + stateCrons
+	// and handed them to store.ApplyProjectPlan; post-PR-G we hand
+	// state.Project + reposcan.Result to reconcileSvc.Reconcile.
 	if !canApply {
-		// Don't even call ApplyProjectPlan — quota check is the
-		// store's job but the handler routes the right HTTP code
-		// based on the resp flags. Return a sentinel problem so the
-		// handler can branch on canApply=false without parsing.
+		// Don't even call Reconcile — quota check is reconcile's
+		// job but the handler routes the right HTTP code based on
+		// the resp flags. Return a sentinel problem so the handler
+		// can branch on canApply=false without parsing.
 		var prob *api.Problem
 		switch {
 		case notAllowed:
@@ -275,27 +290,95 @@ func (s *server) scanService(
 		InstallID:        req.InstallID,
 		ScanSource:       resp.ScanSource,
 	}
-	stateApps := make([]state.App, 0, len(filteredW))
-	stateCrons := make([]state.Cron, 0, len(crons))
-	for _, wl := range filteredW {
-		stateApps = append(stateApps, wlToApp(acct, wl))
+	// CreateProject inserts the projects row and stamps ID +
+	// CreatedAt. This MUST happen before reconcile runs — the
+	// reconcile path's CreateAppIfUnderQuota cascades a
+	// project_id FK (apps.project_id → projects.id), and a NULL
+	// project_id would skip the apps_project_workload_uniq
+	// enforcement path. Pre-PR-G, store.ApplyProjectPlan inserted
+	// project + apps in one Tx; the split here is the cost of
+	// the package boundary (pkg/reconcile never imports pkg/state
+	// types beyond the Store interface).
+	created, projErr := s.store.CreateProject(r.Context(), project)
+	if projErr != nil {
+		var prob *api.Problem
+		switch {
+		case errors.Is(projErr, state.ErrConflict):
+			prob = api.NewProblem(http.StatusConflict,
+				api.CodeValidation, "Project slug collision",
+				"this project slug is already taken")
+		case errors.Is(projErr, state.ErrNotFound):
+			prob = api.NewProblem(http.StatusNotFound,
+				api.CodeValidation, "Account not found", "")
+		default:
+			prob = api.ErrInternal(fmt.Sprintf("create project: %v", projErr))
+		}
+		return resp, state.Project{}, nil, nil, prob
 	}
-	// Crons arrive with AppID="" so the store doesn't try to insert
-	// them before the AppID resolution. The handler reads the
-	// cronWorkloadNames field off the response and, once
-	// ApplyProjectPlan returns insertedApps, calls CreateCron for
-	// each one with the resolved AppID.
-	for _, c := range crons {
-		stateCrons = append(stateCrons, state.Cron{
-			Schedule: c.Schedule,
-			Path:     c.Path,
-			Enabled:  c.Enabled,
-		})
-	}
+	project = created
+
+	// Build the cron name list (handler uses index parity to look up
+	// the AppID post-reconcile). Order is the same as the scan order
+	// (reposcan sorts by Name), and reconcile's workloadToDraftApp
+	// preserves that order in Result.Added — so the handler's
+	// resp.CronNames[i] ↔ Result.Added/Changed slug lookup is safe.
 	for i := range crons {
 		resp.CronNames = append(resp.CronNames, crons[i].WorkloadName)
 	}
-	return resp, project, stateApps, stateCrons, nil
+
+	// Hand off to reconcile.Service. The post-Reconcile Result
+	// carries Added (creates), Changed (updates), Removed (soft-
+	// deletes), and Alerts (guard-tripped notifications). The
+	// handler reads Added + Changed to build the slug→ID map for
+	// cron stamping and to emit per-app NotifyAppChanged.
+	//
+	// The reposcan.Result handed to reconcile is the --only-filtered
+	// subset, mirroring the legacy stateApps construction at the top
+	// of this branch (filteredW). The tier + warnings + managed
+	// metadata pass through verbatim — only Workloads is filtered.
+	filteredScan := reposcan.Result{
+		Workloads: filteredW,
+		Managed:   filteredMc,
+		Tier:      result.Tier,
+		Warnings:  result.Warnings,
+	}
+	reconcileInputs := toReconcileInputs(*req, project, filteredScan)
+	rec, recErr := s.reconcileSvc.Reconcile(
+		r.Context(), project, filteredScan,
+		reconcileInputs.CommitSHA, reconcileInputs.Branch)
+	if recErr != nil {
+		// Map reconcile-package errors into the existing RFC 7807
+		// problem shapes so the handler can use a single dispatch
+		// path. mapReconcileError returns nil for nil err, so the
+		// caller can guard on prob != nil.
+		mapped := mapReconcileError(recErr)
+		if mapped != nil {
+			var prob *api.Problem
+			if mapped.Quota != nil {
+				prob = quotaProblem(acct.Plan, limits, mapped.Quota)
+			} else {
+				prob = api.NewProblem(mapped.Status, mapped.Code, mapped.Msg, "")
+			}
+			return resp, state.Project{}, nil, nil, prob
+		}
+		// mapReconcileError returned nil for nil err — unreachable
+		// here, but defensively pass through as 500.
+		return resp, state.Project{}, nil, nil, api.ErrInternal(
+			fmt.Sprintf("reconcile: %v", recErr))
+	}
+
+	// Fold the reconcile Result into the legacy return shape. The
+	// handler reads the third slot (added) and fourth slot
+	// (changed) to:
+	//
+	//  - build the slug→ID map for cron stamping (added ∪ changed)
+	//  - emit per-app NotifyAppChanged with kind=created for
+	//    rec.Added entries and kind=updated for rec.Changed entries
+	//
+	// Each slice carries post-insert/post-update rows with valid
+	// IDs (reconcile's CreateAppIfUnderQuota stamps ID + CreatedAt;
+	// UpdateApp stamps UpdatedAt).
+	return resp, project, rec.Added, rec.Changed, nil
 }
 
 // parseScanMultipart reads the multipart body, spools, validates, and
@@ -458,70 +541,6 @@ func countAccountCrons(ctx context.Context, s *server, accountID string) int {
 		total += len(cs)
 	}
 	return total
-}
-
-// deriveScanSource picks the project scan_source from the workloads
-// that survived --only. The rule mirrors the impl plan: if any
-// workload came from compose, prefer compose; if any came from k8s
-// and any came from compose, prefer k8s (compose is the union of
-// k8s + docker-compose semantics, but the highest-priority detector
-// wins per the reposcan merge rule).
-//
-// We lean on Workload.Source ("compose.yaml: api") — the first
-// segment is the detector tag, which is the same string the merge
-// rule's detector priority uses. This avoids hard-coding detector
-// names twice.
-func deriveScanSource(workloads []reposcan.Workload) state.ProjectScanSource {
-	// Priority order matches the detector fan-out in
-	// pkg/reposcan/scan.go:130. The first match wins.
-	priority := []string{
-		"compose", "procfile", "k8s", "render", "fly",
-		"serverless", "app.yaml", "workspaces", "convention",
-	}
-	for _, want := range priority {
-		for _, w := range workloads {
-			if strings.HasPrefix(w.Source, want+":") || strings.HasPrefix(w.Source, want+".") {
-				return state.ProjectScanSource(want)
-			}
-		}
-	}
-	if len(workloads) == 1 {
-		return state.ProjectScanSourceSingle
-	}
-	return state.ProjectScanSourceUnknown
-}
-
-// wlToApp translates a reposcan.Workload into a state.App draft.
-// The handler hands this to store.ApplyProjectPlan; the store
-// stamps ID, CreatedAt, status='active', and backfills project_id
-// to the freshly-inserted project.
-func wlToApp(acct state.Account, w reposcan.Workload) state.App {
-	class := state.WorkloadClass(string(w.Class))
-	if class == "" {
-		class = state.WorkloadClassHTTP
-	}
-	if w.Class == reposcan.ClassServer {
-		// "server" hint is normalised to "http" — ADR-051 will
-		// re-derive the authoritative class.
-		class = state.WorkloadClassHTTP
-	}
-	startCmd := ""
-	if len(w.Command) > 0 {
-		startCmd = strings.Join(w.Command, " ")
-	}
-	return state.App{
-		AccountID:      acct.ID,
-		Slug:           w.Name,
-		Type:           state.AppTypeApp,
-		RAMMB:          api.MustLimitsFor(acct.Plan).RAMMB,
-		MaxConcurrency: api.MustLimitsFor(acct.Plan).MaxConcurrency,
-		Status:         state.AppActive,
-		ProjectID:      "", // backfilled by store
-		RootDir:        w.RootDir,
-		WorkloadName:   w.Name,
-		WorkloadClass:  class,
-		StartCommand:   startCmd,
-	}
 }
 
 // --- response side helpers --------------------------------------------------

@@ -230,6 +230,18 @@ func (a *auditor) SetFailedOps(ops auditFailedOps) {
 	a.failedOps = ops
 }
 
+// pkgAuditor returns the underlying pkg/audit.Auditor so other
+// in-process subsystems (PR-G's reconcile.Service) can emit audit
+// rows under the same actor (auditActor="apid") without rebuilding
+// a parallel pipeline. Returns nil only when the auditor wrapper
+// itself is nil (defensive — same shape as setOps).
+func (a *auditor) pkgAuditor() *audit.Auditor {
+	if a == nil {
+		return nil
+	}
+	return a.inner
+}
+
 // Start spins up the flusher goroutine. Called once per server
 // after SetFailedOps. The goroutine terminates when the channel is
 // closed via Close.

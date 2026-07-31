@@ -107,7 +107,7 @@ func (s *Service) runGuards(
 		}
 	}
 
-	// Guard 3 — scanSourceStable. deriveScanSource picks the
+	// Guard 3 — scanSourceStable. DeriveScanSource picks the
 	// canonical ProjectScanSource from the scan's workloads; the
 	// store-side monotonic-upgrade guard rejects a downgrade.
 	desired := DeriveScanSource(scan.Workloads)

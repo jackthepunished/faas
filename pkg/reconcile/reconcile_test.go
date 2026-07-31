@@ -605,3 +605,116 @@ func TestReconcile_AppliedIDs_IsolatesAddsFromChanged(t *testing.T) {
 		}
 	}
 }
+
+// TestPlan_NoMutation_ProjectsDiff pins the Plan path's central
+// invariant: it returns Added/Changed/Removed projections identical
+// to what Reconcile would emit, but the fakeStore's existing apps
+// remain untouched and the event slice stays empty (no audit rows).
+// apid's dry-run endpoint relies on this — calling Plan must never
+// side-effect the database.
+func TestPlan_NoMutation_ProjectsDiff(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, newFakeAuditor(store), nil)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", RootDir: "", Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+			{Name: "web", RootDir: "", Source: "compose.yaml: web", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-1", "main")
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(out.Added) != 2 {
+		t.Errorf("expected 2 Added in projection, got %d", len(out.Added))
+	}
+	if len(out.Changed) != 0 {
+		t.Errorf("expected 0 Changed, got %d", len(out.Changed))
+	}
+	if len(out.Removed) != 0 {
+		t.Errorf("expected 0 Removed, got %d", len(out.Removed))
+	}
+	// fakeStore.appendEvents stays empty — Plan never calls Emit.
+	if got := len(store.snapshotEvents()); got != 0 {
+		t.Errorf("Plan leaked %d audit rows; expected 0", got)
+	}
+	// Existing project membership unchanged (AppsForProject returns []).
+	got, err := store.AppsForProject(context.Background(), proj.AccountID, proj.ID)
+	if err != nil {
+		t.Fatalf("AppsForProject after Plan: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("Plan leaked %d app rows; expected 0", len(got))
+	}
+}
+
+// TestPlan_FeatureBranchIgnored asserts the production-branch guard
+// is honored on the Plan path when branch != "" (apid's dry-run
+// can render projections for any branch, but a non-prod branch
+// must surface WasIgnored=true so the handler returns
+// {ignored: true}).
+func TestPlan_FeatureBranchIgnored(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, newFakeAuditor(store), nil)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "api", Source: "compose.yaml: api", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-2", "feature/foo")
+	if err != nil {
+		t.Fatalf("Plan feature-branch: %v", err)
+	}
+	if !out.WasIgnored {
+		t.Errorf("expected WasIgnored=true on feature branch")
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindFeatureBranch {
+		t.Errorf("expected feature_branch alert, got %+v", out.Alerts)
+	}
+}
+
+// TestPlan_EmptyScan_AlertNoWorkloads pins guard 1 on the Plan path.
+func TestPlan_EmptyScan_AlertNoWorkloads(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, newFakeAuditor(store), nil)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+
+	out, err := svc.Plan(context.Background(), proj, reposcan.Result{Tier: reposcan.TierCompose}, "sha-plan-3", "main")
+	if err == nil {
+		t.Fatalf("Plan on empty scan must error")
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindNoWorkloads {
+		t.Errorf("expected no_workloads alert, got %+v", out.Alerts)
+	}
+}
+
+// TestPlan_ScanSourceDowngrade_NoMutation pins guard 3 on the Plan
+// path: a downgrade is reported but never applied.
+func TestPlan_ScanSourceDowngrade_NoMutation(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, newFakeAuditor(store), nil)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "app", Source: "root-floor", Tier: reposcan.TierSingle},
+		},
+		Tier: reposcan.TierSingle,
+	}
+	out, err := svc.Plan(context.Background(), proj, scan, "sha-plan-4", "main")
+	if err == nil {
+		t.Fatalf("Plan on downgrade must error")
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindScanSourceDowngrade {
+		t.Errorf("expected scan_source_downgrade alert, got %+v", out.Alerts)
+	}
+	if len(store.snapshotEvents()) != 0 {
+		t.Errorf("Plan on downgrade leaked audit rows")
+	}
+}

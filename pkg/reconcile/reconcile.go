@@ -20,6 +20,8 @@ package reconcile
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 
@@ -91,6 +93,14 @@ type Alert struct {
 	Data    map[string]any
 }
 
+// ErrPlanEmpty is the sentinel Plan returns when guard 1
+// (never-empty) trips on the dry-run path. Daemons match via
+// errors.Is to distinguish "scan found zero workloads" from
+// other failures and emit a stable 422 problem. ErrIgnored and
+// state.ErrScanSourceDowngrade are the Plan-side sentinels for
+// guards 2 and 3.
+var ErrPlanEmpty = errors.New("reconcile: plan scan returned zero workloads")
+
 // NewService builds a Service with the default Scan and Limits
 // resolvers. Callers typically set Store + Audit explicitly; the
 // rest is wired by the constructor.
@@ -130,3 +140,148 @@ func (s *Service) Reconcile(
 	// the package's public-surface contract.
 	return s.reconcile(ctx, project, scan, commitSHA, branch)
 }
+
+// Plan runs the same three guards + diff as Reconcile but never
+// persists and never emits audit rows. Used by apid's dry-run
+// endpoint (POST /v1/projects/scan) to project the would-be
+// Added/Changed/Removed/Alerts without mutation. The caller can
+// render Result.Added/Changed/Removed to the client so the user
+// sees exactly what apply would do, and bail before persisting
+// if a guard tripped.
+//
+// branch=="" skips the production-branch guard (apid enforces
+// prod-branch upstream of Plan in the dry-run flow).
+//
+// commitSHA is informational only on the Plan path — there is no
+// audit row to populate, and the store is never called.
+func (s *Service) Plan(
+	ctx context.Context,
+	project state.Project,
+	scan reposcan.Result,
+	commitSHA string,
+	branch string,
+) (Result, error) {
+	if s.Scan == nil {
+		// Mirror NewService's panic-on-nil so test stubs that
+		// forget to wire Scan fail loudly rather than segfault on
+		// the first call.
+		panic("reconcile: Service.Scan is nil")
+	}
+	if s.Log == nil {
+		s.Log = slog.Default()
+	}
+
+	// 1. Guards. Same set as Reconcile but the production-branch
+	// guard is bypassed when branch=="" so the dry-run endpoint
+	// can render projections for any branch without rejecting.
+	outcome := s.runGuardsForPlan(ctx, project, scan, commitSHA, branch)
+	if outcome.err != nil {
+		// Surface the alert to the caller so the dry-run response
+		// can include the guard reason (matches Reconcile's
+		// Aligned: when the guard trips, the Result carries the
+		// Alert regardless of whether err is non-nil).
+		return Result{Alerts: outcome.alerts}, outcome.err
+	}
+	if outcome.ignored {
+		return Result{WasIgnored: true, Alerts: outcome.alerts}, nil
+	}
+
+	// 2. Read existing membership (read-only on the Plan path).
+	existing, err := s.Store.AppsForProject(ctx, project.AccountID, project.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("reconcile: plan: load apps: %w", err)
+	}
+
+	// 3. Diff. workloadDiff is read-only; it does not touch the
+	// store and does not emit audit.
+	actions := workloadDiff(scan, project, existing)
+
+	// 4. Project the would-be Result without applying. The shape
+	// mirrors applyActions' return: Added = would-be creates,
+	// Changed = would-be updates, Removed = would-be remove IDs,
+	// BuildIDs = nil (Plan does not enqueue builds).
+	var out Result
+	for _, a := range actions {
+		switch a.Op {
+		case "create":
+			draft := workloadToDraftApp(project, a.Workload, a.StartCommand)
+			out.Added = append(out.Added, draft)
+		case "update":
+			out.Changed = append(out.Changed, a.App)
+		case "remove":
+			out.Removed = append(out.Removed, a.App.ID)
+		}
+	}
+	return out, nil
+}
+
+// guardOutcome is the internal shape returned by runGuards /
+// runGuardsForPlan. Defined here (next to Plan) so the Plan path
+// can share guard plumbing without exporting the production-only
+// fields.
+type planGuardOutcome struct {
+	err     error
+	ignored bool
+	alerts  []Alert
+}
+
+// runGuardsForPlan is the Plan-side sibling of runGuards. It
+// honors guards 1 (never-empty) and 3 (scan-source stability)
+// verbatim; guard 2 (production-branch-only) is gated on branch
+// being non-empty so the dry-run can render projections for any
+// branch.
+func (s *Service) runGuardsForPlan(
+	_ context.Context,
+	project state.Project,
+	scan reposcan.Result,
+	_ string,
+	branch string,
+) planGuardOutcome {
+	if len(scan.Workloads) == 0 || scan.Tier == 0 {
+		return planGuardOutcome{
+			err: fmt.Errorf("%w", ErrPlanEmpty),
+			alerts: []Alert{{
+				Kind:    AlertKindNoWorkloads,
+				Message: "scan returned zero workloads",
+			}},
+		}
+	}
+	if branch != "" && branch != project.ProductionBranch {
+		return planGuardOutcome{
+			ignored: true,
+			alerts: []Alert{{
+				Kind:    AlertKindFeatureBranch,
+				Message: "non-production branch; reconcile is a no-op",
+				Data: map[string]any{
+					"branch":            branch,
+					"production_branch": project.ProductionBranch,
+				},
+			}},
+		}
+	}
+	desired := DeriveScanSource(scan.Workloads)
+	if tierRank(desired) < tierRank(project.ScanSource) {
+		return planGuardOutcome{
+			err: errors.Join(state.ErrScanSourceDowngrade,
+				fmt.Errorf("%s→%s", project.ScanSource, desired)),
+			alerts: []Alert{{
+				Kind:    AlertKindScanSourceDowngrade,
+				Message: "scan tier dropped below stored tier",
+				Data: map[string]any{
+					"current": string(project.ScanSource),
+					"desired": string(desired),
+				},
+			}},
+		}
+	}
+	return planGuardOutcome{}
+}
+
+// errReconcileIgnoredPlan is the Plan-side sentinel for guard 1
+// (never-empty). The Plan endpoint renders this as a 422 with
+// alert.no_workloads; the apply path's reconcile.Service already
+// returns errReconcileScanSourceDowngrade and ErrIgnored for the
+// other two guards, so callers use errors.Is to branch.
+type errReconcileIgnoredPlan struct{ msg string }
+
+func (e errReconcileIgnoredPlan) Error() string { return e.msg }
