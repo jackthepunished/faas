@@ -92,10 +92,14 @@ func LoadHostKey(path string) (*age.X25519Identity, error) {
 		}
 		return nil, fmt.Errorf("secretbox: stat host key %q: %w", path, err)
 	}
-	// The private key must be owner-read (0o400) or group-read (0o440, as created by systemd LoadCredential).
-	// Any other bit (other read, write, exec, suid) is rejected.
+	// Security check (M8 §11): refuse to load if the file's mode permits anything
+	// other than owner-read (0o400).
+	// Exception: systemd LoadCredential creates files in /run/credentials/...
+	// with mode 0o440 owned by the service user/group. If the path is under a
+	// credentials directory, mode 0o440 is also permitted.
 	perm := info.Mode().Perm()
-	if perm != 0o400 && perm != 0o440 {
+	isSystemdCredential := strings.Contains(path, "/credentials/")
+	if perm != 0o400 && (!isSystemdCredential || perm != 0o440) {
 		return nil, fmt.Errorf("secretbox: host key %q mode %#o: %w",
 			path, perm, ErrHostKeyInsecurePerms)
 	}
