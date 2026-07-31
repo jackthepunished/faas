@@ -89,6 +89,29 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 			wantInBody: "entrypoint[1]",
 		},
 		{
+			name: "single-empty-entrypoint-element",
+			overrides: &CreateDeploymentOverrides{
+				Entrypoint: []string{""},
+			},
+			wantStatus: http.StatusBadRequest,
+			// Pin the "every element non-empty" rule alone: a single
+			// empty string is still rejected. A future refactor that
+			// checks `len(o.Entrypoint) == 0` (treating the zero
+			// slice as the only "absent" sentinel) would let this
+			// slip through; this case fails loudly if so.
+			wantInBody: "entrypoint[0] is empty",
+		},
+		{
+			name: "empty-entrypoint-slice-is-accepted",
+			overrides: &CreateDeploymentOverrides{
+				// Len-0 slice is the "no override" sentinel — the
+				// handler short-circuits on the wire side. The
+				// validator must agree. Pinned so a future refactor
+				// that demands len > 0 fails here.
+				Entrypoint: []string{},
+			},
+		},
+		{
 			name: "empty-cmd-element",
 			overrides: &CreateDeploymentOverrides{
 				Entrypoint: []string{"/usr/bin/node"},
@@ -96,6 +119,13 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 			},
 			wantStatus: http.StatusBadRequest,
 			wantInBody: "cmd[1]",
+		},
+		{
+			name: "empty-cmd-slice-is-accepted",
+			overrides: &CreateDeploymentOverrides{
+				Entrypoint: []string{"/usr/bin/node"},
+				Cmd:        []string{},
+			},
 		},
 		{
 			name: "env-count-exceeds-quota",
@@ -154,7 +184,10 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: `must start with "secret:"`,
+			// Match the precise customer-facing phrasing — naming
+			// the offending key + the required prefix. A refactor
+			// that drops the key from the message fails here.
+			wantInBody: `env_secrets["DB_URL"] value must start with "secret:"`,
 		},
 		{
 			name: "env-secrets-ref-name-violates-grammar",
@@ -209,7 +242,12 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				Port: -1,
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: "out of range",
+			// Match the exact phrasing the helper emits
+			// ("port -1 out of range") so a future refactor that
+			// produces a generic "Out of range (0..65535)" message
+			// fails loudly here — the customer-facing detail must
+			// name the offending port.
+			wantInBody: "port -1 out of range",
 		},
 		{
 			name: "healthcheck-path-must-start-with-slash",
@@ -219,7 +257,10 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: `must start with "/"`,
+			// Match the precise field name + required leading "/".
+			// A refactor that drops the field name from the message
+			// fails here.
+			wantInBody: `healthcheck.path must start with "/"`,
 		},
 		{
 			name: "healthcheck-negative-interval",
@@ -230,7 +271,11 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: "interval_s",
+			// Match the precise field name + value. The "must be >= 0"
+			// suffix is required — a future refactor that says
+			// "must be non-negative" must also update this test, so
+			// the message stays parseable.
+			wantInBody: "healthcheck.interval_s must be >= 0; got -1",
 		},
 		{
 			name: "healthcheck-negative-timeout",
@@ -241,7 +286,7 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: "timeout_s",
+			wantInBody: "healthcheck.timeout_s must be >= 0; got -1",
 		},
 		{
 			name: "healthcheck-negative-retries",
@@ -252,7 +297,7 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 			wantStatus: http.StatusBadRequest,
-			wantInBody: "retries",
+			wantInBody: "healthcheck.retries must be >= 0; got -1",
 		},
 		{
 			name: "healthcheck-minimal-path-only",

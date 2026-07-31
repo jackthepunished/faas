@@ -411,6 +411,83 @@ func TestCreateDeployment_Overrides_NoOverrideIsUnchanged(t *testing.T) {
 	}
 }
 
+// TestCreateDeployment_Overrides_RedeployDifferentPort pins the
+// per-deployment (not per-app) property of the override columns
+// (ADR-053 §Decision 3). Two deploys of the same image to the same
+// app with different override ports must:
+//   - both be accepted (202),
+//   - both echo their distinct override_port on the response,
+//   - both rows exist in the deployments table (verified via
+//     GET /v1/apps/{slug}/deployments, when present, or via the
+//     underlying store directly).
+//
+// This is the load-bearing property that a per-app column would
+// have violated: a customer who redeploys the same image with a
+// different port must NOT have to PATCH the app AND redeploy.
+func TestCreateDeployment_Overrides_RedeployDifferentPort(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "dep-app"}, nil)
+
+	// Two distinct image digests. The OCI digest IS the only
+	// difference between the two deploys — same app, same plan,
+	// same override shape except the port.
+	digestA := "sha256:" + repeat("a", 64)
+	digestB := "sha256:" + repeat("b", 64)
+
+	deployPort := func(digest string, port int) api.DeploymentResponse {
+		rec := e.do(t, "POST", "/v1/apps/dep-app/deployments",
+			api.CreateDeploymentRequest{
+				Image: "r/x@" + digest,
+				Overrides: &api.CreateDeploymentOverrides{
+					Port: port,
+				},
+			}, nil)
+		if rec.Code != 202 {
+			t.Fatalf("POST deploy (port=%d): %d %s", port, rec.Code, rec.Body)
+		}
+		var resp api.DeploymentResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal (port=%d): %v body=%s", port, err, rec.Body)
+		}
+		return resp
+	}
+
+	respA := deployPort(digestA, 9090)
+	respB := deployPort(digestB, 9091)
+
+	if respA.OverridePort != 9090 {
+		t.Errorf("deploy A OverridePort = %d, want 9090", respA.OverridePort)
+	}
+	if respB.OverridePort != 9091 {
+		t.Errorf("deploy B OverridePort = %d, want 9091", respB.OverridePort)
+	}
+	if respA.ID == respB.ID {
+		t.Errorf("deploy A and B share id %q; redeploy must mint a new row", respA.ID)
+	}
+	if !respA.HasOverrides || !respB.HasOverrides {
+		t.Errorf("Both deploys must have HasOverrides=true; A=%v B=%v", respA.HasOverrides, respB.HasOverrides)
+	}
+
+	// Round-trip through the store to prove both rows persisted with
+	// their distinct port values. This is the property that a
+	// per-app column would fail — a per-app override_port would
+	// overwrite on the second deploy.
+	depA, err := e.store.DeploymentByID(context.Background(), respA.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID(A): %v", err)
+	}
+	if depA.OverridePort != 9090 {
+		t.Errorf("store.A OverridePort = %d, want 9090", depA.OverridePort)
+	}
+	depB, err := e.store.DeploymentByID(context.Background(), respB.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID(B): %v", err)
+	}
+	if depB.OverridePort != 9091 {
+		t.Errorf("store.B OverridePort = %d, want 9091", depB.OverridePort)
+	}
+}
+
 func TestParseImageDigest_PureUnit(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	cases := map[string]bool{
@@ -469,6 +546,39 @@ func TestIsDigestPinned(t *testing.T) {
 		if got := isDigestPinned(in); got != want {
 			t.Errorf("isDigestPinned(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestCreateDeployment_Overrides_RejectsUnknownField pins the wire-side
+// enforcement of ADR-053 §Decision 1: the override field list is FROZEN.
+// The handler's decoder uses DisallowUnknownFields, so a 7th field
+// 400s the request — even one that isn't recognised by the override
+// type. This complements pkg/api/dto_overrides_test.go which exercises
+// the decoder in isolation; here the test goes through the live handler
+// stack so a future refactor that drops the DisallowUnknownFields flag
+// (or swaps the decoder for a more permissive one) fails loudly.
+//
+// Mirrors the dto_test.go "unknown-field-is-rejected" case but at the
+// handler+transport layer.
+func TestCreateDeployment_Overrides_RejectsUnknownField(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	e.do(t, "POST", "/v1/apps", api.CreateAppRequest{Slug: "dep-app"}, nil)
+
+	// volume_mounts is a field shaped for a future ADR (mountPoints
+	// mount type). Sending it on the override object today must 400.
+	body := `{"image":"r/x@sha256:` + repeat("a", 64) +
+		`","overrides":{"volume_mounts":[{"path":"/data","size_mb":1024}]}}`
+	req := newRawRequest(t, "POST", "/v1/apps/dep-app/deployments", body,
+		map[string]string{"Authorization": "Bearer " + e.key})
+	rec := serveRaw(e.h, req)
+	if rec.Code != 400 {
+		t.Fatalf("unknown override field should 400, got %d %s", rec.Code, rec.Body)
+	}
+	// Body must reference the offending field so the customer can
+	// fix the request. The wire-side error is produced by Go's
+	// encoding/json "unknown field" sentinel.
+	if !strings.Contains(rec.Body.String(), "volume_mounts") {
+		t.Errorf("body = %s, want it to mention the unknown field volume_mounts", rec.Body)
 	}
 }
 

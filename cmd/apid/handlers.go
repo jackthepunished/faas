@@ -136,13 +136,18 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		return
 	}
 	ct := r.Header.Get("Content-Type")
+	// Lookup the plan limits once. Both branches need them:
+	//   - multipart: cap upload size at SourceTarballMaxMB
+	//   - JSON:     validate override env byte + count caps
+	// Hoisting avoids a second MustLimitsFor call in the override
+	// branch (issue #460 / ADR-053).
+	limits := api.MustLimitsFor(acct.Plan)
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		// Cap upload size at the plan's SourceTarballMaxMB before any
 		// multipart parsing — MaxBytesReader returns a *MaxBytesError on
 		// overflow, which r.MultipartReader surfaces as a parse error that
 		// createDeploymentMultipart already maps to 413. The pre-Check
 		// in deploy_inputs.go only fires when ContentLength is known.
-		limits := api.MustLimitsFor(acct.Plan)
 		max := int64(limits.SourceTarballMaxMB) * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, max)
 		s.createDeploymentMultipart(w, r, acct, app)
@@ -163,12 +168,10 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// fundamental request shape error than a malformed override).
 	// A failed override validation 400s the whole request — the
 	// override is NEVER silently dropped (ADR-053 §Decision 2).
-	// Plan tier comes from the authenticated account, the same
-	// source `limits := api.MustLimitsFor(acct.Plan)` already uses
-	// for the source-tarball cap a few lines up.
+	// Plan tier comes from the authenticated account (limits already
+	// hoisted above the multipart branch).
 	var overrides *api.CreateDeploymentOverrides
 	if req.Overrides != nil {
-		limits := api.MustLimitsFor(acct.Plan)
 		if p := req.Overrides.Validate(limits); p != nil {
 			api.WriteProblem(w, p)
 			return
@@ -260,11 +263,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// pre-PR-#340 layout). Empty when this is the first deploy
 	// on the app — dashboards can distinguish "first deploy"
 	// from "supersede" without inspecting app history.
+	//
+	// Issue #460 / ADR-053: data.has_overrides is the audit-side
+	// mirror of the HasOverrides response field. Set true when the
+	// deployment carried any override_* column. The override values
+	// themselves are NEVER in the audit payload — only the boolean
+	// (ADR-053 §Decision 4 + ADR-045 §Decision 6 mirror: env values
+	// never cross the audit sink).
+	hasOverrides := req.Overrides != nil
 	s.audit.Emit(ctx(r), "app.deployed", &acct.ID, map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": d.ID,
 		"ref":           req.Image,
 		"supersedes":    prev.ID,
+		"has_overrides": hasOverrides,
 	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
