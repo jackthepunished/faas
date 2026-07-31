@@ -316,13 +316,15 @@ jobs:
             # preflight; if it's not, this errors out and we lean on
             # the drift guard below to surface a clear failure. jq is
             # not a baseline dep — avoid it.
+            #
+            # Inline as a single -c arg on one logical line — a multi-
+            # line `python3 -c '…'` or stdin-fed heredoc escapes bash
+            # word-splitting + YAML block-scalar folding, both of which
+            # preserve inconsistent leading whitespace and trip python's
+            # IndentationError. The single-line form is bulletproof.
             FAAS_PARENT_DIG=$(curl -fsSL \
               https://mirror.gcr.io/v2/library/debian/manifests/12-slim \
-              | python3 -c 'import sys, json
-              d = json.load(sys.stdin)
-              amd = [m["digest"] for m in d.get("manifests", [])
-                     if m.get("platform", {}).get("architecture") == "amd64"]
-              print(amd[0] if amd else "")')
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); amd=[m["digest"] for m in d.get("manifests",[]) if m.get("platform",{}).get("architecture")=="amd64"]; print(amd[0] if amd else "")')
             if [ -z "${FAAS_PARENT_DIG}" ]; then
               echo "::error::could not resolve amd64 digest for mirror.gcr.io/library/debian:12-slim; set FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT manually in /etc/faas/sealed.env per deploy/controlplane/sealed.env.example"
               exit 1
