@@ -63,6 +63,12 @@ type fakeVMM struct {
 	// per-key rows correctly.
 	lastColdBootSpec AppSpec
 	lastRestoreSpec  AppSpec
+
+	// ADR-051 PR-D: characterization report. The default zero
+	// value is "no observation" — the engine leaves apps.workload_class
+	// alone. Tests that want to exercise the SetAppWorkloadClass
+	// branch set this to a non-empty value (ObservedClass != "").
+	characterization api.CharacterizationReport
 }
 
 func (f *fakeVMM) outcome(instance string, method vmmdpb.WakeMethod, requested vmmdpb.WakeMethod) *WakeOutcome {
@@ -70,6 +76,7 @@ func (f *fakeVMM) outcome(instance string, method vmmdpb.WakeMethod, requested v
 		Instance: instance, LeaseUID: 20001, HostIP: "10.100.0.2",
 		Netns: "fc-" + instance, VethHost: "vh1", VethPeer: "vp1",
 		Method: method, RequestedMethod: requested,
+		Characterization: f.characterization,
 	}
 }
 
@@ -314,6 +321,43 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	// Resident RAM = ram + overhead (still reserved while running).
 	if got := e.Ledger().ResidentRAM(); got != 512+api.PerVMOverheadMB {
 		t.Errorf("resident = %d, want %d", got, 512+api.PerVMOverheadMB)
+	}
+}
+
+// TestEngineWake_ColdBootPersistsObservedClass pins ADR-051 PR-D:
+// when the cold-boot's characterization report carries an
+// ObservedClass, the engine must persist it via
+// SetAppWorkloadClass("observed"). The seed app's class is the
+// PG default 'http'; the probe reports 'graphql'; the apps row
+// becomes 'graphql'. A zero report (no observed class) leaves the
+// row untouched — covered by TestEngineWake_ColdBoot which uses
+// the zero-report fakeVMM seeded with the default 'http' class.
+func TestEngineWake_ColdBootPersistsObservedClass(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// MemStore defaults to ""; align with PG's 'http' default so
+	// the before/after comparison is meaningful.
+	if _, err := store.SetAppWorkloadClass(context.Background(), app.ID, state.WorkloadClassHTTP, "scan_hint"); err != nil {
+		t.Fatalf("seed SetAppWorkloadClass: %v", err)
+	}
+
+	vmm := &fakeVMM{
+		characterization: api.CharacterizationReport{
+			ObservedClass: string(state.WorkloadClassGraphQL),
+			ObservedPort:  4000,
+			ExitCode:      0,
+		},
+	}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	if _, err := e.Wake(context.Background(), app.ID); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	got, err := store.AppByID(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.WorkloadClass != state.WorkloadClassGraphQL {
+		t.Errorf("observed class = %q, want %q", got.WorkloadClass, state.WorkloadClassGraphQL)
 	}
 }
 

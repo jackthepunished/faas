@@ -255,6 +255,16 @@ message WakeResponse {
   // RFC 7807 fields, populated only on failure. The status code itself is
   // google.rpc.Status via google.golang.org/grpc/status; see pkg/grpcerr.
   google.protobuf.Struct problem = 9;
+  // Characterization (ADR-051 Phase 4 / PR-D) is the guest-init
+  // characterization report the host received during the wake.
+  // Populated on cold boots; absent on restore (the warm path
+  // inherits the class from the apps row captured in the original
+  // cold boot). The JSON shape mirrors
+  // pkg/api.CharacterizationReport; we use Struct (not a typed
+  // message) here so proto changes don't have to cascade through
+  // the codegen pipeline for a single optional payload — only
+  // schedd consumes this and it decodes via pkg/api on the way in.
+  google.protobuf.Struct characterization = 10;
 }
 
 // WakeMethod is whether a wake was a snapshot restore or a cold boot.

@@ -1480,6 +1480,26 @@ func (m *MemStore) SetAppMinInstances(_ context.Context, appID string, min int) 
 	return nil
 }
 
+// SetAppWorkloadClass mirrors PgStore.SetAppWorkloadClass. The
+// `source` argument is metadata only — the store does not persist
+// or log it. The same ErrInvalidArgument / ErrNotFound contract as
+// PgStore keeps tests parameterizable across backends.
+func (m *MemStore) SetAppWorkloadClass(_ context.Context, appID string, class WorkloadClass, source string) (App, error) {
+	_ = source
+	if class == "" {
+		return App{}, ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok {
+		return App{}, ErrNotFound
+	}
+	a.WorkloadClass = class
+	m.apps[appID] = a
+	return a, nil
+}
+
 func (m *MemStore) DeleteApp(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

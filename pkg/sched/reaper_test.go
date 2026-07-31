@@ -495,3 +495,81 @@ func TestReapAggressive_EmptyCandidates(t *testing.T) {
 		t.Fatalf("all candidates protected: got %v, want empty", got)
 	}
 }
+
+// TestReapIdle_WorkerClassCarveOut pins ADR-051 PR-D: workers
+// (cron workers, background consumers, no incoming HTTP) are
+// reaper-exempt. A worker with stale LastRequest is NOT a
+// candidate for idle parking — it has no per-request traffic,
+// so LastRequest is meaningless. RAM pressure (SelectEvictions)
+// is unchanged; this carve-out only affects ReapIdle and
+// ReapAggressive.
+func TestReapIdle_WorkerClassCarveOut(t *testing.T) {
+	now := time.Now()
+	// 1 worker + 1 http app, both stale LastRequest. Without the
+	// carve-out, both would park. With it, only the http app parks.
+	instances := []InstanceInfo{
+		{
+			Instance: "worker-1", AppID: "app1", Plan: api.PlanPro,
+			State:         state.StateRunning,
+			LastRequest:   now.Add(-10 * time.Minute), // stale
+			Started:       now.Add(-time.Hour),
+			WorkloadClass: state.WorkloadClassWorker,
+		},
+		{
+			Instance: "http-1", AppID: "app2", Plan: api.PlanPro,
+			State:         state.StateRunning,
+			LastRequest:   now.Add(-10 * time.Minute), // stale
+			Started:       now.Add(-time.Hour),
+			WorkloadClass: state.WorkloadClassHTTP,
+		},
+	}
+	got := ReapIdle(now, instances)
+	if len(got) != 1 || got[0] != "http-1" {
+		t.Fatalf("ReapIdle worker carve-out: got %v, want [http-1] (worker must be exempt)", got)
+	}
+}
+
+// TestReapAggressive_WorkerClassCarveOut: the autoscale-driven
+// path computes desired = ceil(rps/target). For a worker, RPS is
+// undefined; if the loop used running+=1, the limit would compute
+// extra = running - 1 and want to park everything above the first
+// survivor. The worker carve-out must skip the addition entirely so
+// workers don't inflate the running count and don't enter the
+// candidate set.
+func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
+	now := time.Now()
+	mk := func(id string, cls state.WorkloadClass) InstanceInfo {
+		return InstanceInfo{
+			Instance: id, AppID: "app1", Plan: api.PlanPro,
+			State:         state.StateRunning,
+			LastRequest:   now.Add(-time.Hour),
+			Started:       now.Add(-time.Hour),
+			WorkloadClass: cls,
+		}
+	}
+	instances := []InstanceInfo{
+		mk("worker-1", state.WorkloadClassWorker),
+		mk("worker-2", state.WorkloadClassWorker),
+		mk("http-1", state.WorkloadClassHTTP),
+	}
+	// desired=0, no autoscale signal → ReapAggressive defers to
+	// ReapIdle. But here autoscale is on, so we want to see only
+	// http-1 as a candidate. workers must not run, not enter the
+	// candidate set, and not park.
+	desired := map[string]int{"app1": 0}
+	got := ReapAggressive(now, instances, desired)
+	// Running=1 (only http-1), limit=max(0, 0+1)=1, extra=0 → no park.
+	for _, id := range got {
+		if id == "worker-1" || id == "worker-2" {
+			t.Errorf("ReapAggressive carved-out worker; got %v, want no workers", id)
+		}
+	}
+	// also with desired=10 — must NOT park workers under "running is 3".
+	desired10 := map[string]int{"app1": 10}
+	got = ReapAggressive(now, instances, desired10)
+	for _, id := range got {
+		if id == "worker-1" || id == "worker-2" {
+			t.Errorf("ReapAggressive carved-out worker under desired=10; got %v", id)
+		}
+	}
+}

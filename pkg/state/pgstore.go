@@ -815,6 +815,42 @@ func (s *PgStore) SetAppMinInstances(ctx context.Context, appID string, min int)
 	return nil
 }
 
+// SetAppWorkloadClass overwrites apps.workload_class (ADR-050 §3,
+// ADR-051). Single round-trip UPDATE … RETURNING; the RETURNING
+// projection matches appsSelectColumns so scanAppInto can decode it.
+// SQLSTATE 23514 (apps_workload_class_chk) maps to ErrInvalidArgument
+// via mapErr; SQLSTATE 23502 (not_null) is unreachable because the
+// column carries a DEFAULT in the migration.
+//
+// The `source` argument is caller metadata only — the store does NOT
+// log or persist it. The engine/reconcile caller writes an audit row
+// carrying {app_id, observed_class, source} with the same value
+// (ADR-035 best-effort).
+//
+// Returns the fresh App row so the cold-boot path in pkg/sched
+// (PR-D) can pass it on to SetInstanceRuntime without a second read.
+// Returns ErrNotFound when the app is gone.
+func (s *PgStore) SetAppWorkloadClass(ctx context.Context, appID string, class WorkloadClass, source string) (App, error) {
+	_ = source // metadata only — see comment above
+	if class == "" {
+		return App{}, ErrInvalidArgument
+	}
+	var a App
+	row := s.pool.QueryRow(ctx,
+		`update apps set workload_class = $2 where id = $1
+		 returning `+appsSelectColumns,
+		appID, string(class))
+	if err := scanAppInto(&a, row); err != nil {
+		// Funnel through mapErr so a CHECK violation on
+		// apps_workload_class_chk (SQLSTATE 23514) surfaces as
+		// ErrInvalidArgument instead of a raw pgx error. The empty
+		// class guard above covers the Go-side validation; this
+		// covers the schema-side defence-in-depth.
+		return App{}, mapErr(err)
+	}
+	return a, nil
+}
+
 // RenameApp changes an app's slug atomically (issue #63). The UPDATE
 // is scoped to (account_id, oldSlug, status<>'deleted') so a wrong
 // accountID or unknown slug returns ErrNotFound via mapErr → pgx.ErrNoRows.
@@ -6699,6 +6735,28 @@ var ErrConflict = errors.New("state: conflict")
 // for issue #165 / ADR-032.
 var ErrInvalidArgument = errors.New("state: invalid argument")
 
+// checkViolationMappedToInvalid lists the constraint names whose
+// CHECK violations surface as ErrInvalidArgument at the Store
+// contract. The list is intentionally narrow — most CHECK violations
+// bubble the raw *pgconn.PgError so tripwire tests like
+// TestPgStore_InstancesStateCheck_RejectsBogusState,
+// TestPgStore_InstancesStateCheck_RejectsInjection, and
+// TestPgStore_UpdateApp_SlashZeroRejected can substring-match
+// "23514" and a future widening of the CHECK (e.g. to text) is
+// visible at the test boundary.
+//
+// The two entries below map to ErrInvalidArgument because their
+// Store-layer callers (PR-B's SetAppWorkloadClass +
+// SetProjectScanSource) explicitly validate the input upstream
+// — a CHECK hit is a contract violation between the Store and the
+// schema, not a transient DB error. Don't add
+// `instances_state_check` or `apps_egress_allowlist_cidr` here —
+// their raw errors are load-bearing for the tripwires above.
+var checkViolationMappedToInvalid = map[string]struct{}{
+	"apps_workload_class_chk": {}, // SetAppWorkloadClass (PR-B)
+	"scan_source_tier_chk":    {}, // SetProjectScanSource tier enum
+}
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -6707,8 +6765,27 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
-		return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case pgerrcode.UniqueViolation:
+			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+		case pgerrcode.CheckViolation:
+			// CHECK violations surface as ErrInvalidArgument ONLY
+			// for the constraints named in
+			// checkViolationMappedToInvalid — the rest bubble the
+			// raw SQLSTATE so tripwire tests like
+			// TestPgStore_InstancesStateCheck_RejectsBogusState can
+			// substring-match `23514` and a future widening of
+			// `instances.state` to text is visible at the test
+			// boundary. The empty-class guard in
+			// SetAppWorkloadClass covers Go-side validation; this
+			// mapping covers schema-side defence-in-depth for the
+			// three named constraints.
+			if _, ok := checkViolationMappedToInvalid[pgErr.ConstraintName]; ok {
+				return fmt.Errorf("%w: %s", ErrInvalidArgument, pgErr.ConstraintName)
+			}
+			return err
+		}
 	}
 	return err
 }

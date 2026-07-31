@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"filippo.io/age"
 
@@ -59,6 +60,17 @@ type VMM interface {
 	// ADR-022 records the wire format (4-byte msg type + JSON body, port 1024
 	// on the fixed host CID 3).
 	TriggerResumeHook(ctx context.Context, l Lease, hostTimeUnixNano int64) error
+	// WaitCharacterizationReport (ADR-051 Phase 4 / PR-D) is the
+	// host-side mirror of TriggerResumeHook: it accepts ONE
+	// guest-initiated AF_VSOCK STREAM connection at port 1026
+	// (msg_type=3) carrying the CharacterizationReport, writes a
+	// 1-byte ack, and returns. Called only on cold boots (the warm
+	// path inherits the class from the apps row captured in the
+	// original cold boot). On deadline elapse the implementation
+	// MUST return (zero, err) and the caller (Manager.Wake) MUST
+	// fall back to the scan-hint class — never fail the wake, that
+	// would regress vs today's `:8080` accept failure path.
+	WaitCharacterizationReport(ctx context.Context, l Lease, deadline time.Duration) (api.CharacterizationReport, error)
 	// Snapshot pauses the running VM, writes a full snapshot to spec's paths, and
 	// destroys the VM (spec §4.4). The instance is gone when this returns.
 	Snapshot(ctx context.Context, l Lease, spec SnapshotSpec) (SnapshotInfo, error)
@@ -179,6 +191,17 @@ type Instance struct {
 	// The Lease stays allocator-owned and instance-id-keyed; the Plan
 	// is schedd-owned and recorded at Wake time.
 	Plan api.Plan
+
+	// Characterization (ADR-051 Phase 4 / PR-D) is the
+	// CharacterizationReport the host received via
+	// WaitCharacterizationReport during this cold boot. Empty on
+	// restore (warm wake inherits the class from the apps row) and
+	// empty on cold-boot timeouts (the caller falls back to the
+	// scan-hint class). The field is settable here so Manager.Wake
+	// can populate it post-bringUp; vmmdgrpc then ships it on the
+	// wire as WakeResponse.characterization so schedd can persist
+	// it via SetAppWorkloadClass.
+	Characterization api.CharacterizationReport
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
@@ -220,6 +243,14 @@ type Manager struct {
 	// the kernel supports ct expressions in netns (CONFIG_NF_CONNTRACK_NET_NS),
 	// 0 when it doesn't (the ct cap rule is omitted, egress tc cap unaffected).
 	conntrackCap int64
+	// characterizationWait (ADR-051 Phase 4 / PR-D) bounds the
+	// WaitCharacterizationReport dial+read inside Wake. The guest
+	// retries its report 4× (initial + 3 backoffs totalling ~1.85s),
+	// so 4s gives us margin for slow vsock proxies on nested KVM.
+	// Mismatch with the guest deadline matters only in that the
+	// guest falls back to "ack_timeout" earlier than we fall back
+	// to scan-hint class — both sides degrade the same way.
+	characterizationWait time.Duration
 	// storage is the artifact backend vmmd reads scan sidecars from at
 	// boot time (issue #299). Wired via WithStorage, mirroring the VMM's
 	// own WithStorage setter at pkg/fcvm/vmm.go. nil means "no scan
@@ -262,16 +293,17 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		log = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Manager{
-		alloc:        NewAllocator(),
-		run:          run,
-		vmm:          vmm,
-		paths:        paths,
-		fcVersion:    fcVersion,
-		log:          log,
-		live:         make(map[string]*Instance),
-		exportDirs:   make(map[string]string),
-		metrics:      metrics,
-		conntrackCap: api.ConntrackCapProbe(),
+		alloc:                NewAllocator(),
+		run:                  run,
+		vmm:                  vmm,
+		paths:                paths,
+		fcVersion:            fcVersion,
+		log:                  log,
+		live:                 make(map[string]*Instance),
+		exportDirs:           make(map[string]string),
+		metrics:              metrics,
+		conntrackCap:         api.ConntrackCapProbe(),
+		characterizationWait: 4 * time.Second,
 	}
 }
 
@@ -704,7 +736,23 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"instance", req.Instance, "plan", req.Plan, "err", err)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan}
+	// ADR-051 Phase 4 / PR-D: on cold boot, gate the wake on the
+	// characterization report. The guest dials host CID 2 at port
+	// 1026 with the report framed as [4B msg_type=3][4B body_len][JSON].
+	// On deadline we fall back to the scan-hint class — never fail
+	// the wake, that's strictly worse than today's `:8080` accept
+	// failure path (the operator gets no signal). Restore inherits
+	// the class from the apps row captured in the original cold boot.
+	var report api.CharacterizationReport
+	if method == WakeColdBoot {
+		report, _ = m.vmm.WaitCharacterizationReport(ctx, lease, m.characterizationWait)
+		m.log.Info("wake: characterization report",
+			"instance", req.Instance, "observed_class", report.ObservedClass,
+			"observed_port", report.ObservedPort, "exit", report.ExitCode,
+			"port_norm_mode", report.PortNormalizationMode)
+	}
+
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Characterization: report}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and

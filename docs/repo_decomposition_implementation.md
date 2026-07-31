@@ -285,8 +285,8 @@ deferred-cron skip) landed on the same PR before merge.
 ### Phase 4 — characterization boot
 
 Specified in full by
-**[ADR-051](adr/051-characterization-boot-workload-classification.md)**. Summary
-of what lands here:
+**[ADR-051](adr/051-characterization-boot-workload-classification.md)** (accepted
+2026-07-31, was proposed since 2026-07-29). Summary of what lands here:
 
 The first cold boot of a new deployment runs in *characterizing mode* — **no
 extra VM**, because a separate probe boot would run the app's startup side

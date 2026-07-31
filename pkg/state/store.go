@@ -556,6 +556,16 @@ type Store interface {
 	// column unconditionally. Updates an existing row's min_instances
 	// column in place; returns ErrNotFound when the app is gone.
 	SetAppMinInstances(ctx context.Context, appID string, min int) error
+	// SetAppWorkloadClass overwrites apps.workload_class (ADR-050 §3,
+	// ADR-051 §"Consequences"). The `source` parameter records who
+	// stamped the value ("scan_hint" | "observed" | "manual") and is
+	// kept on the audit row emitted by the caller (engine in Phase 4;
+	// pkg/reconcile in Phase 5) — the store does NOT emit audit. The
+	// apps_workload_class_chk CHECK rejects unknown values; invalid
+	// classes surface as ErrInvalidArgument via SQLSTATE 23514. Returns
+	// ErrNotFound when the app is gone so a redelivered characterize
+	// event returns cleanly.
+	SetAppWorkloadClass(ctx context.Context, appID string, class WorkloadClass, source string) (App, error)
 	DeleteApp(ctx context.Context, id string) error
 
 	// Projects (ADR-050, Phase 1).

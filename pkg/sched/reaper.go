@@ -62,6 +62,14 @@ type InstanceInfo struct {
 	// Don't try to set MinInstances per-instance — it's a per-app
 	// concept reflected redundantly on each row.
 	MinInstances int
+	// WorkloadClass is the apps-row workload class
+	// (ADR-051 PR-D). Workers (background jobs / cron workers /
+	// long-running consumers) are reaper-exempt: they have no
+	// per-request traffic so LastRequest is a meaningless idle
+	// signal, and ReapAggressive's desired=ceil(rps/target) would
+	// compute 0 and want to park them. RAM pressure (SelectEvictions)
+	// still wins — invariant §6.2-2 is the ceiling.
+	WorkloadClass state.WorkloadClass
 }
 
 func (i InstanceInfo) admissionMB() int { return api.BillableRAMMB(i.RAMMB) }
@@ -121,6 +129,16 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		if !ok {
 			g = &appGroup{floor: in.MinInstances}
 			byApp[in.AppID] = g
+		}
+		// ADR-051 PR-D: workers are reaper-exempt. They have no
+		// per-request traffic — a worker's LastRequest is either
+		// stale (no HTTP server) or zero (cold start, never
+		// served). Skip them entirely so they don't inflate
+		// `running` (the floor arithmetic depends on it) and
+		// don't enter the candidate set. RAM pressure still
+		// wins via SelectEvictions.
+		if in.WorkloadClass == state.WorkloadClassWorker {
+			continue
 		}
 		g.running++
 		// G7: an app with open TCP flows is active. Wins over stale
@@ -197,6 +215,14 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		desired, ok := desiredByApp[in.AppID]
 		if !ok {
 			continue // no autoscale target — defer to ReapIdle
+		}
+		// ADR-051 PR-D: workers are reaper-exempt here too. A
+		// worker's measured RPS is undefined (no HTTP server) so
+		// desired = ceil(0 / target) = 0 and the loop would compute
+		// extra = running - 1 (limit = max(floor, 0+1)) and want to
+		// park everything above the first. We don't want that.
+		if in.WorkloadClass == state.WorkloadClassWorker {
+			continue
 		}
 		g, ok := byApp[in.AppID]
 		if !ok {
