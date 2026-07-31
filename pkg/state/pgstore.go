@@ -650,11 +650,38 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11)
+// type: NOT NULL CHECK (type IN ('app','function')) with DEFAULT 'app'.
+// DEFAULT is bypassed because we pass the column explicitly; empty Go
+// string would trip the CHECK. Coerce "" to AppTypeApp so the
+// default's value is preserved whenever the caller hasn't picked.
+// maxConcurrency: NOT NULL DEFAULT 1 CHECK (>= 1). Coerce <= 0 to 1.
+// ramMB: NOT NULL CHECK (ram_mb > 0). Coerce <= 0 to 128 (Free plan
+// minimum, pkg/api/limits.go:242) — the smallest legal value the
+// column accepts.
+// project_id + workload_name (migration 00074). project_id is nullable
+// (empty → NULL via nullString); workload_name is NOT NULL DEFAULT ''
+// so empty stays as ''. Together with the unique index
+// apps_project_workload_uniq (project_id, workload_name) WHERE
+// project_id IS NOT NULL, a project-bound insert must carry both
+// columns and a non-project insert lands with (NULL, '') which the
+// index filters out.
+	appType := app.Type
+	if appType == "" {
+		appType = AppTypeApp
+	}
+	maxConcurrency := app.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
+	ramMB := app.RAMMB
+	if ramMB <= 0 {
+		ramMB = 128
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
 	return scanApp(row)
 }
 
@@ -1263,6 +1290,10 @@ func (s *PgStore) ApplyProjectPlan(
 		manifestBytes, _ := json.Marshal(manifest)
 		runtime := nullString(a.Runtime)
 		idle := nullableInt(a.IdleTimeoutS)
+		// Same rationale as CreateApp: pass nil for MaxConcurrency=0
+		// so DEFAULT 1 fires (CHECK >= 1) and the autoscale trigger
+		// sees NULL = disabled.
+		maxConcurrency := nullableInt(a.MaxConcurrency)
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
@@ -1271,7 +1302,7 @@ func (s *PgStore) ApplyProjectPlan(
 		        $11, $12, $13, $14, $15)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
-			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
+			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
