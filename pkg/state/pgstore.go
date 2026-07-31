@@ -6735,6 +6735,24 @@ var ErrConflict = errors.New("state: conflict")
 // for issue #165 / ADR-032.
 var ErrInvalidArgument = errors.New("state: invalid argument")
 
+// checkViolationMappedToInvalid lists the constraint names whose
+// CHECK violations surface as ErrInvalidArgument at the Store
+// contract. The list is intentionally narrow: the canonical
+// tripwire tests
+// (TestPgStore_InstancesStateCheck_RejectsBogusState +
+// TestPgStore_InstancesStateCheck_RejectsInjection) pin the
+// inverse — instances_state_check MUST bubble the raw SQLSTATE
+// 23514 so a future regression that widens the CHECK to text is
+// visible. Adding a constraint here should match a Store contract
+// change (PR-B's SetAppWorkloadClass + the apps.egress_allowlist
+// path in pkg/netns + scan_source_tier on Project). Don't add
+// `instances_state_check` here — its raw error is the point.
+var checkViolationMappedToInvalid = map[string]struct{}{
+	"apps_workload_class_chk":    {}, // PR-B SetAppWorkloadClass
+	"apps_egress_allowlist_cidr": {}, // pkg/netns policy validation
+	"scan_source_tier_chk":       {}, // SetProjectScanSource tier enum
+}
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -6748,15 +6766,21 @@ func mapErr(err error) error {
 		case pgerrcode.UniqueViolation:
 			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
 		case pgerrcode.CheckViolation:
-			// CHECK constraint violations (e.g. apps_workload_class_chk,
-			// apps_egress_allowlist_cidr, scan_source_tier_chk) surface
-			// as ErrInvalidArgument at the Store contract — the caller
-			// already validated user input upstream, so a CHECK hit is
-			// a contract violation between the Store and the schema,
-			// not a transient DB error. The constraint name is appended
-			// so an operator tailing logs can pinpoint the offending
-			// check.
-			return fmt.Errorf("%w: %s", ErrInvalidArgument, pgErr.ConstraintName)
+			// CHECK violations surface as ErrInvalidArgument ONLY
+			// for the constraints named in
+			// checkViolationMappedToInvalid — the rest bubble the
+			// raw SQLSTATE so tripwire tests like
+			// TestPgStore_InstancesStateCheck_RejectsBogusState can
+			// substring-match `23514` and a future widening of
+			// `instances.state` to text is visible at the test
+			// boundary. The empty-class guard in
+			// SetAppWorkloadClass covers Go-side validation; this
+			// mapping covers schema-side defence-in-depth for the
+			// three named constraints.
+			if _, ok := checkViolationMappedToInvalid[pgErr.ConstraintName]; ok {
+				return fmt.Errorf("%w: %s", ErrInvalidArgument, pgErr.ConstraintName)
+			}
+			return err
 		}
 	}
 	return err
