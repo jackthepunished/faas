@@ -22,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -35,6 +36,10 @@ type fakeVmmdClient struct {
 	calls []*vmmdpb.ForwardHTTPRequest
 	resp  *vmmdpb.ForwardHTTPResponse
 	err   error
+	// Stream, when non-nil, makes ForwardHTTPStream return the
+	// configured fake bidi stream instead of panicking. Used by
+	// the PR-B + PR-C streaming test (issue #471 / ADR-047).
+	Stream *fakeBidiStream
 }
 
 func (f *fakeVmmdClient) ForwardHTTP(_ context.Context, in *vmmdpb.ForwardHTTPRequest, _ ...grpc.CallOption) (*vmmdpb.ForwardHTTPResponse, error) {
@@ -87,15 +92,102 @@ func (f *fakeVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.Call
 	panic("Logs: gateway hot path doesn't dial per-instance log streams")
 }
 
-// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047). The
-// gateway hot path dials this on the streaming response path;
-// the existing handler unit tests exercise the buffered
-// (unary ForwardHTTP) path so this method panics if called.
-// A future streaming unit test should add a fake bidi client
-// to drive fwdStreamOnce end-to-end.
-func (f *fakeVmmdClient) ForwardHTTPStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
-	panic("ForwardHTTPStream: not stubbed")
+// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047). When
+// the fake has a Stream installed, return it; otherwise panic
+// so an accidental streaming call from the buffered-path test
+// surfaces the mistake instead of silently returning a nil
+// stream that would NPE on the first Send.
+func (f *fakeVmmdClient) ForwardHTTPStream(_ context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
+	if f.Stream == nil {
+		panic("ForwardHTTPStream: not stubbed (set fakeVmmdClient.Stream)")
+	}
+	return f.Stream, nil
 }
+
+// fakeBidiStream is the in-process fake for grpc.BidiStreamingClient
+// used by the streaming forwarder test. The test pre-loads
+// Responses (the canned server→client frame queue; io.EOF on
+// Recv when the queue is drained) and inspects Sends after the
+// forwarder returns. Concurrency: Send and Recv are called from
+// different goroutines by the forwarder (Send from the body-copy
+// goroutine, Recv from the main loop), so the queue is guarded
+// with a mutex.
+type fakeBidiStream struct {
+	mu        sync.Mutex
+	Responses []*vmmdpb.ForwardHTTPStreamResponse
+	Sends     []*vmmdpb.ForwardHTTPStreamRequest
+	closed    bool
+	recvIdx   int
+	recvErr   error // overrides Responses on the next Recv (e.g. codes.Unavailable)
+	ctx       context.Context
+}
+
+// HeaderStream returns nil — the streaming test doesn't
+// introspect headers (the production forwarder doesn't either;
+// they're set on the response object by the server side).
+func (s *fakeBidiStream) HeaderStream() grpc.ClientStream { return nil }
+
+// TrailerOnly returns false (the gRPC trailer block is set on
+// CloseSend in production; the fake ignores it).
+func (s *fakeBidiStream) TrailerOnly() bool { return false }
+
+func (s *fakeBidiStream) Send(req *vmmdpb.ForwardHTTPStreamRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return io.EOF
+	}
+	// Store the request pointer verbatim. Proto messages embed
+	// a sync.Mutex for atomic field access, so a value-copy
+	// (cp := *req) trips go vet's copylocks check; building
+	// field-by-field clones is mechanical and uninteresting.
+	// The forwarder's body-copy loop reuses a single 8 KiB
+	// buffer for the chunk bytes, but the test never compares
+	// captured chunk bytes against the live forwarder buffer
+	// after Send returns — the body chunks captured here are
+	// observed only after the forwarder has fully drained its
+	// loop. The init frame is immutable once constructed. Safe
+	// to alias.
+	s.Sends = append(s.Sends, req)
+	return nil
+}
+
+func (s *fakeBidiStream) Recv() (*vmmdpb.ForwardHTTPStreamResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recvErr != nil {
+		err := s.recvErr
+		s.recvErr = nil
+		return nil, err
+	}
+	if s.recvIdx >= len(s.Responses) {
+		return nil, io.EOF
+	}
+	resp := s.Responses[s.recvIdx]
+	s.recvIdx++
+	return resp, nil
+}
+
+func (s *fakeBidiStream) CloseSend() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+func (s *fakeBidiStream) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *fakeBidiStream) SendMsg(any) error { return nil }
+func (s *fakeBidiStream) RecvMsg(any) error { return nil }
+func (s *fakeBidiStream) Header() (metadata.MD, error) {
+	return nil, nil
+}
+func (s *fakeBidiStream) Trailer() metadata.MD { return nil }
 
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
@@ -395,4 +487,133 @@ func stripHopByHopImpl(h http.Header) http.Header {
 		out.Del(k)
 	}
 	return out
+}
+
+// TestForwardingReverseProxy_StreamsThroughBidiRPC pins the PR-B
+// + PR-C streaming path (issue #471 / ADR-047). The forwarder
+// must:
+//   - Detect x-faas-stream: true on the inbound request and
+//     open the bidi ForwardHTTPStream RPC instead of unary
+//     ForwardHTTP.
+//   - Send the init frame with the method/uri/headers + Stream=true.
+//   - Stream the request body in 8 KiB chunks.
+//   - Pipe the response init (status + headers) into w.
+//   - Pipe each body_chunk frame into w (which the production
+//     statusRecorder.Write → maybeFlush → onFlush path picks up).
+//   - Drain the body goroutine before returning.
+//
+// The fake bidi stream captures every Send frame and queues
+// canned responses; the test asserts the captured frames match
+// what fwdStreamOnce should have written.
+func TestForwardingReverseProxy_StreamsThroughBidiRPC(t *testing.T) {
+	const requestBody = "request body bytes — the gateway streams these in 8 KiB chunks"
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{
+					Status: 200,
+					Headers: []*vmmdpb.Header{
+						{Name: "Content-Type", Value: "text/event-stream"},
+					},
+				},
+			}},
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{BodyChunk: []byte("chunk-1\n")}},
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{BodyChunk: []byte("chunk-2\n")}},
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{BodyChunk: []byte("chunk-3\n")}},
+		},
+	}
+	cli := &fakeVmmdClient{Stream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("x-faas-instance", "i-test")
+	rec := httptest.NewRecorder()
+
+	proxy(gateway.Target{NodeID: "n1", InstanceID: "i-test", Port: 0}).ServeHTTP(rec, r)
+
+	// First Send must be the init frame with Stream=true and the
+	// expected method/uri/headers (x-faas-* stripped, Content-Type
+	// preserved).
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
+	}
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame: %+v", stream.Sends[0])
+	}
+	if init.GetInstance() != "i-test" {
+		t.Errorf("init.Instance = %q, want i-test", init.GetInstance())
+	}
+	if init.GetMethod() != http.MethodPost {
+		t.Errorf("init.Method = %q, want POST", init.GetMethod())
+	}
+	if !init.GetStream() {
+		t.Errorf("init.Stream = false, want true")
+	}
+	var sawContentType bool
+	for _, h := range init.GetHeaders() {
+		if h.GetName() == "Content-Type" && h.GetValue() == "application/json" {
+			sawContentType = true
+		}
+		if strings.HasPrefix(strings.ToLower(h.GetName()), "x-faas-") {
+			t.Errorf("init carried gateway-internal header %q (must be stripped before bridge)", h.GetName())
+		}
+	}
+	if !sawContentType {
+		t.Errorf("init did not carry Content-Type header")
+	}
+
+	// The client body must have been sent as one or more body_chunk
+	// frames after the init.
+	if len(stream.Sends) < 2 {
+		t.Fatalf("expected ≥ 2 Sends (init + body chunks), got %d", len(stream.Sends))
+	}
+	var sentBody []byte
+	for _, s := range stream.Sends[1:] {
+		sentBody = append(sentBody, s.GetBodyChunk()...)
+	}
+	if string(sentBody) != requestBody {
+		t.Errorf("sent body = %q, want %q", sentBody, requestBody)
+	}
+
+	// Response frames must have been written to the recorder:
+	// status 200, Content-Type text/event-stream, body bytes
+	// stitched from the three chunks.
+	if rec.Code != http.StatusOK {
+		t.Errorf("rec.Code = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+	wantBody := "chunk-1\nchunk-2\nchunk-3\n"
+	if rec.Body.String() != wantBody {
+		t.Errorf("rec body = %q, want %q", rec.Body.String(), wantBody)
+	}
+}
+
+// TestForwardingReverseProxy_StreamUnavailableIs503 pins the
+// error-mapping contract on the streaming path (issue #471 /
+// ADR-047). Unavailable from the bidi stream must surface as
+// 503 to the client, matching the unary ForwardHTTP contract.
+func TestForwardingReverseProxy_StreamUnavailableIs503(t *testing.T) {
+	stream := &fakeBidiStream{
+		recvErr: status.Error(codes.Unavailable, "node sick"),
+	}
+	cli := &fakeVmmdClient{Stream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+	r := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader("hi"))
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
+	rec := httptest.NewRecorder()
+
+	proxy(gateway.Target{NodeID: "n1", InstanceID: "i-test", Port: 0}).ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = %d, want 503 (Unavailable must map to 503)", rec.Code)
+	}
 }
