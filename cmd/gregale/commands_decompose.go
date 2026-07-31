@@ -240,10 +240,11 @@ func splitCSV(s string) []string {
 // services we won't provision). Cron rows appear under Workloads with
 // a "(cron: <schedule>)" suffix.
 //
-//nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
 // Fprintf at the tab stop is no different from a panic mid-row for the
 // operator — both surface as malformed output and the CLI exits non-zero
 // on the JSON-parse path below (mirrors commands_builds.go:166).
+//
+//nolint:errcheck // tabular printer writes to a typed io.Writer; a failed
 func printPlanText(w io.Writer, plan api.PlanResponse) int {
 	fmt.Fprintf(w, "Project: %s\n", plan.ProjectSlug)
 	fmt.Fprintf(w, "Scan source: %s   tier: %s\n", plan.ScanSource, plan.Tier)
