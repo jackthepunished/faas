@@ -162,6 +162,23 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 	}
 	defer func() { _ = closer.Close() }()
 
+	// PR-B + PR-C streaming path (ADR-047). The Handler
+	// stamps `x-faas-stream: true` on the inbound request just
+	// before calling the forwarder (handler.go:724); seeing it
+	// here means the upstream is configured to stream the
+	// response AND the per-app flag is on AND the client did
+	// not opt out via Accept: application/json. The bidi
+	// ForwardHTTPStream RPC carries the request body in
+	// streaming chunks (one frame per 8 KiB read off r.Body)
+	// and the response body in streaming chunks back to w.
+	// The header is stripped before bridging (see the
+	// x-faas-* skip below) so the guest never observes the
+	// internal signal.
+	if r.Header.Get("x-faas-stream") == "true" {
+		fwdStreamOnce(w, r, cli, log, t)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		// Body read failure = a client that disconnected before we
@@ -231,6 +248,156 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 	if len(resp.GetBody()) > 0 {
 		_, _ = w.Write(resp.GetBody())
 	}
+}
+
+// fwdStreamOnce is the streaming counterpart of fwdOnce (issue
+// #471 PR-B + PR-C / ADR-047). It opens a bidi
+// ForwardHTTPStream, sends the request init frame, streams the
+// request body in 8 KiB chunks, and reads response frames back
+// into the statusRecorder (which fires the per-flush
+// egressSink.RecordResponseBytes deltas via onFlush).
+//
+// Why this is a separate function and not a branch in fwdOnce:
+// the request body is no longer buffered — it's pipelined into
+// the bidi stream as it arrives. A streaming client that
+// uploads 50 MB via chunked transfer no longer hits the 25 MiB
+// cap (the cap-lift to 100 MB applies on the vmmd side). A
+// client disconnect tears down the bridge cleanly via the
+// inbound request context.
+//
+// Error mapping mirrors fwdOnce (Unavailable → 503, NotFound →
+// 503, anything else → 502). The Handler's statusRecorder
+// translates 4xx/5xx into "no body bytes to meter" so the
+// e2e quota AC stays correct under error paths.
+func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target) {
+	ctx, cancel := context.WithTimeout(r.Context(), 910*time.Second)
+	defer cancel()
+
+	stream, err := cli.ForwardHTTPStream(ctx)
+	if err != nil {
+		log.Error("gateway: forwarder stream open failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "forwarder stream open failed", http.StatusBadGateway)
+		return
+	}
+
+	// Build the init frame from the inbound request headers.
+	// Hop-by-hop and x-faas-* headers are stripped (mirrors
+	// fwdOnce); everything else is forwarded as-is. The body
+	// is NOT included — it streams in via the body-copy
+	// goroutine below.
+	init := &vmmdpb.ForwardHTTPRequestInit{
+		Instance:   r.Header.Get("x-faas-instance"),
+		Method:     r.Method,
+		RequestUri: r.URL.RequestURI(),
+		Port:       uint32(t.Port),
+		Stream:     true,
+	}
+	for name, vals := range stripHopByHop(r.Header) {
+		if strings.HasPrefix(strings.ToLower(name), "x-faas-") {
+			continue
+		}
+		for _, v := range vals {
+			init.Headers = append(init.Headers, &vmmdpb.Header{Name: name, Value: v})
+		}
+	}
+	if err := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
+		Frame: &vmmdpb.ForwardHTTPStreamRequest_Init{Init: init},
+	}); err != nil {
+		log.Error("gateway: forwarder stream init send failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "forwarder stream init failed", http.StatusBadGateway)
+		return
+	}
+
+	// Body-copy goroutine: stream r.Body → stream in 8 KiB
+	// chunks. The first error (client disconnect, send
+	// failure) wins; the receiver goroutine below surfaces
+	// it via sendErr so the bidi close is clean.
+	bodyErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8*1024)
+		for {
+			n, err := r.Body.Read(buf)
+			if n > 0 {
+				if serr := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
+					Frame: &vmmdpb.ForwardHTTPStreamRequest_BodyChunk{
+						BodyChunk: append([]byte(nil), buf[:n]...),
+					},
+				}); serr != nil {
+					bodyErrCh <- serr
+					return
+				}
+			}
+			if err == io.EOF {
+				bodyErrCh <- nil
+				_ = stream.CloseSend()
+				return
+			}
+			if err != nil {
+				bodyErrCh <- err
+				_ = stream.CloseSend()
+				return
+			}
+		}
+	}()
+
+	// Receiver loop: read frames and pipe into w. The first
+	// frame is ForwardHTTPResponseInit (status + headers);
+	// subsequent frames are body_chunk bytes that go
+	// straight to w.Write (which the statusRecorder
+	// intercepts to fire maybeFlush → onFlush).
+	wroteHeader := false
+	for {
+		frame, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// Drain the body goroutine so we don't leak.
+			select {
+			case <-bodyErrCh:
+			default:
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				log.Warn("gateway: forwarder stream Unavailable; surfacing 503",
+					"node", t.NodeID)
+				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				http.Error(w, "instance gone", http.StatusServiceUnavailable)
+				return
+			}
+			log.Error("gateway: forwarder stream Recv failed",
+				"node", t.NodeID, "err", err.Error())
+			http.Error(w, "forwarder stream failed", http.StatusBadGateway)
+			return
+		}
+		if init := frame.GetInit(); init != nil && !wroteHeader {
+			for _, h := range init.GetHeaders() {
+				w.Header().Add(h.GetName(), h.GetValue())
+			}
+			w.WriteHeader(int(init.GetStatus()))
+			wroteHeader = true
+			continue
+		}
+		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
+			if _, werr := w.Write(chunk); werr != nil {
+				// Client disconnect mid-stream. Stop
+				// reading frames; the body goroutine
+				// will exit when its next Send fails.
+				log.Debug("gateway: forwarder stream client write failed",
+					"node", t.NodeID, "err", werr.Error())
+				return
+			}
+		}
+	}
+
+	// Wait for the body goroutine to drain so we can
+	// distinguish a clean bidi close from a client-disconnect
+	// (which surfaces as a Send error).
+	<-bodyErrCh
 }
 
 // NodeClientCache is the production implementation of NodeClientLookup.

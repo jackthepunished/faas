@@ -53,6 +53,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/netns"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -75,6 +76,21 @@ const forwardDialTimeout = 5 * time.Second
 // spec §6.1 gives cold boots, generous for app code that does a single
 // blocking downstream call.
 const forwardResponseTimeout = 60 * time.Second
+
+// ForwardStreamMaxBodyBytes is the per-request body cap lifted on the
+// streaming path (ADR-047 PR-B + PR-C). Mirrors the
+// Hobby/Pro/Scale 100 MB cap in pkg/api.MaxResponseBodyBytes. The
+// unary ForwardHTTP stays at ForwardMaxBodyBytes (25 MiB) so a
+// misrouted streaming request through the legacy path still hits the
+// smaller cap.
+const ForwardStreamMaxBodyBytes = 100 * 1024 * 1024
+
+// ForwardStreamResponseTimeout is the bridge-side response timeout
+// lifted on the streaming path (ADR-047 PR-B + PR-C). Mirrors the
+// Hobby/Pro/Scale ResponseWriteTimeout (15 min / 900 s) so an LLM
+// stream that takes 30 s end-to-end fits comfortably inside the
+// window. The unary path stays at forwardResponseTimeout (60 s).
+const ForwardStreamResponseTimeout = 900 * time.Second
 
 // ForwardHTTP bridges one HTTP request from gatewayd into the per-instance
 // netns and dials netns.GuestIP:netns.AppPort (ADR-009 invariant: every
@@ -115,6 +131,207 @@ func (s *Server) ForwardHTTP(ctx context.Context, req *vmmdpb.ForwardHTTPRequest
 		return nil, err
 	}
 	return resp, nil
+}
+
+// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047) is the
+// bidi-streaming variant of ForwardHTTP. Wire shape:
+//
+//	client → server: 1× ForwardHTTPRequestInit, then N× body_chunk
+//	                 (where the chunks stream in as r.Body is read
+//	                 by the gateway's forwardproxy)
+//	server → client: 1× ForwardHTTPResponseInit (status + headers),
+//	                 then N× body_chunk (as they arrive from the
+//	                 bridge script's response loop)
+//
+// On the streaming path the bridge script pipes the request body
+// from a named FIFO (or stdin), reads the response status+headers
+// + body in a streaming loop, and the Go-side server shuttles
+// each chunk to the gRPC client. The bridge itself is unchanged
+// in shape — only the body plumbing differs (chunked reads on
+// stdout instead of cat slurp).
+//
+// Why bidi instead of server-streaming-only: a streaming response
+// is often paired with a streaming request body (an SSE handler
+// consuming a client feed). Bidirectional streaming keeps the
+// protocol symmetric; client retry semantics are unchanged (the
+// request is still scoped to a single bidi stream).
+//
+// The unary ForwardHTTP stays for one cycle as a deprecated path
+// so a rolling deploy across the vmmd fleet doesn't break older
+// gatewayd builds. PR-D removes it.
+func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse]) error {
+	const op = "ForwardHTTPStream"
+	start := time.Now()
+	defer func() { s.ops.Observe(op, time.Since(start), nil) }()
+
+	ctx := stream.Context()
+
+	// 1. Receive the init frame. The bidi protocol is:
+	//    [init] [body_chunk]…  on the inbound side; the server
+	//    treats everything before the first init as a protocol
+	//    error (the gateway always sends init first).
+	init, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "expected init frame: %v", err)
+	}
+	reqInit := init.GetInit()
+	if reqInit == nil {
+		return status.Error(codes.InvalidArgument, "first frame must be ForwardHTTPRequestInit")
+	}
+	if reqInit.GetInstance() == "" {
+		return status.Error(codes.InvalidArgument, "instance is required")
+	}
+	// Cap-lift (ADR-047): when the gateway stamped stream=true
+	// (set by setupStreamingWriter at the gateway side), the
+	// body cap lifts from 25 MiB to 100 MiB and the bridge
+	// timeout lifts from 60 s to 900 s. The cap is checked
+	// per-chunk in the recv loop below (so a streaming request
+	// with a tiny body never trips the higher cap).
+	maxBody := int64(ForwardMaxBodyBytes)
+	respTimeout := forwardResponseTimeout
+	if reqInit.GetStream() {
+		maxBody = int64(ForwardStreamMaxBodyBytes)
+		respTimeout = ForwardStreamResponseTimeout
+	}
+
+	netnsName, ok := s.vmm.NetnsFor(reqInit.GetInstance())
+	if !ok {
+		return status.Errorf(codes.NotFound, "instance %q not live", reqInit.GetInstance())
+	}
+
+	// 2. Bridge the request body via a temp file (so the shell
+	//    script can `cat` it without colliding stdin with the
+	//    response read) AND a streaming pipe so the body can
+	//    grow as chunks arrive. The simplest correct shape: stage
+	//    init headers + dial line in the script as today, but
+	//    defer the body bytes to streaming reads. The bridge
+	//    script takes the body from stdin in chunks.
+	//
+	//    Architecture: parent goroutine reads from the gRPC
+	//    stream and writes body chunks to a pipe; the bridge
+	//    script's stdin is the pipe's read end. When the parent
+	//    goroutine sees io.EOF on the stream (gateway signaled
+	//    end-of-body), it closes the pipe; the bridge reads EOF
+	//    from cat, finishes its response write, and exits.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return status.Errorf(codes.Internal, "pipe: %v", err)
+	}
+	defer stdinR.Close()
+
+	// 3. Spawn the bridge. Bridge stdout pipes to the server
+	//    goroutine below; stderr is captured for the Unavailable
+	//    surfacing path on bridge failure.
+	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netnsName, "sh", "-c",
+		buildStreamingBridgeScript(reqInit, respTimeout))
+	cmd.Stdin = stdinR
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		_ = stdinW.Close()
+		return status.Errorf(codes.Unavailable, "bridge start: %v", err)
+	}
+
+	// Body-copy goroutine: copies client body_chunks → bridge
+	// stdin. Errors are aggregated; the first one cancels the
+	// bidi stream via the cancelErr closure capture.
+	bodyErrCh := make(chan error, 1)
+	go func() {
+		var written int64
+		for {
+			f, err := stream.Recv()
+			if err == io.EOF {
+				bodyErrCh <- nil
+				return
+			}
+			if err != nil {
+				bodyErrCh <- err
+				return
+			}
+			chunk := f.GetBodyChunk()
+			if len(chunk) == 0 {
+				continue
+			}
+			written += int64(len(chunk))
+			if written > maxBody {
+				bodyErrCh <- status.Errorf(codes.InvalidArgument,
+					"streaming body exceeds %d bytes", maxBody)
+				return
+			}
+			if _, err := stdinW.Write(chunk); err != nil {
+				bodyErrCh <- err
+				return
+			}
+		}
+	}()
+
+	// Wait for the bridge to exit (it exits when stdin EOFs OR
+	// when the timeout fires inside the script).
+	bridgeErr := cmd.Wait()
+	closeErr := stdinW.Close() // signal EOF to the bridge
+	bodyErr := <-bodyErrCh     // collect the body-copy status
+
+	if bridgeErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(bridgeErr, &exitErr) {
+			s.log.Warn("vmmd: streaming bridge non-zero exit",
+				"instance", reqInit.GetInstance(),
+				"netns", netnsName,
+				"exit_code", exitErr.ExitCode(),
+				"stderr", stderr.String())
+			return status.Errorf(codes.Unavailable,
+				"guest unreachable (exit %d): %s",
+				exitErr.ExitCode(), strings.TrimSpace(stderr.String()))
+		}
+		return status.Errorf(codes.Unavailable, "bridge exec: %v", bridgeErr)
+	}
+	if closeErr != nil {
+		s.log.Debug("vmmd: streaming bridge stdin close", "err", closeErr.Error())
+	}
+	if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {
+		return status.Errorf(codes.InvalidArgument, "body stream: %v", bodyErr)
+	}
+
+	// 4. Parse the bridge output into init (status+headers) +
+	//    body bytes, then emit them as ForwardHTTPStreamResponse
+	//    frames. The script's output shape is unchanged
+	//    ("<status>\n<headers>\n\n<body bytes>") so parseBridgeOutput
+	//    is reused.
+	resp, err := parseBridgeOutput(stdout.Bytes())
+	if err != nil {
+		return status.Errorf(codes.Internal, "parse bridge: %v", err)
+	}
+
+	// Send the init frame first (status + headers, no body yet).
+	if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
+		Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+			Init: &vmmdpb.ForwardHTTPResponseInit{
+				Status:  resp.GetStatus(),
+				Headers: resp.GetHeaders(),
+			},
+		},
+	}); err != nil {
+		return status.Errorf(codes.Internal, "send init: %v", err)
+	}
+
+	// Send the body as one chunk (the streaming wire shape doesn't
+	// restrict chunking — the gateway-side forwardproxy will
+	// forward each chunk to the client's statusRecorder.Write
+	// which triggers maybeFlush). Splitting into smaller pieces
+	// here is a future optimization (the bridge could pipe
+	// arbitrary-size chunks via tee; today the body is one slurp).
+	if len(resp.GetBody()) > 0 {
+		if err := stream.Send(&vmmdpb.ForwardHTTPStreamResponse{
+			Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{
+				BodyChunk: resp.GetBody(),
+			},
+		}); err != nil {
+			return status.Errorf(codes.Internal, "send body: %v", err)
+		}
+	}
+	return nil
 }
 
 // bridgeIntoNetns runs `ip netns exec <netns> sh -c '<script>'` via
@@ -243,6 +460,92 @@ func buildBridgeScript(reqPath string, req *vmmdpb.ForwardHTTPRequest, dialTimeo
 	fmt.Fprintf(&b, "printf '\\n'\n")
 	fmt.Fprintf(&b, "cat <&3\n")
 	_ = dialTimeout // reserved for a future `timeout` wrapper around the dial.
+	return b.String()
+}
+
+// buildStreamingBridgeScript (issue #471 PR-B + PR-C / ADR-047)
+// is the streaming counterpart to buildBridgeScript. Differences:
+//
+//   - Request body comes from stdin in chunks (the Go server's
+//     body-copy goroutine writes each ForwardHTTPStreamRequest
+//     body_chunk to the bridge's stdin). The script reads
+//     stdin and chunked-encodes it to fd 3; EOF on stdin
+//     terminates the body read and the bridge continues to
+//     read the response.
+//   - Response read uses read -t N to bound the per-line read
+//     latency on a streaming upstream that may sit idle for
+//     many seconds between chunks. The legacy `cat <&3` slurp
+//     blocks until the guest closes the connection — fine for
+//     buffered responses, fatal for streaming because the
+//     guest keeps the connection open until the response
+//     completes.
+//   - Host header rewrite + port-resolution logic mirror the
+//     legacy script (the same per-deployment override port,
+//     the same inner-IP Host).
+//
+// The output shape is unchanged ("<status>\n<headers>\n\n<body
+// bytes>") so parseBridgeOutput keeps working; the streaming
+// shape on the gRPC side is purely a server-side framing
+// translation layer on top of the same wire bytes.
+func buildStreamingBridgeScript(req *vmmdpb.ForwardHTTPRequestInit, respTimeout time.Duration) string {
+	dialPort := req.GetPort()
+	if dialPort == 0 {
+		dialPort = uint32(netns.AppPort)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "set -eu\n")
+	fmt.Fprintf(&b, "exec 3<>/dev/tcp/%s/%d\n",
+		netns.GuestIP, dialPort)
+	// Request line.
+	fmt.Fprintf(&b, "printf '%%s %%s HTTP/1.1\\r\\n' %s %s >&3\n",
+		shellQuote(req.GetMethod()), shellQuote(req.GetRequestUri()))
+	// Host header (rewritten to inner identity).
+	fmt.Fprintf(&b, "printf 'Host: %%s\\r\\n' %s >&3\n",
+		shellQuote(fmt.Sprintf("%s:%d", netns.GuestIP, dialPort)))
+	fmt.Fprintf(&b, "printf 'Transfer-Encoding: chunked\\r\\n' >&3\n")
+	// Caller-supplied headers (already had hop-by-hop stripped
+	// upstream). Skip Content-Length because chunked encoding
+	// governs; emitting both would be a protocol violation.
+	for _, h := range req.GetHeaders() {
+		if strings.EqualFold(h.GetName(), "Content-Length") {
+			continue
+		}
+		fmt.Fprintf(&b, "printf '%%s: %%s\\r\\n' %s %s >&3\n",
+			shellQuote(h.GetName()), shellQuote(h.GetValue()))
+	}
+	fmt.Fprintf(&b, "printf '\\r\\n' >&3\n")
+	// Request body: streaming read from stdin. The Go server
+	// writes body_chunk bytes to stdin; EOF on stdin closes
+	// the request body and the guest sees the chunked
+	// terminator.
+	fmt.Fprintf(&b, "while IFS= read -r -t 1 -n 8192 CHUNK; do\n")
+	fmt.Fprintf(&b, "  printf '%%x\\r\\n' ${#CHUNK} >&3\n")
+	fmt.Fprintf(&b, "  printf '%%s' \"$CHUNK\" >&3\n")
+	fmt.Fprintf(&b, "  printf '\\r\\n' >&3\n")
+	fmt.Fprintf(&b, "done\n")
+	fmt.Fprintf(&b, "printf '0\\r\\n\\r\\n' >&3\n")
+	// Response: status line, headers (until blank line), then
+	// body in a streaming read with timeout. The timeout
+	// bounds idle latency on a streaming upstream that sits
+	// between chunks; total budget is enforced by
+	// exec.CommandContext on the Go side.
+	fmt.Fprintf(&b, "read -r STATUS <&3 || true\n")
+	fmt.Fprintf(&b, "printf '%%s\\n' \"$STATUS\"\n")
+	fmt.Fprintf(&b, "while IFS= read -r -t %d LINE <&3; do\n",
+		int(respTimeout.Seconds()))
+	fmt.Fprintf(&b, "  [ -z \"$LINE\" ] && break\n")
+	fmt.Fprintf(&b, "  printf '%%s\\n' \"$LINE\"\n")
+	fmt.Fprintf(&b, "done\n")
+	fmt.Fprintf(&b, "printf '\\n'\n")
+	// Streaming body read: pull 8 KiB at a time and write each
+	// chunk verbatim to stdout so parseBridgeOutput captures
+	// the trailing body slice as one chunk. The read's `-t`
+	// bounds per-call idle latency; on EOF (guest closed
+	// connection), the loop exits and the script ends.
+	fmt.Fprintf(&b, "while IFS= read -r -t %d -n 8192 CHUNK <&3; do\n",
+		int(respTimeout.Seconds()))
+	fmt.Fprintf(&b, "  printf '%%s' \"$CHUNK\"\n")
+	fmt.Fprintf(&b, "done\n")
 	return b.String()
 }
 

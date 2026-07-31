@@ -87,6 +87,16 @@ func (f *fakeVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.Call
 	panic("Logs: gateway hot path doesn't dial per-instance log streams")
 }
 
+// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047). The
+// gateway hot path dials this on the streaming response path;
+// the existing handler unit tests exercise the buffered
+// (unary ForwardHTTP) path so this method panics if called.
+// A future streaming unit test should add a fake bidi client
+// to drive fwdStreamOnce end-to-end.
+func (f *fakeVmmdClient) ForwardHTTPStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
+	panic("ForwardHTTPStream: not stubbed")
+}
+
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
 // vmmd socket directly to assert the filter is in place. Panics

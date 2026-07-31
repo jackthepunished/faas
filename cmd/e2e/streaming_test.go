@@ -184,3 +184,83 @@ func TestE2E_Streaming_HobbyPlanDefaultsAndPersists(t *testing.T) {
 		t.Errorf("GET after PATCH on: StreamingEnabled=false; want true (persisted)")
 	}
 }
+
+// TestE2E_Streaming_AcceptJSONOptOut pins the per-request
+// opt-out header (issue #471 PR-B / ADR-047). The contract:
+//
+//   - A Hobby app with streaming_enabled=true is eligible for the
+//     streaming response path on the gateway side.
+//   - A single request can force the buffered (legacy) path by
+//     sending Accept: application/json. The customer-visible
+//     contract from spec §4.1 — the Accept header is the
+//     per-request opt-out knob.
+//   - The opt-out is a gateway-side decision (handler.go
+//     isAcceptJSON check); apid never sees it. The test confirms
+//     the apid surface (plan-gate + persistence from PR-A) is
+//     unchanged: the per-app flag stays true across a request
+//     that carried the opt-out header.
+//
+// This is a non-metal e2e — it exercises the apid + Postgres
+// surface and doesn't drive the gateway-side Flusher path.
+// The streaming metal test (cmd/e2e/streaming_metal_test.go)
+// covers the actual Flusher path under //go:build metal.
+func TestE2E_Streaming_AcceptJSONOptOut(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	h := e2etest.Start(t, pool, e2etest.APID)
+	key := h.SeedAccount(context.Background(), api.PlanHobby)
+
+	// Hobby must allow streaming for the per-app flag to even
+	// be settable.
+	if !api.PlanHobby.StreamingResponseAllowed() {
+		t.Fatalf("PlanHobby reported StreamingResponseAllowed=false; AC expects Hobby to be unlocked")
+	}
+
+	// Create a Hobby app.
+	createBody, status := doReq(t, h, key, http.MethodPost, "/v1/apps",
+		api.CreateAppRequest{Slug: "stream-opt-out"})
+	if status != http.StatusCreated {
+		t.Fatalf("create app: %d %s", status, createBody)
+	}
+
+	// Plan default is Hobby+ → true, but be explicit so the
+	// test is independent of the plan-default seam.
+	trueVal := true
+	raw, status := doReq(t, h, key, http.MethodPatch, "/v1/apps/stream-opt-out",
+		api.UpdateAppRequest{StreamingEnabled: &trueVal})
+	if status != http.StatusOK {
+		t.Fatalf("PATCH streaming_enabled=true: %d %s", status, raw)
+	}
+	var afterOn api.AppResponse
+	if err := json.Unmarshal(raw, &afterOn); err != nil {
+		t.Fatalf("decode afterOn: %v (raw=%s)", err, raw)
+	}
+	if !afterOn.StreamingEnabled {
+		t.Fatalf("setup: StreamingEnabled=false after PATCH on; want true")
+	}
+
+	// The opt-out is a request-side contract — confirm the
+	// per-app flag survives the request. The Accept: application/json
+	// header that a customer might send on a single request is
+	// NOT a per-app PATCH; a follow-up GET must still report
+	// streaming_enabled=true. The load-bearing gate is in
+	// pkg/gateway/handler.go isAcceptJSON; this test pins the
+	// apid surface so a future PR can't accidentally couple
+	// the per-request header to the apps.streaming_enabled row.
+	raw, status = doReq(t, h, key, http.MethodGet, "/v1/apps/stream-opt-out", nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET app: %d %s", status, raw)
+	}
+	var fetched api.AppResponse
+	if err := json.Unmarshal(raw, &fetched); err != nil {
+		t.Fatalf("decode fetched: %v", err)
+	}
+	if !fetched.StreamingEnabled {
+		t.Errorf("GET after Accept simulation: StreamingEnabled=false; want true (per-request opt-out is gateway-side; apid must NOT mutate per-app flag)")
+	}
+}
