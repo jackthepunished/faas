@@ -1,8 +1,8 @@
 // Test fakes for pkg/reconcile. The fakeStore embeds *state.MemStore
 // (which already implements the full state.Store interface) and
-// overrides only the methods the reconcile package calls. This
-// keeps the fake authoritative on the 200+ method interface while
-// letting tests assert on the few that matter.
+// overrides only the methods the reconcile package exercises.
+// This keeps the fake authoritative on the 200+ method interface
+// while letting tests assert on the few that matter.
 //
 // The fakeAuditor is intentionally a thin wrapper around the real
 // pkg/audit.Auditor. audit.New requires a Store (for AppendEvent),
@@ -32,32 +32,30 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// fakeStore wraps *state.MemStore and adds three hooks the
+// fakeStore wraps *state.MemStore and exposes two test hooks the
 // reconcile tests inspect:
 //
-//   - appsForProjectHook (lets a test inject a custom result for
-//     one call without mutating the underlying MemStore)
-//   - appendEventHook (records every AppendEvent call so the
-//     audit-ordering assertion can pin the chronology)
-//   - updateAppHook (lets a test override the UpdateApp payload
-//     for the audit-ordering test)
-//   - applyProjectPlanHook (lets a test inject the post-apply App
-//     set for the create set)
-//   - softDeleteAppCascadeHook (lets a test inject the post-delete
-//     App for the removes)
+//   - appendEvents (recorded via the AppendEvent override below):
+//     every audit row the service emits, in order. Pinned by the
+//     audit-ordering and chronology tests.
 //
-// All hooks are optional; when nil, the embeds call through to
-// MemStore.
+//   - createAppIfUnderQuotaHook (optional): when non-nil, the
+//     per-app create path delegates to this hook instead of the
+//     MemStore. Tests use it to inject a *QuotaError on the Nth
+//     call so the inner-error path can be exercised without a
+//     real DB. When nil, calls go through to MemStore.
+//
+// All hooks are optional; when nil, the embedded MemStore is the
+// substrate for everything.
 type fakeStore struct {
 	*state.MemStore
 
-	mu sync.Mutex
-	// appendEvents records every call to AppendEvent in order.
-	// Pinned by the audit-ordering test.
+	mu           sync.Mutex
 	appendEvents []fakeEvent
-	// accountPlan is the plan the fakeStore's AccountByID returns.
-	// Defaults to api.PlanHobby.
-	accountPlan api.Plan
+	accountPlan  api.Plan
+	// createAppIfUnderQuotaHook intercepts the per-app create
+	// path. When nil, MemStore.CreateAppIfUnderQuota is called.
+	createAppIfUnderQuotaHook func(app state.App) (state.App, error)
 }
 
 type fakeEvent struct {
@@ -101,6 +99,18 @@ func (s *fakeStore) CreateAccount(ctx context.Context, email string, plan api.Pl
 	return s.MemStore.CreateAccount(ctx, email, plan)
 }
 
+// CreateAppIfUnderQuota forwards to the test hook when set;
+// otherwise delegates to the embedded MemStore. The hook is the
+// only way to exercise the inner *QuotaError safety net without
+// a real Postgres quota race — MemStore's CreateAppIfUnderQuota
+// only fires QuotaError when the cap is genuinely exceeded, which
+// is hard to set up reliably across runs.
+func (s *fakeStore) CreateAppIfUnderQuota(ctx context.Context, app state.App, limits api.Limits) (state.App, error) {
+	if s.createAppIfUnderQuotaHook != nil {
+		return s.createAppIfUnderQuotaHook(app)
+	}
+	return s.MemStore.CreateAppIfUnderQuota(ctx, app, limits)
+}
 
 // snapshotEvents returns a copy of the recorded AppendEvent calls
 // since the last reset. Safe under concurrent mutation because
@@ -147,7 +157,3 @@ func newFakeAuditor(store *fakeStore) *audit.Auditor {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return audit.New(store, log, noopOps{}, "reconcile")
 }
-
-// suppress unused-import warnings if these helpers go untouched
-// in a future refactor.
-var _ = api.PlanHobby

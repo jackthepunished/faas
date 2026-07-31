@@ -54,12 +54,17 @@ func seedProject(t *testing.T, store *fakeStore, scanSource state.ProjectScanSou
 // id, created_at, and status='active'. The test reads the App
 // back from AppsForProject so the WorkloadName-based merge key
 // captures the canonical values.
+//
+// Slug mirrors the production path: verbatim w.Name, no slugify.
+// apps.slug is unconstrained in the schema; reconcile + apid
+// must agree (see workloadToDraftApp's docstring for the
+// rationale + the dual-pin requirement).
 func seedApp(t *testing.T, store *fakeStore, project state.Project, rootDir, workloadName, startCmd string) state.App {
 	t.Helper()
 	a := state.App{
 		AccountID:     project.AccountID,
 		ProjectID:     project.ID,
-		Slug:          slugify(workloadName),
+		Slug:          workloadName,
 		RootDir:       rootDir,
 		WorkloadName:  workloadName,
 		WorkloadClass: state.WorkloadClassHTTP,
@@ -106,6 +111,22 @@ func extractKinds(events []fakeEvent) []string {
 		out = append(out, e.Kind)
 	}
 	return out
+}
+
+// equalSlices returns true iff a and b have the same length and
+// the same elements at every index. Used by audit-ordering
+// assertions where extractKinds's "sorted" return would mask the
+// very chronology the test is trying to pin.
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // findEvent returns the first recorded event whose kind matches.
@@ -397,6 +418,82 @@ func TestReconcile_OverQuota_CreatesSkipped(t *testing.T) {
 	kinds := extractKinds(store.snapshotEvents())
 	if len(kinds) != 2 || kinds[0] != KindReconcileStarted || kinds[1] != KindReconcileQuotaBlocked {
 		t.Errorf("expected [started, quota_blocked], got %v", kinds)
+	}
+}
+
+func TestReconcile_InnerQuotaError_PartialAddsAndAlert(t *testing.T) {
+	// Pins the inner CreateAppIfUnderQuota → *QuotaError safety
+	// net. Hobby plan cap = 5; seed 1 existing app (matching a
+	// scan workload so it doesn't trigger a remove), then a
+	// 2-workload create set with workload names that aren't in
+	// existing. Pre-check sees 1+2=3 ≤ 5 → passes. The hook
+	// fires QuotaError on the 2nd call to simulate a per-app
+	// race losing against a concurrent insert.
+	store := newFakeStore()
+	store.accountPlan = api.PlanHobby
+	aud := newFakeAuditor(store)
+	_, proj := seedProject(t, store, state.ProjectScanSourceCompose, "main")
+	seedApp(t, store, proj, "", "existing", "")
+
+	hookCalls := 0
+	store.createAppIfUnderQuotaHook = func(app state.App) (state.App, error) {
+		hookCalls++
+		if hookCalls == 2 {
+			return state.App{}, &state.QuotaError{
+				Kind:     state.QuotaErrorKindApps,
+				Limit:    5,
+				Observed: 6,
+			}
+		}
+		return app, nil
+	}
+
+	scan := reposcan.Result{
+		Workloads: []reposcan.Workload{
+			{Name: "existing", RootDir: "", Source: "compose.yaml: existing", Tier: reposcan.TierCompose},
+			{Name: "new-a", RootDir: "", Source: "compose.yaml: new-a", Tier: reposcan.TierCompose},
+			{Name: "new-b", RootDir: "", Source: "compose.yaml: new-b", Tier: reposcan.TierCompose},
+		},
+		Tier: reposcan.TierCompose,
+	}
+	svc := freshService(store, aud)
+	out, err := svc.Reconcile(context.Background(), proj, scan, "sha-inner-q", "main")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(out.Added) != 1 {
+		t.Fatalf("expected 1 partial add, got %d", len(out.Added))
+	}
+	if len(out.Alerts) != 1 || out.Alerts[0].Kind != AlertKindQuotaBlocked {
+		t.Fatalf("expected 1 quota_blocked alert, got %v", out.Alerts)
+	}
+	// skipped_creates must exclude the one that already landed.
+	skipped, _ := out.Alerts[0].Data["skipped_creates"].([]string)
+	if len(skipped) != 1 {
+		t.Fatalf("expected 1 skipped name (not 2), got %v", skipped)
+	}
+	if skipped[0] == out.Added[0].WorkloadName {
+		t.Errorf("added workload %q leaked into skipped_creates", skipped[0])
+	}
+	// Audit row payload is the source of truth for dashboards;
+	// pin it too.
+	ev, ok := findEvent(store.snapshotEvents(), KindReconcileQuotaBlocked)
+	if !ok {
+		t.Fatalf("missing quota_blocked audit row")
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("audit payload unparseable: %v", err)
+	}
+	auditSkipped, _ := data["skipped_creates"].([]any)
+	if len(auditSkipped) != 1 {
+		t.Errorf("audit row skipped_creates: expected 1, got %d (%v)", len(auditSkipped), auditSkipped)
+	}
+	// Chronology: started, added (the one that landed), quota_blocked.
+	kinds := extractKinds(store.snapshotEvents())
+	want := []string{KindReconcileStarted, KindWorkloadAdded, KindReconcileQuotaBlocked}
+	if !equalSlices(kinds, want) {
+		t.Errorf("expected kinds %v, got %v", want, kinds)
 	}
 }
 

@@ -70,8 +70,11 @@ func (s *Service) reconcile(
 
 	// 5. Apply. applyActions may emit a quota_blocked alert and
 	// return out with no error; it returns a real error only on
-	// store failures (FK, conflict, etc.).
-	applied, err := s.applyActions(ctx, project, actions, commitSHA)
+	// store failures (FK, conflict, etc.). Pass `existing` through
+	// so the quota pre-check inside applyActions reuses the same
+	// slice the diff just consumed — no second round-trip, no
+	// race window between the count and the create Tx.
+	applied, err := s.applyActions(ctx, project, actions, existing, commitSHA)
 	if err != nil {
 		return out, err
 	}
