@@ -59,7 +59,7 @@ horizontal-scale variant, not active-passive).
 >   `make egress-render-cross-check` byte-compares the Go
 >   and Jinja2 surfaces for every supported pair. The
 >   runtime `pg_notify` watcher
->   (`cmd/vmmd/egress_watcher.go`, migration 00077) keeps
+>   (`cmd/vmmd/egress_watcher.go`, migration 00078) keeps
 >   `/etc/nftables.conf` live-reloadable without a
 >   `make bootstrap` rerun.
 > - **#250 (off-host Postgres backup)** — ✗ NOT shipped.

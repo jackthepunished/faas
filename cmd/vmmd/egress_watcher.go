@@ -1,7 +1,7 @@
 // egress_watcher.go — ADR-055 / Tier 1 Phase 4 runtime policy reload.
 //
 // vmmd's per-host egress policy watcher. Subscribes to the
-// `egress_policy_changed` pg_notify channel (migration 00077), and
+// `egress_policy_changed` pg_notify channel (migration 00078), and
 // on every notification re-renders the policy with the host's
 // compile-time defaults, validates via `nft -c -f <staging>`, and
 // atomic-replaces /etc/nftables.conf followed by `nft -f`. Single-box
@@ -88,7 +88,7 @@ func (osExecNft) Reload(ctx context.Context, path string) error {
 }
 
 // egressPolicyAuditRow is the JSON payload shape the migration
-// 00077 trigger emits on `egress_policy_changed`. The watcher logs
+// 00078 trigger emits on `egress_policy_changed`. The watcher logs
 // the payload's fields for diagnostic correlation but does NOT
 // trust the payload for the render — the canonical values live in
 // `pkg/netns.DefaultHostPolicy`. A misconfigured audit row is
@@ -294,7 +294,12 @@ func runNftCmd(ctx context.Context, cmdline string) error {
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %s", err, buf.String())
+		// Wrap the *exec.ExitError with %w so callers can errors.As
+		// to a *exec.ExitError and inspect ExitCode; append the
+		// captured stdout+stderr as diagnostic context (a flat
+		// string — the nft(8) error text goes here, not in the
+		// wrap chain).
+		return fmt.Errorf("nft: %w: %s", err, buf.String())
 	}
 	return nil
 }

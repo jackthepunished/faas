@@ -1,9 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00077_egress_policy_notify.sql
+-- filename: 00078_egress_policy_notify.sql
 --
--- 00077_egress_policy_notify.sql — ADR-055, Tier 1 Phase 4.
+-- 00078_egress_policy_notify.sql — ADR-055, Tier 1 Phase 4.
 --
 -- The egress_policy table is the per-host policy audit row. The
 -- canonical values still live in pkg/netns.DefaultHostPolicy (the

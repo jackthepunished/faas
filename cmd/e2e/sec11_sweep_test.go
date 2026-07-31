@@ -1021,7 +1021,7 @@ func repoRootIfReachable() (string, error) {
 
 // --- TestSec11_EgressPolicyMigrationShape --------------------------------
 //
-// ADR-055 + migration 00077: the `egress_policy` audit table and
+// ADR-055 + migration 00078: the `egress_policy` audit table and
 // its `egress_policy_changed` pg_notify channel are the runtime
 // contract cmd/vmmd/egress_watcher.go subscribes to. Pin both the
 // table shape and the channel name so a future migration that drops
@@ -1037,7 +1037,7 @@ func TestSec11_EgressPolicyMigrationShape(t *testing.T) {
 	pool := openSchemaPG(t)
 
 	// 1. The egress_policy table exists with the singleton PK.
-	//    We don't assert column count here — migration 00077 may grow
+	//    We don't assert column count here — migration 00078 may grow
 	//    columns under future ADRs (e.g. per-tenant policy) and the
 	//    test should track that without churn. We DO assert the
 	//    singleton CHECK constraint, which is load-bearing for the

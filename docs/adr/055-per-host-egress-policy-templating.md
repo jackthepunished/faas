@@ -99,7 +99,7 @@ MUST be byte-identical:
 | `pkg/netns/policy_test.go` | + `TestHostPolicyRenderSubstitutesPublicIface` and `TestHostPolicyRenderSubstitutesMasqueradeCIDR` (single-field, in addition to the existing combined-fields test) |
 | `cmd/faas-nft-render/main.go` | + `--public-iface` / `--masquerade-cidr` flags + env fallbacks |
 | `pkg/db/notify.go` | + `NotifyEgressPolicyChanged = "egress_policy_changed"` constant |
-| `migrations/00077_egress_policy_notify.sql` | NEW — small audit table + notify trigger |
+| `migrations/00078_egress_policy_notify.sql` | NEW — small audit table + notify trigger |
 | `cmd/vmmd/egress_watcher.go` | NEW — drain loop + `nft -c -f` + atomic-replace |
 | `cmd/vmmd/egress_watcher_test.go` | NEW — stub `nftExec` interface |
 | `cmd/vmmd/main.go` | wire `EgressWatcher.Run` into `runDeps`; gate on `cfg.ComputeNode.NodeName != ""` |
@@ -135,7 +135,7 @@ MUST be byte-identical:
 | render | `cmd/faas-nft-render/main.go` | + `--public-iface` / `--masquerade-cidr` flags |
 | ansible | `deploy/ansible/roles/nftables/{defaults,tasks,files,templates}/*` | Jinja2 template + `host_vars` plumbing |
 | notify | `pkg/db/notify.go` | + `NotifyEgressPolicyChanged` constant |
-| migration | `migrations/00077_egress_policy_notify.sql` | NEW — audit table + trigger |
+| migration | `migrations/00078_egress_policy_notify.sql` | NEW — audit table + trigger |
 | watcher | `cmd/vmmd/egress_watcher.go` | NEW — `pg_notify` listener + `nft -c -f` + atomic-replace |
 | watcher-test | `cmd/vmmd/egress_watcher_test.go` | NEW — stub `nftExec` |
 | daemon | `cmd/vmmd/main.go::runDeps` | + `startEgressWatcher` test seam |
