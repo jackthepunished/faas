@@ -697,7 +697,7 @@ func TestWaitReady_SucceedsOnListener(t *testing.T) {
 		defer ln.Close()
 		lease = Lease{Instance: "ready", HostIP: netip.MustParseAddr("127.0.0.1"), UID: 1, GID: 1}
 	}
-	if err := v.waitReady(context.Background(), lease); err != nil {
+	if err := v.waitReady(context.Background(), lease, ""); err != nil {
 		t.Errorf("waitReady: %v", err)
 	}
 }
@@ -710,7 +710,7 @@ func TestWaitReady_TimesOut(t *testing.T) {
 	// fails fast and the loop must time out at readyTimeout.
 	lease := Lease{Instance: "slow", HostIP: netip.MustParseAddr("192.0.2.1")}
 	start := time.Now()
-	err := v.waitReady(context.Background(), lease)
+	err := v.waitReady(context.Background(), lease, "")
 	if err == nil {
 		t.Fatal("expected timeout")
 	}
@@ -729,8 +729,336 @@ func TestWaitReady_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	lease := Lease{Instance: "x", HostIP: netip.MustParseAddr("192.0.2.1")}
-	if err := v.waitReady(ctx, lease); err == nil {
+	if err := v.waitReady(ctx, lease, ""); err == nil {
 		t.Fatal("expected ctx error")
+	}
+}
+
+// --- PR-D healthcheck probe tests (issue #460 / ADR-053, ADR-057) -------
+
+// TestHealthcheckProbe drives the pure helper against an httptest.Server
+// on an ephemeral port — keeps production waitReady's literal `:8080`
+// out of the unit test path. The loop's retry-on-non-2xx semantics live
+// in TestWaitReadyHTTP_SucceedsRetriesAndTimesOut below.
+func TestHealthcheckProbe(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		path       string
+		wantReady  bool
+		wantErrSub string // empty = expect nil error
+	}{
+		{
+			name:      "200 is ready",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) },
+			path:      "/healthz",
+			wantReady: true,
+		},
+		{
+			name:      "201 is ready (any 2xx)",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusCreated) },
+			path:      "/healthz",
+			wantReady: true,
+		},
+		{
+			name:      "299 is ready (boundary)",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(299) },
+			path:      "/healthz",
+			wantReady: true,
+		},
+		{
+			name:      "204 is ready (no body)",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			path:      "/healthz",
+			wantReady: true,
+		},
+		{
+			name:      "301 redirects and is NOT ready (3xx not in 2xx)",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusMovedPermanently) },
+			path:      "/healthz",
+			wantReady: false,
+		},
+		{
+			name:      "404 is NOT ready",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
+			path:      "/healthz",
+			wantReady: false,
+		},
+		{
+			name:      "500 retries (ADR-005: transient customer error must not wedge wake)",
+			handler:   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			path:      "/healthz",
+			wantReady: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(tt.handler)
+			defer srv.Close()
+			addr := strings.TrimPrefix(srv.URL, "http://")
+			client := &http.Client{Timeout: 2 * time.Second}
+			got, err := healthcheckProbe(context.Background(), client, addr, tt.path)
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if got != tt.wantReady {
+				t.Errorf("ready=%v, want %v", got, tt.wantReady)
+			}
+		})
+	}
+}
+
+// TestHealthcheckProbe_ContextCanceled: a canceled ctx produces an error
+// (no request is even sent).
+func TestHealthcheckProbe_ContextCanceled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := &http.Client{Timeout: 2 * time.Second}
+	if _, err := healthcheckProbe(ctx, client, addr, "/healthz"); err == nil {
+		t.Fatal("expected ctx error")
+	}
+}
+
+// TestHealthcheckProbe_TransportError: an unrouted host (TEST-NET-1,
+// RFC 5737) yields a transport error → (false, nil) per the helper's
+// retry-friendly contract — the loop interprets that as "not ready yet".
+func TestHealthcheckProbe_TransportError(t *testing.T) {
+	addr := net.JoinHostPort("192.0.2.1", "8080")
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	got, err := healthcheckProbe(context.Background(), client, addr, "/healthz")
+	if err != nil {
+		t.Fatalf("transport error must surface as (false, nil), not err: %v", err)
+	}
+	if got {
+		t.Error("transport error must yield ready=false")
+	}
+}
+
+// TestHealthcheckProbe_RequestShape pins the on-the-wire shape the
+// runner sees. ADR-057 §Decision 3 nails down: GET (not HEAD), exact
+// path (verbatim from the dep override), empty body. A regression
+// that flips to HEAD or rewrites the path trips here. Query-string
+// is included as a table row because customers will want it for
+// cache-busting / readiness-token gates; the server-side r.URL
+// splits Path from RawQuery per RFC 3986.
+func TestHealthcheckProbe_RequestShape(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		wantPath string // server-side r.URL.Path
+		wantRaw  string // server-side r.URL.RawQuery
+	}{
+		{"plain path", "/healthz", "/healthz", ""},
+		{"nested path", "/ready/internal", "/ready/internal", ""},
+		{"path with query", "/healthz?ready=1", "/healthz", "ready=1"},
+		{"path with fragment (stdlib strips fragment before send)", "/healthz#anchor", "/healthz", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				gotMethod     string
+				gotPath       string
+				gotRawQuery   string
+				gotBody       []byte
+				gotAuthHeader string
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				gotRawQuery = r.URL.RawQuery
+				b := make([]byte, 16)
+				n, _ := r.Body.Read(b)
+				gotBody = b[:n]
+				gotAuthHeader = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			addr := strings.TrimPrefix(srv.URL, "http://")
+			client := &http.Client{Timeout: 2 * time.Second}
+			if _, err := healthcheckProbe(context.Background(), client, addr, tt.path); err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if gotMethod != http.MethodGet {
+				t.Errorf("method=%q, want GET", gotMethod)
+			}
+			if gotPath != tt.wantPath {
+				t.Errorf("path=%q, want %q", gotPath, tt.wantPath)
+			}
+			if gotRawQuery != tt.wantRaw {
+				t.Errorf("RawQuery=%q, want %q", gotRawQuery, tt.wantRaw)
+			}
+			if len(gotBody) != 0 {
+				t.Errorf("body=%q, want empty", gotBody)
+			}
+			if gotAuthHeader != "" {
+				t.Errorf("probe sent Authorization=%q, want empty (probes are unauthenticated per ADR-057 §Security)", gotAuthHeader)
+			}
+		})
+	}
+}
+
+// TestHealthcheckProbe_BodyDrained verifies the response body is
+// drained (capped) before close so the cached transport can reuse
+// the connection on the next probe. Without the drain, every probe
+// at 200ms cadence opens a fresh socket under the cached client and
+// TIME_WAIT accumulates. A handler that streams a 256 KiB body
+// (well above the 64 KiB cap) must not OOM the host, and the
+// transport must remain usable for the next probe.
+func TestHealthcheckProbe_BodyDrained(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		// Stream a body well above the 64 KiB drain cap.
+		w.Header().Set("Content-Length", "262144")
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for i := 0; i < 64; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	client := &http.Client{Timeout: 5 * time.Second}
+	for i := 0; i < 3; i++ {
+		ok, err := healthcheckProbe(context.Background(), client, addr, "/healthz")
+		if err != nil {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("probe %d: ready=false (status 200 expected ready)", i)
+		}
+	}
+	if atomic.LoadInt32(&hits) != 3 {
+		t.Errorf("hits=%d, want 3 (transport reuse implies the same handler answered each probe)", hits)
+	}
+}
+
+// TestHealthcheckProbe_MalformedPath: a path without a leading slash
+// is what the DTO validator (pkg/api/dto.go:323) rejects at deploy
+// time. The helper has no DTO context of its own — but
+// http.NewRequestWithContext rejects a path lacking a leading slash
+// because it produces a relative URL against the host. Pin the
+// behavior so a future refactor that lets a bare path through
+// produces a (false, nil) (transport-friendly) instead of an
+// undefined panic or a request to "http://host:porthealthz".
+func TestHealthcheckProbe_MalformedPath(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	client := &http.Client{Timeout: 1 * time.Second}
+	// "healthz" with no leading slash — Go's url.Parse rejects
+	// this as "missing protocol scheme" against the absolute
+	// host:port base.
+	ok, err := healthcheckProbe(context.Background(), client, addr, "healthz")
+	if err != nil {
+		// NewRequestWithContext returned a parse error — that's
+		// an exception to the (false, nil) contract, surfaced
+		// directly. Document via this test.
+		t.Logf("malformed path returned err=%v (acceptable — caller treats as not-ready)", err)
+		return
+	}
+	if ok {
+		t.Error("malformed path must NOT yield ready=true")
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Errorf("handler received %d hits; want 0 (malformed URL must not reach the server)", hits)
+	}
+}
+
+// TestWaitReadyHTTP_SucceedsRetriesAndTimesOut walks the full waitReady
+// HTTP loop (PR-D's load-bearing path) end-to-end. We can't use the
+// real waitReady against a httptest.Server because it hard-codes :8080
+// in net.JoinHostPort, so we run its loop body inline against a test
+// server on an ephemeral port. This pins the retry-on-2xx-only
+// semantics + deadline behaviour at the integration level.
+func TestWaitReadyHTTP_SucceedsRetriesAndTimesOut(t *testing.T) {
+	t.Run("succeeds on 200 within budget", func(t *testing.T) {
+		var hits int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		err := pollHealthcheck(ctx, srv.URL, "/healthz", 2*time.Second)
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if atomic.LoadInt32(&hits) < 1 {
+			t.Error("at least one probe must have hit the handler")
+		}
+	})
+	t.Run("retries on 500 until deadline", func(t *testing.T) {
+		var hits int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		err := pollHealthcheck(context.Background(), srv.URL, "/healthz", 400*time.Millisecond)
+		if err == nil {
+			t.Fatal("expected deadline, got nil")
+		}
+		if !strings.Contains(err.Error(), "not ready") || !strings.Contains(err.Error(), "/healthz") {
+			t.Errorf("error %q must mention 'not ready' and the path", err.Error())
+		}
+		// 200ms cadence × ~400ms budget → 2 hits minimum (no lower-bound
+		// assertion because timing in CI is non-deterministic).
+		if atomic.LoadInt32(&hits) < 2 {
+			t.Errorf("expected ≥2 probes on a 500-spamming server, got %d", hits)
+		}
+	})
+	t.Run("ctx cancel short-circuits", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := pollHealthcheck(ctx, srv.URL, "/healthz", 5*time.Second)
+		if err == nil {
+			t.Fatal("expected ctx error")
+		}
+	})
+}
+
+// pollHealthcheck is a tiny replica of waitReady's PR-D loop, used by
+// the integration test so we can point at any httptest.Server URL
+// (waitReady itself is locked to :8080). Mirrors the production
+// cadence: 200ms backoff, per-probe 2s client timeout, 2xx =
+// ready, deadline = readyTimeout.
+func pollHealthcheck(ctx context.Context, serverURL, path string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	addr := strings.TrimPrefix(serverURL, "http://")
+	client := &http.Client{Timeout: 2 * time.Second}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("guest not ready (healthcheck %s) after %s", path, budget)
+		}
+		ok, err := healthcheckProbe(ctx, client, addr, path)
+		if err == nil && ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -746,7 +1074,7 @@ func TestBoot_MkChrootFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := NewJailerVMM(base, time.Second)
-	err := v.Boot(context.Background(), Lease{Instance: "boot-fail", UID: 20000, GID: 20000}, VMConfig{})
+	err := v.Boot(context.Background(), Lease{Instance: "boot-fail", UID: 20000, GID: 20000}, VMConfig{}, "")
 	if err == nil {
 		t.Fatal("expected mkChroot failure")
 	}

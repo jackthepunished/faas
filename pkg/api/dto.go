@@ -210,9 +210,13 @@ type CreateDeploymentOverrides struct {
 	// column and surfaces it on the response.
 	Port int `json:"port,omitempty"`
 	// Healthcheck is the optional readiness probe. PR-A persists
-	// the shape; PR-A does NOT yet extend vmm.waitReady to issue
-	// an HTTP probe — the probe stays a bare TCP accept. The
-	// HTTP-probe variant is its own ADR + property test.
+	// the shape; PR-B stamps AppManifest.Healthz at deploy time;
+	// PR-D activates the runtime half — pkg/fcvm/vmm.go::waitReady
+	// issues an HTTP GET against <HostIP>:8080<Healthcheck.Path>
+	// and accepts 2xx (issue #460 / ADR-053 / ADR-057). Empty path
+	// preserves the legacy TCP-accept behaviour. IntervalS /
+	// TimeoutS / Retries are stored + validated here but remain
+	// dormant until a v2 contract lands them on the wire.
 	Healthcheck *DeploymentHealthcheck `json:"healthcheck,omitempty"`
 }
 

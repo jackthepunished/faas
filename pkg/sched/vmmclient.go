@@ -250,6 +250,16 @@ type AppSpec struct {
 	// guest/init/portnorm_linux.go); only vmmd's ForwardHTTP bridge uses
 	// this port to dial the guest.
 	Port int
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path vmmd's waitReady
+	// uses when non-empty. "" = legacy TCP-accept on :8080 (zero
+	// regression risk for pre-PR-D callers). Non-empty → vmmd issues
+	// HTTP GET <HealthcheckPath> against <HostIP>:8080 and accepts
+	// 2xx as ready (ADR-057 §Decision 3). The host probe target is
+	// always :8080 — ADR-009 + portnorm re-expose the customer bind
+	// on :8080 inside the guest, so the path is the customer's choice
+	// and the port is the host's choice. Additive per ADR-016.
+	HealthcheckPath string
 }
 
 // SnapshotRef points at the snapshot to restore from and the Firecracker
@@ -616,6 +626,12 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 		ApiEnv:          apiEnv,
 		EgressAllowlist: a.EgressAllowlist,
 		Port:            uint32(a.Port),
+		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+		// override readiness probe path. "" = legacy TCP-accept on
+		// :8080 (pre-PR-D default). Non-empty → vmmd's waitReady
+		// does HTTP GET <HealthcheckPath> against <HostIP>:8080
+		// and accepts 2xx.
+		HealthcheckPath: a.HealthcheckPath,
 	}
 }
 
