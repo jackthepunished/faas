@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // RegistryClient is a minimal OCI/Docker registry v2 client. It resolves a
@@ -90,7 +91,7 @@ func NewRegistryClient(opts ...Option) *RegistryClient {
 	c := &RegistryClient{
 		hc:     &http.Client{Timeout: time.Duration(api.OCIPullTimeoutSeconds) * time.Second},
 		scheme: "https",
-		ua:     "faas-imaged/1 (+https://DOMAIN)",
+		ua:     "faas-imaged/1 (+https://" + wire.PlatformHost + ")",
 	}
 	for _, o := range opts {
 		o(c)
