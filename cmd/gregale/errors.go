@@ -5,9 +5,15 @@ import "github.com/onebox-faas/faas/pkg/api"
 // docsURLPrefix is the placeholder docs host used to synthesise the
 // "→ see docs at …" line when Problem.DocsURL is empty. The constant
 // is the single point of override (an env-var override is a follow-up).
-// gregale.example is reserved by IANA (RFC 2606) and unreachable, so a stray
-// lookup fails fast and is obviously wrong.
-const docsURLPrefix = "https://docs.gregale.example/errors"
+// Issue #420 — keeps the synthesized row aligned with the live
+// Problem.DocsURL the server emits (pkg/wire.DocsHost).
+//
+// History: until PR #458 the prefix used `docs.gregale.example`, the
+// IANA-reserved example TLD (RFC 2606). Reserved and unreachable,
+// so a stray lookup failed fast and was obviously wrong. The host
+// was renamed to gregale.dev in PR #458 to match the live docs site
+// — the example domain is no longer used here.
+const docsURLPrefix = "https://docs.gregale.dev/errors"
 
 // errorDocsURL is the per-stable-Code docs URL table. Codes live in
 // pkg/api/errors.go; this table mirrors them 1:1 and is consulted only
