@@ -23,6 +23,15 @@ type App struct {
 	ID        string
 	AccountID string // joined in pgRouter.toApp; empty only in fakeBackend unit tests (ADR-040)
 	Plan      api.Plan
+	// StreamingEnabled is the per-app streaming flag (issue #471 /
+	// ADR-047). Plumbed through pgRouter.toApp from the apps row so
+	// ServeHTTP can decide between the buffered and streamed
+	// response path WITHOUT re-reading the database. PR-A uses the
+	// flag only for the once-per-process buffered-fallback
+	// deprecation log; PR-B activates the actual Flusher path.
+	// Default-false in fakeBackend unit tests (the in-memory
+	// backend doesn't populate the column).
+	StreamingEnabled bool
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -142,6 +151,24 @@ type Handler struct {
 	topNSample func(appID string)
 	// lastSeen records per-instance last_request_at (spec §4.1). nil-safe.
 	lastSeen LastSeenSink
+
+	// streamingEnabled gates the per-app streaming response path
+	// (issue #471 / ADR-047). When false (the default), every app is
+	// on the legacy buffered path regardless of the per-app
+	// apps.streaming_enabled column; an app that emits
+	// text/event-stream is buffered end-to-end with a once-per-process
+	// deprecation log so a noisy Free-tier app doesn't spam logs.
+	// PR-B activates the Flusher path when this is true; PR-A only
+	// tests the buffered-fallback AC (#streaming_not_available on
+	// Free + a logged deprecation). Set via WithStreamingEnabled from
+	// cmd/gatewayd/main.go so production defaults to off and operators
+	// opt in per-cluster after PR-B ships.
+	streamingEnabled bool
+	// streamingWarned is the once-per-process log dedup for the
+	// buffered-fallback deprecation. Keyed on (appID, content-type) so
+	// the first instance of an SSE-emitting app under the flag-off
+	// path emits one warn line; subsequent requests are silent.
+	streamingWarned sync.Map // map[string]struct{} (key = appID)
 	// piApps deduplicates Metrics.PreInstantiateApp calls per appID
 	// (issue #273 / ADR-042). A value-typed sync.Map wrapper; the
 	// zero value is valid so NewHandlerWith doesn't have to
@@ -246,6 +273,42 @@ func (h *Handler) WithAccountLimiter(l *Limiter) *Handler {
 func (h *Handler) WithForwarding(fn func(t Target) http.Handler) *Handler {
 	h.proxyByNode = fn
 	return h
+}
+
+// WithStreamingEnabled flips the per-app streaming response path on
+// or off (issue #471 / ADR-047). Production default is false; the
+// e2e harness + metal tests opt in per-process so PR-B's Flusher
+// path can be exercised end-to-end without a fleet-wide rollout.
+// The flag is a single global gate — the per-app apps.streaming_enabled
+// column is read in ServeHTTP and combined with this flag to decide
+// whether to actually stream. Mutates the receiver in place; the
+// returned *Handler is the same pointer (fluent-chaining convention
+// matching WithEgressSink / WithLimiter / etc).
+func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
+	h.streamingEnabled = enabled
+	return h
+}
+
+// streamingFallbackLog emits a once-per-process deprecation line for
+// the buffered-fallback path (issue #471 PR-A AC #4). A misconfigured
+// Free-tier app could land an SSE-emitting response on the buffered
+// path; the log tells operators the flag-off branch fired so they
+// can either flip the per-app flag to false (the correct fix) or
+// upgrade the customer. Keyed on (appID, contentType) so two
+// distinct apps emitting SSE each get their own line; the log
+// dedup uses sync.Map so the hot path is allocation-free after the
+// first observation per key.
+func (h *Handler) streamingFallbackLog(appID, contentType string) {
+	if h.log == nil {
+		return
+	}
+	key := appID + "\x00" + contentType
+	if _, seen := h.streamingWarned.Load(key); seen {
+		return
+	}
+	h.streamingWarned.Store(key, struct{}{})
+	h.log.Warn("gateway: streaming fallback (per-app streaming_enabled=true on a plan that did not unlock streaming; response buffered end-to-end)",
+		"app", appID, "content_type", contentType)
 }
 
 // WithEgressSink installs the per-instance HTTP response byte ring
@@ -490,6 +553,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// host:port by defaultProxy — preserved for tests and the
 		// e2e harness without a vmmd overlay.
 		h.proxyFor(target.NodeID).ServeHTTP(w, r)
+	}
+	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
+	// per-app streaming_enabled flag (ap.StreamingEnabled,
+	// propagated through pgRouter.toApp) is the load-bearing
+	// signal for the fallback log — the customer asked for
+	// streaming, apid's plan-gate (CodePlanStreamingNotAllowed)
+	// should already have rejected the request on a non-paid
+	// plan, but a misconfiguration could land a Free app with
+	// streaming_enabled=true here. h.streamingEnabled (the
+	// operator opt-in) is a separate question: PR-A emits the
+	// log when the per-app flag is set AND the upstream emitted
+	// SSE, regardless of the operator's toggle, because the
+	// per-app flag is the customer-visible contract. PR-B
+	// replaces this with the real Flusher path; PR-A keeps the
+	// log to make AC #4 observable.
+	if app.StreamingEnabled && strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
+		h.streamingFallbackLog(app.ID, rec.ContentType)
 	}
 	h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)
 	// ADR-046 (per-instance egress metering, telemetry only):
@@ -766,17 +846,30 @@ func (h *Handler) preInstantiateApp(appID string) {
 // total. Negative or zero-byte callers (HEAD, 304 Not Modified, error paths
 // without a body) leave Bytes at zero, which the post-proxy recording site
 // treats as "no traffic to meter" (see recordEgress in ServeHTTP).
+//
+// ContentType (issue #471) captures the upstream response's Content-Type
+// at WriteHeader time so the post-proxy site can decide whether the
+// response was an SSE stream (text/event-stream) that got buffered on
+// the way out. The field is read once after proxy.ServeHTTP returns.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
 	Bytes       int64
+	ContentType string
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
 	if !s.wroteHeader {
 		s.status = code
 		s.wroteHeader = true
+		// Issue #471: capture the upstream Content-Type at header
+		// commit time so the post-proxy site can detect a buffered
+		// SSE response for the deprecation log. Header() returns the
+		// current header map (mutable until WriteHeader fires), so
+		// reading it here is race-free relative to the underlying
+		// ResponseWriter.
+		s.ContentType = s.ResponseWriter.Header().Get("Content-Type")
 	}
 	s.ResponseWriter.WriteHeader(code)
 }

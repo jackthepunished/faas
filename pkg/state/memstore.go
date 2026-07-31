@@ -1396,7 +1396,7 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		a.RAMMB = *p.RAMMB
 	}
 	if p.SetIdleTimeout {
-		a.IdleTimeoutS = derefInt(p.IdleTimeoutS)
+		a.IdleTimeoutS = intOrZero(p.IdleTimeoutS)
 	}
 	if p.MaxConcurrency != nil {
 		a.MaxConcurrency = *p.MaxConcurrency
@@ -1408,7 +1408,7 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		a.Manifest = *p.Manifest
 	}
 	if p.SetMinInstances {
-		a.MinInstances = derefInt(p.MinInstances)
+		a.MinInstances = intOrZero(p.MinInstances)
 	}
 	if p.SetEgressAllowlist {
 		// ADR-031 + ADR-032: nil-with-Set is treated as "clear to
@@ -1430,10 +1430,17 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	// (disable). Apid already gated the plan and the bounds
 	// (RPS > 0, CPU in [1,100]); the store is a plain column write.
 	if p.SetAutoscaleTargetRPS {
-		a.AutoscaleTargetRPS = derefInt(p.AutoscaleTargetRPS)
+		a.AutoscaleTargetRPS = intOrZero(p.AutoscaleTargetRPS)
 	}
 	if p.SetAutoscaleTargetCPUPct {
-		a.AutoscaleTargetCPUPct = derefInt(p.AutoscaleTargetCPUPct)
+		a.AutoscaleTargetCPUPct = intOrZero(p.AutoscaleTargetCPUPct)
+	}
+	// Issue #471: per-app streaming flag. Same Set-bit convention as
+	// the autoscale targets — SetStreamingEnabled distinguishes "don't
+	// touch" from "explicit false" (opt out of streaming). Apid
+	// already gated the plan; the store is a plain column write.
+	if p.SetStreamingEnabled {
+		a.StreamingEnabled = boolOrFalse(p.StreamingEnabled)
 	}
 	m.apps[id] = a
 	return a, nil
@@ -4989,9 +4996,28 @@ func (m *MemStore) PutIdempotent(_ context.Context, accountID, key string, statu
 	return nil
 }
 
-func derefInt(p *int) int {
+// intOrZero dereferences a *int UpdateAppParams field, treating nil
+// as 0. The nil sentinel means "don't touch the column" — the
+// SetX bit (e.g. SetIdleTimeout) gates whether this value is even
+// applied, so the 0 default only matters when the Set bit is on
+// AND the caller passed nil (a misuse). Used by both pgstore (for
+// SQL UPDATE args) and memstore (for in-memory App copy); kept
+// here because memstore is the canonical home for the field-shape
+// helpers (the unit-test surface).
+func intOrZero(p *int) int {
 	if p == nil {
 		return 0
+	}
+	return *p
+}
+
+// boolOrFalse is the *bool counterpart to intOrZero, used by both
+// stores for the SetStreamingEnabled UpdateAppParams field. Same
+// nil-means-zero-value contract: pgstore only consults this value
+// when SetStreamingEnabled is on, so a nil pair there is harmless.
+func boolOrFalse(p *bool) bool {
+	if p == nil {
+		return false
 	}
 	return *p
 }
@@ -6546,7 +6572,7 @@ func (m *MemStore) SetSnapshotStorageKeyForTest(deploymentID, storageKey string)
 	}
 }
 
-// derefPrefixes is the []netip.Prefix sibling of derefInt (ADR-031).
+// derefPrefixes is the []netip.Prefix sibling of intOrZero (ADR-031).
 // Returns the underlying slice or nil so callers see a uniform shape
 // for both branches of `SetEgressAllowlist`. Mirrors pgstore's
 // copy; the duplication is intentional — pgstore dereferences for

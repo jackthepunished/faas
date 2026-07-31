@@ -26,6 +26,8 @@ class CreateAppRequest:
     ram_mb: int | Unset = UNSET
     max_concurrency: int | Unset = UNSET
     idle_timeout_s: int | Unset = UNSET
+    streaming_enabled: bool | Unset = UNSET
+    """Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +47,8 @@ class CreateAppRequest:
 
         idle_timeout_s = self.idle_timeout_s
 
+        streaming_enabled = self.streaming_enabled
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -62,6 +66,8 @@ class CreateAppRequest:
             field_dict["max_concurrency"] = max_concurrency
         if idle_timeout_s is not UNSET:
             field_dict["idle_timeout_s"] = idle_timeout_s
+        if streaming_enabled is not UNSET:
+            field_dict["streaming_enabled"] = streaming_enabled
 
         return field_dict
 
@@ -90,6 +96,8 @@ class CreateAppRequest:
 
         idle_timeout_s = d.pop("idle_timeout_s", UNSET)
 
+        streaming_enabled = d.pop("streaming_enabled", UNSET)
+
         create_app_request = cls(
             slug=slug,
             type_=type_,
@@ -97,6 +105,7 @@ class CreateAppRequest:
             ram_mb=ram_mb,
             max_concurrency=max_concurrency,
             idle_timeout_s=idle_timeout_s,
+            streaming_enabled=streaming_enabled,
         )
 
         create_app_request.additional_properties = d

@@ -3683,6 +3683,20 @@ components:
           minimum: 0
           maximum: 100
           example: 70
+        # Issue #471 / ADR-047 (PR-A): per-app streaming flag.
+        # When true on a paid plan that unlocks streaming
+        # (Hobby/Pro/Scale), gatewayd can flush the response
+        # body incrementally instead of buffering end-to-end.
+        # Free apps stay at false regardless of the customer's
+        # preference (apid's plan-gate rejects PATCH true on
+        # Free with 403 plan_streaming_not_allowed). The actual
+        # Flusher path lands in PR-B; PR-A only persists the
+        # flag. Default at create-time is the plan's
+        # default (true for Hobby+, false for Free).
+        streaming_enabled:
+          description: "Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it. PR-B activates the streamed response path; PR-A only persists the flag."
+          type: boolean
+          example: false
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -3695,6 +3709,15 @@ components:
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
         idle_timeout_s: { type: integer }
+        # Issue #471 / ADR-047 (PR-A): optional at create-time.
+        # Omitted → apid applies the plan default (Hobby/Pro/Scale
+        # default to true; Free defaults to false). Spec
+        # consumers should treat the field as optional at create
+        # and required at read (AppResponse).
+        streaming_enabled:
+          description: "Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."
+          type: boolean
+          example: false
 
     UpdateAppRequest:
       description: "Partial update — every field is optional; omitted fields are unchanged."
@@ -3740,6 +3763,15 @@ components:
           minimum: 0
           maximum: 100
           example: 70
+        # Issue #471 / ADR-047 (PR-A): partial-update nullable
+        # boolean. Omitted → no change; non-null → atomic
+        # overwrite. Plan gate runs first (403
+        # plan_streaming_not_allowed) so a Free PATCHing
+        # true surfaces the gate. Hobby/Pro/Scale flow through.
+        streaming_enabled:
+          description: "Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403 plan_streaming_not_allowed."
+          type: [boolean, "null"]
+          example: false
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."

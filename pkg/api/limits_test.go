@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestPlanLimitsMatchSpec pins every value in the table to the financial-model /
 // spec §1 numbers. If the spreadsheet moves, this test must be updated in the
@@ -32,7 +35,15 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			AlertRuleLimitPerApp: 0, AlertRuleLimitPerAccount: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
-			RateLimitPerAccountRPM: 50},
+			RateLimitPerAccountRPM: 50,
+			// Issue #471 / ADR-047 (PR-A): Free is gated out of streaming
+			// entirely. The 25 MiB / 300 s caps are the legacy pre-#471
+			// defaults — kept here so a Free customer that PATCHes
+			// streaming_enabled=false sees the same envelope they'd have
+			// seen before the streaming patch landed. MaxResponseBodyBytes
+			// (25 MiB) and ResponseWriteTimeoutSeconds (300 s) are the
+			// pre-#471 spec §4.1 caps PR-A inherits.
+			StreamingEnabled: false, MaxResponseBodyBytes: 26_214_400, ResponseWriteTimeoutSeconds: 300},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			// Issue #395 / ADR-045: Hobby gets 32 keys / 8 KB per value.
 			EnvVarsMax: 32, EnvValueMaxBytes: 8192,
@@ -56,7 +67,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
-			RateLimitPerAccountRPM: 200},
+			RateLimitPerAccountRPM: 200,
+			// Issue #471 / ADR-047 (PR-A): Hobby unlocks streaming
+			// (100 MiB / 900 s) — the first paid tier. PR-A wires
+			// the flag + accessor; PR-B activates the Flusher path.
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #395 / ADR-045: Pro gets 64 keys / 16 KB per value.
@@ -76,7 +91,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
 			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
-			RateLimitPerAccountRPM: 1000},
+			RateLimitPerAccountRPM: 1000,
+			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
+			// envelope as Hobby. The cap is the same; the per-app
+			// streaming path is gatewayd-edged, not per-tier.
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -101,7 +120,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
-			RateLimitPerAccountRPM: 5000},
+			RateLimitPerAccountRPM: 5000,
+			// Issue #471 / ADR-047 (PR-A): Scale keeps the same envelope
+			// as Hobby/Pro. The streaming cap is uniform across paid
+			// tiers — the spec's paid-only unlock is the boolean, not
+			// the byte/time ceiling.
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -395,6 +419,86 @@ func TestPlanRateLimitPerAccount(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.RateLimitPerAccountRPM(); got != c.wantRPM {
 			t.Errorf("%s.RateLimitPerAccountRPM() = %d, want %d", c.plan, got, c.wantRPM)
+		}
+	}
+}
+
+// TestPlanStreaming pins the per-plan streaming flags (issue #471 /
+// ADR-047 PR-A). Free is gated out (CodePlanStreamingNotAllowed in
+// apid's validateUpdateApp); Hobby/Pro/Scale unlock streaming. MaxResponse
+// bytes cap is the 100 MiB / 25 MiB pin; ResponseWriteTimeout is the
+// 900 s / 300 s pin. Unknown plans must fail closed on all three
+// flags so a missing plan never silently unlocks streaming.
+func TestPlanStreaming(t *testing.T) {
+	enabledCases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range enabledCases {
+		if got := c.plan.StreamingEnabled(); got != c.want {
+			t.Errorf("%s.StreamingEnabled() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+
+	allowedCases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range allowedCases {
+		if got := c.plan.StreamingResponseAllowed(); got != c.want {
+			t.Errorf("%s.StreamingResponseAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+
+	bodyCases := []struct {
+		plan Plan
+		want int64
+	}{
+		{PlanFree, 26_214_400},
+		{PlanHobby, 104_857_600},
+		{PlanPro, 104_857_600},
+		{PlanScale, 104_857_600},
+		// Unknown plans fail closed via the MaxResponseBodyBytesDefault
+		// fallback (25 MiB) — the spec §4.1 pre-#471 buffer ceiling
+		// is the conservative binding cap. Returns the default, not 0,
+		// to guarantee a runaway stream never leaves the cap.
+		{Plan("unknown"), MaxResponseBodyBytesDefault},
+	}
+	for _, c := range bodyCases {
+		if got := c.plan.MaxResponseBodyBytes(); got != c.want {
+			t.Errorf("%s.MaxResponseBodyBytes() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	rwCases := []struct {
+		plan Plan
+		want time.Duration
+	}{
+		{PlanFree, 300 * time.Second},
+		{PlanHobby, 900 * time.Second},
+		{PlanPro, 900 * time.Second},
+		{PlanScale, 900 * time.Second},
+		// Unknown plans fall back to ResponseWriteTimeoutDefault
+		// (300 s) — same conservative-fallback shape as the body
+		// cap above. The listener ceiling always ends up bound by
+		// the spec §4.1 default, never "no timeout".
+		{Plan("unknown"), time.Duration(ResponseWriteTimeoutDefault) * time.Second},
+	}
+	for _, c := range rwCases {
+		if got := c.plan.ResponseWriteTimeout(); got != c.want {
+			t.Errorf("%s.ResponseWriteTimeout() = %v, want %v", c.plan, got, c.want)
 		}
 	}
 }

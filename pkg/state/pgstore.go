@@ -650,11 +650,11 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
+		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled)
 	return scanApp(row)
 }
 
@@ -715,11 +715,11 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
+		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -784,18 +784,20 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   min_instances   = case when $9 then $10 else min_instances end,
 		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
-		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
+		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
+		   streaming_enabled = case when $17 then $18 else streaming_enabled end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, upd,
 		id,
-		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
+		p.RAMMB, p.SetIdleTimeout, intOrZero(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
 		p.Manifest != nil, manifestBytes,
-		p.SetMinInstances, derefInt(p.MinInstances),
+		p.SetMinInstances, intOrZero(p.MinInstances),
 		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
-		p.SetAutoscaleTargetRPS, derefInt(p.AutoscaleTargetRPS),
-		p.SetAutoscaleTargetCPUPct, derefInt(p.AutoscaleTargetCPUPct))
+		p.SetAutoscaleTargetRPS, intOrZero(p.AutoscaleTargetRPS),
+		p.SetAutoscaleTargetCPUPct, intOrZero(p.AutoscaleTargetCPUPct),
+		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled))
 	return scanApp(row)
 }
 
@@ -6446,7 +6448,8 @@ func scanAppInto(a *App, row pgx.Row) error {
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
-		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand); err != nil {
+		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
+		&a.StreamingEnabled); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6470,7 +6473,7 @@ const appsSelectColumns = `
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, '')`
+	workload_class, coalesce(start_command, ''), streaming_enabled`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
