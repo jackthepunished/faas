@@ -283,22 +283,93 @@ jobs:
             fi
           fi
 
-          # --- Config drift guard: builder base registry --------------------
-          # imaged pulls the builder base on every startup. Pointed at
-          # docker.io it pulls ANONYMOUSLY, and the box's IP shares Docker
-          # Hub's unauthenticated rate limit — so a restart loop turns a
-          # transient failure into a permanent one:
+          # --- One-shot config fill: FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT --
+          # PR #465 (ADR-053) added base-debian-parent to
+          # pkg/imaged/base.go::DefaultRuntimeBaseRefs. The const default
+          # points at the org's private ghcr.io/onebox-faas namespace;
+          # the build-time puller is anonymous (pkg/oci/registry.go:519
+          # passes nil BasicAuth), the token endpoint returns 403, and
+          # imaged loops. The override path is per-runtime env var,
+          # but sealed.env on a box that boot-strapped before #465 has
+          # no entry for it — every restart 403s.
           #
-          #   registry returned 429: TOOMANYREQUESTS
-          #   You have reached your unauthenticated pull rate limit
+          # Operator fix is to set FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT
+          # in sealed.env to a digest-pinned mirror.gcr.io ref. The
+          # mirror serves mirror.gcr.io/library/debian:12-slim only as
+          # a multi-arch manifest list (which our digest-pinned gate in
+          # cmd/imaged/main.go refuses — "manifest lists not supported"
+          # per sealed.env.example:15), so we resolve the amd64 entry's
+          # digest out-of-band and pin to that. Script is idempotent:
+          # the grep short-circuits when the var is already present.
+          #
+          # cd-controlplane.yml normally only ships binaries — operator
+          # manages /etc/faas/sealed.env via bootstrap.sh. This carve-
+          # out is for one specific box-side gap introduced by #465
+          # merged to main between operator bootstrap runs (the EX44
+          # was bootstrapped 2026-07-24, #465 merged 2026-07-31 — the
+          # 7-day gap left the var unset).
+          if ! grep -qE '^FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT=' \
+               /etc/faas/sealed.env 2>/dev/null; then
+            echo "→ FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT missing from /etc/faas/sealed.env; resolving amd64 digest from mirror.gcr.io"
+            # Pull the manifest list, extract the amd64 entry digest.
+            # python3 is on every EX44 by default via the bootstrap
+            # preflight; if it's not, this errors out and we lean on
+            # the drift guard below to surface a clear failure. jq is
+            # not a baseline dep — avoid it.
+            FAAS_PARENT_DIG=$(curl -fsSL \
+              https://mirror.gcr.io/v2/library/debian/manifests/12-slim \
+              | python3 -c 'import sys, json
+              d = json.load(sys.stdin)
+              amd = [m["digest"] for m in d.get("manifests", [])
+                     if m.get("platform", {}).get("architecture") == "amd64"]
+              print(amd[0] if amd else "")')
+            if [ -z "${FAAS_PARENT_DIG}" ]; then
+              echo "::error::could not resolve amd64 digest for mirror.gcr.io/library/debian:12-slim; set FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT manually in /etc/faas/sealed.env per deploy/controlplane/sealed.env.example"
+              exit 1
+            fi
+            # Append atomically (no partial-line race if two deploys
+            # race on a slow box — both write the same line).
+            printf '\nFAAS_DEPLOY_BASE_REF_DEBIAN_PARENT=mirror.gcr.io/library/debian@%s\n' \
+              "${FAAS_PARENT_DIG}" >> /etc/faas/sealed.env
+            echo "→ wrote FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT=mirror.gcr.io/library/debian@${FAAS_PARENT_DIG}"
+            # Restart imaged so the new env lands; the services
+            # restart loop below will see it.
+            systemctl restart faas-imaged.service || true
+            # Give imaged a chance to re-pull + re-stage before the
+            # health gate below probes; the 60s gate handles slow
+            # pulls on a cold fs.
+            sleep 5
+          fi
+
+          # --- Config drift guard: OCI base ref registry ------------------
+          # imaged pulls every runtime base on every startup — pointed at a
+          # registry it can't reach anonymously, a restart loop turns a
+          # transient failure into a permanent one. Three failure modes seen
+          # on the box:
+          #
+          #   1. docker.io — anonymous 100/6h pull rate limit (DO deploy
+          #      2026-07-24, burned 20,000 restarts).
+          #   2. ghcr.io/onebox-faas/* — the org's PRIVATE namespace; the
+          #      build-time puller is anonymous (pkg/oci/registry.go:519
+          #      passes nil BasicAuth) so the token endpoint returns 403
+          #      (cd-controlplane runs 30650464753 + 30652515669 on
+          #      2026-07-31 — FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT left at
+          #      the const default of ghcr.io/onebox-faas/base-debian-parent:latest
+          #      and imaged looped 700+ times).
+          #   3. tag-only refs — imaged's per-env-var digest-pinned gate in
+          #      cmd/imaged/main.go refuses them with a fail-loud error.
           #
           # deploy/controlplane/sealed.env.example pins mirror.gcr.io for
-          # exactly this reason, but the box had drifted back to docker.io
-          # and nothing noticed until imaged had burned 20,000 restarts.
-          # Fail the deploy on the drift instead of shipping onto it.
-          if grep -qE '^FAAS_BUILDER_BASE_REF=(https?://)?(registry-1\.)?docker\.io/' \
+          # every override; refuse to ship onto anonymous-pull drift so the
+          # next deploy doesn't get to find it the same way.
+          BAD_RE='^(FAAS_BUILDER_BASE_REF|FAAS_DEPLOY_BASE_REF(_DEBIAN_PARENT|_NODE22|_PYTHON312|_GO124(_ALPINE)?|_NODE24|_PYTHON313)?)=(https?://)?(registry-1\.)?docker\.io/'
+          if grep -qE "${BAD_RE}" /etc/faas/sealed.env 2>/dev/null; then
+            echo "::error::an OCI base ref in /etc/faas/sealed.env points at docker.io — anonymous pulls are rate-limited and will crash-loop imaged. Use mirror.gcr.io (see deploy/controlplane/sealed.env.example)."
+            exit 1
+          fi
+          if grep -qE '^FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT=ghcr\.io/onebox-faas/' \
                /etc/faas/sealed.env 2>/dev/null; then
-            echo "::error::FAAS_BUILDER_BASE_REF points at docker.io — anonymous pulls are rate-limited and will crash-loop imaged. Use mirror.gcr.io (see deploy/controlplane/sealed.env.example)."
+            echo "::error::FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT points at the private ghcr.io/onebox-faas namespace — the build-time puller is anonymous (pkg/oci/registry.go:519), the token endpoint returns 403, and imaged loops. Override to a digest-pinned mirror.gcr.io ref (see deploy/controlplane/sealed.env.example + ADR-053). The PR #465 default const is unreachable from this box; the env var MUST be overridden."
             exit 1
           fi
 
