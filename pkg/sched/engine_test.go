@@ -630,6 +630,44 @@ func TestEngineWake_ForwardsOverridePort(t *testing.T) {
 		// Anchor: the seed flow used seedApp unchanged.
 		_ = acct
 	})
+
+	// Issue #460 / ADR-053 PR-C Phase-1 fast path: when an instance
+	// is already RUNNING, Wake short-circuits under appMu and returns
+	// the existing row. The port must still reach the wire, sourced
+	// from a LiveDeployment read inside the same critical section.
+	// The fast path is the synth-loop hot path (meterd's per-minute
+	// sampler + cron firings), not the customer hot path — but it
+	// must remain truthful so any future caller that consumes
+	// WakeResponse.port on a warm instance sees the same value
+	// AdmitInstance would have produced.
+	t.Run("fast-path-warm", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+		if _, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID:        app.ID,
+			Kind:         state.DeploymentKindImage,
+			ImageDigest:  "sha256:abc",
+			Status:       state.DeployLive,
+			OverridePort: 9090,
+		}); err != nil {
+			t.Fatalf("CreateDeployment override-port: %v", err)
+		}
+		vmm := &fakeVMM{}
+		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+		// Cold-wake first to materialise a RUNNING row.
+		if _, err := e.Wake(context.Background(), app.ID); err != nil {
+			t.Fatalf("first Wake: %v", err)
+		}
+		// Second Wake hits the Phase-1 fast path.
+		res, err := e.Wake(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("second Wake (fast path): %v", err)
+		}
+		if res.Port != 9090 {
+			t.Errorf("fast-path WakeResult.Port = %d, want 9090 "+
+				"(LiveDeployment read must populate Port even on warm path)", res.Port)
+		}
+	})
 }
 
 // TestEngineWake_OverridePortZeroIsZero pins the no-override boundary:

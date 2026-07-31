@@ -108,7 +108,7 @@ func TestDeployOverridePortMetal(t *testing.T) {
 	// (PORT=9090) — the platform contract still wins because
 	// guest-init appends PORT AFTER BuildEnvWithSecrets (see
 	// guest/init/main_linux.go::runAppWithEnv).
-	src := NodeFixturePort(t, 9090)
+	src := NodeFixturePort(t)
 	raw, status := postMultipartDeploymentWithOverrides(t, h, key, slug, src, false, &api.CreateDeploymentOverrides{
 		Port: 9090,
 		Env:  map[string]string{"PORT": "9090"},
@@ -171,17 +171,20 @@ func metalAvailable(t *testing.T) bool {
 	return true
 }
 
-// randHexSuffix returns an 8-char random hex string for per-test
-// slug collision avoidance. Cryptographic randomness is overkill
-// here — we only need non-collision against a single previous run —
-// but `crypto/rand` keeps the helper dependency-free.
+// randHexSuffix returns a 16-char random hex string for per-test
+// slug collision avoidance. 64 bits makes a collision across
+// accumulated failed runs effectively impossible (the previous
+// 32-bit version collided at ~1/4B which was non-trivial for a
+// test that boots real Firecracker and crashes sometimes leave the
+// app's parked instance on disk). `crypto/rand` keeps the helper
+// dependency-free.
 func randHexSuffix() string {
-	var b [4]byte
+	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// Fallback is acceptable for a test helper; the slug is
 		// cosmetic. We still want a non-empty suffix so the slug
 		// matches the fixtures' "portfix-NNNN" pattern.
-		return "fallback"
+		return "fallback00000000"
 	}
 	return hex.EncodeToString(b[:])
 }

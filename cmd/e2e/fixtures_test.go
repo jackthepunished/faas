@@ -64,14 +64,15 @@ http.createServer((req, res) => {
 
 // NodeFixturePort returns the bytes of a minimal Node 22 source tarball
 // whose index.js reads the `PORT` env var (issue #460 / ADR-053, PR-C).
-// The platform contract is that guest-init injects PORT=8080 by
-// default and PORT=<override> when an override port is set; the
-// fixture mirrors that contract so the deploy-with-override-port-boot
-// subtest exercises the full wire shape end-to-end. The default
-// port=8080 fallback matches NodeFixture's hardcoded :3000 only when
-// port=8080 is passed; callers wanting the legacy :3000 bind should
-// keep using NodeFixture unchanged.
-func NodeFixturePort(t *testing.T, port int) []byte {
+// The platform contract is that guest-init always stamps PORT
+// (EffectivePort() resolves to 8080 when the override is unset, and
+// to the override value otherwise), so the fixture mirrors that by
+// reading the env var with no source-level fallback — if guest-init
+// ever drops the stamp, the runner would bind :0 and the
+// TestDeployOverridePortMetal content assertion would catch the
+// regression. Callers wanting a hardcoded :3000 bind should keep
+// using NodeFixture (the legacy fixture that pre-dates PR-C).
+func NodeFixturePort(t *testing.T) []byte {
 	t.Helper()
 	const pkgJSON = `{
   "name": "faas-fixture-node-port",
@@ -83,7 +84,7 @@ func NodeFixturePort(t *testing.T, port int) []byte {
 }
 `
 	const indexJS = `const http = require('http');
-const port = process.env.PORT || '8080';
+const port = process.env.PORT;
 http.createServer((req, res) => {
   res.writeHead(200, {'content-type': 'text/plain'});
   res.end('hello from faas (override-port:' + port + ')\n');
@@ -95,7 +96,6 @@ http.createServer((req, res) => {
 		".faas-fixture":    "node22\n",
 		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
 	}
-	_ = port // the port arg is documentation, not used in the source body.
 	return buildTarGz(t, files)
 }
 

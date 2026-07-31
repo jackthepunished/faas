@@ -487,13 +487,27 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 		// the response's Port field is consistent with what
 		// AdmitInstance would have produced. The instance row
 		// carries no port (port is a deployment-level concept); the
-		// live dep row carries dep.OverridePort. A short PG read
-		// before the release is the cheapest way to make WakeResponse.port
-		// truthful on the warm path without restructuring the
-		// instance row. A read failure here logs (slog) and falls
-		// through with Port=0 — the vmmd wire boundary defaults to
-		// 8080 in that case, so a transient PG hiccup never widens
-		// the failure surface beyond the legacy behaviour.
+		// live dep row carries dep.OverridePort.
+		//
+		// Why a LiveDeployment read is acceptable here: Wake is the
+		// legacy fast path used by meterd's per-minute sampler + cron
+		// firings, NOT the customer hot path. Production customer
+		// requests go through AdmitInstance (cmd/gatewayd/main.go),
+		// which has the live deployment already loaded. So this read
+		// adds one cheap PG roundtrip (~1ms, single-row lookup with
+		// the existing (app_id, status) partial index) per minute per
+		// active app — well below any customer-facing budget.
+		//
+		// A read failure here logs (slog) and falls through with
+		// Port=0 — the vmmd wire boundary defaults to 8080 in that
+		// case, so a transient PG hiccup never widens the failure
+		// surface beyond the legacy behaviour.
+		//
+		// If Wake ever becomes customer-facing, denormalise port onto
+		// the instances row at admit time and read it back alongside
+		// the existing fields — that costs a migration + an extra
+		// column on state.Instance + the RunningInstanceForApp query,
+		// which is overkill for synth traffic.
 		var port int
 		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
 			port = dep.OverridePort

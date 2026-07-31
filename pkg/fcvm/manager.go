@@ -717,10 +717,15 @@ type ColdBootRequest struct {
 	// EgressAllowlist (ADR-031) — same shape as WakeRequest.
 	EgressAllowlist []string
 	// Port (issue #460 / ADR-053, PR-C) — the per-deployment override
-	// port copied verbatim from WakeRequest. ColdBootRequest is the
-	// legacy public entry some wiring still uses; the field exists
-	// for symmetry so callers don't have to drop down to WakeRequest
-	// just to set a port.
+	// port forwarded verbatim to WakeRequest.Port. Production wiring
+	// uses WakeRequest directly via the vmmdgrpc adapters
+	// (pkg/vmmdgrpc/proto.go), so this field is currently exercised
+	// only by unit tests (TestColdBootSuccessStampsInstancePort). Kept
+	// for symmetry so the cold-boot public surface stays a complete
+	// mirror of WakeRequest — a future caller that wants to invoke
+	// ColdBoot without going through WakeRequest shouldn't have to
+	// drop a field. Removing the field would silently break the
+	// port-stamping test.
 	Port int
 }
 
