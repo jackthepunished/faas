@@ -106,7 +106,8 @@ func newApidProxyWithLogs(target string, next http.Handler, logsHandler http.Han
 // apid. The match is run before isApidPath so the loopback
 // proxy never sees the path. The pattern is matched by
 // isApidLogsPath (hand-rolled, not regexp — per-request regex
-// is expensive).
+// is expensive). The dispatch-order invariant is pinned by
+// TestApidProxy_LogsCarveOutPrecedesAPIDRouting in proxy_test.go.
 func (a *apidProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isApidLogsPath(r.URL.Path) && a.logsHandler != nil {
 		a.logsHandler.ServeHTTP(w, r)
@@ -291,12 +292,19 @@ func (a *apidProxy) proxyToApid(w http.ResponseWriter, r *http.Request) {
 		// outbound request").
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(a.target)
+			proto := pr.In.Header.Get("X-Forwarded-Proto")
+			if proto == "" && pr.In.TLS != nil {
+				proto = "https"
+			}
 			// Strip X-Forwarded-For / -Proto / -Host. We rewrite
 			// them ourselves below; the Del calls are belt-and-braces
 			// in case the inbound request already had them set.
 			pr.Out.Header.Del("X-Forwarded-For")
 			pr.Out.Header.Del("X-Forwarded-Proto")
 			pr.Out.Header.Del("X-Forwarded-Host")
+			if proto != "" {
+				pr.Out.Header.Set("X-Forwarded-Proto", proto)
+			}
 			// Pin X-Forwarded-For to the real client IP from
 			// pr.In's RemoteAddr — the gatewayd edge sees the
 			// customer's IP before the loopback hop. We

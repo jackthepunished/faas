@@ -22,3 +22,13 @@ func stdoutIsTTY() bool {
 	}
 	return false
 }
+
+// stdinIsTTY mirrors stdoutIsTTY on windows — always false. Same
+// justification: gregale.exe is not a supported runtime, so the
+// prompt path always falls back to the `--yes` / non-TTY shape.
+func stdinIsTTY() bool {
+	if testOnlyTTY != nil {
+		return *testOnlyTTY
+	}
+	return false
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -323,7 +324,7 @@ func TestPrefixRouterMidSegmentEscape(t *testing.T) {
 		t.Fatalf("apps backend received a mid-segment write — escape!")
 	}
 	// dispatch-level check: confirm the apps backend is NOT selected.
-	b, rem, err := router.dispatch("appsfoo/x")
+	b, rem, _, err := router.dispatch("appsfoo/x")
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -345,4 +346,318 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// fakeOCIBackend is the stub OCI backend for the multi-prefix
+// router test. It's a full StorageBackend so it satisfies the
+// router's signature, and LocalArtifactLister so the router can
+// aggregate its keys into the router-level List. The tracker
+// counters let the test assert which backend received which key.
+type fakeOCIBackend struct {
+	blobs   map[string][]byte
+	puts    int
+	gets    int
+	deletes int
+}
+
+func newFakeOCI() *fakeOCIBackend {
+	return &fakeOCIBackend{blobs: map[string][]byte{}}
+}
+
+func (f *fakeOCIBackend) Put(_ context.Context, key string, r io.Reader) error {
+	f.puts++
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.blobs[key] = data
+	return nil
+}
+
+func (f *fakeOCIBackend) Get(_ context.Context, key string) (io.ReadCloser, error) {
+	f.gets++
+	data, ok := f.blobs[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (f *fakeOCIBackend) Delete(_ context.Context, key string) error {
+	f.deletes++
+	delete(f.blobs, key)
+	return nil
+}
+
+func (f *fakeOCIBackend) List(_ context.Context, prefix string) ([]string, error) {
+	out := make([]string, 0, len(f.blobs))
+	for k := range f.blobs {
+		if prefix == "" || strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// TestPrefixRouterLocalPlusOCI pins the ADR-054 routing semantics
+// end-to-end: a single PrefixRouter carries the canonical local
+// routes (snap/, base/, kernel/, layers/) AND a sibling OCI route
+// (apps/). Every Put/Get/Delete routes by prefix; List aggregates
+// keys from both backends. The fake OCI backend tracks per-op
+// counters so the test asserts which backend actually received
+// each request.
+func TestPrefixRouterLocalPlusOCI(t *testing.T) {
+	snap := newTestBackend(t)
+	base := newTestBackend(t)
+	kernel := newTestBackend(t)
+	layers := newTestBackend(t)
+	oci := newFakeOCI()
+
+	router, err := NewPrefixRouter(map[string]StorageBackend{
+		"snap/":   snap,
+		"base/":   base,
+		"kernel/": kernel,
+		"layers/": layers,
+		"apps/":   oci,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+	ctx := context.Background()
+
+	// --- Puts: each prefix lands in its declared backend ---
+	puts := []struct {
+		key, blob string
+	}{
+		{"snap/d-1/mem", "mem-data"},
+		{"snap/d-1/vmstate", "vmstate-data"},
+		{"base/base.ext4", "base-blob"},
+		{"kernel/v1.0", "kernel-blob"},
+		{"layers/l-1.ext4", "layer-blob"},
+		{"apps/acme/d-1.ext4", "oci-blob"},
+	}
+	for _, p := range puts {
+		if err := router.Put(ctx, p.key, strings.NewReader(p.blob)); err != nil {
+			t.Fatalf("Put %q: %v", p.key, err)
+		}
+	}
+
+	// OCI must have received exactly the apps/ key, nothing else.
+	if oci.puts != 1 {
+		t.Errorf("oci.puts = %d, want 1", oci.puts)
+	}
+	if got, err := readTestBackend(ctx, oci, "acme/d-1.ext4"); err != nil {
+		t.Errorf("read OCI apps/acme/d-1.ext4: %v", err)
+	} else if got != "oci-blob" {
+		t.Errorf("OCI apps/acme/d-1.ext4 = %q, want %q", got, "oci-blob")
+	}
+
+	// Local backends each received exactly their own key. The
+	// router strips the route prefix before forwarding to the
+	// LocalStorageBackend, so we read using the stripped key
+	// directly from the backend (which mirrors what the
+	// underlying fs layout looks like).
+	for _, want := range []struct{ prefix, strippedKey, blob string }{
+		{"snap", "d-1/mem", "mem-data"},
+		{"snap", "d-1/vmstate", "vmstate-data"},
+		{"base", "base.ext4", "base-blob"},
+		{"kernel", "v1.0", "kernel-blob"},
+		{"layers", "l-1.ext4", "layer-blob"},
+	} {
+		got, err := readTestBackend(ctx, mustLister(t, want.prefix, snap, base, kernel, layers), want.strippedKey)
+		if err != nil {
+			t.Errorf("read %s %s: %v", want.prefix, want.strippedKey, err)
+			continue
+		}
+		if got != want.blob {
+			t.Errorf("%s %s = %q, want %q", want.prefix, want.strippedKey, got, want.blob)
+		}
+	}
+
+	// --- Get: same routing for reads ---
+	// Snapshot the counter after the List call above so we can
+	// assert the delta from a single Get. List walks every backend
+	// to aggregate keys, so it's expected to have bumped the
+	// per-backend counters; we only care about the Get path here.
+	beforeGets := oci.gets
+	got, err := router.Get(ctx, "apps/acme/d-1.ext4")
+	if err != nil {
+		t.Fatalf("Get apps/acme/d-1.ext4: %v", err)
+	}
+	if delta := oci.gets - beforeGets; delta != 1 {
+		t.Errorf("after Get: oci.gets delta = %d, want 1", delta)
+	}
+	data, err := io.ReadAll(got)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(data) != "oci-blob" {
+		t.Errorf("apps/acme/d-1.ext4 = %q, want %q", string(data), "oci-blob")
+	}
+	_ = got.Close()
+
+	// --- List: aggregates local + OCI keys ---
+	keys, err := router.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	sort.Strings(keys)
+	want := []string{
+		"apps/acme/d-1.ext4",
+		"base/base.ext4",
+		"kernel/v1.0",
+		"layers/l-1.ext4",
+		"snap/d-1/mem",
+		"snap/d-1/vmstate",
+	}
+	if !equalStrings(keys, want) {
+		t.Errorf("List = %v, want %v", keys, want)
+	}
+
+	// --- Delete: propagates to the right backend ---
+	if err := router.Delete(ctx, "apps/acme/d-1.ext4"); err != nil {
+		t.Fatalf("Delete apps/...: %v", err)
+	}
+	if oci.deletes != 1 {
+		t.Errorf("oci.deletes = %d, want 1", oci.deletes)
+	}
+	if _, err := router.Get(ctx, "apps/acme/d-1.ext4"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("after Delete, Get = %v, want ErrNotFound", err)
+	}
+}
+
+// readTestBackend pulls a blob out of the named test backend.
+// Used by TestPrefixRouterLocalPlusOCI to verify per-backend
+// round-trips without exposing internal counters.
+func readTestBackend(ctx context.Context, be StorageBackend, key string) (string, error) {
+	rc, err := be.Get(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// mustLister picks the right LocalStorageBackend for a prefix
+// assertion. Keeps TestPrefixRouterLocalPlusOCI's per-prefix
+// round-trip loop readable.
+func mustLister(t *testing.T, prefix string, snap, base, kernel, layers *LocalStorageBackend) StorageBackend {
+	t.Helper()
+	switch prefix {
+	case "snap":
+		return snap
+	case "base":
+		return base
+	case "kernel":
+		return kernel
+	case "layers":
+		return layers
+	default:
+		t.Fatalf("unknown prefix %q", prefix)
+		return nil
+	}
+}
+
+// TestPrefixRouterErrorWrapPrefixMatchesKey is the regression for
+// the 2026-07-31 imaged crash-loop on the EX44: the wrapped error
+// from PrefixRouter.Put/Get/Delete used to re-derive the matched
+// route prefix via a second map walk, whose iteration order Go
+// does not guarantee. With the same LocalStorageBackend registered
+// for multiple routes (the production wiring has /srv/fc as the
+// canonical backend for snap/, base/, kernel/, layers/), the wrap
+// prefix alternated between routes on each restart, which made the
+// underlying EROFS root-cause harder to read from the logs.
+//
+// The fix: dispatch returns the matched prefix at call time, and
+// Put/Get/Delete close over that exact value. This test forces an
+// error from the underlying backend and asserts the wrap prefix is
+// the longest match for the key — every iteration, regardless of
+// map-walk order.
+//
+// Run with -count=50 to surface any lingering map-iteration
+// non-determinism; before the fix this would fail at least once
+// across the iterations on a stock Go runtime.
+func TestPrefixRouterErrorWrapPrefixMatchesKey(t *testing.T) {
+	for _, tc := range []struct {
+		key        string
+		wantRoute  string
+		wantRemain string
+	}{
+		{"base/runner-builder-amd64.ext4", "base/", "runner-builder-amd64.ext4"},
+		{"snap/dep/mem", "snap/", "dep/mem"},
+		{"kernel/vmlinux-6.1.128", "kernel/", "vmlinux-6.1.128"},
+		{"layers/slug-1.dep.ext4", "layers/", "slug-1.dep.ext4"},
+	} {
+		for i := 0; i < 50; i++ {
+			failing := &failingPutBackend{err: errors.New("synthetic failure")}
+			// Two routes share the same failing backend — the
+			// pre-fix code would alternate the wrap prefix between
+			// "base/" and "snap/" depending on map-iteration order.
+			router, err := NewPrefixRouter(map[string]StorageBackend{
+				"base/":   failing,
+				"snap/":   failing,
+				"kernel/": failing,
+				"layers/": failing,
+			}, failing)
+			if err != nil {
+				t.Fatalf("NewPrefixRouter: %v", err)
+			}
+
+			err = router.Put(context.Background(), tc.key, strings.NewReader("x"))
+			if err == nil {
+				t.Fatalf("iter %d Put %q: expected error from failing backend", i, tc.key)
+			}
+			// The wrap must be `storage: put "<full key>"` — the full
+			// key, not the strip-then-rebuild shape that lost the
+			// matched prefix.
+			wantSub := fmt.Sprintf(`storage: put %q: synthetic failure`, tc.wantRoute+tc.wantRemain)
+			if !strings.Contains(err.Error(), wantSub) {
+				t.Fatalf("iter %d Put %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, wantSub)
+			}
+
+			// Same check for Get + Delete so the determinism
+			// guarantee covers the full router surface.
+			if _, err := router.Get(context.Background(), tc.key); err == nil {
+				t.Fatalf("iter %d Get %q: expected error from failing backend", i, tc.key)
+			} else if want := fmt.Sprintf(`storage: get %q: synthetic failure`, tc.wantRoute+tc.wantRemain); !strings.Contains(err.Error(), want) {
+				t.Fatalf("iter %d Get %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, want)
+			}
+			if err := router.Delete(context.Background(), tc.key); err == nil {
+				t.Fatalf("iter %d Delete %q: expected error from failing backend", i, tc.key)
+			} else if want := fmt.Sprintf(`storage: delete %q: synthetic failure`, tc.wantRoute+tc.wantRemain); !strings.Contains(err.Error(), want) {
+				t.Fatalf("iter %d Delete %q: wrap mismatch:\n  got:  %v\n  want substring: %q",
+					i, tc.key, err, want)
+			}
+		}
+	}
+}
+
+// failingPutBackend is a test-only StorageBackend that forces every
+// operation to return err. Used to exercise PrefixRouter's error-
+// wrap path without depending on a particular filesystem failure
+// mode (the production bug was an EROFS on a temp file under
+// ProtectSystem=strict; reproducing that on a developer machine
+// would need root + a custom unit, so we synthesise the failure
+// instead).
+type failingPutBackend struct {
+	err error
+}
+
+func (f *failingPutBackend) Put(_ context.Context, _ string, _ io.Reader) error {
+	return f.err
+}
+
+func (f *failingPutBackend) Get(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, f.err
+}
+
+func (f *failingPutBackend) Delete(_ context.Context, _ string) error {
+	return f.err
 }

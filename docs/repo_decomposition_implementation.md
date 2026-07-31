@@ -276,11 +276,17 @@ one transactional endpoint that creates project + apps + crons, quota-checked
 keypress; over-quota creates **nothing** and returns the limit problem;
 `--json` output is stable enough to assert in CI.
 
+**Status (2026-07-31):** shipped on PR #454 (draft). `cmd/gregale scan`,
+`POST /v1/projects/scan` (dry-run) and `POST /v1/projects` (transactional
+apply) all green; the §4 acceptance gate passes end-to-end. Migration 00074
+slots reserve per ADR-041. Post-merge review fixes (Free-plan downgrade +
+deferred-cron skip) landed on the same PR before merge.
+
 ### Phase 4 — characterization boot
 
 Specified in full by
-**[ADR-051](adr/051-characterization-boot-workload-classification.md)**. Summary
-of what lands here:
+**[ADR-051](adr/051-characterization-boot-workload-classification.md)** (accepted
+2026-07-31, was proposed since 2026-07-29). Summary of what lands here:
 
 The first cold boot of a new deployment runs in *characterizing mode* — **no
 extra VM**, because a separate probe boot would run the app's startup side

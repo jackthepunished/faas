@@ -448,6 +448,23 @@ message StreamWarmHintsResponse {
 // budget is box-wide via api.VCPUSlots); the field exists so the
 // wire is forward-compatible with a future per-node vCPU slice.
 //
+// node_signature (ADR-053, slice 3) is the 64-byte raw (r||s)
+// ECDSA P-256 signature over the canonical payload. The canonical
+// payload is sha256("faas.capacity.v1" || node_id || sampled_at_unix_ms
+// || live_count || leased_count || used_mb || ram_headroom_mb ||
+// vcpu_busy) with all ints encoded as big-endian fixed-width.
+// Empty node_signature on a slice-3 schedd is rejected with
+// codes.Unauthenticated; pre-slice-3 schedd ignores it (additive
+// per ADR-016). vmmd loads its signing key from
+// /etc/faas/secrets/vmmd/node.key (mode 0400).
+//
+// node_key_id is the SHA-256 hex of the leaf's
+// SubjectPublicKeyInfo. The schedd-side nodeKeyRegistry maps
+// key_id → *ecdsa.PublicKey; a signature is only accepted when
+// the key_id resolves. This prevents a signature captured under
+// one key from being replayed after a rotation. Pre-slice-3
+// schedd ignores node_key_id.
+//
 // Wire is additive: new fields go at the end.
 //
 // Additive per ADR-016.
@@ -459,6 +476,14 @@ message CapacityReport {
   int32  used_mb             = 5;
   int32  ram_headroom_mb     = 6;
   int32  vcpu_busy           = 7;
+  // node_signature is the ECDSA P-256 (r||s) signature over the
+  // canonical payload. 64 bytes when populated. Empty on
+  // pre-slice-3 vmmd; rejected on slice-3 schedd.
+  bytes  node_signature      = 8;
+  // node_key_id is SHA-256 hex of the leaf's SPKI. Binds the
+  // signature to a registered key so a rotated/replayed
+  // signature cannot piggyback on a stale registry entry.
+  string node_key_id         = 9;
 }
 
 // ReportCapacityAck is the typed "I consumed all your messages"

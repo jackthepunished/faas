@@ -113,6 +113,12 @@ func (f *fakeEngine) CapacitySink() scheddgrpc.CapacitySink {
 	return func(sched.CapacityReport) error { return nil }
 }
 
+// NodeKeyRegistry (ADR-053 slice 3) — the default fake returns
+// nil to disable signature verification (pre-slice-3 mode).
+// Tests that exercise the strict-mode path inject a populated
+// registry via a wrapper (see capacity_test.go).
+func (f *fakeEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
+
 func newServer(t *testing.T, eng scheddgrpc.SchedAPI) scheddpb.ScheddClient {
 	t.Helper()
 	srv := grpc.NewServer()

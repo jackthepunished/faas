@@ -241,6 +241,15 @@ type MemStore struct {
 	// CreateComputeNode to exercise the single-box path. Production
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
+	// computeNodeKeys is the in-memory mirror of compute_node_keys
+	// (migration 00075, ADR-053). Keyed by (nodeID, keyID) tuple
+	// joined by a NUL so the composite key stays string-typed for
+	// map lookup; the value is the canonical public_key_pem string.
+	// Tests that don't pre-seed this map have empty key registries
+	// — same as a fresh Postgres cluster with no vmmd registered
+	// yet. The pkg/sched.NodeKeyRegistry's Refresh path treats
+	// both as "no rows, return empty map".
+	computeNodeKeys map[string]string
 	// computeNodeHeartbeats is the append-only history (CP-1,
 	// migration 00065). Mirrors the same wire shape as the SQL
 	// table; rows are append-only, never mutated, and dropped with
@@ -349,10 +358,15 @@ type usageMinute struct {
 }
 
 // builderUsageRow is the per-build grain (ADR-048 §4) backing
-// AppendBuilderUsage. Mirrors public.builder_usage created by
+// AppendBuilderUsage. Mirrors builder_usage created by
 // migrations/00068_builder_usage.sql. PK is BuildID; first write
 // wins, a redelivered webhook / meterd restart is a no-op. The
 // meterd rollup cron sums Seconds into usage_daily.builder_seconds.
+// The table is search_path-relative; production search_path=public
+// puts it in the public schema, pgtest-isolated tests put it in a
+// faas_test_<hex> schema (the schema scoping closes the 40P01
+// deadlock on pg_class when N parallel test packages race CREATE
+// TABLE on the same cluster).
 type builderUsageRow struct {
 	BuildID    string
 	AccountID  string
@@ -444,6 +458,14 @@ func NewMemStore() *MemStore {
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
+		// computeNodeKeys is the in-memory mirror of
+		// compute_node_keys (migration 00075). Empty by default
+		// — vmmd's self-registration populates it via
+		// UpsertNodeKey. Tests that exercise the slice-3
+		// signature path inject rows by calling the method
+		// directly; tests that don't care about slice-3 see
+		// an empty map (same as a fresh Postgres cluster).
+		computeNodeKeys: map[string]string{},
 		// computeNodeHeartbeats is the CP-1 history mirror. Empty here;
 		// rows accumulate via AppendComputeNodeHeartbeat as the schedd
 		// Heartbeat.Tick goroutine (or test setup) drives them.
@@ -1111,6 +1133,132 @@ func (m *MemStore) SetProjectScanSource(_ context.Context, projectID string, src
 	return p, nil
 }
 
+// ApplyProjectPlan — Phase 3 transactional seam. Mirrors the
+// CreateAppIfUnderQuota critical section but inlines the count +
+// insert for project + apps + crons inside one Tx so the apid
+// "one keypress" path either lands the whole set or nothing.
+func (m *MemStore) ApplyProjectPlan(
+	_ context.Context,
+	project Project,
+	apps []App,
+	crons []Cron,
+	limits api.Limits,
+) (Project, []App, []Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 1. Account exists.
+	if _, ok := m.accounts[project.AccountID]; !ok {
+		return Project{}, nil, nil, ErrNotFound
+	}
+
+	// 2. Project slug collision guard.
+	for _, p := range m.projects {
+		if p.AccountID == project.AccountID && p.Slug == project.Slug {
+			return Project{}, nil, nil, ErrConflict
+		}
+	}
+
+	// 3. Count current deployed apps (mirror CreateAppIfUnderQuota).
+	observedApps := 0
+	for _, a := range m.apps {
+		if a.AccountID == project.AccountID && a.Status != AppDeleted &&
+			(a.Status == AppActive || a.Status == AppEvictedCold) {
+			observedApps++
+		}
+	}
+	if observedApps+len(apps) > limits.DeployedApps {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:     QuotaErrorKindApps,
+			Limit:    limits.DeployedApps,
+			Observed: observedApps + len(apps),
+		}
+	}
+
+	// 4. Free-plan cron guard + cron quota check. Skipped entirely
+	//    when the apply is zero-cron — a Free account with
+	//    pre-existing crons (from a prior plan downgrade) must still
+	//    be able to apply a cron-less project. Same shape as
+	//    PgStore.ApplyProjectPlan step 3 (pgstore.go:1116).
+	if len(crons) > 0 {
+		if limits.CronLimitPerAccount == 0 {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:       QuotaErrorKindCrons,
+				NotAllowed: true,
+			}
+		}
+		observedCrons := 0
+		for _, c := range m.crons {
+			for _, a := range m.apps {
+				if c.AppID == a.ID && a.AccountID == project.AccountID && a.Status != AppDeleted {
+					observedCrons++
+					break
+				}
+			}
+		}
+		if observedCrons+len(crons) > limits.CronLimitPerAccount {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:     QuotaErrorKindCrons,
+				Limit:    limits.CronLimitPerAccount,
+				Observed: observedCrons + len(crons),
+			}
+		}
+	}
+
+	// 5. Insert project.
+	if project.ID == "" {
+		project.ID = uuid.NewString()
+	}
+	now := time.Now()
+	if project.CreatedAt.IsZero() {
+		project.CreatedAt = now
+	}
+	project.UpdatedAt = now
+	if project.ScanSource == "" {
+		project.ScanSource = ProjectScanSourceUnknown
+	}
+	m.projects[project.ID] = project
+
+	// 6. Insert apps. The apply handler resolves crons[i].AppID
+	// against the just-inserted apps — callers see the same Cron
+	// shape CreateCronIfUnderQuota produces (AppID populated, ID
+	// empty). We persist whatever AppID is set; overwriting here
+	// would force callers to learn the apply internal sequencing.
+	insertedApps := make([]App, 0, len(apps))
+	for _, a := range apps {
+		if a.ID == "" {
+			a.ID = uuid.NewString()
+		}
+		a.AccountID = project.AccountID
+		a.ProjectID = project.ID
+		if a.Status == "" {
+			a.Status = AppActive
+		}
+		a.CreatedAt = now
+		m.apps[a.ID] = a
+		insertedApps = append(insertedApps, a)
+	}
+
+	// 7. Insert crons (AppID is the caller's responsibility to set
+	// against the freshly inserted apps). Empty AppID is treated
+	// as "deferred" — the apply handler resolves the workload-name
+	// → ID map from the returned insertedApps and re-inserts via
+	// CreateCron. Quota is already enforced in step 6 so a deferred
+	// cron cannot bypass it.
+	insertedCrons := make([]Cron, 0, len(crons))
+	for _, c := range crons {
+		if c.AppID == "" {
+			continue
+		}
+		c.ID = uuid.NewString()
+		c.CreatedAt = now
+		m.crons[c.ID] = c
+		insertedCrons = append(insertedCrons, c)
+	}
+
+	return project, insertedApps, insertedCrons, nil
+}
+
 // --- Apps -------------------------------------------------------------------
 
 func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
@@ -1335,6 +1483,26 @@ func (m *MemStore) SetAppMinInstances(_ context.Context, appID string, min int) 
 	a.MinInstances = min
 	m.apps[appID] = a
 	return nil
+}
+
+// SetAppWorkloadClass mirrors PgStore.SetAppWorkloadClass. The
+// `source` argument is metadata only — the store does not persist
+// or log it. The same ErrInvalidArgument / ErrNotFound contract as
+// PgStore keeps tests parameterizable across backends.
+func (m *MemStore) SetAppWorkloadClass(_ context.Context, appID string, class WorkloadClass, source string) (App, error) {
+	_ = source
+	if class == "" {
+		return App{}, ErrInvalidArgument
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok {
+		return App{}, ErrNotFound
+	}
+	a.WorkloadClass = class
+	m.apps[appID] = a
+	return a, nil
 }
 
 func (m *MemStore) DeleteApp(_ context.Context, id string) error {
@@ -3699,6 +3867,44 @@ func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (Compu
 	n.Active = true
 	m.computeNodes[n.ID] = n
 	return n, nil
+}
+
+// UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
+// in the in-memory mirror of compute_node_keys (migration 00075,
+// ADR-053). Mirrors PgStore.UpsertNodeKey's ON CONFLICT DO NOTHING
+// semantics: a re-insert of the same (nodeID, keyID) is a no-op
+// (the existing public_key_pem is preserved). See
+// PgStore.UpsertNodeKey for the write-once rationale.
+func (m *MemStore) UpsertNodeKey(_ context.Context, nodeID string, keyID string, publicKeyPEM string) error {
+	if nodeID == "" || keyID == "" {
+		return fmt.Errorf("state: memstore: UpsertNodeKey requires nodeID and keyID (got %q, %q)", nodeID, keyID)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	composite := nodeID + "\x00" + keyID
+	if _, ok := m.computeNodeKeys[composite]; ok {
+		return nil
+	}
+	m.computeNodeKeys[composite] = publicKeyPEM
+	return nil
+}
+
+// LookupNodeKey returns the PEM for the (computeNodeID, keyID)
+// row in the in-memory mirror of compute_node_keys. Returns
+// ("", false) when no row exists. Test convenience for the
+// cmd/vmmd registerComputeNodeKey coverage — production code
+// goes through sched.NodeKeyRegistry.Refresh, which loads via
+// the pg-side query, not this accessor. Keeping it MemStore-only
+// (not on the Store interface) avoids pulling a test-only seam
+// onto the production interface.
+func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID string) (string, bool) {
+	if computeNodeID == "" || keyID == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pem, ok := m.computeNodeKeys[computeNodeID+"\x00"+keyID]
+	return pem, ok
 }
 
 // SetComputeNodeActive flips active on a row by id (issue #98 /

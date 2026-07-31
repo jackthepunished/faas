@@ -43,7 +43,7 @@ func TestRoundTrip_StableCodes(t *testing.T) {
 		t.Run(tc.code, func(t *testing.T) {
 			p := api.NewProblem(int(tc.grpc), tc.code, tc.title, "we hit the cap").
 				WithLimit(42, 50).
-				WithDocs("https://docs/DOMAIN/plans")
+				WithDocs("https://docs.gregale.dev/plans")
 			err := grpcerr.ToStatus(p)
 			if err == nil {
 				t.Fatalf("ToStatus produced nil")
@@ -59,7 +59,7 @@ func TestRoundTrip_StableCodes(t *testing.T) {
 			if got.Code != tc.code {
 				t.Errorf("code round-trip: %q → %q", tc.code, got.Code)
 			}
-			if got.DocsURL != "https://docs/DOMAIN/plans" {
+			if got.DocsURL != "https://docs.gregale.dev/plans" {
 				t.Errorf("docs_url round-trip: %q", got.DocsURL)
 			}
 			if got.Limit == nil || *got.Limit != 42 {
@@ -118,7 +118,7 @@ func TestDetailsAttach(t *testing.T) {
 	p := api.NewProblem(int(codes.ResourceExhausted), api.CodePlanLimitRAM,
 		"RAM cap", "Hobby plan caps at 256 MiB; requested 512.").
 		WithLimit(256, 512).
-		WithDocs("https://docs/DOMAIN/plans#ram")
+		WithDocs("https://docs.gregale.dev/plans#ram")
 	err := grpcerr.ToStatus(p)
 
 	st, ok := status.FromError(err)
@@ -139,7 +139,7 @@ func TestDetailsAttach(t *testing.T) {
 	if ei.Reason != api.CodePlanLimitRAM {
 		t.Errorf("reason = %q, want %q", ei.Reason, api.CodePlanLimitRAM)
 	}
-	if ei.Metadata["docs_url"] != "https://docs/DOMAIN/plans#ram" {
+	if ei.Metadata["docs_url"] != "https://docs.gregale.dev/plans#ram" {
 		t.Errorf("docs_url = %q", ei.Metadata["docs_url"])
 	}
 	if ei.Metadata["limit"] != "256" {

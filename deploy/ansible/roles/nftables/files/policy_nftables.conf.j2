@@ -52,7 +52,7 @@ table inet faas {
     ip6 daddr fc00::/7 counter name "drop_v6_fc00___7" drop
     ip6 daddr fe80::/10 counter name "drop_v6_fe80___10" drop
     ip6 daddr ff00::/8 counter name "drop_v6_ff00___8" drop
-    iifname "br-tenants" oifname "eth0" accept
+    iifname "br-tenants" oifname "{{ public_iface }}" accept
   }
 
   chain output {
@@ -61,6 +61,6 @@ table inet faas {
 
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    ip saddr 10.100.0.0/16 oifname "eth0" masquerade
+    ip saddr {{ masquerade_cidr }} oifname "{{ public_iface }}" masquerade
   }
 }

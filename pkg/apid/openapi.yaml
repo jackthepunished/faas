@@ -109,6 +109,12 @@ tags:
       and §11 ownership proof.
   - name: meta
     description: Self-description endpoints (this spec). Anonymous.
+  - name: projects
+    description: |
+      Multi-workload repo decomposition (ADR-050). /v1/projects/scan is
+      the dry-run that returns the PlanResponse (can_apply, plan_token);
+      /v1/projects is the transactional apply that creates the project,
+      its apps, and its crons in one Tx.
 
 security:
   - bearerAuth: []
@@ -1949,6 +1955,126 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Projects (ADR-050 / Phase 3) ───────────────────────────────────
+  # Two endpoints:
+  #   POST /v1/projects/scan  — dry-run; runs reposcan.Scan over the
+  #                             uploaded tarball and returns a plan
+  #                             with can_apply + plan_token. Never
+  #                             writes.
+  #   POST /v1/projects       — applies the plan in one transaction;
+  #                             emits NotifyAppChanged per inserted
+  #                             app; surfaces the limit problem on
+  #                             over-quota with zero rows inserted.
+  # Both accept the same multipart body shape; the only difference is
+  # the optional `plan_token` query parameter on /v1/projects, which
+  # lets the CLI pass back the dry-run token to skip the second
+  # extract on the interactive flow.
+
+  /v1/projects/scan:
+    post:
+      tags: [projects]
+      operationId: scanProject
+      summary: Scan an uploaded tarball and return a deploy plan.
+      description: |
+        Dry-run. Accepts a multipart upload (`source=<tar.gz>`,
+        `project_slug`, `production_branch`, `install_id`, `only`)
+        and returns a PlanResponse with the discovered workloads,
+        managed services, derived scan_source, and a plan_token
+        that the apply endpoint can echo back to skip the
+        second extract.
+
+        On over-quota the response carries `can_apply=false`
+        (and `crons_not_allowed=true` for Free plan) so the CLI
+        can branch without a second request.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ProjectScanRequest'
+      responses:
+        '200':
+          description: The deploy plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanResponse'
+              example:
+                project_slug: my-app
+                scan_source: compose
+                tier: compose
+                workloads:
+                  - {name: api, root_dir: '', command: [], ports: [8080]}
+                  - {name: worker, root_dir: '', command: [], ports: []}
+                managed:
+                  - {name: db, kind: postgres, env_hint: DATABASE_URL}
+                crons:
+                  - {workload_name: nightly, schedule: "0 3 * * *", path: "/", enabled: true}
+                observed_apps: 3
+                observed_crons: 1
+                limit_apps: 5
+                limit_crons: 5
+                can_apply: true
+                plan_token: eyJoYXMiOiI...
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CronInvalid' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '413': { $ref: '#/components/responses/SourceTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/projects:
+    post:
+      tags: [projects]
+      operationId: applyProject
+      summary: Apply a deploy plan in one transaction.
+      description: |
+        Accepts the same multipart body as /scan plus an optional
+        `plan_token` query parameter echoing the dry-run token. On
+        success the response carries the inserted project_id and
+        per-app IDs so the CLI's `--yes` flow can render
+        `applied: <slug> → <app_id>`. On quota the response is
+        the matching RFC 7807 problem (402 Free crons, 403 apps
+        or cron cap) with zero rows inserted.
+
+        The apply handler resolves workload-name → app_id from
+        the just-inserted apps and inserts crons in a follow-up
+        pass; the quota check ran inside ApplyProjectPlan's Tx.
+      parameters:
+        - name: plan_token
+          in: query
+          required: false
+          description: Echo of the dry-run plan_token (base64-JSON). Omit to skip the cache.
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ProjectApplyRequest'
+      responses:
+        '200':
+          description: The applied project + apps + crons.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplyResponse'
+              example:
+                project_id: 0123456789abcdef0123456789abcdef
+                apps:
+                  - {slug: api, id: 0123456789abcdef0123456789abcdef}
+                  - {slug: worker, id: 0123456789abcdef0123456789abcdef}
+                scan_source: compose
+                can_apply: true
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CronInvalid' }
+        '403': { $ref: '#/components/responses/PlanLimit' }
+        '409': { $ref: '#/components/responses/ValidationFailed' }
+        '413': { $ref: '#/components/responses/SourceTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Alert rules (issue #396 / ADR-045 PR 3) ─────────────────────────
   # Per-app CRUD surface. Account-wide rules (app_id == "") appear in
   # the per-app list endpoint but the create/update/delete endpoints
@@ -3642,7 +3768,7 @@ components:
     # ─── Deployments ──────────────────────────────────────────────────────
 
     DeploymentResponse:
-      description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps."
+      description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design."
       type: object
       required: [id, app_id, image_digest, kind, status, created_at]
       properties:
@@ -3655,6 +3781,33 @@ components:
         error: { type: [string, "null"] }
         error_code: { type: [string, "null"] }
         created_at: { type: string, format: date-time }
+        has_overrides: { type: boolean, description: "True when this deployment carries a non-null override_* column set." }
+        override_entrypoint:
+          type: array
+          items: { type: string }
+          description: "Entrypoint override echoed verbatim from the create request. nil when no override was supplied."
+        override_cmd:
+          type: array
+          items: { type: string }
+          description: "Cmd override echoed verbatim from the create request."
+        override_env_keys:
+          type: array
+          items: { type: string }
+          description: "Sorted set of env-var keys set by the env override. VALUES ARE NEVER ECHOED (ADR-053 §Decision 4)."
+        override_env_secret_keys:
+          type: array
+          items: { type: string }
+          description: "Sorted set of env-var keys set by the env_secrets override. The parallel refs are echoed in `override_env_secret_refs` because the ref shape is non-secret by design."
+        override_env_secret_refs:
+          type: object
+          additionalProperties: { type: string }
+          description: "Verbatim `secret:NAME` ref map; the customer needs to see which secret they bound to which env var to debug a misconfigured deploy."
+        override_port: { type: integer, minimum: 0, maximum: 65535, description: "Listen-port override; 0 = absent (fall back to image default)." }
+        override_healthcheck:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentHealthcheck'
+            - type: 'null'
+          description: "Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept."
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."
@@ -3814,12 +3967,88 @@ components:
         new_balance: { type: integer, minimum: 0 }
 
     CreateDeploymentRequest:
-      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload."
+      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1)."
       type: object
       properties:
         image:
           type: string
           description: 'registry.gregale.dev/...@sha256:... — digest-pinned OCI reference.'
+        overrides:
+          oneOf:
+            - $ref: '#/components/schemas/CreateDeploymentOverrides'
+            - type: 'null'
+          description: "Deploy-time overrides (entrypoint, cmd, env, env_secrets, port, healthcheck). nil/omitted = deploy the image as-is."
+
+    CreateDeploymentOverrides:
+      description: |
+        Fargate-shaped deploy-time override object on `POST /v1/apps/{slug}/deployments`
+        (issue #460 / ADR-053). Field list is FROZEN — six fields, no more. Any extra
+        field on this object 400s the request. ADR-053 §Decision 1 documents the freeze;
+        the handler enforces it via `DisallowUnknownFields` on the JSON decoder.
+
+        - `entrypoint` replaces the OCI image's ENTRYPOINT/CMD argv at exec time.
+        - `cmd` is appended to `entrypoint` (mirrors the OCI runtime contract).
+        - `env` is plaintext; env-var keys must match `^[A-Z][A-Z0-9_]*$`; per-value
+          byte cap = plan `EnvValueMaxBytes`.
+        - `env_secrets` carries `secret:NAME` REFS — the runtime resolver (PR-B)
+          strips the prefix and looks up `NAME` against the existing `app_secrets`
+          table. The ref name must match `^[A-Z][A-Z0-9_]*$`.
+        - `env` + `env_secrets` share the plan `EnvVarsMax` quota — no bypass by
+          mixing the two surfaces.
+        - `port` is per-deployment (1..65535; 0 = absent / fall back to image default).
+        - `healthcheck` is the readiness-probe shape; the actual HTTP probe ships
+          in a follow-up ADR.
+      type: object
+      properties:
+        entrypoint:
+          type: array
+          items: { type: string, minLength: 1 }
+          minItems: 1
+          description: "Replaces the OCI image's ENTRYPOINT/CMD argv. Each element must be non-empty."
+        cmd:
+          type: array
+          items: { type: string, minLength: 1 }
+          minItems: 1
+          description: "Appended to entrypoint at exec time (OCI runtime contract). Each element must be non-empty."
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: "Plaintext env map applied at boot. Keys: `^[A-Z][A-Z0-9_]*$`. Per-value byte cap = plan EnvValueMaxBytes."
+        env_secrets:
+          type: object
+          additionalProperties:
+            type: string
+            pattern: '^secret:[A-Z][A-Z0-9_]*$'
+          description: "Sealed-secret-ref env map. Each VALUE is `secret:NAME`; the runtime resolver looks up `NAME` against `app_secrets` at wake. Counts against the shared `EnvVarsMax` cap with `env`."
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: "Listen port; 0 = absent / fall back to image default (today 8080)."
+        healthcheck:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentHealthcheck'
+            - type: 'null'
+          description: "Readiness-probe shape. Persisted today; the HTTP probe variant ships in a follow-up ADR."
+
+    DeploymentHealthcheck:
+      description: |
+        Readiness-probe shape on the deploy-time override object (issue #460 /
+        ADR-053). Today the probe stays a bare TCP accept — `path`, `interval_s`,
+        `timeout_s`, `retries` are persisted but not yet exercised by `vmm.waitReady`.
+
+        Validation rules (enforced in `pkg/api/dto.go::CreateDeploymentOverrides.Validate`):
+        - `path` must start with `/`.
+        - `interval_s`, `timeout_s`, `retries` must be `>= 0`.
+        - Missing fields default to 0 (interpreted as "use image default" by the
+          future probe implementation).
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, pattern: '^/', description: "Path the probe requests from the guest; must start with `/` (e.g. `/healthz`)." }
+        interval_s: { type: integer, minimum: 0, description: "Probe interval in seconds; 0 = use image default." }
+        timeout_s:  { type: integer, minimum: 0, description: "Probe timeout in seconds; 0 = use image default." }
+        retries:    { type: integer, minimum: 0, description: "Consecutive failures before the instance is considered unhealthy; 0 = use image default." }
 
     # ─── Instances ────────────────────────────────────────────────────────
 
@@ -3898,6 +4127,202 @@ components:
         schedule: { type: [string, "null"] , example: "*/5 * * * *"}
         path: { type: [string, "null"] }
         enabled: { type: [boolean, "null"] }
+
+    # ─── Project decomposition (ADR-050 / Phase 3) ──────────────────────
+    # Wire shape mirrors cmd/apid/scan_service.go::scanPlanResponse +
+    # the reposcan.Workload / Managed structs. The `workloads` and
+    # `managed` arrays are sorted deterministically (by name asc,
+    # case-insensitive) so two scans of identical bytes produce
+    # byte-identical JSON — the §4 acceptance gate asserts this in CI.
+
+    ProjectScanRequest:
+      description: "Multipart body for POST /v1/projects/scan (dry-run)."
+      type: object
+      required: [source]
+      properties:
+        source:
+          type: string
+          format: binary
+          description: "tar.gz of the repo root."
+        project_slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+          description: "kebab slug; default = repo dir basename"
+        production_branch:
+          type: string
+          example: main
+        install_id:
+          type: integer
+          format: int64
+          description: "GitHub install id (with --repo); 0 for unbound repos"
+        only:
+          type: string
+          description: "CSV of workload names to include (others skipped)"
+
+    ProjectApplyRequest:
+      description: |
+        Multipart body for POST /v1/projects (apply). Same shape as
+        ProjectScanRequest; the apply handler resolves AppIDs and
+        inserts crons in a follow-up pass.
+      type: object
+      required: [source]
+      properties:
+        source:
+          type: string
+          format: binary
+        project_slug: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
+        production_branch: { type: string }
+        install_id: { type: integer, format: int64 }
+        only: { type: string }
+
+    PlanWorkload:
+      description: "One discovered unit of work. Mirrors reposcan.Workload."
+      type: object
+      required: [name, root_dir, command, ports]
+      properties:
+        name: { type: string, example: api }
+        root_dir: { type: string, example: "" }
+        dockerfile: { type: string, example: Dockerfile }
+        command:
+          type: array
+          items: { type: string }
+        class:
+          type: string
+          enum: [http, graphql, grpc, job, worker, server, unknown]
+        schedule:
+          type: string
+          description: "cron expression when declared (CronJob, render, serverless)"
+        ports:
+          type: array
+          items: { type: integer }
+        env_keys:
+          type: array
+          items: { type: string }
+          description: "KEYS only — never values; spec §11 forbids logging secrets"
+        source:
+          type: string
+          description: "detector provenance, e.g. compose.yaml: api"
+        tier:
+          type: string
+          enum: [single, convention, workspace, compose, unknown]
+
+    PlanManaged:
+      description: |
+        A service the repo declared (compose image:, render.yaml, etc.)
+        but the platform will NOT provision. Surfaced so the customer
+        sees them in the plan and reads a learnable env hint instead of
+        a runtime 422 (two-drive FROM-base contract, ADR-046).
+      type: object
+      required: [name, kind, env_hint, source, image]
+      properties:
+        name: { type: string }
+        kind: { type: string, example: postgres }
+        env_hint: { type: string, example: DATABASE_URL }
+        source: { type: string }
+        image: { type: string }
+
+    PlanCron:
+      description: "A cron expression lifted from a workload (k8s CronJob, render.yaml, serverless.yml)."
+      type: object
+      required: [workload_name, schedule, path, enabled]
+      properties:
+        workload_name: { type: string, example: nightly }
+        schedule: { type: string, example: "0 3 * * *" }
+        path: { type: string, example: / }
+        enabled: { type: boolean }
+
+    QuotaBlock:
+      description: |
+        Limit + observed extension on a plan-quota problem. Mirrors
+        api.Problem.WithLimit; emitted alongside any 402/403 quota
+        response so the CLI can render "X/Y apps" without a second
+        request.
+      type: object
+      properties:
+        limit: { type: integer, format: int64 }
+        observed: { type: integer, format: int64 }
+        docs_url: { type: string }
+
+    PlanResponse:
+      description: "Dry-run scan response."
+      type: object
+      required:
+        - project_slug
+        - scan_source
+        - tier
+        - workloads
+        - managed
+        - crons
+        - observed_apps
+        - observed_crons
+        - limit_apps
+        - limit_crons
+        - can_apply
+        - plan_token
+      properties:
+        project_slug: { type: string }
+        repo_full_name: { type: string }
+        scan_source:
+          type: string
+          enum: [compose, procfile, k8s, render, fly, serverless, workspace, convention, single, unknown]
+        tier: { type: string }
+        workloads:
+          type: array
+          items: { $ref: '#/components/schemas/PlanWorkload' }
+        managed:
+          type: array
+          items: { $ref: '#/components/schemas/PlanManaged' }
+        crons:
+          type: array
+          items: { $ref: '#/components/schemas/PlanCron' }
+        warnings:
+          type: array
+          items: { type: string }
+        observed_apps: { type: integer }
+        observed_crons: { type: integer }
+        limit_apps: { type: integer }
+        limit_crons: { type: integer }
+        can_apply: { type: boolean }
+        crons_not_allowed: { type: boolean }
+        plan_token: { type: string, description: "base64-JSON plan token; pass back as ?plan_token= on /v1/projects to skip the second extract." }
+
+    ApplyResponse:
+      description: "Apply response. Carries the inserted project_id and per-app IDs."
+      type: object
+      required: [project_slug, scan_source, can_apply, plan_token]
+      properties:
+        project_slug: { type: string }
+        repo_full_name: { type: string }
+        scan_source: { type: string }
+        tier: { type: string }
+        workloads:
+          type: array
+          items: { $ref: '#/components/schemas/PlanWorkload' }
+        managed:
+          type: array
+          items: { $ref: '#/components/schemas/PlanManaged' }
+        crons:
+          type: array
+          items: { $ref: '#/components/schemas/PlanCron' }
+        warnings:
+          type: array
+          items: { type: string }
+        observed_apps: { type: integer }
+        observed_crons: { type: integer }
+        limit_apps: { type: integer }
+        limit_crons: { type: integer }
+        can_apply: { type: boolean }
+        crons_not_allowed: { type: boolean }
+        plan_token: { type: string }
+        project_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        apps:
+          type: array
+          items:
+            type: object
+            required: [slug, id]
+            properties:
+              slug: { type: string }
+              id: { type: string, pattern: '^[a-f0-9]{32}$' }
 
     # ─── Alert rules (issue #396 / ADR-045 PR 3) ──────────────────────────
     # Wire shape mirrors pkg/api/alerts.go. Plaintext webhook_secret is

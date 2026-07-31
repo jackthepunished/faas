@@ -167,24 +167,33 @@ func TestLoadHostKey_RejectsInsecurePerms(t *testing.T) {
 		})
 	}
 
-	// Accept case: 0o400 only. The pre-existing
-	// TestGenerateAndSaveRoundTrip exercises the actual production
-	// path (vmmd writes 0o400 on first boot), but pinning a
-	// standalone accept case here keeps the contract + the
-	// rejection table in one place.
-	t.Run("accept_0o400_and_0o440", func(t *testing.T) {
-		for _, mode := range []os.FileMode{0o400, 0o440} {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "host.age")
-			if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
-				t.Fatalf("seed: %v", err)
-			}
-			if err := os.Chmod(path, mode); err != nil {
-				t.Fatalf("chmod: %v", err)
-			}
-			if _, err := LoadHostKey(path); err != nil {
-				t.Errorf("mode %#o rejected: %v", mode, err)
-			}
+	// Accept case: 0o400 for standard files, 0o440 for systemd credential paths.
+	t.Run("accept_0o400_standard_and_0o440_credential", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "host.age")
+		if err := os.WriteFile(path, []byte(idStr), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := LoadHostKey(path); err != nil {
+			t.Errorf("mode 0400 standard path rejected: %v", err)
+		}
+
+		credDir := filepath.Join(dir, "credentials")
+		if err := os.MkdirAll(credDir, 0o755); err != nil {
+			t.Fatalf("mkdir creds: %v", err)
+		}
+		credPath := filepath.Join(credDir, "faas_host_age_identity")
+		if err := os.WriteFile(credPath, []byte(idStr), 0o600); err != nil {
+			t.Fatalf("seed cred: %v", err)
+		}
+		if err := os.Chmod(credPath, 0o440); err != nil {
+			t.Fatalf("chmod cred: %v", err)
+		}
+		if _, err := LoadHostKey(credPath); err != nil {
+			t.Errorf("mode 0440 credential path rejected: %v", err)
 		}
 	})
 }

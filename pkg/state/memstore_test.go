@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -3444,5 +3445,308 @@ func TestMem_SetProjectScanSource_MonotonicUp(t *testing.T) {
 	}
 	if p3.ScanSource != ProjectScanSourceCompose {
 		t.Errorf("same-tier write ScanSource = %q, want 'compose'", p3.ScanSource)
+	}
+}
+
+// TestMem_ApplyProjectPlan_DeferredCronSkipped pins the F1 review
+// finding (PR #454): ApplyProjectPlan must silently skip crons with
+// empty AppID so the apply handler can resolve them after the Tx
+// commits via CreateCron. The quota check ran inside the Tx (step 4
+// in memstore.go:1114+) so a deferred cron cannot bypass it. The
+// handler-level resolution step is what catches a cron whose
+// workload name doesn't match any inserted app slug — covered in
+// the cmd/gregale/commands_decompose_test.go fixtures.
+//
+// Pins:
+//   - empty-AppID crons are skipped silently inside the Tx
+//   - insertedApps is populated regardless (3 apps in, 3 apps out)
+//   - insertedCrons is empty (the deferred cron re-inserts via CreateCron)
+//   - the project + apps are persisted (the apply side is intact)
+func TestMem_ApplyProjectPlan_DeferredCronSkipped(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acct, err := m.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	proj := Project{AccountID: acct.ID, Slug: "fixture"}
+	// Pre-assign app IDs so a cron can reference one of them by ID
+	// (mirrors the apply handler's post-Tx resolution: after
+	// ApplyProjectPlan returns the insertedApps, the handler looks
+	// up the slug → ID and calls CreateCron). The cron with an empty
+	// AppID is the deferred case we pin.
+	workerID := "00000000-0000-0000-0000-000000000001"
+	apiID := "00000000-0000-0000-0000-000000000002"
+	apps := []App{
+		{ID: apiID, AccountID: acct.ID, Slug: "api", WorkloadName: "api"},
+		{ID: workerID, AccountID: acct.ID, Slug: "worker", WorkloadName: "worker"},
+		{AccountID: acct.ID, Slug: "web", WorkloadName: "web"},
+	}
+	// Two crons: one with empty AppID (must skip), one pre-resolved
+	// against the worker's ID (must survive the Tx). The handler's
+	// slugToID lookup happens post-commit and is not exercised here
+	// — that's cmd/apid/handlers_decompose_test.go territory.
+	crons := []Cron{
+		{AppID: "", Schedule: "*/5 * * * *", Path: "/healthz", Enabled: true},
+		{AppID: workerID, Schedule: "*/10 * * * *", Path: "/check", Enabled: true},
+	}
+
+	insertedProject, insertedApps, insertedCrons, err := m.ApplyProjectPlan(
+		ctx, proj, apps, crons, api.MustLimitsFor(api.PlanHobby))
+	if err != nil {
+		t.Fatalf("ApplyProjectPlan: %v", err)
+	}
+	if insertedProject.ID == "" {
+		t.Errorf("insertedProject.ID is empty")
+	}
+	if len(insertedApps) != 3 {
+		t.Errorf("len(insertedApps) = %d, want 3", len(insertedApps))
+	}
+	if len(insertedCrons) != 1 {
+		t.Errorf("len(insertedCrons) = %d, want 1 (only the pre-resolved cron survives the Tx)", len(insertedCrons))
+	}
+	if insertedCrons[0].AppID != workerID {
+		t.Errorf("insertedCron[0].AppID = %q, want %q", insertedCrons[0].AppID, workerID)
+	}
+}
+
+// TestMem_ApplyProjectPlan_FreePlanBlocksNewCrons pins the Free-plan
+// cron guard inside the MemStore Tx (F2 parity with pgstore_test.go).
+// Free plans have CronLimitPerAccount == 0, so any cron in the input
+// returns QuotaError{Kind:"crons", NotAllowed:true} with zero rows
+// inserted. Mirrors the pgstore step at pkg/state/pgstore.go:1120.
+func TestMem_ApplyProjectPlan_FreePlanBlocksNewCrons(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acct, err := m.CreateAccount(ctx, "alice@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	// Free plan caps DeployedApps at 1; build a single-app plan with
+	// one cron and confirm the cron-not-allowed guard trips before
+	// any write.
+	proj := Project{AccountID: acct.ID, Slug: "fixture"}
+	apps := []App{{AccountID: acct.ID, Slug: "api"}}
+	crons := []Cron{{Schedule: "*/5 * * * *", Path: "/healthz", Enabled: true}}
+
+	_, _, _, err = m.ApplyProjectPlan(ctx, proj, apps, crons, api.MustLimitsFor(api.PlanFree))
+	var qe *QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want *QuotaError", err)
+	}
+	if qe.Kind != QuotaErrorKindCrons {
+		t.Errorf("qe.Kind = %q, want %q", qe.Kind, QuotaErrorKindCrons)
+	}
+	if !qe.NotAllowed {
+		t.Errorf("qe.NotAllowed = false, want true (Free plan)")
+	}
+
+	// Confirm zero rows: the Tx rolled back, no project + no apps.
+	if len(m.projects) != 0 {
+		t.Errorf("len(m.projects) = %d, want 0 (rollback)", len(m.projects))
+	}
+	if len(m.apps) != 0 {
+		t.Errorf("len(m.apps) = %d, want 0 (rollback)", len(m.apps))
+	}
+}
+
+// TestMem_ApplyProjectPlan_FreePlanDowngradeKeepsExistingCrons pins
+// the F2 review finding (PR #454): a Free-plan account with
+// pre-existing crons (from a prior plan downgrade) must still be
+// able to apply a project with len(crons)==0. The cron cap check is
+// skipped entirely when len(crons) == 0 (memstore.go + pgstore.go
+// ApplyProjectPlan step 3); a zero-cron apply lands cleanly even
+// when observedCrons > 0 from prior history. Without this guard, a
+// Free account that ever held crons would lock itself out of every
+// future apply — the regression mode the review flagged.
+//
+// Pins:
+//   - pre-existing crons survive the seed step (via CreateCron, no
+//     per-account cap check, mirroring the historical path)
+//   - a zero-cron apply on the same account lands the project row
+//   - the cron guard does NOT trip when len(crons) == 0
+//   - over-apps still trips (Free caps DeployedApps at 1)
+func TestMem_ApplyProjectPlan_FreePlanDowngradeKeepsExistingCrons(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acct, err := m.CreateAccount(ctx, "alice@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	// Seed a pre-existing app + cron to simulate the post-downgrade
+	// state. Free's DeployedApps cap is 1 so we have exactly one
+	// app; the cron lands via CreateCron (no per-account cap).
+	existing, err := m.CreateApp(ctx, App{AccountID: acct.ID, Slug: "legacy"})
+	if err != nil {
+		t.Fatalf("CreateApp (legacy): %v", err)
+	}
+	if _, err := m.CreateCron(ctx, existing.ID, "*/15 * * * *", "/p", true); err != nil {
+		t.Fatalf("CreateCron (legacy): %v", err)
+	}
+
+	// Free + 1 app already present → a one-app apply is over-quota.
+	// The DeployedApps cap is 1, so observed=1 and len(apps)=1 → 2,
+	// which trips the apps quota. This is the *correct* behavior: a
+	// Free plan cannot add a second app, regardless of crons.
+	// Confirm the over-apps guard still trips so the cron guard is
+	// not shadowing it.
+	proj := Project{AccountID: acct.ID, Slug: "fixture"}
+	apps := []App{{AccountID: acct.ID, Slug: "newapp"}}
+	_, _, _, err = m.ApplyProjectPlan(ctx, proj, apps, nil, api.MustLimitsFor(api.PlanFree))
+	var qe *QuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("err = %v, want *QuotaError (apps cap trips first)", err)
+	}
+	if qe.Kind != QuotaErrorKindApps {
+		t.Errorf("qe.Kind = %q, want %q (apps cap must trip before cron guard)", qe.Kind, QuotaErrorKindApps)
+	}
+
+	// Zero-cron apply: project only (no apps, no crons). The legacy
+	// app's cron must not block this — the cron cap check is
+	// skipped when len(crons) == 0. The apps cap is also fine
+	// (len(apps) == 0, observed = 1, 1 + 0 <= 1). Lands cleanly.
+	proj2 := Project{AccountID: acct.ID, Slug: "metadata-only"}
+	inserted, _, _, err := m.ApplyProjectPlan(ctx, proj2, nil, nil, api.MustLimitsFor(api.PlanFree))
+	if err != nil {
+		t.Fatalf("zero-cron apply failed (F2 fix): %v — pre-existing crons must not block a cron-less apply on Free", err)
+	}
+	if inserted.ID == "" {
+		t.Errorf("inserted.ID is empty after zero-cron apply")
+	}
+	if _, ok := m.projects[inserted.ID]; !ok {
+		t.Errorf("project row missing after zero-cron apply")
+	}
+
+	// Sanity: the legacy cron still exists (the zero-cron apply did
+	// not touch it). m.crons is package-private so this test can
+	// iterate directly — a future refactor that prunes crons on
+	// downgrade trips the test loudly.
+	cronCount := 0
+	for _, c := range m.crons {
+		if c.AppID == existing.ID {
+			cronCount++
+		}
+	}
+	if cronCount != 1 {
+		t.Errorf("legacy cron count = %d, want 1 (zero-cron apply must not prune)", cronCount)
+	}
+}
+
+// --- SetAppWorkloadClass (ADR-051 Phase 4 PR-B parity) ----------------
+
+// memSeedClassApp creates one Pro-plan app for the SetAppWorkloadClass
+// parity tests. Mirrors the pgtest-injection style of seedAppForClass
+// in pgstore_set_workload_class_test.go so the two suites can be
+// read side-by-side.
+func memSeedClassApp(t *testing.T, ctx context.Context, m *MemStore, email string) App {
+	t.Helper()
+	acc, err := m.CreateAccount(ctx, email, api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	limits := api.MustLimitsFor(api.PlanPro)
+	a, err := m.CreateAppIfUnderQuota(ctx, App{
+		AccountID:      acc.ID,
+		Slug:           "class-mem-" + email,
+		Type:           AppTypeFunction,
+		Runtime:        "node22",
+		RAMMB:          256,
+		MaxConcurrency: 5,
+		IdleTimeoutS:   60,
+		Status:         AppActive,
+		WorkloadClass:  WorkloadClassHTTP,
+	}, limits)
+	if err != nil {
+		t.Fatalf("CreateAppIfUnderQuota: %v", err)
+	}
+	return a
+}
+
+func TestMemStore_SetAppWorkloadClass_RoundTrip(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "rt@x.test")
+
+	cases := []WorkloadClass{
+		WorkloadClassHTTP, WorkloadClassGraphQL, WorkloadClassGRPC,
+		WorkloadClassJob, WorkloadClassWorker,
+	}
+	for _, want := range cases {
+		got, err := m.SetAppWorkloadClass(ctx, a.ID, want, "scan_hint")
+		if err != nil {
+			t.Fatalf("SetAppWorkloadClass(%s) = %v, want nil", want, err)
+		}
+		if got.WorkloadClass != want {
+			t.Errorf("SetAppWorkloadClass(%s) round-trip = %q, want %q",
+				want, got.WorkloadClass, want)
+		}
+		if got.ID != a.ID {
+			t.Errorf("returned ID=%q, want %q", got.ID, a.ID)
+		}
+	}
+}
+
+func TestMemStore_SetAppWorkloadClass_EmptyClass_FastFail(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "empty@x.test")
+
+	_, err := m.SetAppWorkloadClass(ctx, a.ID, WorkloadClass(""), "manual")
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("SetAppWorkloadClass(\"\") = %v, want ErrInvalidArgument", err)
+	}
+	// Read-back must NOT have mutated the row.
+	got, err := m.AppByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.WorkloadClass != a.WorkloadClass {
+		t.Errorf("empty-class update mutated WorkloadClass = %q, want original %q",
+			got.WorkloadClass, a.WorkloadClass)
+	}
+}
+
+func TestMemStore_SetAppWorkloadClass_AppMissing(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	_, err := m.SetAppWorkloadClass(ctx,
+		"00000000-0000-0000-0000-000000000000", WorkloadClassHTTP, "observed")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetAppWorkloadClass on missing app = %v, want ErrNotFound", err)
+	}
+}
+
+// Parallel Sets on the same row in MemStore must converge (the PgStore
+// suite proves the SQL path; this proves the mutex path). Last-writer-
+// wins is fine — anything else indicates a torn write inside the lock.
+func TestMemStore_SetAppWorkloadClass_ParallelSameRow(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a := memSeedClassApp(t, ctx, m, "par@x.test")
+
+	var wg sync.WaitGroup
+	const N = 8
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := m.SetAppWorkloadClass(ctx, a.ID, WorkloadClassWorker, "observed"); err != nil {
+				t.Errorf("parallel Set %d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := m.AppByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.WorkloadClass != WorkloadClassWorker {
+		t.Errorf("final WorkloadClass = %q, want worker", got.WorkloadClass)
 	}
 }

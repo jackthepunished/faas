@@ -37,11 +37,13 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/tls"
 	"log/slog"
 	"time"
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -116,6 +118,8 @@ func runCapacityPublish(
 	scheddClientTLS *tls.Config,
 	tick time.Duration,
 	resident residentBytesFn,
+	nodeKey *ecdsa.PrivateKey,
+	nodeKeyID string,
 	log *slog.Logger,
 ) {
 	if scheddTarget == "" {
@@ -132,6 +136,8 @@ func runCapacityPublish(
 		scheddTarget:    scheddTarget,
 		nodeID:          nodeID,
 		scheddClientTLS: scheddClientTLS,
+		nodeKey:         nodeKey,
+		nodeKeyID:       nodeKeyID,
 		log:             log,
 	}
 	runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer, tick, resident, log)
@@ -213,7 +219,7 @@ func drainCapacityPublish(
 			// wait for it here — the ctx is already Done.
 			return nil
 		case <-t.C:
-			report := buildCapacityReport(counts, nodeID, cfg, resident)
+			report := buildCapacityReport(streamer, counts, nodeID, cfg, resident, log)
 			if err := cli.Send(report); err != nil {
 				return err
 			}
@@ -228,6 +234,13 @@ func drainCapacityPublish(
 // review fix).
 type capacityStreamer interface {
 	Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityClient, func(), error)
+	// SigningKey returns the prodStreamer's node-key +
+	// key-id pair so buildCapacityReport can stamp the
+	// node_signature field on every report (ADR-053).
+	// Pre-slice-3 streamers return nil / "" — the report
+	// is emitted unsigned and the schedd accepts it as
+	// long as its registry is also nil.
+	SigningKey() (*ecdsa.PrivateKey, string)
 }
 
 // prodStreamer is the production streamer. It dials schedd
@@ -237,7 +250,16 @@ type prodStreamer struct {
 	scheddTarget    string
 	nodeID          string
 	scheddClientTLS *tls.Config
+	nodeKey         *ecdsa.PrivateKey
+	nodeKeyID       string
 	log             *slog.Logger
+}
+
+// SigningKey returns the node signing key + key_id pair.
+// Used by buildCapacityReport to stamp node_signature on
+// every report (ADR-053).
+func (p prodStreamer) SigningKey() (*ecdsa.PrivateKey, string) {
+	return p.nodeKey, p.nodeKeyID
 }
 
 // Open dials schedd and opens a client-streaming ReportCapacity
@@ -287,11 +309,25 @@ func (p prodStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityC
 // Per-cgroup-weight-sum is a v1.1 upgrade; the placeholder
 // is conservative and matches the §4.5 future-work note
 // in ADR-025.
+//
+// Slice-3 (ADR-053): when the streamer has a node signing
+// key + key_id, the report carries a 64-byte raw (r||s)
+// ECDSA-P-256 signature over the canonical payload. Pre-slice-3
+// streamers (nil key / empty key_id) emit an empty signature
+// — the wire field is additive, so legacy schedd silently
+// accepts and slice-3 schedd (when configured with a
+// registry) rejects the stream.
+//
+// Sign failures are logged + the report is emitted unsigned.
+// A persistent signing-key bug must surface in `vmmd` logs,
+// not silently regress to "sends zero signatures".
 func buildCapacityReport(
+	streamer capacityStreamer,
 	counts countReader,
 	nodeID string,
 	cfg ComputeNodeConfig,
 	resident residentBytesFn,
+	log *slog.Logger,
 ) *scheddpb.CapacityReport {
 	// nil counts → live=0, leased=0. Lets the unit tests
 	// run without a real *fcvm.Manager (which requires
@@ -323,7 +359,7 @@ func buildCapacityReport(
 	usedMB = clampInt32(usedMB)
 	headroom = clampInt32(headroom)
 
-	return &scheddpb.CapacityReport{
+	report := &scheddpb.CapacityReport{
 		NodeId:          nodeID,
 		SampledAtUnixMs: time.Now().UnixMilli(),
 		LiveCount:       live,
@@ -332,6 +368,38 @@ func buildCapacityReport(
 		RamHeadroomMb:   int32(headroom),
 		VcpuBusy:        live * 2,
 	}
+	// Slice-3: stamp node_signature + node_key_id when the
+	// streamer was wired with a signing key. Pre-slice-3
+	// streamers (nil key) leave both fields empty — additive.
+	if streamer != nil {
+		if key, keyID := streamer.SigningKey(); key != nil && keyID != "" {
+			schedReport := sched.CapacityReport{
+				NodeID:        report.NodeId,
+				SampledAt:     time.UnixMilli(report.SampledAtUnixMs),
+				LiveCount:     report.LiveCount,
+				LeasedCount:   report.LeasedCount,
+				UsedMB:        report.UsedMb,
+				RAMHeadroomMB: report.RamHeadroomMb,
+				VCPUBusy:      report.VcpuBusy,
+			}
+			sig, err := sched.SignNodeReport(key, schedReport)
+			if err != nil {
+				// Sign failure is rare (crypto/rand) but
+				// must not silently regress to unsigned.
+				// Emit a one-shot-style log; the report is
+				// sent unsigned and schedd (if signature-
+				// strict) will reject.
+				if log != nil {
+					log.Warn("vmmd: capacity sign failed; sending unsigned",
+						"node_id", nodeID, "err", err)
+				}
+			} else {
+				report.NodeSignature = sig
+				report.NodeKeyId = keyID
+			}
+		}
+	}
+	return report
 }
 
 // clampInt32 caps v at the int32 max. Used to avoid

@@ -815,6 +815,42 @@ func (s *PgStore) SetAppMinInstances(ctx context.Context, appID string, min int)
 	return nil
 }
 
+// SetAppWorkloadClass overwrites apps.workload_class (ADR-050 §3,
+// ADR-051). Single round-trip UPDATE … RETURNING; the RETURNING
+// projection matches appsSelectColumns so scanAppInto can decode it.
+// SQLSTATE 23514 (apps_workload_class_chk) maps to ErrInvalidArgument
+// via mapErr; SQLSTATE 23502 (not_null) is unreachable because the
+// column carries a DEFAULT in the migration.
+//
+// The `source` argument is caller metadata only — the store does NOT
+// log or persist it. The engine/reconcile caller writes an audit row
+// carrying {app_id, observed_class, source} with the same value
+// (ADR-035 best-effort).
+//
+// Returns the fresh App row so the cold-boot path in pkg/sched
+// (PR-D) can pass it on to SetInstanceRuntime without a second read.
+// Returns ErrNotFound when the app is gone.
+func (s *PgStore) SetAppWorkloadClass(ctx context.Context, appID string, class WorkloadClass, source string) (App, error) {
+	_ = source // metadata only — see comment above
+	if class == "" {
+		return App{}, ErrInvalidArgument
+	}
+	var a App
+	row := s.pool.QueryRow(ctx,
+		`update apps set workload_class = $2 where id = $1
+		 returning `+appsSelectColumns,
+		appID, string(class))
+	if err := scanAppInto(&a, row); err != nil {
+		// Funnel through mapErr so a CHECK violation on
+		// apps_workload_class_chk (SQLSTATE 23514) surfaces as
+		// ErrInvalidArgument instead of a raw pgx error. The empty
+		// class guard above covers the Go-side validation; this
+		// covers the schema-side defence-in-depth.
+		return App{}, mapErr(err)
+	}
+	return a, nil
+}
+
 // RenameApp changes an app's slug atomically (issue #63). The UPDATE
 // is scoped to (account_id, oldSlug, status<>'deleted') so a wrong
 // accountID or unknown slug returns ErrNotFound via mapErr → pgx.ErrNoRows.
@@ -1041,6 +1077,204 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 		          created_at, updated_at
 	`, projectID, string(src))
 	return scanProject(row)
+}
+
+// ApplyProjectPlan persists a project + its member apps + crons in
+// one transaction. The critical section sits behind a
+// `SELECT … FOR UPDATE` on the parent accounts row so two concurrent
+// applies on the same account serialise; an over-quota call returns
+// *QuotaError with Kind set and zero rows inserted. Per ADR-050 §3
+// and repo_decomposition_implementation.md §3 (lines 268-276):
+// quota is evaluated before any write, the limit problem carries
+// limit + observed + docs URL, and nothing is created on a tripped
+// cap.
+//
+// The Cron input carries AppID already resolved against the just-
+// inserted apps — the apply handler runs in two passes: first it
+// collects the workload → app_id map by inserting each app and
+// reading RETURNING, then it inserts crons referencing those IDs.
+// Persisting crons by AppID (not by name) avoids re-running the
+// lookup inside the Tx and keeps the input shape identical to what
+// CreateCronIfUnderQuota produces.
+//
+// Errors:
+//   - *QuotaError: Kind="apps" or "crons"; "crons"+NotAllowed=true
+//     when the plan tier has CronLimitPerAccount==0 (Free plan).
+//   - ErrConflict: projects_account_slug_uniq 23505, or
+//     apps_project_workload_uniq 23505 inside the apply batch.
+//   - ErrNotFound: accounts row gone (23503 on project insert).
+func (s *PgStore) ApplyProjectPlan(
+	ctx context.Context,
+	project Project,
+	apps []App,
+	crons []Cron,
+	limits api.Limits,
+) (Project, []App, []Cron, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent accounts row. SELECT 1 + FOR UPDATE keeps the
+	//    lock acquisition in one round-trip; the FOR UPDATE blocks any
+	//    concurrent CreateAppIfUnderQuota or ApplyProjectPlan on the
+	//    same account until COMMIT/ROLLBACK. apps_account_idx
+	//    (account_id, status) is not relevant here — accounts_pkey is.
+	var locked int
+	if err := tx.QueryRow(ctx,
+		`select 1 from accounts where id = $1 for update`, project.AccountID,
+	).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Project{}, nil, nil, ErrNotFound
+		}
+		return Project{}, nil, nil, fmt.Errorf("state: lock account %s: %w", project.AccountID, err)
+	}
+
+	// 2. Authoritative deployed-app count under the lock. Same predicate
+	//    as CreateAppIfUnderQuota so the MemStore mirror matches.
+	var observedApps int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from apps where account_id = $1
+		 and status in ('active','evicted_cold')`,
+		project.AccountID,
+	).Scan(&observedApps); err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: count apps for account %s: %w", project.AccountID, err)
+	}
+	if observedApps+len(apps) > limits.DeployedApps {
+		return Project{}, nil, nil, &QuotaError{
+			Kind:     QuotaErrorKindApps,
+			Limit:    limits.DeployedApps,
+			Observed: observedApps + len(apps),
+		}
+	}
+
+	// 3. Cron quota pre-check. Free plan (CronLimitPerAccount==0)
+	//    short-circuits with NotAllowed; paid plans compare against
+	//    the current count. We join through apps so deleted apps'
+	//    crons don't poison the cap (mirrors CreateCronIfUnderQuota).
+	//    Skipped entirely when len(crons) == 0 — a Free account with
+	//    pre-existing crons (from a prior plan downgrade) must still
+	//    be able to apply a cron-less project. PR #454 review F2
+	//    finding: the cap check must not block zero-cron applies.
+	if len(crons) > 0 {
+		if limits.CronLimitPerAccount == 0 {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:       QuotaErrorKindCrons,
+				NotAllowed: true,
+			}
+		}
+		var observedCrons int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from crons c
+			 join apps a on a.id = c.app_id
+			 where a.account_id = $1 and a.status <> 'deleted'`,
+			project.AccountID,
+		).Scan(&observedCrons); err != nil {
+			return Project{}, nil, nil, fmt.Errorf("state: count crons for account %s: %w", project.AccountID, err)
+		}
+		if observedCrons+len(crons) > limits.CronLimitPerAccount {
+			return Project{}, nil, nil, &QuotaError{
+				Kind:     QuotaErrorKindCrons,
+				Limit:    limits.CronLimitPerAccount,
+				Observed: observedCrons + len(crons),
+			}
+		}
+	}
+
+	// 4. Insert the project. 23503 (FK violation on account_id) maps
+	//    to ErrNotFound (same shape as CreateProject); 23505
+	//    (account_slug unique) maps to ErrConflict via mapErr.
+	scanSrc := project.ScanSource
+	if scanSrc == "" {
+		scanSrc = ProjectScanSourceUnknown
+	}
+	projRow := tx.QueryRow(ctx, `
+		insert into projects
+		    (account_id, slug, repo_full_name, production_branch, install_id, scan_source)
+		values ($1, $2, $3, $4, $5, $6)
+		returning id, account_id, slug, coalesce(repo_full_name,''),
+		          coalesce(production_branch,''), coalesce(install_id,0),
+		          scan_source, created_at, updated_at
+	`,
+		project.AccountID, project.Slug, nullString(project.RepoFullName),
+		nullString(project.ProductionBranch), project.InstallID, string(scanSrc),
+	)
+	insertedProject, err := scanProject(projRow)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ForeignKeyViolation {
+			return Project{}, nil, nil, fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+		}
+		return Project{}, nil, nil, mapErr(err)
+	}
+
+	// 5. Insert apps one at a time, inside the same Tx, populating
+	//    the workload fields. Reuse appsSelectColumns so the column
+	//    list stays in one place (scanAppInto is the matching
+	//    positional reader). 23505 on apps_project_workload_uniq maps
+	//    to ErrConflict — handlers must dedupe workload_name upstream.
+	insertedApps := make([]App, 0, len(apps))
+	for _, a := range apps {
+		manifest := a.Manifest
+		if manifest.Entrypoint == nil && manifest.Env == nil {
+			manifest = AppManifest{}
+		}
+		manifestBytes, _ := json.Marshal(manifest)
+		runtime := nullString(a.Runtime)
+		idle := nullableInt(a.IdleTimeoutS)
+		insertAppSQL := `insert into apps
+		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
+		     status, manifest, min_instances, egress_allowlist,
+		     project_id, root_dir, workload_name, workload_class, start_command)
+		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
+		        $11, $12, $13, $14, $15)
+		returning ` + appsSelectColumns
+		row := tx.QueryRow(ctx, insertAppSQL,
+			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
+			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
+			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
+			nullString(a.StartCommand),
+		)
+		app, err := scanApp(row)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+				return Project{}, nil, nil, ErrConflict
+			}
+			return Project{}, nil, nil, err
+		}
+		insertedApps = append(insertedApps, app)
+	}
+
+	// 6. Insert crons attached to the freshly inserted apps. AppID is
+	//    set by the caller; an empty AppID is treated as "deferred"
+	//    so the apply handler can resolve the workload-name → ID map
+	//    from the returned insertedApps and re-insert via CreateCron.
+	//    The cron quota check (step 3) already ran so a deferred cron
+	//    cannot bypass it; the worst case on a name-resolution bug is
+	//    a missing cron row + a 500 the handler can retry.
+	insertedCrons := make([]Cron, 0, len(crons))
+	for _, c := range crons {
+		if c.AppID == "" {
+			continue // deferred to the handler
+		}
+		row := tx.QueryRow(ctx,
+			`insert into crons (app_id, schedule, path, enabled) values ($1, $2, $3, $4)
+			 returning id, app_id, schedule, path, enabled, created_at`,
+			c.AppID, c.Schedule, c.Path, c.Enabled,
+		)
+		var out Cron
+		if err := row.Scan(&out.ID, &out.AppID, &out.Schedule, &out.Path, &out.Enabled, &out.CreatedAt); err != nil {
+			return Project{}, nil, nil, mapErr(err)
+		}
+		insertedCrons = append(insertedCrons, out)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Project{}, nil, nil, fmt.Errorf("state: commit apply project plan: %w", err)
+	}
+	return insertedProject, insertedApps, insertedCrons, nil
 }
 
 // RecordGitHubBinding writes the (install_id, repo_full_name,
@@ -1520,16 +1754,26 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	// TestPgStore_InstancesStateCheck_RejectsInjection got "got 13 and 15"
 	// before this fix). Both columns are nullable; empty string on the
 	// write side mirrors the rest of the read-side coalesce shape.
+	//
+	// Issue #460 / ADR-053: include the six override_* columns. Empty
+	// text[] is signalled by the caller passing a nil []string — pgx
+	// marshals nil to NULL which the column accepts (nullable).
+	// jsonb columns accept NULL too; the handler marshals an empty
+	// map to "{}" rather than NULL so a downstream consumer never
+	// has to branch on "is the jsonb column populated but the JSON
+	// string empty?".
 	row := tx.QueryRow(ctx,
-		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha, status)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
-		 returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		           coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		           status, coalesce(error,''), coalesce(error_code,''), created_at,
-		           coalesce(source_url,''), coalesce(commit_sha,'')`,
+		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
+		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          status)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
+		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
-		nullString(d.SourceURL), nullString(d.CommitSHA))
+		nullString(d.SourceURL), nullString(d.CommitSHA),
+		d.OverrideEntrypoint, d.OverrideCmd,
+		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
+		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck))
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -1542,42 +1786,28 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 
 func (s *PgStore) DeploymentByID(ctx context.Context, id string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where id = $1`, id)
 	return scanDeploymentWithRootfs(row)
 }
 
 func (s *PgStore) LatestDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumns+`
 		 from deployments where app_id = $1 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
 }
 
 func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
 	return scanDeploymentWithRootfs(row)
 }
 
 func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		        status, coalesce(error,''), coalesce(error_code,''), created_at,
-		        coalesce(source_url,''), coalesce(commit_sha,'')
+		`select `+deploymentSelectColumns+`
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
@@ -1611,18 +1841,12 @@ func (s *PgStore) ListDeploymentsForApp(ctx context.Context, appID string, limit
 	)
 	if limit > 0 {
 		rows, err = s.pool.Query(ctx,
-			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at,
-			        coalesce(source_url,''), coalesce(commit_sha,'')
+			`select `+deploymentSelectColumns+`
 			 from deployments where app_id = $1 order by created_at desc limit $2 offset $3`,
 			appID, limit, offset)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select id, app_id, coalesce(build_id::text,''), image_digest, kind,
-			        coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-			        status, coalesce(error,''), coalesce(error_code,''), created_at,
-			        coalesce(source_url,''), coalesce(commit_sha,'')
+			`select `+deploymentSelectColumns+`
 			 from deployments where app_id = $1 order by created_at desc offset $2`,
 			appID, offset)
 	}
@@ -1649,19 +1873,13 @@ func (s *PgStore) ListDeploymentsForAccount(ctx context.Context, accountID strin
 	)
 	if before.IsZero() {
 		rows, err = s.pool.Query(ctx,
-			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
-			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
-			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
+			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 order by d.created_at desc limit $2`,
 			accountID, limit)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
-			        coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
-			        d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
-			        coalesce(d.source_url,''), coalesce(d.commit_sha,'')
+			`select `+deploymentSelectColumnsQualified+`
 			 from deployments d join apps a on a.id = d.app_id
 			 where a.account_id = $1 and d.created_at < $2
 			 order by d.created_at desc limit $3`,
@@ -1760,11 +1978,7 @@ func (s *PgStore) SetDeploymentFailed(ctx context.Context, id, code, message str
 		`update deployments
 		    set status = 'failed', error = $2, error_code = $3
 		  where id = $1
-		  returning id, app_id, coalesce(build_id::text,''), image_digest, kind,
-		            coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-		            coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
-		            status, coalesce(error,''), coalesce(error_code,''), created_at,
-		            coalesce(source_url,''), coalesce(commit_sha,'')`,
+		  returning `+deploymentSelectColumnsWithRootfs,
 		id, nullString(message), nullString(code))
 	return scanDeploymentWithRootfs(row)
 }
@@ -4608,6 +4822,37 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 	return n, nil
 }
 
+// UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
+// in compute_node_keys (migration 00075, ADR-053). vmmd's
+// self-registration calls this on startup once it has loaded its
+// node signing key (cmd/vmmd/main.go::loadNodeSigningKey) and
+// computed the key_id (the SHA-256 hex of the SubjectPublicKeyInfo).
+//
+// ON CONFLICT is a no-op (DO NOTHING) because key material is
+// write-once — re-applying public_key_pem on conflict would
+// silently overwrite a rotation that produced a different key
+// (the PK is (compute_node_id, key_id), so a rotated key on the
+// same node has a different key_id and lands as a fresh row).
+// Re-stamping public_key_pem on the same key_id would be a
+// defensive no-op anyway (the bytes are deterministic) but we
+// keep the explicit semantics to flag the omit-intent at review
+// time. Migration 00075's CHECK constraints
+// (compute_node_keys_key_id_shape, compute_node_keys_pem_shape)
+// reject malformed shapes at INSERT — a vmmd that mints a
+// non-64-hex-char key_id or a non-PEM block fails loud at the
+// persist step rather than corrupting the registry.
+func (s *PgStore) UpsertNodeKey(ctx context.Context, nodeID string, keyID string, publicKeyPEM string) error {
+	_, err := s.pool.Exec(ctx, `
+		insert into compute_node_keys (compute_node_id, key_id, public_key_pem)
+		values ($1, $2, $3)
+		on conflict (compute_node_id, key_id) do nothing
+	`, nodeID, keyID, publicKeyPEM)
+	if err != nil {
+		return fmt.Errorf("state: upsert compute_node_keys (node=%q, key=%s): %w", nodeID, keyID, err)
+	}
+	return nil
+}
+
 // SetComputeNodeActive flips active on a row by id (issue #98 /
 // ADR-028). The watchdog uses this to mark a row drained when
 // last_heartbeat_at ages past 90s, and the heartbeat goroutine uses it
@@ -6234,13 +6479,98 @@ const appsSelectColumns = `
 // nine callers) trips the linter instead of rotting silently.
 var _ = appsSelectColumns
 
+// deploymentSelectColumns is the canonical SELECT projection for a
+// deployment row. Used by every read path that needs the full
+// deployment state without the rootfs triple (CreateDeployment
+// RETURNING, LatestDeployment, LatestSupersededDeployment, and the
+// non-rootfs variants of ListDeploymentsForApp / ListDeploymentsForAccount).
+// The order is load-bearing — pgx scans scanDeployment positionally,
+// and the scan order matches the SELECT list.
+//
+// Issue #460 / ADR-053: the trailing 6 columns are the override shape.
+// Coalesce rules:
+//   - text[] columns: coalesce with ARRAY[]::text[] so the read
+//     destination is always a non-nil []string (mirrors the pre-PR
+//     convention used for non-override reads).
+//   - jsonb columns: NO coalesce — pgx scans into json.RawMessage which
+//     can be nil for a NULL column (pre-override rows + a refresh
+//     that didn't write env/env_secrets/healthcheck).
+//   - int port: coalesce to 0 so the absence sentinel reads as 0
+//     (mirrors nullableOverridePort on the write side).
+//
+// Adding a new column touches: this const + scanDeployment +
+// scanDeployments + the INSERT in CreateDeployment. Keep them
+// aligned; the gofmt/golangci-lint gate catches the constant binding
+// but not column-order drift.
+const deploymentSelectColumns = `
+	id, app_id, coalesce(build_id::text,''), image_digest, kind,
+	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
+	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	coalesce(source_url,''), coalesce(commit_sha,''),
+	coalesce(override_entrypoint, ARRAY[]::text[]),
+	coalesce(override_cmd, ARRAY[]::text[]),
+	override_env, override_env_secrets,
+	coalesce(override_port, 0), override_healthcheck`
+
+// deploymentSelectColumnsWithRootfs is the variant used by read paths
+// that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
+// — the three columns land between the source columns and the
+// status/error columns. Used by DeploymentByID, LiveDeployment,
+// SetDeploymentFailed.
+//
+// The order is the same as deploymentSelectColumns but with the
+// rootfs triple inserted at the canonical position. Keep this and
+// scanDeploymentWithRootfs in lockstep.
+const deploymentSelectColumnsWithRootfs = `
+	id, app_id, coalesce(build_id::text,''), image_digest, kind,
+	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
+	coalesce(rootfs_path,''), coalesce(rootfs_key,''), coalesce(rootfs_bytes,0),
+	status, coalesce(error,''), coalesce(error_code,''), created_at,
+	coalesce(source_url,''), coalesce(commit_sha,''),
+	coalesce(override_entrypoint, ARRAY[]::text[]),
+	coalesce(override_cmd, ARRAY[]::text[]),
+	override_env, override_env_secrets,
+	coalesce(override_port, 0), override_healthcheck`
+
+// Compile-time anchors for the deployment column constants. See the
+// appsSelectColumns comment above for rationale.
+var _ = deploymentSelectColumns
+var _ = deploymentSelectColumnsWithRootfs
+
+// deploymentSelectColumnsQualified is the d.alias-prefixed variant of
+// deploymentSelectColumns for SELECTs that JOIN with another table
+// (e.g. ListDeploymentsForAccount joins deployments d with apps a on
+// a.id = d.app_id). The qualifications resolve the id / app_id
+// ambiguity that arises when both tables carry the same column name.
+// Column order matches deploymentSelectColumns exactly so the
+// scanDeployments helper stays in lockstep across all read paths.
+const deploymentSelectColumnsQualified = `
+	d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
+	coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
+	d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
+	coalesce(d.source_url,''), coalesce(d.commit_sha,''),
+	coalesce(d.override_entrypoint, ARRAY[]::text[]),
+	coalesce(d.override_cmd, ARRAY[]::text[]),
+	d.override_env, d.override_env_secrets,
+	coalesce(d.override_port, 0), d.override_healthcheck`
+
+var _ = deploymentSelectColumnsQualified
+
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
 	var kind, statusStr string
+	// Issue #460 / ADR-053: six override columns scanned here so the
+	// SELECT projections in DeploymentByID / LatestDeployment / etc.
+	// match. The scan order matches the column order in the SELECT
+	// list — keep them in lockstep or pgx's positional Scan returns
+	// the wrong field into the wrong destination.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-		&d.SourceURL, &d.CommitSHA); err != nil {
+		&d.SourceURL, &d.CommitSHA,
+		&d.OverrideEntrypoint, &d.OverrideCmd,
+		&d.OverrideEnv, &d.OverrideEnvSecrets,
+		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
@@ -6263,7 +6593,10 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&rootfsPath, &rootfsKey, &d.RootfsBytes,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-		&d.SourceURL, &d.CommitSHA); err != nil {
+		&d.SourceURL, &d.CommitSHA,
+		&d.OverrideEntrypoint, &d.OverrideCmd,
+		&d.OverrideEnv, &d.OverrideEnvSecrets,
+		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
@@ -6281,7 +6614,10 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-			&d.SourceURL, &d.CommitSHA); err != nil {
+			&d.SourceURL, &d.CommitSHA,
+			&d.OverrideEntrypoint, &d.OverrideCmd,
+			&d.OverrideEnv, &d.OverrideEnvSecrets,
+			&d.OverridePort, &d.OverrideHealthcheck); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
@@ -6470,6 +6806,28 @@ var ErrConflict = errors.New("state: conflict")
 // for issue #165 / ADR-032.
 var ErrInvalidArgument = errors.New("state: invalid argument")
 
+// checkViolationMappedToInvalid lists the constraint names whose
+// CHECK violations surface as ErrInvalidArgument at the Store
+// contract. The list is intentionally narrow — most CHECK violations
+// bubble the raw *pgconn.PgError so tripwire tests like
+// TestPgStore_InstancesStateCheck_RejectsBogusState,
+// TestPgStore_InstancesStateCheck_RejectsInjection, and
+// TestPgStore_UpdateApp_SlashZeroRejected can substring-match
+// "23514" and a future widening of the CHECK (e.g. to text) is
+// visible at the test boundary.
+//
+// The two entries below map to ErrInvalidArgument because their
+// Store-layer callers (PR-B's SetAppWorkloadClass +
+// SetProjectScanSource) explicitly validate the input upstream
+// — a CHECK hit is a contract violation between the Store and the
+// schema, not a transient DB error. Don't add
+// `instances_state_check` or `apps_egress_allowlist_cidr` here —
+// their raw errors are load-bearing for the tripwires above.
+var checkViolationMappedToInvalid = map[string]struct{}{
+	"apps_workload_class_chk": {}, // SetAppWorkloadClass (PR-B)
+	"scan_source_tier_chk":    {}, // SetProjectScanSource tier enum
+}
+
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -6478,8 +6836,27 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
-		return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case pgerrcode.UniqueViolation:
+			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+		case pgerrcode.CheckViolation:
+			// CHECK violations surface as ErrInvalidArgument ONLY
+			// for the constraints named in
+			// checkViolationMappedToInvalid — the rest bubble the
+			// raw SQLSTATE so tripwire tests like
+			// TestPgStore_InstancesStateCheck_RejectsBogusState can
+			// substring-match `23514` and a future widening of
+			// `instances.state` to text is visible at the test
+			// boundary. The empty-class guard in
+			// SetAppWorkloadClass covers Go-side validation; this
+			// mapping covers schema-side defence-in-depth for the
+			// three named constraints.
+			if _, ok := checkViolationMappedToInvalid[pgErr.ConstraintName]; ok {
+				return fmt.Errorf("%w: %s", ErrInvalidArgument, pgErr.ConstraintName)
+			}
+			return err
+		}
 	}
 	return err
 }
@@ -6505,6 +6882,35 @@ func nullAppStatus(p *AppStatus) any {
 		return nil
 	}
 	return string(*p)
+}
+
+// nullJSONRaw returns nil for an empty json.RawMessage so the DB column
+// is NULL rather than the byte string "{}" or "null". Used by the
+// CreateDeployment INSERT for the override_*_env / override_healthcheck
+// jsonb columns (issue #460 / ADR-053) — a deployment that didn't
+// carry an override writes NULL, not an empty object.
+//
+// json.RawMessage IS []byte, so the non-empty branch is a direct
+// return — no conversion needed. The redirection to `any` here
+// gates the value through pgx's encode path; the slice type is
+// preserved on the wire so pgx sends the raw bytes.
+func nullJSONRaw(b json.RawMessage) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// nullableOverridePort returns nil when port is 0 (the "absent" sentinel
+// for CreateDeploymentOverrides.Port) so the column reads NULL on a
+// round-trip; otherwise the int value. Mirrors nullableInt's zero-to-NULL
+// rule but keeps the override-intent explicit at the call site so a
+// future reader can grep for it.
+func nullableOverridePort(p int) any {
+	if p == 0 {
+		return nil
+	}
+	return p
 }
 
 // cidrPrefixesToArray renders a Go []netip.Prefix as a pgx driver value

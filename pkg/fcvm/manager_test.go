@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
@@ -114,6 +115,16 @@ type fakeVMM struct {
 	// return a real (pid, true) register one here; the default
 	// (empty map) makes the handler return NotFound.
 	pids map[string]int
+	// ADR-051 PR-D: characterization report observation. The
+	// default is a zero report (no observed class) which matches
+	// the deploy-time fallback — the engine stamps the scan-hint
+	// class and the boot path proceeds. Tests that want to
+	// exercise the set-class path use characterizationReport to
+	// inject a non-empty result; charReportErr to test the
+	// "characterization failed" branch (cold-boot still proceeds
+	// because Wake treats the report as best-effort).
+	characterizationReport api.CharacterizationReport
+	charReportErr          error
 }
 
 type stagedSecret struct {
@@ -399,6 +410,22 @@ func (v *fakeVMM) DestroyWithExport(_ context.Context, l Lease, _ string) (int, 
 	v.destroyedWithExport = append(v.destroyedWithExport, l.Instance)
 	v.mu.Unlock()
 	return v.destroyWithExportExit, v.destroyWithExportErr
+}
+
+// WaitCharacterizationReport (ADR-051 PR-D) is the host-side
+// mirror of the guest-init characterize probe. The fake returns
+// the configured characterizationReport (or zero if unset) and
+// charReportErr. Tests assert the Wake path calls this on cold
+// boots only and that the report lands on the Instance. The
+// error branch is wired but Wake treats both branches as
+// best-effort (the deploy does not fail on characterize errors).
+func (v *fakeVMM) WaitCharacterizationReport(_ context.Context, l Lease, _ time.Duration) (api.CharacterizationReport, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.charReportErr != nil {
+		return api.CharacterizationReport{}, v.charReportErr
+	}
+	return v.characterizationReport, nil
 }
 
 func (v *fakeVMM) StageSecretsEnv(_ string, jsonBlob []byte) error {

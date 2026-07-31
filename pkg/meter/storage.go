@@ -1,7 +1,10 @@
 // Package meter — storage rollup tick (ADR-049 §B.3).
 //
-// pkg/meter/storage.go populates public.snapshot_storage_daily
-// (migration 00070) on a meterd cron tick. Every
+// pkg/meter/storage.go populates snapshot_storage_daily
+// (migration 00070) on a meterd cron tick. The table is
+// search_path-relative; production search_path=public puts it
+// in the public schema, pgtest-isolated tests put it in a
+// faas_test_<hex> schema. Every
 // FAAS_STORAGE_ROLLUP_INTERVAL (default 1 h) the loop walks
 // every (account, app) and sums the latest non-stale
 // snapshots.mem_bytes + snapshots.disk_bytes + the overlay

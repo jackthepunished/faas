@@ -12,6 +12,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // toWakeRequest flattens CreateFromSnapshotRequest into an fcvm.WakeRequest.
@@ -183,8 +184,14 @@ func apiEnvFromProto(pbs []*vmmdpb.APIEnvEntry) []fcvm.APIEnvEntry {
 // requestMethod is what the *caller* asked for (WAKE_RESTORE or
 // WAKE_COLD_BOOT); the actual method reflects what Manager did (a restore
 // that fell back reads WAKE_COLD_BOOT).
+//
+// ADR-051 Phase 4 / PR-D: when the wake was a cold boot and the host
+// received a CharacterizationReport, it's shipped on the wire as a
+// google.protobuf.Struct so schedd can persist the workload class via
+// SetAppWorkloadClass. Restores leave Characterization nil (the class
+// is inherited from the apps row captured in the original cold boot).
 func wakeResponseFromInstance(instance string, req fcvm.WakeRequest, inst *fcvm.Instance, requestMethod vmmdpb.WakeMethod) *vmmdpb.WakeResponse {
-	return &vmmdpb.WakeResponse{
+	resp := &vmmdpb.WakeResponse{
 		Instance:        instance,
 		LeaseUid:        int32(inst.Lease.UID),
 		HostIp:          addrOrEmpty(inst.Lease.HostIP),
@@ -194,6 +201,12 @@ func wakeResponseFromInstance(instance string, req fcvm.WakeRequest, inst *fcvm.
 		Method:          wakeMethodFrom(inst.Method),
 		RequestedMethod: requestMethod,
 	}
+	if inst.Method == fcvm.WakeColdBoot {
+		if structVal, ok := characterizationToStruct(inst.Characterization); ok {
+			resp.Characterization = structVal
+		}
+	}
+	return resp
 }
 
 func wakeMethodFrom(m fcvm.WakeMethod) vmmdpb.WakeMethod {
@@ -201,6 +214,42 @@ func wakeMethodFrom(m fcvm.WakeMethod) vmmdpb.WakeMethod {
 		return vmmdpb.WakeMethod_WAKE_RESTORE
 	}
 	return vmmdpb.WakeMethod_WAKE_COLD_BOOT
+}
+
+// characterizationToStruct encodes a CharacterizationReport as a
+// google.protobuf.Struct for the WakeResponse wire. The zero-value
+// report (the guest's deadline elapsed, no class observed) returns
+// (nil, false) so the wire field stays unset and schedd's "fall
+// back to scan-hint class" path runs unchanged. The encoding shape
+// mirrors pkg/api.CharacterizationReport's JSON tags exactly —
+// schedd decodes via json.Unmarshal into the same struct.
+func characterizationToStruct(r api.CharacterizationReport) (*structpb.Struct, bool) {
+	// Empty report = nothing useful to ship. ObservedClass is the
+	// canonical "did the probe run" signal: empty means bind_timeout
+	// or ack_timeout.
+	if r.ObservedClass == "" && r.ObservedPort == 0 && r.ExitCode == 0 {
+		return nil, false
+	}
+	m := map[string]any{
+		"observed_class": r.ObservedClass,
+		"observed_port":  r.ObservedPort,
+		"exit_code":      r.ExitCode,
+		"outbound_count": r.OutboundCount,
+		"log_tail":       r.LogTail,
+		"port_norm_mode": r.PortNormalizationMode,
+	}
+	if len(r.ListeningAddrs) > 0 {
+		l := make([]any, len(r.ListeningAddrs))
+		for i, a := range r.ListeningAddrs {
+			l[i] = a
+		}
+		m["listening_addrs"] = l
+	}
+	s, err := structpb.NewStruct(m)
+	if err != nil {
+		return nil, false
+	}
+	return s, true
 }
 
 // addrOrEmpty renders an addr as a string if valid; "" otherwise. Mirrors

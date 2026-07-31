@@ -17,9 +17,21 @@
 -- app_id, day), additive-merge ON CONFLICT, indexed by
 -- (account_id, day DESC) for the cron window scan.
 --
+-- Schema-scoping: identifiers are search_path-relative (no
+-- `public.` prefix) per the convention documented at
+-- migrations/00064_invocations_dead_letter.sql:39-49. Production
+-- search_path=public puts the table there; pgtest search_path=
+-- faas_test_<hex> puts the table in the isolated test schema —
+-- preventing the 40P01 deadlock on pg_class when N parallel test
+-- packages each try CREATE TABLE public.snapshot_storage_daily
+-- against the same cluster (issue surfaced on CI run 30645758787
+-- TestPg_ClaimCliAuthCode_BindsAccountID alongside migration
+-- 00068). Companion test updated to query through
+-- current_schema(). Original convention pinned by PR #394.
+--
 -- Slot history: 70 (next free after 00069_metering_ops_surfaces.sql).
 
-CREATE TABLE IF NOT EXISTS public.snapshot_storage_daily (
+CREATE TABLE IF NOT EXISTS snapshot_storage_daily (
     account_id      uuid    NOT NULL,
     app_id          uuid    NOT NULL,
     day             date    NOT NULL,
@@ -30,15 +42,15 @@ CREATE TABLE IF NOT EXISTS public.snapshot_storage_daily (
 );
 
 CREATE INDEX IF NOT EXISTS snapshot_storage_daily_account_day_idx
-    ON public.snapshot_storage_daily (account_id, day DESC);
+    ON snapshot_storage_daily (account_id, day DESC);
 
-COMMENT ON TABLE public.snapshot_storage_daily IS
+COMMENT ON TABLE snapshot_storage_daily IS
     'Per-(account, app, day) byte totals from snapshots.mem_bytes + disk_bytes + overlay staging. Source: pkg/meter/storage.go cron tick. ADR-049 §B.3. Informational only — not billed today; the future "Pro plan 1 GB included" PR consumes this surface.';
 
-COMMENT ON COLUMN public.snapshot_storage_daily.snapshot_bytes IS
+COMMENT ON COLUMN snapshot_storage_daily.snapshot_bytes IS
     'Σ snapshots.mem_bytes + snapshots.disk_bytes (latest non-stale row per app per day). ADR-049 §B.3. Informational.';
 
-COMMENT ON COLUMN public.snapshot_storage_daily.layer_bytes IS
+COMMENT ON COLUMN snapshot_storage_daily.layer_bytes IS
     'Σ overlay staging bytes per app per day. ADR-049 §B.3. Informational.';
 
 -- +goose StatementEnd
@@ -46,5 +58,5 @@ COMMENT ON COLUMN public.snapshot_storage_daily.layer_bytes IS
 -- +goose Down
 -- +goose StatementBegin
 DROP INDEX IF EXISTS snapshot_storage_daily_account_day_idx;
-DROP TABLE IF EXISTS public.snapshot_storage_daily;
+DROP TABLE IF EXISTS snapshot_storage_daily;
 -- +goose StatementEnd

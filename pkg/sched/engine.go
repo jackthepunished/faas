@@ -30,6 +30,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -138,6 +139,15 @@ type Engine struct {
 	// verifier is nil — see WithVerifier's doc.
 	verifier LayerVerifier
 
+	// audit is the IAM-4 seam for cold-boot characterization events
+	// (ADR-051 PR-D review finding #6: "app.characterized audit
+	// emission"). Distinct from pkg/sched/loop.go::Loop.audit, which
+	// serves the cron-fired path; the wake-path emit lives here so
+	// it sits next to the SetAppWorkloadClass call it accompanies.
+	// nil opts out (no row written); production cmd/schedd wires the
+	// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
+	audit *audit.Auditor
+
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
@@ -181,6 +191,19 @@ type Engine struct {
 	// accessor) so pre-axis-5 test fixtures that don't wire a
 	// table keep their existing single-box behaviour.
 	capacityTable *nodeCapacityTable
+
+	// nodeKeys is the in-memory (key_id → *ecdsa.PublicKey)
+	// registry the ReportCapacity handler consults to verify
+	// the report's node_signature (ADR-053). Populated by the
+	// 'compute_node_changed' pg_notify listener at startup;
+	// refreshed on every node key INSERT/UPDATE/DELETE.
+	//
+	// nil means "signature verification disabled" — pre-slice-3
+	// schedd accepts every report as in axis 5. Slice-3 schedd
+	// always returns a non-nil registry; the production wiring
+	// sets it inside cmd/schedd/main.go's NewEngine caller via
+	// WithNodeKeyRegistry (or any future wiring seam).
+	nodeKeys *NodeKeyRegistry
 
 	// defaultLocalNodeID is the resolved UUID of the 'default-local'
 	// compute_node (issue #97 / ADR-025 axis 3). Looked up once at
@@ -296,6 +319,18 @@ func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
 	return e
 }
 
+// WithAudit attaches the IAM-4 audit seam for the cold-boot
+// characterization path (ADR-051 PR-D review finding #6).
+// Distinct from pkg/sched/loop.go::Loop.WithAudit, which serves
+// the cron-fired path; this setter scopes audit emission to the
+// wake path. nil opts out (no row written) so pre-PR-D fixtures
+// keep their existing behaviour. Production cmd/schedd wires the
+// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
+func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
+	e.audit = a
+	return e
+}
+
 // CapacityTable returns the per-node live-capacity table for
 // the ReportCapacity gRPC handler to drive (ADR-025 axis 5).
 // The handler calls table.Replace per stream Recv; the chooser
@@ -321,7 +356,38 @@ func (e *Engine) CapacityTable() *nodeCapacityTable { return e.capacityTable }
 //
 // nil table (pre-axis-5 fixture) returns a no-op sink.
 func (e *Engine) CapacitySink() CapacitySink {
+	if e == nil || e.capacityTable == nil {
+		return func(CapacityReport) error { return nil }
+	}
 	return e.capacityTable.CapacitySink()
+}
+
+// WithNodeKeyRegistry wires the ADR-053 signature-verification
+// registry onto the engine. Called once at startup after
+// NewEngine returns; the listener for 'compute_node_changed'
+// fires Refresh on every notify. A nil registry disables
+// signature verification (pre-slice-3 mode).
+//
+// Returns the engine so it composes with the NewEngine call:
+// `e, err := NewEngine(...).WithNodeKeyRegistry(reg)`.
+func (e *Engine) WithNodeKeyRegistry(reg *NodeKeyRegistry) *Engine {
+	if e == nil {
+		return e
+	}
+	e.nodeKeys = reg
+	return e
+}
+
+// NodeKeyRegistry returns the engine's signature-verification
+// registry. nil means "verification disabled" — the handler
+// accepts every report as in pre-slice-3.
+//
+// Implements scheddgrpc.SchedAPI.
+func (e *Engine) NodeKeyRegistry() *NodeKeyRegistry {
+	if e == nil {
+		return nil
+	}
+	return e.nodeKeys
 }
 
 // WakeResult is what the gateway needs back from a wake: which instance
@@ -821,6 +887,43 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)
 	}
+
+	// ADR-051 Phase 4 / PR-D: persist the workload class the
+	// characterize probe observed on the cold boot. On restore we
+	// inherit from the apps row (no observation here — the warm
+	// path runs the same scan-hint class the original cold boot
+	// committed). On cold-boot timeouts the report is empty and we
+	// keep the scan-hint class (no row mutation). Best-effort:
+	// SetAppWorkloadClass failure doesn't block the RUNNING
+	// transition — the class is metadata, not the boot path.
+	if out.Characterization.ObservedClass != "" {
+		if _, err := e.store.SetAppWorkloadClass(ctx, bootInput.appID, state.WorkloadClass(out.Characterization.ObservedClass), "observed"); err != nil {
+			e.log.Warn("wake: SetAppWorkloadClass", "app", bootInput.appID, "err", err)
+		}
+		// PR-D review finding #6: emit an `app.characterized` audit
+		// row so an operator tailing events can pin the observed
+		// class back to the boot that surfaced it. Carries the
+		// guest's class hint, the observed port, exit code, and
+		// the chosen portnorm rung — enough to reconstruct "why is
+		// this app now classed http" from the event log alone
+		// (no vmmd slog archaeology). Best-effort per ADR-035:
+		// audit.Emit never returns an error and never blocks the
+		// RUNNING transition. nil auditor (pre-PR-D fixtures) is
+		// tolerated via the nil check.
+		if e.audit != nil {
+			e.audit.Emit(ctx, "app.characterized", nil, map[string]any{
+				"app_id":          bootInput.appID,
+				"wake_id":         bootInput.wakeID,
+				"observed_class":  out.Characterization.ObservedClass,
+				"observed_port":   out.Characterization.ObservedPort,
+				"exit_code":       out.Characterization.ExitCode,
+				"listening_addrs": out.Characterization.ListeningAddrs,
+				"port_norm_mode":  out.Characterization.PortNormalizationMode,
+				"log_tail_chars":  len(out.Characterization.LogTail),
+			})
+		}
+	}
+
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
 	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID}, nil

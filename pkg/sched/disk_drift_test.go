@@ -10,10 +10,13 @@ package sched
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -659,3 +662,162 @@ func TestDiskDrift_TableDriven(t *testing.T) {
 // platform-dependent; the symlink test exercises the most common
 // non-regular mode).
 var _ fs.FileMode = 0
+
+// --- ADR-054 §3 storage-backend-aware sweep tests ----------------------
+//
+// The tests below pin the storage-backed path: when WithStorage is
+// wired, the sweep enumerates the snap/ prefix via backend.List
+// instead of os.ReadDir. The byte-comparison path is intentionally
+// not exercised here (registry manifests don't expose byte sizes);
+// these tests assert the presence + orphan checks that survive the
+// storage backend's abstraction layer.
+
+// fakeStorageLister is a hand-rolled minimal StorageBackend stub
+// for the storage-backed tests. DiskDrift.WithStorage type-asserts
+// the value to LocalArtifactLister; we satisfy that surface with a
+// single List method. Put/Get/Delete are stubbed so the value also
+// satisfies StorageBackend (the function parameter type).
+type fakeStorageLister struct {
+	keys []string
+	err  error
+}
+
+func (f *fakeStorageLister) Put(_ context.Context, _ string, _ io.Reader) error {
+	return nil
+}
+func (f *fakeStorageLister) Get(_ context.Context, _ string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (f *fakeStorageLister) Delete(_ context.Context, _ string) error { return nil }
+
+// List is the surface DiskDrift.WithStorage type-asserts and calls.
+func (f *fakeStorageLister) List(_ context.Context, _ string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.keys, nil
+}
+
+// TestDiskDrift_StorageBackend_PresenceMatch pins the happy path:
+// when WithStorage is wired and the listed keys include both mem +
+// vmstate for every DB-known dep, drift stays at 0.
+func TestDiskDrift_StorageBackend_PresenceMatch(t *testing.T) {
+	store := state.NewMemStore()
+	dd := NewDiskDrift(store, nil).
+		WithStorage(&fakeStorageLister{keys: []string{
+			"snap/d-1/mem",
+			"snap/d-1/vmstate",
+			"snap/d-2/mem",
+			"snap/d-2/vmstate",
+		}})
+	// Seed two dep rows.
+	ctx := context.Background()
+	seedDriftRow(ctx, t, store, "d-1")
+	seedDriftRow(ctx, t, store, "d-2")
+	drift, err := dd.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if drift != 0 {
+		t.Errorf("drift = %d, want 0 (all keys present)", drift)
+	}
+}
+
+// TestDiskDrift_StorageBackend_MissingFileIncrements pins the
+// presence-check contract: a missing mem file in storage increments
+// the drift counter, regardless of whether the deployment has bytes
+// recorded in the DB.
+func TestDiskDrift_StorageBackend_MissingFileIncrements(t *testing.T) {
+	store := state.NewMemStore()
+	dd := NewDiskDrift(store, nil).
+		WithStorage(&fakeStorageLister{keys: []string{
+			"snap/d-1/mem",
+			// vmstate deliberately absent.
+		}})
+	ctx := context.Background()
+	seedDriftRow(ctx, t, store, "d-1")
+	drift, err := dd.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if drift != 1 {
+		t.Errorf("drift = %d, want 1 (vmstate missing)", drift)
+	}
+}
+
+// TestDiskDrift_StorageBackend_OrphanDepIncrements pins the
+// orphan check: a key in storage with no matching DB row is drift.
+func TestDiskDrift_StorageBackend_OrphanDepIncrements(t *testing.T) {
+	store := state.NewMemStore()
+	dd := NewDiskDrift(store, nil).
+		WithStorage(&fakeStorageLister{keys: []string{
+			"snap/d-orphan/mem",
+			"snap/d-orphan/vmstate",
+		}})
+	drift, err := dd.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if drift != 1 {
+		t.Errorf("drift = %d, want 1 (orphan dep dir)", drift)
+	}
+}
+
+// TestDiskDrift_StorageBackend_ListErrorFallsBackToDisk pins the
+// degradation path: a backend.List error falls back to the on-disk
+// os.ReadDir path so a transient registry outage doesn't silence
+// the drift detector entirely. The fixture also leaves /srv/fc/snap
+// empty (snapDir is package-default), so the fallback returns 0
+// drift (no orphan + no expected).
+func TestDiskDrift_StorageBackend_ListErrorFallsBackToDisk(t *testing.T) {
+	store := state.NewMemStore()
+	dd := NewDiskDrift(store, nil).
+		WithStorage(&fakeStorageLister{err: errors.New("registry down")})
+	// Don't seed any DB rows — the fallback runs with empty
+	// expected set + empty snap dir → 0 drift, but proves the
+	// fallback path doesn't propagate the List error.
+	drift, err := dd.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v (fallback should swallow List error)", err)
+	}
+	if drift != 0 {
+		t.Errorf("drift = %d, want 0 (fallback clean run)", drift)
+	}
+}
+
+// seedDriftRow inserts a minimal Account + App + Deployment +
+// Snapshot triple for a single depID via MemStore. The email is
+// depID-suffixed because MemStore rejects duplicate emails, and
+// several storage-backed tests share a single MemStore instance.
+func seedDriftRow(ctx context.Context, t *testing.T, store *state.MemStore, depID string) {
+	t.Helper()
+	now := time.Now()
+	acct, err := store.CreateAccount(ctx, "drift-store-"+depID+"@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	app, err := store.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "drift-store-" + depID, Type: state.AppTypeApp,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	dep, err := store.CreateDeployment(ctx, state.Deployment{
+		ID: depID, AppID: app.ID, ImageDigest: "img:latest", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("create deployment: %v", err)
+	}
+	_, err = store.CreateSnapshot(ctx, state.Snapshot{
+		DeploymentID: dep.ID,
+		FCVersion:    "v1.0",
+		StorageKey:   "snap/" + depID + "/mem",
+		MemBytes:     1024,
+		DiskBytes:    2048,
+		CreatedAt:    now,
+	})
+	if err != nil {
+		t.Fatalf("create snapshot: %v", err)
+	}
+}

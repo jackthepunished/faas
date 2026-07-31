@@ -2,5 +2,19 @@
 # nftables role defaults — mirror pkg/netns constants so ansible tasks
 # can reference them by name. Keep these in lockstep with the Go source
 # of truth (pkg/netns/config.go: TenantBridge, HostBridgeCIDR).
+#
+# Per-host egress (ADR-055). `public_iface` and `masquerade_cidr` are
+# the per-host substitution points. The defaults below match
+# `pkg/netns.DefaultHostPolicy` (the EX44 default-local node shape:
+# eth0 + 10.100.0.0/16). A Hetzner compute node on a different NIC
+# name (e.g. `ens5`) overrides via `host_vars[<compute_node>].public_iface`
+# in the ansible inventory; the Jinja2 template at
+# `files/policy_nftables.conf.j2` substitutes these values site-for-
+# site. The Go render (`cmd/faas-nft-render` with the matching flags
+# or `FAAS_PUBLIC_IFACE` / `FAAS_MASQUERADE_CIDR` envs) is the
+# source of truth; `make egress-render-cross-check` byte-compares the
+# two for the default values.
 tenant_bridge: br-tenants
 bridge_cidr: 10.100.0.1/16
+public_iface: eth0
+masquerade_cidr: 10.100.0.0/16

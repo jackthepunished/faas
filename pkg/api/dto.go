@@ -3,6 +3,9 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -120,6 +123,203 @@ type AppResponse struct {
 // variant is used for tarball/dockerfile deploys).
 type CreateDeploymentRequest struct {
 	Image string `json:"image,omitempty"` // registry.gregale.dev/...@sha256:...
+	// Overrides is the Fargate-shaped deploy-time override object
+	// (issue #460 / ADR-053). Lets a customer redeploy the same
+	// digest-pinned image with a different entrypoint/cmd/env/port
+	// without rebuilding the image. The field list is frozen by
+	// ADR-053 §Decision 1 — any new override field requires a new
+	// ADR. Nil/omitted means "no overrides; deploy the image as-is".
+	Overrides *CreateDeploymentOverrides `json:"overrides,omitempty"`
+}
+
+// CreateDeploymentOverrides is the optional override object on
+// CreateDeploymentRequest (issue #460 / ADR-053). Six fields, frozen
+// by ADR-053 §Decision 1. The handler calls Validate(limits) before
+// persisting — a failed validation 400s the whole request (the
+// override is never silently dropped; the customer who set it
+// expects it to apply).
+//
+// Env / env_secrets share Limits.EnvVarsMax (ADR-045 §Decision 1 +
+// ADR-053 §Decision 1): the total len(env) + len(env_secrets) is
+// checked against the cap, so a customer cannot bypass the per-app
+// quota by mixing the two surfaces.
+//
+// Env values are persisted plaintext into override_env jsonb. Env
+// secret values are NOT plaintext — they are refs of the shape
+// "secret:NAME" where NAME matches ^[A-Z][A-Z0-9_]*$ and resolves at
+// wake time against the existing app_secrets table. The refs are
+// stored verbatim in override_env_secrets jsonb; runtime resolution
+// is a follow-up PR (imaged layer injection).
+type CreateDeploymentOverrides struct {
+	// Entrypoint replaces the OCI image's ENTRYPOINT/CMD argv when
+	// the guest execs the workload. Required to be non-empty if
+	// present; each element must be non-empty. nil = no override.
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	// Cmd is appended to Entrypoint (mirrors the OCI runtime
+	// contract: argv = entrypoint + cmd). nil = no override.
+	Cmd []string `json:"cmd,omitempty"`
+	// Env is the plaintext env map applied at boot. Key per
+	// ValidateEnvKey (^[A-Z][A-Z0-9_]*$); per-value byte cap per
+	// limits.EnvValueMaxBytes. nil/empty = no override.
+	Env map[string]string `json:"env,omitempty"`
+	// EnvSecrets is the sealed-secret-ref env map applied at boot.
+	// Each VALUE is a "secret:NAME" ref (NAME matching the same
+	// identifier grammar); each KEY is the env-var name set inside
+	// the guest. Counts toward the same env_vars_max cap as Env.
+	// nil/empty = no override.
+	EnvSecrets map[string]string `json:"env_secrets,omitempty"`
+	// Port is the listen port; 1..65535. 0 means "absent / fall
+	// back to image default" (DefaultAppPort, today = 8080). The
+	// host-side plumbing that propagates this value to netns +
+	// vmmd waitReady + runners ships in PR-C; PR-A persists the
+	// column and surfaces it on the response.
+	Port int `json:"port,omitempty"`
+	// Healthcheck is the optional readiness probe. PR-A persists
+	// the shape; PR-A does NOT yet extend vmm.waitReady to issue
+	// an HTTP probe — the probe stays a bare TCP accept. The
+	// HTTP-probe variant is its own ADR + property test.
+	Healthcheck *DeploymentHealthcheck `json:"healthcheck,omitempty"`
+}
+
+// DeploymentHealthcheck is the readiness-probe shape on the
+// override object. Defaults: interval 5s, timeout 2s, retries 3.
+// Path is required (and must start with "/") when the parent
+// healthcheck is set.
+type DeploymentHealthcheck struct {
+	Path      string `json:"path"`
+	IntervalS int    `json:"interval_s,omitempty"`
+	TimeoutS  int    `json:"timeout_s,omitempty"`
+	Retries   int    `json:"retries,omitempty"`
+}
+
+// secretRefPrefix is the wire prefix on env_secrets values that
+// flags the value as a sealed-secret ref rather than a plaintext
+// fallback. ADR-053 §Decision 1 — the runtime resolver (PR-B) will
+// strip this prefix and look up the trailing name against the
+// app_secrets table. PR-A only validates the shape; resolution is
+// a follow-up.
+const secretRefPrefix = "secret:"
+
+// secretRefNameRe matches the NAME portion of a sealed-secret ref.
+// Same identifier grammar as env keys / secret keys (ADR-045
+// §Decision 1 mirror) — one regex, no drift.
+var secretRefNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+// Validate enforces every override field's constraint from
+// ADR-053 §Decision 1. Returns nil on success or a *Problem with
+// RFC 7807 status 400 (or 413 for value-too-large, mirroring
+// ErrEnvVarValueTooLarge). The handler maps this directly to
+// api.WriteProblem; no further error wrapping needed.
+//
+// Limits is passed in by the caller (apid looks up via
+// api.MustLimitsFor(acct.Plan)) so this stays a pure function —
+// testable without an account / DB.
+func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
+	if o == nil {
+		return nil
+	}
+
+	// entrypoint: non-empty if present; every element non-empty.
+	for i, e := range o.Entrypoint {
+		if e == "" {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("entrypoint[%d] is empty; every argv element must be non-empty.", i))
+		}
+	}
+
+	// cmd: non-empty if present; every element non-empty.
+	for i, c := range o.Cmd {
+		if c == "" {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("cmd[%d] is empty; every argv element must be non-empty.", i))
+		}
+	}
+
+	// env + env_secrets share EnvVarsMax. Compute total first so
+	// the cap error names BOTH surfaces when both contribute.
+	totalEnv := len(o.Env) + len(o.EnvSecrets)
+	if limits.EnvVarsMax > 0 && totalEnv > limits.EnvVarsMax {
+		return NewProblem(http.StatusBadRequest, CodeValidation,
+			"Override env count exceeded",
+			fmt.Sprintf("%s plan allows %d env+env_secrets entries per override; got %d (env=%d, env_secrets=%d).",
+				limits.Plan, limits.EnvVarsMax, totalEnv, len(o.Env), len(o.EnvSecrets))).
+			WithLimit(int64(limits.EnvVarsMax), int64(totalEnv)).
+			WithDocs("https://docs.gregale.dev/deploy-overrides#env")
+	}
+
+	// env: key grammar + per-value byte cap. The same byte cap
+	// covers env_secrets ref strings (they are also text the
+	// customer sends); the ref grammar check is below.
+	for k, v := range o.Env {
+		if p := ValidateEnvKey(k); p != nil {
+			return p
+		}
+		if limits.EnvValueMaxBytes > 0 && len(v) > limits.EnvValueMaxBytes {
+			return ErrEnvVarValueTooLarge(limits, len(v))
+		}
+	}
+
+	// env_secrets: key grammar + "secret:NAME" ref shape + per-value
+	// byte cap on the ref string.
+	for k, v := range o.EnvSecrets {
+		if p := ValidateEnvKey(k); p != nil {
+			return p
+		}
+		if !strings.HasPrefix(v, secretRefPrefix) {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("env_secrets[%q] value must start with %q (e.g. %qDB-URL); got %q.",
+					k, secretRefPrefix, secretRefPrefix, v))
+		}
+		name := strings.TrimPrefix(v, secretRefPrefix)
+		if !secretRefNameRe.MatchString(name) {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("env_secrets[%q] ref name %q must match %s.",
+					k, name, secretRefNameRe.String()))
+		}
+		if limits.EnvValueMaxBytes > 0 && len(v) > limits.EnvValueMaxBytes {
+			return ErrEnvVarValueTooLarge(limits, len(v))
+		}
+	}
+
+	// port: 0 means absent (fall back to image default). 1..65535
+	// when present.
+	if o.Port != 0 && (o.Port < 1 || o.Port > 65535) {
+		return NewProblem(http.StatusBadRequest, CodeValidation,
+			"Invalid override",
+			fmt.Sprintf("port %d out of range; must be 0 (absent) or 1..65535.", o.Port))
+	}
+
+	// healthcheck: path must start with "/" if set; defaults
+	// applied on Persist side (the column shape is the raw shape).
+	if o.Healthcheck != nil {
+		if !strings.HasPrefix(o.Healthcheck.Path, "/") {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("healthcheck.path must start with %q; got %q.",
+					"/", o.Healthcheck.Path))
+		}
+		if o.Healthcheck.IntervalS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("healthcheck.interval_s must be >= 0; got %d.", o.Healthcheck.IntervalS))
+		}
+		if o.Healthcheck.TimeoutS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("healthcheck.timeout_s must be >= 0; got %d.", o.Healthcheck.TimeoutS))
+		}
+		if o.Healthcheck.Retries < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("healthcheck.retries must be >= 0; got %d.", o.Healthcheck.Retries))
+		}
+	}
+
+	return nil
 }
 
 // BuildProvenanceResponse is the public surface of build_provenance
@@ -167,6 +367,39 @@ type DeploymentResponse struct {
 	// programmatic consumer can branch on ErrorCode != "".
 	ErrorCode string `json:"error_code,omitempty"`
 	CreatedAt string `json:"created_at"`
+	// HasOverrides is true when the deployment carries an
+	// override_* column set (issue #460 / ADR-053). Lets dashboards
+	// render "this deploy pinned overrides" without re-parsing the
+	// six sibling fields.
+	HasOverrides bool `json:"has_overrides,omitempty"`
+	// OverrideEntrypoint is the argv override echoed verbatim; nil
+	// when the deployment carried no override. ADR-053 §Decision 4:
+	// these fields are non-secret and safe to echo.
+	OverrideEntrypoint []string `json:"override_entrypoint,omitempty"`
+	// OverrideCmd is the cmd override echoed verbatim; nil when
+	// the deployment carried no override.
+	OverrideCmd []string `json:"override_cmd,omitempty"`
+	// OverrideEnvKeys is the set of env-var keys set by the env
+	// override. VALUES ARE NEVER ECHOED (ADR-053 §Decision 4 +
+	// ADR-045 §Decision 6 mirror). Empty when no env override.
+	OverrideEnvKeys []string `json:"override_env_keys,omitempty"`
+	// OverrideEnvSecretKeys is the set of env-var keys set by the
+	// env_secrets override. VALUES (the "secret:NAME" refs) are
+	// echoed verbatim because the ref shape is non-secret by
+	// design — the customer needs to see which secret they bound
+	// to which env var to debug a misconfigured deploy. Empty
+	// when no env_secrets override.
+	OverrideEnvSecretKeys []string `json:"override_env_secret_keys,omitempty"`
+	// OverrideEnvSecretRefs is the verbatim "secret:NAME" map,
+	// parallel to OverrideEnvSecretKeys. Same rationale: the refs
+	// are non-secret. nil when no env_secrets override.
+	OverrideEnvSecretRefs map[string]string `json:"override_env_secret_refs,omitempty"`
+	// OverridePort is the listen-port override (0 = absent /
+	// fall back to image default). ADR-053 §Decision 1.
+	OverridePort int `json:"override_port,omitempty"`
+	// OverrideHealthcheck is the readiness-probe override
+	// verbatim. Persisted; the actual HTTP probe is a follow-up.
+	OverrideHealthcheck *DeploymentHealthcheck `json:"override_healthcheck,omitempty"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's
@@ -1256,4 +1489,108 @@ type AppsMetricsResponse struct {
 	Source string                        `json:"source"`
 	AsOf   string                        `json:"as_of"`
 	Apps   map[string]AppMetricsResponse `json:"apps"`
+}
+
+// ProjectScanRequest is the multipart body for POST /v1/projects/scan.
+// Defined as a DTO (rather than an inline handler struct) so the
+// schema-parity AST gate can assert field-for-field equivalence with
+// the OpenAPI spec.
+type ProjectScanRequest struct {
+	Source           string `json:"source"`            // tar.gz binary blob
+	ProjectSlug      string `json:"project_slug"`      // kebab slug
+	ProductionBranch string `json:"production_branch"` // default "main"
+	InstallID        int64  `json:"install_id"`        // GitHub install id (--repo); 0 for unbound
+	Only             string `json:"only"`              // CSV of workload names
+}
+
+// ProjectApplyRequest is the multipart body for POST /v1/projects.
+// Shape mirrors ProjectScanRequest — the handler re-runs the scan
+// and re-checks the plan token internally.
+type ProjectApplyRequest struct {
+	Source           string `json:"source"`
+	ProjectSlug      string `json:"project_slug"`
+	ProductionBranch string `json:"production_branch"`
+	InstallID        int64  `json:"install_id"`
+	Only             string `json:"only"`
+}
+
+// PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).
+// Field names match the OpenAPI schema verbatim — the spec-check
+// AST gate enforces the field-for-field mapping.
+type PlanWorkload struct {
+	Name       string   `json:"name"`
+	RootDir    string   `json:"root_dir"`
+	Dockerfile string   `json:"dockerfile,omitempty"`
+	Command    []string `json:"command"`
+	Class      string   `json:"class,omitempty"`
+	Schedule   string   `json:"schedule,omitempty"`
+	Ports      []int    `json:"ports"`
+	EnvKeys    []string `json:"env_keys,omitempty"`
+	Source     string   `json:"source,omitempty"`
+	Tier       string   `json:"tier,omitempty"`
+}
+
+// PlanManaged mirrors reposcan.Managed.
+type PlanManaged struct {
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	EnvHint string `json:"env_hint"`
+	Source  string `json:"source"`
+	Image   string `json:"image"`
+}
+
+// PlanCron is the per-cron line in the scan response. Carries the
+// workload name (NOT the AppID — that's resolved at apply time).
+type PlanCron struct {
+	WorkloadName string `json:"workload_name"`
+	Schedule     string `json:"schedule"`
+	Path         string `json:"path"`
+	Enabled      bool   `json:"enabled"`
+}
+
+// QuotaBlock is the limit + observed extension on a plan-quota
+// problem. Mirrors api.Problem.WithLimit — emitted alongside any
+// 402/403 quota response so the CLI can render "X/Y apps" without
+// a second request.
+type QuotaBlock struct {
+	Limit    int64  `json:"limit,omitempty"`
+	Observed int64  `json:"observed,omitempty"`
+	DocsURL  string `json:"docs_url,omitempty"`
+}
+
+// PlanResponse is the dry-run response from POST /v1/projects/scan.
+// Fields mirror scanPlanResponse in cmd/apid/scan_service.go; the
+// DTO is the wire shape, the in-process struct is the
+// handler-internal carrier.
+type PlanResponse struct {
+	ProjectSlug     string         `json:"project_slug"`
+	RepoFullName    string         `json:"repo_full_name,omitempty"`
+	ScanSource      string         `json:"scan_source"`
+	Tier            string         `json:"tier"`
+	Workloads       []PlanWorkload `json:"workloads"`
+	Managed         []PlanManaged  `json:"managed"`
+	Crons           []PlanCron     `json:"crons"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	ObservedApps    int            `json:"observed_apps"`
+	ObservedCrons   int            `json:"observed_crons"`
+	LimitApps       int            `json:"limit_apps"`
+	LimitCrons      int            `json:"limit_crons"`
+	CanApply        bool           `json:"can_apply"`
+	CronsNotAllowed bool           `json:"crons_not_allowed,omitempty"`
+	PlanToken       string         `json:"plan_token"`
+}
+
+// ApplyResponse is the success body for POST /v1/projects. Carries
+// the inserted project_id + per-app IDs so the CLI's --yes flow
+// can render "applied: <slug> → <app_id>".
+type ApplyResponse struct {
+	PlanResponse
+	ProjectID string             `json:"project_id"`
+	Apps      []ApplyResponseApp `json:"apps"`
+}
+
+// ApplyResponseApp is the per-app line in the apply response.
+type ApplyResponseApp struct {
+	Slug string `json:"slug"`
+	ID   string `json:"id"`
 }

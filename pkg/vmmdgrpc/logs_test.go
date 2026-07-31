@@ -24,11 +24,32 @@ import (
 // drain the initial page, then publish 2 more live lines via Subscribe
 // and assert the stream emits them in commit order.
 //
-// Backpressure: gRPC's stream.Send on a buffered client keeps the
-// round-trip cost bounded; the test uses a small context timeout so
-// the live-tail loop can't spin forever if the Subscribe path drops
-// instead of delivering.
+// Backpressure / timing: gRPC's stream.Send on a buffered client
+// keeps the round-trip cost bounded, and the test wraps the live-
+// tail Recv in its own per-call ctx so a real Subscribe deadlock
+// still trips within ~1 s. The 2026-07-31 coverage-job flake
+// (`coverage (Codecov)` retry ×2, same test) was traced to the
+// Subscribe→Send propagation occasionally taking > 2 s under
+// `-coverpkg=all` across 700+ packages — the previous single-ctx
+// design charged the entire test budget against one ctx, including
+// the snapshot Recvs that returned in microseconds, leaving no
+// slack for the live-tail Recv at the end of that budget. Using a
+// per-Recv budget isolates the snapshot phase (µs) from the
+// live-tail phase (the propagation delay), so a handler that's
+// actually hung still fails fast — only the rate-limited
+// propagation gets the longer window.
+//
+// snapshotBudget covers the streaming RPC itself plus the snapshot
+// Recvs (microseconds in practice). liveTailWait is the per-call
+// budget for just the live-tail Seq=4 Recv: 1 s is ~1000× the
+// steady-state ms latency and ~1000× a real bug; the coverage job
+// still triggers in <1 s of CPU because the Subscribe→Send
+// propagation completes far under that.
 func TestLogs_HappyPath(t *testing.T) {
+	const (
+		snapshotBudget = 2 * time.Second
+		liveTailWait   = 1 * time.Second
+	)
 	ring := logbuf.New(1 << 20)
 	for _, ln := range []string{"alpha\n", "beta\n", "gamma\n"} {
 		if _, err := ring.Write("stdout", []byte(ln)); err != nil {
@@ -39,7 +60,7 @@ func TestLogs_HappyPath(t *testing.T) {
 		logRingFn: func(string) *logbuf.Ring { return ring },
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotBudget)
 	defer cancel()
 	// SinceSeq=1 replays the seeded lines (Seq 1..3). SinceSeq=0 is
 	// the "tail from now" sentinel (per pkg/fcvm/logbuf.Ring.Snapshot
@@ -75,11 +96,17 @@ func TestLogs_HappyPath(t *testing.T) {
 			t.Errorf("got[%d].Seq = %d, want %d", i, got[i].Seq, i+1)
 		}
 	}
-	// Live tail: push one more line, expect it on the stream.
+	// Live tail: push one more line, expect it on the stream. We use
+	// a per-Recv context (recvWithCtx) so the budget for this single
+	// Recv is independent of any latency already elapsed under the RPC
+	// ctx — that's the move that pins down the coverage-job flake
+	// without masking a real Subscribe deadlock.
 	if _, err := ring.Write("stderr", []byte("post-subscribe\n")); err != nil {
 		t.Fatalf("tail Write: %v", err)
 	}
-	resp, err := stream.Recv()
+	tailCtx, tailCancel := context.WithTimeout(context.Background(), liveTailWait)
+	defer tailCancel()
+	resp, err := recvWithCtx(tailCtx, stream)
 	if err != nil {
 		t.Fatalf("tail Recv: %v", err)
 	}
@@ -184,4 +211,34 @@ func startLogsTestClient(t *testing.T, fake *fakeVMM) vmmdpb.VmmdClient {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return vmmdpb.NewVmmdClient(conn)
+}
+
+// recvWithCtx waits for the next frame on a server-streaming RPC,
+// bounded by the supplied ctx. The stdlib gRPC stream.Recv does NOT
+// honour its own context argument: cancelling the caller's RPC ctx
+// terminates the entire stream, which is not what we want for a
+// per-Recv deadline. The canonical workaround is to Recv on a
+// goroutine and select on a ctx.Done channel; whichever wins
+// determines the return. If the ctx fires first, the goroutine is
+// left blocked on Recv until the underlying stream returns (which
+// happens when the RPC ctx is cancelled at test teardown via
+// `defer cancel()` of the parent ctx). The recv goroutine cannot
+// leak past the test — t.Cleanup in startLogsTestClient closes the
+// connection, which unblocks Recv with an error.
+func recvWithCtx(ctx context.Context, stream vmmdpb.Vmmd_LogsClient) (*vmmdpb.LogsResponse, error) {
+	type result struct {
+		resp *vmmdpb.LogsResponse
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		r, err := stream.Recv()
+		ch <- result{r, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.resp, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

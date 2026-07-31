@@ -20,10 +20,12 @@ import (
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/overlay"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // VMM is the slice of vmmd schedd depends on. Defined as an interface so the
@@ -283,15 +285,25 @@ type SnapshotBytes struct {
 // WakeOutcome is the decoded result of a vmmd wake. Method reports what vmmd
 // actually did; RequestedMethod is what schedd asked for (a restore that fell
 // back to cold boot per ADR-005 reads Method=WAKE_COLD_BOOT here).
+//
+// ADR-051 Phase 4 / PR-D: Characterization carries the
+// guest-init characterization report vmmd received during a cold
+// boot. Empty on restore (the warm wake inherits the class from the
+// apps row) and empty on cold-boot timeouts (engine falls back to
+// the scan-hint class). The struct payload decodes via
+// json.Unmarshal into pkg/api.CharacterizationReport on the engine
+// side; we keep the wire shape as a structpb.Struct here so the
+// proto side stays narrow.
 type WakeOutcome struct {
-	Instance        string
-	LeaseUID        int32
-	HostIP          string
-	Netns           string
-	VethHost        string
-	VethPeer        string
-	Method          vmmdpb.WakeMethod
-	RequestedMethod vmmdpb.WakeMethod
+	Instance         string
+	LeaseUID         int32
+	HostIP           string
+	Netns            string
+	VethHost         string
+	VethPeer         string
+	Method           vmmdpb.WakeMethod
+	RequestedMethod  vmmdpb.WakeMethod
+	Characterization api.CharacterizationReport
 }
 
 // VMMClient is the production VMM: a gRPC connection to vmmd's unix socket.
@@ -600,7 +612,7 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 }
 
 func outcomeFromProto(r *vmmdpb.WakeResponse) *WakeOutcome {
-	return &WakeOutcome{
+	o := &WakeOutcome{
 		Instance:        r.GetInstance(),
 		LeaseUID:        r.GetLeaseUid(),
 		HostIP:          r.GetHostIp(),
@@ -610,6 +622,51 @@ func outcomeFromProto(r *vmmdpb.WakeResponse) *WakeOutcome {
 		Method:          r.GetMethod(),
 		RequestedMethod: r.GetRequestedMethod(),
 	}
+	// ADR-051 PR-D: decode the optional characterization struct
+	// back into pkg/api.CharacterizationReport. Empty struct =
+	// restore or cold-boot timeout — caller distinguishes via Method.
+	if s := r.GetCharacterization(); s != nil {
+		o.Characterization = characterizationFromStruct(s)
+	}
+	return o
+}
+
+// characterizationFromStruct decodes a google.protobuf.Struct
+// payload back into pkg/api.CharacterizationReport. Used only when
+// the wire field is populated; the empty struct is the contract
+// for "no observation" (warm wake / cold-boot timeout).
+func characterizationFromStruct(s *structpb.Struct) api.CharacterizationReport {
+	if s == nil {
+		return api.CharacterizationReport{}
+	}
+	m := s.AsMap()
+	r := api.CharacterizationReport{}
+	if v, ok := m["observed_class"].(string); ok {
+		r.ObservedClass = v
+	}
+	if v, ok := m["observed_port"].(float64); ok {
+		r.ObservedPort = int(v)
+	}
+	if v, ok := m["exit_code"].(float64); ok {
+		r.ExitCode = int(v)
+	}
+	if v, ok := m["outbound_count"].(float64); ok {
+		r.OutboundCount = int(v)
+	}
+	if v, ok := m["log_tail"].(string); ok {
+		r.LogTail = v
+	}
+	if v, ok := m["port_norm_mode"].(string); ok {
+		r.PortNormalizationMode = v
+	}
+	if v, ok := m["listening_addrs"].([]any); ok {
+		for _, a := range v {
+			if sa, ok := a.(string); ok {
+				r.ListeningAddrs = append(r.ListeningAddrs, sa)
+			}
+		}
+	}
+	return r
 }
 
 // liftErr converts a vmmd gRPC error back into the platform's *api.Problem so

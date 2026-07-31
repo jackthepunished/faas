@@ -229,24 +229,30 @@ type CustomDomain struct {
 }
 
 type Deployment struct {
-	ID          pgtype.UUID
-	AppID       pgtype.UUID
-	BuildID     pgtype.UUID
-	ImageDigest string
-	RootfsPath  pgtype.Text
-	RootfsBytes pgtype.Int8
-	Status      string
-	Error       pgtype.Text
-	CreatedAt   pgtype.Timestamptz
-	Kind        string
-	SourcePath  pgtype.Text
-	SourceBytes pgtype.Int8
-	Handler     pgtype.Text
-	LogPath     pgtype.Text
-	ErrorCode   pgtype.Text
-	RootfsKey   string
-	SourceUrl   pgtype.Text
-	CommitSha   pgtype.Text
+	ID                  pgtype.UUID
+	AppID               pgtype.UUID
+	BuildID             pgtype.UUID
+	ImageDigest         string
+	RootfsPath          pgtype.Text
+	RootfsBytes         pgtype.Int8
+	Status              string
+	Error               pgtype.Text
+	CreatedAt           pgtype.Timestamptz
+	Kind                string
+	SourcePath          pgtype.Text
+	SourceBytes         pgtype.Int8
+	Handler             pgtype.Text
+	LogPath             pgtype.Text
+	ErrorCode           pgtype.Text
+	RootfsKey           string
+	SourceUrl           pgtype.Text
+	CommitSha           pgtype.Text
+	OverrideEntrypoint  []string
+	OverrideCmd         []string
+	OverrideEnv         []byte
+	OverrideEnvSecrets  []byte
+	OverridePort        pgtype.Int4
+	OverrideHealthcheck []byte
 }
 
 type DeploymentLog struct {

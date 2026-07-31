@@ -231,3 +231,38 @@
       - egress.crt
   register: faas_pki_leaf_stat
   failed_when: not faas_pki_leaf_stat.stat.exists
+
+# Spec §11 — ProtectSystem=strict: every ReadWritePaths= target
+# MUST exist and be writable by the unit's User= before systemd
+# activates the unit, or the mount-namespace setup fails and the
+# daemon enters a crash-loop. The 2026-07-31 cd-controlplane
+# failure on the EX44 exposed a related but distinct gap: a
+# Process could not create a temp file at the root of a whitelisted
+# prefix (e.g. /srv/fc/runner-builder-amd64.ext4.tmp.*) because
+# only the subdirectories were whitelisted, not /srv/fc/ itself.
+# That code-level fix lives in pkg/storage/local.go::Put; this
+# assert is the deployment-side belt-and-braces — it pins every
+# ReadWritePaths= path to the same list as the unit, so a future
+# tighten of the unit that omits a dir the role doesn't create
+# fails the playbook rather than crash-looping the daemon on
+# the box.
+#
+# The list is read from the unit file (not hardcoded) so a unit
+# edit does not silently drift from the role's mkdir list.
+- name: control_plane_service — assert imaged ReadWritePaths= targets exist (spec §11)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ faas_imaged_rwp_paths }}"
+  vars:
+    # Parse the unit file's ReadWritePaths= line into a list. The
+    # value lives in faas-imaged.service (deploy/ansible/.../files)
+    # as a single space-separated line; split + filter empty.
+    faas_imaged_rwp_raw: >-
+      {{ lookup('file', role_path + '/files/faas-imaged.service')
+         | regex_search('ReadWritePaths=([^\n]+)', '\\1')
+         | first }}
+    faas_imaged_rwp_paths: "{{ faas_imaged_rwp_raw.split() }}"
+  register: faas_imaged_rwp_stat
+  failed_when: not faas_imaged_rwp_stat.stat.exists
+  loop_control:
+    label: "{{ item }}"

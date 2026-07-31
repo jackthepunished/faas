@@ -321,6 +321,13 @@ type OpsMetrics struct {
 	// daemon's OpsMetrics registry (single-registry pattern); only
 	// schedd's Tick produces samples in production.
 	snapshotDiskDrift prometheus.Counter
+	// capacity_signature_rejected: ADR-053 §3 — every rejected
+	// CapacityReport stream increments this counter once. See
+	// CapacitySignatureRejected() accessor for the operator-facing
+	// semantics. Registered on every daemon's OpsMetrics registry
+	// (single-registry pattern); only schedd's ReportCapacity handler
+	// produces samples in production.
+	capacitySignatureRejected prometheus.Counter
 	// buildDur / buildQueueWait: introduced in ADR-030 for builderd's
 	// build lifecycle. Distinct from the dur histogram (which tops out
 	// at 5 s — sub-millisecond control-plane sizing) because a build runs
@@ -729,6 +736,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	snapshotDiskDrift := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_snapshot_disk_drift_total",
 		Help: "Count of disk-vs-DB discrepancies observed by the read-only /srv/fc/snap drift sweep (PR scale-out readiness #3). Each Tick increments once per missing file, size mismatch, unexpected entry, or non-regular entry under <SnapDir>/<depID>/. Repeated sweeps increment the counter while the discrepancy remains; rate(snapshot_disk_drift_total[5m]) alerts on a non-zero rate. Sweep never writes — diagnostic only.",
+	})
+	// capacity_signature_rejected (ADR-053 §3): every ReportCapacity
+	// frame that fails schedule.VerifyNodeSignature increments the
+	// counter. The handler rejects the whole stream (not per-frame)
+	// with codes.Unauthenticated, so a single bad frame contributes
+	// exactly one increment + closes the stream. A non-zero rate is
+	// the canary for a stale or rotated vmmd node key, a clock-skew
+	// induced canonical-payload mismatch, or a hostile publisher
+	// probing the stream. Unlabelled — the closure of the stream is
+	// the natural bound on cardinality (one increment per stream,
+	// not per frame), and the node_id is already in the audit log
+	// via Warn emission.
+	capacitySignatureRejected := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_capacity_signature_rejected_total",
+		Help: "Count of CapacityReport streams rejected by scheddgrpc.Server.ReportCapacity because sched.VerifyNodeSignature returned ErrUnknownNodeKey, ErrEmptySignature, or ErrSignatureMismatch (ADR-053 §3). One increment per rejected stream (the handler rejects the whole stream on the first bad frame, not per-frame). A non-zero rate is the canary for a stale/rotated node key, a clock-skew-induced canonical-payload mismatch, or a hostile publisher. Unlabelled — the node_id is in the audit log via the Warn emission; cardinality is bounded by stream-rate.",
 	})
 
 	alertEvalSkippedDegradedTotal := prometheus.NewCounter(prometheus.CounterOpts{
@@ -1248,6 +1270,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		billingCapExceededTotal:          billingCapExceededTotal,
 		wakeIDV4Fallback:                 wakeIDV4Fallback,
 		snapshotDiskDrift:                snapshotDiskDrift,
+		capacitySignatureRejected:        capacitySignatureRejected,
 		imagedOCIPull:                    imagedOCIPull,
 		instanceCPUPct:                   instanceCPUPct,
 		instanceRSSMB:                    instanceRSSMB,
@@ -1761,6 +1784,23 @@ func (m *OpsMetrics) SnapshotDiskDrift() prometheus.Counter {
 		return nil
 	}
 	return m.snapshotDiskDrift
+}
+
+// CapacitySignatureRejected returns the counter accessor for the
+// ADR-053 §3 signature-failure path. The handler
+// (pkg/scheddgrpc.Server.ReportCapacity) increments this once per
+// rejected stream — the handler closes the stream on the first
+// bad frame, so per-frame increment would over-count under any
+// publish-after-verify scenario. Nil-safe — returns nil on a nil
+// receiver so the handler can call this without a nil-check at
+// every call site. The counter is unlabelled; the operator's
+// "which node?" question is answered by the audit log's
+// stream-rejection event, not by the metric label.
+func (m *OpsMetrics) CapacitySignatureRejected() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.capacitySignatureRejected
 }
 
 // CPUStatsCollectDuration returns the histogram accessor for the

@@ -121,15 +121,27 @@ func (r *PrefixRouter) allLocal() bool {
 
 // dispatch selects the backend for a key. The longest matching
 // prefix wins; absent a match, the fallback handles it. Returns
-// (backend, remainder) where remainder is the key with the matched
-// prefix stripped.
+// (backend, remainder, prefix) where remainder is the key with the
+// matched prefix stripped, and prefix is the route prefix that
+// matched (or "" for the fallback).
+//
+// Returning the prefix at dispatch time is load-bearing for error-
+// wrapping determinism: when the same backend is registered under
+// multiple routes (the production wiring has /srv/fc as the
+// canonical backend for snap/, base/, kernel/, layers/), the wrap
+// key must be the prefix that actually matched the dispatch — not a
+// map-iteration accident. The pre-fix implementation re-discovered
+// the prefix via a second map walk whose order Go does not
+// guarantee; an operator reading the log saw different wrapped keys
+// between restarts (alternating base/, snap/, kernel/) which made
+// the underlying EROFS root-cause harder to read.
 //
 // Put/Get/Delete on a missing-route key with no fallback return
 // ErrInvalidKey so the caller sees a clear "no route" error
 // instead of a confusing 404.
-func (r *PrefixRouter) dispatch(key string) (StorageBackend, string, error) {
+func (r *PrefixRouter) dispatch(key string) (StorageBackend, string, string, error) {
 	if err := validateKey(key); err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	bestLen := -1
 	var best StorageBackend
@@ -161,30 +173,27 @@ func (r *PrefixRouter) dispatch(key string) (StorageBackend, string, error) {
 		// remainder is empty; the underlying backend rejects empty
 		// keys with ErrInvalidKey, which is the correct behaviour.
 		remainder := strings.TrimPrefix(key, bestPrefix)
-		return best, remainder, nil
+		return best, remainder, bestPrefix, nil
 	}
 	if r.fallback != nil {
-		return r.fallback, key, nil
+		return r.fallback, key, "", nil
 	}
-	return nil, "", fmt.Errorf("%w: no route for %q", ErrInvalidKey, key)
+	return nil, "", "", fmt.Errorf("%w: no route for %q", ErrInvalidKey, key)
 }
 
 // Put dispatches via dispatch and forwards to the matching backend.
 // ctx propagation: the per-call ctx is passed through verbatim so a
 // cancelled caller observes cancellation on every dispatched Put.
 func (r *PrefixRouter) Put(ctx context.Context, key string, rd io.Reader) error {
-	b, rem, err := r.dispatch(key)
+	b, rem, prefix, err := r.dispatch(key)
 	if err != nil {
 		return err
 	}
 	if err := b.Put(ctx, rem, rd); err != nil {
 		// Re-add the route prefix so the caller sees the full key in
-		// the error chain. The dispatch() helper already returned the
-		// stripped remainder; rebuild by combining the route's known
-		// prefix (matched at dispatch time) with rem. We re-discover
-		// the prefix here so the wrap is exact even when the backend
-		// surfaced an error that wraps its own key.
-		prefix := r.prefixFor(b)
+		// the error chain. dispatch() returned the matched prefix at
+		// call time; rebuilding prefix+rem is exact and deterministic
+		// even when multiple routes share a backend.
 		return fmt.Errorf("storage: put %q: %w", prefix+rem, err)
 	}
 	return nil
@@ -192,13 +201,12 @@ func (r *PrefixRouter) Put(ctx context.Context, key string, rd io.Reader) error 
 
 // Get mirrors Put: dispatch, forward, wrap on error.
 func (r *PrefixRouter) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	b, rem, err := r.dispatch(key)
+	b, rem, prefix, err := r.dispatch(key)
 	if err != nil {
 		return nil, err
 	}
 	rc, err := b.Get(ctx, rem)
 	if err != nil {
-		prefix := r.prefixFor(b)
 		return nil, fmt.Errorf("storage: get %q: %w", prefix+rem, err)
 	}
 	return rc, nil
@@ -208,7 +216,7 @@ func (r *PrefixRouter) Get(ctx context.Context, key string) (io.ReadCloser, erro
 // when the backend signals it via ErrNotFound wrapping. Anything
 // else propagates.
 func (r *PrefixRouter) Delete(ctx context.Context, key string) error {
-	b, rem, err := r.dispatch(key)
+	b, rem, prefix, err := r.dispatch(key)
 	if err != nil {
 		return err
 	}
@@ -217,27 +225,9 @@ func (r *PrefixRouter) Delete(ctx context.Context, key string) error {
 		// route maps to a backend that already lost the file — we
 		// keep it but re-wrap with the full key so the caller can
 		// branch on IsNotFound without losing the route context.
-		prefix := r.prefixFor(b)
 		return fmt.Errorf("storage: delete %q: %w", prefix+rem, err)
 	}
 	return nil
-}
-
-// prefixFor returns the route prefix whose backend matches b. Used
-// to re-decorate error chains with the full key. If b is the
-// fallback, returns "". A non-match indicates a programming error
-// (dispatch gave us a backend we never registered) and is treated
-// as ErrInvalidKey so the failure mode is loud rather than silent.
-func (r *PrefixRouter) prefixFor(b StorageBackend) string {
-	for p, candidate := range r.routes {
-		if candidate == b {
-			return p
-		}
-	}
-	if r.fallback == b {
-		return ""
-	}
-	return "" // programming error; the wrap below will still produce a usable error
 }
 
 // List aggregates every LocalArtifactLister-capable backend in the

@@ -227,7 +227,11 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:15
+        # 2026-07-31: pull from mirror.gcr.io to avoid Docker Hub
+        # rate-limit / region flakiness (see migrations job for the
+        # full backstory; the unit-tests job uses the same image
+        # so it shares the failure mode).
+        image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
           POSTGRES_PASSWORD: faas
@@ -242,6 +246,26 @@ jobs:
     env:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
     steps:
+      # 2026-07-31: pre-pull the postgres image with a 3-attempt
+      # backoff retry. The service-container auto-pull path is
+      # not retried by GitHub Actions, so a transient
+      # `registry-1.docker.io/v2/: context deadline exceeded`
+      # fails the job. mirror.gcr.io is also faster from Azure
+      # centralus (Google's CDN, no Docker Hub rate limits).
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -713,7 +737,9 @@ jobs:
   coverage:
     services:
       postgres:
-        image: postgres:15
+        # mirror.gcr.io for the same reason as unit-tests/migrations
+        # (2026-07-31): Docker Hub pull flake.
+        image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
           POSTGRES_PASSWORD: faas
@@ -742,7 +768,10 @@ jobs:
     # tick here as "coverage held".
     name: coverage (Codecov)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20m to cover the -timeout=15m go test step (cmd/e2e under -race
+    # + coverage runs ~11-12 min; see memory cmd-e2e-coverage-timeout-
+    # edge.md) plus startup, dependency download, and upload overhead.
+    timeout-minutes: 20
     # OIDC for the Codecov upload. Codecov accepts a short-lived GitHub
     # OIDC token in place of a long-lived CODECOV_TOKEN for public repos
     # (per codecov-action's `use_oidc` input). This is the right path for
@@ -754,6 +783,22 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # 2026-07-31: pre-pull postgres with 3-attempt retry (see
+      # unit-tests job for the full backstory).
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -863,9 +908,18 @@ jobs:
     # Decoupled from `test` so a regression surfaces immediately with the
     # exact missing-slot name rather than being buried in the unit-test
     # sweep.
+    #
+    # 2026-07-31 follow-up: this job failed on the main push with a Docker
+    # Hub pull timeout (`registry-1.docker.io/v2/: context deadline
+    # exceeded`) on the Azure centralus runner. Switch the image to
+    # mirror.gcr.io (Google's transparent mirror of Docker Hub, no auth,
+    # no per-IP rate limit) — same pattern as FAAS_BUILDER_BASE_REF on
+    # the prod box (deploy/controlplane/sealed.env.example:22). A
+    # pre-step `docker pull` with retry covers the case where the service
+    # container's own pull path flakes before the retry.
     services:
       postgres:
-        image: postgres:15
+        image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
           POSTGRES_PASSWORD: faas
@@ -883,6 +937,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # 2026-07-31: pre-pull postgres with 3-attempt retry. This job
+      # is the one that actually hit the Docker Hub pull timeout on
+      # the main push; the retry is the second layer after the
+      # mirror.gcr.io image swap.
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
       # fetch-depth: 0 — the slot-collision and replay-safety steps both diff
       # against origin/<base>, which a shallow clone cannot resolve.
       - uses: actions/checkout@v7
@@ -1026,7 +1098,9 @@ jobs:
     # would otherwise fail.
     services:
       postgres:
-        image: postgres:15
+        # mirror.gcr.io for the same reason as unit-tests/migrations
+        # (2026-07-31): Docker Hub pull flake on Azure centralus.
+        image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
           POSTGRES_PASSWORD: faas
@@ -1047,6 +1121,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # 2026-07-31: pre-pull postgres with 3-attempt retry (see
+      # unit-tests job for the full backstory).
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -1059,5 +1149,15 @@ jobs:
       # by default; see https://docs.github.com/actions/hosting-your-runners).
       - name: install postgresql-client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      # jinja2 is required by TestSec11_PerHostEgressTemplating
+      # (cmd/e2e/sec11_sweep_test.go) to cross-check the Go render
+      # against the Jinja2 template. Without this, the test
+      # t.Logf-skips the cross-check and `make egress-render-cross-check`
+      # (which the same Python import supports) fails its `python3 -c
+      # "from jinja2 import Template"` shell-out on the lint+build
+      # job. ADR-055. Match the version the local `make egress-render-cross-check`
+      # and the e2e sweep use.
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
       - name: make e2e
         run: make e2e
