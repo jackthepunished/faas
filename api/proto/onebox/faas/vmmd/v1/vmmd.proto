@@ -111,6 +111,38 @@ service Vmmd {
   // Backpressure flows through gRPC's natural flow control. NotFound
   // when the instance is not alive on this vmmd (nil ring).
   rpc Logs(LogsRequest) returns (stream LogsResponse);
+
+  // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
+  // lets imaged compose the per-runtime base ext4 from a shared
+  // debian:12-slim parent. imaged is not root (User=faas-imaged +
+  // NoNewPrivileges=yes per spec §11), so it cannot mount the parent
+  // ext4 itself; vmmd is the only root component and runs the
+  // `mount -o loop,ro` on imaged's behalf. The returned mountpoint
+  // is an absolute host path into a tmpfs mount dir owned by vmmd
+  // — the caller (imaged) is expected to `cp -a <mp>/. <staging>`
+  // and immediately call UmountParentExt4. The mount is read-only
+  // (-o ro) so a child re-stage cannot corrupt the parent. vmmd
+  // tracks the mount in an in-memory registry and sweeps orphans
+  // every 5 minutes + at SIGTERM. Storage_key is the canonical
+  // StorageBackend key (issue #96 / ADR-025 axis 2), e.g.
+  // "base/runner-base-debian-parent-amd64.ext4". Empty storage_key
+  // → InvalidArgument. Unknown storage_key (Get returns
+  // ErrNotFound) → NotFound. vmmd writes the bytes through its
+  // own configured StorageBackend — there is no precedent for
+  // imaged→vmmd dialing; CLAUDE.md is amended (ADR-053) to call
+  // this out as a deliberate exception to "components talk via
+  // Postgres rows + pg_notify, or gRPC on unix sockets in
+  // /run/faas/".
+  rpc MountParentExt4ReadOnly(MountParentExt4ReadOnlyRequest) returns (MountParentExt4ReadOnlyResponse);
+
+  // UmountParentExt4 (ADR-053) releases a mount vmmd previously
+  // returned from MountParentExt4ReadOnly. Idempotent on an
+  // unknown mountpoint — imaged's call-on-error-defer pattern
+  // (cp -a errored → umount anyway) is safe. The mountpoint path
+  // is validated to live under vmmd's parent-mnt scratch dir to
+  // refuse unmounting an unrelated filesystem (defence in depth
+  // against a caller that hands back a path vmmd never issued).
+  rpc UmountParentExt4(UmountParentExt4Request) returns (UmountParentExt4Response);
 }
 
 // AppSpec flattens what the caller knows about an app. vmmd stores none of
@@ -597,3 +629,43 @@ message LogsResponse {
   string line = 3;
   google.protobuf.Timestamp written_at = 4;
 }
+
+// MountParentExt4ReadOnlyRequest (ADR-053) is the input to
+// MountParentExt4ReadOnly. storage_key is the canonical StorageBackend
+// key of the parent base ext4 (issue #96 / ADR-025 axis 2). vmmd
+// resolves the bytes via the same configured StorageBackend the rest
+// of vmmd uses (snapshot publishes, vmstate publishes); staging into
+// a tmpfs scratch + loopback mount happens after the bytes are in
+// hand. Empty → InvalidArgument. Unknown → NotFound.
+message MountParentExt4ReadOnlyRequest {
+  string storage_key = 1;
+}
+
+// MountParentExt4ReadOnlyResponse returns the absolute host path of
+// the read-only loopback mountpoint. The caller (imaged) treats this
+// as a regular directory tree: `cp -a <mountpoint>/. <staging>`
+// copies the parent tree, then calls UmountParentExt4 to release.
+// The mountpoint lives under vmmd's parent-mnt scratch dir
+// (/tmp/faas-parent-mnt-XXXXXX on Linux; macOS dev skips because
+// vmmd doesn't run there).
+message MountParentExt4ReadOnlyResponse {
+  string mountpoint = 1;
+}
+
+// UmountParentExt4Request is the input to UmountParentExt4.
+// mountpoint is the path MountParentExt4ReadOnly previously
+// returned. Empty → InvalidArgument. Unknown → InvalidArgument
+// (NOT NotFound) so imaged's defer-after-error pattern is
+// idempotent on a never-issued or already-released path; the
+// distinction from MountParentExt4ReadOnly's NotFound is
+// load-bearing — Umount must be safe to call blindly.
+message UmountParentExt4Request {
+  string mountpoint = 1;
+}
+
+// UmountParentExt4Response is the empty success envelope. On
+// failure vmmd returns a gRPC status (InvalidArgument for an
+// empty/unknown path, Internal for the umount syscall failure
+// itself — e.g. EBUSY when a child re-stage is still walking
+// the parent).
+message UmountParentExt4Response {}

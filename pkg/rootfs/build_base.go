@@ -28,7 +28,10 @@ import (
 type BaseBuildInput struct {
 	// Layers are ALL layers of the base OCI image, bottom-to-top,
 	// gzip-compressed (same wire shape as Builders expect from
-	// oci.RegistryClient.PullBlob).
+	// oci.RegistryClient.PullBlob). Empty when BuildBaseFromStaging
+	// is invoked with a pre-populated staging dir (ADR-053 parent-ref
+	// path: the staging dir is filled by imaged's vmmd-mounted parent
+	// + delta layer apply loop, not by BuildBase itself).
 	Layers []io.Reader
 	// Storage is the artifact backend the produced ext4 is Put into.
 	// Mutually exclusive with OutImage.
@@ -47,6 +50,18 @@ type BaseBuildResult struct {
 	ImageKey  string // set when Storage + StorageKey was used
 	ImagePath string // set when OutImage was used
 	SizeBytes int64
+}
+
+// MkdirBaseStaging creates a fresh temp dir for a base-image staging
+// tree. Exported (ADR-053) so pkg/imaged's parent-ref path can
+// pre-create the dir, populate it via cp -a from the vmmd-mounted
+// parent ext4 + a delta layer apply loop, then hand it to
+// BuildBaseFromStaging for mkfs. The dir is NOT auto-removed: callers
+// running BuildBaseFromStaging rely on this function's sibling-temp
+// pattern (mirrors publishExt4 / publishBaseExt4). Callers that want
+// automatic cleanup should defer os.RemoveAll on the returned path.
+func MkdirBaseStaging() (string, error) {
+	return os.MkdirTemp("", "faas-base-*")
 }
 
 // BuildBase assembles a base-image ext4 from the supplied OCI layers.
@@ -70,7 +85,7 @@ func (b *Builder) BuildBase(ctx context.Context, in BaseBuildInput) (BaseBuildRe
 		return BaseBuildResult{}, fmt.Errorf("rootfs: BuildBase: no layers")
 	}
 
-	staging, err := os.MkdirTemp("", "faas-base-*")
+	staging, err := MkdirBaseStaging()
 	if err != nil {
 		return BaseBuildResult{}, fmt.Errorf("rootfs: staging dir: %w", err)
 	}
@@ -82,6 +97,45 @@ func (b *Builder) BuildBase(ctx context.Context, in BaseBuildInput) (BaseBuildRe
 		}
 	}
 
+	return b.buildBaseFromStaging(ctx, staging, in)
+}
+
+// BuildBaseFromStaging (ADR-053) is the seam used by the parent-ref
+// staging path: imaged pre-populates `staging` with the parent's tree
+// (cp -a from a vmmd loopback mount of the parent ext4) + the delta
+// OCI layers, then calls BuildBaseFromStaging to mkfs + publish.
+//
+// `staging` MUST be a path returned by MkdirBaseStaging (or otherwise
+// outside the published ext4's directory, to avoid mkfs's -d flag
+// copying its own growing output back into itself — see
+// publishBaseExt4's sibling-temp pattern, this comment is mirrored
+// there).
+//
+// `in.Storage` / `in.StorageKey` / `in.OutImage` follow the same
+// exclusive-or rules as BaseBuildInput. The function does NOT touch
+// in.Layers (those are zero in the parent-ref path).
+//
+// Cleanup of `staging` is the caller's responsibility: BuildBaseFromStaging
+// does not RemoveAll it (matches the "caller owns the staging tree"
+// contract the parent-ref path needs — imaged cleans up after publishing).
+func (b *Builder) BuildBaseFromStaging(ctx context.Context, staging string, in BaseBuildInput) (BaseBuildResult, error) {
+	if err := validateBaseOutputTarget(in); err != nil {
+		return BaseBuildResult{}, err
+	}
+	if staging == "" {
+		return BaseBuildResult{}, fmt.Errorf("rootfs: BuildBaseFromStaging: empty staging dir")
+	}
+	if _, err := os.Stat(staging); err != nil {
+		return BaseBuildResult{}, fmt.Errorf("rootfs: BuildBaseFromStaging: stat staging: %w", err)
+	}
+	return b.buildBaseFromStaging(ctx, staging, in)
+}
+
+// buildBaseFromStaging is the shared tail of BuildBase (apply-all
+// path) and BuildBaseFromStaging (ADR-053 parent-ref path): measure,
+// mkfs, publish. Extracted so both paths share the same padding +
+// signing + storage Put semantics.
+func (b *Builder) buildBaseFromStaging(ctx context.Context, staging string, in BaseBuildInput) (BaseBuildResult, error) {
 	content, err := DirSize(staging)
 	if err != nil {
 		return BaseBuildResult{}, err

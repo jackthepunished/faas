@@ -74,6 +74,18 @@ type VmmdAPI interface {
 	// is filling from firecracker's own stdout. nil when the instance
 	// is not alive on this vmmd (the Logs handler maps nil to NotFound).
 	LogRing(instance string) *logbuf.Ring
+	// MountParentExt4 (ADR-053) loopback-mounts the parent base ext4
+	// identified by `storageKey` read-only and returns the absolute
+	// host path of the mountpoint. vmmd is the only root component
+	// (spec §11); imaged (User=faas-imaged, NoNewPrivileges=yes)
+	// cannot mount on its own. Returns ErrNotFound when the storage
+	// key isn't published (imaged's parent must already be staged via
+	// EnsureBases before any child re-stage fires this).
+	MountParentExt4(ctx context.Context, storageKey string) (string, error)
+	// UmountParentExt4 (ADR-053) releases a mount MountParentExt4
+	// previously returned. Idempotent on unknown mountpoints so
+	// imaged's defer-after-error pattern is safe.
+	UmountParentExt4(ctx context.Context, mountpoint string) error
 }
 
 // Server implements vmmdpb.VmmdServer.
@@ -524,6 +536,63 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 		Mode:      mode,
 		FilterLen: filterLen,
 	}, nil
+}
+
+// MountParentExt4ReadOnly (ADR-053) is the staging-only path
+// that lets imaged compose the per-runtime base ext4 from a
+// shared debian:12-slim parent. The handler validates the
+// storage key against the configured StorageBackend, stages
+// the bytes into a tmpfs scratch, loopback-mounts read-only,
+// and registers the mountpoint in the parent-mnt registry for
+// sweep-at-SIGTERM + 5-minute orphan sweep. The actual mount
+// syscall lives in pkg/vmmdgrpc/mount.go to keep this handler
+// ≤50 lines (spec §Conventions).
+//
+// Empty storage_key → InvalidArgument; unknown storage_key →
+// NotFound; storage.Get error → Internal. imaged's defer-after-
+// error pattern relies on UmountParentExt4 being idempotent so
+// the parent is always released — see MountParentRegistry.
+func (s *Server) MountParentExt4ReadOnly(ctx context.Context, req *vmmdpb.MountParentExt4ReadOnlyRequest) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
+	const op = "MountParentExt4ReadOnly"
+	start := time.Now()
+	if req.GetStorageKey() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing storage_key", "storage_key is required").
+			WithDocs("https://docs/DOMAIN/vmmd#mount-parent-ext4")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	mp, err := s.vmm.MountParentExt4(ctx, req.GetStorageKey())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.MountParentExt4ReadOnlyResponse{Mountpoint: mp}, nil
+}
+
+// UmountParentExt4 (ADR-053) releases a parent mount the
+// previous handler returned. Empty mountpoint → InvalidArgument;
+// unknown mountpoint → InvalidArgument (NOT NotFound) so
+// imaged's defer-after-error is idempotent on a never-issued or
+// already-released path; the asymmetry with MountParentExt4ReadOnly's
+// NotFound is intentional and load-bearing. Real umount errors
+// surface as Internal so imaged's log surfaces the cause.
+func (s *Server) UmountParentExt4(ctx context.Context, req *vmmdpb.UmountParentExt4Request) (*vmmdpb.UmountParentExt4Response, error) {
+	const op = "UmountParentExt4"
+	start := time.Now()
+	if req.GetMountpoint() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing mountpoint", "mountpoint is required").
+			WithDocs("https://docs/DOMAIN/vmmd#umount-parent-ext4")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	if err := s.vmm.UmountParentExt4(ctx, req.GetMountpoint()); err != nil {
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	s.ops.Observe(op, time.Since(start), nil)
+	return &vmmdpb.UmountParentExt4Response{}, nil
 }
 
 // readSeccompStatus parses /proc/<pid>/status and returns (mode, filterLen, err).

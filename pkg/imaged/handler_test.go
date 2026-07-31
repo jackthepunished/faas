@@ -163,6 +163,21 @@ func (b *fakeBuilder) BuildBase(ctx context.Context, in rootfs.BaseBuildInput) (
 	return rootfs.BaseBuildResult{ImagePath: in.OutImage, SizeBytes: b.bytesOut}, nil
 }
 
+// BuildBaseFromStaging (ADR-053) is part of the LayerBuilder
+// interface. The imaged parent-ref path calls it after cp -a +
+// delta layer apply; the fake streams a small placeholder so
+// tests don't need a host mkfs binary.
+func (b *fakeBuilder) BuildBaseFromStaging(ctx context.Context, _ string, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
+	b.calls = append(b.calls, rootfs.BuildInput{Plan: api.PlanScale})
+	if in.Storage != nil && in.StorageKey != "" {
+		if err := in.Storage.Put(ctx, in.StorageKey, strings.NewReader("fake ext4 parent-ref")); err != nil {
+			return rootfs.BaseBuildResult{}, err
+		}
+		return rootfs.BaseBuildResult{ImageKey: in.StorageKey, SizeBytes: b.bytesOut}, nil
+	}
+	return rootfs.BaseBuildResult{}, nil
+}
+
 // fakeNotifier records every Notify so tests can assert fan-out.
 type fakeNotifier struct {
 	calls []notifyCall
@@ -831,6 +846,10 @@ func (panicBuilder) Build(_ context.Context, _ rootfs.BuildInput) (rootfs.BuildR
 }
 
 func (panicBuilder) BuildBase(_ context.Context, _ rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
+	panic("boom")
+}
+
+func (panicBuilder) BuildBaseFromStaging(_ context.Context, _ string, _ rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
 	panic("boom")
 }
 

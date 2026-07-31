@@ -14,6 +14,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -55,6 +56,16 @@ type BaseStageResult struct {
 // is republished via Storage.Put; storage.Put's internal temp+rename
 // preserves the atomicity the legacy os.Rename provided.
 //
+// parentRef + parentBaseKey (ADR-053) gate the parent-ref staging
+// branch: when parentRef is non-empty, EnsureBaseExt4 asks vmmd
+// (the only root component, spec §11) to loopback-mount the parent
+// ext4 at parentBaseKey read-only, cp -a's the parent tree into a
+// fresh staging dir, applies ONLY the runtime delta OCI layers
+// (oci.LayersAboveBase) on top, and hands the staging tree to
+// BuildBaseFromStaging. Empty parentRef stays on the legacy "apply
+// ALL layers" path (builder-base / go124 / go124-alpine /
+// base-debian-parent itself).
+//
 // outImage is the resolved host path schedd hands to vmmd when cold-
 // booting a builder against the local /srv/fc base. For a non-canonical
 // storage root (a future remote driver) outImage is empty and schedd
@@ -65,7 +76,11 @@ type BaseStageResult struct {
 // streaming). Without it, EnsureBaseExt4 returns an error: M6+'s builderd
 // only runs with full M6 wiring, and skipping silently would mask a real
 // config error.
-func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, outImage string) (BaseStageResult, error) {
+func (h *Handler) EnsureBaseExt4(
+	ctx context.Context,
+	ref, baseKey, digestKey, outImage string,
+	parentRef, parentBaseKey string, // ADR-053; empty = legacy path
+) (BaseStageResult, error) {
 	if ref == "" {
 		return BaseStageResult{}, errors.New("imaged: EnsureBaseExt4: empty ref")
 	}
@@ -119,6 +134,18 @@ func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, o
 		}
 	}
 
+	// ADR-053: dispatch on parentRef. The parent-ref branch asks
+	// vmmd to loopback-mount the parent ext4 read-only, cp -a's
+	// the parent tree into a fresh staging dir, applies ONLY the
+	// runtime delta OCI layers (oci.LayersAboveBase), and hands
+	// the staging tree to BuildBaseFromStaging. Empty parentRef
+	// stays on the legacy "apply ALL layers" path
+	// (builder-base / go124 / go124-alpine / base-debian-parent).
+	if parentRef != "" {
+		return h.ensureBaseExt4ParentRef(ctx, mp, manifest, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey, wantDigest, be)
+	}
+
+	// --- Legacy "apply ALL layers" path ----------------------------
 	// Pre-allocate the readers slice + closers so a partial pull on layer N
 	// still closes layers 0..N-1. PullBlob streams the gzipped tarball; we
 	// hand it to Builder.BuildBase which copies it through ApplyLayerGz.
@@ -158,30 +185,9 @@ func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, o
 		return BaseStageResult{}, fmt.Errorf("imaged: build base ext4: %w", err)
 	}
 
-	// Sidecar is a tiny text payload, but the storage backend is the
-	// source of truth — Put under digestKey. Put's atomicity is per-key,
-	// but since reads compare baseKey's existence first and digestKey
-	// is only used as a decision oracle, a transient inconsistency
-	// between the two is observable next run as "rebuild" rather than
-	// "use half-published artifact".
-	digestRC, err := openStringReader(wantDigest)
-	if err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: open digest sidecar: %w", err)
+	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest); err != nil {
+		h.log.Warn("imaged: write base digest sidecar", "err", err)
 	}
-	if err := be.Put(ctx, digestKey, digestRC); err != nil {
-		h.log.Warn("imaged: write base digest sidecar", "key", digestKey, "err", err)
-	}
-
-	// issue #299: scan-and-write the Grype sidecar in lock-step
-	// with the digest sidecar above. The scan key is derived from
-	// the base key so vmmd's bringUpScanCheck can find it on the
-	// wake wire. Fail-closed: a scan failure (Grype missing,
-	// JSON malformed, timeout) writes a CRITICAL=9999 placeholder
-	// so vmmd refuses to boot any staged ext4 whose scan failed —
-	// the alternative (silently admit) would let a missing
-	// scanner hide CVEs. The fail-closed sidecar is the canonical
-	// posture for this PR and is mirrored in the
-	// pkg/fcvm/manager.go bringUpScanCheck admission seam.
 	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
 		h.log.Warn("imaged: write grype scan sidecar",
 			"key", wire.ScanKeyForBaseKey(baseKey), "err", err)
@@ -190,6 +196,225 @@ func (h *Handler) EnsureBaseExt4(ctx context.Context, ref, baseKey, digestKey, o
 	h.log.Info("imaged: staged builder base",
 		"ref", ref, "key", res.ImageKey, "size_bytes", res.SizeBytes,
 		"digest", wantDigest)
+
+	return BaseStageResult{
+		OutImage:     outImage,
+		StorageKey:   res.ImageKey,
+		ConfigDigest: wantDigest,
+	}, nil
+}
+
+// writeBaseDigestSidecar writes the per-base config-digest
+// sidecar at digestKey. Extracted from the legacy EnsureBaseExt4
+// path so the parent-ref branch can call the same helper
+// (ADR-053). The sidecar is the source of truth for the
+// "did this base already stage?" check — re-fetching tens of
+// MB of layers on every daemon restart would be wasteful.
+func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.StorageBackend, digestKey, wantDigest string) error {
+	digestRC, err := openStringReader(wantDigest)
+	if err != nil {
+		return fmt.Errorf("imaged: open digest sidecar: %w", err)
+	}
+	if err := be.Put(ctx, digestKey, digestRC); err != nil {
+		return fmt.Errorf("imaged: write digest sidecar %q: %w", digestKey, err)
+	}
+	return nil
+}
+
+// ensureBaseExt4ParentRef is the ADR-053 staging path: ask vmmd
+// to mount the parent ext4, cp -a the parent tree, apply ONLY
+// the runtime delta OCI layers (oci.LayersAboveBase), and
+// hand the staging tree to BuildBaseFromStaging for mkfs +
+// publish.
+//
+// Pre-conditions:
+//   - parentRef is non-empty; parentBaseKey is the staged
+//     parent's StorageBackend key (e.g.
+//     "base/runner-base-debian-parent-amd64.ext4"). The parent
+//     must already be staged via EnsureBases (the loop stages
+//     RuntimeDebianParent at index 0 so this precondition holds
+//     for every child row that follows).
+//   - h.vmmClient is wired (cmd/imaged calls WithVMMClient at
+//     startup). Fail loud if nil — the legacy "apply all layers"
+//     path stays operational without a client, but the parent-ref
+//     path requires vmmd to run the loopback mount.
+//
+// Failure modes (all surfaced as wrapped errors so cmd/imaged's
+// EnsureBases loop can abort cleanly):
+//   - parent base not yet staged: vmmClient.MountParentExt4ReadOnly
+//     returns vmmdmount.ErrNotFound → wrapped here.
+//   - vmmd down or unreachable: dial error.
+//   - delta resolution fails (LayersAboveBase reports the parent's
+//     DiffIDs aren't a prefix of the runtime's): re-wrap the
+//     sentinel so the operator sees the OCI-chain composability
+//     invariant failure (the load-bearing ADR-053 invariant —
+//     a Dockerfile that drifts to `FROM scratch + COPY` would
+//     surface here).
+func (h *Handler) ensureBaseExt4ParentRef(
+	ctx context.Context,
+	mp oci.ManifestPuller,
+	manifest oci.Manifest,
+	ref, baseKey, digestKey, outImage string,
+	parentRef, parentBaseKey, wantDigest string,
+	be storage.StorageBackend,
+) (BaseStageResult, error) {
+	if h.vmmClient == nil {
+		return BaseStageResult{}, fmt.Errorf(
+			"imaged: EnsureBaseExt4 (parent-ref): no VMMClient wired (run WithVMMClient in cmd/imaged; ADR-053)")
+	}
+
+	// Pull + parse the runtime config to get DiffIDs. The runtime
+	// manifest is already in hand (EnsureBaseExt4 pulled it).
+	ociRef, err := oci.ParseReference(ref)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parse runtime ref %q: %w", ref, err)
+	}
+	runtimeCfg, err := h.pullConfig(ctx, mp, ociRef.Registry+"/"+ociRef.Repository, manifest.Config.Digest)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: pull runtime config: %w", err)
+	}
+
+	// Pull + parse the parent config so we can compute the delta.
+	parentManifest, err := mp.PullManifest(ctx, parentRef)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: pull parent manifest %s: %w", parentRef, err)
+	}
+	parentOCI, err := oci.ParseReference(parentRef)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parse parent ref %q: %w", parentRef, err)
+	}
+	parentCfg, err := h.pullConfig(ctx, mp, parentOCI.Registry+"/"+parentOCI.Repository, parentManifest.Config.Digest)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: pull parent config: %w", err)
+	}
+
+	// Load-bearing invariant: parent's DiffIDs MUST be an exact
+	// prefix of runtime's. If they aren't, the staging-time
+	// composition can't apply the delta layers on top of the
+	// parent ext4 (LayersAboveBase returns ErrEmptyDelta or
+	// ErrNotPrefix). The failure message names the ADR so an
+	// operator chasing a `FROM scratch + COPY` regression sees
+	// the root cause in the log.
+	delta, err := oci.LayersAboveBase(parentCfg.DiffIDs, runtimeCfg.DiffIDs)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf(
+			"imaged: parent-ref delta (ADR-053): %w "+
+				"(parent_ref=%s parent_diff_ids=%d runtime_ref=%s runtime_diff_ids=%d)",
+			err, parentRef, len(parentCfg.DiffIDs), ref, len(runtimeCfg.DiffIDs))
+	}
+	if len(delta) == 0 {
+		// Empty delta = runtime has no layers above parent = the
+		// staged child IS the parent. Surface this loudly so a
+		// future Dockerfile drift (e.g. accidentally bumping
+		// FROM parent → FROM scratch) trips here rather than
+		// silently producing a base-less child ext4.
+		return BaseStageResult{}, fmt.Errorf(
+			"imaged: parent-ref delta (ADR-053): empty — runtime %s has no layers above parent %s "+
+				"(check the Dockerfile's FROM chain)", ref, parentRef)
+	}
+
+	// Map runtime DiffIDs → compressed-blob descriptors (same shape
+	// as aboveBaseLayers in pkg/imaged/handler.go).
+	if len(manifest.Layers) != len(runtimeCfg.DiffIDs) {
+		return BaseStageResult{}, fmt.Errorf(
+			"imaged: parent-ref layer count mismatch: manifest=%d config=%d",
+			len(manifest.Layers), len(runtimeCfg.DiffIDs))
+	}
+	blobByDiff := make(map[string]oci.Descriptor, len(manifest.Layers))
+	for i, l := range manifest.Layers {
+		blobByDiff[runtimeCfg.DiffIDs[i]] = l
+	}
+
+	// Mount the parent ext4 read-only via vmmd (the only root
+	// component). Defer the umount so a partial copy or
+	// ApplyLayerGz error still releases the mount — a stuck
+	// parent mount would surface as the next 5-minute orphan
+	// sweep, but explicit defer-on-error is faster + safer.
+	mountpoint, err := h.vmmClient.MountParentExt4ReadOnly(ctx, parentBaseKey)
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: mount parent ext4 %q: %w", parentBaseKey, err)
+	}
+	defer func() {
+		if uerr := h.vmmClient.UmountParentExt4(context.WithoutCancel(ctx), mountpoint); uerr != nil {
+			h.log.Warn("imaged: umount parent ext4 failed", "mountpoint", mountpoint, "err", uerr)
+		}
+	}()
+
+	// cp -a the parent tree into a fresh staging dir. The
+	// staging dir is the input to BuildBaseFromStaging — same
+	// caller-owned-cleanup contract as the per-runtime staging
+	// dir MkdirBaseStaging returns.
+	staging, err := rootfs.MkdirBaseStaging()
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref staging dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(staging) }()
+
+	if err := CopyTree(ctx, mountpoint+"/.", staging); err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: cp -a parent tree %s -> %s: %w", mountpoint, staging, err)
+	}
+
+	// Release the parent mount as early as possible — the delta
+	// layers we apply next don't read the parent tree, they
+	// only write on top of staging. The deferred umount is
+	// still there for the error path, but this explicit call
+	// drops the mount's RSS contribution immediately and lets a
+	// subsequent sibling restage of a different runtime see the
+	// freed slot in vmmd's parent-mount registry.
+	if err := h.vmmClient.UmountParentExt4(ctx, mountpoint); err != nil {
+		h.log.Warn("imaged: parent umount (early release) failed", "mountpoint", mountpoint, "err", err)
+	}
+
+	// Apply the delta layers on top of the parent's tree. Pre-
+	// allocate readers + closers so a partial pull on layer N
+	// still closes layers 0..N-1 (mirrors the legacy path's
+	// closer-defer pattern).
+	readers := make([]io.Reader, 0, len(delta))
+	closers := make([]io.ReadCloser, 0, len(delta))
+	for _, diffID := range delta {
+		desc, ok := blobByDiff[diffID]
+		if !ok {
+			for _, c := range closers {
+				_ = c.Close()
+			}
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref missing blob for diff %s", diffID)
+		}
+		rc, err := mp.PullBlob(ctx, ociRef.Registry+"/"+ociRef.Repository, desc.Digest)
+		if err != nil {
+			for _, c := range closers {
+				_ = c.Close()
+			}
+			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref pull blob %s: %w", desc.Digest, err)
+		}
+		closers = append(closers, rc)
+		readers = append(readers, rc)
+	}
+	defer func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}()
+
+	res, err := h.builder.BuildBaseFromStaging(ctx, staging, rootfs.BaseBuildInput{
+		Storage:    be,
+		StorageKey: baseKey,
+	})
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref build base ext4: %w", err)
+	}
+
+	if err := h.writeBaseDigestSidecar(ctx, be, digestKey, wantDigest); err != nil {
+		h.log.Warn("imaged: write base digest sidecar", "err", err)
+	}
+	if err := h.writeScanSidecar(ctx, baseKey, ref, outImage); err != nil {
+		h.log.Warn("imaged: write grype scan sidecar",
+			"key", wire.ScanKeyForBaseKey(baseKey), "err", err)
+	}
+
+	h.log.Info("imaged: staged runtime base (parent-ref)",
+		"ref", ref, "parent_ref", parentRef,
+		"key", res.ImageKey, "size_bytes", res.SizeBytes,
+		"delta_layers", len(delta), "digest", wantDigest)
 
 	return BaseStageResult{
 		OutImage:     outImage,
@@ -301,6 +526,16 @@ type RuntimeBaseRef struct {
 	// fail-loud error, the same posture the deploy-base-ref gate uses
 	// in cmd/imaged/main.go.
 	EnvOverride string
+	// ParentRef (ADR-053) is the OCI ref of the staging-only parent
+	// runtime this row's base composes on top of. Empty for rows on
+	// the legacy "apply all layers" path (builder-base, go124,
+	// go124-alpine, base-minimal). When set, EnsureBaseExt4 takes
+	// the parent-ref branch: ask vmmd to mount the parent ext4,
+	// cp -a its tree into a fresh staging dir, apply ONLY the
+	// delta OCI layers, and mkfs. The parent runtime's row
+	// (ParentRef="") is staged first so children always find a
+	// valid parent.
+	ParentRef string
 }
 
 // DefaultRuntimeBaseRefs is the canonical runtime → OCI-base mapping
@@ -317,13 +552,21 @@ type RuntimeBaseRef struct {
 // its own key (`base/runner-go124-alpine-<arch>.ext4`), even though
 // the build/run path at function-deploy time reuses go124's runner
 // binary.
+//
+// ADR-053: the four node/python runtime rows now declare
+// ParentRef: BaseRefDebianParent. The shared parent is staged
+// first (index 0) so a parent re-stage failure aborts the loop
+// before any child is attempted — half-staged fleet is worse
+// than refuse. The parent row's ParentRef is "" (legacy path:
+// apply ALL its layers, no composition).
 var DefaultRuntimeBaseRefs = []RuntimeBaseRef{
-	{Runtime: RuntimeNode22, Ref: BaseRefNode22, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE22"},
-	{Runtime: RuntimePython312, Ref: BaseRefPython312, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON312"},
+	{Runtime: RuntimeDebianParent, Ref: BaseRefDebianParent, EnvOverride: "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT"},
+	{Runtime: RuntimeNode22, Ref: BaseRefNode22, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE22", ParentRef: BaseRefDebianParent},
+	{Runtime: RuntimePython312, Ref: BaseRefPython312, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON312", ParentRef: BaseRefDebianParent},
 	{Runtime: RuntimeGo124, Ref: BaseRefGo124, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124"},
 	{Runtime: RuntimeGo124Alpine, Ref: BaseRefGo124Alpine, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124_ALPINE"},
-	{Runtime: RuntimeNode24, Ref: BaseRefNode24, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE24"},
-	{Runtime: RuntimePython313, Ref: BaseRefPython313, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON313"},
+	{Runtime: RuntimeNode24, Ref: BaseRefNode24, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE24", ParentRef: BaseRefDebianParent},
+	{Runtime: RuntimePython313, Ref: BaseRefPython313, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON313", ParentRef: BaseRefDebianParent},
 }
 
 // EnsureBasesResult reports what EnsureBases did for a single runtime
@@ -392,7 +635,19 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 		baseKey := sched.BaseKeyForArch(row.Runtime, arch)
 		digestKey := sched.BaseDigestKeyForArch(row.Runtime, arch)
 		outImage := sched.BaseKeyForArch(row.Runtime, arch) // LocalStorageBackend joins under FAAS_STORAGE_ROOT
-		res, err := h.EnsureBaseExt4(ctx, ref, baseKey, digestKey, outImage)
+		// ADR-053: when the row declares a parent runtime, pass its
+		// resolved OCI ref + StorageBackend key so EnsureBaseExt4
+		// can take the parent-ref branch. The parent row's
+		// ParentRef is "" (its own loop iteration skips this
+		// block) and runs the legacy "apply ALL layers" path —
+		// staged first because DefaultRuntimeBaseRefs[0] is the
+		// parent.
+		parentRef := row.ParentRef
+		parentBaseKey := ""
+		if parentRef != "" {
+			parentBaseKey = sched.BaseKeyForArch(RuntimeDebianParent, arch)
+		}
+		res, err := h.EnsureBaseExt4(ctx, ref, baseKey, digestKey, outImage, parentRef, parentBaseKey)
 		if err != nil {
 			return nil, fmt.Errorf("imaged: stage runtime base %s (%s → %s): %w", row.Runtime, ref, baseKey, err)
 		}
