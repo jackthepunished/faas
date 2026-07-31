@@ -590,6 +590,17 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 	if dep.Handler != "" {
 		manifest.Entrypoint = []string{dep.Handler}
 	}
+	// PR-B (issue #460 / ADR-053): layer the deployment's six persisted
+	// override columns onto the OCI-derived manifest before validation. The
+	// helper is a pure function; an error here means a jsonb column failed
+	// to decode (i.e. the row was tampered with or a migration replayed an
+	// old shape). Mirror the manifest.Validate() error path: deploy failed
+	// + wrap.
+	manifest, err = applyOverrides(manifest, dep)
+	if err != nil {
+		_ = h.markDeployFailed(ctx, dep.ID, err, "manifest overrides: decode failed")
+		return fmt.Errorf("imaged: apply overrides: %w", err)
+	}
 	if err := manifest.Validate(); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "manifest invalid: "+err.Error())
 		return fmt.Errorf("imaged: validate manifest: %w", err)
@@ -820,6 +831,16 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 			"--runtime", runtime,
 			"--handler", "/app/handler",
 		}
+	}
+	// PR-B (issue #460 / ADR-053): same seam as buildImageLayer (handler.go:546).
+	// Function deploys build their manifest inline (no OCI pull), so the
+	// "OCI base" is the runtime-default argv from the switch above;
+	// overrides layer on top. snapshot-boot fans out through here, so this
+	// one insertion covers both routes.
+	manifest, err := applyOverrides(manifest, dep)
+	if err != nil {
+		_ = h.markDeployFailed(ctx, dep.ID, err, "manifest overrides: decode failed")
+		return fmt.Errorf("imaged: apply overrides: %w", err)
 	}
 	if err := manifest.Validate(); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "manifest invalid: "+err.Error())

@@ -2,6 +2,7 @@ package imaged
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -782,6 +784,175 @@ func TestHandleDeployment_HandlerOverrideWinsOverImageCmd(t *testing.T) {
 	in := h.bld.calls[0]
 	if len(in.Manifest.Entrypoint) != 1 || in.Manifest.Entrypoint[0] != "python312:app.handler" {
 		t.Errorf("Entrypoint = %v, want [python312:app.handler]", in.Manifest.Entrypoint)
+	}
+}
+
+// TestHandleDeployment_OverrideEntrypointWinsOverImageCmd pins the PR-B
+// (issue #460 / ADR-053) entrypoint-override seam on the image deploy path:
+// override_entrypoint replaces the OCI cmd-derived argv before the manifest
+// reaches rootfs.Builder.Build. This is the runtime-effect half of entrypoint
+// overrides; the contract half (persistence + echo) is in PR-A's handler test
+// surface.
+func TestHandleDeployment_OverrideEntrypointWinsOverImageCmd(t *testing.T) {
+	h := newTestHarness(t, state.DeploymentKindImage, api.Plan("hobby"), "")
+	h.dep.OverrideEntrypoint = []string{"/usr/local/bin/custom-runner"}
+	if _, err := h.store.CreateDeployment(context.Background(), h.dep); err != nil {
+		t.Fatalf("re-seed deployment with override: %v", err)
+	}
+	puller := fakePuller{
+		digest: "sha256:abc",
+		cfg:    oci.ImageConfig{Cmd: []string{"node", "server.js"}},
+	}
+	handler := New(h.store, h.notif, puller, h.bld, "./init", h.appsR, silentLogger())
+
+	handler.HandleNotification(context.Background(), db.Notification{
+		Channel: db.NotifyDeploymentChanged,
+		Payload: `{"app_id":"` + h.app.ID + `","to":"` + h.dep.ID + `","kind":"image","image_digest":"sha256:abc"}`,
+	})
+
+	if len(h.bld.calls) != 1 {
+		t.Fatalf("Build calls = %d, want 1", len(h.bld.calls))
+	}
+	in := h.bld.calls[0]
+	if len(in.Manifest.Entrypoint) != 1 || in.Manifest.Entrypoint[0] != "/usr/local/bin/custom-runner" {
+		t.Errorf("Entrypoint = %v, want [/usr/local/bin/custom-runner]", in.Manifest.Entrypoint)
+	}
+}
+
+// TestHandleDeployment_OverrideEnvMergesWithImageEnv pins the env-merge seam:
+// override_env wins on key collision, non-colliding OCI keys pass through.
+// Mirrors the applyOverrides table case but at the handler level so a
+// regression in manifestFromImageConfig → applyOverrides wiring surfaces here.
+func TestHandleDeployment_OverrideEnvMergesWithImageEnv(t *testing.T) {
+	h := newTestHarness(t, state.DeploymentKindImage, api.Plan("hobby"), "")
+	override := map[string]string{"LOG_LEVEL": "debug", "IMAGE_VER": "9.9.9"}
+	overrideRaw, _ := json.Marshal(override)
+	h.dep.OverrideEnv = overrideRaw
+	if _, err := h.store.CreateDeployment(context.Background(), h.dep); err != nil {
+		t.Fatalf("re-seed deployment: %v", err)
+	}
+	puller := fakePuller{
+		digest: "sha256:abc",
+		cfg: oci.ImageConfig{
+			Cmd: []string{"node", "server.js"},
+			Env: map[string]string{"IMAGE_VER": "1.2.3", "OCI_VAR": "from_image"},
+		},
+	}
+	handler := New(h.store, h.notif, puller, h.bld, "./init", h.appsR, silentLogger())
+
+	handler.HandleNotification(context.Background(), db.Notification{
+		Channel: db.NotifyDeploymentChanged,
+		Payload: `{"app_id":"` + h.app.ID + `","to":"` + h.dep.ID + `","kind":"image","image_digest":"sha256:abc"}`,
+	})
+
+	if len(h.bld.calls) != 1 {
+		t.Fatalf("Build calls = %d, want 1", len(h.bld.calls))
+	}
+	in := h.bld.calls[0]
+	if in.Manifest.Env["IMAGE_VER"] != "9.9.9" {
+		t.Errorf("Env[IMAGE_VER] = %q, want 9.9.9 (override wins on collision)", in.Manifest.Env["IMAGE_VER"])
+	}
+	if in.Manifest.Env["LOG_LEVEL"] != "debug" {
+		t.Errorf("Env[LOG_LEVEL] = %q, want debug (override-only key added)", in.Manifest.Env["LOG_LEVEL"])
+	}
+	if in.Manifest.Env["OCI_VAR"] != "from_image" {
+		t.Errorf("Env[OCI_VAR] = %q, want from_image (non-colliding OCI key preserved)", in.Manifest.Env["OCI_VAR"])
+	}
+}
+
+// TestHandleDeployment_OverridePortStampsManifest pins the source-of-truth
+// half of port: the override writes manifest.Port (so PR-C can consume it).
+// The runtime-effect half (DNAT, waitReady, runners) ships in PR-C — that
+// regression is NOT here. Keeping this as the manifest-stamp regression net.
+func TestHandleDeployment_OverridePortStampsManifest(t *testing.T) {
+	h := newTestHarness(t, state.DeploymentKindImage, api.Plan("hobby"), "")
+	h.dep.OverridePort = 9090
+	if _, err := h.store.CreateDeployment(context.Background(), h.dep); err != nil {
+		t.Fatalf("re-seed deployment: %v", err)
+	}
+	puller := fakePuller{digest: "sha256:abc", cfg: oci.ImageConfig{Cmd: []string{"node"}}}
+	handler := New(h.store, h.notif, puller, h.bld, "./init", h.appsR, silentLogger())
+
+	handler.HandleNotification(context.Background(), db.Notification{
+		Channel: db.NotifyDeploymentChanged,
+		Payload: `{"app_id":"` + h.app.ID + `","to":"` + h.dep.ID + `","kind":"image","image_digest":"sha256:abc"}`,
+	})
+
+	if len(h.bld.calls) != 1 {
+		t.Fatalf("Build calls = %d, want 1", len(h.bld.calls))
+	}
+	if h.bld.calls[0].Manifest.Port != 9090 {
+		t.Errorf("Manifest.Port = %d, want 9090", h.bld.calls[0].Manifest.Port)
+	}
+}
+
+// TestBuildFunctionLayer_OverrideEntrypointWinsOverRuntimeDefault is the
+// function-deploy mirror of TestHandleDeployment_OverrideEntrypointWinsOverImageCmd.
+// Covers issue #460 §5 PR-B acceptance (override applies at imaged time on
+// function deploys too).
+func TestBuildFunctionLayer_OverrideEntrypointWinsOverRuntimeDefault(t *testing.T) {
+	h := newFunctionTestHarness(t, api.PlanHobby, RuntimeNode22)
+	h.dep.OverrideEntrypoint = []string{"/usr/local/bin/custom", "--port", "9090"}
+	if _, err := h.store.CreateDeployment(context.Background(), h.dep); err != nil {
+		t.Fatalf("re-seed deployment: %v", err)
+	}
+	handler := New(h.store, h.notif, fakePuller{}, h.bld, "./init", h.appsR, silentLogger())
+	handler.WithFunctionRunnerNode22("/runners/node22")
+
+	if err := handler.buildFunctionLayer(context.Background(), h.app, h.dep, h.acct); err != nil {
+		t.Fatalf("buildFunctionLayer: %v", err)
+	}
+	if len(h.bld.calls) != 1 {
+		t.Fatalf("Build calls = %d, want 1", len(h.bld.calls))
+	}
+	got := h.bld.calls[0].Manifest.Entrypoint
+	want := []string{"/usr/local/bin/custom", "--port", "9090"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Entrypoint = %v, want %v", got, want)
+	}
+}
+
+// TestHandleDeployment_NoOverrideLeavesManifestUntouched is the no-op
+// regression net: a deployment with all six override columns nil must
+// produce the OCI argv (image path) or the runtime-default argv (function
+// path) with no field changes from applyOverrides. Defends against a future
+// refactor accidentally writing default values.
+func TestHandleDeployment_NoOverrideLeavesManifestUntouched(t *testing.T) {
+	h := newTestHarness(t, state.DeploymentKindImage, api.Plan("hobby"), "")
+	puller := fakePuller{
+		digest: "sha256:abc",
+		cfg: oci.ImageConfig{
+			Cmd:        []string{"node", "server.js"},
+			Env:        map[string]string{"FROM": "image"},
+			WorkingDir: "/srv",
+		},
+	}
+	handler := New(h.store, h.notif, puller, h.bld, "./init", h.appsR, silentLogger())
+
+	handler.HandleNotification(context.Background(), db.Notification{
+		Channel: db.NotifyDeploymentChanged,
+		Payload: `{"app_id":"` + h.app.ID + `","to":"` + h.dep.ID + `","kind":"image","image_digest":"sha256:abc"}`,
+	})
+
+	if len(h.bld.calls) != 1 {
+		t.Fatalf("Build calls = %d, want 1", len(h.bld.calls))
+	}
+	in := h.bld.calls[0]
+	// applyOverrides must NOT write any field when the deployment has no
+	// overrides. The base values (Env["PORT"]=8080 default + Healthz
+	// default) come from manifestFromImageConfig (ADR-051 Phase 4
+	// characterization-boot seeding) — applyOverrides is downstream of
+	// that and only layers ON TOP. So the expected want mirrors whatever
+	// manifestFromImageConfig produced plus identity (no additional
+	// writes from applyOverrides).
+	want := api.AppManifest{
+		Entrypoint: []string{"node", "server.js"},
+		Env:        map[string]string{"FROM": "image", "PORT": "8080"},
+		WorkingDir: "/srv",
+		Healthz:    "/healthz",
+	}
+	if !reflect.DeepEqual(in.Manifest, want) {
+		t.Errorf("manifest changed by applyOverrides with no override: got %+v, want %+v", in.Manifest, want)
 	}
 }
 

@@ -192,18 +192,18 @@ type DeploymentHealthcheck struct {
 	Retries   int    `json:"retries,omitempty"`
 }
 
-// secretRefPrefix is the wire prefix on env_secrets values that
-// flags the value as a sealed-secret ref rather than a plaintext
-// fallback. ADR-053 §Decision 1 — the runtime resolver (PR-B) will
-// strip this prefix and look up the trailing name against the
-// app_secrets table. PR-A only validates the shape; resolution is
-// a follow-up.
-const secretRefPrefix = "secret:"
+// SecretRefPrefix is the wire prefix on env_secrets values that flags the
+// value as a sealed-secret ref rather than a plaintext fallback.
+// ADR-053 §Decision 1 — pkg/sched/engine.go's loadSealedEnvFor strips this
+// prefix and looks up the trailing name against app_secrets at wake time.
+// PR-A only validated the shape at apid time; the runtime resolver is PR-B.
+const SecretRefPrefix = "secret:"
 
-// secretRefNameRe matches the NAME portion of a sealed-secret ref.
-// Same identifier grammar as env keys / secret keys (ADR-045
-// §Decision 1 mirror) — one regex, no drift.
-var secretRefNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+// SecretRefNameRe matches the NAME portion of a sealed-secret ref. Same
+// identifier grammar as env keys / secret keys (ADR-045 §Decision 1 mirror).
+// Exported so pkg/sched/engine.go::loadSealedEnvFor (PR-B) reuses it at
+// wake time — one regex, no drift between apid and schedd rejection logic.
+var SecretRefNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // Validate enforces every override field's constraint from
 // ADR-053 §Decision 1. Returns nil on success or a *Problem with
@@ -267,18 +267,18 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 		if p := ValidateEnvKey(k); p != nil {
 			return p
 		}
-		if !strings.HasPrefix(v, secretRefPrefix) {
+		if !strings.HasPrefix(v, SecretRefPrefix) {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
-				fmt.Sprintf("env_secrets[%q] value must start with %q (e.g. %qDB-URL); got %q.",
-					k, secretRefPrefix, secretRefPrefix, v))
+				fmt.Sprintf("env_secrets[%q] value must start with %q (e.g. %qDB_URL); got %q.",
+					k, SecretRefPrefix, SecretRefPrefix, v))
 		}
-		name := strings.TrimPrefix(v, secretRefPrefix)
-		if !secretRefNameRe.MatchString(name) {
+		name := strings.TrimPrefix(v, SecretRefPrefix)
+		if !SecretRefNameRe.MatchString(name) {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
 				fmt.Sprintf("env_secrets[%q] ref name %q must match %s.",
-					k, name, secretRefNameRe.String()))
+					k, name, SecretRefNameRe.String()))
 		}
 		if limits.EnvValueMaxBytes > 0 && len(v) > limits.EnvValueMaxBytes {
 			return ErrEnvVarValueTooLarge(limits, len(v))

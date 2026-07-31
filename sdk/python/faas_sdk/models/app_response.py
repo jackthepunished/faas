@@ -34,7 +34,9 @@ class AppResponse:
     url: str
     manifest: AppManifest
     """App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-
-    as-source flag (§ux 6.3)."""
+    as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs ("secret:NAME" strings)
+    resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are
+    NEVER sealed ciphertext — only refs."""
     autoscale_target_rps: int
     """Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured
     per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."""

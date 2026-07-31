@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // AppManifestPath is where imaged writes the manifest inside the app layer and
@@ -28,6 +29,12 @@ type AppManifest struct {
 	// Env is applied before exec. Secret values are injected at boot, not stored
 	// here (spec gap G2) — never put secrets in the manifest.
 	Env map[string]string `json:"env,omitempty"`
+	// EnvSecrets carries sealed-secret REFs ("secret:NAME" strings); the host
+	// resolves them at wake against the app_secrets table (issue #460 /
+	// ADR-053 §Decision 1). Values NEVER contain plaintext — only refs.
+	// guest-init does not read this field; pkg/sched/engine.go's
+	// loadSealedEnvFor consumes it via the deployment row, not the manifest.
+	EnvSecrets map[string]string `json:"env_secrets,omitempty"`
 	// WorkingDir is the app's cwd; empty means "/".
 	WorkingDir string `json:"working_dir,omitempty"`
 	// Port is the readiness/serving port; 0 means DefaultAppPort.
@@ -73,6 +80,21 @@ func (m AppManifest) Validate() error {
 	}
 	if m.Port < 0 || m.Port > 65535 {
 		return fmt.Errorf("app manifest: port %d out of range", m.Port)
+	}
+	// EnvSecrets: each value must be a "secret:NAME" ref (ADR-053 §Decision 1).
+	// The grammar is shared with pkg/api/dto.go::CreateDeploymentOverrides
+	// validation; we duplicate the check here (rather than import) so the
+	// manifest contract is self-contained — guest-init and imaged validate
+	// without depending on the apid DTO package. The full ref-name regex lives
+	// in dto.go for now; if a third caller appears, export it.
+	for k, v := range m.EnvSecrets {
+		if !strings.HasPrefix(v, SecretRefPrefix) {
+			return fmt.Errorf("app manifest: env_secrets[%q]=%q must start with %q", k, v, SecretRefPrefix)
+		}
+		name := strings.TrimPrefix(v, SecretRefPrefix)
+		if !SecretRefNameRe.MatchString(name) {
+			return fmt.Errorf("app manifest: env_secrets[%q] ref name %q must match %s", k, name, SecretRefNameRe.String())
+		}
 	}
 	return nil
 }

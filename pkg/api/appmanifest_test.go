@@ -48,6 +48,29 @@ func TestManifestValidate(t *testing.T) {
 		{"empty argv0", AppManifest{Entrypoint: []string{""}}, false},
 		{"bad port", AppManifest{Entrypoint: []string{"x"}, Port: 70000}, false},
 		{"neg port", AppManifest{Entrypoint: []string{"x"}, Port: -1}, false},
+		// Issue #460 / ADR-053 — env_secrets refs (PR-B wiring). Ref names
+		// match ^[A-Z][A-Z0-9_]*$ (same grammar as pkg/api/dto.go's apid
+		// validation, mirrored to keep the manifest contract self-contained).
+		{"env_secrets well-formed", AppManifest{
+			Entrypoint: []string{"x"},
+			EnvSecrets: map[string]string{"DB_URL": "secret:DB_URL"},
+		}, true},
+		{"env_secrets missing prefix", AppManifest{
+			Entrypoint: []string{"x"},
+			EnvSecrets: map[string]string{"DB_URL": "plaintext"},
+		}, false},
+		{"env_secrets bad ref name (lowercase)", AppManifest{
+			Entrypoint: []string{"x"},
+			EnvSecrets: map[string]string{"DB_URL": "secret:lowercase"},
+		}, false},
+		{"env_secrets empty value", AppManifest{
+			Entrypoint: []string{"x"},
+			EnvSecrets: map[string]string{"DB_URL": ""},
+		}, false},
+		{"env_secrets empty map", AppManifest{
+			Entrypoint: []string{"x"},
+			EnvSecrets: map[string]string{},
+		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,6 +86,7 @@ func TestManifestRoundTrip(t *testing.T) {
 	in := AppManifest{
 		Entrypoint: []string{"node", "server.js"},
 		Env:        map[string]string{"NODE_ENV": "production"},
+		EnvSecrets: map[string]string{"DB_URL": "secret:DB_URL", "API_KEY": "secret:API_KEY"},
 		Port:       3000,
 		Healthz:    "/healthz",
 	}
@@ -76,6 +100,9 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if out.Entrypoint[1] != "server.js" || out.Port != 3000 || out.Env["NODE_ENV"] != "production" {
 		t.Errorf("round trip mismatch: %+v", out)
+	}
+	if out.EnvSecrets["DB_URL"] != "secret:DB_URL" || out.EnvSecrets["API_KEY"] != "secret:API_KEY" {
+		t.Errorf("env_secrets round trip mismatch: %+v", out.EnvSecrets)
 	}
 }
 
