@@ -212,6 +212,15 @@ type OpsMetrics struct {
 	// alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the
 	// operator's "is meterd actually evaluating rules?" view.
 	alertEvaluatorEnabled prometheus.Gauge
+	// pgBackupLastPushed — operator-facing gauge stamped by the
+	// apid's pgBackupPushedSampler (cmd/apid/main.go). Holds the
+	// age of the newest tarball in /var/lib/pgsql/basebackup/ (in
+	// seconds; 0 when the dir is empty). The PgBackupStale alert
+	// (deploy/ansible/roles/prometheus/files/pg_backup.rules.yml,
+	// issue #250) queries this gauge; the alert fires when the
+	// value exceeds 86400 (24h). Unlabelled — single-box fleet, no
+	// per-node fan-out needed today.
+	pgBackupLastPushed prometheus.Gauge
 	// alertEvaluatorMu + alertEvaluatorEnabledValue shadow the gauge
 	// so AlertEvaluatorEnabled() can return a bool without scraping
 	// /metrics or relying on a non-existent prometheus.Gauge.Value()
@@ -1015,6 +1024,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
 	}
+	// Issue #250 — off-host Postgres backup observability. Same
+	// pre-instantiate-to-0 precedent as alertEvaluatorEnabled above:
+	// without a tick, the gauge must still surface from boot so the
+	// alert rule's `time() - pg_backup_last_pushed_seconds` query
+	// has a series to compare against. Without this, a freshly-booted
+	// box would look identical to one with no basebackup root —
+	// both return NaN, and the alert is silently skipped.
+	pgBackupLastPushed := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_pg_backup_last_pushed_seconds",
+		Help: "Age of the newest Postgres basebackup tarball in /var/lib/pgsql/basebackup/, in seconds (issue #250). 0 when the directory is empty. The PgBackupStale alert (deploy/ansible/roles/prometheus/files/pg_backup.rules.yml) queries `time() - pg_backup_last_pushed_seconds > 86400` to surface a stuck push timer; the value is stamped once per minute by cmd/apid's pgBackupPushedSampler goroutine (60s tick).",
+	})
+	pgBackupLastPushed.Set(0)
+	commonCollectors = append(commonCollectors, pgBackupLastPushed)
 	// ADR-038 / Tier 3 / issue #197 B3.1: build_provenance
 	// populator counter. Single CounterVec with a closed `code`
 	// label set ({ok, error}); pre-instantiated below so both rows
@@ -1254,6 +1276,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		alertEvalFiredTotal:              alertEvalFiredTotal,
 		alertDeliveryAttemptsTotal:       alertDeliveryAttemptsTotal,
 		alertEvaluatorEnabled:            alertEvaluatorEnabled,
+		pgBackupLastPushed:               pgBackupLastPushed,
 		ipLabels:                         newIPLabelSet(maxIPLabelValues),
 		topTenantRPS:                     topTenantRPS,
 		topAccounts:                      newTopAccountSet(topAccountSetCap),
@@ -2125,6 +2148,20 @@ func (m *OpsMetrics) AlertDeliveryAttemptsTotal(outcome string) func() {
 	}
 	m.alertDeliveryAttemptsTotal.WithLabelValues(outcome).Inc()
 	return func() {}
+}
+
+// PgBackupLastPushed returns the unlabelled gauge stamped by the
+// apid's pgBackupPushedSampler goroutine (issue #250). Operators
+// scrape it via the cluster-wide /metrics endpoint; the alert rule
+// `PgBackupStale` (deploy/ansible/roles/prometheus/files/pg_backup.rules.yml)
+// fires when `time() - pg_backup_last_pushed_seconds > 86400`.
+// Safe on a nil receiver (returns nil — same shape as the other
+// accessor shortcuts).
+func (m *OpsMetrics) PgBackupLastPushed() prometheus.Gauge {
+	if m == nil {
+		return nil
+	}
+	return m.pgBackupLastPushed
 }
 
 // SetAlertEvaluatorEnabled stamps the alert-evaluator-enabled gauge.

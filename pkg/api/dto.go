@@ -21,6 +21,12 @@ type CreateAppRequest struct {
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
+	// StreamingEnabled (issue #471) lets a customer opt out of
+	// streaming at creation time. nil → plan default (Free off,
+	// Hobby+ on). Explicit false on a Hobby/Pro/Scale plan = opt out
+	// (a synchronous JSON API that wants Content-Length). Explicit
+	// true on Free = rejected by apid with 403 plan_streaming_not_allowed.
+	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -65,6 +71,27 @@ type UpdateAppRequest struct {
 	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
+	// StreamingEnabled (issue #471) toggles the per-app streaming
+	// response path through gatewayd. When true (or unset on a plan
+	// where the default is true), gatewayd streams the response body
+	// from the guest through to the client with a periodic 200 ms /
+	// 256 KiB tx_bytes flush; when false, the legacy buffered path
+	// runs (spec §4.1: 25 MB / 300 s). Plan-gated upstream: Free
+	// returns 403 plan_streaming_not_allowed. Hobby/Pro/Scale may
+	// PATCH true → false to opt out (e.g. a synchronous JSON API
+	// that wants Content-Length). Pointer distinguishes "don't
+	// touch" (nil) from "explicit false" (*bool=false).
+	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
+	// RootDir, WorkloadName, StartCommand mirror the apps table
+	// columns added in Phase 1 (migration 00074). The customer-facing
+	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
+	// they're populated by pkg/reconcile in PR-G/H via the internal
+	// updateApp flow. json tags keep them off the customer wire
+	// surface (`omitempty` on every field, no separate routes
+	// targeting these) so an existing CLI SDK never sends them.
+	RootDir      *string `json:"-"`
+	WorkloadName *string `json:"-"`
+	StartCommand *string `json:""`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -117,6 +144,14 @@ type AppResponse struct {
 	// current target. Plan-gated upstream.
 	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
 	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
+	// StreamingEnabled (issue #471) reflects the per-app flag stored
+	// on the apps row. False on Free (the plan default and the only
+	// legal state on Free — apid rejects PATCH true with 403
+	// plan_streaming_not_allowed). True on Hobby/Pro/Scale by default
+	// unless the customer explicitly opted out via PATCH. Surfaced so
+	// dashboards can show "streaming on / off" alongside the
+	// egress-allowlist flag.
+	StreamingEnabled bool `json:"streaming_enabled"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
@@ -175,9 +210,13 @@ type CreateDeploymentOverrides struct {
 	// column and surfaces it on the response.
 	Port int `json:"port,omitempty"`
 	// Healthcheck is the optional readiness probe. PR-A persists
-	// the shape; PR-A does NOT yet extend vmm.waitReady to issue
-	// an HTTP probe — the probe stays a bare TCP accept. The
-	// HTTP-probe variant is its own ADR + property test.
+	// the shape; PR-B stamps AppManifest.Healthz at deploy time;
+	// PR-D activates the runtime half — pkg/fcvm/vmm.go::waitReady
+	// issues an HTTP GET against <HostIP>:8080<Healthcheck.Path>
+	// and accepts 2xx (issue #460 / ADR-053 / ADR-057). Empty path
+	// preserves the legacy TCP-accept behaviour. IntervalS /
+	// TimeoutS / Retries are stored + validated here but remain
+	// dormant until a v2 contract lands them on the wire.
 	Healthcheck *DeploymentHealthcheck `json:"healthcheck,omitempty"`
 }
 
@@ -192,18 +231,18 @@ type DeploymentHealthcheck struct {
 	Retries   int    `json:"retries,omitempty"`
 }
 
-// secretRefPrefix is the wire prefix on env_secrets values that
-// flags the value as a sealed-secret ref rather than a plaintext
-// fallback. ADR-053 §Decision 1 — the runtime resolver (PR-B) will
-// strip this prefix and look up the trailing name against the
-// app_secrets table. PR-A only validates the shape; resolution is
-// a follow-up.
-const secretRefPrefix = "secret:"
+// SecretRefPrefix is the wire prefix on env_secrets values that flags the
+// value as a sealed-secret ref rather than a plaintext fallback.
+// ADR-053 §Decision 1 — pkg/sched/engine.go's loadSealedEnvFor strips this
+// prefix and looks up the trailing name against app_secrets at wake time.
+// PR-A only validated the shape at apid time; the runtime resolver is PR-B.
+const SecretRefPrefix = "secret:"
 
-// secretRefNameRe matches the NAME portion of a sealed-secret ref.
-// Same identifier grammar as env keys / secret keys (ADR-045
-// §Decision 1 mirror) — one regex, no drift.
-var secretRefNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+// SecretRefNameRe matches the NAME portion of a sealed-secret ref. Same
+// identifier grammar as env keys / secret keys (ADR-045 §Decision 1 mirror).
+// Exported so pkg/sched/engine.go::loadSealedEnvFor (PR-B) reuses it at
+// wake time — one regex, no drift between apid and schedd rejection logic.
+var SecretRefNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // Validate enforces every override field's constraint from
 // ADR-053 §Decision 1. Returns nil on success or a *Problem with
@@ -267,18 +306,18 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 		if p := ValidateEnvKey(k); p != nil {
 			return p
 		}
-		if !strings.HasPrefix(v, secretRefPrefix) {
+		if !strings.HasPrefix(v, SecretRefPrefix) {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
-				fmt.Sprintf("env_secrets[%q] value must start with %q (e.g. %qDB-URL); got %q.",
-					k, secretRefPrefix, secretRefPrefix, v))
+				fmt.Sprintf("env_secrets[%q] value must start with %q (e.g. %qDB_URL); got %q.",
+					k, SecretRefPrefix, SecretRefPrefix, v))
 		}
-		name := strings.TrimPrefix(v, secretRefPrefix)
-		if !secretRefNameRe.MatchString(name) {
+		name := strings.TrimPrefix(v, SecretRefPrefix)
+		if !SecretRefNameRe.MatchString(name) {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
 				fmt.Sprintf("env_secrets[%q] ref name %q must match %s.",
-					k, name, secretRefNameRe.String()))
+					k, name, SecretRefNameRe.String()))
 		}
 		if limits.EnvValueMaxBytes > 0 && len(v) > limits.EnvValueMaxBytes {
 			return ErrEnvVarValueTooLarge(limits, len(v))

@@ -150,8 +150,8 @@ func TestPaddedSizeMB(t *testing.T) {
 	if got := PaddedSizeMB(0); got != MinLayerMB {
 		t.Errorf("empty content -> %d, want floor %d", got, MinLayerMB)
 	}
-	if got := PaddedSizeMB(100 * mib); got < 104 { // 100 + 10% slack
-		t.Errorf("100MB content -> %d MB, want >= 104", got)
+	if got := PaddedSizeMB(100 * mib); got < 110 { // 100 + perAppSlackPct% slack
+		t.Errorf("100MB content -> %d MB, want >= 110", got)
 	}
 	// Monotonic: more content never shrinks the image.
 	prev := 0
@@ -161,6 +161,88 @@ func TestPaddedSizeMB(t *testing.T) {
 			t.Fatalf("size not monotonic at %d bytes: %d < %d", c, s, prev)
 		}
 		prev = s
+	}
+}
+
+func TestBasePaddedSizeMB(t *testing.T) {
+	// Empty content still gets a floor — same as PaddedSizeMB.
+	if got := BasePaddedSizeMB(0, 0); got != MinLayerMB {
+		t.Errorf("empty content -> %d, want floor %d", got, MinLayerMB)
+	}
+	// Tree with NO small files: BasePaddedSizeMB must equal the legacy
+	// PaddedSizeMB (smallFileSlackPct contributes 0 when smallRatio=0).
+	for c := int64(0); c <= 500*mib; c += 50 * mib {
+		legacy := PaddedSizeMB(c)
+		new := BasePaddedSizeMB(c, 0)
+		if legacy != new {
+			t.Errorf("all-big-file tree: BasePaddedSizeMB(%d, 0) = %d, want %d (matches PaddedSizeMB)",
+				c, new, legacy)
+		}
+	}
+	// Tree with all-small files (smallRatio=1) — at the 76 MB
+	// apparent-shape observed on the EX44 (run 30656504195,
+	// 2026-07-31, base-debian-parent staging), BasePaddedSizeMB
+	// must overshoot the empirical mkfs.ext4 -d floor (109 MB).
+	// Empirical bisect at e2fsprogs 1.47.0 showed 109 MB passes and
+	// 108 MB fails with "Could not allocate block in ext2 filesystem
+	// while writing file 'Dakar'". 1 MB headroom protects against a
+	// future mkfs rev tightening the bound.
+	const debianApparentBytes = 75_518_000 // du -sb of debian:12-slim on Lima
+	const empiricalMinMB = 109
+	got := BasePaddedSizeMB(debianApparentBytes, 1)
+	if got <= empiricalMinMB {
+		t.Errorf("BasePaddedSizeMB(76 MB, all-small) = %d MB, want > %d MB (empirical mkfs -d floor at run 30656504195)",
+			got, empiricalMinMB)
+	}
+	// Edge cases on smallRatio: clamped to [0, 1].
+	if got := BasePaddedSizeMB(100*mib, -0.5); got != PaddedSizeMB(100*mib) {
+		t.Errorf("negative smallRatio should clamp to 0; got %d", got)
+	}
+	if got := BasePaddedSizeMB(100*mib, 2); got != BasePaddedSizeMB(100*mib, 1) {
+		t.Errorf("smallRatio > 1 should clamp to 1; got %d", got)
+	}
+	// Monotonic in both arguments.
+	prevContent := 0
+	for c := int64(0); c <= 500*mib; c += 50 * mib {
+		s := BasePaddedSizeMB(c, 0.8)
+		if s < prevContent {
+			t.Fatalf("not monotonic at c=%d: %d < %d", c, s, prevContent)
+		}
+		prevContent = s
+	}
+}
+
+func TestInspectStaging(t *testing.T) {
+	root := t.TempDir()
+	must := func(p string, body []byte) {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must("a/big1", bytes.Repeat([]byte{0}, 8192))    // 8 KB — at threshold
+	must("a/big2", bytes.Repeat([]byte{0}, 16*1024)) // 16 KB — big
+	must("a/small1", bytes.Repeat([]byte{0}, 100))   // 100 B — small
+	must("a/small2", []byte("hi"))                   // 2 B — small
+	if err := os.MkdirAll(filepath.Join(root, "a/empty-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := InspectStaging(root)
+	if err != nil {
+		t.Fatalf("InspectStaging: %v", err)
+	}
+	// 8192 + 16*1024 + 100 + 2 = 24_678 bytes apparent.
+	if want := int64(24_678); stats.ContentBytes != want {
+		t.Errorf("ContentBytes = %d, want %d", stats.ContentBytes, want)
+	}
+	// 4 regular files: 2 below threshold (100, 2), 2 at-or-above (8192,
+	// 16384). smallRatio = 2/4 = 0.5.
+	if want := 0.5; stats.SmallRatio != want {
+		t.Errorf("SmallRatio = %f, want %f", stats.SmallRatio, want)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -52,6 +54,31 @@ type baseHarness struct {
 	be storage.StorageBackend
 }
 
+// legacyRefs returns the DefaultRuntimeBaseRefs slice filtered to
+// only the rows on the legacy "apply ALL layers" path
+// (ParentRef == ""). The legacy-path unit tests use this so
+// they don't have to wire a fake VMMClient and arrange parent
+// DiffIDs as a runtime DiffID prefix — the parent-ref branch
+// has its own dedicated tests (TestEnsureBaseExt4_WithParentRef_*
+// in vmmclient_test.go).
+//
+// ADR-053: the four node/python runtime rows are excluded. Their
+// parentRef non-empty triggers the parent-ref branch, which
+// requires the parent's DiffIDs to be a strict prefix of the
+// runtime's — the minimal test puller doesn't arrange that. The
+// parent runtime itself stays in this slice because its
+// ParentRef is empty (legacy path) and the test can stage it as
+// usual.
+func legacyRefs() []RuntimeBaseRef {
+	var out []RuntimeBaseRef
+	for _, r := range DefaultRuntimeBaseRefs {
+		if r.ParentRef == "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func newBaseHarness(t *testing.T, mp *minimalManifestPuller, b LayerBuilder) *baseHarness {
 	t.Helper()
 	be, err := storage.NewLocalStorageBackend(t.TempDir())
@@ -87,7 +114,7 @@ func TestEnsureBaseExt4_StagesOnFirstRun(t *testing.T) {
 	const baseKey = "base/runtime.ext4"
 	const digKey = "base/runtime.ext4.digest"
 	res, err := hs.h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "")
+		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "", "", "")
 	if err != nil {
 		t.Fatalf("EnsureBaseExt4: %v", err)
 	}
@@ -152,7 +179,7 @@ func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
 	}
 
 	if _, err := hs.h.EnsureBaseExt4(context.Background(),
-		ociRef, baseKey, digKey, outImage); err != nil {
+		ociRef, baseKey, digKey, outImage, "", ""); err != nil {
 		t.Fatalf("EnsureBaseExt4: %v", err)
 	}
 	if capturedDir != outImage {
@@ -184,7 +211,7 @@ func TestEnsureBaseExt4_SkipsWhenDigestMatches(t *testing.T) {
 	b := &callCountingBuilder{}
 	h := &Handler{oci: mp, builder: b, log: silentLogger(), storage: be}
 	res, err := h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "")
+		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "", "", "")
 	if err != nil {
 		t.Fatalf("EnsureBaseExt4: %v", err)
 	}
@@ -218,7 +245,7 @@ func TestEnsureBaseExt4_RestagesWhenDigestDiffers(t *testing.T) {
 	b := &callCountingBuilder{}
 	h := &Handler{oci: mp, builder: b, log: silentLogger(), storage: be}
 	res, err := h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "")
+		"ghcr.io/onebox-faas/builder-base:latest", baseKey, digKey, "", "", "")
 	if err != nil {
 		t.Fatalf("EnsureBaseExt4: %v", err)
 	}
@@ -236,13 +263,13 @@ func TestEnsureBaseExt4_RestagesWhenDigestDiffers(t *testing.T) {
 func TestEnsureBaseExt4_RejectsEmptyInputs(t *testing.T) {
 	be, _ := storage.NewLocalStorageBackend(t.TempDir())
 	h := &Handler{oci: &minimalManifestPuller{}, builder: &fakeBuilder{}, log: silentLogger(), storage: be}
-	if _, err := h.EnsureBaseExt4(context.Background(), "", "k", "k.digest", ""); err == nil {
+	if _, err := h.EnsureBaseExt4(context.Background(), "", "k", "k.digest", "", "", ""); err == nil {
 		t.Error("empty ref should error")
 	}
-	if _, err := h.EnsureBaseExt4(context.Background(), "ref", "", "k.digest", ""); err == nil {
+	if _, err := h.EnsureBaseExt4(context.Background(), "ref", "", "k.digest", "", "", ""); err == nil {
 		t.Error("empty baseKey should error")
 	}
-	if _, err := h.EnsureBaseExt4(context.Background(), "ref", "k", "", ""); err == nil {
+	if _, err := h.EnsureBaseExt4(context.Background(), "ref", "k", "", "", "", ""); err == nil {
 		t.Error("empty digestKey should error")
 	}
 }
@@ -254,7 +281,7 @@ func TestEnsureBaseExt4_RejectsPullerWithoutManifestPuller(t *testing.T) {
 	be, _ := storage.NewLocalStorageBackend(t.TempDir())
 	h := &Handler{oci: oci.DefaultPuller{}, builder: &fakeBuilder{}, log: silentLogger(), storage: be}
 	_, err := h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", "k", "k.digest", "")
+		"ghcr.io/onebox-faas/builder-base:latest", "k", "k.digest", "", "", "")
 	if err == nil {
 		t.Fatal("expected error when puller lacks ManifestPuller")
 	}
@@ -270,7 +297,7 @@ func TestEnsureBaseExt4_BubblesPullManifestErrors(t *testing.T) {
 	be, _ := storage.NewLocalStorageBackend(t.TempDir())
 	h := &Handler{oci: bad, builder: &fakeBuilder{}, log: silentLogger(), storage: be}
 	_, err := h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", "k", "k.digest", "")
+		"ghcr.io/onebox-faas/builder-base:latest", "k", "k.digest", "", "", "")
 	if err == nil {
 		t.Fatal("expected error from broken puller")
 	}
@@ -293,7 +320,7 @@ func TestEnsureBaseExt4_BuildFailureSurfaces(t *testing.T) {
 		storage: be,
 	}
 	_, err := h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", "base/runtime.ext4", "base/runtime.ext4.digest", "")
+		"ghcr.io/onebox-faas/builder-base:latest", "base/runtime.ext4", "base/runtime.ext4.digest", "", "", "")
 	if err == nil {
 		t.Fatal("expected build failure")
 	}
@@ -333,7 +360,11 @@ func newTwoLayerPuller(t *testing.T) *minimalManifestPuller {
 // BuildBase has been called. Used by the skip-vs-restage tests. Storage.Put
 // is invoked by the production code path, so the helper just records
 // BuildBase calls rather than writing to disk.
-type callCountingBuilder struct{ calls int }
+type callCountingBuilder struct {
+	calls            int
+	fromStagingCalls int      // ADR-053: BuildBaseFromStaging invocations
+	fromStagingArgs  []string // ADR-053 §4.6: the staging path passed to BuildBaseFromStaging
+}
 
 func (b *callCountingBuilder) Build(_ context.Context, in rootfs.BuildInput) (rootfs.BuildResult, error) {
 	return rootfs.BuildResult{ImageKey: in.StorageKey}, nil
@@ -348,6 +379,26 @@ func (b *callCountingBuilder) BuildBase(ctx context.Context, in rootfs.BaseBuild
 	}
 	return rootfs.BaseBuildResult{ImageKey: in.StorageKey}, nil
 }
+func (b *callCountingBuilder) BuildBaseFromStaging(ctx context.Context, staging string, in rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
+	// ADR-053: parent-ref branch ends here. Tests that exercise the
+	// legacy path use the callCountingBuilder too; calling
+	// BuildBaseFromStaging must NOT bump BuildBase's call counter
+	// (which is asserted by TestEnsureBaseExt4_PerArchPartition) so
+	// we count parent-ref builds on a separate field. Tests for the
+	// parent-ref branch can branch on fromStagingCalls vs calls.
+	//
+	// fromStagingArgs captures the staging path so a future test
+	// can assert the §4.6 contract: BuildBaseFromStaging must be
+	// called with the merged overlay view (not a copy of the
+	// parent tree) — that's what gives the on-disk dedup the
+	// review called out as missing in PR #465's blocker #3.
+	b.fromStagingCalls++
+	b.fromStagingArgs = append(b.fromStagingArgs, staging)
+	if in.Storage != nil && in.StorageKey != "" {
+		_ = in.Storage.Put(ctx, in.StorageKey, bytes.NewReader([]byte("fake ext4 parent-ref")))
+	}
+	return rootfs.BaseBuildResult{ImageKey: in.StorageKey}, nil
+}
 
 // failingBuilder always errors from BuildBase. Used to prove cleanup of
 // the .tmp file on failure.
@@ -357,6 +408,9 @@ func (b *failingBuilder) Build(_ context.Context, in rootfs.BuildInput) (rootfs.
 	return rootfs.BuildResult{}, b.err
 }
 func (b *failingBuilder) BuildBase(_ context.Context, _ rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
+	return rootfs.BaseBuildResult{}, b.err
+}
+func (b *failingBuilder) BuildBaseFromStaging(_ context.Context, _ string, _ rootfs.BaseBuildInput) (rootfs.BaseBuildResult, error) {
 	return rootfs.BaseBuildResult{}, b.err
 }
 
@@ -380,12 +434,12 @@ func TestEnsureBaseExt4_PerArchPartition(t *testing.T) {
 
 	// Stage the amd64 base.
 	if _, err := hs.h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", baseKeyAmd64, digKeyAmd64, ""); err != nil {
+		"ghcr.io/onebox-faas/builder-base:latest", baseKeyAmd64, digKeyAmd64, "", "", ""); err != nil {
 		t.Fatalf("amd64 stage: %v", err)
 	}
 	// Stage the arm64 base into the same storage backend.
 	if _, err := hs.h.EnsureBaseExt4(context.Background(),
-		"ghcr.io/onebox-faas/builder-base:latest", baseKeyArm64, digKeyArm64, ""); err != nil {
+		"ghcr.io/onebox-faas/builder-base:latest", baseKeyArm64, digKeyArm64, "", "", ""); err != nil {
 		t.Fatalf("arm64 stage: %v", err)
 	}
 
@@ -441,21 +495,27 @@ func (b *brokenManifestPuller) PullBlob(_ context.Context, _, _ string) (io.Read
 // if a future runtime is added to DefaultRuntimeBaseRefs without
 // matching it here, TestDefaultRuntimeBaseRefs_HasExpectedRuntimes
 // (below) catches the drift at unit-test speed. Pinned by ADR-052.
+//
+// ADR-053: this test now uses legacyRefs (the four non-parent-ref
+// rows + builder-base) so it stays on the legacy "apply ALL
+// layers" path. The parent-ref branch is exercised by
+// TestEnsureBaseExt4_WithParentRef_* (no fake mount needed for
+// those — they wire a real tmpdir via fakeVMMClient).
 func TestEnsureBases_AllRowsStage(t *testing.T) {
 	mp := newTwoLayerPuller(t)
 	hs := newBaseHarness(t, mp, &callCountingBuilder{})
 
-	results, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	results, err := hs.h.EnsureBases(context.Background(), "amd64", legacyRefs(), nil)
 	if err != nil {
 		t.Fatalf("EnsureBases: %v", err)
 	}
-	if len(results) != len(DefaultRuntimeBaseRefs) {
-		t.Fatalf("results = %d rows, want %d", len(results), len(DefaultRuntimeBaseRefs))
+	if len(results) != len(legacyRefs()) {
+		t.Fatalf("results = %d rows, want %d", len(results), len(legacyRefs()))
 	}
 	keysSeen := map[string]bool{}
 	for i, r := range results {
-		if r.Runtime != DefaultRuntimeBaseRefs[i].Runtime {
-			t.Errorf("row %d runtime = %q, want %q", i, r.Runtime, DefaultRuntimeBaseRefs[i].Runtime)
+		if r.Runtime != legacyRefs()[i].Runtime {
+			t.Errorf("row %d runtime = %q, want %q", i, r.Runtime, legacyRefs()[i].Runtime)
 		}
 		if r.ConfigDigest == "" {
 			t.Errorf("row %d (%s) ConfigDigest empty", i, r.Runtime)
@@ -496,7 +556,13 @@ func TestEnsureBases_OperatorOverride_DigestPinnedWins(t *testing.T) {
 	const overrideRef = "ghcr.io/onebox-faas/runner-node24@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	env := map[string]string{"FAAS_DEPLOY_BASE_REF_NODE24": overrideRef}
 	lookup := func(k string) string { return env[k] }
-	refs := DefaultRuntimeBaseRefs
+	// ADR-053: this test only cares about the operator-override
+	// path, not the parent-ref branch. Use a one-row slice
+	// (RuntimeNode24 on the legacy path) so the test doesn't need
+	// a fake VMMClient or parent-DiffID prefix arrangement.
+	refs := []RuntimeBaseRef{
+		{Runtime: RuntimeNode24, Ref: BaseRefNode24, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE24"},
+	}
 	results, err := hs.h.EnsureBases(context.Background(), "amd64", refs, lookup)
 	if err != nil {
 		t.Fatalf("EnsureBases: %v", err)
@@ -528,7 +594,13 @@ func TestEnsureBases_OperatorOverride_TagOnlyFailsLoud(t *testing.T) {
 	hs := newBaseHarness(t, mp, &callCountingBuilder{})
 	env := map[string]string{"FAAS_DEPLOY_BASE_REF_NODE24": "ghcr.io/onebox-faas/runner-node24:latest"}
 	lookup := func(k string) string { return env[k] }
-	_, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, lookup)
+	// ADR-053: one-row slice (RuntimeNode24 on the legacy path);
+	// this test asserts the operator-override abort path and
+	// shouldn't need a fake VMMClient.
+	refs := []RuntimeBaseRef{
+		{Runtime: RuntimeNode24, Ref: BaseRefNode24, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE24"},
+	}
+	_, err := hs.h.EnsureBases(context.Background(), "amd64", refs, lookup)
 	if err == nil {
 		t.Fatal("tag-only EnvOverride should fail-loud before any byte is pulled")
 	}
@@ -546,11 +618,14 @@ func TestEnsureBases_OperatorOverride_TagOnlyFailsLoud(t *testing.T) {
 func TestEnsureBases_SkipsOnDigestMatch(t *testing.T) {
 	mp := newTwoLayerPuller(t)
 	hs := newBaseHarness(t, mp, &callCountingBuilder{})
-	first, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	// ADR-053: legacyRefs so the parent-ref branch (which would
+	// need fake VMMClient + parent DiffID prefix arrangement)
+	// doesn't trip this skip-on-digest-match test.
+	first, err := hs.h.EnsureBases(context.Background(), "amd64", legacyRefs(), nil)
 	if err != nil {
 		t.Fatalf("first EnsureBases: %v", err)
 	}
-	second, err := hs.h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	second, err := hs.h.EnsureBases(context.Background(), "amd64", legacyRefs(), nil)
 	if err != nil {
 		t.Fatalf("second EnsureBases: %v", err)
 	}
@@ -580,7 +655,9 @@ func TestEnsureBases_FailsLoudOnPullError(t *testing.T) {
 			return map[string]int{}, nil
 		},
 	}
-	_, err := h.EnsureBases(context.Background(), "amd64", DefaultRuntimeBaseRefs, nil)
+	// ADR-053: legacyRefs — broken puller should fail on the
+	// parent runtime row, not need a fake VMMClient.
+	_, err := h.EnsureBases(context.Background(), "amd64", legacyRefs(), nil)
 	if err == nil {
 		t.Fatal("EnsureBases must fail on a broken puller")
 	}
@@ -602,7 +679,7 @@ func TestEnsureBases_EmptyArchRejected(t *testing.T) {
 		storage:  be,
 		grypeRun: func(_ context.Context, _ string) (map[string]int, error) { return map[string]int{}, nil },
 	}
-	if _, err := h.EnsureBases(context.Background(), "", DefaultRuntimeBaseRefs, nil); err == nil {
+	if _, err := h.EnsureBases(context.Background(), "", legacyRefs(), nil); err == nil {
 		t.Error("empty arch should error")
 	}
 }
@@ -631,8 +708,15 @@ func TestEnsureBases_NilRefsIsNoOp(t *testing.T) {
 // runtime was added but its base isn't auto-staged, or a removed
 // runtime's row wasn't deleted; either trips Tier 1 PR 2's load-bearing
 // promise of "every runtime base auto-stages on imaged startup".
+//
+// ADR-053: 7 rows now (added RuntimeDebianParent at index 0). The
+// four node/python runtime rows declare ParentRef: BaseRefDebianParent
+// and would otherwise pull the parent's tree via the parent-ref
+// branch. The parent row stays first so its stage failure aborts
+// the loop before any child is attempted.
 func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 	want := []string{
+		RuntimeDebianParent,
 		RuntimeNode22, RuntimeNode24,
 		RuntimePython312, RuntimePython313,
 		RuntimeGo124, RuntimeGo124Alpine,
@@ -649,6 +733,22 @@ func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 		if r.EnvOverride == "" {
 			t.Errorf("row %d (%s) EnvOverride empty", i, r.Runtime)
 		}
+		// ADR-053: the four node/python rows MUST declare
+		// ParentRef=BaseRefDebianParent. A drift here means a
+		// runtime was added without wiring parent-ref — the
+		// dedup invariant at staging time breaks silently.
+		switch r.Runtime {
+		case RuntimeNode22, RuntimeNode24, RuntimePython312, RuntimePython313:
+			if r.ParentRef != BaseRefDebianParent {
+				t.Errorf("row %d (%s) ParentRef = %q, want %q (ADR-053)",
+					i, r.Runtime, r.ParentRef, BaseRefDebianParent)
+			}
+		case RuntimeDebianParent, RuntimeGo124, RuntimeGo124Alpine:
+			if r.ParentRef != "" {
+				t.Errorf("row %d (%s) ParentRef = %q, want empty (legacy path)",
+					i, r.Runtime, r.ParentRef)
+			}
+		}
 	}
 	for _, rt := range want {
 		if !seen[rt] {
@@ -660,3 +760,297 @@ func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 // schedBaseKeyForArch is removed; tests use pkg/sched.BaseKeyForArch
 // / BaseDigestKeyForArch directly so the key format is sourced from
 // the same constant the production code reads.
+
+// =================================================================
+// ADR-053: parent-ref staging tests
+// =================================================================
+//
+// These tests exercise the parent-ref branch of EnsureBaseExt4
+// (mount → cp -a → umount → pull delta → ApplyLayerGz → mkfs).
+// They use a parentPuller that returns one manifest for the
+// parent ref and a different, longer manifest for the runtime
+// ref, with the parent's DiffIDs as a strict prefix of the
+// runtime's. The fakeVMMClient provides a real tmpdir so cp
+// -a has something to read.
+
+// parentRuntimePuller implements oci.ManifestPuller for the
+// parent-ref tests. Two registries keyed by ref string: the
+// parent ref → 1-layer manifest; the runtime ref → 2-layer
+// manifest whose first DiffID matches the parent's. This is
+// the OCI-chain composability invariant (ADR-053).
+type parentRuntimePuller struct {
+	parentCfg   string
+	parentLayer string
+	runtimeCfg  string
+	runtimeLy1  string // matches parentLayer (delta prefix invariant)
+	runtimeLy2  string
+	layers      map[string][]byte // gzipped tarball bytes keyed by digest
+}
+
+func (p *parentRuntimePuller) PullDigest(_ context.Context, ref string) (string, error) {
+	return ref, nil
+}
+func (p *parentRuntimePuller) PullImageConfig(_ context.Context, _ string) (oci.ImageConfig, error) {
+	return oci.ImageConfig{}, nil
+}
+func (p *parentRuntimePuller) PullLayers(_ context.Context, _ string) (oci.PullLayersResult, error) {
+	return oci.PullLayersResult{}, nil
+}
+func (p *parentRuntimePuller) PullManifest(_ context.Context, ref string) (oci.Manifest, error) {
+	switch ref {
+	case BaseRefDebianParent:
+		return oci.Manifest{
+			Config: oci.Descriptor{Digest: p.parentCfg},
+			Layers: []oci.Descriptor{{Digest: p.parentLayer}},
+		}, nil
+	default:
+		return oci.Manifest{
+			Config: oci.Descriptor{Digest: p.runtimeCfg},
+			Layers: []oci.Descriptor{{Digest: p.runtimeLy1}, {Digest: p.runtimeLy2}},
+		}, nil
+	}
+}
+func (p *parentRuntimePuller) PullBlob(_ context.Context, _ string, digest string) (io.ReadCloser, error) {
+	b, ok := p.layers[digest]
+	if !ok {
+		return nil, errors.New("parentRuntimePuller: no such digest " + digest)
+	}
+	return io.NopCloser(strings.NewReader(string(b))), nil
+}
+
+// newParentRuntimePuller builds the two-manifest puller with
+// stable synthetic digests. The delta is exactly 1 layer
+// (the runtime's second layer; the first matches the
+// parent's DiffID, satisfying oci.LayersAboveBase).
+func newParentRuntimePuller(t *testing.T) *parentRuntimePuller {
+	t.Helper()
+	parentLy := "sha256:parent-layer-aaaaaaaaaaaaaaaa"
+	parentCfg := "sha256:parent-config-bbbbbbbbbbbbbbbb"
+	runtimeLy1 := parentLy
+	runtimeLy2 := "sha256:runtime-layer-ccccccccccccccccc"
+	runtimeCfg := "sha256:runtime-config-ddddddddddddddddd"
+	// OCI config JSON blobs — pullConfig reads them via
+	// PullBlob(repo, manifest.Config.Digest) and decodes
+	// rootfs.diff_ids. The parent's DiffID list is exactly the
+	// prefix of the runtime's, satisfying
+	// oci.LayersAboveBase.
+	parentCfgBlob := []byte(`{"rootfs":{"type":"layers","diff_ids":["` + parentLy + `"]}}`)
+	runtimeCfgBlob := []byte(`{"rootfs":{"type":"layers","diff_ids":["` + runtimeLy1 + `","` + runtimeLy2 + `"]}}`)
+	return &parentRuntimePuller{
+		parentCfg:   parentCfg,
+		parentLayer: parentLy,
+		runtimeCfg:  runtimeCfg,
+		runtimeLy1:  runtimeLy1,
+		runtimeLy2:  runtimeLy2,
+		layers: map[string][]byte{
+			parentLy:   gzTar(t, map[string]string{"lib/libc.so.6": "fake libc"}),
+			runtimeLy2: gzTar(t, map[string]string{"usr/local/bin/node": "fake node"}),
+			parentCfg:  parentCfgBlob,
+			runtimeCfg: runtimeCfgBlob,
+		},
+	}
+}
+
+// newParentHarness builds a Handler wired with the parent-ref
+// puller, a real tmpdir-backed fakeVMMClient (so cp -a has
+// something to read), and a callCountingBuilder so tests can
+// assert BuildBaseFromStaging was the actual mkfs call.
+type parentHarness struct {
+	h   *Handler
+	be  storage.StorageBackend
+	fvm *fakeVMMClient
+	cb  *callCountingBuilder
+}
+
+func newParentHarness(t *testing.T) *parentHarness {
+	t.Helper()
+	// Stub the overlay mount syscall so the unit-test runner
+	// doesn't need CAP_SYS_ADMIN or a userns mount. Production
+	// (cmd/imaged running as faas-imaged on the EX44) uses the
+	// real mount syscall; here we just remember the args so the
+	// test can assert the staging composition wired them up
+	// correctly.
+	withMountStub(t)
+
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	mp := newParentRuntimePuller(t)
+	cb := &callCountingBuilder{}
+	// Real tmpdir for the fake mountpoint so BuildBaseFromStaging
+	// has a tree to mkfs over (the stub treats the merged dir as
+	// a pass-through — callCountingBuilder records the staging
+	// path it was handed).
+	mountDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(mountDir, "lib"), []byte("placeholder"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	fvm := &fakeVMMClient{mountHook: func(_ string) (string, error) {
+		return mountDir, nil
+	}}
+	h := &Handler{
+		oci:     mp,
+		builder: cb,
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
+		vmmClient: fvm,
+	}
+	return &parentHarness{h: h, be: be, fvm: fvm, cb: cb}
+}
+
+// withMountStub swaps mountOverlayFn / umountOverlayFn for
+// no-op stubs and registers a t.Cleanup that restores the
+// production values. The stubs record the args so a future
+// test can assert the staging composition wired them up
+// correctly; for now they're no-ops because the unit-test
+// runtime doesn't have the kernel support to actually mount
+// overlayfs.
+//
+// Production cmd/imaged does NOT call this — the real mount
+// syscall runs (EX44 has CAP_SYS_ADMIN via the userns mount).
+func withMountStub(t *testing.T) {
+	t.Helper()
+	origMount := mountOverlayFn
+	origUmount := umountOverlayFn
+	mountOverlayFn = func(_ context.Context, _, _, _, _ string) error { return nil }
+	umountOverlayFn = func(_ string) error { return nil }
+	t.Cleanup(func() {
+		mountOverlayFn = origMount
+		umountOverlayFn = origUmount
+	})
+}
+
+// TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly — happy
+// path for the ADR-053 staging branch. The runtime has 2
+// DiffIDs, the parent has 1 (matching the runtime's first).
+// After staging:
+//   - BuildBaseFromStaging called once with the merged overlay
+//     path (NOT a separate staging dir — that was the pre-§4.6
+//     `cp -a` flow that produced 5 duplicated Debian images).
+//   - BuildBase NOT called (delta applied in-place on the
+//     overlay upper dir, not via BuildBase's "apply ALL layers"
+//     loop).
+//   - fvm.MountParentExt4ReadOnly invoked exactly once with
+//     the parent base key; UmountParentExt4 called once on
+//     shutdown path.
+//   - the base ext4 was published under the runtime baseKey.
+func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
+	hs := newParentHarness(t)
+	const baseKey = "base/runner-node22-amd64.ext4"
+	const digKey = "base/runner-node22-amd64.ext4.digest"
+	res, err := hs.h.EnsureBaseExt4(context.Background(),
+		BaseRefNode22, baseKey, digKey, "", BaseRefDebianParent, "base/runner-base-debian-parent-amd64.ext4")
+	if err != nil {
+		t.Fatalf("EnsureBaseExt4: %v", err)
+	}
+	if res.Skipped {
+		t.Error("Skipped=true on first run, want false")
+	}
+	if res.ConfigDigest == "" {
+		t.Error("ConfigDigest empty")
+	}
+	if hs.cb.calls != 0 {
+		t.Errorf("BuildBase called %d times, want 0 (parent-ref path uses BuildBaseFromStaging)", hs.cb.calls)
+	}
+	if hs.cb.fromStagingCalls != 1 {
+		t.Errorf("BuildBaseFromStaging called %d times, want 1", hs.cb.fromStagingCalls)
+	}
+	// §4.6 contract: BuildBaseFromStaging must be called with a
+	// path that ends in "merged" (the overlay merged view). The
+	// pre-§4.6 flow passed a separate staging dir produced by
+	// `cp -a` — that contract would fail this assertion because
+	// the staging path was the parent mountpoint + "/.", not the
+	// merged overlay.
+	if got := hs.cb.fromStagingArgs[0]; filepath.Base(got) != "merged" {
+		t.Errorf("BuildBaseFromStaging staging path = %q (basename %q); want a path ending in /merged (the §4.6 overlay merged view)",
+			got, filepath.Base(got))
+	}
+	if len(hs.fvm.mountedKeys) != 1 {
+		t.Fatalf("MountParentExt4ReadOnly called %d times, want 1", len(hs.fvm.mountedKeys))
+	}
+	if hs.fvm.mountedKeys[0] != "base/runner-base-debian-parent-amd64.ext4" {
+		t.Errorf("mounted with key %q, want base/runner-base-debian-parent-amd64.ext4", hs.fvm.mountedKeys[0])
+	}
+	// UmountParentExt4 must be called on shutdown path even on
+	// the success branch — pinned because a leak here would
+	// surface as the next 30-minute orphan sweep.
+	if hs.fvm.umountCalls != 1 {
+		t.Errorf("UmountParentExt4 called %d times, want 1 (parent mount must always be released)", hs.fvm.umountCalls)
+	}
+	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
+		t.Errorf("base ext4 not published at %s: %v", baseKey, err)
+	} else {
+		_ = rc.Close()
+	}
+	if rc, err := hs.be.Get(context.Background(), digKey); err != nil {
+		t.Errorf("digest sidecar not published at %s: %v", digKey, err)
+	} else {
+		_ = rc.Close()
+	}
+}
+
+// TestEnsureBaseExt4_WithParentRef_RejectsNilVMMClient —
+// the parent-ref branch must fail loud when h.vmmClient is
+// nil. The legacy path stays operational without a client
+// wired; only the parent-ref branch fails loud so a misconfig
+// surfaces here rather than at the cold-boot wake.
+func TestEnsureBaseExt4_WithParentRef_RejectsNilVMMClient(t *testing.T) {
+	be, _ := storage.NewLocalStorageBackend(t.TempDir())
+	mp := newParentRuntimePuller(t)
+	h := &Handler{
+		oci:     mp,
+		builder: &callCountingBuilder{},
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
+			return map[string]int{}, nil
+		},
+		// vmmClient intentionally nil
+	}
+	_, err := h.EnsureBaseExt4(context.Background(),
+		BaseRefNode22, "k", "k.digest", "", BaseRefDebianParent, "base/runner-base-debian-parent-amd64.ext4")
+	if err == nil {
+		t.Fatal("expected error when vmmClient is nil")
+	}
+	if !strings.Contains(err.Error(), "VMMClient") || !strings.Contains(err.Error(), "ADR-053") {
+		t.Errorf("error %q must mention VMMClient + ADR-053", err.Error())
+	}
+}
+
+// TestEnsureBaseExt4_WithoutParentRef_AppliesAllLayers —
+// the legacy "apply ALL layers" path stays operational when
+// parentRef is empty. Confirms the dispatcher in
+// EnsureBaseExt4 doesn't accidentally route a parent-less
+// row through the parent-ref branch (a regression here
+// would break every legacy runtime + builder-base).
+func TestEnsureBaseExt4_WithoutParentRef_AppliesAllLayers(t *testing.T) {
+	mp := newTwoLayerPuller(t)
+	hs := newBaseHarness(t, mp, &callCountingBuilder{})
+	// Use an empty parentRef — the legacy path. The vmmClient
+	// stays nil (no client wired) and that's fine.
+	const baseKey = "base/runner-go124-amd64.ext4"
+	const digKey = "base/runner-go124-amd64.ext4.digest"
+	res, err := hs.h.EnsureBaseExt4(context.Background(),
+		BaseRefGo124, baseKey, digKey, "", "", "")
+	if err != nil {
+		t.Fatalf("EnsureBaseExt4: %v", err)
+	}
+	if res.Skipped {
+		t.Error("Skipped=true on first run, want false")
+	}
+	if hs.h.builder.(*callCountingBuilder).calls != 1 {
+		t.Errorf("BuildBase called %d times, want 1 (legacy path)", hs.h.builder.(*callCountingBuilder).calls)
+	}
+	if hs.h.builder.(*callCountingBuilder).fromStagingCalls != 0 {
+		t.Errorf("BuildBaseFromStaging called %d times, want 0 (legacy path)", hs.h.builder.(*callCountingBuilder).fromStagingCalls)
+	}
+	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
+		t.Errorf("base ext4 not published at %s: %v", baseKey, err)
+	} else {
+		_ = rc.Close()
+	}
+}

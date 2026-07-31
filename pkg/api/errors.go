@@ -297,6 +297,15 @@ const (
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
 
+	// Issue #471 — per-app streaming responses. Same gate shape as
+	// EgressAllowlist: a single plan-locked feature with a 403 code
+	// when the PATCH asks for a capability the plan does not unlock.
+	// Free customers see this; Hobby/Pro/Scale don't. Distinct code
+	// from CodePlanEgressAllowlistNotAllowed so the CLI can render
+	// "streaming is a paid feature" vs "allowlist is a paid feature"
+	// without conflating them in telemetry.
+	CodePlanStreamingNotAllowed = "plan_streaming_not_allowed"
+
 	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
 	// shape as MinInstances: a single plan-locked feature with two
 	// failure modes that warrant distinct codes so the CLI can render

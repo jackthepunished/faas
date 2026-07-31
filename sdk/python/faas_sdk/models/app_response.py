@@ -34,7 +34,9 @@ class AppResponse:
     url: str
     manifest: AppManifest
     """App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-
-    as-source flag (§ux 6.3)."""
+    as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs ("secret:NAME" strings)
+    resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are
+    NEVER sealed ciphertext — only refs."""
     autoscale_target_rps: int
     """Per-instance RPS target for the reactive scale-up trigger. 0 = disabled. Hobby/Pro/Scale only. When measured
     per-instance RPS exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037."""
@@ -49,6 +51,9 @@ class AppResponse:
     """Per-app outbound CIDR allowlist (ADR-031 + ADR-032). Each entry is a CIDR string — v4 (`1.2.3.0/24`) or v6
     (`2001:db8::/32`). v4-mapped v6 form (`::ffff:1.2.3.0/120`) is silently canonicalised to its v4 form at write
     time. Empty array means no allowlist rule; the per-netns chain's default-accept policy applies."""
+    streaming_enabled: bool | Unset = UNSET
+    """Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it.
+    PR-B activates the streamed response path; PR-A only persists the flag."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +93,8 @@ class AppResponse:
         if not isinstance(self.egress_allowlist, Unset):
             egress_allowlist = self.egress_allowlist
 
+        streaming_enabled = self.streaming_enabled
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -111,6 +118,8 @@ class AppResponse:
             field_dict["idle_timeout_s"] = idle_timeout_s
         if egress_allowlist is not UNSET:
             field_dict["egress_allowlist"] = egress_allowlist
+        if streaming_enabled is not UNSET:
+            field_dict["streaming_enabled"] = streaming_enabled
 
         return field_dict
 
@@ -159,6 +168,8 @@ class AppResponse:
 
         egress_allowlist = cast(list[str], d.pop("egress_allowlist", UNSET))
 
+        streaming_enabled = d.pop("streaming_enabled", UNSET)
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -174,6 +185,7 @@ class AppResponse:
             runtime=runtime,
             idle_timeout_s=idle_timeout_s,
             egress_allowlist=egress_allowlist,
+            streaming_enabled=streaming_enabled,
         )
 
         app_response.additional_properties = d

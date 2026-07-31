@@ -62,6 +62,96 @@ http.createServer((req, res) => {
 	return buildTarGz(t, files)
 }
 
+// NodeFixturePort returns the bytes of a minimal Node 22 source tarball
+// whose index.js reads the `PORT` env var (issue #460 / ADR-053, PR-C).
+// The platform contract is that guest-init always stamps PORT
+// (EffectivePort() resolves to 8080 when the override is unset, and
+// to the override value otherwise), so the fixture mirrors that by
+// reading the env var with no source-level fallback — if guest-init
+// ever drops the stamp, the runner would bind :0 and the
+// TestDeployOverridePortMetal content assertion would catch the
+// regression. Callers wanting a hardcoded :3000 bind should keep
+// using NodeFixture (the legacy fixture that pre-dates PR-C).
+func NodeFixturePort(t *testing.T) []byte {
+	t.Helper()
+	const pkgJSON = `{
+  "name": "faas-fixture-node-port",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {"node": "22"},
+  "scripts": {"start": "node index.js"},
+  "dependencies": {}
+}
+`
+	const indexJS = `const http = require('http');
+const port = process.env.PORT;
+http.createServer((req, res) => {
+  res.writeHead(200, {'content-type': 'text/plain'});
+  res.end('hello from faas (override-port:' + port + ')\n');
+}).listen(parseInt(port, 10), () => console.log('node fixture listening on :' + port));
+`
+	files := map[string]string{
+		"package.json":     pkgJSON,
+		"index.js":         indexJS,
+		".faas-fixture":    "node22\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
+// NodeFixtureHealthcheck returns the bytes of a minimal Node 22 source
+// tarball whose index.js binds `:8080` (the host's stable readiness
+// probe target per ADR-009 + portnorm ladder) and registers a /healthz
+// route returning 200 (issue #460 / ADR-053 / ADR-057, PR-D). The
+// healthcheck body includes "override-healthz:<readyFlag>" so the
+// test can confirm readiness on the /healthz path independently of
+// the main / response. Binds :8080 directly — portnorm re-exposes the
+// customer bind on :8080 inside the guest so the host's
+// `GET <HostIP>:8080/healthz` reaches the fixture.
+//
+// Why explicit bind on :8080 (no PORT env): waitReady's probe target
+// is hard-wired to :8080 in fcvm/manager.go. The override-port PR-C
+// fixture reads PORT because EffectivePort() can stamp 9090, but
+// PR-D's probe port doesn't change with override-port. If a future
+// ADR widens waitReady to probe the override port directly (rejected
+// in ADR-057 §Decision 2), NodeFixturePort would be the right
+// starting point — for now, hardcoded :8080 is the contract.
+func NodeFixtureHealthcheck(t *testing.T) []byte {
+	t.Helper()
+	const pkgJSON = `{
+  "name": "faas-fixture-node-healthz",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {"node": "22"},
+  "scripts": {"start": "node index.js"},
+  "dependencies": {}
+}
+`
+	const indexJS = `const http = require('http');
+let ready = false;
+http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(ready ? 200 : 503, {'content-type': 'text/plain'});
+    res.end('override-healthz:' + (ready ? 'ready' : 'not-ready') + '\n');
+    return;
+  }
+  // Mark ready on first non-/healthz request — exercises the
+  // PR-D "retry-until-2xx" loop on the first wake, since waitReady
+  // may probe before the runner has handled /healthz.
+  if (!ready) ready = true;
+  res.writeHead(200, {'content-type': 'text/plain'});
+  res.end('hello from faas (override-healthz)\n');
+}).listen(8080, () => console.log('healthz fixture listening on :8080'));
+`
+	files := map[string]string{
+		"package.json":     pkgJSON,
+		"index.js":         indexJS,
+		".faas-fixture":    "node22\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
 // PythonFixture returns the bytes of a minimal Python 3.12 source tarball
 // with Flask as the single dep. Railpack auto-detects from requirements.txt
 // and uses uvicorn+gunicorn under the hood; we don't pin that here because

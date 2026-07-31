@@ -12,5 +12,9 @@ export type CreateAppRequest = {
   ram_mb?: number;
   max_concurrency?: number;
   idle_timeout_s?: number;
+  /**
+   * Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471).
+   */
+  streaming_enabled?: boolean;
 };
 

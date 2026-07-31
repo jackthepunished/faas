@@ -119,6 +119,13 @@ type ColdBootSpec struct {
 	VcpuCount  int    // 2, or 4 for Scale
 	MemSizeMiB int    // plan RAM
 	Tap        string // netns-side tap device (always "tap0")
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. Empty = legacy
+	// TCP-accept on :8080 (pre-PR-D default). Non-empty → waitReady
+	// does HTTP GET <HealthcheckPath> against <HostIP>:8080 and
+	// accepts 2xx as ready. Forwarded from WakeRequest.HealthcheckPath
+	// by Manager.bringUp.
+	HealthcheckPath string
 }
 
 // BuildColdBootConfig assembles the Firecracker config for a cold boot. MMDS and

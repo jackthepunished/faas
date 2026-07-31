@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +25,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -43,7 +46,11 @@ type Runner interface {
 type VMM interface {
 	// Boot spawns jailer→firecracker with cfg and returns once the guest passes
 	// readiness. It must clean up its own chroot/process if it returns an error.
-	Boot(ctx context.Context, l Lease, cfg VMConfig) error
+	// healthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. Empty keeps the legacy
+	// TCP-accept on :8080 (pre-PR-D default). Non-empty → waitReady does
+	// HTTP GET <path> against <HostIP>:8080 and accepts 2xx as ready.
+	Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheckPath string) error
 	// BootColdBoot is the cold-boot entry point (issue #96 / ADR-025 axis 2
 	// / PR #116): it materializes the StorageBackend keys in spec through
 	// the configured backend into vmmd-allocated tmp paths, then delegates
@@ -52,6 +59,9 @@ type VMM interface {
 	BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec) error
 	// Restore loads a snapshot into a fresh jailed firecracker and resumes it,
 	// returning once the guest is ready. On error it cleans up its own process.
+	// spec.HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. Empty keeps the legacy
+	// TCP-accept on :8080; non-empty → waitReady does HTTP GET <path>.
 	Restore(ctx context.Context, l Lease, spec RestoreSpec) error
 	// TriggerResumeHook dials the guest's vsock UDS and asks it to run its
 	// post-restore side effects (re-seed entropy + step clock, guest/init/resume.go).
@@ -192,6 +202,26 @@ type Instance struct {
 	// is schedd-owned and recorded at Wake time.
 	Plan api.Plan
 
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
+	// override port copied from WakeRequest.Port. The vmmdgrpc
+	// forwarder reads this to resolve the per-instance guest dial
+	// port (server-side default to netns.AppPort when 0). 0 on
+	// instances that pre-date PR-C and on legacy callers that
+	// never set the wire field; the wire-level default at the
+	// buildBridgeScript boundary keeps those legacy instances
+	// dial-able on 8080.
+	Port int
+
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path copied from
+	// WakeRequest.HealthcheckPath. "" = legacy TCP-accept on :8080
+	// (pre-PR-D default). Non-empty → vmmd's waitReady does HTTP GET
+	// <HealthcheckPath> against <HostIP>:8080 and accepts 2xx as
+	// ready. Stamped onto the live Instance so server-side readers
+	// can resolve Instance.HealthcheckPath without a second request
+	// lookup (PR-C mirror).
+	HealthcheckPath string
+
 	// Characterization (ADR-051 Phase 4 / PR-D) is the
 	// CharacterizationReport the host received via
 	// WaitCharacterizationReport during this cold boot. Empty on
@@ -286,6 +316,17 @@ type Manager struct {
 	// pkg/vmmdgrpc already imports pkg/fcvm for Lease +
 	// LogRing types.
 	advisoryClient AdvisoryForwarder
+	// parentMounts (ADR-053) tracks every active parent-base
+	// loopback mount vmmd has issued. vmmd is the only root
+	// component (spec §11); imaged (User=faas-imaged +
+	// NoNewPrivileges=yes) cannot mount on its own, so the
+	// storage path for each node/python runtime base passes
+	// through this registry. nil-safe: MountParentExt4 returns
+	// vmmdmount.ErrNotFound when storage isn't wired (the legacy
+	// / unit-test path). Wired via SetParentMountRegistry at
+	// daemon startup; the registry owns the 5-minute orphan
+	// sweep + SIGTERM sync-sweep.
+	parentMounts *vmmdmount.Registry
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -379,6 +420,18 @@ func (m *Manager) SetAdvisoryClient(c AdvisoryForwarder) {
 	m.advisoryClient = c
 }
 
+// SetParentMountRegistry wires the parent-base loopback mount
+// registry (ADR-053). Production cmd/vmmd constructs a registry
+// with cap=16 and calls this once at startup; the registry owns
+// the 5-minute orphan sweep + SIGTERM sync-sweep. nil-safe:
+// MountParentExt4 returns vmmdmount.ErrNotFound when the
+// registry (or the storage backend) is unwired, so unit tests
+// that don't care about parent-mounts keep working without a
+// stub.
+func (m *Manager) SetParentMountRegistry(r *vmmdmount.Registry) {
+	m.parentMounts = r
+}
+
 // ForwardStatelessAdvisory is the public Manager seam that turns
 // one guest-init fanotify batch into one apid audit row. The vsock
 // DGRAM receiver in cmd/vmmd calls this with the parsed batch.
@@ -398,6 +451,129 @@ func (m *Manager) ForwardStatelessAdvisory(ctx context.Context, instance, appID 
 	if err := m.advisoryClient.Forward(ctx, instance, appID, batch); err != nil {
 		m.log.Warn("advisory forward: client returned error", "err", err, "instance", instance)
 		return nil // ADR-035: silent on forward failure
+	}
+	return nil
+}
+
+// MountParentExt4 (ADR-053) loopback-mounts the parent base ext4
+// identified by `storageKey` read-only and returns the absolute
+// host path of the mountpoint. The flow:
+//
+//  1. Stage the StorageBackend bytes into /tmp/faas-parent-src-*
+//     via a sibling-temp tmp file so the Storage.Put pattern in
+//     pkg/rootfs (which mkdirs its staging dir elsewhere) doesn't
+//     collide. The tmp file is the loopback source.
+//  2. Create /tmp/faas-parent-mnt-* via vmmdmount.MountExt4ReadOnly.
+//  3. Register (mountpoint, storageKey) in parentMounts; load-shed
+//     the oldest entry when the cap is reached.
+//  4. The src tmp is removed on UmountParentExt4 (it lives as long
+//     as the mount).
+//
+// Returns vmmdmount.ErrNotFound when the StorageBackend reports the
+// key missing, or the registry is nil (unwired). Returns the
+// wrapped mount error otherwise. Idempotent for a second mount of
+// the same storageKey: returns a fresh mountpoint — imaged's
+// EnsureBaseExt4 calls once per child restage so two concurrent
+// restages of different runtimes see distinct mountpoints.
+func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (string, error) {
+	if m.storage == nil {
+		return "", vmmdmount.ErrNotFound
+	}
+	if m.parentMounts == nil {
+		return "", vmmdmount.ErrNotFound
+	}
+	if storageKey == "" {
+		return "", vmmdmount.ErrNotFound
+	}
+	rc, err := m.storage.Get(ctx, storageKey)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %w", vmmdmount.ErrNotFound, storageKey, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	src, err := os.CreateTemp("", parentSrcPrefix)
+	if err != nil {
+		return "", fmt.Errorf("parent mount: create src tmp: %w", err)
+	}
+	srcPath := src.Name()
+	if err := src.Close(); err != nil {
+		_ = os.Remove(srcPath)
+		return "", fmt.Errorf("parent mount: close src tmp: %w", err)
+	}
+	if err := streamToPath(rc, srcPath); err != nil {
+		_ = os.Remove(srcPath)
+		return "", fmt.Errorf("parent mount: stream src bytes: %w", err)
+	}
+
+	mp, err := vmmdmount.MountExt4ReadOnly(ctx, srcPath)
+	if err != nil {
+		_ = os.Remove(srcPath)
+		return "", err
+	}
+	evicted := m.parentMounts.RegisterOrEvict(mp, storageKey, srcPath)
+	if evicted != "" {
+		m.log.Warn("vmmd: parent mount cap reached; force-umounted oldest",
+			"evicted_mountpoint", evicted)
+		// Best-effort umount of the evicted entry; the registry
+		// already forgot it, so vmmdmount.UmountExt4 will fall
+		// through to the kernel syscall and clean the mountpoint
+		// dir.
+		_ = vmmdmount.UmountExt4(evicted)
+	}
+	m.log.Info("vmmd: parent mounted", "storage_key", storageKey, "mountpoint", mp)
+	return mp, nil
+}
+
+// UmountParentExt4 (ADR-053) releases a parent mount MountParentExt4
+// previously returned. Idempotent on unknown mountpoints — imaged's
+// defer-after-error pattern is safe to call blindly. Returns the
+// nil-equivalent (no error) on success AND on a never-issued
+// mountpoint; surfaces a real umount error (e.g. EBUSY) verbatim.
+func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
+	if m.parentMounts == nil {
+		// No registry wired — every call is a no-op. Matches the
+		// default-local unit-test path; production cmd/vmmd wires
+		// the registry at startup.
+		return nil
+	}
+	entry, ok := m.parentMounts.Lookup(mountpoint)
+	if !ok {
+		// Idempotent on unknown: imaged's defer-after-error may
+		// call here after a partial Mount failure (mount succeeded
+		// but registration raced, or the registry was swept). The
+		// gRPC handler treats nil as success.
+		return nil
+	}
+	if err := vmmdmount.UmountExt4(mountpoint); err != nil {
+		return err
+	}
+	m.parentMounts.Forget(mountpoint)
+	if entry.SrcPath != "" {
+		_ = os.Remove(entry.SrcPath)
+	}
+	m.log.Info("vmmd: parent umounted", "mountpoint", mountpoint, "storage_key", entry.StorageKey)
+	return nil
+}
+
+// parentSrcPrefix is the tempdir name pattern for the staged
+// parent-ext4 bytes (StorageBackend.Get → tmp file → loopback
+// source). Mirrored on vmmdmount.ParentMountPrefix by convention
+// but kept distinct so the umount-sweep can find mounts and the
+// rmdir-sweep can find src tmp's independently.
+const parentSrcPrefix = "faas-parent-src-"
+
+// streamToPath copies rc's bytes into the file at dstPath. Used by
+// MountParentExt4 to materialise the staged parent ext4 from the
+// StorageBackend reader into a tmp file the loopback mount can
+// source. Caller is responsible for the dstPath lifetime.
+func streamToPath(rc io.Reader, dstPath string) error {
+	f, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open dst: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := io.Copy(f, rc); err != nil {
+		return fmt.Errorf("copy: %w", err)
 	}
 	return nil
 }
@@ -494,6 +670,25 @@ type WakeRequest struct {
 	// and copies build artifacts (build-done.json + /build/out/*) into this host
 	// directory. App VMs leave it empty.
 	ExportDir string
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment override
+	// port the customer's app binds inside the guest. 0 = legacy 8080
+	// (netns.AppPort default). The host's waitReady + DNAT stay fixed
+	// on 8080 (ADR-009 + guest/init/portnorm_linux.go); vmmd's
+	// forwarder uses this port to dial the guest. Stamped onto the
+	// live Instance so vmmdgrpc forwarder callers can resolve
+	// LiveFor(instance).Port without a second request lookup.
+	Port int
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) is the
+	// per-deployment override readiness probe path. "" = legacy
+	// TCP-accept on :8080 (pre-PR-D default). Non-empty → vmmd's
+	// waitReady does HTTP GET <HealthcheckPath> against <HostIP>:8080
+	// and accepts 2xx as ready. The host probe target is always :8080
+	// — ADR-009 + portnorm re-expose the customer bind on :8080 inside
+	// the guest, so the path is the customer's choice and the port is
+	// the host's choice. Stamped onto the live Instance so server-side
+	// readers can resolve LiveFor(instance).HealthcheckPath without a
+	// second request lookup.
+	HealthcheckPath string
 	// SealedEnvEntries are the per-key ciphertext rows from `app_secrets`
 	// the caller wants loaded into the guest's env (spec §11/G2). Each entry is
 	// sealed independently by apid via pkg/secretbox.SealOne against the host
@@ -584,6 +779,27 @@ type ColdBootRequest struct {
 	APIEnvEntries []APIEnvEntry
 	// EgressAllowlist (ADR-031) — same shape as WakeRequest.
 	EgressAllowlist []string
+	// Port (issue #460 / ADR-053, PR-C) — the per-deployment override
+	// port forwarded verbatim to WakeRequest.Port. Production wiring
+	// uses WakeRequest directly via the vmmdgrpc adapters
+	// (pkg/vmmdgrpc/proto.go), so this field is currently exercised
+	// only by unit tests (TestColdBootSuccessStampsInstancePort). Kept
+	// for symmetry so the cold-boot public surface stays a complete
+	// mirror of WakeRequest — a future caller that wants to invoke
+	// ColdBoot without going through WakeRequest shouldn't have to
+	// drop a field. Removing the field would silently break the
+	// port-stamping test.
+	Port int
+	// HealthcheckPath (issue #460 / ADR-053, ADR-057 / PR-D) — the
+	// per-deployment override readiness probe path forwarded verbatim
+	// to WakeRequest.HealthcheckPath. Production wiring uses
+	// WakeRequest directly via the vmmdgrpc adapters
+	// (pkg/vmmdgrpc/proto.go), so this field is currently exercised
+	// only by unit tests. Kept for symmetry so the cold-boot public
+	// surface stays a complete mirror of WakeRequest — a future caller
+	// that wants to invoke ColdBoot without going through WakeRequest
+	// shouldn't have to drop a field.
+	HealthcheckPath string
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -598,6 +814,11 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		APIEnvEntries:   req.APIEnvEntries,
 		EgressAllowlist: req.EgressAllowlist,
 		Plan:            req.Plan,
+		Port:            req.Port,
+		// ADR-057 / PR-D: forward the per-deployment override
+		// readiness probe path so Wake stamps it onto the live
+		// Instance. Empty = legacy TCP-accept on :8080.
+		HealthcheckPath: req.HealthcheckPath,
 	})
 }
 
@@ -791,7 +1012,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Characterization: report}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, Characterization: report}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
@@ -865,6 +1086,12 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// from the lease's slot so the guest's listener is reachable at a
 			// globally unique guest_cid.
 			VsockDevice: NewVsockDevice(lease.Slot),
+			// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+			// override readiness probe path. Empty keeps the legacy
+			// TCP-accept on :8080 (pre-PR-D default). Non-empty →
+			// waitReady does HTTP GET <HealthcheckPath> against
+			// <HostIP>:8080 and accepts 2xx as ready.
+			HealthcheckPath: req.HealthcheckPath,
 		}
 		if rErr := m.vmm.Restore(ctx, lease, rs); rErr == nil {
 			return WakeRestore, nil
@@ -899,6 +1126,12 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		VcpuCount:  req.VcpuCount,
 		MemSizeMiB: req.MemSizeMiB,
 		Tap:        nc.Tap,
+		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+		// override readiness probe path. Empty keeps the legacy
+		// TCP-accept on :8080 (pre-PR-D default). Non-empty →
+		// waitReady does HTTP GET <HealthcheckPath> against
+		// <HostIP>:8080 and accepts 2xx as ready.
+		HealthcheckPath: req.HealthcheckPath,
 	}
 	if err := m.vmm.BootColdBoot(ctx, lease, spec); err != nil {
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)

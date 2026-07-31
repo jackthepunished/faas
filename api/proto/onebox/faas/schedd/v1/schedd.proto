@@ -230,6 +230,13 @@ message WakeResponse {
   // minted by an earlier wake — gateway can resolve it via
   // PGBackend.InstanceIDForNodeID if needed.
   string wake_id     = 5;
+  // port (issue #460 / ADR-053, PR-C) is the per-deployment override
+  // port copied from deployments.override_port (0 = legacy 8080).
+  // schedd resolves the live deployment row on the Phase-1 fast
+  // path so the value is consistent with AdmitInstanceResponse.port;
+  // gateway caches it on Target and stamps it onto ForwardHTTPRequest.
+  // Additive per ADR-016.
+  int32  port        = 6;
 }
 
 // AdmitInstanceRequest mirrors WakeRequest for the schedule scale-out
@@ -262,6 +269,12 @@ message AdmitInstanceResponse {
   // pkg/grpcerr. This field mirrors WakeResponse and stays unset on
   // the admitted / at_capacity paths.
   google.protobuf.Struct problem = 6;
+  // port (issue #460 / ADR-053, PR-C) is the per-deployment override
+  // port copied from deployments.override_port (0 = legacy 8080).
+  // The production gateway path consumes this — set on the admitted
+  // path; 0 on the at-capacity path (no instance was admitted).
+  // Additive per ADR-016.
+  int32  port        = 7;
 }
 
 // Touch is one instance's most-recent request time.

@@ -16,6 +16,10 @@ global:
 # See docs/runbooks/<AlertName>.md for triage steps per alert.
 rule_files:
   - /etc/prometheus/faas.rules.yml
+  # Issue #250 — off-host Postgres backup alert (PgBackupStale). The
+  # postgres_backup role drops this file; if it's absent the alert
+  # is simply skipped (Prometheus tolerates a missing rule_files entry).
+  - /etc/prometheus/pg_backup.rules.yml
 
 # Alertmanager — loopback-only, dialed from the Prometheus binary on the
 # same box. Wired here so the operator's pager sees what the dashboard

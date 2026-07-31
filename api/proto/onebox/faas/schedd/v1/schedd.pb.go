@@ -158,7 +158,14 @@ type WakeResponse struct {
 	// Phase-1 fast-path return where the existing RUNNING instance was
 	// minted by an earlier wake — gateway can resolve it via
 	// PGBackend.InstanceIDForNodeID if needed.
-	WakeId        string `protobuf:"bytes,5,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
+	WakeId string `protobuf:"bytes,5,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
+	// port (issue #460 / ADR-053, PR-C) is the per-deployment override
+	// port copied from deployments.override_port (0 = legacy 8080).
+	// schedd resolves the live deployment row on the Phase-1 fast
+	// path so the value is consistent with AdmitInstanceResponse.port;
+	// gateway caches it on Target and stamps it onto ForwardHTTPRequest.
+	// Additive per ADR-016.
+	Port          int32 `protobuf:"varint,6,opt,name=port,proto3" json:"port,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -226,6 +233,13 @@ func (x *WakeResponse) GetWakeId() string {
 		return x.WakeId
 	}
 	return ""
+}
+
+func (x *WakeResponse) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
 }
 
 // AdmitInstanceRequest mirrors WakeRequest for the schedule scale-out
@@ -298,7 +312,13 @@ type AdmitInstanceResponse struct {
 	// google.rpc.Status via google.golang.org/grpc/status; see
 	// pkg/grpcerr. This field mirrors WakeResponse and stays unset on
 	// the admitted / at_capacity paths.
-	Problem       *structpb.Struct `protobuf:"bytes,6,opt,name=problem,proto3" json:"problem,omitempty"`
+	Problem *structpb.Struct `protobuf:"bytes,6,opt,name=problem,proto3" json:"problem,omitempty"`
+	// port (issue #460 / ADR-053, PR-C) is the per-deployment override
+	// port copied from deployments.override_port (0 = legacy 8080).
+	// The production gateway path consumes this — set on the admitted
+	// path; 0 on the at-capacity path (no instance was admitted).
+	// Additive per ADR-016.
+	Port          int32 `protobuf:"varint,7,opt,name=port,proto3" json:"port,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -373,6 +393,13 @@ func (x *AdmitInstanceResponse) GetProblem() *structpb.Struct {
 		return x.Problem
 	}
 	return nil
+}
+
+func (x *AdmitInstanceResponse) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
 }
 
 // Touch is one instance's most-recent request time.
@@ -1311,16 +1338,17 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\n" +
 	"\"onebox/faas/schedd/v1/schedd.proto\x12\x15onebox.faas.schedd.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"$\n" +
 	"\vWakeRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xcf\x01\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xe3\x01\n" +
 	"\fWakeResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x129\n" +
 	"\x06method\x18\x03 \x01(\x0e2!.onebox.faas.schedd.v1.WakeMethodR\x06method\x121\n" +
 	"\aproblem\x18\x04 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x17\n" +
-	"\awake_id\x18\x05 \x01(\tR\x06wakeId\"-\n" +
+	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
+	"\x04port\x18\x06 \x01(\x05R\x04port\"-\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xf9\x01\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\x8d\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -1329,7 +1357,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\awake_id\x18\x04 \x01(\tR\x06wakeId\x12\x1f\n" +
 	"\vat_capacity\x18\x05 \x01(\bR\n" +
 	"atCapacity\x121\n" +
-	"\aproblem\x18\x06 \x01(\v2\x17.google.protobuf.StructR\aproblem\"A\n" +
+	"\aproblem\x18\x06 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x12\n" +
+	"\x04port\x18\a \x01(\x05R\x04port\"A\n" +
 	"\x05Touch\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +

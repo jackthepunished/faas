@@ -22,3 +22,12 @@
     name: postgresql
     state: reloaded
   failed_when: false
+
+# Issue #250 — daemon-reload handler for the postgresql.service.d/
+# storage-box drop-in. Without this, a changed drop-in doesn't take
+# effect until the next manual `systemctl daemon-reload`. Mirror the
+# canonical fail-closed pattern from control_plane_service/tasks/main.yml.
+- name: daemon-reload postgres
+  ansible.builtin.systemd:
+    daemon_reload: true
+  failed_when: false  # chroot/CI lacks systemd

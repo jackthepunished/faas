@@ -650,11 +650,43 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[])
+	// type: NOT NULL CHECK (type IN ('app','function')) with DEFAULT 'app'.
+	// DEFAULT is bypassed because we pass the column explicitly; empty Go
+	// string would trip the CHECK. Coerce "" to AppTypeApp so the
+	// default's value is preserved whenever the caller hasn't picked.
+	// maxConcurrency: NOT NULL DEFAULT 1 CHECK (>= 1). Coerce <= 0 to 1.
+	// ramMB: NOT NULL CHECK (ram_mb > 0). Coerce <= 0 to 128 (Free plan
+	// minimum, pkg/api/limits.go:242) — the smallest legal value the
+	// column accepts.
+	// project_id + workload_name (migration 00074). project_id is nullable
+	// (empty → NULL via nullString); workload_name is NOT NULL DEFAULT ''
+	// so empty stays as ''. Together with the unique index
+	// apps_project_workload_uniq (project_id, workload_name) WHERE
+	// project_id IS NOT NULL, a project-bound insert must carry both
+	// columns and a non-project insert lands with (NULL, '') which the
+	// index filters out.
+	appType := app.Type
+	if appType == "" {
+		appType = AppTypeApp
+	}
+	maxConcurrency := app.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
+	// ramMB is NOT NULL with CHECK (ram_mb > 0) (migrations/00001_init.sql:36).
+	// Callers that leave it at the Go int zero (no plan resolution / no
+	// explicit mem cap set) would trip the CHECK if passed as-is; coerce
+	// <= 0 to 128 — the Free plan minimum from pkg/api/limits.go:242 —
+	// the smallest legal value the column accepts.
+	ramMB := app.RAMMB
+	if ramMB <= 0 {
+		ramMB = 128
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist))
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
 	return scanApp(row)
 }
 
@@ -715,11 +747,37 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	manifestBytes, _ := json.Marshal(manifest)
 	runtime := nullString(app.Runtime)
 	idle := nullableInt(app.IdleTimeoutS)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9)
+	// Coerce MaxConcurrency <= 0 to 1 so the NOT NULL CHECK (>= 1) is
+	// satisfied (matches the CreateApp / ApplyProjectPlan paths).
+	maxConcurrency := app.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
+	// Coerce RAMMB <= 0 to 128 (Free plan minimum, pkg/api/limits.go:242)
+	// so the NOT NULL CHECK (ram_mb > 0) is satisfied (matches CreateApp).
+	ramMB := app.RAMMB
+	if ramMB <= 0 {
+		ramMB = 128
+	}
+	// Coerce Type=="" to AppTypeApp so the NOT NULL CHECK
+	// (type IN ('app','function')) is satisfied (matches CreateApp).
+	appType := app.Type
+	if appType == "" {
+		appType = AppTypeApp
+	}
+	// project_id + workload_name are added by migration 00074. The
+	// reconcile path passes project-bound Apps and AppsForProject
+	// filters by project_id; the unique index apps_project_workload_uniq
+	// (project_id, workload_name) WHERE project_id IS NOT NULL means
+	// every project-bound insert must carry both columns or it
+	// collides with the prior row. project_id is nullable (empty →
+	// NULL via nullString); workload_name is NOT NULL DEFAULT '' so
+	// the empty string stays as '' (matches the v1 default).
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(app.Type), runtime, app.RAMMB, idle, app.MaxConcurrency, manifestBytes, app.MinInstances)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -784,19 +842,37 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   min_instances   = case when $9 then $10 else min_instances end,
 		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
-		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end
+		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
+		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
+		   root_dir       = case when $19 then $20 else root_dir end,
+		   workload_name  = case when $21 then $22 else workload_name end,
+		   start_command  = case when $23 then $24::text else start_command end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, upd,
 		id,
-		p.RAMMB, p.SetIdleTimeout, derefInt(p.IdleTimeoutS),
+		p.RAMMB, p.SetIdleTimeout, intOrZero(p.IdleTimeoutS),
 		p.MaxConcurrency, nullAppStatus(p.Status),
 		p.Manifest != nil, manifestBytes,
-		p.SetMinInstances, derefInt(p.MinInstances),
+		p.SetMinInstances, intOrZero(p.MinInstances),
 		p.SetEgressAllowlist, cidrPrefixesToArray(derefPrefixes(p.EgressAllowlist)),
-		p.SetAutoscaleTargetRPS, derefInt(p.AutoscaleTargetRPS),
-		p.SetAutoscaleTargetCPUPct, derefInt(p.AutoscaleTargetCPUPct))
+		p.SetAutoscaleTargetRPS, intOrZero(p.AutoscaleTargetRPS),
+		p.SetAutoscaleTargetCPUPct, intOrZero(p.AutoscaleTargetCPUPct),
+		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled),
+		p.RootDir != nil, p.RootDir,
+		p.WorkloadName != nil, p.WorkloadName,
+		p.StartCommand != nil, nullString(derefString(p.StartCommand)))
 	return scanApp(row)
+}
+
+// derefString returns the dereferenced value of a *string, or "" if
+// nil. Mirrors derefInt at this file's helper section; both are safe
+// to call with a nil pointer because the CASE guards the read site.
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // SetAppMinInstances stamps the per-app floor (ux_spec §6.5). Plan-tier
@@ -870,8 +946,36 @@ func (s *PgStore) RenameApp(ctx context.Context, accountID, oldSlug, newSlug str
 }
 
 func (s *PgStore) DeleteApp(ctx context.Context, id string) error {
-	_, err := s.pool.Exec(ctx, `update apps set status = 'deleted' where id = $1`, id)
+	// Legacy thin wrapper retained for the apid deleteApp handler
+	// (Phase 5 pkg/reconcile calls SoftDeleteAppCascade directly).
+	_, err := s.SoftDeleteAppCascade(ctx, id)
 	return err
+}
+
+// SoftDeleteAppCascade marks the app deleted (status='deleted') and
+// returns the freshly-deleted App row. Per Phase 5 user decision the
+// cascade is status-only — child rows survive for slug-reuse (an app
+// deleted then recreated under the same slug keeps its envs and
+// secrets; cf. memstore_test.go:309-312). GDPR-style hard cascade
+// still lives in DeleteAccount. Returns ErrNotFound when no row
+// matches; the subsequent mapErr funnel wraps SQLSTATE 23502
+// (not_null) the same way as SetAppWorkloadClass.
+func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, error) {
+	var a App
+	// The apps table does NOT have an updated_at column (appsSelectColumns
+	// at pgstore.go:6531 doesn't include it; no migration adds it). The
+	// earlier PR-E code touched updated_at = now() here, which trips
+	// SQLSTATE 42703 on every soft-delete. The deleted row is filtered
+	// out of every list/read by status <> 'deleted', so the deletion
+	// timestamp is implicit — no separate column needed.
+	row := s.pool.QueryRow(ctx, `
+		update apps set status = 'deleted'
+		where id = $1
+		returning `+appsSelectColumns, id)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
 }
 
 // --- Projects (ADR-050, Phase 1) ----------------------------------
@@ -1223,6 +1327,27 @@ func (s *PgStore) ApplyProjectPlan(
 		manifestBytes, _ := json.Marshal(manifest)
 		runtime := nullString(a.Runtime)
 		idle := nullableInt(a.IdleTimeoutS)
+		// Same rationale as CreateApp: coerce MaxConcurrency <= 0
+		// to 1 so the NOT NULL CHECK (>= 1) is satisfied. Autoscale
+		// "disabled" is autoscale_target_rps / autoscale_target_cpu_pct,
+		// not max_concurrency.
+		maxConcurrency := a.MaxConcurrency
+		if maxConcurrency <= 0 {
+			maxConcurrency = 1
+		}
+		// Coerce RAMMB <= 0 to 128 (Free plan minimum) so the NOT NULL
+		// CHECK (ram_mb > 0) is satisfied (matches CreateApp /
+		// CreateAppIfUnderQuota).
+		ramMB := a.RAMMB
+		if ramMB <= 0 {
+			ramMB = 128
+		}
+		// Coerce Type=="" to AppTypeApp so the NOT NULL CHECK
+		// (type IN ('app','function')) is satisfied (matches CreateApp).
+		appType := a.Type
+		if appType == "" {
+			appType = AppTypeApp
+		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
@@ -1231,7 +1356,7 @@ func (s *PgStore) ApplyProjectPlan(
 		        $11, $12, $13, $14, $15)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
-			project.AccountID, a.Slug, string(a.Type), runtime, a.RAMMB, idle, a.MaxConcurrency,
+			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
@@ -6446,7 +6571,8 @@ func scanAppInto(a *App, row pgx.Row) error {
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
-		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand); err != nil {
+		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
+		&a.StreamingEnabled); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6470,7 +6596,7 @@ const appsSelectColumns = `
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, '')`
+	workload_class, coalesce(start_command, ''), streaming_enabled`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

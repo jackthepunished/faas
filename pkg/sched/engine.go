@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -427,6 +429,12 @@ type WakeResult struct {
 	// inspects error codes. Always false on Wake (the existing fast
 	// path is the only short-circuit there).
 	AtCapacity bool
+	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
+	// override port copied from dep.OverridePort. 0 = legacy 8080.
+	// On the Phase-1 fast path this comes from a LiveDeployment
+	// lookup so the gateway sees the same value AdmitInstance would
+	// have produced; on the admit path it comes from bootInput.spec.
+	Port int
 }
 
 // Wake ensures a running instance for appID and returns its address (spec §4.3
@@ -475,6 +483,38 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {
+		// PR-C (issue #460 / ADR-053): resolve the live deployment so
+		// the response's Port field is consistent with what
+		// AdmitInstance would have produced. The instance row
+		// carries no port (port is a deployment-level concept); the
+		// live dep row carries dep.OverridePort.
+		//
+		// Why a LiveDeployment read is acceptable here: Wake is the
+		// legacy fast path used by meterd's per-minute sampler + cron
+		// firings, NOT the customer hot path. Production customer
+		// requests go through AdmitInstance (cmd/gatewayd/main.go),
+		// which has the live deployment already loaded. So this read
+		// adds one cheap PG roundtrip (~1ms, single-row lookup with
+		// the existing (app_id, status) partial index) per minute per
+		// active app — well below any customer-facing budget.
+		//
+		// A read failure here logs (slog) and falls through with
+		// Port=0 — the vmmd wire boundary defaults to 8080 in that
+		// case, so a transient PG hiccup never widens the failure
+		// surface beyond the legacy behaviour.
+		//
+		// If Wake ever becomes customer-facing, denormalise port onto
+		// the instances row at admit time and read it back alongside
+		// the existing fields — that costs a migration + an extra
+		// column on state.Instance + the RunningInstanceForApp query,
+		// which is overkill for synth traffic.
+		var port int
+		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
+			port = dep.OverridePort
+		} else {
+			e.log.Warn("sched: wake: live deployment lookup for port failed; falling through with 0",
+				"app", appID, "err", depErr)
+		}
 		release()
 		// Surface the existing row's wake_id so a Phase-1 fast-path
 		// response carries x-faas-wake-id just like a cold-wake
@@ -482,7 +522,7 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 		// brought the instance up; an operator tailing a warm request
 		// can still pin it back to the schedd slog line that stamped
 		// it (gaps analysis 2026-07-23 review finding #1).
-		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID}, nil
+		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port}, nil
 	} else if !errors.Is(err, state.ErrNotFound) {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: running lookup: %w", err)
@@ -689,11 +729,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// local backend's Get maps the same keys to the same files the
 	// legacy *_path fields used, so single-box behaviour is
 	// preserved. See pkg/sched/paths.go baseKey / layerKey.
+	//
+	// PR-B (issue #460 / ADR-053 §Decision 1): env_secrets override
+	// filtering happens here, on the wake path. dep.OverrideEnvSecrets
+	// (a jsonb blob) is the per-deployment allowlist; pre-PR-B
+	// deployments without override columns get the legacy "stage
+	// everything for the app" behaviour so tarball/dockerfile paths
+	// keep working unchanged.
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	if err != nil {
+		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		SealedEnv:  sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -708,6 +759,24 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// effect on the next wake. Live instances keep their
 		// old netns — same contract as RAMMB and MaxConcurrency.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
+		// Issue #460 / ADR-053 (PR-C): per-deployment override
+		// port the customer's app binds inside the guest. 0 =
+		// legacy 8080 (vmmd's wire-level default). The host's
+		// waitReady + DNAT stay fixed on 8080 (ADR-009 +
+		// guest/init/portnorm_linux.go); only vmmd's ForwardHTTP
+		// bridge uses this port to dial the guest.
+		Port: dep.OverridePort,
+		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment
+		// override readiness probe path. Empty = legacy TCP-accept
+		// on :8080 (pre-PR-D default). Non-empty → vmmd's
+		// waitReady does HTTP GET <HealthcheckPath> against
+		// <HostIP>:8080 and accepts 2xx as ready. The host probe
+		// target is always :8080 — ADR-009 + portnorm re-expose the
+		// customer bind on :8080 inside the guest, so the path is
+		// the customer's choice and the port is the host's choice.
+		// Mirror of `Port` above: empty OverrideHealthcheck
+		// (legacy / no-override) → empty path → legacy probe.
+		HealthcheckPath: healthcheckPathFromDep(dep),
 	}
 
 	// Capture the boot inputs we need across the unlocked window. These
@@ -926,7 +995,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
-	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID}, nil
+	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port}, nil
 }
 
 // bootInput is the immutable bundle of values needed across the
@@ -1113,11 +1182,20 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	// local backend's Get maps the same keys to the same files the
 	// legacy *_path fields used, so single-box behaviour is
 	// preserved. See pkg/sched/paths.go baseKey / layerKey.
+	//
+	// PR-B (issue #460 / ADR-053 §Decision 1): env_secrets override
+	// filtering — see Wake builder for the full contract. ColdBoot /
+	// Prime shares the wake path; the dep row is the same one Wake
+	// loaded (so no extra DB read).
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	if err != nil {
+		return fmt.Errorf("sched: prime: load sealed env: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  e.loadSealedEnv(ctx, acct.ID, appID),
+		SealedEnv:  sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -1486,30 +1564,135 @@ func (e *Engine) resolveAppForDeploy(ctx context.Context, appID string) (state.A
 	return app, acct, limits, nil
 }
 
-// loadSealedEnv reads the per-app sealed env rows and flattens them into
-// the fcvm shape Manager.Wake consumes. A read failure here is non-fatal:
-// it logs and returns nil (an empty SealedEnv). That preserves the
-// "wake succeeds even if PG has a hiccup" property — the app comes up
-// without secrets rather than failing entirely. vmmd never sees a stale
-// ciphertext, so there's nothing to leak; the worst case is a missing
-// secret, which customer support can spot from the next failed deploy.
+// loadSealedEnvFor returns the sealed env entries to stage at wake for the
+// given deployment.
+//
+// Issue #460 / ADR-053 §Decision 1: when the deployment's OverrideEnvSecrets
+// is non-empty, the result is filtered to ONLY those keys (the override is a
+// positive allowlist — "secret:DB_URL" resolves to the app_secrets row whose
+// Key == "DB_URL"). When OverrideEnvSecrets is empty (legacy behaviour for
+// source-tarball / dockerfile deploys that pre-date the override surface),
+// the entire app_secrets set for the app is returned.
+//
+// Missing-secret posture (mirrors ADR-053 §Decision 2 "fail-loud"): an
+// override entry referencing a NAME that has no row in app_secrets is
+// reported as a loud error — schedd aborts the wake so the deployment row
+// transitions to failed. The shape was already validated at apid-create time
+// (CreateDeploymentOverrides.Validate at pkg/api/dto.go using
+// api.SecretRefNameRe); the existence check is the wake-side equivalent.
+// Customers who specify an env_secrets override expect those keys to land in
+// the guest — silently dropping them surfaces as a confusing "env var
+// missing" without ever telling the customer why.
+//
+// When ANY override entry is missing its row, ALL missing keys are reported
+// in a single error — non-deterministic, but bounded: a customer with three
+// missing secrets sees all three in one wake failure, not three sequential
+// "fix one, retry, see the next" deploys.
+//
+// Behaviour change vs. the pre-PR-B loadSealedEnv: a ListAppSecrets error
+// (PG hiccup, replication lag, role separation dropping the connection)
+// now aborts the wake instead of being silently logged-and-swallowed. This
+// is intentional — a wake that comes up without the sealed env the customer
+// configured is exactly the "silent drop" ADR-053 §Decision 2 forbids.
+//
+// Ciphertext + key only — VALUES never appear here or in logs.
 //
 // We carry AccountID explicitly so a cross-account (accountID, appID) pair
 // returns ErrNotFound (consistent with apid's 404 contract).
-func (e *Engine) loadSealedEnv(ctx context.Context, accountID, appID string) []fcvm.SealedEnvEntry {
+func (e *Engine) loadSealedEnvFor(ctx context.Context, accountID, appID string, overrideEnvSecrets map[string]string) ([]fcvm.SealedEnvEntry, error) {
 	rows, err := e.store.ListAppSecrets(ctx, accountID, appID)
 	if err != nil {
-		e.log.Warn("load sealed env", "app", appID, "err", err)
-		return nil
+		return nil, fmt.Errorf("load sealed env (account=%s app=%s): %w", accountID, appID, err)
 	}
-	if len(rows) == 0 {
-		return nil
+	if len(overrideEnvSecrets) == 0 {
+		// Legacy path: stage everything for the app. Preserved for
+		// pre-PR-A deployments without override columns populated AND for
+		// tarball/dockerfile deploys that don't use the override surface.
+		out := make([]fcvm.SealedEnvEntry, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
+		}
+		return out, nil
 	}
-	out := make([]fcvm.SealedEnvEntry, 0, len(rows))
+	// Filtered path: build a Key→row index, then iterate the override's
+	// requested env_keys in declaration order (so the staged
+	// /etc/faas/secrets.env is stable and easy to diff in support tickets).
+	// Each requested env_key MUST resolve; missing keys are accumulated and
+	// reported as one error rather than one-at-a-time so support tickets see
+	// the full set.
+	index := make(map[string]state.AppSecret, len(rows))
 	for _, r := range rows {
-		out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
+		index[r.Key] = r
+	}
+	var missing []string
+	out := make([]fcvm.SealedEnvEntry, 0, len(overrideEnvSecrets))
+	for envKey, ref := range overrideEnvSecrets {
+		row, ok := index[envKey]
+		if !ok {
+			missing = append(missing, fmt.Sprintf("%q (-> %q)", envKey, ref))
+			continue
+		}
+		out = append(out, fcvm.SealedEnvEntry{Key: row.Key, Ciphertext: row.Ciphertext})
+	}
+	if len(missing) > 0 {
+		// Sort for determinism — Go map iteration is randomised, so without
+		// this a customer with three missing keys would see them in
+		// different orders on different wakes.
+		sort.Strings(missing)
+		return nil, fmt.Errorf("env_secrets: missing app_secrets rows for %s on (%s, %s); set the secret first via faas secrets set",
+			strings.Join(missing, ", "), accountID, appID)
+	}
+	return out, nil
+}
+
+// envSecretsFromDep unmarshals dep.OverrideEnvSecrets (jsonb column) into a
+// map[string]string. Pre-PR-B deployments store nil here (the column didn't
+// exist); an empty result preserves the legacy "stage everything for the
+// app" behaviour. A malformed column is treated as no override rather than
+// fail-the-wake, because the apid path validates the shape at INSERT time —
+// a tampered column would need a direct DB write, which the spec gates
+// behind DB role separation (CLAUDE.md security rules).
+//
+// Returned map is owned by the caller; mutating it does not affect the
+// deployment row.
+func envSecretsFromDep(dep state.Deployment) map[string]string {
+	if len(dep.OverrideEnvSecrets) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	if err := json.Unmarshal(dep.OverrideEnvSecrets, &out); err != nil {
+		// Defensive: apid validates shape at INSERT. Treat malformed as
+		// no-override so a corrupted row doesn't compound with a missing
+		// secrets row to surface as a confusing wake failure.
+		return nil
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
+}
+
+// healthcheckPathFromDep (issue #460 / ADR-053, ADR-057 / PR-D) unmarshals
+// dep.OverrideHealthcheck (jsonb column) and returns the readiness probe
+// path. Returns "" when the column is nil (pre-PR-A deployments), when
+// the path field is empty (legacy no-healthcheck), or when the column is
+// malformed (fail-soft to the legacy TCP-accept on :8080). The mirror of
+// envSecretsFromDep above: defensive against a malformed column rather
+// than fail-the-wake, because the apid validator already enforces the
+// shape at INSERT time — a tampered column would need a direct DB write
+// behind the spec's role separation.
+//
+// Returned string is owned by the caller; mutating it does not affect
+// the deployment row.
+func healthcheckPathFromDep(dep state.Deployment) string {
+	if len(dep.OverrideHealthcheck) == 0 {
+		return ""
+	}
+	var hc api.DeploymentHealthcheck
+	if err := json.Unmarshal(dep.OverrideHealthcheck, &hc); err != nil {
+		return ""
+	}
+	return hc.Path
 }
 
 // loadAPIEnv is the plaintext sibling of loadSealedEnv (issue #395 /

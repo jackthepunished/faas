@@ -142,7 +142,7 @@ type stagedAPIEnvEntry struct {
 	blob     []byte
 }
 
-func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig) error {
+func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig, _ string) error {
 	v.mu.Lock()
 	v.bootCount++
 	v.mu.Unlock()
@@ -175,7 +175,11 @@ func (v *fakeVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec) 
 	if err := spec.Validate(); err != nil {
 		return err
 	}
-	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot))
+	// Mirror production: thread the per-deployment override
+	// readiness probe path through Boot. The fakeVMM's Boot
+	// discards the parameter (the test doesn't go through
+	// waitReady), but the call signature is the contract.
+	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.HealthcheckPath)
 }
 
 func (v *fakeVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) error {
@@ -544,6 +548,25 @@ func req(id string) ColdBootRequest {
 	return ColdBootRequest{Instance: id, BaseKey: "/b.ext4", LayerKey: "/l.ext4", VcpuCount: 2, MemSizeMiB: 128, Plan: api.PlanHobby}
 }
 
+// reqWithPort mirrors req() but stamps a per-deployment override port
+// (issue #460 / ADR-053, PR-C). Used by the port-propagation test that
+// exercises ColdBoot → WakeRequest → Instance.Port.
+func reqWithPort(id string, port int) ColdBootRequest {
+	r := req(id)
+	r.Port = port
+	return r
+}
+
+// reqWithHealthcheck mirrors req() but stamps a per-deployment override
+// readiness probe path (issue #460 / ADR-053, ADR-057 / PR-D). Used by
+// the healthcheck-propagation test that exercises ColdBoot →
+// WakeRequest → Instance.HealthcheckPath.
+func reqWithHealthcheck(id, path string) ColdBootRequest {
+	r := req(id)
+	r.HealthcheckPath = path
+	return r
+}
+
 func newTestManager(run Runner, vmm VMM) *Manager {
 	return NewManager(run, vmm, Paths{Kernel: "/srv/fc/base/vmlinux-6.1"}, testFCVersion, nil, nil)
 }
@@ -586,6 +609,76 @@ func TestColdBootSuccessTracksInstance(t *testing.T) {
 	}
 	if !run.ran("netns add fc-i1") {
 		t.Error("network setup did not run")
+	}
+}
+
+// TestColdBootSuccessStampsInstancePort pins issue #460 / ADR-053
+// (PR-C): when ColdBootRequest carries a per-deployment override
+// port, the live Instance must carry that port so the vmmdgrpc
+// forwarder (or any other server-side reader that walks m.live) can
+// resolve the per-instance dial port without a second lookup. A
+// regression that drops the propagation forces the forwarder to
+// re-resolve from the deployment row on every request — breaking
+// the "in-memory cache" invariant vmmdgrpc.forward.go relies on.
+func TestColdBootSuccessStampsInstancePort(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), reqWithPort("i1", 9090))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.Port != 9090 {
+		t.Errorf("Instance.Port = %d, want 9090 (inst=%+v)", inst.Port, inst)
+	}
+	if m.LiveCount() != 1 {
+		t.Errorf("LiveCount = %d, want 1 (the live map should hold the stamped instance)", m.LiveCount())
+	}
+}
+
+// TestColdBootSuccessStampsInstanceHealthcheckPath pins issue #460 /
+// ADR-053, ADR-057 (PR-D): when ColdBootRequest carries a per-deployment
+// override readiness probe path, the live Instance must carry that path
+// so server-side readers (e.g. a future observability probe) can
+// resolve the per-instance probe target without a second lookup. A
+// regression that drops the propagation forces the waiter to re-read
+// from the deployment row on every request — breaking the same
+// in-memory-cache invariant that TestColdBootSuccessStampsInstancePort
+// (PR-C) covers for the port side.
+//
+// Mirror of the PR-C port test, which established the pattern.
+func TestColdBootSuccessStampsInstanceHealthcheckPath(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), reqWithHealthcheck("i1", "/healthz"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.HealthcheckPath != "/healthz" {
+		t.Errorf("Instance.HealthcheckPath = %q, want %q (inst=%+v)", inst.HealthcheckPath, "/healthz", inst)
+	}
+	if m.LiveCount() != 1 {
+		t.Errorf("LiveCount = %d, want 1 (the live map should hold the stamped instance)", m.LiveCount())
+	}
+}
+
+// TestColdBootEmptyHealthcheckPathIsEmpty verifies the legacy / no-override
+// path: when ColdBootRequest carries no HealthcheckPath, the live Instance
+// must carry the empty string so the waitReady HTTP probe branch is
+// skipped (it falls through to the legacy TCP-accept on :8080). The
+// negation of TestColdBootSuccessStampsInstanceHealthcheckPath — both
+// together pin the propagation contract.
+func TestColdBootEmptyHealthcheckPathIsEmpty(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), req("i1"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.HealthcheckPath != "" {
+		t.Errorf("Instance.HealthcheckPath = %q, want empty (legacy TCP-accept on :8080)", inst.HealthcheckPath)
 	}
 }
 

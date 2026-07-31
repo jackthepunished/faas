@@ -378,3 +378,54 @@ func TestServerParkInstance_InternalError(t *testing.T) {
 		t.Errorf("code = %v, want Internal", code)
 	}
 }
+
+// TestWake_PropagatesPort pins issue #460 / ADR-053 (PR-C): the
+// per-deployment override port schedd computes during admit must
+// reach the WakeResponse wire frame so the gateway's
+// Client.AdmitInstance wrapper can hand it to the upstream forwarder.
+// A regression that drops Port from the response forces the gateway
+// to dial :8080 against a guest that bound :9090 → 503.
+func TestWake_PropagatesPort(t *testing.T) {
+	cli := newServer(t, &fakeEngine{
+		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+			return sched.WakeResult{
+				InstanceID: "i-1",
+				NodeID:     "node-test-1",
+				Method:     vmmdpb.WakeMethod_WAKE_RESTORE,
+				Port:       9090,
+			}, nil
+		},
+	})
+	resp, err := cli.Wake(context.Background(), &scheddpb.WakeRequest{AppId: "app-1"})
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if got := resp.GetPort(); got != 9090 {
+		t.Errorf("port = %d, want 9090", got)
+	}
+}
+
+// TestAdmitInstance_PropagatesPort mirrors the Wake port test for
+// the AdmitInstance RPC, which is the production-path call gatewayd
+// actually uses. The legacy Wake call still carries Port for
+// back-compat with any pre-sliced-4 callers, but the gateway forward
+// path is on AdmitInstance + Target.Port in pkg/gateway.
+func TestAdmitInstance_PropagatesPort(t *testing.T) {
+	cli := newServer(t, &fakeEngine{
+		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+			return sched.WakeResult{
+				InstanceID: "i-1",
+				NodeID:     "node-test-1",
+				Method:     vmmdpb.WakeMethod_WAKE_COLD_BOOT,
+				Port:       9090,
+			}, nil
+		},
+	})
+	resp, err := cli.AdmitInstance(context.Background(), &scheddpb.AdmitInstanceRequest{AppId: "app-1"})
+	if err != nil {
+		t.Fatalf("AdmitInstance: %v", err)
+	}
+	if got := resp.GetPort(); got != 9090 {
+		t.Errorf("port = %d, want 9090", got)
+	}
+}

@@ -194,23 +194,34 @@ func (s *Server) bridgeIntoNetns(ctx context.Context, netnsName string, req *vmm
 //  4. prints a single "<status>\n<headers-blocks>\n\n<body>" record so
 //     parseBridgeOutput can split on the first "\n\n" cleanly.
 //
-// The Host header is rewritten to netns.GuestIP:netns.AppPort so the
+// The Host header is rewritten to netns.GuestIP:<dial-port> so the
 // guest's vhost matcher (apps that pin Host) sees the inner identity.
 // gatewayd already strips hop-by-hop headers (Connection, etc.) so we
 // don't repeat that here — keeping the bridge dumb about HTTP semantics
 // is what keeps the script auditable.
+//
+// dial-port resolution (issue #460 / ADR-053, PR-C): the per-deployment
+// override port the customer's app binds inside the guest comes in via
+// req.GetPort(). 0 = legacy 8080 (netns.AppPort default). The host's
+// waitReady + DNAT stay fixed on 8080 (ADR-009 +
+// guest/init/portnorm_linux.go); only the vmmd bridge uses this port to
+// dial the guest.
 func buildBridgeScript(reqPath string, req *vmmdpb.ForwardHTTPRequest, dialTimeout, respTimeout time.Duration) string {
+	dialPort := req.GetPort()
+	if dialPort == 0 {
+		dialPort = uint32(netns.AppPort)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "set -eu\n")
 	fmt.Fprintf(&b, "exec 3<>/dev/tcp/%s/%d\n",
-		netns.GuestIP, netns.AppPort)
+		netns.GuestIP, dialPort)
 	// Request line.
 	fmt.Fprintf(&b, "printf '%%s %%s HTTP/1.1\\r\\n' %s %s >&3\n",
 		shellQuote(req.GetMethod()), shellQuote(req.GetRequestUri()))
 	// Host header (rewritten to inner identity — apps with a vhost pin
 	// must see the inner addr, not the overlay one).
 	fmt.Fprintf(&b, "printf 'Host: %%s\\r\\n' %s >&3\n",
-		shellQuote(fmt.Sprintf("%s:%d", netns.GuestIP, netns.AppPort)))
+		shellQuote(fmt.Sprintf("%s:%d", netns.GuestIP, dialPort)))
 	fmt.Fprintf(&b, "printf 'Content-Length: %%d\\r\\n' %d >&3\n", len(req.GetBody()))
 	// Caller-supplied headers (already had hop-by-hop stripped upstream).
 	for _, h := range req.GetHeaders() {
@@ -370,4 +381,13 @@ var (
 // obvious to a future maintainer reading the test.
 func ParseBridgeOutputForTest(raw []byte) (*vmmdpb.ForwardHTTPResponse, error) {
 	return parseBridgeOutput(raw)
+}
+
+// BuildBridgeScriptForTest exposes the script generator so unit tests
+// can assert the dial-port + Host header rewrite (issue #460 /
+// ADR-053 PR-C) without an ip netns exec. Tests grep the rendered
+// script for the dial line + Host header; the strings are stable
+// (see forward.go buildBridgeScript doc).
+func BuildBridgeScriptForTest(reqPath string, req *vmmdpb.ForwardHTTPRequest, dialTimeout, respTimeout time.Duration) string {
+	return buildBridgeScript(reqPath, req, dialTimeout, respTimeout)
 }

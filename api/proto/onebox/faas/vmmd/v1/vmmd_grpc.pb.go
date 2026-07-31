@@ -22,17 +22,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Vmmd_CreateFromSnapshot_FullMethodName    = "/onebox.faas.vmmd.v1.Vmmd/CreateFromSnapshot"
-	Vmmd_CreateColdBoot_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/CreateColdBoot"
-	Vmmd_PauseAndSnapshot_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/PauseAndSnapshot"
-	Vmmd_Destroy_FullMethodName               = "/onebox.faas.vmmd.v1.Vmmd/Destroy"
-	Vmmd_Stats_FullMethodName                 = "/onebox.faas.vmmd.v1.Vmmd/Stats"
-	Vmmd_Ping_FullMethodName                  = "/onebox.faas.vmmd.v1.Vmmd/Ping"
-	Vmmd_ForwardHTTP_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTP"
-	Vmmd_Heartbeat_FullMethodName             = "/onebox.faas.vmmd.v1.Vmmd/Heartbeat"
-	Vmmd_UpdateEgressAllowlist_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/UpdateEgressAllowlist"
-	Vmmd_SeccompStatus_FullMethodName         = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
-	Vmmd_Logs_FullMethodName                  = "/onebox.faas.vmmd.v1.Vmmd/Logs"
+	Vmmd_CreateFromSnapshot_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/CreateFromSnapshot"
+	Vmmd_CreateColdBoot_FullMethodName          = "/onebox.faas.vmmd.v1.Vmmd/CreateColdBoot"
+	Vmmd_PauseAndSnapshot_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/PauseAndSnapshot"
+	Vmmd_Destroy_FullMethodName                 = "/onebox.faas.vmmd.v1.Vmmd/Destroy"
+	Vmmd_Stats_FullMethodName                   = "/onebox.faas.vmmd.v1.Vmmd/Stats"
+	Vmmd_Ping_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Ping"
+	Vmmd_ForwardHTTP_FullMethodName             = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTP"
+	Vmmd_Heartbeat_FullMethodName               = "/onebox.faas.vmmd.v1.Vmmd/Heartbeat"
+	Vmmd_UpdateEgressAllowlist_FullMethodName   = "/onebox.faas.vmmd.v1.Vmmd/UpdateEgressAllowlist"
+	Vmmd_SeccompStatus_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
+	Vmmd_Logs_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Logs"
+	Vmmd_MountParentExt4ReadOnly_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/MountParentExt4ReadOnly"
+	Vmmd_UmountParentExt4_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/UmountParentExt4"
 )
 
 // VmmdClient is the client API for Vmmd service.
@@ -127,6 +129,45 @@ type VmmdClient interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogsResponse], error)
+	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
+	// lets imaged compose the per-runtime base ext4 from a shared
+	// debian:12-slim parent. imaged is not root (User=faas-imaged +
+	// NoNewPrivileges=yes per spec §11), so it cannot mount the parent
+	// ext4 itself; vmmd is the only root component and runs the
+	// `mount -o loop,ro,nodev,nosuid,noexec` on imaged's behalf. The
+	// returned mountpoint is an absolute host path under
+	// /srv/fc/parent/faas-parent-mnt-<id>/ — shared between vmmd and
+	// imaged because BOTH daemons carry systemd `PrivateTmp=yes`
+	// (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's /tmp is
+	// its own tmpfs, invisible to imaged's mount namespace. The caller
+	// (imaged) §4.6-honours the contract by `mkfs.ext4 -d <mountpoint>`
+	// directly through the read-only loopback mount — no `cp -a`, no
+	// separate staging tree — and immediately calls UmountParentExt4.
+	// The mount is read-only so a child re-stage cannot corrupt the
+	// parent; vmmd tracks the mount in an in-memory registry and
+	// sweeps orphans every ParentMountMaxAge (default 30 min) + at
+	// SIGTERM. Storage_key is the canonical StorageBackend key
+	// (issue #96 / ADR-025 axis 2), e.g.
+	// "base/runner-base-debian-parent-amd64.ext4". Storage_key MUST be
+	// in the parent-base allow-list (sched.IsParentBaseKey — host arch
+	// + sibling for heterogenous clusters); anything else is rejected
+	// with InvalidArgument. Empty storage_key → InvalidArgument.
+	// Unknown storage_key (Get returns ErrNotFound) → NotFound. vmmd
+	// writes the bytes through its own configured StorageBackend —
+	// there is no precedent for imaged→vmmd dialing; CLAUDE.md is
+	// amended (ADR-053) to call this out as a deliberate exception to
+	// "components talk via Postgres rows + pg_notify, or gRPC on unix
+	// sockets in /run/faas/".
+	MountParentExt4ReadOnly(ctx context.Context, in *MountParentExt4ReadOnlyRequest, opts ...grpc.CallOption) (*MountParentExt4ReadOnlyResponse, error)
+	// UmountParentExt4 (ADR-053) releases a mount vmmd previously
+	// returned from MountParentExt4ReadOnly. Idempotent on an
+	// unknown mountpoint — imaged's call-on-error-defer pattern
+	// (mkfs.ext4 errored → umount anyway) is safe. The mountpoint
+	// path is validated to live under /srv/fc/parent/faas-parent-mnt-*
+	// (vmmdmount.MountRoot) to refuse unmounting an unrelated
+	// filesystem (defence in depth against a caller that hands back
+	// a path vmmd never issued).
+	UmountParentExt4(ctx context.Context, in *UmountParentExt4Request, opts ...grpc.CallOption) (*UmountParentExt4Response, error)
 }
 
 type vmmdClient struct {
@@ -256,6 +297,26 @@ func (c *vmmdClient) Logs(ctx context.Context, in *LogsRequest, opts ...grpc.Cal
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_LogsClient = grpc.ServerStreamingClient[LogsResponse]
 
+func (c *vmmdClient) MountParentExt4ReadOnly(ctx context.Context, in *MountParentExt4ReadOnlyRequest, opts ...grpc.CallOption) (*MountParentExt4ReadOnlyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MountParentExt4ReadOnlyResponse)
+	err := c.cc.Invoke(ctx, Vmmd_MountParentExt4ReadOnly_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vmmdClient) UmountParentExt4(ctx context.Context, in *UmountParentExt4Request, opts ...grpc.CallOption) (*UmountParentExt4Response, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UmountParentExt4Response)
+	err := c.cc.Invoke(ctx, Vmmd_UmountParentExt4_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VmmdServer is the server API for Vmmd service.
 // All implementations must embed UnimplementedVmmdServer
 // for forward compatibility.
@@ -348,6 +409,45 @@ type VmmdServer interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error
+	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
+	// lets imaged compose the per-runtime base ext4 from a shared
+	// debian:12-slim parent. imaged is not root (User=faas-imaged +
+	// NoNewPrivileges=yes per spec §11), so it cannot mount the parent
+	// ext4 itself; vmmd is the only root component and runs the
+	// `mount -o loop,ro,nodev,nosuid,noexec` on imaged's behalf. The
+	// returned mountpoint is an absolute host path under
+	// /srv/fc/parent/faas-parent-mnt-<id>/ — shared between vmmd and
+	// imaged because BOTH daemons carry systemd `PrivateTmp=yes`
+	// (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's /tmp is
+	// its own tmpfs, invisible to imaged's mount namespace. The caller
+	// (imaged) §4.6-honours the contract by `mkfs.ext4 -d <mountpoint>`
+	// directly through the read-only loopback mount — no `cp -a`, no
+	// separate staging tree — and immediately calls UmountParentExt4.
+	// The mount is read-only so a child re-stage cannot corrupt the
+	// parent; vmmd tracks the mount in an in-memory registry and
+	// sweeps orphans every ParentMountMaxAge (default 30 min) + at
+	// SIGTERM. Storage_key is the canonical StorageBackend key
+	// (issue #96 / ADR-025 axis 2), e.g.
+	// "base/runner-base-debian-parent-amd64.ext4". Storage_key MUST be
+	// in the parent-base allow-list (sched.IsParentBaseKey — host arch
+	// + sibling for heterogenous clusters); anything else is rejected
+	// with InvalidArgument. Empty storage_key → InvalidArgument.
+	// Unknown storage_key (Get returns ErrNotFound) → NotFound. vmmd
+	// writes the bytes through its own configured StorageBackend —
+	// there is no precedent for imaged→vmmd dialing; CLAUDE.md is
+	// amended (ADR-053) to call this out as a deliberate exception to
+	// "components talk via Postgres rows + pg_notify, or gRPC on unix
+	// sockets in /run/faas/".
+	MountParentExt4ReadOnly(context.Context, *MountParentExt4ReadOnlyRequest) (*MountParentExt4ReadOnlyResponse, error)
+	// UmountParentExt4 (ADR-053) releases a mount vmmd previously
+	// returned from MountParentExt4ReadOnly. Idempotent on an
+	// unknown mountpoint — imaged's call-on-error-defer pattern
+	// (mkfs.ext4 errored → umount anyway) is safe. The mountpoint
+	// path is validated to live under /srv/fc/parent/faas-parent-mnt-*
+	// (vmmdmount.MountRoot) to refuse unmounting an unrelated
+	// filesystem (defence in depth against a caller that hands back
+	// a path vmmd never issued).
+	UmountParentExt4(context.Context, *UmountParentExt4Request) (*UmountParentExt4Response, error)
 	mustEmbedUnimplementedVmmdServer()
 }
 
@@ -390,6 +490,12 @@ func (UnimplementedVmmdServer) SeccompStatus(context.Context, *SeccompStatusRequ
 }
 func (UnimplementedVmmdServer) Logs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error {
 	return status.Error(codes.Unimplemented, "method Logs not implemented")
+}
+func (UnimplementedVmmdServer) MountParentExt4ReadOnly(context.Context, *MountParentExt4ReadOnlyRequest) (*MountParentExt4ReadOnlyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MountParentExt4ReadOnly not implemented")
+}
+func (UnimplementedVmmdServer) UmountParentExt4(context.Context, *UmountParentExt4Request) (*UmountParentExt4Response, error) {
+	return nil, status.Error(codes.Unimplemented, "method UmountParentExt4 not implemented")
 }
 func (UnimplementedVmmdServer) mustEmbedUnimplementedVmmdServer() {}
 func (UnimplementedVmmdServer) testEmbeddedByValue()              {}
@@ -603,6 +709,42 @@ func _Vmmd_Logs_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_LogsServer = grpc.ServerStreamingServer[LogsResponse]
 
+func _Vmmd_MountParentExt4ReadOnly_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MountParentExt4ReadOnlyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).MountParentExt4ReadOnly(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_MountParentExt4ReadOnly_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).MountParentExt4ReadOnly(ctx, req.(*MountParentExt4ReadOnlyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vmmd_UmountParentExt4_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UmountParentExt4Request)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).UmountParentExt4(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_UmountParentExt4_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).UmountParentExt4(ctx, req.(*UmountParentExt4Request))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Vmmd_ServiceDesc is the grpc.ServiceDesc for Vmmd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -649,6 +791,14 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SeccompStatus",
 			Handler:    _Vmmd_SeccompStatus_Handler,
+		},
+		{
+			MethodName: "MountParentExt4ReadOnly",
+			Handler:    _Vmmd_MountParentExt4ReadOnly_Handler,
+		},
+		{
+			MethodName: "UmountParentExt4",
+			Handler:    _Vmmd_UmountParentExt4_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

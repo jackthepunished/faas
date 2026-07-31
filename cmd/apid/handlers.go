@@ -114,9 +114,22 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if prob := api.ValidateAppConfig(limits, ram, mc); prob != nil {
 		return state.App{}, prob
 	}
+	// Issue #471 / ADR-047: per-app streaming flag. Apply the
+	// plan-level default when the request didn't carry one — a
+	// Hobby customer's brand-new app is streaming-ready without an
+	// extra PATCH round-trip. Free defaults to false (the only
+	// legal value on Free; apid rejects PATCH true with 403
+	// plan_streaming_not_allowed). The Plan accessor keeps the
+	// fail-closed contract (pkg/api/limits.go) — Free's accessor
+	// returns false just like LimitsFor(false) would.
+	streaming := acct.Plan.StreamingEnabled()
+	if req.StreamingEnabled != nil {
+		streaming = *req.StreamingEnabled
+	}
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
+		StreamingEnabled: streaming,
 	}, nil
 }
 
@@ -311,6 +324,10 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		// these columns every tick.
 		AutoscaleTargetRPS:    a.AutoscaleTargetRPS,
 		AutoscaleTargetCPUPct: a.AutoscaleTargetCPUPct,
+		// Issue #471 / ADR-047: per-app streaming flag. Surfaced so
+		// dashboards can show "streaming on / off" alongside the
+		// egress-allowlist flag.
+		StreamingEnabled: a.StreamingEnabled,
 	}
 }
 

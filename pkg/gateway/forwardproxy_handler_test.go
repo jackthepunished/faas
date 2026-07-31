@@ -106,6 +106,21 @@ func (s *stubVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusReq
 	return &vmmdpb.SeccompStatusResponse{}, nil
 }
 
+// MountParentExt4ReadOnly (ADR-053) — gateway never drives the
+// parent-mount staging path; imaged owns that RPC. Returns
+// empty + nil so the vmmdpb.VmmdClient interface is satisfied.
+// Any accidental caller would surface as imaged's
+// "empty mountpoint" check rather than a NotFound from vmmd.
+func (s *stubVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountParentExt4ReadOnlyRequest, ...grpc.CallOption) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
+	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
+}
+
+// UmountParentExt4 (ADR-053) — gateway never drives the parent
+// umount path. Returns nil.
+func (s *stubVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {
+	return &vmmdpb.UmountParentExt4Response{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).
@@ -216,10 +231,10 @@ func TestHandler_LookupMissStill404sBeforeProxy(t *testing.T) {
 }
 
 func TestHandler_WithForwardingIdempotent(t *testing.T) {
-	first := func(string) http.Handler {
+	first := func(Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
 	}
-	second := func(string) http.Handler {
+	second := func(Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	}
 	b := &fakeBackend{app: App{ID: "app-1", Plan: api.PlanScale}, host: "app.example.com", running: true}
@@ -227,7 +242,7 @@ func TestHandler_WithForwardingIdempotent(t *testing.T) {
 	h.WithForwarding(first)
 	h.WithForwarding(second)
 
-	if got := h.proxyByNode("anything"); got == nil {
+	if got := h.proxyByNode(Target{NodeID: "anything"}); got == nil {
 		t.Fatal("proxyByNode nil after install")
 	}
 }

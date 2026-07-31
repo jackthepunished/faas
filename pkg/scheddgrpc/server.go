@@ -213,6 +213,7 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 		NodeId:     res.NodeID,
 		Method:     mapMethod(res.Method),
 		WakeId:     res.WakeID,
+		Port:       int32(res.Port),
 	}, nil
 }
 
@@ -246,6 +247,7 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		Method:     mapMethod(res.Method),
 		WakeId:     res.WakeID,
 		AtCapacity: res.AtCapacity,
+		Port:       int32(res.Port),
 	}, nil
 }
 

@@ -1,0 +1,67 @@
+[Unit]
+Description=onebox-faas Postgres base backup push (Hetzner Storage Box)
+Documentation=https://github.com/poyrazK/cloud-faas
+After=faas-pg-basebackup.service
+# Don't gate on faas-pg-basebackup.service — the timer fires at 03:30
+# UTC (30 min after the local 03:00 UTC basebackup timer). If the local
+# run was skipped / is still in flight, the push waits at `rclone sync`
+# for the newest tarball — but only one tarball exists at any time on
+# a healthy box, so the "wait" is bounded by the basebackup's own
+# 30 min TimeoutStartSec.
+
+# Spec §14 M8 + issue #250: ships /var/lib/pgsql/basebackup/ to a
+# Hetzner Storage Box via rclone so a host loss is recoverable from
+# off-host state. The Storage Box is the canonical S3-of-one-box
+# replacement the spec explicitly forbids (no local-only backup).
+#
+# Why `rclone sync` (not `copy`): removes orphaned files on the
+# Storage Box so a failed intermediate push + basebackup prune
+# doesn't accumulate stale tarballs. The local tree is the source of
+# truth; the box is a mirror.
+#
+# Why `--config=%d/faas_storage_box_rclone`: the rclone.conf is
+# sealed-at-rest via host.age (PR #371 cosign precedent) and decrypted
+# into a tmpfs staging dir at ansible-run time. systemd `LoadCredential=`
+# surfaces the plaintext file inside the unit's $CREDENTIALS_DIRECTORY
+# at activation; systemd's `%d` expands to that directory. The
+# end-to-end chain is: age-sealed on disk → tmpfs staging at ansible
+# run → LoadCredential in unit → rclone reads plaintext at exec time
+# (the network channel is SSH-encrypted by rclone's sftp backend; the
+# file on disk is what we're protecting at rest).
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+Environment=HETZNER_STORAGE_BOX_BASEBACKUP_PATH=faas-pg-basebackup
+EnvironmentFile=/etc/faas/sealed.env
+
+ExecStart=/usr/bin/env bash -c '\
+  set -euo pipefail; \
+  src=/var/lib/pgsql/basebackup; \
+  [[ -d "$${src}" ]] || { echo "no $$src" >&2; exit 1; }; \
+  [[ -n "$$(ls -1A "$${src}")" ]] || { echo "$$src empty — nothing to push" >&2; exit 1; }; \
+  rclone sync "$${src}" "hertznerbox:$${HETZNER_STORAGE_BOX_BASEBACKUP_PATH}" \
+    --config=%d/faas_storage_box_rclone \
+    --stats=0 --quiet; \
+  echo "pushed $$src → hertznerbox:$${HETZNER_STORAGE_BOX_BASEBACKUP_PATH}"'
+SuccessExitStatus=0
+TimeoutStartSec=2h
+
+# Spec §11: backup tarballs contain customer PII and sealed secrets;
+# any process that touches them must not pass them world-readable.
+# Root-owned run is the right primitive — only root can run the push
+# (matches the LoadCredential pattern: $CREDENTIALS_DIRECTORY is
+# mode 0600 root:root by systemd contract).
+UMask=0077
+
+# Push is disk + network bound; stdio to journal is fine. Failures
+# surface in `journalctl -u faas-pg-basebackup-push.service` and the
+# `pg_backup_last_pushed_seconds` gauge on apid's /metrics scrape
+# (cmd/apid/main.go pgBackupPushedSampler).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

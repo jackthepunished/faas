@@ -122,6 +122,69 @@ func BaseKeyForArch(runtime, arch string) string {
 	return "base/runner-" + runtime + "-" + arch + ".ext4"
 }
 
+// ParentBaseRuntime is the synthetic runtime name pkg/imaged uses for
+// the shared debian:12-slim parent ext4 every child runtime
+// (node22, node24, python312, python313) layers on top of (ADR-053).
+// The name lives in pkg/sched so the gRPC allow-list check
+// (pkg/vmmdgrpc/server.go::MountParentExt4ReadOnly) and the imaged
+// staging-time composition share one canonical spelling. Keep in
+// sync with pkg/imaged's BaseRefDebianParent constant.
+const ParentBaseRuntime = "base-debian-parent"
+
+// IsParentBaseKey returns true when storageKey names the canonical
+// parent ext4 for an arch the box supports. The check is the gRPC
+// allow-list for MountParentExt4ReadOnly — anything else (a per-app
+// base key, a layer key, an arbitrary blob) is rejected at the
+// wire boundary so a misbehaving imaged caller (or a leaked token
+// from another `faas`-group member) cannot read arbitrary storage
+// bytes through vmmd's loopback mount. The set of supported
+// arches is constructed at startup from runtime.GOARCH plus the
+// x86_64 sibling (a single-arch box vs a heterogeneous cluster).
+func IsParentBaseKey(storageKey string) bool {
+	if storageKey == "" {
+		return false
+	}
+	for _, alt := range parentBaseKeyAliases() {
+		if storageKey == alt {
+			return true
+		}
+	}
+	return false
+}
+
+// parentBaseKeyAliases returns every storageKey that names a
+// parent-base ext4 vmmd is willing to mount. Production boxes ship
+// one arch; we include the cross-arch sibling so a heterogenous
+// cluster (one box amd64, one arm64) doesn't reject a sibling's
+// staging request routed through this vmmd.
+//
+// Kept as a function (not a const slice) so a future arch can be
+// added without touching every callsite — IsParentBaseKey is the
+// single consumer.
+func parentBaseKeyAliases() []string {
+	arches := []string{goruntime.GOARCH}
+	switch goruntime.GOARCH {
+	case archAMD64:
+		arches = append(arches, archARM64)
+	case archARM64:
+		arches = append(arches, archAMD64)
+	}
+	out := make([]string, 0, len(arches))
+	for _, a := range arches {
+		out = append(out, BaseKeyForArch(ParentBaseRuntime, a))
+	}
+	return out
+}
+
+// Arch name constants. Defined here (rather than reusing literals)
+// to keep goconst happy across the helpers — the arch strings
+// appear in BaseKeyForArch call sites, the parent-allow-list switch,
+// and the test fixtures.
+const (
+	archAMD64 = "amd64"
+	archARM64 = "arm64"
+)
+
 // BaseDigestKey returns the storage key for a runtime's base-image
 // config digest sidecar. The sidecar is the immutable check on whether
 // the staged base ext4 needs re-pulling. Thin wrapper over

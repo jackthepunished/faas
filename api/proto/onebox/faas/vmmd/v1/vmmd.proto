@@ -111,6 +111,47 @@ service Vmmd {
   // Backpressure flows through gRPC's natural flow control. NotFound
   // when the instance is not alive on this vmmd (nil ring).
   rpc Logs(LogsRequest) returns (stream LogsResponse);
+
+  // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
+  // lets imaged compose the per-runtime base ext4 from a shared
+  // debian:12-slim parent. imaged is not root (User=faas-imaged +
+  // NoNewPrivileges=yes per spec §11), so it cannot mount the parent
+  // ext4 itself; vmmd is the only root component and runs the
+  // `mount -o loop,ro,nodev,nosuid,noexec` on imaged's behalf. The
+  // returned mountpoint is an absolute host path under
+  // /srv/fc/parent/faas-parent-mnt-<id>/ — shared between vmmd and
+  // imaged because BOTH daemons carry systemd `PrivateTmp=yes`
+  // (deploy/systemd/faas-{vmmd,imaged}.service) and vmmd's /tmp is
+  // its own tmpfs, invisible to imaged's mount namespace. The caller
+  // (imaged) §4.6-honours the contract by `mkfs.ext4 -d <mountpoint>`
+  // directly through the read-only loopback mount — no `cp -a`, no
+  // separate staging tree — and immediately calls UmountParentExt4.
+  // The mount is read-only so a child re-stage cannot corrupt the
+  // parent; vmmd tracks the mount in an in-memory registry and
+  // sweeps orphans every ParentMountMaxAge (default 30 min) + at
+  // SIGTERM. Storage_key is the canonical StorageBackend key
+  // (issue #96 / ADR-025 axis 2), e.g.
+  // "base/runner-base-debian-parent-amd64.ext4". Storage_key MUST be
+  // in the parent-base allow-list (sched.IsParentBaseKey — host arch
+  // + sibling for heterogenous clusters); anything else is rejected
+  // with InvalidArgument. Empty storage_key → InvalidArgument.
+  // Unknown storage_key (Get returns ErrNotFound) → NotFound. vmmd
+  // writes the bytes through its own configured StorageBackend —
+  // there is no precedent for imaged→vmmd dialing; CLAUDE.md is
+  // amended (ADR-053) to call this out as a deliberate exception to
+  // "components talk via Postgres rows + pg_notify, or gRPC on unix
+  // sockets in /run/faas/".
+  rpc MountParentExt4ReadOnly(MountParentExt4ReadOnlyRequest) returns (MountParentExt4ReadOnlyResponse);
+
+  // UmountParentExt4 (ADR-053) releases a mount vmmd previously
+  // returned from MountParentExt4ReadOnly. Idempotent on an
+  // unknown mountpoint — imaged's call-on-error-defer pattern
+  // (mkfs.ext4 errored → umount anyway) is safe. The mountpoint
+  // path is validated to live under /srv/fc/parent/faas-parent-mnt-*
+  // (vmmdmount.MountRoot) to refuse unmounting an unrelated
+  // filesystem (defence in depth against a caller that hands back
+  // a path vmmd never issued).
+  rpc UmountParentExt4(UmountParentExt4Request) returns (UmountParentExt4Response);
 }
 
 // AppSpec flattens what the caller knows about an app. vmmd stores none of
@@ -180,6 +221,24 @@ message AppSpec {
   // = no env.json file written (manifest env still flows in via
   // /etc/faas/app.json, the legacy path).
   repeated APIEnvEntry api_env = 9;
+  // port (issue #460 / ADR-053, PR-C) is the per-deployment override
+  // port the customer's app binds inside the guest. Defaults to
+  // netns.AppPort (8080) when zero — wire legacy. The host's
+  // waitReady + DNAT stay fixed on 8080 (ADR-009 +
+  // guest/init/portnorm_linux.go); vmmd's ForwardHTTP bridge uses
+  // this port to dial the guest. Additive per ADR-016.
+  uint32 port         = 10;
+  // healthcheck_path (issue #460 / ADR-053, ADR-057 / PR-D) is the
+  // per-deployment override readiness probe path. When empty,
+  // vmmd's waitReady keeps the legacy TCP-accept on :8080 (zero
+  // regression risk for pre-PR-D callers). When non-empty, vmmd
+  // issues an HTTP GET <healthcheck_path> against <HostIP>:8080
+  // and accepts 2xx as ready; non-2xx retries every 200ms until
+  // readyTimeout (default 30s). The host's probe target stays
+  // :8080 — ADR-009 + portnorm re-expose the customer bind on
+  // :8080 inside the guest, so the path is the customer's choice
+  // and the port is the host's choice. Additive per ADR-016.
+  string healthcheck_path = 11;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -482,6 +541,13 @@ message ForwardHTTPRequest {
   // Request body. Capped at ForwardMaxBodyBytes. vmmd treats an empty
   // body as zero-length, not missing.
   bytes  body         = 5;
+  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
+  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
+  // zero — legacy gateway clients keep working. New gateway clients
+  // always set this explicitly from the per-app Target cached at
+  // admit time. The dial target is the inner guest IP, never the
+  // host IP, so this is purely a guest port. Additive per ADR-016.
+  uint32 port         = 6;
 }
 
 // Header is one (name, value) HTTP header line. Both fields are
@@ -607,3 +673,46 @@ message LogsResponse {
   string line = 3;
   google.protobuf.Timestamp written_at = 4;
 }
+
+// MountParentExt4ReadOnlyRequest (ADR-053) is the input to
+// MountParentExt4ReadOnly. storage_key is the canonical StorageBackend
+// key of the parent base ext4 (issue #96 / ADR-025 axis 2). vmmd
+// resolves the bytes via the same configured StorageBackend the rest
+// of vmmd uses (snapshot publishes, vmstate publishes); staging into
+// /srv/fc/parent/ + loopback mount happens after the bytes are in
+// hand. Empty → InvalidArgument. Non-parent key (allow-list reject)
+// → InvalidArgument. Unknown → NotFound.
+message MountParentExt4ReadOnlyRequest {
+  string storage_key = 1;
+}
+
+// MountParentExt4ReadOnlyResponse returns the absolute host path of
+// the read-only loopback mountpoint under
+// /srv/fc/parent/faas-parent-mnt-<id>/. The caller (imaged) §4.6-
+// honours the contract: pass the path straight to `mkfs.ext4 -d
+// <mountpoint>` (no `cp -a`, no separate staging tree) — the parent
+// userland is shared via the read-only loopback mount, the delta
+// layers land on an overlayfs upper dir, and mkfs packs the merged
+// view into the child ext4 without ever copying the parent.
+// Then call UmountParentExt4 to release the parent mount.
+message MountParentExt4ReadOnlyResponse {
+  string mountpoint = 1;
+}
+
+// UmountParentExt4Request is the input to UmountParentExt4.
+// mountpoint is the path MountParentExt4ReadOnly previously
+// returned. Empty → InvalidArgument. Unknown → InvalidArgument
+// (NOT NotFound) so imaged's defer-after-error pattern is
+// idempotent on a never-issued or already-released path; the
+// distinction from MountParentExt4ReadOnly's NotFound is
+// load-bearing — Umount must be safe to call blindly.
+message UmountParentExt4Request {
+  string mountpoint = 1;
+}
+
+// UmountParentExt4Response is the empty success envelope. On
+// failure vmmd returns a gRPC status (InvalidArgument for an
+// empty/unknown path, Internal for the umount syscall failure
+// itself — e.g. EBUSY when a child re-stage is still walking
+// the parent).
+message UmountParentExt4Response {}

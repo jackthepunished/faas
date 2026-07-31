@@ -22,5 +22,9 @@ export type UpdateAppRequest = {
    * Per-instance CPU% target (1..100, 0 = disable) for the reactive scale-up trigger. Pro/Scale only. Values outside [1, 100] (other than 0) are 422 invalid_autoscale_target_cpu_pct.
    */
   autoscale_target_cpu_pct?: number | null;
+  /**
+   * Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403 plan_streaming_not_allowed.
+   */
+  streaming_enabled?: boolean | null;
 };
 

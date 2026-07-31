@@ -29,15 +29,28 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
 # ProtectSystem=strict makes everything read-only except these. imaged writes:
-#   /srv/fc/snap  — snapshots
-#   /srv/fc/base  — base ext4 images (staged at startup, EnsureBaseExt4)
-#   /srv/fc/sigs  — ADR-038 build attestations, written as sigs/<key>.sig
-#                   under FAAS_STORAGE_ROOT by the cosign signer
+#   /srv/fc        — the FAAS_STORAGE_ROOT parent; the subdirs (snap/,
+#                    base/, sigs/, layers/, kernel/) live under it.
+#                    Whitelisting /srv/fc/ itself is the belt-and-braces
+#                    against any code path that creates a file at the root
+#                    (a regression of this exact shape crash-looped imaged
+#                    on the EX44 in 2026-07-31, runs 30626694333 +
+#                    30650464753 — the storage: local Put's atomic-rename
+#                    temp landed at /srv/fc/<tmp> under ProtectSystem=strict
+#                    + ReadWritePaths on the subdirs only; EROFS). Each
+#                    subdir remains individually whitelisted so the path
+#                    granularity stays auditable.
+#   /srv/fc/snap   — snapshots
+#   /srv/fc/base   — base ext4 images (staged at startup, EnsureBaseExt4)
+#   /srv/fc/sigs   — ADR-038 build attestations, written as sigs/<key>.sig
+#                    under FAAS_STORAGE_ROOT by the cosign signer
+#   /var/log/faas  — slog handler
+#   /var/spool/faas — staging scratch
 # A path missing here does not fail at startup — it fails later, mid-build,
 # as "mkdir /srv/fc/<dir>: read-only file system", which reads like a disk
 # fault rather than a unit-file gap. /srv/fc/sigs was missed when ADR-038
 # landed and crash-looped imaged on the DO box.
-ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/sigs /var/log/faas /var/spool/faas
+ReadWritePaths=/srv/fc /srv/fc/snap /srv/fc/base /srv/fc/sigs /srv/fc/layers /srv/fc/kernel /var/log/faas /var/spool/faas
 
 [Install]
 WantedBy=multi-user.target

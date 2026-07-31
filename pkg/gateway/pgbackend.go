@@ -374,7 +374,7 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 	}
 	b.tgtMu.Unlock()
 
-	instanceID, nodeID, wakeID, rawMethod, atCapacity, err := b.sched.AdmitInstance(ctx, appID)
+	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := b.sched.AdmitInstance(ctx, appID)
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -405,6 +405,12 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 		InstanceID: instanceID,
 		WakeID:     wakeID,
 		AddedAt:    time.Now(),
+		// PR-C (issue #460 / ADR-053): cache the per-deployment
+		// override port on the Target. The forwarder reads this
+		// to stamp ForwardHTTPRequest.port so vmmd dials the
+		// override port instead of legacy 8080. Zero is fine
+		// (vmmd server-side defaults to netns.AppPort).
+		Port: port,
 	})
 	b.tgtMu.Unlock()
 	return wakeID, method, false, nil

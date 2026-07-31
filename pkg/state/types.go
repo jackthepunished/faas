@@ -243,6 +243,16 @@ type App struct {
 	// must set WorkloadClassHTTP (or another canonical value)
 	// explicitly before CreateApp.
 	WorkloadClass WorkloadClass
+	// StreamingEnabled toggles the per-app streaming response path
+	// through gatewayd (issue #471 / ADR-047). When true, gatewayd
+	// streams response body chunks instance → gateway → client with
+	// a periodic 200 ms / 256 KiB tx_bytes flush so ADR-046 metering
+	// stays accurate. Plan-gated upstream: Free defaults to false and
+	// cannot PATCH it to true (apid returns 403 plan_streaming_not_allowed);
+	// Hobby/Pro/Scale default to true. The buffered path remains the
+	// v1 contract — a Free app with StreamingEnabled=false keeps the
+	// legacy 25 MB / 300 s envelope (spec §4.1).
+	StreamingEnabled bool
 	// StartCommand overrides the OCI image's CMD when present.
 	// Phase 3 writes it from compose/Procfile declarations; Phase
 	// 1 carries the column through but the apid handler does not
@@ -1099,8 +1109,35 @@ type UpdateAppParams struct {
 	// semantics as AutoscaleTargetRPS. Pro/Scale only.
 	AutoscaleTargetCPUPct    *int
 	SetAutoscaleTargetCPUPct bool
-	Status                   *AppStatus
-	Manifest                 *AppManifest
+	// StreamingEnabled (issue #471) toggles the per-app response
+	// streaming path. SetStreamingEnabled distinguishes "unset"
+	// (don't touch) from "explicit false" (opt out of streaming).
+	// Plan-gated upstream (apid returns 403 plan_streaming_not_allowed
+	// when the plan lacks the gate). Hobby/Pro/Scale customers may
+	// PATCH true → false to disable streaming for a specific app
+	// (e.g. a synchronous JSON API that wants Content-Length).
+	StreamingEnabled    *bool
+	SetStreamingEnabled bool
+	Status              *AppStatus
+	Manifest            *AppManifest
+	// RootDir is the workload's repo-relative build context (Phase 5
+	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
+	// update; the apid handler leaves it nil on customer-initiated
+	// PATCH. Empty string = default ('' in DB). No Set* flag: the
+	// "nil vs explicit empty" distinction is irrelevant for a column
+	// whose canonical "unset" is the empty string.
+	RootDir *string
+	// WorkloadName is the per-app workload identity (e.g. the
+	// compose service name). Mirrors apps.workload_name. Same
+	// semantics as RootDir: nil = leave alone, empty string = reset
+	// to default. Reconcile writes this on every update.
+	WorkloadName *string
+	// StartCommand is the customer-supplied override for the image's
+	// entrypoint (e.g. compose `command:`). apps.start_command is
+	// NULL-able; the nullString helper treats the empty string as
+	// NULL on the wire. Reconcile writes this on every update; the
+	// apid handler leaves it nil.
+	StartCommand *string
 }
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

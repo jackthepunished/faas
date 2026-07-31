@@ -97,6 +97,21 @@ func (f *fakeVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusReq
 	panic("SeccompStatus: not stubbed")
 }
 
+// MountParentExt4ReadOnly (ADR-053) — gateway forwardproxy tests
+// never drive the parent-mount staging path; imaged owns those
+// RPCs. Returns empty + nil so the vmmdpb.VmmdClient interface
+// is satisfied; any accidental caller would surface as imaged's
+// "empty mountpoint" check rather than a NotFound from vmmd.
+func (f *fakeVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountParentExt4ReadOnlyRequest, ...grpc.CallOption) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
+	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
+}
+
+// UmountParentExt4 (ADR-053) — gateway forwardproxy tests never
+// drive the parent umount path. Returns nil.
+func (f *fakeVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentExt4Request, ...grpc.CallOption) (*vmmdpb.UmountParentExt4Response, error) {
+	return &vmmdpb.UmountParentExt4Response{}, nil
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can
@@ -146,7 +161,7 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 	req.Header.Set("X-Custom", "keep-me")
 
 	rec := httptest.NewRecorder()
-	proxy("node-1").ServeHTTP(rec, req)
+	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -192,13 +207,66 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 	}
 }
 
+// TestForwardingReverseProxy_StampsTargetPort pins issue #460 /
+// ADR-053 (PR-C): the picked Target's Port must reach
+// ForwardHTTPRequest.port so vmmd's buildBridgeScript dials the
+// override port. A regression that drops Port from the picked
+// Target's view (or omits it from ForwardHTTPRequest) would
+// silently force every override-port deployment to 8080, which
+// the vmmd server-side default would mask — silent 503s only
+// visible in production logs.
+func TestForwardingReverseProxy_StampsTargetPort(t *testing.T) {
+	cli := &fakeVmmdClient{
+		resp: &vmmdpb.ForwardHTTPResponse{Status: 200, Body: []byte(`{"ok":true}`)},
+	}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{NodeID: "node-1", Port: 9090}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(cli.calls) != 1 {
+		t.Fatalf("ForwardHTTP calls = %d, want 1", len(cli.calls))
+	}
+	if got := cli.calls[0].GetPort(); got != 9090 {
+		t.Errorf("ForwardHTTPRequest.port = %d, want 9090", got)
+	}
+}
+
+// TestForwardingReverseProxy_PortZeroDefaultsAtBoundary pins the
+// legacy wiring: a Target with Port=0 (the no-override case) still
+// sends a ForwardHTTPRequest with port=0 — the server-side 8080
+// default lives in vmmd's buildBridgeScript, not here. Asserting
+// this prevents a future "forwardproxy auto-fills 8080 on behalf
+// of legacy callers" regression from masking port wiring bugs.
+func TestForwardingReverseProxy_PortZeroDefaultsAtBoundary(t *testing.T) {
+	cli := &fakeVmmdClient{
+		resp: &vmmdpb.ForwardHTTPResponse{Status: 200, Body: []byte(`{"ok":true}`)},
+	}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if len(cli.calls) != 1 {
+		t.Fatalf("ForwardHTTP calls = %d, want 1", len(cli.calls))
+	}
+	if got := cli.calls[0].GetPort(); got != 0 {
+		t.Errorf("ForwardHTTPRequest.port = %d, want 0 (server defaults to 8080)", got)
+	}
+}
+
 func TestForwardingReverseProxy_UnknownNodeIs503(t *testing.T) {
 	cli := &fakeVmmdClient{} // no calls expected
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy("").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	proxy(gateway.Target{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
@@ -218,7 +286,7 @@ func TestForwardingReverseProxy_UpstreamUnavailableIs503(t *testing.T) {
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy("node-1").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
@@ -237,7 +305,7 @@ func TestForwardingReverseProxy_NotFoundIs503(t *testing.T) {
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy("node-1").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
@@ -252,7 +320,7 @@ func TestForwardingReverseProxy_OtherErrorIs502(t *testing.T) {
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy("node-1").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", rec.Code)
 	}

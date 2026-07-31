@@ -40,6 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/vmmdgrpc"
+	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 )
@@ -488,6 +489,41 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// /srv/fc).
 	mgr.WithStorage(storageBackend)
 
+	// ADR-053: parent-base loopback registry. Constructed AFTER
+	// WithStorage so Manager.MountParentExt4's storage.Get has a
+	// backend to read from. The cap + max-age + sweep cadence come
+	// from cfg (defaults via pkg/vmmdmount). Without this wiring
+	// every production MountParentExt4ReadOnly RPC short-circuits
+	// to vmmdmount.ErrNotFound (Manager.parentMounts nil guard) —
+	// see review blocker #1.
+	parentReg := vmmdmount.NewRegistry(cfg.ParentMountCap)
+	mgr.SetParentMountRegistry(parentReg)
+	log.Info("vmmd: parent-mount registry wired",
+		"cap", cfg.ParentMountCap,
+		"max_age", cfg.ParentMountMaxAge.String(),
+		"sweep_interval", cfg.ParentSweepInterval.String())
+
+	// Orphan sweep — schedule via a context-bound goroutine that
+	// exits cleanly on ctx.Done. Mirrors the schedd watchdog tick
+	// pattern (1s tick + KillStuck), adapted to the configurable
+	// sweep interval. A tick that fires during shutdown exits
+	// harmlessly because Registry.SweepOrphans is safe on a
+	// partially-drained map.
+	sweepCtx, sweepCancel := context.WithCancel(ctx)
+	defer sweepCancel()
+	go runParentMountSweep(sweepCtx, parentReg, cfg.ParentSweepInterval, log)
+	// Shutdown sweep — registered as a defer BEFORE the gRPC
+	// GracefulStop so a late RPC still gets serviced and the
+	// registry is empty when vmmd exits. Defers run LIFO, so
+	// this fires AFTER gsrv.GracefulStop + httpSrv.Shutdown —
+	// correct order (no late caller waiting on a mountpoint
+	// while we sweep it).
+	defer func() {
+		if n := parentReg.SweepAll(log); n > 0 {
+			log.Info("vmmd: shutdown parent-mount sweep", "n", n)
+		}
+	}()
+
 	// Ops + listener. Resolve the listen target (issue #95): unix://
 	// default, tcp/dns optional; tcp targets require a complete mTLS
 	// cluster and the loader rejects partial configs.
@@ -529,11 +565,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
 		"host_key_path", keyPath, "recipient_path", pubPath,
 		"recipient", hostID.Recipient().String())
-	serverTLS, err := cfg.LoadServerTLS()
+	// ADR-056: handshake-layer NodeVerifier. Single-box vmmd
+	// (cfg.ComputeNode.NodeName == "") does NOT construct a
+	// verifier — stdlib trust alone runs. Multi-box vmmd
+	// constructs a PG-backed verifier, refreshes once at
+	// startup, and pumps compute_node_changed notifications into
+	// a drain goroutine for the lifetime of the daemon.
+	var nodeVerifier *wire.PGNodeVerifier
+	if nodeID != "" {
+		nodeVerifier = wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log)
+		// Drive a synchronous startup Refresh so the first
+		// handshake after listen sees a populated snapshot.
+		if _, rerr := nodeVerifier.Refresh(ctx); rerr != nil {
+			return fmt.Errorf("vmmd: node verifier startup refresh: %w", rerr)
+		}
+		go func() {
+			ch, lerr := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyComputeNodeChanged}, log)
+			if lerr != nil {
+				log.Error("vmmd: node verifier LISTEN failed", "err", lerr)
+				return
+			}
+			if rerr := nodeVerifier.Run(ctx, ch); rerr != nil && !errors.Is(rerr, context.Canceled) {
+				log.Error("vmmd: node verifier exited", "err", rerr)
+			}
+		}()
+	}
+
+	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)
 	}
-	scheddClientTLS, err := cfg.LoadScheddClientTLS()
+	scheddClientTLS, err := cfg.LoadScheddClientTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
 	}

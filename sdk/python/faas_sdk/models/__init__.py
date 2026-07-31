@@ -24,6 +24,7 @@ from .app_env_list_response import AppEnvListResponse
 from .app_env_response import AppEnvResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
+from .app_manifest_env_secrets import AppManifestEnvSecrets
 from .app_metrics_response import AppMetricsResponse
 from .app_metrics_response_range import AppMetricsResponseRange
 from .app_response import AppResponse
@@ -209,6 +210,7 @@ __all__ = (
     "ApplyResponseAppsItem",
     "AppManifest",
     "AppManifestEnv",
+    "AppManifestEnvSecrets",
     "AppMetricsResponse",
     "AppMetricsResponseRange",
     "AppResponse",

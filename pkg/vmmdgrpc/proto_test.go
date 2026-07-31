@@ -285,3 +285,133 @@ func TestToColdBootRequest_ForwardsSealedEnv(t *testing.T) {
 		t.Errorf("SealedEnvEntries wrong: %+v", wr.SealedEnvEntries)
 	}
 }
+
+// TestToWakeRequest_ForwardsPort pins issue #460 / ADR-053 (PR-C): the
+// per-deployment override port on AppSpec must reach fcvm.WakeRequest.Port
+// so vmmd's forwarder can dial the override port. The server-side default
+// for port=0 lives in buildBridgeScript (netns.AppPort), NOT here — the
+// adapter just copies the wire value verbatim.
+func TestToWakeRequest_ForwardsPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port uint32
+		want int
+	}{
+		{"zero is zero (legacy default handled in buildBridgeScript)", 0, 0},
+		{"override port 9090", 9090, 9090},
+		{"override port 3000", 3000, 3000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &vmmdpb.CreateFromSnapshotRequest{
+				Instance: "inst-1",
+				App:      &vmmdpb.AppSpec{BaseKey: "/b", Port: tt.port},
+				Snapshot: &vmmdpb.SnapshotRef{StorageKey: "snap/inst-1/mem"},
+			}
+			wr, err := toWakeRequest(req)
+			if err != nil {
+				t.Fatalf("toWakeRequest: %v", err)
+			}
+			if wr.Port != tt.want {
+				t.Errorf("Port = %d, want %d", wr.Port, tt.want)
+			}
+		})
+	}
+}
+
+// TestToColdBootRequest_ForwardsPort mirrors the wake variant on the
+// cold-boot adapter. The very first boot of a deploy happens here; if
+// it lost the port, the runner would bind :8080 and the forwarder
+// would dial :9090 → 503 on every cold-boot even when the snapshot
+// path was unchanged.
+func TestToColdBootRequest_ForwardsPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port uint32
+		want int
+	}{
+		{"zero is zero", 0, 0},
+		{"override port 9090", 9090, 9090},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &vmmdpb.CreateColdBootRequest{
+				Instance: "inst-2",
+				App:      &vmmdpb.AppSpec{BaseKey: "/b", Port: tt.port},
+			}
+			wr, err := toColdBootRequest(req)
+			if err != nil {
+				t.Fatalf("toColdBootRequest: %v", err)
+			}
+			if wr.Port != tt.want {
+				t.Errorf("Port = %d, want %d", wr.Port, tt.want)
+			}
+		})
+	}
+}
+
+// TestToWakeRequest_ForwardsHealthcheckPath pins issue #460 /
+// ADR-053, ADR-057 (PR-D): the per-deployment override readiness
+// probe path on AppSpec must reach fcvm.WakeRequest.HealthcheckPath
+// so vmmd's waitReady can pick the HTTP probe on the cold-boot +
+// restore paths. Empty path keeps the legacy TCP-accept on :8080
+// (zero regression risk for pre-PR-D callers).
+func TestToWakeRequest_ForwardsHealthcheckPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"empty is empty (legacy TCP-accept on :8080)", "", ""},
+		{"override path /healthz", "/healthz", "/healthz"},
+		{"override path /readyz", "/readyz", "/readyz"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &vmmdpb.CreateFromSnapshotRequest{
+				Instance: "inst-1",
+				App:      &vmmdpb.AppSpec{BaseKey: "/b", HealthcheckPath: tt.path},
+				Snapshot: &vmmdpb.SnapshotRef{StorageKey: "snap/inst-1/mem"},
+			}
+			wr, err := toWakeRequest(req)
+			if err != nil {
+				t.Fatalf("toWakeRequest: %v", err)
+			}
+			if wr.HealthcheckPath != tt.want {
+				t.Errorf("HealthcheckPath = %q, want %q", wr.HealthcheckPath, tt.want)
+			}
+		})
+	}
+}
+
+// TestToColdBootRequest_ForwardsHealthcheckPath mirrors the wake
+// variant on the cold-boot adapter. The very first boot of a deploy
+// happens here; if it lost the path, the cold-boot probe would fall
+// through to the legacy TCP-accept and the customer's `connectDB()`
+// window would surface as a 503-during-wake even when the snapshot
+// path was unchanged.
+func TestToColdBootRequest_ForwardsHealthcheckPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"empty is empty", "", ""},
+		{"override path /healthz", "/healthz", "/healthz"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &vmmdpb.CreateColdBootRequest{
+				Instance: "inst-2",
+				App:      &vmmdpb.AppSpec{BaseKey: "/b", HealthcheckPath: tt.path},
+			}
+			wr, err := toColdBootRequest(req)
+			if err != nil {
+				t.Fatalf("toColdBootRequest: %v", err)
+			}
+			if wr.HealthcheckPath != tt.want {
+				t.Errorf("HealthcheckPath = %q, want %q", wr.HealthcheckPath, tt.want)
+			}
+		})
+	}
+}

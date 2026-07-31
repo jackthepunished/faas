@@ -11,6 +11,7 @@ package main
 
 import (
 	"sort"
+	"strconv"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -121,4 +122,15 @@ func cut(kv string) (string, string, bool) {
 		return "", "", false
 	}
 	return kv, "", true
+}
+
+// StampOverridePortEnv appends "PORT=<port>" to env and returns the
+// augmented slice. It is the pure helper behind issue #460 / ADR-053
+// (PR-C) — guest-init's runAppWithEnv appends to BuildEnvWithSecrets'
+// output so customer-set PORT entries (whether in manifest env, the
+// apiEnv layer, or sealed secrets) cannot accidentally shadow the
+// platform contract. Exported for tests; the test asserts the
+// precedence directly without launching the customer's process.
+func StampOverridePortEnv(env []string, port int) []string {
+	return append(env, "PORT="+strconv.Itoa(port))
 }

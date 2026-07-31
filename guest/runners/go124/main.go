@@ -62,7 +62,15 @@ func main() {
 		handle(w, r, *handlerPath)
 	})
 
-	addr := ":8080"
+	// Issue #460 / ADR-053 (PR-C): PORT env var carries the
+	// per-deployment override port guest-init stamped onto the
+	// exec'd env (see guest/init/main_linux.go::runAppWithEnv).
+	// Falls back to 8080 for unit tests + non-PR-C paths.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
 	log.Printf("go124 runner: listening on %s (handler=%s)", addr, *handlerPath)
 	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // bind-all is intentional inside the guest
 		log.Fatalf("go124 runner: listen: %v", err)

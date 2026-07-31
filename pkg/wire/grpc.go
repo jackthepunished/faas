@@ -387,6 +387,49 @@ func LoadServerTLSConfigWithPrefix(prefix, certPath, keyPath, caPath string) (*t
 	return loadServerTLSConfig(certPath, keyPath, caPath, prefix)
 }
 
+// LoadServerTLSConfigWithPrefixAndVerifier combines the role-distinguished
+// error naming of LoadServerTLSConfigWithPrefix with the handshake-layer
+// NodeVerifier hook of LoadServerTLSConfigWithVerifier (ADR-056).
+func LoadServerTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadServerTLSConfigWithVerifier is the LoadServerTLSConfig variant
+// that installs a VerifyPeerCertificate hook augmenting stdlib trust
+// (chain / RFC 6125 SAN / EKU) with the supplied NodeVerifier
+// (ADR-056). The hook runs AFTER stdlib trust succeeds —
+// InsecureSkipVerify stays false, so CodeQL #58 doesn't fire.
+//
+// v==nil degrades to the existing LoadServerTLSConfig (no hook
+// installed): single-box dev paths and pre-slice-3 schedd keep
+// their current behaviour. A nil/empty all-paths input returns the
+// LoadServerTLSConfig nil contract — the production caller (cmd/schedd)
+// already handles "no TLS at all" as a legitimate single-box state.
+//
+// This is the TEST-HELPER / unprefixed shape — production daemons
+// with role-distinguished clusters (schedd's `tls_*` vs vmmd's
+// `vmmd_tls_*`) call LoadServerTLSConfigWithPrefixAndVerifier so the
+// missing-field error names an operator-actionable TOML key. The
+// unprefixed variant is kept for symmetry with LoadServerTLSConfig and
+// for tests that don't model a role prefix.
+func LoadServerTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 func loadServerTLSConfig(certPath, keyPath, caPath, prefix string) (*tls.Config, error) {
 	if certPath == "" && keyPath == "" && caPath == "" {
 		return nil, nil
@@ -426,6 +469,64 @@ func LoadClientTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) 
 // LoadClientTLSConfigWithPrefix is the role-distinguished variant.
 func LoadClientTLSConfigWithPrefix(prefix, certPath, keyPath, caPath string) (*tls.Config, error) {
 	return loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+}
+
+// LoadClientTLSConfigWithPrefixAndVerifier combines the
+// role-distinguished error naming of LoadClientTLSConfigWithPrefix
+// with the handshake-layer NodeVerifier hook of
+// LoadClientTLSConfigWithVerifier (ADR-056).
+func LoadClientTLSConfigWithPrefixAndVerifier(prefix, certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadClientTLSConfigWithVerifier is the client-side mirror of
+// LoadServerTLSConfigWithVerifier (ADR-056). Same contract: the
+// stdlib chain/SAN/EKU check runs first; the verifier's
+// VerifyPeerCertificate hook augments it AFTER stdlib trust succeeds.
+// InsecureSkipVerify stays false (CodeQL #58 invariant).
+//
+// v==nil degrades to the existing LoadClientTLSConfig (no hook
+// installed): single-box clients continue to work. All-paths-empty
+// input returns LoadClientTLSConfig's nil contract — the production
+// caller decides whether to fall back to insecure (unix sockets).
+//
+// This is the TEST-HELPER / unprefixed shape — production daemons
+// call LoadClientTLSConfigWithPrefixAndVerifier so the
+// missing-field error names an operator-actionable TOML key.
+func LoadClientTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVerifier) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// setVerifyHook installs the hook returned by VerifyCNClosure on cfg
+// when (and only when) the closure is non-nil. A nil cfg keeps the
+// Load*TLSConfig nil contract (no TLS, no hook); a nil v degrades to
+// the existing Load*TLSConfig behaviour (no hook installed). The
+// helper is package-private so the only canonical installation point
+// is the *WithVerifier factory family — a side-channel
+// SetVerifier(cfg, v) helper would let callers splice the hook onto
+// a *tls.Config built elsewhere and bypass the production wiring.
+func setVerifyHook(cfg *tls.Config, v NodeVerifier) error {
+	if cfg == nil {
+		return nil
+	}
+	if hook := VerifyCNClosure(v); hook != nil {
+		cfg.VerifyPeerCertificate = hook
+	}
+	return nil
 }
 
 func loadClientTLSConfig(certPath, keyPath, caPath, prefix string) (*tls.Config, error) {

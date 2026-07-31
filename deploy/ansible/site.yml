@@ -28,6 +28,14 @@
   serial: 1
   max_fail_percentage: 0
 
+  # Issue #250 — load Hetzner Storage Box wiring from group_vars.
+  # The vars feed the postgres_backup role's fail-closed assert and
+  # the postgres role's archive_command template. Operators source
+  # /etc/faas/sealed.env before running the playbook so the
+  # lookup('env', 'HETZNER_STORAGE_BOX_*') calls resolve.
+  vars_files:
+    - group_vars/box/hetzner.yml
+
   # Roles are sequenced deliberately: prerequisites first, side effects
   # last. Order is enforced by ansible, not conventions.
   roles:

@@ -33,5 +33,9 @@ export type AppResponse = {
    * Per-instance CPU% target (1..100) for the reactive scale-up trigger. 0 = disabled. Pro/Scale only. When measured per-instance CPU% exceeds this value, schedd admits another instance (up to max_concurrency). See ADR-037.
    */
   autoscale_target_cpu_pct: number;
+  /**
+   * Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it. PR-B activates the streamed response path; PR-A only persists the flag.
+   */
+  streaming_enabled?: boolean;
 };
 
