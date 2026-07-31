@@ -110,7 +110,7 @@ func (s *Service) runGuards(
 	// Guard 3 — scanSourceStable. deriveScanSource picks the
 	// canonical ProjectScanSource from the scan's workloads; the
 	// store-side monotonic-upgrade guard rejects a downgrade.
-	desired := deriveScanSource(scan.Workloads)
+	desired := DeriveScanSource(scan.Workloads)
 	if tierRank(desired) < tierRank(project.ScanSource) {
 		// Emit the alert BEFORE the store call so dashboards see
 		// the rejection even when the store call races with a

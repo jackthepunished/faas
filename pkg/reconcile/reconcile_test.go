@@ -538,9 +538,9 @@ func TestReconcile_DeriveScanSource_MirrorsApid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := deriveScanSource(tc.workloads)
+			got := DeriveScanSource(tc.workloads)
 			if got != tc.want {
-				t.Errorf("deriveScanSource(%v) = %q, want %q", tc.workloads, got, tc.want)
+				t.Errorf("DeriveScanSource(%v) = %q, want %q", tc.workloads, got, tc.want)
 			}
 		})
 	}

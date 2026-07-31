@@ -191,19 +191,22 @@ func diffFieldsChanged(a state.App, w reposcan.Workload, startCmd string) []stri
 	return changed
 }
 
-// deriveScanSource picks the project scan_source from the
+// DeriveScanSource picks the project scan_source from the
 // workloads that survived any earlier filter. The priority list
-// here mirrors cmd/apid/scan_service.go:474-491. The two copies
-// diverge only if the detector fan-out in pkg/reposcan changes.
-// The dual-test TestReconcile_DeriveScanSource_MirrorsApid pins
-// the priority list verbatim.
+// here is the canonical one — apid's scan_service previously
+// duplicated it; PR-GH.2 retires the apid copy and routes through
+// this exported function instead.
 //
 // Marker returns ProjectScanSourceSingle when exactly one workload
 // survives and that workload is the root-floor (RootDir == "" +
 // Name == "app"). detector tag is "root-floor" in that case, not
 // in the priority list, so it falls through to the len(workloads)==1
 // branch.
-func deriveScanSource(workloads []reposcan.Workload) state.ProjectScanSource {
+//
+// Exported so apid (PR-GH.2) and any future caller can derive the
+// project scan_source without importing cmd/apid (which would
+// create a cyclic dep through pkg/reconcile).
+func DeriveScanSource(workloads []reposcan.Workload) state.ProjectScanSource {
 	// Priority order matches the detector fan-out in
 	// pkg/reposcan/scan.go:145-156. The first match wins.
 	priority := []string{
