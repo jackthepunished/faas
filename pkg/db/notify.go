@@ -209,6 +209,18 @@ const (
 	NotifyComputeNodeChanged = "compute_node_changed"
 	NotifyInvocationDue      = "invocation_due"
 	NotifyInvocationDone     = "invocation_done"
+	// NotifyEgressPolicyChanged {"policy_id":uuid, "public_iface":"...",
+	//                           "masquerade_cidr":"..."}
+	//   ops → cmd/vmmd/egress_watcher: the per-host egress policy
+	//   audit row was written/updated. The watcher re-renders the
+	//   ruleset with the canonical values from pkg/netns.DefaultHostPolicy
+	//   (the host's compile-time defaults — the payload is informational,
+	//   the canonical values still live in the Go renderer), validates
+	//   via `nft -c -f <staging>`, and atomic-replaces
+	//   /etc/nftables.conf followed by `nft -f`. Gated on
+	//   cfg.ComputeNode.NodeName != "" so single-box daemons don't
+	//   observe the channel. ADR-055.
+	NotifyEgressPolicyChanged = "egress_policy_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

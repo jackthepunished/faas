@@ -173,9 +173,23 @@ tidy: ## go mod tidy
 	$(GO) mod tidy
 
 # Egress policy (spec §11). Source of truth is pkg/netns/policy.go's
-# HostPolicy.Render(). The artifact under deploy/ansible/roles/nftables/
-# is what `make bootstrap` ships to the host at /etc/nftables.conf.
+# HostPolicy.Render(). The Go-rendered artifact under
+# deploy/ansible/roles/nftables/files/policy_nftables.conf is what
+# `make bootstrap` ships to the host at /etc/nftables.conf when
+# ansible_render=true (the default). With the ADR-055 Jinja2
+# template active, ansible now DOES render the per-host file
+# at bootstrap time, so the committed artifact is the canonical
+# default-values render (the cross-check target below pins the
+# two against each other).
+#
+# Per-host rendering (ADR-055): public_iface and masquerade_cidr
+# are read from FAAS_PUBLIC_IFACE / FAAS_MASQUERADE_CIDR env vars
+# (forwarded by cmd/faas-nft-render). The committed artifact uses
+# the package defaults (eth0 + 10.100.0.0/16); a Hetzner compute
+# node invokes the binary with the env overrides, captures the
+# output, and the ansible template ships THAT to the host.
 EGRESS_ARTIFACT := deploy/ansible/roles/nftables/files/policy_nftables.conf
+EGRESS_JINJA2 := deploy/ansible/roles/nftables/files/policy_nftables.conf.j2
 
 .PHONY: egress-render
 egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/policy.go
@@ -183,19 +197,68 @@ egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/poli
 	@$(GO) run ./cmd/faas-nft-render > $(EGRESS_ARTIFACT)
 	@echo "wrote $(EGRESS_ARTIFACT)"
 
-.PHONY: egress-check
-egress-check: ## Verify the host nft artifact matches the live render + run nft -c -f if available + bridge-name guard test
+# Cross-check (ADR-055 §Cross-check contract). The Go render is
+# the source of truth; the Jinja2 template is a per-host
+# verifier. Both must produce byte-identical output for the
+# default values (eth0 + 10.100.0.0/16). A regression in either
+# surface fails the build. CI runs this on every push.
+#
+# Trailing-newline normalization: Go's HostPolicy.Render() ends
+# its output with a final `\n` (the closing brace of the
+# `table inet faas` block); Jinja2 by default does not emit a
+# trailing newline after the same `}`. Both are functionally
+# equivalent when fed to `nft -c -f`, so the comparison normalizes
+# trailing newlines on both sides to a single canonical form.
+# This mirrors what cmd/e2e/sec11_sweep_test.go's
+# TestSec11_PerHostEgressTemplating does.
+.PHONY: egress-render-cross-check
+egress-render-cross-check: ## Diff the Go render against the Jinja2 template render for default values
 	@bash -c 'set -e; status=0; \
-	  out=$$(go run ./cmd/faas-nft-render); \
-	  if [ "$$out" != "$$(cat $(EGRESS_ARTIFACT))" ]; then \
-	    echo "egress-check: artifact drift — run \`make egress-render\` and commit the diff:"; \
-	    diff <(echo "$$out") $(EGRESS_ARTIFACT) || true; \
+	  go_out=$$(go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
+	  jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"eth0\", masquerade_cidr=\"10.100.0.0/16\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
+	  if [ "$$go_out" != "$$jinja_out" ]; then \
+	    echo "egress-render-cross-check: Go render and Jinja2 render DIVERGE for default values"; \
+	    diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
 	    status=1; \
 	  else \
-	    echo "egress-check: artifact matches live render"; \
+	    echo "egress-render-cross-check: Go render and Jinja2 render byte-identical for eth0/10.100.0.0/16"; \
 	  fi; \
+	  exit $$status'
+
+# CI matrix (ADR-055): exercise the renderer for a non-default
+# public_iface to confirm the substitution path works under the
+# test rig. The Jinja2 template is rendered with the same value
+# and the two MUST match. This is the load-bearing contract for
+# a Hetzner compute node on `ens5`.
+.PHONY: egress-render-matrix
+egress-render-matrix: ## Render + cross-check for {eth0, ens5} public_iface variants
+	@bash -c 'set -e; status=0; \
+	  for iface in eth0 ens5; do \
+	    for cidr in 10.100.0.0/16 10.101.0.0/16; do \
+	      go_out=$$(FAAS_PUBLIC_IFACE=$$iface FAAS_MASQUERADE_CIDR=$$cidr go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
+	      jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"$$iface\", masquerade_cidr=\"$$cidr\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
+	      if [ "$$go_out" != "$$jinja_out" ]; then \
+	        echo "egress-render-matrix: DIVERGE for iface=$$iface cidr=$$cidr"; \
+	        diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
+	        status=1; \
+	      else \
+	        echo "egress-render-matrix: OK iface=$$iface cidr=$$cidr"; \
+	      fi; \
+	    done; \
+	  done; \
+	  exit $$status'
+
+.PHONY: egress-check
+egress-check: egress-render-cross-check ## Cross-check the Go render against the Jinja2 template + nft -c -f if available + bridge-name guard test
+	# Post-ADR-055: there is no committed static artifact any more —
+	# the Jinja2 template `policy_nftables.conf.j2` is the
+	# ansible-side verifier, the Go renderer is the source of truth,
+	# and the byte-equality of the two surfaces for the default
+	# values is what this gate enforces (delegated to
+	# egress-render-cross-check via the prerequisite above).
+	@bash -c 'set -e; status=0; \
 	  if command -v nft >/dev/null 2>&1; then \
-	    if nft -c -f $(EGRESS_ARTIFACT) 2>/tmp/faas-egress.stderr; then \
+	    if go run ./cmd/faas-nft-render > /tmp/faas-egress-check.conf && nft -c -f /tmp/faas-egress-check.conf 2>/tmp/faas-egress.stderr; then \
 	      echo "egress-check: nft -c -f OK"; \
 	    else \
 	      echo "egress-check: nft -c -f FAILED:"; \

@@ -1062,5 +1062,15 @@ jobs:
       # by default; see https://docs.github.com/actions/hosting-your-runners).
       - name: install postgresql-client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      # jinja2 is required by TestSec11_PerHostEgressTemplating
+      # (cmd/e2e/sec11_sweep_test.go) to cross-check the Go render
+      # against the Jinja2 template. Without this, the test
+      # t.Logf-skips the cross-check and `make egress-render-cross-check`
+      # (which the same Python import supports) fails its `python3 -c
+      # "from jinja2 import Template"` shell-out on the lint+build
+      # job. ADR-055. Match the version the local `make egress-render-cross-check`
+      # and the e2e sweep use.
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
       - name: make e2e
         run: make e2e

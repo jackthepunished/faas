@@ -250,6 +250,22 @@ type runDeps struct {
 	// satisfies the interface) and tests can inject a stub without
 	// booting a real Manager.
 	startCapacityPublish func(ctx context.Context, counts countReader, nodeID string, cfg ComputeNodeConfig, scheddTarget string, scheddClientTLS *tls.Config, tick time.Duration, resident func() (map[string]int64, bool), nodeKey *ecdsa.PrivateKey, nodeKeyID string, log *slog.Logger)
+	// startEgressWatcher: ADR-055 — seam for the runtime egress
+	// policy watcher. nil → start the production goroutine bound to
+	// ctx + log + the watcher struct built inline. Tests inject a
+	// no-op to skip the loop, or a callback to capture the watcher
+	// reference for stub-driven reload assertions.
+	//
+	// The watcher is gated on cfg.ComputeNode.NodeName != "" in
+	// runWithDeps (mirrors the capacity publisher gate), so single-box
+	// default-local vmmd does NOT observe the egress_policy_changed
+	// channel. The watcher is the only consumer of NotifyEgressPolicyChanged.
+	startEgressWatcher func(ctx context.Context, log *slog.Logger)
+	// egressWatcher: the constructed watcher. nil in production
+	// (runWithDeps builds it); tests inject a stub to drive Reload
+	// without subscribing to pg_notify. Bulk of the watcher's logic
+	// is in egressWatcher.Reload — see cmd/vmmd/egress_watcher.go.
+	egressWatcher *egressWatcher
 }
 
 func defaultDeps() runDeps {
@@ -374,6 +390,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// is required on a fresh single-box dev install beyond what
 	// already exists.
 	var nodeID string
+	var pool *pgxpool.Pool
 	if cfg.ComputeNode.NodeName != "" {
 		dbURL := cfg.DBURL
 		if dbURL == "" {
@@ -629,6 +646,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log)
 		}
 		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())
+	}
+
+	// ADR-055 / Tier 1 Phase 4: the per-host egress policy watcher.
+	// Subscribes to `egress_policy_changed` pg_notify and re-renders
+	// the host nftables ruleset on every notification. Gated on
+	// nodeID (the multi-node path) so single-box default-local vmmd
+	// does NOT observe the channel — the legacy single-box install
+	// has no compute_nodes row, no platform-wide migration runner,
+	// and the operator's working contract is `make bootstrap` which
+	// already drops the policy file into place. The watcher is the
+	// multi-box hot-reload path.
+	//
+	// Staging defaults: /tmp/vmmd-egress-staging (mode 0755, owned
+	// by the daemon's process uid). /etc/nftables.conf is the
+	// canonical live path; cross-fs renames fall through atomicReplace's
+	// copy+rename fallback so the daemon does not silently fail on a
+	// host where /tmp is tmpfs and /etc is on ext4.
+	if nodeID != "" {
+		w := newEgressWatcher(log, "/tmp/vmmd-egress-staging", "/etc/nftables.conf")
+		deps.egressWatcher = w
+		if deps.startEgressWatcher != nil {
+			deps.startEgressWatcher(ctx, log)
+		} else {
+			go func() {
+				if err := w.Run(ctx, pool); err != nil {
+					log.Error("vmmd: egress watcher exited", "err", err)
+				}
+			}()
+		}
+		log.Info("vmmd: egress watcher wired", "node_id", nodeID, "staging", "/tmp/vmmd-egress-staging", "live", "/etc/nftables.conf")
 	}
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
