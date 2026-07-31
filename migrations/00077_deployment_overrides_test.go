@@ -102,10 +102,10 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 
 	// (4) Round-trip each column type.
 	var (
-		gotEntrypoint                                          []string
-		gotCmd                                                 []string
-		gotPort                                                int
-		gotEnvRaw, gotEnvSecretsRaw, gotHealthcheckRaw        []byte
+		gotEntrypoint                                  []string
+		gotCmd                                         []string
+		gotPort                                        int
+		gotEnvRaw, gotEnvSecretsRaw, gotHealthcheckRaw []byte
 	)
 	if err := pool.QueryRow(ctx, `
 		select override_entrypoint, override_cmd, override_port,
@@ -162,9 +162,9 @@ func TestMigrations_00077_DeploymentOverrides(t *testing.T) {
 		t.Fatalf("insert deployment with no override: %v", err)
 	}
 	var (
-		nullEntrypoint    []string
-		nullCmd           []string
-		nullPort          *int
+		nullEntrypoint            []string
+		nullCmd                   []string
+		nullPort                  *int
 		nullEnv, nullSecs, nullHC []byte
 	)
 	if err := pool.QueryRow(ctx, `

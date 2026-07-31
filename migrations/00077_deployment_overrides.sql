@@ -1,6 +1,5 @@
 -- filename: 00077_deployment_overrides.sql
 -- +goose Up
--- +goose StatementBegin
 -- Add deploy-time override columns to `deployments` (issue #460 /
 -- ADR-053). Customers redeploy the same digest-pinned OCI image with a
 -- different entrypoint/cmd/env/port/healthcheck without rebuilding the
@@ -30,7 +29,7 @@
 -- No new limits columns on pkg/api/limits.go: env + env_secrets share
 -- Limits.EnvVarsMax (ADR-045 §Decision 1). A per-deploy quota would let
 -- a customer bypass the per-app quota by issuing many deploys.
--- +goose StatementEnd
+-- +goose StatementBegin
 ALTER TABLE deployments
   ADD COLUMN IF NOT EXISTS override_entrypoint    text[],
   ADD COLUMN IF NOT EXISTS override_cmd          text[],
@@ -38,14 +37,15 @@ ALTER TABLE deployments
   ADD COLUMN IF NOT EXISTS override_env_secrets  jsonb,
   ADD COLUMN IF NOT EXISTS override_port         int,
   ADD COLUMN IF NOT EXISTS override_healthcheck  jsonb;
+-- +goose StatementEnd
 
 -- +goose Down
--- +goose StatementBegin
 -- Reverse: drop the six columns. A row that wrote overrides under the
 -- new columns will lose them on downgrade (jsonb/text[] are opaque to
 -- the down-migration); the GET /v1/apps/{slug}/deployments/{id} response
 -- shape omits the override fields because the columns no longer exist,
 -- which is the correct degraded behaviour.
+-- +goose StatementBegin
 ALTER TABLE deployments
   DROP COLUMN IF EXISTS override_entrypoint,
   DROP COLUMN IF EXISTS override_cmd,

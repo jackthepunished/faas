@@ -390,12 +390,12 @@ type Deployment struct {
 	// because the DB columns are jsonb and the handler marshals
 	// the validated map before INSERT (mirrors how RootfsKey
 	// carries the canonical storage handle).
-	OverrideEntrypoint   []string          `json:"override_entrypoint,omitempty"`
-	OverrideCmd          []string          `json:"override_cmd,omitempty"`
-	OverrideEnv          json.RawMessage   `json:"override_env,omitempty"`
-	OverrideEnvSecrets   json.RawMessage   `json:"override_env_secrets,omitempty"`
-	OverridePort         int               `json:"override_port,omitempty"`
-	OverrideHealthcheck  json.RawMessage   `json:"override_healthcheck,omitempty"`
+	OverrideEntrypoint  []string        `json:"override_entrypoint,omitempty"`
+	OverrideCmd         []string        `json:"override_cmd,omitempty"`
+	OverrideEnv         json.RawMessage `json:"override_env,omitempty"`
+	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
+	OverridePort        int             `json:"override_port,omitempty"`
+	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
 }
 
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes
