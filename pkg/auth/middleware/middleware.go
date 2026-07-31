@@ -59,6 +59,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // --- interfaces ----------------------------------------------------------
@@ -433,7 +434,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 				if !acct.Active() {
 					if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
 						api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,
-							"Account suspended", "resolve billing to continue: https://DOMAIN/billing"))
+							"Account suspended", "resolve billing to continue: https://"+wire.DocsHost+"/billing"))
 						return
 					}
 				}
@@ -497,7 +498,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 						if !acct.Active() {
 							if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
 								api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,
-									"Account suspended", "resolve billing to continue: https://DOMAIN/billing"))
+									"Account suspended", "resolve billing to continue: https://"+wire.DocsHost+"/billing"))
 								return
 							}
 						}

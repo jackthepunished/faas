@@ -10,6 +10,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc/codes"
 )
 
@@ -19,13 +20,13 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 	if req.GetInstance() == "" {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
-			WithDocs("https://docs/DOMAIN/vmmd#create")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#create")
 	}
 	app := req.GetApp()
 	if app == nil {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing app", "AppSpec is required").
-			WithDocs("https://docs/DOMAIN/vmmd#appspec")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#appspec")
 	}
 	snap := req.GetSnapshot()
 	wr := fcvm.WakeRequest{
@@ -99,13 +100,13 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 	if req.GetInstance() == "" {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
-			WithDocs("https://docs/DOMAIN/vmmd#create")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#create")
 	}
 	app := req.GetApp()
 	if app == nil {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing app", "AppSpec is required").
-			WithDocs("https://docs/DOMAIN/vmmd#appspec")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#appspec")
 	}
 	return fcvm.WakeRequest{
 		Instance:         req.GetInstance(),

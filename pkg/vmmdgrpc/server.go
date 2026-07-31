@@ -222,7 +222,7 @@ func (s *Server) PauseAndSnapshot(ctx context.Context, req *vmmdpb.PauseAndSnaps
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing paths",
 			"storage_key is required; at least one of vmstate_storage_key or vmstate_path must be set").
-			WithDocs("https://docs/DOMAIN/vmmd#pause")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#pause")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -457,7 +457,7 @@ func (s *Server) UpdateEgressAllowlist(ctx context.Context, req *vmmdpb.UpdateEg
 	if req.GetAppId() == "" {
 		return nil, grpcerr.ToStatus(toProblem(api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing app_id", "app_id is required").
-			WithDocs("https://docs/DOMAIN/vmmd#update-egress-allowlist")))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#update-egress-allowlist")))
 	}
 	allowlist, err := toEgressAllowlist(req.GetEgressAllowlist())
 	if err != nil {
@@ -496,13 +496,13 @@ func (s *Server) SeccompStatus(ctx context.Context, req *vmmdpb.SeccompStatusReq
 	if req.GetInstance() == "" {
 		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
-			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#seccomp"))
 	}
 	pid, ok := s.vmm.InstancePID(req.GetInstance())
 	if !ok {
 		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.NotFound),
 			api.CodeNotFound, "Instance not alive", fmt.Sprintf("instance %q is not alive on this vmmd", req.GetInstance())).
-			WithDocs("https://docs/DOMAIN/vmmd#seccomp"))
+			WithDocs("https://" + wire.DocsHost + "/vmmd#seccomp"))
 	}
 
 	mode, filterLen, err := readSeccompStatus(pid)
