@@ -93,28 +93,34 @@ func Test00076_ComputeNodeKeys_TableShape(t *testing.T) {
 	defer pool.Close()
 	migrateUpOnce(ctx, t, pool)
 
-	row := pool.QueryRow(ctx, `
+	// Pool.Query (NOT QueryRow) — we need to iterate every column.
+	// QueryRow returns a single row and a re-Scan would hit
+	// io.EOF on the second iteration, leaving the loop with
+	// only the first column. Scope by current_schema() so a
+	// parallel pgtest schema doesn't leak its own compute_node_keys
+	// rows into the iteration (per memory: migrations info_schema
+	// scoping pattern).
+	rows, err := pool.Query(ctx, `
 		select column_name, is_nullable, data_type
 		  from information_schema.columns
-		 where table_name = 'compute_node_keys'
+		 where table_schema = current_schema()
+		   and table_name   = 'compute_node_keys'
 		 order by ordinal_position
 	`)
-	type col struct {
-		Name     string
-		Nullable string
-		DType    string
+	if err != nil {
+		t.Fatalf("query columns: %v", err)
 	}
-	var cols []col
-	for {
-		var c col
-		if err := row.Scan(&c.Name, &c.Nullable, &c.DType); err != nil {
-			break
-		}
-		cols = append(cols, c)
-	}
+	defer rows.Close()
 	got := map[string]string{}
-	for _, c := range cols {
-		got[c.Name] = c.Nullable + "|" + c.DType
+	for rows.Next() {
+		var name, nullable, dtype string
+		if err := rows.Scan(&name, &nullable, &dtype); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		got[name] = nullable + "|" + dtype
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
 	}
 	// expected schema per the migration body. Pin each column
 	// individually so a future schema drift fails loud.
