@@ -135,6 +135,14 @@ type SchedAPI interface {
 	// narrow seam so tests can fake the engine with a
 	// single function field.
 	CapacitySink() CapacitySink
+
+	// NodeKeyRegistry (ADR-053 slice 3) returns the
+	// sched-side signature verification registry. nil
+	// disables signature verification — the handler
+	// accepts every report as in pre-slice-3. Slice-3
+	// schedd always returns a non-nil registry; tests
+	// pass nil to bypass verification.
+	NodeKeyRegistry() *sched.NodeKeyRegistry
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -434,6 +442,16 @@ func (s *Server) StreamWarmHints(req *scheddpb.StreamWarmHintsRequest, stream sc
 // per-node capacity table via the SchedAPI.CapacitySink seam,
 // and replies with a single ReportCapacityAck on stream close.
 //
+// Slice 3 (ADR-053) adds node_signature verification at the
+// stream boundary: every report carries a 64-byte ECDSA-P-256
+// (r||s) signature over the canonical payload plus a key_id
+// pointer into the schedd-side NodeKeyRegistry. A bad signature
+// rejects the whole stream (not the bad frame) with
+// codes.Unauthenticated so an attacker can't DoS by injecting
+// one valid frame + 1000 garbage ones — the stream closes and
+// vmmd reconnects. Pre-slice-3 schedd (nil registry) skips
+// verification entirely (back-compat).
+//
 // Wire error mapping:
 //
 //   - codes.OK + nil on clean shutdown (vmmd cancels after
@@ -446,6 +464,7 @@ func (s *Server) StreamWarmHints(req *scheddpb.StreamWarmHintsRequest, stream sc
 //     a programming bug in vmmd; the handler must NOT silently
 //     drop empty-id reports because that would let a future
 //     publisher regression poison the cache silently.
+//   - codes.Unauthenticated on signature failure (slice-3 strict).
 //
 // Observability note: same shape as StreamWarmHints — the single
 // Observe call times the entire stream lifetime, not per-event.
@@ -472,6 +491,11 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 		<-stream.Context().Done()
 		return nil
 	}
+	// Slice-3 signature verification. A nil registry means
+	// pre-slice-3 schedd — skip verification (back-compat).
+	// A non-nil registry means slice-3 strict: every report
+	// must carry a valid signature or the stream closes.
+	keys := s.engine.NodeKeyRegistry()
 	for {
 		msg, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -490,10 +514,7 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 			sendErr = status.Error(codes.InvalidArgument, "capacity report missing node_id")
 			return sendErr
 		}
-		// Apply to the table. The sink closure handles the
-		// empty-nodeid no-op as a defensive fallback (the
-		// explicit check above is the load-bearing gate).
-		if err := table(sched.CapacityReport{
+		report := sched.CapacityReport{
 			NodeID:        msg.GetNodeId(),
 			SampledAt:     time.UnixMilli(msg.GetSampledAtUnixMs()),
 			LiveCount:     msg.GetLiveCount(),
@@ -501,7 +522,38 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 			UsedMB:        msg.GetUsedMb(),
 			RAMHeadroomMB: msg.GetRamHeadroomMb(),
 			VCPUBusy:      msg.GetVcpuBusy(),
-		}); err != nil {
+			NodeSignature: msg.GetNodeSignature(),
+			NodeKeyID:     msg.GetNodeKeyId(),
+		}
+		// Slice-3 verification. Pre-slice-3 vmmd sends an
+		// empty signature; pre-slice-3 schedd has keys == nil
+		// so this block is skipped. Slice-3 vmmd + slice-3
+		// schedd verifies; slice-3 vmmd + pre-slice-3 schedd
+		// (legacy) silently accepts — the additive field is
+		// unused on the legacy side.
+		if keys != nil {
+			if verr := sched.VerifyNodeSignature(report, report.NodeSignature, keys); verr != nil {
+				sendErr = status.Errorf(codes.Unauthenticated,
+					"capacity report signature rejected: %v", verr)
+				s.log.Warn("schedd: capacity signature rejected; closing stream",
+					"node_id", report.NodeID, "err", verr)
+				// ADR-053 §3: one increment per rejected stream
+				// (the handler closes the stream on the first
+				// bad frame, so per-frame increment would
+				// over-count). The operator's "which node?"
+				// question is answered by the audit log
+				// stream-rejection event, not by the metric
+				// label — the counter is unlabelled.
+				if c := s.ops.CapacitySignatureRejected(); c != nil {
+					c.Inc()
+				}
+				return sendErr
+			}
+		}
+		// Apply to the table. The sink closure handles the
+		// empty-nodeid no-op as a defensive fallback (the
+		// explicit check above is the load-bearing gate).
+		if err := table(report); err != nil {
 			sendErr = err
 			return status.Error(codes.Unavailable, err.Error())
 		}

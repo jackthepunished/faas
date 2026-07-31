@@ -32,6 +32,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -112,9 +117,24 @@ func (f *fakeSinkSchedAPI) StreamWarmHints(context.Context, scheddgrpc.WarmHintS
 	return nil
 }
 
+// NodeKeyRegistry returns nil to disable signature verification
+// (pre-slice-3 mode). The bufconn-backed schedd in this e2e
+// suite accepts unsigned reports; a future slice-3 test injects
+// a populated registry to assert the strict-mode path.
+func (f *fakeSinkSchedAPI) NodeKeyRegistry() *sched.NodeKeyRegistry {
+	return nil
+}
+
 // bufconnStreamer is a capacityStreamer backed by a bufconn
 // dialer. Construct one with newBufconnStreamer(t) inside a
 // test and pass it to runCapacityPublishWithStreamer.
+//
+// Pre-slice-3 mode: SigningKey returns (nil, "") so the
+// publisher emits unsigned reports. The bufconn-backed schedd
+// in the e2e suite wires a fakeSinkSchedAPI that returns nil
+// from NodeKeyRegistry, so the empty signature is accepted.
+// A future slice-3 signed-report test injects a populated
+// fakeSinkSchedAPI + a populated SigningKey.
 type bufconnStreamer struct {
 	cli scheddpb.ScheddClient
 }
@@ -131,6 +151,13 @@ func (b *bufconnStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapac
 		_, _ = stream.CloseAndRecv()
 	}
 	return stream, cleanup, nil
+}
+
+// SigningKey returns (nil, "") — pre-slice-3 mode. The
+// publisher emits unsigned reports and the bufconn-backed
+// schedd (with a nil NodeKeyRegistry) accepts them.
+func (b *bufconnStreamer) SigningKey() (*ecdsa.PrivateKey, string) {
+	return nil, ""
 }
 
 // newBufconnFixture wires a bufconn-backed schedd server
@@ -363,6 +390,14 @@ func (f fakeCapacityStreamerErr) Open(context.Context) (scheddpb.Schedd_ReportCa
 	return nil, nil, f.err
 }
 
+// SigningKey returns (nil, "") — pre-slice-3 mode. The
+// publisher never reaches the signing path on a dial error,
+// but the capacityStreamer interface still requires the
+// method.
+func (f fakeCapacityStreamerErr) SigningKey() (*ecdsa.PrivateKey, string) {
+	return nil, ""
+}
+
 // TestDrainCapacityPublish_PropagatesDialError pins the
 // behaviour: drainCapacityPublish returns the open() error
 // verbatim so the outer reconnect loop can log + sleep.
@@ -379,4 +414,231 @@ func TestDrainCapacityPublish_PropagatesDialError(t *testing.T) {
 	if !errors.Is(err, wireErr) {
 		t.Errorf("drain returned %v; want %v", err, wireErr)
 	}
+}
+
+// stubKeyLoaderVmmd is the cmd/vmmd test-side loader for the
+// schedd's NodeKeyRegistry. Mirrors the production loader
+// (Postgres-backed) at the NodeKeyLoader interface only.
+type stubKeyLoaderVmmd struct {
+	rows []sched.NodeKeyRow
+}
+
+func (s *stubKeyLoaderVmmd) LoadNodeKeys(_ context.Context) ([]sched.NodeKeyRow, error) {
+	out := make([]sched.NodeKeyRow, len(s.rows))
+	copy(out, s.rows)
+	return out, nil
+}
+
+// strictModeKeyRegistry returns a populated NodeKeyRegistry
+// for the bufconn fixture. Test injects the matching key into
+// both the publisher's streamer AND the schedd's registry so
+// the round-trip verifies.
+func strictModeKeyRegistry(t *testing.T) (*sched.NodeKeyRegistry, *ecdsa.PrivateKey, string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	keyID, err := sched.KeyIDForPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("KeyIDForPublicKey: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	loader := &stubKeyLoaderVmmd{
+		rows: []sched.NodeKeyRow{
+			{KeyID: keyID, PublicKeyPEM: string(pemBytes)},
+		},
+	}
+	reg := sched.NewNodeKeyRegistry(loader, nil)
+	if n, err := reg.Refresh(context.Background()); err != nil || n != 1 {
+		t.Fatalf("registry init: n=%d err=%v", n, err)
+	}
+	return reg, priv, keyID
+}
+
+// strictModeFakeSink is a fakeSinkSchedAPI variant that
+// exposes a populated NodeKeyRegistry (slice-3 strict mode).
+// Reports land in `gotReports`; tests verify they stamped
+// node_signature + node_key_id.
+type strictModeFakeSink struct {
+	*fakeSinkSchedAPI
+	registry *sched.NodeKeyRegistry
+}
+
+func (s *strictModeFakeSink) NodeKeyRegistry() *sched.NodeKeyRegistry {
+	return s.registry
+}
+
+// signedBufconnStreamer is a bufconnStreamer variant that
+// stamps node_signature + node_key_id on every report via
+// streamer.SigningKey. Pre-slice-3 bufconnStreamer returns
+// (nil, "") and yields unsigned reports.
+type signedBufconnStreamer struct {
+	cli scheddpb.ScheddClient
+	// key + keyID sourced from a real ECDSA P-256 key
+	// pre-loaded into the schedd-side registry.
+	key   *ecdsa.PrivateKey
+	keyID string
+}
+
+func (s *signedBufconnStreamer) Open(ctx context.Context) (scheddpb.Schedd_ReportCapacityClient, func(), error) {
+	stream, err := s.cli.ReportCapacity(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { _, _ = stream.CloseAndRecv() }
+	return stream, cleanup, nil
+}
+
+func (s *signedBufconnStreamer) SigningKey() (*ecdsa.PrivateKey, string) {
+	return s.key, s.keyID
+}
+
+// newSignedBufconnFixture wires a bufconn-backed schedd with
+// a populated NodeKeyRegistry and returns a streamer that
+// stamps the matching signature on every report. Mirrors
+// newBufconnFixture but takes the (key, keyID) pair so the
+// publisher and the registry share the same key.
+func newSignedBufconnFixture(t *testing.T, eng *strictModeFakeSink, key *ecdsa.PrivateKey, keyID string) *signedBufconnStreamer {
+	t.Helper()
+	srv := grpc.NewServer()
+	scheddgrpc.New(eng, wire.NewOpsMetrics("vmmd_e2e_signed"), nil).Register(srv)
+
+	lis := bufconn.Listen(1024 * 1024)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() { srv.Stop(); _ = lis.Close() })
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+	)
+	if err != nil {
+		t.Fatalf("dial bufconn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return &signedBufconnStreamer{
+		cli:   scheddpb.NewScheddClient(conn),
+		key:   key,
+		keyID: keyID,
+	}
+}
+
+// TestRunCapacityPublish_SignedReportAccepted pins the
+// publisher-side wire contract for slice-3: when the streamer
+// has a node signing key, buildCapacityReport stamps
+// node_signature + node_key_id on every report, schedd
+// verifies against the registry, and the report lands in the
+// engine via the CapacitySink seam.
+func TestRunCapacityPublish_SignedReportAccepted(t *testing.T) {
+	t.Parallel()
+	reg, priv, keyID := strictModeKeyRegistry(t)
+	eng := &strictModeFakeSink{
+		fakeSinkSchedAPI: &fakeSinkSchedAPI{},
+		registry:         reg,
+	}
+	streamer := newSignedBufconnFixture(t, eng, priv, keyID)
+	counts := &fakeCountReader{live: 2, leased: 1}
+	resident := func() (map[string]int64, bool) {
+		return map[string]int64{
+			"i-1": 100 * 1024 * 1024,
+			"i-2": 100 * 1024 * 1024,
+		}, true
+	}
+	cfg := ComputeNodeConfig{MemMB: 1000}
+	const nodeID = "0193f7c0-rtt-7bbb-9def-0123456789ab"
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runCapacityPublishWithStreamer(ctx, counts, nodeID, cfg, streamer,
+			20*time.Millisecond, resident, logger)
+	}()
+
+	// Wait for at least 3 reports to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(eng.snapshot()) >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publisher did not exit within 2s of cancel")
+	}
+
+	reports := eng.snapshot()
+	if len(reports) < 3 {
+		t.Fatalf("got %d reports, want ≥3", len(reports))
+	}
+	for i, r := range reports {
+		if r.NodeID != nodeID {
+			t.Errorf("report %d: node_id = %q, want %q", i, r.NodeID, nodeID)
+		}
+		if len(r.NodeSignature) != 64 {
+			t.Errorf("report %d: node_signature length = %d, want 64", i, len(r.NodeSignature))
+		}
+		if r.NodeKeyID != keyID {
+			t.Errorf("report %d: node_key_id = %q, want %q", i, r.NodeKeyID, keyID)
+		}
+	}
+}
+
+// TestBuildCapacityReport_SignedStampsSignature is a unit
+// test for the producer-side signing path: when the streamer
+// has a key, buildCapacityReport returns a report with
+// node_signature + node_key_id populated. When the streamer
+// has no key, both fields are empty (pre-slice-3 mode).
+func TestBuildCapacityReport_SignedStampsSignature(t *testing.T) {
+	t.Parallel()
+	_, priv, keyID := strictModeKeyRegistry(t) // returns registry too; we only need key
+
+	streamer := &signedBufconnStreamerNoDial{key: priv, keyID: keyID}
+	resident := func() (map[string]int64, bool) { return nil, true }
+	cfg := ComputeNodeConfig{MemMB: 1000}
+
+	// Signed: both fields populated.
+	got := buildCapacityReport(streamer, nil, "node-1", cfg, resident, silentLogger())
+	if len(got.GetNodeSignature()) != 64 {
+		t.Errorf("signed: node_signature length = %d, want 64", len(got.GetNodeSignature()))
+	}
+	if got.GetNodeKeyId() != keyID {
+		t.Errorf("signed: node_key_id = %q, want %q", got.GetNodeKeyId(), keyID)
+	}
+
+	// Unsigned: both fields empty.
+	got = buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
+	if len(got.GetNodeSignature()) != 0 {
+		t.Errorf("unsigned: node_signature length = %d, want 0", len(got.GetNodeSignature()))
+	}
+	if got.GetNodeKeyId() != "" {
+		t.Errorf("unsigned: node_key_id = %q, want \"\"", got.GetNodeKeyId())
+	}
+}
+
+// signedBufconnStreamerNoDial is a capacityStreamer that
+// never opens a connection (the unit test doesn't drive a
+// publisher loop). Open returns an error that the test
+// ignores; SigningKey returns the key.
+type signedBufconnStreamerNoDial struct {
+	key   *ecdsa.PrivateKey
+	keyID string
+}
+
+func (s *signedBufconnStreamerNoDial) Open(context.Context) (scheddpb.Schedd_ReportCapacityClient, func(), error) {
+	return nil, nil, errors.New("signedBufconnStreamerNoDial: Open not used")
+}
+
+func (s *signedBufconnStreamerNoDial) SigningKey() (*ecdsa.PrivateKey, string) {
+	return s.key, s.keyID
 }

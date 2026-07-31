@@ -33,6 +33,12 @@ import (
 	"time"
 )
 
+// silentLogger is the slog.Logger used by tests that don't care
+// about log output. Discarded via io.Writer sink.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 // TestBuildCapacityReport_NodeIDPropagated asserts the proto's
 // node_id matches the publisher's parameter. The publisher
 // receives nodeID from registerComputeNode's
@@ -49,7 +55,7 @@ func TestBuildCapacityReport_NodeIDPropagated(t *testing.T) {
 		}, true
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000}
-	got := buildCapacityReport(counts, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident)
+	got := buildCapacityReport(nil, counts, "0193f7c0-uuid-7bbb-9def-0123456789ab", cfg, resident, silentLogger())
 	if got.GetNodeId() != "0193f7c0-uuid-7bbb-9def-0123456789ab" {
 		t.Errorf("node_id = %q, want 0193f7c0-uuid-7bbb-9def-0123456789ab", got.GetNodeId())
 	}
@@ -67,7 +73,7 @@ func TestBuildCapacityReport_ResidentBytesSummed(t *testing.T) {
 		}, true
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000}
-	got := buildCapacityReport(nil, "node-1", cfg, resident)
+	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 200 {
 		t.Errorf("used_mb = %d, want 200", got.GetUsedMb())
 	}
@@ -87,7 +93,7 @@ func TestBuildCapacityReport_NonLinuxHostEmitsZero(t *testing.T) {
 		return nil, false // non-Linux: cgroup read failed
 	}
 	cfg := ComputeNodeConfig{MemMB: 47600}
-	got := buildCapacityReport(nil, "node-1", cfg, resident)
+	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 0 {
 		t.Errorf("used_mb = %d on non-Linux; want 0", got.GetUsedMb())
 	}
@@ -107,7 +113,7 @@ func TestBuildCapacityReport_OverCommitClampsAtZero(t *testing.T) {
 		return map[string]int64{"i-1": 2000 * 1024 * 1024}, true // 2000 MiB
 	}
 	cfg := ComputeNodeConfig{MemMB: 1000} // 1000 MiB cap
-	got := buildCapacityReport(nil, "node-1", cfg, resident)
+	got := buildCapacityReport(nil, nil, "node-1", cfg, resident, silentLogger())
 	if got.GetUsedMb() != 2000 {
 		t.Errorf("used_mb = %d, want 2000", got.GetUsedMb())
 	}
@@ -129,7 +135,7 @@ func TestBuildCapacityReport_VCPUScaledByLiveCount(t *testing.T) {
 	// placeholder is a no-op for live=0; the load-bearing
 	// path is exercised in the metal suite.
 	resident := func() (map[string]int64, bool) { return nil, true }
-	got := buildCapacityReport(nil, "node-1", ComputeNodeConfig{MemMB: 1000}, resident)
+	got := buildCapacityReport(nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, resident, silentLogger())
 	if got.GetVcpuBusy() != 0 {
 		t.Errorf("vcpu_busy = %d, want 0 (live=0)", got.GetVcpuBusy())
 	}
@@ -143,7 +149,7 @@ func TestBuildCapacityReport_VCPUScaledByLiveCount(t *testing.T) {
 func TestBuildCapacityReport_TimeStampMonotonic(t *testing.T) {
 	t.Parallel()
 	before := time.Now().UnixMilli()
-	got := buildCapacityReport(nil, "node-1", ComputeNodeConfig{MemMB: 1000}, noResident)
+	got := buildCapacityReport(nil, nil, "node-1", ComputeNodeConfig{MemMB: 1000}, noResident, silentLogger())
 	after := time.Now().UnixMilli()
 	if got.GetSampledAtUnixMs() < before || got.GetSampledAtUnixMs() > after {
 		t.Errorf("sampled_at_unix_ms = %d, want in [%d, %d]", got.GetSampledAtUnixMs(), before, after)
@@ -162,7 +168,7 @@ func TestRunCapacityPublish_EmptyTargetReturnsImmediately(t *testing.T) {
 	go func() {
 		defer close(done)
 		runCapacityPublish(context.Background(), nil, "node-1",
-			ComputeNodeConfig{MemMB: 1000}, "", nil, 1*time.Second, noResident, logger)
+			ComputeNodeConfig{MemMB: 1000}, "", nil, 1*time.Second, noResident, nil, "", logger)
 	}()
 	select {
 	case <-done:
@@ -188,7 +194,7 @@ func TestRunCapacityPublish_CtxCancelExitsPromptly(t *testing.T) {
 		// blocking on the dialer's full timeout.
 		runCapacityPublish(ctx, nil, "node-1",
 			ComputeNodeConfig{MemMB: 1000}, "unix:///nonexistent.sock", nil,
-			1*time.Second, noResident, logger)
+			1*time.Second, noResident, nil, "", logger)
 	}()
 	// Give the publisher a tick to enter the dial path.
 	time.Sleep(50 * time.Millisecond)

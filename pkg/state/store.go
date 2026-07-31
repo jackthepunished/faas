@@ -1358,6 +1358,19 @@ type Store interface {
 	// ErrConflict is reserved for a future partial-cluster failure;
 	// the upsert path doesn't currently fail.
 	UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error)
+	// UpsertNodeKey inserts or updates a (compute_node_id, key_id)
+	// row in compute_node_keys (ADR-053 / migration 00075). vmmd's
+	// self-registration calls this on startup once it has loaded
+	// its node signing key (cmd/vmmd/main.go::loadNodeSigningKey)
+	// and computed the key_id (the SHA-256 hex of the
+	// SubjectPublicKeyInfo). The PK is (compute_node_id, key_id),
+	// so a single key per node is the typical shape; a future
+	// rotation adds a new row with the same compute_node_id but a
+	// different key_id. ON CONFLICT is a no-op (the existing row
+	// is left unchanged) because key material is write-once —
+	// re-applying public_key_pem would silently overwrite a
+	// rotation that produced a different key.
+	UpsertNodeKey(ctx context.Context, nodeID string, keyID string, publicKeyPEM string) error
 	// SetComputeNodeActive flips the active flag on a row by id.
 	// The schedd heartbeat staleness gate (issue #98) calls this
 	// to mark a node active=false when last_heartbeat_at ages past
