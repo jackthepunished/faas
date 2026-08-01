@@ -38,7 +38,7 @@ func TestBuildInstanceStatsRow_PopulatesNetTxBytes(t *testing.T) {
 	netCache.Observe(netstats.Observation{InstanceID: "vm-A", RXBytes: 0, At: time.Unix(0, 0)})
 	netCache.Observe(netstats.Observation{InstanceID: "vm-A", RXBytes: 4096, At: time.Unix(1, 0)})
 
-	row := buildInstanceStatsRow("vm-A", 8192, nil, netCache, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 8192, nil, netCache, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.GetInstance() != "vm-A" {
 		t.Errorf("Instance = %q, want vm-A", row.GetInstance())
@@ -72,7 +72,7 @@ func TestBuildInstanceStatsRow_PopulatesNetTxBytes(t *testing.T) {
 func TestBuildInstanceStatsRow_AbsentWhenNetCacheEmpty(t *testing.T) {
 	netCache := netstats.New(func() time.Time { return time.Unix(0, 0) })
 
-	row := buildInstanceStatsRow("vm-A", 4096, nil, netCache, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, nil, netCache, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.NetTxBytes != nil {
 		t.Errorf("NetTxBytes = %v, want nil (cache has no baseline for vm-A)", row.NetTxBytes)
@@ -84,7 +84,7 @@ func TestBuildInstanceStatsRow_AbsentWhenNetCacheEmpty(t *testing.T) {
 // produce a row with resident_bytes only, no panic. This is the
 // shape tests that don't exercise the caches fall through to.
 func TestBuildInstanceStatsRow_NilCachesDoesNotPanic(t *testing.T) {
-	row := buildInstanceStatsRow("vm-A", 4096, nil, nil, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, nil, nil, nil, wire.NewOpsMetrics("vmmd_test"))
 	if row.GetInstance() != "vm-A" {
 		t.Errorf("Instance = %q, want vm-A", row.GetInstance())
 	}
@@ -134,7 +134,7 @@ func TestBuildInstanceStatsRow_CPUCachePopulatesAllThreeFields(t *testing.T) {
 		At:            time.Unix(1, 0),
 	})
 
-	row := buildInstanceStatsRow("vm-A", 4096, cpuCache, nil, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, cpuCache, nil, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.CpuPct == nil || row.CpuPct.Value != 12.5 {
 		t.Errorf("CpuPct = %v, want 12.5", row.CpuPct)

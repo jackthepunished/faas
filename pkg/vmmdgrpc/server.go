@@ -387,7 +387,7 @@ func (s *Server) Stats(ctx context.Context, _ *vmmdpb.StatsRequest) (*vmmdpb.Sta
 	resp.Instances = make([]*vmmdpb.InstanceStats, 0, len(resident))
 	for inst, b := range resident {
 		total += b
-		row := buildInstanceStatsRow(inst, b, s.cpuCache, s.netCache, s.ops)
+		row := buildInstanceStatsRow(inst, b, s.cpuCache, s.netCache, s.activity, s.ops)
 		resp.Instances = append(resp.Instances, row)
 	}
 	resp.TotalResidentBytes = wrapperspb.Int64(total)
@@ -428,6 +428,7 @@ func buildInstanceStatsRow(
 	resident int64,
 	cpuCache *cpustats.Cache,
 	netCache *netstats.Cache,
+	activityCache *activity.ActivityTracker,
 	ops *wire.OpsMetrics,
 ) *vmmdpb.InstanceStats {
 	row := &vmmdpb.InstanceStats{
@@ -476,6 +477,23 @@ func buildInstanceStatsRow(
 			//
 			// Once regen lands:
 			//   row.NetRxBytes = wrapperspb.Int64(int64(nReading.IngressDeltaBytes))
+		}
+	}
+	// PR-B (issue #462): in-flight ForwardHTTP request
+	// counter and last-observed moment. The wire field
+	// InflightRequests is a bare int64 (no wrapper — see
+	// api/proto/onebox/faas/vmmd/v1/vmmd.pb.go:1243);
+	// zero is a valid "idle" reading the schedd poller
+	// already handles. LastRequestAt is a pointer so nil
+	// means "no request observed yet on this instance" —
+	// the poller falls back to state.Instance.LastRequestAt
+	// in that case (vmmd.pb.go:1245-1247).
+	if activityCache != nil {
+		if inflight, ok := activityCache.Inflight(instance); ok {
+			row.InflightRequests = inflight
+		}
+		if lastAt, ok := activityCache.LastAt(instance); ok {
+			row.LastRequestAt = timestamppb.New(lastAt)
 		}
 	}
 	return row
