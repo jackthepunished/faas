@@ -274,6 +274,16 @@ type MemStore struct {
 	projects              map[string]Project
 	projectsByAccountSlug map[string]map[string]string // account_id → slug → id
 	projectsByInstallRepo map[installRepoKey]string    // install_id, repo_full_name → id
+	// clock is the seam CurrentMonthOverageCents uses to compute the
+	// UTC month-start cutoff. Default is time.Now (production); tests
+	// install a fixture via SetClockForTest so a usage row planted at
+	// "2026-07-21" is still visible to a CurrentMonthOverageCents call
+	// later in the test (issue surfaced 2026-08-01 — the meterd
+	// quota-tick tests' "1200 cents of derived overage at fixture
+	// 2026-07-21" read zero because real wall-clock had advanced to
+	// 2026-08-01, putting the row's Minute before the current
+	// monthStart and silently filtering it out). Protected by m.mu.
+	clock func() time.Time
 }
 
 // installRepoKey mirrors the projects_install_repo_uniq partial index
@@ -484,6 +494,10 @@ func NewMemStore() *MemStore {
 	// the migration's seed (e.g., target_url mismatch); both land in
 	// the test 00024_compute_nodes_test.go.
 	m.seedDefaultLocalNodeLocked()
+	// Default clock is real wall-clock; tests override via
+	// SetClockForTest so a fixture-time AppendUsage row is still
+	// visible to CurrentMonthOverageCents later in the same test.
+	m.clock = func() time.Time { return time.Now().UTC() }
 	return m
 }
 
@@ -4614,7 +4628,7 @@ func (m *MemStore) LoadAllOverageCapCents(_ context.Context) (map[string]int64, 
 func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now().UTC()
+	now := m.clock()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	var mbSeconds int64
 	for _, u := range m.usage {
@@ -4637,6 +4651,27 @@ func (m *MemStore) SetOverageCapCentsForTest(accountID string, cents int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.overageCapCents[accountID] = cents
+}
+
+// SetClockForTest replaces the wall-clock source
+// CurrentMonthOverageCents uses to compute the UTC month-start
+// cutoff. Tests that pin a fixture time for AppendUsage (so the
+// derived overage is computable at a deterministic monthly bucket)
+// MUST also pin the same fixture here, otherwise real wall-clock
+// drifts past the fixture's month and the usage row is filtered as
+// "before monthStart" (issue surfaced 2026-08-01 on
+// TestRunQuotaOnce_OverageCapHonored + TestRunQuotaOnce_OverageCapAtCap).
+// Not on the Store interface — production code never needs to
+// override the clock; PgStore's date_trunc('month', now()) reads
+// the SQL `now()`, which the test harness can't substitute cleanly
+// without a clock-rewind transaction wrapper.
+func (m *MemStore) SetClockForTest(clock func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if clock == nil {
+		clock = func() time.Time { return time.Now().UTC() }
+	}
+	m.clock = clock
 }
 
 // AppendCreditForTest is the test-only seam that plants a credit row
