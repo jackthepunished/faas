@@ -3994,10 +3994,10 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 		// synthetic default-local row carries api.VCPUSlots so a
 		// single-box install sees identical behaviour to the
 		// pre-migration box-wide gate.
-		VCPUBudget:         api.VCPUSlots,
-		Active:             true,
-		LastHeartbeatAt:    now,
-		CreatedAt:          now,
+		VCPUBudget:      api.VCPUSlots,
+		Active:          true,
+		LastHeartbeatAt: now,
+		CreatedAt:       now,
 		// Phase 2 / Gate A: per-node schedd dial target. The
 		// single-box synthetic row points at the legacy
 		// /run/faas/schedd.sock so the gateway's per-node cache
