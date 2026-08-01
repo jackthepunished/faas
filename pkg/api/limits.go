@@ -105,7 +105,7 @@ type Limits struct {
 	EnvVarsMax       int // max env vars per app (Free 8, Hobby 32, Pro 64, Scale 256)
 	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
-// TrustedSignerCountMax bounds the (app_id, signer_name) row count
+	// TrustedSignerCountMax bounds the (app_id, signer_name) row count
 	// in app_trusted_signers (issue #472 / ADR-054). Mirrors
 	// EnvVarsMax's posture — a config cap, not a credential one.
 	// Per-plan values are tuned to cover the typical CI rotation
@@ -360,7 +360,7 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 4 * 1024,
 		EnvVarsMax:          8,
 		EnvValueMaxBytes:    4 * 1024,
-// TrustedSignerCountMax: Free keeps the open-deploy posture;
+		// TrustedSignerCountMax: Free keeps the open-deploy posture;
 		// signature enforcement is a regulated-workload feature that
 		// Free never needs (issue #472 / ADR-054).
 		TrustedSignerCountMax: 0,
@@ -444,7 +444,7 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 8 * 1024,
 		EnvVarsMax:          32,
 		EnvValueMaxBytes:    8 * 1024,
-// TrustedSignerCountMax: Hobby is the lowest paid tier; the
+		// TrustedSignerCountMax: Hobby is the lowest paid tier; the
 		// 4-publisher cap covers a hobbyist running a single CI
 		// (GitHub Actions) + a backup CI (Codeberg) + a personal
 		// signing key + an emergency break-glass. Anything beyond

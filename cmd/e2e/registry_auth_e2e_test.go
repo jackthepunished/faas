@@ -75,7 +75,7 @@ func TestRegistryAuth_E2E_PutGetDeleteRoundTrip_RealSeal(t *testing.T) {
 	// Pin the head migration. A future PR that reorders slots 82/83
 	// should land the bump here too (test-pgstore-billing-logs-usage
 	// memory note: trust `make test`, not worktree ls).
-	pgtest.WaitForMigration(t, pool, 83, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, 87, 10*time.Second)
 
 	// apid loads the recipient lazily via FAAS_HOST_AGE_RECIPIENT_PATH.
 	// Same posture as the secrets e2e (account_scoped_e2e_test.go).

@@ -358,10 +358,10 @@ const testDomain = "apps.test.example"
 // parallel slot-83 race against PR #509; the second lands on the
 // next free slot past the live migration head.
 //
-// (issue #461 / ADR-062 — registry_credentials landing on the slot
-// the branch was bumped to during rebase; see also the renumber
-// comment on the migration file itself.)
-const e2eMigrationTarget = 86
+// (issue #461 / ADR-062 — registry_credentials landing on slot 87,
+// the next free slot past main's 00086 apps_require_signed. Bumped
+// from the original 83 during rebase when main moved the head.)
+const e2eMigrationTarget = 87
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

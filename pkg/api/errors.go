@@ -289,7 +289,7 @@ const (
 	CodeEnvVarValueTooLarge = "env_value_too_large"
 	CodeEnvVarNotFound      = "env_var_not_found"
 
-// Trusted cosign signers (issue #472 / ADR-054). Same shape as
+	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
 	// the env-var quota — config cap, not a credential one — but a
 	// distinct code so the dashboard can surface "trusted publishers"
 	// as its own row and so SDK callers don't accidentally decode a

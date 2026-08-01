@@ -493,14 +493,14 @@ func TestRegistryAuth_HTTPSRequired(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "https-app")
 	reject := []string{
-		"registry.example.com",                       // schemeless
-		"http://registry.example.com",                // cleartext
-		"http://registry.example.com:443",            // cleartext even with port
-		"ftp://registry.example.com",                 // wrong scheme
-		"https://registry.example.com/path",          // embedded path
-		"https://registry.example.com:99999",         // bad port
-		"",                                           // empty
-		"  ",                                         // whitespace only
+		"registry.example.com",               // schemeless
+		"http://registry.example.com",        // cleartext
+		"http://registry.example.com:443",    // cleartext even with port
+		"ftp://registry.example.com",         // wrong scheme
+		"https://registry.example.com/path",  // embedded path
+		"https://registry.example.com:99999", // bad port
+		"",                                   // empty
+		"  ",                                 // whitespace only
 	}
 	for _, h := range reject {
 		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",

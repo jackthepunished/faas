@@ -960,7 +960,7 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		return err
 	}
 
-// Issue #472 / ADR-054: per-app cosign signature verification.
+	// Issue #472 / ADR-054: per-app cosign signature verification.
 	// Runs AFTER the stateful-deny check (a known-bad base is
 	// rejected faster without a network round-trip) and BEFORE
 	// PullDigest (no point pulling an unsigned / untrusted image).
