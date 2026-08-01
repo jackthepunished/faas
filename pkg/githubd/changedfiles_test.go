@@ -521,3 +521,33 @@ func TestBreaker_SuccessResetsFailureCount(t *testing.T) {
 		t.Errorf("inner.calls = %d, want 6 (successes must reset counter, no false trip)", inner.calls)
 	}
 }
+
+// TestNewUnavailableChangedFiles_Unit pins the credentials-
+// missing stub. The dispatcher surfaces the no-credentials case
+// via githubd_path_filter_total{mode="error"} → {mode="breaker_open"}
+// and falls back to full fan-out; this test verifies the stub
+// itself always errors with ErrUnavailable regardless of inputs.
+func TestNewUnavailableChangedFiles_Unit(t *testing.T) {
+	t.Parallel()
+	client := NewUnavailableChangedFiles()
+	if client == nil {
+		t.Fatal("NewUnavailableChangedFiles returned nil")
+	}
+	files, err := client.ChangedFiles(
+		context.Background(),
+		/* installationID */ 42,
+		/* owner */ "octocat",
+		/* repo */ "hello",
+		/* base */ "main",
+		/* head */ "feature",
+	)
+	if err == nil {
+		t.Fatal("ChangedFiles err = nil, want ErrUnavailable")
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("ChangedFiles err = %v, want errors.Is(ErrUnavailable)", err)
+	}
+	if files != nil {
+		t.Errorf("ChangedFiles files = %v, want nil", files)
+	}
+}

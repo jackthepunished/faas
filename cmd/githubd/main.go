@@ -131,6 +131,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Slice 7 Service skeleton (inbound webhook path).
 	webhookSvc := githubd.NewService(log)
+	// PR-GH.6 flip: wire Ops unconditionally so the
+	// githubd_path_filter_total counter ticks on ALL push-dispatch
+	// paths — including the credentials-missing branches below
+	// that wire NewUnavailableChangedFiles. The previous
+	// credentialed-only wiring at the success branch left Ops
+	// nil on unprovisioned boxes, which silently dropped the
+	// mode=error / mode=breaker_open increments and made the
+	// FaasGithubdPathFilterDegraded alert unreachable in
+	// production. Hoisting here means the operator's §12
+	// dashboard reflects reality on every box.
+	webhookSvc.Ops = ops
 	webhookSvc.Bindings = storeAdapter
 	webhookSvc.Installs = installsAdapter
 	webhookSvc.Source = source
@@ -172,14 +183,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		keyPEM, kerr := deps.readKeyPEM()
 		if kerr != nil {
 			log.Warn("githubd: read app private key", "err", kerr)
-			log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
+			// PR-GH.6 flip: wrap the stub in the breaker so
+			// operators see the natural error → breaker_open
+			// progression after 3 pushes (matches the runbook
+			// claim and avoids burning metric cardinality on
+			// a static configuration error).
+			webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(githubd.NewUnavailableChangedFiles(), deps.now)
+			log.Warn("githubd: GitHub App credentials not provisioned; wiring unavailable ChangedFiles stub (path-filter falls back to full rebuild with error-mode metric)")
 		} else {
 			clientID := os.Getenv("FAAS_GITHUB_APP_CLIENT_ID")
 			clientSecret := os.Getenv("FAAS_GITHUB_APP_CLIENT_SECRET")
 			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient(), clientID, clientSecret)
 			if aerr != nil {
 				log.Warn("githubd: app auth init", "err", aerr)
-				log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
+				webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(githubd.NewUnavailableChangedFiles(), deps.now)
+				log.Warn("githubd: GitHub App credentials not provisioned; wiring unavailable ChangedFiles stub (path-filter falls back to full rebuild with error-mode metric)")
 			} else {
 				tokens := githubd.NewTokenCache(auth, 5*time.Minute)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
@@ -242,13 +260,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// surfaces the trip in the §12 dashboard.
 				inner := githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
 				webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(inner, deps.now)
-				webhookSvc.Ops = ops
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
 	} else {
 		log.Info("githubd: FAAS_GITHUB_APP_ID unset; OAuth + Checks disabled (webhook path only)")
-		log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
+		// PR-GH.6 flip: wrap the stub in the breaker so
+		// operators see the natural error → breaker_open
+		// progression after 3 pushes (matches the runbook
+		// claim and avoids burning metric cardinality on
+		// a static configuration error).
+		webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(githubd.NewUnavailableChangedFiles(), deps.now)
+		log.Warn("githubd: GitHub App credentials not provisioned; wiring unavailable ChangedFiles stub (path-filter falls back to full rebuild with error-mode metric)")
 	}
 
 	// The gRPC server hands out the RealService (full slice 8

@@ -222,3 +222,11 @@
   (`DeployedApps`, `cron_limit_per_app`, `cron_limit_per_account`).
 - Companion: `docs/repo_decomposition_implementation.md` (phased plan).
 - Requires at its gate: **ADR-051** (probe-boot workload classification).
+- **Path-filter posture flip (issue #432 phase 5 follow-up):** path-filter is
+  the production default (`pkg/githubd/service.go:299`); the full-fan-out
+  fallback fires only when the compare API itself fails. Credentials-missing
+  boxes wire `pkg/githubd.NewUnavailableChangedFiles` so the dispatcher
+  surfaces `githubd_path_filter_total{mode="error"} → {mode="breaker_open"}`
+  rather than `{mode="full_fallback"}` — dashboards can distinguish
+  "intentional no-credentials" from "compare API unreachable." ADR unchanged;
+  this is a posture flip, not a constraint change.

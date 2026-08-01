@@ -163,6 +163,36 @@ func NewBreakerChangedFiles(inner ChangedFilesClient, now func() time.Time) Chan
 	return &wrappingChangedFiles{inner: inner, now: now}
 }
 
+// NewUnavailableChangedFiles returns a stub ChangedFilesClient
+// that always errors with ErrUnavailable. Wire when the GitHub
+// App credentials aren't provisioned (so the production
+// httpChangedFiles can't be built). The dispatcher surfaces
+// the "no credentials" case via
+// githubd_path_filter_total{mode="error"} → {mode="breaker_open"}
+// and falls back to full fan-out, preserving the pre-flip
+// rebuild-all behaviour for unprovisioned boxes while changing
+// the metric label so dashboards distinguish "intentional
+// no-credentials" from "compare API is unreachable".
+//
+// Going through the real breaker wrapper (NewBreakerChangedFiles)
+// is intentional: the stub honours the same contract as the
+// production client, and operators see the natural progression
+// from error → breaker_open after breakerFailureThreshold
+// pushes, which is load-bearing evidence the dispatcher
+// actually attempted a call.
+func NewUnavailableChangedFiles() ChangedFilesClient {
+	return unavailableChangedFiles{}
+}
+
+type unavailableChangedFiles struct{}
+
+// ChangedFiles always returns (nil, ErrUnavailable). The
+// context / installationID / owner / repo / base / head args
+// are ignored — there is no upstream to consult.
+func (unavailableChangedFiles) ChangedFiles(_ context.Context, _ int64, _, _, _, _ string) ([]string, error) {
+	return nil, ErrUnavailable
+}
+
 // wrappingChangedFiles is the breaker wrapper. It tracks
 // consecutive non-truncation errors (ErrUnavailable, transport,
 // 4xx/5xx) and trips after breakerFailureThreshold in

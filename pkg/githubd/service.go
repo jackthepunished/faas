@@ -85,9 +85,13 @@ type WriteCheck func(ctx context.Context, repoFullName, commitSHA string, phase 
 // HandlePushRequest queries GitHub's compare API between
 // ev.Before and ev.After and rebuilds only the apps whose
 // RootDir intersects the changed file set. nil falls back to
-// the naive "rebuild every touched app" loop (PR-GH.5
-// behaviour), which is the safe default until cmd/githubd
-// wires the production client.
+// the naive "rebuild every touched app" loop — this is the
+// test-rig path; production wires either the real client
+// (NewHTTPChangedFiles wrapped in NewBreakerChangedFiles) or
+// NewUnavailableChangedFiles on credentials-missing branches
+// so the dispatcher surfaces the "no credentials" case via the
+// mode="error" / mode="breaker_open" metric labels rather than
+// silently downgrading to full fan-out.
 type Service struct {
 	Log          *slog.Logger
 	Bindings     AppBindingStore
@@ -275,8 +279,10 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 	// compare API for the changed files between before and after,
 	// then rebuild only the apps whose RootDir intersects that
 	// set. Falls back to full fan-out on truncation, transport
-	// error, or any other compare failure (ADR-050 §109 — the
-	// conservative v1.0 posture).
+	// error, empty-before, or any other compare failure
+	// (ADR-050 §109). Path-filter is the default posture; the
+	// full-fan-out fallback fires only when the compare API
+	// itself fails.
 	enqueuer := s.Enqueuer
 	if enqueuer == nil {
 		enqueuer = NewNoopEnqueuer(s.Log)
@@ -296,7 +302,7 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 	// workloads, or a "no-op drift" reconcile that produced
 	// Added=∅, Changed=∅).
 	var changedFiles []string
-	filterMode := filterModeFullFallback
+	filterMode := filterModePaths
 	if len(touched) > 0 {
 		changedFiles, filterMode = s.lookupChangedFiles(ctx, ev, install.InstallationID)
 	} else {

@@ -2767,6 +2767,25 @@ func (m *OpsMetrics) ObserveGithubdPathFilter(mode string) {
 	}
 }
 
+// GithubdPathFilterTotal returns the labelled-counter accessor for
+// the path-filter mode counter, used by service-level tests in
+// pkg/githubd to assert that the dispatcher emitted the expected
+// mode after a push. The mode argument must be one of the closed
+// set {paths, full_fallback, truncated, error, breaker_open} —
+// any other value returns nil so a typo can't silently succeed.
+// Nil-safe — returns nil on a nil receiver so the dispatcher can
+// call this without a nil-check at every site.
+func (m *OpsMetrics) GithubdPathFilterTotal(mode string) prometheus.Counter {
+	if m == nil || m.githubdPathFilterTotal == nil {
+		return nil
+	}
+	switch mode {
+	case PathFilterModePaths, PathFilterModeFullFallback, PathFilterModeTruncated, PathFilterModeError, PathFilterModeBreakerOpen:
+		return m.githubdPathFilterTotal.WithLabelValues(mode)
+	}
+	return nil
+}
+
 // Handler returns an http.Handler that serves the registry's metrics.
 // Plug into any mux — daemons mount it at /metrics.
 func (m *OpsMetrics) Handler() http.Handler {
