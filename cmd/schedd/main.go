@@ -532,7 +532,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (PR #115) fires. Production cadence is overridable via
 	// FAAS_HEARTBEAT_INTERVAL; tests inject a sub-second interval
 	// through runDeps.heartbeatInterval to exercise the wiring.
-	hb := sched.NewHeartbeat(store, sched.HeartbeatDialerFunc(deps.dialVMM), vmmTLS, log)
+	hb := sched.NewHeartbeat(store, sched.HeartbeatDialerFunc(deps.dialVMM), vmmTLS, log).
+		WithOwnerNodeID(ownerNodeID)
 	hb.Interval = cfg.HeartbeatInterval
 	hb.Staleness = cfg.HeartbeatStaleness
 	if deps.heartbeatInterval > 0 {

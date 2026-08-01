@@ -88,6 +88,25 @@ type Heartbeat struct {
 	// Staleness is the age threshold for deactivation. Zero
 	// falls back to DefaultHeartbeatStaleness.
 	Staleness time.Duration
+	// ownerNodeID is the Phase 2 / Gate A shard key this schedd
+	// owns. Empty = legacy fleet-wide sweep (one-box posture);
+	// non-empty = single-node ping (the schedd only watches its
+	// own vmmd). Set via WithOwnerNodeID after NewHeartbeat.
+	ownerNodeID string
+}
+
+// WithOwnerNodeID scopes the heartbeat to a single node. Phase 2
+// / Gate A: each schedd pings only its own vmmd; per-node liveness
+// is the responsibility of the schedd that owns the node. The
+// staleness gate (MarkComputeNodeInactive on a stale node) still
+// applies — a dead vmmd on this schedd's own node gets flipped
+// inactive and the chooser skips it on the next wake.
+func (h *Heartbeat) WithOwnerNodeID(nodeID string) *Heartbeat {
+	if h == nil {
+		return h
+	}
+	h.ownerNodeID = nodeID
+	return h
 }
 
 // HeartbeatDialer is the per-tick fresh-dial contract. The heartbeat
@@ -159,6 +178,18 @@ func (h *Heartbeat) Tick(ctx context.Context) error {
 		// is unaffected.
 		h.log.Warn("heartbeat: list active compute_nodes failed", "err", err)
 		return err
+	}
+	// Phase 2 / Gate A: scope the sweep to this schedd's owner
+	// node. Multi-node schedd → single-node ping; single-box
+	// (empty owner) → legacy fleet-wide sweep unchanged.
+	if h.ownerNodeID != "" {
+		filtered := nodes[:0]
+		for _, n := range nodes {
+			if n.ID == h.ownerNodeID {
+				filtered = append(filtered, n)
+			}
+		}
+		nodes = filtered
 	}
 	for _, n := range nodes {
 		// ctx cancellation check between nodes — a long fleet

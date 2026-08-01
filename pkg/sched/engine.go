@@ -150,6 +150,15 @@ type Engine struct {
 	// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
 	audit *audit.Auditor
 
+	// ownerNodeID is the durable Phase 2 / Gate A shard key this
+	// schedd serves. Empty = legacy single-box posture (the
+	// chooser is free to pick any active node). Non-empty =
+	// choosePlacementLocked pins placement.NodeID to this id
+	// and refuses to admit an app whose apps.node_id != owner.
+	// Wired via WithOwnerNodeID after NewEngine; nil-safe so
+	// pre-Phase-2 tests stay green.
+	ownerNodeID string
+
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
@@ -337,6 +346,22 @@ func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
 // same `audit.New(store, log, ops, "schedd")` instance Loop uses.
 func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
 	e.audit = a
+	return e
+}
+
+// WithOwnerNodeID stamps the Phase 2 / Gate A owner shard key
+// on the engine. cmd/schedd wires the same id it passes to
+// scheddgrpc.WithOwner; choosePlacementLocked pins
+// placement.NodeID = ownerNodeID when set, refuses to admit
+// an app whose apps.node_id != owner. Empty = legacy
+// single-box posture: the chooser picks freely across active
+// nodes. Safe to call concurrently with the wake path: reads
+// of e.ownerNodeID race only with the initial stamp.
+func (e *Engine) WithOwnerNodeID(nodeID string) *Engine {
+	if e == nil {
+		return e
+	}
+	e.ownerNodeID = nodeID
 	return e
 }
 
@@ -1232,6 +1257,26 @@ func (e *Engine) applyLiveCapacityMB(_ context.Context, nodeID string) int64 {
 // pre-axis-5 behaviour rather than dropping the node from the
 // fleet view entirely.
 func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placement, error) {
+	// Phase 2 / Gate A: pin placement to the schedd's owner
+	// node. The chooser still runs the per-node headroom checks
+	// (usedMB + usedVCPU + ceiling), but every candidate is
+	// either this owner or nothing — the wake can't escape to
+	// another schedd's fleet. An empty ownerNodeID preserves
+	// the legacy behaviour (pick any active node).
+	if e.ownerNodeID != "" {
+		// Defence-in-depth: refuse to admit if the app's
+		// persisted owner doesn't match. The gRPC handler's
+		// authorizeApp guard is the load-bearing check (the
+		// gateway partitions by apps.node_id before dialling);
+		// this is the second-line filter for direct Engine
+		// calls (the engine_test.go wake-locality tests).
+		if app, err := e.store.AppByID(ctx, r.AppID); err == nil && app.NodeID != "" && app.NodeID != e.ownerNodeID {
+			return Placement{}, api.ErrCapacity(fmt.Sprintf(
+				"placement: app %s is owned by node %s; this schedd owns %s",
+				r.AppID, app.NodeID, e.ownerNodeID))
+		}
+		r.PreferredNodeID = e.ownerNodeID
+	}
 	nodes, err := e.store.ActiveComputeNodes(ctx)
 	if err != nil {
 		return Placement{}, fmt.Errorf("sched: placement: list active compute_nodes: %w", err)
@@ -2319,6 +2364,17 @@ func (e *Engine) Ledger() *NodeLedger { return e.ledger }
 // Store exposes the engine's Store so the Loop can build the reaper's
 // read-only instance snapshot and read crons.
 func (e *Engine) Store() state.Store { return e.store }
+
+// OwnerNodeID returns the Phase 2 / Gate A shard key this
+// schedd owns, or "" for the legacy single-box posture. The
+// Loop uses this to scope its per-tick reads (reaper, cron,
+// scale-up) to apps this schedd is responsible for.
+func (e *Engine) OwnerNodeID() string {
+	if e == nil {
+		return ""
+	}
+	return e.ownerNodeID
+}
 
 // Notifier returns the pg_notify notifier the engine writes through.
 // nil-safe: returns a noop when the engine was wired without one
