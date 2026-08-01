@@ -150,10 +150,22 @@ func (s *Service) Reconcile(
 // if a guard tripped.
 //
 // branch=="" skips the production-branch guard (apid enforces
-// prod-branch upstream of Plan in the dry-run flow).
+// prod-branch upstream of Plan in the dry-run flow). commitSHA
+// is informational only on the Plan path — there is no audit
+// row to populate, and the store is only read (AppsForProject
+// to compute the diff) — never written.
 //
-// commitSHA is informational only on the Plan path — there is no
-// audit row to populate, and the store is never called.
+// Returned errors:
+//
+//   - ErrPlanEmpty when guard 1 (never-empty) trips.
+//   - state.ErrScanSourceDowngrade when guard 3 trips.
+//   - other errors from Store.AppsForProject bubble verbatim.
+//
+// The Result is always returned (even when err is non-nil) when
+// the err came from a guard — the guard's Alerts populate
+// Result.Alerts so the dry-run response can include the
+// reason. The ErrIgnored / ErrPlanEmpty / ErrScanSourceDowngrade
+// sentinels give the caller a typed switch.
 func (s *Service) Plan(
 	ctx context.Context,
 	project state.Project,

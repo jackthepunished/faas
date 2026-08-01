@@ -114,22 +114,25 @@ type planCron struct {
 // third/fourth slots. When apply=false, the caller renders the
 // response as JSON.
 //
-// Returns (response, project, added, changed, problem). project/added/
-// changed are valid only when problem == nil and apply==true.
+// Returns (response, project, added, changed, removedSlugs, problem).
+// project/added/changed/removedSlugs are valid only when problem == nil
+// and apply==true.
 //
 // added is the post-insert state.App slice for newly-created apps;
 // changed is the post-update slice for workloads whose RootDir /
-// WorkloadName / StartCommand drifted. The handler uses these two
-// slices to fire kind=created vs kind=updated NotifyAppChanged
-// notifications and to stamp cron AppID from the slug→ID map.
+// WorkloadName / StartCommand drifted. removedSlugs carries the slugs
+// of workloads that the scan dropped from the project — the handler
+// uses these to soft-delete the corresponding crons (issue: a cron
+// for a removed workload previously 500'd because the slug→ID map
+// had no entry; PR-GH.6 fixes that by walking removedSlugs).
 func (s *server) scanService(
 	w http.ResponseWriter, r *http.Request, acct state.Account,
 	planToken string, apply bool,
-) (*scanPlanResponse, state.Project, []state.App, []state.App, *api.Problem) {
+) (*scanPlanResponse, state.Project, []state.App, []state.App, []string, *api.Problem) {
 	limits := api.MustLimitsFor(acct.Plan)
 	req, prob := parseScanMultipart(r, acct, limits)
 	if prob != nil {
-		return nil, state.Project{}, nil, nil, prob
+		return nil, state.Project{}, nil, nil, nil, prob
 	}
 	// The handler owns cleanup of the extracted dir (it defers
 	// RemoveAll). Don't do that here — the lifecycle crosses this
@@ -152,13 +155,13 @@ func (s *server) scanService(
 				"plan_token_stale",
 				"plan_token does not match uploaded source",
 				"re-run scan and apply in one flow"))
-			return nil, state.Project{}, nil, nil, api.ErrInternal("plan_token stale")
+			return nil, state.Project{}, nil, nil, nil, api.ErrInternal("plan_token stale")
 		}
 	}
 
 	result, scanErr := reposcan.Scan(os.DirFS(req.ScanDir))
 	if scanErr != nil {
-		return nil, state.Project{}, nil, nil, api.NewProblem(
+		return nil, state.Project{}, nil, nil, nil, api.NewProblem(
 			http.StatusBadRequest, api.CodeSourceInvalid,
 			"Scan failed", scanErr.Error())
 	}
@@ -204,7 +207,7 @@ func (s *server) scanService(
 	// pre-check (no Tx here — the store is authoritative).
 	observedApps, appCountErr := s.store.CountDeployedApps(r.Context(), acct.ID)
 	if appCountErr != nil {
-		return nil, state.Project{}, nil, nil, api.ErrInternal(
+		return nil, state.Project{}, nil, nil, nil, api.ErrInternal(
 			fmt.Sprintf("count apps: %v", appCountErr))
 	}
 	observedCrons := countAccountCrons(r.Context(), s, acct.ID)
@@ -243,7 +246,7 @@ func (s *server) scanService(
 	if planToken == "" {
 		tok, mintErr := mintPlanToken(acct.ID, req.ProjectSlug, req.SourceSHA256)
 		if mintErr != nil {
-			return nil, state.Project{}, nil, nil, api.ErrInternal(
+			return nil, state.Project{}, nil, nil, nil, api.ErrInternal(
 				fmt.Sprintf("mint plan_token: %v", mintErr))
 		}
 		resp.PlanToken = tok
@@ -252,7 +255,7 @@ func (s *server) scanService(
 	}
 
 	if !apply {
-		return resp, state.Project{}, nil, nil, nil
+		return resp, state.Project{}, nil, nil, nil, nil
 	}
 
 	// Apply path (PR-G, repo decomposition Phase 5): route every
@@ -279,7 +282,7 @@ func (s *server) scanService(
 			prob = api.ErrPlanCronQuota(acct.Plan, "account",
 				limits.CronLimitPerAccount, observedCrons+len(crons))
 		}
-		return resp, state.Project{}, nil, nil, prob
+		return resp, state.Project{}, nil, nil, nil, prob
 	}
 
 	project := state.Project{
@@ -313,7 +316,7 @@ func (s *server) scanService(
 		default:
 			prob = api.ErrInternal(fmt.Sprintf("create project: %v", projErr))
 		}
-		return resp, state.Project{}, nil, nil, prob
+		return resp, state.Project{}, nil, nil, nil, prob
 	}
 	project = created
 
@@ -359,12 +362,44 @@ func (s *server) scanService(
 			} else {
 				prob = api.NewProblem(mapped.Status, mapped.Code, mapped.Msg, "")
 			}
-			return resp, state.Project{}, nil, nil, prob
+			return resp, state.Project{}, nil, nil, nil, prob
 		}
 		// mapReconcileError returned nil for nil err — unreachable
 		// here, but defensively pass through as 500.
-		return resp, state.Project{}, nil, nil, api.ErrInternal(
-			fmt.Sprintf("reconcile: %v", recErr))
+		prob := api.ErrInternal(fmt.Sprintf("reconcile: %v", recErr))
+		return resp, state.Project{}, nil, nil, nil, prob
+	}
+
+	// Compute removed slugs. rec.Removed is a list of IDs; the
+	// handler needs slugs to soft-delete the corresponding crons
+	// (workloads dropped from the scan no longer appear in
+	// resp.Crons so the slug→ID lookup in handlers_decompose.go
+	// returns empty — without removedSlugs the handler would 500
+	// on a removed workload that previously had a cron). We
+	// resolve slug from the (now-deleted) rec.Added ∪ rec.Changed
+	// maps via the inverse map below.
+	removedSlugs := make([]string, 0, len(rec.Removed))
+	if len(rec.Removed) > 0 {
+		// removedSlugByID is keyed by the pre-remove app ID.
+		// Build it BEFORE reconcile so we capture the slug of
+		// every app that the scan dropped. The state.App rows
+		// we look at are the project's pre-reconcile member
+		// list (read-only); reconcile's removal happens
+		// downstream of this lookup.
+		existingApps, lerr := s.store.AppsForProject(r.Context(), acct.ID, project.ID)
+		if lerr != nil {
+			prob := api.ErrInternal(fmt.Sprintf("load existing apps: %v", lerr))
+			return resp, state.Project{}, nil, nil, nil, prob
+		}
+		idToSlug := make(map[string]string, len(existingApps))
+		for _, a := range existingApps {
+			idToSlug[a.ID] = a.Slug
+		}
+		for _, id := range rec.Removed {
+			if slug, ok := idToSlug[id]; ok {
+				removedSlugs = append(removedSlugs, slug)
+			}
+		}
 	}
 
 	// Fold the reconcile Result into the legacy return shape. The
@@ -374,11 +409,12 @@ func (s *server) scanService(
 	//  - build the slug→ID map for cron stamping (added ∪ changed)
 	//  - emit per-app NotifyAppChanged with kind=created for
 	//    rec.Added entries and kind=updated for rec.Changed entries
+	//  - soft-delete crons whose workload_name is in removedSlugs
 	//
 	// Each slice carries post-insert/post-update rows with valid
 	// IDs (reconcile's CreateAppIfUnderQuota stamps ID + CreatedAt;
 	// UpdateApp stamps UpdatedAt).
-	return resp, project, rec.Added, rec.Changed, nil
+	return resp, project, rec.Added, rec.Changed, removedSlugs, nil
 }
 
 // parseScanMultipart reads the multipart body, spools, validates, and
