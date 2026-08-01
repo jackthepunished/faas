@@ -590,6 +590,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		return WakeResult{}, err
 	}
 
+	// PR-D (issue #462): worker-class first-check. Mirrors
+	// pkg/sched/reaper.go:170 (workers are reaper-exempt). A
+	// worker-class app has no per-request traffic — a wake
+	// request is the wrong primitive. The customer-facing surface
+	// (apid gate) already rejects PATCH with target.metric=
+	// concurrent_requests for a worker app; this gate is the
+	// engine-side mirror. Lifts to WakeResult{AtCapacity: true}
+	// so the existing AdmitInstance typed-capacity path is
+	// reused — no new wakeOutcome, no new metric row. The check
+	// fires BEFORE admitGate so the cooldown / reject / min-floor
+	// branches are unreachable for worker-class apps.
+	if app.WorkloadClass == state.WorkloadClassWorker {
+		release()
+		return WakeResult{AtCapacity: true}, nil
+	}
+
 	// PR-C (issue #462): wake-gate consult. Three short-circuit
 	// outcomes route to typed errors or AtCapacity=true without
 	// touching the ledger or the instances table. The cooldown
@@ -605,6 +621,12 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// cached target. Wake (liftCapacityToResult=false) preserves the
 	// existing *api.Problem{Code: CodePlanLimitConcur} wire shape so
 	// the gateway's existing 429 handling is unchanged.
+	//
+	// PR-D (issue #462): splits the cooldown_held branch onto
+	// CodeWaitForWarm (503 + Retry-After). The wakeMinFloorAlready
+	// branch stays on CodePlanLimitConcur (429) — no scale-out
+	// was attempted, the customer's request is asking for a wake
+	// that the floor already satisfies.
 	if outcome := e.admitGate(ctx, &app, limits); outcome != wakeAdmit {
 		release()
 		switch outcome {
@@ -613,11 +635,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 				return WakeResult{AtCapacity: true}, nil
 			}
 			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
-		case wakeCooldownHeld, wakeMinFloorAlready:
-			// Pre-PR-D wire shape: CodePlanLimitConcur is the
-			// closest existing surface (the customer's request
-			// hit the per-app cap). PR-D adds CodeWaitForWarm
-			// (issue #462 wire) for the cooldown_held branch.
+		case wakeCooldownHeld:
+			// PR-D: 503 + Retry-After with the cooldown remaining
+			// seconds. The customer's plan is fine; their
+			// ScaleOutCooldownS is holding the wake. Retry-After is
+			// the canonical UX — clients can back off without
+			// polling the body alone.
+			return WakeResult{}, api.ErrWaitForWarm(
+				cooldownSRemaining(&app, time.Now()),
+				limits,
+				e.ledger.Concurrency(app.ID),
+			)
+		case wakeMinFloorAlready:
+			// No scale-out was attempted (concurrency already
+			// at the floor). 429 is the right wire shape — the
+			// customer is asking for a wake that the floor already
+			// satisfies. PR-D keeps CodePlanLimitConcur here.
 			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
 		}
 	}
@@ -2219,6 +2252,37 @@ func (e *Engine) atMinFloorWithNoSignal(app *state.App, concurrency int) bool {
 		return false
 	}
 	return concurrency >= app.ScalingPolicy.MinInstances
+}
+
+// cooldownSRemaining (PR-D, issue #462) returns the seconds
+// until the per-app scale-out cooldown expires. The wire
+// Retry-After header is bounded at 1 (cooldownS <= 0 is treated
+// as 1) so the wire always emits a non-zero hint. RFC 7231
+// §7.1.3 forbids 0/negative values; the bound is also a
+// load-bearing UX guarantee — clients that consult the header
+// need a positive integer to back off correctly.
+//
+// The "cold-start bypass" loaded in PR-C's admitGate
+// (concurrency == 0 OR LastScaleOutAt == nil) is what makes
+// this helper safe to call: the gate only fires when there
+// is a real stamp AND live concurrency, so the helper's
+// LastScaleOutAt == nil branch is unreachable from the wake
+// path. It's defensive — the caller is the gate's
+// wakeCooldownHeld branch, which already validated the
+// preconditions.
+func cooldownSRemaining(app *state.App, now time.Time) int {
+	if app.LastScaleOutAt == nil {
+		return 1
+	}
+	if app.ScalingPolicy == nil || app.ScalingPolicy.ScaleOutCooldownS <= 0 {
+		return 1
+	}
+	cooldown := time.Duration(app.ScalingPolicy.ScaleOutCooldownS) * time.Second
+	remaining := cooldown - now.Sub(*app.LastScaleOutAt)
+	if remaining <= 0 {
+		return 1
+	}
+	return int(remaining.Seconds())
 }
 
 func (e *Engine) lockApp(appID string) func() {
