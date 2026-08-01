@@ -67,6 +67,17 @@ type runDeps struct {
 	// existing app_changed consumer stays as the logging-only
 	// fallback. Tests inject a fake channel.
 	subscribeEgressDrift func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribePlacementClaim (Phase 2 / Gate A, migration 00084)
+	// is the producer-side seam for the app_changed consumer that
+	// atomically stamps apps.node_id via Engine.ClaimUnplaced.
+	// The original plan placed the chooser in apid; the depguard
+	// rule apid-control-plane-only forbids apid from importing
+	// pkg/sched, so the chooser moved here. apid writes apps with
+	// node_id = NULL; schedd races to stamp the owner on
+	// kind="created". nil = the subscriber is not started; the
+	// cold-start sweep still runs so an unplaced app from a prior
+	// run gets reconciled on boot.
+	subscribePlacementClaim func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
 	// for the 'compute_node_changed' pg_notify consumer that
 	// refreshes the in-memory NodeKeyRegistry on every relevant
@@ -122,6 +133,16 @@ func defaultDeps() runDeps {
 		// filters to kind="updated" internally — wider-list
 		// callers are safe.
 		subscribeEgressDrift: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
+		},
+		// Phase 2 / Gate A: subscribe to NotifyAppChanged and let
+		// PlacementClaimSubscriber filter to kind="created". The
+		// subscriber is a no-op on every other kind. The
+		// EgressDriftSubscriber above shares the same channel but
+		// filters to kind="updated"; widening the LISTEN across
+		// multiple subscribers is the canonical pattern (see
+		// subscribeEgressDrift comment).
+		subscribePlacementClaim: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
 		},
 		// Production wires db.Subscribe on the
@@ -517,6 +538,46 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		driftSub := sched.NewEgressDriftSubscriber(engine, vmmRouter, log)
 		go subscribeWithReconnect(ctx, "egress drift", log, deps.subscribeEgressDrift, pool, driftSub.Run)
 	}
+
+	// Phase 2 / Gate A (migration 00084): placement claim
+	// subscriber. The post-00084 schema lets apid insert apps
+	// with node_id = NULL; schedd races to stamp the owner on
+	// kind="created" via Engine.ClaimUnplaced. The
+	// EgressDriftSubscriber above shares the same channel but
+	// filters to kind="updated"; both run side-by-side. nil seam
+	// = skip in tests that don't want a fake channel; the
+	// cold-start sweep below still runs.
+	if deps.subscribePlacementClaim != nil {
+		claimSub := sched.NewPlacementClaimSubscriber(engine, log)
+		go subscribeWithReconnect(ctx, "placement claim", log, deps.subscribePlacementClaim, pool, claimSub.Run)
+	}
+
+	// Cold-start sweep: pg_notify is fire-and-forget, so a schedd
+	// that was down while an apid createApp landed missed the
+	// kind="created" notify. ListUnplacedApps at boot closes that
+	// gap (one tx per unplaced app, sub-second in steady state).
+	// Runs once, not per tick — the subscriber handles the live
+	// path. Errors are logged and dropped; the next notify (or the
+	// next schedd restart) is the next opportunity.
+	go func() {
+		apps, err := store.ListUnplacedApps(ctx)
+		if err != nil {
+			log.Warn("schedd: cold-start sweep: list unplaced apps", "err", err)
+			return
+		}
+		for _, a := range apps {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := engine.ClaimUnplaced(ctx, a.ID); err != nil {
+				log.Warn("schedd: cold-start sweep: claim", "app_id", a.ID, "err", err)
+				continue
+			}
+		}
+		if len(apps) > 0 {
+			log.Info("schedd: cold-start sweep: reconciled unplaced apps", "count", len(apps))
+		}
+	}()
 
 	// PR #114 / ADR-025 axis 3: per-node liveness sweep. Every
 	// `HeartbeatInterval` (default 30s) the heartbeat goroutine

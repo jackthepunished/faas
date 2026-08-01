@@ -99,19 +99,6 @@ func authorizeInstance(ctx context.Context, owner OwnerNodeID, resolver AppResol
 	return ins, nil
 }
 
-// mustOwnerID returns the owner id string with a nil-safe guard.
-// The schedd wiring resolves OwnerNodeID at startup; if it's
-// missing on a non-empty configuration, this returns an Internal
-// status error so a wiring bug surfaces as a 500 rather than a
-// silent FailedPrecondition.
-func mustOwnerID(owner OwnerNodeID) (string, error) {
-	if owner == "" {
-		return "", status.Error(codes.Internal,
-			"schedd: owner node id not configured; cmd/schedd must call ResolveLocalNodeID at startup")
-	}
-	return string(owner), nil
-}
-
 // String is a defensive accessor so log lines render the empty
 // case as "<legacy single-box>" rather than as a blank, which is
 // ambiguous when grepping for owner-related log entries.

@@ -15,6 +15,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// ScheddClient is the gateway-side interface a per-node schedd
+// router holds (Phase 2 / Gate A). Production wires it to *Client;
+// tests substitute a fake so the router doesn't need a real gRPC
+// dial. The surface is the union of every gRPC call gatewayd
+// makes against schedd: admit, wake, activity flush, log stream,
+// warmhint stream, close. Each method maps 1:1 to a method on
+// *Client, so any fake only needs to forward the same shape.
+type ScheddClient interface {
+	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error)
+	Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error)
+	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
+	ParkInstance(ctx context.Context, instanceID, reason string) error
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (LogStream, error)
+	StreamWarmHints(ctx context.Context) (WarmHintStream, error)
+	Close() error
+}
+
 // Client is gatewayd's handle to schedd's gRPC surface (ADR-018). It satisfies
 // the gateway.Scheduler shape (Wake) and carries the last_request_at flush
 // (ReportActivity) — schedd is the sole writer to `instances`, so the gateway
@@ -23,6 +40,12 @@ type Client struct {
 	conn *grpc.ClientConn
 	cli  scheddpb.ScheddClient
 }
+
+// compile-time assertion: *Client satisfies ScheddClient so the
+// per-node schedd router can type its cache as ScheddClient without
+// a wrapping shim. Add new methods to the ScheddClient surface as
+// they appear on *Client; the compiler will refuse to drift.
+var _ ScheddClient = (*Client)(nil)
 
 // Dial opens a lazy gRPC connection to schedd's unix socket. As with vmmd
 // (ADR-015) the socket's 0660/group-`faas` DAC is the only auth in v1.0, so the
