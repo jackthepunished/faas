@@ -54,7 +54,8 @@ type LogFrameSink func(LogFrame) error
 // InstanceID + Seq + Stream + Line + WrittenAt follow the Move 4
 // contract verbatim; the line-frame fields are unset on a gap
 // frame (the wire shape mirrors the vmmd response: Seq=0,
-// Stream="", Line="").
+// Stream="", Line=""). GapReason names the bound that triggered
+// the gap; meaningful only when IsGap is true.
 type LogFrame struct {
 	InstanceID     string
 	Seq            int64
@@ -63,6 +64,7 @@ type LogFrame struct {
 	WrittenAt      time.Time
 	IsGap          bool
 	GapToWrittenAt time.Time
+	GapReason      string
 }
 
 // StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B) is the
@@ -166,10 +168,7 @@ func (e *Engine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64
 					// this instance is done.
 					return
 				}
-				select {
-				case <-ctx.Done():
-					return
-				case ch <- LogFrame{
+				frame := LogFrame{
 					InstanceID:     ins.ID,
 					Seq:            line.Seq,
 					Stream:         line.Stream,
@@ -177,7 +176,24 @@ func (e *Engine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64
 					WrittenAt:      line.WrittenAt,
 					IsGap:          line.IsGap,
 					GapToWrittenAt: line.GapToWrittenAt,
-				}:
+					GapReason:      line.GapReason,
+				}
+				// Gap frames must NOT carry stale line-frame
+				// values from any prior frame that reused the
+				// same buffer (vmmdgrpc zero-initialises but we
+				// belt-and-brace here so a future transport
+				// change can't accidentally leak seq/line into
+				// a gap event).
+				if line.IsGap {
+					frame.Seq = 0
+					frame.Stream = ""
+					frame.Line = ""
+					frame.WrittenAt = time.Time{}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case ch <- frame:
 				}
 			}
 		}()

@@ -129,16 +129,19 @@ func StartSSE(w http.ResponseWriter) {
 // Reason is one of a small taxonomy: "seq_below_retained" (the
 // ring evicted older lines between attach and our first read),
 // "since_below_retained" (the since-time predates the oldest
-// surviving line). The SDK surface (pkg/api/sse.go::LogGapEvent)
-// mirrors these names verbatim.
+// surviving line). vmmdgrpc.Logs labels the frame at the producer
+// and schedd propagates the label verbatim through StreamAppLogs;
+// this renderer surfaces it as the wire payload's "reason" key.
+// The SDK surface (pkg/api/sse.go::LogGapEvent) mirrors these
+// names verbatim.
 func RenderAppLogGap(w http.ResponseWriter, flusher http.Flusher, f scheddgrpc.LogFrame, appID string, ops *wire.OpsMetrics) {
-	reason := "seq_below_retained"
-	if !f.GapToWrittenAt.IsZero() && f.GapToWrittenAt.Equal(f.WrittenAt) {
-		// same timestamp on both fields means the since-time
-		// bound, not the seq bound, narrowed the cursor. Both
-		// happen on attach so we surface the more informative
-		// "since_below_retained".
-		reason = "since_below_retained"
+	reason := f.GapReason
+	if reason == "" {
+		// Defensive default — a gap frame without a label means
+		// a pre-PR-B vmmd / schedd is upstream. Surface the
+		// broader "seq_below_retained" so the consumer still
+		// gets a meaningful, non-empty reason.
+		reason = "seq_below_retained"
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"reason":            reason,

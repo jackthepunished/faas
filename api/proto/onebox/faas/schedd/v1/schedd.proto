@@ -397,9 +397,10 @@ message StreamAppLogsRequest {
 // instance_id is the instance whose ring reported the gap; the
 // line-frame fields (seq/stream/line/written_at) are unset;
 // gap_to_written_at carries the host-side ingest time of the oldest
-// line that instance currently retains. Wire is additive per
-// ADR-016 — pre-PR-B clients receive is_gap=false and observe a
-// normal line frame.
+// line that instance currently retains; gap_reason names the bound
+// that triggered the gap ("seq_below_retained" or "since_below_retained").
+// Wire is additive per ADR-016 — pre-PR-B clients receive is_gap=false
+// and observe a normal line frame.
 //
 // Wire is additive: new fields go at the end. The seq/stream/line
 // triple mirrors vmmd's LogsResponse; written_at is the host-side
@@ -425,6 +426,9 @@ message StreamAppLogsResponse {
   // line the instance's ring currently retains; meaningful only on
   // is_gap=true frames.
   google.protobuf.Timestamp gap_to_written_at = 7;
+  // gap_reason is the bound that triggered the gap; meaningful only
+  // on is_gap=true frames. Mirrors vmmd's LogsResponse.gap_reason.
+  string gap_reason = 8;
 }
 
 // StreamWarmHintsRequest kicks off the sticky-warm affinity stream.

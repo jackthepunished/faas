@@ -65,6 +65,12 @@ func TestLogs_GapWhenSinceSeqBelowRetained(t *testing.T) {
 	if first.GetGapToWrittenAt() == nil {
 		t.Errorf("gap frame missing gap_to_written_at timestamp")
 	}
+	// Finding 1: the producer MUST label the frame with the bound
+	// that triggered the gap. The seq-bound branch is
+	// "seq_below_retained" (Finding 1's explicit discriminator).
+	if got := first.GetGapReason(); got != "seq_below_retained" {
+		t.Errorf("gap_reason = %q, want seq_below_retained", got)
+	}
 	// Drain the surviving lines (snap[0].Seq == LowestRetainedSeq
 	// so Snapshot(1) returns from the oldest retained onward) or
 	// observe io.EOF if eviction wiped them all. We bound this
@@ -205,5 +211,55 @@ func TestLogs_SinceWrittenAt_AppliesToReplay(t *testing.T) {
 	}
 	if count > 3 {
 		t.Errorf("count = %d, want ≤3 (the bound should narrow the replay)", count)
+	}
+}
+
+// TestLogs_GapWhenSinceWrittenAtBelowRetained pins Finding 1's
+// second producer branch: when the caller passes no since_seq
+// (live-tail sentinel) but the since_written_at bound predates
+// the ring's oldest retained line, vmmdgrpc MUST emit a labelled
+// gap frame with reason="since_below_retained". The schedd-side
+// fan-out + RenderAppLogGap rely on this label to render a
+// meaningful diagnostic instead of guessing between the two
+// possible bounds.
+//
+// The test seeds one line BEFORE opening the stream so the ring
+// has a non-zero head_written_at (the producer's gap check is
+// gated on headAt non-zero + headAt.After(bound)). SinceSeq=0
+// skips the initial-page loop; we don't assert on a survivor
+// because Subscribe only delivers lines committed AFTER attach,
+// and that's a property of the ring, not the gap logic.
+func TestLogs_GapWhenSinceWrittenAtBelowRetained(t *testing.T) {
+	ring := logbuf.New(1 << 20)
+	// One line so head_written_at is non-zero at attach time.
+	if _, err := ring.Write("stdout", []byte("alpha\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Anchor a bound strictly older than the ring's head line so
+	// the producer's headAt.After(bound) check fires.
+	bound := time.Now().Add(-1 * time.Hour)
+	cl := startLogsTestClient(t, &fakeVMM{
+		logRingFn: func(string) *logbuf.Ring { return ring },
+	})
+	stream, err := cl.Logs(context.Background(), &vmmdpb.LogsRequest{
+		Instance:       "inst-1",
+		SinceSeq:       0, // live-tail sentinel
+		SinceWrittenAt: timestamppb.New(bound),
+	})
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("stream.Recv[0]: %v", err)
+	}
+	if !first.GetIsGap() {
+		t.Fatalf("first frame is_gap = false; want gap frame (since_time < oldest retained); got %+v", first)
+	}
+	if got := first.GetGapReason(); got != "since_below_retained" {
+		t.Errorf("gap_reason = %q, want since_below_retained", got)
+	}
+	if first.GetGapToWrittenAt() == nil {
+		t.Errorf("gap frame missing gap_to_written_at timestamp")
 	}
 }

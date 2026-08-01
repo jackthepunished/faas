@@ -171,13 +171,12 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 	// Free customers (LogDeploymentFilterMax == 0) get a hard
 	// rejection; Hobby+ may scope to N deployments per the per-plan
 	// table in pkg/api/limits.go. The wire surface today is
-	// single-valued so we compare directly against the cap.
+	// single-valued so we compare directly against the cap. The
+	// rejection is a one-liner that delegates to enforceDeploymentFilter
+	// so the plan-gate rule has its own whitebox coverage without
+	// needing to drive the full Auth + Store chain.
 	if deploymentID != "" {
-		max := acct.Plan.LogDeploymentFilterMax()
-		if max == 0 {
-			apislogs.StartSSE(w)
-			flusher, _ := w.(http.Flusher)
-			apislogs.WritePlanDeploymentFilterNotAllowedError(w, flusher, max)
+		if !enforceDeploymentFilter(w, acct.Plan) {
 			return
 		}
 	}
@@ -332,4 +331,27 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 type recvResult struct {
 	frame scheddgrpc.LogFrame
 	err   error
+}
+
+// enforceDeploymentFilter writes the
+// plan_deployment_filter_not_allowed SSE error frame and returns
+// false when the customer's plan is not allowed to scope logs by
+// deployment. Returns true (no write, no early-out) when the
+// customer is on Hobby/Pro/Scale (whose per-plan cap is > 0) and
+// must therefore not be gated.
+//
+// Extracted from stream() so the plan-gate rule has its own
+// whitebox coverage (TestServeAppLogs_FreeRejectsDeploymentFilter
+// + the Hobby-allowed sibling) without standing up the full Auth
+// + Store chain — same whitebox-seam pattern as
+// runServeAppLogs/safeBuffer elsewhere in this package.
+func enforceDeploymentFilter(w http.ResponseWriter, plan api.Plan) bool {
+	max := plan.LogDeploymentFilterMax()
+	if max > 0 {
+		return true
+	}
+	apislogs.StartSSE(w)
+	flusher, _ := w.(http.Flusher)
+	apislogs.WritePlanDeploymentFilterNotAllowedError(w, flusher, max)
+	return false
 }

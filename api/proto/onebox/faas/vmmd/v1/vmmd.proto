@@ -677,10 +677,13 @@ message LogsRequest {
 // true, seq/stream/line/written_at are unset; gap_to_written_at
 // carries the host-side ingest time of the OLDEST line the ring
 // currently retains so the client can render a meaningful
-// "you missed lines whose newest retained time is X" message. When
-// false, the line fields follow the pre-PR-B contract. Wire is
-// additive per ADR-016 — old clients ignore is_gap and receive
-// normal line frames.
+// "you missed lines whose newest retained time is X" message.
+// gap_reason names the bound that triggered the gap: "seq_below_retained"
+// when since_seq sits below the ring's lowest retained Seq,
+// "since_below_retained" when the since_written_at timestamp predates
+// the oldest surviving line. When false, the line fields follow the
+// pre-PR-B contract. Wire is additive per ADR-016 — old clients
+// ignore is_gap and receive normal line frames.
 message LogsResponse {
   int64 seq = 1;
   string stream = 2;
@@ -688,6 +691,7 @@ message LogsResponse {
   google.protobuf.Timestamp written_at = 4;
   bool is_gap = 5;
   google.protobuf.Timestamp gap_to_written_at = 6;
+  string gap_reason = 7;
 }
 
 // MountParentExt4ReadOnlyRequest (ADR-053) is the input to

@@ -13,31 +13,13 @@ import (
 
 // LogFrame is the transport-neutral mirror of
 // scheddpb.StreamAppLogsResponse (ADR-043 / Move 4 acceptance #5).
-// Owned by pkg/scheddgrpc so callers don't reach into the generated
-// protobuf package — cmd/apid's private schedLogFrame is a separate
-// type to keep the apid/server.go interface decoupled from this one.
+// Type-aliased to sched.LogFrame in pkg/scheddgrpc/server.go so
+// there is exactly ONE struct definition to keep in sync when
+// additive gap fields land — the wire encode/decode + the Recv
+// adapter that surfaces this typed frame live here.
 //
 // instance_id is empty on the synthetic terminal frame (none emitted
 // by Move 4 today; reserved for a future "end" marker).
-//
-// IsGap (issue #517 / PR-B acceptance #4) is true only on the
-// synthetic "cursor fell below the ring's high-water mark" frame
-// emitted by schedd when vmmd reports a gap. Wire is additive per
-// ADR-016; pre-PR-B consumers that ignore IsGap see only line
-// frames.
-//
-// GapToWrittenAt is meaningful only when IsGap is true; it carries
-// the host-side ingest time of the OLDEST line the per-instance
-// ring currently retains.
-type LogFrame struct {
-	InstanceID     string
-	Seq            int64
-	Stream         string
-	Line           string
-	WrittenAt      time.Time
-	IsGap          bool
-	GapToWrittenAt time.Time
-}
 
 // LogStream is the per-app log stream returned by Client.StreamAppLogs.
 // Recv blocks until the next frame or the stream ends. A successful
@@ -110,8 +92,9 @@ var _ LogStream = (*logStreamAdapter)(nil)
 //
 // On a gap frame (issue #517 / PR-B acceptance #4) the line-frame
 // fields are zero and IsGap is true. GapToWrittenAt carries the
-// ring's head-line WrittenAt so the caller can render a
-// meaningful diagnostic.
+// ring's head-line WrittenAt and GapReason names the bound that
+// triggered the gap, so the caller can render a meaningful
+// diagnostic without guessing.
 func (a *logStreamAdapter) Recv() (LogFrame, error) {
 	resp, err := a.inner.Recv()
 	if err != nil {
@@ -129,6 +112,7 @@ func (a *logStreamAdapter) Recv() (LogFrame, error) {
 		Stream:     resp.GetStream(),
 		Line:       resp.GetLine(),
 		IsGap:      resp.GetIsGap(),
+		GapReason:  resp.GetGapReason(),
 	}
 	if t := resp.GetWrittenAt(); t != nil {
 		frame.WrittenAt = t.AsTime()

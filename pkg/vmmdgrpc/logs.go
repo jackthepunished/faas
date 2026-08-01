@@ -92,11 +92,29 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	//
 	// The condition is gated on `since_seq > 0` because the "0 =
 	// tail from now" sentinel must NOT trigger a gap frame on an
-	// empty ring (the caller asked to skip the initial page).
+	// empty ring (the caller asked to skip the initial page). When
+	// only the since_written_at bound could have triggered a gap
+	// (i.e. the caller did not pass since_seq, or the ring's lowest
+	// seq still covers it), we label the frame
+	// "since_below_retained" so the consumer can render a meaningful
+	// diagnostic instead of guessing.
 	if req.GetSinceSeq() > 0 {
 		lowest := ring.LowestRetainedSeq()
 		if lowest > 0 && req.GetSinceSeq() < lowest {
-			if err := stream.Send(gapResponse(ring.HeadWrittenAt())); err != nil {
+			if err := stream.Send(gapResponse(ring.HeadWrittenAt(), "seq_below_retained")); err != nil {
+				sendErr = err
+				return err
+			}
+		}
+	} else if !req.GetSinceWrittenAt().AsTime().IsZero() {
+		// since_seq omitted (live-tail sentinel) but a since-time
+		// bound was passed AND the ring's oldest retained line is
+		// strictly newer than the caller's bound: the caller asked
+		// "give me everything since T" and the ring has nothing that
+		// old. Surface an explicit gap frame labelled with the bound.
+		headAt := ring.HeadWrittenAt()
+		if !headAt.IsZero() && headAt.After(req.GetSinceWrittenAt().AsTime()) {
+			if err := stream.Send(gapResponse(headAt, "since_below_retained")); err != nil {
 				sendErr = err
 				return err
 			}
@@ -156,12 +174,16 @@ func lineToPb(l logbuf.Line) *vmmdpb.LogsResponse {
 // gapResponse builds the synthetic "cursor fell below the ring's
 // high-water mark" frame (issue #517 / PR-B acceptance #4). The
 // Seq/Stream/Line/WrittenAt line-frame fields are zero on the wire;
-// is_gap is true and gap_to_written_at carries the head line's
-// host-side ingest time so the client can render a meaningful
-// diagnostic. Wire shape mirrors the additive `is_gap` field PR-B
-// introduced — pre-PR-B consumers ignore it.
-func gapResponse(headAt time.Time) *vmmdpb.LogsResponse {
-	resp := &vmmdpb.LogsResponse{IsGap: true}
+// is_gap is true, gap_to_written_at carries the head line's host-side
+// ingest time so the client can render a meaningful diagnostic, and
+// gap_reason names the bound that triggered the gap ("seq_below_retained"
+// when the since_seq cursor is older than the ring's lowest retained
+// seq, "since_below_retained" when the since_written_at cursor is
+// older than the ring's oldest retained line). Wire shape mirrors
+// the additive `is_gap` field PR-B introduced — pre-PR-B consumers
+// ignore it.
+func gapResponse(headAt time.Time, reason string) *vmmdpb.LogsResponse {
+	resp := &vmmdpb.LogsResponse{IsGap: true, GapReason: reason}
 	if !headAt.IsZero() {
 		resp.GapToWrittenAt = timestamppb.New(headAt)
 	}

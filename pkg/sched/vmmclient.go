@@ -135,6 +135,13 @@ type LogStream interface {
 // currently retains so upstream consumers can render a
 // meaningful "you missed lines whose newest retained time is X"
 // message.
+//
+// GapReason names the bound that triggered the gap; meaningful
+// only when IsGap is true. vmmdgrpc.Logs sets it to
+// "seq_below_retained" when the caller's since_seq cursor is older
+// than the ring's lowest retained seq, or "since_below_retained"
+// when the caller's since_written_at cursor is older than the
+// ring's oldest retained line. Empty on line frames.
 type LogLine struct {
 	Seq            int64
 	Stream         string
@@ -142,6 +149,7 @@ type LogLine struct {
 	WrittenAt      time.Time
 	IsGap          bool
 	GapToWrittenAt time.Time
+	GapReason      string
 }
 
 // PingOutcome is the sched-side view of vmmdpb.PingResponse.
@@ -549,18 +557,20 @@ type grpcLogStream struct {
 //
 // On a gap frame (issue #517 / PR-B acceptance #4) the line-frame
 // fields (Seq/Stream/Line/WrittenAt) are zero and IsGap is true.
-// GapToWrittenAt carries the ring's head-line WrittenAt so the
-// upstream consumer can surface a meaningful diagnostic.
+// GapToWrittenAt carries the ring's head-line WrittenAt and
+// GapReason names the bound that triggered the gap, so the upstream
+// consumer can surface a meaningful diagnostic without guessing.
 func (s *grpcLogStream) Recv() (LogLine, error) {
 	resp, err := s.cli.Recv()
 	if err != nil {
 		return LogLine{}, err
 	}
 	line := LogLine{
-		Seq:    resp.GetSeq(),
-		Stream: resp.GetStream(),
-		Line:   resp.GetLine(),
-		IsGap:  resp.GetIsGap(),
+		Seq:       resp.GetSeq(),
+		Stream:    resp.GetStream(),
+		Line:      resp.GetLine(),
+		IsGap:     resp.GetIsGap(),
+		GapReason: resp.GetGapReason(),
 	}
 	if t := resp.GetWrittenAt(); t != nil {
 		line.WrittenAt = t.AsTime()

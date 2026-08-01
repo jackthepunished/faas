@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -416,3 +417,66 @@ func TestServeAppLogs_NotFoundDelegatesToRenderAppLogsError(t *testing.T) {
 // suppress unused-import warnings when io.EOF is no longer
 // referenced directly inside this file's tests after refactors.
 var _ = io.EOF
+
+// --- plan-gate tests (issue #517 / PR-B, AC3) -----------------------
+//
+// enforceDeploymentFilter is the package-private helper extracted
+// from stream() so the per-plan cap has direct whitebox coverage
+// without standing up the full Auth + Store chain. These tests
+// pin the contract:
+//
+//   - Free (LogDeploymentFilterMax == 0): writes the SSE error
+//     frame and returns false so stream() short-circuits.
+//   - Hobby / Pro / Scale (>0): no write, returns true.
+//
+// The wire shape is asserted via the flusherRecorder body so the
+// stable SSE code "plan_deployment_filter_not_allowed" + the
+// `event: error` framing both ship.
+
+func TestEnforceDeploymentFilter_FreeRejects(t *testing.T) {
+	rec := newFlusherRecorder()
+	allowed := enforceDeploymentFilter(rec, api.PlanFree)
+	if allowed {
+		t.Fatal("Free plan must be rejected (cap=0)")
+	}
+	body := rec.body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("missing event: error frame: %q", body)
+	}
+	if !strings.Contains(body, "plan_deployment_filter_not_allowed") {
+		t.Errorf("missing stable code: %q", body)
+	}
+	if !strings.Contains(body, "max=0") {
+		t.Errorf("missing cap in message (max=0 for Free): %q", body)
+	}
+}
+
+func TestEnforceDeploymentFilter_HobbyAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanHobby) {
+		t.Fatal("Hobby plan must be allowed (cap=1)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Hobby must not write any frame, got %q", got)
+	}
+}
+
+func TestEnforceDeploymentFilter_ProAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanPro) {
+		t.Fatal("Pro plan must be allowed (cap=10)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Pro must not write any frame, got %q", got)
+	}
+}
+
+func TestEnforceDeploymentFilter_ScaleAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanScale) {
+		t.Fatal("Scale plan must be allowed (cap=50)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Scale must not write any frame, got %q", got)
+	}
+}

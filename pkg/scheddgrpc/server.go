@@ -76,6 +76,21 @@ type WarmHintSink = sched.WarmHintSink
 // per-node table via this sink.
 type CapacitySink = sched.CapacitySink
 
+// LogFrame is the transport-neutral mirror of
+// scheddpb.StreamAppLogsResponse (ADR-043 / Move 4 acceptance #5).
+// Type-aliased to sched.LogFrame so there is exactly ONE struct
+// definition to keep in sync when new additive gap fields land
+// (issue #517 / PR-B adds IsGap / GapToWrittenAt / GapReason). The
+// scheddgrpc package still owns the wire encode/decode + the
+// Recv adapter that surfaces this typed frame to callers; the
+// struct itself lives in pkg/sched where the per-instance
+// goroutine constructs it.
+//
+// Pre-aliased callers (pkg/apislogs.RenderAppLogEvent,
+// pkg/apislogs.RenderAppLogGap, cmd/gatewayd) need no change:
+// scheddgrpc.LogFrame and sched.LogFrame are the same type.
+type LogFrame = sched.LogFrame
+
 // mapStreamErr translates a non-nil Recv / engine-drain
 // error into the wire codes the gateway / vmmd reconnect
 // loops speak. Used by StreamWarmHints and ReportCapacity
@@ -459,6 +474,7 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 			resp := &scheddpb.StreamAppLogsResponse{
 				InstanceId: f.InstanceID,
 				IsGap:      true,
+				GapReason:  f.GapReason,
 			}
 			if !f.GapToWrittenAt.IsZero() {
 				resp.GapToWrittenAt = timestamppb.New(f.GapToWrittenAt)
