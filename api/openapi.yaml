@@ -69,6 +69,12 @@ tags:
     description: Customer-facing security event timeline (IAM-4, ADR-035). Append-only; read-only.
   - name: secrets
     description: Per-app sealed secrets (sealed at rest).
+  - name: registry
+    description: |
+      Per-app private-registry Basic Auth credentials (issue #461 / ADR-062).
+      Password is sealed at rest with secretbox under the host X25519
+      recipient (namespace `registry_creds`); imaged transiently unseals
+      in the pull path. The plaintext never lands in PG.
   - name: env
     description: |
       Per-app plaintext env vars (issue #395, ADR-045). Non-sensitive

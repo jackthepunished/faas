@@ -122,12 +122,20 @@ func TestRegistryAuth_E2E_PutGetDeleteRoundTrip_RealSeal(t *testing.T) {
 	// host key is "<ip>:<port>" because pkg/oci.Reference.APIHost
 	// surfaces port. apid normalizes to lowercase + no scheme +
 	// no trailing slash; port preserved.
+	//
+	// apid's HTTPS-only validator (ADR-062 C1) requires an explicit
+	// `https://` prefix on PUT/DELETE; the FakeRegistry host returned
+	// here is `127.0.0.1:<port>`, so we prefix with `https://` before
+	// sending and then keep the un-prefixed form for the storage
+	// round-trip / DELETE query param (apid re-normalises on the way
+	// in and drops the scheme for storage).
 	registryHost := fr.Host()
+	registryURL := "https://" + registryHost
 
 	// PUT — happy path. Password = the marker; if any layer
 	// accidentally echoes the plaintext, the body-scans below fire.
 	putReq := api.PutAppRegistryCredentialRequest{
-		Registry: registryHost,
+		Registry: registryURL,
 		Username: user,
 		Password: pass,
 	}
@@ -247,7 +255,7 @@ func TestRegistryAuth_E2E_PutGetDeleteRoundTrip_RealSeal(t *testing.T) {
 	}
 
 	// DELETE — happy path.
-	delURL := "/v1/apps/registry-app/registry-credentials?registry=" + registryHost
+	delURL := "/v1/apps/registry-app/registry-credentials?registry=" + registryURL
 	_, code = doReq(t, h, key, http.MethodDelete, delURL, nil)
 	if code != http.StatusNoContent {
 		t.Fatalf("DELETE: %d", code)
