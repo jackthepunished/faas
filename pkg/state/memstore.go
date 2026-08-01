@@ -232,6 +232,11 @@ type MemStore struct {
 	// secrets is keyed by (app_id, key) per the schema's PRIMARY KEY.
 	// Value carries account_id for the ownership check on delete.
 	secrets map[secretKey]AppSecret
+	// registryCreds mirrors app_registry_credentials (issue #461 /
+	// ADR-062). Same composite-key shape as secrets/envs. Value
+	// carries account_id for the ownership check on delete and the
+	// cross-account ErrNotFound predicate in Get.
+	registryCreds map[registryCredKey]AppRegistryCredential
 	// envs is the plaintext app_envs mirror (issue #395 / ADR-045).
 	// Same composite-key shape as secrets; same ownership semantics.
 	envs map[envKey]AppEnv
@@ -322,6 +327,16 @@ type envKey struct {
 type trustedSignerKey struct {
 	AppID      string
 	SignerName string
+}
+
+// registryCredKey mirrors the app_registry_credentials UNIQUE
+// (app_id, registry) constraint. Registry is the normalized host
+// (lowercase, no scheme/path/trailing-slash, port preserved) — the
+// handler normalizes both at PUT and at imaged lookup so the same
+// key shape reaches the map regardless of caller.
+type registryCredKey struct {
+	AppID    string
+	Registry string
 }
 
 type idemEntry struct {
@@ -478,6 +493,7 @@ func NewMemStore() *MemStore {
 		// keeps the MemStore parity tests in lockstep.
 		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
 		secrets:              map[secretKey]AppSecret{},
+		registryCreds:        map[registryCredKey]AppRegistryCredential{},
 		envs:                 map[envKey]AppEnv{},
 		trustedSigners:       map[trustedSignerKey]AppTrustedSigner{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
@@ -5821,6 +5837,132 @@ func (m *MemStore) CountAppSecrets(_ context.Context, accountID, appID string) (
 	return n, nil
 }
 
+// --- per-app private-registry Basic Auth (issue #461 / ADR-062) -------------
+//
+// Mirror of the customer-secrets surface (lines 4479-4544) keyed by
+// (app_id, registry) instead of (app_id, key). Same ownership
+// semantics: row carries account_id for the cross-account ErrNotFound
+// predicate in Get and the GDPR/G6 cascade in DeleteAccount.
+//
+// The ciphertext payload (password) is age-sealed at the handler
+// layer; MemStore treats it as opaque bytes and never inspects,
+// formats, or logs it.
+
+// UpsertAppRegistryCredential inserts or replaces the
+// (account_id, app_id, registry) row. updated_at is bumped on every
+// call so imaged's MarkAppRegistryCredentialUsed check sees a fresh
+// mtime; created_at is preserved across re-puts (same shape as
+// UpsertAppSecret).
+//
+// Note: MemStore intentionally does NOT validate that appID belongs
+// to accountID (the FK lives in SQL, not the in-memory check). The
+// existing UpsertAppSecret follows the same posture; cross-account
+// staging surfaces via Get/List/delete, which DO check ownership.
+func (m *MemStore) UpsertAppRegistryCredential(_ context.Context, accountID, appID, registry, username string, passwordEncrypted []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := registryCredKey{AppID: appID, Registry: registry}
+	now := time.Now().UTC()
+	existing, ok := m.registryCreds[k]
+	if !ok {
+		m.registryCreds[k] = AppRegistryCredential{
+			AccountID:         accountID,
+			AppID:             appID,
+			Registry:          registry,
+			Username:          username,
+			PasswordEncrypted: passwordEncrypted,
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		}
+		return nil
+	}
+	existing.Username = username
+	existing.PasswordEncrypted = passwordEncrypted
+	existing.UpdatedAt = now
+	m.registryCreds[k] = existing
+	return nil
+}
+
+// GetAppRegistryCredential returns the row for (app_id, registry).
+// Returns ErrNotFound if the row doesn't exist or the
+// (accountID, appID) ownership doesn't match — defense in depth so a
+// stale ID→slug mapping can't cross accounts.
+func (m *MemStore) GetAppRegistryCredential(_ context.Context, accountID, appID, registry string) (AppRegistryCredential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.registryCreds[registryCredKey{AppID: appID, Registry: registry}]
+	if !ok || row.AccountID != accountID || row.AppID != appID {
+		return AppRegistryCredential{}, ErrNotFound
+	}
+	return row, nil
+}
+
+// ListAppRegistryCredentials returns every (registry, username,
+// ciphertext) row on the app, ordered by registry ASC for
+// deterministic wire output. The handler renders registry +
+// username + timestamps only — ciphertext stays server-side.
+func (m *MemStore) ListAppRegistryCredentials(_ context.Context, accountID, appID string) ([]AppRegistryCredential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]AppRegistryCredential, 0)
+	for _, r := range m.registryCreds {
+		if r.AccountID == accountID && r.AppID == appID {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Registry < out[j].Registry })
+	return out, nil
+}
+
+// DeleteAppRegistryCredential removes the (app_id, registry) row.
+// Returns ErrNotFound if the row doesn't exist or ownership doesn't
+// match — mirrors DeleteAppSecret's 400-by-design posture.
+func (m *MemStore) DeleteAppRegistryCredential(_ context.Context, accountID, appID, registry string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := registryCredKey{AppID: appID, Registry: registry}
+	row, ok := m.registryCreds[k]
+	if !ok || row.AccountID != accountID || row.AppID != appID {
+		return ErrNotFound
+	}
+	delete(m.registryCreds, k)
+	return nil
+}
+
+// CountAppRegistryCredentials is the quota check helper. Mirrors
+// PgStore.CountAppRegistryCredentials.
+func (m *MemStore) CountAppRegistryCredentials(_ context.Context, accountID, appID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.registryCreds {
+		if r.AppID == appID && r.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MarkAppRegistryCredentialUsed updates last_used_at + updated_at to
+// now(). Returns ErrNotFound if the row doesn't exist or ownership
+// doesn't match — callers MUST treat ErrNotFound as non-fatal (the
+// deployment already succeeded; missing-on-cascade is an expected
+// race with account/app delete).
+func (m *MemStore) MarkAppRegistryCredentialUsed(_ context.Context, accountID, appID, registry string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := registryCredKey{AppID: appID, Registry: registry}
+	row, ok := m.registryCreds[k]
+	if !ok || row.AccountID != accountID || row.AppID != appID {
+		return ErrNotFound
+	}
+	now := time.Now().UTC()
+	row.LastUsedAt = &now
+	row.UpdatedAt = now
+	m.registryCreds[k] = row
+	return nil
+}
+
 // --- app env vars (issue #395 / ADR-045) -------------------------------------
 //
 // Mirror of the customer-secrets surface (lines 4479-4544) minus the
@@ -6034,6 +6176,11 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	for k := range m.secrets {
 		if m.secrets[k].AccountID == id {
 			delete(m.secrets, k)
+		}
+	}
+	for k := range m.registryCreds {
+		if m.registryCreds[k].AccountID == id {
+			delete(m.registryCreds, k)
 		}
 	}
 	for k := range m.envs {

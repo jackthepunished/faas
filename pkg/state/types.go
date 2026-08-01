@@ -1601,6 +1601,46 @@ type AppTrustedSigner struct {
 	AddedByAccountID string
 }
 
+// AppRegistryCredential is one row of per-app private-registry Basic
+// Auth (issue #461 / ADR-062). apid is the only writer (the PUT
+// handler in cmd/apid/handlers_registry_auth.go). imaged is the only
+// reader (pkg/imaged/handler.go::buildImageLayer looks up by
+// (accountID, appID, registryHost) and unseals transiently in the
+// pull call frame — plaintext lives only in that frame and is GC'd
+// on return).
+//
+// PasswordEncrypted is the age-sealed bytea produced by
+// pkg/secretbox.SealBytes with namespace="registry_creds". Username
+// is metadata (not a secret) and stays in plaintext, mirroring the
+// AppSecret precedent where each value is sealed independently and
+// metadata is not. The plaintext password NEVER appears in any slog
+// field, audit payload, error string, or HTTP response.
+//
+// Registry is the normalized host the customer supplied (lowercase,
+// no scheme, no path, no trailing slash, port preserved — see
+// apid's normalizeRegistryHost helper). Storage stores the
+// normalized form; the imaged lookup normalizes again before the
+// SQL query.
+//
+// LastUsedAt is updated by imaged after a successful authenticated
+// pull. It's telemetry, not gating; failure to update it is warned
+// but not fatal to the deployment.
+//
+// AccountID is the row's owning account. Both PgStore and MemStore
+// filter on (AccountID, AppID, Registry) so cross-account access
+// returns ErrNotFound.
+type AppRegistryCredential struct {
+	ID                string
+	AccountID         string
+	AppID             string
+	Registry          string
+	Username          string
+	PasswordEncrypted []byte
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	LastUsedAt        *time.Time
+}
+
 // ProjectScanSource is the discoverer that produced the project's
 // current scan (ADR-050 §3, docs/repo_decomposition_implementation.md
 // §2). The stable set is closed by projects_scan_source_chk on the
