@@ -69,6 +69,14 @@ class AppResponse:
     require_signed: bool | Unset = UNSET
     """Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a
     valid signature from a publisher in the per-app trusted_signers list. Default false."""
+    warm_snapshot_enabled: bool | Unset = UNSET
+    """Per-app two-tier snapshot flag (issue #470 / ADR-055). True on Pro/Scale by default; Free/Hobby always
+    false."""
+    warm_snapshot_min_requests: int | Unset = UNSET
+    """Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."""
+    warm_snapshot_min_ms: int | Unset = UNSET
+    """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
+    [100, 60000]."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -138,6 +146,12 @@ class AppResponse:
 
         require_signed = self.require_signed
 
+        warm_snapshot_enabled = self.warm_snapshot_enabled
+
+        warm_snapshot_min_requests = self.warm_snapshot_min_requests
+
+        warm_snapshot_min_ms = self.warm_snapshot_min_ms
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -171,6 +185,12 @@ class AppResponse:
             field_dict["last_scale_in_at"] = last_scale_in_at
         if require_signed is not UNSET:
             field_dict["require_signed"] = require_signed
+        if warm_snapshot_enabled is not UNSET:
+            field_dict["warm_snapshot_enabled"] = warm_snapshot_enabled
+        if warm_snapshot_min_requests is not UNSET:
+            field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
+        if warm_snapshot_min_ms is not UNSET:
+            field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
 
         return field_dict
 
@@ -275,6 +295,12 @@ class AppResponse:
 
         require_signed = d.pop("require_signed", UNSET)
 
+        warm_snapshot_enabled = d.pop("warm_snapshot_enabled", UNSET)
+
+        warm_snapshot_min_requests = d.pop("warm_snapshot_min_requests", UNSET)
+
+        warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -295,6 +321,9 @@ class AppResponse:
             last_scale_out_at=last_scale_out_at,
             last_scale_in_at=last_scale_in_at,
             require_signed=require_signed,
+            warm_snapshot_enabled=warm_snapshot_enabled,
+            warm_snapshot_min_requests=warm_snapshot_min_requests,
+            warm_snapshot_min_ms=warm_snapshot_min_ms,
         )
 
         app_response.additional_properties = d

@@ -54,5 +54,17 @@ export type AppResponse = {
    * Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a valid signature from a publisher in the per-app trusted_signers list. Default false.
    */
   require_signed?: boolean;
+  /**
+   * Per-app two-tier snapshot flag (issue #470 / ADR-055). True on Pro/Scale by default; Free/Hobby always false.
+   */
+  warm_snapshot_enabled?: boolean;
+  /**
+   * Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100].
+   */
+  warm_snapshot_min_requests?: number;
+  /**
+   * Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000].
+   */
+  warm_snapshot_min_ms?: number;
 };
 

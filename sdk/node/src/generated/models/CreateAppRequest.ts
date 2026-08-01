@@ -16,5 +16,17 @@ export type CreateAppRequest = {
    * Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471).
    */
   streaming_enabled?: boolean;
+  /**
+   * Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected.
+   */
+  warm_snapshot_enabled?: boolean;
+  /**
+   * Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100].
+   */
+  warm_snapshot_min_requests?: number;
+  /**
+   * Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000].
+   */
+  warm_snapshot_min_ms?: number;
 };
 

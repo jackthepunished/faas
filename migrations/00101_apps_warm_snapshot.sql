@@ -32,13 +32,36 @@ ALTER TABLE apps
 ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS warm_snapshot_min_requests int NOT NULL DEFAULT 5;
 ALTER TABLE apps
-    ADD CONSTRAINT IF NOT EXISTS apps_warm_snapshot_min_requests_check
-        CHECK (warm_snapshot_min_requests BETWEEN 1 AND 100);
-ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS warm_snapshot_min_ms int NOT NULL DEFAULT 2000;
-ALTER TABLE apps
-    ADD CONSTRAINT IF NOT EXISTS apps_warm_snapshot_min_ms_check
-        CHECK (warm_snapshot_min_ms BETWEEN 100 AND 60000);
+-- Replay-safe CHECK constraints via DO-block guards. `ADD CONSTRAINT
+-- IF NOT EXISTS` is NOT supported by Postgres — Postgres has `IF NOT
+-- EXISTS` for ADD COLUMN but not for ADD CONSTRAINT. The DO-block
+-- pattern matches the codebase's existing convention (see
+-- migrations/00082_apps_scaling_policy.sql:50-77 and
+-- migrations/00074_projects_and_workloads.sql:86-104). A second
+-- MigrateUp against a schema already holding the constraints is a
+-- clean no-op (PR #377 / ADR-041).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'apps_warm_snapshot_min_requests_check'
+          AND conrelid = 'apps'::regclass
+    ) THEN
+        ALTER TABLE apps
+            ADD CONSTRAINT apps_warm_snapshot_min_requests_check
+            CHECK (warm_snapshot_min_requests BETWEEN 1 AND 100);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'apps_warm_snapshot_min_ms_check'
+          AND conrelid = 'apps'::regclass
+    ) THEN
+        ALTER TABLE apps
+            ADD CONSTRAINT apps_warm_snapshot_min_ms_check
+            CHECK (warm_snapshot_min_ms BETWEEN 100 AND 60000);
+    END IF;
+END$$;
 -- +goose StatementEnd
 
 -- +goose Down
