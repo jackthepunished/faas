@@ -5,7 +5,9 @@
 // (cmd/apid/placement.go, deleted by PR #509). The new flow:
 //   1. apid.createApp inserts the apps row with node_id = NULL.
 //   2. apid.createApp emits db.NotifyAppChanged with a
-//      {"kind":"created","slug","app_id"} payload.
+//      {"kind":"created","app_id"} payload (slug is omitted; the
+//      inserted apps row carries it; the subscriber only keys on
+//      payload.app_id).
 //   3. Every schedd's pkg/sched.PlacementClaimSubscriber reacts
 //      to the payload and runs Engine.ClaimUnplaced to stamp
 //      the owner via Store.SetAppNodeID's conditional UPDATE.
@@ -120,7 +122,7 @@ func newTestServerWithCapturingNotifier(t *testing.T, plan api.Plan) (testEnv, *
 // TestCreateApp_EmitsAppChanged is the headline PR #509
 // regression test for the placement-claim wiring: a successful
 // createApp must emit a single NotifyAppChanged with payload
-// kind=created, slug, app_id. schedd's
+// kind=created + app_id (post-rebase). schedd's
 // pkg/sched.PlacementClaimSubscriber filters on payload.Kind
 // == "created"; an emit with a different kind (or no emit at
 // all) breaks the placement claim.
@@ -145,7 +147,7 @@ func TestCreateApp_EmitsAppChanged(t *testing.T) {
 	}
 
 	// Exactly one NotifyAppChanged must fire — payload carries
-	// kind=created + slug + app_id. The shape is what
+	// kind=created + app_id. The shape is what
 	// pkg/sched.PlacementClaimSubscriber.handle parses.
 	got, ok := notif.findAppChanged()
 	if !ok {
@@ -153,7 +155,6 @@ func TestCreateApp_EmitsAppChanged(t *testing.T) {
 	}
 	var payload struct {
 		Kind  string `json:"kind"`
-		Slug  string `json:"slug"`
 		AppID string `json:"app_id"`
 	}
 	if err := json.Unmarshal([]byte(got.Payload), &payload); err != nil {
@@ -162,9 +163,11 @@ func TestCreateApp_EmitsAppChanged(t *testing.T) {
 	if payload.Kind != "created" {
 		t.Errorf("payload.kind = %q, want %q (placement claim subscriber filters on this)", payload.Kind, "created")
 	}
-	if payload.Slug != "hello-app" {
-		t.Errorf("payload.slug = %q, want %q", payload.Slug, "hello-app")
-	}
+	// payload.slug is informational; pkg/sched.PlacementClaimSubscriber
+	// reads it for logs but the claim path is keyed on apps.id (the
+	// "app_id" field above). Per the post-rebase emit shape (taken
+	// from main's reconcile-based apid), slug is omitted to keep the
+	// notify payload minimal — the inserted row carries the slug.
 	if payload.AppID == "" {
 		t.Errorf("payload.app_id is empty; want the newly-inserted app's id")
 	}
@@ -273,7 +276,7 @@ func TestCreateApp_QuotaErrorDoesNotEmit(t *testing.T) {
 // Background: cmd/apid/handlers_decompose.go::applyProject emits one
 // NotifyAppChanged per inserted app at the end of a successful Tx.
 // The same emit shape is shared with createApp ({"kind":"created",
-// "slug", "app_id"}), with an additional "project_id" field that
+// "app_id"}), with an additional "project_id" field that
 // schedd's PlacementClaimSubscriber ignores (it filters on Kind
 // alone). Without the per-app emit every schedd would only learn
 // about the new apps via the cold-start sweep — multi-second
@@ -344,8 +347,9 @@ func applyProjectCountEmits(n *capturingNotifier) int {
 // counterpart to TestCreateApp_EmitsAppChanged. It uploads a
 // one-workload tarball via POST /v1/projects and asserts that the
 // notifier captured exactly one NotifyAppChanged with kind=created
-// + the inserted app's slug + app_id. The shape is what
-// pkg/sched.PlacementClaimSubscriber parses.
+// + the inserted app_id + project_id. The shape is what
+// pkg/sched.PlacementClaimSubscriber parses (payload.Kind == "created"
+// + payload.AppID).
 func TestApplyProjectPlan_EmitsAppChangedPerWorkload(t *testing.T) {
 	// The scan service writes extracted tarballs to FAAS_SCAN_SPOOL_ROOT
 	// (set by cmd/apid's startup) and reads back via os.DirFS. Pin a
@@ -402,13 +406,13 @@ func TestApplyProjectPlan_EmitsAppChangedPerWorkload(t *testing.T) {
 	if emits != 1 {
 		t.Fatalf("NotifyAppChanged count = %d, want 1\nemitted: %+v", emits, notif.emitted)
 	}
-	// The single emit must carry kind=created + the workload's slug
-	// + the inserted app_id. Same shape createApp uses, plus an
-	// extra project_id field (which the subscriber ignores).
+	// The single emit must carry kind=created + the inserted app_id
+	// + the inserted project_id. payload.slug is omitted from this
+	// emit (mirroring createApp's post-rebase shape); the inserted
+	// row carries the slug.
 	got, _ := notif.findAppChanged()
 	var payload struct {
 		Kind      string `json:"kind"`
-		Slug      string `json:"slug"`
 		AppID     string `json:"app_id"`
 		ProjectID string `json:"project_id"`
 	}
@@ -417,9 +421,6 @@ func TestApplyProjectPlan_EmitsAppChangedPerWorkload(t *testing.T) {
 	}
 	if payload.Kind != "created" {
 		t.Errorf("payload.kind = %q, want %q", payload.Kind, "created")
-	}
-	if payload.Slug != "app" {
-		t.Errorf("payload.slug = %q, want %q (reposcan root-floor default)", payload.Slug, "app")
 	}
 	if payload.AppID == "" {
 		t.Errorf("payload.app_id is empty")
