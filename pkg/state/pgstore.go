@@ -861,14 +861,11 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
 		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
-		   root_dir       = case when $19 then $20 else root_dir end,
-		   workload_name  = case when $21 then $22 else workload_name end,
-		   start_command  = case when $23 then $24::text else start_command end,
-		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
-		   require_signed    = case when $19 then $20 else require_signed end,
+		   require_signed = case when $19 then $20 else require_signed end,
 		   root_dir       = case when $21 then $22 else root_dir end,
 		   workload_name  = case when $23 then $24 else workload_name end,
-		   start_command  = case when $25 then $26::text else start_command end
+		   start_command  = case when $25 then $26::text else start_command end,
+		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
