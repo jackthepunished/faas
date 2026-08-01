@@ -304,9 +304,9 @@ const (
 	// to render plan-tier upsell vs. quota guidance without parsing
 	// prose.
 	CodePlanRegistryCredentialNotAllowed = "plan_registry_credentials_not_allowed" // 403, Free
-	CodePlanRegistryCredentialQuota      = "plan_registry_credential_quota"         // 413, per-app cap reached
-	CodeInvalidRegistryHost              = "invalid_registry_host"                  // 400, normalized-host gate
-	CodeRegistryCredentialNotFound       = "registry_credential_not_found"          // 404, DELETE absent
+	CodePlanRegistryCredentialQuota      = "plan_registry_credential_quota"        // 413, per-app cap reached
+	CodeInvalidRegistryHost              = "invalid_registry_host"                 // 400, normalized-host gate
+	CodeRegistryCredentialNotFound       = "registry_credential_not_found"         // 404, DELETE absent
 
 	// Plan-tier feature gates (M8 §6.5). Distinct from CodePlanLimit*
 	// because the failure mode is "your plan doesn't unlock this knob
@@ -656,6 +656,17 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeSecretValueTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// Issue #461 / ADR-062 — per-app private-registry Basic Auth.
+	// The DELETE-absent posture is 400 (mirrors CodeSecretNotFound
+	// convention; the URL resource IS the host, distinct from
+	// CodeNotFound which is reserved for app-not-found). Plan
+	// quota is 403, value size is 413, host validation is 400.
+	case CodePlanRegistryCredentialNotAllowed:
+		return http.StatusForbidden
+	case CodePlanRegistryCredentialQuota:
+		return http.StatusRequestEntityTooLarge
+	case CodeInvalidRegistryHost, CodeRegistryCredentialNotFound:
+		return http.StatusBadRequest
 	// Env vars (issue #395 / ADR-045): mirror the secrets status shape
 	// so SDK callers can reuse the same error-decoding pattern. Plan
 	// quota is 403, value size is 413, key regex + not-found are 400.

@@ -547,8 +547,8 @@ var planLimits = map[Plan]Limits{
 		EnvValueMaxBytes:    16 * 1024,
 		// Issue #461: Pro = 5 — multi-region + CI shapes.
 		RegistryCredentialMax: 5,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Pro covers a small-team rotation
 		// matrix (5-8 publishers). Enough for "every dev has their own
 		// key" workflows without letting the table grow unbounded.
@@ -634,8 +634,8 @@ var planLimits = map[Plan]Limits{
 		EnvValueMaxBytes:    32 * 1024,
 		// Issue #461: Scale = 20 — broad fan-out for SaaS-scale apps.
 		RegistryCredentialMax: 20,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Scale is the regulated-workload
 		// tier; 16 publishers covers "every platform team's CI
 		// plus break-glass" without letting the table grow into
