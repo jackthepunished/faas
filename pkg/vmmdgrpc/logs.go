@@ -39,16 +39,10 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	defer func() {
 		s.ops.Observe(op, time.Since(start), sendErr)
 	}()
-	// issue #517: lift the wake_id / app_id correlation off the
-	// inbound gRPC metadata so any slog record this handler emits
-	// (currently just the open/close; PR-C will adopt the canonical
-	// timeline event names) carries the same correlation fields
-	// the upstream schedd logged. The runtime source is the MD
-	// (CorrelationFromIncoming); the proto field on LogsRequest is
-	// documentation / future-validation. We prefer the MD value
-	// over the proto field so an out-of-band consumer (one that
-	// doesn't set the proto field) still gets correlation if its
-	// middleware sets the MD.
+	// issue #517: lift correlation fields off the inbound gRPC
+	// metadata; the LogsRequest.wake_id proto field is the fallback
+	// for callers that don't set the MD. PR-C will adopt canonical
+	// timeline event names on these log lines.
 	fields, _ := wire.CorrelationFromIncoming(stream.Context())
 	if fields.WakeID == "" {
 		fields.WakeID = req.GetWakeId()

@@ -7,7 +7,10 @@
 package wire_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -15,9 +18,11 @@ import (
 )
 
 func TestCorrelationRoundTrip(t *testing.T) {
-	// Simulate the schedd → vmmd hop: schedd lifts its inbound MD,
-	// attaches new fields (wake_id minted during Engine.Wake), and
-	// sends the resulting ctx on the outgoing gRPC stream.
+	// Simulate the schedd → vmmd hop. In production, gRPC serialises
+	// the outgoing MD to headers and the receiving server
+	// deserialises them via FromIncomingContext — this test simulates
+	// that round-trip without a real connection so a regression in the
+	// wire semantics fails fast and the test stays under -race.
 	incoming := metadata.New(map[string]string{
 		"x-faas-request-id": "req-from-gatewayd",
 	})
@@ -37,7 +42,10 @@ func TestCorrelationRoundTrip(t *testing.T) {
 	lifted.AppID = "app-1"
 	clientCtx := wire.WithCorrelationOutgoing(context.Background(), lifted)
 
-	// The receiving vmmd reads back the full set.
+	// Simulate the server side of the receiving vmmd by hand:
+	// re-wrap the outbound MD as inbound so the helper exercises
+	// its FromIncomingContext path. Real gRPC does this in the
+	// transport layer.
 	got, ok := wire.CorrelationFromIncoming(metadata.NewIncomingContext(clientCtx, mustOutgoingMD(t, clientCtx)))
 	if !ok {
 		t.Fatal("client-side read returned ok=false")
@@ -154,5 +162,39 @@ func TestCorrelationFromIncoming_OnlySomeFieldsSet(t *testing.T) {
 	}
 	if got.RequestID != "" || got.AppID != "" {
 		t.Errorf("expected empty RequestID/AppID, got %+v", got)
+	}
+}
+
+// TestCorrelationRoundTrip_SanitizesAtLift (item 7 review feedback):
+// even when a malicious peer smuggles a control char into MD, the
+// helper chain (lift → WithCorrelationFields) must keep the
+// sanitization on the slog side. This pins the contract end-to-end at
+// the wire level.
+func TestCorrelationRoundTrip_SanitizesAtLift(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	md := metadata.New(map[string]string{
+		// newline injection attempt
+		"x-faas-wake-id": "wake\nINJECT",
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	fields, ok := wire.CorrelationFromIncoming(ctx)
+	if !ok {
+		t.Fatal("lift returned ok=false")
+	}
+
+	streamLogger := wire.WithCorrelationFields(base, fields)
+	streamLogger.Info("vmmd: stream opened")
+
+	line := strings.TrimSpace(buf.String())
+	if strings.Contains(line, "wake\nINJECT") {
+		t.Errorf("emitted record contains raw newline: %q", line)
+	}
+	// The sanitized form (U+00B7 for the control char) must be
+	// present instead.
+	if !strings.Contains(line, "wake·INJECT") {
+		t.Errorf("expected sanitized wake_id with middle dot, got %q", line)
 	}
 }

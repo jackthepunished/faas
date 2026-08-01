@@ -24,7 +24,11 @@ package wire
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
+
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
 // Correlation field names emitted as slog attributes. Stable contract:
@@ -114,27 +118,12 @@ func NewCorrelationLogger(base *slog.Logger, fields CorrelationFields, daemon st
 		base = slog.Default()
 	}
 	attrs := make([]any, 0, 14)
+	// daemon is an in-tree constant ("schedd", "vmmd", …), never
+	// attacker-influenced — sanitization is unnecessary.
 	if daemon != "" {
 		attrs = append(attrs, FieldDaemon, daemon)
 	}
-	if fields.RequestID != "" {
-		attrs = append(attrs, FieldRequestID, fields.RequestID)
-	}
-	if fields.WakeID != "" {
-		attrs = append(attrs, FieldWakeID, fields.WakeID)
-	}
-	if fields.AppID != "" {
-		attrs = append(attrs, FieldAppID, fields.AppID)
-	}
-	if fields.DeploymentID != "" {
-		attrs = append(attrs, FieldDeploymentID, fields.DeploymentID)
-	}
-	if fields.InstanceID != "" {
-		attrs = append(attrs, FieldInstanceID, fields.InstanceID)
-	}
-	if fields.InvocationID != "" {
-		attrs = append(attrs, FieldInvocationID, fields.InvocationID)
-	}
+	attrs = appendCorrelationAttrs(attrs, fields)
 	return base.With(attrs...)
 }
 
@@ -147,6 +136,10 @@ func NewCorrelationLogger(base *slog.Logger, fields CorrelationFields, daemon st
 //	logger := wire.WithCorrelationFields(e.log, wire.CorrelationFields{AppID: app.ID})
 //	logger.Info("wake admit", "wake_id", wakeID)
 //
+// Does NOT stamp "daemon" / "version" — those are wire.Daemon's envelope.
+// Callers that wrap slog.Default() (no daemon envelope) should call
+// NewCorrelationLogger instead to keep the daemon name on every record.
+//
 // Cannot be a method on *slog.Logger because that type lives in the
 // standard library; Go forbids defining new methods on non-local types.
 // The free-function shape is the idiomatic alternative.
@@ -154,29 +147,58 @@ func WithCorrelationFields(base *slog.Logger, fields CorrelationFields) *slog.Lo
 	if base == nil {
 		base = slog.Default()
 	}
-	attrs := make([]any, 0, 12)
+	attrs := appendCorrelationAttrs(nil, fields)
+	return base.With(attrs...)
+}
+
+// appendCorrelationAttrs is the shared emit half of the two envelope
+// helpers. It routes every correlation value through logsanitize.Field
+// — correlation IDs cross protocol boundaries (HTTP headers, gRPC MD,
+// proto fields) and any of those can carry attacker-controlled bytes
+// (per CLAUDE.md §11 ship-blocker and the issue #517 PR-D sanitizer
+// audit). Sanitization at the canonical lift point means every
+// downstream record inherits the protection without per-call-site
+// effort. The daemon name is sanitized separately by NewCorrelationLogger.
+func appendCorrelationAttrs(attrs []any, fields CorrelationFields) []any {
 	if fields.RequestID != "" {
-		attrs = append(attrs, FieldRequestID, fields.RequestID)
+		attrs = append(attrs, FieldRequestID, logsanitize.Field(fields.RequestID))
 	}
 	if fields.WakeID != "" {
-		attrs = append(attrs, FieldWakeID, fields.WakeID)
+		attrs = append(attrs, FieldWakeID, logsanitize.Field(fields.WakeID))
 	}
 	if fields.AppID != "" {
-		attrs = append(attrs, FieldAppID, fields.AppID)
+		attrs = append(attrs, FieldAppID, logsanitize.Field(fields.AppID))
 	}
 	if fields.DeploymentID != "" {
-		attrs = append(attrs, FieldDeploymentID, fields.DeploymentID)
+		attrs = append(attrs, FieldDeploymentID, logsanitize.Field(fields.DeploymentID))
 	}
 	if fields.InstanceID != "" {
-		attrs = append(attrs, FieldInstanceID, fields.InstanceID)
+		attrs = append(attrs, FieldInstanceID, logsanitize.Field(fields.InstanceID))
 	}
 	if fields.InvocationID != "" {
-		attrs = append(attrs, FieldInvocationID, fields.InvocationID)
+		attrs = append(attrs, FieldInvocationID, logsanitize.Field(fields.InvocationID))
 	}
-	return base.With(attrs...)
+	return attrs
 }
 
 // correlationKey is the unexported context key type. Using an empty struct
 // avoids collisions with keys defined by other packages (Go's net/http
 // package convention; net/http uses struct{} keys for its own values).
 type correlationKey struct{}
+
+// NewRequestID returns a 128-bit random hex string (uuid-like, no dashes).
+// Crypto/rand so we don't pull google/uuid just for this; on the
+// extremely-unlikely rand.Read failure it emits zero rather than panicking
+// in the request hot path.
+//
+// Lives in pkg/wire (rather than pkg/middleware) because every daemon's
+// wire.Daemon bootstrap mints one at startup — wire is the layered-in-below
+// package. pkg/middleware.NewRequestID is preserved as a thin re-export so
+// existing callers don't change.
+func NewRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000000000000000000000000000"
+	}
+	return hex.EncodeToString(b[:])
+}

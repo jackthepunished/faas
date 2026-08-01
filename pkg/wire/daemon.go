@@ -11,8 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/onebox-faas/faas/pkg/middleware"
 )
 
 // Version is stamped at build time via -ldflags "-X .../pkg/wire.Version=...".
@@ -43,7 +41,7 @@ func Daemon(name string, fn RunFunc) {
 
 	log := NewCorrelationLogger(
 		Logger().With("daemon", name, "version", Version),
-		CorrelationFields{RequestID: middleware.NewRequestID()},
+		CorrelationFields{RequestID: NewRequestID()},
 		name,
 	)
 

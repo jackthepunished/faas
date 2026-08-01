@@ -98,6 +98,13 @@ func WithCorrelationOutgoing(ctx context.Context, fields CorrelationFields) cont
 // correct behaviour for an envelope helper: schedd may have added
 // wake_id to a ctx that already carries request_id from gatewayd, and
 // the reader must surface both.
+//
+// Multi-valued MD entries (rare, only produced by proxies that duplicate
+// a header) collide to the FIRST value via grpc-go's Get. Correlation
+// IDs are opaque strings and the platform contract is single-valued,
+// so this is consistent with the rest of the codebase; document here
+// so any future caller that hits a duplicate-key case knows the
+// behaviour is by design.
 func CorrelationFromIncoming(ctx context.Context) (CorrelationFields, bool) {
 	if ctx == nil {
 		return CorrelationFields{}, false
