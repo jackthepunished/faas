@@ -357,6 +357,10 @@ const testDomain = "apps.test.example"
 // a slot-84 gap to surface. The first bump (83 → 84) caught the
 // parallel slot-83 race against PR #509; the second lands on the
 // next free slot past the live migration head.
+//
+// (issue #461 / ADR-062 — registry_credentials landing on the slot
+// the branch was bumped to during rebase; see also the renumber
+// comment on the migration file itself.)
 const e2eMigrationTarget = 86
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
