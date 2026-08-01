@@ -197,7 +197,6 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 // load-test seam — the 9 whitebox tests in this package drive
 // serveAppLogs directly with a stub stream without standing up
 // the auth + LoadApp chain.
-<<<<<<< HEAD
 func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) {
 	// Phase 2 / Gate A: resolve the owner schedd for appID via
 	// the per-node router. The fallback path (legacy single
