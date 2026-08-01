@@ -4992,10 +4992,10 @@ components:
       properties:
         registry:
           type: string
-          description: "Normalized registry host (lowercase DNS name, optional :port; no scheme, no path, no trailing slash)."
+          description: "Registry host. Must include explicit `https://` prefix (schemeless + http:// are rejected per ADR-062 §https-only clarification; customer's Basic Auth never leaves the box over cleartext). Trailing slash optional; embedded path / query / fragment rejected."
           pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$'
           maxLength: 253
-          example: "registry.gregale.dev"
+          example: "https://registry.gregale.dev"
         username:
           type: string
           description: "Basic Auth username (metadata, NOT sealed)."

@@ -5943,6 +5943,26 @@ func (m *MemStore) CountAppRegistryCredentials(_ context.Context, accountID, app
 	return n, nil
 }
 
+// RegistryCredentialQuotaCheck collapses the count + exists probe
+// into one walk over the map. Mirrors
+// PgStore.RegistryCredentialQuotaCheck — same (n, exists) shape.
+func (m *MemStore) RegistryCredentialQuotaCheck(_ context.Context, accountID, appID, registry string) (int, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	exists := false
+	for k, r := range m.registryCreds {
+		if r.AppID != appID || r.AccountID != accountID {
+			continue
+		}
+		n++
+		if k.Registry == registry {
+			exists = true
+		}
+	}
+	return n, exists, nil
+}
+
 // MarkAppRegistryCredentialUsed updates last_used_at + updated_at to
 // now(). Returns ErrNotFound if the row doesn't exist or ownership
 // doesn't match — callers MUST treat ErrNotFound as non-fatal (the

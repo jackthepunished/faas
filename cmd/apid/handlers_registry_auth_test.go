@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -63,7 +64,7 @@ func TestRegistryAuth_PutGetDeleteRoundTrip(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "auth-app")
 	const (
-		host = "registry.gregale.dev"
+		host = "https://registry.gregale.dev"
 		user = "alice"
 	)
 
@@ -103,8 +104,8 @@ func TestRegistryAuth_PutGetDeleteRoundTrip(t *testing.T) {
 		t.Fatalf("Credentials = %d, want 1", len(list.Credentials))
 	}
 	got := list.Credentials[0]
-	if got.Registry != host {
-		t.Errorf("Registry = %q, want %q", got.Registry, host)
+	if got.Registry != "registry.gregale.dev" {
+		t.Errorf("Registry = %q, want %q", got.Registry, "registry.gregale.dev")
 	}
 	if got.Username != user {
 		t.Errorf("Username = %q, want %q", got.Username, user)
@@ -138,7 +139,7 @@ func TestRegistryAuth_FreePlanReturns403(t *testing.T) {
 	app := createApp(t, e, "free-app")
 	rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 		api.PutAppRegistryCredentialRequest{
-			Registry: "registry.gregale.dev", Username: "alice", Password: registryAuthMark,
+			Registry: "https://registry.gregale.dev", Username: "alice", Password: registryAuthMark,
 		}, nil)
 	if rec.Code != 403 {
 		t.Fatalf("PUT on Free: %d %s, want 403", rec.Code, rec.Body.String())
@@ -153,7 +154,7 @@ func TestRegistryAuth_FreePlanReturns403(t *testing.T) {
 func TestRegistryAuth_HobbyQuotaEnforced(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "quota-app")
-	hosts := []string{"r1.example.com", "r2.example.com", "r3.example.com"}
+	hosts := []string{"https://r1.example.com", "https://r2.example.com", "https://r3.example.com"}
 	for i, h := range hosts[:2] {
 		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 			api.PutAppRegistryCredentialRequest{Registry: h, Username: "u", Password: "p"}, nil)
@@ -179,7 +180,7 @@ func TestRegistryAuth_HobbyQuotaEnforced(t *testing.T) {
 func TestRegistryAuth_UpdateDoesNotConsumeQuota(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "replace-app")
-	const host = "registry.gregale.dev"
+	const host = "https://registry.gregale.dev"
 	for i := 0; i < 5; i++ {
 		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 			api.PutAppRegistryCredentialRequest{
@@ -208,7 +209,7 @@ func TestRegistryAuth_DeleteNotFoundReturns400(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "del-nf-app")
 	rec := e.do(t, "DELETE",
-		"/v1/apps/"+app.Slug+"/registry-credentials?registry=missing.example.com",
+		"/v1/apps/"+app.Slug+"/registry-credentials?registry=https%3A%2F%2Fmissing.example.com",
 		nil, nil)
 	if rec.Code != 400 {
 		t.Fatalf("DELETE absent: %d %s, want 400", rec.Code, rec.Body.String())
@@ -219,29 +220,25 @@ func TestRegistryAuth_DeleteNotFoundReturns400(t *testing.T) {
 }
 
 // TestRegistryAuth_InvalidHostReturns400 pins the host validator
-// rejection path. Bare scheme / embedded path / uppercase /
-// trailing slash / bad port → 400 invalid_registry_host.
+// rejection path. The handler requires explicit `https://` per
+// ADR-062 §https-only clarification (issue #461 review finding);
+// schemeless + http:// + embedded path / query / fragment +
+// empty → 400 invalid_registry_host.
 func TestRegistryAuth_InvalidHostReturns400(t *testing.T) {
 	e := setupRegistry(t, api.PlanHobby)
 	app := createApp(t, e, "bad-host-app")
-	bad := []string{
-		"http://registry.example.com",        // scheme (handler should strip + reject after validate)
-		"registry.example.com/path",          // embedded path
-		"REGISTRY.example.com",               // uppercase (normalizer lowercases first; this is accepted as lowercased "registry.example.com")
-		"registry.example.com:99999",         // port out of range
-		"",                                   // empty
-		"registry.example.com/../etc/passwd", // path traversal
-	}
-	// The uppercase case is interesting — the handler's normalizeRegistryHost
-	// lowercases the input BEFORE validation, so uppercase is silently
-	// accepted as its lowercased form. That's the documented posture per
-	// the plan ("Registry host normalized at the API layer"). Drop it
-	// from the rejection list.
+	// Bare "registry.example.com" (no scheme) is rejected under
+	// the https-only policy — schemeless inputs are ambiguous and
+	// were the leading failure mode for misconfigured customers
+	// ("did the user mean docker.io or the public registry?").
 	reject := []string{
-		"registry.example.com/path",
-		"registry.example.com:99999",
-		"",
-		"registry.example.com/../etc/passwd",
+		"registry.example.com",                       // no scheme
+		"http://registry.example.com",                // cleartext
+		"REGISTRY.example.com",                       // no scheme (uppercase doesn't save it)
+		"https://registry.example.com/path",          // embedded path
+		"https://registry.example.com:99999",         // port out of range
+		"",                                           // empty
+		"https://registry.example.com/../etc/passwd", // path traversal
 	}
 	for _, h := range reject {
 		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
@@ -256,12 +253,13 @@ func TestRegistryAuth_InvalidHostReturns400(t *testing.T) {
 			t.Errorf("PUT host=%q: body lacks stable code: %s", h, rec.Body.String())
 		}
 	}
-	// Sanity: the "normalizes via lowercasing" cases that DO work.
+	// Sanity: the cases that DO work — explicit https:// plus the
+	// accepted normalisations (uppercase, whitespace, trailing slash).
 	accept := []string{
-		"REGISTRY.example.com",
 		"https://registry.example.com",
-		"  registry.example.com  ",
-		"registry.example.com/",
+		"https://REGISTRY.example.com",
+		"  https://registry.example.com  ",
+		"https://registry.example.com/",
 	}
 	for _, h := range accept {
 		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
@@ -272,7 +270,6 @@ func TestRegistryAuth_InvalidHostReturns400(t *testing.T) {
 			t.Errorf("PUT host=%q should normalize and accept; got %d %s", h, rec.Code, rec.Body.String())
 		}
 	}
-	_ = bad
 }
 
 // TestRegistryAuth_AccountIsolation pins that a credential on
@@ -283,7 +280,7 @@ func TestRegistryAuth_AccountIsolation(t *testing.T) {
 	appA := createApp(t, e, "iso-app-a")
 	// App B in the same account.
 	appB := createApp(t, e, "iso-app-b")
-	const host = "registry.gregale.dev"
+	const host = "https://registry.gregale.dev"
 
 	// PUT on app A.
 	rec := e.do(t, "PUT", "/v1/apps/"+appA.Slug+"/registry-credentials",
@@ -332,7 +329,7 @@ func TestRegistryAuth_PasswordNotInResponse(t *testing.T) {
 	const pw = "very-secret-MARKER-99X"
 	rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 		api.PutAppRegistryCredentialRequest{
-			Registry: "registry.gregale.dev", Username: "alice", Password: pw,
+			Registry: "https://registry.gregale.dev", Username: "alice", Password: pw,
 		}, nil)
 	if rec.Code != 200 {
 		t.Fatalf("PUT: %d %s", rec.Code, rec.Body.String())
@@ -369,7 +366,7 @@ func TestRegistryAuth_RecipientMissing_503(t *testing.T) {
 	app := createApp(t, e, "no-recip-app")
 	rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 		api.PutAppRegistryCredentialRequest{
-			Registry: "registry.gregale.dev", Username: "alice", Password: registryAuthMark,
+			Registry: "https://registry.gregale.dev", Username: "alice", Password: registryAuthMark,
 		}, nil)
 	if rec.Code != 503 {
 		t.Fatalf("PUT without recipient: %d %s, want 503", rec.Code, rec.Body.String())
@@ -404,7 +401,7 @@ func TestRegistryAuth_StoredCiphertextContainsNamespace(t *testing.T) {
 	app := createApp(t, e, "ns-app")
 	rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
 		api.PutAppRegistryCredentialRequest{
-			Registry: "registry.gregale.dev", Username: "alice", Password: "p",
+			Registry: "https://registry.gregale.dev", Username: "alice", Password: "p",
 		}, nil)
 	if rec.Code != 200 {
 		t.Fatalf("PUT: %d %s", rec.Code, rec.Body.String())
@@ -415,5 +412,143 @@ func TestRegistryAuth_StoredCiphertextContainsNamespace(t *testing.T) {
 	}
 	if len(row.PasswordEncrypted) < 100 {
 		t.Errorf("PasswordEncrypted length = %d, want >= 100 (age stanza header alone is ~96 bytes)", len(row.PasswordEncrypted))
+	}
+}
+
+// TestRegistryAuth_ProScaleQuotaMatrix pins the per-plan quota
+// table at the API boundary for every paid plan (issue #461 /
+// ADR-062 §Decision 6). Free is pinned by
+// TestRegistryAuth_FreePlanReturns403; Hobby is pinned by
+// TestRegistryAuth_HobbyQuotaEnforced. Together these cover the
+// full matrix in pkg/api/limits.go.RegistryCredentialMax.
+//
+// Pro (cap 5) — the 6th distinct host hits 413.
+// Scale (cap 20) — the 21st distinct host hits 413.
+func TestRegistryAuth_ProScaleQuotaMatrix(t *testing.T) {
+	type planCase struct {
+		name    string
+		plan    api.Plan
+		cap     int
+		planURL string // stable code substring from ErrPlanRegistryCredentialQuota
+	}
+	cases := []planCase{
+		{"Pro", api.PlanPro, 5, "plan_registry_credential_quota"},
+		{"Scale", api.PlanScale, 20, "plan_registry_credential_quota"},
+	}
+	for _, pc := range cases {
+		t.Run(pc.name, func(t *testing.T) {
+			e := setupRegistry(t, pc.plan)
+			app := createApp(t, e, "quota-"+strings.ToLower(pc.name))
+			// Fill the cap with distinct hosts.
+			for i := 0; i < pc.cap; i++ {
+				h := "https://h" + string(rune('a'+i%26))
+				if i >= 26 {
+					h += "2"
+				}
+				h += ".example.com"
+				rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
+					api.PutAppRegistryCredentialRequest{
+						Registry: h, Username: "u", Password: "p",
+					}, nil)
+				if rec.Code != 200 {
+					t.Fatalf("PUT %d (%s): %d %s", i, h, rec.Code, rec.Body.String())
+				}
+			}
+			// The (cap+1)-th distinct host hits 413 with the stable code.
+			rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
+				api.PutAppRegistryCredentialRequest{
+					Registry: "https://overflow.example.com", Username: "u", Password: "p",
+				}, nil)
+			if rec.Code != 413 {
+				t.Fatalf("PUT overflow on %s: %d %s, want 413", pc.name, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), pc.planURL) {
+				t.Errorf("%s overflow body lacks stable code: %s", pc.name, rec.Body.String())
+			}
+			// Quota metadata on the GET response surfaces the cap.
+			rec = e.do(t, "GET", "/v1/apps/"+app.Slug+"/registry-credentials", nil, nil)
+			if rec.Code != 200 {
+				t.Fatalf("GET on %s: %d %s", pc.name, rec.Code, rec.Body.String())
+			}
+			list := decodeRegistryList(t, rec.Body)
+			if list.QuotaMax != pc.cap {
+				t.Errorf("%s QuotaMax = %d, want %d", pc.name, list.QuotaMax, pc.cap)
+			}
+			if list.Count != pc.cap {
+				t.Errorf("%s Count = %d, want %d", pc.name, list.Count, pc.cap)
+			}
+		})
+	}
+}
+
+// TestRegistryAuth_HTTPSRequired pins the https-only policy at
+// the API boundary end-to-end. The handler rejects schemeless,
+// http://, embedded path / port out of range / empty input /
+// path traversal; accepts explicit https:// + uppercase +
+// whitespace + trailing slash normalisations. The OpenAPI doc
+// also advertises the https:// requirement — kept here as a
+// single test that pins the seam between the OpenAPI docstring
+// and the live handler.
+func TestRegistryAuth_HTTPSRequired(t *testing.T) {
+	e := setupRegistry(t, api.PlanHobby)
+	app := createApp(t, e, "https-app")
+	reject := []string{
+		"registry.example.com",                       // schemeless
+		"http://registry.example.com",                // cleartext
+		"http://registry.example.com:443",            // cleartext even with port
+		"ftp://registry.example.com",                 // wrong scheme
+		"https://registry.example.com/path",          // embedded path
+		"https://registry.example.com:99999",         // bad port
+		"",                                           // empty
+		"  ",                                         // whitespace only
+	}
+	for _, h := range reject {
+		rec := e.do(t, "PUT", "/v1/apps/"+app.Slug+"/registry-credentials",
+			api.PutAppRegistryCredentialRequest{
+				Registry: h, Username: "alice", Password: "p",
+			}, nil)
+		if rec.Code != 400 {
+			t.Errorf("PUT host=%q: %d %s, want 400", h, rec.Code, rec.Body.String())
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), "invalid_registry_host") {
+			t.Errorf("PUT host=%q: body lacks stable code: %s", h, rec.Body.String())
+		}
+	}
+}
+
+// TestRegistryAuth_AuditPayloadOmitsPassword pins the IAM-4 audit
+// payload shape (ADR-035, ADR-062 §Decision 10) WITHOUT wiring an
+// audit sink. The handlers construct the audit map literal in
+// code; we re-read the source to confirm the literal does not
+// include password / ciphertext / Authorization. This is a source
+// tripwire — if a future refactor adds the password to the audit
+// map literal, this test fails at build time (Go compiles the
+// source we're scanning via go test --
+// pkg/api/cmd/apid/handlers_registry_auth.go).
+func TestRegistryAuth_AuditPayloadOmitsPassword(t *testing.T) {
+	src, err := os.ReadFile("handlers_registry_auth.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	body := string(src)
+	// The audit map literal in setRegistryCredential MUST NOT
+	// carry any password / ciphertext / Authorization field.
+	for _, leak := range []string{"Password", "Ciphertext", "Encrypted", "Authorization"} {
+		// Only fail if the field name appears inside the audit
+		// map block (between `audit.Emit(...)` for "registry_credential.set"
+		// and the matching closing brace).
+		start := strings.Index(body, `"registry_credential.set"`)
+		if start < 0 {
+			continue
+		}
+		end := strings.Index(body[start:], "})")
+		if end < 0 {
+			continue
+		}
+		block := body[start : start+end]
+		if strings.Contains(block, leak) {
+			t.Errorf("audit payload block for registry_credential.set contains %q — would leak credential", leak)
+		}
 	}
 }

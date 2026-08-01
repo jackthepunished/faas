@@ -12,6 +12,67 @@
   adding a credential does NOT bypass `pkg/oci.EgressDialContext`,
   and `oci_egress_deny_total` still increments on denied dials.
 
+## Clarifications (post-PR-#522 review)
+
+These were not explicit in the v1 proposal but emerged during
+the review cycle on PR #522. They are binding — same status as
+the numbered decisions above.
+
+**C1. HTTPS-only at the API boundary.** The `Registry` field on
+`PutAppRegistryCredentialRequest` MUST include explicit
+`https://`. Schemeless inputs (e.g. `registry.gregale.dev`) and
+cleartext `http://` are both rejected with `400 invalid_registry_host`.
+Rationale: §11 "no cleartext secrets on the wire" combined with the
+ambiguity of schemeless hostnames (`ghcr.io` vs a typo'd
+`ghcr.io.attacker.example`). Trailing slash, whitespace, and
+uppercase are normalised silently. Embedded path / query /
+fragment are rejected. The OpenAPI `description` advertises the
+requirement so the SDK / CLI can surface a useful error at the
+client side too.
+
+**C2. AuthPuller / AuthManifestPuller contract.** The two additive
+interfaces (issue #461 / ADR-062) are documented at the top of
+`pkg/oci/puller.go`. Contract points (now pinned by tests):
+
+- ADDITIVE: existing test doubles continue to satisfy `Puller` /
+  `ManifestPuller` without modification; the `WithAuth` variants
+  are an additional surface.
+- `auth == nil` = anonymous path. Callers source `auth` from
+  imaged's transient unseal of `app_registry_credentials`
+  (`pkg/secretbox.OpenBytes`, namespace `"registry_creds"`).
+- EGRESS: auth does NOT widen the egress surface. The deny gate
+  (`pkg/oci.EgressDialContext`) is checked BEFORE the credential
+  lookup in imaged; an egress-denied host fails the dial without
+  ever touching the credential. Pinned by
+  `TestFetchToken_EgressDeniedBeforeCredentialSent` in
+  `pkg/oci/registry_auth_test.go`.
+- FAILURE: `WithAuth` variants have identical semantics to their
+  non-auth counterparts modulo the bearer-token realm Basic Auth
+  header. Errors MUST NOT echo the password, base64 composite, or
+  `Authorization` header — `scrubAuthFromError` (registry.go) runs
+  before any error returns. Pinned by
+  `TestScrubAuthFromError_ScrubsAllForms` and the fuzz-style
+  permutations in `TestScrubAuthFromError_Fuzz`.
+
+**C3. Mark-used failure metric.** imaged's
+`store.MarkAppRegistryCredentialUsed` failure increments the
+daemon-wide `imaged_registry_credential_mark_used_failures_total`
+counter (unlabelled `Counter`). The deployment itself succeeds
+(mark-used is intentionally non-fatal per Decision 8) but a
+persistent non-zero rate means `last_used_at` is lagging reality
+and rotation heuristics may evict still-in-use credentials. Wired
+through `pkg/wire.OpsMetrics.RegistryCredentialMarkUsedFailures()`.
+
+**C4. Quota check is one query.** apid's PUT handler calls
+`Store.RegistryCredentialQuotaCheck(ctx, accountID, appID, host)`
+which returns `(count int, exists bool, err error)` in a single
+round-trip — replaced the original
+`CountAppRegistryCredentials` + `GetAppRegistryCredential` pair.
+PgStore impl is a CTE (single-pass over the same scan); MemStore
+impl walks the map once. Both share the same `(n, exists, nil)`
+shape so the handler's gate reads as a single decision:
+`if !exists && n >= cap { reject }`.
+
 ## Why
 
 Today, `pkg/oci.RegistryClient.fetchToken` (`pkg/oci/registry.go:519`)

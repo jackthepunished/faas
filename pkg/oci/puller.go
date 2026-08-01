@@ -99,19 +99,41 @@ type ManifestPuller interface {
 }
 
 // AuthManifestPuller is the additive seam for per-app private-registry
-// Basic Auth in the M6 two-drive path (issue #461 / ADR-062). Production
-// RegistryClient satisfies ManifestPuller AND AuthManifestPuller;
-// offline DefaultPuller ignores auth. imaged's aboveBaseLayers
-// type-asserts to AuthManifestPuller so it can thread the customer's
-// per-app credential to app manifest + app blob pulls while base
-// pulls stay anonymous (the base is always public
-// ghcr.io/onebox-faas/...).
+// Basic Auth in the M6 two-drive path (issue #461 / ADR-062).
 //
-// Pass `auth == nil` for the anonymous path; the caller's Basic Auth
-// is sourced from app_registry_credentials (imaged transiently
-// unseals the password). PullManifestWithAuth + PullBlobWithAuth
-// have IDENTICAL semantics to their non-auth counterparts modulo
-// the bearer-token realm Basic Auth header.
+// Contract (mirrors AuthPuller):
+//
+//  1. ADDITIVE — AuthManifestPuller extends ManifestPuller. Production
+//     RegistryClient satisfies both; offline DefaultPuller satisfies
+//     ManifestPuller and ignores auth on the WithAuth variants
+//     (the auth parameter is kept on the signature to pin the
+//     interface). Existing test doubles that satisfy only
+//     ManifestPuller continue to compile.
+//  2. PASS `auth == nil` for the anonymous path. Callers source
+//     `auth` from imaged's transient unseal of app_registry_credentials
+//     (pkg/secretbox.OpenBytes, namespace "registry_creds"). The
+//     plaintext lives only in the WithAuth call frame — NEVER in
+//     dep, audit, log, or error.
+//  3. THREADING — imaged's aboveBaseLayers passes `auth` to APP
+//     manifest + app blob pulls and `nil` to BASE pulls. The base
+//     image is always public `ghcr.io/onebox-faas/...` — a mismatched
+//     auth header on a public base pull would break the build path.
+//  4. EGRESS — auth does NOT widen the egress surface. The deny
+//     gate (pkg/oci.EgressDialContext) is checked BEFORE the
+//     credential lookup in imaged; an egress-denied host fails the
+//     dial without ever touching the credential. Pinned by
+//     TestFetchToken_EgressDeniedBeforeCredentialSent in
+//     registry_auth_test.go.
+//  5. FAILURE — WithAuth variants have IDENTICAL semantics to their
+//     non-auth counterparts modulo the bearer-token realm Basic
+//     Auth header. Errors MUST NOT echo the password, base64
+//     composite, or Authorization header — scrubAuthFromError
+//     (registry.go) runs before any error returns. Pinned by
+//     TestScrubAuthFromError_ScrubsAllForms.
+//
+// imaged's aboveBaseLayers type-asserts to AuthManifestPuller and
+// falls back to ManifestPuller (anonymous) when the assertion
+// fails — same shape as AuthPuller's fallback in handleDeployment.
 type AuthManifestPuller interface {
 	ManifestPuller
 	PullManifestWithAuth(ctx context.Context, ref string, auth *BasicAuth) (Manifest, error)

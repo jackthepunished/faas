@@ -885,6 +885,13 @@ func (h *Handler) resolveRegistryAuth(ctx context.Context, app state.App, host s
 // and never on error paths — the contract per ADR-062 §Decision 8
 // is "LastUsedAt updated only after a successful authenticated
 // pull".
+//
+// Failure channel: every failed MarkAppRegistryCredentialUsed
+// increments the daemon-wide
+// imaged_registry_credential_mark_used_failures_total counter
+// (ADR-062 / issue #461) so operators can detect a lagging
+// last_used_at — non-fatal here would otherwise be silent. h.ops
+// is nil-checked for unit-test paths that don't wire metrics.
 func (h *Handler) markRegistryCredentialUsed(ctx context.Context, app state.App, host string, appAuth *oci.BasicAuth) {
 	if appAuth == nil || host == "" {
 		return
@@ -894,6 +901,9 @@ func (h *Handler) markRegistryCredentialUsed(ctx context.Context, app state.App,
 		h.log.Warn("imaged: mark registry credential used failed",
 			"registry", logsanitize.Field(host),
 			"err", err.Error())
+		if c := h.ops.RegistryCredentialMarkUsedFailures(); c != nil {
+			c.Inc()
+		}
 	}
 }
 

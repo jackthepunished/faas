@@ -53,14 +53,24 @@ const maxRegistryBodyBytes = 1 << 20
 // Empty input is rejected at the boundary.
 func normalizeRegistryHost(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
-	s = strings.ToLower(s)
-	// Drop optional scheme.
-	for _, p := range []string{"https://", "http://"} {
-		if strings.HasPrefix(s, p) {
-			s = strings.TrimPrefix(s, p)
-			break
-		}
+	if s == "" {
+		return "", errors.New("registry is required")
 	}
+	// HTTPS-only scheme. Plain http:// would put the customer's
+	// Basic Auth on a cleartext wire (§11 tenant egress + §11
+	// "never log secret values" implies we should also refuse to
+	// SEND them in cleartext). Schemeless inputs are ambiguous
+	// ("ghcr.io" could be a typo for a different host entirely)
+	// and we refuse them at the boundary.
+	switch {
+	case strings.HasPrefix(strings.ToLower(s), "https://"):
+		s = s[len("https://"):]
+	case strings.HasPrefix(strings.ToLower(s), "http://"):
+		return "", errors.New("registry must use https:// (cleartext is not allowed)")
+	default:
+		return "", errors.New("registry must include explicit https:// prefix")
+	}
+	s = strings.ToLower(s)
 	// Drop trailing slashes (the typical user input).
 	s = strings.TrimRight(s, "/")
 	// Reject embedded paths / query / fragment — the host is the
@@ -230,17 +240,18 @@ func (s *server) sealAndPersistRegistryCredential(c stdctx, acct state.Account, 
 // "refuse, with this problem envelope". This shape keeps
 // setRegistryCredential readable: it reads as a sequence of
 // guards, each calling a single check.
+//
+// Round-trip cost: one query (RegistryCredentialQuotaCheck —
+// CTE in PgStore, single-pass walk in MemStore) instead of
+// CountAppRegistryCredentials + GetAppRegistryCredential. The
+// (count, exists) shape mirrors the secrets handler's preflight
+// contract.
 func (s *server) checkRegistryCredentialQuota(c stdctx, acct state.Account, app state.App, host string, limits api.Limits) *api.Problem {
-	n, err := s.store.CountAppRegistryCredentials(c, acct.ID, app.ID)
+	n, exists, err := s.store.RegistryCredentialQuotaCheck(c, acct.ID, app.ID, host)
 	if err != nil {
-		return api.ErrCapacity("could not count registry credentials")
+		return api.ErrCapacity("could not check registry credential quota")
 	}
-	_, err = s.store.GetAppRegistryCredential(c, acct.ID, app.ID, host)
-	already := err == nil
-	if err != nil && !errors.Is(err, state.ErrNotFound) {
-		return api.ErrCapacity("could not check registry credential")
-	}
-	if !already && n >= limits.RegistryCredentialMax {
+	if !exists && n >= limits.RegistryCredentialMax {
 		return api.ErrPlanRegistryCredentialQuota(limits, n)
 	}
 	return nil

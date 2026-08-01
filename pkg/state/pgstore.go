@@ -6829,6 +6829,30 @@ func (s *PgStore) CountAppRegistryCredentials(ctx context.Context, accountID, ap
 	return n, err
 }
 
+// RegistryCredentialQuotaCheck collapses the "count rows on app"
+// + "does (app, host) exist" pair into a single CTE query. apid's
+// PUT handler calls this instead of running CountAppRegistryCredentials
+// + GetAppRegistryCredential back-to-back — one round-trip, same
+// shape as AppSecretQuotaCheck (if that ever lands). The CTE form
+// is single-pass: the count and the exists check both read from
+// the same scan. `(n, false, nil)` is the "host isn't set yet"
+// answer.
+func (s *PgStore) RegistryCredentialQuotaCheck(ctx context.Context, accountID, appID, registry string) (int, bool, error) {
+	var n int
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		with counts as (
+		    select count(*) as n,
+		           bool_or(registry = $3) as exists
+		    from app_registry_credentials
+		    where account_id = $1 and app_id = $2
+		)
+		select coalesce(n, 0), coalesce(exists, false)
+		from counts`,
+		accountID, appID, registry).Scan(&n, &exists)
+	return n, exists, err
+}
+
 // MarkAppRegistryCredentialUsed updates last_used_at + updated_at to
 // now(). Returns ErrNotFound when no row matches the
 // (account_id, app_id, registry) triple. Callers MUST treat

@@ -426,13 +426,6 @@ func parseImageConfig(b []byte) (ImageConfig, error) {
 	}, nil
 }
 
-// fetchManifestJSON performs an authenticated GET on a manifest URL and
-// returns (body, content-type, err). Handles the anonymous Bearer challenge
-// exactly once.
-func (c *RegistryClient) fetchManifestJSON(ctx context.Context, url string) ([]byte, string, error) {
-	return c.fetchManifestJSONWithAuth(ctx, url, nil)
-}
-
 // fetchManifestJSONWithAuth is the AuthPuller variant (issue #461 /
 // ADR-062). `auth == nil` is the anonymous path; a non-nil auth is
 // forwarded to the realm endpoint on a 401 challenge. Existing
@@ -496,12 +489,6 @@ func (c *RegistryClient) fetchBlobStreamWithAuth(ctx context.Context, r Referenc
 		return nil, err
 	}
 	return body, nil
-}
-
-// openBlob performs the GET /v2/<repo>/blobs/<digest> request with one retry
-// after a 401 challenge. Returns (content-type, body, err).
-func (c *RegistryClient) openBlob(ctx context.Context, r Reference, digest string) (string, io.ReadCloser, error) {
-	return c.openBlobWithAuth(ctx, r, digest, nil)
 }
 
 // openBlobWithAuth is the AuthPuller variant. The `auth` value is

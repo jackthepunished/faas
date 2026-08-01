@@ -1819,6 +1819,16 @@ type Store interface {
 	// "Get → if found → allow update past cap" check explicitly so
 	// the count helper stays a simple count.
 	CountAppRegistryCredentials(ctx context.Context, accountID, appID string) (int, error)
+	// RegistryCredentialQuotaCheck combines the "count this app's
+	// rows" + "does (app, host) already exist" probe into a single
+	// query. apid's PUT handler calls this instead of running
+	// CountAppRegistryCredentials + GetAppRegistryCredential back-to-
+	// back — the round-trip cost is the same shape as the
+	// AppSecret / AppEnv quota paths. The (count, exists) shape
+	// mirrors the secrets handler's preflight contract: existing
+	// (app, host) replaces in place and does not consume quota.
+	// Returns (n, false, nil) when the host isn't set yet.
+	RegistryCredentialQuotaCheck(ctx context.Context, accountID, appID, registry string) (count int, exists bool, err error)
 	// MarkAppRegistryCredentialUsed is called by imaged after a
 	// successful authenticated pull. Updates last_used_at + updated_at
 	// to now(). Returns ErrNotFound if the row doesn't exist or the
