@@ -279,17 +279,17 @@ func (s *server) scanService(
 	stateCrons := make([]state.Cron, 0, len(crons))
 	for _, wl := range filteredW {
 		app := wlToApp(acct, wl)
-		// Phase 2 / Gate A: pin each app to an owner
-		// compute_node. Same chooser as createApp, same
-		// ordering (placement before ApplyProjectPlan's
-		// FOR UPDATE on accounts). A placement failure
-		// here means the project can never come up — we
-		// surface it via the problem and skip the store.
-		node, prob := s.placement.Choose(r.Context(), "", app.RAMMB)
-		if prob != nil {
-			return resp, state.Project{}, nil, nil, prob
-		}
-		app.NodeID = node.ID
+		// Phase 2 / Gate A (migration 00084): the placement
+		// chooser moved out of apid. apid is a pure
+		// intent-writer; schedd's PlacementClaimSubscriber
+		// stamps the owner on NotifyAppChanged kind="created".
+		// The depguard rule apid-control-plane-only forbids
+		// apid from importing pkg/sched — this is the
+		// architectural shape the rule enforces. The caller
+		// (applyProjectPlan) emits one NotifyAppChanged per
+		// workload at the end of this loop, mirroring the
+		// createApp emit. See
+		// docs/adr/055-tier-a-per-node-schedd-and-placement.md.
 		stateApps = append(stateApps, app)
 	}
 	// Crons arrive with AppID="" so the store doesn't try to insert

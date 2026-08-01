@@ -146,16 +146,6 @@ type server struct {
 	// apid_op_duration_seconds without each one wrapping itself.
 	// Nil = observation disabled (unit tests).
 	ops *wire.OpsMetrics
-	// placement is the Phase 2 / Gate A chooser that picks an
-	// owner compute_node for every new app at create time. Wired
-	// in newServerWithDeps from the store + log; nil falls back to
-	// "skip placement" (the handler stamps node_id = default-local
-	// via the migration backfill, so the single-box posture
-	// stays bit-for-bit). Production wiring: cmd/apid/main.go
-	// sets up the store, NewPlacementScheduler(store, log) lands
-	// here, and the createApp handler calls placement.Choose
-	// before CreateAppIfUnderQuota.
-	placement *PlacementScheduler
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -461,14 +451,17 @@ func newServerWithDeps(
 		cliAuthLimiter:         cliAuthLimiter,
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
-		// Phase 2 / Gate A placement scheduler — chooses the owner
-		// compute_node for every new app. nil-safe: handlers fall
-		// through to "skip placement" which inherits the
-		// default-local backfill from migration 00083 for the
-		// single-box posture. Production wiring uses
-		// cmd/apid/main.go's existing store handle.
-		placement: NewPlacementScheduler(store, log),
-		audit:     newAuditor(store, log, nil),
+		// Phase 2 / Gate A: the placement chooser moved from
+		// apid to schedd (pkg/sched/placement_claim.go +
+		// Engine.ClaimUnplaced). apid inserts the apps row with
+		// node_id = NULL; schedd's PlacementClaimSubscriber
+		// stamps the owner on NotifyAppChanged kind="created".
+		// The original plan placed the chooser here; the depguard
+		// rule apid-control-plane-only forbids apid from
+		// importing pkg/sched — scheduling is the schedd's job,
+		// not the control plane's. See
+		// docs/adr/055-tier-a-per-node-schedd-and-placement.md.
+		audit: newAuditor(store, log, nil),
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the

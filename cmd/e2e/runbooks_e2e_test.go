@@ -120,18 +120,22 @@ func TestRunbooks_DirectoryHasAllAlertRunbooks(t *testing.T) {
 
 // --- TestRunbooks_GateA_ExistsAndHasRequiredSections --------------------
 //
-// Spec §14 M8 row 5: "Gate-A runbook (2nd box active-passive)".
-// The five required sections are pinned here:
+// Spec §14 Phase 2 / Gate A: per-node schedd peer equality +
+// schedd-side async placement claim. The five required sections
+// are pinned here:
 //   - Topology
-//   - Promotion steps
-//   - Failover steps
+//   - Compute eligibility
+//   - Adding a second compute node
 //   - Rollback
 //   - Validation matrix
 //
-// A runbook missing one of these is operationally incomplete
-// (a partner can ship it to the EX44 onboarding checklist,
-// but it can't be the source of truth for a real promotion
-// event). The test fails the PR gate if any section is
+// The original Gate-A runbook documented active/passive HA
+// (Promotion / Failover) — Phase 2 removed that concept (no
+// `compute_nodes.state`, no DNS cutover; the chooser filters by
+// `compute_nodes.active` and `apps.node_id` does the rest). The
+// new runbook documents the operational surface that replaces
+// it. A runbook missing one of these sections is operationally
+// incomplete; the test fails the PR gate if any section is
 // dropped during a future edit.
 func TestRunbooks_GateA_ExistsAndHasRequiredSections(t *testing.T) {
 	root := repoRoot()
@@ -142,14 +146,14 @@ func TestRunbooks_GateA_ExistsAndHasRequiredSections(t *testing.T) {
 
 	body, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read %s: %v — spec §14 M8 row 5 deliverable is missing", path, err)
+		t.Fatalf("read %s: %v — spec §14 Phase 2 / Gate A deliverable is missing", path, err)
 	}
 
 	const required = 5
 	sections := []string{
 		"Topology",
-		"Promotion steps",
-		"Failover steps",
+		"Compute eligibility",
+		"Adding a second compute node",
 		"Rollback",
 		"Validation matrix",
 	}

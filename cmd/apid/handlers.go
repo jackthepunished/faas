@@ -46,27 +46,16 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
-	// Phase 2 / Gate A: pick the owner compute_node BEFORE the
-	// quota transaction. The placement decision reads the
-	// per-node live usedMB (state.ComputeNodeUsedMB) which is a
-	// snapshot of the instances table; running placement inside
-	// the FOR UPDATE account lock would let two concurrent
-	// creates on different accounts see each other's writes
-	// while serialising on the same account. The lock only
-	// protects the deployed-app cap; placement uses a fresh
-	// read at create time. The fresh read is good enough
-	// because the chooser is re-validated by the schedd's
-	// per-instance NodeLedger at first wake (the runtime gate).
-	node, prob := s.placement.Choose(ctx(r), "", app.RAMMB)
-	if prob != nil {
-		// The placement helper returns *api.Problem directly —
-		// capacity refusals land as 503, internal failures as
-		// 500. Customer-facing shape matches the pre-Phase-2
-		// chooser (no shape change at the wire).
-		api.WriteProblem(w, prob)
-		return
-	}
-	app.NodeID = node.ID
+	// Phase 2 / Gate A (migration 00084): the placement chooser
+	// moved out of apid. apid is a pure intent-writer: it
+	// persists the apps row with node_id = NULL; schedd's
+	// PlacementClaimSubscriber atomically stamps the owner on
+	// NotifyAppChanged kind="created" via Engine.ClaimUnplaced.
+	// The depguard rule apid-control-plane-only forbids apid
+	// from importing pkg/sched; this is the architectural shape
+	// the rule enforces. See
+	// docs/adr/055-tier-a-per-node-schedd-and-placement.md.
+	app.NodeID = ""
 	// Deployed-app count quota + insert happen in the same critical
 	// section inside the store (PgStore: SELECT … FOR UPDATE on the
 	// parent accounts row; MemStore: m.mu). This closes the TOCTOU the
@@ -106,6 +95,16 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"max_concurrency": created.MaxConcurrency,
 		"runtime":         created.Runtime,
 	})
+	// Phase 2 / Gate A (migration 00084): schedd reacts to this
+	// payload via pkg/sched.PlacementClaimSubscriber. The
+	// conditional UPDATE in Store.SetAppNodeID serialises N schedds
+	// into exactly one winner; losers drop silently. Failure here
+	// is best-effort: the cold-start sweep at schedd boot will
+	// reconcile an unplaced app on next restart.
+	if s.notif != nil {
+		_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+			fmt.Sprintf(`{"kind":"created","slug":"%s","app_id":"%s"}`, created.Slug, created.ID))
+	}
 	writeJSON(w, http.StatusCreated, s.appResponse(created))
 }
 
