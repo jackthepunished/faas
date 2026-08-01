@@ -2756,6 +2756,40 @@ func (s *PgStore) MarkCronFired(ctx context.Context, id string, at time.Time) er
 	return nil
 }
 
+// StampAppScaleOut (PR-C, issue #462) writes the apps
+// last_scale_out_at column to now(). Migration 00082 added the
+// column. The stamp is best-effort and non-atomic with the
+// instances INSERT — see Store.StampAppScaleOut's doc for the
+// "stamp miss is safe" rationale. ErrNotFound returns when no
+// row matches appID (defensive — schedd never calls this for an
+// unknown app); callers should log and continue.
+func (s *PgStore) StampAppScaleOut(ctx context.Context, appID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update apps set last_scale_out_at = now() where id = $1`, appID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// StampAppScaleIn (PR-C, issue #462) writes the apps
+// last_scale_in_at column to now(). Same shape as
+// StampAppScaleOut.
+func (s *PgStore) StampAppScaleIn(ctx context.Context, appID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update apps set last_scale_in_at = now() where id = $1`, appID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *PgStore) ListCronsForApp(ctx context.Context, appID string) ([]Cron, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, schedule, path, enabled, created_at from crons where app_id = $1 order by created_at`, appID)

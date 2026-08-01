@@ -3214,6 +3214,39 @@ func (m *MemStore) CreateInstance(_ context.Context, appID, deploymentID, state 
 	return ins, nil
 }
 
+// StampAppScaleOut (PR-C, issue #462) records the apps
+// LastScaleOutAt timestamp. The MemStore mirrors the PG contract
+// (PgStore.StampAppScaleOut): a single UPDATE; no row existence
+// check — the stamp is best-effort and a missing row is logged by
+// the caller as a non-fatal warning, not a fatal error.
+func (m *MemStore) StampAppScaleOut(_ context.Context, appID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	app.LastScaleOutAt = &now
+	m.apps[appID] = app
+	return nil
+}
+
+// StampAppScaleIn (PR-C, issue #462) records the apps
+// LastScaleInAt timestamp. Same shape as StampAppScaleOut.
+func (m *MemStore) StampAppScaleIn(_ context.Context, appID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	app.LastScaleInAt = &now
+	m.apps[appID] = app
+	return nil
+}
+
 func (m *MemStore) InstanceByID(_ context.Context, id string) (Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
