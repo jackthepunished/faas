@@ -207,6 +207,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				if identities != nil {
 					realSvc.Identities = identities
 				}
+				// Path-filtered build fan-out (ADR-050 §103-109).
+				// Token resolution is per-call via the TokenCache
+				// (Option A from the plan review) so the daemon
+				// doesn't need to know about a specific install row
+				// at boot. If the AppAuth init failed above the
+				// field stays nil and service.go falls back to
+				// full fan-out.
+				webhookSvc.ChangedFiles = githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
