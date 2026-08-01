@@ -253,6 +253,15 @@ var methodRouteMap = map[string]string{
 	"PUT /v1/apps/{slug}/trusted_signers/{name}":    "PutAppTrustedSigner",
 	"DELETE /v1/apps/{slug}/trusted_signers/{name}": "DeleteAppTrustedSigner",
 	"PATCH /v1/apps/{slug}/security":                "UpdateAppSecurity",
+	// Per-app private-registry Basic Auth (issue #461 / ADR-062). The
+	// SDK natural verb auto-derives to "GetAppsSlugRegistry-credentials"
+	// (dash, not the safer "RegistryCredentials") because the spec path
+	// uses a hyphen. Pin the verb here so the gate stays the SDK's
+	// source of truth on verb choice, matching the trusted_signers
+	// pattern above.
+	"GET /v1/apps/{slug}/registry-credentials":          "ListAppRegistryCredentials",
+	"PUT /v1/apps/{slug}/registry-credentials":          "SetAppRegistryCredential",
+	"DELETE /v1/apps/{slug}/registry-credentials":       "DeleteAppRegistryCredential",
 }
 
 func main() {
