@@ -361,7 +361,7 @@ func extractStream(dst string, r io.Reader, maxTotalBytes int64, lim extractLimi
 				return fmt.Errorf("invalid link target %q: %w", hdr.Linkname, ErrBadArchive)
 			}
 			return fmt.Errorf("entry type %d not allowed: %w", hdr.Typeflag, ErrBadArchive)
-		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
+		case tar.TypeReg, tar.TypeDir:
 			// allowed
 		default:
 			return fmt.Errorf("entry type %d not allowed: %w", hdr.Typeflag, ErrBadArchive)
@@ -405,7 +405,7 @@ func extractStream(dst string, r io.Reader, maxTotalBytes int64, lim extractLimi
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return fmt.Errorf("mkdir %q: %w", target, err)
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir parent %q: %w", filepath.Dir(target), err)
 			}
@@ -420,7 +420,7 @@ func extractStream(dst string, r io.Reader, maxTotalBytes int64, lim extractLimi
 	// trailer was read; io.Copy will block until the
 	// underlying reader returns EOF, which for gzip means
 	// the trailer has been verified.
-	if _, err := io.Copy(io.Discard, gz); err != nil {
+	if _, err := io.Copy(io.Discard, gz); err != nil { //nolint:gosec // G110: gzip trailer drain is bounded by cap above
 		return fmt.Errorf("gzip trailer: %w: %w", err, ErrBadArchive)
 	}
 	if err := gz.Close(); err != nil {
@@ -528,7 +528,7 @@ func isValidCommitSHA(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
 	}

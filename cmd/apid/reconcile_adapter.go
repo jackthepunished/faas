@@ -22,7 +22,6 @@ package main
 // treats both identically.
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -120,16 +119,6 @@ type reconcileErrMapping struct {
 	Quota  *state.QuotaError
 }
 
-// runReconcilePlan invokes the dry-run projection. The handler
-// renders the Result onto the existing scanPlanResponse (or, on
-// guard trip, an api.Problem) without mutating the database.
-func runReconcilePlan(ctx context.Context, svc *reconcile.Service, in reconcileInputs) (reconcile.Result, error) {
-	return svc.Plan(ctx, in.Project, in.Scan, in.CommitSHA, in.Branch)
-}
-
-// runReconcileApply invokes the apply path. The handler uses
-// Result.Added for cron AppID stamping + NotifyAppChanged, and
-// Result.Alerts for guard-tripped flows.
-func runReconcileApply(ctx context.Context, svc *reconcile.Service, in reconcileInputs) (reconcile.Result, error) {
-	return svc.Reconcile(ctx, in.Project, in.Scan, in.CommitSHA, in.Branch)
-}
+// (intentionally empty: the dry-run + apply paths call
+// svc.Plan / svc.Reconcile directly from scan_service.go now that
+// PR-G wired the reconcile seam. No further adapters needed.)

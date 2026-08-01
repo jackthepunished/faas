@@ -263,29 +263,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 }
 
-// noopBindings is retained for slice-7 unit tests that
-// construct a webhookSvc without a live DB. The production
-// wiring in runWithDeps uses newStateBindingsAdapter(pool)
-// directly; this stub stays for cmd/githubd's own
-// (table-driven) tests that exercise the HTTP layer without
-// Postgres.
-type noopBindings struct{}
-
-func (noopBindings) GetAppBinding(_ context.Context, _, _ string) (state.GitHubBinding, error) {
-	return state.GitHubBinding{}, nil
-}
-
-// noopInstalls is the slice-7 placeholder for the durable
-// install row. Every ForAccount returns state.ErrNotFound so the
-// webhook handler's "no binding" fall-through renders the
-// 200-ignored body. Production wiring uses
-// newStateInstallsAdapter(pool).
-type noopInstalls struct{}
-
-func (noopInstalls) ForAccount(_ context.Context, _ string) (state.GitHubInstall, error) {
-	return state.GitHubInstall{}, state.ErrNotFound
-}
-
 // buildGithubdReconcileService constructs the githubd-side
 // reconcile.Service using the per-daemon *audit.Auditor. Actor
 // is "githubd" so every project.reconcile.* / auth.install.*

@@ -289,11 +289,4 @@ func (s *Service) runGuardsForPlan(
 	return planGuardOutcome{}
 }
 
-// errReconcileIgnoredPlan is the Plan-side sentinel for guard 1
-// (never-empty). The Plan endpoint renders this as a 422 with
-// alert.no_workloads; the apply path's reconcile.Service already
-// returns errReconcileScanSourceDowngrade and ErrIgnored for the
-// other two guards, so callers use errors.Is to branch.
-type errReconcileIgnoredPlan struct{ msg string }
-
-func (e errReconcileIgnoredPlan) Error() string { return e.msg }
+// (no remaining types in this file)
