@@ -238,6 +238,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	store := state.NewPgStore(pool)
 
+	// Phase 2 / Gate A: resolve this schedd's owner node id at
+	// startup. Empty cfg.NodeName → empty owner (legacy
+	// single-box posture, ownership guard short-circuits);
+	// non-empty → compute_nodes.id. Failures (DB outage, missing
+	// row, default-local collision, inactive node) exit fast
+	// rather than silently falling back to in-process ownership.
+	ownerNodeID, err := cfg.ResolveLocalNodeID(ctx, store)
+	if err != nil {
+		return fmt.Errorf("schedd: resolve local node id: %w", err)
+	}
+	if ownerNodeID != "" {
+		log.Info("schedd owner node resolved", "node_name", cfg.NodeName, "node_id", ownerNodeID)
+	} else {
+		log.Info("schedd owner node: legacy single-box (cfg.NodeName empty; ownership guard short-circuits)")
+	}
+
 	// Issue #97 / ADR-025 axis 3: enumerate the active compute_nodes
 	// once at startup and build a VMMRouter that dials vmmd per target
 	// URL on demand. The legacy single-box fleet has exactly one row
@@ -547,7 +563,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// per-instance CPU-µs snapshot to meterd. The reader is
 	// populated by the poller above (200 ms cadence); a meterd
 	// call before the first tick returns an empty list.
-	scheddgrpc.NewWithStats(engine, reader, ops, log).Register(gsrv)
+	scheddgrpc.NewWithStats(engine, reader, ops, log).
+		WithOwner(scheddgrpc.OwnerNodeID(ownerNodeID), store).
+		Register(gsrv)
 
 	// Serve goroutine — must run AFTER Register or grpc fatals.
 	serveErr := make(chan error, 1)

@@ -162,6 +162,21 @@ type Server struct {
 	stats  StatsReader
 	ops    *wire.OpsMetrics
 	log    *slog.Logger
+	// owner is the durable Phase 2 / Gate A shard key this schedd
+	// serves. Empty for the legacy single-box posture. Set via
+	// (*Server).WithOwner at wiring time (cmd/schedd resolves it
+	// from cfg.NodeName → compute_nodes.id at startup). The
+	// ownership guard (authorizeApp / authorizeInstance) consults
+	// this on every gRPC handler that mutates or admits state.
+	owner OwnerNodeID
+	// resolver is the slice of state.Store the ownership guard
+	// needs to load app + instance rows. nil is safe: the
+	// ownership guard short-circuits to "in-process" when owner
+	// is empty (the legacy single-box posture); a non-empty owner
+	// with a nil resolver trips an Internal status error so a
+	// wiring bug surfaces as 500 rather than a silent
+	// FailedPrecondition.
+	resolver AppResolver
 }
 
 // New wires the server. ops may be nil (a throwaway registry used by
@@ -192,6 +207,23 @@ func NewWithStats(engine SchedAPI, stats StatsReader, ops *wire.OpsMetrics, log 
 	return &Server{engine: engine, stats: stats, ops: ops, log: log}
 }
 
+// WithOwner stamps the Phase 2 / Gate A owner id + the AppResolver
+// the guard reads. Safe to call concurrently with the gRPC
+// handlers: reads of s.owner race only with the initial stamp and
+// the one-tick-delayed fallback to "in-process" on the very first
+// RPC is benign — cmd/schedd wires WithOwner before Register
+// binds the gRPC server. If the stamp is forgotten on a multi-node
+// fleet, the very first inbound Wake returns codes.Internal with
+// "owner node id not configured" so a wiring bug fails loud.
+func (s *Server) WithOwner(owner OwnerNodeID, resolver AppResolver) *Server {
+	if s == nil {
+		return s
+	}
+	s.owner = owner
+	s.resolver = resolver
+	return s
+}
+
 // Register binds s to a gRPC server.
 func (s *Server) Register(g *grpc.Server) {
 	scheddpb.RegisterScheddServer(g, s)
@@ -202,6 +234,16 @@ func (s *Server) Register(g *grpc.Server) {
 // ResourceExhausted status the gateway turns into a 503.
 func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb.WakeResponse, error) {
 	const op = "Wake"
+	// Phase 2 / Gate A: ownership guard. Empty owner = legacy
+	// single-box posture (in-process); non-empty owner =
+	// FailedPrecondition on mismatch. The gateway's per-node
+	// schedd cache should never dial the wrong schedd, but a
+	// stale direct dial hits this guard and returns 503 to the
+	// customer rather than silently waking the wrong fleet's
+	// instances.
+	if _, err := authorizeApp(ctx, s.owner, s.resolver, req.GetAppId()); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	res, err := s.engine.Wake(ctx, req.GetAppId())
 	s.ops.Observe(op, time.Since(start), err)
@@ -235,6 +277,9 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 //     so the gateway can treat it as a no-op.
 func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceRequest) (*scheddpb.AdmitInstanceResponse, error) {
 	const op = "AdmitInstance"
+	if _, err := authorizeApp(ctx, s.owner, s.resolver, req.GetAppId()); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	res, err := s.engine.AdmitInstance(ctx, req.GetAppId())
 	s.ops.Observe(op, time.Since(start), err)
@@ -254,15 +299,29 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 // ReportActivity persists a last_request_at batch from the gateway.
 func (s *Server) ReportActivity(ctx context.Context, req *scheddpb.ReportActivityRequest) (*scheddpb.ReportActivityResponse, error) {
 	const op = "ReportActivity"
-	start := time.Now()
+	// Phase 2 / Gate A: each touch belongs to a single instance;
+	// ownership is per-instance (load the parent app + compare
+	// node_id). A bad-routed touch is dropped silently via the
+	// for-loop below rather than failing the whole batch —
+	// the gateway already partitions touches by owner via
+	// instance.node_id before dialling, so this loop is the
+	// second-line check (defence-in-depth).
 	in := req.GetTouches()
 	touches := make([]state.InstanceTouch, 0, len(in))
 	for _, t := range in {
+		if _, err := authorizeInstance(ctx, s.owner, s.resolver, t.GetInstanceId()); err != nil {
+			// Drop silently: the legacy ReportActivity already
+			// tolerates dropped touches (a non-owner instance
+			// belongs to a different schedd that will receive
+			// the touch on its own dial).
+			continue
+		}
 		touches = append(touches, state.InstanceTouch{
 			InstanceID:  t.GetInstanceId(),
 			LastRequest: time.UnixMilli(t.GetUnixMs()),
 		})
 	}
+	start := time.Now()
 	applied, err := s.engine.ReportActivity(ctx, touches)
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
@@ -275,6 +334,9 @@ func (s *Server) ReportActivity(ctx context.Context, req *scheddpb.ReportActivit
 // Idempotent: parking an already-parked instance is a no-op + Ok=true.
 func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceRequest) (*scheddpb.ParkInstanceResponse, error) {
 	const op = "ParkInstance"
+	if _, err := authorizeInstance(ctx, s.owner, s.resolver, req.GetInstanceId()); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	err := s.engine.ParkWithReason(ctx, req.GetInstanceId(), req.GetReason())
 	s.ops.Observe(op, time.Since(start), err)
@@ -329,6 +391,16 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	if req.GetAppId() == "" {
 		sendErr = status.Error(codes.InvalidArgument, "app_id is required")
 		return sendErr
+	}
+	// Phase 2 / Gate A: ownership guard. Logs stream only over
+	// apps this schedd owns; the stream opens from the first
+	// non-terminal instance under apps.node_id == owner. A
+	// non-owner dial returns FailedPrecondition immediately so
+	// the apid SSE handler surfaces a clean 4xx rather than
+	// hanging on a closed stream.
+	if _, err := authorizeApp(stream.Context(), s.owner, s.resolver, req.GetAppId()); err != nil {
+		sendErr = err
+		return err
 	}
 	sinceSeq := req.GetSinceSeq()
 	if sinceSeq < 0 {
