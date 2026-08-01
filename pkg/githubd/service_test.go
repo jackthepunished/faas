@@ -390,28 +390,82 @@ func TestHandlePushRequest_FanOut_EnqueueError_SoftFail(t *testing.T) {
 	}
 }
 
-// TestNoopEnqueuer_SyntheticID pins the noop enqueuer's
-// deterministic-but-unique-per-(appID, commitSHA) ID. The
-// ID is opaque to the caller but must differ across both
-// axes so the build log can correlate to the push.
-func TestNoopEnqueuer_SyntheticID(t *testing.T) {
+// TestNoopEnqueuer_UniqueIDs pins the noop enqueuer's
+// uniqueness contract. UUIDv7 means two successive calls
+// produce different IDs; the "noop-build-" prefix lets
+// dashboards filter fake IDs out of real-build metrics.
+func TestNoopEnqueuer_UniqueIDs(t *testing.T) {
 	e := NewNoopEnqueuer(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	id1, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-1")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	id2, err := e.Enqueue(context.Background(), "acct-1", "app-2", "sha-1")
+	id2, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-1")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if id1 == id2 {
-		t.Errorf("id1 == id2 (%q); different apps must produce different IDs", id1)
+		t.Errorf("id1 == id2 (%q); repeat calls must produce different UUIDs", id1)
 	}
-	id3, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-2")
-	if err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if !strings.HasPrefix(id1, "noop-build-") {
+		t.Errorf("id1 = %q; want noop-build- prefix", id1)
 	}
-	if id1 == id3 {
-		t.Errorf("id1 == id3 (%q); different commits must produce different IDs", id1)
+	if !strings.HasPrefix(id2, "noop-build-") {
+		t.Errorf("id2 = %q; want noop-build- prefix", id2)
+	}
+}
+
+// TestHandlePushRequest_BindingInstallIDMismatch_ErrNoBinding
+// pins the M8 takeover guard. A bind row whose InstallID
+// diverges from the install row's InstallationID is a stale
+// binding (rotated webhook secret, takeover/rebind flow).
+// The push must NOT dispatch to the wrong repo; the
+// service returns ErrNoBinding so the webhook handler
+// renders the 200-ignored body.
+func TestHandlePushRequest_BindingInstallIDMismatch_ErrNoBinding(t *testing.T) {
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
+	rig.seedProject(t, "octo/api", "main")
+	svc := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Binding InstallID=42; install row's
+	// InstallationID=99. They must diverge so the guard
+	// fires.
+	svc.Bindings = &stubBindings{byRepo: map[string]state.GitHubBinding{
+		"octo/api|main": {BindingID: "b-1", AccountID: rig.acct, InstallID: 42, RepoFullName: "octo/api", ProductionBranch: "main"},
+	}}
+	svc.Installs = &stubInstalls{byAccount: map[string]state.GitHubInstall{
+		rig.acct: {AccountID: rig.acct, InstallationID: 99, DefaultBranch: "main"},
+	}}
+	svc.Source = &stubSource{fsys: fstest.MapFS{}}
+	svc.Reconcile = rig.rec
+	body := []byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if !IsNoBinding(err) {
+		t.Errorf("err = %v, want ErrNoBinding on InstallID mismatch", err)
+	}
+}
+
+// TestHandlePushRequest_TreeCloseNilSafe pins H6. A Source
+// error returns early without a dangling tree reference.
+// The production wiring does NOT defer tree.Close before
+// the err-check — moving the defer into the success branch
+// means a nil tree is never dereferenced. We don't have a
+// way to inject a nil-but-no-error Source without breaking
+// the SourceFetcher contract, so this test pins the err-path
+// behavior: a Source error short-circuits without panic.
+func TestHandlePushRequest_TreeCloseNilSafe(t *testing.T) {
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
+	rig.seedProject(t, "octo/api", "main")
+	svc := newServiceForRig(rig)
+	want := errors.New("codeload down")
+	svc.Source = &stubSource{err: want}
+	body := []byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	// Should not panic. The error message is wrapped with
+	// "githubd: source fetch".
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "githubd: source fetch") {
+		t.Errorf("err = %v, want op prefix 'githubd: source fetch'", err)
 	}
 }

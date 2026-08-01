@@ -32,7 +32,10 @@ package githubd
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+
+	"github.com/google/uuid"
 )
 
 // BuildEnqueuer is the seam githubd uses to schedule a build
@@ -63,10 +66,12 @@ type noopEnqueuer struct {
 }
 
 // NewNoopEnqueuer returns a BuildEnqueuer that mints a
-// synthetic buildID per call. The ID is the same for repeat
-// (appID, commitSHA) within a single daemon lifetime
-// (handy for log correlation), but it is NOT persistent —
-// a daemon restart renumbers all builds.
+// synthetic buildID per call. The ID is a UUIDv7 prefixed
+// with "noop-build-" so dashboards can filter out fake IDs
+// from the real builderd bridge. The ID is NOT persistent —
+// a daemon restart renumbers all builds; the prefix lets
+// §12 dashboards exclude synthetic builds from real-build
+// throughput metrics.
 func NewNoopEnqueuer(log *slog.Logger) BuildEnqueuer {
 	if log == nil {
 		log = slog.Default()
@@ -74,15 +79,18 @@ func NewNoopEnqueuer(log *slog.Logger) BuildEnqueuer {
 	return &noopEnqueuer{log: log}
 }
 
-// Enqueue mints the synthetic buildID. The composition uses
-// appID + commitSHA so two pushes to the same app produce
-// different buildIDs (the per-app build history is then
-// monotonic in commitSHA order).
+// Enqueue mints the synthetic buildID. UUIDv7 keeps IDs
+// roughly time-ordered (so build log pages sort naturally)
+// while staying unique per call — the prior deterministic
+// "build-<app>-<sha>" composition collided when an
+// installation re-pushed the same commit twice, and the
+// "build-" prefix read like a real build ID in dashboards.
 func (n *noopEnqueuer) Enqueue(ctx context.Context, accountID, appID, commitSHA string) (string, error) {
-	// Compose a synthetic ID. We deliberately do NOT use
-	// uuid.NewV7 so this stays deterministic across reruns
-	// (the unit tests pin specific IDs).
-	bid := "build-" + appID + "-" + commitSHA
+	u, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("noop enqueuer: uuid v7: %w", err)
+	}
+	bid := "noop-build-" + u.String()
 	n.log.Info("noop enqueuer: synthetic build",
 		"build_id", bid, "app_id", appID, "commit_sha", commitSHA, "account_id", accountID)
 	return bid, nil

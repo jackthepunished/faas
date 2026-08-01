@@ -111,9 +111,13 @@ func NewService(log *slog.Logger) *Service {
 //     {status:ignored, reason:feature_branch}.
 //   - any other error → 500 (logged with op context).
 //
-// The source tree's lifecycle is owned by HandlePushRequest: a
-// deferred Close runs even on the panic path so a malicious
-// archive can't leak temp dirs.
+// The source tree's lifecycle is owned by HandlePushRequest:
+// the deferred Close runs on the success branch of
+// s.Source.Fetch (a failed Fetch returns early without a
+// dangling tree reference). The panic path is handled by
+// the runtime's deferred-unwind — Go runs deferreds even
+// on panic, so a panicking reconcile still releases the
+// temp dir.
 func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile.Result, error) {
 	ev, err := DecodePush(body)
 	if err != nil {
@@ -167,12 +171,33 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 		return reconcile.Result{}, fmt.Errorf("githubd: resolve project: %w", err)
 	}
 
+	// 3a. Takeover guard: the bind row's InstallID must match
+	// the install row's InstallationID. If they diverge, the
+	// binding points at a stale install (rotated webhook
+	// secret, takeover/rebind flow) — treating that as a
+	// push-dispatch would push the wrong repo's tree. We
+	// map the divergence to ErrNoBinding so the webhook
+	// handler renders the 200-ignored body. The fetcher's
+	// internal (inst.InstallationID == installID) check is
+	// a self-consistency guard for the install row only;
+	// THIS check is the cross-table consistency guard.
+	if binding.InstallID != install.InstallationID {
+		s.Log.Warn("githubd: binding install_id mismatch",
+			"binding_id", binding.BindingID,
+			"binding_install_id", binding.InstallID,
+			"install_installation_id", install.InstallationID,
+			"repo", ev.Repository.FullName)
+		return reconcile.Result{}, ErrNoBinding
+	}
+
 	// 4. Fetch the source tree. The fetcher unseals the install
 	// token internally (cmd/githubd/source_fetcher.go) and
-	// returns a Tree whose Close() removes the temp dir. The
-	// deferred Close runs on every exit path including panics
-	// in Reconcile (the Go runtime runs deferreds in the panic
-	// unwind).
+	// returns a Tree whose Close() removes the temp dir.
+	//
+	// nil-safe: defer the Close on the success branch only.
+	// Moving it here (after err-check) means a Fetch error
+	// returns early with no defer; the success branch owns
+	// the temp dir's lifecycle.
 	tree, err := s.Source.Fetch(ctx, binding.AccountID, install.InstallationID, ev.Repository.FullName, ev.After)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("githubd: source fetch: %w", err)
