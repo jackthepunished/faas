@@ -8,16 +8,15 @@
 // Result.Changed gets a build enqueued via the BuildEnqueuer
 // seam.
 //
-// FAN-OUT SCOPE (intentional, addressed in a follow-up):
-//
-// The current implementation is a naive FULL fan-out: every
-// touched app is rebuilt regardless of which files changed.
-// This is correct (correct = "rebuild what the user pushed to")
-// but conservative. A path-filtered follow-up (compare/{base}
-// ...{head} per push, only rebuild apps whose RootDir changed
-// files) is deferred per ADR-050 — the loader fan-out
-// throughput is enough for v1.0 volumes. A TODO at the
-// call site points at the ADR-050 reference.
+// PATH FILTER (post-issue-#432 phase 5 flip): the dispatcher
+// in pkg/githubd/service.go queries GitHub's compare API
+// (filterMode = paths, the default) and rebuilds only the
+// apps whose RootDir intersects the changed file set. The
+// full-fan-out fallback fires only when the compare API itself
+// fails (truncation, transport error, empty-before, or the
+// unavailable stub on credentials-missing boxes). See
+// pkg/githubd/service.go:299 + ADR-050 §109 for the
+// load-bearing default.
 //
 // Issue #432 phase 5 (repo-deploy close-the-loop): the seam
 // was extended to carry the staged source path / source URL /

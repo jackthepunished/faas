@@ -11,12 +11,16 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // stubBindings is a hand-rolled fake of AppBindingStore. PR-H widens
@@ -682,9 +686,14 @@ func TestHandlePushRequest_PathFilter_EmptyBeforeFallsBack(t *testing.T) {
 	}
 }
 
-func TestHandlePushRequest_PathFilter_NilClientFallsBack(t *testing.T) {
-	// Back-compat: tests that don't wire ChangedFiles get the
-	// naive full fan-out (PR-GH.5 behaviour).
+func TestHandlePushRequest_PathFilter_NilClient_StillFallsBack_ForTestOnly(t *testing.T) {
+	// Back-compat for the test rig: tests that don't wire
+	// ChangedFiles get the naive full fan-out (PR-GH.5
+	// behaviour). Production code paths ALWAYS wire something —
+	// either NewHTTPChangedFiles (credentialed box) or
+	// NewUnavailableChangedFiles (credentials-missing box) — so
+	// this nil-client branch is rig-only and must not be deleted
+	// by future refactors thinking "production never hits it."
 	svc, rec, _ := pathFilterRig(t, nil, true)
 	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
 	_, err := svc.HandlePushRequest(context.Background(), body)
@@ -693,6 +702,99 @@ func TestHandlePushRequest_PathFilter_NilClientFallsBack(t *testing.T) {
 	}
 	if len(rec.calls) != 3 {
 		t.Fatalf("Enqueue calls = %d, want 3 (nil ChangedFiles → full fan-out)", len(rec.calls))
+	}
+}
+
+// TestHandlePushRequest_PathFilter_UnavailableStubFallsBack pins
+// the production behaviour on credentials-missing boxes: cmd/githubd
+// wires NewUnavailableChangedFiles, the dispatcher queries the
+// stub, gets ErrUnavailable, observes githubd_path_filter_total{
+// mode="error"}, and falls back to full fan-out. The metric label
+// distinguishes this case from a healthy paths-mode push and from
+// the rig-only nil-client path.
+func TestHandlePushRequest_PathFilter_UnavailableStubFallsBack(t *testing.T) {
+	ops := wire.NewOpsMetrics("githubd-test-unavailable")
+	svc, rec, _ := pathFilterRig(t, NewUnavailableChangedFiles(), true)
+	svc.Ops = ops
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (unavailable stub → full fan-out)", len(rec.calls))
+	}
+	// The dispatcher's lookupChangedFiles path emits
+	// githubd_path_filter_total{mode="error"} on ErrUnavailable;
+	// verify the metric actually ticked (the dispatcher relies on
+	// this to distinguish "no credentials" from "compare API
+	// reachable + filter applied successfully").
+	if got := testutil.ToFloat64(ops.GithubdPathFilterTotal(wire.PathFilterModeError)); got != 1 {
+		t.Errorf("githubd_path_filter_total{mode=error} = %v, want 1", got)
+	}
+}
+
+// TestHandlePushRequest_PathFilter_UnavailableStub_BreakerProgression
+// pins the production wiring shape end-to-end (review fixup for
+// PR #521). cmd/githubd wires NewBreakerChangedFiles around
+// NewUnavailableChangedFiles on every credentials-missing branch,
+// so after 3 pushes the breaker trips and subsequent pushes tick
+// mode=breaker_open instead of mode=error. This test would have
+// caught both bugs the review surfaced:
+//  1. Ops wired nil on credentials-missing boxes (silent metric
+//     drop — the breaker progression never reached /metrics).
+//  2. The unavailable stub wasn't wrapped in the breaker (every
+//     push ticks mode=error forever, breaker_open unreachable).
+//
+// The breaker is shared across all 4 iterations (it's the
+// production wiring shape — NewBreakerChangedFiles lives for
+// the daemon's lifetime). A fresh Service + OpsMetrics +
+// project seed is built per iteration because once reconcile
+// settles a project, subsequent pushes see Added=∅, Changed=∅
+// and the dispatcher's `len(touched) > 0` short-circuit bypasses
+// lookupChangedFiles entirely — which would tick mode=paths
+// instead of routing through the breaker.
+func TestHandlePushRequest_PathFilter_UnavailableStub_BreakerProgression(t *testing.T) {
+	ops := wire.NewOpsMetrics("githubd-test-breaker-progression")
+	// Shared breaker across all 4 pushes — this is the production
+	// wiring shape (NewBreakerChangedFiles wraps the unavailable
+	// stub and lives for the daemon's lifetime).
+	breaker := NewBreakerChangedFiles(NewUnavailableChangedFiles(), time.Now)
+	rec := &recordingEnqueuer{}
+
+	for i := 0; i < 4; i++ {
+		svc, _, _ := pathFilterRig(t, nil, true)
+		svc.ChangedFiles = breaker
+		svc.Ops = ops
+		svc.Enqueuer = rec
+		body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+		if _, err := svc.HandlePushRequest(context.Background(), body); err != nil {
+			t.Fatalf("push %d: HandlePushRequest: %v", i+1, err)
+		}
+	}
+
+	// Each push rebuilds 3 apps via full fan-out (the rig always
+	// produces Added=3 because the project is fresh per iteration).
+	// Total = 4 pushes × 3 apps = 12 enqueue calls.
+	if got := len(rec.calls); got != 12 {
+		t.Errorf("Enqueue calls = %d, want 12 (4 pushes × 3 apps)", got)
+	}
+	// First 3 pushes tick mode=error; the 4th hits the open
+	// breaker and ticks mode=breaker_open. This is the load-bearing
+	// signal the FaasGithubdPathFilterDegraded alert + runbook
+	// claim to surface.
+	if got := testutil.ToFloat64(ops.GithubdPathFilterTotal(wire.PathFilterModeError)); got != 3 {
+		t.Errorf("githubd_path_filter_total{mode=error} = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(ops.GithubdPathFilterTotal(wire.PathFilterModeBreakerOpen)); got != 1 {
+		t.Errorf("githubd_path_filter_total{mode=breaker_open} = %v, want 1", got)
+	}
+	// Defensive: no healthy ticks — we're stubbing, not the real
+	// path-filter mode. A mode=paths increment would indicate
+	// the stub is leaking or the dispatcher's mode decision has
+	// regressed to "filter applied successfully."
+	if got := testutil.ToFloat64(ops.GithubdPathFilterTotal(wire.PathFilterModePaths)); got != 0 {
+		t.Errorf("githubd_path_filter_total{mode=paths} = %v, want 0", got)
 	}
 }
 

@@ -797,6 +797,47 @@ groups:
           description: "Plan sub-slice {{ $labels.slice }} has been > 80% throttled over the rolling 5-minute window for 5m (issue #301 / ADR-044). The cpu.max quota for that plan is saturated; quiescent workloads are preempted. Cross-check the top-throttled-apps Grafana panel for which (account_id, app_id) is the dominant offender, then follow docs/runbooks/FaasCpuStarvation.md §Recover."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasCpuStarvation.md"
 
+      # ─────────────────────────────────────────────────────────────────
+      # githubd path-filter posture (issue #432 phase 5 follow-up /
+      # ADR-050 §109). The counter githubd_path_filter_total{mode}
+      # ticks once per inbound push webhook. After the path-filter
+      # default flip the optimistic mode is `paths`; `full_fallback`
+      # only fires on empty-before pushes (legitimate), `truncated`
+      # only on big-diffs (legitimate + rebuild-all per ADR-050),
+      # and `error` / `breaker_open` only when the compare API itself
+      # fails or the GitHub App credentials are missing. Operators
+      # should investigate a sustained `error` or `breaker_open`
+      # because every push in those modes rebuilds every touched
+      # app — the conservative posture that defeats the path-filter
+      # efficiency win.
+      #
+      # family=path_filter so alertmanager inhibits the warn-tier
+      # email when the page-tier fires (alertnames differ).
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasGithubdPathFilterDegraded
+        expr: sum(rate(githubd_path_filter_total{mode=~"error|breaker_open"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: page
+          component: githubd
+          family: path_filter
+        annotations:
+          summary: "githubd path-filter degraded — credentials missing or compare API unreachable"
+          description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 10m. mode=error fires when the GitHub App credentials are not provisioned (cmd/githubd wires NewUnavailableChangedFiles as the stub) or when the GitHub compare API returned a transport / non-2xx error. mode=breaker_open fires after 3 consecutive errors trip the breaker (pkg/githubd/changedfiles.go). Either way every push rebuilds every touched app — the conservative posture defeats the path-filter efficiency win. Verify: 1) FAAS_GITHUB_APP_ID + FAAS_GITHUB_APP_KEY_PATH point at a valid App + key; 2) outbound api.github.com is reachable; 3) the App installation hasn't been revoked. Runbook: docs/runbooks/FaasGithubdPathFilterDegraded.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGithubdPathFilterDegraded.md"
+
+      - alert: FaasGithubdPathFilterDegradedWarn
+        expr: sum(rate(githubd_path_filter_total{mode=~"error|breaker_open"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warn
+          component: githubd
+          family: path_filter
+        annotations:
+          summary: "githubd path-filter degraded (warn-tier) — investigate before page"
+          description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 5m. The page-tier alert (FaasGithubdPathFilterDegraded) fires at 10m; this warn-tier gives you a head start. Run the verify steps in the runbook before the page lands."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGithubdPathFilterDegraded.md"
+
   # Billing drift detector (ADR-049 §B.1). The reconciler
   # (pkg/billing/reconciler) computes abs(local-pushed) / max(local,
   # pushed) over a rolling window per (account, provider) and

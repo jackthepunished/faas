@@ -338,6 +338,16 @@ payload (GitHub caps at 20 commits / 3000 files) rebuilds all. Builds enqueue
 against the 1-guaranteed + 1-opportunistic builder slots and never outrank
 tenant wakes.
 
+> **Post-#432 phase 5 flip:** path-filter is the default posture
+> (`githubd_path_filter_total{mode="paths"}` on credentialed boxes). The
+> full-fan-out fallback fires only when the compare API itself fails:
+> truncation, transport error, empty `before`, or the `NewUnavailableChangedFiles`
+> stub wired on credentials-missing boxes — the stub surfaces
+> `{mode="error"}` → `{mode="breaker_open"}` instead of `{mode="full_fallback"}`
+> so the §12 dashboard distinguishes "no GitHub App credentials" from
+> "compare API reachable + filter applied." See
+> `pkg/githubd/service.go:299` + `pkg/githubd/changedfiles.go:NewUnavailableChangedFiles`.
+
 Every action emits an audit event (`project.workload.added` / `.removed` /
 `.changed`) carrying the triggering commit SHA, surfaced on the dashboard and
 over SSE. Removal deletes the app row and with it that app's `app_envs`, custom
