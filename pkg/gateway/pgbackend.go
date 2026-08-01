@@ -218,6 +218,13 @@ func (s *targetSet) pick(warmHint string) (Target, bool) {
 //     Pick is the ctx-less hot path, so it must be a pure in-memory read —
 //     the notify loop + the admit path keep it fresh rather than per-request
 //     DB hits.
+//
+// Phase 2 / Gate A: schedd resolution is per-app (apps.node_id).
+// The PGBackend exposes WithAppResolver + WithClientForApp hooks so
+// production wiring can hand it a per-node schedd client cache
+// without changing the legacy Scheduler contract tests rely on.
+// When the hooks are unset, Admit falls through to the legacy single
+// schedd field — matching pre-Gate-A behaviour.
 type PGBackend struct {
 	router Router
 	sched  Scheduler
@@ -238,6 +245,53 @@ type PGBackend struct {
 	// holds 1..max_concurrency Targets, picked via per-node sub-cursors
 	// (issue #168 + ADR-025).
 	targets map[string]*targetSet
+
+	// appResolver (Phase 2 / Gate A) maps appID → state.App so the
+	// per-node client cache can find apps.node_id without a second
+	// store hop. Optional: nil falls through to the legacy single-sched
+	// path. Production wires this to a closure that calls
+	// state.Store.AppByID; tests can return a synthetic App.
+	appResolver func(ctx context.Context, appID string) (App, bool, error)
+
+	// clientForApp (Phase 2 / Gate A) returns the schedd client that
+	// owns the given app. Mandatory when appResolver is set. Production
+	// wires this to scheddRouter.ScheddForApp; tests inject a closure
+	// that returns a static fake. Returning ok=false forces a fallback
+	// to the legacy b.sched field — useful for tests that exercise the
+	// single-sched path.
+	clientForApp func(ctx context.Context, app App) (Scheduler, bool, error)
+}
+
+// AppResolverFunc is the typed alias for WithAppResolver. Mirrors
+// Router.ResolveHost so the wire-up is symmetric.
+type AppResolverFunc func(ctx context.Context, appID string) (App, bool, error)
+
+// ClientForAppFunc is the typed alias for WithClientForApp.
+type ClientForAppFunc func(ctx context.Context, app App) (Scheduler, bool, error)
+
+// WithAppResolver sets the appID → state.App hook used by Admit to
+// find apps.node_id (Phase 2 / Gate A). nil clears the hook —
+// production wires a closure that calls state.Store.AppByID; tests
+// pass an in-memory map lookup.
+func (b *PGBackend) WithAppResolver(fn AppResolverFunc) *PGBackend {
+	b.appResolver = fn
+	return b
+}
+
+// WithClientForApp sets the per-app schedd client factory used by
+// Admit to find the owner schedd (Phase 2 / Gate A). nil clears
+// the hook — production wires a closure that calls
+// scheddRouter.ScheddForApp. Tests pass an in-memory map lookup.
+//
+// The factory returns (client, ok, err): ok=true means the hook
+// produced a client and Admit should use it; ok=false (with nil
+// err) means the hook can't resolve (no node_id / no row) and Admit
+// should fall back to the legacy b.sched field; a non-nil err means
+// the hook is configured but the resolution failed, and Admit
+// surfaces the error.
+func (b *PGBackend) WithClientForApp(fn ClientForAppFunc) *PGBackend {
+	b.clientForApp = fn
+	return b
 }
 
 // WithWarmHint attaches the sticky-warm affinity source for the picker.
@@ -364,6 +418,12 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // WakeMethodSnapshotRestore or WakeMethodColdBoot, translated by
 // scheddgrpc.Client from the wire's scheddpb.WakeMethod. On
 // at-capacity and error paths the value is WakeMethodUnspecified.
+//
+// Phase 2 / Gate A: when WithAppResolver + WithClientForApp are
+// configured, Admit first resolves the owning schedd via
+// apps.node_id. Otherwise it falls through to the legacy single
+// b.sched field — byte-identical to pre-Gate-A behaviour for
+// single-box installs where the hooks are not wired.
 func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
 	b.tgtMu.Lock()
@@ -374,7 +434,12 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 	}
 	b.tgtMu.Unlock()
 
-	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := b.sched.AdmitInstance(ctx, appID)
+	sched, err := b.resolveSched(ctx, appID)
+	if err != nil {
+		return "", WakeMethodUnspecified, false, err
+	}
+
+	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID)
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -468,4 +533,42 @@ func (b *PGBackend) putApp(app App) {
 	b.appsMu.Lock()
 	b.apps[app.ID] = app
 	b.appsMu.Unlock()
+}
+
+// resolveSched picks the schedd client that should service appID
+// (Phase 2 / Gate A). Returns the per-node client when both hooks
+// are configured AND the app has a non-empty NodeID; otherwise
+// falls through to the legacy single b.sched field. A nil error
+// and a nil Scheduler means the hook declined — caller falls back.
+func (b *PGBackend) resolveSched(ctx context.Context, appID string) (Scheduler, error) {
+	if b.appResolver != nil && b.clientForApp != nil {
+		app, ok, err := b.appResolver(ctx, appID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			// App row missing; fall back to legacy single
+			// schedd. The owner's auth guard on schedd's side
+			// will turn this into a 4xx (FailedPrecondition)
+			// if app.NodeID exists but mismatches. We let the
+			// legacy path try rather than 503 here because a
+			// transient cache miss must not deny traffic.
+			return b.sched, nil
+		}
+		if app.NodeID == "" {
+			// Pre-migration row or test fixture: legacy
+			// single-sched path. Same fallback as the
+			// empty-ok branch above.
+			return b.sched, nil
+		}
+		cli, ok, err := b.clientForApp(ctx, app)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return b.sched, nil
+		}
+		return cli, nil
+	}
+	return b.sched, nil
 }

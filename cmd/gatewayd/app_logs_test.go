@@ -42,6 +42,18 @@ func (c *controllableScheddClient) StreamAppLogs(_ context.Context, _ string, _ 
 	return c.stream, nil
 }
 
+// fixedScheddResolver adapts a single controllableScheddClient to
+// the logStreamerResolver surface the AppLogsHandler consumes
+// (Phase 2 / Gate A). Production wires a per-app router; tests
+// share one stream across every appID lookup.
+type fixedScheddResolver struct {
+	c *controllableScheddClient
+}
+
+func (f *fixedScheddResolver) ScheddForApp(_ context.Context, _ string) (logStreamer, error) {
+	return f.c, nil
+}
+
 // controllableScheddLogStream is the per-test stream. Frames and
 // errors are queued on buffered channels so the test can drive
 // timing from the outside.
@@ -110,7 +122,7 @@ func runServeAppLogs(t *testing.T, h *AppLogsHandler, stream *controllableSchedd
 	t.Helper()
 	h.Heartbeat = heartbeat
 	h.Backstop = backstop
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -178,7 +190,7 @@ func TestServeAppLogs_CtxCancelReturnsWithoutTerminalFrame(t *testing.T) {
 	stream := newControllableScheddStream()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -212,7 +224,7 @@ func TestServeAppLogs_HeartbeatOnIdleStream(t *testing.T) {
 	// terminal `event: end`.
 	h.Heartbeat = 30 * time.Millisecond
 	h.Backstop = 10 * time.Second // long enough that heartbeats dominate
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	done := make(chan struct{})
 	go func() {
 		// After the pump is reading, push one frame then sit idle.
@@ -265,7 +277,7 @@ func TestServeAppLogs_FramesRenderInOrder(t *testing.T) {
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	stream := newControllableScheddStream()
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -311,7 +323,7 @@ func TestServeAppLogs_CleanEndEmitsEmptyEndEvent(t *testing.T) {
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	stream := newControllableScheddStream()
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -345,7 +357,7 @@ func TestServeAppLogs_GenericErrorDelegatesToRenderAppLogsError(t *testing.T) {
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	stream := newControllableScheddStream()
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -380,7 +392,7 @@ func TestServeAppLogs_NotFoundDelegatesToRenderAppLogsError(t *testing.T) {
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	stream := newControllableScheddStream()
-	h.Schedd = &controllableScheddClient{stream: stream}
+	h.ScheddFor = &fixedScheddResolver{c: &controllableScheddClient{stream: stream}}
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {

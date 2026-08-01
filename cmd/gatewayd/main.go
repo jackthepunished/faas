@@ -51,8 +51,12 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-// scheddSocket is schedd's gRPC unix socket (ADR-018). Overridable via
-// FAAS_SCHEDD_SOCKET so the e2e harness can point at a per-test path.
+// scheddSocket is schedd's gRPC unix socket (ADR-018). Phase 2 /
+// Gate A: kept for tests and the e2e harness that point gatewayd at
+// a single schedd by env override. Production wiring in run()
+// ignores scheddSocket and uses the per-node scheddRouter (the
+// cache derives each per-node client's dial target from
+// compute_nodes.schedd_target_url, not from this var).
 var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 
 // gatewaydInternalSocket is the unix-domain socket schedd dials to
@@ -236,13 +240,14 @@ type runDeps struct {
 	// audit is the *pkg/audit.Auditor that emits the auth.mfa_gate_hit
 	// / auth.session.stolen rows. nil in tests.
 	audit *audit.Auditor
-	// scheddClient is the gRPC stream client AppLogsHandler dials
-	// (issue #254 / Move 4 PR-2). The same client is used by
-	// gateway.Backend for the wake RPC, so the dial is shared —
-	// a second client would burn an extra conn to /run/faas/schedd.sock.
-	// nil in tests (the AppLogsHandler constructor guards + the
-	// carve-out is silently disabled).
-	scheddClient *scheddgrpc.Client
+	// scheddClient is the ScheddClient interface (production: a
+	// single *scheddgrpc.Client from the per-node cache) used by
+	// AppLogsHandler (issue #254 / Move 4 PR-2) and the warm hint
+	// stream consumer. Phase 2 / Gate A: production wires a single
+	// client from the per-node cache; multi-stream fan-in is a v1.1
+	// follow-up. nil in tests (the AppLogsHandler constructor
+	// guards + the carve-out is silently disabled).
+	scheddClient scheddgrpc.ScheddClient
 	// warmHints is the long-lived StreamWarmHints consumer
 	// (ADR-025 axis 4) that drains the sticky-warm affinity
 	// stream from schedd and updates the picker's hint cache.
@@ -256,6 +261,10 @@ type runDeps struct {
 	// cfg.LoadEgressTLS() so the [egress_tls_*] TOML keys apply
 	// before the listener binds.
 	egressTLS *tls.Config
+	// scheddRouter (Phase 2 / Gate A) is the per-node schedd gRPC
+	// client cache. Wired in run() from newScheddRouter. nil in
+	// tests — the legacy single-sched path stays in effect.
+	scheddRouter *scheddRouter
 }
 
 func defaultDeps() runDeps {
@@ -286,16 +295,38 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Phase 2 / Gate A: per-node schedd client cache. Wires the
+	// production dial closure (cross-box via pkg/overlay for tcp
+	// targets; unix for single-box). The router's WatchNodeChanges
+	// goroutine maintains the cache from compute_node_changed
+	// pg_notify. The legacy FAAS_SCHEDD_SOCKET dial is still wired
+	// below as a fallback for the warm-hint stream consumer and the
+	// AppLogsHandler (single-stream consumers; multi-stream fan-in
+	// is a v1.1 follow-up).
+	pgStore := state.NewPgStore(pool)
+	vmmdTLS, err := cfg.LoadVMMDPingTLS()
+	if err != nil {
+		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
+	}
+	deps := defaultDeps()
+	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
+	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
+	// Single-stream fallback: dial the legacy schedd socket once for
+	// the consumers that don't currently fan-in (warm hints, log
+	// stream). On the single-box default-local fleet this dials the
+	// same client the router would resolve; on a multi-box install
+	// the stream comes from one schedd only and is documented as
+	// such in cmd/gatewayd/warmhints.go.
 	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, nil)
 	if err != nil {
 		return fmt.Errorf("gatewayd: dial schedd: %w", err)
 	}
 	defer func() { _ = sched.Close() }()
-
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		return err
-	}
 
 	// Env-derived AppsDomain wins over the TOML file so the e2e harness can
 	// run without writing a TOML. The legacy path is plain :8080 with the
@@ -304,7 +335,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if appsDomain == "" {
 		appsDomain = cfg.AppsDomain
 	}
-	router := pgRouter{store: state.NewPgStore(pool), appsSuffix: appsSuffix(appsDomain)}
+	router := pgRouter{store: pgStore, appsSuffix: appsSuffix(appsDomain)}
 	// ADR-025 axis 4: sticky-warm affinity cache. Built first so the
 	// picker's WarmHintFunc reads from it on every Pick. The cache
 	// itself is empty at this point — it gets populated by the
@@ -313,7 +344,33 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// scoring, identical to a fresh install (ADR-005 cold boot must
 	// always work).
 	warmHintCache := gateway.NewWarmHintCache()
-	backend := gateway.NewPGBackend(router, sched, log).WithWarmHint(warmHintCache.HintFunc())
+	backend := gateway.NewPGBackend(router, sched, log).
+		WithWarmHint(warmHintCache.HintFunc()).
+		WithAppResolver(func(ctx context.Context, appID string) (gateway.App, bool, error) {
+			app, err := pgStore.AppByID(ctx, appID)
+			if err != nil {
+				if errors.Is(err, state.ErrNotFound) {
+					return gateway.App{}, false, nil
+				}
+				return gateway.App{}, false, err
+			}
+			acct, err := pgStore.AccountByID(ctx, app.AccountID)
+			if err != nil {
+				return gateway.App{}, false, err
+			}
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID}, true, nil
+		}).
+		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
+			full, err := pgStore.AppByID(ctx, app.ID)
+			if err != nil {
+				return nil, false, err
+			}
+			cli, err := deps.scheddRouter.ScheddForApp(ctx, full)
+			if err != nil {
+				return nil, false, err
+			}
+			return cli, true, nil
+		})
 
 	// Keep the routing + target caches fresh from apid/schedd's pg_notify
 	// stream (spec §4.1): an instance state change evicts the app's cached
@@ -321,7 +378,6 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// domain change flushes the host→app routes.
 	go watchInvalidations(ctx, pool, backend, log)
 
-	deps := defaultDeps()
 	deps.backend = backend
 	// Flush per-instance last_request_at to schedd so its idle reaper sees
 	// gateway traffic (spec §4.1, ADR-018) — without this a busy app parks once
@@ -329,13 +385,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// it the batch over gRPC (the same client we wake through). Issue #168
 	// dropped the addr→instance resolver hop: the handler now Touches by
 	// instance_id directly, and schedd drops unknown ids on its side.
-	deps.lastSeen = newSchedFlushSink(sched, log)
+	// Phase 2 / Gate A: the flush is partitioned by instance.node_id
+	// via the per-node router so touches land on the owner schedd.
+	deps.lastSeen = newSchedFlushSink(deps.scheddRouter, pgStore, log)
 	// Internal unix-socket RPC for schedd's cron dispatch loop (spec §4.4,
 	// M7). Routes a synthetic wake through schedd so metering + the
 	// per-minute sampler see the live instance. lastSeen-touches for cron
 	// traffic land in a follow-up once we expose an app-scoped touch RPC
 	// (today schedd's ReportActivity takes instance_ids, which the synth
-	// path doesn't have without a Wake first).
+	// path doesn't have without a Wake first). Phase 2 / Gate A: synth
+	// calls resolve the owner schedd per app via the router — they no
+	// longer dial the legacy single schedd.
 	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, &synthAdapter{
 		wake: func(ctx context.Context, appID string) error {
 			// wake_id is discarded on the synth path (gaps analysis
@@ -350,7 +410,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// path. Synth traffic is operational (cron, per-minute
 			// sampler), not customer traffic, and would skew the
 			// "what fraction of admissions were local" reading.
-			_, _, _, _, _, _, err := sched.AdmitInstance(ctx, appID)
+			//
+			// Phase 2 / Gate A: resolve the owner schedd via the
+			// per-node router so the cron path lands on the right
+			// box.
+			app, err := pgStore.AppByID(ctx, appID)
+			if err != nil {
+				return err
+			}
+			cli, err := deps.scheddRouter.ScheddForApp(ctx, app)
+			if err != nil {
+				return err
+			}
+			_, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID)
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -364,7 +436,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// Invocation so schedd can StampInstanceInvocation —
 		// without it the meter's per-instance count lands on 0.
 		invoke: func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
-			instanceID, _, _, _, err := sched.Wake(ctx, appID)
+			app, err := pgStore.AppByID(ctx, appID)
+			if err != nil {
+				return inv, fmt.Errorf("synth invoke resolve app %s: %w", appID, err)
+			}
+			cli, err := deps.scheddRouter.ScheddForApp(ctx, app)
+			if err != nil {
+				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
+			}
+			instanceID, _, _, _, err := cli.Wake(ctx, appID)
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
@@ -383,7 +463,6 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// TLS path: only when the operator opted in via the TOML [tls] table.
 	// The Disabled=true path stays on plain :8080 so the e2e harness keeps
 	// working without a config file (and without bind capability requirements).
-	pgStore := state.NewPgStore(pool)
 	// Wrap pgStore.DomainByName (which returns (state.CustomDomain, error))
 	// as the gateway.OnDemandLookup shape: any-typed result, with state.ErrNotFound
 	// surfaced as gateway.ErrNotFound so the steady-state denial path stays quiet.
@@ -443,10 +522,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// which overlay.Dial (and the underlying wire.DialContext)
 	// accepts on unix targets. Subscribing to compute_node_changed
 	// runs in a goroutine that dies with ctx.
-	vmmdTLS, err := cfg.LoadVMMDPingTLS()
-	if err != nil {
-		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
-	}
+	// (vmmdTLS was loaded earlier in run() — see the scheddRouter
+	// wiring above. The same TLS bundle is shared with the vmmd
+	// node cache.)
 	// ADR-052: load the server mTLS material the egress gRPC
 	// listener uses when meterd dials it from a remote compute
 	// node. Empty cluster returns (nil, nil); partial cluster is
@@ -690,14 +768,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// disabled (the path falls through to apid, matching the
 	// pre-PR-2 behaviour).
 	var logsHandler http.Handler
-	if deps.authMw != nil && deps.pgStore != nil && deps.scheddClient != nil {
+	if deps.authMw != nil && deps.pgStore != nil && deps.scheddRouter != nil {
 		logsMux := http.NewServeMux()
 		logsMux.Handle("GET /v1/apps/{slug}/logs", &AppLogsHandler{
-			Auth:   deps.authMw,
-			Schedd: deps.scheddClient,
-			Store:  deps.pgStore,
-			Log:    log,
-			Ops:    nil,
+			Auth: deps.authMw,
+			// Phase 2 / Gate A: dial the owner schedd via the
+			// per-node router. The legacy scheddClient field is
+			// retained for the warm-hint stream (single-stream
+			// fallback); the log stream is the second fan-in
+			// consumer and resolves per-app.
+			ScheddFor: appLogsScheddResolver{store: deps.pgStore, router: deps.scheddRouter},
+			Store:     deps.pgStore,
+			Log:       log,
+			Ops:       nil,
 		})
 		logsHandler = logsMux
 	}
