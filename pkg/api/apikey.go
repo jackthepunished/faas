@@ -118,19 +118,29 @@ const (
 	// grant "secrets:write" through an env-var surface.
 	ScopeEnvRead  = "env:read"
 	ScopeEnvWrite = "env:write"
+	// Issue #461 / ADR-062: registry_credentials:read scopes GET;
+	// registry_credentials:write scopes PUT/DELETE. Distinct from
+	// secrets:* / env:* because the resource is per-app Basic Auth
+	// sealed at rest, not per-app env config — a customer who can
+	// write env vars cannot write registry credentials without the
+	// new scope, closing the quota-bypass path.
+	ScopeRegistryCredentialsRead  = "registry_credentials:read"
+	ScopeRegistryCredentialsWrite = "registry_credentials:write"
 )
 
 // validScopes is the closed set of scope strings the API accepts. The
 // order is not significant — callers can pass scopes in any order.
 var validScopes = map[string]struct{}{
-	ScopeAdmin:        {},
-	ScopeAppsRead:     {},
-	ScopeDeployWrite:  {},
-	ScopeSecretsRead:  {},
-	ScopeSecretsWrite: {},
-	ScopeUsageRead:    {},
-	ScopeEnvRead:      {},
-	ScopeEnvWrite:     {},
+	ScopeAdmin:                    {},
+	ScopeAppsRead:                 {},
+	ScopeDeployWrite:              {},
+	ScopeSecretsRead:              {},
+	ScopeSecretsWrite:             {},
+	ScopeUsageRead:                {},
+	ScopeEnvRead:                  {},
+	ScopeEnvWrite:                 {},
+	ScopeRegistryCredentialsRead:  {},
+	ScopeRegistryCredentialsWrite: {},
 }
 
 // IsValidScope reports whether s is in the allowed scope vocabulary.
@@ -204,6 +214,21 @@ var (
 	// runtime config (see handlers_env.go file header for the
 	// trust-model rationale + ADR-045 §Decision).
 	ScopesEnvWriteSurface = []string{ScopeAdmin, ScopeEnvWrite}
+
+	// ScopesRegistryCredentialsReadSurface: GET on
+	// /v1/apps/{slug}/registry-credentials (issue #461 / ADR-062).
+	// Granted by admin or registry_credentials:read. The password is
+	// never returned (AppRegistryCredentialResponse has no Password
+	// field), so reading is non-sensitive.
+	ScopesRegistryCredentialsReadSurface = []string{ScopeAdmin, ScopeRegistryCredentialsRead}
+
+	// ScopesRegistryCredentialsWriteSurface: PUT/DELETE on
+	// /v1/apps/{slug}/registry-credentials (issue #461 / ADR-062).
+	// Granted by admin or registry_credentials:write. The handler
+	// chain is authLimited → requireMFA → requireScope → handler — the
+	// MFA gate is mandatory because PUT replaces a credential that
+	// gates a customer's ability to deploy private images.
+	ScopesRegistryCredentialsWriteSurface = []string{ScopeAdmin, ScopeRegistryCredentialsWrite}
 
 	// ScopesDeployWriteSurface: every deploy/mutate action except
 	// secrets and key/admin operations. Granted by admin or

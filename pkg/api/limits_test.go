@@ -46,7 +46,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// seen before the streaming patch landed. MaxResponseBodyBytes
 			// (25 MiB) and ResponseWriteTimeoutSeconds (300 s) are the
 			// pre-#471 spec §4.1 caps PR-A inherits.
-			StreamingEnabled: false, MaxResponseBodyBytes: 26_214_400, ResponseWriteTimeoutSeconds: 300},
+			StreamingEnabled: false, MaxResponseBodyBytes: 26_214_400, ResponseWriteTimeoutSeconds: 300,
+			// Issue #461 / ADR-062: Free has no private-registry
+			// credential surface (handler returns 403
+			// plan_registry_credentials_not_allowed).
+			RegistryCredentialMax: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
@@ -93,7 +97,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
 			// Issue #517 / PR-B: Hobby unlocks the `?deployment=`
 			// filter for the typical one-staging-deployment workload.
-			LogDeploymentFilterMax: 1},
+			LogDeploymentFilterMax: 1,
+			// Issue #461 / ADR-064: Hobby = 2 — staging + production.
+			RegistryCredentialMax: 2},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
@@ -131,7 +137,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// multi-staging fan-out (prod + 3-5 staging + a few
 			// preview slots) without monopolising the schedd's
 			// per-instance goroutine fan-out.
-			LogDeploymentFilterMax: 10},
+			LogDeploymentFilterMax: 10,
+			// Issue #461 / ADR-064: Pro = 5 — multi-region + CI shapes.
+			RegistryCredentialMax: 5},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -174,7 +182,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #517 / PR-B: Scale gets 50 — 5× Pro, tracks the
 			// larger app budget (100 vs 25) and multi-region staging
 			// fan-out SaaS-scale customers typically run.
-			LogDeploymentFilterMax: 50},
+			LogDeploymentFilterMax: 50,
+			// Issue #461 / ADR-064: Scale = 20 — broad fan-out.
+			RegistryCredentialMax: 20},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -311,6 +321,9 @@ func TestPlansAreMonotonic(t *testing.T) {
 			// and the per-value byte cap doubles each step.
 			{"EnvVarsMax", lo.EnvVarsMax, hi.EnvVarsMax},
 			{"EnvValueMaxBytes", lo.EnvValueMaxBytes, hi.EnvValueMaxBytes},
+			// Issue #461 / ADR-062: per-app registry credential quota
+			// (Free=0 → Hobby=2 → Pro=5 → Scale=20).
+			{"RegistryCredentialMax", lo.RegistryCredentialMax, hi.RegistryCredentialMax},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {
