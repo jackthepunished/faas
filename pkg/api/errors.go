@@ -559,6 +559,21 @@ const SecretKeyPattern = `^[A-Z][A-Z0-9_]*$`
 // (NAME_MAX is 255 on Linux) and keeps per-row index size reasonable.
 const MaxSecretKeyLen = 128
 
+// OrgSlugPattern is the regex enforced by the ORG slug validator in PR 5
+// (issue #190 / IAM-6 / ADR-061) and reused by ErrOrgSlugInvalid's detail
+// string so the rejection copy carries the same shape the handler enforces.
+// Lowercase ASCII letters, digits, and single dashes; must start and end
+// with a letter or digit (no leading or trailing dash); 3..32 chars total.
+// Reserved keywords are checked at the handler layer, not in this regex,
+// because the keyword set changes over time and belongs alongside the
+// reserved-slug seed data in cmd/apid.
+const OrgSlugPattern = `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`
+
+// MaxOrgSlugLen bounds the org slug length. Mirrors the regex's upper
+// bound so a future contributor tightening the pattern keeps the two in
+// lock-step.
+const MaxOrgSlugLen = 32
+
 // StatusForCode returns the HTTP status a given stable Code maps to. It is the
 // inverse of the per-code status the constructors below hardcode, kept in one
 // table so any surface that reconstructs a Problem without a Status (notably
@@ -1489,10 +1504,12 @@ func ErrOrgNotFound(slug string) *Problem {
 // regex or shape check (lowercase ASCII letters, digits, dashes;
 // 3..32 chars; not a reserved keyword). Detail names the rule
 // so the dashboard form can highlight which constraint tripped.
+// The regex comes from OrgSlugPattern so PR 5's handler
+// validator and this constructor share one source of truth.
 func ErrOrgSlugInvalid(reason string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeOrgSlugInvalid,
 		"Invalid organization slug",
-		fmt.Sprintf("org slugs must match ^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$; %s", reason)).
+		fmt.Sprintf("org slugs must match %s; %s", OrgSlugPattern, reason)).
 		WithDocs("https://docs.gregale.dev/orgs#slugs")
 }
 

@@ -227,12 +227,14 @@ type Limits struct {
 	// but does NOT invent per-plan values — those land in PR 2
 	// alongside the schema.
 	//
-	// OrgMembersMax caps how many members a non-personal org
-	// may hold at any moment. The owner counts toward the cap;
-	// the personal org is exempt (its membership is exactly one).
+	// OrgMembersMax caps the count of active members
+	// (`removed_at IS NULL`) on a non-personal org. The owner
+	// counts toward the cap; the personal org is exempt (its
+	// membership is exactly one). The PR 2 schema adds the
+	// `removed_at` column so the cap reflects only live members.
 	//
-	// OrgPendingInvitationsMax caps how many pending invitations
-	// a non-personal org may hold at any moment. Independent of
+	// OrgPendingInvitationsMax caps the count of pending
+	// invitations on a non-personal org. Independent of
 	// OrgMembersMax — defends against the N-invites × fast-accept
 	// botnet signature without blocking quiet growth.
 	OrgMembersMax            int

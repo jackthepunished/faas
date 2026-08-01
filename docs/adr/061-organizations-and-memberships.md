@@ -55,14 +55,18 @@
   | Role | Capabilities |
   |---|---|
   | `owner` | org lifecycle, ownership transfer, role changes, invitations, resource writes, plan, billing |
-  | `admin` | role changes, invitations, resource writes; cannot transfer ownership, change plan, or delete the org |
+  | `admin` | role changes (except owner demotion on the last remaining owner), invitations, resource writes; cannot transfer ownership, change plan, or delete the org |
   | `developer` | application/deployment/configuration writes and operational reads |
   | `viewer` | read-only applications, deployments, usage, audit |
   | `billing` | billing, invoices, plan changes, usage reads; no application mutation |
 
   Exactly one `owner` exists per non-personal org. The last owner cannot
-  self-remove, be removed, or be demoted; ownership transfer is the only
-  way to vacate the role.
+  self-remove, be removed, or be demoted **by any role, including `admin`**;
+  ownership transfer is the only way to vacate the role. PR 2 must enforce
+  this in the SQL transaction (`SELECT … FROM org_memberships WHERE org_id
+  = $1 AND role = 'owner' AND removed_at IS NULL FOR UPDATE`); PR 5's
+  RBAC layer must mirror the same check at the handler so a future
+  caller without DB tx access cannot bypass it.
 
 - **Wire / authorization contract:**
 
@@ -80,6 +84,14 @@
     scopes. Effective permission is the intersection of key scopes and
     the creator's current membership role. Removing the creator's
     membership invalidates the key's use immediately.
+  - **Legacy keys cannot auto-promote.** A legacy key created before
+    PR 6 carries no `org_id`; addressing any path-scoped route with
+    such a key returns `CodeOrgAPIKeyRequiresOrg` (409). The
+    customer must mint a successor key via `/v1/orgs/{slug}/keys`;
+    the legacy row stays in the DB but is no longer useable. This
+    avoids the silent-promotion foot-gun (a key whose `account_id`
+    happens to belong to a member accidentally widening its scope
+    to that member's org).
 
 - **Migration strategy: expansion / backfill / cut-over / contraction**
 
@@ -206,9 +218,54 @@
     `schedd` still owns `instances`; `vmmd` still owns Firecracker.
     These ownership rules are not changed.
 
+- **Consequences:**
+
+  - **Stable codes (12).** `pkg/api/errors.go` gains 12 new
+    RFC 7807 codes (`org_not_found`, `org_slug_invalid`,
+    `org_slug_taken`, `org_member_cap_exceeded`,
+    `org_invitation_cap_exceeded`, `org_role_forbidden`,
+    `org_already_member`, `org_invitation_invalid`,
+    `org_invitation_expired`, `org_last_owner`,
+    `org_personal_immutable`, `org_api_key_requires_org`) and a
+    shared `OrgSlugPattern` constant. Once shipped, the code
+    strings cannot be renamed.
+  - **Plan / quota table.** `pkg/api/limits.go` gains two fields
+    per plan row (`OrgMembersMax`, `OrgPendingInvitationsMax`),
+    populated at PR 2 from the financial model. PR 1 ships 0/0
+    rows with fail-closed accessors (`Plan.OrgMembersMax()` /
+    `Plan.OrgPendingInvitationsMax()`) and a guard test
+    (`TestOrgMembersLimits_ZeroUntilAuthorised`) that catches any
+    future contributor who removes the field or the accessor.
+  - **Schema growth.** PR 2 introduces `orgs`, `org_memberships`,
+    `org_invitations`, and nullable `org_id` columns on the
+    tenant-root tables classified in
+    `docs/iam-6-ownership-inventory.md`. Backfill happens in PR 3
+    inside a single transaction per account. Contraction (NOT
+    NULL on the columns) lands in PR 9 after at least two
+    released clean dual-write cycles.
+  - **Wire shape.** Cookie sessions remain account-bound; selecting
+    an org is a per-request decision via the URL slug. The new
+    path-scoped APIs land in PR 4–PR 5 and grow SDK methods
+    (the SDK coverage map is updated in the same PR).
+  - **Operator surface.** No new control-plane surface is introduced
+    in this PR. `apid` is still the only customer-intent writer;
+    `schedd` still owns `instances`; `vmmd` still owns Firecracker.
+    The org authorization seam lands in PR 4 via a new
+    `pkg/authz` package and `pkg/auth/middleware` grows a
+    `LoadOrg` analogue of the existing `LoadApp` IDOR-safe
+    helper.
+
 - **Verification gates:** replay-safety on every migration; `make test`,
   `make lint`, `make spec-check`, `make sdk-check`, `make sqlc-check`,
   `make proto-check`, and the Postgres-backed e2e matrix listed in the
   implementation plan at `/Users/poyrazk/.claude/plans/lexical-roaming-candle.md`.
   VM-lifecycle code is unchanged; no metal re-run is required for this
   PR.
+
+  **PR 1 explicit exemptions:** `make spec-check`, `make sdk-check`,
+  `make sqlc-check`, and `make proto-check` are N/A for this PR —
+  no protos, OpenAPI, SDK code, or SQL is touched. Future PRs in
+  the staged rollout MUST re-enable each gate the first time it
+  becomes load-bearing for that PR's surface (e.g. PR 4 flips
+  `spec-check` on; PR 5 flips `sdk-check`; PR 2 flips
+  `sqlc-check` and `proto-check`).

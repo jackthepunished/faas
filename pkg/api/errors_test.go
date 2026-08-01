@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -736,6 +737,32 @@ func TestErrOrgMemberCapExceeded(t *testing.T) {
 	}
 }
 
+// TestErrOrgMemberCapExceeded_ZeroBoundary pins the wire shape at
+// the (limit=0, observed=0) boundary. WithLimit binds the field
+// non-nil even for zero, so the JSON serialises `"limit": 0`
+// (not omitted). A future refactor that tries to omit zero would
+// silently break the SDK quota decoder on a brand-new account or
+// an org whose plan cap is genuinely 0.
+func TestErrOrgMemberCapExceeded_ZeroBoundary(t *testing.T) {
+	p := ErrOrgMemberCapExceeded(0, 0)
+	if p.Limit == nil {
+		t.Fatal("Limit must remain non-nil even at zero (SDK depends on *int64 presence)")
+	}
+	if *p.Limit != 0 || *p.Observed != 0 {
+		t.Errorf("Limit/Observed = %d/%d, want 0/0", *p.Limit, *p.Observed)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"limit":0`) {
+		t.Errorf("JSON must serialise zero Limit (SDK decoder relies on it): %s", body)
+	}
+	if !strings.Contains(string(body), `"observed":0`) {
+		t.Errorf("JSON must serialise zero Observed: %s", body)
+	}
+}
+
 // TestErrOrgInvitationExpired pins the 410 + code for the
 // one-shot invitation lifecycle. Mirrors TestErrResetTokenExpired
 // so the dashboard's "link expired" copy reuses the same pattern.
@@ -763,5 +790,58 @@ func TestErrOrgLastOwner(t *testing.T) {
 	}
 	if !strings.Contains(p.Detail, "transfer") {
 		t.Errorf("Detail = %q, want to mention ownership transfer", p.Detail)
+	}
+}
+
+// TestErrOrgSlugInvalid pins the 422 + shape copy. The detail
+// must echo the shared OrgSlugPattern constant so PR 5's handler
+// regex and this rejection copy cannot drift silently.
+func TestErrOrgSlugInvalid(t *testing.T) {
+	p := ErrOrgSlugInvalid("leading dash")
+	if p.Status != http.StatusUnprocessableEntity {
+		t.Errorf("Status = %d, want 422", p.Status)
+	}
+	if p.Code != CodeOrgSlugInvalid {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgSlugInvalid)
+	}
+	if !strings.Contains(p.Detail, OrgSlugPattern) {
+		t.Errorf("Detail = %q, want to carry OrgSlugPattern %q", p.Detail, OrgSlugPattern)
+	}
+	if !strings.Contains(p.Detail, "leading dash") {
+		t.Errorf("Detail = %q, want to carry the reason", p.Detail)
+	}
+}
+
+// TestOrgSlugPattern covers the well-formed boundary cases and a few
+// malformed inputs. PR 5's handler validator will compile the same
+// constant so a tightening here breaks the validator in tests rather
+// than on the wire. Keep the boundary cases tight: 3 chars (floor),
+// 32 chars (ceiling), single internal dash, leading digit (allowed),
+// trailing dash (rejected), uppercase (rejected).
+func TestOrgSlugPattern(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    bool
+		comment string
+	}{
+		{"abc", true, "floor length"},
+		{"a-b", true, "single internal dash"},
+		{"a1", false, "below floor length"},
+		{strings.Repeat("a", MaxOrgSlugLen), true, "ceiling length"},
+		{strings.Repeat("a", MaxOrgSlugLen+1), false, "above ceiling"},
+		{"abc-", false, "trailing dash"},
+		{"-abc", false, "leading dash"},
+		{"ABC", false, "uppercase"},
+		{"abc_def", false, "underscore"},
+		{"abc.def", false, "dot"},
+		{"1bc", true, "leading digit allowed"},
+		{"ab1", true, "trailing digit allowed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in+"/"+tc.comment, func(t *testing.T) {
+			if got := regexp.MustCompile(OrgSlugPattern).MatchString(tc.in); got != tc.want {
+				t.Errorf("OrgSlugPattern.MatchString(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
