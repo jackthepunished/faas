@@ -107,28 +107,30 @@ func TestProperty_EngineWake_RespectsMaxConcurrency(t *testing.T) {
 		t.Errorf("denied = %d, want %d", denied, goroutines-maxConc)
 	}
 
-	// State assertions on the store.
+	// State assertions on the store. PR-C (issue #462): the
+	// wake-gate admitGate short-circuits BEFORE CreateInstance,
+	// so denied wakes leave no instances-table footprint. The
+	// invariant §6.2-1 still holds (≤ maxConc in {WAKING,
+	// COLD_BOOTING, RUNNING}); the row count is now exactly
+	// maxConc, not goroutines. The legacy "every Wake leaves a
+	// row, success or fail" pattern from the pre-PR-C
+	// ledger-rejection path no longer applies — gate-denied
+	// wakes never reach the ledger or the instances table.
 	rows, err := store.ListInstancesForApp(context.Background(), app.ID)
 	if err != nil {
 		t.Fatalf("ListInstancesForApp: %v", err)
 	}
-	if len(rows) != goroutines {
-		t.Errorf("len(rows) = %d, want %d (every Wake leaves a row, success or fail)", len(rows), goroutines)
+	if len(rows) != maxConc {
+		t.Errorf("len(rows) = %d, want %d (admitted; gate-denied wakes leave no row)", len(rows), maxConc)
 	}
-	var running, failed int
+	var running int
 	for _, ins := range rows {
-		switch ins.State {
-		case string(state.StateRunning):
+		if ins.State == string(state.StateRunning) {
 			running++
-		case string(state.StateFailed):
-			failed++
 		}
 	}
 	if running != maxConc {
 		t.Errorf("running = %d, want %d", running, maxConc)
-	}
-	if failed != goroutines-maxConc {
-		t.Errorf("failed = %d, want %d", failed, goroutines-maxConc)
 	}
 
 	// Ledger assertion — the cap gate, not the lock, must be the

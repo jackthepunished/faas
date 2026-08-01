@@ -590,6 +590,38 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		return WakeResult{}, err
 	}
 
+	// PR-C (issue #462): wake-gate consult. Three short-circuit
+	// outcomes route to typed errors or AtCapacity=true without
+	// touching the ledger or the instances table. The cooldown
+	// branch carries the customer's "rate-limit scale-outs" knob;
+	// the cold-start discriminator (concurrency > 0) keeps a
+	// request-driven wake from being deferred on a freshly-stamped
+	// apps.last_scale_out_at column. See admitGate's doc for the
+	// branch-by-branch outcome semantics.
+	//
+	// Wake vs AdmitInstance routing: AdmitInstance (liftCapacityToResult=true)
+	// turns the per-app cap rejection into WakeResult{AtCapacity: true},
+	// nil so the gateway treats it as a no-op when it already has ≥1
+	// cached target. Wake (liftCapacityToResult=false) preserves the
+	// existing *api.Problem{Code: CodePlanLimitConcur} wire shape so
+	// the gateway's existing 429 handling is unchanged.
+	if outcome := e.admitGate(ctx, &app, limits); outcome != wakeAdmit {
+		release()
+		switch outcome {
+		case wakeRejectAtCap:
+			if liftCapacityToResult {
+				return WakeResult{AtCapacity: true}, nil
+			}
+			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
+		case wakeCooldownHeld, wakeMinFloorAlready:
+			// Pre-PR-D wire shape: CodePlanLimitConcur is the
+			// closest existing surface (the customer's request
+			// hit the per-app cap). PR-D adds CodeWaitForWarm
+			// (issue #462 wire) for the cooldown_held branch.
+			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
+		}
+	}
+
 	// Mint the per-wake-attempt correlation handle (gaps analysis
 	// 2026-07-23). UUIDv7 is time-ordered so the dashboard's "recent
 	// wakes for this app" scan can use the partial index
@@ -744,6 +776,19 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// deployments without override columns get the legacy "stage
 	// everything for the app" behaviour so tarball/dockerfile paths
 	// keep working unchanged.
+	//
+	// PR-C (issue #462): stamp apps.last_scale_out_at = now() on
+	// every successful wake admit. Best-effort: a stamp failure
+	// logs a warning but does NOT roll back the wake — the wake
+	// is committed and the next cycle repopulates the stamp. The
+	// "stamp miss" direction (stamp UPDATEs after the instance
+	// INSERT, and a rare concurrent wake sees NULL on the consult)
+	// is the SAFE direction: the wake-gate admitGate consults the
+	// stamp BEFORE the insert and bypasses cooldown on NULL.
+	if err := e.store.StampAppScaleOut(ctx, appID); err != nil {
+		e.log.Warn("sched: stamp apps.last_scale_out_at failed", "app", appID, "err", err)
+	}
+
 	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
 	if err != nil {
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
@@ -2044,6 +2089,136 @@ func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstateP
 	if err := e.notif.Notify(ctx, db.NotifySnapshotWritten, string(payload)); err != nil {
 		e.log.Warn("emit snapshot_written", "deployment", deploymentID, "err", err)
 	}
+}
+
+// wakeOutcome is the discrete result of the wake-gate consult
+// (PR-C, issue #462). admitAndDispatch consults admitGate before
+// any work that touches the ledger or the instances table; the
+// caller routes on the result.
+type wakeOutcome int
+
+const (
+	wakeAdmit wakeOutcome = iota
+	wakeRejectAtCap
+	wakeCooldownHeld
+	wakeMinFloorAlready
+)
+
+// admitGate (PR-C, issue #462) is the single decision site for
+// the wake-gate outcome metric on the per-app admission
+// pre-flight. Called by admitAndDispatch BEFORE the ledger check
+// and the instances INSERT. It stamps the wake-gate outcome to
+// schedd_scale_up_decisions_total{outcome=...} via the shared
+// *wire.OpsMetrics.
+//
+// Outcomes:
+//
+//   - wakeAdmit: per-app cap has headroom, no cooldown in effect,
+//     and no min-floor collision. Caller proceeds to ledger.Admit
+//     and instances INSERT. The caller stamps apps.last_scale_out_at
+//     after a successful insert (StampAppScaleOut, best-effort).
+//
+//   - wakeRejectAtCap: per-app cap reached (Concurrency >= MaxConcur).
+//     Caller short-circuits with no INSERT and returns AtCapacity=true
+//     (AdmitInstance) or *api.Problem CodePlanLimitConcur (Wake).
+//
+//   - wakeCooldownHeld: now - apps.last_scale_out_at <
+//     ScalingPolicy.ScaleOutCooldownS AND Concurrency(appID) > 0.
+//     Cold-start wakes (concurrency == 0) bypass cooldown — the
+//     discriminator is load-bearing for the customer's "scale on
+//     demand" use case. Caller short-circuits; the existing wake
+//     surface returns *api.Problem CodePlanLimitConcur (the same
+//     pre-PR-C shape). PR-D adds a dedicated CodeWaitForWarm RFC
+//     7807 code and the customer-facing 503 surface.
+//
+//   - wakeMinFloorAlready: Concurrency >= ScalingPolicy.MinInstances
+//     AND a no-signal wake. Today this is the "wake arrived with
+//     no inflight reading" branch — the targets trigger did not
+//     enqueue this wake. Caller short-circuits with no INSERT.
+//     Mostly informational for the dashboard "why didn't this
+//     scale?" pane; PR-D will shape the wire surface.
+func (e *Engine) admitGate(_ context.Context, app *state.App, limits api.Limits) wakeOutcome {
+	concurrency := e.ledger.Concurrency(app.ID)
+	// Mirror admission.go:149-152: apps created via store.CreateApp
+	// without a subsequent UpdateApp leave MaxConcurrency at 0.
+	// Clamp against the plan ceiling so legacy / pre-PR-A apps still
+	// admit normally. Without the clamp, an app with MaxConcurrency=0
+	// would always return wakeRejectAtCap and every wake would 429.
+	maxConc := app.MaxConcurrency
+	if maxConc <= 0 || maxConc > limits.MaxConcurrency {
+		maxConc = limits.MaxConcurrency
+	}
+	if concurrency >= maxConc {
+		if e.ops != nil {
+			e.ops.ObserveScaleUp(app.ID, "reject_at_cap")
+		}
+		return wakeRejectAtCap
+	}
+	if e.isOnScaleOutCooldown(app, concurrency) {
+		if e.ops != nil {
+			e.ops.ObserveScaleUp(app.ID, "cooldown_held")
+		}
+		return wakeCooldownHeld
+	}
+	if e.atMinFloorWithNoSignal(app, concurrency) {
+		if e.ops != nil {
+			e.ops.ObserveScaleUp(app.ID, "min_floor_already")
+		}
+		return wakeMinFloorAlready
+	}
+	return wakeAdmit
+}
+
+// isOnScaleOutCooldown (PR-C, issue #462) returns true when
+// (a) apps.LastScaleOutAt is non-NIL, (b) Concurrency(appID) > 0,
+// and (c) time.Since(*apps.LastScaleOutAt) < ScaleOutCooldownS.
+//
+// The Concurrency > 0 discriminator is load-bearing: it lets a
+// cold start (zero concurrency) bypass cooldown even when
+// apps.LastScaleOutAt is freshly stamped. Without this check, a
+// request-driven wake would always hit cooldown and defeat the
+// customer's "rate-limit scale-outs" use case. The "stamp
+// missed" direction (LastScaleOutAt == nil → bypass) is safe —
+// the wake proceeds normally.
+//
+// When ScalingPolicy is nil OR ScaleOutCooldownS == 0, the customer
+// has not opted into cooldown enforcement, so the branch does
+// NOT fire — every existing wake proceeds to the ledger.
+func (e *Engine) isOnScaleOutCooldown(app *state.App, concurrency int) bool {
+	if concurrency == 0 {
+		return false
+	}
+	if app.LastScaleOutAt == nil {
+		return false
+	}
+	if app.ScalingPolicy == nil || app.ScalingPolicy.ScaleOutCooldownS <= 0 {
+		return false
+	}
+	cooldown := time.Duration(app.ScalingPolicy.ScaleOutCooldownS) * time.Second
+	return time.Since(*app.LastScaleOutAt) < cooldown
+}
+
+// atMinFloorWithNoSignal (PR-C, issue #462) returns true when the
+// customer has configured ScalingPolicy.MinInstances > 0 AND the
+// live concurrency has reached that floor. The "no signal" suffix
+// captures the customer-facing semantic: an idle wake (no inflight
+// reading) cannot push concurrency below the floor — the
+// dashboard sees this as a no-op scale-out attempt.
+//
+// When ScalingPolicy is nil OR MinInstances == 0, the customer has
+// not opted into floor enforcement, so the branch does NOT fire —
+// every existing wake proceeds to the ledger. PR-D closes the
+// worker-class bypass closure and adds an explicit wake-path gate
+// for worker-class apps (the targets trigger currently no-ops for
+// them because MaxInflightForApp returns (0, false)).
+func (e *Engine) atMinFloorWithNoSignal(app *state.App, concurrency int) bool {
+	if app.ScalingPolicy == nil {
+		return false
+	}
+	if app.ScalingPolicy.MinInstances <= 0 {
+		return false
+	}
+	return concurrency >= app.ScalingPolicy.MinInstances
 }
 
 func (e *Engine) lockApp(appID string) func() {
