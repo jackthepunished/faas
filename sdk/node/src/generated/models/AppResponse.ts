@@ -50,5 +50,9 @@ export type AppResponse = {
    * RFC 3339 timestamp of the most recent scale-in event schedd reaped for this app, or null if the app has never scaled in.
    */
   last_scale_in_at?: string | null;
+  /**
+   * Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a valid signature from a publisher in the per-app trusted_signers list. Default false.
+   */
+  require_signed?: boolean;
 };
 
