@@ -469,3 +469,352 @@ func TestHandlePushRequest_TreeCloseNilSafe(t *testing.T) {
 		t.Errorf("err = %v, want op prefix 'githubd: source fetch'", err)
 	}
 }
+
+// stubChangedFiles adapts a (files, err) pair to the
+// ChangedFilesClient interface so HandlePushRequest's path-
+// filter path can be exercised without spinning up an httptest
+// server. records last args for spy assertions.
+type stubChangedFiles struct {
+	files []string
+	err   error
+
+	calls      int
+	lastInstID int64
+	lastOwner  string
+	lastRepo   string
+	lastBase   string
+	lastHead   string
+}
+
+func (s *stubChangedFiles) ChangedFiles(_ context.Context, instID int64, owner, repo, base, head string) ([]string, error) {
+	s.calls++
+	s.lastInstID = instID
+	s.lastOwner = owner
+	s.lastRepo = repo
+	s.lastBase = base
+	s.lastHead = head
+	return s.files, s.err
+}
+
+// pathFilterRig builds a Service with a recordingEnqueuer and an
+// optional ChangedFilesClient. Used by the path-filter tests
+// below. Returns (service, recorder, acctID).
+//
+// includeRootWorkload toggles whether the stub Scan produces a
+// third repo-root workload (RootDir == "") in addition to the
+// two member dirs. Tests that want to exercise the lockfile
+// fallback (rebuild all on no match) set includeRootWorkload=false
+// so a non-matching change genuinely matches no one.
+//
+// The stub Scan returns a Tier-3 (workspaces) result with each
+// workload's Source field tagged "workspaces:<name>" so
+// reconcile.DeriveScanSource returns ProjectScanSourceWorkspace —
+// matching the seeded project. The scan-source stability guard
+// trips if the project's stored source is below the desired tier;
+// we seed at the same tier to exercise the happy path.
+func pathFilterRig(t *testing.T, cf ChangedFilesClient, includeRootWorkload bool) (*Service, *recordingEnqueuer, string) {
+	t.Helper()
+	workloads := []reposcan.Workload{
+		{Class: reposcan.ClassHTTP, Name: "auth", RootDir: "services/auth/api", Source: "workspaces:auth"},
+		{Class: reposcan.ClassHTTP, Name: "billing", RootDir: "services/billing", Source: "workspaces:billing"},
+	}
+	if includeRootWorkload {
+		workloads = append(workloads, reposcan.Workload{
+			Class: reposcan.ClassHTTP, Name: "root", RootDir: "", Source: "workspaces:root",
+		})
+	}
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{
+			Workloads: workloads,
+			Managed:   []reposcan.Managed{},
+			Tier:      3,
+		}, nil
+	})
+	_, err := rig.mem.CreateProject(context.Background(), state.Project{
+		AccountID:        rig.acct,
+		Slug:             "demo",
+		InstallID:        rig.install,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		// DeriveScanSource returns "workspaces" (plural) for the
+		// tier-3 convention; the typed constant is "workspace"
+		// (singular). They hash to different tierRank slots, so
+		// we seed the plural form to match the scan.
+		ScanSource: state.ProjectScanSource("workspaces"),
+	})
+	if err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	svc := newServiceForRig(rig)
+	rec := &recordingEnqueuer{}
+	svc.Enqueuer = rec
+	svc.ChangedFiles = cf
+	return svc, rec, rig.acct
+}
+
+func TestHandlePushRequest_PathFilter_MatchesOneApp(t *testing.T) {
+	cf := &stubChangedFiles{files: []string{"services/auth/api/index.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"base123","after":"head456","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	// Two apps match: services/auth/api (path intersects) + the
+	// repo-root workload (RootDir == "" always rebuilds). Billing
+	// is the only one that gets skipped.
+	if len(rec.calls) != 2 {
+		t.Fatalf("Enqueue calls = %d, want 2 (auth + root)", len(rec.calls))
+	}
+	if cf.calls != 1 {
+		t.Errorf("ChangedFiles calls = %d, want 1", cf.calls)
+	}
+}
+
+func TestHandlePushRequest_PathFilter_RootDirEmptyAlwaysRebuilds(t *testing.T) {
+	// Single repo-root workload; changed file is anywhere — should
+	// rebuild because RootDir == "".
+	cf := &stubChangedFiles{files: []string{"somewhere/unrelated.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1 (root-dir workload always rebuilds)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_LockfileFallbackRebuildsAll(t *testing.T) {
+	// package.json at repo root, not under any member's RootDir.
+	// We disable the root-dir workload in the rig so a non-matching
+	// change genuinely matches no one — the spec's lockfile/CI
+	// fallback then rebuilds every touched app.
+	cf := &stubChangedFiles{files: []string{"package.json"}}
+	svc, rec, _ := pathFilterRig(t, cf, false)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 2 {
+		t.Fatalf("Enqueue calls = %d, want 2 (lockfile fallback rebuilds both touched apps)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_TruncatedFallsBack(t *testing.T) {
+	cf := &stubChangedFiles{err: ErrTruncated}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (ErrTruncated → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_CompareErrorFallsBack(t *testing.T) {
+	cf := &stubChangedFiles{err: ErrUnavailable}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (any compare error → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_EmptyBeforeFallsBack(t *testing.T) {
+	// First push on a branch: before is empty. Service must NOT
+	// call the client (can't form compare URL).
+	cf := &stubChangedFiles{files: []string{"x.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if cf.calls != 0 {
+		t.Errorf("ChangedFiles calls = %d, want 0 (empty before skips the client)", cf.calls)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (empty before → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_NilClientFallsBack(t *testing.T) {
+	// Back-compat: tests that don't wire ChangedFiles get the
+	// naive full fan-out (PR-GH.5 behaviour).
+	svc, rec, _ := pathFilterRig(t, nil, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (nil ChangedFiles → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_PrefixCollisionDoesNotMatch(t *testing.T) {
+	// services/billing must NOT match services/billing-x.ts. The
+	// rig includes a repo-root workload (RootDir="") that always
+	// rebuilds, so the result is exactly 1 enqueue (root alone) —
+	// NOT 3 (no lockfile fallback because root matched).
+	cf := &stubChangedFiles{files: []string{"services/billing-x/index.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1 (root-dir workload alone; prefix collision prevents billing from matching)", len(rec.calls))
+	}
+}
+
+// TestPathIntersectsDir pins the table directly. The behaviour is
+// load-bearing for the prefix-collision guard above.
+func TestPathIntersectsDir(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		files []string
+		dir   string
+		want  bool
+	}{
+		{"file under dir", []string{"a/b/c.ts"}, "a/b", true},
+		{"file equal to dir", []string{"a/b"}, "a/b", true},
+		{"file at sibling", []string{"a/c.ts"}, "a/b", false},
+		{"prefix collision (auth vs auth-api)", []string{"a/auth-api/x.ts"}, "a/auth", false},
+		{"file at root, dir at root", []string{"x.ts"}, "", false}, // dir=="" is filtered before this helper
+		{"empty files", nil, "a/b", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pathIntersectsDir(tc.files, tc.dir)
+			if got != tc.want {
+				t.Errorf("pathIntersectsDir(%v, %q) = %v, want %v", tc.files, tc.dir, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSplitOwnerRepo pins the helper that decodes "owner/name"
+// from GitHub's repository.full_name. Defends against the
+// "owner/repo/extra" misparse and the "/repo" / "owner/" edge
+// cases that would silently break the compare URL.
+func TestSplitOwnerRepo(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in           string
+		wantOk       bool
+		wantO, wantR string
+	}{
+		{"octo/api", true, "octo", "api"},
+		{"a/b", true, "a", "b"},
+		{"a/b/c", false, "", ""}, // too many slashes
+		{"", false, "", ""},
+		{"/repo", false, "", ""},  // empty owner
+		{"owner/", false, "", ""}, // empty repo
+		{"single", false, "", ""}, // no slash
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			o, r, ok := splitOwnerRepo(tc.in)
+			if ok != tc.wantOk || o != tc.wantO || r != tc.wantR {
+				t.Errorf("splitOwnerRepo(%q) = (%q,%q,%v), want (%q,%q,%v)",
+					tc.in, o, r, ok, tc.wantO, tc.wantR, tc.wantOk)
+			}
+		})
+	}
+}
+
+// TestFilterByPath_Unit pins the helper directly (no HTTP).
+func TestFilterByPath_Unit(t *testing.T) {
+	t.Parallel()
+	appsWithRoot := []state.App{
+		{ID: "auth", RootDir: "services/auth/api"},
+		{ID: "billing", RootDir: "services/billing"},
+		{ID: "root", RootDir: ""},
+	}
+	appsNoRoot := []state.App{
+		{ID: "auth", RootDir: "services/auth/api"},
+		{ID: "billing", RootDir: "services/billing"},
+	}
+	cases := []struct {
+		name      string
+		apps      []state.App
+		files     []string
+		mode      string
+		wantIDs   []string
+		wantSkips []string
+	}{
+		{
+			name:      "paths mode + root_dir match",
+			apps:      appsWithRoot,
+			files:     []string{"services/auth/api/index.ts"},
+			mode:      "paths",
+			wantIDs:   []string{"auth", "root"},
+			wantSkips: []string{"billing"},
+		},
+		{
+			// RootDir == "" always matches, so anyMatched=true and
+			// we don't fall through to the lockfile-rebuild-all
+			// branch — only `root` (the repo-root workload) is in
+			// matched. The lockfile-fallback path is only exercised
+			// when NO member's RootDir is touched AND no member has
+			// RootDir == "".
+			name:      "paths mode + lockfile + root-dir workload rebuilds alone",
+			apps:      appsWithRoot,
+			files:     []string{"package.json"},
+			mode:      "paths",
+			wantIDs:   []string{"root"},
+			wantSkips: []string{"auth", "billing"},
+		},
+		{
+			// Lockfile fallback (no member touched, no root-dir
+			// workload present): rebuild everything.
+			name:    "paths mode + lockfile fallback (no root-dir workload)",
+			apps:    appsNoRoot,
+			files:   []string{"package.json"},
+			mode:    "paths",
+			wantIDs: []string{"auth", "billing"},
+		},
+		{
+			name:    "full_fallback mode is identity",
+			apps:    appsWithRoot,
+			files:   nil, // ignored in full_fallback
+			mode:    "full_fallback",
+			wantIDs: []string{"auth", "billing", "root"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// filterByPath is a method on Service; build a zero-value one.
+			svc := &Service{}
+			matched, skipped := svc.filterByPath(tc.apps, tc.files, tc.mode)
+			gotIDs := make([]string, 0, len(matched))
+			for _, a := range matched {
+				gotIDs = append(gotIDs, a.ID)
+			}
+			if !stringSliceEq(gotIDs, tc.wantIDs) {
+				t.Errorf("matched = %v, want %v", gotIDs, tc.wantIDs)
+			}
+			if !stringSliceEq(skipped, tc.wantSkips) {
+				t.Errorf("skipped = %v, want %v", skipped, tc.wantSkips)
+			}
+		})
+	}
+}
