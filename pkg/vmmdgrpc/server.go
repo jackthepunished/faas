@@ -25,6 +25,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/leakcheck"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
@@ -114,6 +115,16 @@ type Server struct {
 	// interface bytes (includes Ethernet framing) — the same
 	// kernel counter the per-plan tc tbf qdisc reads.
 	netCache *netstats.Cache
+	// activity (PR-B, issue #462) holds the per-instance
+	// in-flight ForwardHTTP request counter used by Stats()
+	// to populate inflight_requests and last_request_at on
+	// the wire. The cache is fed by ForwardHTTP's Begin/End
+	// defer pair (forward.go) and consumed here in
+	// buildInstanceStatsRow. nil-safe so unit tests that
+	// don't assert inflight can pass nil to the lower
+	// constructors; production cmd/vmmd uses
+	// NewWithCPUAndNetAndActivity.
+	activity *activity.ActivityTracker
 }
 
 // New wires the server. ops may be nil (noop metrics), log may be nil
@@ -136,6 +147,22 @@ func NewWithCPU(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logge
 // from cmd/vmmd/main.go); nil is the safe default for unit tests
 // that don't assert egress bytes.
 func NewWithCPUAndNet(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger, cpu *cpustats.Cache, net *netstats.Cache) *Server {
+	return NewWithCPUAndNetAndActivity(vmm, ops, fcVer, log, cpu, net, nil)
+}
+
+// NewWithCPUAndNetAndActivity (PR-B, issue #462) wires all
+// three caches. act must be passed by cmd/vmmd's wiring
+// (activity.NewWithDefaults()); nil is the safe default for
+// unit tests that don't assert inflight — Stats leaves
+// InflightRequests at the zero default and LastRequestAt
+// nil when act is nil, which matches the pre-PR-B wire
+// shape and the schedd poller's additive-merge assumption.
+//
+// TODO (follow-up): collapse New/NewWithCPU/NewWithCPUAndNet/
+// NewWithCPUAndNetAndActivity into a single Options-struct
+// constructor. Tracked but not worth the call-site churn in
+// PR-B.
+func NewWithCPUAndNetAndActivity(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog.Logger, cpu *cpustats.Cache, net *netstats.Cache, act *activity.ActivityTracker) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -144,7 +171,7 @@ func NewWithCPUAndNet(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string, log *slog
 		// never exported. Tests that don't assert metrics use this path.
 		ops = wire.NewOpsMetrics("vmmd_test")
 	}
-	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net}
+	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act}
 }
 
 // ForgetCPU drops the cache baseline for an instance. Called from
@@ -166,6 +193,20 @@ func (s *Server) ForgetNet(instance string) {
 		return
 	}
 	s.netCache.Forget(instance)
+}
+
+// ForgetActivity drops the activity tracker entry for an
+// instance. PR-B (issue #462): parallel to ForgetCPU/ForgetNet.
+// Called from the Destroy path so the activity map does not
+// grow unbounded across the vmmd process lifetime. A leaked
+// Begin-without-End on a destroyed instance is recovered here,
+// not on the End call (which is the last-resort cleanup
+// documented in pkg/fcvm/activity/doc.go).
+func (s *Server) ForgetActivity(instance string) {
+	if s == nil || s.activity == nil {
+		return
+	}
+	s.activity.Forget(instance)
 }
 
 // Register binds s to a gRPC server.
@@ -278,6 +319,7 @@ func (s *Server) Destroy(ctx context.Context, req *vmmdpb.DestroyRequest) (*vmmd
 	}
 	s.ForgetCPU(req.GetInstance())
 	s.ForgetNet(req.GetInstance())
+	s.ForgetActivity(req.GetInstance())
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.DestroyResponse{Instance: req.GetInstance(), ExitCode: int32(code)}, nil
 }
