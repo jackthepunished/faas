@@ -172,6 +172,39 @@ func (r *VMMRouter) Client(nodeID string) VMM {
 	return r.cache[nodeID]
 }
 
+// Refresh (Tier A3) drops the dialed client for nodeID and updates
+// the in-memory target_url from the live compute_nodes row. Called
+// by the router_watcher on every compute_node_changed pg_notify
+// payload; the next resolveFor lazy-dials against the fresh URL.
+//
+// targetURL is the canonical compute_nodes.target_url at notify
+// time. Pass an empty string when the row is no longer in the
+// table — Refresh writes targets[nodeID]="" so resolveFor returns
+// its normal ErrCapacity (no stale dial against an old URL).
+//
+// Concurrent resolves in flight when Refresh lands keep the client
+// they already hold (Close is a best-effort tear-down; the caller
+// will see the new URL on the next RPC and re-dial anyway). The
+// cache eviction is unconditional on entry — even a Refresh that
+// later errors out leaves an empty cache slot, so a transient PG
+// blip cannot prolong the use of a stale dialed client.
+func (r *VMMRouter) Refresh(nodeID, targetURL string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cli, ok := r.cache[nodeID]; ok && cli != nil {
+		if closer, ok := cli.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		delete(r.cache, nodeID)
+	}
+	// targets[nodeID] is written unconditionally — even when
+	// targetURL == "" — so the unknown-node path (resolveFor's
+	// `if !ok` branch) is reachable on the next dial for a
+	// soft-deleted node, and a hard delete avoids a stale-dial
+	// retry against an old URL.
+	r.targets[nodeID] = targetURL
+}
+
 // resolveFor returns the dialed VMM for nodeID, dialing on first
 // use. The dial is serialised under the cache mutex for the same
 // node; concurrent dials for different nodes race freely. A lost
@@ -186,7 +219,15 @@ func (r *VMMRouter) resolveFor(ctx context.Context, nodeID string) (VMM, error) 
 	r.mu.Unlock()
 
 	target, ok := r.targets[nodeID]
-	if !ok {
+	// An empty target_url is the same as "row gone" for the
+	// resolveFor path: resolveFor's contract is to dial vmmd
+	// against a real URL. A blank URL would silently re-dial
+	// against today's default (`unix://` of the empty path) and
+	// either succeed (a real socket at the OS-default path) or
+	// fail with a confusing connection-refused error. Tier A3's
+	// Refresh writes "" precisely so resolveFor returns ErrCapacity
+	// here — the gateway's 503 mapping is consistent.
+	if !ok || target == "" {
 		return nil, api.ErrCapacity(fmt.Sprintf(
 			"vmm router: no target_url for node_id %q (compute_nodes row missing or target_url empty)", nodeID))
 	}

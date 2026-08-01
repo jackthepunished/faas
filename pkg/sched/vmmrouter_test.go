@@ -305,3 +305,93 @@ func TestVMMRouter_NilDialClosureFailsLoud(t *testing.T) {
 func TestVMMRouter_InterfaceSatisfied(t *testing.T) {
 	var _ RoutedVMM = (*VMMRouter)(nil)
 }
+
+// TestVMMRouter_RefreshDropsCacheAndReloadsTargets (Tier A3) pins
+// the live-refresh contract: a fresh target_url replaces the old
+// one and the dialed client is closed; the next resolveFor lazy-
+// dials against the new URL. Dial count rises by 1 — the cache
+// was dropped, so the next call cannot reuse the old client.
+func TestVMMRouter_RefreshDropsCacheAndReloadsTargets(t *testing.T) {
+	targets := map[string]*fakeRouterVMM{}
+	var dials atomic.Int32
+	var mu sync.Mutex
+	dial := trackingDial(&targets, &dials, &mu)
+
+	r := NewVMMRouter([]ComputeNodeInfo{
+		{ID: "node-a", TargetURL: "unix:///run/faas/a.sock"},
+	}, dial, nil)
+
+	// Pre-dial node-a on the original URL.
+	if _, err := r.CreateColdBoot(context.Background(), "node-a", "i-pre", AppSpec{}); err != nil {
+		t.Fatalf("pre-dial CreateColdBoot: %v", err)
+	}
+	pre, ok := targets["unix:///run/faas/a.sock"]
+	if !ok || pre == nil {
+		t.Fatal("trackingDial should have produced a fake for the original URL")
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("pre-dial dials = %d, want 1", got)
+	}
+
+	// The refresh: target_url rotates from a.sock to new.sock.
+	r.Refresh("node-a", "unix:///run/faas/new.sock")
+
+	// Cache slot is empty; targets map carries the new URL.
+	if got := r.Client("node-a"); got != nil {
+		t.Errorf("after Refresh: cache[ node-a ] = %v, want nil (drop is unconditional)", got)
+	}
+
+	// Next CreateColdBoot dials against the fresh URL.
+	if _, err := r.CreateColdBoot(context.Background(), "node-a", "i-post", AppSpec{}); err != nil {
+		t.Fatalf("post-refresh CreateColdBoot: %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Errorf("post-refresh dials = %d, want 2 (cache was dropped)", got)
+	}
+	if _, ok := targets["unix:///run/faas/new.sock"]; !ok {
+		t.Error("expected a fresh fake for the new target_url")
+	}
+}
+
+// TestVMMRouter_RefreshOfMissingNodeDropsOnly pins the row-gone
+// branch of Refresh: a watcher that observed a row drop on
+// compute_nodes writes targets[nodeID]="" so the next resolveFor
+// returns ErrCapacity rather than reusing a stale URL. The cache
+// entry was never set, so no Close() fires — the test asserts
+// only that the unknown-node error surfaces.
+func TestVMMRouter_RefreshOfMissingNodeDropsOnly(t *testing.T) {
+	targets := map[string]*fakeRouterVMM{}
+	var dials atomic.Int32
+	var mu sync.Mutex
+	dial := trackingDial(&targets, &dials, &mu)
+
+	r := NewVMMRouter([]ComputeNodeInfo{
+		{ID: "node-a", TargetURL: "unix:///run/faas/a.sock"},
+	}, dial, nil)
+
+	r.Refresh("ghost-node", "")
+
+	if got := r.Client("ghost-node"); got != nil {
+		t.Errorf("after Refresh(ghost, \"\"): cache[ ghost ] = %v, want nil", got)
+	}
+	_, err := r.CreateColdBoot(context.Background(), "ghost-node", "i", AppSpec{})
+	if err == nil {
+		t.Fatal("CreateColdBoot against a refresh-erased node should fail loudly")
+	}
+	// The unknown-node path uses *api.Problem Capacity so the
+	// gateway's 503 mapping is consistent. Pin the type so a
+	// future regression that silently falls through to a stale
+	// URL surfaces here. api.ErrCapacity is a *Problem
+	// constructor (not a sentinel error), so we assert the
+	// typed-shape directly.
+	var prob *api.Problem
+	if !errors.As(err, &prob) {
+		t.Fatalf("error = %v, want *api.Problem", err)
+	}
+	if prob.Code != api.CodeCapacity {
+		t.Errorf("error code = %q, want %q", prob.Code, api.CodeCapacity)
+	}
+	if got := dials.Load(); got != 0 {
+		t.Errorf("dials = %d, want 0 (no dial should happen on a refresh-erased node)", got)
+	}
+}
