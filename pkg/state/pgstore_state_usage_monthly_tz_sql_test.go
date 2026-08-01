@@ -43,7 +43,7 @@ var pgStoreUsageMonthlySource string
 // The fixed form queries `usage_minutes` directly with a half-open
 // UTC range — see body.
 func TestUsageByMonth_DoesNotUseSessionTZDateTrunc(t *testing.T) {
-	body := extractFnMonthly(pgStoreUsageMonthlySource, "func (s *PgStore) UsageByMonth(")
+	body := extractFn(pgStoreUsageMonthlySource, "func (s *PgStore) UsageByMonth(")
 	if body == "" {
 		t.Fatal("could not locate UsageByMonth in pgstore.go")
 	}
@@ -83,7 +83,7 @@ func TestUsageByMonth_DoesNotUseSessionTZDateTrunc(t *testing.T) {
 // in CurrentMonthOverageCents. The fixed form binds a Go-pre-
 // computed UTC monthStart as $2.
 func TestCurrentMonthOverageCents_DoesNotUseSessionTZDateTrunc(t *testing.T) {
-	body := extractFnMonthly(pgStoreUsageMonthlySource, "func (s *PgStore) CurrentMonthOverageCents(")
+	body := extractFn(pgStoreUsageMonthlySource, "func (s *PgStore) CurrentMonthOverageCents(")
 	if body == "" {
 		t.Fatal("could not locate CurrentMonthOverageCents in pgstore.go")
 	}
@@ -108,7 +108,7 @@ func TestCurrentMonthOverageCents_DoesNotUseSessionTZDateTrunc(t *testing.T) {
 // TestListInvoicesForAccount_DoesNotUseSessionTZDateTrunc pins
 // the same property for ListInvoicesForAccount (both branches).
 func TestListInvoicesForAccount_DoesNotUseSessionTZDateTrunc(t *testing.T) {
-	body := extractFnMonthly(pgStoreUsageMonthlySource, "func (s *PgStore) ListInvoicesForAccount(")
+	body := extractFn(pgStoreUsageMonthlySource, "func (s *PgStore) ListInvoicesForAccount(")
 	if body == "" {
 		t.Fatal("could not locate ListInvoicesForAccount in pgstore.go")
 	}
@@ -123,26 +123,9 @@ func TestListInvoicesForAccount_DoesNotUseSessionTZDateTrunc(t *testing.T) {
 	}
 }
 
-// extractFnMonthly returns the substring of pgstore.go source
-// covering a function body — bounded by the next top-level `func (`
-// signature so we don't drag in unrelated SQL. Same shape as
-// extractFn in pgstore_usage_by_hour_tz_sql_test.go, duplicated
-// here to keep the embed-bounded helper self-contained per file.
-func extractFnMonthly(src, sig string) string {
-	start := strings.Index(src, sig)
-	if start < 0 {
-		return ""
-	}
-	rest := src[start+len(sig):]
-	end := strings.Index(rest, "\nfunc (")
-	if end < 0 {
-		end = len(rest)
-	}
-	if end > 8192 {
-		end = 8192
-	}
-	return src[start : start+len(sig)+end]
-}
+// extractFn is defined in sql_static_guard_helpers_test.go so both
+// pgstore_usage_by_hour_tz_sql_test.go and this file share one
+// implementation.
 
 // stripSQLStaticGuardComments returns only the SQL fragments in
 // `body` that come from Go raw-string literals (the

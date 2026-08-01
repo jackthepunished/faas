@@ -102,17 +102,26 @@ func extractTarGzToDir(src string, lim extractLimits) (string, *api.Problem) {
 	return dst, nil
 }
 
-// pathStaysUnder returns true when `target` is lexically inside
+// pathStaysUnder returns true iff `target` is lexically inside
 // `root`, including the case where target == root. Mirrors the
 // defensive guard at pkg/rootfs/layer.go:148-165 (safeJoin). It does
 // not defend against pre-existing symlink ancestors; dst is freshly
 // created (0o700) by extractTarGzToDir and extraction rejects all
 // symlink/hardlink entry types, so the lexical check is sufficient.
 //
-// `filepath.Rel` errors out only on cases that practically imply
-// containment failure (different volumes on Windows, etc.). Both
-// "rel == .." and "rel starts with ../" are explicit escapes.
-// "rel == "." (target == root) is contained.
+// Contract: the post-`filepath.Rel` result is rejected only when it
+// is `".."` or starts with `"../"`. Every other value is inside
+// root — including `"."` (target == root), a nested path like
+// `"foo/bar"`, and the empty string (the only `Rel` can produce in
+// practice for inputs that resolve identically on every OS; harmless
+// to accept). `filepath.Rel` errors out only on cases that imply
+// containment failure (different volumes on Windows, etc.) and we
+// treat those as escapes too.
+//
+// Callers must pass `target` and `root` after `filepath.Clean`. Both
+// come out of `filepath.Join` already cleaned, so the production
+// call site (extractTarGzInto below) is fine; a future caller that
+// builds paths some other way must clean first.
 //
 // This is the post-Join belt-and-braces guard against a
 // customer-supplied archive that slipped past escapesArchiveRoot
