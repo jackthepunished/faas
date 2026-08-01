@@ -4,10 +4,9 @@
 // The legacy unary ForwardHTTP RPC was removed; the streaming
 // ForwardHTTPStream is the only bridge today. The
 // stubVmmdClient.ForwardHTTPStream method returns a hand-rolled
-// fake that satisfies grpc.BidiStreamingClient via the
-// grpc.GenericClientStream shape (the same wrapper the production
-// vmmdClient uses internally for the fake to behave like a real
-// stream). The fake:
+// fake that satisfies grpc.BidiStreamingClient — the same
+// interface the production vmmdClient.ForwardHTTPStream returns.
+// The fake:
 //
 //   1. Accepts the client→server init frame; records it into the
 //      shared *[]*vmmdpb.ForwardHTTPRequestInit so the integration
@@ -15,8 +14,8 @@
 //   2. Drains subsequent body-chunk frames until CloseSend / EOF.
 //   3. Sends the configured response init frame (status + headers)
 //      then emits the configured body bytes as one body_chunk frame.
-//   4. Closes the client-side stream; the gRPC trailer header is
-//      io.EOF on the next Recv().
+//   4. Closes the receive side; subsequent Recv calls return
+//      io.EOF so the forwarder exits cleanly.
 //
 // We need this stub in-package (not _test) because the test
 // compiles against the unexported stubVmmdClient struct. The
@@ -27,6 +26,7 @@ package gateway
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
@@ -109,7 +109,7 @@ func (s *proxyStubStream) Send(req *vmmdpb.ForwardHTTPStreamRequest) error {
 			}
 		}
 		// Close the receive stream so the next Recv returns io.EOF.
-		s.recvErr = ioEOF
+		s.recvErr = io.EOF
 		close(s.recvCh)
 	}
 	return nil
@@ -135,12 +135,3 @@ func (s *proxyStubStream) Recv() (*vmmdpb.ForwardHTTPStreamResponse, error) {
 	}
 	return frame, nil
 }
-
-// ioEOF is the sentinel error the stub returns on Recv when the
-// stream is closed. We can't import "io" here without a cycle
-// in some test setups; the literal error matches io.EOF.
-var ioEOF = errEOF{}
-
-type errEOF struct{}
-
-func (errEOF) Error() string { return "EOF" }

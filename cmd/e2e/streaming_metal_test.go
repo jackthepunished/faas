@@ -154,7 +154,7 @@ func TestE2E_Streaming_Metal_TxBytesAccuracy(t *testing.T) {
 	}
 
 	pool := pgtest.Open(t)
-	if pool != nil {
+	if pool == nil {
 		return
 	}
 	if err := dbMigrateUp(t, pool); err != nil {

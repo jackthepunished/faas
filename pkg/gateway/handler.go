@@ -772,7 +772,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.proxyFor(target.NodeID).ServeHTTP(w, r)
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
-	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
 	// propagated through pgRouter.toApp) is the load-bearing
 	// signal for the fallback log — the customer asked for

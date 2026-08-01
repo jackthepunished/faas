@@ -5,9 +5,9 @@
 // through it.
 //
 // PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
-// stubVmmdClient now drives the bidi ForwardHTTPStream RPC via a
-// bufconn-based fake server (proxy_stub.go). The streaming-only
-// shape keeps the integration test one bridge-shape consistent.
+// stubVmmdClient now drives the bidi ForwardHTTPStream RPC via the
+// in-package proxy_stub.go fake. The streaming-only shape keeps
+// the integration test on one consistent bridge.
 //
 // What this test exercises:
 //   1. proxyByNode != nil + Backend.Target returns a node id → the
