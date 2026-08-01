@@ -8,6 +8,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -86,7 +87,7 @@ func TestMemStore_CreateSnapshot_TwoTierCoexist(t *testing.T) {
 	if _, err := m.CreateSnapshot(ctx, Snapshot{
 		DeploymentID: "00000000-0000-0000-0000-0000000000c1", FCVersion: "fc-1.0",
 		StorageKey: "snap/00000000-0000-0000-0000-0000000000c1/init-dup/mem", Tier: SnapshotTierInit,
-	}); err != ErrConflict {
+	}); !errors.Is(err, ErrConflict) {
 		t.Errorf("dup init insert err = %v, want ErrConflict", err)
 	}
 }
@@ -209,7 +210,7 @@ func TestMemStore_LatestSnapshot_IgnoresStale(t *testing.T) {
 	}
 	// LatestSnapshotForTier(warm) must return ErrNotFound so schedd's
 	// tier-fallback chain falls through to init.
-	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c4", SnapshotTierWarm); err != ErrNotFound {
+	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c4", SnapshotTierWarm); !errors.Is(err, ErrNotFound) {
 		t.Errorf("LatestSnapshotForTier(warm) = %v, want ErrNotFound", err)
 	}
 }
@@ -221,10 +222,10 @@ func TestMemStore_LatestSnapshotForTier_NotFound(t *testing.T) {
 	ctx := context.Background()
 	m := newMemStoreForTest()
 	seedTierAppAndDeployment(t, m, "00000000-0000-0000-0000-0000000000c5")
-	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c5", SnapshotTierWarm); err != ErrNotFound {
+	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c5", SnapshotTierWarm); !errors.Is(err, ErrNotFound) {
 		t.Errorf("empty warm lookup = %v, want ErrNotFound", err)
 	}
-	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c5", ""); err != ErrNotFound {
+	if _, err := m.LatestSnapshotForTier(ctx, "00000000-0000-0000-0000-0000000000c5", ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("empty tier = %v, want ErrNotFound", err)
 	}
 }
