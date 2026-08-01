@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -145,31 +146,10 @@ func cmdTrustedPublishersRemove(args []string) int {
 // chain — the SDK's *Problem wraps the underlying transport error.
 func isTrustedSignerNotFound(err error) bool {
 	var p *api.Problem
-	if !errorsAs(err, &p) {
+	if !errors.As(err, &p) {
 		return false
 	}
 	return p.Code == api.CodeTrustedSignerNotFound
-}
-
-// errorsAs is a local mirror of errors.As that walks the error
-// chain via the standard Unwrap() method. We keep it local because
-// the cmd/gregale package's import set already pulls in stdlib
-// heavily and this is the only place that needs the walk.
-func errorsAs(err error, target any) bool {
-	for err != nil {
-		if t, ok := target.(**api.Problem); ok {
-			if p, ok := err.(*api.Problem); ok {
-				*t = p
-				return true
-			}
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }
 
 // cmdTrustedPublishersList prints every trusted-publisher on the

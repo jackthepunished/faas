@@ -472,7 +472,6 @@ var planLimits = map[Plan]Limits{
 		// matrix (5-8 publishers). Enough for "every dev has their own
 		// key" workflows without letting the table grow unbounded.
 		TrustedSignerCountMax: 8,
-		MinInstancesAllowed:   true,
 		// 256 KB = 0.1 % of Pro's 250 MB tarball.
 		MaxQueueDepth:               25,
 		MaxDelayedTasksPerApp:       50,
@@ -551,7 +550,6 @@ var planLimits = map[Plan]Limits{
 		// key (1024 bytes per migration 00083 CHECK) keeps the
 		// table on-disk under ~16 KiB regardless.
 		TrustedSignerCountMax: 16,
-		MinInstancesAllowed:   true,
 		// Soft ceiling: the binding constraint on Scale is the per-payload
 		// byte cap (1 MiB), not the row count.
 		MaxQueueDepth:               100,

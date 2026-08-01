@@ -369,7 +369,7 @@ func (p *ociImageSignaturePuller) FetchSignature(ctx context.Context, ref, diges
 	// for the same content-addressed blob.
 	rc, err := mp.PullBlob(ctx, ref, digest)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", cosign.ErrSignatureMissing, err)
+		return nil, errors.Join(cosign.ErrSignatureMissing, err)
 	}
 	defer func() { _ = rc.Close() }()
 	return io.ReadAll(rc)
