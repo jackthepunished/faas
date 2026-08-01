@@ -93,10 +93,15 @@ token has lost write authority.
 
 ## Other secrets
 
-- **`/etc/faas/secrets/host-age.key`** — sealed customer-secret box
-  keypair (ADR-020). Rotated only under incident response; the old
-  keypair stays valid for 30 days post-rotation so customers can
-  re-decrypt in-flight secrets.
+- **`/etc/faas/secrets/host.age`** — sealed customer-secret box
+  keypair (ADR-020, ADR-057). Rotated only under incident response
+  or compliance cadence; the old keypair stays valid for 30 days
+  post-rotation so daemons can re-decrypt in-flight envelopes
+  during the overlap window. See
+  [`host-age-rotation.md`](host-age-rotation.md) for the full
+  runbook (`gregale host-age rotate --commit` →
+  bounce daemons → `gregale host-age prune-previous` after 30
+  days).
 - **`apid session secret`** — generated at apid install time, lives in
   apid's TOML. Rotated only if leaked; invalidates every active
   customer session.

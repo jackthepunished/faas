@@ -261,7 +261,27 @@ type App struct {
 	// on reads (same shape as Runtime).
 	StartCommand string
 	Manifest     AppManifest
-	CreatedAt    time.Time
+	// ScalingPolicy is the per-app autoscaling configuration
+	// (issue #462 / ADR-058). The on-disk shape is jsonb
+	// (`apps.scaling_policy`); the in-memory field is the
+	// canonical source for new writes. Legacy rows read back
+	// through the empty-policy projection path: nil pointer +
+	// zero-value `min_instances` / `max_concurrency` = scale to
+	// zero, the pre-#462 contract. See apid's appResponse for
+	// the projection logic.
+	ScalingPolicy *ScalingPolicy
+	// LastScaleOutAt is the wall-clock time of the most recent
+	// scale-out event schedd admitted for this app (issue #462 /
+	// ADR-058). Used by the wake-gate cooldown helper
+	// (`pkg/sched/engine.go::admitGate`) to short-circuit requests
+	// that hit the `ScaleOutCooldownS` window. Nullable:
+	// schedd stamps this on the admit branch (same Tx as the
+	// `instances` row insert), so a NULL means "never scaled
+	// out this app". Same shape for LastScaleInAt, stamped on the
+	// reaper park branch.
+	LastScaleOutAt *time.Time
+	LastScaleInAt  *time.Time
+	CreatedAt      time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -273,6 +293,132 @@ type AppManifest struct {
 	Port       int               `json:"port,omitempty"`
 	Healthz    string            `json:"healthz,omitempty"`
 	User       string            `json:"user,omitempty"`
+}
+
+// ScalingPolicy is the per-app autoscaling configuration (issue #462 /
+// ADR-058). The struct is the canonical in-memory form; the on-disk
+// shape is jsonb (column `apps.scaling_policy`) round-tripped through
+// MarshalJSON / UnmarshalJSON.
+//
+// The struct is layered on top of the existing per-app knobs
+// (`min_instances`, `max_concurrency`, `autoscale_target_rps`) rather
+// than replacing them. The plan is:
+//
+//  1. PR-A persists the policy + adds the Hobby+ tier-up for
+//     min_instances. The struct is the in-memory source of truth for
+//     new writes; legacy rows read back through the empty-policy
+//     projection (empty struct = "use min_instances / max_concurrency
+//     from the existing columns").
+//  2. PR-C wires the engine to read the policy and stamps
+//     `last_scale_out_at` / `last_scale_in_at` on the admit / park
+//     branches. The cooldown fields land here in JSON form because
+//     legacy rows default to a sane floor (the engine applies the
+//     default on the empty-policy read path).
+//  3. PR-D carves out the worker-class branch and adds the financial
+//     ADR.
+//
+// Empty values are equivalent to "policy unset" (the field default
+// is the per-app knob's default). The DTO mirrors this with
+// pointer-fields so the wire form can distinguish "don't touch" from
+// "explicit zero".
+type ScalingPolicy struct {
+	// MinInstances is the per-app cold-wake floor. Mirrors the
+	// existing top-level `min_instances` column; persisted in the
+	// jsonb for the new policy surface, but the column-write stays
+	// in sync (the apid handler writes both, so legacy readers
+	// remain consistent). 0 = scale to zero (default).
+	MinInstances int
+	// MaxInstances is the per-app ceiling on live instances. The
+	// PlanGate (`MaxInstancesAllowed`) gates this; bounded above by
+	// the plan's `MaxConcurrency`. 0 = "use plan max_concurrency".
+	MaxInstances int
+	// Target is the per-instance signal the engine watches for the
+	// scale-up trigger. nil = "engine-derives from
+	// autoscale_target_rps / autoscale_target_cpu_pct" (legacy
+	// compat, also the empty-policy projection). A non-nil zero-
+	// value struct is legal and round-trips (e.g. `{metric: "rps",
+	// value: 0}` — the engine reads Metric rather than Value for
+	// "disabled"). PR-A only persists the shape; PR-B wires the
+	// `concurrent_requests` metric, PR-C the engine cooldown.
+	Target *ScalingTarget
+	// ScaleOutCooldownS is the minimum number of seconds between
+	// two scale-out events for the same app. Floor = 1 s (no
+	// `0` traps); ceiling = 3600 s (1 h). Default = 0 means
+	// "engine uses the plan default" (PR-C sets Hobby = 5, Pro = 3,
+	// Scale = 1).
+	ScaleOutCooldownS int
+	// ScaleInCooldownS is the minimum number of seconds between
+	// two scale-in events for the same app. Floor = 5 s (longer
+	// than the scale-out floor to dampen oscillation); ceiling =
+	// 86400 s (1 day). Default = 0 means "engine uses the plan
+	// default" (PR-C sets Hobby = 60, Pro = 30, Scale = 15).
+	ScaleInCooldownS int
+}
+
+// ScalingTarget is the (metric, value) pair the engine watches for
+// the scale-up trigger. The metric surface is closed: `rps`,
+// `concurrent_requests`, `p99_latency_ms`. Empty Metric = "disabled"
+// (the engine falls back to the legacy autoscale_target_rps column).
+type ScalingTarget struct {
+	Metric string  // "" | "rps" | "concurrent_requests" | "p99_latency_ms"
+	Value  float64 // target value (units depend on Metric)
+}
+
+// MarshalJSON encodes the policy as the canonical jsonb shape. The
+// shape is the one the migration's `apps.scaling_policy` column
+// round-trips, and the one the wire DTO mirrors. Empty fields render
+// as `0` (the convention is "value zero = use default"; the apid
+// gate is what enforces the floor / ceiling, not the encoder).
+// Target uses an inline struct so the nil-pointer case emits `null`
+// (mirrors the DTO's `*ScalingTarget`).
+func (p ScalingPolicy) MarshalJSON() ([]byte, error) {
+	type policyShape struct {
+		MinInstances      int            `json:"min_instances,omitempty"`
+		MaxInstances      int            `json:"max_instances,omitempty"`
+		Target            *ScalingTarget `json:"target,omitempty"`
+		ScaleOutCooldownS int            `json:"scale_out_cooldown_s,omitempty"`
+		ScaleInCooldownS  int            `json:"scale_in_cooldown_s,omitempty"`
+	}
+	// The struct conversion pins the jsonb encoder's tag set to the
+	// policyShape local — adding a json tag here does not silently
+	// change how the canonical state.ScalingPolicy serialises.
+	return json.Marshal(policyShape(p))
+}
+
+// UnmarshalJSON decodes the jsonb shape into the policy. Unknown
+// fields are rejected at the wire boundary (see DTO Strict Unmarshal),
+// but the on-disk schema is the canonical source — the `column OR
+// legacy` union is what the production read paths project back into
+// the in-memory struct.
+func (p *ScalingPolicy) UnmarshalJSON(data []byte) error {
+	type policyShape struct {
+		MinInstances      int            `json:"min_instances,omitempty"`
+		MaxInstances      int            `json:"max_instances,omitempty"`
+		Target            *ScalingTarget `json:"target,omitempty"`
+		ScaleOutCooldownS int            `json:"scale_out_cooldown_s,omitempty"`
+		ScaleInCooldownS  int            `json:"scale_in_cooldown_s,omitempty"`
+	}
+	var raw policyShape
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.MinInstances = raw.MinInstances
+	p.MaxInstances = raw.MaxInstances
+	p.Target = raw.Target
+	p.ScaleOutCooldownS = raw.ScaleOutCooldownS
+	p.ScaleInCooldownS = raw.ScaleInCooldownS
+	return nil
+}
+
+// ScalingPolicyOrDefault returns the policy if non-nil, otherwise the
+// zero-value ScalingPolicy. Used at the read path so an empty jsonb
+// column projects back into a structured value rather than a nil
+// pointer the rest of the codebase has to special-case.
+func ScalingPolicyOrDefault(p *ScalingPolicy) ScalingPolicy {
+	if p == nil {
+		return ScalingPolicy{}
+	}
+	return *p
 }
 
 // GitHubBinding is the (app → github_installation) edge persisted on
@@ -865,9 +1011,16 @@ type ComputeNode struct {
 	MemMB              int
 	MaxConcurrency     int
 	AdmissionCeilingMB int
-	Active             bool
-	LastHeartbeatAt    time.Time
-	CreatedAt          time.Time
+	// VCPUBudget is the per-node vCPU admission ceiling (migration
+	// 00081, Tier A2). schedd's NodeLedger checks vCPU against
+	// this value rather than the legacy box-wide api.VCPUSlots.
+	// Defaults to 160 (api.VCPUSlots) on the synthetic default-local
+	// row seeded by migration 00024; operators tune it per-node in
+	// a heterogeneous fleet (a smaller box gets a smaller budget).
+	VCPUBudget      int
+	Active          bool
+	LastHeartbeatAt time.Time
+	CreatedAt       time.Time
 	// Region is a free-form locality label (e.g. "eu-fsn1", "local").
 	// nil means the row was inserted before 00069 OR the operator
 	// didn't set a region on registration. The chooser treats nil
@@ -1138,6 +1291,16 @@ type UpdateAppParams struct {
 	// NULL on the wire. Reconcile writes this on every update; the
 	// apid handler leaves it nil.
 	StartCommand *string
+	// ScalingPolicy is the per-app autoscaling configuration
+	// (issue #462 / ADR-058). SetScalingPolicy distinguishes "unset"
+	// (don't touch) from "explicit zero" (scale to zero, the
+	// default behaviour). The on-disk shape is jsonb; the in-memory
+	// field is the canonical form for the (de)serialiser. When
+	// SetScalingPolicy is true the handler writes the jsonb column
+	// AND keeps the legacy `min_instances` column in sync (so
+	// legacy readers don't see a stale floor).
+	ScalingPolicy    *ScalingPolicy
+	SetScalingPolicy bool
 }
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).

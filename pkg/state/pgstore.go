@@ -833,22 +833,48 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 	if p.Manifest != nil {
 		manifestBytes, _ = json.Marshal(*p.Manifest)
 	}
+	// Issue #462 / ADR-058 / PR-A: the scaling policy is the jsonb
+	// column `apps.scaling_policy`. The store writes the jsonb
+	// AND keeps the legacy `min_instances` column in sync so the
+	// reaper + the SDK see the same floor without a fan-out read.
+	// The sync is unconditional when the policy is set: the
+	// legacy column is the projection of the policy's
+	// MinInstances (Hobby+ writes 1; Free stays 0).
+	scalingPolicyBytes := []byte(nil)
+	keepMinInstancesInSync := false
+	if p.SetScalingPolicy && p.ScalingPolicy != nil {
+		scalingPolicyBytes, _ = json.Marshal(*p.ScalingPolicy)
+		keepMinInstancesInSync = true
+	}
 	upd := `update apps set
 		   ram_mb          = coalesce($2, ram_mb),
 		   idle_timeout_s  = case when $3 then $4 else idle_timeout_s end,
 		   max_concurrency = coalesce($5, max_concurrency),
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
-		   min_instances   = case when $9 then $10 else min_instances end,
+		   min_instances   = case
+		                        when $25 then $26
+		                        when $9  then $10
+		                        else min_instances
+		                      end,
 		   egress_allowlist = case when $11 then $12::cidr[] else egress_allowlist end,
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
 		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
 		   root_dir       = case when $19 then $20 else root_dir end,
 		   workload_name  = case when $21 then $22 else workload_name end,
-		   start_command  = case when $23 then $24::text else start_command end
+		   start_command  = case when $23 then $24::text else start_command end,
+		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
 		 where id = $1
 		 returning ` + appsSelectColumns
+	// `policyMinInstances` is the value to push into the legacy
+	// column when the policy is set. The two SET sources race on
+	// the same column; the policy-comes-first CASE preserves the
+	// policy author as the canonical writer at PR-A.
+	var policyMinInstances int
+	if p.ScalingPolicy != nil {
+		policyMinInstances = p.ScalingPolicy.MinInstances
+	}
 	row := s.pool.QueryRow(ctx, upd,
 		id,
 		p.RAMMB, p.SetIdleTimeout, intOrZero(p.IdleTimeoutS),
@@ -861,7 +887,9 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled),
 		p.RootDir != nil, p.RootDir,
 		p.WorkloadName != nil, p.WorkloadName,
-		p.StartCommand != nil, nullString(derefString(p.StartCommand)))
+		p.StartCommand != nil, nullString(derefString(p.StartCommand)),
+		keepMinInstancesInSync, policyMinInstances,
+		p.SetScalingPolicy, scalingPolicyBytes)
 	return scanApp(row)
 }
 
@@ -4673,7 +4701,7 @@ type SnapshotSize struct {
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
-		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.Active,
+		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
 		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
@@ -4683,7 +4711,7 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where active = true
@@ -4712,7 +4740,7 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 order by name
@@ -4735,7 +4763,7 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where id = $1
@@ -4750,7 +4778,7 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where name = $1
@@ -4920,14 +4948,14 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
 		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.Active, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Active, node.Region, node.Zone)
 	return scanComputeNode(row)
 }
 
@@ -4939,29 +4967,38 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // last_heartbeat_at and created_at are not touched on conflict: the
 // former is the watchdog's heartbeat stamp (next task); the latter is
 // the row's creation time and stays monotonic.
+//
+// vcpu_budget (Tier A2, migration 00081) is operator-tunable per
+// node. The upsert re-applies the caller's value on conflict so
+// a vmmd self-registering with its config.toml value wins against
+// a stale row; the operator can re-tune later via
+// PUT /v1/compute-nodes/{id}. Migration 00081 backfilled existing
+// rows to api.VCPUSlots (160); pre-migration rows see the same
+// default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 12-column
+	// region/zone are projected to match scanComputeNode's 13-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
-	// default-local backfill. RETURNING projects all 12 columns.
+	// default-local backfill. RETURNING projects all 13 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
 		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, true, $7, $8)
+		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
+		      vcpu_budget         = excluded.vcpu_budget,
 		      active              = true
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node %q: %w", node.Name, err)
@@ -6590,11 +6627,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var manifestBytes []byte
 	var allowlistText string
 	var workloadClassStr string
+	var scalingPolicyBytes []byte
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled); err != nil {
+		&a.StreamingEnabled, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6604,6 +6642,19 @@ func scanAppInto(a *App, row pgx.Row) error {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
 	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	// scaling_policy: an empty jsonb ('{}'::jsonb, the column
+	// default) round-trips as a non-nil zero-length slice. The
+	// non-empty path is the customer-authored shape from
+	// `pkg/state.ScalingPolicy.MarshalJSON`. Empty path = legacy
+	// row, project as the zero-value struct + nil pointer so the
+	// apid read-back falls through to the min_instances /
+	// max_concurrency projection.
+	if len(scalingPolicyBytes) > 0 {
+		p := &ScalingPolicy{}
+		if err := json.Unmarshal(scalingPolicyBytes, p); err == nil {
+			a.ScalingPolicy = p
+		}
+	}
 	return nil
 }
 
@@ -6611,14 +6662,17 @@ func scanAppInto(a *App, row pgx.Row) error {
 // must use. Listed in the same order as scanAppInto — scanAppInto
 // reads columns positionally, so the order is load-bearing. The 5
 // trailing columns (project_id, root_dir, workload_name, workload_class,
-// start_command) are the ADR-050 Phase 1 additions. Keep this const
+// start_command) are the ADR-050 Phase 1 additions. The 3 trailing
+// columns (scaling_policy, last_scale_out_at, last_scale_in_at) are
+// the issue #462 / ADR-058 PR-A additions. Keep this const
 // and the App struct aligned: adding a column touches both.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, ''), streaming_enabled`
+	workload_class, coalesce(start_command, ''), streaming_enabled,
+	scaling_policy, last_scale_out_at, last_scale_in_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

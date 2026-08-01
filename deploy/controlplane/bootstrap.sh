@@ -330,6 +330,29 @@ else
   warn "hostage-gen not found at ${FAAS_BIN}/hostage-gen — MFA won't function until you build it (`make build`)"
 fi
 
+# ─── 11b-overlap. Rotation overlap detection (issue #316 / ADR-057) ─────────
+# Informational only: bootstrap.sh does NOT refuse on .previous
+# existence (the runbook explicitly tolerates the overlap window).
+# The operator sees "rotation in progress, N days old" alongside
+# the host.age status line and can decide whether to wait or to
+# invoke `gregale host-age prune-previous --force` to shorten the
+# overlap. Without this block the only way to know a rotation is
+# in flight is to read host.age.previous by hand — which is the
+# kind of latent signal that gets lost between shifts.
+HOST_AGE_PREV="${SECRETS_DIR}/host.age.previous"
+if [[ -f "${HOST_AGE_PREV}" ]]; then
+  HAP_MODE=$(stat -c '%a' "${HOST_AGE_PREV}" 2>/dev/null || echo "??")
+  HAP_MTIME_EPOCH=$(stat -c '%Y' "${HOST_AGE_PREV}" 2>/dev/null || echo "0")
+  HAP_AGE_DAYS=$(awk -v now="$(date +%s)" -v mtime="${HAP_MTIME_EPOCH}" 'BEGIN { if (mtime > 0) { printf "%d", int((now - mtime) / 86400) } else { print "?" } }')
+  HAP_AGE_HOURS=$(awk -v now="$(date +%s)" -v mtime="${HAP_MTIME_EPOCH}" 'BEGIN { if (mtime > 0) { printf "%d", int(((now - mtime) % 86400) / 3600) } else { print "?" } }')
+  ok "host.age.previous present — rotation overlap in progress (age ${HAP_AGE_DAYS}d ${HAP_AGE_HOURS}h, mode ${HAP_MODE})"
+  if [[ "${HAP_MODE}" != "400" ]]; then
+    chown root:root "${HOST_AGE_PREV}"
+    chmod 0400 "${HOST_AGE_PREV}"
+    warn "host.age.previous perms repaired (was ${HAP_MODE}, now 0400 root:root)"
+  fi
+fi
+
 # ─── 11c. Cosign sign-keypair (Tier 3 / ADR-038 §Phase 3) ────────────────────
 # imaged and schedd fail-loud at startup if /etc/faas/secrets/sign.key
 # or sign-pub.pem is missing or has wrong perms (cmd/imaged/main.go:103-109

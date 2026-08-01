@@ -6,6 +6,16 @@
 // inside EnforceQuota and the meterd_billing_cap_exceeded_total
 // counter is incremented with the plan label. In-budget usage is
 // unchanged; the cap is advisory for overage only.
+//
+// Calendar-month gotcha: every `now := time.Date(...)` below must
+// land inside the CURRENT calendar month (UTC). The cap reads via
+// MemStore.CurrentMonthOverageCents which partitions on
+// `time.Now().UTC()` (memstore.go:4635), not on the injected clock.
+// If a fixture date rolls out of the current month, the loop sees
+// 0 overage cents and the cap counter never increments — surfacing
+// as a deterministic test failure on the first CI run after a
+// month boundary (memory: meterd-testrun-migration-23505-flake.md).
+// Bump the dates in lockstep when the calendar crosses.
 package meter_test
 
 import (
@@ -29,11 +39,18 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	// Cap-bearing Hobby account.
 	acct := makeAccount(t, ctx, store, api.PlanHobby)
 	store.SetOverageCapCentsForTest(acct.ID, 1000)
+	// Pin the store's clock seam to the fixture `now` so
+	// CurrentMonthOverageCents's monthStart is derived from the same
+	// anchor AppendUsage uses. Without this, real wall-clock has
+	// advanced past `now`'s month on the EX44 (test authored when
+	// `now` was the current month) and the row is silently filtered
+	// as "before monthStart" — cap hit never registers.
+	store.SetClockForTest(func() time.Time { return now })
 
 	// 1200 cents of derived overage this month. 100 cents = 1 GB-h, so
 	// 1200 cents = 12 GB-h = 12 * 1024 * 3600 = 44_236_800 mb_seconds.
@@ -105,10 +122,11 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	acct := makeAccount(t, ctx, store, api.PlanPro)
 	store.SetOverageCapCentsForTest(acct.ID, 10_000)
+	store.SetClockForTest(func() time.Time { return now })
 
 	// 500 cents of overage (5 GB-h). Below the 10_000 cap.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds
@@ -162,10 +180,11 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	makeAccount(t, ctx, store, api.PlanScale)
 	// No SetOverageCapCentsForTest call — NULL column analog.
+	store.SetClockForTest(func() time.Time { return now })
 
 	ops := wire.NewOpsMetrics("meter_test_cap_unset")
 	loop := meter.NewLoop(
@@ -213,9 +232,10 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 	t.Parallel()
 	store := &errCapStore{MemStore: state.NewMemStore()}
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	makeAccount(t, ctx, store.MemStore, api.PlanHobby)
+	store.SetClockForTest(func() time.Time { return now })
 
 	ops := wire.NewOpsMetrics("meter_test_cap_fail")
 	loop := meter.NewLoop(
@@ -256,10 +276,11 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	acct := makeAccount(t, ctx, store, api.PlanScale)
 	store.SetOverageCapCentsForTest(acct.ID, 500) // cents
+	store.SetClockForTest(func() time.Time { return now })
 
 	// Exactly 500 cents of derived overage.
 	mbSeconds := int64(500) * 3600 / 100 // 18_000 mb_seconds

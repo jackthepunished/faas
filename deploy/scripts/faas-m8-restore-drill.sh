@@ -20,9 +20,10 @@
 #   4.   Write a recovery stanza so PG replays archived WAL until consistent.
 #   5.   Start Postgres, then every faas daemon.
 #   5.5  Restore host.age{,.pub} into /etc/faas/secrets from the
-#        basebackup; SHA-mismatch fails closed (protects against a
-#        rotation path not yet shipped). Restart vmmd so it loads the
-#        unseal identity before the first wake.
+#        basebackup; SHA-mismatch fails closed (protects against
+#        accidental overwrite during the 30-day rotation overlap
+#        window — issue #316 / ADR-057). Restart vmmd so it loads
+#        the unseal identity before the first wake.
 #   6.   Wait for schedd admission to come up; hit the test app's :8080.
 #   7.   Write the dated record into docs/drills/<UTC-date>-<HHMMSS>-
 #        restore-drill.md with seven required metric fields; print a
@@ -194,7 +195,17 @@ heading "5.5/7 Restore host.age into /etc/faas/secrets"
 SHA_STORED="$(cat "$LATEST_BB/host.age.sha256")"
 SHA_LIVE="$(sha256sum "$LATEST_BB/host.age" | awk '{print $1}')"
 if [[ "$SHA_STORED" != "$SHA_LIVE" ]]; then
-  fail "host.age SHA changed between backup and restore — refusing to overwrite (rotate path not yet shipped)"
+  # Issue #316 / ADR-057: rotation is now a documented procedure
+  # (docs/ops/host-age-rotation.md). If the backup's host.age
+  # differs from the live one AND host.age.previous exists, this
+  # is the normal post-rotation shape and the operator must run
+  # `gregale host-age status` + the runbook to reconcile before
+  # restoring. We still refuse silent overwrite.
+  if [[ -f /etc/faas/secrets/host.age.previous ]]; then
+    fail "host.age SHA changed AND host.age.previous present — rotation overlap in progress; reconcile via 'gregale host-age status' before restoring"
+  else
+    fail "host.age SHA changed between backup and restore — refusing to overwrite"
+  fi
 fi
 install -d -m 0700 -o root -g root /etc/faas/secrets
 install -m 0400 "$LATEST_BB/host.age"     "$HOST_KEY"

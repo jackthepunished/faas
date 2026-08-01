@@ -105,9 +105,13 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 - **Rate limits (ADR-040 / issue #292):** gatewayd runs two token buckets per request in series, both before the wake gate so abuse doesn't burn the schedd gRPC admission queue. The **per-account** bucket (`RateLimitPerAccountRPM` — Free 50/min, Hobby 200/min, Pro 1000/min, Scale 5000/min; key = `apps.account_id` joined in `pgRouter.toApp`) runs first and bounds the botnet signature of attacks spread across one customer's apps. The **per-app** bucket (`RateLimitRPS`/`RateLimitBurst` — existing) runs second as the inner cap. Each 429 carries `Retry-After: 1` and `x-faas-rate-limit-scope: {account,app}` so observability tooling can split the two populations. The new counter is `gateway_per_account_rate_limited_total{account_id, plan}`, pre-instantiated under `__other__` to keep the §12 panel non-dark; alert is `FaasPerAccountRateLimitSpike` (> 100/min fleet, warn).
 - Records `last_request_at[instance]` (in-memory, flushed to PG every 15 s) — this drives idle parking.
 - Rate limits (token bucket, per app): Free 5 rps burst 20; Hobby 20 rps burst 100; Pro 100 rps burst 500; Scale 500 rps burst 2000. Over-limit → `429`.
-- Request/response size caps: 25 MB body either direction. Timeouts: 60 s upstream response start, 300 s total.
-- **Multi-node forwarding (ADR-028):** When schedd has placed an instance on a remote compute_node, gatewayd dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's `ForwardHTTP` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. Body cap is 25 MiB; the bridge refuses larger payloads with `ResourceExhausted` before any bytes leave the gateway. The default-local node (one-box dev) skips the bridge and uses the existing direct reverse-proxy path.
-- Emits: `gateway_requests_total{app,code}`, `gateway_wake_latency_seconds` (histogram), `gateway_queue_depth`.
+- Request/response size caps (per-plan, ADR-047):
+  - **Default (Free-tier path):** 25 MB body either direction; 60 s upstream response start, 300 s total. This is the legacy buffered path; it serves all Free-tier apps (and Hobby+ apps that have not opted in to streaming via the per-app `streaming_enabled` flag, with an operator opt-in via `FAAS_GATEWAY_STREAMING`).
+  - **Streaming path (Hobby+ only, ADR-047):** 100 MB body cap; 900 s response deadline. The `gatewayd` handler takes the streaming path iff `FAAS_GATEWAY_STREAMING` is set (operator opt-in) AND the app's `streaming_enabled` flag is true AND the inbound request did not opt out via `Accept: application/json`. The handler wraps `w` with a per-flush `onFlush` callback (`statusRecorder.doFlush`) that attributes egress bytes (per-instance, per-minute) on every `Write`+`Flush` boundary, plus a residual capture on `finalFlush`. The cap is enforced by `pkg/gateway.capWriter`; on cap-exceeded the gateway emits a 413 `streaming_not_available` problem+json (RFC 7807) instead of stdlib's 502.
+  - **Per-request opt-out:** `Accept: application/json` flips a single request to the buffered path. The customer's per-app flag stays unchanged so flipping the flag on later is a config change, not a per-request decision.
+  - **Plan gate:** `apid` rejects `streaming_enabled=true` on Free apps with `CodePlanStreamingNotAllowed` (per pkg/api/errors.go) at deploy time. The runtime fallback log `streamingFallbackLog` fires only when `!streaming && plan == Free && SSE` — the operator-toggled `FAAS_GATEWAY_STREAMING` is the operator-side lever, not a per-app misconfiguration.
+- **Multi-node forwarding (ADR-028 + ADR-047):** When schedd has placed an instance on a remote compute_node, gatewayd dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's bidi `ForwardHTTPStream` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. The streaming envelope is 100 MB body / 900 s response deadline (the per-plan caps in §4.1 apply on the gateway side via `capWriter`; the vmmd bridge runs the streaming cap uniformly). The default-local node (one-box dev) skips the bridge and uses the existing direct reverse-proxy path. The legacy unary `ForwardHTTP` RPC was removed in PR-D — `ForwardHTTPStream` is the only bridge today.
+- Emits: `gateway_requests_total{app,code}`, `gateway_wake_latency_seconds` (histogram), `gateway_queue_depth`, `gateway_response_bytes_total{app,plan}` (per-flush delta + residual capture), `gateway_stream_flushes_total{app,plan}` (per-`doFlush` increment), `gateway_stream_active{app,plan}` (gauge — Inc on `setupStreamingWriter`, Dec on handler defer; buffered-path requests never touch the gauge). See §12 for the dashboard table.
 
 #### 4.1.1 Platform path reservations
 
@@ -195,7 +199,7 @@ gatewayd is the **only public listener on the box**; before falling through to t
 
 **Owns:** usage truth. Sampling → aggregation → quota state → Stripe.
 
-- Sample loop (1 s): for each RUNNING instance read cgroup `memory.current` (host truth, includes VMM) → accumulate `mb_seconds`. Flush per-minute rows: `usage_minutes(account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)`. `cpu_usec` is the cumulative host-cgroup CPU-µs delta (ADR-039, additive on `(instance_id, minute)`); `tx_bytes` is the cumulative HTTP response bytes the gateway forwarded for this instance in this minute (ADR-046, additive); `net_tx_bytes` is the cumulative byte delta on root-side `vethHost.rx_bytes` for this instance in this minute (ADR-046, additive). The first three columns are billable-floor or telemetry; `tx_bytes` and `net_tx_bytes` are telemetry only — no provider push in this PR.
+- Sample loop (1 s): for each RUNNING instance read cgroup `memory.current` (host truth, includes VMM) → accumulate `mb_seconds`. Flush per-minute rows: `usage_minutes(account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)`. `cpu_usec` is the cumulative host-cgroup CPU-µs delta (ADR-039, additive on `(instance_id, minute)`); `tx_bytes` is the cumulative HTTP response bytes the gateway forwarded for this instance in this minute (ADR-046, additive); `net_tx_bytes` is the cumulative byte delta on root-side `vethHost.rx_bytes` for this instance in this minute (ADR-046, additive). The first three columns are billable-floor or telemetry; `tx_bytes` and `net_tx_bytes` are telemetry only — no provider push in this PR. On the streaming path (ADR-047), `tx_bytes` is attributed per-flush via `statusRecorder.doFlush`'s `onFlush` callback (the residual after the last flush boundary is captured at `finalFlush` so a response that ends mid-chunk is not silently lost).
 - GB-RAM-hour = `Σ mb_seconds / 1024 / 3600`, computed on **plan RAM size + 8 MB overhead**, not sampled RSS, for billing (predictable for customers; matches the financial model's math). Samples are kept for capacity telemetry.
 - Quota ladder per account per month: 0–100 % of included GB-h: nothing; 100 %: email; Free tier at 100 %: hard stop (park, don't wake, `402` page); paid tiers: overage accrues at €0.01/GB-h, pushed to Stripe as usage records hourly.
 - Stripe objects: Product per plan; monthly Price; one metered Price (`gb_ram_hour`); customer + subscription per account; webhooks consumed: `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated/deleted`.
@@ -541,6 +545,9 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | build queue wait p95 | < 60 s | > 300 s warn |
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
 | `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-041: customer dashboard) |
+| `gateway_stream_flushes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: streaming telemetry — see §12.5) |
+| `gateway_response_bytes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: per-flush + residual capture — see §12.5) |
+| `gateway_stream_active{app,plan}` gauge | n/a (per-app) | none (ADR-047: in-flight streams — see §12.5) |
 | `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-041: customer dashboard; fleet wake latency is the SLO) |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
 | `schedd_instance_cpu_pct{app,node}` | max over siblings | > 90 sustained page (hot loop) |
@@ -651,6 +658,63 @@ Two presentation gauges — `apid_top_tenant_rps{account_id}` (apiserver-side, t
 **Dashboard.** `deploy/grafana/top-tenants.json` (uid `faas-top-tenants`, byte-identical to the Ansible copy at `deploy/ansible/roles/grafana/files/top-tenants.json`). Four panels: top-10 by `apid_top_tenant_rps`, top-10 by `gateway_top_tenant_rps`, top-10 customer share of fleet traffic, and a single-stat for overflow bucket growth.
 
 **Cardinality contract.** `apid_top_tenant_rps` cardinality is bounded at 1001 (top-1000 + 1 overflow) across the daemon's lifetime. The contract is pinned by `pkg/wire/topn_test.go::TestTopTenantRPS_BoundedCardinality` (fuzzed 50 000 ids → ≤ 1001 series) and the synthetic-fixture test `pkg/promqlrules/tenant_abuse_test.go` (5 promtool-driven scenarios: positive, sub-threshold, overflow-only, multi-customer, debounce).
+
+### 12.5 Streaming response telemetry (ADR-047)
+
+Three new surfaces expose the streaming path (ADR-047) so an operator can
+see "is the buffered fallback firing more than expected" and "is the
+per-flush `tx_bytes` actually matching the bytes the bridge handed the
+guest" without reading the bridge logs:
+
+| Metric name | Labels | Producer | Semantics |
+|---|---|---|---|
+| `gateway_stream_flushes_total` | `app`, `plan` | `pkg/gateway/metrics.go::ObserveStreamFlush` (one increment per `statusRecorder.doFlush`) | Per-flush boundary crossing — the (256 KiB / 200 ms) trigger that splits a streamed response into Telemetry rows. Pre-instantiated for the four plans under `app="__other__"`. |
+| `gateway_response_bytes_total` | `app`, `plan` | `pkg/gateway/metrics.go::ObserveResponseBytes` (called from the per-flush `onFlush` callback plus the `finalFlush` residual capture) | Cumulative HTTP response bytes the gateway forwarded for this instance in this minute. On the streaming path the bytes accumulate per-flush; on the buffered path they accumulate once per response at `finalFlush`. ADR-046 additive seam; ADR-047 §Decision specifies the per-flush + residual model. |
+| `gateway_stream_active` | `app`, `plan` | `pkg/gateway/metrics.go::ObserveStreamStart` / `ObserveStreamEnd` (Inc at `setupStreamingWriter`, Dec at handler defer) | In-flight streaming responses — the count of open streams at this instant. Buffered-path requests never touch the gauge. A non-zero `gateway_stream_active` that doesn't decay is a leaked stream (R3 in ADR-047). Pre-instantiated for the four plans under `app="__other__"`. |
+
+**Why per-flush, not once-per-response.** A streamed response that
+emits 1 KiB every 200 ms for 30 s totals 150 KiB but writes 0 bytes
+through `flushNow` until the final `finalFlush`. Once-per-response
+metering would under-report by the cumulative chunked body (the
+billing seam's `tx_bytes` is read at `finalFlush` only, missing the
+chunks that arrived before the last boundary). The per-flush delta
+plus a residual capture at `finalFlush` (the bytes sent since the
+last boundary) closes the gap: the sum of every `onFlush` delta
+plus the residual equals the bytes the bridge handed the guest,
+within 1 % under AC #2 (issue #471).
+
+**Why three surfaces, not one.** The three metrics answer three
+distinct questions:
+
+- `gateway_stream_flushes_total` — is the streaming path activating?
+  Expected: small on buffered apps, large on Hobby+ SSE.
+- `gateway_response_bytes_total` — is the bridge accounting
+  matching reality? Compare to `net_tx_bytes` (cgroup veth, source
+  of truth) for drift.
+- `gateway_stream_active` — is there a leak? Should return to zero
+  after traffic drains.
+
+**Single-registry invariant.** All three metrics live on the same
+Prometheus registry as the rest of gatewayd's `wire.NewOpsMetrics`
+set (memory `wire-opsmetrics-single-registry`). The streaming path
+cannot accidentally construct a second registry; the tripwire is
+`pkg/gateway/metrics_test.go::TestMetrics_StreamFlushesRegistered`.
+
+**Dashboard.** `deploy/grafana/faas-fleet.json` (uid `faas-fleet`,
+byte-identical to the Ansible copy at
+`deploy/ansible/roles/grafana/files/faas-fleet.json`) carries three
+new panels: a flush-rate per-plan group-by, a response-byte-rate
+per-plan group-by, and a single-stat for the active-stream gauge.
+The same panels mirror to `top-tenants.json` and
+`top-throttled-apps.json` so an operator looking at "what is this
+tenant doing" sees the streaming data alongside the rate-limit /
+cold-boot data.
+
+**Alert.** None at v1.0. The buffered-fallback rate (derived from
+`streamingFallbackLog` per-app ratio) is a future candidate for a
+"streaming config drift" warn alert (R8 in ADR-047); the metric is
+in place but no alert fires until the rate stabilises across one
+full PR cycle.
 
 ---
 

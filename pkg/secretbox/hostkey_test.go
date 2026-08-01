@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+
+	"filippo.io/age"
 )
 
 // TestLoadHostKeyMissing verifies ErrHostKeyNotFound surfaces for vmmd's
@@ -266,4 +269,185 @@ func TestLoadRecipient_RejectsInsecurePerms(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadHostKeys_CurrentOnly pins the pre-rotation normal state:
+// only host.age exists, LoadHostKeys returns a 1-element slice with
+// the current identity. Mirrors the LoadHostKey contract 1:1 — the
+// new helper is a strict superset.
+func TestLoadHostKeys_CurrentOnly(t *testing.T) {
+	dir := t.TempDir()
+	id, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age"))
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	got, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1 (current only)", len(got))
+	}
+	if got[0].Recipient().String() != id.Recipient().String() {
+		t.Errorf("recipient mismatch")
+	}
+}
+
+// TestLoadHostKeys_CurrentAndPrevious pins the rotation-overlap
+// state (issue #316 / ADR-057): both files exist; LoadHostKeys
+// returns a 2-element slice with current FIRST. The order matters
+// for the `gregale host-age status` output determinism and the
+// audit-log "which key unsealed this envelope" downstream.
+func TestLoadHostKeys_CurrentAndPrevious(t *testing.T) {
+	dir := t.TempDir()
+	curr, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age"))
+	if err != nil {
+		t.Fatalf("gen current: %v", err)
+	}
+	prev, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age.previous"))
+	if err != nil {
+		t.Fatalf("gen previous: %v", err)
+	}
+	got, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2", len(got))
+	}
+	if got[0].Recipient().String() != curr.Recipient().String() {
+		t.Errorf("got[0] is not current")
+	}
+	if got[1].Recipient().String() != prev.Recipient().String() {
+		t.Errorf("got[1] is not previous")
+	}
+}
+
+// TestLoadHostKeys_PreviousOnly pins the manual-promote edge case:
+// the operator renamed current → .previous but the rename hasn't
+// landed yet (or the current was lost). LoadHostKeys surfaces the
+// previous identity as a 1-element slice so the daemons can keep
+// unsealing envelopes until the operator restores a real current.
+func TestLoadHostKeys_PreviousOnly(t *testing.T) {
+	dir := t.TempDir()
+	id, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age.previous"))
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	got, err := LoadHostKeys(dir)
+	if err != nil {
+		t.Fatalf("LoadHostKeys: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1 (previous-only fallback)", len(got))
+	}
+	if got[0].Recipient().String() != id.Recipient().String() {
+		t.Errorf("recipient mismatch")
+	}
+}
+
+// TestLoadHostKeys_BothMissing pins the canonical first-boot signal:
+// ErrHostKeyNotFound surfaces for both files missing. vmmd's run()
+// handles this with GenerateAndSaveHostKey on the current path.
+func TestLoadHostKeys_BothMissing(t *testing.T) {
+	_, err := LoadHostKeys(t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for missing both files")
+	}
+	if !errors.Is(err, ErrHostKeyNotFound) {
+		t.Fatalf("got %v, want ErrHostKeyNotFound", err)
+	}
+}
+
+// TestWriteHostKeyAtPath_ModeAndReload pins the atomic-write dance:
+// after WriteHostKeyAtPath, the destination file is mode 0400 and
+// LoadHostKey reads back the same recipient. The atomic-rename
+// property is implicitly exercised by every test in this file that
+// reads back what WriteHostKeyAtPath wrote.
+func TestWriteHostKeyAtPath_ModeAndReload(t *testing.T) {
+	dir := t.TempDir()
+	id, err := GenerateX25519ForTest()
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	path := filepath.Join(dir, "host.age")
+	if err := WriteHostKeyAtPath(path, id); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o400 {
+		t.Errorf("mode=%o want 0o400", perm)
+	}
+	got, err := LoadHostKey(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.Recipient().String() != id.Recipient().String() {
+		t.Errorf("recipient mismatch")
+	}
+}
+
+// TestPromotePreviousToCurrent pins the manual escape hatch: rename
+// .previous → host.age when no current exists. Covers happy path
+// (rename succeeds, file is readable at the new path) and the
+// refuse-to-overwrite case (both files exist).
+func TestPromotePreviousToCurrent(t *testing.T) {
+	t.Run("happy_path", func(t *testing.T) {
+		dir := t.TempDir()
+		id, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age.previous"))
+		if err != nil {
+			t.Fatalf("gen: %v", err)
+		}
+		if err := PromotePreviousToCurrent(dir); err != nil {
+			t.Fatalf("promote: %v", err)
+		}
+		// .previous must be gone, host.age must hold the promoted identity.
+		if _, err := os.Stat(filepath.Join(dir, "host.age.previous")); !os.IsNotExist(err) {
+			t.Errorf(".previous still present: err=%v", err)
+		}
+		got, err := LoadHostKey(filepath.Join(dir, "host.age"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if got.Recipient().String() != id.Recipient().String() {
+			t.Errorf("recipient mismatch")
+		}
+	})
+
+	t.Run("refuse_overwrite", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age")); err != nil {
+			t.Fatalf("gen current: %v", err)
+		}
+		if _, err := GenerateAndSaveHostKey(filepath.Join(dir, "host.age.previous")); err != nil {
+			t.Fatalf("gen previous: %v", err)
+		}
+		err := PromotePreviousToCurrent(dir)
+		if err == nil {
+			t.Fatal("promote should refuse when current exists")
+		}
+		if !strings.Contains(err.Error(), "already exists") {
+			t.Errorf("err=%q, want 'already exists' substring", err)
+		}
+	})
+
+	t.Run("missing_previous", func(t *testing.T) {
+		dir := t.TempDir()
+		err := PromotePreviousToCurrent(dir)
+		if !errors.Is(err, ErrHostKeyNotFound) {
+			t.Fatalf("err=%v, want ErrHostKeyNotFound", err)
+		}
+	})
+}
+
+// GenerateX25519ForTest is a tiny shim so WriteHostKeyAtPath tests
+// can produce an identity without going through the file write
+// path of GenerateAndSaveHostKey (otherwise every test would have
+// to seed-then-read the file twice). Mirrors the operator-laptop
+// `age-keygen -o host.age` flow at the protocol level.
+func GenerateX25519ForTest() (*age.X25519Identity, error) {
+	return age.GenerateX25519Identity()
 }

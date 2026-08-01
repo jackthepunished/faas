@@ -55,6 +55,22 @@
 //     rule fires when the gauge freezes or drops to 0. The hook is the
 //     OBSERVABILITY point; the alert rule + dashboard panel + window
 //     choice live in ops wiring, out of scope for this PR.)
+//   - gateway_stream_flushes_total{app, plan}    counter (ADR-047 PR-B;
+//     one inc per statusRecorder.doFlush on the streaming path — periodic
+//     256 KiB / 200 ms triggers plus the residual capture. Ratio of
+//     stream_flushes_total to requests_total for streaming apps
+//     approximates avg flush count per response. Bounded to (app, plan)
+//     per the responseBytes counter; the streaming app set is
+//     plan-bounded via pgRouter.)
+//   - gateway_stream_active{app, plan}          gauge (ADR-047 PR-D;
+//     concurrent in-flight streaming requests. Inc'd in
+//     setupStreamingWriter when the streaming path is chosen; Dec'd
+//     in the handler's defer after the final flush. Pre-instantiated
+//     under the `__other__` placeholder for every closed plan so the
+//     §12 panel surfaces from boot — a quiet daemon reads "0 active
+//     streams" rather than "no data". Nil-safe via the ObserveStreamStart
+//     / ObserveStreamEnd wrappers so the handler hot path doesn't need
+//     to gate on every call.)
 package gateway
 
 import (
@@ -87,6 +103,21 @@ type Metrics struct {
 	// ("rate > 1GiB/min sustained for 5m on a single app").
 	// See ObserveResponseBytes below.
 	responseBytes *prometheus.CounterVec
+	// streamFlushes backs the streaming flush counter (ADR-047
+	// PR-B). One inc per statusRecorder.doFlush on the streaming
+	// path. Same (app, plan) labels as responseBytes so the
+	// §12 dashboard can ratio them. See ObserveStreamFlush
+	// below.
+	streamFlushes *prometheus.CounterVec
+	// streamActive backs the ADR-047 PR-D concurrent-stream
+	// gauge. Inc'd in setupStreamingWriter when the streaming
+	// path is chosen; Dec'd in the handler's defer after the
+	// final flush completes. Pre-instantiated under the
+	// `__other__` placeholder for every closed plan so the §12
+	// panel surfaces from boot ("0 active streams" rather than
+	// "no data" for a quiet daemon). See ObserveStreamStart /
+	// ObserveStreamEnd below.
+	streamActive *prometheus.GaugeVec
 	// accountRateLimited backs the per-account throttling introduced by
 	// ADR-040 (issue #292). Labels: account_id, plan. Pre-instantiates
 	// the four plan rows under the `__other__` placeholder so the §12
@@ -272,7 +303,34 @@ func NewMetrics() *Metrics {
 		// cross-daemon consumer is dead counter surface.
 		responseBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_response_bytes_total",
-			Help: "Per-(app, plan) HTTP response body bytes observed by the gateway (ADR-046 PR-2). One Add per observed byte, called once per proxied response after the ReverseProxy returns. Canonical persisted metric is usage_minutes.tx_bytes; this counter is the real-time operator view for §12 anomaly detection.",
+			Help: "Per-(app, plan) HTTP response body bytes observed by the gateway (ADR-046, ADR-047). Sum of per-flush deltas on the streaming path plus the residual capture; single observation on the buffered path. Total equals the canonical persisted usage_minutes.tx_bytes for the same request. Real-time operator view for §12 anomaly detection.",
+		}, []string{"app", "plan"}),
+		// PR-B streaming flush counter (ADR-047). One inc per
+		// statusRecorder.doFlush call on the streaming path —
+		// covers both the periodic (256 KiB / 200 ms) triggers and
+		// the residual capture. Multiply by average delta in a
+		// scrape window to estimate bytes/flush on the §12
+		// dashboard; ratio of stream_flushes_total to requests_total
+		// across streaming apps approximates the avg flush count per
+		// response. Bounded to (app, plan) like the rest of the
+		// gateway counters; the cardinality lives on the streaming
+		// app set which is already plan-bounded via pgRouter.
+		streamFlushes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_stream_flushes_total",
+			Help: "Per-(app, plan) streaming response flushes (ADR-047 PR-B). One increment per statusRecorder.doFlush call on the streaming path: periodic 256 KiB / 200 ms triggers plus the residual capture. Real-time view of streaming activity; ratio to gateway_requests_total for streaming apps estimates avg flush count per response.",
+		}, []string{"app", "plan"}),
+		// ADR-047 PR-D concurrent-stream gauge. Inc'd in
+		// setupStreamingWriter when the streaming path is
+		// chosen; Dec'd in the handler's defer after the final
+		// flush. The buffered path never touches this gauge
+		// (it durates the response into a single Go-time
+		// transfer). Pre-instantiated below under the
+		// `__other__` placeholder for every closed plan so the
+		// §12 dashboard panel surfaces zero-valued series from
+		// boot rather than "no data" for a quiet daemon.
+		streamActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_stream_active",
+			Help: "Per-(app, plan) concurrent in-flight streaming responses (ADR-047 PR-D). Inc'd when setupStreamingWriter installs the streaming path; Dec'd in the handler's defer after the final flush. Buffered-path requests are NOT counted. Real-time operator view of streaming concurrency; pairs with gateway_stream_flushes_total to estimate avg flush per response.",
 		}, []string{"app", "plan"}),
 		// ADR-040 / issue #292. account_id label has cardinality O(active
 		// accounts × 4 plans). Bounded admission lives in
@@ -430,7 +488,18 @@ func NewMetrics() *Metrics {
 	for _, result := range []string{"complete", "partial", "empty"} {
 		m.tlsCertExpiryRefresherWalkComplete.WithLabelValues(result)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive, m.responseBytes)
+	// ADR-047 PR-D: pre-instantiate the closed (plan) set on
+	// gateway_stream_active under the "__other__" placeholder so the
+	// §12 dashboard panel surfaces zero-valued series from the moment
+	// the daemon binds, mirroring the streamFlushes / accountRateLimited
+	// pre-instantiation pattern above. Real app rows appear on the
+	// first streaming request. The bound is the (app, plan) tuple set
+	// (same shape as accountRateLimited); bounded admission is the
+	// alert + runbook concern, not the gauge's.
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		m.streamActive.WithLabelValues("__other__", plan)
+	}
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive)
 	return m
 }
 
@@ -460,6 +529,53 @@ func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
 		return
 	}
 	m.responseBytes.WithLabelValues(appID, plan).Add(float64(n))
+}
+
+// ObserveStreamFlush increments the per-(app, plan) streaming
+// flush counter for ADR-047 PR-B. Called from the per-flush
+// onFlush closure installed by setupStreamingWriter; one inc per
+// statusRecorder.doFlush call on the streaming path. The
+// buffered path never calls this. Nil-receiver safe (the
+// Handler.setupStreamingWriter site already nil-guards before
+// the call, but the extra safety here matches the rest of the
+// Observe* family and keeps the unit tests honest).
+func (m *Metrics) ObserveStreamFlush(appID, plan string) {
+	if m == nil || appID == "" || plan == "" {
+		return
+	}
+	m.streamFlushes.WithLabelValues(appID, plan).Inc()
+}
+
+// ObserveStreamStart increments the per-(app, plan) concurrent
+// streaming gauge for ADR-047 PR-D. Called from
+// setupStreamingWriter when the streaming path is chosen.
+// The buffered path never calls this — buffered requests
+// durate the response in a single Go-time transfer and don't
+// participate in the streaming concurrency model. Balanced by
+// ObserveStreamEnd in the handler's defer after the final
+// flush. Nil-receiver safe (mirrors the rest of the Observe*
+// family).
+func (m *Metrics) ObserveStreamStart(appID, plan string) {
+	if m == nil || appID == "" || plan == "" {
+		return
+	}
+	m.streamActive.WithLabelValues(appID, plan).Inc()
+}
+
+// ObserveStreamEnd decrements the per-(app, plan) concurrent
+// streaming gauge. Always paired with ObserveStreamStart in
+// the same handler goroutine (handler.go:setupStreamingWriter
+// installs the Inc; the handler's defer installs the Dec after
+// the final flush). The defer pattern makes the gauge
+// leak-free under panic — the only way the gauge can drift is
+// if a future PR moves the Dec out of the defer, which the
+// TestMetricsStreamActiveStartEnd 1000-iteration stress loop
+// catches. Nil-receiver safe.
+func (m *Metrics) ObserveStreamEnd(appID, plan string) {
+	if m == nil || appID == "" || plan == "" {
+		return
+	}
+	m.streamActive.WithLabelValues(appID, plan).Dec()
 }
 
 // ObserveRequestDuration records the full request duration (received →

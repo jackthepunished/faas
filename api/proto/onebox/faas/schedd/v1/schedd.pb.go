@@ -131,9 +131,10 @@ type WakeResponse struct {
 	// instance_id is the instances.id row schedd created (or reused).
 	InstanceId string `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
 	// node_id is the compute_node.id (uuid) the instance lives on
-	// (issue #98 / ADR-028). The gateway looks up the node's per-node
-	// gRPC client via its routing cache and forwards the request via the
-	// vmmd ForwardHTTP RPC. Empty only on the error path.
+	// (issue #98 / ADR-028 + ADR-047). The gateway looks up the
+	// node's per-node gRPC client via its routing cache and forwards
+	// the request via the vmmd ForwardHTTPStream RPC. Empty only on
+	// the error path.
 	//
 	// Renamed from the legacy `addr` field (PR #116-era was host_ip:8080,
 	// an inner-netns placeholder unreachable from gatewayd on a remote

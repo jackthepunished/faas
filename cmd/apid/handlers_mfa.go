@@ -559,13 +559,29 @@ func readSealedSecret(s *server, w http.ResponseWriter, r *http.Request, account
 	// the recipient. nil identity = the daemon started without
 	// a host age key, which is the same CodeCapacity condition
 	// as mfaEnroll refusing to seal.
-	ident := mfaIdentity()
-	if ident == nil {
+	//
+	// mfaIdentities returns the multi-identity slice loaded by
+	// secretbox.LoadHostKeys(dir) — current first, previous
+	// second during the 30-day rotation overlap window
+	// (issue #316 / ADR-057). OpenMulti is the rotation-aware
+	// entry point. Fall back to the single-identity accessor so
+	// pre-rotation test harnesses (and any caller that hasn't
+	// migrated to LoadHostKeys) keep working.
+	var idents []*age.X25519Identity
+	if mfaIdentities != nil {
+		idents = mfaIdentities()
+	}
+	if len(idents) == 0 && mfaIdentity != nil {
+		if single := mfaIdentity(); single != nil {
+			idents = []*age.X25519Identity{single}
+		}
+	}
+	if len(idents) == 0 {
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"MFA unavailable", "host age identity not loaded — refusing to unseal"))
 		return ""
 	}
-	env, err := secretbox.Open(ident, encrypted)
+	env, err := secretbox.OpenMulti(idents, encrypted)
 	if err != nil {
 		s.log.Error("mfa.open_sealed_secret", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not unseal TOTP secret"))
@@ -578,12 +594,30 @@ func readSealedSecret(s *server, w http.ResponseWriter, r *http.Request, account
 // key). Same pattern as mfaRecipient, but for Open() instead of
 // Seal(). nil means the daemon hasn't loaded the host key yet
 // — the handler 503s CodeCapacity.
+//
+// Deprecated for new callers: use mfaIdentities + secretbox.OpenMulti
+// instead (issue #316 / ADR-057 rotation overlap). Kept as a
+// backward-compat seam so existing tests that inject a single
+// identity continue to work.
 var mfaIdentity func() *age.X25519Identity
 
 // SetMFAIdentity is the boot-time wire-up called by apid
 // main(). Tests call this directly to inject an in-memory
 // identity.
 func SetMFAIdentity(f func() *age.X25519Identity) { mfaIdentity = f }
+
+// mfaIdentities is the rotation-aware identity accessor: it
+// returns the slice loaded by secretbox.LoadHostKeys(dir) —
+// current first, previous second during the 30-day overlap
+// window. nil means "no host.age loaded yet"; the handler 503s
+// CodeCapacity, matching the single-identity contract.
+var mfaIdentities func() []*age.X25519Identity
+
+// SetMFAIdentities wires the multi-identity accessor. Called
+// from cmd/apid/main.go after secretbox.LoadHostKeys returns.
+// Existing SetMFAIdentity callers (mostly tests) continue to
+// work unchanged — the single-identity accessor is still wired.
+func SetMFAIdentities(f func() []*age.X25519Identity) { mfaIdentities = f }
 
 // reissueSessionCookie mints a fresh session cookie (with the
 // given mfa-pending flag) and sets it on the response. Used by

@@ -84,22 +84,6 @@ func stripHopByHop(h http.Header) http.Header {
 	return out
 }
 
-// safeLogField strips ASCII line breaks from a request-supplied
-// string before it lands in a log line. CodeQL's go/log-injection
-// rule explicitly lists strings.Replace as a recognised sanitiser
-// (its help text shows the pattern: replace "\r" and "\n" before
-// logging); we follow that shape so the alert auto-closes. We also
-// cap at 128 bytes — instance ids are UUIDs (36 chars) and a 1 MB
-// header would otherwise turn into a multi-MB log entry.
-func safeLogField(s string) string {
-	if len(s) > 128 {
-		s = s[:128] + "…"
-	}
-	s = strings.ReplaceAll(s, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "")
-	return s
-}
-
 // ForwardingReverseProxy returns an http.Handler that forwards r to
 // the vmmd that owns the instance the node id routes to. It is the
 // post-#98 / ADR-028 replacement for defaultProxy: defaultProxy
@@ -107,7 +91,7 @@ func safeLogField(s string) string {
 // the inner side is reachable only from inside the vmmd host's netns
 // (10.100.x.y/16 is bound on veth_peer per ADR-009) so gatewayd can't
 // reach it from a remote box. This handler instead asks vmmd to
-// bridge the bytes via the ForwardHTTP RPC.
+// bridge the bytes via the bidi ForwardHTTPStream RPC.
 //
 // ctxHook (optional) lets the caller cancel the bridge mid-flight
 // when the inbound request is cancelled (client disconnect). nil
@@ -116,9 +100,12 @@ func safeLogField(s string) string {
 //
 // PR-C (issue #460 / ADR-053): the returned closure receives the
 // full Target so the per-deployment override port (Target.Port) can
-// be stamped onto ForwardHTTPRequest.port. vmmd's bridge resolves
+// be stamped onto ForwardHTTPRequestInit.port. vmmd's bridge resolves
 // port=0 to netns.AppPort (8080) so legacy cached targets keep
 // working bit-for-bit.
+//
+// PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
+// streaming RPC is the only bridge today — see fwdStreamOnce below.
 func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
@@ -135,6 +122,12 @@ func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Tar
 // is the only panic-safety net — if a future maintainer adds a step
 // that panics on a malformed request, we still observe the request
 // via slog instead of crashing the listener.
+//
+// PR-D / ADR-047: this is now a thin wrapper that delegates to
+// fwdStreamOnce (the bidi ForwardHTTPStream RPC is the only bridge
+// today). The buffered unary path was removed; the streaming path
+// handles small/short responses correctly because the bridge pipes
+// bytes through Go's bufio and never enforces a latency floor.
 func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -162,74 +155,216 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 	}
 	defer func() { _ = closer.Close() }()
 
-	body, err := io.ReadAll(r.Body)
+	// PR-D / ADR-047: the streaming RPC is the only bridge today.
+	// The Handler still stamps `x-faas-stream: true` on the inbound
+	// request (handler.go:setupStreamingWriter) as the load-bearing
+	// signal for the vmmd-side cap-lift; the gateway forwarder
+	// strips it before bridging (see the x-faas-* skip below) so
+	// the guest never observes the internal signal.
+	fwdStreamOnce(w, r, cli, log, t)
+}
+
+// fwdStreamOnce is the streaming counterpart of fwdOnce (issue
+// #471 PR-B + PR-C / ADR-047). It opens a bidi
+// ForwardHTTPStream, sends the request init frame, streams the
+// request body in 8 KiB chunks, and reads response frames back
+// into the statusRecorder (which fires the per-flush
+// egressSink.RecordResponseBytes deltas via onFlush).
+//
+// Why this is a separate function and not a branch in fwdOnce:
+// the request body is no longer buffered — it's pipelined into
+// the bidi stream as it arrives. A streaming client that
+// uploads 50 MB via chunked transfer no longer hits the 25 MiB
+// cap (the cap-lift to 100 MB applies on the vmmd side). A
+// client disconnect tears down the bridge cleanly via the
+// inbound request context.
+//
+// Error mapping mirrors fwdOnce (Unavailable → 503, NotFound →
+// 503, anything else → 502). The Handler's statusRecorder
+// translates 4xx/5xx into "no body bytes to meter" so the
+// e2e quota AC stays correct under error paths.
+func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target) {
+	ctx, cancel := context.WithTimeout(r.Context(), 910*time.Second)
+	defer cancel()
+
+	stream, err := cli.ForwardHTTPStream(ctx)
 	if err != nil {
-		// Body read failure = a client that disconnected before we
-		// finished buffering. Distinct from the bridge failing because
-		// the bridge hasn't started yet.
-		log.Warn("gateway: body read failed", "node", t.NodeID, "err", err.Error())
-		http.Error(w, "body read failed", http.StatusBadRequest)
+		log.Error("gateway: forwarder stream open failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "forwarder stream open failed", http.StatusBadGateway)
 		return
 	}
 
-	pbReq := &vmmdpb.ForwardHTTPRequest{
+	// Build the init frame from the inbound request headers.
+	// Hop-by-hop and x-faas-* headers are stripped (mirrors
+	// fwdOnce); everything else is forwarded as-is. The body
+	// is NOT included — it streams in via the body-copy
+	// goroutine below.
+	init := &vmmdpb.ForwardHTTPRequestInit{
 		Instance:   r.Header.Get("x-faas-instance"),
 		Method:     r.Method,
 		RequestUri: r.URL.RequestURI(),
-		Body:       body,
-		// PR-C (issue #460 / ADR-053): per-deployment override
-		// port the gateway cached at admit time. 0 = legacy 8080
-		// (vmmd's wire boundary defaults 0 to netns.AppPort).
-		Port: uint32(t.Port),
+		Port:       uint32(t.Port),
+		Stream:     true,
 	}
-	// Sanitised copy for log statements: the wire value keeps the raw
-	// header (vmmd validates UUID shape), the log value strips CR/LF
-	// so a hostile instance id cannot split log lines.
-	logInstance := safeLogField(pbReq.Instance)
 	for name, vals := range stripHopByHop(r.Header) {
-		// Skip the request-id and other internal-only headers we add
-		// in the gateway; the bridge doesn't need them and the guest
-		// would just see noise.
 		if strings.HasPrefix(strings.ToLower(name), "x-faas-") {
 			continue
 		}
 		for _, v := range vals {
-			pbReq.Headers = append(pbReq.Headers, &vmmdpb.Header{Name: name, Value: v})
+			init.Headers = append(init.Headers, &vmmdpb.Header{Name: name, Value: v})
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 65*time.Second)
-	defer cancel()
-	resp, err := cli.ForwardHTTP(ctx, pbReq)
-	if err != nil {
-		// Unavailable is the explicit signal from vmmd that the
-		// guest is sick / the netns is gone — the gateway should
-		// evict the cached target and let the next request re-wake.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
-			log.Warn("gateway: forwarder Unavailable; surfacing 503",
-				"node", t.NodeID, "instance", logInstance)
-			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		// NotFound = the instance isn't live. Same retry semantics:
-		// evict + re-wake on next request.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
-			http.Error(w, "instance gone", http.StatusServiceUnavailable)
-			return
-		}
-		log.Error("gateway: forwarder RPC failed",
-			"node", t.NodeID, "instance", logInstance,
-			"err", err.Error())
-		http.Error(w, "forwarder RPC failed", http.StatusBadGateway)
+	if err := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
+		Frame: &vmmdpb.ForwardHTTPStreamRequest_Init{Init: init},
+	}); err != nil {
+		log.Error("gateway: forwarder stream init send failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "forwarder stream init failed", http.StatusBadGateway)
 		return
 	}
 
-	for _, h := range resp.GetHeaders() {
-		w.Header().Add(h.GetName(), h.GetValue())
+	// Body-copy goroutine: stream r.Body → stream in 8 KiB
+	// chunks. The first error (client disconnect, send
+	// failure) wins; the receiver goroutine below surfaces
+	// it via sendErr so the bidi close is clean.
+	//
+	// Cancellation: when r.Context() is cancelled (client
+	// disconnect, gateway-side deadline), the goroutine exits
+	// promptly via the inner ctxReader.Read returning
+	// ctx.Err(). Without this, a client that uploads 1 byte
+	// per second and then disconnects would leave the
+	// goroutine blocked on r.Body.Read until the gateway's
+	// http.Server.ReadTimeout fires — that's a goroutine
+	// leak visible in production dashboards. (Issue #471
+	// review F3 fix.)
+	bodyErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8*1024)
+		cr := &ctxReader{r: r.Body, ctx: r.Context()}
+		for {
+			n, err := cr.Read(buf)
+			if n > 0 {
+				if serr := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
+					Frame: &vmmdpb.ForwardHTTPStreamRequest_BodyChunk{
+						BodyChunk: append([]byte(nil), buf[:n]...),
+					},
+				}); serr != nil {
+					bodyErrCh <- serr
+					return
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				bodyErrCh <- nil
+				_ = stream.CloseSend()
+				return
+			}
+			if err != nil {
+				bodyErrCh <- err
+				_ = stream.CloseSend()
+				return
+			}
+		}
+	}()
+
+	// Receiver loop: read frames and pipe into w. The first
+	// frame is ForwardHTTPResponseInit (status + headers);
+	// subsequent frames are body_chunk bytes that go
+	// straight to w.Write (which the statusRecorder
+	// intercepts to fire maybeFlush → onFlush).
+	wroteHeader := false
+	for {
+		frame, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			// Drain the body goroutine so we don't leak.
+			select {
+			case <-bodyErrCh:
+			default:
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				log.Warn("gateway: forwarder stream Unavailable; surfacing 503",
+					"node", t.NodeID)
+				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				http.Error(w, "instance gone", http.StatusServiceUnavailable)
+				return
+			}
+			log.Error("gateway: forwarder stream Recv failed",
+				"node", t.NodeID, "err", err.Error())
+			http.Error(w, "forwarder stream failed", http.StatusBadGateway)
+			return
+		}
+		if init := frame.GetInit(); init != nil && !wroteHeader {
+			for _, h := range init.GetHeaders() {
+				w.Header().Add(h.GetName(), h.GetValue())
+			}
+			w.WriteHeader(int(init.GetStatus()))
+			wroteHeader = true
+			continue
+		}
+		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
+			if _, werr := w.Write(chunk); werr != nil {
+				// Client disconnect mid-stream. The
+				// receiver stops reading frames. The
+				// body-copy goroutine is cancelled via
+				// the ctxReader (F3 fix) so it exits
+				// within the stream-teardown window;
+				// drain bodyErrCh so the handler
+				// doesn't return while the goroutine
+				// is still unwinding.
+				log.Debug("gateway: forwarder stream client write failed",
+					"node", t.NodeID, "err", werr.Error())
+				<-bodyErrCh
+				return
+			}
+		}
 	}
-	w.WriteHeader(int(resp.GetStatus()))
-	if len(resp.GetBody()) > 0 {
-		_, _ = w.Write(resp.GetBody())
+
+	// Wait for the body goroutine to drain so we can
+	// distinguish a clean bidi close from a client-disconnect
+	// (which surfaces as a Send error).
+	<-bodyErrCh
+}
+
+// ctxReader is a context-aware io.Reader wrapper used by
+// fwdStreamOnce's body-copy goroutine. It returns ctx.Err()
+// when the underlying context is cancelled (client disconnect,
+// gateway deadline, server shutdown) so the goroutine exits
+// promptly instead of staying blocked on r.Body.Read. The
+// base reader is used unchanged on the data path — the context
+// check is a non-blocking select race against the Read result.
+//
+// Issue #471 review F3: the body goroutine previously sat on
+// r.Body.Read until the gateway's http.Server.ReadTimeout fired
+// (up to 30 s). With ctxReader, the goroutine exits within the
+// gRPC client's normal stream-teardown latency (<1 s in
+// practice) on any context cancellation, so a client that
+// disconnects mid-upload doesn't pin the goroutine.
+type ctxReader struct {
+	r   io.Reader
+	ctx context.Context
+}
+
+func (cr *ctxReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := cr.r.Read(p)
+		ch <- result{n, err}
+	}()
+	select {
+	case <-cr.ctx.Done():
+		return 0, cr.ctx.Err()
+	case r := <-ch:
+		return r.n, r.err
 	}
 }
 

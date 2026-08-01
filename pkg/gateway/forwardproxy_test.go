@@ -1,10 +1,15 @@
-// Tests for pkg/gateway/forwardproxy.go (issue #98 / ADR-028). The
-// gateway-side bridge is HTTP-in / gRPC-out. We can't exercise the
+// Tests for pkg/gateway/forwardproxy.go (issue #98 / ADR-028 / ADR-047).
+// The gateway-side bridge is HTTP-in / gRPC-out. We can't exercise the
 // real vmmd end (that requires //go:build metal on Linux), so the
-// test uses an in-memory fake VmmdClient that captures the
-// ForwardHTTPRequest and returns a deterministic
-// ForwardHTTPResponse. The forwarder is then driven through
-// httptest.NewRecorder so we can assert the HTTP shape end-to-end.
+// test uses an in-memory fake VmmdClient that captures the streaming
+// ForwardHTTPStreamRequest frames and emits a deterministic
+// ForwardHTTPStreamResponse queue. The forwarder is then driven
+// through httptest.NewRecorder so we can assert the HTTP shape
+// end-to-end.
+//
+// PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
+// streaming RPC is the only bridge today; every test uses the
+// fakeBidiStream scaffold.
 
 package gateway_test
 
@@ -22,32 +27,34 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 // fakeVmmdClient is a vmmdpb.VmmdClient that records every
-// ForwardHTTPRequest and replies with the canned ForwardHTTPResponse
-// (or canned error) the test installs. It implements only the
-// methods the forwarder uses; everything else panics so a future
-// test that accidentally routes through here surfaces the mistake.
+// ForwardHTTPStreamRequest and replies with the canned
+// ForwardHTTPStreamResponse queue (or canned error) the test
+// installs. It implements only the methods the forwarder uses;
+// everything else panics so a future test that accidentally
+// routes through here surfaces the mistake.
+//
+// PR-D / ADR-047: the streaming RPC is the only bridge. The
+// Stream field carries the configured fakeBidiStream; an
+// unset Stream + a drive-through call panics ("not stubbed").
 type fakeVmmdClient struct {
-	mu    sync.Mutex
-	calls []*vmmdpb.ForwardHTTPRequest
-	resp  *vmmdpb.ForwardHTTPResponse
-	err   error
+	Stream *fakeBidiStream
 }
 
-func (f *fakeVmmdClient) ForwardHTTP(_ context.Context, in *vmmdpb.ForwardHTTPRequest, _ ...grpc.CallOption) (*vmmdpb.ForwardHTTPResponse, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, in)
-	if f.err != nil {
-		return nil, f.err
+// ForwardHTTPStream returns the configured Stream. The forwarder
+// drives the bidi stream directly through Send/Recv/CloseSend.
+func (f *fakeVmmdClient) ForwardHTTPStream(_ context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
+	if f.Stream == nil {
+		panic("ForwardHTTPStream: not stubbed (set fakeVmmdClient.Stream)")
 	}
-	return f.resp, nil
+	return f.Stream, nil
 }
 
-// All other RPCs panic — the forwarder only calls ForwardHTTP.
+// All other RPCs panic — the forwarder only calls ForwardHTTPStream.
 func (f *fakeVmmdClient) CreateFromSnapshot(context.Context, *vmmdpb.CreateFromSnapshotRequest, ...grpc.CallOption) (*vmmdpb.WakeResponse, error) {
 	panic("CreateFromSnapshot: not stubbed")
 }
@@ -87,6 +94,86 @@ func (f *fakeVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.Call
 	panic("Logs: gateway hot path doesn't dial per-instance log streams")
 }
 
+// fakeBidiStream is the in-process fake for grpc.BidiStreamingClient
+// used by the streaming forwarder test. The test pre-loads
+// Responses (the canned server→client frame queue; io.EOF on
+// Recv when the queue is drained) and inspects Sends after the
+// forwarder returns. Concurrency: Send and Recv are called from
+// different goroutines by the forwarder (Send from the body-copy
+// goroutine, Recv from the main loop), so the queue is guarded
+// with a mutex.
+type fakeBidiStream struct {
+	mu        sync.Mutex
+	Responses []*vmmdpb.ForwardHTTPStreamResponse
+	Sends     []*vmmdpb.ForwardHTTPStreamRequest
+	closed    bool
+	recvIdx   int
+	recvErr   error // overrides Responses on the next Recv (e.g. codes.Unavailable)
+	ctx       context.Context
+}
+
+// HeaderStream returns nil — the streaming test doesn't
+// introspect headers (the production forwarder doesn't either;
+// they're set on the response object by the server side).
+func (s *fakeBidiStream) HeaderStream() grpc.ClientStream { return nil }
+
+// TrailerOnly returns false (the gRPC trailer block is set on
+// CloseSend in production; the fake ignores it).
+func (s *fakeBidiStream) TrailerOnly() bool { return false }
+
+func (s *fakeBidiStream) Send(req *vmmdpb.ForwardHTTPStreamRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return io.EOF
+	}
+	// Store the request pointer verbatim. The forwarder's body-copy
+	// loop reuses a single 8 KiB buffer for the chunk bytes, but the
+	// test never compares captured chunk bytes against the live
+	// forwarder buffer after Send returns — the body chunks captured
+	// here are observed only after the forwarder has fully drained its
+	// loop. The init frame is immutable once constructed. Safe to alias.
+	s.Sends = append(s.Sends, req)
+	return nil
+}
+
+func (s *fakeBidiStream) Recv() (*vmmdpb.ForwardHTTPStreamResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recvErr != nil {
+		err := s.recvErr
+		s.recvErr = nil
+		return nil, err
+	}
+	if s.recvIdx >= len(s.Responses) {
+		return nil, io.EOF
+	}
+	resp := s.Responses[s.recvIdx]
+	s.recvIdx++
+	return resp, nil
+}
+
+func (s *fakeBidiStream) CloseSend() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+func (s *fakeBidiStream) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *fakeBidiStream) SendMsg(any) error { return nil }
+func (s *fakeBidiStream) RecvMsg(any) error { return nil }
+func (s *fakeBidiStream) Header() (metadata.MD, error) {
+	return nil, nil
+}
+func (s *fakeBidiStream) Trailer() metadata.MD { return nil }
+
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
 // vmmd socket directly to assert the filter is in place. Panics
@@ -99,8 +186,8 @@ func (f *fakeVmmdClient) SeccompStatus(context.Context, *vmmdpb.SeccompStatusReq
 
 // MountParentExt4ReadOnly (ADR-053) — gateway forwardproxy tests
 // never drive the parent-mount staging path; imaged owns those
-// RPCs. Returns empty + nil so the vmmdpb.VmmdClient interface
-// is satisfied; any accidental caller would surface as imaged's
+// RPCs. Returns empty + nil so the vmmdpb.VmmdClient interface is
+// satisfied; any accidental caller would surface as imaged's
 // "empty mountpoint" check rather than a NotFound from vmmd.
 func (f *fakeVmmdClient) MountParentExt4ReadOnly(context.Context, *vmmdpb.MountParentExt4ReadOnlyRequest, ...grpc.CallOption) (*vmmdpb.MountParentExt4ReadOnlyResponse, error) {
 	return &vmmdpb.MountParentExt4ReadOnlyResponse{}, nil
@@ -138,20 +225,44 @@ func (l lease) Close() error {
 	return nil
 }
 
+// TestForwardingReverseProxy_HappyPath pins the streaming-only path
+// (issue #471 PR-D / ADR-047). The forwarder must:
+//
+//   - Open the bidi ForwardHTTPStream RPC (legacy unary ForwardHTTP
+//     was removed in PR-D).
+//   - Send the init frame with the method/uri/headers + Stream=true.
+//   - Stream the request body in 8 KiB chunks (the body-copy
+//     goroutine handles the loop).
+//   - Pipe the response init (status + headers) into w.
+//   - Pipe each body_chunk frame into w (the production
+//     statusRecorder.Write → maybeFlush → onFlush path picks up).
+//   - Drain the body goroutine before returning.
+//
+// The fake bidi stream captures every Send frame and queues
+// canned responses; the test asserts the captured frames match
+// what fwdStreamOnce should have written.
 func TestForwardingReverseProxy_HappyPath(t *testing.T) {
-	cli := &fakeVmmdClient{
-		resp: &vmmdpb.ForwardHTTPResponse{
-			Status: 200,
-			Headers: []*vmmdpb.Header{
-				{Name: "Content-Type", Value: "application/json"},
-			},
-			Body: []byte(`{"hello":"world"}`),
+	const requestBody = `{"x":1}`
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{
+					Status: 200,
+					Headers: []*vmmdpb.Header{
+						{Name: "Content-Type", Value: "application/json"},
+					},
+				},
+			}},
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_BodyChunk{
+				BodyChunk: []byte(`{"hello":"world"}`),
+			}},
 		},
 	}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/items?id=42", strings.NewReader(`{"x":1}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/items?id=42", strings.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer tok")
 	// Hop-by-hop headers must be stripped before sending — see
@@ -159,9 +270,13 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 	// the guest's response framing.
 	req.Header.Set("Connection", "close")
 	req.Header.Set("X-Custom", "keep-me")
+	// x-faas-stream is always-on post-PR-D; the Handler stamps it
+	// before the forwarder dispatches.
+	req.Header.Set("x-faas-stream", "true")
+	req.Header.Set("x-faas-instance", "i-test")
 
 	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, req)
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test"}).ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -173,23 +288,28 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 		t.Errorf("body = %q", got)
 	}
 
-	// Verify the request the bridge received on the vmmd side.
-	if len(cli.calls) != 1 {
-		t.Fatalf("ForwardHTTP calls = %d, want 1", len(cli.calls))
+	// First Send must be the init frame with Stream=true and the
+	// expected method/uri/headers (x-faas-* stripped, Content-Type
+	// preserved).
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
 	}
-	got := cli.calls[0]
-	if got.GetMethod() != "POST" {
-		t.Errorf("method = %q, want POST", got.GetMethod())
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame: %+v", stream.Sends[0])
 	}
-	if got.GetRequestUri() != "/api/v1/items?id=42" {
-		t.Errorf("uri = %q", got.GetRequestUri())
+	if init.GetInstance() != "i-test" {
+		t.Errorf("init.Instance = %q, want i-test", init.GetInstance())
 	}
-	if string(got.GetBody()) != `{"x":1}` {
-		t.Errorf("body = %q", got.GetBody())
+	if init.GetMethod() != http.MethodPost {
+		t.Errorf("init.Method = %q, want POST", init.GetMethod())
+	}
+	if !init.GetStream() {
+		t.Errorf("init.Stream = false, want true")
 	}
 	// Connection was stripped; X-Custom + Authorization survived.
 	gotHeaders := map[string]string{}
-	for _, h := range got.GetHeaders() {
+	for _, h := range init.GetHeaders() {
 		gotHeaders[h.GetName()] = h.GetValue()
 	}
 	if _, present := gotHeaders["Connection"]; present {
@@ -201,6 +321,20 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 	if gotHeaders["Authorization"] != "Bearer tok" {
 		t.Errorf("Authorization = %q, want Bearer tok", gotHeaders["Authorization"])
 	}
+
+	// The client body must have been sent as one or more body_chunk
+	// frames after the init.
+	if len(stream.Sends) < 2 {
+		t.Fatalf("expected ≥ 2 Sends (init + body chunks), got %d", len(stream.Sends))
+	}
+	var sentBody []byte
+	for _, s := range stream.Sends[1:] {
+		sentBody = append(sentBody, s.GetBodyChunk()...)
+	}
+	if string(sentBody) != requestBody {
+		t.Errorf("sent body = %q, want %q", sentBody, requestBody)
+	}
+
 	// Closer ran exactly once.
 	if lookup.closed != 1 {
 		t.Errorf("closer calls = %d, want 1", lookup.closed)
@@ -209,59 +343,85 @@ func TestForwardingReverseProxy_HappyPath(t *testing.T) {
 
 // TestForwardingReverseProxy_StampsTargetPort pins issue #460 /
 // ADR-053 (PR-C): the picked Target's Port must reach
-// ForwardHTTPRequest.port so vmmd's buildBridgeScript dials the
-// override port. A regression that drops Port from the picked
-// Target's view (or omits it from ForwardHTTPRequest) would
+// ForwardHTTPRequestInit.port so vmmd's buildStreamingBridgeScript
+// dials the override port. A regression that drops Port from the
+// picked Target's view (or omits it from the init frame) would
 // silently force every override-port deployment to 8080, which
 // the vmmd server-side default would mask — silent 503s only
 // visible in production logs.
 func TestForwardingReverseProxy_StampsTargetPort(t *testing.T) {
-	cli := &fakeVmmdClient{
-		resp: &vmmdpb.ForwardHTTPResponse{Status: 200, Body: []byte(`{"ok":true}`)},
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+			}},
+		},
 	}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1", Port: 9090}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test", Port: 9090}).ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if len(cli.calls) != 1 {
-		t.Fatalf("ForwardHTTP calls = %d, want 1", len(cli.calls))
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
 	}
-	if got := cli.calls[0].GetPort(); got != 9090 {
-		t.Errorf("ForwardHTTPRequest.port = %d, want 9090", got)
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame")
+	}
+	if got := init.GetPort(); got != 9090 {
+		t.Errorf("ForwardHTTPRequestInit.port = %d, want 9090", got)
 	}
 }
 
 // TestForwardingReverseProxy_PortZeroDefaultsAtBoundary pins the
 // legacy wiring: a Target with Port=0 (the no-override case) still
-// sends a ForwardHTTPRequest with port=0 — the server-side 8080
-// default lives in vmmd's buildBridgeScript, not here. Asserting
-// this prevents a future "forwardproxy auto-fills 8080 on behalf
-// of legacy callers" regression from masking port wiring bugs.
+// sends a ForwardHTTPRequestInit with port=0 — the server-side 8080
+// default lives in vmmd's buildStreamingBridgeScript, not here.
+// Asserting this prevents a future "forwardproxy auto-fills 8080
+// on behalf of legacy callers" regression from masking port wiring
+// bugs.
 func TestForwardingReverseProxy_PortZeroDefaultsAtBoundary(t *testing.T) {
-	cli := &fakeVmmdClient{
-		resp: &vmmdpb.ForwardHTTPResponse{Status: 200, Body: []byte(`{"ok":true}`)},
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+			}},
+		},
 	}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
 	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test"}).ServeHTTP(rec, r)
 
-	if len(cli.calls) != 1 {
-		t.Fatalf("ForwardHTTP calls = %d, want 1", len(cli.calls))
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
 	}
-	if got := cli.calls[0].GetPort(); got != 0 {
-		t.Errorf("ForwardHTTPRequest.port = %d, want 0 (server defaults to 8080)", got)
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame")
+	}
+	if got := init.GetPort(); got != 0 {
+		t.Errorf("ForwardHTTPRequestInit.port = %d, want 0 (server defaults to 8080)", got)
 	}
 }
 
 func TestForwardingReverseProxy_UnknownNodeIs503(t *testing.T) {
-	cli := &fakeVmmdClient{} // no calls expected
+	stream := &fakeBidiStream{}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
@@ -270,57 +430,54 @@ func TestForwardingReverseProxy_UnknownNodeIs503(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
-	if len(cli.calls) != 0 {
-		t.Errorf("ForwardHTTP called %d times with empty node id", len(cli.calls))
+	if len(stream.Sends) != 0 {
+		t.Errorf("ForwardHTTPStream called %d times with empty node id", len(stream.Sends))
 	}
 }
 
-func TestForwardingReverseProxy_UpstreamUnavailableIs503(t *testing.T) {
-	// vmmd returned Unavailable: gateway must surface 503 so the
-	// client retries, AND the routing cache should evict (handled
-	// upstream by the notify listener). The closer MUST still run.
-	cli := &fakeVmmdClient{
-		err: status.Error(codes.Unavailable, "guest gone"),
+// TestForwardingReverseProxy_StreamUnavailableIs503 pins the
+// error-mapping contract on the streaming path (issue #471 /
+// ADR-047). Unavailable from the bidi stream must surface as
+// 503 to the client, matching the unary ForwardHTTP contract.
+func TestForwardingReverseProxy_StreamUnavailableIs503(t *testing.T) {
+	stream := &fakeBidiStream{
+		recvErr: status.Error(codes.Unavailable, "node sick"),
 	}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+	r := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader("hi"))
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
 	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	proxy(gateway.Target{NodeID: "n1", InstanceID: "i-test", Port: 0}).ServeHTTP(rec, r)
+
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", rec.Code)
-	}
-	if lookup.closed != 1 {
-		t.Errorf("closer calls = %d, want 1", lookup.closed)
+		t.Errorf("rec.Code = %d, want 503 (Unavailable must map to 503)", rec.Code)
 	}
 }
 
-func TestForwardingReverseProxy_NotFoundIs503(t *testing.T) {
-	// vmmd returned NotFound = the instance parked between the wake
-	// and the forward. Same eviction path: 503 + close.
-	cli := &fakeVmmdClient{
-		err: status.Error(codes.NotFound, "instance i-1 not live"),
+// TestForwardingReverseProxy_StreamOtherErrorIs502 pins the
+// non-Unavailable error mapping. A codes.Unknown or rpc-exploded
+// error means vmmd itself failed (panic, RPC bug); that's a
+// gateway-side bug, so 502 Bad Gateway surfaces to the client.
+// Closer still runs (the lease contract is independent of the
+// forwarder outcome).
+func TestForwardingReverseProxy_StreamOtherErrorIs502(t *testing.T) {
+	stream := &fakeBidiStream{
+		recvErr: errors.New("rpc exploded"),
 	}
+	cli := &fakeVmmdClient{Stream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingReverseProxy(lookup, nil)
 
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
 	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", rec.Code)
-	}
-}
-
-func TestForwardingReverseProxy_OtherErrorIs502(t *testing.T) {
-	// A non-Unavailable / non-NotFound error means vmmd itself
-	// failed (panic, RPC bug, etc.) — that's a gateway-side bug, so
-	// 502 Bad Gateway surfaces to the client. Closer still runs.
-	cli := &fakeVmmdClient{err: errors.New("rpc exploded")}
-	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingReverseProxy(lookup, nil)
-
-	rec := httptest.NewRecorder()
-	proxy(gateway.Target{NodeID: "node-1"}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test"}).ServeHTTP(rec, r)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", rec.Code)
 	}

@@ -263,11 +263,15 @@ type Manager struct {
 	// nil-safe: bringUp calls m.metrics.ObserveFallback() which no-ops when nil,
 	// so unit tests that construct a Manager without metrics don't need a stub.
 	metrics *ColdBootMetrics
-	// hostIdentity is the X25519 secret key used to unseal per-app sealed env
-	// blobs at wake time (spec §11/G2). nil means "no host age configured" —
-	// a Wake call with SealedEnvEntries set is rejected with ErrNoHostKey
-	// rather than silently dropping plaintext. vmmd owns the on-disk file.
-	hostIdentity *age.X25519Identity
+	// hostIdentities is the slice of X25519 secret keys used to
+	// unseal per-app sealed env blobs at wake time (spec §11/G2).
+	// Holds the current identity alone in the normal pre-rotation
+	// state and [current, previous] during the 30-day overlap
+	// window (issue #316 / ADR-057). nil means "no host age
+	// configured" — a Wake call with SealedEnvEntries set is
+	// rejected with ErrNoHostKey rather than silently dropping
+	// plaintext. vmmd owns the on-disk files.
+	hostIdentities []*age.X25519Identity
 	// conntrackCap is the effective per-instance conntrack cap. Probed once
 	// at construction from api.ConntrackCapProbe(): DefaultConntrackCap when
 	// the kernel supports ct expressions in netns (CONFIG_NF_CONNTRACK_NET_NS),
@@ -352,8 +356,34 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 // Manager holds the private half for the duration of the process. NOT
 // safe to call concurrently with Wake; production wires it before
 // serving traffic.
+//
+// This is a 1-element convenience wrapper around SetHostIdentities
+// retained for backward compatibility with the existing call sites
+// (cmd/vmmd main.go + unit tests). New callers should call
+// SetHostIdentities directly with the slice returned by
+// secretbox.LoadHostKeys(dir) so the multi-recipient fallback across
+// the rotation overlap window is wired in.
 func (m *Manager) SetHostIdentity(id *age.X25519Identity) {
-	m.hostIdentity = id
+	m.hostIdentities = []*age.X25519Identity{id}
+}
+
+// SetHostIdentities attaches the multi-identity unseal key set.
+// This is the rotation-aware entry point (issue #316 / ADR-057):
+// the caller passes the slice returned by secretbox.LoadHostKeys(dir)
+// — current first, previous second during the 30-day overlap window.
+// age.Decrypt's native multi-recipient fallback tries every
+// supplied identity, so envelopes sealed under EITHER the current
+// or the previous key unseal without operator intervention.
+//
+// NOT safe to call concurrently with Wake; production wires it
+// before serving traffic. A nil or empty slice leaves the Manager
+// in the same "no host age configured" posture as SetHostIdentity(nil).
+func (m *Manager) SetHostIdentities(ids []*age.X25519Identity) {
+	if len(ids) == 0 {
+		m.hostIdentities = nil
+		return
+	}
+	m.hostIdentities = ids
 }
 
 // WithStorage wires the artifact backend the Manager uses to read
@@ -563,7 +593,12 @@ func (m *Manager) metricsImageScan(image, severity string, count int) {
 // HostIdentity returns the identity the Manager was constructed with
 // (nil if SetHostIdentity was never called). Used by tests and by the
 // daemon's start-up self-check.
-func (m *Manager) HostIdentity() *age.X25519Identity { return m.hostIdentity }
+func (m *Manager) HostIdentity() *age.X25519Identity {
+	if len(m.hostIdentities) == 0 {
+		return nil
+	}
+	return m.hostIdentities[0]
+}
 
 // ErrNoHostKey is returned when a WakeRequest carries SealedEnvEntries
 // but the Manager was not configured with a host identity. Surface this
@@ -883,15 +918,19 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// ciphertext never reaches the guest and the caller's "wake succeeded"
 	// hides a missing secret.
 	if len(req.SealedEnvEntries) > 0 {
-		if m.hostIdentity == nil {
+		if len(m.hostIdentities) == 0 {
 			return nil, fmt.Errorf("wake %s: %w", req.Instance, ErrNoHostKey)
 		}
 		// We loop-and-merge rather than unseal-into-buf because each entry
 		// is a sealed full envelope (per-key rows). That's the natural shape
-		// coming from apid's per-row upserts.
+		// coming from apid's per-row upserts. OpenMulti is the
+		// rotation-aware entry point: during the 30-day overlap window
+		// (issue #316 / ADR-057) m.hostIdentities holds [current, previous]
+		// and age.Decrypt natively tries both. Single-identity pre- and
+		// post-overlap states use the 1-element slice.
 		merged := secretbox.Envelope{}
 		for _, e := range req.SealedEnvEntries {
-			inner, err := secretbox.Open(m.hostIdentity, e.Ciphertext)
+			inner, err := secretbox.OpenMulti(m.hostIdentities, e.Ciphertext)
 			if err != nil {
 				return nil, fmt.Errorf("wake %s: open sealed env[%s]: %w",
 					req.Instance, logsanitize.Field(e.Key), err)

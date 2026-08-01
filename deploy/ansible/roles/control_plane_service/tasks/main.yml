@@ -147,6 +147,40 @@
       or faas_host_age_stat.stat.pw_name != "root"
       or faas_host_age_stat.stat.gr_name != "root"
 
+# Issue #316 / ADR-057 — soft assert on host.age.previous. The
+# rotation-overlap twin of host.age appears during the 30-day
+# window after `gregale host-age rotate --commit`. Its presence
+# is INTENTIONAL (the runbook tolerates the overlap so MFA
+# envelopes sealed under the previous key still unseal); ansible
+# must NOT refuse to deploy on a box mid-rotation. We stat it
+# and emit a debug message so the operator log records "rotation
+# overlap in progress" without blocking. Mode tripwire still
+# hard-fails if .previous exists with loose perms — that's the
+# same 0400 root:root tripwire as the current file, no exemption.
+- name: control_plane_service — soft assert host.age.previous (issue #316 / ADR-057)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/host.age.previous
+  register: faas_host_age_previous_stat
+- name: control_plane_service — debug host.age.previous presence
+  ansible.builtin.debug:
+    msg: >-
+      host.age.previous present — rotation overlap in progress
+      mtime={{ faas_host_age_previous_stat.stat.mtime | default('absent') }}
+      mode={{ faas_host_age_previous_stat.stat.mode | default('absent') }}
+  when: faas_host_age_previous_stat.stat.exists
+- name: control_plane_service — assert host.age.previous mode is 0400 root:root if present
+  ansible.builtin.assert:
+    that:
+      - faas_host_age_previous_stat.stat.mode == "0400"
+      - faas_host_age_previous_stat.stat.pw_name == "root"
+      - faas_host_age_previous_stat.stat.gr_name == "root"
+    fail_msg: >-
+      host.age.previous present with loose perms ({{ faas_host_age_previous_stat.stat.mode }}
+      {{ faas_host_age_previous_stat.stat.pw_name }}:{{ faas_host_age_previous_stat.stat.gr_name }}).
+      Same 0400 root:root contract as host.age (spec §11). The rotation overlap is
+      intentional but the perms are not — refusing.
+  when: faas_host_age_previous_stat.stat.exists
+
 # Tier 3 / ADR-038 §Phase 3 — cosign sign-keypair (build attestation).
 # imaged reads /etc/faas/secrets/sign.key at startup
 # (cmd/imaged/main.go:103-109 fail-loud os.Stat). The file MUST be

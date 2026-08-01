@@ -50,15 +50,19 @@ service Vmmd {
   // fresh. Idempotent + side-effect free; no backing Manager call.
   rpc Ping(PingRequest) returns (PingResponse);
 
-  // ForwardHTTP bridges one HTTP request from gatewayd into a live
-  // instance's netns. Issue #98 / ADR-028: the gatewayd hot path speaks
-  // HTTP to vmmd over the Tailscale/Wireguard overlay (no second
-  // transport), and vmmd nsenter's the per-instance netns and dials
-  // netns.GuestIP:netns.AppPort. Body is capped at 25 MiB; response
-  // headers carry a 60s deadline; errors map to Unavailable so the
-  // gateway retries the wake on the next hop. The handler is
-  // additive — single-node deployments never call it.
-  rpc ForwardHTTP(ForwardHTTPRequest) returns (ForwardHTTPResponse);
+  // ForwardHTTPStream (issue #471 PR-B + PR-C) is the bidi bridge
+  // the gatewayd hot path uses for every request. The legacy
+  // unary ForwardHTTP was removed in PR-D (ADR-047) — the
+  // streaming RPC takes its place on every code path. The init-
+  // level `stream` field lifts the per-request body cap to 100
+  // MiB and the response deadline to 900 s on the streaming
+  // envelopes (the per-plan Hobby+ caps are on the gateway side
+  // via capWriter). (Issue #98 / ADR-028: the gatewayd hot path
+  // speaks HTTP to vmmd over the Tailscale/Wireguard overlay (no
+  // second transport), and vmmd nsenter's the per-instance netns
+  // and dials netns.GuestIP:netns.AppPort. Errors map to
+  // Unavailable so the gateway retries the wake on the next hop.)
+  //
 
   // Heartbeat lets schedd ping vmmd over the overlay. The reverse
   // direction (vmmd-pushes) was rejected because schedd is the
@@ -111,6 +115,12 @@ service Vmmd {
   // Backpressure flows through gRPC's natural flow control. NotFound
   // when the instance is not alive on this vmmd (nil ring).
   rpc Logs(LogsRequest) returns (stream LogsResponse);
+
+  // ForwardHTTPStream is the rpc declaration; the docstring above
+  // the service block (above Ping) describes the protocol and the
+  // PR-D state. The repetition kept the comments shipped without
+  // surgery on the surrounding service-doc layout.
+  rpc ForwardHTTPStream(stream ForwardHTTPStreamRequest) returns (stream ForwardHTTPStreamResponse);
 
   // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
   // lets imaged compose the per-runtime base ext4 from a shared
@@ -481,9 +491,9 @@ message InstanceStats {
   // distinct from the empty wire state only by reader-side
   // Validity, not the proto. Populated by PR-B.
   int64 inflight_requests = 6;
-  // Latest ForwardHTTP start time. Zero (1970-01-01) means "no
-  // request observed yet on this instance" — the poller falls back
-  // to state.Instance.LastRequestAt in that case.
+  // Latest ForwardHTTPStream start time. Zero (1970-01-01) means
+  // "no request observed yet on this instance" — the poller falls
+  // back to state.Instance.LastRequestAt in that case.
   google.protobuf.Timestamp last_request_at = 7;
   // ADR-046 (PR-1 → PR-2): per-tick cumulative byte delta on
   // root-side vethHost.rx_bytes for this instance. Wrapper so
@@ -520,35 +530,12 @@ message PingResponse {
   google.protobuf.Timestamp server_time = 2;
 }
 
-// ForwardHTTPRequest is gatewayd→vmmd for one HTTP request. The wire
-// shape mirrors a request line + headers + body. Headers are
-// repeated for natural grpc compatibility (headers can repeat in
-// HTTP/1.1). The body is bounded by ForwardMaxBodyBytes (25 MiB) —
-// gatewayd refuses upstream bodies larger than that before sending.
-message ForwardHTTPRequest {
-  // The compute_node-relative instance id (instances.id, scoped to a
-  // node). vmmd resolves the netns from this.
-  string instance     = 1;
-  // HTTP method: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH.
-  string method       = 2;
-  // Request-target — path?query, e.g. "/api/v1/items?id=42".
-  string request_uri  = 3;
-  // Headers, in order. Each entry is one header line. Multi-valued
-  // headers are repeated (HTTP/1.1 allows). Gatewayd MUST drop
-  // hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
-  // sending — see pkg/gateway/forwardproxy.go's stripHopByHop.
-  repeated Header headers = 4;
-  // Request body. Capped at ForwardMaxBodyBytes. vmmd treats an empty
-  // body as zero-length, not missing.
-  bytes  body         = 5;
-  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
-  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
-  // zero — legacy gateway clients keep working. New gateway clients
-  // always set this explicitly from the per-app Target cached at
-  // admit time. The dial target is the inner guest IP, never the
-  // host IP, so this is purely a guest port. Additive per ADR-016.
-  uint32 port         = 6;
-}
+// ForwardHTTPRequest and ForwardHTTPResponse were removed in PR-D
+// (ADR-047). The legacy unary RPC was the original issue #98 /
+// ADR-028 bridge and stayed as a deprecated path for one cycle so
+// the rolling deploy across the vmmd fleet stayed green. PR-D
+// removes it. The streaming RPC ForwardHTTPStream below is the
+// only bridge today.
 
 // Header is one (name, value) HTTP header line. Both fields are
 // bytes-rather-than-string so non-ASCII values survive the round
@@ -558,22 +545,11 @@ message Header {
   string value = 2;
 }
 
-// ForwardHTTPResponse is what vmmd returns. Status carries the
-// numeric HTTP status code; headers are the upstream response
-// headers; body is the response body (also capped). On a vmmd-side
-// failure (cannot reach guest, guest 500, nsenter EIO) the handler
-// returns a gRPC status instead — the proto envelope here is the
-// success path only.
-message ForwardHTTPResponse {
-  int32 status   = 1;
-  repeated Header headers = 2;
-  bytes body     = 3;
-}
-
-// ForwardMaxBodyBytes is the per-request body cap (25 MiB). It matches
-// the gatewayd upstream cap (spec §13 / pkg/api.Limits.HTTPRequestMax).
-// proto3 has no top-level constants, so this is documented inline;
-// the constant lives in Go at vmmdgrpc.ForwardMaxBodyBytes.
+// ForwardMaxBodyBytes is the per-request body cap documented at
+// vmmdgrpc.ForwardMaxBodyBytes (25 MiB for the legacy unary path
+// that was removed in PR-D; the streaming RPC uses
+// ForwardStreamMaxBodyBytes = 100 MiB).
+// proto3 has no top-level constants, so this is documented inline.
 
 // HeartbeatRequest and HeartbeatResponse are intentionally empty:
 // the heartbeat is a presence-only ping. Schedd measures the round
@@ -716,3 +692,84 @@ message UmountParentExt4Request {
 // itself — e.g. EBUSY when a child re-stage is still walking
 // the parent).
 message UmountParentExt4Response {}
+
+// ForwardHTTPStreamRequest (issue #471 PR-B + PR-C) is one frame
+// on the client→server stream. The first frame MUST carry the
+// `init` field with the full request envelope (instance, method,
+// URI, headers, port). Subsequent frames carry raw request body
+// bytes in `body_chunk`. Half-close on the client side signals
+// end-of-body.
+//
+// Header order is preserved exactly as the caller wrote it; vmmd
+// does not deduplicate. The `stream` field on the init envelope
+// is the truth signal — the server lifts
+// ForwardMaxBodyBytes → ForwardStreamMaxBodyBytes (25 MiB → 100 MiB)
+// and forwardResponseTimeout → ForwardStreamResponseTimeout (60 s
+// → 900 s) when set. Setting both fields explicitly avoids a
+// second round-trip on the streaming path.
+message ForwardHTTPStreamRequest {
+  oneof frame {
+    ForwardHTTPRequestInit init = 1;
+    bytes body_chunk = 2;
+  }
+}
+
+// ForwardHTTPRequestInit is the first frame of ForwardHTTPStreamRequest.
+// It reuses the Header envelope from the unary ForwardHTTPRequest so
+// gatewayd can build a single init frame and pass it to both RPCs
+// without a copy. The init frame is the only place `stream` is
+// honoured; subsequent frames are pure body bytes.
+message ForwardHTTPRequestInit {
+  // The compute_node-relative instance id (instances.id, scoped to a
+  // node). vmmd resolves the netns from this. Empty → InvalidArgument.
+  string instance = 1;
+  // HTTP method: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH.
+  string method = 2;
+  // Request-target — path?query, e.g. "/api/v1/items?id=42".
+  string request_uri = 3;
+  // Headers, in order. Each entry is one header line. Multi-valued
+  // headers are repeated (HTTP/1.1 allows). The gateway MUST drop
+  // hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
+  // sending — see pkg/gateway/forwardproxy.go's stripHopByHop.
+  repeated Header headers = 4;
+  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
+  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
+  // zero — legacy gateway clients keep working. Additive per ADR-016.
+  uint32 port = 5;
+  // stream is the truth signal: when true, vmmd lifts its body and
+  // timeout caps to the streaming envelopes
+  // (ForwardStreamMaxBodyBytes / ForwardStreamResponseTimeout).
+  // Lives on the init frame so a single message carries both
+  // "what to bridge" and "how to bound it" — no second RPC.
+  bool stream = 6;
+}
+
+// ForwardHTTPStreamResponse is one frame on the server→client
+// stream. The first frame carries the response init envelope
+// (status, headers, termination_kind). Subsequent frames carry
+// raw response body bytes. The server half-closes the stream
+// when the upstream bridge script exits; the client EOF on the
+// stream is the clean-shutdown signal.
+message ForwardHTTPStreamResponse {
+  oneof frame {
+    ForwardHTTPResponseInit init = 1;
+    bytes body_chunk = 2;
+  }
+}
+
+// ForwardHTTPResponseInit is the first frame of
+// ForwardHTTPStreamResponse. status is the upstream HTTP status
+// code; headers are the upstream response headers. Content-Length
+// is NOT echoed — the body is chunked and the client counts bytes
+// as they arrive. Error is the gRPC-status-equivalent message
+// (empty on success); non-empty means the server is signalling
+// a failure before the body even started.
+message ForwardHTTPResponseInit {
+  int32 status = 1;
+  repeated Header headers = 2;
+  // Non-empty on failure: e.g. "could not dial guest: timeout".
+  // The client surfaces this as a 502 with the upstream message
+  // in the X-Faas-Forward-Error header (operator-only; not
+  // customer-visible).
+  string error = 3;
+}

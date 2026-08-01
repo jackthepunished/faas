@@ -105,6 +105,14 @@ type Request struct {
 	// negative falls back to api.RAMAdmissionCeilingMB (safe for
 	// un-registered nodes and pre-multi-node test seams).
 	NodeCeilingMB int
+	// VCPUBudget is the per-node vCPU admission budget from
+	// compute_nodes.vcpu_budget for the chosen node (Tier A2,
+	// migration 00081). The chooser already verified the request
+	// fits; the ledger uses this instead of the legacy box-wide
+	// api.VCPUSlots so a node with a smaller budget enforces that
+	// smaller cap. Zero or negative falls back to api.VCPUSlots
+	// (safe for un-registered nodes and pre-multi-node test seams).
+	VCPUBudget int
 }
 
 func (r Request) admissionMB() int { return api.BillableRAMMB(r.RAMMB) }
@@ -168,13 +176,24 @@ func (l *NodeLedger) Admit(r Request) error {
 			r.NodeID, node.residentRAM, r.admissionMB(), ceiling))
 	}
 
-	// vCPU slots (8× overcommit → 160 slots, spec §1) are a
-	// box-wide resource today. PR #113 keeps them box-wide; a
-	// future slice that introduces per-node vCPU budgets will move
-	// this check alongside the RAM check.
-	if l.totalUsedVCPU_locked()+r.VCPU > api.VCPUSlots {
+	// Per-node vCPU headroom (Tier A2, migration 00081). Replaces
+	// the legacy box-wide api.VCPUSlots gate. The Engine reads the
+	// row budget from compute_nodes.vcpu_budget and threads it
+	// into the Request; r.VCPUBudget > 0 means a real row budget;
+	// ≤ 0 falls back to api.VCPUSlots (the legacy single-box
+	// posture, and the safe default for un-registered nodes).
+	// This check sits alongside the RAM check so a node's RAM
+	// and vCPU ceilings are enforced together — a heterogeneous
+	// fleet with one RAM-rich + vCPU-poor box and one vCPU-rich
+	// + RAM-poor box now routes traffic correctly.
+	vcpuCeiling := r.VCPUBudget
+	if vcpuCeiling <= 0 {
+		vcpuCeiling = api.VCPUSlots
+	}
+	if node.usedVCPU+r.VCPU > vcpuCeiling {
 		return api.ErrCapacity(fmt.Sprintf(
-			"vCPU slots: %d used + %d requested exceeds %d", l.totalUsedVCPU_locked(), r.VCPU, api.VCPUSlots))
+			"vCPU headroom: node %q busy %d + %d requested exceeds the %d per-node vCPU budget",
+			r.NodeID, node.usedVCPU, r.VCPU, vcpuCeiling))
 	}
 
 	l.entries[r.Instance] = &reservation{
@@ -210,10 +229,11 @@ func (l *NodeLedger) ceilingForNode_locked(nodeID string, _ api.Limits) int {
 	return api.RAMAdmissionCeilingMB
 }
 
-// totalUsedVCPU_locked sums vCPU across all nodes. The vCPU
-// overcommit budget is global today (spec §1, 160 slots); a future
-// per-node vCPU slice would replace this with a per-node lookup
-// matching the RAM path.
+// totalUsedVCPU_locked sums vCPU across all nodes. The fleet-wide
+// sum is informational (the per-node gate is enforced inside Admit
+// via Request.VCPUBudget); reaper/observability code reads it via
+// the public UsedVCPU accessor. A multi-node fleet's fleet sum can
+// grow past 160 — the per-node budget is the load-bearing check.
 func (l *NodeLedger) totalUsedVCPU_locked() int {
 	var n int
 	for _, r := range l.resident {
@@ -295,6 +315,20 @@ func (l *NodeLedger) ResidentRAMForNode(nodeID string) int {
 	defer l.mu.Unlock()
 	if r, ok := l.resident[nodeID]; ok {
 		return r.residentRAM
+	}
+	return 0
+}
+
+// UsedVCPUForNode returns the Σ(vcpu) on a single node. The
+// per-node budget check inside Admit uses an internal lookup;
+// this is the public read used by the placement chooser
+// (Engine.choosePlacementLocked) to thread the per-node vCPU
+// used state into the request. Tier A2.
+func (l *NodeLedger) UsedVCPUForNode(nodeID string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r, ok := l.resident[nodeID]; ok {
+		return r.usedVCPU
 	}
 	return 0
 }

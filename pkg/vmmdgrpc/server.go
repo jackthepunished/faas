@@ -49,11 +49,12 @@ type VmmdAPI interface {
 	DestroyWithExport(ctx context.Context, instance, exportDir string) (int, error)
 	LiveCount() int
 	LeasedCount() int
-	// NetnsFor is the issue #98 / ADR-028 bridge: the ForwardHTTP
-	// handler needs the per-instance netns name (fc-<instance>) to
-	// nsenter before dialing netns.GuestIP:netns.AppPort. Defined here
-	// (not in pkg/vmmdgrpc/forward.go) so the Server struct's
-	// interface check catches a Manager wiring gap at compile time.
+	// NetnsFor is the issue #98 / ADR-028 + ADR-047 bridge: the
+	// ForwardHTTPStream handler needs the per-instance netns name
+	// (fc-<instance>) to nsenter before dialing
+	// netns.GuestIP:netns.AppPort. Defined here (not in
+	// pkg/vmmdgrpc/forward.go) so the Server struct's interface
+	// check catches a Manager wiring gap at compile time.
 	NetnsFor(instance string) (string, bool)
 	// UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) walks
 	// the live-instance map and applies the new per-app egress

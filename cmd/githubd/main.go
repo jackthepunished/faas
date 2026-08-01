@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"filippo.io/age"
@@ -168,12 +169,44 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				if cerr != nil {
 					return fmt.Errorf("githubd: new checks api: %w", cerr)
 				}
+				// PR-C: load the host age keypair so the install
+				// token can be sealed at rest (SealOne at mint)
+				// and unsealed at cold-start rehydrate (Open).
+				// LoadHostKey enforces 0o400 perms (strict
+				// equality, MEMORY.md/host-age-0400-loadcredential-decouple);
+				// failure here is fatal — without the identity
+				// we can't unseal existing rows. PR-H hoisted
+				// this to the top of runWithDeps; the OAuth branch
+				// here just consumes the loaded identity.
+				//
+				// Issue #316 / ADR-057: also load the rotation-aware
+				// multi-identity slice from the same dir so install
+				// tokens sealed under the previous host.age remain
+				// unsealed during the 30-day overlap window.
+				// Degrade to single-identity (with a Warn) if
+				// LoadHostKeys fails — the box still unseals
+				// current-keyed envelopes, just not previous-keyed ones.
+				var identities []*age.X25519Identity
+				if dir := filepath.Dir(hostKeyPath()); dir != "" {
+					if ids, loadErr := secretbox.LoadHostKeys(dir); loadErr != nil {
+						log.Warn("githubd: LoadHostKeys (rotation overlap) failed; install-token unseal will work only for envelopes sealed under the current host.age",
+							"dir", dir, "err", loadErr.Error())
+					} else {
+						identities = ids
+						if len(identities) > 1 {
+							log.Info("githubd: rotation overlap active — install-token unseal falls back across current + previous host.age")
+						}
+					}
+				}
 				recipient, rerr := loadHostPubKey()
 				if rerr != nil {
 					return fmt.Errorf("githubd: load host age recipient: %w", rerr)
 				}
 				auditFn := newGithubdAuditFn(log)
 				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter, installsAdapter, recipient, identity, auditFn)
+				if identities != nil {
+					realSvc.Identities = identities
+				}
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
@@ -295,12 +328,22 @@ func readKeyPEMDefault() ([]byte, error) {
 // hostKeyPath returns the path to the host age private key. Used
 // by ensureInstallToken's cold-start rehydrate path to unseal
 // stored install tokens. The default matches the rest of the
-// secrets tree; an operator can override via FAAS_HOST_AGE_KEY.
+// secrets tree (spec §11: /etc/faas/secrets/host.age, mode 0400
+// root:root). An operator can override via FAAS_HOST_AGE_KEY.
+//
+// Issue #316 / ADR-057: the previous default had a stray `.key`
+// suffix (/etc/faas/secrets/host.age.key) that didn't match any
+// other component's path. After a host.age rotation the rename
+// would have moved the canonical file to host.age.previous, but
+// githubd would have continued looking for host.age.key and
+// silently failed every unseal. Reconciled to host.age here so
+// LoadHostKeys(dir) (current + previous) returns the same pair
+// every daemon consumes.
 func hostKeyPath() string {
 	if p := os.Getenv("FAAS_HOST_AGE_KEY"); p != "" {
 		return p
 	}
-	return "/etc/faas/secrets/host.age.key"
+	return secretbox.DefaultHostKeyPath
 }
 
 // hostPubKeyPath returns the path to the host age public key. Used

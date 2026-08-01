@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -933,6 +934,7 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 	}
 
 	var identityLoader func() *age.X25519Identity
+	var identitiesLoader func() []*age.X25519Identity
 	if identityPath != "" {
 		ident, err := secretbox.LoadHostKey(identityPath)
 		if err != nil {
@@ -948,6 +950,23 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 		log.Info("meterd: host age identity loaded for alert evaluator",
 			"path", identityPath)
 		identityLoader = func() *age.X25519Identity { return ident }
+
+		// Issue #316 / ADR-057: also load the multi-identity
+		// slice from the same directory so the 30-day rotation
+		// overlap window unseals webhook secrets sealed under
+		// the previous host.age. Degrade to single-identity
+		// (with a Warn) if LoadHostKeys fails — the box is
+		// still unsealing current-keyed envelopes, just not
+		// previous-keyed ones.
+		if identities, loadErr := secretbox.LoadHostKeys(filepath.Dir(identityPath)); loadErr != nil {
+			log.Warn("meterd: LoadHostKeys (rotation overlap) failed; alert dispatch will unseal only envelopes sealed under the current host.age",
+				"dir", filepath.Dir(identityPath), "err", loadErr.Error())
+		} else {
+			identitiesLoader = func() []*age.X25519Identity { return identities }
+			if len(identities) > 1 {
+				log.Info("meterd: rotation overlap active — alert dispatch falls back across current + previous host.age")
+			}
+		}
 	}
 
 	dispatcher := webhookout.NewDispatcher(webhookout.DispatcherOptions{})
@@ -957,6 +976,7 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 		PromQL:     promClient,
 		Audit:      auditor,
 		Identity:   identityLoader,
+		Identities: identitiesLoader,
 		Dispatcher: dispatcher,
 		Log:        log,
 		Ops:        ops,

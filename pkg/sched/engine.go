@@ -194,6 +194,12 @@ type Engine struct {
 	// table keep their existing single-box behaviour.
 	capacityTable *nodeCapacityTable
 
+	// now is the clock source for the chooser's freshness check
+	// (applyLiveCapacityMB). Defaults to time.Now inside NewEngine.
+	// Tests override via `Engine.now = func() time.Time { return ... }`
+	// to fast-forward the CapacityFreshness budget without sleeping.
+	now func() time.Time
+
 	// nodeKeys is the in-memory (key_id → *ecdsa.PublicKey)
 	// registry the ReportCapacity handler consults to verify
 	// the report's node_signature (ADR-053). Populated by the
@@ -274,6 +280,7 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		appMu:           map[string]*sync.Mutex{},
 		warmBroadcaster: newWarmHintBroadcaster(),
 		capacityTable:   newNodeCapacityTable(),
+		now:             time.Now, // tests override post-construction
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
 	// doesn't block the daemon's boot forever — the watchdog goroutine
@@ -681,6 +688,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
 	}); err != nil {
 		// Admit failed (capacity / concurrency). The two rejection
 		// modes differ in how loudly the engine surfaces them:
@@ -1080,6 +1088,44 @@ func (e *Engine) bestEffortDestroy(ctx context.Context, nodeID, instanceID strin
 	_ = e.timedDestroy(ctx, nodeID, instanceID, DestroyTimeout)
 }
 
+// applyLiveCapacityMB returns the chooser's per-node used_mb input:
+// max(live report, ledger) when the report is fresh, 0 (sentinel)
+// when stale or absent. The ledger floor closes the stale-low /
+// hostile-report gap — a vmmd that under-reports its cgroup
+// memory.current cannot shrink the live accounting and force schedd
+// to over-admit. ADR-025 axis 5 / Tier A1.
+//
+// Zero is a sentinel: the caller distinguishes "no live report" from
+// "report says 0 used" by re-reading the store. The caller logs the
+// store error and treats a single missing node as zero headroom so a
+// transient store failure on one node doesn't block placement on
+// others.
+//
+// nil receiver is tolerated — a pre-axis-5 fixture's nil capacityTable
+// returns 0, the caller falls through to the store, and the legacy
+// single-box behaviour is preserved.
+func (e *Engine) applyLiveCapacityMB(_ context.Context, nodeID string) int64 {
+	if e == nil || e.capacityTable == nil {
+		return 0
+	}
+	now := time.Now
+	if e.now != nil {
+		now = e.now
+	}
+	live, ok := e.capacityTable.Lookup(nodeID, now())
+	if !ok {
+		return 0
+	}
+	used := int64(live.UsedMB)
+	if ledger := int64(e.ledger.ResidentRAMForNode(nodeID)); ledger > used {
+		used = ledger
+	}
+	if used < 0 {
+		return 0
+	}
+	return used
+}
+
 // choosePlacement picks a compute_node for the next wake using the
 // pure ChoosePlacement chooser (placement.go). It loads the live
 // fleet from the store and the per-node used_mb aggregate, both
@@ -1087,27 +1133,50 @@ func (e *Engine) bestEffortDestroy(ctx context.Context, nodeID, instanceID strin
 // sees a coherent view. Returns the placement (with TargetURL so
 // the wake loop doesn't need a second lookup) or a *api.Problem
 // from the chooser when no node has headroom.
+//
+// Tier A1: the per-node used_mb input now starts from
+// applyLiveCapacityMB (live publisher report, ledger floor). When
+// the live table has no fresh entry for a node, the chooser falls
+// back to the legacy store sum so a silent vmmd degrades to the
+// pre-axis-5 behaviour rather than dropping the node from the
+// fleet view entirely.
 func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placement, error) {
 	nodes, err := e.store.ActiveComputeNodes(ctx)
 	if err != nil {
 		return Placement{}, fmt.Errorf("sched: placement: list active compute_nodes: %w", err)
 	}
+	// One pass over the fleet — read each node's live-or-store UsedMB
+	// (Tier A1) and the ledger's per-node UsedVCPU (Tier A2) in
+	// lockstep. The two reads are independent (the live table is a
+	// vmmd-side cgroup mirror, the ledger is schedd's local
+	// reservations), so the lockstep is just a fusion of two
+	// contiguous maps for the chooser. The chooser enforces them
+	// independently downstream.
 	usedMB := make(map[string]int64, len(nodes))
+	usedVCPU := make(map[string]int64, len(nodes))
 	for _, n := range nodes {
-		used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
-		if err != nil {
-			// A single node's transient store error must not
-			// block placement; treat as zero headroom and let
-			// the chooser skip or include based on its ceiling.
-			// The next wake re-reads; a permanent failure surfaces
-			// there as well.
-			e.log.Warn("sched: placement: compute node used_mb read failed",
-				"node_id", n.ID, "node_name", n.Name, "err", err)
-			used = 0
+		if used := e.applyLiveCapacityMB(ctx, n.ID); used > 0 {
+			usedMB[n.ID] = used
+		} else {
+			// No live report (table miss / stale) or live says zero:
+			// fall through to the store sum. A single node's transient
+			// store error must not block placement of the rest; the
+			// next wake re-reads; a permanent failure surfaces there.
+			used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
+			if err != nil {
+				e.log.Warn("sched: placement: compute node used_mb read failed",
+					"node_id", n.ID, "node_name", n.Name, "err", err)
+				used = 0
+			}
+			usedMB[n.ID] = used
 		}
-		usedMB[n.ID] = used
+		// Tier A2: per-node vCPU is ledger-authoritative. The chooser
+		// uses this to enforce compute_nodes.vcpu_budget per node;
+		// absent or zero is treated as 0 by the chooser (the
+		// per-node budget is the gate, not the absolute number).
+		usedVCPU[n.ID] = int64(e.ledger.UsedVCPUForNode(n.ID))
 	}
-	return ChoosePlacement(nodes, usedMB, r)
+	return ChoosePlacement(nodes, usedMB, usedVCPU, r)
 }
 
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —
@@ -1171,6 +1240,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
 	}); err != nil {
 		e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_admit_denied")
 		return err
@@ -1371,6 +1441,7 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 	// every wake so a node row edited at runtime is picked up
 	// the next time the chooser runs.
 	ceilings := map[string]int{}
+	budgets := map[string]int{}
 	loadCeiling := func(ctx context.Context, nodeID string) int {
 		if c, ok := ceilings[nodeID]; ok {
 			return c
@@ -1382,6 +1453,23 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 		}
 		ceilings[nodeID] = n.AdmissionCeilingMB
 		return n.AdmissionCeilingMB
+	}
+	// Tier A2: per-node vCPU budget, paralleling loadCeiling.
+	// Missing rows / zero budgets cache as 0; the Admit path
+	// falls back to api.VCPUSlots when VCPUBudget<=0, so a
+	// fresh deployment with no compute_nodes row degrades
+	// gracefully to the legacy single-box posture.
+	loadVCPUBudget := func(ctx context.Context, nodeID string) int {
+		if b, ok := budgets[nodeID]; ok {
+			return b
+		}
+		n, err := e.store.ComputeNodeByID(ctx, nodeID)
+		if err != nil || n.VCPUBudget <= 0 {
+			budgets[nodeID] = 0
+			return 0
+		}
+		budgets[nodeID] = n.VCPUBudget
+		return n.VCPUBudget
 	}
 	for _, app := range apps {
 		acct, err := e.store.AccountByID(ctx, app.AccountID)
@@ -1409,6 +1497,7 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 				RAMMB: ins.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 				NodeID:        nodeID,
 				NodeCeilingMB: loadCeiling(ctx, nodeID),
+				VCPUBudget:    loadVCPUBudget(ctx, nodeID),
 			}); err != nil {
 				e.log.Warn("seed ledger: admit", "instance", ins.ID, "err", err)
 				continue

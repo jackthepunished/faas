@@ -87,10 +87,13 @@ horizontal-scale variant, not active-passive).
 >   Multi-host without off-host PG backup means a CP-host
 >   loss is unrecoverable. The runbook is staging-only on
 >   this ground alone, even with Tier 1 fully shipped.
-> - **#316 (`host.age` rotation runbook)** — ✗ NOT shipped.
->   Per-node signing-key rotation is not yet documented; the
->   runbook's "Key material" step is a placeholder until #316
->   lands.
+> - **#316 (`host.age` rotation runbook)** — ✓ shipped
+>   (PR for issue #316, ADR-057). 30-day rotation-overlap
+>   window via `gregale host-age {init,rotate,status,prune-previous}`,
+>   all five unseal sites migrated to `secretbox.OpenMulti`.
+>   See `docs/ops/host-age-rotation.md` for the operator
+>   runbook. v2 re-seal follow-up filed as
+>   `issue-316-followup-rekey`.
 
 ## Topology
 
@@ -385,8 +388,11 @@ If the cut-over fails irrecoverably:
   node holds a local copy of every app's per-app layer.
 - **#250 (off-host Postgres backup)** — required before the
   runbook is production-safe.
-- **#316 (`host.age` rotation runbook)** — per-node signing-key
-  rotation story; today's runbook doesn't cover key rotation.
+- **#316 (`host.age` rotation runbook)** — shipped
+  (ADR-057); 30-day overlap via `gregale host-age` CLI +
+  `secretbox.LoadHostKeys` multi-identity plumbing. v2
+  follow-up (`issue-316-followup-rekey`) covers the
+  background re-seal of pre-rotation envelopes.
 
 ## Acceptance
 

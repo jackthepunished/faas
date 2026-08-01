@@ -80,14 +80,64 @@ func Seal(recipient *age.X25519Recipient, env Envelope) ([]byte, error) {
 // Open decrypts blob under identity and returns the decoded Envelope.
 // Returns an error if the blob is tampered, the identity doesn't match,
 // or the plaintext isn't a valid Envelope.
+//
+// Open is a 1-element convenience wrapper around OpenMulti and exists
+// for backward compatibility — new callers (issue #316 / ADR-057
+// rotation) should pass `[]*age.X25519Identity{ident}` directly to
+// OpenMulti to enable the multi-recipient fallback across current +
+// previous identities during the rotation overlap window.
 func Open(identity *age.X25519Identity, blob []byte) (Envelope, error) {
 	if identity == nil {
 		return nil, errors.New("secretbox: nil identity")
 	}
+	return OpenMulti([]*age.X25519Identity{identity}, blob)
+}
+
+// OpenMulti decrypts blob under any of the supplied identities and
+// returns the decoded Envelope. This is the rotation-overlap entry
+// point (issue #316 / ADR-057): the caller passes the slice from
+// secretbox.LoadHostKeys(dir) — current first, previous second —
+// and age.Decrypt natively tries every identity in order until one
+// successfully decrypts the file ("All identities will be tried
+// until one successfully decrypts the file", filippo.io/age docs).
+// No schema migration is needed because age's on-wire format
+// already carries a recipient stanza per encryption; the new
+// identity just becomes a new stanza on the next Seal.
+//
+// Empty identities slice is a precondition error (matches Open's
+// nil-identity contract). The single-identity case is the same as
+// Open modulo a slice allocation — callers that need the per-call
+// hot path can keep using Open.
+//
+// Returns an error if the blob is tampered, NO supplied identity
+// matches (every recipient stanza was tried and none decrypted), or
+// the plaintext isn't a valid Envelope (Validate() rejected).
+func OpenMulti(identities []*age.X25519Identity, blob []byte) (Envelope, error) {
+	if len(identities) == 0 {
+		return nil, errors.New("secretbox: no identities supplied")
+	}
 	if len(blob) == 0 {
 		return nil, errors.New("secretbox: empty blob")
 	}
-	r, err := age.Decrypt(bytes.NewReader(blob), identity)
+	// age.Decrypt panics on a nil *age.X25519Identity (x25519.go:158
+	// Unwrap dereferences). Filter silently-supplied nil entries
+	// before widening; the unwrap path would otherwise SIGSEGV.
+	filtered := identities[:0:0]
+	for _, id := range identities {
+		if id != nil {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, errors.New("secretbox: all identities nil")
+	}
+	// age.Decrypt takes []age.Identity (interface type); widen the
+	// X25519Identity pointer slice into the interface slice once.
+	asInterface := make([]age.Identity, len(filtered))
+	for i, id := range filtered {
+		asInterface[i] = id
+	}
+	r, err := age.Decrypt(bytes.NewReader(blob), asInterface...)
 	if err != nil {
 		return nil, fmt.Errorf("secretbox: open age reader: %w", err)
 	}
@@ -167,14 +217,54 @@ func SealBytes(recipient *age.X25519Recipient, namespace string, plaintext []byt
 // the original plaintext. The age decryption authenticates the
 // ciphertext + the namespace tag together; a tampered tag fails
 // the open.
+//
+// OpenBytes is a 1-element convenience wrapper around OpenBytesMulti
+// and exists for backward compatibility — new callers (issue #316
+// / ADR-057 rotation) should pass `[]*age.X25519Identity{ident}`
+// directly to OpenBytesMulti to enable the multi-recipient fallback
+// across current + previous identities during the rotation overlap
+// window.
 func OpenBytes(identity *age.X25519Identity, blob []byte) (namespace string, plaintext []byte, err error) {
 	if identity == nil {
 		return "", nil, errors.New("secretbox: nil identity")
 	}
+	return OpenBytesMulti([]*age.X25519Identity{identity}, blob)
+}
+
+// OpenBytesMulti is the multi-identity counterpart of OpenBytes.
+// Used by alert evaluator paths (pkg/alerts/evaluator.go) during the
+// rotation overlap window so a webhook secret sealed under the
+// previous host.age remains readable after rotate.
+func OpenBytesMulti(identities []*age.X25519Identity, blob []byte) (namespace string, plaintext []byte, err error) {
+	if len(identities) == 0 {
+		return "", nil, errors.New("secretbox: no identities supplied")
+	}
 	if len(blob) == 0 {
 		return "", nil, errors.New("secretbox: empty blob")
 	}
-	r, err := age.Decrypt(bytes.NewReader(blob), identity)
+	// age.Decrypt panics on a nil *age.X25519Identity (x25519.go:158
+	// Unwrap dereferences). Filter silently-supplied nil entries
+	// before widening; the unwrap path would otherwise SIGSEGV.
+	// A nil entry here is always a caller bug — the loader closure
+	// returned a slice with a nil slot — not a runtime condition we
+	// want to silently swallow.
+	filtered := identities[:0:0]
+	for _, id := range identities {
+		if id != nil {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return "", nil, errors.New("secretbox: all identities nil")
+	}
+	// age.Decrypt takes []age.Identity (interface type); widen the
+	// X25519Identity pointer slice into the interface slice once
+	// (same shape as OpenMulti above).
+	asInterface := make([]age.Identity, len(filtered))
+	for i, id := range filtered {
+		asInterface[i] = id
+	}
+	r, err := age.Decrypt(bytes.NewReader(blob), asInterface...)
 	if err != nil {
 		return "", nil, fmt.Errorf("secretbox: open age reader: %w", err)
 	}

@@ -17,15 +17,15 @@
 // pushes one report per second; the gRPC handler
 // (pkg/scheddgrpc.Server.ReportCapacity) decodes and calls
 // table.Replace on each. The chooser
-// (pkg/sched/engine.go::applyLiveCapacityMB, PR-2) consults
-// Lookup before falling back to the legacy store sum.
+// (pkg/sched/engine.go::Engine.applyLiveCapacityMB, Tier A1) consults
+// Lookup with a ledger-floor and falls back to the legacy store sum.
 //
 // Trust model. Capacity is bias, not authority — the chooser
 // reads capacity as ONE input to ChoosePlacement, never the only
 // input. The per-node AdmissionCeilingMB check inside
 // ChoosePlacement and the ledger's per-node floor
-// (applyLiveCapacityMB's `max(report, ledger.ResidentRAM)`) are
-// the load-bearing enforcement. A stale-low or hostile vmmd
+// (Engine.applyLiveCapacityMB's `max(report, ledger.ResidentRAMForNode)`)
+// are the load-bearing enforcement. A stale-low or hostile vmmd
 // cannot shrink the live accounting and force schedd to
 // over-admit. ADR-005 cold-boot safety is preserved by
 // construction: an empty table falls through to

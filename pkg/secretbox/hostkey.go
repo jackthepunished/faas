@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"filippo.io/age"
@@ -57,6 +58,17 @@ var ErrRecipientInsecurePerms = errors.New("secretbox: host.age.pub permissions 
 // mode 0400 root:root. apid reads via systemd LoadCredential, not the
 // on-disk file — see the package docstring above for the decoupling.
 const DefaultHostKeyPath = "/etc/faas/secrets/host.age"
+
+// DefaultHostKeyPreviousPath is the rotation-overlap twin of DefaultHostKeyPath.
+// During the 30-day overlap window (issue #316 / ADR-057), the operator
+// renames the old host.age to host.age.previous; daemons load BOTH
+// identities via LoadHostKeys(dir) and pass the slice to secretbox.OpenMulti,
+// which lets age's native multi-recipient fallback unseal envelopes
+// sealed under either key. After 30 days the operator invokes
+// `gregale host-age prune-previous` to remove this file.
+//
+// Same mode contract (0400 root:root) as DefaultHostKeyPath.
+const DefaultHostKeyPreviousPath = "/etc/faas/secrets/host.age.previous"
 
 // ErrHostKeyInsecurePerms is returned by LoadHostKey when the file's mode
 // allows anything other than owner-read. The private half of the host identity
@@ -206,4 +218,148 @@ func LoadRecipient(path string) (*age.X25519Recipient, error) {
 		return nil, fmt.Errorf("secretbox: parse recipient %q: %w", path, err)
 	}
 	return r, nil
+}
+
+// LoadHostKeys loads BOTH the current and previous host identities
+// from a directory and returns them as an ordered slice suitable for
+// passing to secretbox.OpenMulti / age.Decrypt. The rotation-overlap
+// plumbing (issue #316 / ADR-057): the operator renames
+// /etc/faas/secrets/host.age → host.age.previous, then drops a new
+// host.age. Both files must unseal envelopes during the 30-day
+// overlap window; age.Decrypt(src, identities ...) natively falls
+// back across the slice ("all identities will be tried until one
+// successfully decrypts the file") so no schema migration is needed.
+//
+// Returned order: current first, previous second. age.Decrypt tries
+// every supplied identity regardless of order, but pinning the order
+// keeps `gregale host-age status` output deterministic and means the
+// audit-log shows current-first when the unseal succeeds.
+//
+// If host.age is missing AND host.age.previous is missing, returns
+// ErrHostKeyNotFound (the canonical first-boot signal — vmmd handles
+// this with GenerateAndSaveHostKey). If ONLY host.age.previous is
+// present, returns the previous identity as a 1-element slice (the
+// manual-promote path: operator renamed current → previous without
+// dropping a fresh current, e.g. for a key restore from backup).
+//
+// Each file is parsed via LoadHostKey so the same 0o400/0o440 perm
+// tripwire applies — a loose .previous file is the same leak as a
+// loose current file.
+func LoadHostKeys(dir string) ([]*age.X25519Identity, error) {
+	currentPath := filepath.Join(dir, "host.age")
+	previousPath := filepath.Join(dir, "host.age.previous")
+
+	// Try current first so the "both missing" case surfaces
+	// ErrHostKeyNotFound (matches the single-file LoadHostKey
+	// contract). If current exists but .previous doesn't, we still
+	// return a 1-element slice — the normal pre-rotation state.
+	current, err := LoadHostKey(currentPath)
+	if err != nil {
+		if errors.Is(err, ErrHostKeyNotFound) {
+			// Fall through to the previous-only path so a box that's
+			// been promoted-by-rename (operator flipped .previous →
+			// host.age but the rename hasn't happened yet) still loads.
+			if prev, prevErr := LoadHostKey(previousPath); prevErr == nil {
+				return []*age.X25519Identity{prev}, nil
+			} else if !errors.Is(prevErr, ErrHostKeyNotFound) {
+				return nil, fmt.Errorf("secretbox: load host.age.previous %q: %w", previousPath, prevErr)
+			}
+		}
+		return nil, err
+	}
+
+	previous, err := LoadHostKey(previousPath)
+	if err != nil {
+		if errors.Is(err, ErrHostKeyNotFound) {
+			// Normal pre-rotation state: only current exists.
+			return []*age.X25519Identity{current}, nil
+		}
+		return nil, fmt.Errorf("secretbox: load host.age.previous %q: %w", previousPath, err)
+	}
+	return []*age.X25519Identity{current, previous}, nil
+}
+
+// WriteHostKeyAtPath writes id's textual representation to path with
+// mode 0400 (spec §11). Used by `gregale host-age rotate` to drop a
+// new key and by `gregale host-age prune-previous` (via os.Remove —
+// not this helper).
+//
+// The write is atomic in the same shape as cmd/gregale/commands_backup.go:
+// tmp file in the destination directory (so the rename is a single
+// filesystem operation), 0400 chmod, rename into place. A half-written
+// host.age would brick vmmd's identity load and force a manual
+// recovery, so the tmp + rename dance is load-bearing — a plain
+// os.WriteFile that loses a write to ENOSPC mid-flush would land the
+// daemon unable to unseal customer envelopes on the next restart.
+//
+// Does NOT create the parent directory; the caller (the gregale CLI,
+// or a future installer path) is responsible for ensuring the secrets
+// dir exists with mode 0700 root:root. Silently MkdirAll'ing would
+// mask the canonical "role hasn't run yet" failure mode.
+func WriteHostKeyAtPath(path string, id *age.X25519Identity) error {
+	if id == nil {
+		return errors.New("secretbox: nil identity")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".host.age.tmp.*")
+	if err != nil {
+		return fmt.Errorf("secretbox: create tmp %q: %w", path, err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup if rename didn't happen. The Close
+		// inside Write already happened (or errored); the unlink
+		// here is the safety net for the rename-failure path.
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := tmp.Write([]byte(id.String())); err != nil {
+		// Best-effort close: the tmp file is unlinked by the
+		// deferred os.Remove above; a stuck close on the error path
+		// would only delay that cleanup.
+		_ = tmp.Close()
+		return fmt.Errorf("secretbox: write identity to %q: %w", path, err)
+	}
+	if err := tmp.Chmod(0o400); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secretbox: chmod 0400 %q: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("secretbox: close tmp %q: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("secretbox: rename into place %q: %w", path, err)
+	}
+	return nil
+}
+
+// PromotePreviousToCurrent renames host.age.previous → host.age,
+// preserving mode. Used by the manual escape hatch in
+// `gregale host-age prune-previous --promote` when the operator
+// decides the previous key should be the new current (e.g. the
+// freshly-rotated current key was lost or compromised and the
+// previous key is the recovery target).
+//
+// Refuses if host.age.previous is missing (nothing to promote) or
+// if host.age already exists (would silently overwrite the current).
+// The CLI surfaces a clearer error in those cases; this helper
+// returns ErrHostKeyNotFound for the missing case and a wrapped
+// error for the "would overwrite" case.
+func PromotePreviousToCurrent(dir string) error {
+	previousPath := filepath.Join(dir, "host.age.previous")
+	currentPath := filepath.Join(dir, "host.age")
+
+	if _, err := os.Stat(previousPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("secretbox: promote: %w", ErrHostKeyNotFound)
+		}
+		return fmt.Errorf("secretbox: stat previous %q: %w", previousPath, err)
+	}
+	if _, err := os.Stat(currentPath); err == nil {
+		return fmt.Errorf("secretbox: promote refused: current %q already exists (remove it first)", currentPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("secretbox: stat current %q: %w", currentPath, err)
+	}
+	if err := os.Rename(previousPath, currentPath); err != nil {
+		return fmt.Errorf("secretbox: rename previous → current: %w", err)
+	}
+	return nil
 }

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.scaling_policy import ScalingPolicy
+
 
 T = TypeVar("T", bound="UpdateAppRequest")
 
@@ -30,9 +34,13 @@ class UpdateAppRequest:
     streaming_enabled: bool | None | Unset = UNSET
     """Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403
     plan_streaming_not_allowed."""
+    scaling_policy: None | ScalingPolicy | Unset = UNSET
+    """Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.scaling_policy import ScalingPolicy
+
         ram_mb: int | None | Unset
         if isinstance(self.ram_mb, Unset):
             ram_mb = UNSET
@@ -79,6 +87,14 @@ class UpdateAppRequest:
         else:
             streaming_enabled = self.streaming_enabled
 
+        scaling_policy: dict[str, Any] | None | Unset
+        if isinstance(self.scaling_policy, Unset):
+            scaling_policy = UNSET
+        elif isinstance(self.scaling_policy, ScalingPolicy):
+            scaling_policy = self.scaling_policy.to_dict()
+        else:
+            scaling_policy = self.scaling_policy
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -98,11 +114,15 @@ class UpdateAppRequest:
             field_dict["autoscale_target_cpu_pct"] = autoscale_target_cpu_pct
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if scaling_policy is not UNSET:
+            field_dict["scaling_policy"] = scaling_policy
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.scaling_policy import ScalingPolicy
+
         d = dict(src_dict)
 
         def _parse_ram_mb(data: object) -> int | None | Unset:
@@ -170,6 +190,23 @@ class UpdateAppRequest:
 
         streaming_enabled = _parse_streaming_enabled(d.pop("streaming_enabled", UNSET))
 
+        def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                scaling_policy_type_1 = ScalingPolicy.from_dict(data)
+
+                return scaling_policy_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | ScalingPolicy | Unset, data)
+
+        scaling_policy = _parse_scaling_policy(d.pop("scaling_policy", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -179,6 +216,7 @@ class UpdateAppRequest:
             autoscale_target_rps=autoscale_target_rps,
             autoscale_target_cpu_pct=autoscale_target_cpu_pct,
             streaming_enabled=streaming_enabled,
+            scaling_policy=scaling_policy,
         )
 
         update_app_request.additional_properties = d

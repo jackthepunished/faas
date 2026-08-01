@@ -108,6 +108,8 @@ export type { RateLimitPlain } from './models/RateLimitPlain.js';
 export type { RenameAppRequest } from './models/RenameAppRequest.js';
 export type { RepoResponse } from './models/RepoResponse.js';
 export type { RotateAlertRuleSecretResponse } from './models/RotateAlertRuleSecretResponse.js';
+export type { ScalingPolicy } from './models/ScalingPolicy.js';
+export type { ScalingTarget } from './models/ScalingTarget.js';
 export type { SecretKey } from './models/SecretKey.js';
 export type { SessionInfo } from './models/SessionInfo.js';
 export type { SessionListResponse } from './models/SessionListResponse.js';

@@ -8,8 +8,10 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -129,5 +131,60 @@ func TestQuotaParsePlan(t *testing.T) {
 		if got != want {
 			t.Errorf("quotaParsePlan(%q) = %q; want %q", in, got, want)
 		}
+	}
+}
+
+// TestInternalQuotaHandler_EscapesUserSuppliedValues is the
+// tripwire for CodeQL alert #146 (go/reflected-xss). The endpoint
+// is loopback-only and the live caller is an operator's curl or a
+// future apid-side dial that JSON.parses the response — neither
+// path renders raw response text as HTML — but the test pins the
+// defense-in-depth guarantee that user-supplied app_id/plan
+// values are escaped per RFC 8259 §7 in the JSON body. If a
+// future PR reverts to string-concat, the raw payload leaks and
+// this test fails on the literal `<` / `>` / `</script>` check.
+func TestInternalQuotaHandler_EscapesUserSuppliedValues(t *testing.T) {
+	h := newQuotaTestHandler()
+	// Payload chosen to fail loudly if it lands raw in the body:
+	// would close the surrounding <script> tag and inject a payload
+	// that fires on page load.
+	evil := `</script><script>alert(1)</script>`
+	req := httptest.NewRequest("GET",
+		"/v1/internal/quota?plan=hobby&app_id="+url.QueryEscape(evil), nil)
+	rec := httptest.NewRecorder()
+	internalQuotaHandler(h, nil).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d; want 200", rec.Code)
+	}
+	body := rec.Body.String()
+
+	// Negative assertions: the raw payload must NOT appear in
+	// the body. json.Marshal escapes U+003C / U+003E per RFC 8259
+	// §7 so the literal `<`, `>`, `<script>`, `</script>` and the
+	// full payload are absent.
+	for _, raw := range []string{evil, "<script>", "</script>", "<", ">"} {
+		if strings.Contains(body, raw) {
+			t.Errorf("raw payload %q leaked into body; body = %s", raw, body)
+		}
+	}
+
+	// Positive assertion: the JSON-string must be parseable, and
+	// the round-tripped value must equal the original payload. This
+	// pins the defense-in-depth without dragging the 6-byte ASCII
+	// escape sequences through the test source (the escapes are
+	// easy to typo and the round-trip test exercises the same
+	// production code path).
+	var got struct {
+		AppID string `json:"app_id"`
+		Plan  string `json:"plan"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("body is not valid JSON: %v; body = %s", err, body)
+	}
+	if got.AppID != evil {
+		t.Errorf("round-trip app_id = %q; want %q", got.AppID, evil)
+	}
+	if got.Plan != "hobby" {
+		t.Errorf("plan = %q; want hobby", got.Plan)
 	}
 }

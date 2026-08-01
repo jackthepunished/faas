@@ -110,11 +110,12 @@
     reports (e.g. via a compromised overlay) cannot re-sign them
     without the victim's `node.key`. The signing key is per-node
     and only on the box that owns it.
-  - **Key rotation story.** Out of scope here (deferred to #316,
-    `host.age` rotation runbook). The `compute_node_keys` table
-    schema supports rotation (multiple rows per `compute_node_id`,
-    distinguished by `key_id`); rotation lives behind a future
-    ADR.
+  - **Key rotation story.** Out of scope here (covered by
+    ADR-057 `host.age` rotation runbook for the host identity;
+    per-`node.key` rotation is a separate follow-up). The
+    `compute_node_keys` table schema supports rotation
+    (multiple rows per `compute_node_id`, distinguished by
+    `key_id`); rotation lives behind a future ADR.
 
 ## Reference call sites
 

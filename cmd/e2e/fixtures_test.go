@@ -152,6 +152,107 @@ http.createServer((req, res) => {
 	return buildTarGz(t, files)
 }
 
+// NodeFixtureStreaming returns the bytes of a minimal Node 22 source
+// tarball whose index.js emits a Server-Sent-Events stream with
+// controlled chunk+interval pacing (issue #471 / ADR-047 PR-D).
+// The fixture is the load-bearing source for the metal-driven
+// streaming acceptance tests in cmd/e2e/streaming_metal_test.go:
+//
+//   - GET /sse?chunks=N&size=B&interval=ms  → emit N event-stream
+//     chunks of B bytes each at the given interval. Each chunk is
+//     flushed immediately; the response carries Transfer-Encoding:
+//     chunked implicitly via the streaming HTTP/1.1 socket.
+//   - GET /payload?bytes=N  → emit exactly N bytes of plain text
+//     in a single 200 response (used by the plan-matrix AC #3 test
+//     to assert Free returns 413 streaming_not_available before
+//     exhausting the 100 MB cap; Hobby+ actually streams the bytes).
+//   - GET /healthz  → 200 + "stream-ready" (matches the
+//     NodeFixtureHealthcheck readiness probe so waitReady accepts
+//     the fixture).
+//
+// The Node `setInterval` timer is bounded by the runtime's
+// setTimeout clamp (≈24.8 days as Int32 ms); the metal tests pass
+// realistic durations (200 ms ≤ interval ≤ 1000 ms) way inside that
+// range. The runner binds :8080 (the host's stable probe port) so
+// waitReady reaches the fixture without a `PORT` env stamp.
+func NodeFixtureStreaming(t *testing.T) []byte {
+	t.Helper()
+	const pkgJSON = `{
+  "name": "faas-fixture-node-streaming",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {"node": "22"},
+  "scripts": {"start": "node index.js"},
+  "dependencies": {}
+}
+`
+	const indexJS = `const http = require('http');
+
+function drain(req, res, body) {
+  // The customer contract is "stream N bytes regardless of body
+  // size"; the runner doesn't read req, but if the request
+  // carries a body we discard it so the connection doesn't stall
+  // when the client closes early (F3 tripwire from PR-B+PR-C).
+  req.on('data', () => {});
+  req.on('end', () => {
+    res.end(body);
+  });
+  req.on('close', () => {
+    try { res.end(); } catch (_) {}
+  });
+}
+
+http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname === '/healthz') {
+    res.writeHead(200, {'content-type': 'text/plain'});
+    res.end('stream-ready');
+    return;
+  }
+  if (url.pathname === '/sse') {
+    const chunks = parseInt(url.searchParams.get('chunks') || '10', 10);
+    const size = parseInt(url.searchParams.get('size') || '1024', 10);
+    const interval = parseInt(url.searchParams.get('interval') || '200', 10);
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+    });
+    let n = 0;
+    const handle = setInterval(() => {
+      try {
+        const payload = 'data: ' + 'x'.repeat(size) + '\n\n';
+        res.write(payload);
+        n++;
+        if (n >= chunks) {
+          clearInterval(handle);
+          res.end();
+        }
+      } catch (_) {
+        clearInterval(handle);
+      }
+    }, interval);
+    req.on('close', () => clearInterval(handle));
+    return;
+  }
+  if (url.pathname === '/payload') {
+    const bytes = parseInt(url.searchParams.get('bytes') || '1024', 10);
+    res.writeHead(200, {'content-type': 'application/octet-stream'});
+    drain(req, res, 'x'.repeat(bytes));
+    return;
+  }
+  res.writeHead(404, {'content-type': 'text/plain'});
+  res.end('not found');
+}).listen(8080, () => console.log('streaming fixture listening on :8080'));
+`
+	files := map[string]string{
+		"package.json":     pkgJSON,
+		"index.js":         indexJS,
+		".faas-fixture":    "node22\n",
+		"faas-build-token": time.Now().UTC().Format(time.RFC3339Nano) + "\n",
+	}
+	return buildTarGz(t, files)
+}
+
 // PythonFixture returns the bytes of a minimal Python 3.12 source tarball
 // with Flask as the single dep. Railpack auto-detects from requirements.txt
 // and uses uvicorn+gunicorn under the hood; we don't pin that here because

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
@@ -12,6 +13,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.app_manifest import AppManifest
+    from ..models.scaling_policy import ScalingPolicy
 
 
 T = TypeVar("T", bound="AppResponse")
@@ -54,9 +56,21 @@ class AppResponse:
     streaming_enabled: bool | Unset = UNSET
     """Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it.
     PR-B activates the streamed response path; PR-A only persists the flag."""
+    scaling_policy: None | ScalingPolicy | Unset = UNSET
+    """Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from
+    min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column
+    `apps.scaling_policy`."""
+    last_scale_out_at: datetime.datetime | None | Unset = UNSET
+    """RFC 3339 timestamp of the most recent scale-out event schedd admitted for this app, or null if the app has
+    never scaled out."""
+    last_scale_in_at: datetime.datetime | None | Unset = UNSET
+    """RFC 3339 timestamp of the most recent scale-in event schedd reaped for this app, or null if the app has
+    never scaled in."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.scaling_policy import ScalingPolicy
+
         id = self.id
 
         slug = self.slug
@@ -95,6 +109,30 @@ class AppResponse:
 
         streaming_enabled = self.streaming_enabled
 
+        scaling_policy: dict[str, Any] | None | Unset
+        if isinstance(self.scaling_policy, Unset):
+            scaling_policy = UNSET
+        elif isinstance(self.scaling_policy, ScalingPolicy):
+            scaling_policy = self.scaling_policy.to_dict()
+        else:
+            scaling_policy = self.scaling_policy
+
+        last_scale_out_at: None | str | Unset
+        if isinstance(self.last_scale_out_at, Unset):
+            last_scale_out_at = UNSET
+        elif isinstance(self.last_scale_out_at, datetime.datetime):
+            last_scale_out_at = self.last_scale_out_at.isoformat()
+        else:
+            last_scale_out_at = self.last_scale_out_at
+
+        last_scale_in_at: None | str | Unset
+        if isinstance(self.last_scale_in_at, Unset):
+            last_scale_in_at = UNSET
+        elif isinstance(self.last_scale_in_at, datetime.datetime):
+            last_scale_in_at = self.last_scale_in_at.isoformat()
+        else:
+            last_scale_in_at = self.last_scale_in_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -120,12 +158,19 @@ class AppResponse:
             field_dict["egress_allowlist"] = egress_allowlist
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if scaling_policy is not UNSET:
+            field_dict["scaling_policy"] = scaling_policy
+        if last_scale_out_at is not UNSET:
+            field_dict["last_scale_out_at"] = last_scale_out_at
+        if last_scale_in_at is not UNSET:
+            field_dict["last_scale_in_at"] = last_scale_in_at
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.app_manifest import AppManifest
+        from ..models.scaling_policy import ScalingPolicy
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -170,6 +215,57 @@ class AppResponse:
 
         streaming_enabled = d.pop("streaming_enabled", UNSET)
 
+        def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                scaling_policy_type_1 = ScalingPolicy.from_dict(data)
+
+                return scaling_policy_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | ScalingPolicy | Unset, data)
+
+        scaling_policy = _parse_scaling_policy(d.pop("scaling_policy", UNSET))
+
+        def _parse_last_scale_out_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                last_scale_out_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return last_scale_out_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        last_scale_out_at = _parse_last_scale_out_at(d.pop("last_scale_out_at", UNSET))
+
+        def _parse_last_scale_in_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                last_scale_in_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return last_scale_in_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        last_scale_in_at = _parse_last_scale_in_at(d.pop("last_scale_in_at", UNSET))
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -186,6 +282,9 @@ class AppResponse:
             idle_timeout_s=idle_timeout_s,
             egress_allowlist=egress_allowlist,
             streaming_enabled=streaming_enabled,
+            scaling_policy=scaling_policy,
+            last_scale_out_at=last_scale_out_at,
+            last_scale_in_at=last_scale_in_at,
         )
 
         app_response.additional_properties = d
