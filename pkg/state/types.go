@@ -305,6 +305,17 @@ type App struct {
 	LastScaleOutAt *time.Time
 	LastScaleInAt  *time.Time
 	CreatedAt      time.Time
+	// NodeID is the durable shard key that ties an app to its
+	// owner compute_node (Phase 2 / Gate A, migration 00090).
+	// Set once at CreateApp time by apid's PlacementScheduler
+	// and immutable post-create — no PATCH path mutates it.
+	// Every schedd gRPC handler enforces the owner match via
+	// pkg/scheddgrpc.authorizeApp / authorizeInstance; a
+	// non-owner schedd returns codes.FailedPrecondition rather
+	// than silently mutating state. The synthetic default-local
+	// row's id is the backfill target for every pre-Phase-2 row,
+	// so single-box installs preserve bit-for-bit behaviour.
+	NodeID string
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1029,7 +1040,7 @@ type Instance struct {
 type ComputeNode struct {
 	ID                 string
 	Name               string
-	TargetURL          string // wire.ParseTarget-compatible
+	TargetURL          string // wire.ParseTarget-compatible — the vmmd dial target (Firecracker + jailer)
 	VPCPUs             int
 	MemMB              int
 	MaxConcurrency     int
@@ -1053,6 +1064,20 @@ type ComputeNode struct {
 	// informational; pkg/sched/ChoosePlacement uses it as a tertiary
 	// tie-break after (headroom DESC, region ASC, name ASC).
 	Zone *string
+	// ScheddTargetURL is the per-node schedd gRPC dial target
+	// (Phase 2 / Gate A, migration 00090). Distinct from
+	// TargetURL which is the vmmd dial target. gatewayd reads
+	// this to lazily dial the owner schedd for a customer
+	// request; the per-node dial cache is keyed by node_id and
+	// refreshed through the compute_node_changed pg_notify.
+	// Nullable for legacy operator-added rows: schedd startup
+	// treats nil as "not yet configured" and refreshes from the
+	// cache. The CHECK constraint on the column admits only
+	// (unix|tcp):// schemes (the wire.ParseTarget shape). The
+	// synthetic default-local row is backfilled to
+	// 'unix:///run/faas/schedd.sock' by migration 00090 so
+	// single-box installs preserve bit-for-bit behaviour.
+	ScheddTargetURL *string
 }
 
 // ComputeNodeHeartbeat is one row in the append-only

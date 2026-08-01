@@ -15,12 +15,19 @@ import (
 
 // fakeStore is a minimal AppStore that returns a fixed list of apps
 // from ListAllApps. Constructed once per test; ListAllApps is the
-// only method the trigger calls.
+// only method the trigger calls. Phase 2 / Gate A: ListAppsByNodeID
+// is the new per-schedd slice — the existing tests ignore it (the
+// trigger's ownerNodeID is empty), but the interface mandates
+// the method's presence so we no-op it.
 type fakeStore struct {
 	apps []state.App
 }
 
 func (f *fakeStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	return f.apps, nil
+}
+
+func (f *fakeStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, error) {
 	return f.apps, nil
 }
 

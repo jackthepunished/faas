@@ -32,6 +32,13 @@ type App struct {
 	// Default-false in fakeBackend unit tests (the in-memory
 	// backend doesn't populate the column).
 	StreamingEnabled bool
+	// NodeID is the durable shard key the owning schedd
+	// resolves at startup (Phase 2 / Gate A). Populated by
+	// pgRouter.toApp / the AppResolver closure from apps.node_id;
+	// empty on the pre-migration single-box install where
+	// apps.node_id was added by migration 00090. Tests that
+	// don't exercise the per-schedd routing path leave it zero.
+	NodeID string
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue

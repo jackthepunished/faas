@@ -218,6 +218,13 @@ func (s *targetSet) pick(warmHint string) (Target, bool) {
 //     Pick is the ctx-less hot path, so it must be a pure in-memory read —
 //     the notify loop + the admit path keep it fresh rather than per-request
 //     DB hits.
+//
+// Phase 2 / Gate A: schedd resolution is per-app (apps.node_id).
+// The PGBackend exposes WithAppResolver + WithClientForApp hooks so
+// production wiring can hand it a per-node schedd client cache
+// without changing the legacy Scheduler contract tests rely on.
+// When the hooks are unset, Admit falls through to the legacy single
+// schedd field — matching pre-Gate-A behaviour.
 type PGBackend struct {
 	router Router
 	sched  Scheduler
@@ -238,6 +245,67 @@ type PGBackend struct {
 	// holds 1..max_concurrency Targets, picked via per-node sub-cursors
 	// (issue #168 + ADR-025).
 	targets map[string]*targetSet
+
+	// appResolver (Phase 2 / Gate A) maps appID → state.App so the
+	// per-node client cache can find apps.node_id without a second
+	// store hop. Optional: nil falls through to the legacy single-sched
+	// path. Production wires this to a closure that calls
+	// state.Store.AppByID; tests can return a synthetic App.
+	appResolver func(ctx context.Context, appID string) (App, bool, error)
+
+	// clientForApp (Phase 2 / Gate A) returns the schedd client that
+	// owns the given app. Mandatory when appResolver is set. Production
+	// wires this to scheddRouter.ScheddForApp; tests inject a closure
+	// that returns a static fake. Returning ok=false forces a fallback
+	// to the legacy b.sched field — useful for tests that exercise the
+	// single-sched path.
+	clientForApp func(ctx context.Context, app App) (Scheduler, bool, error)
+
+	// legacySingleBox (Phase 2 / Gate A) gates the resolveSched
+	// fallback to the legacy b.sched field. When true, a missing
+	// app row or empty NodeID falls through to b.sched — this is the
+	// single-box posture where every app lives on the local schedd.
+	// When false (the multi-box posture), the fallback is unsafe
+	// because b.sched is the legacy default-local dial and a foreign
+	// owner's app routed through it would return FailedPrecondition,
+	// surfacing as a 503 storm on transient cache misses. Multi-box
+	// startup sets this to false; single-box startup sets it to true.
+	// The setter (WithLegacySingleBox) is wired by cmd/gatewayd's
+	// startup phase after it has resolved fleet posture from the
+	// compute_nodes table.
+	legacySingleBox bool
+}
+
+// AppResolverFunc is the typed alias for WithAppResolver. Mirrors
+// Router.ResolveHost so the wire-up is symmetric.
+type AppResolverFunc func(ctx context.Context, appID string) (App, bool, error)
+
+// ClientForAppFunc is the typed alias for WithClientForApp.
+type ClientForAppFunc func(ctx context.Context, app App) (Scheduler, bool, error)
+
+// WithAppResolver sets the appID → state.App hook used by Admit to
+// find apps.node_id (Phase 2 / Gate A). nil clears the hook —
+// production wires a closure that calls state.Store.AppByID; tests
+// pass an in-memory map lookup.
+func (b *PGBackend) WithAppResolver(fn AppResolverFunc) *PGBackend {
+	b.appResolver = fn
+	return b
+}
+
+// WithClientForApp sets the per-app schedd client factory used by
+// Admit to find the owner schedd (Phase 2 / Gate A). nil clears
+// the hook — production wires a closure that calls
+// scheddRouter.ScheddForApp. Tests pass an in-memory map lookup.
+//
+// The factory returns (client, ok, err): ok=true means the hook
+// produced a client and Admit should use it; ok=false (with nil
+// err) means the hook can't resolve (no node_id / no row) and Admit
+// should fall back to the legacy b.sched field; a non-nil err means
+// the hook is configured but the resolution failed, and Admit
+// surfaces the error.
+func (b *PGBackend) WithClientForApp(fn ClientForAppFunc) *PGBackend {
+	b.clientForApp = fn
+	return b
 }
 
 // WithWarmHint attaches the sticky-warm affinity source for the picker.
@@ -254,6 +322,22 @@ type PGBackend struct {
 // docs/adr/025 — see plan file).
 func (b *PGBackend) WithWarmHint(fn WarmHintFunc) *PGBackend {
 	b.warmHint = fn
+	return b
+}
+
+// WithLegacySingleBox toggles the resolveSched fallback. Single-box
+// deployments (one schedd, every app owned by default-local) want
+// the legacy fallback to remain in effect so transient cache misses
+// do not deny traffic — there's only one schedd to dial, and the
+// ownership guard never trips because every app's NodeID matches.
+// Multi-box deployments (N schedds, per-app ownership) MUST set this
+// to false: the fallback would otherwise route a foreign-owned app
+// through the legacy default-local dial, and that schedd returns
+// FailedPrecondition, surfacing as a 503 storm on transient cache
+// misses. The setter is documented at the field (see legacySingleBox
+// above). Returns b so the gatewayd startup wire-up can chain.
+func (b *PGBackend) WithLegacySingleBox(v bool) *PGBackend {
+	b.legacySingleBox = v
 	return b
 }
 
@@ -364,6 +448,12 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // WakeMethodSnapshotRestore or WakeMethodColdBoot, translated by
 // scheddgrpc.Client from the wire's scheddpb.WakeMethod. On
 // at-capacity and error paths the value is WakeMethodUnspecified.
+//
+// Phase 2 / Gate A: when WithAppResolver + WithClientForApp are
+// configured, Admit first resolves the owning schedd via
+// apps.node_id. Otherwise it falls through to the legacy single
+// b.sched field — byte-identical to pre-Gate-A behaviour for
+// single-box installs where the hooks are not wired.
 func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
 	b.tgtMu.Lock()
@@ -374,7 +464,12 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 	}
 	b.tgtMu.Unlock()
 
-	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := b.sched.AdmitInstance(ctx, appID)
+	sched, err := b.resolveSched(ctx, appID)
+	if err != nil {
+		return "", WakeMethodUnspecified, false, err
+	}
+
+	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID)
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -468,4 +563,60 @@ func (b *PGBackend) putApp(app App) {
 	b.appsMu.Lock()
 	b.apps[app.ID] = app
 	b.appsMu.Unlock()
+}
+
+// resolveSched picks the schedd client that should service appID
+// (Phase 2 / Gate A). Returns the per-node client when both hooks
+// are configured AND the app has a non-empty NodeID; otherwise
+// either falls through to the legacy single b.sched field
+// (legacy single-box posture, gated by WithLegacySingleBox) or
+// returns a definitive error (multi-box posture, where the
+// fallback would route a foreign-owned app through the wrong
+// schedd and surface a FailedPrecondition storm).
+//
+// A nil error and a nil Scheduler means the hook declined —
+// caller falls back. b.legacySingleBox gates the fallback: when
+// false, any of the three fallback triggers (resolver ok=false,
+// app.NodeID empty, clientForApp ok=false) returns an error so
+// the gateway surfaces a 503 with a useful message rather than
+// a silent FailedPrecondition.
+func (b *PGBackend) resolveSched(ctx context.Context, appID string) (Scheduler, error) {
+	if b.appResolver != nil && b.clientForApp != nil {
+		app, ok, err := b.appResolver(ctx, appID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			// App row missing. On single-box this is the
+			// legacy fallback (b.sched serves every app);
+			// on multi-box it's a 503 because routing to
+			// b.sched would surface FailedPrecondition for
+			// every foreign-owned app on transient miss.
+			if b.legacySingleBox {
+				return b.sched, nil
+			}
+			return nil, fmt.Errorf("gatewayd: app %s: not found (transient resolver miss; multi-box posture forbids legacy fallback)", appID)
+		}
+		if app.NodeID == "" {
+			// Pre-migration row or test fixture: only valid
+			// in single-box where every app lives on the
+			// local schedd.
+			if b.legacySingleBox {
+				return b.sched, nil
+			}
+			return nil, fmt.Errorf("gatewayd: app %s has empty NodeID (pre-migration row; multi-box posture forbids legacy fallback)", appID)
+		}
+		cli, ok, err := b.clientForApp(ctx, app)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			if b.legacySingleBox {
+				return b.sched, nil
+			}
+			return nil, fmt.Errorf("gatewayd: app %s (node %s): client resolver declined (transient miss; multi-box posture forbids legacy fallback)", appID, app.NodeID)
+		}
+		return cli, nil
+	}
+	return b.sched, nil
 }

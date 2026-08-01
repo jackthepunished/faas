@@ -1444,6 +1444,102 @@ func (m *MemStore) ListAllApps(_ context.Context) ([]App, error) {
 	return out, nil
 }
 
+// ListAppsByNodeID mirrors pkg/state/pgstore.go:858. In-process
+// map scan with the same predicate the SQL uses (node_id == X AND
+// status != deleted). Used by schedd in unit tests + by the e2e
+// harness's fake schedd (the metal path goes through pgstore).
+func (m *MemStore) ListAppsByNodeID(_ context.Context, nodeID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.NodeID == nodeID && a.Status != AppDeleted {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ListInstancesByNodeID mirrors pkg/state/pgstore.go:875. Same
+// in-process predicate; for the in-memory store this is a linear
+// scan over m.instances — fine for tests + the e2e harness.
+func (m *MemStore) ListInstancesByNodeID(_ context.Context, nodeID string) ([]Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Build a quick app_id → owner-node lookup.
+	owner := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		owner[a.ID] = a.NodeID
+	}
+	var out []Instance
+	for _, ins := range m.instances {
+		if owner[ins.AppID] == nodeID {
+			out = append(out, ins)
+		}
+	}
+	return out, nil
+}
+
+// ListOwnedCronsByNodeID mirrors pkg/state/pgstore.go:891. Same
+// in-process predicate; crons are 5-column rows keyed by app_id.
+func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owner := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		owner[a.ID] = a.NodeID
+	}
+	var out []Cron
+	for _, c := range m.crons {
+		if owner[c.AppID] == nodeID {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// ListUnplacedApps mirrors pkg/state/pgstore.go: ListUnplacedApps.
+// Same predicate over the in-memory map; ordered by CreatedAt DESC
+// to match the SQL shape.
+func (m *MemStore) ListUnplacedApps(_ context.Context) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]App, 0)
+	for _, a := range m.apps {
+		if a.NodeID != "" || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// SetAppNodeID mirrors pkg/state/pgstore.go: SetAppNodeID. The
+// conditional under m.mu is the in-process equivalent of the
+// WHERE node_id IS NULL guard — exactly one caller wins; losers
+// observe NodeID != "" and receive ErrConflict.
+func (m *MemStore) SetAppNodeID(_ context.Context, appID, nodeID string) error {
+	if nodeID == "" {
+		return fmt.Errorf("state: set app node_id: empty nodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	if a.NodeID != "" {
+		return ErrConflict
+	}
+	a.NodeID = nodeID
+	m.apps[appID] = a
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3902,6 +3998,12 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 		Active:          true,
 		LastHeartbeatAt: now,
 		CreatedAt:       now,
+		// Phase 2 / Gate A: per-node schedd dial target. The
+		// single-box synthetic row points at the legacy
+		// /run/faas/schedd.sock so the gateway's per-node cache
+		// dial path is byte-identical to the pre-PR behaviour when
+		// only the default-local row exists.
+		ScheddTargetURL: func() *string { s := "unix:///run/faas/schedd.sock"; return &s }(),
 		Region:          &local,
 		Zone:            &local,
 	}

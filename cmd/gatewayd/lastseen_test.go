@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -29,13 +30,68 @@ func (r *fakeReporter) ReportActivity(_ context.Context, touches []state.Instanc
 	return len(touches), nil
 }
 
+// fakeScheddClientAdapter wraps fakeReporter as a scheddgrpc.ScheddClient so
+// the resolver interface can be satisfied without a real gRPC dial. Only the
+// ReportActivity method is exercised by the flush sink; the other ScheddClient
+// methods panic if invoked (the test seam asserts they're not called from this
+// path).
+type fakeScheddClientAdapter struct {
+	rep *fakeReporter
+}
+
+func (a *fakeScheddClientAdapter) ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error) {
+	return a.rep.ReportActivity(ctx, touches)
+}
+
+func (a *fakeScheddClientAdapter) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+	panic("fakeScheddClientAdapter.AdmitInstance: not wired")
+}
+func (a *fakeScheddClientAdapter) Wake(context.Context, string) (string, string, string, int, error) {
+	panic("fakeScheddClientAdapter.Wake: not wired")
+}
+func (a *fakeScheddClientAdapter) ParkInstance(context.Context, string, string) error {
+	panic("fakeScheddClientAdapter.ParkInstance: not wired")
+}
+func (a *fakeScheddClientAdapter) StreamAppLogs(context.Context, string, int64) (scheddgrpc.LogStream, error) {
+	panic("fakeScheddClientAdapter.StreamAppLogs: not wired")
+}
+func (a *fakeScheddClientAdapter) StreamWarmHints(context.Context) (scheddgrpc.WarmHintStream, error) {
+	panic("fakeScheddClientAdapter.StreamWarmHints: not wired")
+}
+func (a *fakeScheddClientAdapter) Close() error { return nil }
+
+// fakeResolver is the whitebox seam for scheddInstanceResolver.
+// It returns a single ScheddClient for every instance id, which is
+// the single-box default-local shape. Tests that want multi-node
+// dispatch override `perInstance`.
+type fakeResolver struct {
+	cli         scheddgrpc.ScheddClient
+	perInstance func(instanceID string) scheddgrpc.ScheddClient
+}
+
+func (f *fakeResolver) ScheddForInstance(_ context.Context, instanceID string) (scheddgrpc.ScheddClient, error) {
+	if f.perInstance != nil {
+		if c := f.perInstance(instanceID); c != nil {
+			return c, nil
+		}
+	}
+	if f.cli == nil {
+		return nil, nil
+	}
+	return f.cli, nil
+}
+
+func newSingleClientResolver(rep *fakeReporter) *fakeResolver {
+	return &fakeResolver{cli: &fakeScheddClientAdapter{rep: rep}}
+}
+
 // TestSchedFlushSink_KeysByInstanceID (issue #168) — the sink's key is now
 // the instance id directly (the row PK schedd owns), so no resolver hop is
 // needed on the gateway side. Multiple instances can share a single node;
 // their touches are still kept distinct.
 func TestSchedFlushSink_KeysByInstanceID(t *testing.T) {
 	rep := &fakeReporter{}
-	s := newSchedFlushSink(rep, testLogger())
+	s := newSchedFlushSink(newSingleClientResolver(rep), nil, testLogger())
 
 	t0 := time.UnixMilli(1_700_000_000_000)
 	s.Touch("i-1", t0)
@@ -71,7 +127,7 @@ func TestSchedFlushSink_KeysByInstanceID(t *testing.T) {
 // its own buffer is empty.
 func TestSchedFlushSink_EmptyBufferSkipsReport(t *testing.T) {
 	rep := &fakeReporter{}
-	s := newSchedFlushSink(rep, testLogger())
+	s := newSchedFlushSink(newSingleClientResolver(rep), nil, testLogger())
 
 	// Empty buffer → no call.
 	if err := s.Flush(context.Background()); err != nil {
@@ -93,7 +149,7 @@ func TestSchedFlushSink_EmptyBufferSkipsReport(t *testing.T) {
 // doesn't double-count.
 func TestSchedFlushSink_ClearsBufferAndSurfacesError(t *testing.T) {
 	rep := &fakeReporter{err: errors.New("schedd down")}
-	s := newSchedFlushSink(rep, testLogger())
+	s := newSchedFlushSink(newSingleClientResolver(rep), nil, testLogger())
 
 	s.Touch("i-1", time.Now())
 	if err := s.Flush(context.Background()); err == nil {
@@ -110,7 +166,7 @@ func TestSchedFlushSink_ClearsBufferAndSurfacesError(t *testing.T) {
 }
 
 func TestSchedFlushSink_GetForget(t *testing.T) {
-	s := newSchedFlushSink(&fakeReporter{}, testLogger())
+	s := newSchedFlushSink(newSingleClientResolver(&fakeReporter{}), nil, testLogger())
 	now := time.Now()
 	s.Touch("i-1", now)
 	if got, ok := s.Get("i-1"); !ok || !got.Equal(now) {
@@ -119,5 +175,53 @@ func TestSchedFlushSink_GetForget(t *testing.T) {
 	s.Forget("i-1")
 	if _, ok := s.Get("i-1"); ok {
 		t.Error("instance id survived Forget")
+	}
+}
+
+// TestSchedFlushSink_PartitionsByInstance (Phase 2 / Gate A) — touches for
+// instances on different owner nodes land on different per-node clients.
+// One Flush issues N ReportActivity calls, one per resolved client. A
+// failure on one client does not abort the other.
+func TestSchedFlushSink_PartitionsByInstance(t *testing.T) {
+	repA := &fakeReporter{}
+	repB := &fakeReporter{}
+	cliA := &fakeScheddClientAdapter{rep: repA}
+	cliB := &fakeScheddClientAdapter{rep: repB}
+	resolver := &fakeResolver{
+		perInstance: func(id string) scheddgrpc.ScheddClient {
+			switch id {
+			case "i-a1", "i-a2":
+				return cliA
+			case "i-b1":
+				return cliB
+			}
+			return nil
+		},
+	}
+	s := newSchedFlushSink(resolver, nil, testLogger())
+
+	t0 := time.UnixMilli(1_700_000_000_000)
+	s.Touch("i-a1", t0)
+	s.Touch("i-a2", t0.Add(time.Second))
+	s.Touch("i-b1", t0.Add(2*time.Second))
+
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	repA.mu.Lock()
+	defer repA.mu.Unlock()
+	if repA.calls != 1 {
+		t.Errorf("repA.calls = %d, want 1", repA.calls)
+	}
+	if got := len(repA.last); got != 2 {
+		t.Errorf("repA batch = %d, want 2 (i-a1, i-a2)", got)
+	}
+	repB.mu.Lock()
+	defer repB.mu.Unlock()
+	if repB.calls != 1 {
+		t.Errorf("repB.calls = %d, want 1", repB.calls)
+	}
+	if got := len(repB.last); got != 1 {
+		t.Errorf("repB batch = %d, want 1 (i-b1)", got)
 	}
 }

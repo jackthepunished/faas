@@ -43,6 +43,17 @@ type logStreamer interface {
 	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (scheddgrpc.LogStream, error)
 }
 
+// logStreamerResolver is the per-app dial factory the
+// AppLogsHandler uses to reach the owner schedd (Phase 2 / Gate
+// A). Production wires it to a closure that calls
+// scheddRouter.ScheddForApp; tests pass a stub that returns a
+// fixed logStreamer for every app. The two-field shape keeps the
+// handler decoupled from state.App — it never sees the
+// apps.node_id, only the resolved client.
+type logStreamerResolver interface {
+	ScheddForApp(ctx context.Context, appID string) (logStreamer, error)
+}
+
 // AppLogsHandler owns `GET /v1/apps/{slug}/logs`. The route is
 // mounted on the gatewayd mux before the apidProxy wrapper
 // (cmd/gatewayd/main.go) so the apid loopback proxy never sees
@@ -57,10 +68,13 @@ type logStreamer interface {
 //     gate + the IDOR-safe LoadApp. Same AuthLimit bucket the
 //     apid routes use, so the spec §11 "10/min/IP" rule covers
 //     both gateways.
-//   - logStreamer — dials /run/faas/schedd.sock and opens the
-//     per-app server-streaming RPC. The transport-neutral
-//     `LogStream` interface (pkg/scheddgrpc/client_logs.go) keeps
-//     the handler decoupled from the generated proto.
+//   - logStreamerResolver — Phase 2 / Gate A: a per-app dial
+//     factory that returns the schedd client that owns the
+//     given app. Production wires it to scheddRouter.ScheddForApp;
+//     tests inject a stub that returns a fixed logStreamer for
+//     every app. The two-field shape keeps the handler decoupled
+//     from state.App — it never sees apps.node_id, only the
+//     resolved client.
 //   - state.Store — backs both the IDOR-safe LoadApp call
 //     (slugs → apps) and the parked-app pre-flight
 //     (ListInstancesForApp). The same *state.PgStore pointer
@@ -68,11 +82,11 @@ type logStreamer interface {
 //   - *wire.OpsMetrics — per-frame `apid_logs_emitted_total`
 //     counter; nil-safe so unit tests don't need a registry.
 type AppLogsHandler struct {
-	Auth   *mwauth.Middleware
-	Schedd logStreamer
-	Store  state.Store
-	Log    *slog.Logger
-	Ops    *wire.OpsMetrics
+	Auth      *mwauth.Middleware
+	ScheddFor logStreamerResolver
+	Store     state.Store
+	Log       *slog.Logger
+	Ops       *wire.OpsMetrics
 
 	// Heartbeat is the SSE liveness interval. Defaults to 15s in
 	// production (cmd/gatewayd/main.go); tests shorten it to a
@@ -160,7 +174,16 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 // serveAppLogs directly with a stub stream without standing up
 // the auth + LoadApp chain.
 func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64) {
-	stream, err := h.Schedd.StreamAppLogs(ctx_, appID, sinceSeq)
+	// Phase 2 / Gate A: resolve the owner schedd for appID via
+	// the per-node router. The fallback path (legacy single
+	// schedd) is gone — the router covers the single-box
+	// default-local fleet identically to the multi-box case.
+	sched, err := h.ScheddFor.ScheddForApp(ctx_, appID)
+	if err != nil {
+		apislogs.RenderAppLogsError(w, flusher, err)
+		return
+	}
+	stream, err := sched.StreamAppLogs(ctx_, appID, sinceSeq)
 	if err != nil {
 		// codes.Unimplemented from the stub → "schedd not wired
 		// (dev mode)"; codes.NotFound from a real schedd → "no

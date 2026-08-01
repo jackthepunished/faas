@@ -716,7 +716,18 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 //   - SelectEvictions → Engine.Evict (destroy; next wake cold-boots, ADR-005).
 func (l *Loop) runReaper(ctx context.Context) {
 	store := l.engine.Store()
-	apps, err := store.ListAllApps(ctx)
+	// Phase 2 / Gate A: scope the reaper to this schedd's owner
+	// apps/instances. Empty owner = legacy single-box posture
+	// (list everything). Non-empty = per-node slice via the
+	// apps_node_id_idx / instances_app_id_idx joins added in
+	// migration 00090.
+	var apps []state.App
+	var err error
+	if owner := l.engine.OwnerNodeID(); owner != "" {
+		apps, err = store.ListAppsByNodeID(ctx, owner)
+	} else {
+		apps, err = store.ListAllApps(ctx)
+	}
 	if err != nil {
 		l.log.Warn("reaper: list apps", "err", err)
 		return
@@ -732,7 +743,13 @@ func (l *Loop) runReaper(ctx context.Context) {
 	if warmer, ok := l.flowCounts.(interface {
 		Warm(context.Context, []state.Instance) error
 	}); ok {
-		all, err := store.ListAllInstances(ctx)
+		var all []state.Instance
+		var err error
+		if owner := l.engine.OwnerNodeID(); owner != "" {
+			all, err = store.ListInstancesByNodeID(ctx, owner)
+		} else {
+			all, err = store.ListAllInstances(ctx)
+		}
 		if err != nil {
 			l.log.Warn("reaper: list all instances for warm", "err", err)
 		} else if warmErr := warmer.Warm(ctx, all); warmErr != nil {
@@ -1228,7 +1245,19 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 // synthetic request through the gateway's full path so the metering +
 // quota pipeline can't tell cron traffic from user traffic apart.
 func (l *Loop) runCronTick(ctx context.Context) {
-	crons, err := l.engine.Store().ListEnabledCrons(ctx)
+	// Phase 2 / Gate A: only dispatch crons on apps this schedd
+	// owns. Without this filter every schedd would fire every
+	// cron and the cron_fired_audit row would diverge from
+	// actual dispatch (the duplicate-dispatch hazard). Empty
+	// owner = legacy single-box (list every cron).
+	var crons []state.Cron
+	var err error
+	store := l.engine.Store()
+	if owner := l.engine.OwnerNodeID(); owner != "" {
+		crons, err = store.ListOwnedCronsByNodeID(ctx, owner)
+	} else {
+		crons, err = store.ListEnabledCrons(ctx)
+	}
 	if err != nil {
 		l.log.Warn("cron: list", "err", err)
 		return

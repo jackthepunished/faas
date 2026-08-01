@@ -343,3 +343,142 @@ func TestPGBackend_AdmitPortZeroIsZero(t *testing.T) {
 		t.Errorf("Target.Port = %d, want 0 (legacy 8080 default at vmmd)", tgt.Port)
 	}
 }
+
+// --- resolveSched legacy-fallback posture gate (PR #509 finding F1) ---
+//
+// Background: PGBackend.resolveSched picks between the legacy
+// single-schedd field (b.sched) and the per-node client cache
+// (resolved via WithAppResolver + WithClientForApp). On a transient
+// resolver miss (ok=false on the AppByID path, or app.NodeID empty),
+// the legacy fallback would route a foreign-owned app through the
+// default-local dial and surface a FailedPrecondition storm. The
+// legacySingleBox flag (WithLegacySingleBox) gates the fallback:
+// single-box posture (one schedd, every app owned locally) keeps
+// it; multi-box posture forbids it and surfaces a typed error.
+
+// capturingScheduler records the per-node clients selected by
+// WithClientForApp so the multi-box branch can assert that the
+// owner-schedd client — not b.sched — receives the Admit.
+type capturingScheduler struct {
+	id       string
+	admitted int
+}
+
+func (c *capturingScheduler) AdmitInstance(_ context.Context, _ string) (string, string, string, int32, bool, int, error) {
+	c.admitted++
+	return "fake-instance-" + c.id, "127.0.0.1", "w-1", 8080, true, 0, nil
+}
+
+// TestPGBackend_ResolveSched_MultiBox_RejectsTransientMiss covers
+// the headline fix: with WithLegacySingleBox(false) and the
+// resolver returning ok=false (transient cache miss on AppByID),
+// resolveSched must return an error rather than silently routing
+// through b.sched. The error message names "multi-box posture" so
+// an operator on call can trace the routing mistake without a
+// debugger.
+func TestPGBackend_ResolveSched_MultiBox_RejectsTransientMiss(t *testing.T) {
+	legacySched := gateway.NewFakeScheduler("default-local")
+	ownerSched := &capturingScheduler{id: "node-owner"}
+	b := gateway.NewPGBackend(&fakeRouter{}, legacySched, nil).
+		WithLegacySingleBox(false).
+		WithAppResolver(func(_ context.Context, _ string) (gateway.App, bool, error) {
+			// Resolver says "transient miss" (ok=false, err=nil).
+			return gateway.App{}, false, nil
+		}).
+		WithClientForApp(func(_ context.Context, _ gateway.App) (gateway.Scheduler, bool, error) {
+			// Should NOT be called on a transient miss — if it
+			// were, the test would silently route through
+			// b.sched via the legacy fallback.
+			t.Errorf("clientForApp should not be called on transient miss")
+			return nil, false, nil
+		})
+
+	if _, _, _, err := b.Admit(context.Background(), "app-x", 5); err == nil {
+		t.Fatal("expected Admit to error on transient miss in multi-box posture, got nil")
+	}
+	if legacySched.Calls() != 0 {
+		t.Errorf("legacy b.sched received %d Admits, want 0 (multi-box posture forbids fallback)", legacySched.Calls())
+	}
+	if ownerSched.admitted != 0 {
+		t.Errorf("owner-sched received %d Admits, want 0 (resolver declined before clientForApp)", ownerSched.admitted)
+	}
+}
+
+// TestPGBackend_ResolveSched_MultiBox_RejectsEmptyNodeID pins the
+// pre-migration-row branch: an app row that survived the migration
+// but still has NodeID="" must error rather than fall through. The
+// legacySingleBox=false posture refuses the fallback even though
+// the resolver succeeded.
+func TestPGBackend_ResolveSched_MultiBox_RejectsEmptyNodeID(t *testing.T) {
+	legacySched := gateway.NewFakeScheduler("default-local")
+	b := gateway.NewPGBackend(&fakeRouter{}, legacySched, nil).
+		WithLegacySingleBox(false).
+		WithAppResolver(func(_ context.Context, _ string) (gateway.App, bool, error) {
+			return gateway.App{ID: "app-y", NodeID: ""}, true, nil
+		}).
+		WithClientForApp(func(_ context.Context, _ gateway.App) (gateway.Scheduler, bool, error) {
+			t.Errorf("clientForApp must not be called when NodeID is empty")
+			return nil, false, nil
+		})
+
+	if _, _, _, err := b.Admit(context.Background(), "app-y", 5); err == nil {
+		t.Fatal("expected Admit to error on empty NodeID in multi-box posture, got nil")
+	}
+	if legacySched.Calls() != 0 {
+		t.Errorf("legacy b.sched received %d Admits, want 0", legacySched.Calls())
+	}
+}
+
+// TestPGBackend_ResolveSched_LegacySingleBox_FallsBackToBSched is
+// the regression guard for the single-box posture: a transient
+// resolver miss falls through to b.sched, which is correct because
+// the local schedd owns every app on the box. The pre-PR behaviour
+// is preserved byte-for-byte for single-box installs that never
+// configure FAAS_NODE_NAME.
+func TestPGBackend_ResolveSched_LegacySingleBox_FallsBackToBSched(t *testing.T) {
+	legacySched := gateway.NewFakeScheduler("default-local")
+	b := gateway.NewPGBackend(&fakeRouter{}, legacySched, nil).
+		WithLegacySingleBox(true).
+		WithAppResolver(func(_ context.Context, _ string) (gateway.App, bool, error) {
+			return gateway.App{}, false, nil
+		}).
+		WithClientForApp(func(_ context.Context, _ gateway.App) (gateway.Scheduler, bool, error) {
+			t.Errorf("clientForApp must not be called when resolver returns ok=false")
+			return nil, false, nil
+		})
+
+	if _, _, _, err := b.Admit(context.Background(), "app-z", 5); err != nil {
+		t.Fatalf("single-box posture must accept transient miss; got err=%v", err)
+	}
+	if legacySched.Calls() != 1 {
+		t.Errorf("legacy b.sched received %d Admits, want 1 (single-box fallback)", legacySched.Calls())
+	}
+}
+
+// TestPGBackend_ResolveSched_MultiBox_HappyPathRoutesToOwner is the
+// contrast to the rejection cases: with legacySingleBox=false and
+// the resolver returning ok=true with a valid NodeID, the
+// owner-schedd client (returned by clientForApp) — NOT b.sched —
+// receives the Admit.
+func TestPGBackend_ResolveSched_MultiBox_HappyPathRoutesToOwner(t *testing.T) {
+	legacySched := gateway.NewFakeScheduler("default-local")
+	ownerSched := &capturingScheduler{id: "node-owner"}
+	b := gateway.NewPGBackend(&fakeRouter{}, legacySched, nil).
+		WithLegacySingleBox(false).
+		WithAppResolver(func(_ context.Context, _ string) (gateway.App, bool, error) {
+			return gateway.App{ID: "app-ok", NodeID: "node-owner"}, true, nil
+		}).
+		WithClientForApp(func(_ context.Context, _ gateway.App) (gateway.Scheduler, bool, error) {
+			return ownerSched, true, nil
+		})
+
+	if _, _, _, err := b.Admit(context.Background(), "app-ok", 5); err != nil {
+		t.Fatalf("multi-box happy path Admit: %v", err)
+	}
+	if ownerSched.admitted != 1 {
+		t.Errorf("owner-sched received %d Admits, want 1", ownerSched.admitted)
+	}
+	if legacySched.Calls() != 0 {
+		t.Errorf("legacy b.sched received %d Admits, want 0 (multi-box routes to owner)", legacySched.Calls())
+	}
+}

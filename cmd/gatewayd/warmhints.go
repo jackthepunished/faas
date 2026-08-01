@@ -48,6 +48,17 @@ import (
 // startup; Run is the long-lived goroutine that owns the
 // reconnect loop.
 //
+// Phase 2 / Gate A: sched is a scheddgrpc.ScheddClient (any node's
+// client works because the warm hint cache is the consumer's
+// payload — the stream emits (app_id, node_id) tuples keyed by the
+// schedd's local scope; on a single-box install the only schedd
+// emits every hint; on a multi-box install, multiple schedds each
+// emit a slice). Today the production wiring dials ONE schedd for
+// the stream; full multi-stream fan-in is a v1.1 follow-up (the
+// picker degrades to per-node healthyCount scoring on saturation,
+// so missing hints are bias-only — ADR-005 cold-boot-safe path
+// preserved).
+//
 // cache is the *gateway.warmHintCache whose HintFunc is wired
 // into PGBackend via WithWarmHint. The consumer holds a pointer
 // and writes via cache.update; the picker reads via cache.hint
@@ -55,7 +66,7 @@ import (
 //
 // log is the gatewayd daemon logger; nil → slog.Default().
 type warmHintConsumer struct {
-	sched *scheddgrpc.Client
+	sched scheddgrpc.ScheddClient
 	cache *gateway.WarmHintCache
 	log   *slog.Logger
 }
@@ -64,7 +75,7 @@ type warmHintConsumer struct {
 // non-nil (production dial fails loudly if it's nil); cache may
 // be nil only in tests that drive Run directly with a stub
 // stream and don't exercise the cache-write path.
-func newWarmHintConsumer(sched *scheddgrpc.Client, cache *gateway.WarmHintCache, log *slog.Logger) *warmHintConsumer {
+func newWarmHintConsumer(sched scheddgrpc.ScheddClient, cache *gateway.WarmHintCache, log *slog.Logger) *warmHintConsumer {
 	if log == nil {
 		log = slog.Default()
 	}

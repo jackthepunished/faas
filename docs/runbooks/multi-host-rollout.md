@@ -100,10 +100,10 @@ horizontal-scale variant, not active-passive).
 Two physical boxes at one Hetzner FSN + HEL pair (per spec §14
 "Regional expansion"). Wire identity:
 
-| Role                | Hostname       | `compute_nodes.name` | `target_url`                          |
-|---------------------|----------------|----------------------|---------------------------------------|
-| Control plane + 1st compute | `faas-fsn-1` | `default-local`      | `unix:///run/faas/vmmd.sock` (legacy) |
-| 2nd compute (new)   | `faas-fsn-2`   | `fsn-2`              | `tcp://vmmd-2.faas:50051` (mTLS)      |
+| Role                | Hostname       | `compute_nodes.name` | `target_url` (vmmd)                   | `schedd_target_url` (schedd)               |
+|---------------------|----------------|----------------------|---------------------------------------|-------------------------------------------|
+| Control plane + 1st compute | `faas-fsn-1` | `default-local`      | `unix:///run/faas/vmmd.sock` (legacy) | `unix:///run/faas/schedd.sock` (backfill) |
+| 2nd compute (new)   | `faas-fsn-2`   | `fsn-2`              | `tcp://vmmd-2.faas:50051` (mTLS)      | `tcp://schedd-2.faas:7100` (mTLS)         |
 
 Both boxes share the same Postgres. The new box runs the full
 daemon fleet (apid, schedd, vmmd, imaged, meterd, gatewayd,
@@ -326,6 +326,9 @@ bias is wrong — check `node_capacity_table` (step 5) and
 | 8 | vmmd self-registered                               | `journalctl -u faas-vmmd -n 50`                                                          | `vmmd registered node_id=...` |
 | 9 | `node_capacity_table` freshness                    | PromQL: `time() - max(node_capacity_table_sampled_at_unix_ms) < 5`                       | `1`                            |
 | 10| `gateway_wake_latency_seconds` p95 ≤ 1 s           | PromQL: `histogram_quantile(0.95, rate(gateway_wake_latency_seconds_bucket[5m]))`       | `< 1`                          |
+| 11| `schedd_target_url` populated on new node          | `psql -c "select name, schedd_target_url from compute_nodes where name='fsn-2'"`         | non-null                       |
+| 12| `schedd` resolved its `OwnerNodeID`                | `ssh faas-fsn-2 'journalctl -u faas-schedd --since -1m \| grep -i owner'`                | one log line                   |
+| 13| Apps split across owners within 60 s of a create   | `psql -c "select node_id, count(*) from apps group by node_id"`                          | both `default-local` and `fsn-2` non-zero |
 
 ### 8. Rollback
 

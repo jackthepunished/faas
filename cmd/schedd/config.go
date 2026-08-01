@@ -4,12 +4,14 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -170,6 +172,49 @@ func (c *Config) ResolveListenTarget() string {
 		return c.ListenAddr
 	}
 	return "unix://" + c.SocketPath
+}
+
+// ResolveLocalNodeID translates cfg.NodeName → compute_nodes.id
+// at startup, returning the durable Phase 2 / Gate A shard key
+// this schedd owns. Phase 2 / Gate A, migration 00083. The
+// empty-NodeName legacy posture returns ("", nil): the schedd
+// is the implicit owner of every app on the box, the ownership
+// guard short-circuits, and the single-box install preserves
+// bit-for-bit behaviour.
+//
+// Failures (DB outage, NodeName set but no matching active
+// compute_nodes row, NodeName resolves to default-local while
+// any non-default-local is active) return a non-nil error so
+// cmd/schedd's main exits fast — a misconfigured schedd
+// silently falling back to in-process ownership would mask
+// the multi-box wiring and route every wake to the local
+// schedd instead of the owner.
+func (c *Config) ResolveLocalNodeID(ctx context.Context, store state.Store) (string, error) {
+	if c.NodeName == "" {
+		return "", nil
+	}
+	// Look up the active compute_nodes row by name. The
+	// state.Store exposes ActiveComputeNodes(ctx) but not a
+	// per-name lookup, so we resolve via a small helper that
+	// matches the (name, active=true) predicate.
+	cn, err := store.ComputeNodeByName(ctx, c.NodeName)
+	if err != nil {
+		return "", fmt.Errorf("schedd: resolve %s: %w", c.NodeName, err)
+	}
+	if !cn.Active {
+		return "", fmt.Errorf("schedd: compute_node %s is inactive", c.NodeName)
+	}
+	if cn.Name == "default-local" {
+		// Multi-box guard: refuse to start schedd as the
+		// legacy default-local row while any non-default-local
+		// is also active. The synthetic default-local is
+		// only meant to carry single-box apps; an operator
+		// who set NodeName=default-local on a multi-box
+		// install has a config bug that the runbook would
+		// silently mask.
+		return "", fmt.Errorf("schedd: refusing to start as default-local on a multi-node fleet (NodeName=%q must match a non-default-local active row)", c.NodeName)
+	}
+	return cn.ID, nil
 }
 
 // ResolveVMMTarget returns the gRPC dial target for vmmd. VMMTarget
