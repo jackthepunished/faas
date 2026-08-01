@@ -25,6 +25,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
+	"github.com/onebox-faas/faas/pkg/sched/targets"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -47,6 +48,7 @@ type Loop struct {
 	diskDrift        *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
 	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets          *targets.Trigger      // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
 	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
@@ -201,6 +203,20 @@ func (l *Loop) WithOpsMetrics(ops *wire.OpsMetrics) *Loop {
 // cadence — same opt-out shape as WithHeartbeat / WithWatchdog.
 func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
 	l.scaleup = t
+	return l
+}
+
+// WithTargets (PR-C, issue #462) attaches the per-app
+// concurrent_requests target scale-up trigger. Reads
+// InstatsReader.MaxInflightForApp and compares against
+// ScalingPolicy.Target.Value per app. Distinct from the RPS/CPU
+// scale-up trigger (scaleup.Trigger), which is unchanged. Nil opts
+// out — the targetsTick arm of Run's select never fires.
+// Production wires NewTargets(store, reader, ledger, engine, ops)
+// from cmd/schedd after the InstatsReader is available; tests skip
+// via nil. The trigger's own Interval() governs the cadence.
+func (l *Loop) WithTargets(t *targets.Trigger) *Loop {
+	l.targets = t
 	return l
 }
 
@@ -379,6 +395,18 @@ func (l *Loop) Run(ctx context.Context) error {
 		scaleupT = time.NewTicker(interval)
 		defer scaleupT.Stop()
 	}
+	// PR-C (issue #462): concurrent_requests target scale-up ticker.
+	// Same 1 s cadence as scaleupTick. Nil opts out — no ticker, no
+	// runTargets case.
+	var targetsT *time.Ticker
+	if l.targets != nil {
+		interval := l.targets.Interval()
+		if interval <= 0 {
+			interval = api.ScaleUpDecisionIntervalSeconds * time.Second
+		}
+		targetsT = time.NewTicker(interval)
+		defer targetsT.Stop()
+	}
 	// Recent-load mirror ticker (issue #171). 1 s cadence keeps the
 	// per-app RPS window current between reaper ticks (the reaper
 	// itself runs at 10 s). nil mirror opts out — no ticker, no
@@ -413,6 +441,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runInstanceStats(ctx)
 		case <-scaleupTick(scaleupT):
 			l.runScaleUp(ctx)
+		case <-targetsTick(targetsT):
+			l.runTargets(ctx)
 		case <-recentLoadTick(recentLoadT):
 			l.runRecentLoad(ctx)
 		case <-retentionFirst:
@@ -485,6 +515,15 @@ func instStatsTick(t *time.Ticker) <-chan time.Time {
 // scaleupTick is the reactive scale-up trigger ticker (issue #169 /
 // #172). Same nil-safe shape as the heartbeat/retention tickers.
 func scaleupTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// targetsTick (PR-C, issue #462) is the concurrent_requests target
+// scale-up trigger ticker. Same nil-safe shape as scaleupTick.
+func targetsTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -602,6 +641,17 @@ func (l *Loop) runRetention(ctx context.Context) {
 func (l *Loop) runScaleUp(ctx context.Context) {
 	if err := l.scaleup.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		l.log.Warn("scaleup tick error", "err", err)
+	}
+}
+
+// runTargets (PR-C, issue #462) dispatches one tick of the
+// concurrent_requests target scale-up trigger. Mirror of runScaleUp
+// — Tick errors are logged, never returned, so a transient store
+// blip can't tear down the loop. Nil-safe via the
+// InstatsReader.MaxInflightForApp contract inside Tick itself.
+func (l *Loop) runTargets(ctx context.Context) {
+	if err := l.targets.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("targets tick error", "err", err)
 	}
 }
 
