@@ -760,11 +760,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if ramMB <= 0 {
 		ramMB = 128
 	}
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14)
+	// Issue #470 / ADR-055 + issue #533 / ADR-066: warm_snapshot_* values
+	// arrive populated on the App struct from apid (which applies the
+	// plan-gated default from pkg/api/limits.go). The SQL CHECK bounds
+	// are enforced both at the column layer and at the apid handler so
+	// a bad input here can only come from a test or a buggy internal
+	// caller; both surface via the 22P02/23514 mapping in mapErr.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14, $15, $16, $17)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID))
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
+		app.WarmSnapshotEnabled, app.WarmSnapshotMinRequests, app.WarmSnapshotMinMs)
 	return scanApp(row)
 }
 
@@ -856,11 +863,16 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// PlacementClaimSubscriber can stamp the owner asynchronously).
 	// See CreateApp for the post-00091 contract — pgx passes nil for
 	// the empty string so the column defaults to NULL.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13)
+	// Issue #470 / ADR-055: same warm_snapshot_* projection as CreateApp —
+	// the column default would write false/5/2000 for an unset caller,
+	// but apid always populates the App struct with the plan-gated
+	// defaults from pkg/api/limits.go before reaching either insert path.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID))
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
+		app.WarmSnapshotEnabled, app.WarmSnapshotMinRequests, app.WarmSnapshotMinMs)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1424,13 +1436,20 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   root_dir       = case when $21 then $22 else root_dir end,
 		   workload_name  = case when $23 then $24 else workload_name end,
 		   start_command  = case when $25 then $26::text else start_command end,
-		   scaling_policy = case when $29 then $30::jsonb else scaling_policy end
+		   scaling_policy = case when $29 then $30::jsonb else scaling_policy end,
+		   warm_snapshot_enabled = case when $31 then $32 else warm_snapshot_enabled end,
+		   warm_snapshot_min_requests = case when $33 then $34 else warm_snapshot_min_requests end,
+		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
 	// column when the policy is set. The two SET sources race on
 	// the same column; the policy-comes-first CASE preserves the
 	// policy author as the canonical writer at PR-A.
+	//
+	// Issue #470 / ADR-055: warm_snapshot_* updates follow the same
+	// Set*/optional-pointer pattern as require_signed / streaming_enabled
+	// so unset-vs-explicit-false is distinguishable on the wire.
 	var policyMinInstances int
 	if p.ScalingPolicy != nil {
 		policyMinInstances = p.ScalingPolicy.MinInstances
@@ -1450,7 +1469,10 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.WorkloadName != nil, p.WorkloadName,
 		p.StartCommand != nil, nullString(derefString(p.StartCommand)),
 		keepMinInstancesInSync, policyMinInstances,
-		p.SetScalingPolicy, scalingPolicyBytes)
+		p.SetScalingPolicy, scalingPolicyBytes,
+		p.SetWarmSnapshotEnabled, boolOrFalse(p.WarmSnapshotEnabled),
+		p.SetWarmSnapshotMinRequests, intOrZero(p.WarmSnapshotMinRequests),
+		p.SetWarmSnapshotMinMs, intOrZero(p.WarmSnapshotMinMs))
 	return scanApp(row)
 }
 
@@ -5077,9 +5099,12 @@ func (s *PgStore) TouchInstancesLastSeen(ctx context.Context, touches []Instance
 // --- snapshots --------------------------------------------------------------
 
 // CreateSnapshot writes the immutable snapshot row imaged produces after the
-// rootfs layer is built. Conflicts (same deployment_id) collapse to ErrConflict
-// so imaged can ignore a duplicate emission; the rest of imaged treats the
-// first successful write as truth.
+// rootfs layer is built. Conflicts (same deployment_id, tier) collapse to
+// ErrConflict so imaged can ignore a duplicate emission; the rest of imaged
+// treats the first successful write as truth.
+//
+// Tier (issue #470 / ADR-055): empty tier defaults to "init" for legacy
+// callers; new warm-tier capture code passes SnapshotTierWarm explicitly.
 func (s *PgStore) CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, error) {
 	// StorageKey is required. The migration's `NOT NULL DEFAULT ''`
 	// is a safety net for any path we miss, but the contract here is
@@ -5094,11 +5119,15 @@ func (s *PgStore) CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, 
 	if snap.StorageKey == "" {
 		return Snapshot{}, fmt.Errorf("state: CreateSnapshot: storage_key required (populate via state.SnapMemKey at the call site)")
 	}
+	tier := snap.Tier
+	if tier == "" {
+		tier = SnapshotTierInit
+	}
 	row := s.pool.QueryRow(ctx,
-		`insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale)
-		 values ($1, $2, $3, $4, $5, $6)
-		 returning id, deployment_id::text, fc_version, mem_bytes, disk_bytes, storage_key, stale, created_at`,
-		snap.DeploymentID, snap.FCVersion, snap.MemBytes, snap.DiskBytes, snap.StorageKey, snap.Stale)
+		`insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
+		 values ($1, $2, $3, $4, $5, $6, $7)
+		 returning id, deployment_id::text, fc_version, mem_bytes, disk_bytes, storage_key, stale, created_at, tier`,
+		snap.DeploymentID, snap.FCVersion, snap.MemBytes, snap.DiskBytes, snap.StorageKey, snap.Stale, tier)
 	out, err := scanSnapshot(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -5110,14 +5139,38 @@ func (s *PgStore) CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, 
 	return out, nil
 }
 
-// LatestSnapshot returns the freshest non-stale snapshot for a deployment.
-// schedd's wake path calls this to decide between restore and cold boot
-// (ADR-005 — cold boot must always work, snapshot is cache).
+// LatestSnapshot returns the freshest non-stale snapshot for a deployment
+// across BOTH tiers. Warm wins on a created_at tie (issue #470 / ADR-055):
+// the order-by clause ranks (tier='warm') before created_at so a fresh
+// warm-tier promotion pre-empts a stale-or-equal init-tier row.
+//
+// schedd's wake path now calls LatestSnapshotForTier (per-tier decision)
+// instead of this helper — LatestSnapshot is kept for legacy callers
+// (dashboard queries, snapshot dashboards, manual SQL ops).
 func (s *PgStore) LatestSnapshot(ctx context.Context, deploymentID string) (Snapshot, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, deployment_id::text, fc_version, mem_bytes, disk_bytes, storage_key, stale, created_at
+		`select id, deployment_id::text, fc_version, mem_bytes, disk_bytes, storage_key, stale, created_at, tier
 		 from snapshots where deployment_id = $1 and stale = false
-		 order by created_at desc limit 1`, deploymentID)
+		 order by (tier = 'warm') desc, created_at desc limit 1`, deploymentID)
+	return scanSnapshot(row)
+}
+
+// LatestSnapshotForTier returns the freshest non-stale snapshot for a
+// deployment at a specific tier (issue #470 / ADR-055). Empty tier is
+// treated as "init" for legacy callers; the returned Snapshot has its
+// Tier field populated so schedd can detect the warm-tier hit.
+//
+// Returns ErrNotFound when no non-stale row exists for the
+// (deployment, tier) pair — schedd's tier-fallback chain treats this as
+// "fall through to the next tier".
+func (s *PgStore) LatestSnapshotForTier(ctx context.Context, deploymentID, tier string) (Snapshot, error) {
+	if tier == "" {
+		tier = SnapshotTierInit
+	}
+	row := s.pool.QueryRow(ctx,
+		`select id, deployment_id::text, fc_version, mem_bytes, disk_bytes, storage_key, stale, created_at, tier
+		 from snapshots where deployment_id = $1 and tier = $2 and stale = false
+		 order by created_at desc limit 1`, deploymentID, tier)
 	return scanSnapshot(row)
 }
 
@@ -5148,10 +5201,15 @@ func (s *PgStore) MarkSnapshotStale(ctx context.Context, snapshotID string) erro
 // B1.1 (issue #195): also selects a.slug so the GC loop can build the
 // apps/<slug>/<dep>.ext4 storage key without re-issuing a
 // DeploymentByID + AppByID round-trip per eviction.
+//
+// Issue #470 / ADR-055: also projects s.tier so the GC loop can keep
+// (current warm + previous init) per app for warm-tier apps, while
+// Free/Hobby apps keep just the single init-tier row. The tier column
+// arrives as a 9th value via Scan's last argument.
 func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, error) {
 	rows, err := s.pool.Query(ctx,
 		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text, a.slug,
-		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at
+		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at, s.tier
 		   from snapshots s
 		   join deployments d on d.id = s.deployment_id
 		   join apps a       on a.id = d.app_id
@@ -5167,7 +5225,7 @@ func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, erro
 	for rows.Next() {
 		var r SnapshotForGC
 		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID, &r.AppSlug,
-			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt); err != nil {
+			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt, &r.Tier); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -7538,7 +7596,8 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt); err != nil {
+		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
+		&a.WarmSnapshotEnabled, &a.WarmSnapshotMinRequests, &a.WarmSnapshotMinMs); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -7576,8 +7635,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 // trailing node_id column is the Phase 2 / Gate A shard key
 // (migration 00090); apps.node_id is NOT NULL after backfill + the
 // empty-uuid CHECK, set once at CreateApp time by apid's
-// PlacementScheduler. Keep this const and the App struct aligned:
-// adding a column touches both.
+// PlacementScheduler. The trailing reassigned_at column (migration
+// 00095) tracks when schedd's Tier A4 cross-node rebalance last
+// touched the row. The 3 trailing columns (warm_snapshot_enabled,
+// warm_snapshot_min_requests, warm_snapshot_min_ms) are the
+// issue #470 / ADR-055 additions (two-tier snapshot / warm.snap).
+// Keep this const and the App struct aligned: adding a column touches
+// both.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
@@ -7585,7 +7649,8 @@ const appsSelectColumns = `
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
 	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''),
-	reassigned_at, migrated_at`
+	reassigned_at, migrated_at,
+	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -7944,11 +8009,21 @@ func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 
 func scanSnapshot(row pgx.Row) (Snapshot, error) {
 	s := Snapshot{}
-	if err := row.Scan(&s.ID, &s.DeploymentID, &s.FCVersion, &s.MemBytes, &s.DiskBytes, &s.StorageKey, &s.Stale, &s.CreatedAt); err != nil {
+	// The 9th column is tier (issue #470 / ADR-055). Every query
+	// in this file now selects the tier column explicitly; the
+	// scan returns "init" if the column is NULL (legacy rows from
+	// before migration 00102 applied).
+	var tier *string
+	if err := row.Scan(&s.ID, &s.DeploymentID, &s.FCVersion, &s.MemBytes, &s.DiskBytes, &s.StorageKey, &s.Stale, &s.CreatedAt, &tier); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Snapshot{}, ErrNotFound
 		}
 		return Snapshot{}, err
+	}
+	if tier != nil && *tier != "" {
+		s.Tier = *tier
+	} else {
+		s.Tier = SnapshotTierInit
 	}
 	return s, nil
 }

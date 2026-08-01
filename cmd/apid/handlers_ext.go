@@ -222,6 +222,38 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
 		}
 	}
+	// Issue #470 / ADR-055: per-app two-tier-snapshot flag. Same
+	// plan-gate shape as streaming — Free/Hobby + true = 403
+	// plan_warm_snapshot_not_allowed. Out-of-range thresholds =
+	// 422 invalid_warm_snapshot_min_* (the SQL CHECK rejects the
+	// same range, but the apid layer catches it first so the
+	// customer sees a clean validation error).
+	if req.WarmSnapshotEnabled != nil && *req.WarmSnapshotEnabled {
+		if !acct.Plan.WarmSnapshotAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanWarmSnapshotNotAllowed,
+				"Warm-tier snapshots are not allowed on this plan",
+				"Free and Hobby tiers do not support per-app warm snapshots; upgrade to Pro or higher.")
+		}
+	}
+	if req.WarmSnapshotMinRequests != nil {
+		v := *req.WarmSnapshotMinRequests
+		if v < 1 || v > 100 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidWarmSnapshotMinRequests,
+				"Invalid warm_snapshot_min_requests",
+				fmt.Sprintf("warm_snapshot_min_requests must be in [1, 100]; got %d", v))
+		}
+	}
+	if req.WarmSnapshotMinMs != nil {
+		v := *req.WarmSnapshotMinMs
+		if v < 100 || v > 60000 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeInvalidWarmSnapshotMinMs,
+				"Invalid warm_snapshot_min_ms",
+				fmt.Sprintf("warm_snapshot_min_ms must be in [100, 60000]; got %d", v))
+		}
+	}
 	// Issue #462 / ADR-058: per-app scaling policy (PR-A persists
 	// + Hobby+ tier-up; PR-C wires the engine; PR-D carves out the
 	// worker-class branch). The DTO uses value semantics so the
@@ -447,6 +479,19 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// SDK wire shape stays stable, but it's not honoured here.
 		// imaged reads the column at buildImageLayer time regardless
 		// of how it got set.
+		//
+		// Issue #470 / ADR-055: per-app warm-snapshot knobs ARE
+		// settable via the customer PATCH surface. The plan gate
+		// (Free/Hobby + true → 403 plan_warm_snapshot_not_allowed)
+		// is enforced inside this handler before the store call so
+		// the SQL never sees an illegal value. The min_request /
+		// min_ms bounds are enforced at the JSON-decode layer.
+		WarmSnapshotEnabled:        req.WarmSnapshotEnabled,
+		SetWarmSnapshotEnabled:     req.WarmSnapshotEnabled != nil,
+		WarmSnapshotMinRequests:    req.WarmSnapshotMinRequests,
+		SetWarmSnapshotMinRequests: req.WarmSnapshotMinRequests != nil,
+		WarmSnapshotMinMs:          req.WarmSnapshotMinMs,
+		SetWarmSnapshotMinMs:       req.WarmSnapshotMinMs != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -499,6 +544,23 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// path for the toggle lives on PATCH /v1/apps/{slug}/security
 	// (handlers_security.go) where the admin+MFA chain guarantees
 	// the operator-only posture.
+	// Issue #470 / ADR-055: warm-snapshot toggles + threshold
+	// overrides are recorded alongside the other app.updated
+	// entries. The Set bit drives "what did the customer actually
+	// change" — a `false` here means the audit row is unchanged
+	// from the streaming block above.
+	if req.WarmSnapshotEnabled != nil {
+		oldApp["warm_snapshot_enabled"] = app.WarmSnapshotEnabled
+		newApp["warm_snapshot_enabled"] = updated.WarmSnapshotEnabled
+	}
+	if req.WarmSnapshotMinRequests != nil {
+		oldApp["warm_snapshot_min_requests"] = app.WarmSnapshotMinRequests
+		newApp["warm_snapshot_min_requests"] = updated.WarmSnapshotMinRequests
+	}
+	if req.WarmSnapshotMinMs != nil {
+		oldApp["warm_snapshot_min_ms"] = app.WarmSnapshotMinMs
+		newApp["warm_snapshot_min_ms"] = updated.WarmSnapshotMinMs
+	}
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)

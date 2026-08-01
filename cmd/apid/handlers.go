@@ -121,10 +121,44 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled
 	}
+	// Issue #470 / ADR-055: per-app two-tier snapshot flag. Apply
+	// the plan-level default when the request didn't carry one —
+	// a Pro customer's brand-new app gets warm.snap capture
+	// without an extra PATCH round-trip. Free/Hobby default to
+	// false (the only legal value on those tiers; apid rejects
+	// PATCH-true with 403 plan_warm_snapshot_not_allowed). The
+	// per-request override on Pro/Scale lets a customer opt out
+	// (e.g. an app they know runs cold every request).
+	warmEnabled := acct.Plan.WarmSnapshotEnabled()
+	if req.WarmSnapshotEnabled != nil {
+		warmEnabled = *req.WarmSnapshotEnabled
+	}
+	// Apply the per-app threshold defaults from the plan; an
+	// explicit override on the request wins. Out-of-range values
+	// were already rejected at the JSON-decode layer
+	// (api.ValidateWarmSnapshotBounds), so the only path that
+	// produces an out-of-range value here is a buggy test or
+	// internal caller.
+	warmMinReqs := acct.Plan.WarmSnapshotMinRequestsDefault()
+	if req.WarmSnapshotMinRequests != nil {
+		warmMinReqs = *req.WarmSnapshotMinRequests
+	}
+	warmMinMs := acct.Plan.WarmSnapshotMinMsDefault()
+	if req.WarmSnapshotMinMs != nil {
+		warmMinMs = *req.WarmSnapshotMinMs
+	}
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
-		StreamingEnabled: streaming,
+		StreamingEnabled:    streaming,
+		WarmSnapshotEnabled: warmEnabled,
+		// Coerce to the plan minimums when the request asked for a
+		// warm config but the plan says warm-snapshot is off: the
+		// store ignores them anyway (the cold-boot path doesn't
+		// read min_requests / min_ms), and the apid response
+		// projects the plan defaults so dashboards stay consistent.
+		WarmSnapshotMinRequests: warmMinReqs,
+		WarmSnapshotMinMs:       warmMinMs,
 	}, nil
 }
 
@@ -392,6 +426,14 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		// the streaming flag, and so a customer can verify their
 		// PATCH landed without a second round-trip.
 		RequireSigned: a.RequireSigned,
+		// Issue #470 / ADR-055: per-app two-tier-snapshot flag +
+		// thresholds. Surfaced so dashboards can show "warm snapshot
+		// on / off" alongside the streaming + require_signed pills,
+		// and so a customer can verify the per-app override values
+		// they PATCHed.
+		WarmSnapshotEnabled:     a.WarmSnapshotEnabled,
+		WarmSnapshotMinRequests: a.WarmSnapshotMinRequests,
+		WarmSnapshotMinMs:       a.WarmSnapshotMinMs,
 	}
 }
 

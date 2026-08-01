@@ -3976,6 +3976,30 @@ components:
           description: "Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a valid signature from a publisher in the per-app trusted_signers list. Default false."
           type: boolean
           example: false
+        # Issue #470 / ADR-055: per-app two-tier snapshot flag +
+        # thresholds. True on Pro/Scale by default; Free/Hobby
+        # always false (the only legal state on those tiers —
+        # apid rejects PATCH-true with 403
+        # plan_warm_snapshot_not_allowed). Customer PATCH may
+        # toggle the flag or override the per-app thresholds;
+        # out-of-range threshold values are rejected with 422
+        # invalid_warm_snapshot_min_*.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). True on Pro/Scale by default; Free/Hobby always false."
+          type: boolean
+          example: true
+        warm_snapshot_min_requests:
+          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 5
+        warm_snapshot_min_ms:
+          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]."
+          type: integer
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -3997,6 +4021,27 @@ components:
           description: "Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."
           type: boolean
           example: false
+        # Issue #470 / ADR-055: optional at create-time. Omitted
+        # → apid applies the plan default (Pro/Scale = true;
+        # Free/Hobby = false — the only legal state on those
+        # tiers). PATCH-true on Free/Hobby is rejected with 403
+        # plan_warm_snapshot_not_allowed.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected."
+          type: boolean
+          example: true
+        warm_snapshot_min_requests:
+          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 5
+        warm_snapshot_min_ms:
+          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]."
+          type: integer
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     UpdateAppRequest:
       description: "Partial update — every field is optional; omitted fields are unchanged."
@@ -4086,6 +4131,26 @@ components:
           description: "DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054). The field is parsed for backwards compatibility but never persisted from this endpoint."
           type: [boolean, "null"]
           example: false
+        # Issue #470 / ADR-055: per-app warm-snapshot flag +
+        # thresholds. PATCH-true on Free/Hobby is rejected with
+        # 403 plan_warm_snapshot_not_allowed; out-of-range
+        # threshold values return 422 invalid_warm_snapshot_min_*.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_warm_snapshot_not_allowed."
+          type: [boolean, "null"]
+          example: true
+        warm_snapshot_min_requests:
+          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]. Omitted → no change."
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+          example: 5
+        warm_snapshot_min_ms:
+          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → no change."
+          type: [integer, "null"]
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."

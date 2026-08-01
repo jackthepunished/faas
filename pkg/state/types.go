@@ -305,7 +305,6 @@ type App struct {
 	// reaper park branch.
 	LastScaleOutAt *time.Time
 	LastScaleInAt  *time.Time
-	CreatedAt      time.Time
 	// NodeID is the durable shard key that ties an app to its
 	// owner compute_node (Phase 2 / Gate A, migration 00090).
 	// Set once at CreateApp time by apid's PlacementScheduler
@@ -322,7 +321,7 @@ type App struct {
 	NodeID string
 	// ReassignedAt is the wall-clock time of the most recent
 	// successful cross-node reassignment (Tier A4, migration
-	// 00092). Stamped by Store.ReassignAppOwner in the same
+	// 00095). Stamped by Store.ReassignAppOwner in the same
 	// UPDATE that flips apps.node_id. The rebalancer's hot
 	// filter is `reassigned_at IS NULL OR reassigned_at <
 	// now() - interval '<cooldown>s'`, so a fresh
@@ -350,6 +349,30 @@ type App struct {
 	// rebalancer's hot filter is on instances.state, not on
 	// apps.migrated_at.
 	MigratedAt *time.Time
+	// WarmSnapshotEnabled (issue #470 / ADR-055) toggles the
+	// two-tier snapshot path (init.snap + warm.snap). When true
+	// and the customer's plan is Pro or Scale, schedd captures a
+	// second snapshot after the framework listener reports ready,
+	// and the wake-path prefers warm.snap on restore. The column
+	// is per-app (operators may PATCH it via /v1/apps/{slug}); the
+	// plan-gated default lives in pkg/api/limits.go
+	// (WarmSnapshotDefault).
+	WarmSnapshotEnabled bool
+	// WarmSnapshotMinRequests is the minimum successful request
+	// count before schedd promotes a warm-tier capture. Range
+	// [1, 100], default 5. Lowering this shortens the time to
+	// first warm.snap but risks capturing mid-warmup states; the
+	// range bound is enforced both at the SQL CHECK layer and at
+	// the apid handler so a bad PATCH can't degrade the box.
+	WarmSnapshotMinRequests int
+	// WarmSnapshotMinMs is the minimum time-since-first-ready in
+	// milliseconds before schedd promotes a warm-tier capture.
+	// Range [100, 60000], default 2000. The 100 ms floor blocks
+	// capturing too early (before JIT/AOT has a chance to fire);
+	// the 60 s ceiling bounds the per-park latency cost the warm
+	// capture adds to the cold path (R1 in the plan).
+	WarmSnapshotMinMs int
+	CreatedAt         time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1392,8 +1415,30 @@ type UpdateAppParams struct {
 	// deploys are unaffected.
 	RequireSigned    *bool
 	SetRequireSigned bool
-	Status           *AppStatus
-	Manifest         *AppManifest
+	// WarmSnapshotEnabled (issue #470 / ADR-055) toggles the
+	// two-tier snapshot path. SetWarmSnapshotEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (disable warm
+	// capture). Plan-gated upstream: apid returns
+	// 403 plan_warm_snapshot_not_allowed when the customer's plan
+	// is Free or Hobby AND the value would be true. Customers may
+	// PATCH true → false on any plan to opt out per-app.
+	WarmSnapshotEnabled    *bool
+	SetWarmSnapshotEnabled bool
+	// WarmSnapshotMinRequests (issue #470 / ADR-055) is the
+	// request-count threshold for warm-tier capture. Range [1, 100].
+	// SetWarmSnapshotMinRequests distinguishes "unset" from
+	// "explicit zero" (illegal — the SQL CHECK rejects 0).
+	WarmSnapshotMinRequests    *int
+	SetWarmSnapshotMinRequests bool
+	// WarmSnapshotMinMs (issue #470 / ADR-055) is the
+	// time-since-first-ready threshold for warm-tier capture.
+	// Range [100, 60000]. SetWarmSnapshotMinMs distinguishes
+	// "unset" from "explicit low value" (illegal — the SQL CHECK
+	// rejects <100).
+	WarmSnapshotMinMs    *int
+	SetWarmSnapshotMinMs bool
+	Status               *AppStatus
+	Manifest             *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
@@ -1436,6 +1481,15 @@ type Snapshot struct {
 	FCVersion    string
 	MemBytes     int64
 	DiskBytes    int64
+	// Tier (issue #470 / ADR-055) is which snapshot tier this row
+	// belongs to: "init" (taken right after guest-init signals
+	// :8080 bound; restore pays framework warmup) or "warm"
+	// (taken after N successful requests ≥ warm_snapshot_min_ms,
+	// when the framework is hot — restore skips the warmup cost).
+	// The DEFAULT 'init' on the column covers every pre-PR row.
+	// Empty string in Go is treated as "init" by LatestSnapshotForTier
+	// so legacy callers stay valid.
+	Tier string
 	// StorageKey is the canonical StorageBackend key for the mem
 	// blob (issue #96, ADR-025 axis 2). Local backends resolve it
 	// to a file under /srv/fc; remote backends (OCI registry)
@@ -1449,6 +1503,16 @@ type Snapshot struct {
 	Stale      bool
 	CreatedAt  time.Time
 }
+
+// Snapshot tier constants (issue #470 / ADR-055). Use these rather
+// than bare string literals so the snapshot_written payload wire
+// shape and the LatestSnapshotForTier callers cannot drift. The
+// CHECK constraint on snapshots.tier enforces the same vocabulary at
+// the DB layer (migrations/00102_snapshots_tier.sql).
+const (
+	SnapshotTierInit string = "init"
+	SnapshotTierWarm string = "warm"
+)
 
 // SnapshotForGC is the join-projection used by the imaged nightly GC
 // (spec §4.6: keep current + previous deployment's snapshots per app;
@@ -1475,9 +1539,12 @@ type SnapshotForGC struct {
 	FCVersion string
 	MemBytes  int64
 	DiskBytes int64
-	// StorageKey mirrors Snapshot.StorageKey; populated from the
-	// join so imaged's snapshot GC can Storage.Delete under the
-	// canonical key (issue #96, ADR-025 axis 2 final slice).
+	// Tier (issue #470 / ADR-055) is the snapshot tier — see
+	// Snapshot.Tier for the semantics. The GC projection carries
+	// it so the perAppKeepCurrentPrevious policy can keep
+	// (current warm + previous init) per app instead of the
+	// legacy (current + previous) regardless-of-tier rule.
+	Tier       string
 	StorageKey string
 	Stale      bool
 	CreatedAt  time.Time

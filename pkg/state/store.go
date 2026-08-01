@@ -1498,6 +1498,14 @@ type Store interface {
 	// stale on a failed restore, ADR-005).
 	CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, error)
 	LatestSnapshot(ctx context.Context, deploymentID string) (Snapshot, error)
+	// LatestSnapshotForTier (issue #470 / ADR-055) returns the freshest
+	// non-stale snapshot for the (deployment, tier) pair. Empty tier is
+	// treated as "init". Returns ErrNotFound when no non-stale row
+	// exists — schedd's tier-fallback chain treats that as "fall through
+	// to the next tier". Warm-tier apps use this to pick warm.snap when
+	// usable; cold-boot-only deployments continue to call
+	// LatestSnapshot (which now ranks warm above init on ties).
+	LatestSnapshotForTier(ctx context.Context, deploymentID, tier string) (Snapshot, error)
 	MarkSnapshotStale(ctx context.Context, snapshotID string) error
 
 	// Snapshot GC (imaged nightly + on FC upgrade, spec §4.6 + §4.4).
