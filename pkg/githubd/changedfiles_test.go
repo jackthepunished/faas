@@ -5,6 +5,7 @@ package githubd
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -129,7 +130,7 @@ func TestChangedFiles_TruncatedByCommitsPagination(t *testing.T) {
 
 	client, _ := fixedClient(t, srv, "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "base-sha", "head-sha")
-	if err != ErrTruncated {
+	if !errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want ErrTruncated", err)
 	}
 }
@@ -151,7 +152,7 @@ func TestChangedFiles_TruncatedByFiles300Cap(t *testing.T) {
 
 	client, _ := fixedClient(t, srv, "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "base-sha", "head-sha")
-	if err != ErrTruncated {
+	if !errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want ErrTruncated", err)
 	}
 }
@@ -199,7 +200,7 @@ func TestChangedFiles_RetryExhaustedMapsToTruncated(t *testing.T) {
 
 	client, _ := fixedClient(t, srv, "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "base-sha", "head-sha")
-	if err != ErrTruncated {
+	if !errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want ErrTruncated (429-exhausted is semantically truncation)", err)
 	}
 	// 1 initial + 2 retries = 3 attempts.
@@ -222,7 +223,7 @@ func TestChangedFiles_404ReturnsUnavailable(t *testing.T) {
 	}
 	// 404 is not truncation; it's a clean "unavailable" so the
 	// caller can decide whether to surface a different audit row.
-	if err == ErrTruncated {
+	if errors.Is(err, ErrTruncated) {
 		t.Errorf("err = ErrTruncated, want wrapped ErrUnavailable")
 	}
 }
@@ -264,7 +265,7 @@ func TestChangedFiles_EmptyBaseTruncated(t *testing.T) {
 		t.Errorf("upstream should not be called for empty base")
 	})), "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "", "h")
-	if err != ErrTruncated {
+	if !errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want ErrTruncated", err)
 	}
 }
@@ -275,7 +276,7 @@ func TestChangedFiles_EmptyOwnerRepoUnavailable(t *testing.T) {
 		t.Errorf("upstream should not be called for empty owner/repo")
 	})), "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "", "api", "b", "h")
-	if err == nil || err == ErrTruncated {
+	if err == nil || errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want wrapped ErrUnavailable", err)
 	}
 }

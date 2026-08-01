@@ -25,6 +25,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// filterMode values for path-filtered build fan-out (ADR-050 §103-109).
+// Lifted to constants so deployment + filter tests + the
+// summary log all reference the same identifiers.
+const (
+	filterModePaths        = "paths"
+	filterModeFullFallback = "full_fallback"
+)
+
 // AppBindingStore is the slice of store githubd reads to look up
 // (repo → app) bindings for incoming pushes. PR-H widens the
 // return type from githubdgrpc.AppBinding to state.GitHubBinding so
@@ -309,29 +317,29 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 // dashboard can group by mode + truncated flag.
 func (s *Service) lookupChangedFiles(ctx context.Context, ev PushEvent, installationID int64) ([]string, string) {
 	if s.ChangedFiles == nil {
-		return nil, "full_fallback"
+		return nil, filterModeFullFallback
 	}
 	if ev.Before == "" {
 		// First push on a branch (or stale webhook) — can't
 		// form a compare URL. Treat as fallback.
 		s.Log.Warn("githubd: push missing before SHA; falling back to full fan-out",
 			"repo", ev.Repository.FullName, "sha", ev.After)
-		return nil, "full_fallback"
+		return nil, filterModeFullFallback
 	}
 	owner, repo, ok := splitOwnerRepo(ev.Repository.FullName)
 	if !ok {
 		s.Log.Warn("githubd: invalid repo full name; falling back to full fan-out",
 			"repo", ev.Repository.FullName, "sha", ev.After)
-		return nil, "full_fallback"
+		return nil, filterModeFullFallback
 	}
 	files, err := s.ChangedFiles.ChangedFiles(ctx, installationID, owner, repo, ev.Before, ev.After)
 	if err != nil {
 		s.Log.Warn("githubd: compare failed; falling back to full fan-out",
 			"repo", ev.Repository.FullName, "base", ev.Before, "head", ev.After,
 			"err", err, "truncated", errors.Is(err, ErrTruncated))
-		return nil, "full_fallback"
+		return nil, filterModeFullFallback
 	}
-	return files, "paths"
+	return files, filterModePaths
 }
 
 // filterByPath returns the subset of apps that should be rebuilt
@@ -350,7 +358,7 @@ func (s *Service) lookupChangedFiles(ctx context.Context, ev PushEvent, installa
 // the filter dropped on the "paths" path; it is empty on the
 // "full_fallback" path.
 func (s *Service) filterByPath(touched []state.App, changedFiles []string, filterMode string) ([]state.App, []string) {
-	if filterMode != "paths" {
+	if filterMode != filterModePaths {
 		return touched, nil
 	}
 	var matched []state.App

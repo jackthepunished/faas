@@ -152,7 +152,7 @@ func (c *httpChangedFiles) ChangedFiles(
 
 	token, err := c.tokens.Token(ctx, installationID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: install token: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: install token: %w", ErrUnavailable, err)
 	}
 
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/compare/%s...%s",
@@ -175,7 +175,7 @@ func (c *httpChangedFiles) ChangedFiles(
 		delay := retryAfterDelay(err, c.baseBackoff)
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("%w: %v", ErrUnavailable, ctx.Err())
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, ctx.Err())
 		case <-time.After(delay):
 		}
 	}
@@ -184,7 +184,7 @@ func (c *httpChangedFiles) ChangedFiles(
 	if lastErr != nil && isRetryable(lastErr) {
 		return nil, ErrTruncated
 	}
-	return nil, fmt.Errorf("%w: %v", ErrUnavailable, lastErr)
+	return nil, fmt.Errorf("%w: %w", ErrUnavailable, lastErr)
 }
 
 // fetchOnce does a single compare-API call. Returns
