@@ -1550,6 +1550,21 @@ const (
 	ProjectScanSourceConvention ProjectScanSource = "convention"
 	ProjectScanSourceSingle     ProjectScanSource = "single"
 	ProjectScanSourceUnknown    ProjectScanSource = "unknown"
+	// ProjectScanSourceWorkspaces is the plural form the
+	// reconcile.Service.DeriveScanSource helper returns for
+	// projects whose root tree enumerates a workspaces section
+	// (e.g. yarn/npm/pnpm workspaces). It is distinct from
+	// ProjectScanSourceWorkspace (singular) because the two
+	// occupy different scan-source tiers today: the singular
+	// form is the typed-const slot committed in the apps.scan_source
+	// CHECK constraint, while the plural form is the working
+	// pre-typed value reconciliation stores while it
+	// converges the apps rows. Callers that want to seed or
+	// compare against the plural form should reference this
+	// constant instead of the raw string literal — the L1
+	// review flagged the raw "workspaces" string in a service
+	// test as a tierRank-asymmetry tripwire.
+	ProjectScanSourceWorkspaces ProjectScanSource = "workspaces"
 )
 
 // scanSourceRank is the monotonic-upgrade total ordering. Higher rank
