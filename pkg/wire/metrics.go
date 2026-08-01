@@ -873,14 +873,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Per-slice throttle ratio (throttle_delta / (throttle_delta + usage_delta)) over the 5s sampler window (issue #301, ADR-044). Labelled by slice ∈ {tenant-free, tenant-hobby, tenant-pro, tenant-scale}; the closed plan set is pre-instantiated at boot so the dashboard surfaces 'no data' → '0' on an idle box. The FaasCpuStarvation alert reads slice=~\"tenant-.*\" > 0.8 for 5m. Ratio is the operationally meaningful number — a counter delta alone would conflate 'lots of CPU, low throttle' with 'no CPU, no throttle'.",
 	}, []string{"slice"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
-	// label set is closed ({admit, reject_at_cap, no_signal});
-	// pre-instantiated below so the rows surface in /metrics from
-	// boot. App label is per-app (bounded by apps with autoscale
-	// configured) — the closed outcome set means the total series
-	// cardinality is O(autoscale-enabled apps × 3).
+	// label set is closed ({admit, reject_at_cap, no_signal,
+	// cooldown_held}); pre-instantiated below so the rows surface
+	// in /metrics from boot. App label is per-app (bounded by apps
+	// with autoscale configured) — the closed outcome set means
+	// the total series cardinality is O(autoscale-enabled apps × 4).
+	// cooldown_held (PR-C, issue #462) lands on the wake-gate
+	// path when Concurrency(appID) > 0 AND
+	// time.Since(apps.last_scale_out_at) < ScaleOutCooldownS.
 	scaleUpDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_up_decisions_total",
-		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal}; app label is the apps.id.",
+		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_scale_up_admit_rps",
@@ -896,10 +899,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// Symmetric with scaleUpDecisions — same (app, outcome) label
 	// shape, same outcome pre-instantiation. "park" fires once per
 	// app per 10s reaper tick when at least one instance is parked;
-	// "keep" fires when the aggressive path decided to hold the line.
+	// "keep" fires when the aggressive path decided to hold the
+	// line. min_floor_already (PR-C, issue #462) is a semantic
+	// upgrade over "keep" emitted by the reaper when
+	// Concurrency(appID) >= ScalingPolicy.MinInstances AND the
+	// aggressive path would otherwise have parked an instance.
 	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_down_decisions_total",
-		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep}; app label is the apps.id.",
+		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	sseClients := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_sse_clients",
@@ -1208,7 +1215,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// is a placeholder so the help/TYPE surfaces in /metrics before
 	// the first decision fires. Real per-app rows are added by
 	// ObserveScaleUp below.
-	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal"} {
+	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal", "cooldown_held"} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
 	// Issue #300: pre-instantiate the ("other",) row of the per-tenant
@@ -1237,10 +1244,13 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ReplaceInstanceStats) which routes through topAppSet and
 	// demotes past top-100 into this bucket.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
-	// issue #171: pre-instantiate the {park, keep} outcome rows for
-	// the empty-app label so the help/TYPE surfaces in /metrics from
-	// boot, mirroring the scale-up pattern above.
-	for _, outcome := range []string{"park", "keep"} {
+	// issue #171: pre-instantiate the {park, keep, min_floor_already}
+	// outcome rows for the empty-app label so the help/TYPE surfaces
+	// in /metrics from boot, mirroring the scale-up pattern above.
+	// min_floor_already (PR-C, issue #462) is the per-app "would
+	// have parked, but min_instances is reached" outcome the
+	// aggressive reaper emits.
+	for _, outcome := range []string{"park", "keep", "min_floor_already"} {
 		scaleDownDecisions.WithLabelValues("", outcome)
 	}
 	// issue #279 (PR-B, CPU-hour visibility): pre-instantiate the

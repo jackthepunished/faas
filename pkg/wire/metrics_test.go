@@ -324,8 +324,12 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 		`schedd_scale_down_decisions_total{app="a1",outcome="keep"} 1`,
 		// Pre-instantiated empty-app placeholder: zero-valued, must
 		// surface in /metrics from boot so the panel exists at day 1.
+		// min_floor_already (PR-C, issue #462) is pre-instantiated
+		// alongside park / keep so the closed outcome label set
+		// is fully surfaced from boot.
 		`schedd_scale_down_decisions_total{app="",outcome="park"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="keep"} 0`,
+		`schedd_scale_down_decisions_total{app="",outcome="min_floor_already"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
@@ -339,6 +343,35 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 func TestOpsMetrics_ObserveScaleDownNilSafe(t *testing.T) {
 	var m *wire.OpsMetrics
 	m.ObserveScaleDown("a1", "park")
+}
+
+// TestOpsMetrics_ObserveScaleUpClosedSet (PR-C, issue #462) —
+// pins the scale-up outcome label set: pre-instantiated rows
+// for the closed set {admit, reject_at_cap, no_signal,
+// cooldown_held} must surface in /metrics from boot with the
+// empty-app placeholder. Mirrors TestOpsMetrics_ObserveScaleDown
+// for the scale-up side. The cooldown_held outcome is the new
+// wake-gate path emission added by PR-C.
+func TestOpsMetrics_ObserveScaleUpClosedSet(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveScaleUp("a1", "admit")
+	m.ObserveScaleUp("a1", "cooldown_held")
+
+	body := render(t, m)
+	for _, want := range []string{
+		// Real observations.
+		`schedd_scale_up_decisions_total{app="a1",outcome="admit"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="cooldown_held"} 1`,
+		// Pre-instantiated empty-app placeholder for the closed set.
+		`schedd_scale_up_decisions_total{app="",outcome="admit"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="reject_at_cap"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="no_signal"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="cooldown_held"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
 }
 
 // TestOpsMetrics_ObserveLogEmitted (issue #254, Move 4) — the per-app
