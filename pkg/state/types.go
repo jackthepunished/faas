@@ -865,9 +865,16 @@ type ComputeNode struct {
 	MemMB              int
 	MaxConcurrency     int
 	AdmissionCeilingMB int
-	Active             bool
-	LastHeartbeatAt    time.Time
-	CreatedAt          time.Time
+	// VCPUBudget is the per-node vCPU admission ceiling (migration
+	// 00081, Tier A2). schedd's NodeLedger checks vCPU against
+	// this value rather than the legacy box-wide api.VCPUSlots.
+	// Defaults to 160 (api.VCPUSlots) on the synthetic default-local
+	// row seeded by migration 00024; operators tune it per-node in
+	// a heterogeneous fleet (a smaller box gets a smaller budget).
+	VCPUBudget      int
+	Active          bool
+	LastHeartbeatAt time.Time
+	CreatedAt       time.Time
 	// Region is a free-form locality label (e.g. "eu-fsn1", "local").
 	// nil means the row was inserted before 00069 OR the operator
 	// didn't set a region on registration. The chooser treats nil

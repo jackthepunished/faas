@@ -681,6 +681,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
 	}); err != nil {
 		// Admit failed (capacity / concurrency). The two rejection
 		// modes differ in how loudly the engine surfaces them:
@@ -1080,6 +1081,40 @@ func (e *Engine) bestEffortDestroy(ctx context.Context, nodeID, instanceID strin
 	_ = e.timedDestroy(ctx, nodeID, instanceID, DestroyTimeout)
 }
 
+// applyLiveCapacityMB returns the chooser's per-node used_mb input:
+// max(live report, ledger) when the report is fresh, 0 (sentinel)
+// when stale or absent. The ledger floor closes the stale-low /
+// hostile-report gap — a vmmd that under-reports its cgroup
+// memory.current cannot shrink the live accounting and force schedd
+// to over-admit. ADR-025 axis 5 / Tier A1.
+//
+// Zero is a sentinel: the caller distinguishes "no live report" from
+// "report says 0 used" by re-reading the store. The caller logs the
+// store error and treats a single missing node as zero headroom so a
+// transient store failure on one node doesn't block placement on
+// others.
+//
+// nil receiver is tolerated — a pre-axis-5 fixture's nil capacityTable
+// returns 0, the caller falls through to the store, and the legacy
+// single-box behaviour is preserved.
+func (e *Engine) applyLiveCapacityMB(_ context.Context, nodeID string) int64 {
+	if e == nil || e.capacityTable == nil {
+		return 0
+	}
+	live, ok := e.capacityTable.Lookup(nodeID, time.Now())
+	if !ok {
+		return 0
+	}
+	used := int64(live.UsedMB)
+	if ledger := int64(e.ledger.ResidentRAMForNode(nodeID)); ledger > used {
+		used = ledger
+	}
+	if used < 0 {
+		return 0
+	}
+	return used
+}
+
 // choosePlacement picks a compute_node for the next wake using the
 // pure ChoosePlacement chooser (placement.go). It loads the live
 // fleet from the store and the per-node used_mb aggregate, both
@@ -1087,6 +1122,13 @@ func (e *Engine) bestEffortDestroy(ctx context.Context, nodeID, instanceID strin
 // sees a coherent view. Returns the placement (with TargetURL so
 // the wake loop doesn't need a second lookup) or a *api.Problem
 // from the chooser when no node has headroom.
+//
+// Tier A1: the per-node used_mb input now starts from
+// applyLiveCapacityMB (live publisher report, ledger floor). When
+// the live table has no fresh entry for a node, the chooser falls
+// back to the legacy store sum so a silent vmmd degrades to the
+// pre-axis-5 behaviour rather than dropping the node from the
+// fleet view entirely.
 func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placement, error) {
 	nodes, err := e.store.ActiveComputeNodes(ctx)
 	if err != nil {
@@ -1094,20 +1136,31 @@ func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placemen
 	}
 	usedMB := make(map[string]int64, len(nodes))
 	for _, n := range nodes {
+		if used := e.applyLiveCapacityMB(ctx, n.ID); used > 0 {
+			usedMB[n.ID] = used
+			continue
+		}
+		// No live report (table miss / stale) or live says zero:
+		// fall through to the store sum. A single node's transient
+		// store error must not block placement of the rest; the
+		// next wake re-reads; a permanent failure surfaces there.
 		used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
 		if err != nil {
-			// A single node's transient store error must not
-			// block placement; treat as zero headroom and let
-			// the chooser skip or include based on its ceiling.
-			// The next wake re-reads; a permanent failure surfaces
-			// there as well.
 			e.log.Warn("sched: placement: compute node used_mb read failed",
 				"node_id", n.ID, "node_name", n.Name, "err", err)
 			used = 0
 		}
 		usedMB[n.ID] = used
 	}
-	return ChoosePlacement(nodes, usedMB, r)
+	// Tier A2: per-node vCPU accounting from the ledger. The
+	// chooser uses this to enforce compute_nodes.vcpu_budget
+	// per node; absent or zero is treated as 0 by the chooser
+	// (the per-node budget is the gate, not the absolute number).
+	usedVCPU := make(map[string]int64, len(nodes))
+	for _, n := range nodes {
+		usedVCPU[n.ID] = int64(e.ledger.UsedVCPUForNode(n.ID))
+	}
+	return ChoosePlacement(nodes, usedMB, usedVCPU, r)
 }
 
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —
@@ -1171,6 +1224,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
 	}); err != nil {
 		e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "prime_admit_denied")
 		return err
@@ -1371,6 +1425,7 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 	// every wake so a node row edited at runtime is picked up
 	// the next time the chooser runs.
 	ceilings := map[string]int{}
+	budgets := map[string]int{}
 	loadCeiling := func(ctx context.Context, nodeID string) int {
 		if c, ok := ceilings[nodeID]; ok {
 			return c
@@ -1382,6 +1437,23 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 		}
 		ceilings[nodeID] = n.AdmissionCeilingMB
 		return n.AdmissionCeilingMB
+	}
+	// Tier A2: per-node vCPU budget, paralleling loadCeiling.
+	// Missing rows / zero budgets cache as 0; the Admit path
+	// falls back to api.VCPUSlots when VCPUBudget<=0, so a
+	// fresh deployment with no compute_nodes row degrades
+	// gracefully to the legacy single-box posture.
+	loadVCPUBudget := func(ctx context.Context, nodeID string) int {
+		if b, ok := budgets[nodeID]; ok {
+			return b
+		}
+		n, err := e.store.ComputeNodeByID(ctx, nodeID)
+		if err != nil || n.VCPUBudget <= 0 {
+			budgets[nodeID] = 0
+			return 0
+		}
+		budgets[nodeID] = n.VCPUBudget
+		return n.VCPUBudget
 	}
 	for _, app := range apps {
 		acct, err := e.store.AccountByID(ctx, app.AccountID)
@@ -1409,6 +1481,7 @@ func (e *Engine) SeedLedger(ctx context.Context) error {
 				RAMMB: ins.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 				NodeID:        nodeID,
 				NodeCeilingMB: loadCeiling(ctx, nodeID),
+				VCPUBudget:    loadVCPUBudget(ctx, nodeID),
 			}); err != nil {
 				e.log.Warn("seed ledger: admit", "instance", ins.ID, "err", err)
 				continue

@@ -752,13 +752,24 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	// the global Σ hits api.RAMAdmissionCeilingMB. Each admit goes
 	// through the public API so the per-node accounting stays
 	// consistent (same path the production Wake flow takes).
+	//
+	// Tier A2: VCPU=0 on the fillers so the per-node vCPU budget
+	// (160) does NOT bind first. The legacy single-box fixture
+	// (this test pre-dates Tier A2) was designed to bind on RAM
+	// only; bumping the test to fill vCPU alongside RAM would
+	// shift the binding point and obscure what the test is
+	// verifying. A VCPU=0 filler is the cleanest way to keep the
+	// original "RAM fills first → ledger denies → row is failed"
+	// invariant, and it exercises the defensive VCPU=0 path that
+	// Tier A2 preserves (the placement fit check skips when
+	// r.VCPU==0; the ledger check accepts vcpu=0 admits).
 	billable := api.BillableRAMMB(128)
 	for i := 0; ; i++ {
 		err := e.Ledger().Admit(Request{
 			Instance: "filler-" + strconv.Itoa(i),
 			AppID:    "filler-app-" + strconv.Itoa(i), // distinct appIDs avoid the per-app concurrency gate
 			Plan:     api.PlanFree,
-			RAMMB:    128, VCPU: 1, MaxConcurrency: 1,
+			RAMMB:    128, VCPU: 0, MaxConcurrency: 1,
 			NodeID: e.defaultLocalNodeID,
 		})
 		if err != nil {

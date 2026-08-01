@@ -50,6 +50,11 @@ type Placement struct {
 	// (compute_node.admission_ceiling_mb). The chooser already verified
 	// the request fits; downstream code reads this to log context.
 	CeilingMB int
+	// VCPUBudget is the per-node vCPU admission budget (Tier A2,
+	// compute_node.vcpu_budget). The chooser already verified the
+	// request fits; downstream code (admission) reads this to log
+	// context and to thread the budget into the per-node ledger check.
+	VCPUBudget int
 	// UsedMB is the live Σ(ram_mb + PerVMOverheadMB) on the chosen node
 	// AT THE TIME OF THE CHOICE, BEFORE this request is added. It is
 	// informational — the engine's per-node ledger keeps the canonical
@@ -59,8 +64,8 @@ type Placement struct {
 
 // ChoosePlacement returns the node with the most free RAM headroom that
 // still fits the request, or a *api.Problem if no node can. Tie-break order:
-// (headroom DESC, region ASC, zone ASC, name ASC). Pure function: no
-// Engine/Ledger coupling, no DB access.
+// (headroom DESC, vcpu_headroom DESC, region ASC, zone ASC, name ASC).
+// Pure function: no Engine/Ledger coupling, no DB access.
 //
 // Inputs:
 //
@@ -70,6 +75,12 @@ type Placement struct {
 //   - usedMB: live Σ(ram_mb + PerVMOverheadMB) per node ID, from
 //     ComputeNodeUsedMB. The map may be sparse (a node with no
 //     instances is just absent); missing keys are treated as 0.
+//   - usedVCPU (Tier A2): ledger-observed Σ(vcpu) per node ID, passed
+//     by the engine from NodeLedger.usedVCPUForNode. A nil or
+//     sparse map treats missing keys as 0. Pre-Tier-A2 callers pass
+//     an empty map; the chooser then never refuses on vCPU headroom
+//     (the request's vCPU still has to fit, but a node with a
+//     non-zero budget is always accepted).
 //
 // The request's billable RAM is api.BillableRAMMB(r.RAMMB) — the +8 MB
 // overhead (spec §4.7) is part of the per-node headroom check, mirroring
@@ -79,7 +90,7 @@ type Placement struct {
 // has headroom, return it directly. When set but the preferred node is
 // saturated or absent, fall through to the least-loaded path. Affinity
 // never overrides the headroom invariant (ADR-005).
-func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Request) (Placement, error) {
+func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCPU map[string]int64, r Request) (Placement, error) {
 	if r.RAMMB <= 0 {
 		return Placement{}, api.ErrCapacity(fmt.Sprintf("placement: request RAM must be positive (got %d)", r.RAMMB))
 	}
@@ -89,6 +100,15 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 	// hint if it fits. We keep this single-pass because N is small
 	// (single-digit fleet for v1.0, see cmd/apid/compute_nodes.go
 	// comments) and a separate filter pass would duplicate work.
+	//
+	// Tier A2: vCPU is a per-node budget parallel to RAM. The
+	// chooser must refuse to land a request into a node whose
+	// vcpu_budget - usedVCPU can't fit r.VCPU. The usedVCPU per
+	// node is read from the ledger via the engine — placement.go
+	// itself is a pure function over the nodes slice + a
+	// per-node usedMB map, so the vCPU headroom is threaded
+	// through a parallel per-node usedVCPU map passed by the
+	// engine. (A zero-budget node with r.VCPU > 0 is excluded.)
 	var (
 		candidates []state.ComputeNode
 		warmFit    *state.ComputeNode
@@ -100,6 +120,27 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 		}
 		if n.AdmissionCeilingMB <= 0 {
 			continue
+		}
+		// Per-node vCPU budget gate (Tier A2). A node with
+		// vcpu_budget=0 is treated as "no budget" and skipped
+		// — a freshly-migrated row that didn't get backfilled
+		// (shouldn't happen — DEFAULT 160 — but a defensive
+		// zero-check) or a node that an operator drained.
+		if n.VCPUBudget <= 0 {
+			continue
+		}
+		// usedVCPU is keyed by node id; absent means 0. The
+		// engine passes the ledger's per-node view (reservations
+		// made so far this process). A request of r.VCPU=0
+		// (the build-VM path today? no — build VMs are not
+		// routed through ChoosePlacement) is always accepted
+		// on vCPU headroom, paralleling how r.RAMMB<=0 would
+		// have been rejected by the precondition above.
+		if r.VCPU > 0 {
+			used := usedVCPU[n.ID]
+			if used+int64(r.VCPU) > int64(n.VCPUBudget) {
+				continue // this node can't fit the vCPU
+			}
 		}
 		used := usedMB[n.ID]
 		if used+billable > int64(n.AdmissionCeilingMB) {
@@ -121,14 +162,15 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 			Name:      warmFit.Name,
 			TargetURL: warmFit.TargetURL,
 			CeilingMB: warmFit.AdmissionCeilingMB,
+			VCPUBudget: warmFit.VCPUBudget,
 			UsedMB:    usedMB[warmFit.ID],
 		}, nil
 	}
 
 	if len(candidates) == 0 {
 		return Placement{}, api.ErrCapacity(fmt.Sprintf(
-			"placement: no active compute_node fits %d MB billable across %d candidates (per-node ceilings: see compute_nodes.admission_ceiling_mb)",
-			billable, len(nodes)))
+			"placement: no active compute_node fits %d MB billable (per-node ceilings: see compute_nodes.admission_ceiling_mb) / %d vCPU (per-node budgets: see compute_nodes.vcpu_budget) across %d candidates",
+			billable, r.VCPU, len(nodes)))
 	}
 
 	// Single best candidate — short-circuit the sort.
@@ -139,20 +181,27 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 			Name:      n.Name,
 			TargetURL: n.TargetURL,
 			CeilingMB: n.AdmissionCeilingMB,
+			VCPUBudget: n.VCPUBudget,
 			UsedMB:    usedMB[n.ID],
 		}, nil
 	}
 
-	// Pick by (headroom DESC, region ASC, zone ASC, name ASC).
+	// Pick by (headroom DESC, vcpu_headroom DESC, region ASC, zone ASC, name ASC).
 	//
 	// Region/Zone are *string; treat nil and "" identically so a
 	// pre-00069 row (nil pointers) sorts the same as an operator-
 	// inserted row with empty strings. The seeded default-local row
 	// is backfilled to ('local','local') in migration 00069 so the
 	// single-box deploy has a deterministic ordering.
+	//
+	// Tier A2: vcpu_headroom DESC is the secondary tie-break. A
+	// fleet with one RAM-rich + vCPU-poor box and one vCPU-rich +
+	// RAM-poor box now biases toward the vCPU-richer node when
+	// RAM headroom is tied (the typical "burst" case where every
+	// node is well under its RAM ceiling).
 	best := candidates[0]
 	for _, n := range candidates[1:] {
-		if betterCandidate(n, usedMB[n.ID], best, usedMB[best.ID]) {
+		if betterCandidate(n, usedMB[n.ID], usedVCPU[n.ID], best, usedMB[best.ID], usedVCPU[best.ID]) {
 			best = n
 		}
 	}
@@ -161,6 +210,7 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 		Name:      best.Name,
 		TargetURL: best.TargetURL,
 		CeilingMB: best.AdmissionCeilingMB,
+		VCPUBudget: best.VCPUBudget,
 		UsedMB:    usedMB[best.ID],
 	}, nil
 }
@@ -172,11 +222,27 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, r Reque
 // The ordering is the load-bearing contract — placement_test.go pins it.
 // Changing this function changes where hot apps land; never edit without
 // reading the test cases.
-func betterCandidate(n state.ComputeNode, nUsed int64, best state.ComputeNode, bestUsed int64) bool {
+//
+// Tier A2: a fifth vCPU headroom secondary is added after the
+// existing RAM headroom primary. Tied on RAM headroom → prefer
+// the node with more vCPU headroom. The vCPU headroom is computed
+// against the node's VCPUBudget; a node with vcpu_budget=0 has
+// zero headroom and is excluded upstream (the candidate filter
+// in ChoosePlacement), so betterCandidate never sees it.
+func betterCandidate(n state.ComputeNode, nUsed int64, nVCPUUsed int64, best state.ComputeNode, bestUsed int64, bestVCPUUsed int64) bool {
 	nHead := int64(n.AdmissionCeilingMB) - nUsed
 	bestHead := int64(best.AdmissionCeilingMB) - bestUsed
 	if nHead != bestHead {
 		return nHead > bestHead
+	}
+	// Tier A2 secondary: vCPU headroom. Pure function — no
+	// ledger access here; the per-node vCPU accounting is
+	// threaded in via the caller (Engine.choosePlacementLocked
+	// reads ledger.usedVCPUForNode and stamps Request.usedVCPU).
+	nVHead := int64(n.VCPUBudget) - nVCPUUsed
+	bestVHead := int64(best.VCPUBudget) - bestVCPUUsed
+	if nVHead != bestVHead {
+		return nVHead > bestVHead
 	}
 	// Region/Zone are nullable strings; collapse nil → "" so the
 	// comparator sees a single shape. Tied on headroom → prefer
