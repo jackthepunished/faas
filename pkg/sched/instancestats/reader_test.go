@@ -105,3 +105,62 @@ func TestReader_DeterministicOrdering(t *testing.T) {
 // PropertyReader_NoTornReads deterministic property test in
 // reader_property_test.go — keeping a single property test there
 // and a stable inventory in this file.
+
+// TestReader_MaxInflightForApp pins the PR-B (issue #462)
+// accessor across the three outcomes that matter to PR-C's
+// scale-up trigger:
+//
+//   - app not in snapshot  → (0, false) — "no signal", caller
+//     falls back to "do not scale" semantics.
+//   - app present, all InflightRequests == 0 → (0, true) —
+//     "app has live instances but they are idle", caller
+//     treats as a valid zero reading.
+//   - app present, max = 5 → (5, true) — load-bearing pin
+//     the trigger compares against target.concurrent_requests.
+func TestReader_MaxInflightForApp(t *testing.T) {
+	now := time.Now()
+
+	t.Run("AppNotInSnapshot", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app-other", InstanceID: "i-1", SampledAt: now, InflightRequests: 9},
+		})
+		got, ok := r.MaxInflightForApp("app-missing")
+		if ok || got != 0 {
+			t.Errorf("MaxInflightForApp(missing) = (%d, %v), want (0, false)", got, ok)
+		}
+	})
+
+	t.Run("AppPresentAllIdle", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-1", SampledAt: now, InflightRequests: 0},
+			{AppID: "app1", InstanceID: "i-2", SampledAt: now, InflightRequests: 0},
+		})
+		got, ok := r.MaxInflightForApp("app1")
+		if !ok {
+			t.Errorf("MaxInflightForApp(app1) ok=false, want true (app has live instances)")
+		}
+		if got != 0 {
+			t.Errorf("MaxInflightForApp(app1) = %d, want 0 (all instances idle)", got)
+		}
+	})
+
+	t.Run("AppPresentReturnsMax", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-1", SampledAt: now, InflightRequests: 2},
+			{AppID: "app1", InstanceID: "i-2", SampledAt: now, InflightRequests: 5},
+			{AppID: "app1", InstanceID: "i-3", SampledAt: now, InflightRequests: 1},
+			// Different app must NOT contribute to the max.
+			{AppID: "app-other", InstanceID: "i-9", SampledAt: now, InflightRequests: 99},
+		})
+		got, ok := r.MaxInflightForApp("app1")
+		if !ok {
+			t.Fatalf("MaxInflightForApp(app1) ok=false, want true")
+		}
+		if got != 5 {
+			t.Errorf("MaxInflightForApp(app1) = %d, want 5 (max across i-1..i-3, ignoring app-other)", got)
+		}
+	})
+}
