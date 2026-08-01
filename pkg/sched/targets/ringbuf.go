@@ -32,8 +32,8 @@ import (
 // are NOT supported — Observe is called from schedd's loop
 // goroutine only.
 type RingBuffer struct {
-	windowSize int
-	bucketSize time.Duration
+	windowSize   int
+	bucketSize   time.Duration
 	tickInterval time.Duration
 
 	mu sync.Mutex

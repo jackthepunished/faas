@@ -97,10 +97,10 @@ func scaleUpPolicy(target float64, scaleOutCooldownS int) *state.ScalingPolicy {
 // inflight=5, headroom=3. Tick should fire AdmitInstance once.
 func TestTrigger_AdmitOnInflightTargetHit(t *testing.T) {
 	store := &fakeStore{apps: []state.App{{
-		ID:                 "app1",
-		MaxConcurrency:     5,
-		ScalingPolicy:      scaleUpPolicy(1.0, 60),
-		LastScaleOutAt:     nil, // zero → no cooldown consult
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(1.0, 60),
+		LastScaleOutAt: nil, // zero → no cooldown consult
 	}}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	instats := &fakeInstats{byApp: map[string]int64{"app1": 5}}
@@ -119,9 +119,9 @@ func TestTrigger_AdmitOnInflightTargetHit(t *testing.T) {
 // target (strict > means measured=target falls through to no_signal).
 func TestTrigger_NoSignalOnInflightBelowTarget(t *testing.T) {
 	store := &fakeStore{apps: []state.App{{
-		ID:                 "app1",
-		MaxConcurrency:     5,
-		ScalingPolicy:      scaleUpPolicy(5.0, 60),
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(5.0, 60),
 	}}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	instats := &fakeInstats{byApp: map[string]int64{"app1": 3}} // below target
@@ -140,9 +140,9 @@ func TestTrigger_NoSignalOnInflightBelowTarget(t *testing.T) {
 // trigger does not call AdmitInstance.
 func TestTrigger_NoSignalWithoutInflightReader(t *testing.T) {
 	store := &fakeStore{apps: []state.App{{
-		ID:                 "app1",
-		MaxConcurrency:     5,
-		ScalingPolicy:      scaleUpPolicy(1.0, 60),
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(1.0, 60),
 	}}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	engine := &fakeEngine{}
@@ -162,10 +162,10 @@ func TestTrigger_CooldownHeld(t *testing.T) {
 	now := time.Now()
 	stamp := now.Add(-1 * time.Second)
 	store := &fakeStore{apps: []state.App{{
-		ID:                 "app1",
-		MaxConcurrency:     5,
-		ScalingPolicy:      scaleUpPolicy(1.0, 60),
-		LastScaleOutAt:     &stamp,
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(1.0, 60),
+		LastScaleOutAt: &stamp,
 	}}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	instats := &fakeInstats{byApp: map[string]int64{"app1": 10}} // hot
@@ -185,9 +185,9 @@ func TestTrigger_CooldownHeld(t *testing.T) {
 // same call.
 func TestTrigger_AtCapacityReAdmitReObserved(t *testing.T) {
 	store := &fakeStore{apps: []state.App{{
-		ID:                 "app1",
-		MaxConcurrency:     5,
-		ScalingPolicy:      scaleUpPolicy(1.0, 60),
+		ID:             "app1",
+		MaxConcurrency: 5,
+		ScalingPolicy:  scaleUpPolicy(1.0, 60),
 	}}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	instats := &fakeInstats{byApp: map[string]int64{"app1": 10}}

@@ -86,23 +86,23 @@ type InstatsReader interface {
 // no goroutines, no engine. The trigger's Tick assembles one Stats
 // per app and dispatches to decide.
 type Stats struct {
-	AppID              string
-	TargetValue        float64 // 0 = no target set (OutcomeNoSignal)
-	MaxConcurrency     int     // plan cap
-	Concurrency        int     // live instances counting toward the cap
-	PerInstanceInflight int64  // measured, 0 when no signal
-	HaveInflight       bool    // true iff RingBuffer.AppMaxInflight returned a sample
-	LastScaleOutAt     time.Time
-	ScaleOutCooldownS  int
-	Now                time.Time // injected for testability
+	AppID               string
+	TargetValue         float64 // 0 = no target set (OutcomeNoSignal)
+	MaxConcurrency      int     // plan cap
+	Concurrency         int     // live instances counting toward the cap
+	PerInstanceInflight int64   // measured, 0 when no signal
+	HaveInflight        bool    // true iff RingBuffer.AppMaxInflight returned a sample
+	LastScaleOutAt      time.Time
+	ScaleOutCooldownS   int
+	Now                 time.Time // injected for testability
 }
 
 // Decision is the decide() result. ShouldAdmit=true triggers the
 // Engine.AdmitInstance call in Tick.
 type Decision struct {
-	ShouldAdmit     bool
-	Outcome         Outcome
-	Headroom        int
+	ShouldAdmit      bool
+	Outcome          Outcome
+	Headroom         int
 	ObservedInflight int64
 }
 
@@ -144,9 +144,9 @@ func decide(s Stats) Decision {
 		return Decision{Outcome: OutcomeRejectAtCap, Headroom: 0, ObservedInflight: s.PerInstanceInflight}
 	}
 	return Decision{
-		ShouldAdmit:     true,
-		Outcome:         OutcomeAdmit,
-		Headroom:        headroom,
+		ShouldAdmit:      true,
+		Outcome:          OutcomeAdmit,
+		Headroom:         headroom,
 		ObservedInflight: s.PerInstanceInflight,
 	}
 }
@@ -262,15 +262,15 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			lastScaleOut = *app.LastScaleOutAt
 		}
 		stats := Stats{
-			AppID:              app.ID,
-			TargetValue:        policy.Target.Value,
-			MaxConcurrency:     app.MaxConcurrency,
-			Concurrency:        conc,
+			AppID:               app.ID,
+			TargetValue:         policy.Target.Value,
+			MaxConcurrency:      app.MaxConcurrency,
+			Concurrency:         conc,
 			PerInstanceInflight: perInst,
-			HaveInflight:       haveInflight,
-			LastScaleOutAt:     lastScaleOut,
-			ScaleOutCooldownS:  policy.ScaleOutCooldownS,
-			Now:                now,
+			HaveInflight:        haveInflight,
+			LastScaleOutAt:      lastScaleOut,
+			ScaleOutCooldownS:   policy.ScaleOutCooldownS,
+			Now:                 now,
 		}
 		dec := decide(stats)
 		// Always emit the decision metric so the rate of

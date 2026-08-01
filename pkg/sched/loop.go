@@ -48,7 +48,7 @@ type Loop struct {
 	diskDrift        *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
 	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
-	targets          *targets.Trigger      // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	targets          *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
 	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
@@ -797,7 +797,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// carrier fields. Same value across all rows of
 				// one app — sourced from apps.last_scale_in_at
 				// + ScalingPolicy.ScaleInCooldownS.
-				LastScaleInAt:   a.LastScaleInAt,
+				LastScaleInAt:    a.LastScaleInAt,
 				ScaleInCooldownS: state.ScalingPolicyOrDefault(a.ScalingPolicy).ScaleInCooldownS,
 			})
 		}
