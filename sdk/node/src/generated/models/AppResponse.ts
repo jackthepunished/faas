@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AppManifest } from './AppManifest.js';
+import type { ScalingPolicy } from './ScalingPolicy.js';
 /**
  * An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, per-app outbound CIDR allowlist (ADR-031 + ADR-032), and reactive scale-up trigger targets (issue #169 / #172).
  */
@@ -37,5 +38,17 @@ export type AppResponse = {
    * Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it. PR-B activates the streamed response path; PR-A only persists the flag.
    */
   streaming_enabled?: boolean;
+  /**
+   * Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`.
+   */
+  scaling_policy?: (null | ScalingPolicy);
+  /**
+   * RFC 3339 timestamp of the most recent scale-out event schedd admitted for this app, or null if the app has never scaled out.
+   */
+  last_scale_out_at?: string | null;
+  /**
+   * RFC 3339 timestamp of the most recent scale-in event schedd reaped for this app, or null if the app has never scaled in.
+   */
+  last_scale_in_at?: string | null;
 };
 

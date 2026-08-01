@@ -164,6 +164,9 @@ from .quota_block import QuotaBlock
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
+from .scaling_policy import ScalingPolicy
+from .scaling_target import ScalingTarget
+from .scaling_target_metric import ScalingTargetMetric
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -348,6 +351,9 @@ __all__ = (
     "RenameAppRequest",
     "RepoResponse",
     "RotateAlertRuleSecretResponse",
+    "ScalingPolicy",
+    "ScalingTarget",
+    "ScalingTargetMetric",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",

@@ -143,15 +143,43 @@ func mustSeedAppFor(t *testing.T, store *state.MemStore, accountID, slug string)
 	return app.ID
 }
 
-// TestUpdateAppMinInstances_Hobby locks the plan-tier gate (ux_spec
-// §6.5): Hobby plans cannot set apps.min_instances. The handler must
-// return 403 plan_min_instances_not_allowed, not 422, because the
-// feature is tier-locked — the value the customer typed is irrelevant.
+// TestUpdateAppMinInstances_Hobby locks the new Hobby+ tier-up
+// (issue #462 / ADR-058 / PR-A). After the tier-up, Hobby plans
+// accept apps.min_instances and the response carries the new
+// value. The pre-#462 test expected 403 plan_min_instances_not_allowed;
+// the PR-A tier-up moved Hobby to the same gate as Pro/Scale.
+//
+// Coverage: Hobby is the lowest tier that unlocks the warm floor.
+// The legacy Hobby gate (pre-#462) is no longer the contract; the
+// remaining plan-gate case is Free, exercised by TestUpdateAppMinInstances_Free
+// below.
 func TestUpdateAppMinInstances_Hobby(t *testing.T) {
 	e := setup(t, api.PlanHobby)
 	mustSeedApp(t, e, "hobby-floor")
 	one := 1
 	rec := e.do(t, "PATCH", "/v1/apps/hobby-floor", api.UpdateAppRequest{MinInstances: &one}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.MinInstances != 1 {
+		t.Errorf("MinInstances = %d, want 1", out.MinInstances)
+	}
+}
+
+// TestUpdateAppMinInstances_Free is the new lowest-tier gate (issue
+// #462 / ADR-058 / PR-A). Free plans still cannot set
+// apps.min_instances — the Hobby+ tier-up is as far as the gate
+// goes. The handler must return 403, not 422, because the feature
+// is tier-locked (the value the customer typed is irrelevant).
+func TestUpdateAppMinInstances_Free(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-floor")
+	one := 1
+	rec := e.do(t, "PATCH", "/v1/apps/free-floor", api.UpdateAppRequest{MinInstances: &one}, nil)
 	assertProblem(t, rec, 403, api.CodePlanMinInstancesNotAllowed)
 }
 
@@ -2231,5 +2259,266 @@ func TestGetInvocation_NotFoundAcrossAccount(t *testing.T) {
 	rec := e.do(t, "GET", "/v1/invocations/"+inv.ID, nil, nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// mustSeedAppWithWorkloadClass provisions an app + sets the
+// WorkloadClass via an internal store update. The test-side
+// handler does not expose a PATCH field for WorkloadClass, so
+// the only path is the projected internal store. Used by the
+// issue #462 / ADR-058 carve-out tests where the validation
+// gate branches on WorkloadClass.
+//
+// Returns the app ID for later assertions.
+func mustSeedAppWithWorkloadClass(t *testing.T, e testEnv, slug string, class state.WorkloadClass) string {
+	t.Helper()
+	app, err := e.store.CreateApp(context.Background(), state.App{
+		AccountID:     e.acct.ID,
+		Slug:          slug,
+		Type:          state.AppTypeApp,
+		Status:        state.AppActive,
+		WorkloadClass: class,
+	})
+	if err != nil {
+		t.Fatalf("seed app %s with WorkloadClass=%s: %v", slug, class, err)
+	}
+	return app.ID
+}
+
+// TestUpdateAppScalingPolicy_HobbyHappy is the new Hobby+ tier-up
+// happy path (issue #462 / ADR-058 / PR-A). Hobby plans accept
+// min_instances=1 (the floor) at 200, and the response carries
+// the new value. Hobby does NOT unlock ScaleUpTargetRPSAllowed
+// (still Pro+) — the policy is layered on top of the existing
+// autoscale target columns, so the policy's Target.Metric stays
+// empty in this test (the "engine falls back to legacy autoscale
+// targets" path).
+func TestUpdateAppScalingPolicy_HobbyHappy(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-policy-happy")
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-policy-happy", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			MinInstances:      1,
+			MaxInstances:      2,
+			ScaleOutCooldownS: 5,
+			ScaleInCooldownS:  60,
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ScalingPolicy == nil {
+		t.Fatalf("ScalingPolicy = nil, want non-nil")
+	}
+	if out.ScalingPolicy.MinInstances != 1 {
+		t.Errorf("ScalingPolicy.MinInstances = %d, want 1", out.ScalingPolicy.MinInstances)
+	}
+	if out.ScalingPolicy.MaxInstances != 2 {
+		t.Errorf("ScalingPolicy.MaxInstances = %d, want 2", out.ScalingPolicy.MaxInstances)
+	}
+}
+
+// TestUpdateAppScalingPolicy_FreeGateMaxInstances pins the
+// MaxInstancesAllowed gate at PR-A (issue #462 / ADR-058). A Free
+// plan PATCHing `scaling_policy.max_instances` is 403
+// (plan_max_instances_not_allowed); the legacy Hobby gate does not
+// apply because Hobby now unlocks MinInstancesAllowed at the same
+// time. Hobby/Pro/Scale do not unlock autoscale_*_pct /
+// autoscale_target_rps in this policy block — those are the
+// independent ScaleUpTargetRPSAllowed / ScaleUpTargetCPUAllowed
+// gates, separate from the policy gate.
+func TestUpdateAppScalingPolicy_FreeGateMaxInstances(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-policy-max")
+	rec := e.do(t, "PATCH", "/v1/apps/free-policy-max", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			MaxInstances: 1,
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	assertProblem(t, rec, 403, api.CodePlanMaxInstancesNotAllowed)
+}
+
+// TestUpdateAppScalingPolicy_MaxBelowMin is the bounds check: a
+// policy whose max_instances < min_instances is 422
+// invalid_max_instances. The bounds error names both axes so the
+// CLI can render "raise your max" vs "fix your min" without
+// conflating.
+func TestUpdateAppScalingPolicy_MaxBelowMin(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-policy-maxlow")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-policy-maxlow", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			MinInstances: 3,
+			MaxInstances: 2,
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidMaxInstances)
+}
+
+// TestUpdateAppScalingPolicy_CooldownBelowFloor pins the
+// self-DoS guard: a customer who sets scale_out_cooldown_s=0
+// gets 422 invalid_cooldown (the floor is 1 s, see
+// api.MinScaleOutCooldownS). The gate runs before the engine
+// would otherwise honor a 0-cooldown as "always admit".
+func TestUpdateAppScalingPolicy_CooldownBelowFloor(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-cooldown-zero")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-cooldown-zero", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			MinInstances:      1,
+			ScaleOutCooldownS: 0,
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidCooldown)
+}
+
+// TestUpdateAppScalingPolicy_WorkerClassConcurrentRequests pins
+// the PR-D carve-out at the customer side (issue #462 /
+// ADR-058). A worker-class app (WorkloadClassWorker) cannot use
+// `target.metric = concurrent_requests` because the signal
+// source (pkg/vmmd/activity.ActivityTracker, PR-B) counts
+// in-flight HTTP requests — a worker has none, so the metric is
+// forever 0 and the engine would never admit. The handler
+// rejects the PATCH at 422 with
+// `scaling_target_incompatible_with_workload_class` so the
+// customer sees the misconfiguration immediately.
+func TestUpdateAppScalingPolicy_WorkerClassConcurrentRequests(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedAppWithWorkloadClass(t, e, "pro-worker-class", state.WorkloadClassWorker)
+	rec := e.do(t, "PATCH", "/v1/apps/pro-worker-class", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			Target: &api.ScalingTarget{
+				Metric: "concurrent_requests",
+				Value:  1.0,
+			},
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeScalingTargetIncompatibleWithWorkloadClass)
+}
+
+// TestUpdateAppScalingPolicy_WorkerClassRPSAccepted is the
+// companion to the worker-class carve-out: a worker-class app
+// CAN use `target.metric = rps` (the engine reads the per-app
+// RPS, and zero RPS over the engine window is the "no signal"
+// path, not a hard misconfiguration). The handler must accept
+// the PATCH at 200. Cooldowns are set to the package floors so
+// the validator doesn't reject on cooldown=0 first.
+func TestUpdateAppScalingPolicy_WorkerClassRPSAccepted(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedAppWithWorkloadClass(t, e, "pro-worker-rps", state.WorkloadClassWorker)
+	rec := e.do(t, "PATCH", "/v1/apps/pro-worker-rps", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			ScaleOutCooldownS: 1,
+			ScaleInCooldownS:  5,
+			Target: &api.ScalingTarget{
+				Metric: "rps",
+				Value:  5.0,
+			},
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateAppScalingPolicy_UnknownFieldRejected pins the
+// strict-unmarshal contract. A typo on the wire
+// (`min_instance` instead of `min_instances`) must surface as
+// 422 validation_failed rather than silently dropping the
+// field. The DTO StrictUnmarshalJSON accumulates the unknown
+// field names; the validator surfaces them on the *Problem.
+func TestUpdateAppScalingPolicy_UnknownFieldRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-policy-typo")
+	// Hand-build the request body so the unknown field reaches
+	// the JSON decoder without compile-time filtering. The
+	// ScalingPolicy field is the json.RawMessage so the typo
+	// (`min_instance` vs `min_instances`) survives the
+	// top-level marshal.
+	body := struct {
+		ScalingPolicy *json.RawMessage `json:"scaling_policy"`
+	}{
+		ScalingPolicy: func() *json.RawMessage {
+			raw := json.RawMessage(`{"min_instance":1,"max_instances":2}`)
+			return &raw
+		}(),
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/pro-policy-typo", body, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+// TestUpdateAppScalingPolicy_UnknownFieldOnWorkerWins pins the
+// validator ordering (issue #462 / ADR-058 review #1): the
+// unknown-field error must surface BEFORE the workload-class
+// error when a wire payload contains both an unknown field AND
+// `target.metric=concurrent_requests` on a worker app. Pre-fix the
+// worker gate ran before validateUpdateApp and would shadow the
+// wire-shape error.
+func TestUpdateAppScalingPolicy_UnknownFieldOnWorkerWins(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedAppWithWorkloadClass(t, e, "pro-worker-typo", state.WorkloadClassWorker)
+	body := struct {
+		ScalingPolicy *json.RawMessage `json:"scaling_policy"`
+	}{
+		ScalingPolicy: func() *json.RawMessage {
+			// `min_instance` is a typo (correct is `min_instances`);
+			// the `target.metric=concurrent_requests` would also be
+			// a worker-class reject on a clean payload.
+			raw := json.RawMessage(`{"min_instance":1,"target":{"metric":"concurrent_requests","value":1.0}}`)
+			return &raw
+		}(),
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/pro-worker-typo", body, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+// TestUpdateAppScalingPolicy_TargetValueZeroRoundtrip pins the
+// read-path projection (issue #462 / ADR-058 review #4): a policy
+// whose Target has Metric="rps" and Value=0 must round-trip through
+// the GET response with the Target intact. Pre-fix the read path
+// dropped the Target when Value==0, hiding the customer-authored
+// metric on the read path.
+func TestUpdateAppScalingPolicy_TargetValueZeroRoundtrip(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-target-zero")
+	rec := e.do(t, "PATCH", "/v1/apps/pro-target-zero", api.UpdateAppRequest{
+		ScalingPolicy: &api.ScalingPolicy{
+			ScaleOutCooldownS: 1,
+			ScaleInCooldownS:  5,
+			Target: &api.ScalingTarget{
+				Metric: "rps",
+				Value:  0,
+			},
+		},
+		SetScalingPolicy: true,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ScalingPolicy == nil {
+		t.Fatalf("ScalingPolicy = nil, want non-nil")
+	}
+	if out.ScalingPolicy.Target == nil {
+		t.Fatalf("ScalingPolicy.Target = nil; metric 'rps' lost on read-back")
+	}
+	if out.ScalingPolicy.Target.Metric != "rps" {
+		t.Errorf("ScalingPolicy.Target.Metric = %q, want rps", out.ScalingPolicy.Target.Metric)
+	}
+	if out.ScalingPolicy.Target.Value != 0 {
+		t.Errorf("ScalingPolicy.Target.Value = %v, want 0", out.ScalingPolicy.Target.Value)
 	}
 }

@@ -394,24 +394,29 @@ func pollUntilCompleted(t *testing.T, h *e2etest.Harness, key, id string, deadli
 //
 // ux_spec §6.5 ("Cold-wake transparency surfaces") requires that the
 // floor of `min_instances` instances per app be persisted across the
-// idle reaper's park window. The Free + Hobby plans gate the knob
-// entirely (MinInstancesAllowed=false in pkg/api/limits.go:182-227);
-// Pro + Scale opt in. Three tests pin the cross-process surface:
+// idle reaper's park window. The Free plan gates the knob entirely
+// (MinInstancesAllowed=false in pkg/api/limits.go:182-227); Hobby+
+// was unlocked in issue #462 / ADR-058 PR-A, so Hobby/Pro/Scale opt
+// in. Three tests pin the cross-process surface:
 //
-//   - Hobby → 403 plan_min_instances_not_allowed.
-//   - Pro   → 201 + apps.min_instances persisted.
-//   - Pro with min_instances=1 → at least one RUNNING instance
-//     survives past the spec §6.4 idle window.
+//   - Free   → 403 plan_min_instances_not_allowed (the canonical
+//     "plan forbids it" pin).
+//   - Hobby  → 200 + apps.min_instances persisted (issue #462
+//     tier-up: Hobby now unlocks the knob).
+//   - Pro    → 200 + apps.min_instances persisted.
 //
 // The unit-level pins live in cmd/apid/handlers_ext_test.go:130
-// (`TestExt_UpdateApp_HobbyRejectsMinInstances`) + the 422 over-cap
-// case at :160. The cross-process layer below catches the failures
-// that those can't: the wire format, the apid→apid→PG write path,
-// and the post-write idleness floor.
+// (`TestExt_UpdateApp_HobbyAcceptsMinInstances` post-PR-A) +
+// the 422 over-cap case at :160. The cross-process layer below
+// catches the failures that those can't: the wire format, the
+// apid→apid→PG write path, and the post-write idleness floor.
 
-// TestColdWake_MinInstances_Hobby_Rejects — cross-process equivalent
-// of handlers_ext_test.go:130. Hobby has MinInstancesAllowed=false;
-// PATCH /v1/apps/{slug} with min_instances=1 must 403 with
+// TestColdWake_MinInstances_Free_Rejects — cross-process equivalent
+// of the plan-gate pin in cmd/apid/handlers_ext_test.go. Pre-#462
+// this test exercised Hobby (the plan that used to gate the knob);
+// PR-A's Hobby+ tier-up means Hobby now accepts, so Free is the
+// remaining "plan forbids it" plan. PATCH /v1/apps/{slug} with
+// min_instances=1 on a Free account must 403 with
 // CodePlanMinInstancesNotAllowed. The wire code is the same
 // contract the dashboard form relies on (deferred to Move 3 / the
 // ux_spec §6.5 surfaces).
@@ -420,7 +425,49 @@ func pollUntilCompleted(t *testing.T, h *e2etest.Harness, key, id string, deadli
 // (api.UpdateAppRequest), not on create — CreateAppRequest is the
 // minimal "register an app" surface. The plan gate fires on PATCH,
 // which is what the dashboard form actually uses.
-func TestColdWake_MinInstances_Hobby_Rejects(t *testing.T) {
+func TestColdWake_MinInstances_Free_Rejects(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	h := e2etest.StartWithEnv(t, pool, e2etest.APID, nil)
+	key := h.SeedAccount(context.Background(), api.PlanFree)
+
+	// Create the app first (Free allows create without the
+	// floor; it only rejects setting the floor).
+	if _, status := doReq(t, h, key, http.MethodPost, "/v1/apps",
+		api.CreateAppRequest{Slug: "floor-free", RAMMB: 128}); status != http.StatusCreated {
+		t.Fatalf("create app (Free): status=%d", status)
+	}
+
+	minInstances := 1
+	body, status := doReq(t, h, key, http.MethodPatch, "/v1/apps/floor-free",
+		api.UpdateAppRequest{MinInstances: &minInstances})
+	if status != http.StatusForbidden {
+		t.Fatalf("PATCH /v1/apps/floor-free (Free + min_instances=1): status=%d, want 403\nbody=%s", status, body)
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(body, &prob); err != nil {
+		t.Fatalf("decode problem: %v body=%s", err, body)
+	}
+	if prob.Code != api.CodePlanMinInstancesNotAllowed {
+		t.Errorf("problem.code = %q, want %q", prob.Code, api.CodePlanMinInstancesNotAllowed)
+	}
+}
+
+// TestColdWake_MinInstances_Hobby_Accepts — cross-process equivalent
+// of the post-PR-A Hobby+ tier-up pin in cmd/apid/handlers_ext_test.go
+// (issue #462 / ADR-058). Hobby now unlocks MinInstancesAllowed;
+// PATCH /v1/apps/{slug} with min_instances=1 on a Hobby account must
+// 200 and the apps.min_instances column must round-trip to 1 when
+// GET /v1/apps/{slug} fires. Catches the regression where the
+// handler-side validation accepts the knob but the UPDATE drops it
+// (the kind of drift that handlers_ext_test.go's pure in-memory
+// PgStore can mask).
+func TestColdWake_MinInstances_Hobby_Accepts(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -431,8 +478,6 @@ func TestColdWake_MinInstances_Hobby_Rejects(t *testing.T) {
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID, nil)
 	key := h.SeedAccount(context.Background(), api.PlanHobby)
 
-	// Create the app first (Hobby allows create without the
-	// floor; it only rejects setting the floor).
 	if _, status := doReq(t, h, key, http.MethodPost, "/v1/apps",
 		api.CreateAppRequest{Slug: "floor-hobby", RAMMB: 256}); status != http.StatusCreated {
 		t.Fatalf("create app (Hobby): status=%d", status)
@@ -441,15 +486,23 @@ func TestColdWake_MinInstances_Hobby_Rejects(t *testing.T) {
 	minInstances := 1
 	body, status := doReq(t, h, key, http.MethodPatch, "/v1/apps/floor-hobby",
 		api.UpdateAppRequest{MinInstances: &minInstances})
-	if status != http.StatusForbidden {
-		t.Fatalf("PATCH /v1/apps/floor-hobby (Hobby + min_instances=1): status=%d, want 403\nbody=%s", status, body)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH /v1/apps/floor-hobby (Hobby + min_instances=1): status=%d, want 200\nbody=%s", status, body)
 	}
-	var prob api.Problem
-	if err := json.Unmarshal(body, &prob); err != nil {
-		t.Fatalf("decode problem: %v body=%s", err, body)
+
+	// GET must echo min_instances=1 — the regression pin (write
+	// accepted but value not persisted). Mirrors the
+	// TestColdWake_MinInstances_Pro_Accepts shape.
+	getBody, getStatus := doReq(t, h, key, http.MethodGet, "/v1/apps/floor-hobby", nil)
+	if getStatus != http.StatusOK {
+		t.Fatalf("GET /v1/apps/floor-hobby: status=%d, want 200\nbody=%s", getStatus, getBody)
 	}
-	if prob.Code != api.CodePlanMinInstancesNotAllowed {
-		t.Errorf("problem.code = %q, want %q", prob.Code, api.CodePlanMinInstancesNotAllowed)
+	var app api.AppResponse
+	if err := json.Unmarshal(getBody, &app); err != nil {
+		t.Fatalf("decode app: %v body=%s", err, getBody)
+	}
+	if app.MinInstances != 1 {
+		t.Errorf("GET /v1/apps/floor-hobby min_instances = %d, want 1", app.MinInstances)
 	}
 }
 

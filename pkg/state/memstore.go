@@ -1456,6 +1456,24 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetStreamingEnabled {
 		a.StreamingEnabled = boolOrFalse(p.StreamingEnabled)
 	}
+	// Issue #462 / ADR-058 / PR-A: per-app scaling policy. The
+	// Set bit is the canonical "unset vs explicit zero" signal;
+	// when Set is true the jsonb column is overwritten (deep-copied
+	// to avoid caller-mutation aliasing) and the legacy
+	// `min_instances` column is kept in sync so the reaper + SDK
+	// see the same floor. The policy is the canonical source at
+	// PR-A; the legacy column is the projection.
+	if p.SetScalingPolicy && p.ScalingPolicy != nil {
+		copyPolicy := *p.ScalingPolicy
+		a.ScalingPolicy = &copyPolicy
+		// Sync the legacy min_instances column with the policy's
+		// MinInstances. Mirrors the pgstore's policy-comes-first
+		// CASE so the in-memory and on-disk shapes stay
+		// consistent.
+		if p.ScalingPolicy.MinInstances != 0 {
+			a.MinInstances = p.ScalingPolicy.MinInstances
+		}
+	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
 	// apid handler never sets them (customers don't touch root_dir

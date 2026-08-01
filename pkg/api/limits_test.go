@@ -55,6 +55,15 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// poisoned row exits within ~15s at the default 5s backoff
 			// without thrashing the worker for long.
 			MaxQueueAttempts: 3,
+			// Issue #462 / ADR-058 / PR-A: Hobby unlocks the warm
+			// floor (MinInstancesAllowed) and the max_instances
+			// ceiling (MaxInstancesAllowed). Hobby is still
+			// gated out of the autoscale_target_rps /
+			// autoscale_target_cpu_pct knobs (the cost shape
+			// rationale is unchanged). The bill auto-counts
+			// (pkg/meter/sampler.go:238-239) so the warm floor
+			// has a bounded cost.
+			MinInstancesAllowed: true, MaxInstancesAllowed: true,
 			// Issue #169 / #172: Hobby is gated on Pro+ for both RPS
 			// and CPU (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier
 			// on ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
@@ -75,7 +84,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #395 / ADR-045: Pro gets 64 keys / 16 KB per value.
-			EnvVarsMax: 64, EnvValueMaxBytes: 16384, MinInstancesAllowed: true,
+			EnvVarsMax: 64, EnvValueMaxBytes: 16384,
+			// Issue #462 / ADR-058: Pro unlocks warm-floor + max-instances
+			// ceiling (was min-instances only at the pre-#462 contract).
+			MinInstancesAllowed: true, MaxInstancesAllowed: true,
 			// ADR-044: see PlanFree.
 			CPUWeight: 8, CPUQuotaUS: 500_000, CPUPeriodUS: 500_000,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
@@ -100,7 +112,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
 			// Issue #395 / ADR-045: Scale gets 256 keys / 32 KB per value.
-			EnvVarsMax: 256, EnvValueMaxBytes: 32768, MinInstancesAllowed: true,
+			EnvVarsMax: 256, EnvValueMaxBytes: 32768,
+			// Issue #462 / ADR-058: Scale unlocks warm-floor +
+			// max-instances ceiling (same as Pro).
+			MinInstancesAllowed: true, MaxInstancesAllowed: true,
 			// ADR-044: see PlanFree. Scale's 1000ms/100ms quota is the
 			// upper bound — 10 vCPU worth of compute at the per-instance
 			// level, gated by the §1 56 GB hard fence at the slice level.
@@ -271,17 +286,23 @@ func TestMustLimitsForPanicsOnUnknown(t *testing.T) {
 }
 
 // TestPlanMinInstancesAllowed pins the per-plan gate that apid's
-// updateApp handler uses for ux_spec §6.5. Free/Hobby → false
-// (always scale to zero); Pro/Scale → true. Unknown plans must
-// default to false (fail-closed: a missing plan never silently
-// unlocks a premium feature).
+// updateApp handler uses for ux_spec §6.5. Free → false (always
+// scale to zero); Hobby/Pro/Scale → true (issue #462 / ADR-058
+// PR-A tier-up). Unknown plans must default to false (fail-closed:
+// a missing plan never silently unlocks a premium feature).
+//
+// PR-A history (2026-07-31): Hobby was previously false (the
+// pre-#462 contract). The Hobby+ tier-up landed because the bill
+// auto-counts via pkg/meter/sampler.go:238-239 and Hobby's
+// MaxConcurrency is bounded (2) so the worst-case residency cost
+// is 2 × RAMMB + 16 MB overhead.
 func TestPlanMinInstancesAllowed(t *testing.T) {
 	cases := []struct {
 		plan Plan
 		want bool
 	}{
 		{PlanFree, false},
-		{PlanHobby, false},
+		{PlanHobby, true},
 		{PlanPro, true},
 		{PlanScale, true},
 		{Plan("unknown"), false},

@@ -328,7 +328,42 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		// dashboards can show "streaming on / off" alongside the
 		// egress-allowlist flag.
 		StreamingEnabled: a.StreamingEnabled,
+		// Issue #462 / ADR-058 / PR-A: per-app scaling policy. nil
+		// = legacy row (projected from min_instances / max_concurrency
+		// by the read path). Non-nil = customer-authored policy.
+		// The state layer is the canonical source; the DTO carries
+		// the same shape so the dashboard / CLI surface one
+		// consistent struct.
+		ScalingPolicy:  statePolicyToDTO(a.ScalingPolicy),
+		LastScaleOutAt: a.LastScaleOutAt,
+		LastScaleInAt:  a.LastScaleInAt,
 	}
+}
+
+// statePolicyToDTO converts the state-layer `*state.ScalingPolicy`
+// to the wire DTO `*api.ScalingPolicy`. Returns nil when the input
+// is nil so legacy rows project as a JSON `null` (the pre-#462
+// contract). Target is pointer-to-pointer so a customer-authored
+// `Target: {metric: "rps", value: 0}` round-trips through the read
+// path with the metric intact (the pre-fix path dropped Target when
+// Value==0, which the DTO upgrade to pointer-Target preserves).
+func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
+	if p == nil {
+		return nil
+	}
+	out := &api.ScalingPolicy{
+		MinInstances:      p.MinInstances,
+		MaxInstances:      p.MaxInstances,
+		ScaleOutCooldownS: p.ScaleOutCooldownS,
+		ScaleInCooldownS:  p.ScaleInCooldownS,
+	}
+	if p.Target != nil {
+		out.Target = &api.ScalingTarget{
+			Metric: p.Target.Metric,
+			Value:  p.Target.Value,
+		}
+	}
+	return out
 }
 
 // accountResponse builds the AccountResponse DTO, populating Limits

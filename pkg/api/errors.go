@@ -333,6 +333,35 @@ const (
 	// only; v6 mirror is a separate ADR).
 	CodeInvalidEgressAllowlist = "invalid_egress_allowlist"
 
+	// Issue #462 / ADR-058 — per-app scaling policy (PR-A). Three
+	// new codes, mirroring the existing autoscale shape (one
+	// plan-gate 403 + two shape 422's). The codes are clustered
+	// here so a future reader can see the full #462 surface in
+	// one block. The worker-class gate (concurrent_requests not
+	// allowed for `WorkloadClassWorker`) is the third 422 — PR-A
+	// adds the customer-facing reject; PR-D closes the engine
+	// bypass.
+	//
+	//   * CodePlanMaxInstancesNotAllowed = 403 "your plan does not
+	//     unlock max_instances" (Free stays off; Hobby+ in). 403
+	//     mirrors CodePlanMinInstancesNotAllowed so the CLI
+	//     surfaces the same shape.
+	//   * CodeInvalidMaxInstances = 422 "value outside
+	//     [min_instances, plan.MaxConcurrency]". Distinct from
+	//     CodeInvalidMinInstances so the CLI can render
+	//     "lower your max" vs "fix your min" without conflating.
+	//   * CodeInvalidCooldown = 422 "scale_*_cooldown_s outside
+	//     [Min, Max]". Distinct from CodeValidation so the API
+	//     stable string is reusable for telemetry.
+	//   * CodeScalingTargetIncompatibleWithWorkloadClass = 422
+	//     "worker-class apps cannot use concurrent_requests as the
+	//     scale-up target metric". PR-A closes the customer side;
+	//     PR-D carves out the engine side.
+	CodePlanMaxInstancesNotAllowed                 = "plan_max_instances_not_allowed"
+	CodeInvalidMaxInstances                        = "invalid_max_instances"
+	CodeInvalidCooldown                            = "invalid_cooldown"
+	CodeScalingTargetIncompatibleWithWorkloadClass = "scaling_target_incompatible_with_workload_class"
+
 	// Account self-service (spec §17 G6, ADR-021). The
 	// "confirm_required" code is returned when a DELETE arrives without
 	// the confirmation header so a stale CLI prompt can't silently wipe
@@ -554,6 +583,18 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
+	// Issue #462 / ADR-058 — scaling policy gate. PR-A History
+	// (2026-07-31): Hobby+ tier-up for max_instances. 403 mirrors
+	// CodePlanMinInstancesNotAllowed.
+	case CodePlanMaxInstancesNotAllowed:
+		return http.StatusForbidden
+	case CodeInvalidMaxInstances, CodeInvalidCooldown,
+		CodeScalingTargetIncompatibleWithWorkloadClass:
+		// 422 — request shape is well-formed but the value
+		// conflicts with the plan or the workload class. Sits
+		// next to CodeInvalidMinInstances on the same `422`
+		// branch so a single switch case covers the cluster.
+		return http.StatusUnprocessableEntity
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
 	case CodeInvalidCredentials, CodeEmailNotVerified:
@@ -959,6 +1000,62 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
 		WithDocs("https://docs.gregale.dev/apps#min-instances")
+}
+
+// ErrPlanMaxInstancesNotAllowed (issue #462 / ADR-058) is the
+// 403 plan-gate mirror of ErrPlanMinInstancesNotAllowed. Free
+// stays off; Hobby + Pro + Scale opt in. The 403 runs first
+// (before the 422 bounds check) so a Free customer PATCHing a
+// valid value still sees the plan error, not the bounds error.
+func ErrPlanMaxInstancesNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanMaxInstancesNotAllowed,
+		"Plan doesn't allow a max_instances ceiling",
+		fmt.Sprintf("the %s plan does not expose a per-app max_instances; upgrade to Hobby or higher to set it.", p)).
+		WithDocs("https://docs.gregale.dev/apps#max-instances")
+}
+
+// ErrInvalidMaxInstances (issue #462 / ADR-058) is the 422
+// bounds check on `scaling_policy.max_instances`. The PATCH is
+// rejected when the value is below min_instances or above the
+// plan's MaxConcurrency. Distinct from ErrInvalidMinInstances so
+// the CLI can render "raise your max" vs "fix your min" without
+// conflating the two telemetry streams.
+func ErrInvalidMaxInstances(got, minInstances, maxConcur int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidMaxInstances,
+		"Invalid max_instances",
+		fmt.Sprintf("max_instances must be in [%d, %d] (plan max_concurrency); got %d.", minInstances, maxConcur, got)).
+		WithLimit(int64(maxConcur), int64(got)).
+		WithDocs("https://docs.gregale.dev/apps#max-instances")
+}
+
+// ErrInvalidCooldown (issue #462 / ADR-058) is the 422 bounds
+// check on `scale_out_cooldown_s` / `scale_in_cooldown_s`. The
+// PATCH is rejected when the value is outside the per-direction
+// [Min, Max] range (1..3600 for scale-out, 5..86400 for
+// scale-in). Distinct from CodeValidation so the API stable
+// string is reusable for telemetry.
+func ErrInvalidCooldown(field string, got, minSeconds, maxSeconds int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidCooldown,
+		"Invalid cooldown",
+		fmt.Sprintf("%s must be in [%d, %d]; got %d.", field, minSeconds, maxSeconds, got)).
+		WithLimit(int64(maxSeconds), int64(got)).
+		WithDocs("https://docs.gregale.dev/apps#scaling-policy")
+}
+
+// ErrScalingTargetIncompatibleWithWorkloadClass (issue #462 /
+// ADR-058 / PR-D carve-out) is the 422 returned when a
+// worker-class app sets `target.metric = concurrent_requests`.
+// The signal source is `pkg/vmmd/activity.ActivityTracker` (PR-B)
+// which counts in-flight requests — a worker-class app has none
+// (no inbound HTTP), so the metric is forever 0 and the engine
+// would never admit. The customer-facing reject closes the
+// misconfiguration at PATCH time; PR-D carves out the engine
+// side as a defense-in-depth check.
+func ErrScalingTargetIncompatibleWithWorkloadClass(metric string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeScalingTargetIncompatibleWithWorkloadClass,
+		"Target metric is not compatible with this app's workload class",
+		fmt.Sprintf("target.metric=%q is not compatible with worker-class apps; use an rps or p99_latency_ms target instead.", metric)).
+		WithDocs("https://docs.gregale.dev/apps#scaling-policy")
 }
 
 // ErrPlanEgressAllowlistNotAllowed (ADR-031) is returned when a Free or Hobby
