@@ -1545,17 +1545,19 @@ func TestPg_DeleteSnapshotsByID_BulkAndIdempotent(t *testing.T) {
 
 func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
-	// Seed three snapshots across three FC versions. Only the
-	// matching-version row should stay live; the other two flip.
-	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false
-	// so each new insert supersedes the prior — mark stale before next.
-	mkSnap := func(v string, priorID string) string {
-		if priorID != "" {
-			if err := s.MarkSnapshotStale(ctx, priorID); err != nil {
-				t.Fatalf("MarkSnapshotStale(%s): %v", priorID, err)
-			}
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments — one per FC version — so we end up with
+	// three live init-tier rows for the sweep to act on. The sweep is a
+	// global UPDATE so the post-sweep live-row count is what matters.
+	// Capture the depID for the "matching" version (1.8.0) so the
+	// LatestSnapshot readback below can scope to that deployment.
+	var dep180 string
+	mkSnap := func(v string) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx)
+		if v == "1.8.0" {
+			dep180 = depID
 		}
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: v, MemBytes: 100, DiskBytes: 100,
@@ -1566,17 +1568,12 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 		}
 		return snap.ID
 	}
-	// Three FC versions; only the matching one (1.8.0) stays live
-	// after the sweep. id170/id190 are captured as vars (not `_, _`)
-	// so the assignment expressions read like a fixture table —
-	// their values are checked implicitly via the LatestSnapshot
-	// readback below (only id180 should be live).
-	id170 := mkSnap("1.7.0", "")
-	id180 := mkSnap("1.8.0", id170)
-	id190 := mkSnap("1.9.0", id180)
+	id170 := mkSnap("1.7.0")
+	id180 := mkSnap("1.8.0")
+	id190 := mkSnap("1.9.0")
 	_, _ = id170, id190
 
-	// Sweep against 1.8.0: 1.7.0 and 1.9.0 should flip.
+	// Sweep against 1.8.0: 1.7.0 and 1.9.0 should flip (id180 stays live).
 	n, err := s.MarkAllSnapshotsStaleByFCVersion(ctx, "1.8.0")
 	if err != nil {
 		t.Fatalf("MarkAllSnapshotsStaleByFCVersion: %v", err)
@@ -1585,8 +1582,9 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 		t.Errorf("marked %d stale, want 2", n)
 	}
 
-	// Confirm by reading back via LatestSnapshot (which filters stale).
-	latest, err := s.LatestSnapshot(ctx, depID)
+	// Confirm via LatestSnapshot on the 1.8.0 deployment — it must
+	// return id180 (still live) and not be ErrNotFound.
+	latest, err := s.LatestSnapshot(ctx, dep180)
 	if err != nil {
 		t.Fatalf("LatestSnapshot: %v", err)
 	}
@@ -1614,13 +1612,17 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 
 func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
-	mkSnap := func(suffix string, priorID string) string {
-		if priorID != "" {
-			if err := s.MarkSnapshotStale(ctx, priorID); err != nil {
-				t.Fatalf("MarkSnapshotStale(%s): %v", priorID, err)
-			}
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments (one per snapshot A/B/C) so we can flip
+	// exactly two of three and verify the survivor stays live.
+	// Capture depB so the LatestSnapshot readback below can scope to it.
+	var depB string
+	mkSnap := func(suffix string) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx)
+		if suffix == "b" {
+			depB = depID
 		}
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
@@ -1631,11 +1633,9 @@ func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 		}
 		return snap.ID
 	}
-	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false
-	// so each new init-tier insert supersedes the prior — chain them.
-	idA := mkSnap("a", "")
-	idB := mkSnap("b", idA)
-	idC := mkSnap("c", idB)
+	idA := mkSnap("a")
+	idB := mkSnap("b")
+	idC := mkSnap("c")
 
 	// Mark only A and C stale.
 	n, err := s.MarkOldSnapshotsStale(ctx, []string{idA, idC})
@@ -1651,8 +1651,8 @@ func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 		t.Errorf("MarkOldSnapshotsStale(nil) = (%d, %v), want (0, nil)", n0, err)
 	}
 
-	// LatestSnapshot filters stale; the survivor is B.
-	latest, err := s.LatestSnapshot(ctx, depID)
+	// LatestSnapshot filters stale; the survivor on depB is B.
+	latest, err := s.LatestSnapshot(ctx, depB)
 	if err != nil {
 		t.Fatalf("LatestSnapshot: %v", err)
 	}
@@ -1734,18 +1734,14 @@ func TestPg_ListLiveSnapshotStats_ExcludesStaleAndOrdersByMemBytesDesc(t *testin
 		t.Fatalf("migrate: %v", err)
 	}
 	s := state.NewPgStore(pool)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
 	// Insert three snapshots: one stale (filtered), two live.
-	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false
-	// so the live init-tier inserts must supersede the prior row — chain
-	// MarkSnapshotStale through mkSnap calls.
-	mkSnap := func(suffix string, stale bool, priorID string) string {
-		if priorID != "" {
-			if err := s.MarkSnapshotStale(ctx, priorID); err != nil {
-				t.Fatalf("MarkSnapshotStale(%s): %v", priorID, err)
-			}
-		}
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments — one per snapshot — so we get three rows
+	// (one stale, two live) without colliding on the partial index.
+	mkSnap := func(suffix string, stale bool) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx)
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
 			StorageKey: state.SnapMemKey(depID) + "/" + suffix,
@@ -1756,9 +1752,9 @@ func TestPg_ListLiveSnapshotStats_ExcludesStaleAndOrdersByMemBytesDesc(t *testin
 		}
 		return snap.ID
 	}
-	_ = mkSnap("stale", true, "")
-	live1 := mkSnap("live1", false, "")
-	live2 := mkSnap("live2", false, live1)
+	_ = mkSnap("stale", true)
+	live1 := mkSnap("live1", false)
+	live2 := mkSnap("live2", false)
 
 	// Update mem_bytes/disk_bytes on the live rows so we can assert
 	// the projection shape (the 100/100 from CreateSnapshot is fine
