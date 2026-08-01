@@ -1315,6 +1315,92 @@ func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placemen
 	return ChoosePlacement(nodes, usedMB, usedVCPU, r)
 }
 
+// ClaimUnplaced is the schedd-side async placement claim
+// (Phase 2 / Gate A migration 00084 — apps.node_id nullable).
+//
+// Called by pkg/sched.PlacementClaimSubscriber when apid emits a
+// NotifyAppChanged "created" event. The post-00084 schema lets
+// apid insert with node_id = NULL; every schedd races to stamp
+// the owner via Store.SetAppNodeID, whose conditional UPDATE
+// serialises N schedds into exactly one winner.
+//
+// Idempotent: a redelivered notify or a peer that already won
+// both observe app.NodeID != "" and return nil. Returns the
+// underlying store / chooser error wrapped with %w+op when
+// placement cannot proceed (capacity exhausted, FK rejection,
+// etc.); the subscriber logs and continues — the next notify
+// (e.g. a later admin update) is a fresh opportunity.
+//
+// Caller contract:
+//   - ctx must be cancellable; the subscriber drops on cancel.
+//   - The cold-start sweep calls this once per ListUnplacedApps
+//     row at schedd startup (closes the pg_notify missed-event
+//     window).
+func (e *Engine) ClaimUnplaced(ctx context.Context, appID string) error {
+	if appID == "" {
+		return fmt.Errorf("sched: claim unplaced: empty app id")
+	}
+	app, err := e.store.AppByID(ctx, appID)
+	if err != nil {
+		// AppByID wraps state.ErrNotFound for a deleted row; the
+		// subscriber drops silently on that path (M7 hard-delete
+		// is expected; re-stamping a deleted app is a bug).
+		return fmt.Errorf("sched: claim unplaced: lookup app: %w", err)
+	}
+	if app.NodeID != "" {
+		// Already claimed (by us on redelivery or by a peer).
+		// Idempotent no-op.
+		return nil
+	}
+	if app.RAMMB <= 0 {
+		// Defensive: the quota path normally guarantees a positive
+		// RAM. A non-positive value would have choosePlacementLocked
+		// return ErrCapacity before SetAppNodeID ever runs — which
+		// means the row stays NULL and another peer would also see
+		// it. Better to drop loudly here than to spin on a bad row.
+		e.log.Warn("sched: claim unplaced: skipping app with non-positive RAM",
+			"app_id", appID, "ram_mb", app.RAMMB)
+		return nil
+	}
+	acct, err := e.store.AccountByID(ctx, app.AccountID)
+	if err != nil {
+		return fmt.Errorf("sched: claim unplaced: lookup account: %w", err)
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	placement, err := e.choosePlacementLocked(ctx, Request{
+		AppID:          appID,
+		RAMMB:          app.RAMMB,
+		VCPU:           limits.VCPU,
+		MaxConcurrency: app.MaxConcurrency,
+	})
+	if err != nil {
+		return fmt.Errorf("sched: claim unplaced: choose: %w", err)
+	}
+	if err := e.store.SetAppNodeID(ctx, appID, placement.NodeID); err != nil {
+		if errors.Is(err, state.ErrConflict) {
+			// Peer won between our AppByID and SetAppNodeID.
+			// Expected under contention; drop silently.
+			return nil
+		}
+		return fmt.Errorf("sched: claim unplaced: stamp owner: %w", err)
+	}
+	// Re-emit so any listener interested in the binding (the
+	// gateway's schedd client cache rebuild, the runbook's
+	// SELECT … GROUP BY node_id observability) sees the
+	// transition. The subscriber itself filters out kind=claimed
+	// to avoid re-entry.
+	if e.notif != nil {
+		payload := fmt.Sprintf(`{"kind":"claimed","app_id":%q,"node_id":%q}`, appID, placement.NodeID)
+		if err := e.notif.Notify(ctx, db.NotifyAppChanged, payload); err != nil {
+			e.log.Warn("sched: claim unplaced: notify claimed",
+				"app_id", appID, "node_id", placement.NodeID, "err", err)
+		}
+	}
+	e.log.Info("sched: claim unplaced: stamped owner",
+		"app_id", appID, "node_id", placement.NodeID, "node_name", placement.Name)
+	return nil
+}
+
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —
 // step 6 of the deploy pipeline (spec §5). schedd runs it on imaged's
 // snapshot_prime handshake (ADR-018); on success it emits snapshot_written so
