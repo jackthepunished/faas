@@ -1,4 +1,4 @@
--- filename: 00084_apps_require_signed.sql
+-- filename: 00086_apps_require_signed.sql
 -- +goose Up
 -- Per-app cosign signature-enforcement (issue #472, ADR-058).
 -- Two shapes land in this single slot:
@@ -7,15 +7,16 @@
 --   (2) CREATE TABLE app_trusted_signers — per-app trust list mirroring
 --       AWS Lambda's CodeSigningConfig.
 --
--- Slot 84 chosen at PR-creation time per `migrations/README.md` after
--- origin/main already had 00082 (apps_scaling_policy). Slot 83 was
--- taken by the parallel `phase 2 / gate a — per-node schedd + schedd-
--- side async placement claim` PR (PR #509); the slot-collision CI
--- gate caught the race (run 30703774418) and we renumbered before
--- the second merge could panic goose with "duplicate version 83".
--- The two changes are tightly coupled (the column is the operator
--- toggle, the table is the data) — keeping them in one slot matches
--- the migration-order invariant in ADR-041.
+-- Slot 86 chosen at PR-creation time per `migrations/README.md` after
+-- renumbering twice. Initial slot 83 collided with PR #509 (phase-2
+-- placement claim); renumbering to 84 was invalidated when main
+-- landed the slot-83 / slot-84 reservation placeholders plus a new
+-- builds_kind_github migration at 85. The slot-collision CI gate
+-- and the TestMigrationsContiguous static check both caught each
+-- stage (runs 30703774418 and 30705308356 respectively). The two
+-- changes are tightly coupled (the column is the operator toggle,
+-- the table is the data) — keeping them in one slot matches the
+-- migration-order invariant in ADR-041.
 
 -- (1) Per-app require_signed flag.
 --

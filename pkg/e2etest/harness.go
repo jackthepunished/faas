@@ -350,11 +350,14 @@ const testDomain = "apps.test.example"
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
 //
-// Bumped 83 → 84 when the cosign-deploy-enforcement PR (PR #504)
-// renumbered its slot after PR #509 (phase-2 placement claim) took
-// slot 83 in parallel; the migration-slot-collision CI gate caught
-// the race before either merged.
-const e2eMigrationTarget = 84
+// Bumped 84 → 86 when the cosign-deploy-enforcement PR (PR #504)
+// renumbered a second time: main had moved to slot 85 (builds_kind_
+// github) with 00083/00084 reservation placeholders landing in between,
+// leaving the static contiguity check (TestMigrationsContiguous) with
+// a slot-84 gap to surface. The first bump (83 → 84) caught the
+// parallel slot-83 race against PR #509; the second lands on the
+// next free slot past the live migration head.
+const e2eMigrationTarget = 86
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
