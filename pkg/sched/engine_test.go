@@ -381,12 +381,6 @@ func ptrInt(i int) *int { return &i }
 // Cases also assert the metric row count is 0 for the non-fired
 // outcomes so a regression that double-counts is caught.
 func TestAdmitGate_Outcomes(t *testing.T) {
-	mkApp := func(t *testing.T, plan api.Plan, maxConc int) state.App {
-		t.Helper()
-		store := state.NewMemStore()
-		_, app, _ := seedApp(t, store, plan, 128, maxConc)
-		return app
-	}
 	t.Run("admit", func(t *testing.T) {
 		store := state.NewMemStore()
 		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
@@ -505,9 +499,245 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Errorf("cooldown_held = %d, want 0 (cold start bypass)", n)
 		}
 	})
-	// pin mkApp as a referenced symbol to keep the helper pattern
-	// consistent across the suite.
-	_ = mkApp
+}
+
+// TestAdmitAndDispatch_WorkerClassExempt (PR-D, issue #462) — the
+// worker-class first-check in admitAndDispatch fires BEFORE
+// admitGate. Every worker-class wake (regardless of headroom,
+// cooldown status, or min-floor) returns WakeResult{AtCapacity: true}
+// without emitting a metric row. The contracts:
+//
+//   - AtCapacity=true is the typed-capacity lift: the existing
+//     AdmitInstance path backpressure handles it (no error).
+//   - The gate's closed-set outcome labels (reject_at_cap,
+//     cooldown_held, min_floor_already) MUST NOT increment for
+//     worker-class apps; the carve-out is a no-op on the metric,
+//     a typed-capacity on the wire.
+func TestAdmitAndDispatch_WorkerClassExempt(t *testing.T) {
+	t.Run("worker_class_under_cap", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		// Stamp WorkloadClassWorker on the existing app.
+		if _, err := store.SetAppWorkloadClass(context.Background(), app.ID, state.WorkloadClassWorker, "pr-d-test"); err != nil {
+			t.Fatalf("SetAppWorkloadClass: %v", err)
+		}
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		r, err := e.AdmitInstance(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("AdmitInstance: %v", err)
+		}
+		// Surface: the trigger caller sees AtCapacity=true (typed lift).
+		// Pinned explicitly so a future engineer who broadens the
+		// (WakeResult{}, nil) surface accidentally (e.g. by moving
+		// the worker-class branch into a generic "no-wake" path)
+		// gets caught by this test.
+		if !r.AtCapacity {
+			t.Errorf("AtCapacity = false, want true (worker-class carve-out is a typed-capacity lift)")
+		}
+		// Metric rows: every gate outcome must be 0.
+		for _, outcome := range []string{"reject_at_cap", "cooldown_held", "min_floor_already"} {
+			if n := readScaleUp(t, ops, app.ID, outcome); n != 0 {
+				t.Errorf("%s = %d, want 0 (worker-class carve-out bypasses admitGate)", outcome, n)
+			}
+		}
+		// No instances footprint.
+		inst, err := store.ListInstancesForApp(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("ListInstancesForApp: %v", err)
+		}
+		if len(inst) != 0 {
+			t.Errorf("instances count = %d, want 0 (worker-class wake creates no instance)", len(inst))
+		}
+	})
+	t.Run("non_worker_class_warmup_regression_pin", func(t *testing.T) {
+		// The first-check must NOT swallow non-worker apps. Pin:
+		// a non-worker app with no ScalingPolicy and no ledger
+		// priming gets wakeAdmit (no error, no typed lift).
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		// AdmitInstance proceeds; the wake path either succeeds
+		// (creates an instance) or short-circuits on a downstream
+		// failure. The first-check MUST NOT fire (WorkloadClass is
+		// zero-value = stateless). Symmetric pin to the worker-class
+		// branch: AtCapacity must be false on the warm-up path.
+		r, err := e.AdmitInstance(context.Background(), app.ID)
+		if err != nil {
+			var p *api.Problem
+			if errors.As(err, &p) {
+				t.Errorf("non-worker app AdmitInstance error = %v (the first-check must not fire for stateless apps)", err)
+			}
+		}
+		if r.AtCapacity {
+			t.Errorf("AtCapacity = true, want false (non-worker wakeAdmit path lifts no capacity)")
+		}
+	})
+}
+
+// TestAdmitAndDispatch_CooldownSwitchedToWaitForWarm (PR-D, issue #462)
+// — the wake-cooldown_held branch now surfaces as CodeWaitForWarm
+// (503 + Retry-After) instead of CodePlanLimitConcur (429). The
+// Reaper's cooldown consult still uses the same constant; the wire
+// shape is what changed.
+//
+// The test stamps a 60-second cooldown, primes the ledger to
+// Concurrency=1, then runs a fresh wake and asserts the wire code
+// + Retry-After are correct.
+func TestAdmitAndDispatch_CooldownSwitchedToWaitForWarm(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+	setAppPolicy(t, store, app.ID, &state.ScalingPolicy{
+		ScaleOutCooldownS: 60,
+	}, ptrTime(time.Now().Add(-1*time.Second)))
+	ops := wire.NewOpsMetrics("schedd")
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+	// Prime the ledger to Concurrency=1 (the discriminator).
+	if err := e.ledger.Admit(Request{
+		Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro,
+	}); err != nil {
+		t.Fatalf("prime ledger: %v", err)
+	}
+	_, err := e.AdmitInstance(context.Background(), app.ID)
+	if err == nil {
+		t.Fatal("AdmitInstance = nil, want *api.Problem{CodeWaitForWarm}")
+	}
+	var p *api.Problem
+	if !errors.As(err, &p) {
+		t.Fatalf("AdmitInstance error = %v, want *api.Problem", err)
+	}
+	if p.Code != api.CodeWaitForWarm {
+		t.Errorf("Code = %q, want %q", p.Code, api.CodeWaitForWarm)
+	}
+	if p.Status != http.StatusServiceUnavailable {
+		t.Errorf("Status = %d, want 503", p.Status)
+	}
+	if got := p.HasHeader("Retry-After"); len(got) != 1 {
+		t.Errorf("Retry-After = %v, want 1 value", got)
+	} else {
+		n, perr := strconv.Atoi(got[0])
+		if perr != nil {
+			t.Errorf("Retry-After = %q, want integer (RFC 7231 §7.1.3)", got[0])
+		}
+		// Deterministic 1s-ago stamp + 60s cooldown → expected ≈ 59s.
+		// Tighter bounds catch off-by-one errors in the cooldown
+		// math (the helper converts via int(remaining.Seconds()) so
+		// a 1s truncation is the headroom account).
+		if n < 58 || n > 60 {
+			t.Errorf("Retry-After = %d, want [58, 60] (60s cooldown, 1s stamp)", n)
+		}
+	}
+}
+
+// TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur (PR-D,
+// issue #462) — the wakeMinFloorAlready branch is NOT switched to
+// CodeWaitForWarm. The customer asked for a wake that the floor
+// already satisfies (no scale-out was attempted); 429 is the
+// right wire shape. This is the load-bearing exclusion.
+func TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+	// Floor=2 with no ScalingPolicy cooldown; Concurrency=2 after
+	// the Admit pair.
+	setAppPolicy(t, store, app.ID, &state.ScalingPolicy{
+		MinInstances: 2,
+	}, nil)
+	ops := wire.NewOpsMetrics("schedd")
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+	if err := e.ledger.Admit(Request{
+		Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro,
+	}); err != nil {
+		t.Fatalf("prime ledger 1: %v", err)
+	}
+	if err := e.ledger.Admit(Request{
+		Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro,
+	}); err != nil {
+		t.Fatalf("prime ledger 2: %v", err)
+	}
+	_, err := e.AdmitInstance(context.Background(), app.ID)
+	if err == nil {
+		t.Fatal("AdmitInstance = nil, want *api.Problem{CodePlanLimitConcur}")
+	}
+	var p *api.Problem
+	if !errors.As(err, &p) {
+		t.Fatalf("AdmitInstance error = %v, want *api.Problem", err)
+	}
+	if p.Code != api.CodePlanLimitConcur {
+		t.Errorf("Code = %q, want %q (PR-D exclusion: min_floor stays on 429)", p.Code, api.CodePlanLimitConcur)
+	}
+	if got := p.HasHeader("Retry-After"); len(got) != 0 {
+		t.Errorf("Retry-After = %v, want nil (Retry-After is for cooldown_held, not min_floor)", got)
+	}
+}
+
+// TestCooldownSRemaining pins the cooldownSRemaining helper's
+// floor/nil-stamp/zero-cooldown/remaining branches with
+// deterministic clock injections. The helper is the wire source
+// for the 503 + Retry-After value emitted on wakeCooldownHeld
+// (see engine.go:645); an off-by-one here lands as
+// `Retry-After: 0` on the wire, which RFC 7231 §7.1.3 forbids.
+// PR-D review fix LOW #7.
+func TestCooldownSRemaining(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	stamp := now.Add(-30 * time.Second) // 30s ago
+	const cooldown = 60                 // seconds
+	t.Run("nil_stamp_returns_one", func(t *testing.T) {
+		app := &state.App{ScalingPolicy: &state.ScalingPolicy{ScaleOutCooldownS: cooldown}}
+		if got := cooldownSRemaining(app, now); got != 1 {
+			t.Errorf("nil LastScaleOutAt: got %d, want 1 (cold-start bypass upper-bounds at 1)", got)
+		}
+	})
+	t.Run("nil_policy_returns_one", func(t *testing.T) {
+		app := &state.App{LastScaleOutAt: ptrTime(stamp)}
+		if got := cooldownSRemaining(app, now); got != 1 {
+			t.Errorf("nil ScalingPolicy: got %d, want 1 (no cooldown configured → upper bound)", got)
+		}
+	})
+	t.Run("zero_cooldown_returns_one", func(t *testing.T) {
+		app := &state.App{
+			LastScaleOutAt: ptrTime(stamp),
+			ScalingPolicy:  &state.ScalingPolicy{ScaleOutCooldownS: 0},
+		}
+		if got := cooldownSRemaining(app, now); got != 1 {
+			t.Errorf("ScaleOutCooldownS=0: got %d, want 1 (disabled cooldown upper-bounds at 1)", got)
+		}
+	})
+	t.Run("remaining_zero_bounded_at_one", func(t *testing.T) {
+		// stamp older than the cooldown window: remaining is
+		// negative. Helper must not return 0 or negative — it
+		// floors at 1 because the cold-start path will fire
+		// anyway on the next wake (LastScaleOutAt is stale).
+		app := &state.App{
+			LastScaleOutAt: ptrTime(now.Add(-2 * time.Hour)),
+			ScalingPolicy:  &state.ScalingPolicy{ScaleOutCooldownS: cooldown},
+		}
+		if got := cooldownSRemaining(app, now); got != 1 {
+			t.Errorf("stale stamp: got %d, want 1 (helper floors at 1)", got)
+		}
+	})
+	t.Run("remaining_positive_returns_seconds", func(t *testing.T) {
+		// stamp 10s ago, cooldown 60s → 50s remaining.
+		app := &state.App{
+			LastScaleOutAt: ptrTime(now.Add(-10 * time.Second)),
+			ScalingPolicy:  &state.ScalingPolicy{ScaleOutCooldownS: cooldown},
+		}
+		if got := cooldownSRemaining(app, now); got != 50 {
+			t.Errorf("in-window: got %d, want 50 (60 - 10)", got)
+		}
+	})
+	t.Run("remaining_one_second_pin", func(t *testing.T) {
+		// stamp 59s ago, cooldown 60s → 1s remaining. This is
+		// the smallest positive value the helper returns and
+		// the boundary against the floor.
+		app := &state.App{
+			LastScaleOutAt: ptrTime(now.Add(-59 * time.Second)),
+			ScalingPolicy:  &state.ScalingPolicy{ScaleOutCooldownS: cooldown},
+		}
+		if got := cooldownSRemaining(app, now); got != 1 {
+			t.Errorf("near-boundary: got %d, want 1 (60 - 59)", got)
+		}
+	})
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }

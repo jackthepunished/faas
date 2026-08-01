@@ -431,14 +431,20 @@ func TestProperty_EngineWake_RespectsCooldown(t *testing.T) {
 			continue
 		}
 		var p *api.Problem
-		if errors.As(err, &p) && p.Code == api.CodePlanLimitConcur {
-			// Pre-PR-D surface: the wake-gate emit is the metric
-			// row, the wire code is still the pre-PR-C shape
-			// (CodePlanLimitConcur). PR-D introduces CodeWaitForWarm.
+		if errors.As(err, &p) && p.Code == api.CodeWaitForWarm {
+			// PR-D (issue #462): the cooldown_held branch
+			// surfaces as 503 + Retry-After
+			// (CodeWaitForWarm). Pre-PR-D this was a
+			// CodePlanLimitConcur 429; the wire shape split
+			// is the v1 contract for the customer's
+			// "rate-limit scale-outs" knob.
+			if got := p.HasHeader("Retry-After"); len(got) != 1 {
+				t.Errorf("Retry-After = %v, want [1 value]; cooldown remaining must always be a positive integer", got)
+			}
 			denied++
 			continue
 		}
-		t.Errorf("Wake error = %v; want *api.Problem{Code:CodePlanLimitConcur} (cooldown_held)", err)
+		t.Errorf("Wake error = %v; want *api.Problem{Code:CodeWaitForWarm} (cooldown_held)", err)
 	}
 	if denied != goroutines {
 		t.Errorf("denied = %d, want %d (every wake hits cooldown_held)", denied, goroutines)

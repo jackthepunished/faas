@@ -171,6 +171,78 @@ func TestErrCapacity(t *testing.T) {
 	}
 }
 
+// TestErrWaitForWarm locks the 503 + Retry-After wire shape for
+// the per-app scale-out cooldown (issue #462 / PR-D). Distinct
+// from TestErrPlanLimitConcurrency (429, no Retry-After) and
+// from TestErrCapacity (503, no Retry-After). The Retry-After
+// header is the canonical UX: clients that consult the header
+// can back off without polling the 503 + body alone.
+func TestErrWaitForWarm(t *testing.T) {
+	l := MustLimitsFor(PlanScale) // 20 concurrent
+	p := ErrWaitForWarm(5, l, 7)
+	if p.Status != http.StatusServiceUnavailable {
+		t.Errorf("Status = %d, want 503", p.Status)
+	}
+	if p.Code != CodeWaitForWarm {
+		t.Errorf("Code = %q, want %q", p.Code, CodeWaitForWarm)
+	}
+	if p.Limit == nil || *p.Limit != 5 {
+		t.Errorf("Limit = %v, want 5 (cooldown seconds)", p.Limit)
+	}
+	if p.Observed == nil || *p.Observed != 7 {
+		t.Errorf("Observed = %v, want 7 (live instances)", p.Observed)
+	}
+	if !strings.Contains(p.DocsURL, "scaling-policy#cooldown") {
+		t.Errorf("DocsURL = %q, want /scaling-policy#cooldown", p.DocsURL)
+	}
+	if got := p.HasHeader("Retry-After"); len(got) != 1 || got[0] != "5" {
+		t.Errorf("HasHeader(Retry-After) = %v, want [5]", got)
+	}
+	if !strings.Contains(p.Detail, "5 more second") {
+		t.Errorf("Detail = %q, want to name the cooldown remaining seconds", p.Detail)
+	}
+}
+
+// TestErrWaitForWarm_BoundsAtOne pins the floor: cooldownS <= 0
+// is treated as 1 so the wire Retry-After header is always a
+// positive integer. Without this, a clock-skew-induced zero
+// (Postgres now() ahead of the engine's time.Now()) would emit
+// Retry-After: 0, which RFC 7231 §7.1.3 forbids.
+func TestErrWaitForWarm_BoundsAtOne(t *testing.T) {
+	l := MustLimitsFor(PlanScale)
+	for _, cooldownS := range []int{-5, 0, 1} {
+		p := ErrWaitForWarm(cooldownS, l, 3)
+		if got := p.HasHeader("Retry-After"); len(got) != 1 || got[0] != "1" {
+			t.Errorf("cooldownS=%d: HasHeader(Retry-After) = %v, want [1]", cooldownS, got)
+		}
+	}
+}
+
+// TestErrWaitForWarm_FlushedOnWire pins the WithHeader chain
+// end-to-end: gatewayd's writeWakeError surface WriteProblem
+// flushes the Retry-After header from extraHeaders. Gaps here
+// would silently drop the wire hint and the 503 would look
+// indistinguishable from a permanent failure.
+func TestErrWaitForWarm_FlushedOnWire(t *testing.T) {
+	l := MustLimitsFor(PlanScale)
+	p := ErrWaitForWarm(7, l, 1)
+
+	rr := httptest.NewRecorder()
+	WriteProblem(rr, p)
+
+	if got := rr.Header().Get("Retry-After"); got != "7" {
+		t.Errorf("Retry-After = %q, want \"7\"", got)
+	}
+	// extraHeaders must not leak into the JSON body.
+	body := rr.Body.String()
+	if strings.Contains(body, "Retry-After") {
+		t.Errorf("Retry-After must not appear in the JSON body: %s", body)
+	}
+	if strings.Contains(body, "extraHeaders") {
+		t.Errorf("extraHeaders must not appear on the wire: %s", body)
+	}
+}
+
 // TestErrBillingNotImplemented pins the 501 mapping for issue #279
 // (Paddle's Refund stub returns billing.ErrNotImplemented; an apid
 // handler that calls Provider.Refund dispatches on errors.Is(err,
@@ -279,6 +351,19 @@ func TestStatusForCode_AuthCodes(t *testing.T) {
 				t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestStatusForCode_WaitForWarm locks the 503 inverse-status mapping
+// for the per-app scale-out cooldown (issue #462 / PR-D). The
+// inverse lift lives in pkg/grpcerr.FromStatus: when a wake-gate
+// Problem crosses the gRPC boundary it loses the 503 (both 429 and
+// 503 map to ResourceExhausted on the gRPC side), and the lift
+// re-derives the HTTP status via StatusForCode. A gap here would
+// silently demote the 503 to 429 / 500 on the customer-facing wire.
+func TestStatusForCode_WaitForWarm(t *testing.T) {
+	if got := StatusForCode(CodeWaitForWarm); got != http.StatusServiceUnavailable {
+		t.Errorf("StatusForCode(CodeWaitForWarm) = %d, want %d", got, http.StatusServiceUnavailable)
 	}
 }
 
