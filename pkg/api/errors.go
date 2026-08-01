@@ -514,6 +514,38 @@ const (
 	// later unset both vars; the dashboard's /v1/auth/capabilities
 	// signal keeps the button off in steady state.
 	CodeOAuthProviderUnavailable = "oauth_provider_unavailable"
+
+	// Organizations (issue #190 / IAM-6 / ADR-061). Twelve stable
+	// strings surface the full org lifecycle: slug shape, slug
+	// collision, role gating, member/invitation caps, invitation
+	// lifecycle, ownership-transfer guards, personal-org
+	// immutability, and the legacy API-key re-bind requirement.
+	//
+	// Why so many: each code signals a different remediation path
+	// the dashboard or CLI can branch on without parsing prose.
+	// org_member_cap_exceeded / org_invitation_cap_exceeded
+	// surface the per-plan cap (PR 1 ships 0/0; PR 2 reads actual
+	// values from the financial model). org_already_member covers
+	// the re-invite case. org_invitation_invalid vs
+	// org_invitation_expired split the 410 so the dashboard can
+	// render "link expired, request a new one" vs "link is invalid".
+	// org_last_owner / org_personal_immutable pin the two
+	// immutable-from-PR-1 invariants from the ADR.
+	//
+	// The 12 codes are a complete set: every org-scoped handler
+	// error returns exactly one of these.
+	CodeOrgNotFound              = "org_not_found"
+	CodeOrgSlugInvalid           = "org_slug_invalid"
+	CodeOrgSlugTaken             = "org_slug_taken"
+	CodeOrgMemberCapExceeded     = "org_member_cap_exceeded"
+	CodeOrgInvitationCapExceeded = "org_invitation_cap_exceeded"
+	CodeOrgRoleForbidden         = "org_role_forbidden"
+	CodeOrgAlreadyMember         = "org_already_member"
+	CodeOrgInvitationInvalid     = "org_invitation_invalid"
+	CodeOrgInvitationExpired     = "org_invitation_expired"
+	CodeOrgLastOwner             = "org_last_owner"
+	CodeOrgPersonalImmutable     = "org_personal_immutable"
+	CodeOrgAPIKeyRequiresOrg     = "org_api_key_requires_org"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -526,6 +558,21 @@ const SecretKeyPattern = `^[A-Z][A-Z0-9_]*$`
 // MaxSecretKeyLen bounds the secret key name. Mirrors Unix env-var limits
 // (NAME_MAX is 255 on Linux) and keeps per-row index size reasonable.
 const MaxSecretKeyLen = 128
+
+// OrgSlugPattern is the regex enforced by the ORG slug validator in PR 5
+// (issue #190 / IAM-6 / ADR-061) and reused by ErrOrgSlugInvalid's detail
+// string so the rejection copy carries the same shape the handler enforces.
+// Lowercase ASCII letters, digits, and single dashes; must start and end
+// with a letter or digit (no leading or trailing dash); 3..32 chars total.
+// Reserved keywords are checked at the handler layer, not in this regex,
+// because the keyword set changes over time and belongs alongside the
+// reserved-slug seed data in cmd/apid.
+const OrgSlugPattern = `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`
+
+// MaxOrgSlugLen bounds the org slug length. Mirrors the regex's upper
+// bound so a future contributor tightening the pattern keeps the two in
+// lock-step.
+const MaxOrgSlugLen = 32
 
 // StatusForCode returns the HTTP status a given stable Code maps to. It is the
 // inverse of the per-code status the constructors below hardcode, kept in one
@@ -659,6 +706,31 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeResetTokenInvalid, CodeResetTokenExpired:
 		return http.StatusGone
+	// Organizations (issue #190 / IAM-6 / ADR-061). 404 for slug
+	// not-found matches the IDOR convention used by LoadApp
+	// (cross-tenant access returns 404, never 403). 422 for slug
+	// invalid is a shape failure (matching the convention of
+	// CodeCronInvalid / CodeEnvVarInvalidKey). 409 for slug
+	// taken / already member / last-owner / personal-org
+	// immutability surfaces the lifecycle collisions. 410 for
+	// invitation invalid / expired mirrors the password-reset
+	// one-shot links (the resource was a one-shot and is no
+	// longer addressable). 403 for role / member-cap /
+	// invitation-cap refusal surfaces the plan-limit + RBAC
+	// failure modes. 409 for the legacy API key re-bind so
+	// existing keys can be told to mint an org-bound successor
+	// without deleting the row.
+	case CodeOrgNotFound:
+		return http.StatusNotFound
+	case CodeOrgSlugInvalid:
+		return http.StatusUnprocessableEntity
+	case CodeOrgSlugTaken, CodeOrgAlreadyMember, CodeOrgLastOwner,
+		CodeOrgPersonalImmutable, CodeOrgAPIKeyRequiresOrg:
+		return http.StatusConflict
+	case CodeOrgInvitationInvalid, CodeOrgInvitationExpired:
+		return http.StatusGone
+	case CodeOrgRoleForbidden, CodeOrgMemberCapExceeded, CodeOrgInvitationCapExceeded:
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -1405,4 +1477,150 @@ func ErrResetTokenExpired() *Problem {
 		"Reset link expired",
 		"this password-reset link has expired; request a new one.").
 		WithDocs("https://docs.gregale.dev/auth/reset")
+}
+
+// --- Organizations (issue #190 / IAM-6 / ADR-061) --------------------------
+//
+// Twelve stable constructors cover the full org lifecycle. Each
+// helper is the one-liner PR 5 / PR 6 handlers call; the prefix-
+// shared RFC 7807 body keeps the dashboard / CLI / SDK surface
+// predictable. The 409-vs-410-vs-403-vs-404-vs-422 status mapping
+// lives in StatusForCode so pkg/grpcerr.FromStatus can lift a
+// gRPC code back into the right HTTP status (defence in depth
+// against future code additions that forget the switch case).
+
+// ErrOrgNotFound is the 404 returned when the org slug does not
+// resolve to an org the principal can see. Mirrors the IDOR
+// convention used by LoadApp — cross-tenant access returns 404,
+// never 403, so the surface never leaks existence.
+func ErrOrgNotFound(slug string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeOrgNotFound,
+		"Organization not found",
+		fmt.Sprintf("no organization with slug %q is visible to this account.", slug)).
+		WithDocs("https://docs.gregale.dev/orgs")
+}
+
+// ErrOrgSlugInvalid is the 422 returned when a slug fails the
+// regex or shape check (lowercase ASCII letters, digits, dashes;
+// 3..32 chars; not a reserved keyword). Detail names the rule
+// so the dashboard form can highlight which constraint tripped.
+// The regex comes from OrgSlugPattern so PR 5's handler
+// validator and this constructor share one source of truth.
+func ErrOrgSlugInvalid(reason string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeOrgSlugInvalid,
+		"Invalid organization slug",
+		fmt.Sprintf("org slugs must match %s; %s", OrgSlugPattern, reason)).
+		WithDocs("https://docs.gregale.dev/orgs#slugs")
+}
+
+// ErrOrgSlugTaken is the 409 returned when the slug is already in
+// use (either live or in the deleted-pending window). Detail
+// distinguishes the two so the CLI can render actionable retry
+// guidance.
+func ErrOrgSlugTaken(slug string) *Problem {
+	return NewProblem(http.StatusConflict, CodeOrgSlugTaken,
+		"Organization slug in use",
+		fmt.Sprintf("slug %q is already taken; pick another.", slug)).
+		WithDocs("https://docs.gregale.dev/orgs#slugs")
+}
+
+// ErrOrgMemberCapExceeded is the 403 returned when the plan's
+// OrgMembersMax is reached. limit and observed ride on the
+// Problem so the CLI can render the cap without re-fetching.
+func ErrOrgMemberCapExceeded(limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeOrgMemberCapExceeded,
+		"Organization member limit reached",
+		fmt.Sprintf("the plan caps this organization at %d member(s); you have %d.",
+			limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.gregale.dev/orgs#member-cap")
+}
+
+// ErrOrgInvitationCapExceeded is the 403 returned when the
+// plan's OrgPendingInvitationsMax is reached. Independent of the
+// member cap — defends against the N-invites × fast-accept botnet
+// signature.
+func ErrOrgInvitationCapExceeded(limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeOrgInvitationCapExceeded,
+		"Organization invitation limit reached",
+		fmt.Sprintf("the plan caps this organization at %d pending invitation(s); you have %d.",
+			limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.gregale.dev/orgs#invitation-cap")
+}
+
+// ErrOrgRoleForbidden is the 403 returned when the authenticated
+// member lacks the role required for this action. The action
+// rides in the detail so the dashboard can render "you need to
+// be an admin to invite members" without a separate lookup.
+func ErrOrgRoleForbidden(action string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeOrgRoleForbidden,
+		"Insufficient role for this action",
+		fmt.Sprintf("your role does not allow %s on this organization.", action)).
+		WithDocs("https://docs.gregale.dev/orgs#roles")
+}
+
+// ErrOrgAlreadyMember is the 409 returned when the accepting
+// account already has a membership in the org. Detail names the
+// existing role so the dashboard can offer a "switch to this
+// role" path instead of a plain "already a member" copy.
+func ErrOrgAlreadyMember(role string) *Problem {
+	return NewProblem(http.StatusConflict, CodeOrgAlreadyMember,
+		"Already a member of this organization",
+		fmt.Sprintf("this account is already a member of the organization with role %q.", role)).
+		WithDocs("https://docs.gregale.dev/orgs#members")
+}
+
+// ErrOrgInvitationInvalid is the 410 returned when the invitation
+// token is unknown, already consumed, or revoked. 410 Gone is the
+// semantically correct status — the resource was a one-shot and
+// is no longer addressable.
+func ErrOrgInvitationInvalid() *Problem {
+	return NewProblem(http.StatusGone, CodeOrgInvitationInvalid,
+		"Invitation invalid",
+		"this invitation is unknown, already consumed, or has been revoked.").
+		WithDocs("https://docs.gregale.dev/orgs#invitations")
+}
+
+// ErrOrgInvitationExpired is the 410 returned when the invitation
+// token has aged past its expires_at. Same 410 as the invalid
+// case but distinct code so the dashboard can render "link
+// expired, request a new one" vs "link is invalid".
+func ErrOrgInvitationExpired() *Problem {
+	return NewProblem(http.StatusGone, CodeOrgInvitationExpired,
+		"Invitation expired",
+		"this invitation has expired; ask the inviter to send a new one.").
+		WithDocs("https://docs.gregale.dev/orgs#invitations")
+}
+
+// ErrOrgLastOwner is the 409 returned when removing, demoting,
+// or deleting the only owner of a non-personal org. Ownership
+// transfer is the only way to vacate the role.
+func ErrOrgLastOwner() *Problem {
+	return NewProblem(http.StatusConflict, CodeOrgLastOwner,
+		"Cannot remove the last owner",
+		"transfer ownership to another member before removing or demoting this role.").
+		WithDocs("https://docs.gregale.dev/orgs#ownership")
+}
+
+// ErrOrgPersonalImmutable is the 409 returned when a caller
+// tries to mutate a personal org (add members, transfer
+// ownership, delete standalone). Personal orgs are immutable
+// for the lifetime of the owning account.
+func ErrOrgPersonalImmutable() *Problem {
+	return NewProblem(http.StatusConflict, CodeOrgPersonalImmutable,
+		"Personal organizations are immutable",
+		"this organization is the personal organization of one account; it cannot accept members or be deleted independently.").
+		WithDocs("https://docs.gregale.dev/orgs#personal-orgs")
+}
+
+// ErrOrgAPIKeyRequiresOrg is the 409 returned when a legacy API
+// key (no org binding) is used to address an org-scoped endpoint.
+// The dashboard surfaces "re-mint this key as an org-bound key"
+// rather than a generic 403.
+func ErrOrgAPIKeyRequiresOrg() *Problem {
+	return NewProblem(http.StatusConflict, CodeOrgAPIKeyRequiresOrg,
+		"API key must be bound to an organization",
+		"this legacy API key has no organization binding; create a new key via /v1/orgs/{slug}/keys.").
+		WithDocs("https://docs.gregale.dev/orgs#api-keys")
 }

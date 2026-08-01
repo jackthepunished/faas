@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -289,6 +290,12 @@ func TestCodeConstants_UniqueAndNonEmpty(t *testing.T) {
 		CodeCliAuthPending, CodeCliAuthUnavailable,
 		CodeInvalidCredentials, CodeEmailNotVerified, CodePasswordTooWeak,
 		CodeResetTokenInvalid, CodeResetTokenExpired, CodeAccountExists,
+		// IAM-6 / ADR-061 (issue #190). One cluster per ADR table.
+		CodeOrgNotFound, CodeOrgSlugInvalid, CodeOrgSlugTaken,
+		CodeOrgMemberCapExceeded, CodeOrgInvitationCapExceeded,
+		CodeOrgRoleForbidden, CodeOrgAlreadyMember,
+		CodeOrgInvitationInvalid, CodeOrgInvitationExpired,
+		CodeOrgLastOwner, CodeOrgPersonalImmutable, CodeOrgAPIKeyRequiresOrg,
 	}
 	seen := make(map[string]bool)
 	for _, c := range codes {
@@ -651,5 +658,190 @@ func TestStatusForCode_AlertRules(t *testing.T) {
 		if got := StatusForCode(tc.code); got != tc.want {
 			t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
 		}
+	}
+}
+
+// TestStatusForCode_OrgCodes pins the inverse-status table for the
+// 12 IAM-6 / ADR-061 org codes. The cluster is split across 404
+// (slug not found — IDOR convention), 422 (slug shape), 409
+// (slug taken / already member / last owner / personal immutable /
+// legacy key), 410 (invitation invalid / expired), and 403 (role
+// / member cap / invitation cap). pkg/grpcerr.FromStatus consumes
+// this table on the gRPC boundary; a gap here would silently
+// downgrade a 403 to 500 on the customer-facing wire.
+func TestStatusForCode_OrgCodes(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{CodeOrgNotFound, http.StatusNotFound},
+		{CodeOrgSlugInvalid, http.StatusUnprocessableEntity},
+		{CodeOrgSlugTaken, http.StatusConflict},
+		{CodeOrgMemberCapExceeded, http.StatusForbidden},
+		{CodeOrgInvitationCapExceeded, http.StatusForbidden},
+		{CodeOrgRoleForbidden, http.StatusForbidden},
+		{CodeOrgAlreadyMember, http.StatusConflict},
+		{CodeOrgInvitationInvalid, http.StatusGone},
+		{CodeOrgInvitationExpired, http.StatusGone},
+		{CodeOrgLastOwner, http.StatusConflict},
+		{CodeOrgPersonalImmutable, http.StatusConflict},
+		{CodeOrgAPIKeyRequiresOrg, http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if got := StatusForCode(tc.code); got != tc.want {
+				t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestErrOrgNotFound wires the constructor + status for the most
+// common org error. The 404 status mirrors the IDOR convention so
+// cross-tenant access returns 404, never 403. Other code
+// constructors are pinned via their respective tests / handlers
+// once PR 5 lands; this test seeds the surface.
+func TestErrOrgNotFound(t *testing.T) {
+	p := ErrOrgNotFound("acme")
+	if p.Status != http.StatusNotFound {
+		t.Errorf("Status = %d, want 404", p.Status)
+	}
+	if p.Code != CodeOrgNotFound {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgNotFound)
+	}
+	if !strings.Contains(p.Detail, "acme") {
+		t.Errorf("Detail = %q, want to name the slug", p.Detail)
+	}
+	if !strings.Contains(p.DocsURL, "/orgs") {
+		t.Errorf("DocsURL = %q, want to point at /orgs", p.DocsURL)
+	}
+}
+
+// TestErrOrgMemberCapExceeded pins the 403 + limit/observed pair
+// for the per-plan member cap. Mirrors TestErrPlanCronQuota in
+// spirit so the SDK's error decoder can share the quota-reached
+// branch.
+func TestErrOrgMemberCapExceeded(t *testing.T) {
+	p := ErrOrgMemberCapExceeded(10, 10)
+	if p.Status != http.StatusForbidden {
+		t.Errorf("Status = %d, want 403", p.Status)
+	}
+	if p.Code != CodeOrgMemberCapExceeded {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgMemberCapExceeded)
+	}
+	if p.Limit == nil || *p.Limit != 10 {
+		t.Errorf("Limit = %v, want 10", p.Limit)
+	}
+	if p.Observed == nil || *p.Observed != 10 {
+		t.Errorf("Observed = %v, want 10", p.Observed)
+	}
+}
+
+// TestErrOrgMemberCapExceeded_ZeroBoundary pins the wire shape at
+// the (limit=0, observed=0) boundary. WithLimit binds the field
+// non-nil even for zero, so the JSON serialises `"limit": 0`
+// (not omitted). A future refactor that tries to omit zero would
+// silently break the SDK quota decoder on a brand-new account or
+// an org whose plan cap is genuinely 0.
+func TestErrOrgMemberCapExceeded_ZeroBoundary(t *testing.T) {
+	p := ErrOrgMemberCapExceeded(0, 0)
+	if p.Limit == nil {
+		t.Fatal("Limit must remain non-nil even at zero (SDK depends on *int64 presence)")
+	}
+	if *p.Limit != 0 || *p.Observed != 0 {
+		t.Errorf("Limit/Observed = %d/%d, want 0/0", *p.Limit, *p.Observed)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"limit":0`) {
+		t.Errorf("JSON must serialise zero Limit (SDK decoder relies on it): %s", body)
+	}
+	if !strings.Contains(string(body), `"observed":0`) {
+		t.Errorf("JSON must serialise zero Observed: %s", body)
+	}
+}
+
+// TestErrOrgInvitationExpired pins the 410 + code for the
+// one-shot invitation lifecycle. Mirrors TestErrResetTokenExpired
+// so the dashboard's "link expired" copy reuses the same pattern.
+func TestErrOrgInvitationExpired(t *testing.T) {
+	p := ErrOrgInvitationExpired()
+	if p.Status != http.StatusGone {
+		t.Errorf("Status = %d, want 410", p.Status)
+	}
+	if p.Code != CodeOrgInvitationExpired {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgInvitationExpired)
+	}
+}
+
+// TestErrOrgLastOwner pins the 409 + reusable copy for the
+// own-points-on-the-only-owner guard. Detail names the
+// remediation (transfer ownership) so dashboards can render
+// guidance without parsing prose.
+func TestErrOrgLastOwner(t *testing.T) {
+	p := ErrOrgLastOwner()
+	if p.Status != http.StatusConflict {
+		t.Errorf("Status = %d, want 409", p.Status)
+	}
+	if p.Code != CodeOrgLastOwner {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgLastOwner)
+	}
+	if !strings.Contains(p.Detail, "transfer") {
+		t.Errorf("Detail = %q, want to mention ownership transfer", p.Detail)
+	}
+}
+
+// TestErrOrgSlugInvalid pins the 422 + shape copy. The detail
+// must echo the shared OrgSlugPattern constant so PR 5's handler
+// regex and this rejection copy cannot drift silently.
+func TestErrOrgSlugInvalid(t *testing.T) {
+	p := ErrOrgSlugInvalid("leading dash")
+	if p.Status != http.StatusUnprocessableEntity {
+		t.Errorf("Status = %d, want 422", p.Status)
+	}
+	if p.Code != CodeOrgSlugInvalid {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgSlugInvalid)
+	}
+	if !strings.Contains(p.Detail, OrgSlugPattern) {
+		t.Errorf("Detail = %q, want to carry OrgSlugPattern %q", p.Detail, OrgSlugPattern)
+	}
+	if !strings.Contains(p.Detail, "leading dash") {
+		t.Errorf("Detail = %q, want to carry the reason", p.Detail)
+	}
+}
+
+// TestOrgSlugPattern covers the well-formed boundary cases and a few
+// malformed inputs. PR 5's handler validator will compile the same
+// constant so a tightening here breaks the validator in tests rather
+// than on the wire. Keep the boundary cases tight: 3 chars (floor),
+// 32 chars (ceiling), single internal dash, leading digit (allowed),
+// trailing dash (rejected), uppercase (rejected).
+func TestOrgSlugPattern(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    bool
+		comment string
+	}{
+		{"abc", true, "floor length"},
+		{"a-b", true, "single internal dash"},
+		{"a1", false, "below floor length"},
+		{strings.Repeat("a", MaxOrgSlugLen), true, "ceiling length"},
+		{strings.Repeat("a", MaxOrgSlugLen+1), false, "above ceiling"},
+		{"abc-", false, "trailing dash"},
+		{"-abc", false, "leading dash"},
+		{"ABC", false, "uppercase"},
+		{"abc_def", false, "underscore"},
+		{"abc.def", false, "dot"},
+		{"1bc", true, "leading digit allowed"},
+		{"ab1", true, "trailing digit allowed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in+"/"+tc.comment, func(t *testing.T) {
+			if got := regexp.MustCompile(OrgSlugPattern).MatchString(tc.in); got != tc.want {
+				t.Errorf("OrgSlugPattern.MatchString(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }

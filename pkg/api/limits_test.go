@@ -30,6 +30,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
 			CronLimitPerApp: 0, CronLimitPerAccount: 0,
+			// IAM-6 / ADR-061: PR 1 placeholder. Fail-closed at 0/0
+			// until the financial model authorizes values for PR 2.
+			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): alert rules — Free gated to 402, so the limits
 			// surface is 0/0 to fail-closed by default.
 			AlertRuleLimitPerApp: 0, AlertRuleLimitPerAccount: 0,
@@ -75,6 +78,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: false, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
+			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
+			// financial model authorizes values.
+			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Hobby gets 3 per-app and 10 per-account.
 			AlertRuleLimitPerApp: 3, AlertRuleLimitPerAccount: 10,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
@@ -107,6 +113,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
+			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
+			// financial model authorizes values.
+			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
 			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
@@ -140,6 +149,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
+			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
+			// financial model authorizes values.
+			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
 			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
@@ -156,6 +168,56 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		got := MustLimitsFor(p)
 		if got != want[p] {
 			t.Errorf("limits for %s:\n got  %+v\n want %+v", p, got, want[p])
+		}
+	}
+}
+
+// TestOrgMembersLimits_ZeroUntilAuthorised pins the fail-closed
+// contract for the IAM-6 / ADR-061 org caps (issue #190, PR 1).
+// The handler gates membership creation on Plan.OrgMembersMax()
+// and the store reads the same value as a defence-in-depth
+// back-stop. Until the financial model authorizes per-plan values,
+// every plan must read 0/0 — a missing row must NEVER silently
+// inherit a permissive cap. PR 2 will populate actual values
+// alongside the schema work; this test catches a regression where
+// the field is left at Go's default zero (which happens to be 0)
+// and the accessor is omitted (no reader = silent allow).
+func TestOrgMembersLimits_ZeroUntilAuthorised(t *testing.T) {
+	for _, p := range Plans {
+		t.Run(string(p), func(t *testing.T) {
+			if got := p.OrgMembersMax(); got != 0 {
+				t.Errorf("Plan(%s).OrgMembersMax() = %d, want 0 (fail-closed until financial model authorises)", p, got)
+			}
+			if got := p.OrgPendingInvitationsMax(); got != 0 {
+				t.Errorf("Plan(%s).OrgPendingInvitationsMax() = %d, want 0 (fail-closed until financial model authorises)", p, got)
+			}
+		})
+	}
+
+	// Unknown plan must also fail closed (return 0). Mirrors the
+	// CronLimitPerApp / AlertRuleLimitPerApp contract.
+	if got := Plan("enterprise").OrgMembersMax(); got != 0 {
+		t.Errorf("Plan(unknown).OrgMembersMax() = %d, want 0 (fail-closed)", got)
+	}
+	if got := Plan("enterprise").OrgPendingInvitationsMax(); got != 0 {
+		t.Errorf("Plan(unknown).OrgPendingInvitationsMax() = %d, want 0 (fail-closed)", got)
+	}
+}
+
+// TestOrgAccessorsMatchTable pins that the accessor methods read the
+// same value the Limits struct holds. Catches regressions where a
+// future contributor edits the struct field but forgets the accessor
+// (or vice versa). For PR 1 both fields are 0/0, but the
+// relationship must be stable — when PR 2 adds real values, this
+// test catches asymmetric drift.
+func TestOrgAccessorsMatchTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.OrgMembersMax(), l.OrgMembersMax; got != want {
+			t.Errorf("Plan(%s).OrgMembersMax() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.OrgPendingInvitationsMax(), l.OrgPendingInvitationsMax; got != want {
+			t.Errorf("Plan(%s).OrgPendingInvitationsMax() = %d, table = %d", p, got, want)
 		}
 	}
 }
