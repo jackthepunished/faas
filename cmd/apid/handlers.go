@@ -46,15 +46,9 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
-	// Phase 2 / Gate A (migration 00084): the placement chooser
-	// moved out of apid. apid is a pure intent-writer: it
-	// persists the apps row with node_id = NULL; schedd's
-	// PlacementClaimSubscriber atomically stamps the owner on
-	// NotifyAppChanged kind="created" via Engine.ClaimUnplaced.
-	// The depguard rule apid-control-plane-only forbids apid
-	// from importing pkg/sched; this is the architectural shape
-	// the rule enforces. See
-	// docs/adr/055-tier-a-per-node-schedd-and-placement.md.
+	// Phase 2 / Gate A: leave node_id NULL — schedd's
+	// PlacementClaimSubscriber stamps the owner (see emitAppCreated
+	// for the full architectural rationale + docs/adr/055).
 	app.NodeID = ""
 	// Deployed-app count quota + insert happen in the same critical
 	// section inside the store (PgStore: SELECT … FOR UPDATE on the
@@ -76,17 +70,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 		return
 	}
-	// CodeQL go/log-injection (CWE-117): created.Slug passes validSlug's
-	// regex check before persist (^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$),
-	// but CodeQL's taint engine doesn't model that sanitizer. Wrap the
-	// slug in logsanitize.Field so the audit line is one-event-per-line
-	// regardless of what a future refactor of validSlug does.
 	s.log.Info("app created", "app", created.ID, "slug", logsanitize.Field(created.Slug), "account", acct.ID)
-	// IAM-4 (issue #291): record the app creation. Runtime is
-	// omitted from the data map when empty (AppTypeApp has no
-	// runtime) so the row stays minimal. The audit row never
-	// reaches the structured-log sink, so logsanitize is not
-	// needed here — CodeQL go/log-injection only fires on slog.
 	s.audit.Emit(ctx(r), "app.created", &acct.ID, map[string]any{
 		"app_id":          created.ID,
 		"slug":            created.Slug,
@@ -95,16 +79,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"max_concurrency": created.MaxConcurrency,
 		"runtime":         created.Runtime,
 	})
-	// Phase 2 / Gate A (migration 00084): schedd reacts to this
-	// payload via pkg/sched.PlacementClaimSubscriber. The
-	// conditional UPDATE in Store.SetAppNodeID serialises N schedds
-	// into exactly one winner; losers drop silently. Failure here
-	// is best-effort: the cold-start sweep at schedd boot will
-	// reconcile an unplaced app on next restart.
-	if s.notif != nil {
-		_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
-			fmt.Sprintf(`{"kind":"created","slug":"%s","app_id":"%s"}`, created.Slug, created.ID))
-	}
+	s.emitAppCreated(ctx(r), created)
 	writeJSON(w, http.StatusCreated, s.appResponse(created))
 }
 
@@ -546,4 +521,36 @@ func egressStringList(prefixes []netip.Prefix) []string {
 		out = append(out, p.String())
 	}
 	return out
+}
+
+// emitAppCreated fires the Phase 2 / Gate A placement-claim notify
+// that schedd's PlacementClaimSubscriber consumes (migration 00084 +
+// ADR-055). The subscriber filters by payload.kind=="created", reads
+// apps.row.node_id == NULL (newly inserted), and runs
+// Engine.ClaimUnplaced to stamp the owner. The conditional UPDATE in
+// Store.SetAppNodeID serialises N schedds into exactly one winner;
+// losers drop silently.
+//
+// Failure here is best-effort: the cold-start sweep at schedd boot
+// (cmd/schedd/main.go's ListUnplacedApps + ClaimUnplaced pass)
+// reconciles an unplaced app on next restart, so a transient
+// Postgres notify outage is bounded to "reboot picks it up" rather
+// than "app never gets owned".
+//
+// Both fields are server-validated before persist (validSlug regex,
+// server-generated app.ID UUID), so the JSON interpolation is safe
+// even without explicit escaping — the team's pattern, mirrored from
+// the existing updateApp emit (handlers_ext.go).
+func (s *server) emitAppCreated(ctx context.Context, created state.App) {
+	if s.notif == nil {
+		return
+	}
+	// codeql[go/log-injection] false-positive: created.Slug passes
+	// validSlug's regex (^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$) at
+	// buildApp() before INSERT; created.ID is a server-generated
+	// UUID. The interpolation cannot reach a control character
+	// or quote. Suppression placed at column 1 per the team's
+	// pattern (memory: codeql-suppression-column1).
+	_ = s.notif.Notify(ctx, db.NotifyAppChanged,
+		fmt.Sprintf(`{"kind":"created","slug":"%s","app_id":"%s"}`, created.Slug, created.ID))
 }

@@ -372,6 +372,33 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return cli, true, nil
 		})
 
+	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
+	// active fleet. Single-box posture (only default-local active)
+	// keeps the legacy fallback — every app is owned by the local
+	// schedd, so a transient resolver miss is harmless. Multi-box
+	// posture (any non-default-local active row) DISABLES the
+	// fallback — b.sched is the legacy default-local dial and would
+	// return FailedPrecondition for any foreign-owned app on transient
+	// miss, surfacing as a 503 storm (PR #509 review finding F1).
+	//
+	// The posture check runs once at startup; subsequent compute_node
+	// changes that flip the posture are out of scope (an operator
+	// adding a second box restarts gatewayd alongside schedd).
+	if nodes, err := pgStore.ActiveComputeNodes(ctx); err == nil {
+		multiBox := false
+		for _, n := range nodes {
+			if n.Name != "default-local" {
+				multiBox = true
+				break
+			}
+		}
+		backend.WithLegacySingleBox(!multiBox)
+		log.Info("gatewayd: schedd posture", "legacy_single_box", !multiBox, "active_nodes", len(nodes))
+	} else {
+		log.Warn("gatewayd: schedd posture probe failed; defaulting to legacy single-box fallback", "err", err)
+		backend.WithLegacySingleBox(true)
+	}
+
 	// Keep the routing + target caches fresh from apid/schedd's pg_notify
 	// stream (spec §4.1): an instance state change evicts the app's cached
 	// target so the next request re-resolves via an idempotent wake; an app or

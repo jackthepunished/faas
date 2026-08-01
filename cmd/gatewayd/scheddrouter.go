@@ -44,6 +44,7 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
@@ -86,9 +87,12 @@ type ScheddNodeResolver interface {
 // transient blip cleared).
 //
 // Concurrency: the cache map is mutex-guarded. Lookups and inserts
-// take RLock / Lock respectively; the dial happens under Lock so two
-// concurrent first-lookups for the same node don't race a double
-// dial. Eviction takes Lock + closes the old client.
+// take RLock / Lock respectively. The dial happens under a
+// singleflight key so two concurrent first-lookups for the same
+// node collapse to one dial AND so a slow dial to one node does
+// NOT block dials to other nodes (the lock is released before
+// entering the singleflight call). Eviction takes Lock + closes
+// the old client.
 //
 // Legacy single-box posture: a fleet with only default-local lands
 // here with one entry (the synthetic row seeded by migration
@@ -100,8 +104,9 @@ type scheddRouter struct {
 	dialer ScheddDialer
 	log    *slog.Logger
 
-	mu    sync.Mutex
-	cache map[string]scheddgrpc.ScheddClient
+	mu     sync.Mutex
+	cache  map[string]scheddgrpc.ScheddClient
+	dialSF singleflight.Group
 }
 
 // newScheddRouter wires the production cache. store must be
@@ -175,6 +180,13 @@ func (r *scheddRouter) ScheddForInstance(ctx context.Context, instanceID string)
 // ScheddForApp / ScheddForInstance. Looks up the compute_node row
 // (so a row mutation / deactivation is visible immediately), reads
 // its ScheddTargetURL, and dials on first miss.
+//
+// Concurrency note: the cache lock is released before the dial so
+// a slow handshake to one node does not block fast handshakes to
+// other nodes. singleflight (r.dialSF.Do) collapses concurrent
+// first-lookups for the SAME node to one dial — without it, a
+// fleet where every Wake lands on a freshly-promoted box would
+// race N concurrent dials against the same target.
 func (r *scheddRouter) clientForNode(ctx context.Context, nodeID string) (scheddgrpc.ScheddClient, error) {
 	r.mu.Lock()
 	if c, ok := r.cache[nodeID]; ok {
@@ -183,28 +195,39 @@ func (r *scheddRouter) clientForNode(ctx context.Context, nodeID string) (schedd
 	}
 	r.mu.Unlock()
 
-	// Materialise under Lock so two concurrent first-lookups for the
-	// same node don't race a double dial. The cost is one extra DB
-	// round-trip per (cold node_id, request) — acceptable since
-	// node ids are single-digit per fleet.
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, ok := r.cache[nodeID]; ok {
+	v, err, _ := r.dialSF.Do(nodeID, func() (any, error) {
+		// Re-check inside the singleflight slot too: by the time we
+		// land here, another caller may have raced the cache insert.
+		r.mu.Lock()
+		if c, ok := r.cache[nodeID]; ok {
+			r.mu.Unlock()
+			return c, nil
+		}
+		r.mu.Unlock()
+
+		n, err := r.store.ComputeNodeByID(ctx, nodeID)
+		if err != nil {
+			return nil, fmt.Errorf("scheddrouter: resolve compute_node %s: %w", nodeID, err)
+		}
+		if n.ScheddTargetURL == nil || *n.ScheddTargetURL == "" {
+			return nil, fmt.Errorf("scheddrouter: compute_node %s (%s) has no schedd_target_url configured", n.ID, n.Name)
+		}
+		c, err := r.dialer(ctx, *n.ScheddTargetURL, r.tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("scheddrouter: dial schedd for node %s (%s): %w", n.ID, n.Name, err)
+		}
+		r.mu.Lock()
+		// Single-flighted insert: every concurrent caller gets the
+		// same c pointer back via v, but the cache map takes Lock
+		// here so the insert is atomic w.r.t. Evict.
+		r.cache[nodeID] = c
+		r.mu.Unlock()
 		return c, nil
-	}
-	n, err := r.store.ComputeNodeByID(ctx, nodeID)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("scheddrouter: resolve compute_node %s: %w", nodeID, err)
+		return nil, err
 	}
-	if n.ScheddTargetURL == nil || *n.ScheddTargetURL == "" {
-		return nil, fmt.Errorf("scheddrouter: compute_node %s (%s) has no schedd_target_url configured", n.ID, n.Name)
-	}
-	c, err := r.dialer(ctx, *n.ScheddTargetURL, r.tlsCfg)
-	if err != nil {
-		return nil, fmt.Errorf("scheddrouter: dial schedd for node %s (%s): %w", n.ID, n.Name, err)
-	}
-	r.cache[nodeID] = c
-	return c, nil
+	return v.(scheddgrpc.ScheddClient), nil
 }
 
 // Evict drops the cached client for nodeID. Called by the
