@@ -333,10 +333,14 @@ func (s *server) scanService(
 	// capturedProb tracks whether we already wrapped the
 	// reconcile error; the defer fires BEFORE the return
 	// statement so rollback runs first.
+	//
+	// rollbackCtx is captured explicitly so the defer closure
+	// doesn't extend the lifetime of r (contextcheck linter).
+	rollbackCtx := r.Context()
 	var capturedProb *api.Problem
 	defer func() {
 		if capturedProb != nil && project.ID != "" {
-			if dErr := s.store.DeleteProject(r.Context(), project.ID); dErr != nil {
+			if dErr := s.store.DeleteProject(rollbackCtx, project.ID); dErr != nil {
 				// Best-effort: a DeleteProject failure doesn't
 				// mask the underlying reconcile error the
 				// caller is returning. The DeleteProject's own

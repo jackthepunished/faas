@@ -191,8 +191,12 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 	// kind=created fires for Added; kind=updated fires for Changed.
 	// The latter keeps schedd in sync if a workload's RootDir /
 	// WorkloadName / StartCommand drifted across two applies.
+	//
+	// ctx is captured explicitly so the closure doesn't extend
+	// the lifetime of r (contextcheck linter).
+	notifyCtx := r.Context()
 	notifyApp := func(a state.App, kind string) {
-		_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
+		_ = s.notif.Notify(notifyCtx, db.NotifyAppChanged,
 			fmt.Sprintf(`{"kind":%q,"app_id":"%s","project_id":"%s"}`,
 				kind, a.ID, insertedProject.ID))
 	}
