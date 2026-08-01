@@ -36,7 +36,7 @@ type App struct {
 	// resolves at startup (Phase 2 / Gate A). Populated by
 	// pgRouter.toApp / the AppResolver closure from apps.node_id;
 	// empty on the pre-migration single-box install where
-	// apps.node_id was added by migration 00083. Tests that
+	// apps.node_id was added by migration 00090. Tests that
 	// don't exercise the per-schedd routing path leave it zero.
 	NodeID string
 }

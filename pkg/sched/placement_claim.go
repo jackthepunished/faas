@@ -1,7 +1,7 @@
 package sched
 
 // pkg/sched/placement_claim.go — schedd-side async placement claim
-// (Phase 2 / Gate A, migration 00084).
+// (Phase 2 / Gate A, migration 00091).
 //
 // Architectural note: the original plan placed the chooser inside
 // cmd/apid (cmd/apid/placement.go). The depguard rule

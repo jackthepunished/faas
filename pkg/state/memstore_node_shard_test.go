@@ -45,7 +45,7 @@ func memNodeShardFixture(t *testing.T) (*MemStore, context.Context, Account, App
 		t.Fatal(err)
 	}
 	// claimed: placement chooser (legacy) or schedd's claim
-	// subscriber (post-00084) stamps NodeID before any test sees it.
+	// subscriber (post-00091) stamps NodeID before any test sees it.
 	claimed, err := m.CreateApp(ctx, App{
 		AccountID: account.ID, Slug: "claimed-" + uuid.NewString(),
 		RAMMB: 256, Status: AppActive,

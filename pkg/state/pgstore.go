@@ -665,8 +665,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// project_id IS NOT NULL, a project-bound insert must carry both
 	// columns and a non-project insert lands with (NULL, '') which the
 	// index filters out.
-	// node_id (migration 00083, Phase 2 / Gate A): nullable FK to
-	// compute_nodes(id) + empty-uuid CHECK (migration 00084 relaxed
+	// node_id (migration 00090, Phase 2 / Gate A): nullable FK to
+	// compute_nodes(id) + empty-uuid CHECK (migration 00091 relaxed
 	// NOT NULL → nullable so schedd's PlacementClaimSubscriber can
 	// stamp the owner asynchronously — pkg/sched/placement_claim.go).
 	// apid inserts with node_id = NULL and emits NotifyAppChanged
@@ -785,10 +785,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// collides with the prior row. project_id is nullable (empty →
 	// NULL via nullString); workload_name is NOT NULL DEFAULT '' so
 	// the empty string stays as '' (matches the v1 default).
-	// node_id (migration 00083, Phase 2 / Gate A): nullable FK +
-	// empty-uuid CHECK (migration 00084 relaxed NOT NULL so schedd's
+	// node_id (migration 00090, Phase 2 / Gate A): nullable FK +
+	// empty-uuid CHECK (migration 00091 relaxed NOT NULL so schedd's
 	// PlacementClaimSubscriber can stamp the owner asynchronously).
-	// See CreateApp for the post-00084 contract — pgx passes nil for
+	// See CreateApp for the post-00091 contract — pgx passes nil for
 	// the empty string so the column defaults to NULL.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13)
@@ -838,7 +838,7 @@ func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
 }
 
 // ListAppsByNodeID returns every non-deleted app whose owner is the
-// given compute_nodes.id (Phase 2 / Gate A, migration 00083). This is
+// given compute_nodes.id (Phase 2 / Gate A, migration 00090). This is
 // the schedd's own list: the reaper, the cron dispatcher, the
 // scale-up trigger, and the watchdog all want "apps I'm responsible
 // for", not "apps on this account". The apps_node_id_idx index makes
@@ -907,8 +907,8 @@ func (s *PgStore) ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]
 
 // ListUnplacedApps returns every non-deleted app whose node_id is
 // NULL — the cold-start sweep input for schedd's
-// PlacementClaimSubscriber (Phase 2 / Gate A migration 00084). The
-// post-00084 schema allows node_id NULL at insert time so apid can
+// PlacementClaimSubscriber (Phase 2 / Gate A migration 00091). The
+// post-00091 schema allows node_id NULL at insert time so apid can
 // INSERT a fresh app with the owner undecided; schedd races to
 // stamp the owner on NotifyAppChanged "created". This method is
 // the cold-start sweep path that handles a schedd that was down
@@ -6973,7 +6973,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 // The 3 trailing columns (scaling_policy, last_scale_out_at,
 // last_scale_in_at) are the issue #462 / ADR-058 PR-A additions. The
 // trailing node_id column is the Phase 2 / Gate A shard key
-// (migration 00083); apps.node_id is NOT NULL after backfill + the
+// (migration 00090); apps.node_id is NOT NULL after backfill + the
 // empty-uuid CHECK, set once at CreateApp time by apid's
 // PlacementScheduler. Keep this const and the App struct aligned:
 // adding a column touches both.

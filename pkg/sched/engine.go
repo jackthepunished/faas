@@ -1316,10 +1316,10 @@ func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placemen
 }
 
 // ClaimUnplaced is the schedd-side async placement claim
-// (Phase 2 / Gate A migration 00084 — apps.node_id nullable).
+// (Phase 2 / Gate A migration 00091 — apps.node_id nullable).
 //
 // Called by pkg/sched.PlacementClaimSubscriber when apid emits a
-// NotifyAppChanged "created" event. The post-00084 schema lets
+// NotifyAppChanged "created" event. The post-00091 schema lets
 // apid insert with node_id = NULL; every schedd races to stamp
 // the owner via Store.SetAppNodeID, whose conditional UPDATE
 // serialises N schedds into exactly one winner.

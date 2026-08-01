@@ -547,7 +547,7 @@ type Store interface {
 	// legacy one-box schedd posture.
 	ListAllApps(ctx context.Context) ([]App, error)
 	// ListAppsByNodeID returns every non-deleted app whose owner_node
-	// matches nodeID (Phase 2 / Gate A, migration 00083). The schedd
+	// matches nodeID (Phase 2 / Gate A, migration 00090). The schedd
 	// that resolves to nodeID at startup calls this on every reaper /
 	// scale-up tick. Default-local is a valid nodeID — the single-box
 	// schedd reads the same shape as a peer schedd.
@@ -566,8 +566,8 @@ type Store interface {
 	ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error)
 	// ListUnplacedApps returns every non-deleted app whose node_id is
 	// NULL — the input set for schedd's PlacementClaimSubscriber
-	// (pkg/sched/placement_claim.go, Phase 2 / Gate A migration 00084).
-	// The post-00084 schema allows node_id NULL at insert time so apid
+	// (pkg/sched/placement_claim.go, Phase 2 / Gate A migration 00091).
+	// The post-00091 schema allows node_id NULL at insert time so apid
 	// can INSERT a fresh app with the owner undecided; schedd races to
 	// stamp the owner on NotifyAppChanged "created". This method is the
 	// cold-start sweep path that handles a schedd that was down while a

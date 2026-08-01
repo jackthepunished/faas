@@ -306,7 +306,7 @@ type App struct {
 	LastScaleInAt  *time.Time
 	CreatedAt      time.Time
 	// NodeID is the durable shard key that ties an app to its
-	// owner compute_node (Phase 2 / Gate A, migration 00083).
+	// owner compute_node (Phase 2 / Gate A, migration 00090).
 	// Set once at CreateApp time by apid's PlacementScheduler
 	// and immutable post-create — no PATCH path mutates it.
 	// Every schedd gRPC handler enforces the owner match via
@@ -1065,7 +1065,7 @@ type ComputeNode struct {
 	// tie-break after (headroom DESC, region ASC, name ASC).
 	Zone *string
 	// ScheddTargetURL is the per-node schedd gRPC dial target
-	// (Phase 2 / Gate A, migration 00083). Distinct from
+	// (Phase 2 / Gate A, migration 00090). Distinct from
 	// TargetURL which is the vmmd dial target. gatewayd reads
 	// this to lazily dial the owner schedd for a customer
 	// request; the per-node dial cache is keyed by node_id and
@@ -1075,7 +1075,7 @@ type ComputeNode struct {
 	// cache. The CHECK constraint on the column admits only
 	// (unix|tcp):// schemes (the wire.ParseTarget shape). The
 	// synthetic default-local row is backfilled to
-	// 'unix:///run/faas/schedd.sock' by migration 00083 so
+	// 'unix:///run/faas/schedd.sock' by migration 00090 so
 	// single-box installs preserve bit-for-bit behaviour.
 	ScheddTargetURL *string
 }

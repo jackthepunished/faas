@@ -720,7 +720,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// apps/instances. Empty owner = legacy single-box posture
 	// (list everything). Non-empty = per-node slice via the
 	// apps_node_id_idx / instances_app_id_idx joins added in
-	// migration 00083.
+	// migration 00090.
 	var apps []state.App
 	var err error
 	if owner := l.engine.OwnerNodeID(); owner != "" {

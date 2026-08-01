@@ -1,7 +1,7 @@
 package sched
 
 // Tests for the placement-claim subscriber (Phase 2 / Gate A,
-// migration 00084 — apps.node_id nullable). MemStore-backed, no
+// migration 00091 — apps.node_id nullable). MemStore-backed, no
 // Postgres required.
 //
 //   1. TestClaimUnplaced_SuccessClaimsApp: a fresh app with
@@ -43,7 +43,7 @@ func TestClaimUnplaced_SuccessClaimsApp(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanHobby, 256, 2)
 	if app.NodeID != "" {
-		t.Fatalf("seedApp: app.NodeID = %q, want empty (post-00084 contract)", app.NodeID)
+		t.Fatalf("seedApp: app.NodeID = %q, want empty (post-00091 contract)", app.NodeID)
 	}
 	vmm := &fakeVMM{}
 	notif := &fakeNotifier{}

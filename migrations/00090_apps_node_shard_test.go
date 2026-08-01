@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00083 (apps.node_id + compute_nodes.schedd_target_url,
+// Migration-apply tests for 00090 (apps.node_id + compute_nodes.schedd_target_url,
 // Phase 2 / Gate A — durable app owner per compute node).
 //
 // Pins the Phase 2 acceptance gate verbatim:
-// <the migration set applies cleanly through 00083; the apps
+// <the migration set applies cleanly through 00090; the apps
 // owner column is FK + NOT NULL + empty-uuid CHECK + indexed;
 // compute_nodes carries the schedd dial target separately
 // from the vmmd dial target; default-local is backfilled on
@@ -26,7 +26,7 @@
 //	   scheme, the CHECK is the tripwire.
 //	5. The default-local row seeded by migration 00024
 //	   carries schedd_target_url = 'unix:///run/faas/schedd.sock'
-//	   after 00083 applies — the single-box posture is
+//	   after 00090 applies — the single-box posture is
 //	   preserved bit-for-bit.
 //	6. Existing apps are backfilled to the default-local
 //	   row (NOT NULL with a real FK target), not the empty
@@ -58,17 +58,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00083_1_AppsNodeIDColumnShape pins the
-// apps.node_id column shape after 00083 applies (and after 00084
+// TestMigration_00090_1_AppsNodeIDColumnShape pins the
+// apps.node_id column shape after 00090 applies (and after 00091
 // has relaxed NOT NULL). data_type=uuid + is_nullable=YES. The
 // relaxation from NO→YES is the Phase 2 / Gate A claim path
-// (migration 00084): apid can INSERT with node_id = NULL and
+// (migration 00091): apid can INSERT with node_id = NULL and
 // schedd's PlacementClaimSubscriber stamps it asynchronously.
 // The empty-uuid CHECK (apps_node_id_nonempty_chk) stays in
 // force — the relaxation is "NULL is legal", not "any value
 // is legal". Any drift (e.g. someone typing text instead of
-// uuid, or re-tightening NOT NULL post-00084) fails loud.
-func TestMigration_00083_1_AppsNodeIDColumnShape(t *testing.T) {
+// uuid, or re-tightening NOT NULL post-00091) fails loud.
+func TestMigration_00090_1_AppsNodeIDColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -89,7 +89,7 @@ func TestMigration_00083_1_AppsNodeIDColumnShape(t *testing.T) {
 		t.Errorf("apps.node_id data_type = %q, want %q", dtype, "uuid")
 	}
 	if nullable != "YES" {
-		t.Errorf("apps.node_id is_nullable = %q, want %q (post-00084 relaxation)", nullable, "YES")
+		t.Errorf("apps.node_id is_nullable = %q, want %q (post-00091 relaxation)", nullable, "YES")
 	}
 
 	// Constraint presence: both apps_node_id_fkey and
@@ -137,12 +137,12 @@ func TestMigration_00083_1_AppsNodeIDColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_2_ScheddTargetURLColumnShape pins the
+// TestMigration_00090_2_ScheddTargetURLColumnShape pins the
 // compute_nodes.schedd_target_url column shape. text + nullable
 // (the new column starts nullable; the default-local row gets
 // the unix socket via a backfill UPDATE — operator-added
 // compute_nodes rows must explicitly set the column).
-func TestMigration_00083_2_ScheddTargetURLColumnShape(t *testing.T) {
+func TestMigration_00090_2_ScheddTargetURLColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -167,7 +167,7 @@ func TestMigration_00083_2_ScheddTargetURLColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_3_EmptyUUIDCheck pins the defensive
+// TestMigration_00090_3_EmptyUUIDCheck pins the defensive
 // empty-uuid CHECK. A future operator that tries to upsert
 // node_id = '00000000-0000-0000-0000-000000000000' must hit
 // SQLSTATE 23514 (check_violation), not silently bind an
@@ -176,7 +176,7 @@ func TestMigration_00083_2_ScheddTargetURLColumnShape(t *testing.T) {
 // app + node pair to exercise the CHECK on a non-default
 // branch — the empty-uuid path is the only path the CHECK
 // forbids.
-func TestMigration_00083_3_EmptyUUIDCheck(t *testing.T) {
+func TestMigration_00090_3_EmptyUUIDCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -241,13 +241,13 @@ func TestMigration_00083_3_EmptyUUIDCheck(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_4_ScheddTargetURLSchemeCheck pins the
+// TestMigration_00090_4_ScheddTargetURLSchemeCheck pins the
 // scheme CHECK on compute_nodes.schedd_target_url. Operators
 // that set the column to anything other than a unix:// or
 // tcp:// URL must hit 23514. A value of NULL is fine (the
 // column is nullable; legacy operator-added rows with no
 // schedd yet are a valid state until the daemon starts).
-func TestMigration_00083_4_ScheddTargetURLSchemeCheck(t *testing.T) {
+func TestMigration_00090_4_ScheddTargetURLSchemeCheck(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -304,15 +304,15 @@ func TestMigration_00083_4_ScheddTargetURLSchemeCheck(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_5_DefaultLocalBackfill pins the
+// TestMigration_00090_5_DefaultLocalBackfill pins the
 // load-bearing single-box backfill. Migration 00024 seeded a
-// synthetic default-local row; after 00083 applies, that row
+// synthetic default-local row; after 00090 applies, that row
 // carries schedd_target_url = 'unix:///run/faas/schedd.sock'
 // via the migration's UPDATE. Hard-fail on missing row: the
 // contract this test depends on is "every fresh-DB apply
 // ends with a default-local row carrying the canonical unix
 // socket schedd dial target".
-func TestMigration_00083_5_DefaultLocalBackfill(t *testing.T) {
+func TestMigration_00090_5_DefaultLocalBackfill(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -332,7 +332,7 @@ func TestMigration_00083_5_DefaultLocalBackfill(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_6_AppsBackfilledToDefaultLocal pins
+// TestMigration_00090_6_AppsBackfilledToDefaultLocal pins
 // the apps backfill contract. Every pre-Phase-2 app row is
 // backfilled to the default-local node. Hard-fail on any
 // row still at NULL or at the empty uuid (which the CHECK
@@ -340,7 +340,7 @@ func TestMigration_00083_5_DefaultLocalBackfill(t *testing.T) {
 // could conceivably land at the empty uuid if the migration
 // author got the order wrong). The test queries every apps
 // row and asserts node_id = (default-local's id).
-func TestMigration_00083_6_AppsBackfilledToDefaultLocal(t *testing.T) {
+func TestMigration_00090_6_AppsBackfilledToDefaultLocal(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -386,7 +386,7 @@ func TestMigration_00083_6_AppsBackfilledToDefaultLocal(t *testing.T) {
 	// default-local".
 }
 
-// TestMigration_00083_7_ReplaySafe pins the idempotency
+// TestMigration_00090_7_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — every
 // ADD COLUMN is IF NOT EXISTS, every constraint add is
 // paired with a DROP IF EXISTS in the down block, the
@@ -396,7 +396,7 @@ func TestMigration_00083_6_AppsBackfilledToDefaultLocal(t *testing.T) {
 // ADR-041 established; without it, a hot-reload of the
 // binary would 42710 ("column already exists") or 42P07
 // ("duplicate table") and refuse to boot.
-func TestMigration_00083_7_ReplaySafe(t *testing.T) {
+func TestMigration_00090_7_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -409,7 +409,7 @@ func TestMigration_00083_7_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00083_8_DownSymmetry pins the down path.
+// TestMigration_00090_8_DownSymmetry pins the down path.
 // MigrateDown to 00082 drops apps.node_id and
 // compute_nodes.schedd_target_url; MigrateUp re-creates
 // them; the schema round-trips cleanly. We drive the SQL
@@ -417,8 +417,8 @@ func TestMigration_00083_7_ReplaySafe(t *testing.T) {
 // pkg/db today), then re-apply the up body and assert the
 // columns + constraints come back. A non-symmetric down
 // would leave a broken schema on a release that needs to
-// roll back 00083 in isolation.
-func TestMigration_00083_8_DownSymmetry(t *testing.T) {
+// roll back 00090 in isolation.
+func TestMigration_00090_8_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
