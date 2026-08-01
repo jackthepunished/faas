@@ -287,19 +287,20 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	// PR-H: the response carries the reconcile Result, not a
-	// single deployment_id. PR-GH.5 (next commit) adds the
-	// build fan-out and the BuildIDs slice; this commit returns
-	// {status:queued, added:N, changed:N, removed:N} so the wire
-	// shape is forward-compatible with the fan-out payload.
-	touched := len(result.Added) + len(result.Changed) + len(result.Removed)
+	// PR-GH.5: the response carries the reconcile Result + the
+	// per-app build fan-out. The wire shape is:
+	//   {status: "queued", added: N, changed: N, removed: N,
+	//    build_ids: [...]} when the push reconciles + enqueues
+	// builds. The previous PR-GH.4 response shape
+	// ({status:queued, added:N, changed:N, removed:N}) is
+	// forward-compatible — build_ids is additive.
 	respBody, _ := json.Marshal(struct {
-		Status  string `json:"status"`
-		Added   int    `json:"added"`
-		Changed int    `json:"changed"`
-		Removed int    `json:"removed"`
-	}{Status: statusQueued, Added: len(result.Added), Changed: len(result.Changed), Removed: len(result.Removed)})
-	_ = touched
+		Status   string   `json:"status"`
+		Added    int      `json:"added"`
+		Changed  int      `json:"changed"`
+		Removed  int      `json:"removed"`
+		BuildIDs []string `json:"build_ids"`
+	}{Status: statusQueued, Added: len(result.Added), Changed: len(result.Changed), Removed: len(result.Removed), BuildIDs: result.BuildIDs})
 	_, _ = w.Write(respBody)
 	observe(nil)
 }

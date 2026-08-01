@@ -133,6 +133,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	webhookSvc.Installs = installsAdapter
 	webhookSvc.Source = source
 	webhookSvc.Reconcile = ghReconcile
+	// PR-GH.5: build fan-out. The noop enqueuer mints
+	// synthetic buildIDs so the wire contract is exercised
+	// end-to-end. The follow-up slice that wires the real
+	// builderd bridge swaps this in cmd/githubd/main.go
+	// without touching pkg/githubd.
+	webhookSvc.Enqueuer = githubd.NewNoopEnqueuer(log)
 
 	// Slice 8 RealService (OAuth + Checks). Auth may be nil if
 	// the GitHub App credentials aren't provisioned — the daemon

@@ -281,3 +281,137 @@ func TestWebhookHTTPHandler_IsLoopbackOnly(t *testing.T) {
 		t.Errorf("direct handler status = %d, want 501", rr.Code)
 	}
 }
+
+// recordingEnqueuer is the BuildEnqueuer stub for PR-GH.5
+// fan-out tests. It records every call and returns the
+// configured buildID (or error).
+type recordingEnqueuer struct {
+	buildID string
+	err     error
+	calls   []enqueueCall
+}
+
+type enqueueCall struct {
+	accountID string
+	appID     string
+	commitSHA string
+}
+
+func (r *recordingEnqueuer) Enqueue(_ context.Context, accountID, appID, commitSHA string) (string, error) {
+	r.calls = append(r.calls, enqueueCall{accountID: accountID, appID: appID, commitSHA: commitSHA})
+	if r.err != nil {
+		return "", r.err
+	}
+	return r.buildID, nil
+}
+
+// TestHandlePushRequest_FanOut_HappyPath is the PR-GH.5
+// gate. The stub Scan returns one Tier-1 workload, so the
+// reconcile populates Result.Added with one app. The fan-out
+// must enqueue exactly one build with the right (accountID,
+// appID, commitSHA) triple.
+func TestHandlePushRequest_FanOut_HappyPath(t *testing.T) {
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
+	rig.seedProject(t, "octo/api", "main")
+	svc := newServiceForRig(rig)
+	enq := &recordingEnqueuer{buildID: "build-1"}
+	svc.Enqueuer = enq
+	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+
+	result, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(enq.calls) != 1 {
+		t.Fatalf("enqueue calls = %d, want 1", len(enq.calls))
+	}
+	if len(result.BuildIDs) != 1 || result.BuildIDs[0] != "build-1" {
+		t.Errorf("result.BuildIDs = %v, want [build-1]", result.BuildIDs)
+	}
+	if enq.calls[0].commitSHA != "sha-1" {
+		t.Errorf("enqueue commitSHA = %q, want sha-1", enq.calls[0].commitSHA)
+	}
+	if enq.calls[0].accountID != rig.acct {
+		t.Errorf("enqueue accountID = %q, want %q", enq.calls[0].accountID, rig.acct)
+	}
+}
+
+// TestHandlePushRequest_FanOut_EmptyBuilds_NoEnqueue:
+// the reconcile returns no Added/Changed (nothing to deploy)
+// so the fan-out is a no-op. The HTTP response carries
+// build_ids: [].
+func TestHandlePushRequest_FanOut_EmptyBuilds_NoEnqueue(t *testing.T) {
+	// Empty scan triggers the never-empty alert via
+	// Result.Alerts — no app rows added. The fan-out sees
+	// an empty Added+Changed list and does not enqueue.
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{Workloads: nil, Managed: nil, Tier: 1}, nil
+	})
+	rig.seedProject(t, "octo/api", "main")
+	svc := newServiceForRig(rig)
+	enq := &recordingEnqueuer{buildID: "build-1"}
+	svc.Enqueuer = enq
+	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+
+	result, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(enq.calls) != 0 {
+		t.Errorf("enqueue calls = %d, want 0 (no apps touched)", len(enq.calls))
+	}
+	if len(result.BuildIDs) != 0 {
+		t.Errorf("result.BuildIDs = %v, want []", result.BuildIDs)
+	}
+}
+
+// TestHandlePushRequest_FanOut_EnqueueError_SoftFail drives
+// the partial-success path. The reconcile returns one
+// added app, the enqueuer returns an error. The push is
+// still successful (200 OK with empty build_ids); the
+// error is logged but not propagated. This is the
+// "best-effort fan-out" contract: failing the whole push
+// because one of N builds was rejected is worse for the
+// customer than logging + continuing.
+func TestHandlePushRequest_FanOut_EnqueueError_SoftFail(t *testing.T) {
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
+	rig.seedProject(t, "octo/api", "main")
+	svc := newServiceForRig(rig)
+	enq := &recordingEnqueuer{err: errors.New("queue full")}
+	svc.Enqueuer = enq
+	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+
+	result, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest returned error: %v (must be soft-fail)", err)
+	}
+	if len(result.BuildIDs) != 0 {
+		t.Errorf("result.BuildIDs = %v, want [] (enqueue failed)", result.BuildIDs)
+	}
+}
+
+// TestNoopEnqueuer_SyntheticID pins the noop enqueuer's
+// deterministic-but-unique-per-(appID, commitSHA) ID. The
+// ID is opaque to the caller but must differ across both
+// axes so the build log can correlate to the push.
+func TestNoopEnqueuer_SyntheticID(t *testing.T) {
+	e := NewNoopEnqueuer(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	id1, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-1")
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	id2, err := e.Enqueue(context.Background(), "acct-1", "app-2", "sha-1")
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if id1 == id2 {
+		t.Errorf("id1 == id2 (%q); different apps must produce different IDs", id1)
+	}
+	id3, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-2")
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if id1 == id3 {
+		t.Errorf("id1 == id3 (%q); different commits must produce different IDs", id1)
+	}
+}

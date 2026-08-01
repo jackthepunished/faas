@@ -66,13 +66,17 @@ type WriteCheck func(ctx context.Context, repoFullName, commitSHA string, phase 
 // every dependency is wired). The Reconcile + Source + Installs
 // fields are required for HandlePushRequest to reach the
 // reconcile step; the production wiring in cmd/githubd sets
-// all three from a single boot path.
+// all three from a single boot path. The Enqueuer field is
+// the PR-GH.5 build fan-out seam; nil falls back to a
+// noopEnqueuer so the unit tests don't have to wire an
+// enqueuer just to exercise the reconcile path.
 type Service struct {
 	Log        *slog.Logger
 	Bindings   AppBindingStore
 	Installs   InstallsLookup
 	Source     SourceFetcher
 	Reconcile  *reconcile.Service
+	Enqueuer   BuildEnqueuer
 	WriteCheck WriteCheck
 }
 
@@ -205,7 +209,40 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 		return result, ErrIgnored
 	}
 
-	// 6. Best-effort: queue the queued check on GitHub. Errors
+	// 6. Build fan-out (PR-GH.5). Rebuild every app in
+	// Result.Added ∪ Result.Changed. The slice is freshly
+	// allocated so the caller's view of Result isn't mutated
+	// by the enqueue loop.
+	//
+	// NAIVE FAN-OUT (per ADR-050): path-filtered follow-up
+	// (compare/{base}...{head} per push) is deferred. v1.0
+	// volumes run fine with full fan-out; the §12 dashboard
+	// has a dedicated counter for enqueue throughput so the
+	// follow-up work is observable.
+	enqueuer := s.Enqueuer
+	if enqueuer == nil {
+		enqueuer = NewNoopEnqueuer(s.Log)
+	}
+	touched := make([]state.App, 0, len(result.Added)+len(result.Changed))
+	touched = append(touched, result.Added...)
+	touched = append(touched, result.Changed...)
+	buildIDs := make([]string, 0, len(touched))
+	for _, app := range touched {
+		bid, err := enqueuer.Enqueue(ctx, project.AccountID, app.ID, ev.After)
+		if err != nil {
+			// Best-effort: log + continue. The webhook
+			// contract is 200 OK with the partial build_ids
+			// list; failing the whole push because one of
+			// 50 builds was rejected is worse for the
+			// customer.
+			s.Log.Warn("githubd: enqueue build", "app_id", app.ID, "err", err, "repo", ev.Repository.FullName, "sha", ev.After)
+			continue
+		}
+		buildIDs = append(buildIDs, bid)
+	}
+	result.BuildIDs = buildIDs
+
+	// 7. Best-effort: queue the queued check on GitHub. Errors
 	// here don't block the deploy from being recorded locally.
 	if s.WriteCheck != nil {
 		if werr := s.WriteCheck(ctx, ev.Repository.FullName, ev.After, githubdgrpc.CheckPhaseQueued); werr != nil {
@@ -216,7 +253,8 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 		"repo", ev.Repository.FullName, "branch", branch,
 		"sha", ev.After, "binding", binding.BindingID,
 		"added", len(result.Added), "changed", len(result.Changed),
-		"removed", len(result.Removed), "pusher", ev.Pusher.Name)
+		"removed", len(result.Removed), "builds", len(buildIDs),
+		"pusher", ev.Pusher.Name)
 	return result, nil
 }
 
