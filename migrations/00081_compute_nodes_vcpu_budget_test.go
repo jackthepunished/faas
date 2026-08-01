@@ -182,6 +182,14 @@ func TestMigration_00081_4_DefaultBackfill(t *testing.T) {
 // carries vcpu_budget=160 via the column default without
 // operator action. (We can't predict the synthetic row's id on
 // a fresh DB, so we look it up by name.)
+//
+// Hard-fail on missing row: the contract this test depends on
+// is "every fresh-DB apply ends with a default-local row".
+// A skip would mask a regression where 00024's seed was dropped
+// or 00081's backfill skipped the row entirely. pgtest.Open
+// runs the full migration set, so the row is always present on a
+// clean run; a missing row is a real bug, not a test-rig
+// limitation.
 func TestMigration_00081_5_DefaultLocalRowBackfill(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
@@ -195,11 +203,7 @@ func TestMigration_00081_5_DefaultLocalRowBackfill(t *testing.T) {
 		 limit 1
 	`).Scan(&got)
 	if err != nil {
-		// If no default-local row exists (test schema was
-		// created without the 00024 seed), skip — most pgtest
-		// Open paths seed the full migration set, so this
-		// should be unreachable on a clean run.
-		t.Skipf("default-local row not present in this schema (err=%v); a separate pgtest setup likely bypassed 00024", err)
+		t.Fatalf("default-local row not present in this schema (err=%v); migration 00024's seed is missing — pgtest.Open should run the full migration set", err)
 	}
 	if got != 160 {
 		t.Errorf("default-local vcpu_budget = %d, want 160 (single-box backwards-compat)", got)

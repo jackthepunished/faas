@@ -194,6 +194,12 @@ type Engine struct {
 	// table keep their existing single-box behaviour.
 	capacityTable *nodeCapacityTable
 
+	// now is the clock source for the chooser's freshness check
+	// (applyLiveCapacityMB). Defaults to time.Now inside NewEngine.
+	// Tests override via `Engine.now = func() time.Time { return ... }`
+	// to fast-forward the CapacityFreshness budget without sleeping.
+	now func() time.Time
+
 	// nodeKeys is the in-memory (key_id → *ecdsa.PublicKey)
 	// registry the ReportCapacity handler consults to verify
 	// the report's node_signature (ADR-053). Populated by the
@@ -274,6 +280,7 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		appMu:           map[string]*sync.Mutex{},
 		warmBroadcaster: newWarmHintBroadcaster(),
 		capacityTable:   newNodeCapacityTable(),
+		now:             time.Now, // tests override post-construction
 	}
 	// Resolve default-local. Use a bounded context so a wedged DB
 	// doesn't block the daemon's boot forever — the watchdog goroutine
@@ -1101,7 +1108,11 @@ func (e *Engine) applyLiveCapacityMB(_ context.Context, nodeID string) int64 {
 	if e == nil || e.capacityTable == nil {
 		return 0
 	}
-	live, ok := e.capacityTable.Lookup(nodeID, time.Now())
+	now := time.Now
+	if e.now != nil {
+		now = e.now
+	}
+	live, ok := e.capacityTable.Lookup(nodeID, now())
 	if !ok {
 		return 0
 	}
@@ -1134,30 +1145,35 @@ func (e *Engine) choosePlacementLocked(ctx context.Context, r Request) (Placemen
 	if err != nil {
 		return Placement{}, fmt.Errorf("sched: placement: list active compute_nodes: %w", err)
 	}
+	// One pass over the fleet — read each node's live-or-store UsedMB
+	// (Tier A1) and the ledger's per-node UsedVCPU (Tier A2) in
+	// lockstep. The two reads are independent (the live table is a
+	// vmmd-side cgroup mirror, the ledger is schedd's local
+	// reservations), so the lockstep is just a fusion of two
+	// contiguous maps for the chooser. The chooser enforces them
+	// independently downstream.
 	usedMB := make(map[string]int64, len(nodes))
+	usedVCPU := make(map[string]int64, len(nodes))
 	for _, n := range nodes {
 		if used := e.applyLiveCapacityMB(ctx, n.ID); used > 0 {
 			usedMB[n.ID] = used
-			continue
+		} else {
+			// No live report (table miss / stale) or live says zero:
+			// fall through to the store sum. A single node's transient
+			// store error must not block placement of the rest; the
+			// next wake re-reads; a permanent failure surfaces there.
+			used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
+			if err != nil {
+				e.log.Warn("sched: placement: compute node used_mb read failed",
+					"node_id", n.ID, "node_name", n.Name, "err", err)
+				used = 0
+			}
+			usedMB[n.ID] = used
 		}
-		// No live report (table miss / stale) or live says zero:
-		// fall through to the store sum. A single node's transient
-		// store error must not block placement of the rest; the
-		// next wake re-reads; a permanent failure surfaces there.
-		used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
-		if err != nil {
-			e.log.Warn("sched: placement: compute node used_mb read failed",
-				"node_id", n.ID, "node_name", n.Name, "err", err)
-			used = 0
-		}
-		usedMB[n.ID] = used
-	}
-	// Tier A2: per-node vCPU accounting from the ledger. The
-	// chooser uses this to enforce compute_nodes.vcpu_budget
-	// per node; absent or zero is treated as 0 by the chooser
-	// (the per-node budget is the gate, not the absolute number).
-	usedVCPU := make(map[string]int64, len(nodes))
-	for _, n := range nodes {
+		// Tier A2: per-node vCPU is ledger-authoritative. The chooser
+		// uses this to enforce compute_nodes.vcpu_budget per node;
+		// absent or zero is treated as 0 by the chooser (the
+		// per-node budget is the gate, not the absolute number).
 		usedVCPU[n.ID] = int64(e.ledger.UsedVCPUForNode(n.ID))
 	}
 	return ChoosePlacement(nodes, usedMB, usedVCPU, r)

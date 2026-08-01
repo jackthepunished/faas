@@ -79,19 +79,34 @@ func TestApplyLiveCapacityMB_LiveWinsOverZero(t *testing.T) {
 // and the caller's "if used > 0" gate sends both to the store
 // path — the store returns 0 for an idle node, which is
 // equivalent.)
+//
+// The clock is injected via Engine.now (set in newEngine) so this
+// test does not block on a real time.Sleep. The previous test
+// shape used a 6-second sleep to drift past CapacityFreshness;
+// that added 6 s to the pkg/sched suite wall time and was a
+// real flake risk on slow CI runners. Two reports are stamped 0
+// us and 6 s in the future; the future-dated lookup crosses the
+// freshness budget and falls through to the store.
 func TestApplyLiveCapacityMB_StaleFallsBack(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
 
 	const nodeID = "stale-node"
+	// First, observe the report as fresh (the test's "now" is the
+	// fixture's stamped time; the report's lastSeen is stamped
+	// inside Replace to e.now()).
 	e.capacityTable.Replace(CapacityReport{NodeID: nodeID, UsedMB: 9000})
-	// Force lastSeen into the past by overwriting the entry — we
-	// can't reach the entry directly because capacityEntry is
-	// unexported. Use the public Replace + a long sleep instead.
-	// 6 s > CapacityFreshness (5 s). A real ops outage would
-	// look exactly like this: vmmd goes silent past the budget.
-	time.Sleep(CapacityFreshness + 1*time.Second)
+	if got := e.applyLiveCapacityMB(context.Background(), nodeID); got != 9000 {
+		t.Fatalf("fresh report: applyLiveCapacityMB = %d, want 9000 (setup precondition)", got)
+	}
+	// Now fast-forward the engine's clock past CapacityFreshness.
+	// The Replace inside the gRPC handler would stamp lastSeen to
+	// the dialer-side time.Now (the handler is producer-side, not
+	// under e.now), so this test is exercising the chooser-side
+	// clock, which is exactly the seam we want to pin.
+	offset := CapacityFreshness + 1*time.Second
+	e.now = func() time.Time { return time.Now().Add(offset) }
 
 	got := e.applyLiveCapacityMB(context.Background(), nodeID)
 	if got != 0 {
