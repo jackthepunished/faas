@@ -6,6 +6,16 @@
 // inside EnforceQuota and the meterd_billing_cap_exceeded_total
 // counter is incremented with the plan label. In-budget usage is
 // unchanged; the cap is advisory for overage only.
+//
+// Calendar-month gotcha: every `now := time.Date(...)` below must
+// land inside the CURRENT calendar month (UTC). The cap reads via
+// MemStore.CurrentMonthOverageCents which partitions on
+// `time.Now().UTC()` (memstore.go:4635), not on the injected clock.
+// If a fixture date rolls out of the current month, the loop sees
+// 0 overage cents and the cap counter never increments — surfacing
+// as a deterministic test failure on the first CI run after a
+// month boundary (memory: meterd-testrun-migration-23505-flake.md).
+// Bump the dates in lockstep when the calendar crosses.
 package meter_test
 
 import (
@@ -29,7 +39,7 @@ func TestRunQuotaOnce_OverageCapHonored(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	// Cap-bearing Hobby account.
 	acct := makeAccount(t, ctx, store, api.PlanHobby)
@@ -105,7 +115,7 @@ func TestRunQuotaOnce_OverageCapBelowThreshold(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	acct := makeAccount(t, ctx, store, api.PlanPro)
 	store.SetOverageCapCentsForTest(acct.ID, 10_000)
@@ -162,7 +172,7 @@ func TestRunQuotaOnce_OverageCapUnset(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	makeAccount(t, ctx, store, api.PlanScale)
 	// No SetOverageCapCentsForTest call — NULL column analog.
@@ -213,7 +223,7 @@ func TestRunQuotaOnce_OverageCapLoadFailure(t *testing.T) {
 	t.Parallel()
 	store := &errCapStore{MemStore: state.NewMemStore()}
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	makeAccount(t, ctx, store.MemStore, api.PlanHobby)
 
@@ -256,7 +266,7 @@ func TestRunQuotaOnce_OverageCapAtCap(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	ctx := context.Background()
-	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 
 	acct := makeAccount(t, ctx, store, api.PlanScale)
 	store.SetOverageCapCentsForTest(acct.ID, 500) // cents
