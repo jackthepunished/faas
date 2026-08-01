@@ -92,6 +92,18 @@ func (a *stateBindingsAdapter) FindForRepoBranch(ctx context.Context, repoFullNa
 	return a.store.GithubInstallBindingForRepoBranch(ctx, repoFullName, branch)
 }
 
+// GetAppBinding is the pkg/githubd.AppBindingStore seam. The
+// method name + signature match the interface so the
+// production wiring can hand the adapter directly to
+// webhookSvc.Bindings (= AppBindingStore). The implementation
+// delegates to FindForRepoBranch; they're the same lookup
+// today, but separating the names lets future slices evolve
+// the BindingsStore surface independently of the OAuth-flow
+// adapters (which use FindForRepoBranch).
+func (a *stateBindingsAdapter) GetAppBinding(ctx context.Context, repoFullName, branch string) (state.GitHubBinding, error) {
+	return a.FindForRepoBranch(ctx, repoFullName, branch)
+}
+
 // InstallationIDForRepo is the legacy ChecksAPI seam. Maps
 // state.ErrNotFound to githubd.ErrNoBinding (the pre-PR-B
 // sentinel) so the cmd-side swap is invisible to ChecksAPI.
