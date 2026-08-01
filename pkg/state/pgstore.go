@@ -853,7 +853,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
 		   min_instances   = case
-		                        when $25 then $26
+		                        when $27 then $28
 		                        when $9  then $10
 		                        else min_instances
 		                      end,
@@ -865,7 +865,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   root_dir       = case when $21 then $22 else root_dir end,
 		   workload_name  = case when $23 then $24 else workload_name end,
 		   start_command  = case when $25 then $26::text else start_command end,
-		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
+		   scaling_policy = case when $29 then $30::jsonb else scaling_policy end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
