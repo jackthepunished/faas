@@ -217,6 +217,27 @@ type Limits struct {
 	CronLimitPerApp     int
 	CronLimitPerAccount int
 
+	// Organization limits (issue #190 / IAM-6 / ADR-061). Two
+	// per-org caps; both populated for every plan, currently 0
+	// until the financial model authorizes the per-plan values.
+	// The same fail-closed contract as CronLimitPerApp applies:
+	// 0 means the gate refuses all membership / invitation
+	// operations, which is the safe default before the financial
+	// model is updated. PR 1 ships the fields and the accessors
+	// but does NOT invent per-plan values — those land in PR 2
+	// alongside the schema.
+	//
+	// OrgMembersMax caps how many members a non-personal org
+	// may hold at any moment. The owner counts toward the cap;
+	// the personal org is exempt (its membership is exactly one).
+	//
+	// OrgPendingInvitationsMax caps how many pending invitations
+	// a non-personal org may hold at any moment. Independent of
+	// OrgMembersMax — defends against the N-invites × fast-accept
+	// botnet signature without blocking quiet growth.
+	OrgMembersMax            int
+	OrgPendingInvitationsMax int
+
 	// AlertRuleLimitPerApp caps how many alert rules an account may pin
 	// to a single app. Account-wide rules (Issue #396 / ADR-045,
 	// AppID == "") count toward the per-app cap only when the rule pins
@@ -338,6 +359,12 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// IAM-6 / ADR-061: org membership is plan-gated until the
+		// financial model authorizes a per-plan value. Free reads
+		// 0/0 so the membership gate refuses before the store is
+		// touched, mirroring the cron fail-closed shape.
+		OrgMembersMax:            0,
+		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396 / ADR-045): Free stays at 0/0.
 		// Gates via CodePlanAlertRulesNotAllowed at the handler level
 		// — the value is informational here for fail-closed accessors.
@@ -422,6 +449,12 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// IAM-6 / ADR-061: org caps land in PR 2 once the financial
+		// model authorizes them. PR 1 ships 0/0 so the fail-closed
+		// gate refuses across every plan until the values are
+		// sourced — see limits_test.go::TestOrgMembersLimits_ZeroUntilAuthorised.
+		OrgMembersMax:            0,
+		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396): Hobby gets 3 per-app and 10
 		// per-account — a Hobby customer with 2 apps + 1 account-wide
 		// rule lands inside both caps. The per-account floor tracks the
@@ -499,6 +532,10 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
+		// per-plan values from the financial model.
+		OrgMembersMax:            0,
+		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396): Pro gets 10 per-app and 30
 		// per-account. ~2× the Hobby per-account budget tracks the
 		// Pro app budget (25 apps vs Hobby's 5).
@@ -575,6 +612,10 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
+		// per-plan values from the financial model.
+		OrgMembersMax:            0,
+		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396): Scale gets 25 per-app and 100
 		// per-account — 2.5× Pro's per-app (10→25) and ~3× the
 		// per-account (30→100). Scale's app budget is 4× Pro's, so
@@ -1156,6 +1197,35 @@ func (p Plan) TrustedSignerCountMax() int {
 		return 0
 	}
 	return l.TrustedSignerCountMax
+}
+
+// OrgMembersMax returns the per-non-personal-org member cap for the
+// plan (issue #190 / IAM-6 / ADR-061). 0 for unknown plans — the
+// fail-closed contract mirrors CronLimitPerApp above. The handler
+// gates membership creation on this accessor and surfaces 403
+// org_member_cap_exceeded once the cap is reached; the store still
+// checks the same value as a defence-in-depth back-stop. PR 1 ships
+// 0 for every plan; PR 2 sets the actual per-plan values from the
+// financial model.
+func (p Plan) OrgMembersMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OrgMembersMax
+}
+
+// OrgPendingInvitationsMax returns the per-non-personal-org pending
+// invitation cap for the plan (issue #190 / IAM-6 / ADR-061).
+// Independent of OrgMembersMax — defends against the N-invites ×
+// fast-accept botnet signature. Same fail-closed contract as
+// OrgMembersMax above.
+func (p Plan) OrgPendingInvitationsMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.OrgPendingInvitationsMax
 }
 
 // RateLimitPerAccountRPM returns the per-account requests/minute cap for

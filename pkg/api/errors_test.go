@@ -289,6 +289,12 @@ func TestCodeConstants_UniqueAndNonEmpty(t *testing.T) {
 		CodeCliAuthPending, CodeCliAuthUnavailable,
 		CodeInvalidCredentials, CodeEmailNotVerified, CodePasswordTooWeak,
 		CodeResetTokenInvalid, CodeResetTokenExpired, CodeAccountExists,
+		// IAM-6 / ADR-061 (issue #190). One cluster per ADR table.
+		CodeOrgNotFound, CodeOrgSlugInvalid, CodeOrgSlugTaken,
+		CodeOrgMemberCapExceeded, CodeOrgInvitationCapExceeded,
+		CodeOrgRoleForbidden, CodeOrgAlreadyMember,
+		CodeOrgInvitationInvalid, CodeOrgInvitationExpired,
+		CodeOrgLastOwner, CodeOrgPersonalImmutable, CodeOrgAPIKeyRequiresOrg,
 	}
 	seen := make(map[string]bool)
 	for _, c := range codes {
@@ -651,5 +657,111 @@ func TestStatusForCode_AlertRules(t *testing.T) {
 		if got := StatusForCode(tc.code); got != tc.want {
 			t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
 		}
+	}
+}
+
+// TestStatusForCode_OrgCodes pins the inverse-status table for the
+// 12 IAM-6 / ADR-061 org codes. The cluster is split across 404
+// (slug not found — IDOR convention), 422 (slug shape), 409
+// (slug taken / already member / last owner / personal immutable /
+// legacy key), 410 (invitation invalid / expired), and 403 (role
+// / member cap / invitation cap). pkg/grpcerr.FromStatus consumes
+// this table on the gRPC boundary; a gap here would silently
+// downgrade a 403 to 500 on the customer-facing wire.
+func TestStatusForCode_OrgCodes(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{CodeOrgNotFound, http.StatusNotFound},
+		{CodeOrgSlugInvalid, http.StatusUnprocessableEntity},
+		{CodeOrgSlugTaken, http.StatusConflict},
+		{CodeOrgMemberCapExceeded, http.StatusForbidden},
+		{CodeOrgInvitationCapExceeded, http.StatusForbidden},
+		{CodeOrgRoleForbidden, http.StatusForbidden},
+		{CodeOrgAlreadyMember, http.StatusConflict},
+		{CodeOrgInvitationInvalid, http.StatusGone},
+		{CodeOrgInvitationExpired, http.StatusGone},
+		{CodeOrgLastOwner, http.StatusConflict},
+		{CodeOrgPersonalImmutable, http.StatusConflict},
+		{CodeOrgAPIKeyRequiresOrg, http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if got := StatusForCode(tc.code); got != tc.want {
+				t.Errorf("StatusForCode(%q) = %d, want %d", tc.code, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestErrOrgNotFound wires the constructor + status for the most
+// common org error. The 404 status mirrors the IDOR convention so
+// cross-tenant access returns 404, never 403. Other code
+// constructors are pinned via their respective tests / handlers
+// once PR 5 lands; this test seeds the surface.
+func TestErrOrgNotFound(t *testing.T) {
+	p := ErrOrgNotFound("acme")
+	if p.Status != http.StatusNotFound {
+		t.Errorf("Status = %d, want 404", p.Status)
+	}
+	if p.Code != CodeOrgNotFound {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgNotFound)
+	}
+	if !strings.Contains(p.Detail, "acme") {
+		t.Errorf("Detail = %q, want to name the slug", p.Detail)
+	}
+	if !strings.Contains(p.DocsURL, "/orgs") {
+		t.Errorf("DocsURL = %q, want to point at /orgs", p.DocsURL)
+	}
+}
+
+// TestErrOrgMemberCapExceeded pins the 403 + limit/observed pair
+// for the per-plan member cap. Mirrors TestErrPlanCronQuota in
+// spirit so the SDK's error decoder can share the quota-reached
+// branch.
+func TestErrOrgMemberCapExceeded(t *testing.T) {
+	p := ErrOrgMemberCapExceeded(10, 10)
+	if p.Status != http.StatusForbidden {
+		t.Errorf("Status = %d, want 403", p.Status)
+	}
+	if p.Code != CodeOrgMemberCapExceeded {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgMemberCapExceeded)
+	}
+	if p.Limit == nil || *p.Limit != 10 {
+		t.Errorf("Limit = %v, want 10", p.Limit)
+	}
+	if p.Observed == nil || *p.Observed != 10 {
+		t.Errorf("Observed = %v, want 10", p.Observed)
+	}
+}
+
+// TestErrOrgInvitationExpired pins the 410 + code for the
+// one-shot invitation lifecycle. Mirrors TestErrResetTokenExpired
+// so the dashboard's "link expired" copy reuses the same pattern.
+func TestErrOrgInvitationExpired(t *testing.T) {
+	p := ErrOrgInvitationExpired()
+	if p.Status != http.StatusGone {
+		t.Errorf("Status = %d, want 410", p.Status)
+	}
+	if p.Code != CodeOrgInvitationExpired {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgInvitationExpired)
+	}
+}
+
+// TestErrOrgLastOwner pins the 409 + reusable copy for the
+// own-points-on-the-only-owner guard. Detail names the
+// remediation (transfer ownership) so dashboards can render
+// guidance without parsing prose.
+func TestErrOrgLastOwner(t *testing.T) {
+	p := ErrOrgLastOwner()
+	if p.Status != http.StatusConflict {
+		t.Errorf("Status = %d, want 409", p.Status)
+	}
+	if p.Code != CodeOrgLastOwner {
+		t.Errorf("Code = %q, want %q", p.Code, CodeOrgLastOwner)
+	}
+	if !strings.Contains(p.Detail, "transfer") {
+		t.Errorf("Detail = %q, want to mention ownership transfer", p.Detail)
 	}
 }
