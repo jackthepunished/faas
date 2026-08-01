@@ -665,6 +665,14 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// project_id IS NOT NULL, a project-bound insert must carry both
 	// columns and a non-project insert lands with (NULL, '') which the
 	// index filters out.
+	// node_id (migration 00083, Phase 2 / Gate A): NOT NULL FK to
+	// compute_nodes(id) + empty-uuid CHECK. apid's placement scheduler
+	// resolves the owner before this call; an empty Go string here would
+	// be rendered as '' by pgx and trip 22P02 invalid_text_representation
+	// at the uuid cast — coerce "" to the empty-uuid sentinel so the
+	// CHECK is the load-bearing tripwire (and so a future apid bug that
+	// forgets to set app.NodeID fails loud at the Insert, not silently
+	// with a foreign_key_violation after a separate UPDATE).
 	appType := app.Type
 	if appType == "" {
 		appType = AppTypeApp
@@ -682,11 +690,15 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if ramMB <= 0 {
 		ramMB = 128
 	}
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13)
+	nodeID := app.NodeID
+	if nodeID == "" {
+		nodeID = "00000000-0000-0000-0000-000000000000"
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nodeID)
 	return scanApp(row)
 }
 
@@ -773,11 +785,21 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// collides with the prior row. project_id is nullable (empty →
 	// NULL via nullString); workload_name is NOT NULL DEFAULT '' so
 	// the empty string stays as '' (matches the v1 default).
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12)
+	// node_id (migration 00083, Phase 2 / Gate A): NOT NULL FK + empty-uuid
+	// CHECK. The placement decision lives in apid's handler (see
+	// PlacementScheduler.Choose), and the chosen node_id is bound to
+	// the App before this call. Same empty-string coercion as CreateApp
+	// so a missing owner fails loud at the empty-uuid CHECK rather than
+	// at a foreign_key_violation.
+	nodeID := app.NodeID
+	if nodeID == "" {
+		nodeID = "00000000-0000-0000-0000-000000000000"
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nodeID)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -818,6 +840,74 @@ func (s *PgStore) ListAllApps(ctx context.Context) ([]App, error) {
 	}
 	defer rows.Close()
 	return scanApps(rows)
+}
+
+// ListAppsByNodeID returns every non-deleted app whose owner is the
+// given compute_nodes.id (Phase 2 / Gate A, migration 00083). This is
+// the schedd's own list: the reaper, the cron dispatcher, the
+// scale-up trigger, and the watchdog all want "apps I'm responsible
+// for", not "apps on this account". The apps_node_id_idx index makes
+// this a single index scan + a filter on status; without it the
+// reaper would do a seq scan on apps per schedd per minute (the
+// memory: "schedd watchdog tick" notes the 1s tick budget).
+//
+// The default-local node carries the same shape as any other node;
+// the schedd that resolves to default-local (the single-box posture)
+// reads its owner list from this method unchanged.
+func (s *PgStore) ListAppsByNodeID(ctx context.Context, nodeID string) ([]App, error) {
+	sel := `select ` + appsSelectColumns + ` from apps where node_id = $1 and status <> 'deleted' order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// ListInstancesByNodeID returns every instance whose owning app's
+// owner_node is the given compute_nodes.id. Phase 2 / Gate A — the
+// reaper (parked-instance timer) and the watchdog (kill-stuck) both
+// want "instances I'm responsible for". The JOIN through apps lets
+// the planner hit apps_node_id_idx first and then do a nested-loop
+// on instances.app_id via instances_app_id_idx; for a fleet of <10
+// nodes × <100 apps/node × <20 instances/app this stays under 5 ms.
+// The projection matches ListInstancesForAccount exactly so
+// scanInstanceCols decodes the same 13 columns (id, app_id,
+// deployment_id, state, netns, guest_uid, host_ip, ram_mb, started_at,
+// last_request_at, parked_at, node_id, wake_id).
+func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]Instance, error) {
+	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		   from instances i
+		   join apps a on a.id = i.app_id
+		  where a.node_id = $1`
+	rows, err := s.pool.Query(ctx, sel, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
+// ListOwnedCronsByNodeID returns every cron whose owning app's owner
+// node is the given compute_nodes.id. Phase 2 / Gate A — the cron
+// dispatcher runs once per node and only fires for crons on apps it
+// owns; without this filter every schedd would fire every cron and
+// the duplicate-dispatch hazard would corrupt the
+// cron_fired_audit row. The apps_node_id_idx covers the JOIN.
+// Projection matches scanCrons: id, app_id, schedule, path, enabled
+// (5 columns — the crons table is intentionally narrow).
+func (s *PgStore) ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error) {
+	sel := `select c.id, c.app_id, c.schedule, c.path, c.enabled
+		   from crons c
+		   join apps a on a.id = c.app_id
+		  where a.node_id = $1`
+	rows, err := s.pool.Query(ctx, sel, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCrons(rows)
 }
 
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
@@ -6797,7 +6887,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt); err != nil {
+		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6827,20 +6917,23 @@ func scanAppInto(a *App, row pgx.Row) error {
 // must use. Listed in the same order as scanAppInto — scanAppInto
 // reads columns positionally, so the order is load-bearing. The 5
 // trailing columns (project_id, root_dir, workload_name, workload_class,
-// start_command) are the ADR-050 Phase 1 additions. The 3 trailing
-// columns (scaling_policy, last_scale_out_at, last_scale_in_at) are
-// the issue #462 / ADR-058 PR-A additions. Keep this const
-// and the App struct aligned: adding a column touches both.
 // start_command) are the ADR-050 Phase 1 additions. require_signed
 // (issue #472 / ADR-054) was added after streaming_enabled; keep this
 // const and the App struct aligned: adding a column touches both.
+// The 3 trailing columns (scaling_policy, last_scale_out_at,
+// last_scale_in_at) are the issue #462 / ADR-058 PR-A additions. The
+// trailing node_id column is the Phase 2 / Gate A shard key
+// (migration 00083); apps.node_id is NOT NULL after backfill + the
+// empty-uuid CHECK, set once at CreateApp time by apid's
+// PlacementScheduler. Keep this const and the App struct aligned:
+// adding a column touches both.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
-	scaling_policy, last_scale_out_at, last_scale_in_at`
+	scaling_policy, last_scale_out_at, last_scale_in_at, node_id`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

@@ -1444,6 +1444,61 @@ func (m *MemStore) ListAllApps(_ context.Context) ([]App, error) {
 	return out, nil
 }
 
+// ListAppsByNodeID mirrors pkg/state/pgstore.go:858. In-process
+// map scan with the same predicate the SQL uses (node_id == X AND
+// status != deleted). Used by schedd in unit tests + by the e2e
+// harness's fake schedd (the metal path goes through pgstore).
+func (m *MemStore) ListAppsByNodeID(_ context.Context, nodeID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.NodeID == nodeID && a.Status != AppDeleted {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ListInstancesByNodeID mirrors pkg/state/pgstore.go:875. Same
+// in-process predicate; for the in-memory store this is a linear
+// scan over m.instances — fine for tests + the e2e harness.
+func (m *MemStore) ListInstancesByNodeID(_ context.Context, nodeID string) ([]Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Build a quick app_id → owner-node lookup.
+	owner := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		owner[a.ID] = a.NodeID
+	}
+	var out []Instance
+	for _, ins := range m.instances {
+		if owner[ins.AppID] == nodeID {
+			out = append(out, ins)
+		}
+	}
+	return out, nil
+}
+
+// ListOwnedCronsByNodeID mirrors pkg/state/pgstore.go:891. Same
+// in-process predicate; crons are 5-column rows keyed by app_id.
+func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]Cron, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owner := make(map[string]string, len(m.apps))
+	for _, a := range m.apps {
+		owner[a.ID] = a.NodeID
+	}
+	var out []Cron
+	for _, c := range m.crons {
+		if owner[c.AppID] == nodeID {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

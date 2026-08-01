@@ -540,7 +540,30 @@ type Store interface {
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
 	// cron loops walk this (one-box scale, spec §4.3); apid never calls it.
+	// Phase 2 / Gate A: the schedd-owned variants (ListAppsByNodeID /
+	// ListInstancesByNodeID / ListOwnedCronsByNodeID) replace this in the
+	// reaper / cron / watchdog loops so an N-schedd fleet does N× the
+	// row work. ListAllApps remains for apid read-only tooling and the
+	// legacy one-box schedd posture.
 	ListAllApps(ctx context.Context) ([]App, error)
+	// ListAppsByNodeID returns every non-deleted app whose owner_node
+	// matches nodeID (Phase 2 / Gate A, migration 00083). The schedd
+	// that resolves to nodeID at startup calls this on every reaper /
+	// scale-up tick. Default-local is a valid nodeID — the single-box
+	// schedd reads the same shape as a peer schedd.
+	ListAppsByNodeID(ctx context.Context, nodeID string) ([]App, error)
+	// ListInstancesByNodeID returns every instance whose owning app's
+	// owner_node matches nodeID. Same Phase 2 / Gate A contract; the
+	// reaper's parked-instance timer + the watchdog's kill-stuck path
+	// both want "instances I'm responsible for" rather than the
+	// fleet-wide ListAllInstances.
+	ListInstancesByNodeID(ctx context.Context, nodeID string) ([]Instance, error)
+	// ListOwnedCronsByNodeID returns every cron whose owning app's
+	// owner_node matches nodeID. The cron dispatcher runs once per
+	// node and only fires crons on apps it owns; without this filter
+	// every schedd would fire every cron and the cron_fired_audit row
+	// would diverge from the actual dispatch.
+	ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error)
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)

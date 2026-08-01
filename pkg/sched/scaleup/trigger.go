@@ -45,8 +45,16 @@ const (
 // AppStore is the read-only slice of state.Store the trigger needs.
 // Defined as an interface so tests can inject a fake without spinning
 // up Postgres.
+//
+// Phase 2 / Gate A: ListAppsByNodeID is the per-schedd slice the
+// scale-up trigger calls. Every schedd only scales apps it owns;
+// the trigger's ownerNodeID is plumbed in via WithOwnerNodeID at
+// wiring time. ListAllApps remains for the legacy one-box schedd
+// posture (the default-local-only fleet) where the scaleup trigger
+// was wired before this PR.
 type AppStore interface {
 	ListAllApps(ctx context.Context) ([]state.App, error)
+	ListAppsByNodeID(ctx context.Context, nodeID string) ([]state.App, error)
 }
 
 // Ledger is the read-only slice of NodeLedger the trigger needs.
@@ -192,6 +200,14 @@ type Trigger struct {
 	log         *slog.Logger
 	interval    time.Duration
 
+	// ownerNodeID is the durable Phase 2 / Gate A shard key this
+	// schedd scales. Set via WithOwnerNodeID after construction
+	// (the schedd's startup sequence resolves its local
+	// compute_nodes.id after the trigger is wired). Empty = legacy
+	// one-box posture: Tick reads ListAllApps (the synthetic
+	// default-local-only fleet).
+	ownerNodeID string
+
 	// per-app ring buffer of per-app request deltas. Pre-allocated
 	// in New(); Touch is called on every Tick with the new scrape.
 	ring *RingBuffer
@@ -245,6 +261,26 @@ func (t *Trigger) Interval() time.Duration {
 	return t.interval
 }
 
+// WithOwnerNodeID stamps the Phase 2 / Gate A owner shard key on
+// the trigger. Called by cmd/schedd after ResolveLocalNodeID
+// completes; the trigger then routes Tick's app read through
+// ListAppsByNodeID (the per-schedd slice) rather than ListAllApps
+// (the legacy one-box slice). Safe to call concurrently with Tick:
+// reads of ownerNodeID race only with the initial stamp and the
+// one-tick-delayed fallback to ListAllApps on the very first tick
+// is benign — schedd's loop starts after WithOwnerNodeID is set,
+// so in practice the race never fires.
+//
+// Empty string is allowed (legacy posture): the trigger falls
+// back to ListAllApps so a single-box install without
+// FAAS_NODE_NAME keeps working bit-for-bit.
+func (t *Trigger) WithOwnerNodeID(nodeID string) {
+	if t == nil {
+		return
+	}
+	t.ownerNodeID = nodeID
+}
+
 // Tick runs one sweep. It is the single public entry point the schedd
 // loop calls. Returns nil on success; errors are logged inside the
 // loop (the trigger never aborts the loop on a transient store
@@ -273,7 +309,17 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.ring.Touch(time.Now(), counts)
 		}
 	}
-	apps, err := t.appStore.ListAllApps(ctx)
+	// Phase 2 / Gate A: per-schedd slice. ownerNodeID set via
+	// WithOwnerNodeID at schedd startup → ListAppsByNodeID
+	// (apps_node_id_idx, O(apps-on-this-node)); empty (single-box
+	// posture) → ListAllApps (the legacy read path).
+	var apps []state.App
+	var err error
+	if t.ownerNodeID != "" {
+		apps, err = t.appStore.ListAppsByNodeID(ctx, t.ownerNodeID)
+	} else {
+		apps, err = t.appStore.ListAllApps(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("scaleup: list apps: %w", err)
 	}
