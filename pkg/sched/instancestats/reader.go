@@ -260,18 +260,13 @@ func (r *Reader) SnapshotForInstance(instanceID string) (InstanceStat, bool) {
 //
 // PR-B (issue #462): the vmmd ActivityTracker feeds
 // InflightRequests per instance; the schedd scale-up trigger
-// (PR-C) consumes MaxInflightForApp to compare against the
-// customer's target.concurrent_requests value. The interface
-// widening that lets the trigger call MaxInflightForApp is
-// PR-C's atomic change with MaxCPU; today only the concrete
-// *Reader exposes the method so the wire shape and the
-// numeric path are testable end-to-end.
-//
-// Same complexity as SnapshotForApp: linear scan over the
-// atomic snapshot, called only on cold paths (wake-gate, scale-
-// up trigger, reaper). The snapshot is pinned for the duration
-// of the scan via the Load above; concurrent Replace atomically
-// swaps in a fresh slice that the next caller observes.
+// consumes MaxInflightForApp to compare against the customer's
+// target.concurrent_requests value. Same complexity as
+// SnapshotForApp: linear scan over the atomic snapshot, called
+// only on cold paths (wake-gate, scale-up trigger, reaper). The
+// snapshot is pinned for the duration of the scan via the Load
+// above; concurrent Replace atomically swaps in a fresh slice
+// that the next caller observes.
 func (r *Reader) MaxInflightForApp(appID string) (int64, bool) {
 	cur := r.snap.Load()
 	if cur == nil {
@@ -289,4 +284,55 @@ func (r *Reader) MaxInflightForApp(appID string) (int64, bool) {
 		}
 	}
 	return max, found
+}
+
+// MaxCPU (PR-C, issue #462) returns the maximum CPUPct across
+// all rows of the latest snapshot for appID where CPU is Valid,
+// plus a "present" boolean. (0, false) when no rows exist for the
+// app — caller treats that as "no signal", distinct from
+// (max, true) which means "the app has live instances". When the
+// app has live instances but every row has CPU=Unknown (first
+// sample / transient cgroup miss), the result is (0, true) —
+// caller distinguishes via the boolean.
+//
+// Companion to MaxInflightForApp (same (val, present) shape).
+// The vmmd cpustats cache feeds CPUPct per instance (PR-B); the
+// schedd scale-up trigger (pkg/sched/scaleup) consumes MaxCPU to
+// compare against the customer's target.cpu_pct value. Rows
+// stamped CPU=Unknown are skipped when computing the max: the
+// cgroup-derived CPU rate requires a prior baseline, so the
+// first sample of any instance is silently absent — mirroring
+// the wire shape the schedd poller already decodes.
+//
+// Same complexity as MaxInflightForApp: linear scan over the
+// atomic snapshot, called only on cold paths (scale-up trigger,
+// reaper). The snapshot is pinned for the duration of the scan
+// via the Load above; concurrent Replace atomically swaps in a
+// fresh slice that the next caller observes.
+func (r *Reader) MaxCPU(appID string) (float64, bool) {
+	cur := r.snap.Load()
+	if cur == nil {
+		return 0, false
+	}
+	var max float64
+	var seen bool
+	for _, row := range *cur {
+		if row.AppID != appID {
+			continue
+		}
+		// Any row for the app counts as "the app is live" —
+		// mirrors MaxInflightForApp's seen/found distinction.
+		// Only CPU=Valid rows contribute to the max itself.
+		seen = true
+		if row.CPU != Valid {
+			continue
+		}
+		if row.CPUPct > max {
+			max = row.CPUPct
+		}
+	}
+	if !seen {
+		return 0, false
+	}
+	return max, true
 }

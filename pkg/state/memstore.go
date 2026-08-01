@@ -3237,6 +3237,75 @@ func (m *MemStore) CreateInstance(_ context.Context, appID, deploymentID, state 
 	return ins, nil
 }
 
+// StampAppScaleOut (PR-C, issue #462) records the apps
+// LastScaleOutAt timestamp. The MemStore mirrors the PG contract
+// (PgStore.StampAppScaleOut): a single UPDATE; no row existence
+// check — the stamp is best-effort and a missing row is logged by
+// the caller as a non-fatal warning, not a fatal error.
+func (m *MemStore) StampAppScaleOut(_ context.Context, appID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	app.LastScaleOutAt = &now
+	m.apps[appID] = app
+	return nil
+}
+
+// StampAppScaleIn (PR-C, issue #462) records the apps
+// LastScaleInAt timestamp. Same shape as StampAppScaleOut.
+func (m *MemStore) StampAppScaleIn(_ context.Context, appID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	now := time.Now()
+	app.LastScaleInAt = &now
+	m.apps[appID] = app
+	return nil
+}
+
+// SetLastScaleOutAt (PR-C, issue #462) overwrites the apps
+// LastScaleOutAt timestamp with a caller-supplied value. Used
+// only by sched_test.go to fix the cooldown-consult timestamp
+// in deterministic time; the production path is StampAppScaleOut
+// (now()). The helper is exported so pkg/sched tests can inject
+// a fixed "stamp 1s ago" timestamp without exposing the internal
+// Mutex.
+func (m *MemStore) SetLastScaleOutAt(appID string, ts time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	tsCopy := ts
+	app.LastScaleOutAt = &tsCopy
+	m.apps[appID] = app
+	return nil
+}
+
+// SetLastScaleInAt (PR-C, issue #462) mirrors SetLastScaleOutAt
+// for the LastScaleInAt timestamp. Same rationale: deterministic
+// reaper-cooldown tests need to fix the stamp in absolute time.
+func (m *MemStore) SetLastScaleInAt(appID string, ts time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	tsCopy := ts
+	app.LastScaleInAt = &tsCopy
+	m.apps[appID] = app
+	return nil
+}
+
 func (m *MemStore) InstanceByID(_ context.Context, id string) (Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

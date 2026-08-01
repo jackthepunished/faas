@@ -137,7 +137,8 @@ func happyScan() reposcan.Result {
 	}
 }
 
-func newServiceForRig(r *testRig) *Service {
+func newServiceForRig(t *testing.T, r *testRig) *Service {
+	t.Helper()
 	svc := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	svc.Bindings = &stubBindings{byRepo: map[string]state.GitHubBinding{
 		"octo/api|main": {BindingID: "b-1", AccountID: r.acct, InstallID: r.install, RepoFullName: "octo/api", ProductionBranch: "main"},
@@ -145,10 +146,26 @@ func newServiceForRig(r *testRig) *Service {
 	svc.Installs = &stubInstalls{byAccount: map[string]state.GitHubInstall{
 		r.acct: {AccountID: r.acct, InstallationID: r.install, DefaultBranch: "main"},
 	}}
+	// Issue #432 phase 5: the MapFS fixture now seeds files
+	// under each workload's RootDir so the staging step
+	// (pkg/githubd/staging.go) can walk the subtree and
+	// produce a non-empty tarball. Without these, the
+	// staging step returns ErrNotExist and the dispatcher
+	// skips the enqueue. The "" RootDir (root-dir workload)
+	// is satisfied by the docker-compose.yml at the repo
+	// root.
 	svc.Source = &stubSource{fsys: fstest.MapFS{
-		"docker-compose.yml": &fstest.MapFile{Data: []byte("version: '3'\nservices:\n  api:\n    build: .\n")},
+		"docker-compose.yml":             &fstest.MapFile{Data: []byte("version: '3'\nservices:\n  api:\n    build: .\n")},
+		"services/auth/api/index.ts":     &fstest.MapFile{Data: []byte("export const auth = true;\n")},
+		"services/auth/api/package.json": &fstest.MapFile{Data: []byte("{}\n")},
+		"services/billing/main.go":       &fstest.MapFile{Data: []byte("package main\n")},
 	}}
 	svc.Reconcile = r.rec
+	// Issue #432 phase 5: the staging step needs a workDir
+	// (pkg/githubd/staging.go:stageAppSource). Tests get a
+	// fresh tmpdir per call so parallel test runs don't race
+	// on the staged tarball.
+	svc.WorkDir = t.TempDir()
 	return svc
 }
 
@@ -158,7 +175,7 @@ func TestHandlePushRequest_HappyPath(t *testing.T) {
 	// returns a Tier=1 result (one compose file → single).
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	var checkRepo, checkSHA string
 	var checkPhase githubdgrpc.CheckPhase
 	svc.WriteCheck = func(_ context.Context, repo, sha string, phase githubdgrpc.CheckPhase) error {
@@ -199,7 +216,7 @@ func TestHandlePushRequest_FeatureBranchIgnored(t *testing.T) {
 	// returns ErrIgnored.
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	// Override the binding map to include the feature/x branch.
 	svc.Bindings = &stubBindings{byRepo: map[string]state.GitHubBinding{
 		"octo/api|feature/x": {BindingID: "b-1", AccountID: rig.acct, InstallID: rig.install, RepoFullName: "octo/api", ProductionBranch: "main"},
@@ -216,7 +233,7 @@ func TestHandlePushRequest_SourceFetchFailure(t *testing.T) {
 	// before any ProjectByRepo fall-through.
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	want := errors.New("codeload down")
 	svc.Source = &stubSource{err: want}
 	body := []byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
@@ -248,7 +265,7 @@ func TestHandlePushRequest_ReconcileErrorBubbles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed project: %v", err)
 	}
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	body := []byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
 	_, err = svc.HandlePushRequest(context.Background(), body)
 	if err == nil {
@@ -264,7 +281,7 @@ func TestHandlePushRequest_ReconcileErrorBubbles(t *testing.T) {
 
 func TestHandlePushRequest_TagIsIgnored(t *testing.T) {
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	body := []byte(`{"ref":"refs/tags/v1.0","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
 	_, err := svc.HandlePushRequest(context.Background(), body)
 	if !IsNoBinding(err) {
@@ -285,6 +302,12 @@ func TestWebhookHTTPHandler_IsLoopbackOnly(t *testing.T) {
 // recordingEnqueuer is the BuildEnqueuer stub for PR-GH.5
 // fan-out tests. It records every call and returns the
 // configured buildID (or error).
+//
+// Issue #432 phase 5: the seam grew from (accountID, appID,
+// commitSHA) string triples to BuildSpec structs (carrying the
+// staged source path). The stub records the buildID-mint
+// inputs and the BuildSpec so the fan-out tests can assert
+// on the per-app source path that the staging step produced.
 type recordingEnqueuer struct {
 	buildID string
 	err     error
@@ -292,17 +315,23 @@ type recordingEnqueuer struct {
 }
 
 type enqueueCall struct {
-	accountID string
-	appID     string
-	commitSHA string
+	accountID  string
+	appID      string
+	commitSHA  string
+	sourcePath string
 }
 
-func (r *recordingEnqueuer) Enqueue(_ context.Context, accountID, appID, commitSHA string) (string, error) {
-	r.calls = append(r.calls, enqueueCall{accountID: accountID, appID: appID, commitSHA: commitSHA})
+func (r *recordingEnqueuer) Enqueue(_ context.Context, spec BuildSpec) (state.Build, error) {
+	r.calls = append(r.calls, enqueueCall{
+		accountID:  spec.App.AccountID,
+		appID:      spec.App.ID,
+		commitSHA:  spec.CommitSHA,
+		sourcePath: spec.SourcePath,
+	})
 	if r.err != nil {
-		return "", r.err
+		return state.Build{}, r.err
 	}
-	return r.buildID, nil
+	return state.Build{ID: r.buildID, Kind: state.DeploymentKindGitHub}, nil
 }
 
 // TestHandlePushRequest_FanOut_HappyPath is the PR-GH.5
@@ -313,7 +342,7 @@ func (r *recordingEnqueuer) Enqueue(_ context.Context, accountID, appID, commitS
 func TestHandlePushRequest_FanOut_HappyPath(t *testing.T) {
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	enq := &recordingEnqueuer{buildID: "build-1"}
 	svc.Enqueuer = enq
 	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
@@ -348,7 +377,7 @@ func TestHandlePushRequest_FanOut_EmptyBuilds_NoEnqueue(t *testing.T) {
 		return reposcan.Result{Workloads: nil, Managed: nil, Tier: 1}, nil
 	})
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	enq := &recordingEnqueuer{buildID: "build-1"}
 	svc.Enqueuer = enq
 	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
@@ -376,7 +405,7 @@ func TestHandlePushRequest_FanOut_EmptyBuilds_NoEnqueue(t *testing.T) {
 func TestHandlePushRequest_FanOut_EnqueueError_SoftFail(t *testing.T) {
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	enq := &recordingEnqueuer{err: errors.New("queue full")}
 	svc.Enqueuer = enq
 	body := []byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
@@ -396,22 +425,26 @@ func TestHandlePushRequest_FanOut_EnqueueError_SoftFail(t *testing.T) {
 // dashboards filter fake IDs out of real-build metrics.
 func TestNoopEnqueuer_UniqueIDs(t *testing.T) {
 	e := NewNoopEnqueuer(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	id1, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-1")
+	spec := BuildSpec{
+		App:       state.App{ID: "app-1", AccountID: "acct-1"},
+		CommitSHA: "sha-1",
+	}
+	b1, err := e.Enqueue(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	id2, err := e.Enqueue(context.Background(), "acct-1", "app-1", "sha-1")
+	b2, err := e.Enqueue(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if id1 == id2 {
-		t.Errorf("id1 == id2 (%q); repeat calls must produce different UUIDs", id1)
+	if b1.ID == b2.ID {
+		t.Errorf("b1.ID == b2.ID (%q); repeat calls must produce different UUIDs", b1.ID)
 	}
-	if !strings.HasPrefix(id1, "noop-build-") {
-		t.Errorf("id1 = %q; want noop-build- prefix", id1)
+	if !strings.HasPrefix(b1.ID, "noop-build-") {
+		t.Errorf("b1.ID = %q; want noop-build- prefix", b1.ID)
 	}
-	if !strings.HasPrefix(id2, "noop-build-") {
-		t.Errorf("id2 = %q; want noop-build- prefix", id2)
+	if !strings.HasPrefix(b2.ID, "noop-build-") {
+		t.Errorf("b2.ID = %q; want noop-build- prefix", b2.ID)
 	}
 }
 
@@ -455,7 +488,7 @@ func TestHandlePushRequest_BindingInstallIDMismatch_ErrNoBinding(t *testing.T) {
 func TestHandlePushRequest_TreeCloseNilSafe(t *testing.T) {
 	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) { return happyScan(), nil })
 	rig.seedProject(t, "octo/api", "main")
-	svc := newServiceForRig(rig)
+	svc := newServiceForRig(t, rig)
 	want := errors.New("codeload down")
 	svc.Source = &stubSource{err: want}
 	body := []byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
@@ -467,5 +500,412 @@ func TestHandlePushRequest_TreeCloseNilSafe(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "githubd: source fetch") {
 		t.Errorf("err = %v, want op prefix 'githubd: source fetch'", err)
+	}
+}
+
+// stubChangedFiles adapts a (files, err) pair to the
+// ChangedFilesClient interface so HandlePushRequest's path-
+// filter path can be exercised without spinning up an httptest
+// server. records last args for spy assertions.
+type stubChangedFiles struct {
+	files []string
+	err   error
+
+	calls      int
+	lastInstID int64
+	lastOwner  string
+	lastRepo   string
+	lastBase   string
+	lastHead   string
+}
+
+func (s *stubChangedFiles) ChangedFiles(_ context.Context, instID int64, owner, repo, base, head string) ([]string, error) {
+	s.calls++
+	s.lastInstID = instID
+	s.lastOwner = owner
+	s.lastRepo = repo
+	s.lastBase = base
+	s.lastHead = head
+	return s.files, s.err
+}
+
+// pathFilterRig builds a Service with a recordingEnqueuer and an
+// optional ChangedFilesClient. Used by the path-filter tests
+// below. Returns (service, recorder, acctID).
+//
+// includeRootWorkload toggles whether the stub Scan produces a
+// third repo-root workload (RootDir == "") in addition to the
+// two member dirs. Tests that want to exercise the lockfile
+// fallback (rebuild all on no match) set includeRootWorkload=false
+// so a non-matching change genuinely matches no one.
+//
+// The stub Scan returns a Tier-3 (workspaces) result with each
+// workload's Source field tagged "workspaces:<name>" so
+// reconcile.DeriveScanSource returns ProjectScanSourceWorkspace —
+// matching the seeded project. The scan-source stability guard
+// trips if the project's stored source is below the desired tier;
+// we seed at the same tier to exercise the happy path.
+func pathFilterRig(t *testing.T, cf ChangedFilesClient, includeRootWorkload bool) (*Service, *recordingEnqueuer, string) {
+	t.Helper()
+	workloads := []reposcan.Workload{
+		{Class: reposcan.ClassHTTP, Name: "auth", RootDir: "services/auth/api", Source: "workspaces:auth"},
+		{Class: reposcan.ClassHTTP, Name: "billing", RootDir: "services/billing", Source: "workspaces:billing"},
+	}
+	if includeRootWorkload {
+		workloads = append(workloads, reposcan.Workload{
+			Class: reposcan.ClassHTTP, Name: "root", RootDir: "", Source: "workspaces:root",
+		})
+	}
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{
+			Workloads: workloads,
+			Managed:   []reposcan.Managed{},
+			Tier:      3,
+		}, nil
+	})
+	_, err := rig.mem.CreateProject(context.Background(), state.Project{
+		AccountID:        rig.acct,
+		Slug:             "demo",
+		InstallID:        rig.install,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		// DeriveScanSource returns "workspaces" (plural) for the
+		// tier-3 convention; the singular typed const
+		// ProjectScanSourceWorkspace is a different slot. Use
+		// the plural typed const so the test fails loudly if
+		// either const drifts (the L1 review found the raw
+		// string literal hid the tierRank asymmetry).
+		ScanSource: state.ProjectScanSourceWorkspaces,
+	})
+	if err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	svc := newServiceForRig(t, rig)
+	rec := &recordingEnqueuer{}
+	svc.Enqueuer = rec
+	svc.ChangedFiles = cf
+	return svc, rec, rig.acct
+}
+
+func TestHandlePushRequest_PathFilter_MatchesOneApp(t *testing.T) {
+	cf := &stubChangedFiles{files: []string{"services/auth/api/index.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"base123","after":"head456","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	// Two apps match: services/auth/api (path intersects) + the
+	// repo-root workload (RootDir == "" always rebuilds). Billing
+	// is the only one that gets skipped.
+	if len(rec.calls) != 2 {
+		t.Fatalf("Enqueue calls = %d, want 2 (auth + root)", len(rec.calls))
+	}
+	if cf.calls != 1 {
+		t.Errorf("ChangedFiles calls = %d, want 1", cf.calls)
+	}
+}
+
+func TestHandlePushRequest_PathFilter_RootDirEmptyAlwaysRebuilds(t *testing.T) {
+	// Single repo-root workload; changed file is anywhere — should
+	// rebuild because RootDir == "".
+	cf := &stubChangedFiles{files: []string{"somewhere/unrelated.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1 (root-dir workload always rebuilds)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_LockfileFallbackRebuildsAll(t *testing.T) {
+	// package.json at repo root, not under any member's RootDir.
+	// We disable the root-dir workload in the rig so a non-matching
+	// change genuinely matches no one — the spec's lockfile/CI
+	// fallback then rebuilds every touched app.
+	cf := &stubChangedFiles{files: []string{"package.json"}}
+	svc, rec, _ := pathFilterRig(t, cf, false)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 2 {
+		t.Fatalf("Enqueue calls = %d, want 2 (lockfile fallback rebuilds both touched apps)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_TruncatedFallsBack(t *testing.T) {
+	cf := &stubChangedFiles{err: ErrTruncated}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (ErrTruncated → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_CompareErrorFallsBack(t *testing.T) {
+	cf := &stubChangedFiles{err: ErrUnavailable}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (any compare error → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_EmptyBeforeFallsBack(t *testing.T) {
+	// First push on a branch: before is empty. Service must NOT
+	// call the client (can't form compare URL).
+	cf := &stubChangedFiles{files: []string{"x.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if cf.calls != 0 {
+		t.Errorf("ChangedFiles calls = %d, want 0 (empty before skips the client)", cf.calls)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (empty before → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_NilClientFallsBack(t *testing.T) {
+	// Back-compat: tests that don't wire ChangedFiles get the
+	// naive full fan-out (PR-GH.5 behaviour).
+	svc, rec, _ := pathFilterRig(t, nil, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("Enqueue calls = %d, want 3 (nil ChangedFiles → full fan-out)", len(rec.calls))
+	}
+}
+
+func TestHandlePushRequest_PathFilter_PrefixCollisionDoesNotMatch(t *testing.T) {
+	// services/billing must NOT match services/billing-x.ts. The
+	// rig includes a repo-root workload (RootDir="") that always
+	// rebuilds, so the result is exactly 1 enqueue (root alone) —
+	// NOT 3 (no lockfile fallback because root matched).
+	cf := &stubChangedFiles{files: []string{"services/billing-x/index.ts"}}
+	svc, rec, _ := pathFilterRig(t, cf, true)
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err := svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1 (root-dir workload alone; prefix collision prevents billing from matching)", len(rec.calls))
+	}
+}
+
+// TestHandlePushRequest_PathFilter_NoTouchedApps_SkipsCompare pins
+// review finding #1: when reconcile produces zero touched apps
+// (the binding exists but the scan returned no workloads and no
+// existing apps were drifted), the push-dispatch path must skip
+// the GitHub compare-API call entirely. Per-installation API
+// quota is too precious to burn on no-op webhook deliveries.
+//
+// The empty-touched set is constructed via a dedicated rig whose
+// scan stub returns a Tier-3 result with zero workloads (and no
+// existing apps on the project).
+func TestHandlePushRequest_PathFilter_NoTouchedApps_SkipsCompare(t *testing.T) {
+	cf := &stubChangedFiles{files: []string{"x.ts"}}
+	// rig with an empty workloads slice -> reconcile produces no
+	// Added, no Changed -> touched is empty -> lookupChangedFiles
+	// must NOT be called.
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{Workloads: nil, Managed: nil, Tier: 3}, nil
+	})
+	_, err := rig.mem.CreateProject(context.Background(), state.Project{
+		AccountID:        rig.acct,
+		Slug:             "demo",
+		InstallID:        rig.install,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		ScanSource:       state.ProjectScanSourceWorkspaces,
+	})
+	if err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	svc := newServiceForRig(t, rig)
+	rec := &recordingEnqueuer{}
+	svc.Enqueuer = rec
+	svc.ChangedFiles = cf
+
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err = svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	// Critical: ChangedFiles was NOT called because touched is
+	// empty. The stub also has a synthetic non-empty files slice
+	// to ensure the assertion is meaningful.
+	if cf.calls != 0 {
+		t.Errorf("ChangedFiles calls = %d, want 0 (empty touched set must skip compare-API)", cf.calls)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("Enqueue calls = %d, want 0 (nothing to enqueue)", len(rec.calls))
+	}
+}
+
+// TestPathIntersectsDir pins the table directly. The behaviour is
+// load-bearing for the prefix-collision guard above.
+func TestPathIntersectsDir(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		files []string
+		dir   string
+		want  bool
+	}{
+		{"file under dir", []string{"a/b/c.ts"}, "a/b", true},
+		{"file equal to dir", []string{"a/b"}, "a/b", true},
+		{"file at sibling", []string{"a/c.ts"}, "a/b", false},
+		{"prefix collision (auth vs auth-api)", []string{"a/auth-api/x.ts"}, "a/auth", false},
+		{"file at root, dir at root", []string{"x.ts"}, "", false}, // dir=="" is filtered before this helper
+		{"empty files", nil, "a/b", false},
+		// GitHub emits a trailing-slash entry for directory-only
+		// changes (rename of the directory itself, add/remove of
+		// a directory). Without the f == dir + "/" branch, a
+		// workload whose RootDir matches the renamed directory
+		// would be silently skipped.
+		{"directory-only entry with trailing slash", []string{"a/b/"}, "a/b", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pathIntersectsDir(tc.files, tc.dir)
+			if got != tc.want {
+				t.Errorf("pathIntersectsDir(%v, %q) = %v, want %v", tc.files, tc.dir, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSplitOwnerRepo pins the helper that decodes "owner/name"
+// from GitHub's repository.full_name. Defends against the
+// "owner/repo/extra" misparse and the "/repo" / "owner/" edge
+// cases that would silently break the compare URL.
+func TestSplitOwnerRepo(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in           string
+		wantOk       bool
+		wantO, wantR string
+	}{
+		{"octo/api", true, "octo", "api"},
+		{"a/b", true, "a", "b"},
+		{"a/b/c", false, "", ""}, // too many slashes
+		{"", false, "", ""},
+		{"/repo", false, "", ""},  // empty owner
+		{"owner/", false, "", ""}, // empty repo
+		{"single", false, "", ""}, // no slash
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			o, r, ok := splitOwnerRepo(tc.in)
+			if ok != tc.wantOk || o != tc.wantO || r != tc.wantR {
+				t.Errorf("splitOwnerRepo(%q) = (%q,%q,%v), want (%q,%q,%v)",
+					tc.in, o, r, ok, tc.wantO, tc.wantR, tc.wantOk)
+			}
+		})
+	}
+}
+
+// TestFilterByPath_Unit pins the helper directly (no HTTP).
+func TestFilterByPath_Unit(t *testing.T) {
+	t.Parallel()
+	appsWithRoot := []state.App{
+		{ID: "auth", RootDir: "services/auth/api"},
+		{ID: "billing", RootDir: "services/billing"},
+		{ID: "root", RootDir: ""},
+	}
+	appsNoRoot := []state.App{
+		{ID: "auth", RootDir: "services/auth/api"},
+		{ID: "billing", RootDir: "services/billing"},
+	}
+	cases := []struct {
+		name      string
+		apps      []state.App
+		files     []string
+		mode      string
+		wantIDs   []string
+		wantSkips []string
+	}{
+		{
+			name:      "paths mode + root_dir match",
+			apps:      appsWithRoot,
+			files:     []string{"services/auth/api/index.ts"},
+			mode:      "paths",
+			wantIDs:   []string{"auth", "root"},
+			wantSkips: []string{"billing"},
+		},
+		{
+			// RootDir == "" always matches, so anyMatched=true and
+			// we don't fall through to the lockfile-rebuild-all
+			// branch — only `root` (the repo-root workload) is in
+			// matched. The lockfile-fallback path is only exercised
+			// when NO member's RootDir is touched AND no member has
+			// RootDir == "".
+			name:      "paths mode + lockfile + root-dir workload rebuilds alone",
+			apps:      appsWithRoot,
+			files:     []string{"package.json"},
+			mode:      "paths",
+			wantIDs:   []string{"root"},
+			wantSkips: []string{"auth", "billing"},
+		},
+		{
+			// Lockfile fallback (no member touched, no root-dir
+			// workload present): rebuild everything.
+			name:    "paths mode + lockfile fallback (no root-dir workload)",
+			apps:    appsNoRoot,
+			files:   []string{"package.json"},
+			mode:    "paths",
+			wantIDs: []string{"auth", "billing"},
+		},
+		{
+			name:    "full_fallback mode is identity",
+			apps:    appsWithRoot,
+			files:   nil, // ignored in full_fallback
+			mode:    "full_fallback",
+			wantIDs: []string{"auth", "billing", "root"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// filterByPath is a method on Service; build a zero-value one.
+			svc := &Service{}
+			matched, skipped := svc.filterByPath(tc.apps, tc.files, tc.mode)
+			gotIDs := make([]string, 0, len(matched))
+			for _, a := range matched {
+				gotIDs = append(gotIDs, a.ID)
+			}
+			if !stringSliceEq(gotIDs, tc.wantIDs) {
+				t.Errorf("matched = %v, want %v", gotIDs, tc.wantIDs)
+			}
+			if !stringSliceEq(skipped, tc.wantSkips) {
+				t.Errorf("skipped = %v, want %v", skipped, tc.wantSkips)
+			}
+		})
 	}
 }

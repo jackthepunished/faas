@@ -49,6 +49,16 @@ const (
 	DeploymentKindImage      DeploymentKind = "image"
 	DeploymentKindTarball    DeploymentKind = "tarball"
 	DeploymentKindDockerfile DeploymentKind = "dockerfile"
+	// DeploymentKindGitHub tags builds enqueued by the githubd push
+	// dispatch path (issue #432 phase 5 follow-up). The physical
+	// build pipeline is identical to DeploymentKindTarball
+	// (builderd reads dep.SourcePath as a local .tar.gz), but the
+	// deployment row identifies it as github-triggered so ADR-048
+	// metering dashboards and per-customer billing breakdowns
+	// can split apid-CLI deploys from githubd webhook deploys.
+	// The CHECK constraint on builds.kind is relaxed to allow
+	// this value by migration 00085.
+	DeploymentKindGitHub DeploymentKind = "github"
 )
 
 // DeploymentStatus tracks a deployment through the pipeline (spec §5, §9).
@@ -1592,6 +1602,21 @@ const (
 	ProjectScanSourceConvention ProjectScanSource = "convention"
 	ProjectScanSourceSingle     ProjectScanSource = "single"
 	ProjectScanSourceUnknown    ProjectScanSource = "unknown"
+	// ProjectScanSourceWorkspaces is the plural form the
+	// reconcile.Service.DeriveScanSource helper returns for
+	// projects whose root tree enumerates a workspaces section
+	// (e.g. yarn/npm/pnpm workspaces). It is distinct from
+	// ProjectScanSourceWorkspace (singular) because the two
+	// occupy different scan-source tiers today: the singular
+	// form is the typed-const slot committed in the apps.scan_source
+	// CHECK constraint, while the plural form is the working
+	// pre-typed value reconciliation stores while it
+	// converges the apps rows. Callers that want to seed or
+	// compare against the plural form should reference this
+	// constant instead of the raw string literal — the L1
+	// review flagged the raw "workspaces" string in a service
+	// test as a tierRank-asymmetry tripwire.
+	ProjectScanSourceWorkspaces ProjectScanSource = "workspaces"
 )
 
 // scanSourceRank is the monotonic-upgrade total ordering. Higher rank

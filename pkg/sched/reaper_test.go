@@ -573,3 +573,111 @@ func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------
+// Per-app scale-in cooldown consult (PR-C, issue #462).
+//
+// The reaper consults apps.LastScaleInAt + apps.ScalingPolicy.ScaleInCooldownS
+// via the InstanceInfo carrier fields (LastScaleInAt *time.Time,
+// ScaleInCooldownS int) populated by the loop wrapper at loop.go:799-801.
+// When the consult fires (now - *LastScaleInAt < ScaleInCooldownS), the
+// entire app is skipped: the candidates for that app are dropped from
+// the park list. The "stamp missed" direction is safe — a nil
+// LastScaleInAt bypasses the consult and the reaper proceeds normally.
+// These tests pin both branches for ReapIdle and ReapAggressive.
+// ---------------------------------------------------------------------
+
+// TestReapIdleRespectsScaleInCooldownUnder pins the load-bearing
+// consult: when now - LastScaleInAt < ScaleInCooldownS, ReapIdle
+// returns an empty list (the app is in cooldown, all candidates
+// are dropped). Layout: 2 stale Pro instances, cooldown=60s,
+// lastScaleInAt=now-1s.
+func TestReapIdleRespectsScaleInCooldownUnder(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	instances := []InstanceInfo{
+		{Instance: "idle-a", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		{Instance: "idle-b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
+	}
+	got := ReapIdle(now, instances)
+	if len(got) != 0 {
+		t.Errorf("ReapIdle (cooldown 59s remaining) = %v, want [] (cooldown_held)", got)
+	}
+}
+
+// TestReapIdleRespectsScaleInCooldownOver pins the bypass branch:
+// when now - LastScaleInAt > ScaleInCooldownS, the consult
+// doesn't fire and the reaper proceeds normally. Same layout as
+// the under test but with lastScaleInAt=now-2m so 60s has elapsed.
+func TestReapIdleRespectsScaleInCooldownOver(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-2 * time.Minute)
+	instances := []InstanceInfo{
+		{Instance: "idle-a", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		{Instance: "idle-b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
+	}
+	got := ReapIdle(now, instances)
+	if !equalSet(got, []string{"idle-a", "idle-b"}) {
+		t.Errorf("ReapIdle (cooldown elapsed) = %v, want [idle-a idle-b]", got)
+	}
+}
+
+// TestReapAggressiveRespectsScaleInCooldownUnder mirrors the
+// ReapIdle consult for the aggressive path. Layout: 3 stale
+// Pro instances, desired=0, cooldown=60s, lastScaleInAt=now-1s.
+// All 3 candidates are dropped (cooldown_held); desired=0 would
+// otherwise park all 3 + the +1 buffer (running=3, limit=1, extra=2).
+func TestReapAggressiveRespectsScaleInCooldownUnder(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	instances := []InstanceInfo{
+		mkAggressiveWithStamp("app1", "a", time.Hour, 0, 0, &last, 60),
+		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
+		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if len(got) != 0 {
+		t.Errorf("ReapAggressive (cooldown 59s remaining) = %v, want [] (cooldown_held)", got)
+	}
+}
+
+// TestReapAggressiveRespectsScaleInCooldownOver pins the bypass
+// branch for the aggressive path. Same layout but with
+// lastScaleInAt=now-2m so the cooldown has elapsed and the
+// reaper proceeds normally: running=3, desired=0, limit=1, extra=2 →
+// park the 2 oldest.
+func TestReapAggressiveRespectsScaleInCooldownOver(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-2 * time.Minute)
+	instances := []InstanceInfo{
+		mkAggressiveWithStamp("app1", "a", time.Hour, 0, 0, &last, 60),
+		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
+		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
+	}
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	if !equalSet(got, []string{"a", "b"}) {
+		t.Errorf("ReapAggressive (cooldown elapsed) = %v, want [a b] (park 2 oldest)", got)
+	}
+}
+
+// mkAggressiveWithStamp is the cooldown-aware cousin of mkAggressive.
+// It also stamps the LastScaleInAt + ScaleInCooldownS carrier fields
+// (PR-C, issue #462) so the per-app consult at reaper.go:160 / :271
+// has the inputs it needs.
+func mkAggressiveWithStamp(app, id string, lastSeen time.Duration, open int64, minInst int, lastScaleInAt *time.Time, cooldownS int) InstanceInfo {
+	now := time.Now()
+	return InstanceInfo{
+		Instance: id, AppID: app, Plan: api.PlanPro,
+		State:            state.StateRunning,
+		LastRequest:      now.Add(-lastSeen),
+		Started:          now.Add(-time.Hour),
+		OpenConns:        open,
+		MinInstances:     minInst,
+		LastScaleInAt:    lastScaleInAt,
+		ScaleInCooldownS: cooldownS,
+	}
+}

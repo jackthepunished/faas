@@ -164,3 +164,82 @@ func TestReader_MaxInflightForApp(t *testing.T) {
 		}
 	})
 }
+
+// TestReader_MaxCPU pins the PR-C (issue #462) accessor across
+// the three outcomes that matter to the scale-up trigger:
+//
+//   - app not in snapshot  → (0, false) — "no signal", caller
+//     falls back to "do not scale" semantics.
+//   - app present, all CPU=Unknown → (0, true) — "app has live
+//     instances but no baseline yet", caller treats as a valid
+//     zero reading (matches MaxInflightForApp semantics).
+//   - app present, all CPU=Valid with max=85 → (85, true) —
+//     load-bearing pin the trigger compares against
+//     target.cpu_pct.
+//   - app present, mixed CPU validity — only CPU=Valid rows
+//     contribute; Unknown rows are dropped (mirror wire shape).
+//   - app present, two apps — per-app filter excludes the
+//     other app's rows.
+func TestReader_MaxCPU(t *testing.T) {
+	now := time.Now()
+
+	t.Run("AppNotInSnapshot", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app-other", InstanceID: "i-1", SampledAt: now, CPUPct: 90, CPU: Valid},
+		})
+		got, ok := r.MaxCPU("app-missing")
+		if ok || got != 0 {
+			t.Errorf("MaxCPU(missing) = (%v, %v), want (0, false)", got, ok)
+		}
+	})
+
+	t.Run("AppPresentAllUnknown", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-1", SampledAt: now, CPUPct: 0, CPU: Unknown},
+			{AppID: "app1", InstanceID: "i-2", SampledAt: now, CPUPct: 0, CPU: Unknown},
+		})
+		got, ok := r.MaxCPU("app1")
+		if !ok {
+			t.Errorf("MaxCPU(app1) ok=false, want true (app has live instances)")
+		}
+		if got != 0 {
+			t.Errorf("MaxCPU(app1) = %v, want 0 (all CPU=Unknown skipped)", got)
+		}
+	})
+
+	t.Run("AppPresentReturnsMax", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-1", SampledAt: now, CPUPct: 25, CPU: Valid},
+			{AppID: "app1", InstanceID: "i-2", SampledAt: now, CPUPct: 85, CPU: Valid},
+			{AppID: "app1", InstanceID: "i-3", SampledAt: now, CPUPct: 50, CPU: Valid},
+			// Different app must NOT contribute to the max.
+			{AppID: "app-other", InstanceID: "i-9", SampledAt: now, CPUPct: 99, CPU: Valid},
+		})
+		got, ok := r.MaxCPU("app1")
+		if !ok {
+			t.Fatalf("MaxCPU(app1) ok=false, want true")
+		}
+		if got != 85 {
+			t.Errorf("MaxCPU(app1) = %v, want 85 (max across i-1..i-3, ignoring app-other)", got)
+		}
+	})
+
+	t.Run("AppPresentMixedValidity", func(t *testing.T) {
+		r := NewReader()
+		r.Replace([]InstanceStat{
+			{AppID: "app1", InstanceID: "i-1", SampledAt: now, CPUPct: 70, CPU: Valid},
+			{AppID: "app1", InstanceID: "i-2", SampledAt: now, CPUPct: 0, CPU: Unknown},
+			{AppID: "app1", InstanceID: "i-3", SampledAt: now, CPUPct: 40, CPU: Valid},
+		})
+		got, ok := r.MaxCPU("app1")
+		if !ok {
+			t.Fatalf("MaxCPU(app1) ok=false, want true (one valid row)")
+		}
+		if got != 70 {
+			t.Errorf("MaxCPU(app1) = %v, want 70 (Unknown row skipped)", got)
+		}
+	})
+}

@@ -324,8 +324,12 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 		`schedd_scale_down_decisions_total{app="a1",outcome="keep"} 1`,
 		// Pre-instantiated empty-app placeholder: zero-valued, must
 		// surface in /metrics from boot so the panel exists at day 1.
+		// min_floor_already (PR-C, issue #462) is pre-instantiated
+		// alongside park / keep so the closed outcome label set
+		// is fully surfaced from boot.
 		`schedd_scale_down_decisions_total{app="",outcome="park"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="keep"} 0`,
+		`schedd_scale_down_decisions_total{app="",outcome="min_floor_already"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
@@ -339,6 +343,35 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 func TestOpsMetrics_ObserveScaleDownNilSafe(t *testing.T) {
 	var m *wire.OpsMetrics
 	m.ObserveScaleDown("a1", "park")
+}
+
+// TestOpsMetrics_ObserveScaleUpClosedSet (PR-C, issue #462) —
+// pins the scale-up outcome label set: pre-instantiated rows
+// for the closed set {admit, reject_at_cap, no_signal,
+// cooldown_held} must surface in /metrics from boot with the
+// empty-app placeholder. Mirrors TestOpsMetrics_ObserveScaleDown
+// for the scale-up side. The cooldown_held outcome is the new
+// wake-gate path emission added by PR-C.
+func TestOpsMetrics_ObserveScaleUpClosedSet(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.ObserveScaleUp("a1", "admit")
+	m.ObserveScaleUp("a1", "cooldown_held")
+
+	body := render(t, m)
+	for _, want := range []string{
+		// Real observations.
+		`schedd_scale_up_decisions_total{app="a1",outcome="admit"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="cooldown_held"} 1`,
+		// Pre-instantiated empty-app placeholder for the closed set.
+		`schedd_scale_up_decisions_total{app="",outcome="admit"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="reject_at_cap"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="no_signal"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="cooldown_held"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
 }
 
 // TestOpsMetrics_ObserveLogEmitted (issue #254, Move 4) — the per-app
@@ -666,6 +699,60 @@ func TestOpsMetrics_PreInstantiatesStatelessAdvisorySeries(t *testing.T) {
 	body := render(t, m)
 	for _, sev := range []string{"high", "warn", "info"} {
 		want := `apid_stateless_advisory_events_total{severity="` + sev + `"} 0`
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated line %q missing in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_ObserveGithubdPathFilter (issue #432 phase 5 /
+// ADR-050 §109). The path-filter mode counter is labelled by
+// mode ∈ {paths, full_fallback, truncated, error, breaker_open}.
+// Closed-set semantics — an unknown mode (e.g. "discarded")
+// must NOT create a label series, and the nil-receiver must
+// not panic.
+func TestOpsMetrics_ObserveGithubdPathFilter(t *testing.T) {
+	m := wire.NewOpsMetrics("githubd")
+	m.ObserveGithubdPathFilter(wire.PathFilterModePaths)
+	m.ObserveGithubdPathFilter(wire.PathFilterModePaths)
+	m.ObserveGithubdPathFilter(wire.PathFilterModeFullFallback)
+	m.ObserveGithubdPathFilter(wire.PathFilterModeTruncated)
+	m.ObserveGithubdPathFilter(wire.PathFilterModeError)
+	m.ObserveGithubdPathFilter(wire.PathFilterModeBreakerOpen)
+	// Unknown mode: closed-set guard.
+	m.ObserveGithubdPathFilter("discarded")
+
+	body := render(t, m)
+	wantLines := []string{
+		`githubd_path_filter_total{mode="paths"} 2`,
+		`githubd_path_filter_total{mode="full_fallback"} 1`,
+		`githubd_path_filter_total{mode="truncated"} 1`,
+		`githubd_path_filter_total{mode="error"} 1`,
+		`githubd_path_filter_total{mode="breaker_open"} 1`,
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `mode="discarded"`) {
+		t.Errorf("discarded label series must not be created, got:\n%s", body)
+	}
+
+	// Nil-receiver parity.
+	var nilM *wire.OpsMetrics
+	nilM.ObserveGithubdPathFilter(wire.PathFilterModePaths) // must not panic
+}
+
+// TestOpsMetrics_PreInstantiatesGithubdPathFilterSeries — the
+// closed `mode` label set must surface in /metrics from boot,
+// all five rows at value 0. Same pre-instantiation contract as
+// every other CounterVec on this struct.
+func TestOpsMetrics_PreInstantiatesGithubdPathFilterSeries(t *testing.T) {
+	m := wire.NewOpsMetrics("githubd")
+	body := render(t, m)
+	for _, mode := range []string{wire.PathFilterModePaths, wire.PathFilterModeFullFallback, wire.PathFilterModeTruncated, wire.PathFilterModeError, wire.PathFilterModeBreakerOpen} {
+		want := `githubd_path_filter_total{mode="` + mode + `"} 0`
 		if !strings.Contains(body, want) {
 			t.Errorf("pre-instantiated line %q missing in:\n%s", want, body)
 		}

@@ -72,6 +72,50 @@ func TestRoundTrip_StableCodes(t *testing.T) {
 	}
 }
 
+func TestRoundTrip_CodeWaitForWarm(t *testing.T) {
+	// PR-D (issue #462): CodeWaitForWarm is a 503 wire code, NOT
+	// a 429. It shares the gRPC ResourceExhausted class with
+	// CodePlanLimitConcur (the gRPC code is the lossy carrier),
+	// but the FromStatus inverse lift re-derives the HTTP status
+	// from StatusForCode. Pin both directions so the wire shape
+	// stays intact across the codegen + reverse-lift boundary.
+	p := api.NewProblem(
+		api.StatusForCode(api.CodeWaitForWarm),
+		api.CodeWaitForWarm,
+		"Scale-out cooldown in effect",
+		"App is on a scale-out cooldown; 5 more second(s) before the next wake is allowed.",
+	).WithLimit(5, 3).
+		WithDocs("https://docs.gregale.dev/scaling-policy#cooldown")
+
+	err := grpcerr.ToStatus(p)
+	if err == nil {
+		t.Fatalf("ToStatus produced nil")
+	}
+	if !grpcerr.IsCode(err, codes.ResourceExhausted) {
+		t.Fatalf("code = %v, want %v", status.Code(err), codes.ResourceExhausted)
+	}
+
+	got, ok := grpcerr.FromStatus(err)
+	if !ok {
+		t.Fatalf("FromStatus did not recognise our own error: %v", err)
+	}
+	if got.Code != api.CodeWaitForWarm {
+		t.Errorf("code round-trip: got %q, want %q", got.Code, api.CodeWaitForWarm)
+	}
+	if got.Status != 503 {
+		t.Errorf("status round-trip: got %d, want 503 (StatusForCode inverse lift)", got.Status)
+	}
+	if got.DocsURL != "https://docs.gregale.dev/scaling-policy#cooldown" {
+		t.Errorf("docs_url round-trip: got %q", got.DocsURL)
+	}
+	if got.Limit == nil || *got.Limit != 5 {
+		t.Errorf("limit round-trip: got %v, want 5", got.Limit)
+	}
+	if got.Observed == nil || *got.Observed != 3 {
+		t.Errorf("observed round-trip: got %v, want 3", got.Observed)
+	}
+}
+
 func TestRoundTrip_UnknownCodeFallsThroughToInternal(t *testing.T) {
 	p := api.NewProblem(500, "definitely_new_code", "T", "D")
 	err := grpcerr.ToStatus(p)

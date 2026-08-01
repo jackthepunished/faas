@@ -3750,3 +3750,99 @@ func TestMemStore_SetAppWorkloadClass_ParallelSameRow(t *testing.T) {
 		t.Errorf("final WorkloadClass = %q, want worker", got.WorkloadClass)
 	}
 }
+
+// TestMemStore_StampAppScaleOut (PR-C, issue #462) pins the
+// MemStore.StampAppScaleOut behavior: a fresh MemStore with a
+// freshly-created app's LastScaleOutAt == nil → StampAppScaleOut
+// writes a non-nil timestamp; second stamp overwrites it with a
+// later timestamp. Stamp on a missing app returns ErrNotFound
+// (defensive — schedd never calls this for an unknown app; tests
+// pin the contract so a future refactor that silently no-ops
+// trips the assertion).
+func TestMemStore_StampAppScaleOut(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "stamp-out@x.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "stamp-out-app", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 5, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	// Pre: nil.
+	if app.LastScaleOutAt != nil {
+		t.Errorf("fresh app.LastScaleOutAt = %v, want nil", app.LastScaleOutAt)
+	}
+	// First stamp.
+	if err := m.StampAppScaleOut(ctx, app.ID); err != nil {
+		t.Fatalf("StampAppScaleOut #1: %v", err)
+	}
+	got, err := m.AppByID(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.LastScaleOutAt == nil {
+		t.Fatal("LastScaleOutAt nil after StampAppScaleOut, want non-nil")
+	}
+	first := *got.LastScaleOutAt
+	// Second stamp overwrites with a later time. Sleep a millisecond
+	// to guarantee monotonicity — wall-clock resolution can land two
+	// stamps in the same nanosecond on fast boxes, which would
+	// otherwise race the "second stamp overwrites" assertion.
+	time.Sleep(time.Millisecond)
+	if err := m.StampAppScaleOut(ctx, app.ID); err != nil {
+		t.Fatalf("StampAppScaleOut #2: %v", err)
+	}
+	got2, err := m.AppByID(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if !got2.LastScaleOutAt.After(first) {
+		t.Errorf("second stamp %v not after first %v", got2.LastScaleOutAt, first)
+	}
+	// Stamp on missing app → ErrNotFound.
+	if err := m.StampAppScaleOut(ctx, "missing-app-id"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("StampAppScaleOut(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_StampAppScaleIn mirrors TestMemStore_StampAppScaleOut
+// for the reaper park path. Same shape — fresh → stamp → second
+// stamp overwrites; missing app → ErrNotFound.
+func TestMemStore_StampAppScaleIn(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	acc, err := m.CreateAccount(ctx, "stamp-in@x.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "stamp-in-app", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 5, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	if app.LastScaleInAt != nil {
+		t.Errorf("fresh app.LastScaleInAt = %v, want nil", app.LastScaleInAt)
+	}
+	if err := m.StampAppScaleIn(ctx, app.ID); err != nil {
+		t.Fatalf("StampAppScaleIn: %v", err)
+	}
+	got, err := m.AppByID(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if got.LastScaleInAt == nil {
+		t.Error("LastScaleInAt nil after StampAppScaleIn, want non-nil")
+	}
+	if err := m.StampAppScaleIn(ctx, "missing-app-id"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("StampAppScaleIn(missing) = %v, want ErrNotFound", err)
+	}
+}

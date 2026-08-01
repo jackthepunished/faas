@@ -25,6 +25,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
+	"github.com/onebox-faas/faas/pkg/sched/targets"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -47,6 +48,7 @@ type Loop struct {
 	diskDrift        *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
 	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets          *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
 	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
@@ -201,6 +203,20 @@ func (l *Loop) WithOpsMetrics(ops *wire.OpsMetrics) *Loop {
 // cadence — same opt-out shape as WithHeartbeat / WithWatchdog.
 func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
 	l.scaleup = t
+	return l
+}
+
+// WithTargets (PR-C, issue #462) attaches the per-app
+// concurrent_requests target scale-up trigger. Reads
+// InstatsReader.MaxInflightForApp and compares against
+// ScalingPolicy.Target.Value per app. Distinct from the RPS/CPU
+// scale-up trigger (scaleup.Trigger), which is unchanged. Nil opts
+// out — the targetsTick arm of Run's select never fires.
+// Production wires NewTargets(store, reader, ledger, engine, ops)
+// from cmd/schedd after the InstatsReader is available; tests skip
+// via nil. The trigger's own Interval() governs the cadence.
+func (l *Loop) WithTargets(t *targets.Trigger) *Loop {
+	l.targets = t
 	return l
 }
 
@@ -379,6 +395,18 @@ func (l *Loop) Run(ctx context.Context) error {
 		scaleupT = time.NewTicker(interval)
 		defer scaleupT.Stop()
 	}
+	// PR-C (issue #462): concurrent_requests target scale-up ticker.
+	// Same 1 s cadence as scaleupTick. Nil opts out — no ticker, no
+	// runTargets case.
+	var targetsT *time.Ticker
+	if l.targets != nil {
+		interval := l.targets.Interval()
+		if interval <= 0 {
+			interval = api.ScaleUpDecisionIntervalSeconds * time.Second
+		}
+		targetsT = time.NewTicker(interval)
+		defer targetsT.Stop()
+	}
 	// Recent-load mirror ticker (issue #171). 1 s cadence keeps the
 	// per-app RPS window current between reaper ticks (the reaper
 	// itself runs at 10 s). nil mirror opts out — no ticker, no
@@ -413,6 +441,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runInstanceStats(ctx)
 		case <-scaleupTick(scaleupT):
 			l.runScaleUp(ctx)
+		case <-targetsTick(targetsT):
+			l.runTargets(ctx)
 		case <-recentLoadTick(recentLoadT):
 			l.runRecentLoad(ctx)
 		case <-retentionFirst:
@@ -485,6 +515,15 @@ func instStatsTick(t *time.Ticker) <-chan time.Time {
 // scaleupTick is the reactive scale-up trigger ticker (issue #169 /
 // #172). Same nil-safe shape as the heartbeat/retention tickers.
 func scaleupTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// targetsTick (PR-C, issue #462) is the concurrent_requests target
+// scale-up trigger ticker. Same nil-safe shape as scaleupTick.
+func targetsTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -602,6 +641,17 @@ func (l *Loop) runRetention(ctx context.Context) {
 func (l *Loop) runScaleUp(ctx context.Context) {
 	if err := l.scaleup.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		l.log.Warn("scaleup tick error", "err", err)
+	}
+}
+
+// runTargets (PR-C, issue #462) dispatches one tick of the
+// concurrent_requests target scale-up trigger. Mirror of runScaleUp
+// — Tick errors are logged, never returned, so a transient store
+// blip can't tear down the loop. Nil-safe via the
+// InstatsReader.MaxInflightForApp contract inside Tick itself.
+func (l *Loop) runTargets(ctx context.Context) {
+	if err := l.targets.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("targets tick error", "err", err)
 	}
 }
 
@@ -743,13 +793,45 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// ReapIdle + ReapAggressive; RAM pressure
 				// (SelectEvictions) still wins.
 				WorkloadClass: a.WorkloadClass,
+				// PR-C (issue #462): per-app scale-in cooldown
+				// carrier fields. Same value across all rows of
+				// one app — sourced from apps.last_scale_in_at
+				// + ScalingPolicy.ScaleInCooldownS.
+				LastScaleInAt:    a.LastScaleInAt,
+				ScaleInCooldownS: state.ScalingPolicyOrDefault(a.ScalingPolicy).ScaleInCooldownS,
 			})
 		}
 	}
 	resident := l.engine.Ledger().ResidentRAM()
+	// instanceToApp (PR-C review fix): O(N) instance→app map shared
+	// between the idle and aggressive reaper branches. The pre-PR-C
+	// idle branch was O(N×M) (each parked ID linear-scanned the
+	// snapshot) and the aggressive branch built the same map
+	// locally — hoisting here is O(N+M) for the whole reaper.
+	instanceToApp := make(map[string]string, len(snapshot))
+	for _, s := range snapshot {
+		instanceToApp[s.Instance] = s.AppID
+	}
+	// PR-C (issue #462): per-app stamp after a successful park. We
+	// group the idle park list by app so we stamp ONCE per app per
+	// tick (the column is a per-app stamp; one park from each app is
+	// enough to drive the cooldown consult on the next tick). The
+	// "stamp missed" direction is safe — the consult bypasses
+	// cooldown on a NIL stamp.
+	idleParkByApp := map[string]struct{}{}
 	for _, id := range ReapIdle(now, snapshot) {
 		if err := l.engine.Park(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
+			continue
+		}
+		// O(1) lookup via the hoisted instance→app map.
+		if appID, ok := instanceToApp[id]; ok {
+			idleParkByApp[appID] = struct{}{}
+		}
+	}
+	for appID := range idleParkByApp {
+		if err := l.engine.Store().StampAppScaleIn(ctx, appID); err != nil {
+			l.log.Warn("reaper: stamp scale-in", "app", appID, "err", err)
 		}
 	}
 
@@ -763,7 +845,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// tick from blocking the reaper for `cap × ~150 ms` during a
 	// sudden-scale-down storm.
 	if l.recentLoad != nil && l.reaperAggressive {
-		l.runReaperAggressive(ctx, apps, snapshot, now)
+		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, now)
 	}
 
 	for _, id := range SelectEvictions(resident, now, snapshot) {
@@ -781,16 +863,11 @@ func (l *Loop) runReaper(ctx context.Context) {
 // observation per app per tick. Carved out of runReaper so the
 // behaviour is unit-testable without a clock / DB round-trip on
 // the full reaper body.
-func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, now time.Time) {
-	// Build an instance → app_id map once so the per-app park
-	// grouping below is O(N+M) instead of O(N×M) (issue #171 review
-	// finding: the re-scan was N walks of the snapshot for every
-	// parked ID). Cheap, deterministic, and replaces a linear scan
-	// inside what could become a 100-app reaper tick.
-	instanceToApp := make(map[string]string, len(snapshot))
-	for _, s := range snapshot {
-		instanceToApp[s.Instance] = s.AppID
-	}
+func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, now time.Time) {
+	// PR-C review fix: instanceToApp is built once in runReaper
+	// (O(N)) and threaded through here. Previously this function
+	// built its own copy — cheap but a second O(N) walk on every
+	// tick for no reason.
 	// consideredAppIDs: every autoscale-enabled multi-instance app
 	// gets exactly one metric observation per tick (either `park`
 	// or `keep`). Apps absent from this set fall outside the
@@ -839,10 +916,29 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 			parkByApp[appID] = append(parkByApp[appID], id)
 		}
 	}
+	// runningByApp (PR-C, issue #462): per-app RUNNING count for the
+	// min_floor_already outcome. We track this so the `keep` branch
+	// can distinguish "signal said keep" (running > floor+1) from
+	// "running already at the floor" (running == floor) and emit the
+	// more-informative outcome label.
+	runningByApp := map[string]int{}
+	for _, s := range snapshot {
+		if s.State != state.StateRunning {
+			continue
+		}
+		runningByApp[s.AppID]++
+	}
+	// floorByApp (PR-C, issue #462): per-app MinInstances for the
+	// min_floor_already comparison. Sourced from the `apps` slice
+	// passed into runReaperAggressive.
+	floorByApp := map[string]int{}
+	for _, a := range apps {
+		floorByApp[a.ID] = a.MinInstances
+	}
 	// For each considered app, emit either `park` (≥ 1 instance
-	// parked) or `keep` (signal said the running set is fine OR
-	// said "park to floor" and the floor matches the running
-	// count exactly). The metric counts one decision per app per
+	// parked), `min_floor_already` (running already at the floor
+	// and no signal-driven park), or `keep` (signal said keep and
+	// we have headroom). The metric counts one decision per app per
 	// tick.
 	cap := l.reaperParkCap
 	if cap <= 0 {
@@ -851,6 +947,18 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	for appID := range consideredAppIDs {
 		ids := parkByApp[appID]
 		if len(ids) == 0 {
+			// PR-C (issue #462): distinguish the
+			// "running already at the floor" case from
+			// the plain "keep" case so the dashboard can
+			// render "why didn't this scale down?" with
+			// a more informative label. We only emit
+			// min_floor_already when the customer has
+			// explicitly set MinInstances > 0 (no point
+			// calling out a floor of 0).
+			if floorByApp[appID] > 0 && runningByApp[appID] <= floorByApp[appID] {
+				l.ops.ObserveScaleDown(appID, "min_floor_already")
+				continue
+			}
 			l.ops.ObserveScaleDown(appID, "keep")
 			continue
 		}
@@ -861,9 +969,20 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		l.ops.ObserveScaleDown(appID, "park")
 		l.emitScaleDownAudit(ctx, appID, desiredByApp[appID], ids, now)
+		aggressiveParkOK := false
 		for _, id := range ids {
 			if err := l.engine.Park(ctx, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
+				continue
+			}
+			aggressiveParkOK = true
+		}
+		// PR-C (issue #462): stamp last_scale_in_at after a
+		// successful aggressive park. Best-effort — a stamp failure
+		// logs a warning but does not roll back the parks.
+		if aggressiveParkOK {
+			if err := l.engine.Store().StampAppScaleIn(ctx, appID); err != nil {
+				l.log.Warn("reaper: stamp scale-in (aggressive)", "app", appID, "err", err)
 			}
 		}
 	}

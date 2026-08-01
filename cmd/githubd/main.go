@@ -135,12 +135,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	webhookSvc.Installs = installsAdapter
 	webhookSvc.Source = source
 	webhookSvc.Reconcile = ghReconcile
-	// PR-GH.5: build fan-out. The noop enqueuer mints
-	// synthetic buildIDs so the wire contract is exercised
-	// end-to-end. The follow-up slice that wires the real
-	// builderd bridge swaps this in cmd/githubd/main.go
-	// without touching pkg/githubd.
-	webhookSvc.Enqueuer = githubd.NewNoopEnqueuer(log)
+	// Issue #432 phase 5: workDir is the root under which
+	// the per-app source tarballs land during the dispatch
+	// loop (pkg/githubd/staging.go). Same value as the
+	// gitfetch temp dir hoisted at line 123-127; both
+	// producers share the operator-controlled dir tree.
+	webhookSvc.WorkDir = workDir
+	// Issue #432 phase 5: build fan-out. The production
+	// enqueuer dials the apid gRPC bridge via the
+	// ApidBridgeClient (cmd/githubd/apid_bridge.go). The
+	// apid handler (cmd/apid/githubd_bridge.go) creates
+	// the deployment + build rows and emits the
+	// build_queued pg_notify. Pre-PR-GH.5 the wiring was
+	// a noopEnqueuer (synthetic buildIDs); the swap is
+	// the load-bearing close-out for phase 5.
+	//
+	// The apidClient is the same one the bridge dial
+	// returns below — apidBridgeClient returns the stub
+	// when FAAS_APID_GITHUBD_BRIDGE_SOCK is empty, so
+	// the dispatcher stays safe on a dev box where the
+	// apid daemon isn't running.
+	webhookSvc.Enqueuer = NewApidEnqueuer(newApidBridgeClient(ctx, os.Getenv("FAAS_APID_GITHUBD_BRIDGE_SOCK"), nil, log), log)
 
 	// Slice 8 RealService (OAuth + Checks). Auth may be nil if
 	// the GitHub App credentials aren't provisioned — the daemon
@@ -157,12 +172,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		keyPEM, kerr := deps.readKeyPEM()
 		if kerr != nil {
 			log.Warn("githubd: read app private key", "err", kerr)
+			log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 		} else {
 			clientID := os.Getenv("FAAS_GITHUB_APP_CLIENT_ID")
 			clientSecret := os.Getenv("FAAS_GITHUB_APP_CLIENT_SECRET")
 			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient(), clientID, clientSecret)
 			if aerr != nil {
 				log.Warn("githubd: app auth init", "err", aerr)
+				log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 			} else {
 				tokens := githubd.NewTokenCache(auth, 5*time.Minute)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
@@ -207,11 +224,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				if identities != nil {
 					realSvc.Identities = identities
 				}
+				// Path-filtered build fan-out (ADR-050 §103-109).
+				// Token resolution is per-call via the TokenCache
+				// (Option A from the plan review) so the daemon
+				// doesn't need to know about a specific install row
+				// at boot. If the AppAuth init failed above the
+				// field stays nil and service.go falls back to
+				// full fan-out.
+				//
+				// Issue #432 phase 5: the inner client is wrapped
+				// in a circuit breaker (NewBreakerChangedFiles)
+				// so 3 consecutive compare-API failures trip
+				// the breaker for 10 min and the dispatcher
+				// falls back to full fan-out without further
+				// load on the upstream. The breaker's mode label
+				// (githubd_path_filter_total{breaker_open})
+				// surfaces the trip in the §12 dashboard.
+				inner := githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
+				webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(inner, deps.now)
+				webhookSvc.Ops = ops
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
 	} else {
 		log.Info("githubd: FAAS_GITHUB_APP_ID unset; OAuth + Checks disabled (webhook path only)")
+		log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 	}
 
 	// The gRPC server hands out the RealService (full slice 8
@@ -306,7 +343,8 @@ func readKeyPEMDefault() ([]byte, error) {
 // by ensureInstallToken's cold-start rehydrate path to unseal
 // stored install tokens. The default matches the rest of the
 // secrets tree (spec §11: /etc/faas/secrets/host.age, mode 0400
-// root:root). An operator can override via FAAS_HOST_AGE_KEY.
+// root:root); respects FAAS_HOST_AGE_IDENTITY_PATH (systemd
+// LoadCredential indirection per spec §11) and FAAS_HOST_AGE_KEY.
 //
 // Issue #316 / ADR-057: the previous default had a stray `.key`
 // suffix (/etc/faas/secrets/host.age.key) that didn't match any
@@ -317,6 +355,9 @@ func readKeyPEMDefault() ([]byte, error) {
 // LoadHostKeys(dir) (current + previous) returns the same pair
 // every daemon consumes.
 func hostKeyPath() string {
+	if p := os.Getenv("FAAS_HOST_AGE_IDENTITY_PATH"); p != "" {
+		return p
+	}
 	if p := os.Getenv("FAAS_HOST_AGE_KEY"); p != "" {
 		return p
 	}
