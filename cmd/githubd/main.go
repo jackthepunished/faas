@@ -157,12 +157,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		keyPEM, kerr := deps.readKeyPEM()
 		if kerr != nil {
 			log.Warn("githubd: read app private key", "err", kerr)
+			log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 		} else {
 			clientID := os.Getenv("FAAS_GITHUB_APP_CLIENT_ID")
 			clientSecret := os.Getenv("FAAS_GITHUB_APP_CLIENT_SECRET")
 			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient(), clientID, clientSecret)
 			if aerr != nil {
 				log.Warn("githubd: app auth init", "err", aerr)
+				log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 			} else {
 				tokens := githubd.NewTokenCache(auth, 5*time.Minute)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
@@ -220,6 +222,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	} else {
 		log.Info("githubd: FAAS_GITHUB_APP_ID unset; OAuth + Checks disabled (webhook path only)")
+		log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 	}
 
 	// The gRPC server hands out the RealService (full slice 8
