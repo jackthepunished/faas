@@ -3697,6 +3697,40 @@ components:
           description: "Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it. PR-B activates the streamed response path; PR-A only persists the flag."
           type: boolean
           example: false
+        # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
+        # Nullable: legacy rows project as `null` (the empty
+        # policy falls back to the legacy min_instances /
+        # max_concurrency columns). Plan-gated upstream:
+        # min_instances > 0 / max_instances > 0 are Hobby+ (was
+        # Pro/Scale pre-#462); target.metric is Hobby+; cooldowns
+        # are clamped to api.MinScaleOutCooldownS..MaxScaleOutCooldownS
+        # (1..3600) and api.MinScaleInCooldownS..MaxScaleInCooldownS
+        # (5..86400). Worker-class apps reject
+        # target.metric=concurrent_requests with 422
+        # scaling_target_incompatible_with_workload_class
+        # (PR-D carve-out).
+        scaling_policy:
+          description: "Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`."
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/ScalingPolicy'
+        # Issue #462 / ADR-058: per-app cooldown bookkeeping.
+        # schedd stamps last_scale_out_at on the wake-gate
+        # admit branch (same Tx as the instances row insert);
+        # last_scale_in_at on the reaper park branch. Surfaces
+        # on GET so dashboards can render "warm-up in progress"
+        # + "recently scaled" copy. Nullable: a never-scaled
+        # app reads back as null.
+        last_scale_out_at:
+          description: "RFC 3339 timestamp of the most recent scale-out event schedd admitted for this app, or null if the app has never scaled out."
+          type: [string, "null"]
+          format: date-time
+          example: "2026-07-31T12:00:00Z"
+        last_scale_in_at:
+          description: "RFC 3339 timestamp of the most recent scale-in event schedd reaped for this app, or null if the app has never scaled in."
+          type: [string, "null"]
+          format: date-time
+          example: "2026-07-31T12:00:00Z"
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -3772,6 +3806,30 @@ components:
           description: "Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403 plan_streaming_not_allowed."
           type: [boolean, "null"]
           example: false
+        # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
+        # Omitted → no change. Non-null → atomic full-overwrite
+        # of the jsonb column `apps.scaling_policy` (the
+        # legacy min_instances column is kept in sync by the
+        # store). Validation runs at PATCH time:
+        #   min_instances > 0  → Hobby+ (was Pro/Scale pre-#462).
+        #                           Free → 403 plan_min_instances_not_allowed.
+        #   max_instances > 0  → Hobby+ (new gate at PR-A).
+        #                           Free → 403 plan_max_instances_not_allowed.
+        #   min/max instances  → 422 invalid_min_instances /
+        #                           invalid_max_instances on bounds.
+        #   cooldowns          → 422 invalid_cooldown on
+        #                           out-of-range values.
+        #   target.metric      → Hobby+ (PR-A wires the DTO;
+        #                           PR-C wires the engine).
+        #   worker-class apps
+        #     concurrent_requests → 422
+        #       scaling_target_incompatible_with_workload_class
+        #       (PR-D carve-out).
+        scaling_policy:
+          description: "Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/ScalingPolicy'
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -3779,6 +3837,54 @@ components:
       required: [new_slug]
       properties:
         new_slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', minLength: 3, maxLength: 40, example: "hello-world-v2" }
+
+    ScalingPolicy:
+      description: "Per-app autoscaling configuration (issue #462 / ADR-058). Mirrors the on-disk jsonb column `apps.scaling_policy`. Empty values map to the engine default (the apid gate is load-bearing for the floor / ceiling, not the encoder). PR-A persists the DTO; PR-C wires the engine; PR-D carves out the worker-class branch."
+      type: object
+      additionalProperties: false
+      properties:
+        min_instances:
+          description: "Per-app cold-wake floor. 0 = scale to zero (default). Hobby+ unlocked at PR-A (was Pro/Scale pre-#462). Free → 403 plan_min_instances_not_allowed."
+          type: integer
+          minimum: 0
+          example: 1
+        max_instances:
+          description: "Per-app ceiling on live instances. Must be in [min_instances, plan.MaxConcurrency]. Hobby+ unlocked at PR-A. Free → 403 plan_max_instances_not_allowed. 0 = use plan max_concurrency."
+          type: integer
+          minimum: 0
+          example: 5
+        target:
+          description: "Per-instance signal the engine watches for the scale-up trigger. Closed metric set: rps | concurrent_requests | p99_latency_ms. Empty/null = engine falls back to the legacy autoscale_target_rps / autoscale_target_cpu_pct columns. Worker-class apps reject concurrent_requests with 422 scaling_target_incompatible_with_workload_class (PR-D carve-out)."
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/ScalingTarget'
+        scale_out_cooldown_s:
+          description: "Minimum seconds between two scale-out events. Floor 1 (no 0 traps); ceiling 3600 (1 h). Out-of-range → 422 invalid_cooldown."
+          type: integer
+          minimum: 1
+          maximum: 3600
+          example: 5
+        scale_in_cooldown_s:
+          description: "Minimum seconds between two scale-in events. Floor 5 (matches the reaper's 5 s idle window); ceiling 86400 (1 day). Out-of-range → 422 invalid_cooldown."
+          type: integer
+          minimum: 5
+          maximum: 86400
+          example: 60
+
+    ScalingTarget:
+      description: "(metric, value) pair the engine watches for the scale-up trigger. The metric surface is closed; the unset state (null) is the legacy 'engine falls back to autoscale_target_rps' path."
+      type: object
+      additionalProperties: false
+      properties:
+        metric:
+          type: string
+          enum: [rps, concurrent_requests, p99_latency_ms]
+          example: "rps"
+        value:
+          description: "Target value (units depend on Metric). Must be >= 0."
+          type: number
+          minimum: 0
+          example: 1.0
 
     AppManifest:
       description: "App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs (\"secret:NAME\" strings) resolved by the host at wake time against the app_secrets table (issue #460 / ADR-053 §Decision 1). Values are NEVER sealed ciphertext — only refs."
