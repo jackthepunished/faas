@@ -26,6 +26,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gitfetch"
@@ -122,7 +123,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if mkErr := os.MkdirAll(workDir, 0o750); mkErr != nil {
 		return fmt.Errorf("githubd: create work dir: %w", mkErr)
 	}
-	gitFetcher := gitfetch.NewHTTP(workDir)
+	gitFetcher := gitfetch.NewHTTPWithLimits(workDir, api.MustLimitsFor(api.PlanScale))
 	installsAdapter := newStateInstallsAdapter(pool)
 	storeAdapter := newStateBindingsAdapter(pool)
 	source := newInstallationSourceFetcher(installsAdapter, gitFetcher, identity, log)
