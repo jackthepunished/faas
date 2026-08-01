@@ -122,6 +122,23 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 	if reqInit.GetInstance() == "" {
 		return status.Error(codes.InvalidArgument, "instance is required")
 	}
+	// PR-B (issue #462): in-flight request accounting on the
+	// streaming bridge. Begin as soon as the init frame is
+	// validated; End runs via defer after the bridge returns
+	// or errors. The pair is request-count, not
+	// connection-count — the counter captures concurrent
+	// ForwardHTTPStream RPCs in flight on vmmd.
+	//
+	// Streaming-trap note (pkg/fcvm/activity/doc.go "Future
+	// work"): the Begin/End pair runs over the whole RPC,
+	// not strictly per Recv/Send cycle. A streaming RPC that
+	// idles 900 s on the bridge would still hold a gauge
+	// tick — this is acceptable as an upper bound on
+	// concurrency; a stricter per-chunk accounting would
+	// re-enter Begin/End inside the body goroutine and add
+	// lock contention for marginal signal value.
+	s.beginActivity(reqInit.GetInstance())
+	defer s.endActivity(reqInit.GetInstance())
 	// Cap-lift (ADR-047 PR-B + PR-C, PR-D finalization): the
 	// streaming RPC is the only bridge today, so the base
 	// is the streaming cap (100 MiB / 900 s). The legacy
@@ -651,3 +668,24 @@ func BuildStreamingBridgeScriptForTest(req *vmmdpb.ForwardHTTPRequestInit, respT
 // net/http/httputil).
 var _ = io.EOF
 var _ = http.MethodGet
+
+// beginActivity (PR-B, issue #462) is the nil-safe bridge to
+// ActivityTracker.Begin. Centralising the guard keeps every
+// caller's defer pair simple and makes the "Server wired without
+// activity cache" path a no-op without scattering nil checks.
+func (s *Server) beginActivity(instanceID string) {
+	if s == nil || s.activity == nil {
+		return
+	}
+	s.activity.Begin(instanceID)
+}
+
+// endActivity (PR-B, issue #462) is the nil-safe bridge to
+// ActivityTracker.End. Pairs with beginActivity as the defer
+// after ForwardHTTPStream's bridge work.
+func (s *Server) endActivity(instanceID string) {
+	if s == nil || s.activity == nil {
+		return
+	}
+	s.activity.End(instanceID)
+}

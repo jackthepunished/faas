@@ -251,3 +251,42 @@ func (r *Reader) SnapshotForInstance(instanceID string) (InstanceStat, bool) {
 	}
 	return InstanceStat{}, false
 }
+
+// MaxInflightForApp returns the maximum InflightRequests across
+// all rows of the latest snapshot for appID, plus a "found"
+// boolean. (0, false) when no rows exist for the app — caller
+// treats that as "no signal", distinct from (0, true) which
+// means "the app has live instances but they are idle".
+//
+// PR-B (issue #462): the vmmd ActivityTracker feeds
+// InflightRequests per instance; the schedd scale-up trigger
+// (PR-C) consumes MaxInflightForApp to compare against the
+// customer's target.concurrent_requests value. The interface
+// widening that lets the trigger call MaxInflightForApp is
+// PR-C's atomic change with MaxCPU; today only the concrete
+// *Reader exposes the method so the wire shape and the
+// numeric path are testable end-to-end.
+//
+// Same complexity as SnapshotForApp: linear scan over the
+// atomic snapshot, called only on cold paths (wake-gate, scale-
+// up trigger, reaper). The snapshot is pinned for the duration
+// of the scan via the Load above; concurrent Replace atomically
+// swaps in a fresh slice that the next caller observes.
+func (r *Reader) MaxInflightForApp(appID string) (int64, bool) {
+	cur := r.snap.Load()
+	if cur == nil {
+		return 0, false
+	}
+	var max int64
+	var found bool
+	for _, row := range *cur {
+		if row.AppID != appID {
+			continue
+		}
+		if !found || row.InflightRequests > max {
+			max = row.InflightRequests
+			found = true
+		}
+	}
+	return max, found
+}

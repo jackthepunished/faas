@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -38,7 +39,7 @@ func TestBuildInstanceStatsRow_PopulatesNetTxBytes(t *testing.T) {
 	netCache.Observe(netstats.Observation{InstanceID: "vm-A", RXBytes: 0, At: time.Unix(0, 0)})
 	netCache.Observe(netstats.Observation{InstanceID: "vm-A", RXBytes: 4096, At: time.Unix(1, 0)})
 
-	row := buildInstanceStatsRow("vm-A", 8192, nil, netCache, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 8192, nil, netCache, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.GetInstance() != "vm-A" {
 		t.Errorf("Instance = %q, want vm-A", row.GetInstance())
@@ -72,7 +73,7 @@ func TestBuildInstanceStatsRow_PopulatesNetTxBytes(t *testing.T) {
 func TestBuildInstanceStatsRow_AbsentWhenNetCacheEmpty(t *testing.T) {
 	netCache := netstats.New(func() time.Time { return time.Unix(0, 0) })
 
-	row := buildInstanceStatsRow("vm-A", 4096, nil, netCache, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, nil, netCache, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.NetTxBytes != nil {
 		t.Errorf("NetTxBytes = %v, want nil (cache has no baseline for vm-A)", row.NetTxBytes)
@@ -84,7 +85,7 @@ func TestBuildInstanceStatsRow_AbsentWhenNetCacheEmpty(t *testing.T) {
 // produce a row with resident_bytes only, no panic. This is the
 // shape tests that don't exercise the caches fall through to.
 func TestBuildInstanceStatsRow_NilCachesDoesNotPanic(t *testing.T) {
-	row := buildInstanceStatsRow("vm-A", 4096, nil, nil, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, nil, nil, nil, wire.NewOpsMetrics("vmmd_test"))
 	if row.GetInstance() != "vm-A" {
 		t.Errorf("Instance = %q, want vm-A", row.GetInstance())
 	}
@@ -134,7 +135,7 @@ func TestBuildInstanceStatsRow_CPUCachePopulatesAllThreeFields(t *testing.T) {
 		At:            time.Unix(1, 0),
 	})
 
-	row := buildInstanceStatsRow("vm-A", 4096, cpuCache, nil, wire.NewOpsMetrics("vmmd_test"))
+	row := buildInstanceStatsRow("vm-A", 4096, cpuCache, nil, nil, wire.NewOpsMetrics("vmmd_test"))
 
 	if row.CpuPct == nil || row.CpuPct.Value != 12.5 {
 		t.Errorf("CpuPct = %v, want 12.5", row.CpuPct)
@@ -144,5 +145,59 @@ func TestBuildInstanceStatsRow_CPUCachePopulatesAllThreeFields(t *testing.T) {
 	}
 	if row.CpuThrottledSeconds == nil || row.CpuThrottledSeconds.Value != 0 {
 		t.Errorf("CpuThrottledSeconds = %v, want 0", row.CpuThrottledSeconds)
+	}
+}
+
+// TestBuildInstanceStatsRow_ActivityPopulatesInflightAndLastAt
+// pins the PR-B (issue #462) wire shape: the
+// inflight_requests and last_request_at fields reach the wire
+// when the activityCache has a row for the instance. Five
+// unmatched Begins produce InflightRequests=5 and a
+// LastRequestAt equal to the injected clock moment. Schedd
+// poller (pkg/sched/instancestats/poller.go:218-219) already
+// decodes this shape — the contract here is that buildInstanceStatsRow
+// populates it from the cache and that schedd's reader can
+// ask MaxInflightForApp for the same shape.
+func TestBuildInstanceStatsRow_ActivityPopulatesInflightAndLastAt(t *testing.T) {
+	tracker := activity.New(func() time.Time { return time.Unix(1_700_000_000, 0) })
+	for i := 0; i < 5; i++ {
+		tracker.Begin("vm-A")
+	}
+
+	row := buildInstanceStatsRow("vm-A", 8192, nil, nil, tracker, wire.NewOpsMetrics("vmmd_test"))
+
+	if row.GetInstance() != "vm-A" {
+		t.Errorf("Instance = %q, want vm-A", row.GetInstance())
+	}
+	if got := row.GetResidentBytes().Value; got != 8192 {
+		t.Errorf("ResidentBytes = %d, want 8192", got)
+	}
+	if got := row.GetInflightRequests(); got != 5 {
+		t.Errorf("InflightRequests = %d, want 5 (5 unmatched Begins)", got)
+	}
+	gotTime := row.GetLastRequestAt().AsTime()
+	if !gotTime.Equal(time.Unix(1_700_000_000, 0)) {
+		t.Errorf("LastRequestAt = %v, want %v (the injected clock at Begin time)", gotTime, time.Unix(1_700_000_000, 0))
+	}
+}
+
+// TestBuildInstanceStatsRow_ActivityAbsentWhenNoBegins pins
+// the "never observed" wire shape: an instance the activity
+// cache has not seen leaves InflightRequests=0 (bare int64)
+// and LastRequestAt=nil. This matches the pre-PR-B wire
+// shape exactly — the additive-merge the schedd poller
+// relies on. schedd stamps Unknown on absent LastRequestAt
+// and treats InflightRequests=0 as a valid "no observation
+// yet" reading.
+func TestBuildInstanceStatsRow_ActivityAbsentWhenNoBegins(t *testing.T) {
+	tracker := activity.New(nil)
+
+	row := buildInstanceStatsRow("vm-A", 4096, nil, nil, tracker, wire.NewOpsMetrics("vmmd_test"))
+
+	if row.GetInflightRequests() != 0 {
+		t.Errorf("InflightRequests = %d, want 0 (never observed)", row.GetInflightRequests())
+	}
+	if row.LastRequestAt != nil {
+		t.Errorf("LastRequestAt = %v, want nil (never observed)", row.LastRequestAt)
 	}
 }
