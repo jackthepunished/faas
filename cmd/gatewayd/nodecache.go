@@ -10,10 +10,11 @@
 //
 // The cache is the gateway's hot path: every Wake→proxy roundtrip
 // lands on it. It's safe for concurrent use; pkg/gateway/forwardproxy.go
-// owns the per-call refcount so an in-flight ForwardHTTP finishes
-// against the conn it dialed before Evict closes the underlying
-// transport. dialer errors fall through to 503 — the handler surfaces
-// "node unavailable" and the client retries on the next hop.
+// owns the per-call refcount so an in-flight ForwardHTTPStream RPC
+// finishes against the conn it dialed before Evict closes the
+// underlying transport. dialer errors fall through to 503 — the
+// handler surfaces "node unavailable" and the client retries on
+// the next hop.
 //
 // The resolver hook (gateway.SetNodeResolver) is set inside NewNodeClientCache
 // once we know the pgStore; tests that don't care about the overlay

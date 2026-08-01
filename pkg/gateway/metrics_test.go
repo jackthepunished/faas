@@ -667,3 +667,143 @@ func TestTouchComputeNodeChangedSubscriberNilSafe(t *testing.T) {
 	var m *Metrics
 	m.TouchComputeNodeChangedSubscriber() // must not panic
 }
+
+// TestMetricsStreamFlushesRegistered is the B2 PR-D tripwire for
+// the gateway_stream_flushes_total counter. PR-B+PR-C (commit 34c3677b)
+// shipped the counter construction but omitted m.streamFlushes from
+// the reg.MustRegister args at metrics.go:453. The counter is
+// incremented in code but never emitted on /metrics — every downstream
+// consumer (the §12 dashboard panel in B6, the metal e2e in B5) sees
+// "no data" regardless of actual request shape. This test asserts (a)
+// the metric name appears in the registry output, and (b) the
+// counter increments survive the registered-counter pipeline.
+func TestMetricsStreamFlushesRegistered(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveStreamFlush("app-A", "hobby")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "gateway_stream_flushes_total") {
+		t.Errorf("counter not in registry output:\n%s", body)
+	}
+
+	// Numeric readback via Gather() — same shape as
+	// TestMetricsTLSCertExpiryRegisters / TestMetricsWakeLocalityObserved.
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	var found bool
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_stream_flushes_total" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			app := mt.GetLabel()[0].GetValue()
+			plan := mt.GetLabel()[1].GetValue()
+			if app == "app-A" && plan == "hobby" {
+				got = mt.GetCounter().GetValue()
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("gateway_stream_flushes_total{app=app-A, plan=hobby} not in registry gather")
+	}
+	if got != 1 {
+		t.Errorf("counter value = %v, want 1 after one ObserveStreamFlush", got)
+	}
+}
+
+// TestObserveStreamFlushNilSafe — the wrapper must not panic when
+// called on a nil receiver (mirrors the established nil-safety pattern
+// for the other gateway metrics).
+func TestObserveStreamFlushNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveStreamFlush("app-A", "hobby") // must not panic
+}
+
+// TestMetricsStreamActiveStartEnd asserts the B3 gauge surfaces in
+// the registry and that a paired Start/End leaves the gauge at zero.
+// The 1000-iteration stress loop catches the goroutine-leak-style
+// drift called out in PR-D R3 (a panic between Start and End leaks
+// the gauge; the loop exercises the defer path).
+func TestMetricsStreamActiveStartEnd(t *testing.T) {
+	m := NewMetrics()
+	const appID, plan = "app-A", "hobby"
+	for i := 0; i < 1000; i++ {
+		m.ObserveStreamStart(appID, plan)
+		m.ObserveStreamEnd(appID, plan)
+	}
+
+	// Numeric readback via Gather().
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_stream_active" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			app := mt.GetLabel()[0].GetValue()
+			planL := mt.GetLabel()[1].GetValue()
+			if app == appID && planL == plan {
+				found = true
+				if got := mt.GetGauge().GetValue(); got != 0 {
+					t.Errorf("gauge value = %v, want 0 after 1000 balanced Start/End pairs", got)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("gateway_stream_active not in registry gather after stress loop")
+	}
+}
+
+// TestMetricsStreamActiveConcurrentBalance asserts the gauge is
+// goroutine-safe under concurrent Start/End. 1000 goroutines each
+// issue a balanced Start/End; the final gauge must be zero.
+func TestMetricsStreamActiveConcurrentBalance(t *testing.T) {
+	m := NewMetrics()
+	const appID, plan = "app-A", "hobby"
+	const N = 1000
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			m.ObserveStreamStart(appID, plan)
+			m.ObserveStreamEnd(appID, plan)
+		}()
+	}
+	wg.Wait()
+
+	// Read the gauge back.
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fam := range fams {
+		if fam.GetName() != "gateway_stream_active" {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			if mt.GetGauge().GetValue() != 0 {
+				t.Errorf("gauge value = %v, want 0 after concurrent balanced Start/End", mt.GetGauge().GetValue())
+			}
+		}
+	}
+}
+
+// TestObserveStreamStartEndNilSafe — the wrappers must not panic
+// when called on a nil receiver.
+func TestObserveStreamStartEndNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveStreamStart("app-A", "hobby") // must not panic
+	m.ObserveStreamEnd("app-A", "hobby")   // must not panic
+}

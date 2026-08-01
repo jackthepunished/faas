@@ -513,6 +513,87 @@
         "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Streaming flushes (top 10 apps, by plan)",
+      "id": 100,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 88},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (app, plan) (rate(gateway_stream_flushes_total[5m])))",
+          "legendFormat": "{{app}} ({{plan}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Streaming egress bytes (top 10 apps, by plan)",
+      "id": 101,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 88},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (app, plan) (rate(gateway_response_bytes_total[5m])))",
+          "legendFormat": "{{app}} ({{plan}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Active streaming responses",
+      "id": 102,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 96},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(gateway_stream_active{app!=\"__other__\"})",
+          "legendFormat": "active streams",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 1000}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}
+      }
     }
   ],
   "refresh": "30s",

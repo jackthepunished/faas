@@ -107,7 +107,7 @@ func safeLogField(s string) string {
 // the inner side is reachable only from inside the vmmd host's netns
 // (10.100.x.y/16 is bound on veth_peer per ADR-009) so gatewayd can't
 // reach it from a remote box. This handler instead asks vmmd to
-// bridge the bytes via the ForwardHTTP RPC.
+// bridge the bytes via the bidi ForwardHTTPStream RPC.
 //
 // ctxHook (optional) lets the caller cancel the bridge mid-flight
 // when the inbound request is cancelled (client disconnect). nil
@@ -116,9 +116,12 @@ func safeLogField(s string) string {
 //
 // PR-C (issue #460 / ADR-053): the returned closure receives the
 // full Target so the per-deployment override port (Target.Port) can
-// be stamped onto ForwardHTTPRequest.port. vmmd's bridge resolves
+// be stamped onto ForwardHTTPRequestInit.port. vmmd's bridge resolves
 // port=0 to netns.AppPort (8080) so legacy cached targets keep
 // working bit-for-bit.
+//
+// PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
+// streaming RPC is the only bridge today — see fwdStreamOnce below.
 func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
@@ -135,6 +138,12 @@ func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Tar
 // is the only panic-safety net — if a future maintainer adds a step
 // that panics on a malformed request, we still observe the request
 // via slog instead of crashing the listener.
+//
+// PR-D / ADR-047: this is now a thin wrapper that delegates to
+// fwdStreamOnce (the bidi ForwardHTTPStream RPC is the only bridge
+// today). The buffered unary path was removed; the streaming path
+// handles small/short responses correctly because the bridge pipes
+// bytes through Go's bufio and never enforces a latency floor.
 func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -162,92 +171,13 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 	}
 	defer func() { _ = closer.Close() }()
 
-	// PR-B + PR-C streaming path (ADR-047). The Handler
-	// stamps `x-faas-stream: true` on the inbound request just
-	// before calling the forwarder (handler.go:724); seeing it
-	// here means the upstream is configured to stream the
-	// response AND the per-app flag is on AND the client did
-	// not opt out via Accept: application/json. The bidi
-	// ForwardHTTPStream RPC carries the request body in
-	// streaming chunks (one frame per 8 KiB read off r.Body)
-	// and the response body in streaming chunks back to w.
-	// The header is stripped before bridging (see the
-	// x-faas-* skip below) so the guest never observes the
-	// internal signal.
-	if r.Header.Get("x-faas-stream") == "true" {
-		fwdStreamOnce(w, r, cli, log, t)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		// Body read failure = a client that disconnected before we
-		// finished buffering. Distinct from the bridge failing because
-		// the bridge hasn't started yet.
-		log.Warn("gateway: body read failed", "node", t.NodeID, "err", err.Error())
-		http.Error(w, "body read failed", http.StatusBadRequest)
-		return
-	}
-
-	pbReq := &vmmdpb.ForwardHTTPRequest{
-		Instance:   r.Header.Get("x-faas-instance"),
-		Method:     r.Method,
-		RequestUri: r.URL.RequestURI(),
-		Body:       body,
-		// PR-C (issue #460 / ADR-053): per-deployment override
-		// port the gateway cached at admit time. 0 = legacy 8080
-		// (vmmd's wire boundary defaults 0 to netns.AppPort).
-		Port: uint32(t.Port),
-	}
-	// Sanitised copy for log statements: the wire value keeps the raw
-	// header (vmmd validates UUID shape), the log value strips CR/LF
-	// so a hostile instance id cannot split log lines.
-	logInstance := safeLogField(pbReq.Instance)
-	for name, vals := range stripHopByHop(r.Header) {
-		// Skip the request-id and other internal-only headers we add
-		// in the gateway; the bridge doesn't need them and the guest
-		// would just see noise.
-		if strings.HasPrefix(strings.ToLower(name), "x-faas-") {
-			continue
-		}
-		for _, v := range vals {
-			pbReq.Headers = append(pbReq.Headers, &vmmdpb.Header{Name: name, Value: v})
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 65*time.Second)
-	defer cancel()
-	resp, err := cli.ForwardHTTP(ctx, pbReq)
-	if err != nil {
-		// Unavailable is the explicit signal from vmmd that the
-		// guest is sick / the netns is gone — the gateway should
-		// evict the cached target and let the next request re-wake.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
-			log.Warn("gateway: forwarder Unavailable; surfacing 503",
-				"node", t.NodeID, "instance", logInstance)
-			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		// NotFound = the instance isn't live. Same retry semantics:
-		// evict + re-wake on next request.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
-			http.Error(w, "instance gone", http.StatusServiceUnavailable)
-			return
-		}
-		log.Error("gateway: forwarder RPC failed",
-			"node", t.NodeID, "instance", logInstance,
-			"err", err.Error())
-		http.Error(w, "forwarder RPC failed", http.StatusBadGateway)
-		return
-	}
-
-	for _, h := range resp.GetHeaders() {
-		w.Header().Add(h.GetName(), h.GetValue())
-	}
-	w.WriteHeader(int(resp.GetStatus()))
-	if len(resp.GetBody()) > 0 {
-		_, _ = w.Write(resp.GetBody())
-	}
+	// PR-D / ADR-047: the streaming RPC is the only bridge today.
+	// The Handler still stamps `x-faas-stream: true` on the inbound
+	// request (handler.go:setupStreamingWriter) as the load-bearing
+	// signal for the vmmd-side cap-lift; the gateway forwarder
+	// strips it before bridging (see the x-faas-* skip below) so
+	// the guest never observes the internal signal.
+	fwdStreamOnce(w, r, cli, log, t)
 }
 
 // fwdStreamOnce is the streaming counterpart of fwdOnce (issue

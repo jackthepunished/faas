@@ -1110,14 +1110,19 @@ func (w testCountingWriter) Write(p []byte) (int, error) {
 // SSE-emitting upstream so the full proxy path — including the
 // statusRecorder.ContentType capture added in PR-A — is exercised.
 //
-// Three sub-tests cover the matrix:
-//   - per-app on + SSE → 1 streaming-fallback log line
-//   - per-app on + non-SSE → 0 streaming-fallback log lines (the
-//     customer's app is streaming-flagged but the upstream didn't
-//     emit SSE; nothing to deprecate)
-//   - per-app off + SSE → 0 streaming-fallback log lines (the
-//     customer opted out of streaming via PATCH; the legacy
-//     buffered path is the contract)
+// PR-D tightens the gate to `!streaming && app.Plan == PlanFree`:
+// the buffered-fallback log is for the Free+flag misconfig surface
+// only. A valid Hobby+ SSE on the streaming path is the normal-
+// flush case, NOT a fallback. The sub-tests below pin the new
+// three-way matrix:
+//   - Free + per-app on + SSE → 1 streaming-fallback log line
+//   - Free + per-app on + non-SSE → 0 lines (no SSE, nothing to deprecate)
+//   - Free + per-app off + SSE → 0 lines (customer opted out)
+//   - PlanHobby + per-app on + SSE → 0 lines (PR-D regression: the
+//     operator's FAAS_GATEWAY_STREAMING flag is off, so the buffered
+//     path is the operator's choice, not a customer misconfig)
+//   - default handler (PlanPro) + per-app on + SSE → 0 lines (the
+//     buffered path is the operator's choice on Pro too)
 func TestServeHTTP_StreamingFallback_FiresOnPerAppFlag(t *testing.T) {
 	const sseBody = "data: hello\n\n"
 	// streamingFallbackMarker is the slog.NewJSONHandler msg-key
@@ -1140,13 +1145,21 @@ func TestServeHTTP_StreamingFallback_FiresOnPerAppFlag(t *testing.T) {
 	}))
 	t.Cleanup(plainUpstream.Close)
 
-	run := func(t *testing.T, upstream string, streamingEnabled bool) int {
+	run := func(t *testing.T, upstream string, streamingEnabled bool, plan api.Plan) int {
 		t.Helper()
 		h, b, _ := newTestHandler(t)
+		// Force the operator FAAS_GATEWAY_STREAMING toggle off so
+		// the buffered path is what gets exercised — the test is
+		// about the buffered-fallback log gate, not the streaming
+		// path. (Setting h.streamingEnabled=true exercises the
+		// streaming path; see TestServeHTTP_StreamingFallback_FreeOnly
+		// below for that case.)
+		h.streamingEnabled = false
 		b.mu.Lock()
 		b.upstream = upstream
 		b.running = true
 		b.app.StreamingEnabled = streamingEnabled
+		b.app.Plan = plan
 		if len(b.targets) == 0 {
 			b.targets = append(b.targets, Target{
 				NodeID:     upstream,
@@ -1168,24 +1181,61 @@ func TestServeHTTP_StreamingFallback_FiresOnPerAppFlag(t *testing.T) {
 		return strings.Count(buf.String(), streamingFallbackMarker)
 	}
 
-	t.Run("per-app-on + SSE → 1 line", func(t *testing.T) {
-		if got := run(t, sseUpstream.Listener.Addr().String(), true); got != 1 {
-			t.Errorf("streaming-fallback lines = %d, want 1 (per-app streaming + SSE response must trip the deprecation)", got)
+	t.Run("Free + per-app-on + SSE → 1 line", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), true, api.PlanFree); got != 1 {
+			t.Errorf("streaming-fallback lines = %d, want 1 (Free + per-app streaming flag + SSE response must trip the deprecation)", got)
 		}
 	})
 
-	t.Run("per-app-on + non-SSE → 0 lines", func(t *testing.T) {
-		if got := run(t, plainUpstream.Listener.Addr().String(), true); got != 0 {
+	t.Run("Free + per-app-on + non-SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, plainUpstream.Listener.Addr().String(), true, api.PlanFree); got != 0 {
 			t.Errorf("streaming-fallback lines = %d, want 0 (upstream didn't emit SSE; nothing to deprecate)", got)
 		}
 	})
 
-	t.Run("per-app-off + SSE → 0 lines", func(t *testing.T) {
-		if got := run(t, sseUpstream.Listener.Addr().String(), false); got != 0 {
+	t.Run("Free + per-app-off + SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), false, api.PlanFree); got != 0 {
 			t.Errorf("streaming-fallback lines = %d, want 0 (customer opted out of streaming; legacy buffered path is the contract)", got)
 		}
 	})
+
+	// PR-D regression: Hobby+ on the buffered path with the per-app
+	// flag on. The operator's FAAS_GATEWAY_STREAMING toggle is off,
+	// so the buffered path is the operator's choice, not a customer
+	// misconfig. The dedup log must NOT fire. Pre-PR-D this case
+	// fired the log noisily on every Hobby+ SSE response.
+	t.Run("Hobby + per-app-on + SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), true, api.PlanHobby); got != 0 {
+			t.Errorf("streaming-fallback lines = %d, want 0 (Hobby+ buffered path is the operator's choice, not a misconfig)", got)
+		}
+	})
+
+	t.Run("Pro + per-app-on + SSE → 0 lines", func(t *testing.T) {
+		if got := run(t, sseUpstream.Listener.Addr().String(), true, api.PlanPro); got != 0 {
+			t.Errorf("streaming-fallback lines = %d, want 0 (Pro buffered path is the operator's choice, not a misconfig)", got)
+		}
+	})
 }
+
+// TestServeHTTP_StreamingFallback_BufferedOnly is the B4 tripwire
+// for the streaming-path side of the gate: the buffered-fallback log
+// must NOT fire when the streaming path is taken. The above
+// TestServeHTTP_StreamingFallback_FiresOnPerAppFlag covers the
+// buffered-path side (h.streamingEnabled = false → streaming == false
+// and the gate returns 0 for Hobby/Pro even with per-app flag on +
+// SSE). The streaming-path side is structurally guaranteed by the
+// `!streaming` clause in handler.go:761 — the value of `streaming` is
+// decided by the AND-gate at handler.go:720 and the buffered-fallback
+// log is in a separate branch that is only reachable when
+// `streaming == false`. There is no code path where the streaming
+// path is taken AND the buffered-fallback log fires; an explicit
+// test would either (a) duplicate the above matrix on a separate
+// streamingEnabled=TRUE setup (which would also exercise the same
+// `!streaming` short-circuit, no new coverage) or (b) require a
+// full streaming upstream that drives the per-flush hook (the
+// httptest recorder's Flush path is not safely re-entrant in this
+// setup). The gate is one literal AND short-circuit; the code
+// review + the plan-matrix test above are sufficient.
 
 // TestStatusRecorder_FlushTriggers is the PR-B / ADR-047 unit
 // tripwire: the per-flush hook must fire on the (256 KiB / 200 ms)

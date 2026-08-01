@@ -407,7 +407,7 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 		AddedAt:    time.Now(),
 		// PR-C (issue #460 / ADR-053): cache the per-deployment
 		// override port on the Target. The forwarder reads this
-		// to stamp ForwardHTTPRequest.port so vmmd dials the
+		// to stamp ForwardHTTPRequestInit.port so vmmd dials the
 		// override port instead of legacy 8080. Zero is fine
 		// (vmmd server-side defaults to netns.AppPort).
 		Port: port,
