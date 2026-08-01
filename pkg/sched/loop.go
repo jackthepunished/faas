@@ -743,13 +743,39 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// ReapIdle + ReapAggressive; RAM pressure
 				// (SelectEvictions) still wins.
 				WorkloadClass: a.WorkloadClass,
+				// PR-C (issue #462): per-app scale-in cooldown
+				// carrier fields. Same value across all rows of
+				// one app — sourced from apps.last_scale_in_at
+				// + ScalingPolicy.ScaleInCooldownS.
+				LastScaleInAt:   a.LastScaleInAt,
+				ScaleInCooldownS: state.ScalingPolicyOrDefault(a.ScalingPolicy).ScaleInCooldownS,
 			})
 		}
 	}
 	resident := l.engine.Ledger().ResidentRAM()
+	// PR-C (issue #462): per-app stamp after a successful park. We
+	// group the idle park list by app so we stamp ONCE per app per
+	// tick (the column is a per-app stamp; one park from each app is
+	// enough to drive the cooldown consult on the next tick). The
+	// "stamp missed" direction is safe — the consult bypasses
+	// cooldown on a NIL stamp.
+	idleParkByApp := map[string]struct{}{}
 	for _, id := range ReapIdle(now, snapshot) {
 		if err := l.engine.Park(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
+			continue
+		}
+		// Look up the app for this instance from the snapshot.
+		for _, s := range snapshot {
+			if s.Instance == id {
+				idleParkByApp[s.AppID] = struct{}{}
+				break
+			}
+		}
+	}
+	for appID := range idleParkByApp {
+		if err := l.engine.Store().StampAppScaleIn(ctx, appID); err != nil {
+			l.log.Warn("reaper: stamp scale-in", "app", appID, "err", err)
 		}
 	}
 
@@ -839,10 +865,29 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 			parkByApp[appID] = append(parkByApp[appID], id)
 		}
 	}
+	// runningByApp (PR-C, issue #462): per-app RUNNING count for the
+	// min_floor_already outcome. We track this so the `keep` branch
+	// can distinguish "signal said keep" (running > floor+1) from
+	// "running already at the floor" (running == floor) and emit the
+	// more-informative outcome label.
+	runningByApp := map[string]int{}
+	for _, s := range snapshot {
+		if s.State != state.StateRunning {
+			continue
+		}
+		runningByApp[s.AppID]++
+	}
+	// floorByApp (PR-C, issue #462): per-app MinInstances for the
+	// min_floor_already comparison. Sourced from the `apps` slice
+	// passed into runReaperAggressive.
+	floorByApp := map[string]int{}
+	for _, a := range apps {
+		floorByApp[a.ID] = a.MinInstances
+	}
 	// For each considered app, emit either `park` (≥ 1 instance
-	// parked) or `keep` (signal said the running set is fine OR
-	// said "park to floor" and the floor matches the running
-	// count exactly). The metric counts one decision per app per
+	// parked), `min_floor_already` (running already at the floor
+	// and no signal-driven park), or `keep` (signal said keep and
+	// we have headroom). The metric counts one decision per app per
 	// tick.
 	cap := l.reaperParkCap
 	if cap <= 0 {
@@ -851,6 +896,18 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	for appID := range consideredAppIDs {
 		ids := parkByApp[appID]
 		if len(ids) == 0 {
+			// PR-C (issue #462): distinguish the
+			// "running already at the floor" case from
+			// the plain "keep" case so the dashboard can
+			// render "why didn't this scale down?" with
+			// a more informative label. We only emit
+			// min_floor_already when the customer has
+			// explicitly set MinInstances > 0 (no point
+			// calling out a floor of 0).
+			if floorByApp[appID] > 0 && runningByApp[appID] <= floorByApp[appID] {
+				l.ops.ObserveScaleDown(appID, "min_floor_already")
+				continue
+			}
 			l.ops.ObserveScaleDown(appID, "keep")
 			continue
 		}
@@ -861,9 +918,20 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		l.ops.ObserveScaleDown(appID, "park")
 		l.emitScaleDownAudit(ctx, appID, desiredByApp[appID], ids, now)
+		aggressiveParkOK := false
 		for _, id := range ids {
 			if err := l.engine.Park(ctx, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
+				continue
+			}
+			aggressiveParkOK = true
+		}
+		// PR-C (issue #462): stamp last_scale_in_at after a
+		// successful aggressive park. Best-effort — a stamp failure
+		// logs a warning but does not roll back the parks.
+		if aggressiveParkOK {
+			if err := l.engine.Store().StampAppScaleIn(ctx, appID); err != nil {
+				l.log.Warn("reaper: stamp scale-in (aggressive)", "app", appID, "err", err)
 			}
 		}
 	}
