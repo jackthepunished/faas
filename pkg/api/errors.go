@@ -166,8 +166,8 @@ const (
 	// The Retry-After header is the canonical UX: the constructor
 	// bounds it at 1 second so the wire always emits a non-zero
 	// hint.
-	CodeWaitForWarm = "wait_for_warm"
-	CodeUnauthorized          = "unauthorized"
+	CodeWaitForWarm  = "wait_for_warm"
+	CodeUnauthorized = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
