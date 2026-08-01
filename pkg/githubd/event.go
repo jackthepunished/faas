@@ -19,6 +19,7 @@ import (
 // signal only and end up in slog if requested.
 type PushEvent struct {
 	Ref        string         `json:"ref"`        // "refs/heads/main"
+	Before     string         `json:"before"`     // commit SHA the branch was at before the push; empty for the first push on a branch (0000...0000)
 	After      string         `json:"after"`      // commit SHA the head now points at
 	Repository PushRepository `json:"repository"` // repo identity
 	Pusher     PushPusher     `json:"pusher"`     // optional audit

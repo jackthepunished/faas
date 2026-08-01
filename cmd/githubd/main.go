@@ -157,12 +157,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		keyPEM, kerr := deps.readKeyPEM()
 		if kerr != nil {
 			log.Warn("githubd: read app private key", "err", kerr)
+			log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 		} else {
 			clientID := os.Getenv("FAAS_GITHUB_APP_CLIENT_ID")
 			clientSecret := os.Getenv("FAAS_GITHUB_APP_CLIENT_SECRET")
 			auth, aerr := githubd.NewAppAuth(appID, keyPEM, deps.httpClient(), clientID, clientSecret)
 			if aerr != nil {
 				log.Warn("githubd: app auth init", "err", aerr)
+				log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 			} else {
 				tokens := githubd.NewTokenCache(auth, 5*time.Minute)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
@@ -207,11 +209,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				if identities != nil {
 					realSvc.Identities = identities
 				}
+				// Path-filtered build fan-out (ADR-050 §103-109).
+				// Token resolution is per-call via the TokenCache
+				// (Option A from the plan review) so the daemon
+				// doesn't need to know about a specific install row
+				// at boot. If the AppAuth init failed above the
+				// field stays nil and service.go falls back to
+				// full fan-out.
+				webhookSvc.ChangedFiles = githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
 	} else {
 		log.Info("githubd: FAAS_GITHUB_APP_ID unset; OAuth + Checks disabled (webhook path only)")
+		log.Warn("githubd: ChangedFiles disabled (path-filtered build fan-out will fall back to full rebuild on every push)")
 	}
 
 	// The gRPC server hands out the RealService (full slice 8
@@ -306,7 +317,8 @@ func readKeyPEMDefault() ([]byte, error) {
 // by ensureInstallToken's cold-start rehydrate path to unseal
 // stored install tokens. The default matches the rest of the
 // secrets tree (spec §11: /etc/faas/secrets/host.age, mode 0400
-// root:root). An operator can override via FAAS_HOST_AGE_KEY.
+// root:root); respects FAAS_HOST_AGE_IDENTITY_PATH (systemd
+// LoadCredential indirection per spec §11) and FAAS_HOST_AGE_KEY.
 //
 // Issue #316 / ADR-057: the previous default had a stray `.key`
 // suffix (/etc/faas/secrets/host.age.key) that didn't match any
@@ -317,6 +329,9 @@ func readKeyPEMDefault() ([]byte, error) {
 // LoadHostKeys(dir) (current + previous) returns the same pair
 // every daemon consumes.
 func hostKeyPath() string {
+	if p := os.Getenv("FAAS_HOST_AGE_IDENTITY_PATH"); p != "" {
+		return p
+	}
 	if p := os.Getenv("FAAS_HOST_AGE_KEY"); p != "" {
 		return p
 	}

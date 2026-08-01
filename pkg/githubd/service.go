@@ -18,10 +18,19 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// filterMode values for path-filtered build fan-out (ADR-050 §103-109).
+// Lifted to constants so deployment + filter tests + the
+// summary log all reference the same identifiers.
+const (
+	filterModePaths        = "paths"
+	filterModeFullFallback = "full_fallback"
 )
 
 // AppBindingStore is the slice of store githubd reads to look up
@@ -70,14 +79,23 @@ type WriteCheck func(ctx context.Context, repoFullName, commitSHA string, phase 
 // the PR-GH.5 build fan-out seam; nil falls back to a
 // noopEnqueuer so the unit tests don't have to wire an
 // enqueuer just to exercise the reconcile path.
+//
+// ChangedFiles is the PR-GH.6 path-filter seam: when set,
+// HandlePushRequest queries GitHub's compare API between
+// ev.Before and ev.After and rebuilds only the apps whose
+// RootDir intersects the changed file set. nil falls back to
+// the naive "rebuild every touched app" loop (PR-GH.5
+// behaviour), which is the safe default until cmd/githubd
+// wires the production client.
 type Service struct {
-	Log        *slog.Logger
-	Bindings   AppBindingStore
-	Installs   InstallsLookup
-	Source     SourceFetcher
-	Reconcile  *reconcile.Service
-	Enqueuer   BuildEnqueuer
-	WriteCheck WriteCheck
+	Log          *slog.Logger
+	Bindings     AppBindingStore
+	Installs     InstallsLookup
+	Source       SourceFetcher
+	Reconcile    *reconcile.Service
+	Enqueuer     BuildEnqueuer
+	ChangedFiles ChangedFilesClient
+	WriteCheck   WriteCheck
 }
 
 // NewService builds a Service. Tests inject fakes for the seams;
@@ -234,16 +252,12 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 		return result, ErrIgnored
 	}
 
-	// 6. Build fan-out (PR-GH.5). Rebuild every app in
-	// Result.Added ∪ Result.Changed. The slice is freshly
-	// allocated so the caller's view of Result isn't mutated
-	// by the enqueue loop.
-	//
-	// NAIVE FAN-OUT (per ADR-050): path-filtered follow-up
-	// (compare/{base}...{head} per push) is deferred. v1.0
-	// volumes run fine with full fan-out; the §12 dashboard
-	// has a dedicated counter for enqueue throughput so the
-	// follow-up work is observable.
+	// 6. Build fan-out (PR-GH.6 path-filtered). Query GitHub's
+	// compare API for the changed files between before and after,
+	// then rebuild only the apps whose RootDir intersects that
+	// set. Falls back to full fan-out on truncation, transport
+	// error, or any other compare failure (ADR-050 §109 — the
+	// conservative v1.0 posture).
 	enqueuer := s.Enqueuer
 	if enqueuer == nil {
 		enqueuer = NewNoopEnqueuer(s.Log)
@@ -251,8 +265,29 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 	touched := make([]state.App, 0, len(result.Added)+len(result.Changed))
 	touched = append(touched, result.Added...)
 	touched = append(touched, result.Changed...)
-	buildIDs := make([]string, 0, len(touched))
-	for _, app := range touched {
+
+	// Path-filter optimization (review #1): when the reconcile
+	// step produced zero apps (empty touched set, e.g. a default-
+	// branch push that matched the binding but Reconcile surfaced
+	// no added/changed workloads), skip the GitHub compare-API
+	// call entirely. There's nothing to filter, and the per-
+	// installation API quota is too precious to burn on no-op
+	// webhook deliveries. The empty-touched case is rare but
+	// reachable (binding pointing at a project whose root has no
+	// workloads, or a "no-op drift" reconcile that produced
+	// Added=∅, Changed=∅).
+	var changedFiles []string
+	filterMode := filterModeFullFallback
+	if len(touched) > 0 {
+		changedFiles, filterMode = s.lookupChangedFiles(ctx, ev, install.InstallationID)
+	} else {
+		s.Log.Debug("githubd: no touched apps; skipping compare-api call",
+			"repo", ev.Repository.FullName, "sha", ev.After)
+	}
+	toEnqueue, skipped := s.filterByPath(touched, changedFiles, filterMode)
+
+	buildIDs := make([]string, 0, len(toEnqueue))
+	for _, app := range toEnqueue {
 		bid, err := enqueuer.Enqueue(ctx, project.AccountID, app.ID, ev.After)
 		if err != nil {
 			// Best-effort: log + continue. The webhook
@@ -278,9 +313,139 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 		"repo", ev.Repository.FullName, "branch", branch,
 		"sha", ev.After, "binding", binding.BindingID,
 		"added", len(result.Added), "changed", len(result.Changed),
-		"removed", len(result.Removed), "builds", len(buildIDs),
+		"removed", len(result.Removed),
+		"touched", len(touched), "rebuilt", len(buildIDs),
+		"skipped", len(skipped), "filter_mode", filterMode,
+		"files", len(changedFiles),
 		"pusher", ev.Pusher.Name)
 	return result, nil
+}
+
+// lookupChangedFiles calls the ChangedFilesClient (if wired) and
+// returns (files, filterMode). filterMode is one of:
+//
+//   - "paths": the compare API succeeded; caller applies the
+//     RootDir intersection.
+//   - "full_fallback": any of {client nil, before empty, owner/
+//     repo split failed, transport / 4xx / 5xx, ErrTruncated}.
+//     Caller falls back to the naive full fan-out.
+//
+// Any error from the client is logged at warn level so the
+// dashboard can group by mode + truncated flag.
+func (s *Service) lookupChangedFiles(ctx context.Context, ev PushEvent, installationID int64) ([]string, string) {
+	if s.ChangedFiles == nil {
+		return nil, filterModeFullFallback
+	}
+	if ev.Before == "" {
+		// First push on a branch (or stale webhook) — can't
+		// form a compare URL. Treat as fallback.
+		s.Log.Warn("githubd: push missing before SHA; falling back to full fan-out",
+			"repo", ev.Repository.FullName, "sha", ev.After)
+		return nil, filterModeFullFallback
+	}
+	owner, repo, ok := splitOwnerRepo(ev.Repository.FullName)
+	if !ok {
+		s.Log.Warn("githubd: invalid repo full name; falling back to full fan-out",
+			"repo", ev.Repository.FullName, "sha", ev.After)
+		return nil, filterModeFullFallback
+	}
+	files, err := s.ChangedFiles.ChangedFiles(ctx, installationID, owner, repo, ev.Before, ev.After)
+	if err != nil {
+		s.Log.Warn("githubd: compare failed; falling back to full fan-out",
+			"repo", ev.Repository.FullName, "base", ev.Before, "head", ev.After,
+			"err", err, "truncated", errors.Is(err, ErrTruncated))
+		return nil, filterModeFullFallback
+	}
+	return files, filterModePaths
+}
+
+// filterByPath returns the subset of apps that should be rebuilt
+// given the changed files. filterMode is one of:
+//
+//   - "paths": only apps whose RootDir intersects changedFiles,
+//     plus all apps with RootDir == "" (they sit at repo root).
+//     If NO app intersects the file set, rebuild ALL (spec: a
+//     change at repo root outside every member's RootDir —
+//     lockfile, root Dockerfile, CI config — rebuilds every
+//     member). This is the lockfile/CI-fallback rule from
+//     ADR-050 §103-109.
+//   - "full_fallback": return touched verbatim; filter is a no-op.
+//
+// The returned `skipped` slice carries the IDs of touched apps
+// the filter dropped on the "paths" path; it is empty on the
+// "full_fallback" path.
+func (s *Service) filterByPath(touched []state.App, changedFiles []string, filterMode string) ([]state.App, []string) {
+	if filterMode != filterModePaths {
+		return touched, nil
+	}
+	var matched []state.App
+	var skipped []string
+	anyMatched := false
+	for _, app := range touched {
+		if app.RootDir == "" {
+			// Repo-root workload — always rebuild (it sees
+			// every push).
+			matched = append(matched, app)
+			anyMatched = true
+			continue
+		}
+		if pathIntersectsDir(changedFiles, app.RootDir) {
+			matched = append(matched, app)
+			anyMatched = true
+		} else {
+			skipped = append(skipped, app.ID)
+		}
+	}
+	if !anyMatched {
+		// Lockfile / root CI change: no member's RootDir was
+		// touched → rebuild all per ADR-050 §103-109.
+		return touched, nil
+	}
+	return matched, skipped
+}
+
+// pathIntersectsDir reports whether any changed file lives under
+// the directory `dir`. `dir` must be repo-relative (no leading
+// slash); `""` would be a repo-root workload and is filtered
+// before this helper runs. A path equal to `dir` itself counts as
+// intersecting (top-level file added at the root_dir path).
+//
+// Prefix collision guard: "services/auth" does NOT match
+// "services/auth-api/x.ts" — the helper enforces a trailing
+// slash boundary so the auth-dir-vs-auth-api-dir bug can't
+// misclassify workloads.
+func pathIntersectsDir(changedFiles []string, dir string) bool {
+	prefix := dir + "/"
+	for _, f := range changedFiles {
+		// Three intersection shapes:
+		//   f == dir       — top-level file added at the root_dir path
+		//   f == dir + "/" — directory-level rename/add/remove with
+		//                    trailing slash (GitHub emits these for
+		//                    directory-only entries; without this
+		//                    case, a workload whose RootDir matches
+		//                    the renamed dir would be missed).
+		//   f starts with prefix — file under the directory.
+		if f == dir || f == prefix || strings.HasPrefix(f, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitOwnerRepo splits "owner/name" into ("owner", "name", true).
+// Returns ok=false if the input doesn't contain a single slash,
+// or if either side is empty. Callers log + fall back.
+func splitOwnerRepo(fullName string) (owner, repo string, ok bool) {
+	idx := strings.Index(fullName, "/")
+	if idx <= 0 || idx == len(fullName)-1 {
+		return "", "", false
+	}
+	if strings.Contains(fullName[idx+1:], "/") {
+		// More than one slash — owner/repo/extra. We accept
+		// only the canonical two-segment shape.
+		return "", "", false
+	}
+	return fullName[:idx], fullName[idx+1:], true
 }
 
 // ErrNoBinding is returned by HandlePushRequest when the push
