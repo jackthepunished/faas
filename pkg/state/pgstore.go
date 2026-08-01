@@ -760,18 +760,35 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if ramMB <= 0 {
 		ramMB = 128
 	}
+	// warm_snapshot_min_requests / warm_snapshot_min_ms have CHECK bounds
+	// (1..100 / 100..60000) added by migration 00101. A caller that
+	// leaves them at the Go int zero trips the CHECK at insert time —
+	// mirror the ramMB / maxConcurrency floors above and clamp to the
+	// smallest legal value (1 / 100). apid still applies the plan-gated
+	// default from pkg/api/limits.go at create time, so production code
+	// always arrives with non-zero values; the floor is purely defensive
+	// for tests and internal callers that build an App struct by hand.
+	warmMinRequests := app.WarmSnapshotMinRequests
+	if warmMinRequests <= 0 {
+		warmMinRequests = 1
+	}
+	warmMinMs := app.WarmSnapshotMinMs
+	if warmMinMs <= 0 {
+		warmMinMs = 100
+	}
 	// Issue #470 / ADR-055 + issue #533 / ADR-066: warm_snapshot_* values
 	// arrive populated on the App struct from apid (which applies the
 	// plan-gated default from pkg/api/limits.go). The SQL CHECK bounds
-	// are enforced both at the column layer and at the apid handler so
-	// a bad input here can only come from a test or a buggy internal
-	// caller; both surface via the 22P02/23514 mapping in mapErr.
+	// are enforced both at the column layer and at the apid handler;
+	// the Go floor above is the last-line defence for tests / internal
+	// callers that build an App by hand with the int zero. node_id
+	// (migration 00090, Phase 2 / Gate A) is the durable shard key.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14, $15, $16, $17)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14, $15, $16, $17, $18)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, app.WarmSnapshotMinRequests, app.WarmSnapshotMinMs)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
 	return scanApp(row)
 }
 
@@ -844,6 +861,18 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	if ramMB <= 0 {
 		ramMB = 128
 	}
+	// Issue #470 / ADR-055: warm_snapshot_min_* have CHECK bounds (1..100 /
+	// 100..60000) added by migration 00101. Mirror the ramMB floor above
+	// so a zero-value App struct (test fixtures, internal callers) lands
+	// inside the bound instead of tripping the CHECK at insert time.
+	warmMinRequests := app.WarmSnapshotMinRequests
+	if warmMinRequests <= 0 {
+		warmMinRequests = 1
+	}
+	warmMinMs := app.WarmSnapshotMinMs
+	if warmMinMs <= 0 {
+		warmMinMs = 100
+	}
 	// Coerce Type=="" to AppTypeApp so the NOT NULL CHECK
 	// (type IN ('app','function')) is satisfied (matches CreateApp).
 	appType := app.Type
@@ -866,13 +895,15 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// Issue #470 / ADR-055: same warm_snapshot_* projection as CreateApp —
 	// the column default would write false/5/2000 for an unset caller,
 	// but apid always populates the App struct with the plan-gated
-	// defaults from pkg/api/limits.go before reaching either insert path.
+	// defaults from pkg/api/limits.go before reaching either insert path;
+	// the Go floor above is the last-line defence for tests / internal
+	// callers that build an App by hand with the int zero.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16)
+		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, app.WarmSnapshotMinRequests, app.WarmSnapshotMinMs)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
