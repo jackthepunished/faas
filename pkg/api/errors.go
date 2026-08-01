@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 )
 
 // AsProblem walks err's chain and returns the first *Problem. Returns nil
@@ -154,6 +155,18 @@ const (
 	// generic error. Maps to HTTP 501.
 	CodeBillingNotImplemented = "billing_not_implemented"
 	CodeCapacity              = "capacity_unavailable"
+	// CodeWaitForWarm marks a wake that was held by the customer's
+	// per-app scale-out cooldown (issue #462 / PR-D). Distinct
+	// from CodePlanLimitConcur (the customer's plan is fine; their
+	// ScaleOutCooldownS is holding the wake) and from
+	// CodeAppConcurReached (per-app concurrency exhausted, not
+	// relevant at the wake-gate). The 503 status mirrors
+	// CodeCapacity / CodeBuildXXX / CodeOAuthProviderUnavailable
+	// (existing 503 surface for transient / recoverable conditions).
+	// The Retry-After header is the canonical UX: the constructor
+	// bounds it at 1 second so the wire always emits a non-zero
+	// hint.
+	CodeWaitForWarm = "wait_for_warm"
 	CodeUnauthorized          = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
@@ -504,7 +517,7 @@ func StatusForCode(code string) int {
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
 		CodeAlertRuleInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
-	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable:
+	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm:
 		return http.StatusServiceUnavailable
 	case CodeScanCritical:
 		// 503 — the base ext4 has a CRITICAL Grype finding
@@ -673,6 +686,31 @@ func ErrCapacity(detail string) *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeCapacity,
 		"Briefly at capacity", detail).
 		WithDocs("https://apps.gregale.dev/status")
+}
+
+// ErrWaitForWarm is returned when a wake is held by the customer's
+// per-app scale-out cooldown (issue #462 / PR-D). The 503 + Retry-After
+// wire shape is the v1 contract: StatusForCode must map CodeWaitForWarm
+// to http.StatusServiceUnavailable so pkg/grpcerr.FromStatus can lift
+// the gRPC code back to the right HTTP status. The cooldownS argument
+// is the seconds remaining until the cooldown expires; the
+// constructor bounds it at 1 (cooldownS <= 0 is treated as 1) so the
+// Retry-After header is always a positive integer. The Retry-After
+// header is the canonical UX — clients that consult the header can
+// back off without polling the 503 + body alone.
+func ErrWaitForWarm(cooldownS int, l Limits, observed int) *Problem {
+	if cooldownS <= 0 {
+		cooldownS = 1
+	}
+	return NewProblem(http.StatusServiceUnavailable, CodeWaitForWarm,
+		"Scale-out cooldown in effect",
+		fmt.Sprintf(
+			"App is on a scale-out cooldown; %d more second(s) before the next wake is allowed. "+
+				"Plan %s allows %d concurrent instance(s); %d live.",
+			cooldownS, l.Plan, l.MaxConcurrency, observed)).
+		WithLimit(int64(cooldownS), int64(observed)).
+		WithDocs("https://docs.gregale.dev/scaling-policy#cooldown").
+		WithHeader("Retry-After", strconv.Itoa(cooldownS))
 }
 
 // ErrInternal is the catch-all 500 envelope for handler-side failures
