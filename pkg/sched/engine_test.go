@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // fakeVMM is a sched.VMM that records calls and stands in for firecracker. It is
@@ -278,6 +281,236 @@ func newEngine(t *testing.T, store state.Store, vmm RoutedVMM, notif Notifier, f
 	}
 	return e
 }
+
+// readScaleUp is a test helper that scrapes the closed-set
+// schedd_scale_up_decisions_total{app, outcome} counter from the
+// OpsMetrics HTTP handler. Returns 0 when the line is missing
+// (Prometheus pre-instantiates zero rows for the closed set).
+func readScaleUp(t *testing.T, ops *wire.OpsMetrics, app, outcome string) int {
+	t.Helper()
+	if ops == nil {
+		return 0
+	}
+	body := getMetricsBody(t, ops)
+	want := `schedd_scale_up_decisions_total{app="` + app + `",outcome="` + outcome + `"}`
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, want) {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return 0
+			}
+			n, err := strconv.Atoi(fields[len(fields)-1])
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			return n
+		}
+	}
+	return 0
+}
+
+// getMetricsBody fetches /metrics from the OpsMetrics HTTP handler.
+// Mirrors pkg/wire/metrics_test.go::render.
+func getMetricsBody(t *testing.T, ops *wire.OpsMetrics) string {
+	t.Helper()
+	srv := httptest.NewServer(ops.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
+
+// setAppPolicy stamps the post-create fields admitGate consults:
+// ScalingPolicy (*state.ScalingPolicy) and LastScaleOutAt (*time.Time).
+// Mirrors the apid PATCH path that wires the customer-facing knobs.
+//
+// lastScaleOutAt is supplied in absolute terms; MemStore keeps the
+// timestamp in apps[id].LastScaleOutAt which we splice directly via
+// the Store's exposed helper. The PG path is tested separately in
+// pkg/state/pgstore_stamp_app_scale_test.go.
+func setAppPolicy(t *testing.T, store state.Store, appID string, policy *state.ScalingPolicy, lastScaleOutAt *time.Time) {
+	t.Helper()
+	_, err := store.UpdateApp(context.Background(), appID, state.UpdateAppParams{
+		MaxConcurrency:   ptrInt(5),
+		MinInstances:     ptrInt(0),
+		SetMinInstances:  true,
+		ScalingPolicy:    policy,
+		SetScalingPolicy: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateApp ScalingPolicy: %v", err)
+	}
+	if lastScaleOutAt != nil {
+		if ms, ok := store.(*state.MemStore); ok {
+			ms.SetLastScaleOutAt(appID, *lastScaleOutAt)
+		} else {
+			if err := store.StampAppScaleOut(context.Background(), appID); err != nil {
+				t.Fatalf("StampAppScaleOut: %v", err)
+			}
+		}
+	}
+}
+
+func ptrInt(i int) *int { return &i }
+
+// TestAdmitGate_Outcomes pins the wake-gate admitGate decision
+// matrix (PR-C, issue #462). admintGate is the single decision
+// site before the ledger and the instances INSERT; it stamps the
+// per-(app, outcome) schedd_scale_up_decisions_total counter so
+// the dashboard "why didn't this scale?" pane can render the
+// reason. The four cases fence every outcome branch:
+//
+//   - admit: clean state → wakeAdmit, no metric increment.
+//   - reject_at_cap: Concurrency >= MaxConcurrency → wakeRejectAtCap,
+//     metric row increments to 1.
+//   - cooldown_held: Concurrency > 0 AND non-nil LastScaleOutAt
+//     AND non-zero ScaleOutCooldownS → wakeCooldownHeld, metric
+//     row increments to 1.
+//   - min_floor_already: ScalingPolicy.MinInstances > 0 AND
+//     Concurrency >= MinInstances → wakeMinFloorAlready, metric
+//     row increments to 1; this uses Pro (cap=5) and primes the
+//     ledger to Concurrency=2 to mirror the floor.
+//
+// Cases also assert the metric row count is 0 for the non-fired
+// outcomes so a regression that double-counts is caught.
+func TestAdmitGate_Outcomes(t *testing.T) {
+	mkApp := func(t *testing.T, plan api.Plan, maxConc int) state.App {
+		t.Helper()
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, plan, 128, maxConc)
+		return app
+	}
+	t.Run("admit", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		// No ScalingPolicy set — atMinFloorWithNoSignal returns
+		// false (nil policy short-circuits at engine.go:2215).
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		limits := api.MustLimitsFor(api.PlanPro)
+		got := e.admitGate(context.Background(), &app, limits)
+		if got != wakeAdmit {
+			t.Errorf("admitGate = %v, want wakeAdmit", got)
+		}
+		// Counter for reject_at_cap / cooldown_held / min_floor_already
+		// must remain 0 — a non-fired branch must not emit.
+		if n := readScaleUp(t, ops, app.ID, "reject_at_cap"); n != 0 {
+			t.Errorf("reject_at_cap = %d, want 0", n)
+		}
+		if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != 0 {
+			t.Errorf("cooldown_held = %d, want 0", n)
+		}
+		if n := readScaleUp(t, ops, app.ID, "min_floor_already"); n != 0 {
+			t.Errorf("min_floor_already = %d, want 0", n)
+		}
+	})
+	t.Run("reject_at_cap", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 2)
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		// Prime the ledger to MaxConcurrency (=2).
+		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
+		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
+		limits := api.MustLimitsFor(api.PlanPro)
+		got := e.admitGate(context.Background(), &app, limits)
+		if got != wakeRejectAtCap {
+			t.Errorf("admitGate = %v, want wakeRejectAtCap", got)
+		}
+		if n := readScaleUp(t, ops, app.ID, "reject_at_cap"); n != 1 {
+			t.Errorf("reject_at_cap = %d, want 1", n)
+		}
+	})
+	t.Run("cooldown_held", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		// Stamp a ScalingPolicy with ScaleOutCooldownS=60 and a
+		// lastScaleOutAt 1s ago so the consult fires.
+		setAppPolicy(t, store, app.ID, &state.ScalingPolicy{
+			ScaleOutCooldownS: 60,
+		}, ptrTime(time.Now().Add(-1*time.Second)))
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		// Prime the ledger to Concurrency=1 (the discriminator).
+		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
+		// Reload the app so the in-memory copy reflects the
+		// post-UpdateApp + post-StampAppScaleOut values.
+		reloaded, err := store.AppByID(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("GetApp: %v", err)
+		}
+		limits := api.MustLimitsFor(api.PlanPro)
+		got := e.admitGate(context.Background(), &reloaded, limits)
+		if got != wakeCooldownHeld {
+			t.Errorf("admitGate = %v, want wakeCooldownHeld", got)
+		}
+		if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != 1 {
+			t.Errorf("cooldown_held = %d, want 1", n)
+		}
+	})
+	t.Run("min_floor_already", func(t *testing.T) {
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		// Floor=2 with non-zero Size; Concurrency will be 2 after
+		// the Admit pair.
+		setAppPolicy(t, store, app.ID, &state.ScalingPolicy{
+			MinInstances: 2,
+		}, nil)
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
+		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
+		reloaded, err := store.AppByID(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("GetApp: %v", err)
+		}
+		limits := api.MustLimitsFor(api.PlanPro)
+		got := e.admitGate(context.Background(), &reloaded, limits)
+		if got != wakeMinFloorAlready {
+			t.Errorf("admitGate = %v, want wakeMinFloorAlready", got)
+		}
+		if n := readScaleUp(t, ops, app.ID, "min_floor_already"); n != 1 {
+			t.Errorf("min_floor_already = %d, want 1", n)
+		}
+	})
+	t.Run("cold_start_bypass_cooldown", func(t *testing.T) {
+		// Concurrency == 0 with a freshly-stamped LastScaleOutAt
+		// MUST admit — the discriminator is load-bearing for the
+		// customer's "scale on demand" use case.
+		store := state.NewMemStore()
+		_, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		setAppPolicy(t, store, app.ID, &state.ScalingPolicy{
+			ScaleOutCooldownS: 60,
+		}, ptrTime(time.Now().Add(-1*time.Second)))
+		ops := wire.NewOpsMetrics("schedd")
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+		// Do NOT prime the ledger — concurrency stays at 0.
+		reloaded, err := store.AppByID(context.Background(), app.ID)
+		if err != nil {
+			t.Fatalf("GetApp: %v", err)
+		}
+		limits := api.MustLimitsFor(api.PlanPro)
+		got := e.admitGate(context.Background(), &reloaded, limits)
+		if got != wakeAdmit {
+			t.Errorf("admitGate = %v, want wakeAdmit (cold-start bypass)", got)
+		}
+		if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != 0 {
+			t.Errorf("cooldown_held = %d, want 0 (cold start bypass)", n)
+		}
+	})
+	// pin mkApp as a referenced symbol to keep the helper pattern
+	// consistent across the suite.
+	_ = mkApp
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
 
 // testBootBudget is the scaled-down vmmd budget the deadline tests
 // inject in place of the §6.1 constants. Large enough that a loaded

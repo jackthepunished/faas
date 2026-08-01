@@ -803,6 +803,15 @@ func (l *Loop) runReaper(ctx context.Context) {
 		}
 	}
 	resident := l.engine.Ledger().ResidentRAM()
+	// instanceToApp (PR-C review fix): O(N) instance→app map shared
+	// between the idle and aggressive reaper branches. The pre-PR-C
+	// idle branch was O(N×M) (each parked ID linear-scanned the
+	// snapshot) and the aggressive branch built the same map
+	// locally — hoisting here is O(N+M) for the whole reaper.
+	instanceToApp := make(map[string]string, len(snapshot))
+	for _, s := range snapshot {
+		instanceToApp[s.Instance] = s.AppID
+	}
 	// PR-C (issue #462): per-app stamp after a successful park. We
 	// group the idle park list by app so we stamp ONCE per app per
 	// tick (the column is a per-app stamp; one park from each app is
@@ -815,12 +824,9 @@ func (l *Loop) runReaper(ctx context.Context) {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
 		}
-		// Look up the app for this instance from the snapshot.
-		for _, s := range snapshot {
-			if s.Instance == id {
-				idleParkByApp[s.AppID] = struct{}{}
-				break
-			}
+		// O(1) lookup via the hoisted instance→app map.
+		if appID, ok := instanceToApp[id]; ok {
+			idleParkByApp[appID] = struct{}{}
 		}
 	}
 	for appID := range idleParkByApp {
@@ -839,7 +845,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// tick from blocking the reaper for `cap × ~150 ms` during a
 	// sudden-scale-down storm.
 	if l.recentLoad != nil && l.reaperAggressive {
-		l.runReaperAggressive(ctx, apps, snapshot, now)
+		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, now)
 	}
 
 	for _, id := range SelectEvictions(resident, now, snapshot) {
@@ -857,16 +863,11 @@ func (l *Loop) runReaper(ctx context.Context) {
 // observation per app per tick. Carved out of runReaper so the
 // behaviour is unit-testable without a clock / DB round-trip on
 // the full reaper body.
-func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, now time.Time) {
-	// Build an instance → app_id map once so the per-app park
-	// grouping below is O(N+M) instead of O(N×M) (issue #171 review
-	// finding: the re-scan was N walks of the snapshot for every
-	// parked ID). Cheap, deterministic, and replaces a linear scan
-	// inside what could become a 100-app reaper tick.
-	instanceToApp := make(map[string]string, len(snapshot))
-	for _, s := range snapshot {
-		instanceToApp[s.Instance] = s.AppID
-	}
+func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, now time.Time) {
+	// PR-C review fix: instanceToApp is built once in runReaper
+	// (O(N)) and threaded through here. Previously this function
+	// built its own copy — cheap but a second O(N) walk on every
+	// tick for no reason.
 	// consideredAppIDs: every autoscale-enabled multi-instance app
 	// gets exactly one metric observation per tick (either `park`
 	// or `keep`). Apps absent from this set fall outside the

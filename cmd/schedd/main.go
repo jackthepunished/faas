@@ -853,13 +853,21 @@ type schedTargetsEngine struct {
 }
 
 // AdmitInstance implements targets.Engine: delegates to the wrapped
-// engine and lifts InstanceID into targets.AdmitResult.
+// engine and lifts InstanceID + AtCapacity into targets.AdmitResult.
+// AtCapacity MUST be forwarded — pkg/sched/targets.Trigger.Tick
+// consults result.AtCapacity on the admit path and re-observes
+// the wake-gate outcome metric as reject_at_cap when the engine
+// itself refused the admit (the race between decide()'s cap check
+// and engine.AdmitInstance's ledger call). Without forwarding,
+// the re-observe branch is dead code and the metric loses the
+// per-tick AtCapacity signal that the dashboard's "would have
+// scaled but cap reached" pane depends on.
 func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
 	r, err := s.engine.AdmitInstance(ctx, appID)
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
-	return targets.AdmitResult{InstanceID: r.InstanceID}, nil
+	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
 // schedTargetsLedger (PR-C, issue #462) adapts *sched.NodeLedger

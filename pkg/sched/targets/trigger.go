@@ -275,7 +275,9 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		dec := decide(stats)
 		// Always emit the decision metric so the rate of
 		// no_signal vs admit vs cooldown_held is observable.
-		t.metrics.ObserveScaleUp(app.ID, string(dec.Outcome))
+		if t.metrics != nil {
+			t.metrics.ObserveScaleUp(app.ID, string(dec.Outcome))
+		}
 		if !dec.ShouldAdmit {
 			continue
 		}
@@ -293,7 +295,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
 			continue
 		}
-		if result.AtCapacity {
+		if result.AtCapacity && t.metrics != nil {
 			t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
 		}
 	}
