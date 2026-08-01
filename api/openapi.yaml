@@ -74,6 +74,12 @@ tags:
       Per-app plaintext env vars (issue #395, ADR-045). Non-sensitive
       runtime config — credentials stay on /secrets. Values are
       stored as-is and applied on next wake.
+  - name: security
+    description: |
+      Operator-only per-app security knobs (issue #472 / ADR-058):
+      PATCH /v1/apps/{slug}/security (admin + MFA) flips the
+      require_signed flag; trusted_signers CRUD manages the
+      per-app cosign trusted-publisher list.
   - name: usage
     description: Usage roll-up and metering.
   - name: billing
