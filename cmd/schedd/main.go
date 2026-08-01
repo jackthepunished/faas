@@ -76,6 +76,16 @@ type runDeps struct {
 	// yet has a coherent (empty) state. Tests inject a fake
 	// channel.
 	subscribeNodeKeyChanges func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeRouterRefresh (Tier A3) is the producer-side seam
+	// for the compute_node_changed consumer that drops a stale
+	// dialed client and reloads target_url into VMMRouter. The
+	// first subscribe is critical-path (a vmmd URL rotation that
+	// arrives before the daemon registered for events will silently
+	// stale-dial the old URL until restart), so the wiring below
+	// fails the boot inline rather than logging-and-continuing.
+	// After boot, SubscribeWithReconnect handles transient LISTEN
+	// failures internally (100ms→5s backoff).
+	subscribeRouterRefresh func(context.Context, *pgxpool.Pool, *slog.Logger) (<-chan db.Notification, error)
 	// heartbeatInterval overrides sched.DefaultHeartbeatInterval for
 	// tests that want a sub-second cadence. Zero falls back to the
 	// production default (30s).
@@ -122,6 +132,17 @@ func defaultDeps() runDeps {
 		// ReplaceAll map swap).
 		subscribeNodeKeyChanges: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyComputeNodeChanged})
+		},
+		// Tier A3: a second LISTEN on compute_node_changed. The
+		// node-key verifier above wraps its subscribe in a
+		// goroutine because a transient LISTEN failure there is
+		// a degraded (not fatal) state; the router refresh
+		// watcher is critical-path for vmmd URL rotation
+		// visibility, so we open a separate LISTEN backed by
+		// SubscribeWithReconnect and fail the daemon inline if
+		// the first Subscribe fails.
+		subscribeRouterRefresh: func(ctx context.Context, p *pgxpool.Pool, l *slog.Logger) (<-chan db.Notification, error) {
+			return db.SubscribeWithReconnect(ctx, p, []string{db.NotifyComputeNodeChanged}, l)
 		},
 	}
 }
@@ -242,6 +263,43 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		nodeInfos = append(nodeInfos, sched.ComputeNodeInfo{ID: n.ID, TargetURL: n.TargetURL})
 	}
 	vmmRouter := sched.NewVMMRouter(nodeInfos, deps.dialVMM, vmmTLS)
+
+	// Tier A3: subscribe to compute_node_changed and refresh the
+	// router's (nodeID, target_url) map on every payload. The
+	// first subscribe is critical-path; on failure we fail the
+	// boot inline (mirrors the inline Refresh call at lines
+	// ~181-183 for the node-key verifier, but where that one is
+	// best-effort, this one is critical because a missed notify
+	// means vmmd URL rotations stale-dial silently until restart).
+	// After boot, SubscribeWithReconnect drives the channel across
+	// transient LISTEN failures.
+	routerRefreshCh, err := deps.subscribeRouterRefresh(ctx, pool, log)
+	if err != nil {
+		return fmt.Errorf("schedd: router refresh subscribe: %w", err)
+	}
+	// The watcher only needs the (nodeID, target_url) pair from
+	// each compute_nodes row; pkg/sched does not import
+	// pkg/state today, so the lookup lives here and the watcher
+	// takes a RouterRefreshFunc closure. ErrNotFound means the row
+	// was soft-deleted between NOTIFY and the SELECT — write "" so
+	// the next resolveFor returns ErrCapacity (the same path an
+	// unknown node takes).
+	routerRefreshFn := func(rctx context.Context, nodeID string) error {
+		row, err := store.ComputeNodeByID(rctx, nodeID)
+		switch {
+		case err == nil:
+			vmmRouter.Refresh(nodeID, row.TargetURL)
+			return nil
+		case errors.Is(err, state.ErrNotFound):
+			vmmRouter.Refresh(nodeID, "")
+			return nil
+		default:
+			return err
+		}
+	}
+	go func() {
+		sched.RunRouterRefreshWatcher(ctx, log, routerRefreshCh, routerRefreshFn)
+	}()
 
 	ledger := sched.NewNodeLedger()
 	ops := wire.NewOpsMetrics("schedd")
