@@ -938,6 +938,23 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	var out *WakeOutcome
 	bootCtx, cancel := context.WithTimeout(ctx, e.budgetFor(bootInput.initState))
 	defer cancel()
+	// issue #517: stamp the per-wake correlation fields onto the
+	// bootCtx so the VMMClient wrappers can lift them onto the gRPC
+	// outbound metadata (and vmmd can stamp its own slog records).
+	// We populate AppID / DeploymentID / InstanceID / WakeID; the
+	// HTTP-side request_id (if any) flows in from gatewayd via ctx
+	// and is preserved by reading the inbound correlation first and
+	// joining it into the bootCtx-bound set so a single inbound
+	// request_id carries across the schedd → vmmd boundary.
+	inboundCorr, _ := wire.FromContext(ctx)
+	bootCtx = wire.WithContext(bootCtx, wire.CorrelationFields{
+		RequestID:    inboundCorr.RequestID,
+		InvocationID: inboundCorr.InvocationID,
+		AppID:        appID,
+		DeploymentID: bootInput.depID,
+		InstanceID:   bootInput.insID,
+		WakeID:       wakeID,
+	})
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
 		// carries (imaged stamps it from the snapshot_written

@@ -24,6 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/overlay"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -384,9 +385,18 @@ func (c *VMMClient) Close() error {
 }
 
 func (c *VMMClient) CreateColdBoot(ctx context.Context, instance string, app AppSpec) (*WakeOutcome, error) {
+	// issue #517: lift correlation fields (wake_id, app_id, etc.)
+	// from the engine's bootCtx onto both the gRPC outbound
+	// metadata (for vmmd's slog correlation) and the proto
+	// field (for codegen-visible contracts). The metadata reader
+	// in vmmdgrpc.Logs consults MD as the runtime source; the
+	// proto field is the documentation seam.
+	fields, _ := wire.FromContext(ctx)
+	ctx = wire.WithCorrelationOutgoing(ctx, fields)
 	resp, err := c.cli.CreateColdBoot(ctx, &vmmdpb.CreateColdBootRequest{
 		Instance: instance,
 		App:      app.toProto(),
+		WakeId:   fields.WakeID,
 	})
 	if err != nil {
 		return nil, liftErr(err)
@@ -395,6 +405,9 @@ func (c *VMMClient) CreateColdBoot(ctx context.Context, instance string, app App
 }
 
 func (c *VMMClient) CreateFromSnapshot(ctx context.Context, instance string, app AppSpec, snap SnapshotRef) (*WakeOutcome, error) {
+	// issue #517: see CreateColdBoot above for the rationale.
+	fields, _ := wire.FromContext(ctx)
+	ctx = wire.WithCorrelationOutgoing(ctx, fields)
 	resp, err := c.cli.CreateFromSnapshot(ctx, &vmmdpb.CreateFromSnapshotRequest{
 		Instance: instance,
 		App:      app.toProto(),
@@ -405,6 +418,7 @@ func (c *VMMClient) CreateFromSnapshot(ctx context.Context, instance string, app
 			StorageKey:        snap.StorageKey,
 			VmstateStorageKey: snap.VMStateStorageKey,
 		},
+		WakeId: fields.WakeID,
 	})
 	if err != nil {
 		return nil, liftErr(err)
@@ -474,9 +488,16 @@ func (c *VMMClient) Logs(ctx context.Context, instance string, sinceSeq int64) (
 	if sinceSeq < 0 {
 		sinceSeq = 0
 	}
+	// issue #517: lift correlation fields onto the outbound gRPC
+	// metadata + the new wake_id proto field. The runtime source
+	// for vmmd's slog correlation is the MD; the proto field is
+	// documentation / future-validation.
+	fields, _ := wire.FromContext(ctx)
+	ctx = wire.WithCorrelationOutgoing(ctx, fields)
 	cli, err := c.cli.Logs(ctx, &vmmdpb.LogsRequest{
 		Instance: instance,
 		SinceSeq: sinceSeq,
+		WakeId:   fields.WakeID,
 	})
 	if err != nil {
 		return nil, liftErr(err)

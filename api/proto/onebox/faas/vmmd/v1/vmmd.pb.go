@@ -642,7 +642,17 @@ type CreateFromSnapshotRequest struct {
 	// and the throttle top-N admission primitive (topAppSet, cap
 	// 100). Empty = "anonymous" admission (matches the requestTotal
 	// overflow policy).
-	AccountId     string `protobuf:"bytes,5,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	AccountId string `protobuf:"bytes,5,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	// WakeID (issue #517 / ADR-061) is the per-wake UUID minted by
+	// schedd's Engine.Wake and persisted on the instances row.
+	// vmmd stamps it onto every slog record it emits during the
+	// restore path so a single cold wake is queryable as a
+	// timeline. The runtime source of truth is the gRPC metadata
+	// key x-faas-wake-id (CorrelationFromIncoming in pkg/wire);
+	// the proto field is documented here for codegen visibility
+	// and as a synchronous-validation seam for future callers
+	// that don't read MD. Empty on a non-wake RPC (e.g. ping).
+	WakeId        string `protobuf:"bytes,6,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -712,6 +722,13 @@ func (x *CreateFromSnapshotRequest) GetAccountId() string {
 	return ""
 }
 
+func (x *CreateFromSnapshotRequest) GetWakeId() string {
+	if x != nil {
+		return x.WakeId
+	}
+	return ""
+}
+
 type CreateColdBootRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Instance string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
@@ -727,7 +744,10 @@ type CreateColdBootRequest struct {
 	Plan string `protobuf:"bytes,4,opt,name=plan,proto3" json:"plan,omitempty"`
 	// AccountID (issue #301, ADR-043) — same semantics as
 	// CreateFromSnapshotRequest.account_id.
-	AccountId     string `protobuf:"bytes,5,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	AccountId string `protobuf:"bytes,5,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	// WakeID (issue #517 / ADR-061) — same semantics as
+	// CreateFromSnapshotRequest.wake_id.
+	WakeId        string `protobuf:"bytes,6,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -793,6 +813,13 @@ func (x *CreateColdBootRequest) GetPlan() string {
 func (x *CreateColdBootRequest) GetAccountId() string {
 	if x != nil {
 		return x.AccountId
+	}
+	return ""
+}
+
+func (x *CreateColdBootRequest) GetWakeId() string {
+	if x != nil {
+		return x.WakeId
 	}
 	return ""
 }
@@ -1855,10 +1882,17 @@ func (x *SeccompStatusResponse) GetError() string {
 // since_seq replays from a sequence number; 0 = tail from now (skip the
 // initial page and only stream new lines). The producer's ring is keyed
 // per instance so each instance carries its own monotonic Seq.
+//
+// wake_id (issue #517 / ADR-061) is the wake correlation key the caller
+// attaches so vmmd can stamp the wake id onto any log lines that
+// cross its logs handler (currently zero — the producer only emits
+// per-instance Seq/Stream/Line; the wake_id is consumed by the
+// envelope, not the line payload). Empty on a tail-only consumer.
 type LogsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Instance      string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
 	SinceSeq      int64                  `protobuf:"varint,2,opt,name=since_seq,json=sinceSeq,proto3" json:"since_seq,omitempty"`
+	WakeId        string                 `protobuf:"bytes,3,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1905,6 +1939,13 @@ func (x *LogsRequest) GetSinceSeq() int64 {
 		return x.SinceSeq
 	}
 	return 0
+}
+
+func (x *LogsRequest) GetWakeId() string {
+	if x != nil {
+		return x.WakeId
+	}
+	return ""
 }
 
 // LogsResponse is one streamed log line. seq is the per-instance
@@ -2588,21 +2629,23 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x10requested_method\x18\b \x01(\x0e2\x1f.onebox.faas.vmmd.v1.WakeMethodR\x0frequestedMethod\x121\n" +
 	"\aproblem\x18\t \x01(\v2\x17.google.protobuf.StructR\aproblem\x12C\n" +
 	"\x10characterization\x18\n" +
-	" \x01(\v2\x17.google.protobuf.StructR\x10characterization\"\xd8\x01\n" +
+	" \x01(\v2\x17.google.protobuf.StructR\x10characterization\"\xf1\x01\n" +
 	"\x19CreateFromSnapshotRequest\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12.\n" +
 	"\x03app\x18\x02 \x01(\v2\x1c.onebox.faas.vmmd.v1.AppSpecR\x03app\x12<\n" +
 	"\bsnapshot\x18\x03 \x01(\v2 .onebox.faas.vmmd.v1.SnapshotRefR\bsnapshot\x12\x12\n" +
 	"\x04plan\x18\x04 \x01(\tR\x04plan\x12\x1d\n" +
 	"\n" +
-	"account_id\x18\x05 \x01(\tR\taccountId\"\xcc\x01\n" +
+	"account_id\x18\x05 \x01(\tR\taccountId\x12\x17\n" +
+	"\awake_id\x18\x06 \x01(\tR\x06wakeId\"\xe5\x01\n" +
 	"\x15CreateColdBootRequest\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12.\n" +
 	"\x03app\x18\x02 \x01(\v2\x1c.onebox.faas.vmmd.v1.AppSpecR\x03app\x124\n" +
 	"\x05build\x18\x03 \x01(\v2\x1e.onebox.faas.vmmd.v1.BuildSpecR\x05build\x12\x12\n" +
 	"\x04plan\x18\x04 \x01(\tR\x04plan\x12\x1d\n" +
 	"\n" +
-	"account_id\x18\x05 \x01(\tR\taccountId\"*\n" +
+	"account_id\x18\x05 \x01(\tR\taccountId\x12\x17\n" +
+	"\awake_id\x18\x06 \x01(\tR\x06wakeId\"*\n" +
 	"\tBuildSpec\x12\x1d\n" +
 	"\n" +
 	"export_dir\x18\x01 \x01(\tR\texportDir\"\xaf\x01\n" +
@@ -2664,10 +2707,11 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x04mode\x18\x03 \x01(\tR\x04mode\x12\x1d\n" +
 	"\n" +
 	"filter_len\x18\x04 \x01(\x05R\tfilterLen\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\"F\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"_\n" +
 	"\vLogsRequest\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12\x1b\n" +
-	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\"\x87\x01\n" +
+	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\x12\x17\n" +
+	"\awake_id\x18\x03 \x01(\tR\x06wakeId\"\x87\x01\n" +
 	"\fLogsResponse\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x12\n" +

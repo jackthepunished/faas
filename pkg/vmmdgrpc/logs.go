@@ -5,6 +5,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -38,15 +39,36 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	defer func() {
 		s.ops.Observe(op, time.Since(start), sendErr)
 	}()
+	// issue #517: lift the wake_id / app_id correlation off the
+	// inbound gRPC metadata so any slog record this handler emits
+	// (currently just the open/close; PR-C will adopt the canonical
+	// timeline event names) carries the same correlation fields
+	// the upstream schedd logged. The runtime source is the MD
+	// (CorrelationFromIncoming); the proto field on LogsRequest is
+	// documentation / future-validation. We prefer the MD value
+	// over the proto field so an out-of-band consumer (one that
+	// doesn't set the proto field) still gets correlation if its
+	// middleware sets the MD.
+	fields, _ := wire.CorrelationFromIncoming(stream.Context())
+	if fields.WakeID == "" {
+		fields.WakeID = req.GetWakeId()
+	}
+	streamLogger := wire.WithCorrelationFields(s.log, fields)
 	if req.GetInstance() == "" {
 		sendErr = status.Error(codes.InvalidArgument, "instance is required")
+		streamLogger.Warn("vmmd: Logs: missing instance")
 		return sendErr
 	}
 	ring := s.vmm.LogRing(req.GetInstance())
 	if ring == nil {
 		sendErr = status.Error(codes.NotFound, "instance not live on this vmmd")
+		streamLogger.Info("vmmd: Logs: ring not found",
+			"instance", req.GetInstance())
 		return sendErr
 	}
+	streamLogger.Info("vmmd: Logs: stream opened",
+		"instance", req.GetInstance(),
+		"since_seq", req.GetSinceSeq())
 	// Initial page: lines with Seq > since_seq in commit order. The
 	// ring's Snapshot filters by Seq >= sinceSeq (>= so a sinceSeq
 	// equal to the last seq is still considered replayed; the caller

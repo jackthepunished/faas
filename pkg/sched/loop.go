@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/sched/targets"
@@ -1151,6 +1152,18 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 		return fmt.Errorf("sched: synth request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// issue #517: stamp the per-cron-fire request_id on the
+	// synthetic inbound request so gatewayd's middleware picks it
+	// up unchanged and the downstream wake timeline logs share
+	// the same correlation id. Falls back to a fresh mint when
+	// dispatchOneCron didn't set one (defence in depth — direct
+	// SynthesizeRequest callers should pass a correlation
+	// context, but the helper is robust without one).
+	if fields, ok := wire.FromContext(ctx); ok && fields.RequestID != "" {
+		req.Header.Set("x-faas-request-id", fields.RequestID)
+	} else {
+		req.Header.Set("x-faas-request-id", middleware.NewRequestID())
+	}
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("sched: synth do: %w", err)
@@ -1245,6 +1258,18 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		l.log.Warn("cron: bad schedule", "cron_id", c.ID, "err", err)
 		return
 	}
+	// issue #517: mint a fresh request_id at the cron dispatch
+	// boundary so the synthetic request that flows through gatewayd
+	// carries the same correlation id the rest of the wake
+	// timeline logs use. Stored on ctx so SynthesizeRequest can
+	// stamp it on the outbound x-faas-request-id header, and on
+	// the cron.fired notify payload so an operator query joins
+	// the synthetic request back to the cron that fired it.
+	requestID := middleware.NewRequestID()
+	ctx = wire.WithContext(ctx, wire.CorrelationFields{
+		RequestID: requestID,
+		AppID:     c.AppID,
+	})
 	// Boundary guard: fire iff we've crossed the next-fire boundary
 	// since LastFiredAt. robfig's NextFireAt(from) is exclusive — call
 	// it with LastFiredAt to get the upcoming boundary; if that boundary
@@ -1409,6 +1434,10 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"cron_id": c.ID, "app_id": c.AppID, "at": now.UTC().Format(time.RFC3339Nano),
+		// issue #517: thread the synthetic request_id so a dashboard
+		// join from the cron.fired SSE frame back to the wake
+		// timeline logs is one query, not a guess.
+		"request_id": requestID,
 	})
 	if err := l.engine.Notifier().Notify(ctx, db.NotifyCronFired, string(payload)); err != nil {
 		l.log.Warn("cron: notify cron_fired", "err", err)
