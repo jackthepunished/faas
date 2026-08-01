@@ -537,10 +537,12 @@ func pathFilterRig(t *testing.T, cf ChangedFilesClient, includeRootWorkload bool
 		RepoFullName:     "octo/api",
 		ProductionBranch: "main",
 		// DeriveScanSource returns "workspaces" (plural) for the
-		// tier-3 convention; the typed constant is "workspace"
-		// (singular). They hash to different tierRank slots, so
-		// we seed the plural form to match the scan.
-		ScanSource: state.ProjectScanSource("workspaces"),
+		// tier-3 convention; the singular typed const
+		// ProjectScanSourceWorkspace is a different slot. Use
+		// the plural typed const so the test fails loudly if
+		// either const drifts (the L1 review found the raw
+		// string literal hid the tierRank asymmetry).
+		ScanSource: state.ProjectScanSourceWorkspaces,
 	})
 	if err != nil {
 		t.Fatalf("seed project: %v", err)
@@ -678,6 +680,56 @@ func TestHandlePushRequest_PathFilter_PrefixCollisionDoesNotMatch(t *testing.T) 
 	}
 }
 
+// TestHandlePushRequest_PathFilter_NoTouchedApps_SkipsCompare pins
+// review finding #1: when reconcile produces zero touched apps
+// (the binding exists but the scan returned no workloads and no
+// existing apps were drifted), the push-dispatch path must skip
+// the GitHub compare-API call entirely. Per-installation API
+// quota is too precious to burn on no-op webhook deliveries.
+//
+// The empty-touched set is constructed via a dedicated rig whose
+// scan stub returns a Tier-3 result with zero workloads (and no
+// existing apps on the project).
+func TestHandlePushRequest_PathFilter_NoTouchedApps_SkipsCompare(t *testing.T) {
+	cf := &stubChangedFiles{files: []string{"x.ts"}}
+	// rig with an empty workloads slice -> reconcile produces no
+	// Added, no Changed -> touched is empty -> lookupChangedFiles
+	// must NOT be called.
+	rig := newRig(t, func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{Workloads: nil, Managed: nil, Tier: 3}, nil
+	})
+	_, err := rig.mem.CreateProject(context.Background(), state.Project{
+		AccountID:        rig.acct,
+		Slug:             "demo",
+		InstallID:        rig.install,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		ScanSource:       state.ProjectScanSourceWorkspaces,
+	})
+	if err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	svc := newServiceForRig(rig)
+	rec := &recordingEnqueuer{}
+	svc.Enqueuer = rec
+	svc.ChangedFiles = cf
+
+	body := []byte(`{"ref":"refs/heads/main","before":"b","after":"h","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`)
+	_, err = svc.HandlePushRequest(context.Background(), body)
+	if err != nil {
+		t.Fatalf("HandlePushRequest: %v", err)
+	}
+	// Critical: ChangedFiles was NOT called because touched is
+	// empty. The stub also has a synthetic non-empty files slice
+	// to ensure the assertion is meaningful.
+	if cf.calls != 0 {
+		t.Errorf("ChangedFiles calls = %d, want 0 (empty touched set must skip compare-API)", cf.calls)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("Enqueue calls = %d, want 0 (nothing to enqueue)", len(rec.calls))
+	}
+}
+
 // TestPathIntersectsDir pins the table directly. The behaviour is
 // load-bearing for the prefix-collision guard above.
 func TestPathIntersectsDir(t *testing.T) {
@@ -694,6 +746,12 @@ func TestPathIntersectsDir(t *testing.T) {
 		{"prefix collision (auth vs auth-api)", []string{"a/auth-api/x.ts"}, "a/auth", false},
 		{"file at root, dir at root", []string{"x.ts"}, "", false}, // dir=="" is filtered before this helper
 		{"empty files", nil, "a/b", false},
+		// GitHub emits a trailing-slash entry for directory-only
+		// changes (rename of the directory itself, add/remove of
+		// a directory). Without the f == dir + "/" branch, a
+		// workload whose RootDir matches the renamed directory
+		// would be silently skipped.
+		{"directory-only entry with trailing slash", []string{"a/b/"}, "a/b", true},
 	}
 	for _, tc := range cases {
 		tc := tc
