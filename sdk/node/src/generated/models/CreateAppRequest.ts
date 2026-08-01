@@ -21,11 +21,11 @@ export type CreateAppRequest = {
    */
   warm_snapshot_enabled?: boolean;
   /**
-   * Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100].
+   * Optional create-time override for the warm-tier request-count threshold (issue #470 / ADR-055). Range [1, 100]. Omitted → apid applies the plan default.
    */
   warm_snapshot_min_requests?: number;
   /**
-   * Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000].
+   * Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → apid applies the plan default.
    */
   warm_snapshot_min_ms?: number;
 };

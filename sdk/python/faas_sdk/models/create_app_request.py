@@ -32,10 +32,11 @@ class CreateAppRequest:
     """Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan
     default. Free/Hobby PATCH-true is rejected."""
     warm_snapshot_min_requests: int | Unset = UNSET
-    """Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."""
+    """Optional create-time override for the warm-tier request-count threshold (issue #470 / ADR-055). Range [1,
+    100]. Omitted → apid applies the plan default."""
     warm_snapshot_min_ms: int | Unset = UNSET
-    """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
-    [100, 60000]."""
+    """Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 /
+    ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

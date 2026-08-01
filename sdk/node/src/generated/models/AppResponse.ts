@@ -59,7 +59,7 @@ export type AppResponse = {
    */
   warm_snapshot_enabled?: boolean;
   /**
-   * Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100].
+   * Effective per-app request-count threshold for warm-tier capture on this app (issue #470 / ADR-055). Range [1, 100].
    */
   warm_snapshot_min_requests?: number;
   /**

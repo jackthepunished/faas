@@ -73,7 +73,8 @@ class AppResponse:
     """Per-app two-tier snapshot flag (issue #470 / ADR-055). True on Pro/Scale by default; Free/Hobby always
     false."""
     warm_snapshot_min_requests: int | Unset = UNSET
-    """Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."""
+    """Effective per-app request-count threshold for warm-tier capture on this app (issue #470 / ADR-055). Range
+    [1, 100]."""
     warm_snapshot_min_ms: int | Unset = UNSET
     """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
     [100, 60000]."""

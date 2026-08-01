@@ -3989,11 +3989,12 @@ components:
           type: boolean
           example: true
         warm_snapshot_min_requests:
-          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."
+          description: "Effective per-app request-count threshold for warm-tier capture on this app (issue #470 / ADR-055). Range [1, 100]."
           type: integer
           minimum: 1
           maximum: 100
           example: 5
+
         warm_snapshot_min_ms:
           description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]."
           type: integer
@@ -4031,13 +4032,14 @@ components:
           type: boolean
           example: true
         warm_snapshot_min_requests:
-          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]."
+          description: "Optional create-time override for the warm-tier request-count threshold (issue #470 / ADR-055). Range [1, 100]. Omitted → apid applies the plan default."
           type: integer
           minimum: 1
           maximum: 100
           example: 5
+
         warm_snapshot_min_ms:
-          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]."
+          description: "Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."
           type: integer
           minimum: 100
           maximum: 60000
