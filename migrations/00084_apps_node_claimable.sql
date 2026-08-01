@@ -1,11 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00087_apps_node_claimable.sql
+-- filename: 00084_apps_node_claimable.sql
 --
 -- Phase 2 / Gate A — schedd-side async placement claim.
 --
--- Pre-00087 apps.node_id was NOT NULL: the apid createApp handler
+-- Pre-00084 apps.node_id was NOT NULL: the apid createApp handler
 -- resolved placement in-process (PlacementScheduler.Choose) and
 -- stamped the chosen node_id inside the same transaction that
 -- called CreateAppIfUnderQuota. The lint gate tripped on that
@@ -30,10 +30,10 @@
 -- Replay-safety: ALTER TABLE … ALTER COLUMN … DROP NOT NULL is
 -- idempotent. The down path re-tightens NOT NULL; Postgres
 -- rejects the down if any row has node_id IS NULL (because the
--- 00086 backfill guarantees all pre-00087 rows have a real
--- node_id, and post-00087 every new row is stamped by schedd
+-- 00083 backfill guarantees all pre-00084 rows have a real
+-- node_id, and post-00084 every new row is stamped by schedd
 -- before the down could be exercised). The
--- migrations/00087_apps_node_claimable_test.go suite pins this
+-- migrations/00084_apps_node_claimable_test.go suite pins this
 -- behaviour.
 
 alter table apps

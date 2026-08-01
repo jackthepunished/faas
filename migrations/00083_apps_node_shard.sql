@@ -1,11 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00086_apps_node_shard.sql
+-- filename: 00083_apps_node_shard.sql
 --
 -- Phase 2 / Gate A — durable app owner per compute node.
 --
--- Pre-00086 `apps` has no node_id column: schedd chose the
+-- Pre-00083 `apps` has no node_id column: schedd chose the
 -- placement at wake time, and one schedd was implicitly the
 -- owner of every app because there was only one schedd. Going
 -- to N peer-equal schedds (one per non-default-local active
