@@ -46,6 +46,27 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
+	// Phase 2 / Gate A: pick the owner compute_node BEFORE the
+	// quota transaction. The placement decision reads the
+	// per-node live usedMB (state.ComputeNodeUsedMB) which is a
+	// snapshot of the instances table; running placement inside
+	// the FOR UPDATE account lock would let two concurrent
+	// creates on different accounts see each other's writes
+	// while serialising on the same account. The lock only
+	// protects the deployed-app cap; placement uses a fresh
+	// read at create time. The fresh read is good enough
+	// because the chooser is re-validated by the schedd's
+	// per-instance NodeLedger at first wake (the runtime gate).
+	node, prob := s.placement.Choose(ctx(r), "", app.RAMMB)
+	if prob != nil {
+		// The placement helper returns *api.Problem directly —
+		// capacity refusals land as 503, internal failures as
+		// 500. Customer-facing shape matches the pre-Phase-2
+		// chooser (no shape change at the wire).
+		api.WriteProblem(w, prob)
+		return
+	}
+	app.NodeID = node.ID
 	// Deployed-app count quota + insert happen in the same critical
 	// section inside the store (PgStore: SELECT … FOR UPDATE on the
 	// parent accounts row; MemStore: m.mu). This closes the TOCTOU the

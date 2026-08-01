@@ -20,7 +20,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/promql"
-	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -147,6 +146,16 @@ type server struct {
 	// apid_op_duration_seconds without each one wrapping itself.
 	// Nil = observation disabled (unit tests).
 	ops *wire.OpsMetrics
+	// placement is the Phase 2 / Gate A chooser that picks an
+	// owner compute_node for every new app at create time. Wired
+	// in newServerWithDeps from the store + log; nil falls back to
+	// "skip placement" (the handler stamps node_id = default-local
+	// via the migration backfill, so the single-box posture
+	// stays bit-for-bit). Production wiring: cmd/apid/main.go
+	// sets up the store, NewPlacementScheduler(store, log) lands
+	// here, and the createApp handler calls placement.Choose
+	// before CreateAppIfUnderQuota.
+	placement *PlacementScheduler
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -180,15 +189,6 @@ type server struct {
 	// any OAuth env — the per-handler 503 path is then exercised
 	// on every redirect.
 	oauthConfig auth.SignInConfig
-	// reconcileSvc is the apid-side workload mutation primitive
-	// (PR-G, repo decomposition Phase 5). Built once per daemon
-	// from store + audit (actor="apid" via audit.pkgAuditor()) so
-	// every reconcile-driven audit row carries the same actor
-	// the apid-side audit pipeline emits under. Both scan_service
-	// (dry-run via Service.Plan) and applyProject (apply via
-	// Service.Reconcile) route through this seam — there is no
-	// other workload-mutation path post PR-G.
-	reconcileSvc *reconcile.Service
 }
 
 // anonymousAccountLabel is the literal value of the `account_id`
@@ -444,13 +444,6 @@ func newServerWithDeps(
 	// then audit.ops is nil and Emit silently skips the counter
 	// increment (the production caller always sets ops before
 	// serving traffic; tests can call WithOpsMetrics to opt in).
-	//
-	// The same auditor is the source of the inner *audit.Auditor
-	// that powers reconcileSvc (PR-G, repo decomposition Phase 5).
-	// Constructing a temporary here lets the field initializer below
-	// pass the inner Auditor into buildReconcileService — the
-	// resulting reconcile rows carry actor="apid" in events.actor.
-	aud := newAuditor(store, log, nil)
 	return &server{
 		store:                  store,
 		log:                    log,
@@ -468,7 +461,14 @@ func newServerWithDeps(
 		cliAuthLimiter:         cliAuthLimiter,
 		cliAuthSubmitLimiter:   cliAuthSubmitLimiter,
 		dashboardExportLimiter: dashboardExportLimiter,
-		audit:                  aud,
+		// Phase 2 / Gate A placement scheduler — chooses the owner
+		// compute_node for every new app. nil-safe: handlers fall
+		// through to "skip placement" which inherits the
+		// default-local backfill from migration 00083 for the
+		// single-box posture. Production wiring uses
+		// cmd/apid/main.go's existing store handle.
+		placement: NewPlacementScheduler(store, log),
+		audit:     newAuditor(store, log, nil),
 		// pkg/auth.Middleware backs the s.requireMFA + s.requireScope
 		// facade (cmd/apid/auth_facade.go). The auditor's Emit is
 		// nil-safe so the auth.mfa_gate_hit audit row fires when the
@@ -490,15 +490,6 @@ func newServerWithDeps(
 		// from cmd/apid/main.go, mirroring the With* setter pattern
 		// used by WithBillingProvider / WithOpsMetrics so existing
 		// positional callers in tests don't need editing.
-		//
-		// reconcileSvc (PR-G, repo decomposition Phase 5) shares
-		// the apid-side *audit.Auditor constructed above. The same
-		// store powers both apid audit rows and reconcile audit
-		// rows, and they carry the same actor="apid" so dashboards
-		// can group by source. Pre-PR-G callers used
-		// store.ApplyProjectPlan directly; post-PR-G every
-		// workload-mutating path goes through Service.Reconcile.
-		reconcileSvc: buildReconcileService(store, aud.pkgAuditor(), log),
 	}
 }
 
