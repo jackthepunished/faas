@@ -302,6 +302,16 @@ func (s *server) scanService(
 	// project + apps in one Tx; the split here is the cost of
 	// the package boundary (pkg/reconcile never imports pkg/state
 	// types beyond the Store interface).
+	//
+	// Atomicity (PR-GH.6 review H9 fix): if the subsequent
+	// reconcile fails, the project row is rolled back via
+	// store.DeleteProject. apps.project_id is declared ON
+	// DELETE SET NULL (migration 00074:74), so any apps
+	// reconcile already inserted (per-row Tx) have their FK
+	// nulled — they stay durable (audit chain) but no longer
+	// appear under any project. The rollback is best-effort:
+	// a DeleteProject failure logs but does not mask the
+	// reconcile error the caller is returning.
 	created, projErr := s.store.CreateProject(r.Context(), project)
 	if projErr != nil {
 		var prob *api.Problem
@@ -319,6 +329,25 @@ func (s *server) scanService(
 		return resp, state.Project{}, nil, nil, nil, prob
 	}
 	project = created
+	// Defer project rollback for any error path below.
+	// capturedProb tracks whether we already wrapped the
+	// reconcile error; the defer fires BEFORE the return
+	// statement so rollback runs first.
+	var capturedProb *api.Problem
+	defer func() {
+		if capturedProb != nil && project.ID != "" {
+			if dErr := s.store.DeleteProject(r.Context(), project.ID); dErr != nil {
+				// Best-effort: a DeleteProject failure doesn't
+				// mask the underlying reconcile error the
+				// caller is returning. The DeleteProject's own
+				// ErrNotFound is fine (concurrent delete raced).
+				if !errors.Is(dErr, state.ErrNotFound) {
+					s.log.Warn("apid: rollback project on reconcile error",
+						"project_id", project.ID, "err", dErr)
+				}
+			}
+		}
+	}()
 
 	// Build the cron name list (handler uses index parity to look up
 	// the AppID post-reconcile). Order is the same as the scan order
@@ -362,11 +391,13 @@ func (s *server) scanService(
 			} else {
 				prob = api.NewProblem(mapped.Status, mapped.Code, mapped.Msg, "")
 			}
+			capturedProb = prob
 			return resp, state.Project{}, nil, nil, nil, prob
 		}
 		// mapReconcileError returned nil for nil err — unreachable
 		// here, but defensively pass through as 500.
 		prob := api.ErrInternal(fmt.Sprintf("reconcile: %v", recErr))
+		capturedProb = prob
 		return resp, state.Project{}, nil, nil, nil, prob
 	}
 
@@ -389,6 +420,7 @@ func (s *server) scanService(
 		existingApps, lerr := s.store.AppsForProject(r.Context(), acct.ID, project.ID)
 		if lerr != nil {
 			prob := api.ErrInternal(fmt.Sprintf("load existing apps: %v", lerr))
+			capturedProb = prob
 			return resp, state.Project{}, nil, nil, nil, prob
 		}
 		idToSlug := make(map[string]string, len(existingApps))

@@ -617,6 +617,14 @@ type Store interface {
 	// ErrScanSourceDowngrade. Returns ErrNotFound when the project
 	// row is gone. Phase 5's reconciler is the only intended caller
 	// in Phase 1.
+	//
+	// DeleteProject removes a project row by ID. The apps.project_id
+	// FK is declared ON DELETE SET NULL (migration 00074:74), so
+	// apps already inserted via the reconcile path have their
+	// project_id nulled (not the row deleted). Returns ErrNotFound
+	// when the project doesn't exist. Used by cmd/apid's
+	// scan_service to roll back a half-created project when the
+	// subsequent reconcile errors out (PR-GH.6 review H9).
 	CreateProject(ctx context.Context, p Project) (Project, error)
 	ProjectByID(ctx context.Context, projectID string) (Project, error)
 	ProjectBySlug(ctx context.Context, accountID, slug string) (Project, error)
@@ -624,6 +632,7 @@ type Store interface {
 	ListProjectsForAccount(ctx context.Context, accountID string) ([]Project, error)
 	AppsForProject(ctx context.Context, accountID, projectID string) ([]App, error)
 	SetProjectScanSource(ctx context.Context, projectID string, src ProjectScanSource) (Project, error)
+	DeleteProject(ctx context.Context, projectID string) error
 
 	// ApplyProjectPlan persists a project + its member apps + crons
 	// in a single transaction. Quota is checked inside the locked
