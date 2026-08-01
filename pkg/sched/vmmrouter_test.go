@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -85,10 +86,12 @@ func (f *fakeRouterVMM) UpdateEgressAllowlist(_ context.Context, _ string, _ []n
 	return nil
 }
 
-// Logs (issue #254 / Move 4) — router tests don't drive the
-// log stream path; the scheddgrpc handler tests do. Returns a
-// closed fakeLogStream so any accidental caller exits cleanly.
-func (f *fakeRouterVMM) Logs(_ context.Context, _ string, _ int64) (LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — router tests
+// don't drive the log stream path; the scheddgrpc handler tests
+// do. Returns a closed fakeLogStream so any accidental caller exits
+// cleanly. PR-B adds the sinceWrittenAt time lower-bound; the fake
+// ignores it.
+func (f *fakeRouterVMM) Logs(_ context.Context, _ string, _ int64, _ time.Time) (LogStream, error) {
 	return &fakeLogStream{}, nil
 }
 

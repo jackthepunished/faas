@@ -1888,13 +1888,21 @@ func (x *SeccompStatusResponse) GetError() string {
 // cross its logs handler (currently zero — the producer only emits
 // per-instance Seq/Stream/Line; the wake_id is consumed by the
 // envelope, not the line payload). Empty on a tail-only consumer.
+//
+// since_written_at (issue #517 / PR-B acceptance #3) is the
+// client-inclusive lower bound on the host-side WrittenAt for the
+// replay page. Wire is additive per ADR-016; clients that don't set
+// it get no time-bound replay (matching the pre-PR-B behaviour).
+// Empty = no bound. Strictly inclusive: a line whose WrittenAt is
+// equal to since_written_at passes.
 type LogsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Instance      string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
-	SinceSeq      int64                  `protobuf:"varint,2,opt,name=since_seq,json=sinceSeq,proto3" json:"since_seq,omitempty"`
-	WakeId        string                 `protobuf:"bytes,3,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Instance       string                 `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
+	SinceSeq       int64                  `protobuf:"varint,2,opt,name=since_seq,json=sinceSeq,proto3" json:"since_seq,omitempty"`
+	WakeId         string                 `protobuf:"bytes,3,opt,name=wake_id,json=wakeId,proto3" json:"wake_id,omitempty"`
+	SinceWrittenAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=since_written_at,json=sinceWrittenAt,proto3" json:"since_written_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *LogsRequest) Reset() {
@@ -1948,6 +1956,13 @@ func (x *LogsRequest) GetWakeId() string {
 	return ""
 }
 
+func (x *LogsRequest) GetSinceWrittenAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.SinceWrittenAt
+	}
+	return nil
+}
+
 // LogsResponse is one streamed log line. seq is the per-instance
 // monotonic identifier the ring assigns at intake; consumers dedupe
 // on (instance, seq) across reconnects. stream is "stdout" or "stderr"
@@ -1955,14 +1970,26 @@ func (x *LogsRequest) GetWakeId() string {
 // BEFORE the newline terminator (the splitter consumes the '\n').
 // written_at is the host-side ingest time, not the guest clock —
 // we don't trust the guest clock (ADR-022 entropy hazard).
+//
+// is_gap (issue #517 / PR-B acceptance #4) is true on the synthetic
+// "cursor fell below the ring's high-water mark" frame only. When
+// true, seq/stream/line/written_at are unset; gap_to_written_at
+// carries the host-side ingest time of the OLDEST line the ring
+// currently retains so the client can render a meaningful
+// "you missed lines whose newest retained time is X" message. When
+// false, the line fields follow the pre-PR-B contract. Wire is
+// additive per ADR-016 — old clients ignore is_gap and receive
+// normal line frames.
 type LogsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Seq           int64                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
-	Stream        string                 `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
-	Line          string                 `protobuf:"bytes,3,opt,name=line,proto3" json:"line,omitempty"`
-	WrittenAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=written_at,json=writtenAt,proto3" json:"written_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Seq            int64                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	Stream         string                 `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
+	Line           string                 `protobuf:"bytes,3,opt,name=line,proto3" json:"line,omitempty"`
+	WrittenAt      *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=written_at,json=writtenAt,proto3" json:"written_at,omitempty"`
+	IsGap          bool                   `protobuf:"varint,5,opt,name=is_gap,json=isGap,proto3" json:"is_gap,omitempty"`
+	GapToWrittenAt *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=gap_to_written_at,json=gapToWrittenAt,proto3" json:"gap_to_written_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *LogsResponse) Reset() {
@@ -2019,6 +2046,20 @@ func (x *LogsResponse) GetLine() string {
 func (x *LogsResponse) GetWrittenAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.WrittenAt
+	}
+	return nil
+}
+
+func (x *LogsResponse) GetIsGap() bool {
+	if x != nil {
+		return x.IsGap
+	}
+	return false
+}
+
+func (x *LogsResponse) GetGapToWrittenAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.GapToWrittenAt
 	}
 	return nil
 }
@@ -2707,17 +2748,20 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\x04mode\x18\x03 \x01(\tR\x04mode\x12\x1d\n" +
 	"\n" +
 	"filter_len\x18\x04 \x01(\x05R\tfilterLen\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\"_\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"\xa5\x01\n" +
 	"\vLogsRequest\x12\x1a\n" +
 	"\binstance\x18\x01 \x01(\tR\binstance\x12\x1b\n" +
 	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\x12\x17\n" +
-	"\awake_id\x18\x03 \x01(\tR\x06wakeId\"\x87\x01\n" +
+	"\awake_id\x18\x03 \x01(\tR\x06wakeId\x12D\n" +
+	"\x10since_written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x0esinceWrittenAt\"\xe5\x01\n" +
 	"\fLogsResponse\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x12\n" +
 	"\x04line\x18\x03 \x01(\tR\x04line\x129\n" +
 	"\n" +
-	"written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt\"A\n" +
+	"written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt\x12\x15\n" +
+	"\x06is_gap\x18\x05 \x01(\bR\x05isGap\x12E\n" +
+	"\x11gap_to_written_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\x0egapToWrittenAt\"A\n" +
 	"\x1eMountParentExt4ReadOnlyRequest\x12\x1f\n" +
 	"\vstorage_key\x18\x01 \x01(\tR\n" +
 	"storageKey\"A\n" +
@@ -2847,42 +2891,44 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	38, // 16: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
 	36, // 17: onebox.faas.vmmd.v1.InstanceStats.net_tx_bytes:type_name -> google.protobuf.Int64Value
 	38, // 18: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
-	38, // 19: onebox.faas.vmmd.v1.LogsResponse.written_at:type_name -> google.protobuf.Timestamp
-	32, // 20: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPRequestInit
-	18, // 21: onebox.faas.vmmd.v1.ForwardHTTPRequestInit.headers:type_name -> onebox.faas.vmmd.v1.Header
-	34, // 22: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPResponseInit
-	18, // 23: onebox.faas.vmmd.v1.ForwardHTTPResponseInit.headers:type_name -> onebox.faas.vmmd.v1.Header
-	6,  // 24: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
-	7,  // 25: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
-	9,  // 26: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
-	11, // 27: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
-	13, // 28: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
-	16, // 29: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
-	19, // 30: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
-	21, // 31: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
-	23, // 32: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:input_type -> onebox.faas.vmmd.v1.SeccompStatusRequest
-	25, // 33: onebox.faas.vmmd.v1.Vmmd.Logs:input_type -> onebox.faas.vmmd.v1.LogsRequest
-	31, // 34: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:input_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
-	27, // 35: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:input_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
-	29, // 36: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:input_type -> onebox.faas.vmmd.v1.UmountParentExt4Request
-	5,  // 37: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	5,  // 38: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	10, // 39: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
-	12, // 40: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
-	14, // 41: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
-	17, // 42: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
-	20, // 43: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
-	22, // 44: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	24, // 45: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:output_type -> onebox.faas.vmmd.v1.SeccompStatusResponse
-	26, // 46: onebox.faas.vmmd.v1.Vmmd.Logs:output_type -> onebox.faas.vmmd.v1.LogsResponse
-	33, // 47: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:output_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
-	28, // 48: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:output_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
-	30, // 49: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:output_type -> onebox.faas.vmmd.v1.UmountParentExt4Response
-	37, // [37:50] is the sub-list for method output_type
-	24, // [24:37] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	38, // 19: onebox.faas.vmmd.v1.LogsRequest.since_written_at:type_name -> google.protobuf.Timestamp
+	38, // 20: onebox.faas.vmmd.v1.LogsResponse.written_at:type_name -> google.protobuf.Timestamp
+	38, // 21: onebox.faas.vmmd.v1.LogsResponse.gap_to_written_at:type_name -> google.protobuf.Timestamp
+	32, // 22: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPRequestInit
+	18, // 23: onebox.faas.vmmd.v1.ForwardHTTPRequestInit.headers:type_name -> onebox.faas.vmmd.v1.Header
+	34, // 24: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPResponseInit
+	18, // 25: onebox.faas.vmmd.v1.ForwardHTTPResponseInit.headers:type_name -> onebox.faas.vmmd.v1.Header
+	6,  // 26: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
+	7,  // 27: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
+	9,  // 28: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
+	11, // 29: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
+	13, // 30: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
+	16, // 31: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
+	19, // 32: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
+	21, // 33: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
+	23, // 34: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:input_type -> onebox.faas.vmmd.v1.SeccompStatusRequest
+	25, // 35: onebox.faas.vmmd.v1.Vmmd.Logs:input_type -> onebox.faas.vmmd.v1.LogsRequest
+	31, // 36: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:input_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
+	27, // 37: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:input_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
+	29, // 38: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:input_type -> onebox.faas.vmmd.v1.UmountParentExt4Request
+	5,  // 39: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	5,  // 40: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	10, // 41: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
+	12, // 42: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
+	14, // 43: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
+	17, // 44: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
+	20, // 45: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
+	22, // 46: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
+	24, // 47: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:output_type -> onebox.faas.vmmd.v1.SeccompStatusResponse
+	26, // 48: onebox.faas.vmmd.v1.Vmmd.Logs:output_type -> onebox.faas.vmmd.v1.LogsResponse
+	33, // 49: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:output_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
+	28, // 50: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:output_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
+	30, // 51: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:output_type -> onebox.faas.vmmd.v1.UmountParentExt4Response
+	39, // [39:52] is the sub-list for method output_type
+	26, // [26:39] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_onebox_faas_vmmd_v1_vmmd_proto_init() }

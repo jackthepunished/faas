@@ -282,9 +282,11 @@ func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) er
 	return nil
 }
 
-// Logs (issue #254 / Move 4) — wiring tests don't drive the log
-// stream path; the scheddgrpc handler tests do. Returns nil
-// + io.EOF so any accidental caller exits cleanly.
-func (stubVMM) Logs(context.Context, string, int64) (sched.LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — wiring tests
+// don't drive the log stream path; the scheddgrpc handler tests
+// do. Returns nil + io.EOF so any accidental caller exits cleanly.
+// PR-B adds the sinceWrittenAt time lower-bound; the fake ignores
+// it.
+func (stubVMM) Logs(context.Context, string, int64, time.Time) (sched.LogStream, error) {
 	return nil, io.EOF
 }

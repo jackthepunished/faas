@@ -90,7 +90,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #471 / ADR-047 (PR-A): Hobby unlocks streaming
 			// (100 MiB / 900 s) — the first paid tier. PR-A wires
 			// the flag + accessor; PR-B activates the Flusher path.
-			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #517 / PR-B: Hobby unlocks the `?deployment=`
+			// filter for the typical one-staging-deployment workload.
+			LogDeploymentFilterMax: 1},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
@@ -123,7 +126,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
 			// envelope as Hobby. The cap is the same; the per-app
 			// streaming path is gatewayd-edged, not per-tier.
-			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #517 / PR-B: Pro gets 10 — covers the typical
+			// multi-staging fan-out (prod + 3-5 staging + a few
+			// preview slots) without monopolising the schedd's
+			// per-instance goroutine fan-out.
+			LogDeploymentFilterMax: 10},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -162,7 +170,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// as Hobby/Pro. The streaming cap is uniform across paid
 			// tiers — the spec's paid-only unlock is the boolean, not
 			// the byte/time ceiling.
-			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
+			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #517 / PR-B: Scale gets 50 — 5× Pro, tracks the
+			// larger app budget (100 vs 25) and multi-region staging
+			// fan-out SaaS-scale customers typically run.
+			LogDeploymentFilterMax: 50},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -472,6 +484,32 @@ func TestPlanEgressAllowlistMonotonic(t *testing.T) {
 // 5 per-app / 10 per-account; Pro 20/50; Scale 100/500. Unknown plans
 // must fail closed (return 0) so a missing row never silently unlocks
 // crons — same contract as EgressAllowlistMaxSize above.
+// TestPlanLogDeploymentFilterMax pins the per-plan cap on the
+// `?deployment=` log-stream filter (issue #517 / PR-B, AC3). Free
+// returns 0 so the handler rejects with
+// `plan_deployment_filter_not_allowed`; Hobby unlocks the filter for
+// the typical one-staging-deployment workload; Pro/Scale get the
+// larger caps the multi-deployment fan-out needs. Unknown plans
+// must fail closed (return 0) so a missing row never silently
+// unlocks a paid feature — same contract as CronLimitPerApp.
+func TestPlanLogDeploymentFilterMax(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 1},
+		{PlanPro, 10},
+		{PlanScale, 50},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.LogDeploymentFilterMax(); got != c.want {
+			t.Errorf("%s.LogDeploymentFilterMax() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
 func TestPlanCronLimits(t *testing.T) {
 	cases := []struct {
 		plan                    Plan

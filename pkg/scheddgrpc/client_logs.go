@@ -8,6 +8,7 @@ import (
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // LogFrame is the transport-neutral mirror of
@@ -18,12 +19,24 @@ import (
 //
 // instance_id is empty on the synthetic terminal frame (none emitted
 // by Move 4 today; reserved for a future "end" marker).
+//
+// IsGap (issue #517 / PR-B acceptance #4) is true only on the
+// synthetic "cursor fell below the ring's high-water mark" frame
+// emitted by schedd when vmmd reports a gap. Wire is additive per
+// ADR-016; pre-PR-B consumers that ignore IsGap see only line
+// frames.
+//
+// GapToWrittenAt is meaningful only when IsGap is true; it carries
+// the host-side ingest time of the OLDEST line the per-instance
+// ring currently retains.
 type LogFrame struct {
-	InstanceID string
-	Seq        int64
-	Stream     string
-	Line       string
-	WrittenAt  time.Time
+	InstanceID     string
+	Seq            int64
+	Stream         string
+	Line           string
+	WrittenAt      time.Time
+	IsGap          bool
+	GapToWrittenAt time.Time
 }
 
 // LogStream is the per-app log stream returned by Client.StreamAppLogs.
@@ -40,22 +53,39 @@ type LogStream interface {
 }
 
 // StreamAppLogs opens a server-streaming RPC against the schedd's
-// StreamAppLogs endpoint (issue #254 / Move 4). The schedd fans
-// out per-instance vmmd Logs RPCs into one server stream; this
-// method hands the caller a typed view of that stream.
+// StreamAppLogs endpoint (issue #254 / Move 4, issue #517 / PR-B
+// acceptance #3 + #4). The schedd fans out per-instance vmmd Logs
+// RPCs into one server stream; this method hands the caller a
+// typed view of that stream.
 //
 // sinceSeq is the per-instance replay cursor forwarded verbatim
 // to each vmmd (each instance's ring is independent; Seq scopes
 // are per-instance, not global — see schedd.proto:268).
 //
+// sinceWrittenAt (issue #517 / PR-B acceptance #3) is the
+// host-side lower bound on the per-instance written_at; the
+// zero time is the "no bound" sentinel and is skipped on the
+// wire.
+//
+// deploymentID (issue #517 / PR-B acceptance #3) is the
+// per-deployment soft scoping; empty = fan out to every live
+// instance for the app.
+//
 // Returned errors pass through unchanged. The caller owns error
 // mapping; this method never lifts gRPC statuses to *api.Problem
 // because the SSE renderer needs the raw code.
-func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (LogStream, error) {
-	stream, err := c.cli.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (LogStream, error) {
+	req := &scheddpb.StreamAppLogsRequest{
 		AppId:    appID,
 		SinceSeq: sinceSeq,
-	})
+	}
+	if !sinceWrittenAt.IsZero() {
+		req.SinceWrittenAt = timestamppb.New(sinceWrittenAt)
+	}
+	if deploymentID != "" {
+		req.DeploymentId = deploymentID
+	}
+	stream, err := c.cli.StreamAppLogs(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +107,11 @@ var _ LogStream = (*logStreamAdapter)(nil)
 // yields the zero time.Time, which writeAppLogEvent renders as
 // "0001-01-01T00:00:00Z" — Move 4's schedd always sets it, so
 // callers can rely on the field being populated.
+//
+// On a gap frame (issue #517 / PR-B acceptance #4) the line-frame
+// fields are zero and IsGap is true. GapToWrittenAt carries the
+// ring's head-line WrittenAt so the caller can render a
+// meaningful diagnostic.
 func (a *logStreamAdapter) Recv() (LogFrame, error) {
 	resp, err := a.inner.Recv()
 	if err != nil {
@@ -88,11 +123,18 @@ func (a *logStreamAdapter) Recv() (LogFrame, error) {
 		}
 		return LogFrame{}, err
 	}
-	return LogFrame{
+	frame := LogFrame{
 		InstanceID: resp.GetInstanceId(),
 		Seq:        resp.GetSeq(),
 		Stream:     resp.GetStream(),
 		Line:       resp.GetLine(),
-		WrittenAt:  resp.GetWrittenAt().AsTime(),
-	}, nil
+		IsGap:      resp.GetIsGap(),
+	}
+	if t := resp.GetWrittenAt(); t != nil {
+		frame.WrittenAt = t.AsTime()
+	}
+	if t := resp.GetGapToWrittenAt(); t != nil {
+		frame.GapToWrittenAt = t.AsTime()
+	}
+	return frame, nil
 }

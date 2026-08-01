@@ -650,10 +650,18 @@ message SeccompStatusResponse {
 // cross its logs handler (currently zero — the producer only emits
 // per-instance Seq/Stream/Line; the wake_id is consumed by the
 // envelope, not the line payload). Empty on a tail-only consumer.
+//
+// since_written_at (issue #517 / PR-B acceptance #3) is the
+// client-inclusive lower bound on the host-side WrittenAt for the
+// replay page. Wire is additive per ADR-016; clients that don't set
+// it get no time-bound replay (matching the pre-PR-B behaviour).
+// Empty = no bound. Strictly inclusive: a line whose WrittenAt is
+// equal to since_written_at passes.
 message LogsRequest {
   string instance = 1;
   int64  since_seq = 2;
   string wake_id = 3;
+  google.protobuf.Timestamp since_written_at = 4;
 }
 
 // LogsResponse is one streamed log line. seq is the per-instance
@@ -663,11 +671,23 @@ message LogsRequest {
 // BEFORE the newline terminator (the splitter consumes the '\n').
 // written_at is the host-side ingest time, not the guest clock —
 // we don't trust the guest clock (ADR-022 entropy hazard).
+//
+// is_gap (issue #517 / PR-B acceptance #4) is true on the synthetic
+// "cursor fell below the ring's high-water mark" frame only. When
+// true, seq/stream/line/written_at are unset; gap_to_written_at
+// carries the host-side ingest time of the OLDEST line the ring
+// currently retains so the client can render a meaningful
+// "you missed lines whose newest retained time is X" message. When
+// false, the line fields follow the pre-PR-B contract. Wire is
+// additive per ADR-016 — old clients ignore is_gap and receive
+// normal line frames.
 message LogsResponse {
   int64 seq = 1;
   string stream = 2;
   string line = 3;
   google.protobuf.Timestamp written_at = 4;
+  bool is_gap = 5;
+  google.protobuf.Timestamp gap_to_written_at = 6;
 }
 
 // MountParentExt4ReadOnlyRequest (ADR-053) is the input to

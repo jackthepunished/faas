@@ -9,6 +9,7 @@ import (
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -25,14 +26,14 @@ import (
 // multi-instance streams deterministically (acceptance #5).
 func TestStreamAppLogs_HappyPath(t *testing.T) {
 	cl := newServer(t, &fakeEngine{
-		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
-			if err := sink("inst-A", 1, "stdout", "alpha", time.Unix(0, 0).UTC()); err != nil {
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 1, Stream: "stdout", Line: "alpha", WrittenAt: time.Unix(0, 0).UTC()}); err != nil {
 				return err
 			}
-			if err := sink("inst-A", 2, "stdout", "beta", time.Unix(0, 0).UTC()); err != nil {
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 2, Stream: "stdout", Line: "beta", WrittenAt: time.Unix(0, 0).UTC()}); err != nil {
 				return err
 			}
-			if err := sink("inst-B", 1, "stderr", "gamma", time.Unix(0, 0).UTC()); err != nil {
+			if err := sink(sched.LogFrame{InstanceID: "inst-B", Seq: 1, Stream: "stderr", Line: "gamma", WrittenAt: time.Unix(0, 0).UTC()}); err != nil {
 				return err
 			}
 			<-ctx.Done()
@@ -88,7 +89,7 @@ func TestStreamAppLogs_HappyPath(t *testing.T) {
 // to its 404 "the app is parked; wake it first".
 func TestStreamAppLogs_NotFound(t *testing.T) {
 	cl := newServer(t, &fakeEngine{
-		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 			return state.ErrNotFound
 		},
 	})
@@ -141,7 +142,7 @@ func TestStreamAppLogs_InvalidArgument(t *testing.T) {
 // (or io.EOF) on cancel; not a gRPC error status.
 func TestStreamAppLogs_ContextCancel(t *testing.T) {
 	cl := newServer(t, &fakeEngine{
-		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 			<-ctx.Done()
 			return nil
 		},

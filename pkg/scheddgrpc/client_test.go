@@ -377,14 +377,14 @@ func TestClientStreamAppLogs_FrameConversion(t *testing.T) {
 	var gotSinceSeq int64
 
 	c := newClient(t, &fakeEngine{
-		streamLogFn: func(_ context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(_ context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 			gotAppID = appID
 			gotSinceSeq = sinceSeq
-			return sink("i-99", wantSeq, "stdout", wantLine, wantWrittenAt)
+			return sink(sched.LogFrame{InstanceID: "i-99", Seq: wantSeq, Stream: "stdout", Line: wantLine, WrittenAt: wantWrittenAt})
 		},
 	})
 
-	stream, err := c.StreamAppLogs(context.Background(), wantAppID, 7)
+	stream, err := c.StreamAppLogs(context.Background(), wantAppID, 7, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -424,11 +424,11 @@ func TestClientStreamAppLogs_FrameConversion(t *testing.T) {
 // branch (handlers_ext.go).
 func TestClientStreamAppLogs_CleanEOFReturnsExactEOF(t *testing.T) {
 	c := newClient(t, &fakeEngine{
-		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ time.Time, _ string, _ scheddgrpc.LogFrameSink) error {
 			return nil
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -445,11 +445,11 @@ func TestClientStreamAppLogs_CleanEOFReturnsExactEOF(t *testing.T) {
 // needs the raw code (cmd/apid/handlers_ext.go::renderAppLogsError).
 func TestClientStreamAppLogs_NotFoundPassesThrough(t *testing.T) {
 	c := newClient(t, &fakeEngine{
-		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ time.Time, _ string, _ scheddgrpc.LogFrameSink) error {
 			return state.ErrNotFound
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -469,11 +469,11 @@ func TestClientStreamAppLogs_NotFoundPassesThrough(t *testing.T) {
 // envelope fires.
 func TestClientStreamAppLogs_GenericErrorIsUnavailable(t *testing.T) {
 	c := newClient(t, &fakeEngine{
-		streamLogFn: func(_ context.Context, _ string, _ int64, _ scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(_ context.Context, _ string, _ int64, _ time.Time, _ string, _ scheddgrpc.LogFrameSink) error {
 			return errors.New("vmmd dial failed")
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0)
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestClientStreamAppLogs_GenericErrorIsUnavailable(t *testing.T) {
 func TestClientStreamAppLogs_ContextCancelUnblocks(t *testing.T) {
 	release := make(chan struct{})
 	c := newClient(t, &fakeEngine{
-		streamLogFn: func(ctx context.Context, _ string, _ int64, sink scheddgrpc.LogFrameSink) error {
+		streamLogFn: func(ctx context.Context, _ string, _ int64, _ time.Time, _ string, sink scheddgrpc.LogFrameSink) error {
 			// Block until the caller cancels — emulate an idle
 			// vmmd stream that hasn't seen new bytes.
 			select {
@@ -505,7 +505,7 @@ func TestClientStreamAppLogs_ContextCancelUnblocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stream, err := c.StreamAppLogs(ctx, "app-1", 0)
+	stream, err := c.StreamAppLogs(ctx, "app-1", 0, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}

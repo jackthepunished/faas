@@ -38,7 +38,7 @@ type controllableScheddClient struct {
 	stream scheddgrpc.LogStream
 }
 
-func (c *controllableScheddClient) StreamAppLogs(_ context.Context, _ string, _ int64) (scheddgrpc.LogStream, error) {
+func (c *controllableScheddClient) StreamAppLogs(_ context.Context, _ string, _ int64, _ time.Time, _ string) (scheddgrpc.LogStream, error) {
 	return c.stream, nil
 }
 
@@ -126,7 +126,7 @@ func runServeAppLogs(t *testing.T, h *AppLogsHandler, stream *controllableSchedd
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -194,7 +194,7 @@ func TestServeAppLogs_CtxCancelReturnsWithoutTerminalFrame(t *testing.T) {
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(ctx, rec, rec, "app-1", 0)
+		h.serveAppLogs(ctx, rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	// Let the receive goroutine settle into Recv().
@@ -281,7 +281,7 @@ func TestServeAppLogs_FramesRenderInOrder(t *testing.T) {
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	// Let the receive goroutine settle into Recv().
@@ -329,7 +329,7 @@ func TestServeAppLogs_CleanEndEmitsEmptyEndEvent(t *testing.T) {
 	go func() {
 		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "hi\n", WrittenAt: time.Now()})
 		stream.closeStream() // -> io.EOF on Recv
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -363,7 +363,7 @@ func TestServeAppLogs_GenericErrorDelegatesToRenderAppLogsError(t *testing.T) {
 	go func() {
 		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "first\n", WrittenAt: time.Now()})
 		stream.finish(errors.New("vmmd dial failed"))
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -397,7 +397,7 @@ func TestServeAppLogs_NotFoundDelegatesToRenderAppLogsError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		stream.finish(status.Error(codes.NotFound, "state: not found"))
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done

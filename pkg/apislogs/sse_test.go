@@ -106,7 +106,7 @@ func TestStartSSE_Headers(t *testing.T) {
 // so the CLI and the server share the same source of truth.
 func TestValidateLogFilters_Level(t *testing.T) {
 	r := httptest.NewRequest("GET", "/v1/apps/foo/logs?level=debug", nil)
-	_, _, reason, ok := ValidateLogFilters(r)
+	_, _, _, _, reason, ok := ValidateLogFilters(r)
 	if ok {
 		t.Error("ValidateLogFilters accepted level=debug; should reject")
 	}
@@ -122,7 +122,7 @@ func TestValidateLogFilters_Level(t *testing.T) {
 func TestValidateLogFilters_Grep(t *testing.T) {
 	r := httptest.NewRequest("GET", "/v1/apps/foo/logs?grep=foo", nil)
 	r.URL.RawQuery = "grep=foo\nbar"
-	_, _, reason, ok := ValidateLogFilters(r)
+	_, _, _, _, reason, ok := ValidateLogFilters(r)
 	if ok {
 		t.Error("ValidateLogFilters accepted grep with newline; should reject")
 	}
@@ -134,7 +134,7 @@ func TestValidateLogFilters_Grep(t *testing.T) {
 // TestValidateLogFilters_HappyPath confirms a valid request passes.
 func TestValidateLogFilters_HappyPath(t *testing.T) {
 	r := httptest.NewRequest("GET", "/v1/apps/foo/logs?level=info&grep=hello", nil)
-	level, grep, reason, ok := ValidateLogFilters(r)
+	level, grep, sinceWrittenAt, deploymentID, reason, ok := ValidateLogFilters(r)
 	if !ok {
 		t.Fatal("ValidateLogFilters rejected a valid request")
 	}
@@ -143,6 +143,41 @@ func TestValidateLogFilters_HappyPath(t *testing.T) {
 	}
 	if level != "info" || grep != "hello" {
 		t.Errorf("level=%q grep=%q, want info/hello", level, grep)
+	}
+	if !sinceWrittenAt.IsZero() {
+		t.Errorf("sinceWrittenAt = %v, want zero on default request", sinceWrittenAt)
+	}
+	if deploymentID != "" {
+		t.Errorf("deploymentID = %q, want empty on default request", deploymentID)
+	}
+}
+
+// TestValidateLogFilters_SinceAccepted (issue #517 / PR-B, AC3)
+// confirms a well-formed RFC3339 `since=` parses to the
+// corresponding time.Time. Empty → zero time.
+func TestValidateLogFilters_SinceAccepted(t *testing.T) {
+	r := httptest.NewRequest("GET", "/v1/apps/foo/logs?since=2026-08-01T12:00:00Z", nil)
+	_, _, sinceWrittenAt, _, reason, ok := ValidateLogFilters(r)
+	if !ok {
+		t.Fatalf("ValidateLogFilters rejected a valid since= RFC3339; reason=%q", reason)
+	}
+	want := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if !sinceWrittenAt.Equal(want) {
+		t.Errorf("sinceWrittenAt = %v, want %v", sinceWrittenAt, want)
+	}
+}
+
+// TestValidateLogFilters_SinceMalformed (issue #517 / PR-B, AC3)
+// confirms a non-RFC3339 `since=` is rejected with the
+// InvalidSinceCode so the handler renders an `event: error` frame.
+func TestValidateLogFilters_SinceMalformed(t *testing.T) {
+	r := httptest.NewRequest("GET", "/v1/apps/foo/logs?since=yesterday", nil)
+	_, _, _, _, reason, ok := ValidateLogFilters(r)
+	if ok {
+		t.Fatal("ValidateLogFilters accepted since=yesterday; should reject")
+	}
+	if reason != InvalidSinceCode {
+		t.Errorf("reason = %q, want %q", reason, InvalidSinceCode)
 	}
 }
 
@@ -166,17 +201,80 @@ func TestParseInt64Query(t *testing.T) {
 	}
 }
 
-// TestIsTerminalFrame pins the five-event vocabulary contract.
+// TestIsTerminalFrame pins the six-event vocabulary contract.
+// `gap` (issue #517 / PR-B) is NOT terminal — the stream
+// continues with the surviving replay and the live tail.
 func TestIsTerminalFrame(t *testing.T) {
 	for _, ev := range []string{"end", "error", "degraded"} {
 		if !IsTerminalFrame(ev) {
 			t.Errorf("IsTerminalFrame(%q) = false, want true", ev)
 		}
 	}
-	for _, ev := range []string{"log", "ping", ""} {
+	for _, ev := range []string{"log", "gap", "ping", ""} {
 		if IsTerminalFrame(ev) {
 			t.Errorf("IsTerminalFrame(%q) = true, want false", ev)
 		}
+	}
+}
+
+// TestRenderAppLogGap (issue #517 / PR-B, AC4) pins the `event:
+// gap` wire shape: {reason, gap_to_written_at, replay_advised},
+// non-terminal (no event:end follow-up). ops is nil-safe.
+func TestRenderAppLogGap(t *testing.T) {
+	rec := httptest.NewRecorder()
+	f := scheddgrpc.LogFrame{
+		InstanceID:     "i-1",
+		GapToWrittenAt: time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+	}
+	RenderAppLogGap(rec, rec, f, "app-1", nil)
+	out := rec.Body.String()
+	for _, want := range []string{
+		`event: gap`,
+		`"reason":`,
+		`"gap_to_written_at":"2026-07-29T12:00:00Z"`,
+		`"replay_advised":true`,
+		"\n\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("body missing %q\nbody=%s", want, out)
+		}
+	}
+	// Must NOT include a terminal end frame — gap is mid-stream.
+	if strings.Contains(out, `event: end`) {
+		t.Errorf("gap frame must not be followed by an end frame; body=%s", out)
+	}
+}
+
+// TestWriteInvalidSinceError confirms the SSE error-frame wire
+// shape for an invalid `since=` value (issue #517 / PR-B, AC3).
+func TestWriteInvalidSinceError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteInvalidSinceError(rec, rec)
+	out := rec.Body.String()
+	if !strings.Contains(out, `"code":"invalid_since"`) {
+		t.Errorf("missing invalid_since code: %s", out)
+	}
+	if !strings.Contains(out, `event: end`) {
+		t.Errorf("missing end sentinel: %s", out)
+	}
+}
+
+// TestWritePlanDeploymentFilterNotAllowedError confirms the
+// SSE error-frame wire shape for a Free-plan customer sending
+// `?deployment=...` (issue #517 / PR-B, AC3). The `max` arg
+// surfaces in the message so the SDK can hint the upgrade path.
+func TestWritePlanDeploymentFilterNotAllowedError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WritePlanDeploymentFilterNotAllowedError(rec, rec, 0)
+	out := rec.Body.String()
+	if !strings.Contains(out, `"code":"plan_deployment_filter_not_allowed"`) {
+		t.Errorf("missing plan_deployment_filter_not_allowed code: %s", out)
+	}
+	if !strings.Contains(out, `max=0`) {
+		t.Errorf("missing max=0 hint in message: %s", out)
+	}
+	if !strings.Contains(out, `event: end`) {
+		t.Errorf("missing end sentinel: %s", out)
 	}
 }
 

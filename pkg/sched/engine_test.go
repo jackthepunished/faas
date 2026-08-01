@@ -222,10 +222,12 @@ func (f *fakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []neti
 	return nil
 }
 
-// Logs (issue #254 / Move 4) — engine tests don't drive the
-// log stream path; the scheddgrpc handler tests do. Returns a
-// closed fakeLogStream so any accidental caller exits cleanly.
-func (f *fakeVMM) Logs(ctx context.Context, _, _ string, _ int64) (LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — engine tests
+// don't drive the log stream path; the scheddgrpc handler tests
+// do. Returns a closed fakeLogStream so any accidental caller exits
+// cleanly. PR-B adds the sinceWrittenAt time lower-bound; the fake
+// ignores it but still records the ctx for fan-out assertions.
+func (f *fakeVMM) Logs(ctx context.Context, _, _ string, _ int64, _ time.Time) (LogStream, error) {
 	f.mu.Lock()
 	f.lastLogsCtx = ctx
 	f.mu.Unlock()

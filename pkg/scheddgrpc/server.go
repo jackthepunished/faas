@@ -33,6 +33,13 @@ import (
 // trailer carries it back to the apid caller); a nil return tells
 // the handler to keep delivering the next frame.
 //
+// Shape (PR-B / issue #517 acceptance #4): the callback receives
+// a typed sched.LogFrame (single argument) so the same path emits
+// both line frames and gap frames. The IsGap field is the additive
+// discriminator; pre-PR-B sinks that ignore it see only line
+// frames. Type aliased to sched.LogFrameSink so callers in
+// pkg/sched can name it without importing pkg/scheddgrpc.
+//
 // The production caller (Server.StreamAppLogs) renders the frame
 // to a scheddpb.StreamAppLogsResponse proto and forwards it on
 // the caller's gRPC stream. That work is bounded by the per-frame
@@ -107,14 +114,22 @@ type SchedAPI interface {
 	// The reason string is for the audit log; the park semantics are
 	// identical to the idle-reaper Park.
 	ParkWithReason(ctx context.Context, instanceID, reason string) error
-	// StreamAppLogs (issue #254 / Move 4) fans out the per-instance
-	// log stream to a callback. The engine resolves the live
-	// instances, opens one vmmd Logs RPC per instance, and invokes
-	// the sink for every frame (initial-page + live tail) until
+	// StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B
+	// acceptance #3 + #4) fans out the per-instance log stream
+	// to a callback. The engine resolves the live instances,
+	// opens one vmmd Logs RPC per instance, and invokes the
+	// sink for every frame (initial-page + live tail) until
 	// the context cancels. Returns nil on a clean shutdown; the
 	// underlying gRPC / vmmd errors propagate as-is so the
 	// handlers can decide to lift or map them.
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sink LogFrameSink) error
+	//
+	// sinceWrittenAt (PR-B acceptance #3) is the host-side
+	// lower bound on the per-instance written_at; the zero time
+	// is the "no bound" sentinel and is skipped on the wire.
+	//
+	// deploymentID (PR-B acceptance #3) is the per-deployment
+	// soft scoping; empty = fan out to every live instance.
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink LogFrameSink) error
 	// StreamWarmHints (ADR-025 axis 4) is the push-side
 	// sticky-warm affinity stream. The engine fans out
 	// WarmHintEvents from its warmHintBroadcaster to the sink
@@ -350,10 +365,11 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 	return &scheddpb.ParkInstanceResponse{Ok: true}, nil
 }
 
-// StreamAppLogs (issue #254 / Move 4) implements the schedd-side
-// half of the per-app log stream. It fans out the per-instance
-// vmmd Logs RPCs into a single server-streaming response so the
-// apid daemon can render one SSE stream per app.
+// StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B
+// acceptance #3 + #4) implements the schedd-side half of the
+// per-app log stream. It fans out the per-instance vmmd Logs
+// RPCs into a single server-streaming response so the apid /
+// gatewayd consumer can render one SSE stream per app.
 //
 // Two phases that mirror the vmmd Logs RPC:
 //
@@ -366,6 +382,22 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 //     instance death (park / snapshot) the per-instance stream
 //     ends with io.EOF and the next iteration of the outer loop
 //     drops that goroutine from the wart set.
+//
+// PR-B extends the request envelope with two additive fields:
+//
+//   - deployment_id: per-deployment soft scoping. Empty = fan
+//     out to every live instance.
+//   - since_written_at: host-side lower bound on the
+//     per-instance written_at. Zero = no bound.
+//
+// The response envelope gains issue #517 / PR-B acceptance #4's
+// gap signalling: when vmmd reports a synthetic gap frame
+// (cursor fell below the ring's high-water mark), the per-
+// instance vmmd.Recv returns a LogLine with IsGap=true and the
+// per-frame sink translates it into an `is_gap=true` response
+// carrying the GapToWrittenAt timestamp so the caller can
+// render a meaningful diagnostic. Wire is additive per
+// ADR-016.
 //
 // Backpressure: the per-instance vmmd Logs stream is gRPC; the
 // apid-side caller's gRPC stream is also gRPC. The two-stage
@@ -406,26 +438,45 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	if sinceSeq < 0 {
 		sinceSeq = 0
 	}
+	sinceWrittenAt := req.GetSinceWrittenAt().AsTime()
+	deploymentID := req.GetDeploymentId()
 	// sink is the per-frame callback that writes one
 	// StreamAppLogsResponse onto the caller's gRPC stream. We
 	// synchronise on stream.Context() so a cancelled caller
 	// short-circuits the vmmd-side drain immediately.
-	sink := func(instance string, seq int64, streamName, line string, writtenAt time.Time) error {
+	//
+	// Shape (PR-B acceptance #4): the callback receives the
+	// typed sched.LogFrame (single-arg) so the same path emits
+	// both line frames and gap frames. IsGap=true on the latter
+	// flips the response into the `is_gap`/`gap_to_written_at`
+	// arm; the line-frame fields stay zero (matches the wire
+	// shape mirrors the vmmd proto).
+	sink := func(f sched.LogFrame) error {
 		if stream.Context().Err() != nil {
 			return stream.Context().Err()
 		}
-		resp := &scheddpb.StreamAppLogsResponse{
-			InstanceId: instance,
-			Seq:        seq,
-			Stream:     streamName,
-			Line:       line,
+		if f.IsGap {
+			resp := &scheddpb.StreamAppLogsResponse{
+				InstanceId: f.InstanceID,
+				IsGap:      true,
+			}
+			if !f.GapToWrittenAt.IsZero() {
+				resp.GapToWrittenAt = timestamppb.New(f.GapToWrittenAt)
+			}
+			return stream.Send(resp)
 		}
-		if !writtenAt.IsZero() {
-			resp.WrittenAt = timestamppb.New(writtenAt)
+		resp := &scheddpb.StreamAppLogsResponse{
+			InstanceId: f.InstanceID,
+			Seq:        f.Seq,
+			Stream:     f.Stream,
+			Line:       f.Line,
+		}
+		if !f.WrittenAt.IsZero() {
+			resp.WrittenAt = timestamppb.New(f.WrittenAt)
 		}
 		return stream.Send(resp)
 	}
-	if err := s.engine.StreamAppLogs(stream.Context(), req.GetAppId(), sinceSeq, sink); err != nil {
+	if err := s.engine.StreamAppLogs(stream.Context(), req.GetAppId(), sinceSeq, sinceWrittenAt, deploymentID, sink); err != nil {
 		// Engine.StreamAppLogs surfaces "no live instances" as
 		// state.ErrNotFound (apid maps this to its 404 "the app
 		// is parked; wake it first"). A clean caller cancel
