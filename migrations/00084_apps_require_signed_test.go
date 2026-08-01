@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00083_apps_require_signed.sql (issue #472,
+// Migration-apply test for 00084_apps_require_signed.sql (issue #472,
 // ADR-058). Pins the new column + replay-safety contract.
 //
 // Pins:
 //
-//  1. The migration set applies cleanly through 00083.
+//  1. The migration set applies cleanly through 00084.
 //  2. The column accepts the canonical boolean shape and round-trips.
 //  3. Default is false (regression check — pre-PR rows stay on the
 //     open-deploy path; require_signed is operator opt-in).
@@ -13,10 +13,14 @@
 //     no-op (PR #377 / ADR-041).
 //
 // Slot note: HEAD on origin/main was at 00082 (apps_scaling_policy) when
-// this PR was opened, so we claim slot 83. The migration is slot-agnostic
-// — only the filename and the test function name carry the literal slot.
-// If a sibling PR grabs 00083 first, renumber per `migrations/README.md`
-// and update this test's filename + ApplyUp range.
+// this PR was opened. Slot 83 was claimed in parallel by the
+// `phase 2 / gate a — per-node schedd` PR (#509); the slot-collision
+// CI gate caught the race (run 30703774418) and we renumbered to 84
+// before the second merge could panic goose with "duplicate version
+// 83". The migration is slot-agnostic — only the filename, the test
+// function name, the seed UUIDs, and the e2eMigrationTarget carry
+// the literal slot. Bump pkg/e2etest/harness.go::e2eMigrationTarget
+// to match the filename when renumbering.
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -30,27 +34,27 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
+func TestMigrations_00084_AppsRequireSigned(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000083`,
-	// `...000183`) so a reader scanning the test fixtures can pin each
+	// Seed UUIDs carry the slot number in the last group (`...000084`,
+	// `...000184`) so a reader scanning the test fixtures can pin each
 	// row to this migration without grepping the file name. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00083 first.
+	// `migrations/README.md` if a sibling PR grabs 00084 first.
 
-	// (1) Apply through 00083. A regression that drops a slot between
-	// 1 and 83 surfaces here before the per-assertion pins.
+	// (1) Apply through 00084. A regression that drops a slot between
+	// 1 and 84 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 83)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 84)", err)
 	}
 
 	// (2) Seed an account + app. The literal UUIDs are fixed across
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000083',
+		values ('00000000-0000-0000-0000-000000000084',
 		        'require-signed-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -58,8 +62,8 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000183',
-		        '00000000-0000-0000-0000-000000000083',
+		values ('00000000-0000-0000-0000-000000000184',
+		        '00000000-0000-0000-0000-000000000084',
 		        'require-signed-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -71,7 +75,7 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	// regression check that pre-PR rows stay on the open-deploy path.
 	var defaultVal bool
 	if err := pool.QueryRow(ctx, `
-		select require_signed from apps where id = '00000000-0000-0000-0000-000000000183'
+		select require_signed from apps where id = '00000000-0000-0000-0000-000000000184'
 	`).Scan(&defaultVal); err != nil {
 		t.Fatalf("read default require_signed: %v", err)
 	}
@@ -83,13 +87,13 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	// back true. Mirrors the apid updateApp handler path so a future
 	// regression in the write side surfaces here.
 	if _, err := pool.Exec(ctx, `
-		update apps set require_signed = true where id = '00000000-0000-0000-0000-000000000183'
+		update apps set require_signed = true where id = '00000000-0000-0000-0000-000000000184'
 	`); err != nil {
 		t.Fatalf("update require_signed: %v", err)
 	}
 	var optedIn bool
 	if err := pool.QueryRow(ctx, `
-		select require_signed from apps where id = '00000000-0000-0000-0000-000000000183'
+		select require_signed from apps where id = '00000000-0000-0000-0000-000000000184'
 	`).Scan(&optedIn); err != nil {
 		t.Fatalf("read opted-in require_signed: %v", err)
 	}
@@ -108,10 +112,10 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into app_trusted_signers
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
-		values ('00000000-0000-0000-0000-000000000083',
-		        '00000000-0000-0000-0000-000000000183',
+		values ('00000000-0000-0000-0000-000000000084',
+		        '00000000-0000-0000-0000-000000000184',
 		        'Capitalised-Label', decode(repeat('aa', 64), 'hex'),
-		        '00000000-0000-0000-0000-000000000083')
+		        '00000000-0000-0000-0000-000000000084')
 	`); err == nil {
 		t.Errorf("trusted-signer name-shape: Capitalised-Label should be rejected by CHECK")
 	}
@@ -121,20 +125,20 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into app_trusted_signers
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
-		values ('00000000-0000-0000-0000-000000000083',
-		        '00000000-0000-0000-0000-000000000183',
+		values ('00000000-0000-0000-0000-000000000084',
+		        '00000000-0000-0000-0000-000000000184',
 		        'short-blob', repeat('\xAA', 32)::bytea,
-		        '00000000-0000-0000-0000-000000000083')
+		        '00000000-0000-0000-0000-000000000084')
 	`); err == nil {
 		t.Errorf("trusted-signer pem-shape: 32-byte blob should be rejected by CHECK")
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into app_trusted_signers
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
-		values ('00000000-0000-0000-0000-000000000083',
-		        '00000000-0000-0000-0000-000000000183',
+		values ('00000000-0000-0000-0000-000000000084',
+		        '00000000-0000-0000-0000-000000000184',
 		        'oversized-blob', repeat('\xAA', 2048)::bytea,
-		        '00000000-0000-0000-0000-000000000083')
+		        '00000000-0000-0000-0000-000000000084')
 	`); err == nil {
 		t.Errorf("trusted-signer pem-shape: 2048-byte blob should be rejected by CHECK")
 	}
@@ -143,10 +147,10 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into app_trusted_signers
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
-		values ('00000000-0000-0000-0000-000000000083',
-		        '00000000-0000-0000-0000-000000000183',
+		values ('00000000-0000-0000-0000-000000000084',
+		        '00000000-0000-0000-0000-000000000184',
 		        'ci-bot', decode(repeat('aa', 64), 'hex'),
-		        '00000000-0000-0000-0000-000000000083')
+		        '00000000-0000-0000-0000-000000000084')
 		on conflict (app_id, signer_name) do nothing
 	`); err != nil {
 		t.Fatalf("seed trusted signer: %v", err)
@@ -154,7 +158,7 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	var n int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from app_trusted_signers
-		where app_id = '00000000-0000-0000-0000-000000000183'
+		where app_id = '00000000-0000-0000-0000-000000000184'
 	`).Scan(&n); err != nil {
 		t.Fatalf("count trusted signers: %v", err)
 	}
@@ -168,18 +172,18 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 	// delete, so the test removes the app first, mirroring the
 	// production DeleteApp cleanup order.
 	if _, err := pool.Exec(ctx, `
-		delete from apps where id = '00000000-0000-0000-0000-000000000183'
+		delete from apps where id = '00000000-0000-0000-0000-000000000184'
 	`); err != nil {
 		t.Fatalf("delete app: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		delete from accounts where id = '00000000-0000-0000-0000-000000000083'
+		delete from accounts where id = '00000000-0000-0000-0000-000000000084'
 	`); err != nil {
 		t.Fatalf("delete account: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
 		select count(*) from app_trusted_signers
-		where app_id = '00000000-0000-0000-0000-000000000183'
+		where app_id = '00000000-0000-0000-0000-000000000184'
 	`).Scan(&n); err != nil {
 		t.Fatalf("count after cascade: %v", err)
 	}

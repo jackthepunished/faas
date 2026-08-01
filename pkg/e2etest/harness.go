@@ -349,7 +349,12 @@ const testDomain = "apps.test.example"
 // match the highest NNNNN_<name>.sql filename under migrations/. The
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
-const e2eMigrationTarget = 83
+//
+// Bumped 83 → 84 when the cosign-deploy-enforcement PR (PR #504)
+// renumbered its slot after PR #509 (phase-2 placement claim) took
+// slot 83 in parallel; the migration-slot-collision CI gate caught
+// the race before either merged.
+const e2eMigrationTarget = 84
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

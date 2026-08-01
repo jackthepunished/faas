@@ -104,8 +104,9 @@ func TestPg_DeleteAppTrustedSigner_HappyAndErrNotFound(t *testing.T) {
 
 func TestPg_ListAppTrustedSigners_OrdersAndScopesByAccount(t *testing.T) {
 	s, ctx := pgStore(t)
-	acctA := createAccount(t, s, ctx, pgTestEmail(t))
-	acctB := createAccount(t, s, ctx, pgTestEmail(t))
+	baseEmail := pgTestEmail(t)
+	acctA := createAccount(t, s, ctx, baseEmail+"-a")
+	acctB := createAccount(t, s, ctx, baseEmail+"-b")
 	appA := createApp(t, s, ctx, acctA, "trust-list-a")
 	appB := createApp(t, s, ctx, acctB, "trust-list-b")
 
@@ -168,7 +169,8 @@ func TestPg_ListAppTrustedSignersForApp_NoAccountScope(t *testing.T) {
 
 func TestPg_CountAppTrustedSigners_QuotaShape(t *testing.T) {
 	s, ctx := pgStore(t)
-	acctID := createAccount(t, s, ctx, pgTestEmail(t))
+	baseEmail := pgTestEmail(t)
+	acctID := createAccount(t, s, ctx, baseEmail+"-main")
 	appID := createApp(t, s, ctx, acctID, "trust-count")
 
 	// Empty app → 0.
@@ -196,7 +198,7 @@ func TestPg_CountAppTrustedSigners_QuotaShape(t *testing.T) {
 
 	// Sibling app on a different account → 0 (scoped by account_id
 	// + app_id; mirrors CountAppSecrets).
-	acctB := createAccount(t, s, ctx, pgTestEmail(t))
+	acctB := createAccount(t, s, ctx, baseEmail+"-sibling")
 	appB := createApp(t, s, ctx, acctB, "trust-count-sibling")
 	n, err = s.CountAppTrustedSigners(ctx, acctB, appB)
 	if err != nil {
