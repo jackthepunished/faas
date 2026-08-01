@@ -23,12 +23,15 @@ func strPtr(s string) *string { return &s }
 // cases readable (the alternative — full struct literals — is verbose
 // for 5 scenarios). Sets Active=true and a default ceiling; individual
 // cases override as needed. Region/Zone are nil so callers opt in
-// explicitly (pre-00069 shape).
+// explicitly (pre-00069 shape). VCPUBudget is seeded to 160
+// (api.VCPUSlots) so the Tier A2 vCPU fit check accepts the
+// request; the vCPU-headroom-specific scenarios override it
+// explicitly.
 func node(id, name string, usedMB int64, ceilingMB int) state.ComputeNode {
 	return state.ComputeNode{
 		ID: id, Name: name, TargetURL: "unix:///run/faas/" + name + ".sock",
 		VPCPUs: 160, MemMB: ceilingMB + 8400, MaxConcurrency: 200,
-		AdmissionCeilingMB: ceilingMB, Active: true,
+		AdmissionCeilingMB: ceilingMB, VCPUBudget: 160, Active: true,
 	}
 }
 
@@ -196,8 +199,8 @@ func TestChoosePlacement_Table(t *testing.T) {
 			// chooser must prefer a.
 			name: "tie-break on region when headroom equal",
 			nodes: []state.ComputeNode{
-				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
-				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
 			},
 			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
 			r:      Request{RAMMB: req},
@@ -208,8 +211,8 @@ func TestChoosePlacement_Table(t *testing.T) {
 			// "eu-fra"; zone a-1 sorts before zone a-2.
 			name: "tie-break on zone when region equal",
 			nodes: []state.ComputeNode{
-				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-2")},
-				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-2")},
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
 			},
 			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
 			r:      Request{RAMMB: req},
@@ -221,8 +224,8 @@ func TestChoosePlacement_Table(t *testing.T) {
 			// toward the post-migration rows.
 			name: "nil region sorts as empty string",
 			nodes: []state.ComputeNode{
-				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true}, // nil region
-				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("z-region")},
+				{ID: "a-id", Name: "a", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true}, // nil region
+				{ID: "b-id", Name: "b", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("z-region")},
 			},
 			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
 			r:      Request{RAMMB: req},
@@ -237,8 +240,8 @@ func TestChoosePlacement_Table(t *testing.T) {
 			// later.
 			name: "region tie-break beats name tie-break",
 			nodes: []state.ComputeNode{
-				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
-				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra"), Zone: strPtr("eu-fra-1")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east"), Zone: strPtr("us-east-1")},
 			},
 			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
 			r:      Request{RAMMB: req},
@@ -247,7 +250,7 @@ func TestChoosePlacement_Table(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ChoosePlacement(tc.nodes, tc.usedMB, tc.r)
+			got, err := ChoosePlacement(tc.nodes, tc.usedMB, nil, tc.r)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got placement %+v", got)
@@ -281,11 +284,11 @@ func TestChoosePlacement_Table(t *testing.T) {
 func TestChoosePlacement_RejectsNonPositiveRAM(t *testing.T) {
 	nodes := []state.ComputeNode{node("a-id", "a", 0, 1000)}
 	usedMB := map[string]int64{"a-id": 0}
-	_, err := ChoosePlacement(nodes, usedMB, Request{RAMMB: 0})
+	_, err := ChoosePlacement(nodes, usedMB, nil, Request{RAMMB: 0})
 	if err == nil {
 		t.Fatal("expected error for zero RAM")
 	}
-	_, err = ChoosePlacement(nodes, usedMB, Request{RAMMB: -10})
+	_, err = ChoosePlacement(nodes, usedMB, nil, Request{RAMMB: -10})
 	if err == nil {
 		t.Fatal("expected error for negative RAM")
 	}
@@ -302,16 +305,16 @@ func TestChoosePlacement_BillableIncludesOverhead(t *testing.T) {
 	ceilingNode := state.ComputeNode{
 		ID: "tight", Name: "tight", TargetURL: "unix:///tight.sock",
 		VPCPUs: 160, MemMB: 999, MaxConcurrency: 200,
-		AdmissionCeilingMB: 100, Active: true,
+		AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true,
 	}
 	r := Request{RAMMB: 92} // billable = 100
 	usedMB := map[string]int64{"tight": 0}
 
-	if _, err := ChoosePlacement([]state.ComputeNode{ceilingNode}, usedMB, r); err != nil {
+	if _, err := ChoosePlacement([]state.ComputeNode{ceilingNode}, usedMB, nil, r); err != nil {
 		t.Errorf("100 MB ceiling should fit 100 MB billable, got %v", err)
 	}
 	ceilingNode.AdmissionCeilingMB = 99 // 100 > 99 → no fit
-	if _, err := ChoosePlacement([]state.ComputeNode{ceilingNode}, usedMB, r); err == nil {
+	if _, err := ChoosePlacement([]state.ComputeNode{ceilingNode}, usedMB, nil, r); err == nil {
 		t.Error("99 MB ceiling must refuse 100 MB billable (overhead included)")
 	}
 }

@@ -3760,11 +3760,16 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 		// so the helper and cmd/vmmd/config.go share a single source of truth.
 		// Resolves to the same integer (47_600) as before — no behavior change.
 		AdmissionCeilingMB: api.DefaultComputeNodeCeilingMB(),
-		Active:             true,
-		LastHeartbeatAt:    now,
-		CreatedAt:          now,
-		Region:             &local,
-		Zone:               &local,
+		// Tier A2 / migration 00081: per-node vCPU budget. The
+		// synthetic default-local row carries api.VCPUSlots so a
+		// single-box install sees identical behaviour to the
+		// pre-migration box-wide gate.
+		VCPUBudget:      api.VCPUSlots,
+		Active:          true,
+		LastHeartbeatAt: now,
+		CreatedAt:       now,
+		Region:          &local,
+		Zone:            &local,
 	}
 }
 

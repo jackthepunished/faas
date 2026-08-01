@@ -752,13 +752,24 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	// the global Σ hits api.RAMAdmissionCeilingMB. Each admit goes
 	// through the public API so the per-node accounting stays
 	// consistent (same path the production Wake flow takes).
+	//
+	// Tier A2: VCPU=0 on the fillers so the per-node vCPU budget
+	// (160) does NOT bind first. The legacy single-box fixture
+	// (this test pre-dates Tier A2) was designed to bind on RAM
+	// only; bumping the test to fill vCPU alongside RAM would
+	// shift the binding point and obscure what the test is
+	// verifying. A VCPU=0 filler is the cleanest way to keep the
+	// original "RAM fills first → ledger denies → row is failed"
+	// invariant, and it exercises the defensive VCPU=0 path that
+	// Tier A2 preserves (the placement fit check skips when
+	// r.VCPU==0; the ledger check accepts vcpu=0 admits).
 	billable := api.BillableRAMMB(128)
 	for i := 0; ; i++ {
 		err := e.Ledger().Admit(Request{
 			Instance: "filler-" + strconv.Itoa(i),
 			AppID:    "filler-app-" + strconv.Itoa(i), // distinct appIDs avoid the per-app concurrency gate
 			Plan:     api.PlanFree,
-			RAMMB:    128, VCPU: 1, MaxConcurrency: 1,
+			RAMMB:    128, VCPU: 0, MaxConcurrency: 1,
 			NodeID: e.defaultLocalNodeID,
 		})
 		if err != nil {
@@ -782,6 +793,83 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
 	if len(rows) != 1 || rows[0].State != string(state.StateFailed) {
 		t.Errorf("rows = %+v, want one failed row", rows)
+	}
+}
+
+func TestEngineWake_AdmissionDeniedOnVCPU(t *testing.T) {
+	// Companion to TestEngineWake_AdmissionDeniedReturnsProblem
+	// (RAM-bound rejection). Fills the per-node vCPU budget
+	// (Tier A2, default-local vcpu_budget=160) without binding RAM,
+	// then drives a wake whose request vCPU cannot fit and asserts
+	// the row transitions to FAILED with a CodeCapacity problem.
+	//
+	// The vCPU fillers use VCPU=1 (the smallest non-zero request)
+	// and distinct appIDs so the per-app concurrency gate allows
+	// each admit. The wake's app uses Pro (VCPU=2) so the 161st
+	// filler is the rejection point — the wake's own vCPU=2 admit
+	// pushes the node over the 160 budget. RAM is well below the
+	// 47,600 MB ceiling (160 × 16 MB = 2,560 MB), so the RAM gate
+	// doesn't bind first.
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 128, 1) // Pro plan → vCPU=2
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	for i := 0; i < 160; i++ {
+		err := e.Ledger().Admit(Request{
+			Instance: "vfill-" + strconv.Itoa(i),
+			AppID:    "vfill-app-" + strconv.Itoa(i), // distinct appIDs avoid the per-app concurrency gate
+			Plan:     api.PlanFree,
+			RAMMB:    8, VCPU: 1, MaxConcurrency: 1, // tiny RAM, no per-app concurrency collision
+			NodeID: e.defaultLocalNodeID,
+		})
+		if err != nil {
+			t.Fatalf("vCPU filler %d: %v (test setup; vCPU gate fired before RAM filled)", i, err)
+		}
+	}
+	// The 161st fill (VCPU=1) would push the node to 161/160 — the
+	// vCPU gate is the rejection point. The wake's own vCPU=2
+	// admit is the test's load-bearing rejection: it's the same
+	// path the wake takes in production (placement → admit → ledger
+	// gate), and it should reach the ledger with the node at
+	// 160/160, accept 2 only by lifting the ledger floor (which
+	// it doesn't), and return CodeCapacity.
+	//
+	// We don't run the 161st filler; the wake itself is the
+	// rejection. This mirrors the RAM test's pattern, which also
+	// stops the filler loop at the first admit capacity failure
+	// and uses the wake as the assertion path.
+
+	_, err := e.Wake(context.Background(), app.ID)
+	if err == nil {
+		t.Fatal("expected vCPU capacity denial")
+	}
+	var p *api.Problem
+	if !errors.As(err, &p) || p.Code != api.CodeCapacity {
+		t.Fatalf("error = %v, want *api.Problem capacity (vCPU headroom)", err)
+	}
+	// The chooser surfaces the vCPU binding constraint in the
+	// denial detail so an operator triaging the failure can
+	// identify which limit bound first. The substring is the
+	// chooser's "no active compute_node fits %d MB billable / %d
+	// vCPU" message (placement.go:312).
+	if !strings.Contains(p.Detail, "vCPU") {
+		t.Errorf("denial detail = %q, want substring \"vCPU\" (the vCPU gate is the binding constraint)", p.Detail)
+	}
+	if vmm.coldBoots != 0 {
+		t.Errorf("no boot should happen on vCPU denial; coldBoots=%d", vmm.coldBoots)
+	}
+	// The chooser rejected the placement — no instance row was
+	// created (the engine creates the row only after the chooser
+	// picks a node). This is correct: the chooser's vCPU fit
+	// check is the load-bearing Tier A2 gate, and a fleet-wide
+	// refusal is the expected lever (vs. the RAM-bound test
+	// where the chooser still picks the node and the ledger
+	// rejects at Admit because the store sum was zero — the
+	// test-seam difference, not a Tier A2 issue).
+	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
+	if len(rows) != 0 {
+		t.Errorf("rows = %+v, want empty (chooser rejected, no row created)", rows)
 	}
 }
 

@@ -4679,7 +4679,7 @@ type SnapshotSize struct {
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
-		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.Active,
+		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
 		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
@@ -4689,7 +4689,7 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where active = true
@@ -4718,7 +4718,7 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error) {
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 order by name
@@ -4741,7 +4741,7 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where id = $1
@@ -4756,7 +4756,7 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNode, error) {
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		       region, zone
 		  from compute_nodes
 		 where name = $1
@@ -4926,14 +4926,14 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
 		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.Active, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Active, node.Region, node.Zone)
 	return scanComputeNode(row)
 }
 
@@ -4945,29 +4945,38 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // last_heartbeat_at and created_at are not touched on conflict: the
 // former is the watchdog's heartbeat stamp (next task); the latter is
 // the row's creation time and stays monotonic.
+//
+// vcpu_budget (Tier A2, migration 00081) is operator-tunable per
+// node. The upsert re-applies the caller's value on conflict so
+// a vmmd self-registering with its config.toml value wins against
+// a stale row; the operator can re-tune later via
+// PUT /v1/compute-nodes/{id}. Migration 00081 backfilled existing
+// rows to api.VCPUSlots (160); pre-migration rows see the same
+// default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 12-column
+	// region/zone are projected to match scanComputeNode's 13-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
-	// default-local backfill. RETURNING projects all 12 columns.
+	// default-local backfill. RETURNING projects all 13 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
-		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, active,
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
 		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, true, $7, $8)
+		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
+		      vcpu_budget         = excluded.vcpu_budget,
 		      active              = true
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		          admission_ceiling_mb, active, last_heartbeat_at, created_at,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
 		          region, zone
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node %q: %w", node.Name, err)
