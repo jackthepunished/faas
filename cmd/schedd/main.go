@@ -273,7 +273,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// means vmmd URL rotations stale-dial silently until restart).
 	// After boot, SubscribeWithReconnect drives the channel across
 	// transient LISTEN failures.
-	routerRefreshCh, err := deps.subscribeRouterRefresh(ctx, pool, log)
+	//
+	// nil-deps.test-seam: a test that exercises a deeper failure
+	// path (e.g. TestRun_ListenFailurePropagates) may build a
+	// runDeps without this field set. Falling back to a closed
+	// channel keeps the watcher alive but dormant — the test's
+	// intended failure surface (the listen call further down)
+	// still drives the assertion.
+	subscribeRouterRefresh := deps.subscribeRouterRefresh
+	if subscribeRouterRefresh == nil {
+		subscribeRouterRefresh = func(context.Context, *pgxpool.Pool, *slog.Logger) (<-chan db.Notification, error) {
+			ch := make(chan db.Notification)
+			close(ch)
+			return ch, nil
+		}
+	}
+	routerRefreshCh, err := subscribeRouterRefresh(ctx, pool, log)
 	if err != nil {
 		return fmt.Errorf("schedd: router refresh subscribe: %w", err)
 	}
