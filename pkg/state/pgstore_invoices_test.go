@@ -321,3 +321,125 @@ func TestPgStore_ListInvoicesForAccount_MonthBoundary(t *testing.T) {
 			allRows[0].ProviderInvoiceID, allRows[1].ProviderInvoiceID)
 	}
 }
+
+// TestPgStore_ListInvoicesForAccount_MonthBoundary_NonUTC pins the
+// Dec→Jan roll-over under a non-UTC Postgres session. The previous
+// SQL form `period_end >= date_trunc('month', $2::timestamptz)` is
+// session-TZ dependent: `date_trunc('month', timestamptz)` returns
+// the start of the local-TZ month as a timestamptz, which on a
+// `Europe/Istanbul` session becomes `2026-11-30T21:00:00+00` — a
+// DIFFERENT UTC instant from the literal `2026-12-01T00:00:00Z` we
+// meant. With the bug, a row seeded at `2026-12-31T23:00:00Z`
+// (which is 2027-01-01T02:00 Istanbul wall) is bucketed into Jan
+// under month=2026-12 instead of Dec, and a row seeded at
+// `2026-12-31T22:00:00Z` (= 2027-01-01T01:00 Istanbul) is rejected
+// outright as "earlier than the bucket boundary". The fix replaced
+// `date_trunc('month', $2::timestamptz)` with direct comparison
+// against the Go-pre-computed UTC `monthStart`, so the behaviour
+// is identical on every session TZ.
+//
+// CI runs Postgres on UTC, so the upstream
+// TestPgStore_ListInvoicesForAccount_MonthBoundary cannot catch
+// this. This sibling flips session TZ to a non-UTC one and runs
+// the same fixture, which would have failed with the buggy SQL.
+func TestPgStore_ListInvoicesForAccount_MonthBoundary_NonUTC(t *testing.T) {
+	s, pool, ctx := pgStoreInvoicesWithPool(t)
+	if _, err := pool.Exec(ctx, `set time zone 'Europe/Istanbul'`); err != nil {
+		t.Fatalf("set time zone: %v", err)
+	}
+
+	acct, err := s.CreateAccount(ctx, "istanbul@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	// 23:00 UTC on 2026-12-31 = 02:00 Istanbul wall on 2027-01-01.
+	// This row sits squarely in the buggy-session month bucket
+	// (Istanbul's 2026-12 ends at 2026-12-31T21:00:00Z, so any
+	// minute after that "belongs to" Istanbul's 2027-01 even though
+	// UTC says it's still 2026-12-31).
+	decEveningUTC := time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC)
+	// 22:00 UTC on 2027-01-01 = 01:00 Istanbul wall on 2027-01-01.
+	// A Jan row that should NOT leak into Dec under either form.
+	janMorningUTC := time.Date(2027, 1, 1, 22, 0, 0, 0, time.UTC)
+	seedInvoiceFixture(t, pool, ctx, acct.ID, "stripe", "in_dec_istanbul", decEveningUTC, 700)
+	seedInvoiceFixture(t, pool, ctx, acct.ID, "stripe", "in_jan_istanbul", janMorningUTC, 700)
+
+	// month=2026-12 must return ONLY the Dec row, regardless of
+	// session TZ. With the bug, the bucket boundary in Istanbul
+	// session was 2026-11-30T21:00:00Z, but the row is at
+	// 2026-12-31T23:00:00Z and period_end <= monthEnd-1ns would
+	// have rejected it because the bucket's UTC representation was
+	// 2027-01-01T00:00:00+03 (which == 2026-12-31T21:00:00Z, an
+	// earlier instant). The fix made the boundary
+	// period_end < monthStart+1month, evaluated in UTC, so the Dec
+	// row passes regardless of session TZ.
+	dec := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	decRows, err := s.ListInvoicesForAccount(ctx, acct.ID, &dec, time.Time{}, 25)
+	if err != nil {
+		t.Fatalf("ListInvoicesForAccount(dec): %v", err)
+	}
+	if len(decRows) != 1 || decRows[0].ProviderInvoiceID != "in_dec_istanbul" {
+		t.Fatalf("month=2026-12 (Istanbul session) returned wrong rows: got %+v want [in_dec_istanbul]", decRows)
+	}
+
+	// month=2027-01 must return ONLY the Jan row.
+	jan := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	janRows, err := s.ListInvoicesForAccount(ctx, acct.ID, &jan, time.Time{}, 25)
+	if err != nil {
+		t.Fatalf("ListInvoicesForAccount(jan): %v", err)
+	}
+	if len(janRows) != 1 || janRows[0].ProviderInvoiceID != "in_jan_istanbul" {
+		t.Fatalf("month=2027-01 (Istanbul session) returned wrong rows: got %+v want [in_jan_istanbul]", janRows)
+	}
+
+	// month=nil must return both.
+	allRows, err := s.ListInvoicesForAccount(ctx, acct.ID, nil, time.Time{}, 25)
+	if err != nil {
+		t.Fatalf("ListInvoicesForAccount(all): %v", err)
+	}
+	if len(allRows) != 2 {
+		t.Fatalf("month=nil expected 2 rows, got %d", len(allRows))
+	}
+	if allRows[0].ProviderInvoiceID != "in_jan_istanbul" || allRows[1].ProviderInvoiceID != "in_dec_istanbul" {
+		t.Fatalf("ordering broken: got [%s, %s] want [in_jan_istanbul, in_dec_istanbul]",
+			allRows[0].ProviderInvoiceID, allRows[1].ProviderInvoiceID)
+	}
+}
+
+// TestPgStore_ListInvoicesForAccount_MonthBoundary_NonUTC_BeforeCursor
+// covers the second branch (with `before` cursor) under the same
+// non-UTC session. Both branches share the same buggy predicate
+// (`period_end >= date_trunc('month', $2::timestamptz)`), so both
+// need a regression test.
+func TestPgStore_ListInvoicesForAccount_MonthBoundary_NonUTC_BeforeCursor(t *testing.T) {
+	s, pool, ctx := pgStoreInvoicesWithPool(t)
+	if _, err := pool.Exec(ctx, `set time zone 'Europe/Istanbul'`); err != nil {
+		t.Fatalf("set time zone: %v", err)
+	}
+
+	acct, err := s.CreateAccount(ctx, "istanbul2@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	early := time.Date(2026, 12, 1, 12, 0, 0, 0, time.UTC)
+	mid := time.Date(2026, 12, 15, 12, 0, 0, 0, time.UTC)
+	late := time.Date(2027, 1, 1, 12, 0, 0, 0, time.UTC)
+	seedInvoiceFixture(t, pool, ctx, acct.ID, "stripe", "early", early, 100)
+	seedInvoiceFixture(t, pool, ctx, acct.ID, "stripe", "mid", mid, 100)
+	seedInvoiceFixture(t, pool, ctx, acct.ID, "stripe", "late", late, 100)
+
+	// With cursor=mid, month=2026-12 must return ONLY `early`.
+	// The buggy form would have produced the wrong period_end bound
+	// (Istanbul's 2026-12 starts at 2026-11-30T21:00:00Z instead of
+	// 2026-12-01T00:00:00Z, so the `before` cursor slice on
+	// `early` would compare `early.period_end < mid.period_end`
+	// after a TZ-flipped bucket that excluded `early` entirely).
+	dec := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	rows, err := s.ListInvoicesForAccount(ctx, acct.ID, &dec, mid, 25)
+	if err != nil {
+		t.Fatalf("ListInvoicesForAccount(dec, before=mid): %v", err)
+	}
+	if len(rows) != 1 || rows[0].ProviderInvoiceID != "early" {
+		t.Fatalf("got %+v want [early]", rows)
+	}
+}
