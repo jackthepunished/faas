@@ -31,6 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched/instancestats"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
+	"github.com/onebox-faas/faas/pkg/sched/targets"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
@@ -612,7 +613,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// req/sec instead of ~2.
 		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
 		trigger := scaleup.New(
-			store, nil, scraper,
+			// PR-C (issue #462): thread the *instancestats.Reader
+			// into the scale-up trigger so InstatsReader.MaxCPU
+			// is callable. The reader was nil before PR-B / PR-C;
+			// PR-B added the accessor; PR-C wires the dependency
+			// so the trigger can consult live CPU values alongside
+			// the RPS scrape. MaxInflightForApp is exposed by the
+			// same interface but the scaleup trigger itself does
+			// not read it (the concurrent_requests axis lives in
+			// pkg/sched/targets — see loop.WithTargets below).
+			store, reader, scraper,
 			schedScaleUpEngine{engine: engine},
 			engine.Ledger(),
 			scaleup.Options{
@@ -622,6 +632,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			},
 		)
 		loop.WithScaleUp(trigger)
+		// PR-C (issue #462): concurrent_requests target scale-up
+		// trigger. Reads InstatsReader.MaxInflightForApp and
+		// compares against ScalingPolicy.Target.Value per app.
+		// Distinct from the RPS/CPU scale-up trigger (above) which
+		// is unchanged. The instats reader is the same one already
+		// constructed for the scaleup trigger; both triggers share
+		// the reader (it's read-only). nil reader ⇒ targets
+		// construction is skipped (test wiring without Instats).
+		if reader != nil {
+			targetsTrigger := targets.New(
+				store, reader,
+				schedTargetsEngine{engine: engine},
+				schedTargetsLedger{ledger: engine.Ledger()},
+				targets.Options{
+					Logger:   log,
+					Metrics:  ops,
+					Interval: cfg.ScaleUpInterval,
+				},
+			)
+			loop.WithTargets(targetsTrigger)
+			log.Info("concurrent_requests target trigger enabled",
+				"interval", cfg.ScaleUpInterval)
+		}
 		// Issue #171: wire the recent-load mirror off the same
 		// scraper so the reaper sees per-app RPS without duplicating
 		// the scraping wiring. nil scraper ⇒ mirror is a no-op
@@ -807,4 +840,46 @@ func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (sc
 		return scaleup.AdmitResult{}, err
 	}
 	return scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// schedTargetsEngine (PR-C, issue #462) adapts *sched.Engine to
+// the targets.Engine interface. Mirrors schedScaleUpEngine above
+// but lifts into the thinned targets.AdmitResult shape (which only
+// carries the InstanceID echo — the targets trigger never reads
+// AtCapacity itself; the engine's internal admitGate handles the
+// cap rejection).
+type schedTargetsEngine struct {
+	engine *sched.Engine
+}
+
+// AdmitInstance implements targets.Engine: delegates to the wrapped
+// engine and lifts InstanceID + AtCapacity into targets.AdmitResult.
+// AtCapacity MUST be forwarded — pkg/sched/targets.Trigger.Tick
+// consults result.AtCapacity on the admit path and re-observes
+// the wake-gate outcome metric as reject_at_cap when the engine
+// itself refused the admit (the race between decide()'s cap check
+// and engine.AdmitInstance's ledger call). Without forwarding,
+// the re-observe branch is dead code and the metric loses the
+// per-tick AtCapacity signal that the dashboard's "would have
+// scaled but cap reached" pane depends on.
+func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID)
+	if err != nil {
+		return targets.AdmitResult{}, err
+	}
+	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// schedTargetsLedger (PR-C, issue #462) adapts *sched.NodeLedger
+// to the targets.Ledger interface. Read-only — the trigger never
+// mutates the ledger; AdmitInstance inside engine.admitGate is the
+// sole mutation path.
+type schedTargetsLedger struct {
+	ledger *sched.NodeLedger
+}
+
+// Concurrency implements targets.Ledger: delegates to the wrapped
+// ledger's Concurrency accessor (pkg/sched/admission.go).
+func (s schedTargetsLedger) Concurrency(appID string) int {
+	return s.ledger.Concurrency(appID)
 }

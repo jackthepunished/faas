@@ -70,6 +70,21 @@ type InstanceInfo struct {
 	// compute 0 and want to park them. RAM pressure (SelectEvictions)
 	// still wins — invariant §6.2-2 is the ceiling.
 	WorkloadClass state.WorkloadClass
+	// LastScaleInAt is the apps-row last_scale_in_at stamp
+	// (PR-C, issue #462). Carrier semantics: every row of the same
+	// app carries the SAME value (sourced from app.LastScaleInAt in
+	// runReaper; nil if the customer has never had a scale-in event).
+	// ReapIdle and ReapAggressive consult it: when now - *LastScaleInAt
+	// < ScaleInCooldownS, the entire app is skipped (cooldown_held).
+	// Selecting the FIRST row's stamp and consulting once per app is
+	// the loop-side contract.
+	LastScaleInAt *time.Time
+	// ScaleInCooldownS is the per-app scale-in cooldown in seconds
+	// (PR-C, issue #462). Same carrier semantics as MinInstances —
+	// sourced from app.ScalingPolicy.ScaleInCooldownS via
+	// ScalingPolicyOrDefault; identical across rows of one app. Zero
+	// disables cooldown enforcement (the customer has not opted in).
+	ScaleInCooldownS int
 }
 
 func (i InstanceInfo) admissionMB() int { return api.BillableRAMMB(i.RAMMB) }
@@ -116,9 +131,11 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 	// candidates separately so we can trim the candidate list against
 	// the floor AFTER the G7 / idle-timeout filter has run.
 	type appGroup struct {
-		running int            // total RUNNING instances of this app
-		floor   int            // app.MinInstances
-		cands   []InstanceInfo // idle-eligible (RUNNING, no flows, stale)
+		running         int            // total RUNNING instances of this app
+		floor           int            // app.MinInstances
+		cands           []InstanceInfo // idle-eligible (RUNNING, no flows, stale)
+		lastScaleInAt   *time.Time     // carrier (PR-C): from first row seen
+		scaleInCooldown time.Duration  // carrier (PR-C): zero disables
 	}
 	byApp := map[string]*appGroup{}
 	for _, in := range instances {
@@ -127,8 +144,21 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		}
 		g, ok := byApp[in.AppID]
 		if !ok {
-			g = &appGroup{floor: in.MinInstances}
+			g = &appGroup{
+				floor:           in.MinInstances,
+				lastScaleInAt:   in.LastScaleInAt,
+				scaleInCooldown: time.Duration(in.ScaleInCooldownS) * time.Second,
+			}
 			byApp[in.AppID] = g
+		}
+		// PR-C (issue #462): per-app scale-in cooldown consult. When
+		// now - *LastScaleInAt < ScaleInCooldownS, the entire app is
+		// skipped. The "stamp missed" direction is safe: nil
+		// LastScaleInAt → bypass → normal reaping. Carrier semantics:
+		// the first row's values are read once per app, so callers
+		// MUST stamp the same value across all rows of one app.
+		if g.lastScaleInAt != nil && g.scaleInCooldown > 0 && now.Sub(*g.lastScaleInAt) < g.scaleInCooldown {
+			continue
 		}
 		// ADR-051 PR-D: workers are reaper-exempt. They have no
 		// per-request traffic — a worker's LastRequest is either
@@ -202,10 +232,12 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 // first; ties broken by instance ID, matching ReapIdle).
 func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int) []string {
 	type appGroup struct {
-		running    int
-		floor      int
-		desired    int
-		candidates []InstanceInfo // RUNNING, !young, !busy
+		running         int
+		floor           int
+		desired         int
+		candidates      []InstanceInfo // RUNNING, !young, !busy
+		lastScaleInAt   *time.Time
+		scaleInCooldown time.Duration
 	}
 	byApp := map[string]*appGroup{}
 	for _, in := range snapshot {
@@ -226,8 +258,18 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		}
 		g, ok := byApp[in.AppID]
 		if !ok {
-			g = &appGroup{floor: in.MinInstances, desired: desired}
+			g = &appGroup{
+				floor:           in.MinInstances,
+				desired:         desired,
+				lastScaleInAt:   in.LastScaleInAt,
+				scaleInCooldown: time.Duration(in.ScaleInCooldownS) * time.Second,
+			}
 			byApp[in.AppID] = g
+		}
+		// PR-C (issue #462): per-app scale-in cooldown consult (mirror
+		// ReapIdle). Skip the entire app when within the cooldown window.
+		if g.lastScaleInAt != nil && g.scaleInCooldown > 0 && now.Sub(*g.lastScaleInAt) < g.scaleInCooldown {
+			continue
 		}
 		g.running++
 		// G7: open TCP flows count as activity regardless of

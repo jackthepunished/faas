@@ -39,8 +39,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // TestProperty_EngineWake_RespectsMaxConcurrency — six goroutines all
@@ -107,28 +109,30 @@ func TestProperty_EngineWake_RespectsMaxConcurrency(t *testing.T) {
 		t.Errorf("denied = %d, want %d", denied, goroutines-maxConc)
 	}
 
-	// State assertions on the store.
+	// State assertions on the store. PR-C (issue #462): the
+	// wake-gate admitGate short-circuits BEFORE CreateInstance,
+	// so denied wakes leave no instances-table footprint. The
+	// invariant §6.2-1 still holds (≤ maxConc in {WAKING,
+	// COLD_BOOTING, RUNNING}); the row count is now exactly
+	// maxConc, not goroutines. The legacy "every Wake leaves a
+	// row, success or fail" pattern from the pre-PR-C
+	// ledger-rejection path no longer applies — gate-denied
+	// wakes never reach the ledger or the instances table.
 	rows, err := store.ListInstancesForApp(context.Background(), app.ID)
 	if err != nil {
 		t.Fatalf("ListInstancesForApp: %v", err)
 	}
-	if len(rows) != goroutines {
-		t.Errorf("len(rows) = %d, want %d (every Wake leaves a row, success or fail)", len(rows), goroutines)
+	if len(rows) != maxConc {
+		t.Errorf("len(rows) = %d, want %d (admitted; gate-denied wakes leave no row)", len(rows), maxConc)
 	}
-	var running, failed int
+	var running int
 	for _, ins := range rows {
-		switch ins.State {
-		case string(state.StateRunning):
+		if ins.State == string(state.StateRunning) {
 			running++
-		case string(state.StateFailed):
-			failed++
 		}
 	}
 	if running != maxConc {
 		t.Errorf("running = %d, want %d", running, maxConc)
-	}
-	if failed != goroutines-maxConc {
-		t.Errorf("failed = %d, want %d", failed, goroutines-maxConc)
 	}
 
 	// Ledger assertion — the cap gate, not the lock, must be the
@@ -346,5 +350,120 @@ func TestProperty_EngineWake_DropsLockAroundBootRPC(t *testing.T) {
 	// blows past the deadline immediately.
 	if elapsed > deadline {
 		t.Errorf("elapsed = %v, want < %v (lock likely held during Phase 3)", elapsed, deadline)
+	}
+}
+
+// TestProperty_EngineWake_RespectsCooldown (PR-C, issue #462) —
+// pins the wake-gate cooldown enforcement under contention. The
+// plan calls for "6 goroutines wake the same app in quick
+// succession; first inserts, remaining 5 hit cooldown_held" but
+// that pattern races on the per-app appMu and the post-insert
+// stamp ordering. The deterministic shape pre-stamps the app's
+// LastScaleOutAt to 1s ago + primes the ledger to Concurrency=1
+// so EVERY goroutine sees the cooldown state; this asserts the
+// load-bearing Concurrency > 0 discriminator. PR-D will add the
+// CodeWaitForWarm constant; for now we assert on the metric
+// counter increment + the absence of any successful wake.
+//
+// Properties the test asserts:
+//
+//   - all goroutines return *api.Problem (none succeed) — the
+//     wake-gate short-circuits BEFORE the ledger check and the
+//     instances INSERT, so a cooldown_held wake leaves no row.
+//   - state.ListInstancesForApp returns 0 rows (gate-denied
+//     wakes never reach the instances table).
+//   - the wake-gate outcome metric
+//     schedd_scale_up_decisions_total{outcome=cooldown_held} is
+//     incremented once per cooldown_held decision. The exact
+//     value is goroutine-count (no race: admitGate is the only
+//     writer and the per-app appMu serialises the calls).
+//   - the ledger.Concurrency(appID) stays at 1 (no admit
+//     happened, no increment).
+//
+// Direction this test pins: a request-driven wake that races
+// with a freshly-stamped scale-out MUST NOT admit. The
+// Concurrency > 0 discriminator is the gate — a cold-start
+// wake (Concurrency == 0) bypasses cooldown even when the
+// stamp is fresh (TestAdmitGate_Outcomes/cold_start_bypass_cooldown
+// covers that branch).
+func TestProperty_EngineWake_RespectsCooldown(t *testing.T) {
+	store := state.NewMemStore()
+	const maxConc = 5
+	_, app, _ := seedApp(t, store, api.PlanPro, 128, maxConc)
+	// Set the customer-facing ScalingPolicy (ScaleOutCooldownS=60)
+	// and stamp LastScaleOutAt = 1s ago so the consult fires.
+	_, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		ScalingPolicy:    &state.ScalingPolicy{ScaleOutCooldownS: 60},
+		SetScalingPolicy: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	stamp := time.Now().Add(-1 * time.Second)
+	if err := store.StampAppScaleOut(context.Background(), app.ID); err != nil {
+		t.Fatalf("StampAppScaleOut: %v", err)
+	}
+	// Re-stamp the deterministic time. The production path uses
+	// time.Now(); the helper is a whitebox seam for the test.
+	store.SetLastScaleOutAt(app.ID, stamp)
+	// Prime the ledger to Concurrency=1 so the Concurrency > 0
+	// discriminator in admitGate fires.
+	vmm := &fakeVMM{}
+	ops := wire.NewOpsMetrics("schedd")
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+	if err := e.Ledger().Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro}); err != nil {
+		t.Fatalf("prime ledger: %v", err)
+	}
+
+	const goroutines = 6
+	results := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, err := e.Wake(context.Background(), app.ID)
+			results <- err
+		}()
+	}
+	denied := 0
+	for i := 0; i < goroutines; i++ {
+		err := <-results
+		if err == nil {
+			t.Errorf("Wake error = nil; want *api.Problem (cooldown_held)")
+			continue
+		}
+		var p *api.Problem
+		if errors.As(err, &p) && p.Code == api.CodePlanLimitConcur {
+			// Pre-PR-D surface: the wake-gate emit is the metric
+			// row, the wire code is still the pre-PR-C shape
+			// (CodePlanLimitConcur). PR-D introduces CodeWaitForWarm.
+			denied++
+			continue
+		}
+		t.Errorf("Wake error = %v; want *api.Problem{Code:CodePlanLimitConcur} (cooldown_held)", err)
+	}
+	if denied != goroutines {
+		t.Errorf("denied = %d, want %d (every wake hits cooldown_held)", denied, goroutines)
+	}
+
+	// State assertions: gate-denied wakes leave no instances
+	// footprint. This is the §6.2-1 invariant expressed under
+	// the cooldown path: the cap is the upper bound on
+	// (WAKING + COLD_BOOTING + RUNNING) and the cooldown_held
+	// outcome never creates an instance to count.
+	rows, err := store.ListInstancesForApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("len(rows) = %d, want 0 (gate-denied wakes never INSERT)", len(rows))
+	}
+	// Ledger stays at 1 — no admit happened.
+	if got := e.Ledger().Concurrency(app.ID); got != 1 {
+		t.Errorf("ledger.Concurrency(%s) = %d, want 1 (no admit)", app.ID, got)
+	}
+	// Metric counter: one cooldown_held emission per goroutine.
+	// admitGate runs under the per-app appMu, so the increments
+	// are serialised; the total is exactly goroutines.
+	if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != goroutines {
+		t.Errorf("cooldown_held = %d, want %d", n, goroutines)
 	}
 }

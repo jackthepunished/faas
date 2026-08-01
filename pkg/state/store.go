@@ -1185,6 +1185,24 @@ type Store interface {
 	CreateInstance(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID string) (Instance, error)
 	InstanceByID(ctx context.Context, id string) (Instance, error)
 	ListInstancesForApp(ctx context.Context, appID string) ([]Instance, error)
+	// StampAppScaleOut (PR-C, issue #462) records apps.last_scale_out_at
+	// = now() on the wake-gate admit path. Non-atomic with the
+	// instances INSERT — single-leader schedd + per-app appMu
+	// serialise the wake path; the second line of defence is the
+	// wake-gate admitGate consult, which sees the freshly-stamped
+	// column on the next wake attempt. The "stamp miss" direction
+	// (the stamp UPDATEs after the instance INSERT, and a rare
+	// concurrent wake sees NULL on the consult) is the SAFE
+	// direction: the consult bypasses cooldown on NULL and the
+	// wake proceeds normally. The opposite (Tx-wrapped insert +
+	// stamp) would buy nothing because the wake-gate still
+	// consults before INSERT.
+	StampAppScaleOut(ctx context.Context, appID string) error
+	// StampAppScaleIn (PR-C, issue #462) records apps.last_scale_in_at
+	// = now() on the reaper park branch. Same shape as
+	// StampAppScaleOut — best-effort, post-park call; stamp failure
+	// does NOT roll back the park.
+	StampAppScaleIn(ctx context.Context, appID string) error
 	// ListLatestInstancesForApp returns up to `limit` instance rows for
 	// appID ordered by started_at DESC. The dashboard's app-detail
 	// "Recent wakes" table uses this to bound the per-render scan at
