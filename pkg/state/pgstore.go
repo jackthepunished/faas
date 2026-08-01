@@ -6982,13 +6982,8 @@ const appsSelectColumns = `
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-<<<<<<< HEAD
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
 	scaling_policy, last_scale_out_at, last_scale_in_at, node_id`
-=======
-	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
-	scaling_policy, last_scale_out_at, last_scale_in_at, node_id`
->>>>>>> c35918a6 (fix(state): coalesce node_id in appsSelectColumns + gofmt)
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
