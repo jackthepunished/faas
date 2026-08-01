@@ -250,10 +250,11 @@ func (s *Service) applyRemove(
 	return err
 }
 
-// workloadToDraftApp mirrors cmd/apid/scan_service.go:494-525
-// (wlToApp). The Slug is w.Name verbatim — apps.slug is
-// unconstrained in the schema (migrations/00074_…:141-145
-// documents the historical allowance of uppercase, dots, longer
+// workloadToDraftApp replaces the legacy cmd/apid
+// `wlToApp` helper (retired in PR-GH.2). The Slug is w.Name
+// verbatim — apps.slug is unconstrained in the schema
+// (migrations/00074_…:141-145 documents the historical
+// allowance of uppercase, dots, longer
 // strings), so the apid path and the reconcile path must agree
 // byte-for-byte to keep customer URLs stable. Any future
 // normalisation must land in BOTH paths at the same time, with

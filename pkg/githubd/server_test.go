@@ -16,32 +16,61 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 
-	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/audit"
+	"github.com/onebox-faas/faas/pkg/reconcile"
+	"github.com/onebox-faas/faas/pkg/reposcan"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // recordingService (intentionally omitted — slice 7 uses the
 // shared Service directly via the binding-store stub below).
 
-// Stub bindings + create so the HTTP test sees a happy path.
+// Stub bindings + reconcile stub so the HTTP test sees a happy
+// path. PR-H retires CreateDeployment; the happy-path test now
+// wires the new Source+Reconcile path so the dispatch contract
+// stays pinned end-to-end.
 func newRecording(t *testing.T) *Service {
 	t.Helper()
+	mem := state.NewMemStore()
+	aud := audit.New(mem, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "githubd_test")
+	rec := reconcile.NewService(mem, aud, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rec.Scan = func(_ fs.FS) (reposcan.Result, error) {
+		return reposcan.Result{}, nil
+	}
+	acct, err := mem.CreateAccount(context.Background(), "octo@example.com", "hobby")
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := mem.CreateProject(context.Background(), state.Project{
+		AccountID:        acct.ID,
+		Slug:             "demo",
+		InstallID:        42,
+		RepoFullName:     "octo/api",
+		ProductionBranch: "main",
+		ScanSource:       state.ProjectScanSourceCompose,
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
 	svc := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	svc.Bindings = &stubBindings{
-		byRepo: map[string]githubdgrpc.AppBinding{
-			"octo/api|main": {BindingID: "b-1", RepoFullName: "octo/api", ProductionBranch: "main"},
+		byRepo: map[string]state.GitHubBinding{
+			"octo/api|main": {BindingID: "b-1", AccountID: acct.ID, InstallID: 42, RepoFullName: "octo/api", ProductionBranch: "main"},
 		},
 	}
-	svc.CreateDeployment = func(_ context.Context, repo, branch, sha string) (string, error) {
-		svc.Log.Info("recording deployment", "repo", repo, "branch", branch, "sha", sha)
-		return "dep-rec-1", nil
-	}
+	svc.Installs = &stubInstalls{byAccount: map[string]state.GitHubInstall{
+		acct.ID: {AccountID: acct.ID, InstallationID: 42},
+	}}
+	svc.Source = &stubSource{fsys: fstest.MapFS{}}
+	svc.Reconcile = rec
 	return svc
 }
 
@@ -88,19 +117,25 @@ func TestServerWebhook_RejectsGet(t *testing.T) {
 	}
 }
 
-// Service-level test: ensure the dispatcher reaches CreateDeployment
-// with the right args when the binding exists. (Bypasses the HTTP
-// handler because the handler has its own secret-via-env path; the
-// Service contract is what the gRPC adapter will rely on in slice 8.)
+// Service-level test: ensure the dispatcher reaches Reconcile
+// when the binding + project are wired. PR-H drives the push
+// through reconcile.Service.Reconcile (the legacy CreateDeployment
+// seam is retired); this test pins that the new path is wired
+// (no nil-deref on Reconcile.Store.ProjectByRepo) and that an
+// empty scan surfaces the never-empty alert via Result.Alerts
+// (no error — that's the contract).
 func TestServerWebhook_DispatchThroughService(t *testing.T) {
 	svc := newRecording(t)
-	depID, err := svc.HandlePushRequest(context.Background(),
+	result, err := svc.HandlePushRequest(context.Background(),
 		[]byte(`{"ref":"refs/heads/main","after":"sha-1","repository":{"full_name":"octo/api","name":"api"},"pusher":{"name":"alice"}}`))
 	if err != nil {
-		t.Fatalf("dispatch: %v", err)
+		t.Fatalf("HandlePushRequest: %v", err)
 	}
-	if depID != "dep-rec-1" {
-		t.Errorf("depID = %q, want dep-rec-1", depID)
+	if len(result.Alerts) == 0 {
+		t.Error("expected never-empty alert, got 0 alerts")
+	}
+	if result.Alerts[0].Kind != "no_workloads" {
+		t.Errorf("alert kind = %q, want no_workloads", result.Alerts[0].Kind)
 	}
 }
 
@@ -109,7 +144,7 @@ func TestServerWebhook_DispatchThroughService(t *testing.T) {
 // surfaces ErrNoBinding so the handler can write that body.
 func TestServerWebhook_NoBindingSurfaced(t *testing.T) {
 	svc := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	svc.Bindings = &stubBindings{byRepo: map[string]githubdgrpc.AppBinding{}}
+	svc.Bindings = &stubBindings{byRepo: map[string]state.GitHubBinding{}}
 	_, err := svc.HandlePushRequest(context.Background(),
 		[]byte(`{"ref":"refs/heads/main","after":"x","repository":{"full_name":"unknown/repo","name":"repo"},"pusher":{"name":"x"}}`))
 	if !IsNoBinding(err) {
@@ -122,7 +157,7 @@ func TestServerWebhook_NoBindingSurfaced(t *testing.T) {
 // today we fake it via the unexported package seam).
 func TestServerWebhook_NoBindingHandlerPath(t *testing.T) {
 	svc := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	svc.Bindings = &stubBindings{byRepo: map[string]githubdgrpc.AppBinding{}}
+	svc.Bindings = &stubBindings{byRepo: map[string]state.GitHubBinding{}}
 	// Build a handler that bypasses the secret check (the
 	// production handler requires webhookSecretFromHeader to return
 	// a non-nil value; slice 7 leaves that nil so all webhooks are

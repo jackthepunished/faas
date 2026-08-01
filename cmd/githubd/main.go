@@ -27,10 +27,15 @@ import (
 	"filippo.io/age"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/gitfetch"
 	"github.com/onebox-faas/faas/pkg/githubd"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
+	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -77,9 +82,65 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	defer pool.Close()
 
+	// PR-H (Phase 5, mega-PR-GH): the host age identity is
+	// needed for two distinct paths:
+	//
+	//   1. RealService.SealOne / Open in the OAuth branch (slice 8
+	//      scope). The cold-start rehydrate path unseals the
+	//      stored install token at boot.
+	//   2. installationSourceFetcher.Open in the push-dispatch
+	//      path (this PR). Every inbound webhook needs an
+	//      unsealed install token to fetch the codeload archive.
+	//
+	// Loading the identity unconditionally (before the OAuth
+	// branch) keeps a single failure path: an operator who
+	// hasn't provisioned host.age yet gets a fatal startup error
+	// regardless of which daemon mode they want to run. The
+	// 0o400 perm check inside LoadHostKey trips first.
+	identity, err := secretbox.LoadHostKey(hostKeyPath())
+	if err != nil {
+		return fmt.Errorf("githubd: load host age identity: %w", err)
+	}
+
+	// PR-H: per-daemon audit + reconcile services. The auditor
+	// carries actor="githubd" so every project.reconcile.* /
+	// auth.install.* audit row the reconcile package emits
+	// through this Auditor is correctly attributed. The
+	// reconcile service shares the same state.Store as the
+	// apid-side reconcile (one PgStore per daemon — no
+	// cross-process shared state).
+	store := state.NewPgStore(pool)
+	ops := wire.NewOpsMetrics("githubd")
+	ghAud := audit.New(store, log, ops, "githubd")
+	ghReconcile := buildGithubdReconcileService(store, ghAud, log)
+
+	// PR-H: source fetcher for the push-dispatch path. The
+	// work dir is operator-configurable (default
+	// /var/lib/faas/githubd) so the temp dirs created by
+	// gitfetch don't accumulate on the root partition. The
+	// installsAdapter is the same one the OAuth branch wires
+	// into RealService.
+	workDir := githubdWorkDir()
+	if mkErr := os.MkdirAll(workDir, 0o750); mkErr != nil {
+		return fmt.Errorf("githubd: create work dir: %w", mkErr)
+	}
+	gitFetcher := gitfetch.NewHTTPWithLimits(workDir, api.MustLimitsFor(api.PlanScale))
+	installsAdapter := newStateInstallsAdapter(pool)
+	storeAdapter := newStateBindingsAdapter(pool)
+	source := newInstallationSourceFetcher(installsAdapter, gitFetcher, identity, log)
+
 	// Slice 7 Service skeleton (inbound webhook path).
 	webhookSvc := githubd.NewService(log)
-	webhookSvc.Bindings = noopBindings{}
+	webhookSvc.Bindings = storeAdapter
+	webhookSvc.Installs = installsAdapter
+	webhookSvc.Source = source
+	webhookSvc.Reconcile = ghReconcile
+	// PR-GH.5: build fan-out. The noop enqueuer mints
+	// synthetic buildIDs so the wire contract is exercised
+	// end-to-end. The follow-up slice that wires the real
+	// builderd bridge swaps this in cmd/githubd/main.go
+	// without touching pkg/githubd.
+	webhookSvc.Enqueuer = githubd.NewNoopEnqueuer(log)
 
 	// Slice 8 RealService (OAuth + Checks). Auth may be nil if
 	// the GitHub App credentials aren't provisioned — the daemon
@@ -87,6 +148,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// This is "fail-closed but stay-up": the webhook path
 	// continues to work for any installation that's already
 	// configured its webhook out-of-band.
+	//
+	// storeAdapter / installsAdapter / identity are already loaded
+	// above (PR-H hoisted them so the webhook dispatch path can
+	// reach them even when OAuth + Checks are disabled).
 	var realSvc *githubd.RealService
 	if appID := deps.readAppID(); appID != "" {
 		keyPEM, kerr := deps.readKeyPEM()
@@ -100,13 +165,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				log.Warn("githubd: app auth init", "err", aerr)
 			} else {
 				tokens := githubd.NewTokenCache(auth, 5*time.Minute)
-				// BindingsLookup is the seam that closes review
-				// finding #1+#2: pkg/state.Store owns the binding
-				// table (migration 00007), and githubd's Checks
-				// writer threads the right installation_id per
-				// repo through it instead of hardcoding install=1.
-				storeAdapter := newStateBindingsAdapter(pool)
-				installsAdapter := newStateInstallsAdapter(pool)
 				checks, cerr := githubd.NewChecksAPI(tokens, deps.httpClient(), storeAdapter)
 				if cerr != nil {
 					return fmt.Errorf("githubd: new checks api: %w", cerr)
@@ -117,11 +175,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// LoadHostKey enforces 0o400 perms (strict
 				// equality, MEMORY.md/host-age-0400-loadcredential-decouple);
 				// failure here is fatal — without the identity
-				// we can't unseal existing rows.
-				identity, ierr := secretbox.LoadHostKey(hostKeyPath())
-				if ierr != nil {
-					return fmt.Errorf("githubd: load host age identity: %w", ierr)
-				}
+				// we can't unseal existing rows. PR-H hoisted
+				// this to the top of runWithDeps; the OAuth branch
+				// here just consumes the loaded identity.
+				//
 				// Issue #316 / ADR-057: also load the rotation-aware
 				// multi-identity slice from the same dir so install
 				// tokens sealed under the previous host.age remain
@@ -165,13 +222,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		gRPCImpl = realSvc
 	}
 
-	// ops: one per-daemon Prometheus registry shared by every
-	// observer in githubd (gRPC handlers + the inbound webhook
-	// push). WebhookLoopbackHandler mounts it at GET /metrics on
-	// the loopback :8083 mux (§11 loopback-only invariant; gatewayd
-	// only forwards POST /webhooks/github, so GET /metrics can't
-	// leak externally).
-	ops := wire.NewOpsMetrics("githubd")
+	// ops: hoisted above (PR-H moved it next to the Auditor
+	// construction so the per-daemon registry is shared by
+	// audit + reconcile + sync.Mutex-free observer paths).
 	srv := &githubd.Server{
 		Service:     webhookSvc,
 		Log:         log,
@@ -210,13 +263,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 }
 
-// noopBindings is a placeholder until slice 8 introduces the
-// bindings table. Every GetAppBinding returns an empty struct (the
-// service treats empty BindingID as "no binding").
-type noopBindings struct{}
+// buildGithubdReconcileService constructs the githubd-side
+// reconcile.Service using the per-daemon *audit.Auditor. Actor
+// is "githubd" so every project.reconcile.* / auth.install.*
+// audit row emitted through this service is correctly
+// attributed. The same store powers both the DAO and the
+// audit reader — no cross-process shared state.
+func buildGithubdReconcileService(store state.Store, aud *audit.Auditor, log *slog.Logger) *reconcile.Service {
+	return reconcile.NewService(store, aud, log)
+}
 
-func (noopBindings) GetAppBinding(_ context.Context, _, _ string) (githubdgrpc.AppBinding, error) {
-	return githubdgrpc.AppBinding{}, nil
+// githubdWorkDir returns the root directory under which
+// gitfetch creates per-push temp dirs. Override via
+// FAAS_GITHUBD_WORK_DIR. The default matches the spec §11 disk
+// layout. The directory is created at startup (mode 0750)
+// so the gitfetch.NewHTTP(workDir) call doesn't fail with
+// ENOENT on the first push.
+func githubdWorkDir() string {
+	if p := os.Getenv("FAAS_GITHUBD_WORK_DIR"); p != "" {
+		return p
+	}
+	return "/var/lib/faas/githubd"
 }
 
 // readKeyPEMDefault reads the GitHub App private key from

@@ -254,7 +254,7 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 		observe(errors.New("githubd: webhook signature invalid"))
 		return
 	}
-	depID, err := s.Service.HandlePushRequest(r.Context(), body)
+	result, err := s.Service.HandlePushRequest(r.Context(), body)
 	if err != nil {
 		if IsNoBinding(err) {
 			// 200 + ignored payload — the push doesn't apply to
@@ -269,6 +269,17 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 			observe(nil)
 			return
 		}
+		if IsIgnored(err) {
+			// Feature-branch push — the production-branch guard
+			// tripped. Same 200-ignored shape as no_binding, but
+			// with reason=feature_branch so dashboards can group
+			// these together.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ignored","reason":"feature_branch"}`))
+			observe(nil)
+			return
+		}
 		s.Log.Error("githubd webhook handle", "err", err)
 		http.Error(w, "internal", http.StatusInternalServerError)
 		observe(err)
@@ -276,14 +287,20 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	// Marshal the depID into JSON so the response body is
-	// safely escaped (the depID is operator-controlled today
-	// but a future caller might thread a tainted string
-	// through this path).
+	// PR-GH.5: the response carries the reconcile Result + the
+	// per-app build fan-out. The wire shape is:
+	//   {status: "queued", added: N, changed: N, removed: N,
+	//    build_ids: [...]} when the push reconciles + enqueues
+	// builds. The previous PR-GH.4 response shape
+	// ({status:queued, added:N, changed:N, removed:N}) is
+	// forward-compatible — build_ids is additive.
 	respBody, _ := json.Marshal(struct {
-		Status       string `json:"status"`
-		DeploymentID string `json:"deployment_id"`
-	}{Status: statusQueued, DeploymentID: depID})
+		Status   string   `json:"status"`
+		Added    int      `json:"added"`
+		Changed  int      `json:"changed"`
+		Removed  int      `json:"removed"`
+		BuildIDs []string `json:"build_ids"`
+	}{Status: statusQueued, Added: len(result.Added), Changed: len(result.Changed), Removed: len(result.Removed), BuildIDs: result.BuildIDs})
 	_, _ = w.Write(respBody)
 	observe(nil)
 }

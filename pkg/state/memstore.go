@@ -1147,6 +1147,48 @@ func (m *MemStore) SetProjectScanSource(_ context.Context, projectID string, src
 	return p, nil
 }
 
+// DeleteProject removes a project row by ID. Mirrors the pgstore
+// trigger: apps pointing at this project get their project_id
+// nulled (the row stays; reconcile already soft-deleted any
+// apps it touched via SoftDeleteAppCascade). Returns ErrNotFound
+// when no project matches. Used by cmd/apid's scanService to
+// roll back a half-created project on a reconcile error.
+func (m *MemStore) DeleteProject(_ context.Context, projectID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.projects[projectID]
+	if !ok {
+		return ErrNotFound
+	}
+	delete(m.projects, projectID)
+	// Drop the by-account+slug entry. The map is keyed by
+	// accountID → slug → projectID; nil-ing out the slug
+	// entry is enough.
+	if byAcctSlug, ok := m.projectsByAccountSlug[p.AccountID]; ok && p.Slug != "" {
+		delete(byAcctSlug, p.Slug)
+	}
+	// Drop the by-(installID, repoFullName) entry. Keyed by
+	// the installRepoKey struct; only present for projects
+	// bound to a GitHub install.
+	if p.InstallID != 0 && p.RepoFullName != "" {
+		delete(m.projectsByInstallRepo, installRepoKey{InstallID: p.InstallID, RepoFullName: p.RepoFullName})
+	}
+	// Walk apps and null project_id where it points here. This
+	// mirrors the PG trigger ON DELETE SET NULL on the
+	// apps.project_id FK (migration 00074:74). The app row
+	// stays — reconciler may have soft-deleted it but the
+	// history remains. m.apps is map[string]App (not pointer
+	// values), so we have to re-assign the whole struct to
+	// mutate a field.
+	for appID, a := range m.apps {
+		if a.ProjectID == projectID {
+			a.ProjectID = ""
+			m.apps[appID] = a
+		}
+	}
+	return nil
+}
+
 // ApplyProjectPlan — Phase 3 transactional seam. Mirrors the
 // CreateAppIfUnderQuota critical section but inlines the count +
 // insert for project + apps + crons inside one Tx so the apid

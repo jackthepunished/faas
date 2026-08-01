@@ -86,7 +86,7 @@ func (s *Service) reconcile(
 	// 6. ScanSource upgrade (strictly greater; same-tier is a
 	// no-op per the store). The audit row is emitted ONLY on a
 	// real upgrade via emitScanSourceChanged.
-	desired := deriveScanSource(scan.Workloads)
+	desired := DeriveScanSource(scan.Workloads)
 	if tierRank(desired) > tierRank(project.ScanSource) {
 		prev := project.ScanSource
 		updated, err := s.Store.SetProjectScanSource(ctx, project.ID, desired)

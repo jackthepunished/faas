@@ -1211,6 +1211,28 @@ func (s *PgStore) SetProjectScanSource(ctx context.Context, projectID string, sr
 	return scanProject(row)
 }
 
+// DeleteProject removes a project row by ID. The apps.project_id
+// FK is declared ON DELETE SET NULL (migration 00074:74), so apps
+// already pointing at this project have their project_id
+// nulled on delete; reconcile-managed apps that were soft-deleted
+// by the reconciler before this DeleteProject is called stay
+// soft-deleted (the FK trigger runs after our DELETE). Returns
+// ErrNotFound when no row matches.
+//
+// Used by cmd/apid's scan_service to roll back a half-created
+// project when the subsequent reconcile errors out (PR-GH.6
+// review H9).
+func (s *PgStore) DeleteProject(ctx context.Context, projectID string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM projects WHERE id = $1`, projectID)
+	if err != nil {
+		return fmt.Errorf("pgstore: delete project %q: %w", projectID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ApplyProjectPlan persists a project + its member apps + crons in
 // one transaction. The critical section sits behind a
 // `SELECT … FOR UPDATE` on the parent accounts row so two concurrent
