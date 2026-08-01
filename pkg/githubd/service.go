@@ -266,7 +266,24 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 	touched = append(touched, result.Added...)
 	touched = append(touched, result.Changed...)
 
-	changedFiles, filterMode := s.lookupChangedFiles(ctx, ev, install.InstallationID)
+	// Path-filter optimization (review #1): when the reconcile
+	// step produced zero apps (empty touched set, e.g. a default-
+	// branch push that matched the binding but Reconcile surfaced
+	// no added/changed workloads), skip the GitHub compare-API
+	// call entirely. There's nothing to filter, and the per-
+	// installation API quota is too precious to burn on no-op
+	// webhook deliveries. The empty-touched case is rare but
+	// reachable (binding pointing at a project whose root has no
+	// workloads, or a "no-op drift" reconcile that produced
+	// Added=∅, Changed=∅).
+	var changedFiles []string
+	filterMode := filterModeFullFallback
+	if len(touched) > 0 {
+		changedFiles, filterMode = s.lookupChangedFiles(ctx, ev, install.InstallationID)
+	} else {
+		s.Log.Debug("githubd: no touched apps; skipping compare-api call",
+			"repo", ev.Repository.FullName, "sha", ev.After)
+	}
 	toEnqueue, skipped := s.filterByPath(touched, changedFiles, filterMode)
 
 	buildIDs := make([]string, 0, len(toEnqueue))
@@ -400,7 +417,15 @@ func (s *Service) filterByPath(touched []state.App, changedFiles []string, filte
 func pathIntersectsDir(changedFiles []string, dir string) bool {
 	prefix := dir + "/"
 	for _, f := range changedFiles {
-		if f == dir || strings.HasPrefix(f, prefix) {
+		// Three intersection shapes:
+		//   f == dir       — top-level file added at the root_dir path
+		//   f == dir + "/" — directory-level rename/add/remove with
+		//                    trailing slash (GitHub emits these for
+		//                    directory-only entries; without this
+		//                    case, a workload whose RootDir matches
+		//                    the renamed dir would be missed).
+		//   f starts with prefix — file under the directory.
+		if f == dir || f == prefix || strings.HasPrefix(f, prefix) {
 			return true
 		}
 	}

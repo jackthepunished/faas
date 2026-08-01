@@ -67,6 +67,23 @@ var ErrUnavailable = errors.New("changedfiles: lookup failed")
 // unambiguous).
 const compareFilesCap = 300
 
+// compareCommitsCap is the documented per-page ceiling on
+// the commits[] array GitHub returns from compare. Per
+// GitHub's REST docs the compare-API caps commits at 250
+// per page; the response links to the next page via Link
+// header only when total_commits > len(commits). We treat
+// len(commits) >= the cap as truncated even without the Link
+// header (defense in depth — a 250-commit payload that
+// GitHub failed to link is still untrustworthy, and the
+// conservative fallback rebuilds all).
+//
+// Why we don't just rely on TotalCommits > len(Commits):
+// the API can return total=250, page=250 at the boundary,
+// claiming the diff "fits on one page" while actually
+// being truncated. The `>=` boundary check catches the
+// off-by-one.
+const compareCommitsCap = 250
+
 // ChangedFilesClient returns the list of changed file paths
 // between two SHAs for the named repo. The token is resolved
 // per-call via TokenCache for installationID — keeps the
@@ -233,7 +250,11 @@ func (c *httpChangedFiles) fetchOnce(
 	// Truncation detection: commits paginated past page 1, or
 	// files capped at 300. Either means the diff is too large to
 	// trust per ADR-050 §109.
-	if payload.TotalCommits > len(payload.Commits) {
+	if payload.TotalCommits > len(payload.Commits) || len(payload.Commits) >= compareCommitsCap {
+		// total_commits > len(commits) — the canonical
+		// signal that paginated past page 1.
+		// len(commits) >= compareCommitsCap — defense in
+		// depth at the documented per-page boundary.
 		return nil, true, nil
 	}
 	if len(payload.Files) >= compareFilesCap {

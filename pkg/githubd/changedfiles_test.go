@@ -6,9 +6,11 @@ package githubd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -218,13 +220,52 @@ func TestChangedFiles_404ReturnsUnavailable(t *testing.T) {
 
 	client, _ := fixedClient(t, srv, "tok")
 	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "base-sha", "head-sha")
-	if err == nil {
-		t.Fatal("err = nil, want non-nil")
+	// 404 is mapped to ErrUnavailable (NOT ErrTruncated) so the
+	// caller can distinguish a force-push wipe (full rebuild
+	// triggered by "truncated" semantics) from a missing-repo
+	// race or ACL change (where the caller may want to surface
+	// a different audit row). Pinned by the M2 review fix.
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("err = %v, want errors.Is(err, ErrUnavailable)", err)
 	}
-	// 404 is not truncation; it's a clean "unavailable" so the
-	// caller can decide whether to surface a different audit row.
 	if errors.Is(err, ErrTruncated) {
-		t.Errorf("err = ErrTruncated, want wrapped ErrUnavailable")
+		t.Errorf("err = ErrTruncated, want ErrUnavailable (404 must not be classified as truncation)")
+	}
+}
+
+// TestRetryAfterDelay_HonorsParsedHeader asserts the retry-backoff
+// helper derives the delay from the Retry-After header (delta-seconds
+// form) instead of the base backoff. The M2 review flagged that the
+// production client invokes retryAfterDelay with parseRetryAfter's
+// output; this pins the contract without paying the multi-second
+// cost of a real retry loop.
+//
+// Jitter is ±10% per retryAfterDelay, so the asserted floor is the
+// parsed value minus 5% (round down) and the ceiling is the parsed
+// value plus 10% (round up).
+func TestRetryAfterDelay_HonorsParsedHeader(t *testing.T) {
+	t.Parallel()
+	const base = 200 * time.Millisecond
+	// Happy path: Retry-After: 5 → delay ≈ 5s (±10% jitter).
+	parsed := parseRetryAfter("5")
+	if parsed != 5*time.Second {
+		t.Fatalf("parseRetryAfter(\"5\") = %v, want 5s", parsed)
+	}
+	delay := retryAfterDelay(&retryableError{retryAfter: parsed}, base)
+	if delay < 4500*time.Millisecond || delay > 5500*time.Millisecond {
+		t.Errorf("retryAfterDelay(parsed=5s) = %v, want 4.5s..5.5s", delay)
+	}
+	// Empty header → parseRetryAfter returns 0 → retryAfterDelay
+	// falls back to base. Jitter is ±10%, so the bound is the
+	// base ± 10%. Pinned by the second case.
+	delay = retryAfterDelay(&retryableError{retryAfter: 0}, base)
+	if delay < base-base/10 || delay > base+base/10 {
+		t.Errorf("retryAfterDelay(zero retryAfter) = %v, want %v±10%%", delay, base)
+	}
+	// Unparseable header → parseRetryAfter returns 0 → same fallback.
+	// The zero-value path above exercises the same code path.
+	if got := parseRetryAfter("not-a-number"); got != 0 {
+		t.Errorf("parseRetryAfter(\"not-a-number\") = %v, want 0", got)
 	}
 }
 
@@ -278,6 +319,31 @@ func TestChangedFiles_EmptyOwnerRepoUnavailable(t *testing.T) {
 	_, err := client.ChangedFiles(context.Background(), 7, "", "api", "b", "h")
 	if err == nil || errors.Is(err, ErrTruncated) {
 		t.Errorf("err = %v, want wrapped ErrUnavailable", err)
+	}
+}
+
+func TestChangedFiles_TruncatedByCommitsBoundary(t *testing.T) {
+	t.Parallel()
+	// Pins review finding #2: a payload where total_commits ==
+	// len(commits) == compareCommitsCap (250) is misclassified as
+	// trustworthy under the old `TotalCommits > len(Commits)`
+	// check. The new `>=` boundary mirrors the files-cap check
+	// (defense in depth at the per-page boundary).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		commits := make([]string, 0, compareCommitsCap)
+		for i := 0; i < compareCommitsCap; i++ {
+			commits = append(commits, fmt.Sprintf(`{"sha":"c%d"}`, i))
+		}
+		body := fmt.Sprintf(`{"status":"ahead","ahead_by":250,"behind_by":0,"total_commits":250,"commits":[%s],"files":[{"filename":"x","status":"modified"}]}`,
+			strings.Join(commits, ","))
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	client, _ := fixedClient(t, srv, "tok")
+	_, err := client.ChangedFiles(context.Background(), 7, "octo", "api", "base-sha", "head-sha")
+	if !errors.Is(err, ErrTruncated) {
+		t.Errorf("err = %v, want ErrTruncated (250-commit boundary must trigger fallback)", err)
 	}
 }
 
