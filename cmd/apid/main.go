@@ -268,6 +268,40 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// 60s matches the meterd dunning sweep cadence.
 		webhookSweeper := webhookdedupe.NewSweeper(webhookdedupe.DefaultSweepInterval)
 		go func() { _ = webhookSweeper.Run(ctx) }()
+		// Issue #472 / ADR-058: bridge the `audit_event` pg_notify
+		// channel (imaged emits signature-failure events via this
+		// channel since imaged is the only fire-and-forget audit
+		// publisher that doesn't write the events table directly)
+		// into the apid-side auditor. Subscribing via
+		// SubscribeWithReconnect is the same pattern schedd's
+		// deletion_subscriber uses (pkg/db/notify.go:304) so the
+		// daemon survives Postgres restarts. The initial Subscribe
+		// error is fatal — silent drop is the bug we're closing.
+		if srv.audit != nil {
+			go func() {
+				if err := runAuditSubscriber(ctx, pool, srv.audit, log); err != nil && ctx.Err() == nil {
+					log.Error("audit: subscriber exited", "err", err)
+				}
+			}()
+		}
+		// Issue #472 / ADR-058: maintain the on-disk mirror of
+		// app_trusted_signers at /etc/faas/secrets/trusted-publishers
+		// (the dir imaged reads at startup and on every
+		// trusted_signer_changed notify). Without this writer, the
+		// disk stays empty and every signed deploy fails with
+		// ErrSignatureInvalid even when the operator has correctly
+		// onboarded publishers via the API. The writer is the only
+		// producer of the per-app PEM files; the dir is created
+		// at daemon start so the first ever onboard succeeds even
+		// before the first notify.
+		trustedDir := os.Getenv("FAAS_TRUSTED_PUBLISHERS_DIR")
+		if trustedDir != "" && srv.store != nil {
+			go func() {
+				if err := runTrustedPublisherWriter(ctx, pool, srv.store, trustedDir, log); err != nil && ctx.Err() == nil {
+					log.Error("trusted-publisher-writer: exited", "err", err)
+				}
+			}()
+		}
 	}
 	return runWithDeps(ctx, log, deps)
 }

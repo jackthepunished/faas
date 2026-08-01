@@ -15,5 +15,9 @@ export type CreateDeploymentRequest = {
    * Deploy-time overrides (entrypoint, cmd, env, env_secrets, port, healthcheck). nil/omitted = deploy the image as-is.
    */
   overrides?: (CreateDeploymentOverrides | null);
+  /**
+   * Per-deploy signature-enforcement opt-in (issue #472 / ADR-054). nil = inherit apps.require_signed; *true is a no-op when the app flag is already on; *false is rejected with 403 deploy_signature_invalid when the app flag is on (operator policy wins).
+   */
+  require_signed?: boolean | null;
 };
 

@@ -587,6 +587,22 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppsMetrics)))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
+	// Issue #472 / ADR-054 — admin-only signature-enforcement toggle.
+	// Mounted with the admin+MFA chain (mirrors PATCH /v1/account/plan
+	// at server.go:516) so a customer cannot self-onboard signature
+	// enforcement on their own app. The customer PATCH surface above
+	// silently drops a customer-set require_signed — see
+	// handlers_ext.go::updateApp for the rationale.
+	mux.HandleFunc("PATCH /v1/apps/{slug}/security", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.patchAppSecurity))))
+	// Issue #472 / ADR-054 — per-app cosign trusted-publisher list
+	// (admin + MFA). GET requires admin (read), PUT/DELETE require
+	// admin + MFA (write). The mount chain handles both via the
+	// admin scope; the same authLimited → requireMFA → requireScope
+	// wrapper covers both verbs. Mirrors the env / secrets handlers
+	// above for the (slug, name) resource pattern.
+	mux.HandleFunc("GET /v1/apps/{slug}/trusted_signers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.listTrustedSigners))))
+	mux.HandleFunc("PUT /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.upsertTrustedSigner))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteTrustedSigner))))
 
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))

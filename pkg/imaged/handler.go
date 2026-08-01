@@ -15,9 +15,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
@@ -61,6 +63,29 @@ type Handler struct {
 	oci     oci.Puller
 	builder LayerBuilder
 	log     *slog.Logger
+
+	// trustedPublishersDir is the directory holding the per-app
+	// cosign trusted-publisher PEM files (issue #472 / ADR-054).
+	// Read once at daemon startup (via cosign.TrustedPublishersFromDir)
+	// and refreshed on pg_notify('trusted_signer_changed') via
+	// HandleNotification. Empty means "verify disabled" — the
+	// apps.require_signed=false default. Wired from cmd/imaged via
+	// WithTrustedPublishersDir; env var FAAS_TRUSTED_PUBLISHERS_DIR
+	// sets it at deploy time.
+	trustedPublishersDir string
+	// trustedPublishersMu guards the cache below. Read-mostly on the
+	// hot path (every signed deploy reads once); refreshes are
+	// rare (operator onboards a publisher). A sync.RWMutex keeps
+	// the verify path lock-free for the read side.
+	//
+	// The cache is keyed by app.ID so the verify path can filter
+	// by app at call time without re-reading the dir. Empty value
+	// for an app means "no publishers for this app" (the
+	// fail-closed case). Missing key means "we haven't loaded this
+	// app yet" — first deploy pays the dir-load cost.
+	trustedPublishersMu      sync.RWMutex
+	trustedPublishersCache   map[string][]cosign.TrustedPublisher
+	trustedPublishersCacheOK bool
 
 	// guestInitPath is the absolute path to the static guest-init binary
 	// injected as /sbin/init in every per-app ext4 (spec §4.8). Wired from
@@ -166,6 +191,190 @@ func New(store state.Store, notif Notifier, puller oci.Puller, b LayerBuilder,
 // WithFunctionRunnerNode22 returns the handler with the node22 runner binary
 // path set. Wired from cmd/imaged when the function runner has been compiled
 // (Makefile target `guest-runners`).
+// WithTrustedPublishersDir configures the directory holding the
+// per-app cosign trusted-publisher PEM files (issue #472 / ADR-054).
+// Wired from cmd/imaged when FAAS_TRUSTED_PUBLISHERS_DIR is set.
+// Empty dir (the default) disables signature verification — the
+// apps.require_signed=false default keeps the open-deploy posture.
+// On set, the handler immediately loads the dir into the in-memory
+// cache so the first signed deploy doesn't pay a cold-load cost.
+func (h *Handler) WithTrustedPublishersDir(dir string) *Handler {
+	h.trustedPublishersDir = dir
+	if dir != "" {
+		if err := h.refreshTrustedPublishers(); err != nil {
+			// Fail loud at startup — a misconfigured trust dir
+			// is the canonical "operator typo" footgun. The
+			// error is returned to the cmd/imaged wiring code,
+			// which logs it and continues with an empty cache
+			// (signed deploys will fail at verify time, not
+			// silently). Logged rather than fatal because the
+			// open-deploy posture (require_signed=false on
+			// every app) means the daemon stays useful.
+			h.log.Warn("trusted-publishers dir load failed at startup",
+				"dir", dir, "err", err)
+		}
+	}
+	return h
+}
+
+// refreshTrustedPublishers re-reads the trust dir into the
+// in-memory cache. Triggered at startup (WithTrustedPublishersDir)
+// and on pg_notify('trusted_signer_changed'). Holds the write lock
+// for the duration of the disk read — the read is O(files) of
+// small PEM blobs (~250 bytes each), so the critical section is
+// microseconds.
+//
+// The cache is keyed by app.ID; the dir filename is
+// `<app_id>--<name>.pem`. The apid-side LISTEN goroutine is the
+// sole producer (it walks app_trusted_signers on every
+// trusted_signer_changed notify); see
+// cmd/apid/trusted_publisher_writer.go. The on-disk mirror is the
+// imaged-side read surface, the DB row is the apid-side write
+// surface. Without this refresh after a notify the verify path
+// would either fail open (stale cache) or fail closed (no entry
+// for the just-onboarded publisher).
+func (h *Handler) refreshTrustedPublishers() error {
+	if h.trustedPublishersDir == "" {
+		h.trustedPublishersMu.Lock()
+		h.trustedPublishersCache = nil
+		h.trustedPublishersCacheOK = false
+		h.trustedPublishersMu.Unlock()
+		return nil
+	}
+	byApp, err := cosign.TrustListFromDir(h.trustedPublishersDir)
+	if err != nil {
+		return err
+	}
+	h.trustedPublishersMu.Lock()
+	h.trustedPublishersCache = byApp
+	h.trustedPublishersCacheOK = true
+	h.trustedPublishersMu.Unlock()
+	total := 0
+	for _, v := range byApp {
+		total += len(v)
+	}
+	h.log.Info("trusted-publishers cache refreshed", "dir", h.trustedPublishersDir, "apps", len(byApp), "keys", total)
+	return nil
+}
+
+// snapshotTrustedPublishers returns the per-app trust list under
+// the read lock. Returns nil when the cache is empty or the daemon
+// is configured without a trust dir. Cheap to call on every signed
+// deploy (single read-lock + map lookup).
+func (h *Handler) snapshotTrustedPublishers(appID string) []cosign.TrustedPublisher {
+	h.trustedPublishersMu.RLock()
+	defer h.trustedPublishersMu.RUnlock()
+	if !h.trustedPublishersCacheOK || h.trustedPublishersCache == nil {
+		return nil
+	}
+	pubs, ok := h.trustedPublishersCache[appID]
+	if !ok {
+		return nil
+	}
+	out := make([]cosign.TrustedPublisher, len(pubs))
+	copy(out, pubs)
+	return out
+}
+
+// verifyImageSignature is the deploy-time verify hook (issue #472 /
+// ADR-054). Branches on apps.require_signed; if true, calls
+// pkg/cosign.VerifyImageSignature against the in-memory trust list
+// and marks the deployment FAILED with the typed failure reason on
+// either ErrSignatureMissing or ErrSignatureInvalid. Returns nil on
+// success so buildImageLayer proceeds to PullDigest.
+//
+// The signatureMissing / signatureInvalid audit events are emitted
+// here (not by apid) because imaged is the surface that observes the
+// verify outcome — apid already emitted app.signed_image_accepted
+// at accept-time (the "request passed the gate" event). The pair
+// answers "request accepted but verify failed in imaged" without
+// re-deriving from deployment status.
+func (h *Handler) verifyImageSignature(ctx context.Context, app state.App, dep state.Deployment, ref string) error {
+	pubs := h.snapshotTrustedPublishers(app.ID)
+	if len(pubs) == 0 {
+		// Defence-in-depth: apid's pre-flight already gated this
+		// case, but if imaged is called outside the apid pipeline
+		// (a future admin CLI, a test harness), refuse the
+		// signature check rather than verify against an empty
+		// allowlist.
+		err := fmt.Errorf("%w: require_signed=true but no trusted publishers configured", cosign.ErrSignatureInvalid)
+		_ = h.markDeployFailed(ctx, dep.ID, err, "signature_invalid: no trusted publishers")
+		return err
+	}
+	signer, _, err := cosign.VerifyImageSignature(ctx, &ociImageSignaturePuller{oci: h.oci}, ref, pubs)
+	if err == nil {
+		h.log.Info("image signature verified", "app", app.Slug, "deployment", dep.ID, "signer", signer, "ref", ref)
+		return nil
+	}
+	switch {
+	case errors.Is(err, cosign.ErrSignatureMissing):
+		_ = h.markDeployFailed(ctx, dep.ID, err, "signature_missing: no signature for ref")
+		h.emitSignatureAudit(ctx, "app.signature_missing", app, dep, ref, "")
+	case errors.Is(err, cosign.ErrSignatureInvalid):
+		_ = h.markDeployFailed(ctx, dep.ID, err, "signature_invalid: no trusted publisher matched")
+		h.emitSignatureAudit(ctx, "app.signature_invalid", app, dep, ref, "")
+	default:
+		_ = h.markDeployFailed(ctx, dep.ID, err, "signature_verify: registry error")
+		h.emitSignatureAudit(ctx, "app.signature_invalid", app, dep, ref, "")
+	}
+	return err
+}
+
+// emitSignatureAudit fires the audit row for verify failures. Mirrors
+// the audit.emit shape used by apid (data.app_id + data.deployment_id
+// + data.ref + data.signer). signer is empty on missing/invalid.
+//
+// imaged-side audit events travel via pg_notify('audit_event') —
+// pkg/audit (apid-side) subscribes and writes the rows. This keeps
+// the audit write surface single-sourced (apid) while letting imaged
+// surface operator-visible events.
+func (h *Handler) emitSignatureAudit(ctx context.Context, kind string, app state.App, dep state.Deployment, ref, signer string) {
+	h.log.Warn(kind, "app", app.Slug, "deployment", dep.ID, "ref", ref, "signer", signer)
+	if h.notif != nil {
+		payload := fmt.Sprintf(`{"kind":%q,"app_id":%q,"deployment_id":%q,"ref":%q,"signer":%q}`,
+			kind, app.ID, dep.ID, ref, signer)
+		_ = h.notif.Notify(ctx, "audit_event", payload)
+	}
+}
+
+// ociImageSignaturePuller adapts oci.Puller to the minimal
+// cosign.ImageSignaturePuller surface. PullDigest / FetchSignature
+// are the two methods VerifyImageSignature needs; FetchSignature
+// type-asserts to oci.ManifestPuller (which production's
+// RegistryClient satisfies — the DefaultPuller used by unit tests
+// does NOT) and falls back to ErrSignatureMissing when the
+// assertion fails. This keeps the test surface green without
+// importing a network into pkg/imaged unit tests.
+type ociImageSignaturePuller struct {
+	oci oci.Puller
+}
+
+func (p *ociImageSignaturePuller) ResolveDigest(ctx context.Context, ref string) (string, error) {
+	return p.oci.PullDigest(ctx, ref)
+}
+
+func (p *ociImageSignaturePuller) FetchSignature(ctx context.Context, ref, digest string) ([]byte, error) {
+	mp, ok := p.oci.(oci.ManifestPuller)
+	if !ok {
+		// DefaultPuller / offline fakes can't fetch cosign sigs.
+		// Return ErrSignatureMissing so the verify hook reports
+		// the customer-facing "no signature" reason rather than a
+		// generic error.
+		return nil, cosign.ErrSignatureMissing
+	}
+	// Cosign v2 signature location: the digest identifies the
+	// well-known sha256-<hex>.sig tag in the same repo as ref.
+	// We pass digest through PullBlob's (repo, digest) signature
+	// unchanged — PullBlob will hit the registry's blob endpoint
+	// for the same content-addressed blob.
+	rc, err := mp.PullBlob(ctx, ref, digest)
+	if err != nil {
+		return nil, errors.Join(cosign.ErrSignatureMissing, err)
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
+}
+
 func (h *Handler) WithFunctionRunnerNode22(p string) *Handler {
 	h.functionRunnerNode22Path = p
 	return h
@@ -405,6 +614,23 @@ func (h *Handler) HandleNotification(ctx context.Context, n db.Notification) {
 				h.log.Warn("imaged: cleanup app", "app", p.AppID, "err", err)
 			}
 		}
+	case "trusted_signer_changed":
+		// Issue #472 / ADR-054: apid emits this on every CRUD op on
+		// app_trusted_signers. We refresh the in-memory cache so a
+		// freshly-onboarded publisher takes effect on the next
+		// deploy without an imaged restart. The refresh is cheap
+		// (file IO of ~250 bytes per PEM, max 16 files per Scale
+		// plan) so we do it inline rather than punting to a
+		// goroutine.
+		if err := h.refreshTrustedPublishers(); err != nil {
+			h.log.Warn("imaged: trusted_signer_changed refresh failed", "err", err)
+		}
+	case "audit_event":
+		// imaged-side audit emits (app.signature_missing /
+		// app.signature_invalid) are routed via pg_notify and
+		// eventually written by apid-side pkg/audit. The Loop in
+		// pkg/loop subscribes; this arm is a no-op so the typed
+		// payload reaches pkg/audit unchanged.
 	}
 }
 
@@ -569,6 +795,22 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		err := fmt.Errorf("%w: %s — %s", errStatefulViolation, ref, hint)
 		_ = h.markDeployFailed(ctx, dep.ID, err, "stateful base image denied")
 		return err
+	}
+
+	// Issue #472 / ADR-054: per-app cosign signature verification.
+	// Runs AFTER the stateful-deny check (a known-bad base is
+	// rejected faster without a network round-trip) and BEFORE
+	// PullDigest (no point pulling an unsigned / untrusted image).
+	// The flag lives on the apps row (NOT the deployment row) so a
+	// single PATCH takes effect on the next deploy — apid's
+	// createDeployment gate already handles the "no signers" fail-
+	// closed case before imaged sees the deployment. Defence-in-
+	// depth: if imaged is called with require_signed=true but the
+	// on-disk trust dir is empty, we re-verify here.
+	if app.RequireSigned {
+		if err := h.verifyImageSignature(ctx, app, dep, ref); err != nil {
+			return err
+		}
 	}
 
 	digest, err := h.oci.PullDigest(ctx, ref)

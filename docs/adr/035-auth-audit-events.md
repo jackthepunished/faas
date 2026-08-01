@@ -39,6 +39,12 @@
   | `account.deletion_scheduled` | `scheduleDeletion` (REST + dashboard) | `{via: "rest"\|"dashboard"}` |
   | `account.deletion_restored` | `cancelDeletion` (REST + dashboard) | `{via: ...}` |
   | `stateless.advisory` | `cmd/apid/advisory_receiver.go` (vmmd → apid gRPC forward) | `{instance, app_id, count, events: [{path, mask, pid, ts_unix_ms}, ...]}` — Wave 0 PR-C / ADR-047 |
+  | `app.security_updated` | `patchAppSecurity` (issue #472 / ADR-058) | `{app_id, slug, old_require, new_require}` — admin toggled `apps.require_signed`. Distinct from generic `app.updated` so the audit-log panel can filter signature-related config changes. |
+  | `app.trusted_signer_added` | `upsertTrustedSigner` (issue #472 / ADR-058) | `{app_id, slug, signer_name}` — admin onboarded a cosign trusted publisher. The PEM bytes are never logged (operator-side mirror at `/etc/faas/secrets/trusted-publishers/<name>.pem` is the canonical store). |
+  | `app.trusted_signer_removed` | `deleteTrustedSigner` (issue #472 / ADR-058) | `{app_id, slug, signer_name}` — admin offboarded a publisher. |
+  | `app.signed_image_accepted` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, signer_name, digest}` — deploy passed signature check. Emitted via `pg_notify('audit_event')` from imaged so apid is the single-source writer to the events table. |
+  | `app.signature_missing` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, ref, digest}` — registry had no `.sig` blob. Fail-closed: deployment marked FAILED with `failure_reason="signature_missing"`. |
+  | `app.signature_invalid` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, ref, digest}` — sig exists but no trusted publisher matched. Fail-closed: deployment marked FAILED with `failure_reason="signature_invalid"`. |
 
   All `auth.*`, `key.*`, `secret.*`, `account.*`, and `stateless.*` values are namespaced
   with a dot prefix; schedd's existing kinds (`state_transition`,

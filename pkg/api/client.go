@@ -1313,3 +1313,51 @@ func (c *Client) ConsumeInvoiceCredits(ctx context.Context, invoiceID, idemKey s
 	var out ConsumeInvoiceResponse
 	return out, c.doReq(c.http, req, &out)
 }
+
+// --- cosign trusted-publisher list (issue #472 / ADR-054) -------------------
+//
+// Four admin-scoped methods. Mounted in apid under the
+// authLimited → requireMFA → requireScope(ScopesAdminOnly) chain
+// (cmd/apid/server.go). The SDK callers here are operator-side
+// (`gregale trusted-publishers add|remove|list`); programmatic
+// SDK users reach the surface through the same methods.
+//
+// ListAppTrustedSigners returns every (name, public_key_pem) row on
+// the app. The empty-slice case returns a non-nil empty slice (the
+// server uses `make([]TrustedSigner, 0)`), so callers can iterate
+// without a nil check.
+func (c *Client) ListAppTrustedSigners(ctx context.Context, slug string) (AppTrustedSignerListResponse, error) {
+	var out AppTrustedSignerListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/trusted_signers", nil, &out)
+}
+
+// PutAppTrustedSigner uploads a base64-encoded DER SPKI pubkey to
+// the per-app trusted-publisher list. The PEM-armoured wrapper is
+// stripped on the CLI side (commands_trusted_publishers.go) so the
+// wire shape is canonical across operators. Idempotent: re-PUT
+// replaces the key material and stamps the calling admin's id on
+// added_by_account_id.
+func (c *Client) PutAppTrustedSigner(ctx context.Context, slug, name string, req AddTrustedSignerRequest) error {
+	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/trusted_signers/"+name, req, nil)
+}
+
+// DeleteAppTrustedSigner removes the (slug, name) row. 404 is
+// surfaced as a *Problem with code trusted_signer_not_found; the
+// CLI treats that as a no-op success (matching the cmdKeys delete
+// shape on the customer API-key surface).
+func (c *Client) DeleteAppTrustedSigner(ctx context.Context, slug, name string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/trusted_signers/"+name, nil, nil)
+}
+
+// UpdateAppSecurity flips the per-app require_signed flag
+// (issue #472 / ADR-054). The body is a pointer-to-bool so callers
+// can distinguish "don't touch" (nil) from "explicit true/false".
+// Admin-scoped via the mount chain — a customer who could set this
+// flag could pre-stage the trust list however they wanted, which is
+// why the customer PATCH /v1/apps/{slug} endpoint silently drops
+// require_signed (see AppResponse.RequireSigned doc on
+// api/dto.go::UpdateAppRequest). Audit event: app.security_updated.
+func (c *Client) UpdateAppSecurity(ctx context.Context, slug string, req AppSecurityRequest) (AppSecurityResponse, error) {
+	var out AppSecurityResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/security", req, &out)
+}

@@ -10,6 +10,7 @@ from .account_limits_plan import AccountLimitsPlan
 from .account_response import AccountResponse
 from .account_response_plan import AccountResponsePlan
 from .account_response_status import AccountResponseStatus
+from .add_trusted_signer_request import AddTrustedSignerRequest
 from .alert_rule_response import AlertRuleResponse
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
@@ -33,6 +34,9 @@ from .app_response_type import AppResponseType
 from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
 from .app_secret_response import AppSecretResponse
+from .app_security_request import AppSecurityRequest
+from .app_security_response import AppSecurityResponse
+from .app_trusted_signer_list_response import AppTrustedSignerListResponse
 from .apply_response import ApplyResponse
 from .apply_response_apps_item import ApplyResponseAppsItem
 from .apps_metrics_response import AppsMetricsResponse
@@ -176,6 +180,7 @@ from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
@@ -197,6 +202,7 @@ __all__ = (
     "AccountResponse",
     "AccountResponsePlan",
     "AccountResponseStatus",
+    "AddTrustedSignerRequest",
     "AlertRuleResponse",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",
@@ -222,9 +228,12 @@ __all__ = (
     "AppSecretExportResponse",
     "AppSecretListResponse",
     "AppSecretResponse",
+    "AppSecurityRequest",
+    "AppSecurityResponse",
     "AppsMetricsResponse",
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
+    "AppTrustedSignerListResponse",
     "AsyncInvokeResponse",
     "AuditEventResponse",
     "AuditEventResponseData",
@@ -363,6 +372,7 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "TrustedSigner",
     "UpdateAlertRuleRequest",
     "UpdateAlertRuleRequestComparison",
     "UpdateAlertRuleRequestMetric",

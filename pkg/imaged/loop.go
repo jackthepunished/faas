@@ -149,6 +149,13 @@ func (l *Loop) Run(ctx context.Context) error {
 			db.NotifySnapshotBoot,
 			db.NotifySnapshotWritten,
 			db.NotifyAppChanged,
+			// Issue #472 / ADR-054: cosign trusted-publisher CRUD
+			// (apid → imaged refresh) + imaged-side audit emits
+			// (imaged → apid-side pkg/audit writer). Both are
+			// routed via pg_notify so the audit write surface
+			// stays single-sourced in apid.
+			db.NotifyTrustedSignerChanged,
+			db.NotifyAuditEvent,
 		}, l.log)
 		if err != nil {
 			return err

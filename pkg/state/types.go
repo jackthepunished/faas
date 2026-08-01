@@ -263,6 +263,19 @@ type App struct {
 	// v1 contract — a Free app with StreamingEnabled=false keeps the
 	// legacy 25 MB / 300 s envelope (spec §4.1).
 	StreamingEnabled bool
+	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
+	// a valid cosign signature from a trusted publisher. When true,
+	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
+	// before pulling the OCI manifest and rejects (FAILED +
+	// failure_reason=signature_missing|signature_invalid) if no
+	// signer in app_trusted_signers matches. Source-tarball deploys
+	// (Railpack path) bypass the gate — they never touch a customer
+	// OCI image. Default false: pre-existing apps stay on the
+	// open-deploy path; operator opt-in via PATCH /v1/apps/{slug}
+	// (admin-scoped). Operators MUST add at least one trusted signer
+	// before flipping the flag — empty trust list + require_signed=true
+	// is fail-closed (every deploy is rejected).
+	RequireSigned bool
 	// StartCommand overrides the OCI image's CMD when present.
 	// Phase 3 writes it from compose/Procfile declarations; Phase
 	// 1 carries the column through but the apid handler does not
@@ -1281,8 +1294,16 @@ type UpdateAppParams struct {
 	// (e.g. a synchronous JSON API that wants Content-Length).
 	StreamingEnabled    *bool
 	SetStreamingEnabled bool
-	Status              *AppStatus
-	Manifest            *AppManifest
+	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
+	// on a valid cosign signature from a trusted publisher. SetRequireSigned
+	// distinguishes "unset" (don't touch) from "explicit false"
+	// (opt out of signature enforcement). Admin-only via PATCH
+	// /v1/apps/{slug}; not plan-gated (any plan may opt in). Source-tarball
+	// deploys are unaffected.
+	RequireSigned    *bool
+	SetRequireSigned bool
+	Status           *AppStatus
+	Manifest         *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
@@ -1532,6 +1553,27 @@ type AppEnv struct {
 	Value     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// AppTrustedSigner is one row of the per-app cosign trusted-publisher
+// list (issue #472 / ADR-054). apid is the only writer; imaged reads
+// the matching set at deploy-time verify and caches the parsed keys in
+// memory (refreshed on pg_notify('trusted_signer_changed')).
+//
+// CosignPublicKey is the raw DER SubjectPublicKeyInfo blob (mirrors the
+// bytea shape pkg/cosign.LoadPublicKeyFile returns for ECDSA P-256 per
+// ADR-038). SignerName matches the DNS-1123-label CHECK on the table —
+// the handler MUST pre-validate before INSERT.
+//
+// AccountID is the row's owning account. PgStore filters on
+// (AccountID, AppID) so cross-account access returns ErrNotFound.
+type AppTrustedSigner struct {
+	AccountID        string
+	AppID            string
+	SignerName       string
+	CosignPublicKey  []byte
+	AddedAt          time.Time
+	AddedByAccountID string
 }
 
 // ProjectScanSource is the discoverer that produced the project's

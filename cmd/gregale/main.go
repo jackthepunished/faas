@@ -187,6 +187,13 @@ func run(args []string) int {
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:
 		return cmdSignKeys(args[1:])
+	case dispatchTrustedPublishers:
+		// Issue #472 / ADR-054 — operator CLI for the per-app
+		// cosign trusted-publisher list. Admin API key required;
+		// every leaf calls authedClient() and hits apid. The
+		// sibling operator surface `sign-keys` (above) hits the
+		// local fs, never apid.
+		return cmdTrustedPublishers(args[1:])
 	case dispatchHostAge:
 		// Operator-side host.age rotation (issue #316 / ADR-057).
 		// Same operator-only surface as sign-keys / pki: every

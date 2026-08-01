@@ -221,6 +221,24 @@ const (
 	//   cfg.ComputeNode.NodeName != "" so single-box daemons don't
 	//   observe the channel. ADR-055.
 	NotifyEgressPolicyChanged = "egress_policy_changed"
+	// NotifyTrustedSignerChanged {"app_id":uuid, "signer":"...",
+	//                              "kind":"upserted|deleted"}
+	//   apid → imaged (issue #472 / ADR-054): a row was written or
+	//   removed from app_trusted_signers. imaged refreshes its
+	//   in-memory cache of /etc/faas/secrets/trusted-publishers/ so
+	//   a freshly-onboarded publisher takes effect on the NEXT
+	//   deploy without an imaged restart. The pg_notify payload is
+	//   informational — the on-disk dir is the source of truth.
+	NotifyTrustedSignerChanged = "trusted_signer_changed"
+	// NotifyAuditEvent {"kind":"app.signature_missing|...",
+	//                    "app_id":uuid, "deployment_id":uuid,
+	//                    "ref":"...", "signer":"..."}
+	//   imaged → apid-side pkg/audit (issue #472 / ADR-054):
+	//   imaged-side audit emits (cosign signature verify failures)
+	//   travel over pg_notify so the audit write surface stays
+	//   single-sourced in apid. The Loop in pkg/loop subscribes;
+	//   the audit row lands in `events` like any other kind.
+	NotifyAuditEvent = "audit_event"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

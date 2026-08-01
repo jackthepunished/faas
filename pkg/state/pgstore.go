@@ -853,7 +853,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   status          = coalesce($6, status),
 		   manifest        = case when $7 then $8::jsonb else manifest end,
 		   min_instances   = case
-		                        when $25 then $26
+		                        when $27 then $28
 		                        when $9  then $10
 		                        else min_instances
 		                      end,
@@ -861,10 +861,11 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   autoscale_target_rps    = case when $13 then $14 else autoscale_target_rps end,
 		   autoscale_target_cpu_pct = case when $15 then $16 else autoscale_target_cpu_pct end,
 		   streaming_enabled = case when $17 then $18 else streaming_enabled end,
-		   root_dir       = case when $19 then $20 else root_dir end,
-		   workload_name  = case when $21 then $22 else workload_name end,
-		   start_command  = case when $23 then $24::text else start_command end,
-		   scaling_policy = case when $27 then $28::jsonb else scaling_policy end
+		   require_signed = case when $19 then $20 else require_signed end,
+		   root_dir       = case when $21 then $22 else root_dir end,
+		   workload_name  = case when $23 then $24 else workload_name end,
+		   start_command  = case when $25 then $26::text else start_command end,
+		   scaling_policy = case when $29 then $30::jsonb else scaling_policy end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -885,6 +886,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetAutoscaleTargetRPS, intOrZero(p.AutoscaleTargetRPS),
 		p.SetAutoscaleTargetCPUPct, intOrZero(p.AutoscaleTargetCPUPct),
 		p.SetStreamingEnabled, boolOrFalse(p.StreamingEnabled),
+		p.SetRequireSigned, boolOrFalse(p.RequireSigned),
 		p.RootDir != nil, p.RootDir,
 		p.WorkloadName != nil, p.WorkloadName,
 		p.StartCommand != nil, nullString(derefString(p.StartCommand)),
@@ -6624,6 +6626,135 @@ func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int
 	return n, err
 }
 
+// --- app trusted cosign signers (issue #472 / ADR-054) -----------------------
+//
+// Per-app allowlist of cosign public keys whose signatures on OCI images
+// are accepted at deploy time. Mirrors AWS Lambda's CodeSigningConfig
+// (trusted-signing-profiles + signing-job-completion). Default
+// apps.require_signed=false means no production behavior changes on the
+// merged PR; only apps that opt in via PATCH /v1/apps/{slug} pay the
+// verify cost. apid is the only writer; imaged reads the resulting rows
+// at buildImageLayer time (and via pg_notify('trusted_signer_changed')).
+//
+// Quota: enforced at the apid handler via Limits.TrustedSignerCountMax
+// (default 16), mirroring the CountAppSecrets/CountAppEnv pattern.
+
+// UpsertAppTrustedSigner inserts or replaces the (app_id, signer_name)
+// row. On conflict the public-key blob and added_by_account_id are
+// refreshed; added_at stays at the original write so the audit trail
+// distinguishes "created" from "rotated".
+//
+// Returns (addedAt, rotated, err) where rotated=false means this
+// was a fresh insert (the audit row emits app.trusted_signer_added)
+// and rotated=true means this was an update on an existing row
+// (the audit row emits app.trusted_signer_rotated). The addedAt
+// returned is the original write timestamp, preserved across
+// rotations.
+//
+// The detection uses PostgreSQL's `(xmax = 0)` idiom: on a fresh
+// INSERT, xmax is 0 (no row to lock); on an UPDATE-via-ON CONFLICT
+// xmax is the conflicting row's xid. This is exact, race-free, and
+// does NOT require a second SELECT (the prior 1-second heuristic
+// in cmd/apid/handlers_trusted_signers.go would misclassify
+// concurrent rotations within the same second).
+func (s *PgStore) UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) (time.Time, bool, error) {
+	var addedAt time.Time
+	var isNewRow bool
+	err := s.pool.QueryRow(ctx,
+		`insert into app_trusted_signers (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (app_id, signer_name) do update
+		   set cosign_public_key   = excluded.cosign_public_key,
+		       added_by_account_id = excluded.added_by_account_id
+		 returning added_at, (xmax = 0) AS is_new`,
+		accountID, appID, signerName, pubKey, addedByAccountID).Scan(&addedAt, &isNewRow)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	// isNewRow=true means inserted now; rotated = !isNewRow.
+	return addedAt, !isNewRow, nil
+}
+
+// DeleteAppTrustedSigner removes the (app_id, signer_name) row scoped to
+// accountID. Returns ErrNotFound when no row matches — handler renders
+// 404 CodeTrustedSignerNotFound.
+func (s *PgStore) DeleteAppTrustedSigner(ctx context.Context, accountID, appID, signerName string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from app_trusted_signers where account_id = $1 and app_id = $2 and signer_name = $3`,
+		accountID, appID, signerName)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListAppTrustedSigners returns every (signer_name, cosign_public_key)
+// row on the app, scoped to accountID. Order: by signer_name ASC for
+// deterministic stage (mirrors ListAppEnv). Returns nil slice when the
+// app has no trusted signers.
+func (s *PgStore) ListAppTrustedSigners(ctx context.Context, accountID, appID string) ([]AppTrustedSigner, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, signer_name, cosign_public_key, added_at, added_by_account_id
+		 from app_trusted_signers
+		 where account_id = $1 and app_id = $2
+		 order by signer_name asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppTrustedSigner
+	for rows.Next() {
+		var r AppTrustedSigner
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.SignerName, &r.CosignPublicKey, &r.AddedAt, &r.AddedByAccountID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListAppTrustedSignersForApp is the system-side sibling of
+// ListAppTrustedSigners: takes only appID, used by the on-disk
+// mirror writer (cmd/apid/trusted_publisher_writer.go) which is
+// system-side and doesn't have an accountID in scope. Same order
+// (signer_name ASC) and shape as the accountID-scoped sibling.
+func (s *PgStore) ListAppTrustedSignersForApp(ctx context.Context, appID string) ([]AppTrustedSigner, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, signer_name, cosign_public_key, added_at, added_by_account_id
+		 from app_trusted_signers
+		 where app_id = $1
+		 order by signer_name asc`,
+		appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppTrustedSigner
+	for rows.Next() {
+		var r AppTrustedSigner
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.SignerName, &r.CosignPublicKey, &r.AddedAt, &r.AddedByAccountID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CountAppTrustedSigners is the quota helper used by apid's PUT handler
+// to enforce Limits.TrustedSignerCountMax BEFORE UpsertAppTrustedSigner.
+// Mirrors CountAppSecrets.
+func (s *PgStore) CountAppTrustedSigners(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_trusted_signers where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
 // --- row scanners ------------------------------------------------------------
 
 func scanAccount(row pgx.Row) (Account, error) {
@@ -6653,7 +6784,7 @@ func scanApps(rows pgx.Rows) ([]App, error) {
 }
 
 // scanAppInto decodes the apps projection (appsSelectColumns) into a.
-// Single source of truth for the 19-column scanApp shape — every
+// Single source of truth for the 20-column scanApp shape — every
 // SELECT/RETURNING that reads an App row uses this helper so adding
 // a column only touches the const + the App struct + this function.
 func scanAppInto(a *App, row pgx.Row) error {
@@ -6666,7 +6797,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt); err != nil {
+		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -6700,12 +6831,15 @@ func scanAppInto(a *App, row pgx.Row) error {
 // columns (scaling_policy, last_scale_out_at, last_scale_in_at) are
 // the issue #462 / ADR-058 PR-A additions. Keep this const
 // and the App struct aligned: adding a column touches both.
+// start_command) are the ADR-050 Phase 1 additions. require_signed
+// (issue #472 / ADR-054) was added after streaming_enabled; keep this
+// const and the App struct aligned: adding a column touches both.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
-	workload_class, coalesce(start_command, ''), streaming_enabled,
+	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
 	scaling_policy, last_scale_out_at, last_scale_in_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string

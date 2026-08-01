@@ -218,6 +218,26 @@ const (
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
+	// CodeDeploySignatureInvalid is returned by apid when the
+	// customer's OCI image deploy is rejected at the accept-time
+	// signature-enforcement gate (issue #472 / ADR-054). Three
+	// triggers: (a) apps.require_signed=true but no trusted signers
+	// are configured (fail-closed — the operator toggled the flag
+	// but forgot to onboard a publisher); (b) the image carries no
+	// cosign signature under the registry's well-known sha256-<digest>.sig
+	// location; (c) the signature was made by a key not in the
+	// per-app trusted-publisher list. 403 because the deploy is
+	// REJECTED at accept time, distinct from CodeSigInvalid's 503
+	// (which fires on the cold-boot layer-verify path).
+	CodeDeploySignatureInvalid = "deploy_signature_invalid"
+	// CodeTrustedSignerInvalid is returned when the PUT body fails
+	// the PEM-shape validation (size 64..1024 bytes after
+	// base64-decode, ECDSA P-256 SPKI per ADR-038). 400 with the
+	// same Problem body shape as CodeSecretInvalidKey.
+	CodeTrustedSignerInvalid = "trusted_signer_invalid"
+	// CodeTrustedSignerNotFound is the 404 mirror of
+	// CodeSecretNotFound / CodeEnvVarNotFound for the DELETE path.
+	CodeTrustedSignerNotFound = "trusted_signer_not_found"
 
 	// CodeScanCritical is returned by vmmd when the staged base
 	// ext4's Grype scan sidecar reports a CRITICAL finding (or
@@ -268,6 +288,13 @@ const (
 	CodeEnvVarInvalidKey    = "env_var_invalid_key"
 	CodeEnvVarValueTooLarge = "env_value_too_large"
 	CodeEnvVarNotFound      = "env_var_not_found"
+
+	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
+	// the env-var quota — config cap, not a credential one — but a
+	// distinct code so the dashboard can surface "trusted publishers"
+	// as its own row and so SDK callers don't accidentally decode a
+	// trusted-signer quota error as an env-var quota error.
+	CodePlanLimitTrustedSigners = "plan_limit_trusted_signers"
 
 	// Plan-tier feature gates (M8 §6.5). Distinct from CodePlanLimit*
 	// because the failure mode is "your plan doesn't unlock this knob
@@ -545,6 +572,11 @@ func StatusForCode(code string) int {
 		return http.StatusConflict
 	case CodeDeployFailed:
 		return http.StatusUnprocessableEntity
+	case CodeDeploySignatureInvalid:
+		// 403 — the deploy is REJECTED at accept time, distinct from
+		// CodeSigInvalid's 503 (which fires on the cold-boot layer-verify
+		// path). See CodeDeploySignatureInvalid declaration above.
+		return http.StatusForbidden
 	case CodeImageNotFound, CodeImageManifestInvalid:
 		return http.StatusUnprocessableEntity
 	case CodeImageEgressDenied:
@@ -574,6 +606,17 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeEnvVarValueTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// Trusted cosign signers (issue #472 / ADR-054): mirror the env
+	// status shape. PUT body shape is 400, quota is 403, not-found is
+	// 404 (the URL resource IS the signer name; we deliberately
+	// diverge from the secret/env 400 to make the resource model
+	// explicit on the new surface).
+	case CodePlanLimitTrustedSigners:
+		return http.StatusForbidden
+	case CodeTrustedSignerInvalid:
+		return http.StatusBadRequest
+	case CodeTrustedSignerNotFound:
+		return http.StatusNotFound
 	case CodeAccountDeletionConfirm, CodeAccountDeletionPending, CodeAccountNotRestorable:
 		return http.StatusConflict
 	case CodeAppRenameFailed:
@@ -918,6 +961,41 @@ func ErrDeployFailed(detail string) *Problem {
 		WithDocs("https://docs.gregale.dev/deploys")
 }
 
+// ErrDeploySignatureInvalid is returned by apid when an OCI image
+// deploy is rejected at the accept-time signature-enforcement gate
+// (issue #472 / ADR-054). Detail carries the human-readable reason
+// (one of: "no signature", "signature by untrusted publisher", or
+// "no trusted publishers configured"). The customer sees this code
+// only when apps.require_signed=true; imaged surfaces the deeper
+// failure_reason (signature_missing / signature_invalid) on
+// deployments.error_code and via the audit events.
+func ErrDeploySignatureInvalid(detail string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeDeploySignatureInvalid,
+		"Signed-image enforcement rejected the deploy", detail).
+		WithDocs("https://docs.gregale.dev/deploys#signed-images")
+}
+
+// ErrTrustedSignerInvalid is the 400 mirror of ErrSecretInvalidKey
+// for the PUT /v1/apps/{slug}/trusted_signers/{name} body. Detail
+// carries the shape failure ("public_key_pem must be 64..1024 bytes
+// after base64-decode", etc.).
+func ErrTrustedSignerInvalid(detail string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeTrustedSignerInvalid,
+		"Trusted signer invalid", detail).
+		WithDocs("https://docs.gregale.dev/deploys#trusted-signers")
+}
+
+// ErrTrustedSignerNotFound is the 404 mirror of ErrSecretNotFound
+// for the DELETE path. The URL resource IS the signer name, so a
+// missing row is rendered as 400 in the legacy secret/env shape —
+// issue #472 deliberately uses 404 to make the resource model
+// explicit on the new surface.
+func ErrTrustedSignerNotFound(signer string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeTrustedSignerNotFound,
+		"Trusted signer not found",
+		"no trusted signer named "+signer+" on this app")
+}
+
 // ErrNoRollbackTarget is returned by POST /v1/apps/{slug}/rollback when no
 // superseded deployment exists (spec §9 line 376).
 func ErrNoRollbackTarget() *Problem {
@@ -979,6 +1057,20 @@ func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
 		fmt.Sprintf("%s plan allows %d env var(s) per app; you have %d.", l.Plan, l.EnvVarsMax, observed)).
 		WithLimit(int64(l.EnvVarsMax), int64(observed)).
 		WithDocs("https://docs.gregale.dev/env#limits")
+}
+
+// ErrPlanLimitTrustedSigners is returned when a trusted-signer PUT
+// would exceed the plan's per-app count (issue #472 / ADR-054).
+// Observed is the post-write count. The 403 mirrors ErrPlanLimitEnvVars
+// so the SDK's quota-reached branch decodes this code without
+// hand-rolling a new switch arm. Distinct `code` keeps the dashboard
+// row count for "trusted publishers" separate from "env vars".
+func ErrPlanLimitTrustedSigners(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLimitTrustedSigners,
+		"Trusted signer count limit reached",
+		fmt.Sprintf("%s plan allows %d trusted signer(s) per app; you have %d.", l.Plan, l.TrustedSignerCountMax, observed)).
+		WithLimit(int64(l.TrustedSignerCountMax), int64(observed)).
+		WithDocs("https://docs.gregale.dev/deploys#trusted-signers")
 }
 
 // ErrEnvVarInvalidKey is returned when an env key fails the

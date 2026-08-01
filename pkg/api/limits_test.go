@@ -45,6 +45,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// pre-#471 spec §4.1 caps PR-A inherits.
 			StreamingEnabled: false, MaxResponseBodyBytes: 26_214_400, ResponseWriteTimeoutSeconds: 300},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
+			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
+			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
+			// in-house) without letting one app accumulate an unbounded allowlist.
+			TrustedSignerCountMax: 4,
 			// Issue #395 / ADR-045: Hobby gets 32 keys / 8 KB per value.
 			EnvVarsMax: 32, EnvValueMaxBytes: 8192,
 			// ADR-044: see PlanFree. Hobby's tight quota is the
@@ -83,6 +87,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
+			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
+			// larger team rotation surface (multiple repos × multiple CI providers).
+			TrustedSignerCountMax: 8,
 			// Issue #395 / ADR-045: Pro gets 64 keys / 16 KB per value.
 			EnvVarsMax: 64, EnvValueMaxBytes: 16384,
 			// Issue #462 / ADR-058: Pro unlocks warm-floor + max-instances
@@ -111,6 +118,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
+			// Issue #472 / ADR-058: Scale gets 16 trusted publishers — 2× Pro for the
+			// enterprise rotation surface (multi-team, multi-cloud, multi-CI).
+			TrustedSignerCountMax: 16,
 			// Issue #395 / ADR-045: Scale gets 256 keys / 32 KB per value.
 			EnvVarsMax: 256, EnvValueMaxBytes: 32768,
 			// Issue #462 / ADR-058: Scale unlocks warm-floor +

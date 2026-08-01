@@ -36,6 +36,10 @@ class UpdateAppRequest:
     plan_streaming_not_allowed."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."""
+    require_signed: bool | None | Unset = UNSET
+    """DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the
+    operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054).
+    The field is parsed for backwards compatibility but never persisted from this endpoint."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +99,12 @@ class UpdateAppRequest:
         else:
             scaling_policy = self.scaling_policy
 
+        require_signed: bool | None | Unset
+        if isinstance(self.require_signed, Unset):
+            require_signed = UNSET
+        else:
+            require_signed = self.require_signed
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -116,6 +126,8 @@ class UpdateAppRequest:
             field_dict["streaming_enabled"] = streaming_enabled
         if scaling_policy is not UNSET:
             field_dict["scaling_policy"] = scaling_policy
+        if require_signed is not UNSET:
+            field_dict["require_signed"] = require_signed
 
         return field_dict
 
@@ -207,6 +219,15 @@ class UpdateAppRequest:
 
         scaling_policy = _parse_scaling_policy(d.pop("scaling_policy", UNSET))
 
+        def _parse_require_signed(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        require_signed = _parse_require_signed(d.pop("require_signed", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -217,6 +238,7 @@ class UpdateAppRequest:
             autoscale_target_cpu_pct=autoscale_target_cpu_pct,
             streaming_enabled=streaming_enabled,
             scaling_policy=scaling_policy,
+            require_signed=require_signed,
         )
 
         update_app_request.additional_properties = d

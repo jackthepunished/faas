@@ -105,6 +105,19 @@ type Limits struct {
 	EnvVarsMax       int // max env vars per app (Free 8, Hobby 32, Pro 64, Scale 256)
 	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
+	// TrustedSignerCountMax bounds the (app_id, signer_name) row count
+	// in app_trusted_signers (issue #472 / ADR-054). Mirrors
+	// EnvVarsMax's posture — a config cap, not a credential one.
+	// Per-plan values are tuned to cover the typical CI rotation
+	// surface (3-5 publishers: GitHub Actions, GitLab CI, Jenkins,
+	// Argo CD, custom in-house) without letting one app accumulate
+	// an unbounded allowlist. Free plan is 0 — the open-deploy
+	// posture for Free means customers on Free never need
+	// require_signed=true and so never need signers either.
+	// Spec §11: signature enforcement is a regulated-workload feature;
+	// Free tier keeps its "ship any image" path.
+	TrustedSignerCountMax int // Free 0, Hobby 4, Pro 8, Scale 16
+
 	// MinInstancesAllowed toggles the per-app cold-wake floor (ux_spec
 	// §6.5). Free keeps the default scale-to-zero behaviour because
 	// `min_instances = N` keeps N × RAMMB resident at all times, which
@@ -297,6 +310,10 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 4 * 1024,
 		EnvVarsMax:          8,
 		EnvValueMaxBytes:    4 * 1024,
+		// TrustedSignerCountMax: Free keeps the open-deploy posture;
+		// signature enforcement is a regulated-workload feature that
+		// Free never needs (issue #472 / ADR-054).
+		TrustedSignerCountMax: 0,
 		// Move 1: async invoke and queues are paid-only (§4.4); Free
 		// keeps HTTP-only. The tiny 1 KB payload cap is the binding
 		// constraint should a Free customer spoof the gate.
@@ -362,6 +379,12 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 8 * 1024,
 		EnvVarsMax:          32,
 		EnvValueMaxBytes:    8 * 1024,
+		// TrustedSignerCountMax: Hobby is the lowest paid tier; the
+		// 4-publisher cap covers a hobbyist running a single CI
+		// (GitHub Actions) + a backup CI (Codeberg) + a personal
+		// signing key + an emergency break-glass. Anything beyond
+		// that is "you're a Pro" territory.
+		TrustedSignerCountMax: 4,
 		// 64 KB envelope = 0.25 % of Hobby's 25 MB tarball budget — small
 		// enough to keep the drain tick bounded, large enough for typical
 		// JSON event payloads.
@@ -445,6 +468,10 @@ var planLimits = map[Plan]Limits{
 		EnvValueMaxBytes:    16 * 1024,
 		MinInstancesAllowed: true,
 		MaxInstancesAllowed: true,
+		// TrustedSignerCountMax: Pro covers a small-team rotation
+		// matrix (5-8 publishers). Enough for "every dev has their own
+		// key" workflows without letting the table grow unbounded.
+		TrustedSignerCountMax: 8,
 		// 256 KB = 0.1 % of Pro's 250 MB tarball.
 		MaxQueueDepth:               25,
 		MaxDelayedTasksPerApp:       50,
@@ -516,6 +543,13 @@ var planLimits = map[Plan]Limits{
 		EnvValueMaxBytes:    32 * 1024,
 		MinInstancesAllowed: true,
 		MaxInstancesAllowed: true,
+		// TrustedSignerCountMax: Scale is the regulated-workload
+		// tier; 16 publishers covers "every platform team's CI
+		// plus break-glass" without letting the table grow into
+		// config-management territory. The byte-size cap on each
+		// key (1024 bytes per migration 00083 CHECK) keeps the
+		// table on-disk under ~16 KiB regardless.
+		TrustedSignerCountMax: 16,
 		// Soft ceiling: the binding constraint on Scale is the per-payload
 		// byte cap (1 MiB), not the row count.
 		MaxQueueDepth:               100,
@@ -1108,6 +1142,20 @@ func (p Plan) AlertRuleLimitPerAccount() int {
 		return 0
 	}
 	return l.AlertRuleLimitPerAccount
+}
+
+// TrustedSignerCountMax returns the per-app cosign trusted-publisher
+// cap for the plan (issue #472 / ADR-054). 0 for Free (the open-deploy
+// posture for Free means customers on Free never need require_signed=true
+// and so never need signers either); positive for Hobby/Pro/Scale.
+// Unknown plans fail closed (return 0) — same contract as the cron +
+// alert-rule getters above.
+func (p Plan) TrustedSignerCountMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.TrustedSignerCountMax
 }
 
 // RateLimitPerAccountRPM returns the per-account requests/minute cap for

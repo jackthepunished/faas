@@ -30,6 +30,10 @@ class CreateDeploymentRequest:
     overrides: CreateDeploymentOverrides | None | Unset = UNSET
     """Deploy-time overrides (entrypoint, cmd, env, env_secrets, port, healthcheck). nil/omitted = deploy the image
     as-is."""
+    require_signed: bool | None | Unset = UNSET
+    """Per-deploy signature-enforcement opt-in (issue #472 / ADR-054). nil = inherit apps.require_signed; *true is
+    a no-op when the app flag is already on; *false is rejected with 403 deploy_signature_invalid when the app flag
+    is on (operator policy wins)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +49,12 @@ class CreateDeploymentRequest:
         else:
             overrides = self.overrides
 
+        require_signed: bool | None | Unset
+        if isinstance(self.require_signed, Unset):
+            require_signed = UNSET
+        else:
+            require_signed = self.require_signed
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -52,6 +62,8 @@ class CreateDeploymentRequest:
             field_dict["image"] = image
         if overrides is not UNSET:
             field_dict["overrides"] = overrides
+        if require_signed is not UNSET:
+            field_dict["require_signed"] = require_signed
 
         return field_dict
 
@@ -79,9 +91,19 @@ class CreateDeploymentRequest:
 
         overrides = _parse_overrides(d.pop("overrides", UNSET))
 
+        def _parse_require_signed(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        require_signed = _parse_require_signed(d.pop("require_signed", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
+            require_signed=require_signed,
         )
 
         create_deployment_request.additional_properties = d

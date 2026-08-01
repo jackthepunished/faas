@@ -66,6 +66,9 @@ class AppResponse:
     last_scale_in_at: datetime.datetime | None | Unset = UNSET
     """RFC 3339 timestamp of the most recent scale-in event schedd reaped for this app, or null if the app has
     never scaled in."""
+    require_signed: bool | Unset = UNSET
+    """Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a
+    valid signature from a publisher in the per-app trusted_signers list. Default false."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -133,6 +136,8 @@ class AppResponse:
         else:
             last_scale_in_at = self.last_scale_in_at
 
+        require_signed = self.require_signed
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -164,6 +169,8 @@ class AppResponse:
             field_dict["last_scale_out_at"] = last_scale_out_at
         if last_scale_in_at is not UNSET:
             field_dict["last_scale_in_at"] = last_scale_in_at
+        if require_signed is not UNSET:
+            field_dict["require_signed"] = require_signed
 
         return field_dict
 
@@ -266,6 +273,8 @@ class AppResponse:
 
         last_scale_in_at = _parse_last_scale_in_at(d.pop("last_scale_in_at", UNSET))
 
+        require_signed = d.pop("require_signed", UNSET)
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -285,6 +294,7 @@ class AppResponse:
             scaling_policy=scaling_policy,
             last_scale_out_at=last_scale_out_at,
             last_scale_in_at=last_scale_in_at,
+            require_signed=require_signed,
         )
 
         app_response.additional_properties = d

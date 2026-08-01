@@ -239,6 +239,20 @@ var methodRouteMap = map[string]string{
 	"GET /v1/auth/sessions":             "GetAccountSessions",
 	"DELETE /v1/auth/sessions/{id}":     "DeleteAccountSession",
 	"POST /v1/auth/sessions/revoke_all": "PostAccountSessionsRevokeAll",
+
+	// Issue #472 / ADR-054 — cosign signature-enforcement surface. The
+	// auto-derivation would produce names with literal underscores
+	// ("GetAppsSlugTrusted_signers", "DeleteAppsSlugTrusted_signersName",
+	// "PutAppsSlugTrusted_signersName") because the spec path uses an
+	// underscore; the SDK verb drops the placeholder + underscore
+	// segment and conforms to the flat resource naming (same pattern
+	// as alerts). PATCH /v1/apps/{slug}/security would auto-derive to
+	// "PatchAppsSlugSecurity" — pin it explicitly so the gate stays
+	// the SDK's source of truth on verb choice.
+	"GET /v1/apps/{slug}/trusted_signers":           "ListAppTrustedSigners",
+	"PUT /v1/apps/{slug}/trusted_signers/{name}":    "PutAppTrustedSigner",
+	"DELETE /v1/apps/{slug}/trusted_signers/{name}": "DeleteAppTrustedSigner",
+	"PATCH /v1/apps/{slug}/security":                "UpdateAppSecurity",
 }
 
 func main() {
