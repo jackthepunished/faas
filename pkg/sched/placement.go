@@ -158,12 +158,12 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 
 	if warmFit != nil {
 		return Placement{
-			NodeID:    warmFit.ID,
-			Name:      warmFit.Name,
-			TargetURL: warmFit.TargetURL,
-			CeilingMB: warmFit.AdmissionCeilingMB,
+			NodeID:     warmFit.ID,
+			Name:       warmFit.Name,
+			TargetURL:  warmFit.TargetURL,
+			CeilingMB:  warmFit.AdmissionCeilingMB,
 			VCPUBudget: warmFit.VCPUBudget,
-			UsedMB:    usedMB[warmFit.ID],
+			UsedMB:     usedMB[warmFit.ID],
 		}, nil
 	}
 
@@ -177,12 +177,12 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 	if len(candidates) == 1 {
 		n := candidates[0]
 		return Placement{
-			NodeID:    n.ID,
-			Name:      n.Name,
-			TargetURL: n.TargetURL,
-			CeilingMB: n.AdmissionCeilingMB,
+			NodeID:     n.ID,
+			Name:       n.Name,
+			TargetURL:  n.TargetURL,
+			CeilingMB:  n.AdmissionCeilingMB,
 			VCPUBudget: n.VCPUBudget,
-			UsedMB:    usedMB[n.ID],
+			UsedMB:     usedMB[n.ID],
 		}, nil
 	}
 
@@ -206,12 +206,12 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 		}
 	}
 	return Placement{
-		NodeID:    best.ID,
-		Name:      best.Name,
-		TargetURL: best.TargetURL,
-		CeilingMB: best.AdmissionCeilingMB,
+		NodeID:     best.ID,
+		Name:       best.Name,
+		TargetURL:  best.TargetURL,
+		CeilingMB:  best.AdmissionCeilingMB,
 		VCPUBudget: best.VCPUBudget,
-		UsedMB:    usedMB[best.ID],
+		UsedMB:     usedMB[best.ID],
 	}, nil
 }
 
