@@ -1316,7 +1316,7 @@ func (c *Client) ConsumeInvoiceCredits(ctx context.Context, invoiceID, idemKey s
 
 // --- cosign trusted-publisher list (issue #472 / ADR-054) -------------------
 //
-// Three admin-scoped methods. Mounted in apid under the
+// Four admin-scoped methods. Mounted in apid under the
 // authLimited → requireMFA → requireScope(ScopesAdminOnly) chain
 // (cmd/apid/server.go). The SDK callers here are operator-side
 // (`gregale trusted-publishers add|remove|list`); programmatic
@@ -1347,4 +1347,17 @@ func (c *Client) PutAppTrustedSigner(ctx context.Context, slug, name string, req
 // shape on the customer API-key surface).
 func (c *Client) DeleteAppTrustedSigner(ctx context.Context, slug, name string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/trusted_signers/"+name, nil, nil)
+}
+
+// UpdateAppSecurity flips the per-app require_signed flag
+// (issue #472 / ADR-054). The body is a pointer-to-bool so callers
+// can distinguish "don't touch" (nil) from "explicit true/false".
+// Admin-scoped via the mount chain — a customer who could set this
+// flag could pre-stage the trust list however they wanted, which is
+// why the customer PATCH /v1/apps/{slug} endpoint silently drops
+// require_signed (see AppResponse.RequireSigned doc on
+// api/dto.go::UpdateAppRequest). Audit event: app.security_updated.
+func (c *Client) UpdateAppSecurity(ctx context.Context, slug string, req AppSecurityRequest) (AppSecurityResponse, error) {
+	var out AppSecurityResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/security", req, &out)
 }
