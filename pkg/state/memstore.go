@@ -1499,6 +1499,47 @@ func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]C
 	return out, nil
 }
 
+// ListUnplacedApps mirrors pkg/state/pgstore.go: ListUnplacedApps.
+// Same predicate over the in-memory map; ordered by CreatedAt DESC
+// to match the SQL shape.
+func (m *MemStore) ListUnplacedApps(_ context.Context) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]App, 0)
+	for _, a := range m.apps {
+		if a.NodeID != "" || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// SetAppNodeID mirrors pkg/state/pgstore.go: SetAppNodeID. The
+// conditional under m.mu is the in-process equivalent of the
+// WHERE node_id IS NULL guard — exactly one caller wins; losers
+// observe NodeID != "" and receive ErrConflict.
+func (m *MemStore) SetAppNodeID(_ context.Context, appID, nodeID string) error {
+	if nodeID == "" {
+		return fmt.Errorf("state: set app node_id: empty nodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	if a.NodeID != "" {
+		return ErrConflict
+	}
+	a.NodeID = nodeID
+	m.apps[appID] = a
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3953,10 +3994,16 @@ func (m *MemStore) seedDefaultLocalNodeLocked() {
 		// synthetic default-local row carries api.VCPUSlots so a
 		// single-box install sees identical behaviour to the
 		// pre-migration box-wide gate.
-		VCPUBudget:      api.VCPUSlots,
-		Active:          true,
-		LastHeartbeatAt: now,
-		CreatedAt:       now,
+		VCPUBudget:         api.VCPUSlots,
+		Active:             true,
+		LastHeartbeatAt:    now,
+		CreatedAt:          now,
+		// Phase 2 / Gate A: per-node schedd dial target. The
+		// single-box synthetic row points at the legacy
+		// /run/faas/schedd.sock so the gateway's per-node cache
+		// dial path is byte-identical to the pre-PR behaviour when
+		// only the default-local row exists.
+		ScheddTargetURL: func() *string { s := "unix:///run/faas/schedd.sock"; return &s }(),
 		Region:          &local,
 		Zone:            &local,
 	}

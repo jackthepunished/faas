@@ -564,6 +564,25 @@ type Store interface {
 	// every schedd would fire every cron and the cron_fired_audit row
 	// would diverge from the actual dispatch.
 	ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error)
+	// ListUnplacedApps returns every non-deleted app whose node_id is
+	// NULL — the input set for schedd's PlacementClaimSubscriber
+	// (pkg/sched/placement_claim.go, Phase 2 / Gate A migration 00084).
+	// The post-00084 schema allows node_id NULL at insert time so apid
+	// can INSERT a fresh app with the owner undecided; schedd races to
+	// stamp the owner on NotifyAppChanged "created". This method is the
+	// cold-start sweep path that handles a schedd that was down while a
+	// notify landed (pg_notify is fire-and-forget; missed events
+	// surface as NULL-row apps at the next start).
+	ListUnplacedApps(ctx context.Context) ([]App, error)
+	// SetAppNodeID atomically claims the owner for an unplaced app.
+	// The UPDATE is conditional on node_id IS NULL so exactly one
+	// schedd wins the race; losers receive ErrConflict and the
+	// subscriber drops silently. Returns ErrNotFound when the app row
+	// is gone (hard-deleted between notify and claim — possible on the
+	// M7 path; the subscriber treats this as a no-op drop). The FK +
+	// empty-uuid CHECK on apps.node_id reject bad values via the
+	// existing 23503 / 23514 paths.
+	SetAppNodeID(ctx context.Context, appID, nodeID string) error
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)

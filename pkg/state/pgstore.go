@@ -665,14 +665,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// project_id IS NOT NULL, a project-bound insert must carry both
 	// columns and a non-project insert lands with (NULL, '') which the
 	// index filters out.
-	// node_id (migration 00083, Phase 2 / Gate A): NOT NULL FK to
-	// compute_nodes(id) + empty-uuid CHECK. apid's placement scheduler
-	// resolves the owner before this call; an empty Go string here would
-	// be rendered as '' by pgx and trip 22P02 invalid_text_representation
-	// at the uuid cast — coerce "" to the empty-uuid sentinel so the
-	// CHECK is the load-bearing tripwire (and so a future apid bug that
-	// forgets to set app.NodeID fails loud at the Insert, not silently
-	// with a foreign_key_violation after a separate UPDATE).
+	// node_id (migration 00083, Phase 2 / Gate A): nullable FK to
+	// compute_nodes(id) + empty-uuid CHECK (migration 00084 relaxed
+	// NOT NULL → nullable so schedd's PlacementClaimSubscriber can
+	// stamp the owner asynchronously — pkg/sched/placement_claim.go).
+	// apid inserts with node_id = NULL and emits NotifyAppChanged
+	// "created"; every schedd races to claim via Store.SetAppNodeID,
+	// whose UPDATE … WHERE node_id IS NULL serialises N schedds into
+	// exactly one winner. The empty-uuid CHECK stays in force; the
+	// pgx driver passes nil for an empty string here so the column
+	// defaults to NULL (no 22P02 invalid_text_representation — pgx
+	// understands the nilable interface). A future apid bug that
+	// tries to bind a literal zero-uuid still trips 23514.
 	appType := app.Type
 	if appType == "" {
 		appType = AppTypeApp
@@ -690,15 +694,11 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if ramMB <= 0 {
 		ramMB = 128
 	}
-	nodeID := app.NodeID
-	if nodeID == "" {
-		nodeID = "00000000-0000-0000-0000-000000000000"
-	}
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14)
 		 returning ` + appsSelectColumns
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nodeID)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID))
 	return scanApp(row)
 }
 
@@ -785,21 +785,16 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// collides with the prior row. project_id is nullable (empty →
 	// NULL via nullString); workload_name is NOT NULL DEFAULT '' so
 	// the empty string stays as '' (matches the v1 default).
-	// node_id (migration 00083, Phase 2 / Gate A): NOT NULL FK + empty-uuid
-	// CHECK. The placement decision lives in apid's handler (see
-	// PlacementScheduler.Choose), and the chosen node_id is bound to
-	// the App before this call. Same empty-string coercion as CreateApp
-	// so a missing owner fails loud at the empty-uuid CHECK rather than
-	// at a foreign_key_violation.
-	nodeID := app.NodeID
-	if nodeID == "" {
-		nodeID = "00000000-0000-0000-0000-000000000000"
-	}
+	// node_id (migration 00083, Phase 2 / Gate A): nullable FK +
+	// empty-uuid CHECK (migration 00084 relaxed NOT NULL so schedd's
+	// PlacementClaimSubscriber can stamp the owner asynchronously).
+	// See CreateApp for the post-00084 contract — pgx passes nil for
+	// the empty string so the column defaults to NULL.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id)
 		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13)
 		 returning ` + appsSelectColumns
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nodeID)
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -908,6 +903,60 @@ func (s *PgStore) ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]
 	}
 	defer rows.Close()
 	return scanCrons(rows)
+}
+
+// ListUnplacedApps returns every non-deleted app whose node_id is
+// NULL — the cold-start sweep input for schedd's
+// PlacementClaimSubscriber (Phase 2 / Gate A migration 00084). The
+// post-00084 schema allows node_id NULL at insert time so apid can
+// INSERT a fresh app with the owner undecided; schedd races to
+// stamp the owner on NotifyAppChanged "created". This method is
+// the cold-start sweep path that handles a schedd that was down
+// while a notify landed (pg_notify is fire-and-forget; missed
+// events surface as NULL-row apps at the next start).
+func (s *PgStore) ListUnplacedApps(ctx context.Context) ([]App, error) {
+	sel := `select ` + appsSelectColumns + `
+			  from apps
+			 where node_id is null
+			   and status <> 'deleted'
+			 order by created_at desc`
+	rows, err := s.pool.Query(ctx, sel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// SetAppNodeID atomically claims the owner for an unplaced app. The
+// UPDATE is conditional on node_id IS NULL so exactly one schedd
+// wins the race; losers receive ErrConflict and the subscriber
+// drops silently. Returns ErrNotFound when the app row is gone
+// (hard-deleted between notify and claim — possible on the M7
+// path; the subscriber treats this as a no-op drop). The FK +
+// empty-uuid CHECK on apps.node_id reject bad values via the
+// existing 23503 / 23514 paths.
+func (s *PgStore) SetAppNodeID(ctx context.Context, appID, nodeID string) error {
+	if nodeID == "" {
+		return fmt.Errorf("state: set app node_id: empty nodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update apps set node_id = $2 where id = $1 and node_id is null`,
+		appID, nodeID)
+	if err != nil {
+		return fmt.Errorf("state: set app node_id: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either a peer already claimed (most common) or the row
+		// is gone. Disambiguate via AppByID so the caller can drop
+		// silently in both cases without a second round-trip on
+		// the hot path.
+		if _, err := s.AppByID(ctx, appID); err != nil {
+			return err
+		}
+		return ErrConflict
+	}
+	return nil
 }
 
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
@@ -4828,7 +4877,8 @@ func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
-		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone); err != nil {
+		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone,
+		&n.ScheddTargetURL); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
 	return n, nil
@@ -4838,7 +4888,7 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone
+		       region, zone, schedd_target_url
 		  from compute_nodes
 		 where active = true
 		 order by name
@@ -4867,7 +4917,7 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone
+		       region, zone, schedd_target_url
 		  from compute_nodes
 		 order by name
 	`)
@@ -4890,7 +4940,7 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone
+		       region, zone, schedd_target_url
 		  from compute_nodes
 		 where id = $1
 	`, id)
@@ -4905,7 +4955,7 @@ func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNo
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone
+		       region, zone, schedd_target_url
 		  from compute_nodes
 		 where name = $1
 	`, name)
@@ -5070,7 +5120,7 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// region/zone (issue #254 / PR #429) are nullable and default to
 	// NULL on INSERT — schedd's placement chooser doesn't yet surface
 	// them at register time, so we explicitly project NULL when the
-	// caller leaves the pointer nil. RETURNING projects all 12 columns
+	// caller leaves the pointer nil. RETURNING projects all 13 columns
 	// to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
@@ -5079,7 +5129,7 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone
+		          region, zone, schedd_target_url
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget, node.Active, node.Region, node.Zone)
 	return scanComputeNode(row)
@@ -5102,11 +5152,11 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // rows to api.VCPUSlots (160); pre-migration rows see the same
 // default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 13-column
+	// region/zone are projected to match scanComputeNode's 14-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
-	// default-local backfill. RETURNING projects all 13 columns.
+	// default-local backfill. RETURNING projects all 14 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
@@ -5122,7 +5172,7 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      active              = true
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone
+		          region, zone, schedd_target_url
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
 	n, err := scanComputeNode(row)

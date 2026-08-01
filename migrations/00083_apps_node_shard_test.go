@@ -59,11 +59,15 @@ import (
 )
 
 // TestMigration_00083_1_AppsNodeIDColumnShape pins the
-// apps.node_id column shape after 00083 applies. data_type=uuid
-// + is_nullable=NO. Any drift (e.g. someone typing text instead
-// of uuid, or making the column nullable post-backfill) fails
-// loud — both are silent invariants the rest of the Phase 2
-// PR assumes without re-checking.
+// apps.node_id column shape after 00083 applies (and after 00084
+// has relaxed NOT NULL). data_type=uuid + is_nullable=YES. The
+// relaxation from NO→YES is the Phase 2 / Gate A claim path
+// (migration 00084): apid can INSERT with node_id = NULL and
+// schedd's PlacementClaimSubscriber stamps it asynchronously.
+// The empty-uuid CHECK (apps_node_id_nonempty_chk) stays in
+// force — the relaxation is "NULL is legal", not "any value
+// is legal". Any drift (e.g. someone typing text instead of
+// uuid, or re-tightening NOT NULL post-00084) fails loud.
 func TestMigration_00083_1_AppsNodeIDColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
@@ -84,8 +88,8 @@ func TestMigration_00083_1_AppsNodeIDColumnShape(t *testing.T) {
 	if dtype != "uuid" {
 		t.Errorf("apps.node_id data_type = %q, want %q", dtype, "uuid")
 	}
-	if nullable != "NO" {
-		t.Errorf("apps.node_id is_nullable = %q, want %q", nullable, "NO")
+	if nullable != "YES" {
+		t.Errorf("apps.node_id is_nullable = %q, want %q (post-00084 relaxation)", nullable, "YES")
 	}
 
 	// Constraint presence: both apps_node_id_fkey and
