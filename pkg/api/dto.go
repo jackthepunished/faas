@@ -83,6 +83,19 @@ type UpdateAppRequest struct {
 	// that wants Content-Length). Pointer distinguishes "don't
 	// touch" (nil) from "explicit false" (*bool=false).
 	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
+	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys on
+	// a valid cosign signature from a trusted publisher (mirrors AWS
+	// Lambda's Code Signing for Lambda). When true, imaged verifies
+	// the deploy image against the per-app trusted-publisher list
+	// (PUT /v1/apps/{slug}/trusted_signers/{name}) before any
+	// buildImageLayer work. Default false — pre-PR apps stay on the
+	// open-deploy path. Pointer distinguishes "don't touch" (nil)
+	// from "explicit false" (opt out). Admin-only via PATCH
+	// /v1/apps/{slug}; not plan-gated (any plan may opt in).
+	// Source-tarball deploys (Railpack path) bypass the gate by
+	// design — builds run inside ephemeral builder microVMs
+	// (ADR-003) and the customer image is never shipped over the wire.
+	RequireSigned *bool `json:"require_signed,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -336,6 +349,14 @@ type AppResponse struct {
 	// never-scaled app.
 	LastScaleOutAt *time.Time `json:"last_scale_out_at,omitempty"`
 	LastScaleInAt  *time.Time `json:"last_scale_in_at,omitempty"`
+	// RequireSigned (issue #472 / ADR-054) reflects the per-app
+	// signature-enforcement flag. False by default; toggled true via
+	// PATCH /v1/apps/{slug}. When true, OCI image deploys are
+	// rejected at imaged's verify hook (403 deploy_signature_invalid)
+	// unless the image carries a cosign signature from one of the
+	// per-app trusted publishers (GET /v1/apps/{slug}/trusted_signers).
+	// Source-tarball deploys are unaffected.
+	RequireSigned bool `json:"require_signed"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
@@ -349,6 +370,16 @@ type CreateDeploymentRequest struct {
 	// ADR-053 §Decision 1 — any new override field requires a new
 	// ADR. Nil/omitted means "no overrides; deploy the image as-is".
 	Overrides *CreateDeploymentOverrides `json:"overrides,omitempty"`
+	// RequireSigned (issue #472 / ADR-054) is the per-deploy opt-in
+	// to cosign signature verification. apid flips the row flag from
+	// the request body and imaged's buildImageLayer verifies before
+	// PullDigest. The operator policy on apps.require_signed is the
+	// source of truth — a customer request that tries to clear an
+	// operator-on flag is rejected (operator > customer). nil on the
+	// wire = leave the per-app flag alone (default off). Source-
+	// tarball deploys ignore this field (Railpack path bypasses the
+	// verify hook entirely).
+	RequireSigned *bool `json:"require_signed,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -1816,4 +1847,64 @@ type ApplyResponse struct {
 type ApplyResponseApp struct {
 	Slug string `json:"slug"`
 	ID   string `json:"id"`
+}
+
+// --- cosign trusted-publisher wire types (issue #472 / ADR-054) -------------
+//
+// TrustedSigner is one row of the per-app cosign trusted-publisher
+// list. Mirrors AWS Lambda's TrustedSigner's profileArn / profileVersionArn
+// pair — the signer_name is the customer-facing label and the
+// cosign_public_key_pem is the DER SPKI the verify path matches against.
+//
+// PublicKeyPEM is base64-encoded DER (the wire form), distinct from
+// the bytea shape pkg/state.AppTrustedSigner stores (already a
+// []byte). The handler decodes on the read side before reaching the
+// state layer.
+//
+// AddedAt is RFC 3339 (Go time.Time default JSON marshal). AddedBy
+// is the operator account email (NOT the account UUID), surfaced so
+// the dashboard's audit-log panel can show "rotated by alice@…" without
+// a second round-trip to /v1/account.
+type TrustedSigner struct {
+	Name         string    `json:"name"`
+	PublicKeyPEM string    `json:"public_key_pem"`
+	AddedAt      time.Time `json:"added_at"`
+	AddedBy      string    `json:"added_by,omitempty"`
+}
+
+// AppTrustedSignerListResponse is the body of
+// GET /v1/apps/{slug}/trusted_signers. Always an empty slice (never
+// nil) so the JSON shape is stable — same posture as
+// AppResponse.EgressAllowlist.
+type AppTrustedSignerListResponse struct {
+	Signers []TrustedSigner `json:"signers"`
+}
+
+// AddTrustedSignerRequest is the body of
+// PUT /v1/apps/{slug}/trusted_signers/{name}. PublicKeyPEM is the
+// DER SPKI as a base64 string (NOT a PEM-armoured block — the wire
+// is binary-clean so we don't have to parse the PEM header to reach
+// the bytes). 64..1024 bytes after decode (matches the DB CHECK
+// app_trusted_signers_pem_shape); the handler validates before
+// INSERT and returns 400 deploy_signature_invalid_key on shape
+// failures.
+type AddTrustedSignerRequest struct {
+	PublicKeyPEM string `json:"public_key_pem"`
+}
+
+// AppSecurityRequest is the body of PATCH /v1/apps/{slug}/security.
+// RequireSigned is a *bool so the wire form can distinguish "don't
+// touch" (nil) from "explicit true/false" — the Set-bit convention
+// the broader UpdateAppRequest uses (issue #471 streaming flag
+// precedent). Admin-scoped surface (the customer PATCH
+// /v1/apps/{slug} silently drops require_signed).
+type AppSecurityRequest struct {
+	RequireSigned *bool `json:"require_signed,omitempty"`
+}
+
+// AppSecurityResponse is the success body of PATCH
+// /v1/apps/{slug}/security. Mirrors the AppResponse RequireSigned
+// field so the CLI can render the new state without a follow-up GET.
+type AppSecurityResponse struct {
+	RequireSigned bool `json:"require_signed"`
 }

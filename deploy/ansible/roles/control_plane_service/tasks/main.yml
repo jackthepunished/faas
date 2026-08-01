@@ -217,6 +217,25 @@
       or faas_sign_pub_stat.stat.pw_name != "root"
       or faas_sign_pub_stat.stat.gr_name != "root"
 
+# Issue #472 / ADR-058 — per-app cosign trusted-publisher directory.
+# imaged reads /etc/faas/secrets/trusted-publishers/ at startup and
+# on every pg_notify('trusted_signer_changed'). The dir is created
+# by this task (mode 0755 root:root) so imaged's first read never
+# ENOENTs; per-file perms are 0444 root:root (enforced by the Go
+# loader at read time — see pkg/cosign/keys.go). Operator onboards
+# publishers via `gregale trusted-publishers add <slug> <name> <pub>`,
+# which PUTs base64(DER) to apid; apid writes the mirror .pem here.
+# Missing dir on a deploy attempt is fail-closed at the apid
+# pre-flight gate (handlers.go::createDeployment), so a never-
+# populated install is non-fatal at startup.
+- name: control_plane_service — ensure trusted-publishers dir exists with mode 0755 root:root (issue #472)
+  ansible.builtin.file:
+    path: /etc/faas/secrets/trusted-publishers
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Tier 1 control-plane mTLS (ADR-052). The local-dev PKI
 # bootstrap lays out /etc/faas/tls/{ca,<daemon>/} with 0400
 # private keys and 0444 public certs; this stat-assert proves

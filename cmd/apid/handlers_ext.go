@@ -325,6 +325,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			}
 		}
 	}
+	// Issue #472 / ADR-054: per-app cosign signature-enforcement flag
+	// is NOT settable via the customer PATCH surface — the operator
+	// controls it through PATCH /v1/apps/{slug}/security
+	// (handlers_security.go) which mounts with the admin+MFA chain.
+	// updateApp silently drops a customer-set RequireSigned; the
+	// field stays on the wire shape (UpdateAppRequest) for SDK
+	// stability but is honoured only on the admin route.
 	return nil
 }
 
@@ -431,6 +438,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// floor.
 		ScalingPolicy:    policyPtrFromReq(&req),
 		SetScalingPolicy: req.ScalingPolicy != nil,
+		// Issue #472 / ADR-054: per-app cosign signature-enforcement
+		// flag is NOT settable via the customer PATCH surface.
+		// Operators control it through PATCH /v1/apps/{slug}/security
+		// (handlers_security.go), which mounts with the admin+MFA
+		// chain. updateApp SILENTLY DROPS a customer-set
+		// RequireSigned — the field is in UpdateAppRequest so the
+		// SDK wire shape stays stable, but it's not honoured here.
+		// imaged reads the column at buildImageLayer time regardless
+		// of how it got set.
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -478,6 +494,11 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["streaming_enabled"] = app.StreamingEnabled
 		newApp["streaming_enabled"] = updated.StreamingEnabled
 	}
+	// Note: req.RequireSigned is intentionally NOT audited here —
+	// it's silently dropped by updateApp (see above). The audit
+	// path for the toggle lives on PATCH /v1/apps/{slug}/security
+	// (handlers_security.go) where the admin+MFA chain guarantees
+	// the operator-only posture.
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)

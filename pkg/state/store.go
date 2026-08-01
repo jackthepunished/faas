@@ -1739,4 +1739,25 @@ type Store interface {
 	// CountAppEnv is the quota check helper. apid calls it before
 	// UpsertAppEnv to enforce Limits.EnvVarsMax.
 	CountAppEnv(ctx context.Context, accountID, appID string) (int, error)
+
+	// AppTrustedSigner is the per-app cosign trusted-publisher list
+	// (issue #472 / ADR-054). apid is the only writer; imaged reads
+	// the matching set at deploy-time verify. The four methods mirror
+	// the AppEnv surface 1:1: accountID is passed for ownership
+	// verification (and to scope the IDOR guard), pubKey is the raw
+	// DER SPKI bytea, addedByAccountID is stamped on every write.
+	UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) error
+	// DeleteAppTrustedSigner removes the (app_id, signer_name) row.
+	// Returns ErrNotFound if the row doesn't exist — handlers render
+	// 404 CodeTrustedSignerNotFound (URL resource IS the signer name).
+	DeleteAppTrustedSigner(ctx context.Context, accountID, appID, signerName string) error
+	// ListAppTrustedSigners returns every trusted-signer row on the
+	// app, scoped to accountID. Order: by signer_name ASC for
+	// deterministic verify-loop ordering. Returns nil slice when the
+	// app has no trusted signers — handler renders fail-closed 403.
+	ListAppTrustedSigners(ctx context.Context, accountID, appID string) ([]AppTrustedSigner, error)
+	// CountAppTrustedSigners is the quota check helper. apid calls it
+	// before UpsertAppTrustedSigner to enforce
+	// Limits.TrustedSignerCountMax.
+	CountAppTrustedSigners(ctx context.Context, accountID, appID string) (int, error)
 }

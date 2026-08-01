@@ -1549,6 +1549,141 @@ paths:
   # signal. env:write is NOT MFA-gated because env vars are explicitly
   # non-sensitive runtime config — credentials stay on /secrets.
 
+  # Issue #472 / ADR-054: per-app cosign signature-enforcement surface.
+  # Three admin-scoped routes (require MFA + ScopesAdminOnly) plus
+  # one PATCH endpoint for the require_signed toggle itself. The
+  # customer PATCH /v1/apps/{slug} endpoint silently drops
+  # require_signed so the gate can't be flipped by the customer.
+
+  /v1/apps/{slug}/security:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    patch:
+      tags: [security]
+      operationId: patchAppSecurity
+      summary: Toggle the require_signed flag for an app (admin + MFA).
+      description: |
+        Operator-only surface for the per-app cosign signature-enforcement
+        flag (issue #472 / ADR-054). Mounted with `authLimited → requireMFA →
+        requireScope(ScopesAdminOnly...)`. The customer PATCH /v1/apps/{slug}
+        endpoint silently drops the field — flipping it through that surface
+        is a no-op — so the only path that persists `require_signed=true` is
+        this one.
+
+        `nil` = no field set (no-op 200). Non-nil = atomic overwrite.
+
+        Audit event: `app.security_updated` carries old/new values.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppSecurityRequest'
+      responses:
+        '200':
+          description: The updated flag state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppSecurityResponse' }
+        '400': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/AppNotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /v1/apps/{slug}/trusted_signers:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [security]
+      operationId: listAppTrustedSigners
+      summary: List the per-app trusted-publisher list (admin).
+      description: |
+        Lists every (signer_name, public_key_pem) row for this app
+        (issue #472 / ADR-054). Admin-scoped; the wire form is the
+        base64-encoded DER SPKI bytes, NOT a PEM-armoured block.
+        Empty list is the EXPECTED state for any app with
+        require_signed=false. Mounted with `authLimited → requireMFA →
+        requireScope(ScopesAdminOnly...)`.
+      responses:
+        '200':
+          description: The trusted-publisher list (may be empty).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppTrustedSignerListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/AppNotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /v1/apps/{slug}/trusted_signers/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+        description: "Lower-case signer label. Matches the on-disk filename (without .pem) under /etc/faas/secrets/trusted-publishers/."
+    put:
+      tags: [security]
+      operationId: putAppTrustedSigner
+      summary: Onboard (or replace) a trusted publisher (admin + MFA).
+      description: |
+        Writes the (app_id, signer_name) row with the supplied base64-DER
+        blob (issue #472 / ADR-054). apid decodes the blob and persists it
+        verbatim; imaged mirrors the row to `/etc/faas/secrets/trusted-publishers/{name}.pem`
+        and refreshes its in-memory trust cache on `pg_notify('trusted_signer_changed')`.
+        PUT semantics: idempotent re-PUT replaces the previous blob.
+
+        Audit event: `app.trusted_signer_added`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTrustedSignerRequest' }
+      responses:
+        '200':
+          description: The onboarded trusted signer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrustedSigner' }
+        '400':
+          description: "trusted_signer_invalid (bytes out of [64,1024] range, non-ECDSA, non-P-256, etc)."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "Forbidden — admin scope required, OR plan_limit_trusted_signers when the per-app count would exceed the plan cap."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/AppNotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [security]
+      operationId: deleteAppTrustedSigner
+      summary: Offboard a trusted publisher (admin + MFA).
+      description: |
+        Deletes the (app_id, signer_name) row. 404 returns the canonical
+        `trusted_signer_not_found` Problem so `gregale trusted-publishers remove`
+        can treat absent rows as idempotent success.
+
+        Audit event: `app.trusted_signer_removed`.
+      responses:
+        '204':
+          description: Row removed.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: "trusted_signer_not_found — the (slug, name) row does not exist."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
   /v1/apps/{slug}/env:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -3731,6 +3866,19 @@ components:
           type: [string, "null"]
           format: date-time
           example: "2026-07-31T12:00:00Z"
+        # Issue #472 / ADR-054: per-app signature-enforcement flag.
+        # When true, OCI image deploys to this app must carry a
+        # valid cosign signature from a publisher in the
+        # per-app trusted_signers list (mirrors AWS Lambda's
+        # Code Signing for Lambda). The flag is operator-only —
+        # PATCH /v1/apps/{slug}/security requires the admin
+        # scope and MFA; the customer-scoped PATCH /v1/apps/{slug}
+        # silently drops the field. Default false (no production
+        # behaviour change until an operator opts in).
+        require_signed:
+          description: "Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a valid signature from a publisher in the per-app trusted_signers list. Default false."
+          type: boolean
+          example: false
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -3830,6 +3978,17 @@ components:
           oneOf:
             - type: "null"
             - $ref: '#/components/schemas/ScalingPolicy'
+        # Issue #472 / ADR-054: require_signed is OPERATOR-ONLY.
+        # The customer PATCH surface (here) silently DROPS the
+        # field — flipping it through the customer endpoint is a
+        # no-op. Use PATCH /v1/apps/{slug}/security (admin scope
+        # + MFA) instead. Documented here so SDK consumers
+        # discover the customer-side restriction without
+        # encountering a silent 200.
+        require_signed:
+          description: "DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054). The field is parsed for backwards compatibility but never persisted from this endpoint."
+          type: [boolean, "null"]
+          example: false
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -4120,6 +4279,18 @@ components:
             - $ref: '#/components/schemas/CreateDeploymentOverrides'
             - type: 'null'
           description: "Deploy-time overrides (entrypoint, cmd, env, env_secrets, port, healthcheck). nil/omitted = deploy the image as-is."
+        # Issue #472 / ADR-054: per-deploy require_signed opt-in.
+        # Only honoured when the apps row's require_signed is
+        # already false (i.e. the customer is volunteering to
+        # gate THIS deploy). When apps.require_signed=true the
+        # operator policy wins — a *false request field is
+        # rejected with 403 deploy_signature_invalid (no
+        # per-deploy opt-out). nil = "leave the per-app flag
+        # alone" (apid default).
+        require_signed:
+          description: "Per-deploy signature-enforcement opt-in (issue #472 / ADR-054). nil = inherit apps.require_signed; *true is a no-op when the app flag is already on; *false is rejected with 403 deploy_signature_invalid when the app flag is on (operator policy wins)."
+          type: [boolean, "null"]
+          example: true
 
     CreateDeploymentOverrides:
       description: |
@@ -5482,6 +5653,87 @@ components:
       type: object
       additionalProperties: false
 
+    # Issue #472 / ADR-054: per-app cosign trusted-publisher surface.
+    # Mirrors AWS Lambda's TrustedSigners / SigningProfileVersionArns.
+
+    TrustedSigner:
+      description: |
+        One entry in the per-app cosign trusted-publisher list. `name` is the
+        apid-side label (matches `app_trusted_signers.signer_name`); `public_key_pem`
+        is the base64-encoded DER SubjectPublicKeyInfo bytes — NOT a PEM-armoured
+        block. The wire form strips the PEM armour at upload time so the
+        on-disk mirror (imaged reads `/etc/faas/secrets/trusted-publishers/`) is
+        a single blob per publisher. ECDSA P-256 only (ADR-038); apid rejects
+        other curves at PUT time with `trusted_signer_invalid`.
+      type: object
+      required: [name, public_key_pem, added_at]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+          example: "ci-bot"
+          description: "Lower-case label. Matches `app_trusted_signers.signer_name`. The label is the on-disk filename (without .pem) under /etc/faas/secrets/trusted-publishers/."
+        public_key_pem:
+          type: string
+          description: "Base64-encoded DER SubjectPublicKeyInfo. Bytes length must be in [64, 1024] (DB CHECK)."
+          example: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+        added_at:
+          type: string
+          format: date-time
+          description: "RFC3339 timestamp of when the operator onboarded this publisher."
+        added_by:
+          type: string
+          description: "Account ID of the admin who onboarded this publisher (omit when not yet in audit log)."
+          example: "0123456789abcdef0123456789abcdef"
+
+    AddTrustedSignerRequest:
+      description: |
+        PUT body for `/v1/apps/{slug}/trusted_signers/{name}`. `public_key_pem` is
+        the base64-encoded DER blob (apid side strips PEM armour). The DER must
+        parse as an ECDSA P-256 SPKI; any other curve or non-ECDSA key returns
+        400 `trusted_signer_invalid`. Bytes length must land in [64, 1024].
+      type: object
+      required: [public_key_pem]
+      properties:
+        public_key_pem:
+          type: string
+          minLength: 88
+          maxLength: 1400
+          description: "Base64-encoded DER SubjectPublicKeyInfo. Length bounds match the DB CHECK."
+          example: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+
+    AppTrustedSignerListResponse:
+      description: "GET /v1/apps/{slug}/trusted_signers response body. Empty list is the EXPECTED state for any app with require_signed=false."
+      type: object
+      required: [signers]
+      properties:
+        signers:
+          type: array
+          items: { $ref: '#/components/schemas/TrustedSigner' }
+
+    AppSecurityRequest:
+      description: |
+        PATCH body for `/v1/apps/{slug}/security`. `require_signed` is a
+        pointer so the wire form can distinguish "don't touch" (nil) from
+        "explicit true/false" — the same Set-bit convention the broader
+        UpdateAppRequest uses (issue #471 streaming flag precedent).
+      type: object
+      properties:
+        require_signed:
+          type: [boolean, "null"]
+          description: "Operator-only toggle. nil = no change. *true = opt in to signature enforcement (requires the trust list to be non-empty). *false = opt out."
+          example: true
+
+    AppSecurityResponse:
+      description: "PATCH /v1/apps/{slug}/security response body — the updated flag state."
+      type: object
+      required: [require_signed]
+      properties:
+        require_signed:
+          type: boolean
+          description: "The current state of the require_signed flag after the patch."
+          example: true
+
   responses:
 
     Unauthorized:
@@ -5692,3 +5944,4 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
         text/plain:
           schema: { $ref: '#/components/schemas/RateLimitPlain' }
+

@@ -235,6 +235,10 @@ type MemStore struct {
 	// envs is the plaintext app_envs mirror (issue #395 / ADR-045).
 	// Same composite-key shape as secrets; same ownership semantics.
 	envs map[envKey]AppEnv
+	// trustedSigners is the in-memory mirror of app_trusted_signers
+	// (issue #472 / ADR-054). Populated by the admin CRUD handlers in
+	// cmd/apid/handlers_trusted_signers.go; not exposed to schedd.
+	trustedSigners map[trustedSignerKey]AppTrustedSigner
 	// computeNodes mirrors the compute_nodes table; keyed by id (issue
 	// #97 / ADR-025 axis 3). The synthetic 'default-local' row is
 	// seeded by NewMemStore so tests don't have to call
@@ -308,6 +312,16 @@ type secretKey struct {
 type envKey struct {
 	AppID string
 	Key   string
+}
+
+// trustedSignerKey mirrors the app_trusted_signers PRIMARY KEY
+// (app_id, signer_name) added in migration 00083 (issue #472 / ADR-058).
+// Same composite-key shape as secretKey/envKey by intent — the handler
+// URL is /v1/apps/{slug}/trusted_signers/{name}, so the resource IS the
+// signer_name.
+type trustedSignerKey struct {
+	AppID      string
+	SignerName string
 }
 
 type idemEntry struct {
@@ -465,6 +479,7 @@ func NewMemStore() *MemStore {
 		paddleOverageWindows: map[paddleOverageWindowKey]paddleOverageClaimState{},
 		secrets:              map[secretKey]AppSecret{},
 		envs:                 map[envKey]AppEnv{},
+		trustedSigners:       map[trustedSignerKey]AppTrustedSigner{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -1515,6 +1530,14 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		if p.ScalingPolicy.MinInstances != 0 {
 			a.MinInstances = p.ScalingPolicy.MinInstances
 		}
+	}
+	// Issue #472 / ADR-054: per-app cosign signature-enforcement flag.
+	// Same Set-bit convention — SetRequireSigned distinguishes "don't
+	// touch" from "explicit false" (opt out of signed-image enforcement).
+	// Apid already gated the admin scope; the store is a plain column
+	// write. imaged reads this at buildImageLayer time.
+	if p.SetRequireSigned {
+		a.RequireSigned = boolOrFalse(p.RequireSigned)
 	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
@@ -5693,6 +5716,85 @@ func (m *MemStore) CountAppEnv(_ context.Context, accountID, appID string) (int,
 	n := 0
 	for _, e := range m.envs {
 		if e.AppID == appID && e.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// --- app trusted cosign signers (issue #472 / ADR-054) -----------------------
+//
+// MemStore mirrors the PgStore trusted-signer CRUD so handler tests
+// exercise the same shape the production store enforces. Same posture as
+// the app_secrets/app_envs parity clusters above.
+
+// UpsertAppTrustedSigner inserts or replaces the (app_id, signer_name)
+// row. On conflict only cosign_public_key + added_by_account_id refresh;
+// AddedAt stays at the original write so the audit trail distinguishes
+// "created" from "rotated" (matches PgStore.on conflict do update).
+func (m *MemStore) UpsertAppTrustedSigner(_ context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := trustedSignerKey{AppID: appID, SignerName: signerName}
+	if existing, ok := m.trustedSigners[k]; ok {
+		if existing.AccountID != accountID {
+			return ErrNotFound
+		}
+		existing.CosignPublicKey = pubKey
+		existing.AddedByAccountID = addedByAccountID
+		m.trustedSigners[k] = existing
+		return nil
+	}
+	m.trustedSigners[k] = AppTrustedSigner{
+		AccountID:        accountID,
+		AppID:            appID,
+		SignerName:       signerName,
+		CosignPublicKey:  pubKey,
+		AddedAt:          time.Now(),
+		AddedByAccountID: addedByAccountID,
+	}
+	return nil
+}
+
+// DeleteAppTrustedSigner removes the (app_id, signer_name) row scoped to
+// accountID. Returns ErrNotFound when no row matches — handler renders
+// 404 CodeTrustedSignerNotFound.
+func (m *MemStore) DeleteAppTrustedSigner(_ context.Context, accountID, appID, signerName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := trustedSignerKey{AppID: appID, SignerName: signerName}
+	row, ok := m.trustedSigners[k]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.trustedSigners, k)
+	return nil
+}
+
+// ListAppTrustedSigners returns every trusted-signer row on the app,
+// scoped to accountID. Order: by signer_name ASC (matches PgStore
+// ORDER BY). Returns nil slice when the app has no trusted signers.
+func (m *MemStore) ListAppTrustedSigners(_ context.Context, accountID, appID string) ([]AppTrustedSigner, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppTrustedSigner
+	for _, r := range m.trustedSigners {
+		if r.AppID != appID || r.AccountID != accountID {
+			continue
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SignerName < out[j].SignerName })
+	return out, nil
+}
+
+// CountAppTrustedSigners is the quota helper. Mirrors PgStore.CountAppTrustedSigners.
+func (m *MemStore) CountAppTrustedSigners(_ context.Context, accountID, appID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.trustedSigners {
+		if r.AppID == appID && r.AccountID == accountID {
 			n++
 		}
 	}

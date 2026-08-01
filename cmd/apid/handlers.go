@@ -176,6 +176,45 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 			"Image required", "image: deploys require a digest-pinned reference, e.g. registry.gregale.dev/app@sha256:..."))
 		return
 	}
+	// Issue #472 / ADR-054: pre-flight signature-enforcement gate.
+	// Runs after the digest check (a missing image is a more
+	// fundamental request shape error than a missing signer) and
+	// before the override Validate (so a fail-closed deployment
+	// doesn't pay the override-validation cost). The flag is on
+	// the apps row (apps.require_signed); we do NOT trust the
+	// customer's req.RequireSigned opt-in to override the operator
+	// policy — the per-app flag wins (fail-closed). A customer
+	// attempt to clear an operator-on flag is rejected here:
+	//
+	//   app.require_signed=true  &  req.RequireSigned=*false   → 403
+	//
+	// The "no trusted signers configured" check is the actual
+	// fail-closed trip — the operator toggled the flag but never
+	// onboarded a publisher. We surface this immediately at
+	// accept-time so the customer sees 403 with a clear message,
+	// not a pending→failed two-step inside imaged.
+	if app.RequireSigned {
+		signers, sErr := s.store.ListAppTrustedSigners(ctx(r), acct.ID, app.ID)
+		if sErr != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not load trusted signers"))
+			return
+		}
+		if len(signers) == 0 {
+			api.WriteProblem(w, api.ErrDeploySignatureInvalid(
+				"apps.require_signed=true but no trusted publishers are configured for this app; ask the operator to onboard a publisher via PUT /v1/apps/{slug}/trusted_signers/{name}."))
+			return
+		}
+		// Customer-request override: an attempt to turn the flag
+		// off on this single deploy is rejected with operator >
+		// customer. A nil request field is "leave the per-app flag
+		// alone" (the apid default); *true is a no-op (the flag
+		// is already on); only *false collides.
+		if req.RequireSigned != nil && !*req.RequireSigned {
+			api.WriteProblem(w, api.ErrDeploySignatureInvalid(
+				"apps.require_signed=true on this app; per-deploy opt-out is not permitted (operator policy wins)."))
+			return
+		}
+	}
 	// Issue #460 / ADR-053: validate the override object AFTER the
 	// image digest check (digest first — a missing image is a more
 	// fundamental request shape error than a malformed override).
@@ -291,6 +330,22 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		"supersedes":    prev.ID,
 		"has_overrides": hasOverrides,
 	})
+	// Issue #472 / ADR-054: emit app.signed_image_accepted here ONLY
+	// when require_signed is on for this deploy. imaged will later
+	// emit app.signature_invalid / app.signature_missing from its
+	// verify hook (Bucket 4), but the "request passed the operator
+	// gate" event is apid's surface — the deploy is acked before
+	// imaged even runs the verify. The audit row answers "which
+	// signature-gated deploy was accepted on what app" without a
+	// follow-up GET. Empty ref column keeps the row distinct from
+	// the plain app.deployed event (different `kind`).
+	if app.RequireSigned {
+		s.audit.Emit(ctx(r), "app.signed_image_accepted", &acct.ID, map[string]any{
+			"app_id":        app.ID,
+			"deployment_id": d.ID,
+			"ref":           req.Image,
+		})
+	}
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
 
@@ -337,6 +392,11 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		ScalingPolicy:  statePolicyToDTO(a.ScalingPolicy),
 		LastScaleOutAt: a.LastScaleOutAt,
 		LastScaleInAt:  a.LastScaleInAt,
+		// Issue #472 / ADR-054: per-app signature-enforcement flag.
+		// Surfaced so dashboards can show "signature required" alongside
+		// the streaming flag, and so a customer can verify their
+		// PATCH landed without a second round-trip.
+		RequireSigned: a.RequireSigned,
 	}
 }
 
