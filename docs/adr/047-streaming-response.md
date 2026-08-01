@@ -1,8 +1,9 @@
 # ADR-047 · Streaming responses through gatewayd
 
-- **Status:** proposed (PR-B + PR-C + PR-D ship in sequence; this ADR
-  is the design record for all three)
-- **Date:** 2026-07-31
+- **Status:** accepted (PR-D 2026-08-01; PR-A #481, PR-B + PR-C #490
+  shipped earlier. PR-D closes the four deferred items: metal e2e,
+  ADR status flip, dashboards, unary ForwardHTTP removal)
+- **Date:** 2026-07-31 (initial); 2026-08-01 (PR-D finalization)
 - **Issue:** #471 (HTTP streaming responses through the FaaS gateway)
 - **Predecessors:** ADR-009 (identical inner network world — the
   invariant that makes snapshot reuse work), ADR-028 (ForwardHTTP gRPC
@@ -164,11 +165,18 @@ before the streaming wrap.
     on at any time without the request-level opt-out mutating
     state.
 11. **Single-registry metrics.** `gateway_stream_flushes_total`
-    is registered on the gatewayd-local Prometheus registry only
-    (one registry per `Metrics` struct, per the
-    `wire-opsmetrics-single-registry` invariant). One increment
-    per `doFlush()` call (covers periodic + first-flush +
-    residual capture). Labelled by (app, plan) — same shape as
+    and `gateway_stream_active` are registered on the
+    gatewayd-local Prometheus registry only (one registry per
+    `Metrics` struct, per the `wire-opsmetrics-single-registry`
+    invariant). PR-D closes the bug where `streamFlushes` was
+    constructed but omitted from `reg.MustRegister` — both
+    series are now emitted from the moment the daemon binds.
+    `stream_flushes` incs once per `doFlush()` call (covers
+    periodic + first-flush + residual capture). `stream_active`
+    incs in `setupStreamingWriter` and decs in the handler's
+    defer after `finalFlush` — buffered-path requests never
+    touch the gauge. Both are labelled by (app, plan) under
+    the `__other__` pre-instantiation pattern, same shape as
     `gateway_response_bytes_total` so the §12 dashboard can
     ratio them.
 
@@ -255,9 +263,14 @@ writes); only the gateway→vmmd leg is bidi gRPC.
   `streaming_enabled=true` (operator misconfiguration OR a
   future plan default flip) gets a buffered response with no
   streaming; the PR-A `streamingFallbackLog` surfaces this in
-  the gateway slog. apid's `CodePlanStreamingNotAllowed`
-  403 is the load-bearing gate; the log is the tripwire for
-  the misconfig path.
+  the gateway slog. PR-D tightened the call site to fire only
+  when `!streaming && app.Plan == api.PlanFree` — the
+  pre-PR-D code fired on any Hobby+ SSE response on the
+  buffered path, which was a noisy false positive (the
+  operator's `FAAS_GATEWAY_STREAMING` toggle is the lever
+  there, not a customer misconfig). apid's
+  `CodePlanStreamingNotAllowed` 403 is the load-bearing gate;
+  the log is the tripwire for the misconfig path.
 - **R9. `x-faas-stream` header timing.** The header is stamped
   on the OUTBOUND request to vmmd (before the bridge is
   dialed) — that's a normal pre-body header. The CLIENT
@@ -266,28 +279,40 @@ writes); only the gateway→vmmd leg is bidi gRPC.
   gateway-side stamp is the load-bearing signal for the vmmd
   cap-lift.
 
-## Open questions (PR-D territory)
+## PR-D resolutions
 
-- **O1.** Should `gateway_stream_active{app, plan}` (gauge)
-  ship? One increment when a streaming response starts, one
-  decrement when it ends. Useful for §12 capacity planning
-  but not load-bearing for any AC. Defer until a dashboard
-  panel needs it.
-- **O2.** Should `capWriter` use `http.MaxBytesWriter` as the
-  underlying writer and just translate the 502 to 413 on the
-  Error path? Would inherit stdlib's interaction with
-  `http.Server.WriteTimeout` and the per-flush `SetWriteDeadline`
-  safety net. Trade-off: stdlib's behavior on partial Write is
-  well-tested; rolling our own loses that. Defer to PR-D when
-  metal testing exposes edge cases.
-- **O3.** Plan-lift to 100 MB on Pro: the model already gives
-  Pro 100 MB (the same as Hobby+). Document this in the SDK so
-  customers building chat apps don't assume Hobby vs Pro has
-  different streaming budgets.
-- **O4.** AC #3 plan matrix (Free 100 MB → 413, Hobby 100 MB →
-  200, Pro 100 MB → 200, Scale 100 MB → 200) — the non-metal
-  e2e covers Free and Hobby; the metal e2e (PR-D) covers the
-  full plan matrix with real Firecracker guests.
+The four PR-D-territory questions resolved in the PR-D commit:
+
+- **O1. `gateway_stream_active` gauge.** **Shipped.** PR-D adds
+  the gauge alongside `gateway_stream_flushes_total`; the
+  streaming path Inc's in `setupStreamingWriter` and the
+  handler's defer Dec's after `finalFlush`. The buffered path
+  never touches the gauge. Pre-instantiated under
+  `__other__`. Dashboard panel added to all three dashboards.
+  Load-bearing for the §12 capacity-planning story and
+  completes the streaming metric surface.
+- **O2. `capWriter` vs `http.MaxBytesWriter`.** **Closed
+  without rolling our own.** PR-D kept the existing
+  `capWriter` design. The PR-B `SetWriteDeadline` sliding
+  window is the substitute for stdlib's interaction with
+  `http.Server.WriteTimeout`, and the structured 413
+  problem+json shape is required for the customer-facing
+  contract — stdlib's 502 is the wrong code. The unit
+  test `TestCapWriter_EmitsStructuredProblem` already
+  exercises the cap path; no edge case was surfaced during
+  PR-D metal testing.
+- **O3. Pro plan 100 MB cap.** **Closed.** The spec
+  consistently reflects Pro = 100 MB (the same as Hobby+)
+  because that's the model. The SDK reflects it via the
+  `pkg/api.MaxResponseBodyBytes()` accessor. No new
+  customer-facing copy needed.
+- **O4. Plan matrix AC #3.** **Closed.** PR-D adds
+  `cmd/e2e/streaming_metal_test.go` with the four-plan
+  matrix: Free 1 MB → 413 streaming_not_available; Hobby /
+  Pro / Scale 1 MB → 200. The full 100 MB stress is left to
+  the EX44 metal acceptance (the per-test 1 MB payload
+  exercises the apid-side gate cleanly; the metal test
+  verifies the platform's wiring under real Firecracker).
 
 ## Cross-references
 
@@ -305,6 +330,9 @@ writes); only the gateway→vmmd leg is bidi gRPC.
 - issue #471 (this work)
 - PR-A #481 (the seam — per-app flag, plan default, env
   opt-in, buffered-fallback log)
-- PR-B + PR-C (this PR — Flusher path + bidi RPC)
-- PR-D (forthcoming — full metal e2e, ADR-047 finalization,
-  unary ForwardHTTP removal, dashboard panel updates)
+- PR-B + PR-C #490 (Flusher path + bidi RPC + per-flush
+  accounting + residual capture)
+- PR-D (full metal e2e, ADR-047 finalization, unary
+  ForwardHTTP removal, dashboard panel updates, the
+  `gateway_stream_active` gauge, the unified `reg.MustRegister`
+  fix, the narrower `streamingFallbackLog` gate)
