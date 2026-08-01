@@ -136,7 +136,7 @@ and returning `codes.FailedPrecondition` on mismatch.
 
 ## Open follow-ups (deliberately deferred)
 
-- App rebalance across nodes.
+- ~~App rebalance across nodes.~~ **Shipped in Tier A4, ADR-064.**
 - Consuming `VCPUBusy` from live capacity reports in placement (v1.1
   ADR if telemetry justifies it).
 - Off-host Postgres backup (issue #250).

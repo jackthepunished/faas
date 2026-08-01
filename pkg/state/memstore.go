@@ -1540,6 +1540,98 @@ func (m *MemStore) SetAppNodeID(_ context.Context, appID, nodeID string) error {
 	return nil
 }
 
+// ListOrphanedApps mirrors pkg/state/pgstore.go::ListOrphanedApps.
+// Walks every app whose node_id points at an inactive
+// compute_node, non-deleted only, and applies the same
+// cooldown + per-tick cap the SQL path uses. cooldownSeconds
+// < 0 disables the cooldown filter; maxPerTick < 1 returns
+// empty. The MemStore walk is O(N apps) but the test fixture
+// is small (MemStore is unit-test only — pgstore_test.go
+// covers the production path under pgtest).
+func (m *MemStore) ListOrphanedApps(_ context.Context, cooldownSeconds, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	var out []App
+	for _, a := range m.apps {
+		if a.NodeID == "" {
+			continue
+		}
+		if a.Status != AppActive && a.Status != AppEvictedCold {
+			continue
+		}
+		node, ok := m.computeNodes[a.NodeID]
+		if !ok || node.Active {
+			continue
+		}
+		if cooldownSeconds >= 0 {
+			if a.ReassignedAt != nil &&
+				now.Sub(*a.ReassignedAt) < time.Duration(cooldownSeconds)*time.Second {
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	// Sort: null ReassignedAt first (never reassigned = always
+	// eligible, treat as priority); then by id for stable
+	// ordering across runs.
+	sort.Slice(out, func(i, j int) bool {
+		iNil := out[i].ReassignedAt == nil
+		jNil := out[j].ReassignedAt == nil
+		if iNil != jNil {
+			return iNil
+		}
+		if !iNil && !out[i].ReassignedAt.Equal(*out[j].ReassignedAt) {
+			return out[i].ReassignedAt.Before(*out[j].ReassignedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// ReassignAppOwner mirrors pkg/state/pgstore.go::ReassignAppOwner.
+// Conditional under m.mu: fromNodeID + status in {active,
+// evicted_cold} predicate matches the SQL; on success, the
+// ReassignedAt pointer is set to now() so the cooldown
+// filter suppresses further moves for at least
+// api.RebalanceCooldownSeconds. Returns ErrConflict on a
+// lost race / moved-to-live / missing-row — the rebalancer
+// drops silently.
+func (m *MemStore) ReassignAppOwner(_ context.Context, appID, fromNodeID, toNodeID string) error {
+	if appID == "" {
+		return fmt.Errorf("state: reassign app owner: empty appID")
+	}
+	if fromNodeID == "" {
+		return fmt.Errorf("state: reassign app owner: empty fromNodeID")
+	}
+	if toNodeID == "" {
+		return fmt.Errorf("state: reassign app owner: empty toNodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok {
+		return ErrNotFound
+	}
+	if a.NodeID != fromNodeID {
+		return ErrConflict
+	}
+	if a.Status != AppActive && a.Status != AppEvictedCold {
+		return ErrConflict
+	}
+	now := time.Now()
+	a.NodeID = toNodeID
+	a.ReassignedAt = &now
+	m.apps[appID] = a
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

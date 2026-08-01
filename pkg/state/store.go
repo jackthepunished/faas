@@ -583,6 +583,31 @@ type Store interface {
 	// empty-uuid CHECK on apps.node_id reject bad values via the
 	// existing 23503 / 23514 paths.
 	SetAppNodeID(ctx context.Context, appID, nodeID string) error
+	// ListOrphanedApps returns every parked/stopped app whose node_id
+	// points at a compute_node with active=false — the input set for
+	// schedd's rebalancer (pkg/sched/rebalancer.go, Tier A4 migration
+	// 00092). Used by both the live compute_node_changed watcher (which
+	// filters by deadNodeID in memory) and the cold-start sweep (which
+	// scans every dead node at schedd boot — pg_notify is fire-and-
+	// forget; a schedd down while a drain event landed recovers via
+	// this path). Cooldown + per-tick cap are bound as parameters so
+	// the live watcher and cold-start sweep can use different cadences
+	// if needed; the rebalancer's caller passes
+	// api.RebalanceCooldownSeconds and api.RebalanceMaxPerTickPerNode
+	// (constants in pkg/api/limits.go).
+	ListOrphanedApps(ctx context.Context, cooldownSeconds, maxPerTick int) ([]App, error)
+	// ReassignAppOwner atomically transfers app ownership from
+	// fromNodeID to toNodeID. Tier A4 / migration 00092 — the
+	// conditional UPDATE that closes the Phase-2 follow-up "apps
+	// pinned to a dead node" gap (ADR-062 §"Open follow-ups"). The
+	// UPDATE stamps reassigned_at = now() in the same statement so
+	// the two columns stay coherent. Returns ErrConflict on
+	// RowsAffected()==0 — peer already won the race, app moved to
+	// a non-parked/non-stopped status, or the row is gone. The
+	// fromNodeID predicate is load-bearing: a peer-claim-then-
+	// second-peer-claim race never silently succeeds with a stale
+	// from-node.
+	ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNodeID string) error
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)

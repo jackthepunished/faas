@@ -77,6 +77,48 @@ The `compute_node_changed` notify fires on UPDATE; the schedd's
 router refresh watcher rebuilds its dial cache and the gateway's
 per-node schedd client cache rebuilds its target URL map.
 
+### Drain behaviour — Tier A4 cross-node rebalance (ADR-064)
+
+Draining a node is now self-healing for the parked-app fleet.
+Every peer schedd consumes the `active=false` event via the
+rebalancer watcher (`pkg/sched/rebalancer.go`) and reassigns
+each parked app owned by the drained node to itself, gated by
+admission headroom + cooldown + per-tick cap (defaults: 60s
+cooldown, 50 apps per drain event — both overridable via
+`FAAS_REBALANCE_COOLDOWN_SECONDS` and
+`FAAS_REBALANCE_MAX_PER_TICK`).
+
+Apps that are `running` / `waking` / `cold_booting` /
+`snapshotting` at the moment of drain stay with the dying node
+(active-passive HA is orthogonal — the operator must let the
+node drain cleanly before shutting down). Apps past the per-tick
+cap retry on the next `compute_node_changed` event (the
+upcoming heartbeat-staleness watchdog at issue #97 §3 will
+re-fire on a different cadence, closing the gap on a stuck
+app).
+
+Observe the rebalancer's per-batch decision breakdown via the
+metric:
+
+```
+curl -s http://localhost:9100/metrics | grep schedd_rebalance_decisions_total
+```
+
+The `outcome="migrated"` counter is the success signal;
+`outcome="conflict"` is a peer winning the conditional UPDATE
+race (expected under contention); `outcome="no_headroom"` is
+the admission cap rejecting a rebalance (operator should drain
+the dead node's apps across more peers or wait for the next
+event); `outcome="cooldown"` is the per-app gate (a flap-loop
+suppression); `outcome="no_eligibility"` is the status filter
+rejecting a non-parked app.
+
+If a schedd was down while the drain notify fired, the next
+boot runs `Engine.RebalanceOrphanedApps(ctx, "")` once at
+startup — the cold-start sweep reconciles every orphan
+regardless of which dead node owned it, so an interrupted
+drain doesn't leave apps permanently pinned to the dead node.
+
 ## Adding a second compute node
 
 The minimum operator surface for cutting over a second compute
@@ -179,11 +221,28 @@ rolling back is local:
    ```bash
    psql -c "UPDATE compute_nodes SET active = false WHERE name = 'fsn-2';"
    ```
-3. **Rebind apps to a single owner.** The legacy `default-local`
-   backfill from migration 00083 stays in place; do **not** flip
-   rows manually — the chooser would just re-stamp them on the
-   next cold start. Leave the rollback at "one schedd serves
-   everyone via default-local" and triage in a follow-up PR.
+3. **Apps auto-rebalance to the surviving schedds.** Each peer
+   schedd consumes the `active=false` notify via the
+   Tier-A4 rebalancer (ADR-064) and atomically re-stamps the
+   pinned apps onto itself, gated by admission headroom and
+   capped at 50 apps per drain event (60s cooldown between
+   same-app reassignments). Excess apps past the per-tick cap
+   retry on the next `compute_node_changed` event. Verify the
+   rebalance landed:
+   ```bash
+   psql -c "SELECT name, active FROM compute_nodes;"
+   psql -c "SELECT slug, node_id, status, reassigned_at FROM apps ORDER BY slug;"
+   ```
+   The apps previously owned by the dead node should now show
+   `node_id = <surviving schedd's id>`. Confirm via the
+   metric on the surviving schedd:
+   ```bash
+   curl -s http://localhost:9100/metrics | grep schedd_rebalance_decisions_total
+   ```
+   The `outcome="migrated"` counter should equal the number of
+   apps that moved. A schedd that was down during the drain
+   catches up on its next boot via the cold-start sweep
+   (`Engine.RebalanceOrphanedApps(ctx, "")`).
 
 `vmmd`, `imaged`, `meterd`, `builderd`, `apid`, `gatewayd` are
 unaffected by the rollback.

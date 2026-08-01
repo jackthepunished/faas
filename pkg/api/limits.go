@@ -787,6 +787,27 @@ const (
 	MinScaleInCooldownS  = 5
 	MaxScaleInCooldownS  = 86400
 
+	// Tier A4 (cross-node app rebalance, ADR-063 follow-up to
+	// ADR-062): pacing + per-tick cap on pkg/sched/rebalancer.go.
+	//
+	// RebalanceCooldownSeconds is the minimum gap between two
+	// successful reassignments of the same app. A flap-loop
+	// (operator toggles compute_nodes.active=false / true rapidly)
+	// is suppressed by stamping apps.reassigned_at and filtering
+	//   now() - reassigned_at < RebalanceCooldownSeconds.
+	// Defaults to 60s; tunable via FAAS_REBALANCE_COOLDOWN_SECONDS
+	// (cmd/schedd/config.go reads the env, the live watcher
+	// stamps the value through Store.ListOrphanedApps's bound
+	// parameter).
+	//
+	// RebalanceMaxPerTickPerNode caps the per-drain-event batch so
+	// a 5,000-app orphaned node doesn't monopolise the schedd
+	// worker pool. Excess apps stay pinned; the next
+	// compute_node_changed event retries (heartbeat-staleness also
+	// re-fires). Tunable via FAAS_REBALANCE_MAX_PER_TICK.
+	RebalanceCooldownSeconds   = 60
+	RebalanceMaxPerTickPerNode = 50
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 

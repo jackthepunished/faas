@@ -584,6 +584,18 @@ type OpsMetrics struct {
 	// base-stage time (pkg/imaged/base_stage.go) and re-read on
 	// every cold-boot by vmmd.
 	imageScanVulns *prometheus.CounterVec
+	// rebalanceDecisions: Tier A4 / ADR-063 cross-node app
+	// rebalance observability. Counter labelled by outcome ∈
+	// {migrated, conflict, no_headroom, cooldown,
+	// no_eligibility} — the closed set the rebalancer's batch
+	// loop can land in. The migrated label is the §12 dashboard
+	// panel (renamed per outcome, sum over 5m for the rate);
+	// the others surface in the operator runbook for triage.
+	// Single-registry: registered on every daemon (the field is
+	// unused except on schedd, but the shared struct demands it
+	// be present so /metrics doesn't show a 404 for cmd/<other>
+	// scrapes that incidentally probe the prefix).
+	rebalanceDecisions *prometheus.CounterVec
 	// githubdPathFilterTotal: issue #432 phase 5 / ADR-050
 	// §109. Counter labelled by `mode` ∈ {paths, full_fallback,
 	// truncated, error, breaker_open} — the closed set
@@ -625,6 +637,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_watchdog_kills_total",
 		Help: "Count of instances the §6.1 watchdog transitioned out of a stuck state, labelled by from→to state.",
 	}, []string{"from_state", "to_state"})
+	rebalanceDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_rebalance_decisions_total",
+		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-063), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
+	}, []string{"outcome"})
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
@@ -1363,6 +1379,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ops:                              ops,
 		dur:                              dur,
 		watchdogKills:                    watchdogKills,
+		rebalanceDecisions:               rebalanceDecisions,
 		eventsWriteFail:                  eventsWriteFail,
 		auditWriteFail:                   auditWriteFail,
 		auditWriteDur:                    auditWriteDur,
@@ -1427,6 +1444,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// RebalanceDecisions returns the per-(outcome) counter the Tier
+// A4 cross-node rebalancer (ADR-063) increments once per app
+// per drain-event. outcome ∈ {migrated, conflict, no_headroom,
+// cooldown, no_eligibility}. Same caching rules as
+// WatchdogKills — the returned Counter is safe to retain.
+func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
+	return m.rebalanceDecisions.WithLabelValues(outcome)
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log
