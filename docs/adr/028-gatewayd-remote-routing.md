@@ -1,13 +1,13 @@
 # ADR-028 · gatewayd Remote Routing via gRPC-Bridged ForwardHTTP
 
-- **Status:** accepted v1.1 (2026-07-31). Shipped via PRs #112, #113, #114, #115, #119, #122; the placeholder `host_ip:8080` is gone, `WakeResponse.node_id` is on the wire, and gatewayd's `NodeClientCache` evicts on `compute_node_changed`. v1.1 cross-references ADR-025 v1.1 and ADR-029 v1.1 — the three-axis story now reads as a unit. The §6.4 failure-mode catalogue (spec §6.4) lists the per-error-mode contract for `ForwardHTTP` (overlay partition, per-instance bridge fail, TargetSet regression guard, WakeResponse wire-shape reverts).
-- **Date:** 2026-07-22 (proposed); 2026-07-31 (accepted v1.1)
+- **Status:** accepted v1.2 (2026-08-01). Shipped via PRs #112, #113, #114, #115, #119, #122; the placeholder `host_ip:8080` is gone, `WakeResponse.node_id` is on the wire, and gatewayd's `NodeClientCache` evicts on `compute_node_changed`. v1.1 cross-references ADR-025 v1.1 and ADR-029 v1.1 — the three-axis story now reads as a unit. v1.2 (PR-D / ADR-047): the legacy unary `ForwardHTTP` RPC was removed in favour of the bidi `ForwardHTTPStream` RPC — every code path between gatewayd and vmmd now streams. The §6.4 failure-mode catalogue (spec §6.4) lists the per-error-mode contract for `ForwardHTTPStream` (overlay partition, per-instance bridge fail, TargetSet regression guard, WakeResponse wire-shape reverts).
+- **Date:** 2026-07-22 (proposed); 2026-07-31 (accepted v1.1); 2026-08-01 (accepted v1.2 — streaming supersession)
 - **Issue:** #98
 - **Decision:** Replace gatewayd's direct HTTP-to-inner-VM reverse proxy
   with an in-process HTTP→gRPC forwarder. gatewayd dials the vmmd that owns
   the instance over the overlay and bridges the bytes through vmmd's
-  ForwardHTTP RPC; vmmd nsenter's the per-instance netns and dials the
-  guest's 10.0.0.2:8080 from inside.
+  ForwardHTTPStream RPC (issue #471 / ADR-047); vmmd nsenter's the
+  per-instance netns and dials the guest's 10.0.0.2:8080 from inside.
 
 ## Context
 

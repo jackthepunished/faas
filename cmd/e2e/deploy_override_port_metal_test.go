@@ -19,7 +19,7 @@
 //	    → guest-init runAppWithEnv stamps PORT=9090
 //	    → runner binds :9090
 //	    → vmmd buildBridgeScript dials 10.0.0.2:9090 (Port=9090)
-//	    → gateway Target.Port = 9090 → ForwardHTTPRequest.Port = 9090
+//	    → gateway Target.Port = 9090 → ForwardHTTPRequestInit.Port = 9090
 //
 // A regression that drops Port at any seam trips the final
 // assertion: the gateway 200's the request only when the vmmd

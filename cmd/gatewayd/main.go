@@ -599,13 +599,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	gatewayTopNSampler := newTopNSampler(handler.Metrics(), log)
 	go gatewayTopNSampler.run(ctx)
 
-	// Issue #98 / ADR-028: install the per-node HTTP→gRPC forwarder.
-	// Backend.Target returns a compute_node.id (string-typed for
-	// backwards compat); the forwarder dereferences it via the
+	// Issue #98 / ADR-028 + ADR-047: install the per-node HTTP→gRPC
+	// forwarder. Backend.Target returns a compute_node.id (string-typed
+	// for backwards compat); the forwarder dereferences it via the
 	// per-node vmmd client cache and bridges HTTP bytes to the
-	// instance netns through vmmd's ForwardHTTP RPC. nil cache =
-	// legacy addr-based path (tests + e2e harness without vmmd
-	// overlay).
+	// instance netns through vmmd's bidi ForwardHTTPStream RPC. nil
+	// cache = legacy addr-based path (tests + e2e harness without
+	// vmmd overlay).
 	if deps.nodeCache != nil {
 		handler.WithForwarding(deps.nodeCache.Forwarding())
 	}
@@ -928,9 +928,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		if deps.nodeCache != nil {
 			// Closing every cached *grpc.ClientConn here means
-			// in-flight ForwardHTTP RPCs see a "transport closing"
-			// error → handler maps it to 502; the listener is
-			// already draining so no new requests land.
+			// in-flight ForwardHTTPStream RPCs see a "transport
+			// closing" error → handler maps it to 502; the
+			// listener is already draining so no new requests
+			// land.
 			_ = deps.nodeCache.Close()
 		}
 		return nil

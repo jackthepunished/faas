@@ -47,11 +47,11 @@ type Target struct {
 	WakeID     string
 	AddedAt    time.Time
 	// Port (issue #460 / ADR-053, PR-C) is the per-deployment
-	// override port copied from AdmitInstanceResponse.port. 0
-	// = legacy 8080 (vmmd wire-boundary default). The forwarder
-	// reads this to populate ForwardHTTPRequest.port; vmmd's
-	// buildBridgeScript resolves 0 to netns.AppPort (8080) for
-	// legacy cached targets that pre-date the field.
+	// override port copied from AdmitInstanceResponse.port. 0 =
+	// legacy 8080 (vmmd wire-boundary default). The forwarder
+	// reads this to populate ForwardHTTPRequestInit.Port; vmmd's
+	// buildStreamingBridgeScript resolves 0 to netns.AppPort (8080)
+	// for legacy cached targets that pre-date the field.
 	Port int
 }
 
@@ -135,11 +135,11 @@ type Handler struct {
 	//
 	// PR-C (issue #460 / ADR-053): the callback receives the full
 	// Target (not just the node id) so the forwarder can stamp
-	// ForwardHTTPRequest.port with the per-deployment override port
-	// the gateway cached at admit time. Legacy callers that still
-	// expect the node-id-only shape must update to func(Target)
-	// http.Handler — the wire defaulting at vmmd keeps pre-PR-C
-	// targets (Port=0) reaching 8080.
+	// ForwardHTTPRequestInit.port with the per-deployment override
+	// port the gateway cached at admit time. Legacy callers that
+	// still expect the node-id-only shape must update to
+	// func(Target) http.Handler — the wire defaulting at vmmd
+	// keeps pre-PR-C targets (Port=0) reaching 8080.
 	proxyByNode func(t Target) http.Handler
 	// topNSample is the per-request bump for the gateway-side
 	// top-N sampler (cmd/gatewayd/topn.go, issue #300). Set via
@@ -730,20 +730,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// path); the forwarder strips x-faas-* headers before
 		// bridging so the guest never sees it.
 		r.Header.Set("x-faas-stream", "true")
+		// ADR-047 PR-D: bookend the streaming concurrency gauge.
+		// setupStreamingWriter installs the per-flush onFlush hook
+		// that increments streamFlushes; this Inc opens the
+		// streamActive window, balanced by the Dec below in the
+		// defer after finalFlush. The buffered path never touches
+		// the gauge — buffered requests durate the response in a
+		// single Go-time transfer and don't participate in the
+		// streaming concurrency model.
+		if h.metrics != nil {
+			h.metrics.ObserveStreamStart(app.ID, string(app.Plan))
+		}
 	}
+	// Defer the Dec with the streaming flag captured so a panic
+	// between ObserveStreamStart and finalFlush still drains the
+	// gauge. The streaming path is the only path that incremented;
+	// the buffered path is a no-op for the Dec.
+	defer func() {
+		if streaming && h.metrics != nil {
+			h.metrics.ObserveStreamEnd(app.ID, string(app.Plan))
+		}
+	}()
 
 	wakeStart := time.Now()
 	if h.proxyByNode != nil {
 		// Issue #98 / ADR-028: Target.NodeID is the compute_node.id;
 		// the forwarder dials the per-node vmmd over the overlay and
 		// bridges the HTTP bytes through the instance netns via the
-		// ForwardHTTP RPC. target stays in scope for the metrics
-		// labels and observe() last-seen hook below.
+		// ForwardHTTPStream RPC. target stays in scope for the
+		// metrics labels and observe() last-seen hook below.
 		//
 		// PR-C (issue #460 / ADR-053): the callback receives the
 		// full Target so the forwarder can stamp
-		// ForwardHTTPRequest.port with the per-deployment override
-		// port cached at admit time.
+		// ForwardHTTPRequestInit.port with the per-deployment
+		// override port cached at admit time.
 		h.proxyByNode(target).ServeHTTP(w, r)
 	} else {
 		// Legacy addr-based path. Target.NodeID is treated as a
@@ -758,14 +778,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// streaming, apid's plan-gate (CodePlanStreamingNotAllowed)
 	// should already have rejected the request on a non-paid
 	// plan, but a misconfiguration could land a Free app with
-	// streaming_enabled=true here. h.streamingEnabled (the
-	// operator opt-in) is a separate question: PR-A emits the
-	// log when the per-app flag is set AND the upstream emitted
-	// SSE, regardless of the operator's toggle, because the
-	// per-app flag is the customer-visible contract. PR-B
-	// replaces this with the real Flusher path; PR-A keeps the
-	// log to make AC #4 observable.
-	if app.StreamingEnabled && strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
+	// streaming_enabled=true here. PR-D tightens the gate:
+	//
+	//   !streaming — the buffered path actually got used. A
+	//     valid Hobby+ SSE on the streaming path is the
+	//     normal-flush case, NOT a fallback; logging it would
+	//     be a noisy false positive.
+	//   app.Plan == PlanFree — the misconfig surface is
+	//     specifically Free+flag. Hobby/Pro/Scale plans
+	//     default streaming_enabled=true at the apid layer
+	//     (per PR-A), so the buffered path on those plans is
+	//     the operator's FAAS_GATEWAY_STREAMING flag being
+	//     off, not a customer misconfig. Log only when both
+	//     gates fire.
+	//
+	// The dedup in streamingFallbackLog keeps the hot path
+	// allocation-free after the first observation per
+	// (appID, contentType), so the log fires at most once per
+	// misconfigured app.
+	if !streaming && app.StreamingEnabled &&
+		app.Plan == api.PlanFree &&
+		strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
 		h.streamingFallbackLog(app.ID, rec.ContentType)
 	}
 	h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)

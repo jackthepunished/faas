@@ -297,9 +297,9 @@ func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
 // TestPGBackend_AdmitCarriesOverridePort pins issue #460 / ADR-053
 // (PR-C) on the gateway's caching surface: when the FakeScheduler
 // returns port=9090, the cached Target must carry that port so the
-// forwarder can stamp it onto ForwardHTTPRequest. A regression that
-// drops Target.Port would force the forwarder to dial :8080 against
-// a guest bound on :9090 — silent 503s.
+// forwarder can stamp it onto ForwardHTTPRequestInit. A regression
+// that drops Target.Port would force the forwarder to dial :8080
+// against a guest bound on :9090 — silent 503s.
 func TestPGBackend_AdmitCarriesOverridePort(t *testing.T) {
 	sched := gateway.NewFakeScheduler("n-1").
 		WithInstanceID("i-1").

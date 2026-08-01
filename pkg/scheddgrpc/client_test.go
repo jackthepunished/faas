@@ -97,8 +97,9 @@ func TestClientWake_CapacityLiftsToProblem(t *testing.T) {
 // TestClientWake_PropagatesPort pins issue #460 / ADR-053 (PR-C): the
 // per-deployment override port the engine computed must surface in
 // Client.Wake's return tuple so gatewayd callers can stamp it onto
-// ForwardHTTPRequest. The fake stub here mirrors the engine contract:
-// WakeResult.Port populated → Client.Wake's 5-tuple last value matches.
+// ForwardHTTPRequestInit. The fake stub here mirrors the engine
+// contract: WakeResult.Port populated → Client.Wake's 5-tuple last
+// value matches.
 func TestClientWake_PropagatesPort(t *testing.T) {
 	c := newClient(t, &fakeEngine{
 		wakeFn: func(context.Context, string) (sched.WakeResult, error) {

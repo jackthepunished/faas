@@ -50,15 +50,19 @@ service Vmmd {
   // fresh. Idempotent + side-effect free; no backing Manager call.
   rpc Ping(PingRequest) returns (PingResponse);
 
-  // ForwardHTTP bridges one HTTP request from gatewayd into a live
-  // instance's netns. Issue #98 / ADR-028: the gatewayd hot path speaks
-  // HTTP to vmmd over the Tailscale/Wireguard overlay (no second
-  // transport), and vmmd nsenter's the per-instance netns and dials
-  // netns.GuestIP:netns.AppPort. Body is capped at 25 MiB; response
-  // headers carry a 60s deadline; errors map to Unavailable so the
-  // gateway retries the wake on the next hop. The handler is
-  // additive — single-node deployments never call it.
-  rpc ForwardHTTP(ForwardHTTPRequest) returns (ForwardHTTPResponse);
+  // ForwardHTTPStream (issue #471 PR-B + PR-C) is the bidi bridge
+  // the gatewayd hot path uses for every request. The legacy
+  // unary ForwardHTTP was removed in PR-D (ADR-047) — the
+  // streaming RPC takes its place on every code path. The init-
+  // level `stream` field lifts the per-request body cap to 100
+  // MiB and the response deadline to 900 s on the streaming
+  // envelopes (the per-plan Hobby+ caps are on the gateway side
+  // via capWriter). (Issue #98 / ADR-028: the gatewayd hot path
+  // speaks HTTP to vmmd over the Tailscale/Wireguard overlay (no
+  // second transport), and vmmd nsenter's the per-instance netns
+  // and dials netns.GuestIP:netns.AppPort. Errors map to
+  // Unavailable so the gateway retries the wake on the next hop.)
+  //
 
   // Heartbeat lets schedd ping vmmd over the overlay. The reverse
   // direction (vmmd-pushes) was rejected because schedd is the
@@ -112,23 +116,10 @@ service Vmmd {
   // when the instance is not alive on this vmmd (nil ring).
   rpc Logs(LogsRequest) returns (stream LogsResponse);
 
-  // ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
-  // peer of ForwardHTTP. Same semantics as ForwardHTTP but the
-  // request body is sent as a stream of chunks (the first frame
-  // carries the init envelope; subsequent frames carry body bytes),
-  // and the response is returned as a stream of chunks (the first
-  // frame carries status + headers; subsequent frames carry body
-  // bytes). The bidirectional streaming lets gatewayd push the
-  // request body incrementally and pull the response body
-  // incrementally — the vmmd-side bridge script no longer needs to
-  // buffer the entire response body before sending it back.
-  //
-  // The init-level `stream` field on ForwardHTTPRequestInit lifts
-  // ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
-  // envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
-  // caps are on the gateway side via http.MaxBytesWriter). The
-  // legacy unary ForwardHTTP stays as the deprecated path for one
-  // release cycle to keep a rolling deploy green; PR-D removes it.
+  // ForwardHTTPStream is the rpc declaration; the docstring above
+  // the service block (above Ping) describes the protocol and the
+  // PR-D state. The repetition kept the comments shipped without
+  // surgery on the surrounding service-doc layout.
   rpc ForwardHTTPStream(stream ForwardHTTPStreamRequest) returns (stream ForwardHTTPStreamResponse);
 
   // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
@@ -500,9 +491,9 @@ message InstanceStats {
   // distinct from the empty wire state only by reader-side
   // Validity, not the proto. Populated by PR-B.
   int64 inflight_requests = 6;
-  // Latest ForwardHTTP start time. Zero (1970-01-01) means "no
-  // request observed yet on this instance" — the poller falls back
-  // to state.Instance.LastRequestAt in that case.
+  // Latest ForwardHTTPStream start time. Zero (1970-01-01) means
+  // "no request observed yet on this instance" — the poller falls
+  // back to state.Instance.LastRequestAt in that case.
   google.protobuf.Timestamp last_request_at = 7;
   // ADR-046 (PR-1 → PR-2): per-tick cumulative byte delta on
   // root-side vethHost.rx_bytes for this instance. Wrapper so
@@ -539,35 +530,12 @@ message PingResponse {
   google.protobuf.Timestamp server_time = 2;
 }
 
-// ForwardHTTPRequest is gatewayd→vmmd for one HTTP request. The wire
-// shape mirrors a request line + headers + body. Headers are
-// repeated for natural grpc compatibility (headers can repeat in
-// HTTP/1.1). The body is bounded by ForwardMaxBodyBytes (25 MiB) —
-// gatewayd refuses upstream bodies larger than that before sending.
-message ForwardHTTPRequest {
-  // The compute_node-relative instance id (instances.id, scoped to a
-  // node). vmmd resolves the netns from this.
-  string instance     = 1;
-  // HTTP method: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH.
-  string method       = 2;
-  // Request-target — path?query, e.g. "/api/v1/items?id=42".
-  string request_uri  = 3;
-  // Headers, in order. Each entry is one header line. Multi-valued
-  // headers are repeated (HTTP/1.1 allows). Gatewayd MUST drop
-  // hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
-  // sending — see pkg/gateway/forwardproxy.go's stripHopByHop.
-  repeated Header headers = 4;
-  // Request body. Capped at ForwardMaxBodyBytes. vmmd treats an empty
-  // body as zero-length, not missing.
-  bytes  body         = 5;
-  // port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
-  // vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
-  // zero — legacy gateway clients keep working. New gateway clients
-  // always set this explicitly from the per-app Target cached at
-  // admit time. The dial target is the inner guest IP, never the
-  // host IP, so this is purely a guest port. Additive per ADR-016.
-  uint32 port         = 6;
-}
+// ForwardHTTPRequest and ForwardHTTPResponse were removed in PR-D
+// (ADR-047). The legacy unary RPC was the original issue #98 /
+// ADR-028 bridge and stayed as a deprecated path for one cycle so
+// the rolling deploy across the vmmd fleet stayed green. PR-D
+// removes it. The streaming RPC ForwardHTTPStream below is the
+// only bridge today.
 
 // Header is one (name, value) HTTP header line. Both fields are
 // bytes-rather-than-string so non-ASCII values survive the round
@@ -577,22 +545,11 @@ message Header {
   string value = 2;
 }
 
-// ForwardHTTPResponse is what vmmd returns. Status carries the
-// numeric HTTP status code; headers are the upstream response
-// headers; body is the response body (also capped). On a vmmd-side
-// failure (cannot reach guest, guest 500, nsenter EIO) the handler
-// returns a gRPC status instead — the proto envelope here is the
-// success path only.
-message ForwardHTTPResponse {
-  int32 status   = 1;
-  repeated Header headers = 2;
-  bytes body     = 3;
-}
-
-// ForwardMaxBodyBytes is the per-request body cap (25 MiB). It matches
-// the gatewayd upstream cap (spec §13 / pkg/api.Limits.HTTPRequestMax).
-// proto3 has no top-level constants, so this is documented inline;
-// the constant lives in Go at vmmdgrpc.ForwardMaxBodyBytes.
+// ForwardMaxBodyBytes is the per-request body cap documented at
+// vmmdgrpc.ForwardMaxBodyBytes (25 MiB for the legacy unary path
+// that was removed in PR-D; the streaming RPC uses
+// ForwardStreamMaxBodyBytes = 100 MiB).
+// proto3 has no top-level constants, so this is documented inline.
 
 // HeartbeatRequest and HeartbeatResponse are intentionally empty:
 // the heartbeat is a presence-only ping. Schedd measures the round

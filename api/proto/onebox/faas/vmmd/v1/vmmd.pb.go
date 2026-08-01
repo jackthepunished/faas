@@ -1241,9 +1241,9 @@ type InstanceStats struct {
 	// distinct from the empty wire state only by reader-side
 	// Validity, not the proto. Populated by PR-B.
 	InflightRequests int64 `protobuf:"varint,6,opt,name=inflight_requests,json=inflightRequests,proto3" json:"inflight_requests,omitempty"`
-	// Latest ForwardHTTP start time. Zero (1970-01-01) means "no
-	// request observed yet on this instance" — the poller falls back
-	// to state.Instance.LastRequestAt in that case.
+	// Latest ForwardHTTPStream start time. Zero (1970-01-01) means
+	// "no request observed yet on this instance" — the poller falls
+	// back to state.Instance.LastRequestAt in that case.
 	LastRequestAt *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=last_request_at,json=lastRequestAt,proto3" json:"last_request_at,omitempty"`
 	// ADR-046 (PR-1 → PR-2): per-tick cumulative byte delta on
 	// root-side vethHost.rx_bytes for this instance. Wrapper so
@@ -1463,111 +1463,6 @@ func (x *PingResponse) GetServerTime() *timestamppb.Timestamp {
 	return nil
 }
 
-// ForwardHTTPRequest is gatewayd→vmmd for one HTTP request. The wire
-// shape mirrors a request line + headers + body. Headers are
-// repeated for natural grpc compatibility (headers can repeat in
-// HTTP/1.1). The body is bounded by ForwardMaxBodyBytes (25 MiB) —
-// gatewayd refuses upstream bodies larger than that before sending.
-type ForwardHTTPRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The compute_node-relative instance id (instances.id, scoped to a
-	// node). vmmd resolves the netns from this.
-	Instance string `protobuf:"bytes,1,opt,name=instance,proto3" json:"instance,omitempty"`
-	// HTTP method: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH.
-	Method string `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
-	// Request-target — path?query, e.g. "/api/v1/items?id=42".
-	RequestUri string `protobuf:"bytes,3,opt,name=request_uri,json=requestUri,proto3" json:"request_uri,omitempty"`
-	// Headers, in order. Each entry is one header line. Multi-valued
-	// headers are repeated (HTTP/1.1 allows). Gatewayd MUST drop
-	// hop-by-hop headers (Connection, Transfer-Encoding, etc.) before
-	// sending — see pkg/gateway/forwardproxy.go's stripHopByHop.
-	Headers []*Header `protobuf:"bytes,4,rep,name=headers,proto3" json:"headers,omitempty"`
-	// Request body. Capped at ForwardMaxBodyBytes. vmmd treats an empty
-	// body as zero-length, not missing.
-	Body []byte `protobuf:"bytes,5,opt,name=body,proto3" json:"body,omitempty"`
-	// port (issue #460 / ADR-053, PR-C) is the guest-side TCP port
-	// vmmd's bridge should dial. Defaults to netns.AppPort (8080) when
-	// zero — legacy gateway clients keep working. New gateway clients
-	// always set this explicitly from the per-app Target cached at
-	// admit time. The dial target is the inner guest IP, never the
-	// host IP, so this is purely a guest port. Additive per ADR-016.
-	Port          uint32 `protobuf:"varint,6,opt,name=port,proto3" json:"port,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ForwardHTTPRequest) Reset() {
-	*x = ForwardHTTPRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[17]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ForwardHTTPRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ForwardHTTPRequest) ProtoMessage() {}
-
-func (x *ForwardHTTPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[17]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ForwardHTTPRequest.ProtoReflect.Descriptor instead.
-func (*ForwardHTTPRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{17}
-}
-
-func (x *ForwardHTTPRequest) GetInstance() string {
-	if x != nil {
-		return x.Instance
-	}
-	return ""
-}
-
-func (x *ForwardHTTPRequest) GetMethod() string {
-	if x != nil {
-		return x.Method
-	}
-	return ""
-}
-
-func (x *ForwardHTTPRequest) GetRequestUri() string {
-	if x != nil {
-		return x.RequestUri
-	}
-	return ""
-}
-
-func (x *ForwardHTTPRequest) GetHeaders() []*Header {
-	if x != nil {
-		return x.Headers
-	}
-	return nil
-}
-
-func (x *ForwardHTTPRequest) GetBody() []byte {
-	if x != nil {
-		return x.Body
-	}
-	return nil
-}
-
-func (x *ForwardHTTPRequest) GetPort() uint32 {
-	if x != nil {
-		return x.Port
-	}
-	return 0
-}
-
 // Header is one (name, value) HTTP header line. Both fields are
 // bytes-rather-than-string so non-ASCII values survive the round
 // trip without proto-text round-trip surprises.
@@ -1581,7 +1476,7 @@ type Header struct {
 
 func (x *Header) Reset() {
 	*x = Header{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[18]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1593,7 +1488,7 @@ func (x *Header) String() string {
 func (*Header) ProtoMessage() {}
 
 func (x *Header) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[18]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1606,7 +1501,7 @@ func (x *Header) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Header.ProtoReflect.Descriptor instead.
 func (*Header) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{18}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Header) GetName() string {
@@ -1623,72 +1518,6 @@ func (x *Header) GetValue() string {
 	return ""
 }
 
-// ForwardHTTPResponse is what vmmd returns. Status carries the
-// numeric HTTP status code; headers are the upstream response
-// headers; body is the response body (also capped). On a vmmd-side
-// failure (cannot reach guest, guest 500, nsenter EIO) the handler
-// returns a gRPC status instead — the proto envelope here is the
-// success path only.
-type ForwardHTTPResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        int32                  `protobuf:"varint,1,opt,name=status,proto3" json:"status,omitempty"`
-	Headers       []*Header              `protobuf:"bytes,2,rep,name=headers,proto3" json:"headers,omitempty"`
-	Body          []byte                 `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ForwardHTTPResponse) Reset() {
-	*x = ForwardHTTPResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[19]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ForwardHTTPResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ForwardHTTPResponse) ProtoMessage() {}
-
-func (x *ForwardHTTPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[19]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ForwardHTTPResponse.ProtoReflect.Descriptor instead.
-func (*ForwardHTTPResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{19}
-}
-
-func (x *ForwardHTTPResponse) GetStatus() int32 {
-	if x != nil {
-		return x.Status
-	}
-	return 0
-}
-
-func (x *ForwardHTTPResponse) GetHeaders() []*Header {
-	if x != nil {
-		return x.Headers
-	}
-	return nil
-}
-
-func (x *ForwardHTTPResponse) GetBody() []byte {
-	if x != nil {
-		return x.Body
-	}
-	return nil
-}
-
 // HeartbeatRequest and HeartbeatResponse are intentionally empty:
 // the heartbeat is a presence-only ping. Schedd measures the round
 // trip itself; vmmd reports nothing. We keep the envelopes
@@ -1703,7 +1532,7 @@ type HeartbeatRequest struct {
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[20]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1715,7 +1544,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[20]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1728,7 +1557,7 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{20}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{18}
 }
 
 type HeartbeatResponse struct {
@@ -1739,7 +1568,7 @@ type HeartbeatResponse struct {
 
 func (x *HeartbeatResponse) Reset() {
 	*x = HeartbeatResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[21]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1751,7 +1580,7 @@ func (x *HeartbeatResponse) String() string {
 func (*HeartbeatResponse) ProtoMessage() {}
 
 func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[21]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1764,7 +1593,7 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{21}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{19}
 }
 
 // UpdateEgressAllowlistRequest is the input to UpdateEgressAllowlist.
@@ -1790,7 +1619,7 @@ type UpdateEgressAllowlistRequest struct {
 
 func (x *UpdateEgressAllowlistRequest) Reset() {
 	*x = UpdateEgressAllowlistRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[22]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1802,7 +1631,7 @@ func (x *UpdateEgressAllowlistRequest) String() string {
 func (*UpdateEgressAllowlistRequest) ProtoMessage() {}
 
 func (x *UpdateEgressAllowlistRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[22]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1815,7 +1644,7 @@ func (x *UpdateEgressAllowlistRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateEgressAllowlistRequest.ProtoReflect.Descriptor instead.
 func (*UpdateEgressAllowlistRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{22}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *UpdateEgressAllowlistRequest) GetAppId() string {
@@ -1847,7 +1676,7 @@ type UpdateEgressAllowlistAck struct {
 
 func (x *UpdateEgressAllowlistAck) Reset() {
 	*x = UpdateEgressAllowlistAck{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1859,7 +1688,7 @@ func (x *UpdateEgressAllowlistAck) String() string {
 func (*UpdateEgressAllowlistAck) ProtoMessage() {}
 
 func (x *UpdateEgressAllowlistAck) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1872,7 +1701,7 @@ func (x *UpdateEgressAllowlistAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateEgressAllowlistAck.ProtoReflect.Descriptor instead.
 func (*UpdateEgressAllowlistAck) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{23}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{21}
 }
 
 // SeccompStatusRequest is the input to SeccompStatus. Instance is
@@ -1891,7 +1720,7 @@ type SeccompStatusRequest struct {
 
 func (x *SeccompStatusRequest) Reset() {
 	*x = SeccompStatusRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1903,7 +1732,7 @@ func (x *SeccompStatusRequest) String() string {
 func (*SeccompStatusRequest) ProtoMessage() {}
 
 func (x *SeccompStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1916,7 +1745,7 @@ func (x *SeccompStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SeccompStatusRequest.ProtoReflect.Descriptor instead.
 func (*SeccompStatusRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{24}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *SeccompStatusRequest) GetInstance() string {
@@ -1958,7 +1787,7 @@ type SeccompStatusResponse struct {
 
 func (x *SeccompStatusResponse) Reset() {
 	*x = SeccompStatusResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[25]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1970,7 +1799,7 @@ func (x *SeccompStatusResponse) String() string {
 func (*SeccompStatusResponse) ProtoMessage() {}
 
 func (x *SeccompStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[25]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1983,7 +1812,7 @@ func (x *SeccompStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SeccompStatusResponse.ProtoReflect.Descriptor instead.
 func (*SeccompStatusResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{25}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SeccompStatusResponse) GetInstance() string {
@@ -2036,7 +1865,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[26]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2048,7 +1877,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[26]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2061,7 +1890,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{26}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *LogsRequest) GetInstance() string {
@@ -2097,7 +1926,7 @@ type LogsResponse struct {
 
 func (x *LogsResponse) Reset() {
 	*x = LogsResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[27]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2109,7 +1938,7 @@ func (x *LogsResponse) String() string {
 func (*LogsResponse) ProtoMessage() {}
 
 func (x *LogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[27]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2122,7 +1951,7 @@ func (x *LogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsResponse.ProtoReflect.Descriptor instead.
 func (*LogsResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{27}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LogsResponse) GetSeq() int64 {
@@ -2170,7 +1999,7 @@ type MountParentExt4ReadOnlyRequest struct {
 
 func (x *MountParentExt4ReadOnlyRequest) Reset() {
 	*x = MountParentExt4ReadOnlyRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[28]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2182,7 +2011,7 @@ func (x *MountParentExt4ReadOnlyRequest) String() string {
 func (*MountParentExt4ReadOnlyRequest) ProtoMessage() {}
 
 func (x *MountParentExt4ReadOnlyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[28]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2195,7 +2024,7 @@ func (x *MountParentExt4ReadOnlyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountParentExt4ReadOnlyRequest.ProtoReflect.Descriptor instead.
 func (*MountParentExt4ReadOnlyRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{28}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *MountParentExt4ReadOnlyRequest) GetStorageKey() string {
@@ -2223,7 +2052,7 @@ type MountParentExt4ReadOnlyResponse struct {
 
 func (x *MountParentExt4ReadOnlyResponse) Reset() {
 	*x = MountParentExt4ReadOnlyResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[29]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2235,7 +2064,7 @@ func (x *MountParentExt4ReadOnlyResponse) String() string {
 func (*MountParentExt4ReadOnlyResponse) ProtoMessage() {}
 
 func (x *MountParentExt4ReadOnlyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[29]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2248,7 +2077,7 @@ func (x *MountParentExt4ReadOnlyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountParentExt4ReadOnlyResponse.ProtoReflect.Descriptor instead.
 func (*MountParentExt4ReadOnlyResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{29}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *MountParentExt4ReadOnlyResponse) GetMountpoint() string {
@@ -2274,7 +2103,7 @@ type UmountParentExt4Request struct {
 
 func (x *UmountParentExt4Request) Reset() {
 	*x = UmountParentExt4Request{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[30]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2286,7 +2115,7 @@ func (x *UmountParentExt4Request) String() string {
 func (*UmountParentExt4Request) ProtoMessage() {}
 
 func (x *UmountParentExt4Request) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[30]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2299,7 +2128,7 @@ func (x *UmountParentExt4Request) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UmountParentExt4Request.ProtoReflect.Descriptor instead.
 func (*UmountParentExt4Request) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{30}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UmountParentExt4Request) GetMountpoint() string {
@@ -2322,7 +2151,7 @@ type UmountParentExt4Response struct {
 
 func (x *UmountParentExt4Response) Reset() {
 	*x = UmountParentExt4Response{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[31]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2334,7 +2163,7 @@ func (x *UmountParentExt4Response) String() string {
 func (*UmountParentExt4Response) ProtoMessage() {}
 
 func (x *UmountParentExt4Response) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[31]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2347,7 +2176,7 @@ func (x *UmountParentExt4Response) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UmountParentExt4Response.ProtoReflect.Descriptor instead.
 func (*UmountParentExt4Response) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{31}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{29}
 }
 
 // ForwardHTTPStreamRequest (issue #471 PR-B + PR-C) is one frame
@@ -2377,7 +2206,7 @@ type ForwardHTTPStreamRequest struct {
 
 func (x *ForwardHTTPStreamRequest) Reset() {
 	*x = ForwardHTTPStreamRequest{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2389,7 +2218,7 @@ func (x *ForwardHTTPStreamRequest) String() string {
 func (*ForwardHTTPStreamRequest) ProtoMessage() {}
 
 func (x *ForwardHTTPStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2402,7 +2231,7 @@ func (x *ForwardHTTPStreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardHTTPStreamRequest.ProtoReflect.Descriptor instead.
 func (*ForwardHTTPStreamRequest) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{32}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ForwardHTTPStreamRequest) GetFrame() isForwardHTTPStreamRequest_Frame {
@@ -2481,7 +2310,7 @@ type ForwardHTTPRequestInit struct {
 
 func (x *ForwardHTTPRequestInit) Reset() {
 	*x = ForwardHTTPRequestInit{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[33]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2493,7 +2322,7 @@ func (x *ForwardHTTPRequestInit) String() string {
 func (*ForwardHTTPRequestInit) ProtoMessage() {}
 
 func (x *ForwardHTTPRequestInit) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[33]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2506,7 +2335,7 @@ func (x *ForwardHTTPRequestInit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardHTTPRequestInit.ProtoReflect.Descriptor instead.
 func (*ForwardHTTPRequestInit) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{33}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ForwardHTTPRequestInit) GetInstance() string {
@@ -2570,7 +2399,7 @@ type ForwardHTTPStreamResponse struct {
 
 func (x *ForwardHTTPStreamResponse) Reset() {
 	*x = ForwardHTTPStreamResponse{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[34]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2582,7 +2411,7 @@ func (x *ForwardHTTPStreamResponse) String() string {
 func (*ForwardHTTPStreamResponse) ProtoMessage() {}
 
 func (x *ForwardHTTPStreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[34]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2595,7 +2424,7 @@ func (x *ForwardHTTPStreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardHTTPStreamResponse.ProtoReflect.Descriptor instead.
 func (*ForwardHTTPStreamResponse) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{34}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ForwardHTTPStreamResponse) GetFrame() isForwardHTTPStreamResponse_Frame {
@@ -2661,7 +2490,7 @@ type ForwardHTTPResponseInit struct {
 
 func (x *ForwardHTTPResponseInit) Reset() {
 	*x = ForwardHTTPResponseInit{}
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[35]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2673,7 +2502,7 @@ func (x *ForwardHTTPResponseInit) String() string {
 func (*ForwardHTTPResponseInit) ProtoMessage() {}
 
 func (x *ForwardHTTPResponseInit) ProtoReflect() protoreflect.Message {
-	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[35]
+	mi := &file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2686,7 +2515,7 @@ func (x *ForwardHTTPResponseInit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardHTTPResponseInit.ProtoReflect.Descriptor instead.
 func (*ForwardHTTPResponseInit) Descriptor() ([]byte, []int) {
-	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{35}
+	return file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ForwardHTTPResponseInit) GetStatus() int32 {
@@ -2817,22 +2646,10 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\n" +
 	"fc_version\x18\x01 \x01(\tR\tfcVersion\x12;\n" +
 	"\vserver_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"serverTime\"\xc8\x01\n" +
-	"\x12ForwardHTTPRequest\x12\x1a\n" +
-	"\binstance\x18\x01 \x01(\tR\binstance\x12\x16\n" +
-	"\x06method\x18\x02 \x01(\tR\x06method\x12\x1f\n" +
-	"\vrequest_uri\x18\x03 \x01(\tR\n" +
-	"requestUri\x125\n" +
-	"\aheaders\x18\x04 \x03(\v2\x1b.onebox.faas.vmmd.v1.HeaderR\aheaders\x12\x12\n" +
-	"\x04body\x18\x05 \x01(\fR\x04body\x12\x12\n" +
-	"\x04port\x18\x06 \x01(\rR\x04port\"2\n" +
+	"serverTime\"2\n" +
 	"\x06Header\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\"x\n" +
-	"\x13ForwardHTTPResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\x05R\x06status\x125\n" +
-	"\aheaders\x18\x02 \x03(\v2\x1b.onebox.faas.vmmd.v1.HeaderR\aheaders\x12\x12\n" +
-	"\x04body\x18\x03 \x01(\fR\x04body\"\x12\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"\x12\n" +
 	"\x10HeartbeatRequest\"\x13\n" +
 	"\x11HeartbeatResponse\"`\n" +
 	"\x1cUpdateEgressAllowlistRequest\x12\x15\n" +
@@ -2894,15 +2711,15 @@ const file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc = "" +
 	"\n" +
 	"WakeMethod\x12\x12\n" +
 	"\x0eWAKE_COLD_BOOT\x10\x00\x12\x10\n" +
-	"\fWAKE_RESTORE\x10\x012\x8c\v\n" +
+	"\fWAKE_RESTORE\x10\x012\xaa\n" +
+	"\n" +
 	"\x04Vmmd\x12g\n" +
 	"\x12CreateFromSnapshot\x12..onebox.faas.vmmd.v1.CreateFromSnapshotRequest\x1a!.onebox.faas.vmmd.v1.WakeResponse\x12_\n" +
 	"\x0eCreateColdBoot\x12*.onebox.faas.vmmd.v1.CreateColdBootRequest\x1a!.onebox.faas.vmmd.v1.WakeResponse\x12g\n" +
 	"\x10PauseAndSnapshot\x12,.onebox.faas.vmmd.v1.PauseAndSnapshotRequest\x1a%.onebox.faas.vmmd.v1.SnapshotResponse\x12T\n" +
 	"\aDestroy\x12#.onebox.faas.vmmd.v1.DestroyRequest\x1a$.onebox.faas.vmmd.v1.DestroyResponse\x12N\n" +
 	"\x05Stats\x12!.onebox.faas.vmmd.v1.StatsRequest\x1a\".onebox.faas.vmmd.v1.StatsResponse\x12K\n" +
-	"\x04Ping\x12 .onebox.faas.vmmd.v1.PingRequest\x1a!.onebox.faas.vmmd.v1.PingResponse\x12`\n" +
-	"\vForwardHTTP\x12'.onebox.faas.vmmd.v1.ForwardHTTPRequest\x1a(.onebox.faas.vmmd.v1.ForwardHTTPResponse\x12Z\n" +
+	"\x04Ping\x12 .onebox.faas.vmmd.v1.PingRequest\x1a!.onebox.faas.vmmd.v1.PingResponse\x12Z\n" +
 	"\tHeartbeat\x12%.onebox.faas.vmmd.v1.HeartbeatRequest\x1a&.onebox.faas.vmmd.v1.HeartbeatResponse\x12y\n" +
 	"\x15UpdateEgressAllowlist\x121.onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest\x1a-.onebox.faas.vmmd.v1.UpdateEgressAllowlistAck\x12f\n" +
 	"\rSeccompStatus\x12).onebox.faas.vmmd.v1.SeccompStatusRequest\x1a*.onebox.faas.vmmd.v1.SeccompStatusResponse\x12M\n" +
@@ -2924,7 +2741,7 @@ func file_onebox_faas_vmmd_v1_vmmd_proto_rawDescGZIP() []byte {
 }
 
 var file_onebox_faas_vmmd_v1_vmmd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
 var file_onebox_faas_vmmd_v1_vmmd_proto_goTypes = []any{
 	(WakeMethod)(0),                         // 0: onebox.faas.vmmd.v1.WakeMethod
 	(*AppSpec)(nil),                         // 1: onebox.faas.vmmd.v1.AppSpec
@@ -2944,90 +2761,84 @@ var file_onebox_faas_vmmd_v1_vmmd_proto_goTypes = []any{
 	(*InstanceStats)(nil),                   // 15: onebox.faas.vmmd.v1.InstanceStats
 	(*PingRequest)(nil),                     // 16: onebox.faas.vmmd.v1.PingRequest
 	(*PingResponse)(nil),                    // 17: onebox.faas.vmmd.v1.PingResponse
-	(*ForwardHTTPRequest)(nil),              // 18: onebox.faas.vmmd.v1.ForwardHTTPRequest
-	(*Header)(nil),                          // 19: onebox.faas.vmmd.v1.Header
-	(*ForwardHTTPResponse)(nil),             // 20: onebox.faas.vmmd.v1.ForwardHTTPResponse
-	(*HeartbeatRequest)(nil),                // 21: onebox.faas.vmmd.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),               // 22: onebox.faas.vmmd.v1.HeartbeatResponse
-	(*UpdateEgressAllowlistRequest)(nil),    // 23: onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
-	(*UpdateEgressAllowlistAck)(nil),        // 24: onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	(*SeccompStatusRequest)(nil),            // 25: onebox.faas.vmmd.v1.SeccompStatusRequest
-	(*SeccompStatusResponse)(nil),           // 26: onebox.faas.vmmd.v1.SeccompStatusResponse
-	(*LogsRequest)(nil),                     // 27: onebox.faas.vmmd.v1.LogsRequest
-	(*LogsResponse)(nil),                    // 28: onebox.faas.vmmd.v1.LogsResponse
-	(*MountParentExt4ReadOnlyRequest)(nil),  // 29: onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
-	(*MountParentExt4ReadOnlyResponse)(nil), // 30: onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
-	(*UmountParentExt4Request)(nil),         // 31: onebox.faas.vmmd.v1.UmountParentExt4Request
-	(*UmountParentExt4Response)(nil),        // 32: onebox.faas.vmmd.v1.UmountParentExt4Response
-	(*ForwardHTTPStreamRequest)(nil),        // 33: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
-	(*ForwardHTTPRequestInit)(nil),          // 34: onebox.faas.vmmd.v1.ForwardHTTPRequestInit
-	(*ForwardHTTPStreamResponse)(nil),       // 35: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
-	(*ForwardHTTPResponseInit)(nil),         // 36: onebox.faas.vmmd.v1.ForwardHTTPResponseInit
-	(*structpb.Struct)(nil),                 // 37: google.protobuf.Struct
-	(*wrapperspb.Int64Value)(nil),           // 38: google.protobuf.Int64Value
-	(*wrapperspb.DoubleValue)(nil),          // 39: google.protobuf.DoubleValue
-	(*timestamppb.Timestamp)(nil),           // 40: google.protobuf.Timestamp
+	(*Header)(nil),                          // 18: onebox.faas.vmmd.v1.Header
+	(*HeartbeatRequest)(nil),                // 19: onebox.faas.vmmd.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),               // 20: onebox.faas.vmmd.v1.HeartbeatResponse
+	(*UpdateEgressAllowlistRequest)(nil),    // 21: onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
+	(*UpdateEgressAllowlistAck)(nil),        // 22: onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
+	(*SeccompStatusRequest)(nil),            // 23: onebox.faas.vmmd.v1.SeccompStatusRequest
+	(*SeccompStatusResponse)(nil),           // 24: onebox.faas.vmmd.v1.SeccompStatusResponse
+	(*LogsRequest)(nil),                     // 25: onebox.faas.vmmd.v1.LogsRequest
+	(*LogsResponse)(nil),                    // 26: onebox.faas.vmmd.v1.LogsResponse
+	(*MountParentExt4ReadOnlyRequest)(nil),  // 27: onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
+	(*MountParentExt4ReadOnlyResponse)(nil), // 28: onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
+	(*UmountParentExt4Request)(nil),         // 29: onebox.faas.vmmd.v1.UmountParentExt4Request
+	(*UmountParentExt4Response)(nil),        // 30: onebox.faas.vmmd.v1.UmountParentExt4Response
+	(*ForwardHTTPStreamRequest)(nil),        // 31: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
+	(*ForwardHTTPRequestInit)(nil),          // 32: onebox.faas.vmmd.v1.ForwardHTTPRequestInit
+	(*ForwardHTTPStreamResponse)(nil),       // 33: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
+	(*ForwardHTTPResponseInit)(nil),         // 34: onebox.faas.vmmd.v1.ForwardHTTPResponseInit
+	(*structpb.Struct)(nil),                 // 35: google.protobuf.Struct
+	(*wrapperspb.Int64Value)(nil),           // 36: google.protobuf.Int64Value
+	(*wrapperspb.DoubleValue)(nil),          // 37: google.protobuf.DoubleValue
+	(*timestamppb.Timestamp)(nil),           // 38: google.protobuf.Timestamp
 }
 var file_onebox_faas_vmmd_v1_vmmd_proto_depIdxs = []int32{
 	2,  // 0: onebox.faas.vmmd.v1.AppSpec.sealed_env:type_name -> onebox.faas.vmmd.v1.SealedSecret
 	3,  // 1: onebox.faas.vmmd.v1.AppSpec.api_env:type_name -> onebox.faas.vmmd.v1.APIEnvEntry
 	0,  // 2: onebox.faas.vmmd.v1.WakeResponse.method:type_name -> onebox.faas.vmmd.v1.WakeMethod
 	0,  // 3: onebox.faas.vmmd.v1.WakeResponse.requested_method:type_name -> onebox.faas.vmmd.v1.WakeMethod
-	37, // 4: onebox.faas.vmmd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
-	37, // 5: onebox.faas.vmmd.v1.WakeResponse.characterization:type_name -> google.protobuf.Struct
+	35, // 4: onebox.faas.vmmd.v1.WakeResponse.problem:type_name -> google.protobuf.Struct
+	35, // 5: onebox.faas.vmmd.v1.WakeResponse.characterization:type_name -> google.protobuf.Struct
 	1,  // 6: onebox.faas.vmmd.v1.CreateFromSnapshotRequest.app:type_name -> onebox.faas.vmmd.v1.AppSpec
 	4,  // 7: onebox.faas.vmmd.v1.CreateFromSnapshotRequest.snapshot:type_name -> onebox.faas.vmmd.v1.SnapshotRef
 	1,  // 8: onebox.faas.vmmd.v1.CreateColdBootRequest.app:type_name -> onebox.faas.vmmd.v1.AppSpec
 	8,  // 9: onebox.faas.vmmd.v1.CreateColdBootRequest.build:type_name -> onebox.faas.vmmd.v1.BuildSpec
-	38, // 10: onebox.faas.vmmd.v1.StatsResponse.total_resident_bytes:type_name -> google.protobuf.Int64Value
+	36, // 10: onebox.faas.vmmd.v1.StatsResponse.total_resident_bytes:type_name -> google.protobuf.Int64Value
 	15, // 11: onebox.faas.vmmd.v1.StatsResponse.instances:type_name -> onebox.faas.vmmd.v1.InstanceStats
-	38, // 12: onebox.faas.vmmd.v1.InstanceStats.resident_bytes:type_name -> google.protobuf.Int64Value
-	39, // 13: onebox.faas.vmmd.v1.InstanceStats.cpu_pct:type_name -> google.protobuf.DoubleValue
-	39, // 14: onebox.faas.vmmd.v1.InstanceStats.cpu_seconds:type_name -> google.protobuf.DoubleValue
-	39, // 15: onebox.faas.vmmd.v1.InstanceStats.cpu_throttled_seconds:type_name -> google.protobuf.DoubleValue
-	40, // 16: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
-	38, // 17: onebox.faas.vmmd.v1.InstanceStats.net_tx_bytes:type_name -> google.protobuf.Int64Value
-	40, // 18: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
-	19, // 19: onebox.faas.vmmd.v1.ForwardHTTPRequest.headers:type_name -> onebox.faas.vmmd.v1.Header
-	19, // 20: onebox.faas.vmmd.v1.ForwardHTTPResponse.headers:type_name -> onebox.faas.vmmd.v1.Header
-	40, // 21: onebox.faas.vmmd.v1.LogsResponse.written_at:type_name -> google.protobuf.Timestamp
-	34, // 22: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPRequestInit
-	19, // 23: onebox.faas.vmmd.v1.ForwardHTTPRequestInit.headers:type_name -> onebox.faas.vmmd.v1.Header
-	36, // 24: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPResponseInit
-	19, // 25: onebox.faas.vmmd.v1.ForwardHTTPResponseInit.headers:type_name -> onebox.faas.vmmd.v1.Header
-	6,  // 26: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
-	7,  // 27: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
-	9,  // 28: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
-	11, // 29: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
-	13, // 30: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
-	16, // 31: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
-	18, // 32: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:input_type -> onebox.faas.vmmd.v1.ForwardHTTPRequest
-	21, // 33: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
-	23, // 34: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
-	25, // 35: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:input_type -> onebox.faas.vmmd.v1.SeccompStatusRequest
-	27, // 36: onebox.faas.vmmd.v1.Vmmd.Logs:input_type -> onebox.faas.vmmd.v1.LogsRequest
-	33, // 37: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:input_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
-	29, // 38: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:input_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
-	31, // 39: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:input_type -> onebox.faas.vmmd.v1.UmountParentExt4Request
-	5,  // 40: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	5,  // 41: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
-	10, // 42: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
-	12, // 43: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
-	14, // 44: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
-	17, // 45: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
-	20, // 46: onebox.faas.vmmd.v1.Vmmd.ForwardHTTP:output_type -> onebox.faas.vmmd.v1.ForwardHTTPResponse
-	22, // 47: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
-	24, // 48: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
-	26, // 49: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:output_type -> onebox.faas.vmmd.v1.SeccompStatusResponse
-	28, // 50: onebox.faas.vmmd.v1.Vmmd.Logs:output_type -> onebox.faas.vmmd.v1.LogsResponse
-	35, // 51: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:output_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
-	30, // 52: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:output_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
-	32, // 53: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:output_type -> onebox.faas.vmmd.v1.UmountParentExt4Response
-	40, // [40:54] is the sub-list for method output_type
-	26, // [26:40] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	36, // 12: onebox.faas.vmmd.v1.InstanceStats.resident_bytes:type_name -> google.protobuf.Int64Value
+	37, // 13: onebox.faas.vmmd.v1.InstanceStats.cpu_pct:type_name -> google.protobuf.DoubleValue
+	37, // 14: onebox.faas.vmmd.v1.InstanceStats.cpu_seconds:type_name -> google.protobuf.DoubleValue
+	37, // 15: onebox.faas.vmmd.v1.InstanceStats.cpu_throttled_seconds:type_name -> google.protobuf.DoubleValue
+	38, // 16: onebox.faas.vmmd.v1.InstanceStats.last_request_at:type_name -> google.protobuf.Timestamp
+	36, // 17: onebox.faas.vmmd.v1.InstanceStats.net_tx_bytes:type_name -> google.protobuf.Int64Value
+	38, // 18: onebox.faas.vmmd.v1.PingResponse.server_time:type_name -> google.protobuf.Timestamp
+	38, // 19: onebox.faas.vmmd.v1.LogsResponse.written_at:type_name -> google.protobuf.Timestamp
+	32, // 20: onebox.faas.vmmd.v1.ForwardHTTPStreamRequest.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPRequestInit
+	18, // 21: onebox.faas.vmmd.v1.ForwardHTTPRequestInit.headers:type_name -> onebox.faas.vmmd.v1.Header
+	34, // 22: onebox.faas.vmmd.v1.ForwardHTTPStreamResponse.init:type_name -> onebox.faas.vmmd.v1.ForwardHTTPResponseInit
+	18, // 23: onebox.faas.vmmd.v1.ForwardHTTPResponseInit.headers:type_name -> onebox.faas.vmmd.v1.Header
+	6,  // 24: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:input_type -> onebox.faas.vmmd.v1.CreateFromSnapshotRequest
+	7,  // 25: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:input_type -> onebox.faas.vmmd.v1.CreateColdBootRequest
+	9,  // 26: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:input_type -> onebox.faas.vmmd.v1.PauseAndSnapshotRequest
+	11, // 27: onebox.faas.vmmd.v1.Vmmd.Destroy:input_type -> onebox.faas.vmmd.v1.DestroyRequest
+	13, // 28: onebox.faas.vmmd.v1.Vmmd.Stats:input_type -> onebox.faas.vmmd.v1.StatsRequest
+	16, // 29: onebox.faas.vmmd.v1.Vmmd.Ping:input_type -> onebox.faas.vmmd.v1.PingRequest
+	19, // 30: onebox.faas.vmmd.v1.Vmmd.Heartbeat:input_type -> onebox.faas.vmmd.v1.HeartbeatRequest
+	21, // 31: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:input_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistRequest
+	23, // 32: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:input_type -> onebox.faas.vmmd.v1.SeccompStatusRequest
+	25, // 33: onebox.faas.vmmd.v1.Vmmd.Logs:input_type -> onebox.faas.vmmd.v1.LogsRequest
+	31, // 34: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:input_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamRequest
+	27, // 35: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:input_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyRequest
+	29, // 36: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:input_type -> onebox.faas.vmmd.v1.UmountParentExt4Request
+	5,  // 37: onebox.faas.vmmd.v1.Vmmd.CreateFromSnapshot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	5,  // 38: onebox.faas.vmmd.v1.Vmmd.CreateColdBoot:output_type -> onebox.faas.vmmd.v1.WakeResponse
+	10, // 39: onebox.faas.vmmd.v1.Vmmd.PauseAndSnapshot:output_type -> onebox.faas.vmmd.v1.SnapshotResponse
+	12, // 40: onebox.faas.vmmd.v1.Vmmd.Destroy:output_type -> onebox.faas.vmmd.v1.DestroyResponse
+	14, // 41: onebox.faas.vmmd.v1.Vmmd.Stats:output_type -> onebox.faas.vmmd.v1.StatsResponse
+	17, // 42: onebox.faas.vmmd.v1.Vmmd.Ping:output_type -> onebox.faas.vmmd.v1.PingResponse
+	20, // 43: onebox.faas.vmmd.v1.Vmmd.Heartbeat:output_type -> onebox.faas.vmmd.v1.HeartbeatResponse
+	22, // 44: onebox.faas.vmmd.v1.Vmmd.UpdateEgressAllowlist:output_type -> onebox.faas.vmmd.v1.UpdateEgressAllowlistAck
+	24, // 45: onebox.faas.vmmd.v1.Vmmd.SeccompStatus:output_type -> onebox.faas.vmmd.v1.SeccompStatusResponse
+	26, // 46: onebox.faas.vmmd.v1.Vmmd.Logs:output_type -> onebox.faas.vmmd.v1.LogsResponse
+	33, // 47: onebox.faas.vmmd.v1.Vmmd.ForwardHTTPStream:output_type -> onebox.faas.vmmd.v1.ForwardHTTPStreamResponse
+	28, // 48: onebox.faas.vmmd.v1.Vmmd.MountParentExt4ReadOnly:output_type -> onebox.faas.vmmd.v1.MountParentExt4ReadOnlyResponse
+	30, // 49: onebox.faas.vmmd.v1.Vmmd.UmountParentExt4:output_type -> onebox.faas.vmmd.v1.UmountParentExt4Response
+	37, // [37:50] is the sub-list for method output_type
+	24, // [24:37] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_onebox_faas_vmmd_v1_vmmd_proto_init() }
@@ -3035,11 +2846,11 @@ func file_onebox_faas_vmmd_v1_vmmd_proto_init() {
 	if File_onebox_faas_vmmd_v1_vmmd_proto != nil {
 		return
 	}
-	file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32].OneofWrappers = []any{
+	file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[30].OneofWrappers = []any{
 		(*ForwardHTTPStreamRequest_Init)(nil),
 		(*ForwardHTTPStreamRequest_BodyChunk)(nil),
 	}
-	file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[34].OneofWrappers = []any{
+	file_onebox_faas_vmmd_v1_vmmd_proto_msgTypes[32].OneofWrappers = []any{
 		(*ForwardHTTPStreamResponse_Init)(nil),
 		(*ForwardHTTPStreamResponse_BodyChunk)(nil),
 	}
@@ -3049,7 +2860,7 @@ func file_onebox_faas_vmmd_v1_vmmd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc), len(file_onebox_faas_vmmd_v1_vmmd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   36,
+			NumMessages:   34,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

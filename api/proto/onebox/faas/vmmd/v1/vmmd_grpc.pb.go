@@ -28,7 +28,6 @@ const (
 	Vmmd_Destroy_FullMethodName                 = "/onebox.faas.vmmd.v1.Vmmd/Destroy"
 	Vmmd_Stats_FullMethodName                   = "/onebox.faas.vmmd.v1.Vmmd/Stats"
 	Vmmd_Ping_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Ping"
-	Vmmd_ForwardHTTP_FullMethodName             = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTP"
 	Vmmd_Heartbeat_FullMethodName               = "/onebox.faas.vmmd.v1.Vmmd/Heartbeat"
 	Vmmd_UpdateEgressAllowlist_FullMethodName   = "/onebox.faas.vmmd.v1.Vmmd/UpdateEgressAllowlist"
 	Vmmd_SeccompStatus_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
@@ -73,15 +72,6 @@ type VmmdClient interface {
 	// handler — the two facts schedd needs to keep last_heartbeat_at
 	// fresh. Idempotent + side-effect free; no backing Manager call.
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
-	// ForwardHTTP bridges one HTTP request from gatewayd into a live
-	// instance's netns. Issue #98 / ADR-028: the gatewayd hot path speaks
-	// HTTP to vmmd over the Tailscale/Wireguard overlay (no second
-	// transport), and vmmd nsenter's the per-instance netns and dials
-	// netns.GuestIP:netns.AppPort. Body is capped at 25 MiB; response
-	// headers carry a 60s deadline; errors map to Unavailable so the
-	// gateway retries the wake on the next hop. The handler is
-	// additive — single-node deployments never call it.
-	ForwardHTTP(ctx context.Context, in *ForwardHTTPRequest, opts ...grpc.CallOption) (*ForwardHTTPResponse, error)
 	// Heartbeat lets schedd ping vmmd over the overlay. The reverse
 	// direction (vmmd-pushes) was rejected because schedd is the
 	// admission authority and shouldn't trust inbound traffic from a
@@ -130,23 +120,10 @@ type VmmdClient interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogsResponse], error)
-	// ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
-	// peer of ForwardHTTP. Same semantics as ForwardHTTP but the
-	// request body is sent as a stream of chunks (the first frame
-	// carries the init envelope; subsequent frames carry body bytes),
-	// and the response is returned as a stream of chunks (the first
-	// frame carries status + headers; subsequent frames carry body
-	// bytes). The bidirectional streaming lets gatewayd push the
-	// request body incrementally and pull the response body
-	// incrementally — the vmmd-side bridge script no longer needs to
-	// buffer the entire response body before sending it back.
-	//
-	// The init-level `stream` field on ForwardHTTPRequestInit lifts
-	// ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
-	// envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
-	// caps are on the gateway side via http.MaxBytesWriter). The
-	// legacy unary ForwardHTTP stays as the deprecated path for one
-	// release cycle to keep a rolling deploy green; PR-D removes it.
+	// ForwardHTTPStream is the rpc declaration; the docstring above
+	// the service block (above Ping) describes the protocol and the
+	// PR-D state. The repetition kept the comments shipped without
+	// surgery on the surrounding service-doc layout.
 	ForwardHTTPStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse], error)
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
@@ -251,16 +228,6 @@ func (c *vmmdClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.Cal
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PingResponse)
 	err := c.cc.Invoke(ctx, Vmmd_Ping_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *vmmdClient) ForwardHTTP(ctx context.Context, in *ForwardHTTPRequest, opts ...grpc.CallOption) (*ForwardHTTPResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ForwardHTTPResponse)
-	err := c.cc.Invoke(ctx, Vmmd_ForwardHTTP_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -384,15 +351,6 @@ type VmmdServer interface {
 	// handler — the two facts schedd needs to keep last_heartbeat_at
 	// fresh. Idempotent + side-effect free; no backing Manager call.
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
-	// ForwardHTTP bridges one HTTP request from gatewayd into a live
-	// instance's netns. Issue #98 / ADR-028: the gatewayd hot path speaks
-	// HTTP to vmmd over the Tailscale/Wireguard overlay (no second
-	// transport), and vmmd nsenter's the per-instance netns and dials
-	// netns.GuestIP:netns.AppPort. Body is capped at 25 MiB; response
-	// headers carry a 60s deadline; errors map to Unavailable so the
-	// gateway retries the wake on the next hop. The handler is
-	// additive — single-node deployments never call it.
-	ForwardHTTP(context.Context, *ForwardHTTPRequest) (*ForwardHTTPResponse, error)
 	// Heartbeat lets schedd ping vmmd over the overlay. The reverse
 	// direction (vmmd-pushes) was rejected because schedd is the
 	// admission authority and shouldn't trust inbound traffic from a
@@ -441,23 +399,10 @@ type VmmdServer interface {
 	// Backpressure flows through gRPC's natural flow control. NotFound
 	// when the instance is not alive on this vmmd (nil ring).
 	Logs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error
-	// ForwardHTTPStream (issue #471 PR-B + PR-C) is the server-streaming
-	// peer of ForwardHTTP. Same semantics as ForwardHTTP but the
-	// request body is sent as a stream of chunks (the first frame
-	// carries the init envelope; subsequent frames carry body bytes),
-	// and the response is returned as a stream of chunks (the first
-	// frame carries status + headers; subsequent frames carry body
-	// bytes). The bidirectional streaming lets gatewayd push the
-	// request body incrementally and pull the response body
-	// incrementally — the vmmd-side bridge script no longer needs to
-	// buffer the entire response body before sending it back.
-	//
-	// The init-level `stream` field on ForwardHTTPRequestInit lifts
-	// ForwardMaxBodyBytes and forwardResponseTimeout to the streaming
-	// envelopes (100 MiB / 900 s on the free tier; the per-plan Hobby+
-	// caps are on the gateway side via http.MaxBytesWriter). The
-	// legacy unary ForwardHTTP stays as the deprecated path for one
-	// release cycle to keep a rolling deploy green; PR-D removes it.
+	// ForwardHTTPStream is the rpc declaration; the docstring above
+	// the service block (above Ping) describes the protocol and the
+	// PR-D state. The repetition kept the comments shipped without
+	// surgery on the surrounding service-doc layout.
 	ForwardHTTPStream(grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]) error
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
@@ -525,9 +470,6 @@ func (UnimplementedVmmdServer) Stats(context.Context, *StatsRequest) (*StatsResp
 }
 func (UnimplementedVmmdServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
-}
-func (UnimplementedVmmdServer) ForwardHTTP(context.Context, *ForwardHTTPRequest) (*ForwardHTTPResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ForwardHTTP not implemented")
 }
 func (UnimplementedVmmdServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
@@ -679,24 +621,6 @@ func _Vmmd_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Vmmd_ForwardHTTP_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ForwardHTTPRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(VmmdServer).ForwardHTTP(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Vmmd_ForwardHTTP_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(VmmdServer).ForwardHTTP(ctx, req.(*ForwardHTTPRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _Vmmd_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HeartbeatRequest)
 	if err := dec(in); err != nil {
@@ -835,10 +759,6 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Ping",
 			Handler:    _Vmmd_Ping_Handler,
-		},
-		{
-			MethodName: "ForwardHTTP",
-			Handler:    _Vmmd_ForwardHTTP_Handler,
 		},
 		{
 			MethodName: "Heartbeat",

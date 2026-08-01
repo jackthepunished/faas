@@ -1,8 +1,13 @@
 // Tests for the gatewayd Handler × ForwardingReverseProxy integration
-// (issue #98 / ADR-028). The unit tests in forwardproxy_test.go pin
-// the forwarder in isolation; this file pins the seam — when the
+// (issue #98 / ADR-028 / ADR-047). The unit tests in forwardproxy_test.go
+// pin the forwarder in isolation; this file pins the seam — when the
 // Handler has proxyByNode installed, every request dispatches
-// through it. The legacy proxyFor path stays untouched.
+// through it.
+//
+// PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
+// stubVmmdClient now drives the bidi ForwardHTTPStream RPC via the
+// in-package proxy_stub.go fake. The streaming-only shape keeps
+// the integration test on one consistent bridge.
 //
 // What this test exercises:
 //   1. proxyByNode != nil + Backend.Target returns a node id → the
@@ -42,21 +47,28 @@ import (
 // stubVmmdClient is the in-package fake for the handler-side seam
 // test. forwardproxy_test.go's fakeVmmdClient lives in
 // package gateway_test and isn't reachable from here. This stub
-// satisfies the full vmmdpb.VmmdClient interface (ForwardHTTP +
-// the other RPCs the cache might exercise on shutdown) so the
+// satisfies the full vmmdpb.VmmdClient interface (ForwardHTTPStream
+// + the other RPCs the cache might exercise on shutdown) so the
 // NodeClientLookup can hand it back without an interface-conversion
 // error.
+//
+// PR-D / ADR-047: the streaming RPC is the only bridge today. The
+// stub dispatches ForwardHTTPStream through a bufconn-based fake
+// server (proxy_stub.go) that records the request init and writes
+// a fixed response body — the integration test asserts the body
+// reaches the inbound ResponseWriter and the init was sent.
 type stubVmmdClient struct {
 	mu    sync.Mutex
-	calls []*vmmdpb.ForwardHTTPRequest
-	resp  *vmmdpb.ForwardHTTPResponse
+	calls []*vmmdpb.ForwardHTTPRequestInit
+	resp  *vmmdpb.ForwardHTTPResponseInit
+	body  []byte
 }
 
-func (s *stubVmmdClient) ForwardHTTP(_ context.Context, in *vmmdpb.ForwardHTTPRequest, _ ...grpc.CallOption) (*vmmdpb.ForwardHTTPResponse, error) {
+func (s *stubVmmdClient) ForwardHTTPStream(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, in)
-	return s.resp, nil
+	stream := newProxyStubStream(ctx, &s.calls, s.resp, s.body)
+	return stream, nil
 }
 
 func (s *stubVmmdClient) CreateFromSnapshot(context.Context, *vmmdpb.CreateFromSnapshotRequest, ...grpc.CallOption) (*vmmdpb.WakeResponse, error) {
@@ -95,18 +107,6 @@ func (s *stubVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEg
 // that touches the codepath fails fast with a stable gRPC code.
 func (s *stubVmmdClient) Logs(context.Context, *vmmdpb.LogsRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[vmmdpb.LogsResponse], error) {
 	return nil, status.Error(codes.Unimplemented, "gateway stub does not stream logs")
-}
-
-// ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047). The
-// gateway hot path uses this on the streaming response path;
-// the unit-test handler suite doesn't drive the streaming
-// codepath today (the streaming e2e lives in cmd/e2e with
-// //go:build metal). Returning Unimplemented keeps any
-// accidental test firing the codepath honest: the test
-// either flips the stub to drive a fake bidi stream or the
-// caller fixes itself to use the unary ForwardHTTP.
-func (s *stubVmmdClient) ForwardHTTPStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
-	return nil, status.Error(codes.Unimplemented, "gateway stub does not stream HTTP")
 }
 
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
@@ -160,10 +160,10 @@ func (nopCloserFn) Close() error { return nil }
 
 func TestHandler_DispatchesThroughProxyByNode(t *testing.T) {
 	cli := &stubVmmdClient{
-		resp: &vmmdpb.ForwardHTTPResponse{
+		resp: &vmmdpb.ForwardHTTPResponseInit{
 			Status: 200,
-			Body:   []byte("forwarded:ok"),
 		},
+		body: []byte("forwarded:ok"),
 	}
 	lookup := &stubLookup{cli: cli}
 	b := &fakeBackend{
@@ -225,7 +225,9 @@ func TestHandler_WithoutForwardingFallsBackToProxyFor(t *testing.T) {
 }
 
 func TestHandler_LookupMissStill404sBeforeProxy(t *testing.T) {
-	cli := &stubVmmdClient{resp: &vmmdpb.ForwardHTTPResponse{Status: 200}}
+	cli := &stubVmmdClient{
+		resp: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+	}
 	lookup := &stubLookup{cli: cli}
 	b := &fakeBackend{app: App{ID: "app-1", Plan: api.PlanScale}, host: "app.example.com", running: true}
 	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
