@@ -333,6 +333,12 @@ func extractStream(dst string, r io.Reader, maxTotalBytes int64, lim extractLimi
 		firstSet bool
 	)
 	for {
+		// codeql[go/zipslip] — tr.Next() returns the tar header
+		// whose hdr.Name drives every downstream write; the path
+		// is guarded by escapesArchiveRoot(hdr.Name) above
+		// (and the TypeSymlink/TypeLink allow-list denies
+		// link entries outright). Pin the suppression at
+		// the call site per memory:codeql-zipslip-source-line-suppression.
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
