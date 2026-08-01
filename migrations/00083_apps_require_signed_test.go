@@ -164,7 +164,14 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 
 	// (9) Cascade-on-account-delete: drop the seeded account, the
 	// trusted-signer row should follow (account_id FK ON DELETE
-	// CASCADE).
+	// CASCADE). The apps.account_id FK would otherwise block the
+	// delete, so the test removes the app first, mirroring the
+	// production DeleteApp cleanup order.
+	if _, err := pool.Exec(ctx, `
+		delete from apps where id = '00000000-0000-0000-0000-000000000183'
+	`); err != nil {
+		t.Fatalf("delete app: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		delete from accounts where id = '00000000-0000-0000-0000-000000000083'
 	`); err != nil {
