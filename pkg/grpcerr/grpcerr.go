@@ -39,7 +39,15 @@ func codeToGRPC(code string) codes.Code {
 		api.CodeSourceTooLarge,
 		api.CodeAppLayerTooBig,
 		api.CodeQuotaExhausted,
-		api.CodeCapacity:
+		api.CodeCapacity,
+		api.CodeWaitForWarm:
+		// CodeWaitForWarm (PR-D, issue #462) is a 503 on the HTTP
+		// surface and ResourceExhausted on gRPC. The gRPC code is
+		// the lossy carrier — the HTTP status is re-derived from
+		// api.StatusForCode on the FromStatus side. Shared class
+		// with CodePlanLimitConcur is fine: the inverse-lift reads
+		// the Code field on the Problem and dispatches the right
+		// HTTP status (503 vs 429).
 		return codes.ResourceExhausted
 	case api.CodeBuildUndetected,
 		api.CodeValidation:

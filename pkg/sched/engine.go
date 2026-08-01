@@ -2255,21 +2255,13 @@ func (e *Engine) atMinFloorWithNoSignal(app *state.App, concurrency int) bool {
 }
 
 // cooldownSRemaining (PR-D, issue #462) returns the seconds
-// until the per-app scale-out cooldown expires. The wire
-// Retry-After header is bounded at 1 (cooldownS <= 0 is treated
-// as 1) so the wire always emits a non-zero hint. RFC 7231
-// §7.1.3 forbids 0/negative values; the bound is also a
-// load-bearing UX guarantee — clients that consult the header
-// need a positive integer to back off correctly.
-//
-// The "cold-start bypass" loaded in PR-C's admitGate
-// (concurrency == 0 OR LastScaleOutAt == nil) is what makes
-// this helper safe to call: the gate only fires when there
-// is a real stamp AND live concurrency, so the helper's
-// LastScaleOutAt == nil branch is unreachable from the wake
-// path. It's defensive — the caller is the gate's
-// wakeCooldownHeld branch, which already validated the
-// preconditions.
+// until the per-app scale-out cooldown expires. Bounded at 1
+// (cooldownS <= 0 is treated as 1) so the wire always emits
+// a non-zero hint. RFC 7231 §7.1.3 forbids 0/negative values;
+// the bound is a load-bearing UX guarantee — clients that
+// consult the header need a positive integer to back off
+// correctly. Caller must have validated the stamp and
+// concurrency preconditions (admitGate's wakeCooldownHeld).
 func cooldownSRemaining(app *state.App, now time.Time) int {
 	if app.LastScaleOutAt == nil {
 		return 1
