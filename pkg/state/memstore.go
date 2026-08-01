@@ -5732,28 +5732,36 @@ func (m *MemStore) CountAppEnv(_ context.Context, accountID, appID string) (int,
 // row. On conflict only cosign_public_key + added_by_account_id refresh;
 // AddedAt stays at the original write so the audit trail distinguishes
 // "created" from "rotated" (matches PgStore.on conflict do update).
-func (m *MemStore) UpsertAppTrustedSigner(_ context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) error {
+//
+// Returns (addedAt, rotated, err). Rotated=true means this was an
+// update on an existing row (audit emits app.trusted_signer_rotated);
+// rotated=false means this was a fresh insert. The addedAt returned
+// is the original write timestamp, preserved across rotations.
+// Mirrors PgStore's `(xmax = 0)` detection — there is no second
+// SELECT race.
+func (m *MemStore) UpsertAppTrustedSigner(_ context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) (time.Time, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := trustedSignerKey{AppID: appID, SignerName: signerName}
 	if existing, ok := m.trustedSigners[k]; ok {
 		if existing.AccountID != accountID {
-			return ErrNotFound
+			return time.Time{}, false, ErrNotFound
 		}
 		existing.CosignPublicKey = pubKey
 		existing.AddedByAccountID = addedByAccountID
 		m.trustedSigners[k] = existing
-		return nil
+		return existing.AddedAt, true, nil
 	}
+	now := time.Now()
 	m.trustedSigners[k] = AppTrustedSigner{
 		AccountID:        accountID,
 		AppID:            appID,
 		SignerName:       signerName,
 		CosignPublicKey:  pubKey,
-		AddedAt:          time.Now(),
+		AddedAt:          now,
 		AddedByAccountID: addedByAccountID,
 	}
-	return nil
+	return now, false, nil
 }
 
 // DeleteAppTrustedSigner removes the (app_id, signer_name) row scoped to
@@ -5780,6 +5788,25 @@ func (m *MemStore) ListAppTrustedSigners(_ context.Context, accountID, appID str
 	var out []AppTrustedSigner
 	for _, r := range m.trustedSigners {
 		if r.AppID != appID || r.AccountID != accountID {
+			continue
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SignerName < out[j].SignerName })
+	return out, nil
+}
+
+// ListAppTrustedSignersForApp is the system-side sibling of
+// ListAppTrustedSigners: takes only appID. Used by the on-disk
+// mirror writer (cmd/apid/trusted_publisher_writer.go). Same
+// order (signer_name ASC) and shape as the accountID-scoped
+// sibling.
+func (m *MemStore) ListAppTrustedSignersForApp(_ context.Context, appID string) ([]AppTrustedSigner, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppTrustedSigner
+	for _, r := range m.trustedSigners {
+		if r.AppID != appID {
 			continue
 		}
 		out = append(out, r)

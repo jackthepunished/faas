@@ -77,8 +77,15 @@ type Handler struct {
 	// hot path (every signed deploy reads once); refreshes are
 	// rare (operator onboards a publisher). A sync.RWMutex keeps
 	// the verify path lock-free for the read side.
-	trustedPublishersMu    sync.RWMutex
-	trustedPublishersCache []cosign.TrustedPublisher
+	//
+	// The cache is keyed by app.ID so the verify path can filter
+	// by app at call time without re-reading the dir. Empty value
+	// for an app means "no publishers for this app" (the
+	// fail-closed case). Missing key means "we haven't loaded this
+	// app yet" — first deploy pays the dir-load cost.
+	trustedPublishersMu      sync.RWMutex
+	trustedPublishersCache   map[string][]cosign.TrustedPublisher
+	trustedPublishersCacheOK bool
 
 	// guestInitPath is the absolute path to the static guest-init binary
 	// injected as /sbin/init in every per-app ext4 (spec §4.8). Wired from
@@ -210,39 +217,62 @@ func (h *Handler) WithTrustedPublishersDir(dir string) *Handler {
 	return h
 }
 
-// refreshTrustedPublishers re-reads the trust dir into the in-memory
-// cache. Triggered at startup (WithTrustedPublishersDir) and on
-// pg_notify('trusted_signer_changed'). Holds the write lock for the
-// duration of the disk read — the read is O(files) of small PEM
-// blobs (~250 bytes each), so the critical section is microseconds.
+// refreshTrustedPublishers re-reads the trust dir into the
+// in-memory cache. Triggered at startup (WithTrustedPublishersDir)
+// and on pg_notify('trusted_signer_changed'). Holds the write lock
+// for the duration of the disk read — the read is O(files) of
+// small PEM blobs (~250 bytes each), so the critical section is
+// microseconds.
+//
+// The cache is keyed by app.ID; the dir filename is
+// `<app_id>--<name>.pem`. The apid-side LISTEN goroutine is the
+// sole producer (it walks app_trusted_signers on every
+// trusted_signer_changed notify); see
+// cmd/apid/trusted_publisher_writer.go. The on-disk mirror is the
+// imaged-side read surface, the DB row is the apid-side write
+// surface. Without this refresh after a notify the verify path
+// would either fail open (stale cache) or fail closed (no entry
+// for the just-onboarded publisher).
 func (h *Handler) refreshTrustedPublishers() error {
 	if h.trustedPublishersDir == "" {
 		h.trustedPublishersMu.Lock()
 		h.trustedPublishersCache = nil
+		h.trustedPublishersCacheOK = false
 		h.trustedPublishersMu.Unlock()
 		return nil
 	}
-	pubs, err := cosign.TrustedPublishersFromDir(h.trustedPublishersDir)
+	byApp, err := cosign.TrustListFromDir(h.trustedPublishersDir)
 	if err != nil {
 		return err
 	}
 	h.trustedPublishersMu.Lock()
-	h.trustedPublishersCache = pubs
+	h.trustedPublishersCache = byApp
+	h.trustedPublishersCacheOK = true
 	h.trustedPublishersMu.Unlock()
-	h.log.Info("trusted-publishers cache refreshed", "dir", h.trustedPublishersDir, "count", len(pubs))
+	total := 0
+	for _, v := range byApp {
+		total += len(v)
+	}
+	h.log.Info("trusted-publishers cache refreshed", "dir", h.trustedPublishersDir, "apps", len(byApp), "keys", total)
 	return nil
 }
 
-// snapshotTrustedPublishers returns the cached trust list under the
-// read lock. Cheap to call on every signed deploy.
-func (h *Handler) snapshotTrustedPublishers() []cosign.TrustedPublisher {
+// snapshotTrustedPublishers returns the per-app trust list under
+// the read lock. Returns nil when the cache is empty or the daemon
+// is configured without a trust dir. Cheap to call on every signed
+// deploy (single read-lock + map lookup).
+func (h *Handler) snapshotTrustedPublishers(appID string) []cosign.TrustedPublisher {
 	h.trustedPublishersMu.RLock()
 	defer h.trustedPublishersMu.RUnlock()
-	if len(h.trustedPublishersCache) == 0 {
+	if !h.trustedPublishersCacheOK || h.trustedPublishersCache == nil {
 		return nil
 	}
-	out := make([]cosign.TrustedPublisher, len(h.trustedPublishersCache))
-	copy(out, h.trustedPublishersCache)
+	pubs, ok := h.trustedPublishersCache[appID]
+	if !ok {
+		return nil
+	}
+	out := make([]cosign.TrustedPublisher, len(pubs))
+	copy(out, pubs)
 	return out
 }
 
@@ -260,7 +290,7 @@ func (h *Handler) snapshotTrustedPublishers() []cosign.TrustedPublisher {
 // answers "request accepted but verify failed in imaged" without
 // re-deriving from deployment status.
 func (h *Handler) verifyImageSignature(ctx context.Context, app state.App, dep state.Deployment, ref string) error {
-	pubs := h.snapshotTrustedPublishers()
+	pubs := h.snapshotTrustedPublishers(app.ID)
 	if len(pubs) == 0 {
 		// Defence-in-depth: apid's pre-flight already gated this
 		// case, but if imaged is called outside the apid pipeline

@@ -1746,7 +1746,7 @@ type Store interface {
 	// the AppEnv surface 1:1: accountID is passed for ownership
 	// verification (and to scope the IDOR guard), pubKey is the raw
 	// DER SPKI bytea, addedByAccountID is stamped on every write.
-	UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) error
+	UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) (addedAt time.Time, rotated bool, err error)
 	// DeleteAppTrustedSigner removes the (app_id, signer_name) row.
 	// Returns ErrNotFound if the row doesn't exist — handlers render
 	// 404 CodeTrustedSignerNotFound (URL resource IS the signer name).
@@ -1756,6 +1756,13 @@ type Store interface {
 	// deterministic verify-loop ordering. Returns nil slice when the
 	// app has no trusted signers — handler renders fail-closed 403.
 	ListAppTrustedSigners(ctx context.Context, accountID, appID string) ([]AppTrustedSigner, error)
+	// ListAppTrustedSignersForApp is the system-side equivalent of
+	// ListAppTrustedSigners that takes only appID. The on-disk
+	// mirror writer (cmd/apid/trusted_publisher_writer.go) is the
+	// only production caller — it doesn't have an accountID in
+	// scope (the notify payload carries app_id only). Sibling
+	// helper of ListAppTrustedSigners; same shape, same order.
+	ListAppTrustedSignersForApp(ctx context.Context, appID string) ([]AppTrustedSigner, error)
 	// CountAppTrustedSigners is the quota check helper. apid calls it
 	// before UpsertAppTrustedSigner to enforce
 	// Limits.TrustedSignerCountMax.

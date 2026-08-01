@@ -40,7 +40,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -137,7 +136,8 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		api.WriteProblem(w, prob)
 		return
 	}
-	if err := s.store.UpsertAppTrustedSigner(ctx(r), acct.ID, app.ID, name, pubKey, acct.ID); err != nil {
+	_, rotated, err := s.store.UpsertAppTrustedSigner(ctx(r), acct.ID, app.ID, name, pubKey, acct.ID)
+	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not persist trusted signer"))
 		return
 	}
@@ -155,14 +155,14 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		"account", acct.ID,
 		"key_bytes", len(pubKey),
 	)
-	// Issue #472 / ADR-054: app.trusted_signer_added / app.trusted_signer_removed
-	// are the audit taxonomy. We emit "added" on first PUT and
-	// "rotated" on subsequent PUTs of the same name — the rotate
-	// distinction matters for regulated-workload change logs
-	// (SOC 2 CC7.1 / ISO 27001 A.12.4.1). The store doesn't surface
-	// "was this an insert or an update", so we re-list to tell.
+	// Issue #472 / ADR-058: app.trusted_signer_added / app.trusted_signer_rotated
+	// are the audit taxonomy. The store returns rotated=true when
+	// the row pre-existed (the PostgreSQL `(xmax = 0)` idiom on the
+	// upsert's RETURNING gives an exact, race-free signal — no
+	// follow-up List query). The same SQL semantics is mirrored by
+	// the MemStore, so the audit classification is uniform.
 	kind := "app.trusted_signer_added"
-	if s.signerAlreadyExisted(ctx(r), acct.ID, app.ID, name, pubKey) {
+	if rotated {
 		kind = "app.trusted_signer_rotated"
 	}
 	s.audit.Emit(ctx(r), kind, &acct.ID, map[string]any{
@@ -173,33 +173,6 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 	writeJSON(w, http.StatusOK, struct {
 		Name string `json:"name"`
 	}{Name: name})
-}
-
-// signerAlreadyExisted inspects the just-upserted row to distinguish
-// "added" from "rotated". added_at is the only stable signal: if the
-// pre-write mtime is older than ~1s ago, the row was already there.
-// We re-read via ListAppTrustedSigners and pick the matching row —
-// O(N) over a tiny N (max 16 per Scale plan), so the cost is
-// negligible against the verify-loop cost on the imaged side.
-func (s *server) signerAlreadyExisted(c ctxAlias, accountID, appID, name string, _ []byte) bool {
-	rows, err := s.store.ListAppTrustedSigners(c, accountID, appID)
-	if err != nil {
-		return false
-	}
-	for _, r := range rows {
-		if r.SignerName != name {
-			continue
-		}
-		// If added_at is more than 1 second in the past, the row
-		// pre-dates this request — it's a rotation. We use a
-		// 1-second window so a normal request that crosses a
-		// second-boundary doesn't get misclassified.
-		if !r.AddedAt.IsZero() && time.Since(r.AddedAt) > time.Second {
-			return true
-		}
-		return false
-	}
-	return false
 }
 
 // checkTrustedSignerQuota mirrors checkEnvQuota 1:1 — re-PUTs of an

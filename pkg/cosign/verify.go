@@ -45,7 +45,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // DefaultTrustedPublishersDir is the canonical location for the
@@ -242,3 +246,77 @@ func hexByte(c byte) (byte, bool) {
 		return 0, false
 	}
 }
+
+// TrustListFromDir reads every `<app_id>--<name>.pem` file in dir
+// and returns the per-app trust list. Filename format is the
+// apid-side writer's contract (cmd/apid/trusted_publisher_writer.go):
+// the leading 36-char UUID segment is the app_id, the trailing
+// segment is the operator-chosen signer_name (DNS-1123-label style,
+// matching the DB CHECK app_trusted_signers_name_shape).
+//
+// Sort order within each app is alphabetical by signer_name so the
+// cache is deterministic across refreshes (handy for tests; the
+// verify path is independent of order — ECDSA verify is commutative).
+//
+// Empty dir / missing dir → (nil, nil). Malformed filename
+// (missing the `--` separator, app_id not a valid UUID, name
+// violating the DNS-1123-label pattern) is skipped with a warning
+// shape but currently does not surface to the caller — the apid
+// writer is the only producer, so a malformed filename is a bug
+// in the writer, not a production data input.
+func TrustListFromDir(dir string) (map[string][]TrustedPublisher, error) {
+	if dir == "" {
+		return nil, errors.New("cosign: empty trusted-publishers dir")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cosign: read trusted-publishers dir %q: %w", dir, err)
+	}
+	byApp := map[string][]TrustedPublisher{}
+	const sep = "--"
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".pem") {
+			continue
+		}
+		stem := strings.TrimSuffix(name, ".pem")
+		idx := strings.Index(stem, sep)
+		if idx <= 0 || idx == len(stem)-len(sep) {
+			// Malformed — skip silently. The apid writer is the
+			// only producer and would never emit this shape; the
+			// skip is a defence against hand-edited files.
+			continue
+		}
+		appID := stem[:idx]
+		signer := stem[idx+len(sep):]
+		if _, err := uuid.Parse(appID); err != nil {
+			continue
+		}
+		if !dns1123LabelPattern.MatchString(signer) {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		pub, err := LoadPublicKeyFile(full)
+		if err != nil {
+			return nil, fmt.Errorf("cosign: load trusted publisher %q: %w", full, err)
+		}
+		byApp[appID] = append(byApp[appID], TrustedPublisher{Name: signer, PublicKey: pub})
+	}
+	for appID := range byApp {
+		sort.Slice(byApp[appID], func(i, j int) bool {
+			return byApp[appID][i].Name < byApp[appID][j].Name
+		})
+	}
+	return byApp, nil
+}
+
+// dns1123LabelPattern mirrors the DB CHECK
+// app_trusted_signers_name_shape (migration 00083). Kept local so
+// pkg/cosign doesn't import pkg/state for the regex.
+var dns1123LabelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)

@@ -119,6 +119,48 @@ P-256 r||s over the 32-byte SHA-256 of the manifest digest).
 Rekor transparency log verification is out of scope per the
 issue body; it surfaces as a follow-up if a customer asks for it.
 
+## Wire format (operator contract)
+
+The verify path expects a **raw 64-byte ECDSA P-256 r||s signature
+over the 32-byte SHA-256 digest of the manifest** — NOT the
+cosign v2 JSON envelope (Rekor bundle, plain sig, or certificate).
+
+This is the same wire format as the build-side
+`pkg/cosign/verifier.go::verifyDigest` (ECDSAP256Raw signing /
+verification). The signature MUST be reachable via the OCI
+content-addressed blob endpoint at the manifest's digest.
+
+Operators MUST sign with a tooling that emits this raw shape — the
+official `cosign sign` CLI emits the cosign v2 JSON envelope as a
+*tagged* `sha256-<hex>.sig` artifact, which the platform's
+verify path does NOT parse. Recommended signers (in priority
+order):
+
+1. **`cosign sign --output-signature=signature.sig --key <key>`** then
+   push the signature blob with the manifest digest as the OCI tag
+   (manually, e.g. `crane blob push <registry>/<image>@sha256-<manifest-hex>.sig signature.sig`).
+2. **A custom OCI signing CLI** that emits the raw 64-byte signature
+   blob and pushes it via the registry's content-addressed blob endpoint.
+3. **`rekor-cli`** — see `rekor-cli` docs for the raw signature
+   emission flow.
+
+The verify path returns `ErrSignatureInvalid` (NOT
+`ErrSignatureMissing`) when the signature blob is present but
+fails ECDSA verification. Operators hitting this 403 should:
+
+- Confirm the signing tool emitted raw r||s (not JSON envelope).
+- Confirm the trusted publisher's public key DER bytes match the
+  signing tool's `--key` argument.
+- Confirm the signature was pushed to the manifest's digest path,
+  not the cosign v2 `sha256-<hex>.sig` tag location.
+
+This is a deliberate deviation from the cosign v2 standard. The
+trade-off is documented in `## Why not the full cosign CLI / sigstore-go bundle?`
+above — we keep the verifier primitive to keep the deploy-time
+dependency surface minimal. A follow-up issue will add full
+cosign v2 envelope parsing (with Rekor bundle verification) when
+a customer asks for it.
+
 ## What this PR is NOT
 
 - **Not KMS-backed signing.** ADR-039 / Phase 4 covers the

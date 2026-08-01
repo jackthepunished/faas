@@ -93,7 +93,7 @@ func seedTrustedSigner(t *testing.T, e testEnv, appID, signerName string) {
 	for i := range der {
 		der[i] = 0xAA
 	}
-	if err := e.store.UpsertAppTrustedSigner(testCtx(), e.acct.ID, appID, signerName, der, e.acct.ID); err != nil {
+	if _, _, err := e.store.UpsertAppTrustedSigner(testCtx(), e.acct.ID, appID, signerName, der, e.acct.ID); err != nil {
 		t.Fatalf("UpsertAppTrustedSigner: %v", err)
 	}
 }

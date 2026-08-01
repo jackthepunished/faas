@@ -6612,15 +6612,36 @@ func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int
 // row. On conflict the public-key blob and added_by_account_id are
 // refreshed; added_at stays at the original write so the audit trail
 // distinguishes "created" from "rotated".
-func (s *PgStore) UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) error {
-	_, err := s.pool.Exec(ctx,
+//
+// Returns (addedAt, rotated, err) where rotated=false means this
+// was a fresh insert (the audit row emits app.trusted_signer_added)
+// and rotated=true means this was an update on an existing row
+// (the audit row emits app.trusted_signer_rotated). The addedAt
+// returned is the original write timestamp, preserved across
+// rotations.
+//
+// The detection uses PostgreSQL's `(xmax = 0)` idiom: on a fresh
+// INSERT, xmax is 0 (no row to lock); on an UPDATE-via-ON CONFLICT
+// xmax is the conflicting row's xid. This is exact, race-free, and
+// does NOT require a second SELECT (the prior 1-second heuristic
+// in cmd/apid/handlers_trusted_signers.go would misclassify
+// concurrent rotations within the same second).
+func (s *PgStore) UpsertAppTrustedSigner(ctx context.Context, accountID, appID, signerName string, pubKey []byte, addedByAccountID string) (time.Time, bool, error) {
+	var addedAt time.Time
+	var isNewRow bool
+	err := s.pool.QueryRow(ctx,
 		`insert into app_trusted_signers (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
 		 values ($1, $2, $3, $4, $5)
 		 on conflict (app_id, signer_name) do update
 		   set cosign_public_key   = excluded.cosign_public_key,
-		       added_by_account_id = excluded.added_by_account_id`,
-		accountID, appID, signerName, pubKey, addedByAccountID)
-	return err
+		       added_by_account_id = excluded.added_by_account_id
+		 returning added_at, (xmax = 0) AS is_new`,
+		accountID, appID, signerName, pubKey, addedByAccountID).Scan(&addedAt, &isNewRow)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	// isNewRow=true means inserted now; rotated = !isNewRow.
+	return addedAt, !isNewRow, nil
 }
 
 // DeleteAppTrustedSigner removes the (app_id, signer_name) row scoped to
@@ -6650,6 +6671,33 @@ func (s *PgStore) ListAppTrustedSigners(ctx context.Context, accountID, appID st
 		 where account_id = $1 and app_id = $2
 		 order by signer_name asc`,
 		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppTrustedSigner
+	for rows.Next() {
+		var r AppTrustedSigner
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.SignerName, &r.CosignPublicKey, &r.AddedAt, &r.AddedByAccountID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListAppTrustedSignersForApp is the system-side sibling of
+// ListAppTrustedSigners: takes only appID, used by the on-disk
+// mirror writer (cmd/apid/trusted_publisher_writer.go) which is
+// system-side and doesn't have an accountID in scope. Same order
+// (signer_name ASC) and shape as the accountID-scoped sibling.
+func (s *PgStore) ListAppTrustedSignersForApp(ctx context.Context, appID string) ([]AppTrustedSigner, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, signer_name, cosign_public_key, added_at, added_by_account_id
+		 from app_trusted_signers
+		 where app_id = $1
+		 order by signer_name asc`,
+		appID)
 	if err != nil {
 		return nil, err
 	}
