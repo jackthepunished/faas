@@ -5784,6 +5784,24 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
 
+    Forbidden:
+      description: 'code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    AppNotFound:
+      description: 'code: app_not_found — slug does not exist for the authenticated account.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    ServerError:
+      description: 'code: capacity — server-side error; retry with backoff.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
     NoRollbackTarget:
       description: 'code: no_rollback_target — there is no superseded deployment to roll back to.'
       content:
