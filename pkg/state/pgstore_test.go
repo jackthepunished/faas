@@ -86,21 +86,27 @@ func pgStoreWithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Conte
 }
 
 // seedLiveDeploy creates account+app+live-deployment and returns their ids.
-// The optional emailSuffix disambiguates the account.email UNIQUE key when
-// a test wants multiple independent accounts (issue #470 / migration 00089
-// tests seed three deployments, one per fixture row).
+// The optional emailSuffix disambiguates the account.email UNIQUE key and
+// the optional slug disambiguates apps.slug (a global UNIQUE column, not
+// (account_id, slug)-scoped — see migrations/00001_init.sql:33) when a
+// test wants multiple independent accounts/apps (issue #470 / migration
+// 00089 tests seed three deployments, one per fixture row).
 func seedLiveDeploy(t *testing.T, s *state.PgStore, ctx context.Context, emailSuffix ...string) (acctID, appID, depID string) {
 	t.Helper()
 	suffix := ""
 	if len(emailSuffix) > 0 {
 		suffix = emailSuffix[0]
 	}
+	slug := "pg-app"
+	if len(emailSuffix) > 1 {
+		slug = "pg-app-" + emailSuffix[1]
+	}
 	acct, err := s.CreateAccount(ctx, "u"+suffix+"@example.com", api.PlanPro)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	app, err := s.CreateApp(ctx, state.App{
-		AccountID: acct.ID, Slug: "pg-app", Type: state.AppTypeApp,
+		AccountID: acct.ID, Slug: slug, Type: state.AppTypeApp,
 		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
@@ -1562,7 +1568,7 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 	// LatestSnapshot readback below can scope to that deployment.
 	var dep180 string
 	mkSnap := func(v string) string {
-		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+v)
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+v, v)
 		if v == "1.8.0" {
 			dep180 = depID
 		}
@@ -1627,7 +1633,7 @@ func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 	// Capture depB so the LatestSnapshot readback below can scope to it.
 	var depB string
 	mkSnap := func(suffix string) string {
-		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix)
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix, suffix)
 		if suffix == "b" {
 			depB = depID
 		}
@@ -1748,7 +1754,7 @@ func TestPg_ListLiveSnapshotStats_ExcludesStaleAndOrdersByMemBytesDesc(t *testin
 	// separate deployments — one per snapshot — so we get three rows
 	// (one stale, two live) without colliding on the partial index.
 	mkSnap := func(suffix string, stale bool) string {
-		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix)
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix, suffix)
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
 			StorageKey: state.SnapMemKey(depID) + "/" + suffix,
