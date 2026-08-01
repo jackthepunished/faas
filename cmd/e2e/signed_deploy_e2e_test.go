@@ -408,8 +408,8 @@ func mustAccountID(t *testing.T, h *e2etest.Harness, apiKey string) string {
 	t.Helper()
 	var id string
 	if err := h.Pool.QueryRow(context.Background(),
-		`select account_id::text from api_keys where key_value = $1`,
-		apiKey).Scan(&id); err != nil {
+		`select account_id::text from api_keys where key_sha256 = $1`,
+		api.HashAPIKey(apiKey)).Scan(&id); err != nil {
 		t.Fatalf("resolve account_id from key: %v", err)
 	}
 	return id
