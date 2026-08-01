@@ -54,7 +54,6 @@ import (
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
-	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
