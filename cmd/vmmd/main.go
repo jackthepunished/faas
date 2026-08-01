@@ -32,6 +32,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
 	"github.com/onebox-faas/faas/pkg/fcvm/netstats"
 	"github.com/onebox-faas/faas/pkg/netns"
@@ -618,8 +619,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
 	// loop entirely.
 	netCache := netstats.NewWithDefaults()
+	// Activity tracker (PR-B, issue #462): per-instance in-flight
+	// ForwardHTTP request counter, fed by vmmdgrpc.ForwardHTTP's
+	// Begin/End defer pair (forward.go) and consumed by
+	// vmmdgrpc.Server.Stats as the inflight_requests and
+	// last_request_at wire fields. PR-C reads them via
+	// instancestats.Reader.MaxInflightForApp.
+	activityTracker := activity.NewWithDefaults()
 	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
-	impl := vmmdgrpc.NewWithCPUAndNet(mgr, ops, fcVersion, log, cpuCache, netCache)
+	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(mgr, ops, fcVersion, log, cpuCache, netCache, activityTracker)
 	impl.Register(gsrv)
 
 	// Optional /metrics endpoint.
