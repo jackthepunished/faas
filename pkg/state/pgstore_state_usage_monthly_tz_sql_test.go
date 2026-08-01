@@ -129,7 +129,7 @@ func TestListInvoicesForAccount_DoesNotUseSessionTZDateTrunc(t *testing.T) {
 
 // stripSQLStaticGuardComments returns only the SQL fragments in
 // `body` that come from Go raw-string literals (the
-// `` `...` `` form), with `//` comments stripped first. The
+// “ `...` “ form), with `//` comments stripped first. The
 // doc-comments on these functions reference the buggy form to
 // document the fix (e.g. "The previous shape `minute >=
 // date_trunc('month', now())` returned …"); without the comment
