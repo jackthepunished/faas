@@ -84,16 +84,27 @@ func (s *fakeScraper) Scrape(_ context.Context) (map[string]int64, error) {
 }
 
 // fakeInstats is a minimal InstatsReader. Returns the per-app
-// max-CPU from a map; nil is the no-signal case.
+// max-CPU from byCPU; nil is the no-signal case. After PR-C
+// (issue #462) the interface also requires MaxInflightForApp —
+// byInflight is the per-app map; nil is the no-signal case.
 type fakeInstats struct {
-	byApp map[string]float64
+	byCPU      map[string]float64
+	byInflight map[string]int64
 }
 
 func (i *fakeInstats) MaxCPU(appID string) (float64, bool) {
-	if i == nil || i.byApp == nil {
+	if i == nil || i.byCPU == nil {
 		return 0, false
 	}
-	v, ok := i.byApp[appID]
+	v, ok := i.byCPU[appID]
+	return v, ok
+}
+
+func (i *fakeInstats) MaxInflightForApp(appID string) (int64, bool) {
+	if i == nil || i.byInflight == nil {
+		return 0, false
+	}
+	v, ok := i.byInflight[appID]
 	return v, ok
 }
 
@@ -174,7 +185,7 @@ func TestTrigger_NilScraperNoOp(t *testing.T) {
 	}}
 	ledger := &fakeLedger{conc: map[string]int{"rps-app": 2, "cpu-app": 2}}
 	engine := &fakeEngine{}
-	instats := &fakeInstats{byApp: map[string]float64{"cpu-app": 80}}
+	instats := &fakeInstats{byCPU: map[string]float64{"cpu-app": 80}}
 	tr := New(store, instats, nil, engine, ledger, Options{})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)

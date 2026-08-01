@@ -83,17 +83,30 @@ func (f PromScraperFunc) Scrape(ctx context.Context) (map[string]int64, error) {
 	return f(ctx)
 }
 
-// InstatsReader is the per-instance CPU signal source (PR #205). May
-// be nil at runtime — the trigger falls back to RPS-only mode and
-// ignores the CPU target. The interface is the minimal surface the
-// trigger needs; the real reader in pkg/sched/instancestats has a
-// richer SnapshotForApp signature.
+// InstatsReader is the per-instance CPU and inflight signal source
+// (PR #205 + PR-C, issue #462). May be nil at runtime — the trigger
+// falls back to RPS-only mode and ignores the CPU / inflight
+// targets. The interface is the minimal surface the trigger needs;
+// the real reader in pkg/sched/instancestats has a richer
+// SnapshotForApp signature.
 type InstatsReader interface {
 	// MaxCPU returns the max CPU% observed across live instances of
 	// appID in the most recent snapshot. Returns (0, false) when no
 	// snapshot is available yet (cold path) or when the reader is
 	// not configured for this app.
 	MaxCPU(appID string) (pct float64, ok bool)
+	// MaxInflightForApp (PR-C, issue #462) returns the max in-flight
+	// ForwardHTTP count across live instances of appID in the most
+	// recent snapshot. Returns (0, false) when no rows exist for
+	// the app. The pkg/sched/targets trigger consumes this to
+	// compare against ScalingPolicy.Target.Value for the
+	// concurrent_requests axis. The scaleup trigger itself does
+	// not currently consult it (PR-C did not add a
+	// concurrent_requests scale-up axis to scaleup — that lives in
+	// pkg/sched/targets); the interface widening is the only
+	// shared surface so callers can wire a single reader into both
+	// triggers.
+	MaxInflightForApp(appID string) (n int64, ok bool)
 }
 
 // AppStats is the snapshot of inputs the pure decide() function
