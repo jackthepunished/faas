@@ -42,8 +42,6 @@ import (
 // Stream field carries the configured fakeBidiStream; an
 // unset Stream + a drive-through call panics ("not stubbed").
 type fakeVmmdClient struct {
-	mu     sync.Mutex
-	calls  []*vmmdpb.ForwardHTTPRequestInit
 	Stream *fakeBidiStream
 }
 

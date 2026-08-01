@@ -84,22 +84,6 @@ func stripHopByHop(h http.Header) http.Header {
 	return out
 }
 
-// safeLogField strips ASCII line breaks from a request-supplied
-// string before it lands in a log line. CodeQL's go/log-injection
-// rule explicitly lists strings.Replace as a recognised sanitiser
-// (its help text shows the pattern: replace "\r" and "\n" before
-// logging); we follow that shape so the alert auto-closes. We also
-// cap at 128 bytes — instance ids are UUIDs (36 chars) and a 1 MB
-// header would otherwise turn into a multi-MB log entry.
-func safeLogField(s string) string {
-	if len(s) > 128 {
-		s = s[:128] + "…"
-	}
-	s = strings.ReplaceAll(s, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "")
-	return s
-}
-
 // ForwardingReverseProxy returns an http.Handler that forwards r to
 // the vmmd that owns the instance the node id routes to. It is the
 // post-#98 / ADR-028 replacement for defaultProxy: defaultProxy
