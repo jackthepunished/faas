@@ -48,7 +48,7 @@ func (c *RegistryClient) PullManifest(ctx context.Context, ref string) (Manifest
 	if resp.StatusCode == http.StatusUnauthorized {
 		ch := parseChallenge(resp.Header.Get("Www-Authenticate"))
 		_ = resp.Body.Close()
-		token, err := c.fetchToken(ctx, ch)
+		token, err := c.fetchToken(ctx, ch, nil)
 		if err != nil {
 			return Manifest{}, err
 		}

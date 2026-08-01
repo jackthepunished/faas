@@ -58,6 +58,30 @@ type Puller interface {
 	PullLayers(ctx context.Context, ref string) (PullLayersResult, error)
 }
 
+// AuthPuller is the additive seam for per-app private-registry Basic
+// Auth (issue #461 / ADR-062). Production RegistryClient satisfies
+// Puller AND AuthPuller; offline DefaultPuller satisfies Puller
+// (auth ignored by callers via the type-asserted fallback in imaged).
+//
+// The interface is intentionally separate from Puller so existing test
+// doubles (cmd/e2e/fakevmm, etc.) and every Puller implementation
+// across the codebase don't break. imaged type-asserts to AuthPuller
+// and falls back to the anonymous path when the assertion fails —
+// that mirrors the ManifestPuller pattern (puller.go:71).
+//
+// Pass `auth == nil` for the anonymous path; the caller's Basic Auth
+// is sourced from app_registry_credentials (imaged transiently
+// unseals the password). The handler-side egress gate
+// (`apps.egress_allowlist`) is evaluated BEFORE the credential lookup
+// so an egress-denied host fails the dial without ever touching the
+// credential.
+type AuthPuller interface {
+	Puller
+	PullDigestWithAuth(ctx context.Context, ref string, auth *BasicAuth) (string, error)
+	PullImageConfigWithAuth(ctx context.Context, ref string, auth *BasicAuth) (ImageConfig, error)
+	PullLayersWithAuth(ctx context.Context, ref string, auth *BasicAuth) (PullLayersResult, error)
+}
+
 // ManifestPuller is the M6 extension surface: production's RegistryClient
 // satisfies it; offline fakes do not. imaged's handleDeployment type-asserts
 // to ManifestPuller and falls back to the digest-only flow when the assertion
@@ -92,5 +116,21 @@ func (DefaultPuller) PullImageConfig(_ context.Context, _ string) (ImageConfig, 
 }
 
 func (DefaultPuller) PullLayers(_ context.Context, digest string) (PullLayersResult, error) {
+	return PullLayersResult{Digest: digest}, nil
+}
+
+// DefaultPuller also satisfies AuthPuller (issue #461 / ADR-062). The
+// auth argument is ignored — offline tests don't ship credentials and
+// the seam is exercised only in production via RegistryClient. Keeping
+// the auth parameter on the signature pins the AuthPuller interface.
+func (DefaultPuller) PullDigestWithAuth(_ context.Context, ref string, _ *BasicAuth) (string, error) {
+	return ref, nil
+}
+
+func (DefaultPuller) PullImageConfigWithAuth(_ context.Context, _ string, _ *BasicAuth) (ImageConfig, error) {
+	return ImageConfig{}, nil
+}
+
+func (DefaultPuller) PullLayersWithAuth(_ context.Context, digest string, _ *BasicAuth) (PullLayersResult, error) {
 	return PullLayersResult{Digest: digest}, nil
 }
