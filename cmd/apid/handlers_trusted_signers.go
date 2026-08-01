@@ -165,7 +165,7 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 	if rotated {
 		kind = "app.trusted_signer_rotated"
 	}
-	s.audit.Emit(ctx(r), kind, &acct.ID, map[string]any{
+	s.audit.Emit(ctx(r), kind, &app.ID, map[string]any{
 		"app_id":    app.ID,
 		"signer":    name,
 		"key_bytes": len(pubKey),
@@ -248,7 +248,7 @@ func (s *server) deleteTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		"signer", name,
 		"account", acct.ID,
 	)
-	s.audit.Emit(ctx(r), "app.trusted_signer_removed", &acct.ID, map[string]any{
+	s.audit.Emit(ctx(r), "app.trusted_signer_removed", &app.ID, map[string]any{
 		"app_id": app.ID,
 		"signer": name,
 	})

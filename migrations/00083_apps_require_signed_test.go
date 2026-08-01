@@ -110,7 +110,7 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
 		values ('00000000-0000-0000-0000-000000000083',
 		        '00000000-0000-0000-0000-000000000183',
-		        'Capitalised-Label', repeat(decode('aa', 'hex'), 64),
+		        'Capitalised-Label', decode(repeat('aa', 64), 'hex'),
 		        '00000000-0000-0000-0000-000000000083')
 	`); err == nil {
 		t.Errorf("trusted-signer name-shape: Capitalised-Label should be rejected by CHECK")
@@ -145,7 +145,7 @@ func TestMigrations_00083_AppsRequireSigned(t *testing.T) {
 		    (account_id, app_id, signer_name, cosign_public_key, added_by_account_id)
 		values ('00000000-0000-0000-0000-000000000083',
 		        '00000000-0000-0000-0000-000000000183',
-		        'ci-bot', repeat(decode('aa', 'hex'), 64),
+		        'ci-bot', decode(repeat('aa', 64), 'hex'),
 		        '00000000-0000-0000-0000-000000000083')
 		on conflict (app_id, signer_name) do nothing
 	`); err != nil {
