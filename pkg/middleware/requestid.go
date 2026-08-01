@@ -9,9 +9,9 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
+
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // RequestIDKey is the context key for the per-request id. Exported so
@@ -48,12 +48,12 @@ func RequestIDFrom(r *http.Request) string {
 // crypto/rand so we don't pull google/uuid just for this. On the
 // (extremely unlikely) rand.Read failure we emit zero rather than
 // panicking in the request hot path.
+//
+// Re-exported from pkg/wire so the layering reads downward — wire is
+// the transport-level home and middleware depends on it (not the other
+// way around). Behaviour is identical to the prior implementation.
 func NewRequestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "00000000000000000000000000000000"
-	}
-	return hex.EncodeToString(b[:])
+	return wire.NewRequestID()
 }
 
 // RequestID is a middleware that ensures every request has an

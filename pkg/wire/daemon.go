@@ -39,7 +39,11 @@ func Daemon(name string, fn RunFunc) {
 		return
 	}
 
-	log := Logger().With("daemon", name, "version", Version)
+	log := NewCorrelationLogger(
+		Logger().With("daemon", name, "version", Version),
+		CorrelationFields{RequestID: NewRequestID()},
+		name,
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

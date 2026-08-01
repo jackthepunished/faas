@@ -360,6 +360,16 @@ message CreateFromSnapshotRequest {
   // 100). Empty = "anonymous" admission (matches the requestTotal
   // overflow policy).
   string account_id = 5;
+  // WakeID (issue #517 / ADR-061) is the per-wake UUID minted by
+  // schedd's Engine.Wake and persisted on the instances row.
+  // vmmd stamps it onto every slog record it emits during the
+  // restore path so a single cold wake is queryable as a
+  // timeline. The runtime source of truth is the gRPC metadata
+  // key x-faas-wake-id (CorrelationFromIncoming in pkg/wire);
+  // the proto field is documented here for codegen visibility
+  // and as a synchronous-validation seam for future callers
+  // that don't read MD. Empty on a non-wake RPC (e.g. ping).
+  string wake_id = 6;
 }
 
 message CreateColdBootRequest {
@@ -377,6 +387,9 @@ message CreateColdBootRequest {
   // AccountID (issue #301, ADR-043) — same semantics as
   // CreateFromSnapshotRequest.account_id.
   string account_id = 5;
+  // WakeID (issue #517 / ADR-061) — same semantics as
+  // CreateFromSnapshotRequest.wake_id.
+  string wake_id = 6;
 }
 
 // BuildSpec identifies an instance as a builder VM. vmmd's Destroy waits for
@@ -631,9 +644,16 @@ message SeccompStatusResponse {
 // since_seq replays from a sequence number; 0 = tail from now (skip the
 // initial page and only stream new lines). The producer's ring is keyed
 // per instance so each instance carries its own monotonic Seq.
+//
+// wake_id (issue #517 / ADR-061) is the wake correlation key the caller
+// attaches so vmmd can stamp the wake id onto any log lines that
+// cross its logs handler (currently zero — the producer only emits
+// per-instance Seq/Stream/Line; the wake_id is consumed by the
+// envelope, not the line payload). Empty on a tail-only consumer.
 message LogsRequest {
   string instance = 1;
   int64  since_seq = 2;
+  string wake_id = 3;
 }
 
 // LogsResponse is one streamed log line. seq is the per-instance

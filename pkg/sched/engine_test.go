@@ -73,6 +73,14 @@ type fakeVMM struct {
 	// alone. Tests that want to exercise the SetAppWorkloadClass
 	// branch set this to a non-empty value (ObservedClass != "").
 	characterization api.CharacterizationReport
+
+	// PR-A (issue #517): correlation ctx capture. The fake records
+	// the ctx CreateColdBoot / CreateFromSnapshot / Logs received so
+	// TestEngineWake_PropagatesWakeIDToVMM can assert wake_id /
+	// app_id cross the schedd → vmmd boundary.
+	lastColdBootCtx context.Context
+	lastRestoreCtx  context.Context
+	lastLogsCtx     context.Context
 }
 
 func (f *fakeVMM) outcome(instance string, method vmmdpb.WakeMethod, requested vmmdpb.WakeMethod) *WakeOutcome {
@@ -109,6 +117,7 @@ func (f *fakeVMM) CreateColdBoot(ctx context.Context, _, instance string, app Ap
 		return nil, f.wakeErr
 	}
 	f.lastColdBootSpec = app
+	f.lastColdBootCtx = ctx
 	f.coldBoots++
 	return f.outcome(instance, vmmdpb.WakeMethod_WAKE_COLD_BOOT, vmmdpb.WakeMethod_WAKE_COLD_BOOT), nil
 }
@@ -139,6 +148,7 @@ func (f *fakeVMM) CreateFromSnapshot(ctx context.Context, _, instance string, ap
 	}
 	f.lastRestoreSpec = app
 	f.lastSnapRef = ref
+	f.lastRestoreCtx = ctx
 	f.restores++
 	method := vmmdpb.WakeMethod_WAKE_RESTORE
 	if f.forceColdFallback {
@@ -215,7 +225,10 @@ func (f *fakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []neti
 // Logs (issue #254 / Move 4) — engine tests don't drive the
 // log stream path; the scheddgrpc handler tests do. Returns a
 // closed fakeLogStream so any accidental caller exits cleanly.
-func (f *fakeVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+func (f *fakeVMM) Logs(ctx context.Context, _, _ string, _ int64) (LogStream, error) {
+	f.mu.Lock()
+	f.lastLogsCtx = ctx
+	f.mu.Unlock()
 	return &fakeLogStream{}, nil
 }
 
@@ -822,6 +835,73 @@ func TestEngineWake_ColdBootPersistsObservedClass(t *testing.T) {
 	}
 	if got.WorkloadClass != state.WorkloadClassGraphQL {
 		t.Errorf("observed class = %q, want %q", got.WorkloadClass, state.WorkloadClassGraphQL)
+	}
+}
+
+// TestEngineWake_PropagatesWakeIDToVMM (PR-A, issue #517) asserts the
+// engine lifts wake_id / app_id / deployment_id from its inbound ctx
+// (set by gatewayd via the request middleware) and forwards them on
+// the ctx passed to vmmd's CreateColdBoot. This is the half of the
+// AC1 contract the schedd package owns: correlation fields stamped on
+// the engine's bootCtx must reach the vmmd boundary.
+func TestEngineWake_PropagatesWakeIDToVMM(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	// Simulate the inbound ctx gatewayd produces: request_id from
+	// x-faas-request-id, app_id / deployment_id from URL params, and
+	// (eventually, on cold wake) wake_id minted by the gateway path.
+	// PR-A is the envelope + propagation half; the engine here mints
+	// wake_id itself, but the inbound ctx already carries request_id /
+	// app_id / deployment_id so we can assert they survive.
+	inboundCtx := wire.WithContext(context.Background(), wire.CorrelationFields{
+		RequestID:    "req-gateway-1",
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+	})
+
+	res, err := e.Wake(inboundCtx, app.ID)
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+
+	if vmm.coldBoots != 1 {
+		t.Fatalf("coldBoots = %d, want 1", vmm.coldBoots)
+	}
+	if vmm.lastColdBootCtx == nil {
+		t.Fatal("fakeVMM did not capture cold-boot ctx")
+	}
+
+	// Lift correlation off the captured ctx. The engine joins
+	// wake_id / instance_id onto the inbound set, so the resulting
+	// fields must include everything inbound PLUS the engine-minted
+	// wake_id / instance_id.
+	got, ok := wire.FromContext(vmm.lastColdBootCtx)
+	if !ok {
+		t.Fatal("vmmd-bound ctx has no correlation fields")
+	}
+	if got.RequestID != "req-gateway-1" {
+		t.Errorf("RequestID = %q, want req-gateway-1", got.RequestID)
+	}
+	if got.AppID != app.ID {
+		t.Errorf("AppID = %q, want %q", got.AppID, app.ID)
+	}
+	if got.DeploymentID != dep.ID {
+		t.Errorf("DeploymentID = %q, want %q", got.DeploymentID, dep.ID)
+	}
+	if got.WakeID == "" {
+		t.Error("WakeID empty; engine must mint wake_id at cold boot")
+	}
+	if got.WakeID != res.WakeID {
+		t.Errorf("WakeID %q != engine's WakeID %q", got.WakeID, res.WakeID)
+	}
+	if got.InstanceID == "" {
+		t.Error("InstanceID empty; engine must record the leased instance id")
+	}
+	if got.InstanceID != res.InstanceID {
+		t.Errorf("InstanceID %q != engine's WakeResult.InstanceID %q", got.InstanceID, res.InstanceID)
 	}
 }
 

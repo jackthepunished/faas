@@ -5,6 +5,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -38,15 +39,30 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	defer func() {
 		s.ops.Observe(op, time.Since(start), sendErr)
 	}()
+	// issue #517: lift correlation fields off the inbound gRPC
+	// metadata; the LogsRequest.wake_id proto field is the fallback
+	// for callers that don't set the MD. PR-C will adopt canonical
+	// timeline event names on these log lines.
+	fields, _ := wire.CorrelationFromIncoming(stream.Context())
+	if fields.WakeID == "" {
+		fields.WakeID = req.GetWakeId()
+	}
+	streamLogger := wire.WithCorrelationFields(s.log, fields)
 	if req.GetInstance() == "" {
 		sendErr = status.Error(codes.InvalidArgument, "instance is required")
+		streamLogger.Warn("vmmd: Logs: missing instance")
 		return sendErr
 	}
 	ring := s.vmm.LogRing(req.GetInstance())
 	if ring == nil {
 		sendErr = status.Error(codes.NotFound, "instance not live on this vmmd")
+		streamLogger.Info("vmmd: Logs: ring not found",
+			"instance", req.GetInstance())
 		return sendErr
 	}
+	streamLogger.Info("vmmd: Logs: stream opened",
+		"instance", req.GetInstance(),
+		"since_seq", req.GetSinceSeq())
 	// Initial page: lines with Seq > since_seq in commit order. The
 	// ring's Snapshot filters by Seq >= sinceSeq (>= so a sinceSeq
 	// equal to the last seq is still considered replayed; the caller
