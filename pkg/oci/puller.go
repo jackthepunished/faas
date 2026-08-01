@@ -98,6 +98,26 @@ type ManifestPuller interface {
 	PullBlob(ctx context.Context, repo, digest string) (io.ReadCloser, error)
 }
 
+// AuthManifestPuller is the additive seam for per-app private-registry
+// Basic Auth in the M6 two-drive path (issue #461 / ADR-062). Production
+// RegistryClient satisfies ManifestPuller AND AuthManifestPuller;
+// offline DefaultPuller ignores auth. imaged's aboveBaseLayers
+// type-asserts to AuthManifestPuller so it can thread the customer's
+// per-app credential to app manifest + app blob pulls while base
+// pulls stay anonymous (the base is always public
+// ghcr.io/onebox-faas/...).
+//
+// Pass `auth == nil` for the anonymous path; the caller's Basic Auth
+// is sourced from app_registry_credentials (imaged transiently
+// unseals the password). PullManifestWithAuth + PullBlobWithAuth
+// have IDENTICAL semantics to their non-auth counterparts modulo
+// the bearer-token realm Basic Auth header.
+type AuthManifestPuller interface {
+	ManifestPuller
+	PullManifestWithAuth(ctx context.Context, ref string, auth *BasicAuth) (Manifest, error)
+	PullBlobWithAuth(ctx context.Context, repo, digest string, auth *BasicAuth) (io.ReadCloser, error)
+}
+
 // DefaultPuller is the offline default — it echoes the reference back from
 // PullDigest / PullImageConfig and returns no layers from PullLayers.
 // imaged.New substitutes it when no puller is injected; the shape

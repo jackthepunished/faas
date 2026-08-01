@@ -38,6 +38,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -224,6 +225,28 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// override with FAAS_VMM_SOCK for dev (e.g. a bufconn
 		// test on a Mac).
 		WithVMMClient(imaged.NewVMMClient(envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock), log))
+
+	// Issue #461 / ADR-062: load the host age identity so imaged
+	// can transiently unseal per-app private-registry Basic Auth
+	// passwords in the pull path. Same FAAS_HOST_AGE_IDENTITY_PATH
+	// env var apid loads for MFA — they're the SAME key file
+	// (vmmd writes it on wake). The identity stays in-process; we
+	// never log it or write it to disk. Required only when an
+	// app has a private-registry credential stored; with no
+	// identity wired, the registry credential lookup is skipped
+	// and pulls stay anonymous (matches Free plan + no-cred
+	// Hobby paths).
+	if identityPath := envOr("FAAS_HOST_AGE_IDENTITY_PATH", ""); identityPath != "" {
+		ident, err := secretbox.LoadHostKey(identityPath)
+		if err != nil {
+			return fmt.Errorf("imaged: load host age identity %q: %w", identityPath, err)
+		}
+		h.WithSecretboxIdentity(ident)
+		log.Info("host age identity loaded for registry credential unseal",
+			"path", identityPath)
+	} else {
+		log.Warn("FAAS_HOST_AGE_IDENTITY_PATH unset — registry credential unseal disabled (Free plan + anonymous-only deployments)")
+	}
 
 	// F3: function runner wiring. cmd/imaged refuses to come up if either
 	// env var is set but the path doesn't exist on disk — silent omission

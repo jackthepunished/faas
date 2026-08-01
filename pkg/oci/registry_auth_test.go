@@ -87,6 +87,14 @@ func TestScrubAuthFromError_Idempotent(t *testing.T) {
 func TestRegistryClient_SatisfiesAuthPuller(t *testing.T) {
 	var _ AuthPuller = (*RegistryClient)(nil)
 	var _ AuthPuller = DefaultPuller{}
+	// AuthManifestPuller is the M6 two-drive seam (issue #461 / ADR-062);
+	// production RegistryClient must satisfy it. DefaultPuller
+	// intentionally implements only Puller (offline default), not
+	// ManifestPuller / AuthManifestPuller — the auth path runs only
+	// when production wires RegistryClient. fakes that DO implement
+	// ManifestPuller (e.g. cmd/e2e fakes) must additionally implement
+	// AuthManifestPuller for the auth path to engage.
+	var _ AuthManifestPuller = (*RegistryClient)(nil)
 }
 
 // TestPullDigestWithAuth_SendsBasicAuthToRealm drives the realm
