@@ -1142,14 +1142,14 @@ func TestPg_ComputeNodes_ActiveComputeNodes_ExcludesInactive_AndSortsByName(t *t
 	if _, err := s.CreateComputeNode(ctx, state.ComputeNode{
 		Name: "alpha-node", TargetURL: "unix:///run/faas/vmmd.sock",
 		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
-		Active: true,
+		VCPUBudget: api.VCPUSlots, Active: true,
 	}); err != nil {
 		t.Fatalf("CreateComputeNode(alpha): %v", err)
 	}
 	if _, err := s.CreateComputeNode(ctx, state.ComputeNode{
 		Name: "zulu-drained", TargetURL: "tcp://10.0.0.10:50051",
 		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
-		Active: false,
+		VCPUBudget: api.VCPUSlots, Active: false,
 	}); err != nil {
 		t.Fatalf("CreateComputeNode(zulu): %v", err)
 	}
@@ -1375,6 +1375,7 @@ func TestPg_ComputeNodes_Create_RejectsBadTargetURL(t *testing.T) {
 		_, err := s.CreateComputeNode(ctx, state.ComputeNode{
 			Name: "bad-" + bad, TargetURL: bad,
 			VPCPUs: 1, MemMB: 1, MaxConcurrency: 1, AdmissionCeilingMB: 1,
+			VCPUBudget: api.VCPUSlots,
 		})
 		if err == nil {
 			t.Errorf("CreateComputeNode(target_url=%q) returned nil error; CHECK should reject", bad)
@@ -1397,6 +1398,7 @@ func TestPg_ComputeNodes_Create_DuplicateNameConflicts(t *testing.T) {
 	_, err := s.CreateComputeNode(ctx, state.ComputeNode{
 		Name: state.DefaultLocalNodeName, TargetURL: "unix:///run/faas/vmmd.sock",
 		VPCPUs: 1, MemMB: 1, MaxConcurrency: 1, AdmissionCeilingMB: 1,
+		VCPUBudget: api.VCPUSlots,
 	})
 	if err == nil {
 		t.Fatal("CreateComputeNode(duplicate name): want error, got nil")
@@ -1416,7 +1418,7 @@ func TestPg_ComputeNodes_Create_AssignsUUIDWhenEmpty(t *testing.T) {
 	got, err := s.CreateComputeNode(ctx, state.ComputeNode{
 		Name: "fresh-uuid", TargetURL: "unix:///run/faas/vmmd.sock",
 		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
-		Active: true,
+		VCPUBudget: api.VCPUSlots, Active: true,
 	})
 	if err != nil {
 		t.Fatalf("CreateComputeNode: %v", err)
