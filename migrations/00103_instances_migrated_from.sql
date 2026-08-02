@@ -43,10 +43,24 @@ alter table instances
   add column if not exists migrated_from_node_id uuid
     references compute_nodes(id) on delete set null,
   add column if not exists migrated_at timestamptz,
-  add column if not exists lease_token text,
-  add constraint instances_migrated_at_chk
-    check (migrated_at is null
-           or migrated_at <= now() + interval '1 minute');
+  add column if not exists lease_token text;
+
+-- PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS, so guard with
+-- pg_constraint existence check (00053_deployments_source_url.sql
+-- pattern — PR #377 / ADR-041 contract).
+do $$
+begin
+  if not exists (
+    select 1 from pg_catalog.pg_constraint
+     where conname = 'instances_migrated_at_chk'
+       and conrelid = 'instances'::regclass
+  ) then
+    alter table instances
+      add constraint instances_migrated_at_chk
+        check (migrated_at is null
+               or migrated_at <= now() + interval '1 minute');
+  end if;
+end$$;
 
 create index if not exists instances_migrated_from_node_id_idx
   on instances (migrated_from_node_id)

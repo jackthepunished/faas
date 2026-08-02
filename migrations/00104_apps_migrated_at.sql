@@ -34,10 +34,24 @@
 -- (PR #377 / ADR-041 contract).
 
 alter table apps
-  add column if not exists migrated_at timestamptz,
-  add constraint apps_migrated_at_chk
-    check (migrated_at is null
-           or migrated_at <= now() + interval '1 minute');
+  add column if not exists migrated_at timestamptz;
+
+-- PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS, so guard with
+-- pg_constraint existence check (00053_deployments_source_url.sql
+-- pattern — PR #377 / ADR-041 contract).
+do $$
+begin
+  if not exists (
+    select 1 from pg_catalog.pg_constraint
+     where conname = 'apps_migrated_at_chk'
+       and conrelid = 'apps'::regclass
+  ) then
+    alter table apps
+      add constraint apps_migrated_at_chk
+        check (migrated_at is null
+               or migrated_at <= now() + interval '1 minute');
+  end if;
+end$$;
 
 -- +goose StatementEnd
 -- +goose Down
