@@ -1,0 +1,40 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00092_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot 92 is held by open PR #522 (per-app private-registry Basic
+-- Auth, issue #461 / ADR-064) as a reservation; PR #522 renumbered
+-- its migration from 00087 → 00092 after the cross-PR collision
+-- detector found PR #529 (Tier A4 cross-node app rebalance) had
+-- also claimed slot 92. The reservation keeps PR #522's embedded
+-- set contiguous from 1 through 93 without leaving a 92 gap that
+-- TestMigrationsContiguous would flag.
+--
+-- Whichever PR lands first (PR #522 with this reservation, or
+-- PR #529 with its real 92 migration), the other drops its 92
+-- reservation on rebase. The cross-PR slot gate hides reservation
+-- files via the slots_from_paths regex carve-out, so the
+-- simultaneous reservations do not surface as a collision.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

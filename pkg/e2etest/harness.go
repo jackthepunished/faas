@@ -358,13 +358,13 @@ const testDomain = "apps.test.example"
 // parallel slot-83 race against PR #509; the second lands on the
 // next free slot past the live migration head.
 //
-// (issue #461 / ADR-064 — registry_credentials landing on slot 92,
-// the next free slot past main's 00091 apps_node_claimable. Bumped
-// 83 → 87 → 92 across two rebase cycles when main kept moving the
-// head: 86 (apps_require_signed) → 91 (apps_node_claimable, with
-// 87/88/89 reservation placeholders and 90 builds_node_signature
-// in between).)
-const e2eMigrationTarget = 92
+// (issue #461 / ADR-064 — registry_credentials landing on slot 93
+// after adding a 00092 reservation fence to dodge the cross-PR slot
+// collision with PR #529 (Tier A4 cross-node app rebalance, ADR-064).
+// Bumped 83 → 87 → 92 → 93 across three rebase cycles; the renumber
+// chain tracks the gate's "next free slot past the live head" rule
+// when sibling PRs race for the same N.)
+const e2eMigrationTarget = 93
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
