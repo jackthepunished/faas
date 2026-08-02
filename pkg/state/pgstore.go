@@ -784,10 +784,19 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// callers that build an App by hand with the int zero. node_id
 	// (migration 00090, Phase 2 / Gate A) is the durable shard key.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11, $12, $13, $14, $15, $16, $17, $18)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18)
 		 returning ` + appsSelectColumns
+	// status: pull from app.Status when non-empty (the API surfaces it on
+	// update / restore paths); fall back to 'active' on the Go zero so the
+	// create path keeps the schema DEFAULT behaviour. The column is NOT
+	// NULL with a CHECK (status IN ('active','evicted_cold','deleted')),
+	// so the empty-string fallback would trip 23514 — coerce to AppActive.
+	statusValue := app.Status
+	if statusValue == "" {
+		statusValue = AppActive
+	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
 	return scanApp(row)
 }
@@ -899,10 +908,18 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// the Go floor above is the last-line defence for tests / internal
 	// callers that build an App by hand with the int zero.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17)
 		 returning ` + appsSelectColumns
+	// status: same fallback as CreateApp above — empty Go Status would
+	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
+	// column DEFAULT is documented as 'active' but the explicit INSERT
+	// would trip the check_violation otherwise.
+	statusValue := app.Status
+	if statusValue == "" {
+		statusValue = AppActive
+	}
 	row := tx.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
 	created, err := scanApp(row)
 	if err != nil {
