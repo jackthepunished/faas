@@ -259,6 +259,27 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		}
 		overrides = req.Overrides
 	}
+	// Issue #463 / ADR-066: validate sidecars AFTER the override
+	// block (sidecars are an additive surface; the override gate is
+	// the more fundamental shape error). The 2-cap, type-uniqueness,
+	// digest-pinning, and stateful-deny rules all run here. A failed
+	// validation 400s the whole request — the sidecar is NEVER
+	// silently dropped (mirrors the override contract). Plan tier
+	// comes from the authenticated account (limits already hoisted
+	// above the multipart branch). PR-A's `Plan.SidecarAllowed()`
+	// returns true for every plan; the accessor exists for a future
+	// per-plan gate so the handler doesn't have to branch on Plan
+	// strings.
+	if len(req.Sidecars) > 0 {
+		if !acct.Plan.SidecarAllowed() {
+			api.WriteProblem(w, api.ErrSidecarNotAllowedOnPlan(acct.Plan))
+			return
+		}
+		if p := req.Sidecars.Validate(limits); p != nil {
+			api.WriteProblem(w, p)
+			return
+		}
+	}
 	// PR-B: the prior-deployment supersede is folded into
 	// store.CreateDeployment's tx (pkg/state/pgstore.go). apid no longer
 	// holds a "supersede then create" two-step — the in-tx ordering
@@ -299,6 +320,24 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 				dep.OverrideHealthcheck = b
 			}
 		}
+	}
+	// Issue #463 / ADR-066: envelope-seal each sidecar's env
+	// values via secretbox.SealBytes (namespace="sidecar_env",
+	// mirrors AppSecret's namespace="secrets"). The sealed
+	// payload is base64'd into the JSONB sidecar's `env` map;
+	// plaintext is NEVER persisted, logged, audited, or echoed
+	// in errors. The recipient-not-loaded branch surfaces
+	// 503 ErrCapacity so apid fails closed at the API layer
+	// rather than at the wake path. Empty / nil sidecars
+	// produce `[]` so the NOT NULL DEFAULT constraint
+	// (migration 00095) is satisfied.
+	if len(req.Sidecars) > 0 {
+		sealed, sErr := sealSidecars(req.Sidecars, setSidecarRecipient())
+		if sErr != nil {
+			api.WriteProblem(w, sErr)
+			return
+		}
+		dep.Sidecars = sealed
 	}
 	d, err := s.store.CreateDeployment(ctx(r), dep)
 	if err != nil {
@@ -373,6 +412,28 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 			"app_id":        app.ID,
 			"deployment_id": d.ID,
 			"ref":           req.Image,
+		})
+	}
+	// Issue #463 / ADR-066: sidecar audit event. Emitted ONLY when
+	// the deployment carries sidecars (the no-sidecar deploy path
+	// is a no-op; the regular app.deployed event already covers
+	// it). The payload carries metadata only — names, types,
+	// count. NEVER the env plaintext, NEVER the sealed ciphertext,
+	// NEVER the image digest. The audit sink uses
+	// `logsanitize.Field` on the names list (the same way
+	// handlers_secrets.go handles secret keys). A future PR-C
+	// observability addendum may surface per-sidecar cardinality
+	// here (names → sidecar_restart_total{app,sidecar} metric).
+	if len(req.Sidecars) > 0 {
+		names := make([]string, 0, len(req.Sidecars))
+		for _, sc := range req.Sidecars {
+			names = append(names, sc.Name)
+		}
+		s.audit.Emit(ctx(r), "sidecar.set", &acct.ID, map[string]any{
+			"app_id":        app.ID,
+			"deployment_id": d.ID,
+			"sidecar_count": len(req.Sidecars),
+			"sidecar_names": names,
 		})
 	}
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
