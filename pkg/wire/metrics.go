@@ -1372,7 +1372,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
 		imageScanVulns.WithLabelValues("<unknown>", sev)
 	}
-// Pre-instantiate every outcome in the closed set so the
+	// Pre-instantiate every outcome in the closed set so the
 	// counter's HELP/TYPE and zero-valued rows surface in
 	// `/metrics` from the moment schedd boots — even before the
 	// first four-phase handoff resolves. Matches the rebalance
@@ -1538,7 +1538,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// before the first sampler tick.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
-registry:                           reg,
+		registry:                           reg,
 		ops:                                ops,
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
