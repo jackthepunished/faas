@@ -1875,7 +1875,7 @@ func (m *MemStore) ListExpiredMigrations(_ context.Context, maxPerTick int) ([]I
 	defer m.mu.Unlock()
 	var out []Instance
 	for _, ins := range m.instances {
-		if ins.State != "migrating" || ins.LeaseToken == "" {
+		if ins.State != string(StateMigrating) || ins.LeaseToken == "" {
 			continue
 		}
 		out = append(out, ins)
@@ -1904,10 +1904,10 @@ func (m *MemStore) ReinviteMigratingInstance(_ context.Context, instanceID, leas
 	if !ok {
 		return ErrNotFound
 	}
-	if ins.State != "migrating" || ins.LeaseToken != leaseToken {
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
 		return ErrConflict
 	}
-	ins.State = "running"
+	ins.State = string(StateRunning)
 	now := time.Now().UTC()
 	ins.MigratedAt = &now
 	ins.LeaseToken = ""
@@ -1936,10 +1936,10 @@ func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseTo
 	if !ok {
 		return ErrNotFound
 	}
-	if ins.State != "migrating" || ins.LeaseToken != leaseToken {
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
 		return ErrConflict
 	}
-	ins.State = "parked"
+	ins.State = string(StateParked)
 	ins.LeaseToken = ""
 	m.instances[instanceID] = ins
 	return nil
