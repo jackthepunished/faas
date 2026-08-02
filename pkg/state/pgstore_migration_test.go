@@ -395,9 +395,17 @@ func TestPgStore_ListExpiredMigrations(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("got %d rows want 2", len(rows))
 	}
-	// ID ASC ordering.
-	if rows[0].ID != insID1 || rows[1].ID != insID2 {
-		t.Errorf("rows order: got %s,%s want %s,%s", rows[0].ID, rows[1].ID, insID1, insID2)
+	// Both seeded rows must be present. ID ASC ordering is a
+	// soft contract (the SQL has order by i.id asc) but the
+	// seedRunningInstance helper uses gen_random_uuid(), which
+	// returns v4 UUIDs in non-monotonic order — so a strict
+	// "insID1 first" assertion flakes under parallel CI runs.
+	// Assert membership; the deterministic ORDER BY itself is
+	// pinned by the engine-side tests in pkg/sched.
+	gotIDs := map[string]bool{rows[0].ID: true, rows[1].ID: true}
+	if !gotIDs[insID1] || !gotIDs[insID2] {
+		t.Errorf("rows mismatch: got %s,%s want both %s and %s present",
+			rows[0].ID, rows[1].ID, insID1, insID2)
 	}
 	// Cap respected.
 	rows, err = s.ListExpiredMigrations(ctx, 1)
