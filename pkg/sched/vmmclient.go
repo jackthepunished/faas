@@ -93,6 +93,26 @@ type VMM interface {
 	// is additive per ADR-016; the zero-time value is the
 	// "no bound" sentinel and is skipped on the wire.
 	Logs(ctx context.Context, instance string, sinceSeq int64, sinceWrittenAt time.Time) (LogStream, error)
+	// PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
+	// four-phase cross-node live-instance handoff. The caller
+	// (schedd's migration_handoff.go) dials the DYING vmmd and
+	// asks it to pause the running VM + write a snapshot to the
+	// canonical storage key. Returns the snapshot storage keys
+	// + the lease_token the dying vmmd minted (used as the
+	// conditional-UPDATE predicate at Phase 3).
+	PrepareLiveMigration(ctx context.Context, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error)
+	// AdoptMigratedInstance (Tier A5 / ADR-065) is Phase 2. The
+	// caller dials the NEW owner vmmd and asks it to restore the
+	// snapshot the dying vmmd wrote at Phase 1.
+	AdoptMigratedInstance(ctx context.Context, instanceID string, app AppSpec, memKey, vmstateKey, leaseToken string) (LiveMigrationAdopt, error)
+	// AcknowledgeMigration (Tier A5 / ADR-065) is Phase 3.5. The
+	// caller dials the DYING vmmd and tells it "Phase 3 committed;
+	// destroy the paused VM". Idempotent.
+	AcknowledgeMigration(ctx context.Context, instanceID, leaseToken string) error
+	// CancelLiveMigration (Tier A5 / ADR-065) is Phase 4. The
+	// caller dials the DYING vmmd and tells it "abort — resume
+	// the paused VM". Idempotent on an already-resumed VM.
+	CancelLiveMigration(ctx context.Context, instanceID, leaseToken string) error
 }
 
 // LogReceiver is the per-instance callback the vmmd Logs RPC hands
@@ -579,6 +599,79 @@ func (s *grpcLogStream) Recv() (LogLine, error) {
 		line.GapToWrittenAt = t.AsTime()
 	}
 	return line, nil
+}
+
+// PrepareLiveMigration implements VMM (Tier A5 / ADR-065).
+// Phase 1 of the four-phase handoff. The caller is schedd's
+// migration_handoff.go; the dial target is the DYING vmmd.
+// Forwards over gRPC to vmmdpb.Vmmd_PrepareLiveMigration and
+// lifts the typed response into LiveMigrationPrepare. A non-OK
+// gRPC status surfaces via liftErr (typed *api.Problem if vmmd
+// emitted one, raw gRPC status otherwise).
+func (c *VMMClient) PrepareLiveMigration(ctx context.Context, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error) {
+	resp, err := c.cli.PrepareLiveMigration(ctx, &vmmdpb.PrepareLiveMigrationRequest{
+		InstanceId:         instanceID,
+		SnapshotStorageKey: snapshotStorageKey,
+	})
+	if err != nil {
+		return LiveMigrationPrepare{}, liftErr(err)
+	}
+	return LiveMigrationPrepare{
+		MemStorageKey:     resp.GetMemStorageKey(),
+		VMStateStorageKey: resp.GetVmstateStorageKey(),
+		LeaseToken:        resp.GetLeaseToken(),
+	}, nil
+}
+
+// AdoptMigratedInstance implements VMM (Tier A5 / ADR-065).
+// Phase 2 of the four-phase handoff. The dial target is the NEW
+// owner vmmd; the call restores the snapshot the dying vmmd
+// wrote at Phase 1 and returns the new instance's network
+// identifiers.
+func (c *VMMClient) AdoptMigratedInstance(ctx context.Context, instanceID string, app AppSpec, memKey, vmstateKey, leaseToken string) (LiveMigrationAdopt, error) {
+	resp, err := c.cli.AdoptMigratedInstance(ctx, &vmmdpb.AdoptMigratedInstanceRequest{
+		InstanceId:        instanceID,
+		AppSpec:           app.toProto(),
+		MemStorageKey:     memKey,
+		VmstateStorageKey: vmstateKey,
+		LeaseToken:        leaseToken,
+	})
+	if err != nil {
+		return LiveMigrationAdopt{}, liftErr(err)
+	}
+	return LiveMigrationAdopt{
+		HostIP:   resp.GetHostIp(),
+		Netns:    resp.GetNetns(),
+		GuestUID: int(resp.GetGuestUid()),
+	}, nil
+}
+
+// AcknowledgeMigration implements VMM (Tier A5 / ADR-065).
+// Phase 3.5 of the four-phase handoff. The dial target is the
+// DYING vmmd; the call tells it "Phase 3 committed, destroy the
+// paused VM". Idempotent.
+func (c *VMMClient) AcknowledgeMigration(ctx context.Context, instanceID, leaseToken string) error {
+	if _, err := c.cli.AcknowledgeMigration(ctx, &vmmdpb.AcknowledgeMigrationRequest{
+		InstanceId: instanceID,
+		LeaseToken: leaseToken,
+	}); err != nil {
+		return liftErr(err)
+	}
+	return nil
+}
+
+// CancelLiveMigration implements VMM (Tier A5 / ADR-065).
+// Phase 4 of the four-phase handoff. The dial target is the
+// DYING vmmd; the call tells it "abort — resume the paused VM".
+// Idempotent on an already-resumed VM.
+func (c *VMMClient) CancelLiveMigration(ctx context.Context, instanceID, leaseToken string) error {
+	if _, err := c.cli.CancelLiveMigration(ctx, &vmmdpb.CancelLiveMigrationRequest{
+		InstanceId: instanceID,
+		LeaseToken: leaseToken,
+	}); err != nil {
+		return liftErr(err)
+	}
+	return nil
 }
 
 // Ping implements VMM. Wire-level liveness probe (issue #97 /
