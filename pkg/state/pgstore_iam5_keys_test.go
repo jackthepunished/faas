@@ -53,7 +53,7 @@ func TestPg_CreateAPIKeyWithExpiry_FutureExpiryPersistsValue(t *testing.T) {
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
 	hash := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	exp := time.Now().Add(24 * time.Hour).Truncate(time.Microsecond)
-	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, hash, "scoped", []string{"invoke"}, &exp)
+	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, hash, "scoped", []string{"apps:read"}, &exp)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestPg_CountAPIKeys_ExcludesRevoked(t *testing.T) {
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
 	// Seed three keys: two active, one revoked.
 	for i, hash := range [][]byte{{0x01}, {0x02}, {0x03}} {
-		_, err := s.CreateAPIKeyWithExpiry(ctx, acctID, hash, "k"+string(rune('a'+i)), []string{"invoke"}, nil)
+		_, err := s.CreateAPIKeyWithExpiry(ctx, acctID, hash, "k"+string(rune('a'+i)), []string{"apps:read"}, nil)
 		if err != nil {
 			t.Fatalf("CreateAPIKeyWithExpiry[%d]: %v", i, err)
 		}
@@ -110,7 +110,7 @@ func TestPg_CountAPIKeys_EmptyAccountIsZero(t *testing.T) {
 func TestPg_MarkAPIKeyRevoked_FlipsStatusAndStampsRevokedAt(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
-	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, []byte{0xAA}, "to-revoke", []string{"invoke"}, nil)
+	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, []byte{0xAA}, "to-revoke", []string{"apps:read"}, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestPg_MarkAPIKeyRevoked_FlipsStatusAndStampsRevokedAt(t *testing.T) {
 func TestPg_MarkAPIKeyRevoked_IdempotentReturnsRow(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
-	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, []byte{0xBB}, "to-revoke", []string{"invoke"}, nil)
+	k, err := s.CreateAPIKeyWithExpiry(ctx, acctID, []byte{0xBB}, "to-revoke", []string{"apps:read"}, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestPg_MarkAPIKeyRevoked_CrossAccountReturnsErrNotFound(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctA := createAccount(t, s, ctx, pgTestEmail(t))
 	acctB := createAccount(t, s, ctx, pgTestEmail(t))
-	k, err := s.CreateAPIKeyWithExpiry(ctx, acctA, []byte{0xCC}, "cross", []string{"invoke"}, nil)
+	k, err := s.CreateAPIKeyWithExpiry(ctx, acctA, []byte{0xCC}, "cross", []string{"apps:read"}, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
 	}
